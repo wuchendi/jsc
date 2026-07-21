@@ -1,0 +1,284 @@
+//! Integration tests: cross-wave regression and acceptance gates via the CLI.
+#![allow(clippy::expect_used)]
+
+use std::process::Command;
+mod common;
+use common::{jsc, jsc_raw_stdout};
+
+/// The full pre-S10 milestone set still holds after the string layer landed.
+///
+/// Numbers, `while`-sum, recursive `fib`, `typeof` over non-string types,
+/// `null === null`, and a boolean-driven ternary all survive S10 unchanged.
+#[test]
+fn regression_survives_strings() {
+    assert_eq!(jsc(&["-e", "40 + 2"]), "42");
+    assert_eq!(jsc(&["-e", "let x = 40; x + 2"]), "42");
+    assert_eq!(
+        jsc(&["-e", "let i=0; let s=0; while(i<10){ s=s+i; i=i+1 } s"]),
+        "45",
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)"
+        ]),
+        "55",
+    );
+    assert_eq!(jsc(&["-e", "typeof 42"]), "number");
+    assert_eq!(jsc(&["-e", "typeof true"]), "boolean");
+    assert_eq!(jsc(&["-e", "typeof null"]), "object");
+    assert_eq!(jsc(&["-e", "null === null"]), "true");
+    assert_eq!(jsc(&["-e", "let b=true; b === true ? 42 : 0"]), "42");
+}
+
+/// The string milestones still dispatch correctly after arrays landed.
+///
+/// `s[i]` and `.length` share syntax with arrays but must keep routing to the
+/// string path at runtime; concatenation and strict equality are unchanged.
+#[test]
+fn regression_survives_arrays() {
+    assert_eq!(jsc(&["-e", r#""abc"[1]"#]), "b");
+    assert_eq!(jsc(&["-e", r#""foo".length"#]), "3");
+    assert_eq!(jsc(&["-e", r#""foo" + "bar""#]), "foobar");
+    assert_eq!(jsc(&["-e", "40+2"]), "42");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)"
+        ]),
+        "55",
+    );
+    assert_eq!(jsc(&["-e", "typeof 42"]), "number");
+    assert_eq!(jsc(&["-e", "null===null"]), "true");
+}
+
+/// Arrays, strings, and numbers still dispatch correctly after objects landed.
+///
+/// `o.a` / `o["a"]` share syntax with array/string indexing but must keep routing
+/// to the object path at runtime; every earlier heap type stays intact.
+#[test]
+fn regression_survives_objects() {
+    assert_eq!(jsc(&["-e", "let a=[1,2,3]; a[0]+a[2]"]), "4");
+    assert_eq!(jsc(&["-e", "[1,2,3].length"]), "3");
+    assert_eq!(jsc(&["-e", "let a=[10,20]; a[1]=5; a[0]+a[1]"]), "15");
+    assert_eq!(jsc(&["-e", "typeof []"]), "object");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a=[1,2,3,4]; let i=0; let s=0; while(i<a.length){ s=s+a[i]; i=i+1 } s"
+        ]),
+        "10",
+    );
+    assert_eq!(jsc(&["-e", r#""abc"[1]"#]), "b");
+    assert_eq!(jsc(&["-e", r#""foo".length"#]), "3");
+    assert_eq!(jsc(&["-e", r#""foo" + "bar""#]), "foobar");
+    assert_eq!(jsc(&["-e", "40+2"]), "42");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)"
+        ]),
+        "55",
+    );
+    assert_eq!(jsc(&["-e", "typeof 42"]), "number");
+    assert_eq!(jsc(&["-e", "null===null"]), "true");
+}
+
+/// The full S11 + prior-milestone set stays green after nesting integration.
+///
+/// One assertion per earlier wave — arrays, objects (read/assign/computed),
+/// strings, numbers, `fib`, `typeof`, and strict equality — so a nesting change
+/// that regressed any base behavior is caught here.
+#[test]
+fn regression_survives_nesting() {
+    // Objects: read, computed read, property assign.
+    assert_eq!(jsc(&["-e", "let o={a:1,b:2}; o.a+o.b"]), "3");
+    assert_eq!(jsc(&["-e", "let o={a:1}; o[\"a\"]"]), "1");
+    assert_eq!(jsc(&["-e", "let o={x:10}; o.x=42; o.x"]), "42");
+    // Arrays: length, element assign.
+    assert_eq!(jsc(&["-e", "[1,2,3].length"]), "3");
+    assert_eq!(jsc(&["-e", "let a=[10,20]; a[1]=5; a[0]+a[1]"]), "15");
+    // Heap typeof.
+    assert_eq!(jsc(&["-e", "typeof []"]), "object");
+    assert_eq!(jsc(&["-e", "typeof {}"]), "object");
+    // Strings.
+    assert_eq!(jsc(&["-e", r#""abc"[1]"#]), "b");
+    assert_eq!(jsc(&["-e", r#""foo" + "bar""#]), "foobar");
+    // Numbers, recursion, strict equality.
+    assert_eq!(jsc(&["-e", "40+2"]), "42");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)"
+        ]),
+        "55",
+    );
+    assert_eq!(jsc(&["-e", "null===null"]), "true");
+}
+
+/// S13.7 — a regression sampling across every earlier wave, confirming the S13
+/// tag refactor and function/closure additions left the prior language intact:
+/// numbers, recursion, `for`-sum, `switch`, block scope, `typeof`, strict
+/// equality, logical/coalescing operators, compound assignment, and the string /
+/// array / object basics all still render their expected values.
+#[test]
+fn s13_regression_sampling() {
+    // Numbers and recursion.
+    assert_eq!(jsc(&["-e", "40 + 2"]), "42");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)"
+        ]),
+        "55"
+    );
+    // Statement forms: `for`-sum, `switch` match, block scoping.
+    assert_eq!(
+        jsc(&["-e", "let s=0; for(let i=0;i<5;i=i+1){ s=s+i } s"]),
+        "10"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let x=2; let r=0; switch(x){ case 1: r=1; break; case 2: r=42; break } r"
+        ]),
+        "42"
+    );
+    assert_eq!(jsc(&["-e", "let x=1; { let x=2; } x"]), "1");
+    // Operators: `typeof`, strict equality, logical / coalescing, compound assign.
+    assert_eq!(jsc(&["-e", "typeof 42"]), "number");
+    assert_eq!(jsc(&["-e", "null === null"]), "true");
+    assert_eq!(jsc(&["-e", "!true"]), "false");
+    assert_eq!(jsc(&["-e", "0 && 1"]), "0");
+    assert_eq!(jsc(&["-e", "null ?? 4"]), "4");
+    assert_eq!(jsc(&["-e", "let x=5; x+=3; x"]), "8");
+    assert_eq!(jsc(&["-e", "let x=10; x%=3; x"]), "1");
+    // Heap basics: strings, arrays, objects (including nested read).
+    assert_eq!(jsc(&["-e", r#""foo"+"bar""#]), "foobar");
+    assert_eq!(jsc(&["-e", r#""abc"[1]"#]), "b");
+    assert_eq!(jsc(&["-e", r#""foo".length"#]), "3");
+    assert_eq!(jsc(&["-e", "let a=[1,2,3]; a[0]+a[2]"]), "4");
+    assert_eq!(jsc(&["-e", "let o={a:1,b:2}; o.a+o.b"]), "3");
+    assert_eq!(jsc(&["-e", "let o={v:[7,8]}; o.v[1]"]), "8");
+}
+
+/// S14.7 — the full S14 milestone matrix as one consolidated end-to-end gate through
+/// the built binary. The `console.log` milestones assert **stdout** byte-for-byte; the
+/// value milestones assert the decoded final value. Covers every S14 feature group:
+/// `console.log`, `Math`, conversions, array growth (`push`/`pop`), the higher-order
+/// callback methods (`map`/`filter`/`reduce`/`forEach`), and the array/string method
+/// surface.
+#[test]
+fn s14_acceptance_milestones() {
+    // console.log — printed output, independent of the final-expression value.
+    assert_eq!(
+        jsc_raw_stdout(&["-e", "console.log(40 + 2)"]),
+        "42\nundefined\n"
+    );
+    assert_eq!(
+        jsc_raw_stdout(&["-e", r#"console.log("hi")"#]),
+        "hi\nundefined\n"
+    );
+    assert_eq!(
+        jsc_raw_stdout(&["-e", "console.log(1, 2, 3)"]),
+        "1 2 3\nundefined\n"
+    );
+    // Math — floor / max / sqrt / abs / min.
+    assert_eq!(jsc(&["-e", "Math.floor(3.7)"]), "3");
+    assert_eq!(jsc(&["-e", "Math.max(1, 42)"]), "42");
+    assert_eq!(jsc(&["-e", "Math.sqrt(1764)"]), "42");
+    assert_eq!(jsc(&["-e", "Math.abs(-42)"]), "42");
+    assert_eq!(jsc(&["-e", "Math.min(5, 2, 9)"]), "2");
+    // Conversions — String / Number / parseInt / Boolean.
+    assert_eq!(jsc(&["-e", "String(42)"]), "42");
+    assert_eq!(jsc(&["-e", "typeof String(42)"]), "string");
+    assert_eq!(jsc(&["-e", r#"Number("42")"#]), "42");
+    assert_eq!(jsc(&["-e", r#"parseInt("42px")"#]), "42");
+    assert_eq!(jsc(&["-e", "Boolean(0)"]), "false");
+    // Array growth — push observed through the binding's length and element.
+    assert_eq!(jsc(&["-e", "let a=[1,2]; a.push(3); a.length"]), "3");
+    assert_eq!(jsc(&["-e", "let a=[1,2]; a.push(3); a[2]"]), "3");
+    // Higher-order — map / filter / reduce / forEach through the callback ABI.
+    assert_eq!(jsc(&["-e", "[1,2,3].map(x => x*2)[2]"]), "6");
+    assert_eq!(jsc(&["-e", "[1,2,3,4].filter(x => x > 2).length"]), "2");
+    assert_eq!(jsc(&["-e", "[1,2,3,4].reduce((a,b) => a+b, 0)"]), "10");
+    assert_eq!(
+        jsc(&["-e", "let s=0; [1,2,3,4].forEach(x => { s = s + x }); s"]),
+        "10",
+    );
+    // Array/string methods — indexOf / join / toUpperCase / slice.
+    assert_eq!(jsc(&["-e", "[10,20,30].indexOf(20)"]), "1");
+    assert_eq!(jsc(&["-e", r#"[1,2,3].join("-")"#]), "1-2-3");
+    assert_eq!(jsc(&["-e", r#""abc".toUpperCase()"#]), "ABC");
+    assert_eq!(jsc(&["-e", r#""HELLO".slice(1,3)"#]), "EL");
+}
+
+/// S14.7 — the S8–S13 regression list must still hold through the built binary after
+/// the whole S14 built-in library landed: numbers, recursion, closures, statement
+/// forms, heap basics, and the operator/typeof/strict-equality surface. S14 adds no
+/// value-level encoding change, so every earlier program renders result-for-result
+/// identically.
+#[test]
+fn s14_full_regression() {
+    // Numbers and recursion.
+    assert_eq!(jsc(&["-e", "40 + 2"]), "42");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)"
+        ]),
+        "55"
+    );
+    // Closures — stateful counter and a returned adder.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function counter(){ let c=0; return function(){ c=c+1; return c } } \
+             let n=counter(); n();n();n()"
+        ]),
+        "3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function adder(x){ return y=>x+y } let a5=adder(5); a5(37)"
+        ]),
+        "42"
+    );
+    // Statement forms — for-sum, switch match, block scope.
+    assert_eq!(
+        jsc(&["-e", "let s=0; for(let i=0;i<5;i=i+1){ s=s+i } s"]),
+        "10"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let x=2; let r=0; switch(x){ case 1: r=1; break; case 2: r=42; break } r"
+        ]),
+        "42"
+    );
+    assert_eq!(jsc(&["-e", "let x=1; { let x=2; } x"]), "1");
+    // Strings, arrays, objects.
+    assert_eq!(jsc(&["-e", r#""foo" + "bar""#]), "foobar");
+    assert_eq!(jsc(&["-e", r#""abc"[1]"#]), "b");
+    assert_eq!(jsc(&["-e", "let a=[1,2,3]; a[0]+a[2]"]), "4");
+    assert_eq!(jsc(&["-e", "let o={a:1,b:2}; o.a+o.b"]), "3");
+    // typeof, strict equality.
+    assert_eq!(jsc(&["-e", "typeof 42"]), "number");
+    assert_eq!(jsc(&["-e", "typeof (x=>x)"]), "function");
+    assert_eq!(jsc(&["-e", "null === null"]), "true");
+    // const reassignment is a compile error: non-zero exit, names the constant.
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "const x = 1; x = 2; x"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert!(
+        !output.status.success(),
+        "reassigning a const must make jsc exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("constant"),
+        "stderr should explain the const violation, got: {stderr}"
+    );
+}

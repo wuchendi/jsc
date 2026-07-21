@@ -1,0 +1,58 @@
+name: Web
+
+# Frontend/JS-side quality gate for the monorepo (packages/jsc + apps/jsc-web).
+# MANUAL only — run it from the Actions tab (workflow_dispatch) when you want to
+# check the JS/TS side. The push/PR Rust gate lives in ci.yml.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: biome + typecheck + build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The @cdlab/jsc package loads a wasm-bindgen artifact that is gitignored,
+      # so build it first (needs Rust + wasm-pack).
+      - name: Install toolchain 1.96.0 (+ wasm target)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Builds the wasm artifact (ensure-wasm) AND the package's TS dist (tsdown),
+      # so apps/jsc-web can resolve @cdlab/jsc types.
+      - name: Build @cdlab/jsc (wasm + types)
+        run: bun run --filter @cdlab/jsc build
+
+      - name: Lint (biome)
+        run: bun run lint
+
+      - name: Typecheck
+        run: |
+          bun run --filter @cdlab/jsc typecheck
+          bun run --filter @cdlab/jsc-web typecheck
+
+      - name: Build web
+        run: bun run --filter @cdlab/jsc-web build
+
+      - name: Test (@cdlab/jsc)
+        run: bun run --filter @cdlab/jsc test

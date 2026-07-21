@@ -1,0 +1,52 @@
+[package]
+name         = "jsc-wasm"
+description  = "WebAssembly boundary crate for @cdlab/jsc"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+publish      = { workspace = true }
+
+[lib]
+# `cdylib` produces the wasm module for `wasm-pack`; `rlib` keeps the crate
+# host-buildable so `cargo test` / `cargo clippy` run without a browser.
+crate-type = ["cdylib", "rlib"]
+
+# `wasm-pack` runs `wasm-opt` on the release build with these flags. `-Oz`
+# optimizes aggressively for size while preserving behaviour.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz"]
+
+[dependencies]
+# `default-features = false` drops jsc-core's `native-run` feature (and with it
+# the wasmtime dependency), leaving a frontend+codegen+emit core that produces
+# module bytes with no runtime — exactly what a wasm32 boundary needs.
+# `anyhow` is the error type jsc-core's `parse`/`lower` surface; the boundary
+# holds one to downcast for the spanned `CompileError` diagnostic.
+anyhow       = "1"
+jsc-core     = { path = "../jsc-core", default-features = false }
+wasm-bindgen = "0.2"
+
+# Replicate the workspace lint policy but relax `unsafe_code` from `forbid` to
+# `deny`: the `#[wasm_bindgen]` export glue expands to `unsafe` FFI shims we do
+# not write by hand. `deny` still bans unsafe in our own source while permitting
+# the generated boundary code.
+[lints.rust]
+warnings                      = { level = "deny", priority = -2 }
+unsafe_code                   = "deny"
+missing_debug_implementations = "warn"
+missing_docs                  = "warn"
+unreachable_pub               = "warn"
+elided_lifetimes_in_paths     = "warn"
+
+[lints.clippy]
+pedantic    = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic       = "deny"
+dbg_macro   = "deny"
+todo        = "warn"
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"

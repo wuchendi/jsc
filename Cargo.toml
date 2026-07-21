@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members  = ["crates/jsc-core", "crates/jsc", "crates/jsc-wasm"]
+exclude  = ["tmp"]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.96"
+license      = "Apache-2.0"
+publish      = false
+
+# === Lock 4 — deny-warnings policy lives in the manifest (inherited by every member) ===
+[workspace.lints.rust]
+warnings                      = { level = "deny", priority = -2 }
+unsafe_code                   = "forbid"
+missing_debug_implementations = "warn"
+missing_docs                  = "warn"
+unreachable_pub               = "warn"
+elided_lifetimes_in_paths     = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Lock 6 — no panic in runtime paths.
+unwrap_used = "deny"
+expect_used = "deny"
+panic       = "deny"
+dbg_macro   = "deny"
+todo        = "warn"
+# Pedantic lints with poor signal-to-noise.
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+debug         = "line-tables-only"
+
+# Optimized distribution profile for portable static (musl) release binaries.
+# See DESIGN.md "Building a static release". Inherits release, then tightens for
+# a small, self-contained artifact. opt-level = 3 (not "z"): jsc embeds wasmtime,
+# so compiler throughput matters more than shaving the last few KB; fat LTO +
+# single codegen unit + strip already keep the binary compact. panic = "abort"
+# drops unwinding tables (no runtime path unwinds — Lock 6 forbids panics anyway).
+[profile.dist]
+inherits      = "release"
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = true
+panic         = "abort"

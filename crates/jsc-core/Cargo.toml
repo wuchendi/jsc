@@ -1,0 +1,28 @@
+[package]
+name         = "jsc-core"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[features]
+default = ["native-run"]
+# Native execution stage: pulls in wasmtime to instantiate and run the emitted
+# module. Off by the caller (e.g. wasm32 targets) leaves a frontend+codegen+emit
+# core that produces module bytes without a runtime.
+native-run = ["dep:wasmtime"]
+
+[dependencies]
+anyhow          = "1"
+swc_common      = "24"
+swc_ecma_ast    = "26"
+swc_ecma_parser = "42"
+wasm-encoder    = "0.253"
+wasmtime        = { version = "46", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
+
+[dev-dependencies]
+wasmparser = "0.253"
+
+[lints]
+workspace = true

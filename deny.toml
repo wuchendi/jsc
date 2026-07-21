@@ -1,0 +1,42 @@
+# cargo-deny policy for jsc.
+# Run: cargo deny check
+
+[advisories]
+version = 2
+yanked  = "deny"
+
+[bans]
+multiple-versions = "allow" # transitive duplicates are out of scope for the skeleton
+wildcards         = "deny"
+# Intra-workspace path dependencies carry no version req; exempt local path
+# deps from the wildcard ban while still catching registry wildcards.
+allow-wildcard-paths = true
+
+# Lock 1/2 — pure-Rust ecosystem, rustls only. Ban C-FFI TLS stacks.
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    { name = "native-tls-sys" },
+    { name = "git2" },
+    { name = "libgit2-sys" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses expected across the pure-Rust dependency tree.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

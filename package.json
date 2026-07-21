@@ -1,0 +1,25 @@
+{
+  "name": "@cdlab/jsc-root",
+  "private": true,
+  "workspaces": {
+    "packages": [
+      "packages/*",
+      "apps/*"
+    ],
+    "catalog": {
+      "@types/node": "^26.1.1",
+      "typescript": "^7.0.2",
+      "vitest": "^4.1.10"
+    }
+  },
+  "scripts": {
+    "lint": "biome check",
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "dev": "bun run --filter @cdlab/jsc-web dev",
+    "dev:web": "bash scripts/ensure-wasm.sh && bun run --filter @cdlab/jsc-web dev",
+    "build:web": "bun run --filter @cdlab/jsc build && bun run --filter @cdlab/jsc-web build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.4"
+  }
+}

@@ -1,0 +1,80 @@
+# CI for jsc — the Rust acceptance gate.
+#
+# swc is consumed from crates.io (pinned versions in crates/jsc-core/Cargo.toml),
+# so the workspace compiles on any runner — no local path provisioning needed.
+#
+# This gate only checks the Rust workspace, so it runs only when Rust-relevant
+# files change (paths allowlist below). Changes to the JS/TS monorepo
+# (package.json, apps/**, packages/**, scripts/**) and docs do NOT trigger it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths: &rust-paths
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - "deny.toml"
+      - "_typos.toml"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths: *rust-paths
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: rust (fmt + clippy + test + deny + shear + typos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Toolchain is pinned to 1.96.0 (matches rust-toolchain.toml / MSRV).
+      - name: Install toolchain 1.96.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install gate tools (nextest, deny, shear, typos)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-deny,cargo-shear,typos-cli
+
+      # --- Gates that do not compile the workspace: always run. ---
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Typos
+        run: typos
+
+      # --- Gates that compile the workspace. ---
+      # deny-warnings is inherited from [workspace.lints], so clippy needs no -D.
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace
+
+      - name: Test (nextest)
+        run: cargo nextest run --workspace
+
+      - name: Doctests
+        run: cargo test --doc --workspace
+
+      - name: Unused deps (cargo-shear)
+        run: cargo shear
+
+      # cargo-deny reads manifests/lockfile only — no workspace compile needed.
+      - name: Supply-chain (cargo-deny)
+        run: cargo deny check
+
+  # NOTE: portable musl / multi-platform release binaries are built by
+  # release.yml on `v*` tags (and manual dispatch), not on every push.

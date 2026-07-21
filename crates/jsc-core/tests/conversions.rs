@@ -1,0 +1,135 @@
+//! Integration tests: `String`/`Number`/`Boolean`/`parseInt`/`parseFloat` conversions.
+
+use jsc_core::run::compile_and_run;
+mod common;
+use common::{
+    assert_bool, assert_nan, assert_number, assert_output, assert_string, assert_type_str,
+};
+
+/// `String(42)` yields the string `"42"` (same form as `format_number`), and its
+/// runtime type is "string".
+#[test]
+fn string_conversion_milestone() {
+    assert_string("String(42)", "42");
+    assert_type_str("typeof String(42)", "string");
+    assert_string("String(3.5)", "3.5");
+    // Non-number operands stringify per `format_value`.
+    assert_string("String(true)", "true");
+    assert_string("String(false)", "false");
+    assert_string("String(null)", "null");
+    assert_string("String(undefined)", "undefined");
+    // A string operand round-trips to the same content.
+    assert_string("String(\"hi\")", "hi");
+    // The result is a real heap string: it concatenates and compares by content.
+    assert_string("String(42) + \"px\"", "42px");
+    assert_bool("String(42) === \"42\"", true);
+}
+
+/// `Number(x)` coerces per the JS subset: strings are full-string parsed (trimmed;
+/// empty => 0; non-numeric => NaN), booleans map to 1/0, null => 0, undefined =>
+/// NaN, and numbers pass through.
+#[test]
+fn number_conversion_milestone() {
+    assert_number("Number(\"42\")", 42.0);
+    assert_number("Number(\"  3.5 \")", 3.5);
+    assert_number("Number(\"\")", 0.0);
+    assert_nan("Number(\"x\")");
+    assert_number("Number(true)", 1.0);
+    assert_number("Number(false)", 0.0);
+    assert_number("Number(null)", 0.0);
+    assert_nan("Number(undefined)");
+    assert_number("Number(42)", 42.0);
+    // The result is a real number: it flows into arithmetic.
+    assert_number("Number(\"40\") + 2", 42.0);
+    assert_type_str("typeof Number(\"1\")", "number");
+}
+
+/// `Boolean(x)` applies JS truthiness. Falsy: 0/-0/NaN, "", null, undefined,
+/// false; everything else (non-empty strings, arrays, objects, nonzero numbers) is
+/// true.
+#[test]
+fn boolean_conversion_milestone() {
+    assert_bool("Boolean(0)", false);
+    assert_bool("Boolean(\"\")", false);
+    assert_bool("Boolean(\"x\")", true);
+    assert_bool("Boolean(1)", true);
+    assert_bool("Boolean(null)", false);
+    assert_bool("Boolean(undefined)", false);
+    assert_bool("Boolean(false)", false);
+    assert_bool("Boolean(true)", true);
+    assert_bool("Boolean(0 / 0)", false); // NaN
+    // Arrays and objects are always truthy.
+    assert_bool("Boolean([])", true);
+    assert_bool("Boolean({})", true);
+    assert_type_str("typeof Boolean(0)", "boolean");
+}
+
+/// `parseInt(s)` parses a leading base-10 integer, skipping whitespace and honoring
+/// a sign, stopping at the first non-digit; no digits yields NaN.
+#[test]
+fn parse_int_milestone() {
+    assert_number("parseInt(\"42px\")", 42.0);
+    assert_nan("parseInt(\"abc\")");
+    assert_number("parseInt(\"  -7z\")", -7.0);
+    assert_number("parseInt(\"3.9\")", 3.0);
+    // The radix argument is accepted but ignored (base-10 only).
+    assert_number("parseInt(\"42\", 16)", 42.0);
+    assert_type_str("typeof parseInt(\"1\")", "number");
+}
+
+/// `parseFloat(s)` parses a leading decimal float, including a fraction or
+/// exponent; no numeric prefix yields NaN.
+// `3.14` is an acceptance-criteria input, not an approximation of PI.
+#[allow(clippy::approx_constant)]
+#[test]
+fn parse_float_milestone() {
+    assert_number("parseFloat(\"3.14xyz\")", 3.14);
+    assert_number("parseFloat(\"  .5\")", 0.5);
+    assert_number("parseFloat(\"1e3\")", 1000.0);
+    assert_nan("parseFloat(\"abc\")");
+}
+
+/// The conversions are bare global names, not real bindings, so a user binding of
+/// the same name shadows the built-in (mirrors `Math`): the call then resolves to
+/// the user value (here a function value invoked indirectly).
+#[test]
+fn conversions_are_shadowable() {
+    // `let String = ..` shadows the built-in `String`.
+    assert_number("let String = function (x) { return 99 }; String(1)", 99.0);
+    // `let Number = ..` shadows the built-in `Number`.
+    assert_number(
+        "let Number = function (x) { return 7 }; Number(\"42\")",
+        7.0,
+    );
+    // `let Boolean = ..` shadows the built-in `Boolean`.
+    assert_number("let Boolean = function (x) { return 5 }; Boolean(0)", 5.0);
+    // A user `function parseInt(){}` declaration also shadows the built-in.
+    assert_number("function parseInt(s) { return 1 } parseInt(\"42px\")", 1.0);
+}
+
+/// Wrong argument counts are compile errors, matching the existing call style.
+#[test]
+fn conversion_arity_errors() {
+    assert!(compile_and_run("String()").is_err(), "String needs an arg");
+    assert!(
+        compile_and_run("Number(1, 2)").is_err(),
+        "Number takes one arg"
+    );
+    assert!(
+        compile_and_run("Boolean()").is_err(),
+        "Boolean needs an arg"
+    );
+    assert!(
+        compile_and_run("parseFloat(1, 2)").is_err(),
+        "parseFloat takes one arg"
+    );
+}
+
+/// Conversion results flow through `console.log` like any value (S14.1 parity).
+#[test]
+fn conversions_through_console_log() {
+    assert_output(
+        "console.log(String(42), Number(\"8\"), Boolean(1))",
+        "42 8 true\n",
+    );
+}

@@ -1,0 +1,447 @@
+#[allow(clippy::wildcard_imports)]
+use super::*;
+
+use swc_common::Spanned;
+
+use crate::error::CompileError;
+
+/// Lower a single top-level function declaration into an [`IrFunction`].
+///
+/// The locals are laid out for the uniform ABI: locals `0..K` are the fixed
+/// positional-argument slots (`K = max_arity`; the source parameters bind to
+/// the first of them, surplus slots stay unused), local `K` is the **env slot**
+/// (`undefined` for a non-capturing function), and body-declared locals follow.
+/// Every function therefore shares the one wasm signature
+/// `(a0..a_{K-1}, env) -> i64`, so a single `call_indirect` type serves them
+/// all. A top-level function does not close over `main`'s locals, so its
+/// environment layout is always empty. The body may call any function in
+/// `funcs`, including itself (recursion).
+pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::Result<IrFunction> {
+    let mut ctx = LowerCtx::new(shared);
+    // Mark this as an independent top-level function frame so a call to a demoted
+    // sibling closure (G2) — unreachable from here — is a precise error.
+    ctx.top_level_fn = true;
+    // A top-level `function*` lowers to a generator constructor + state machine
+    // (P4.2 M2), not an ordinary function body.
+    if fn_decl.function.is_generator && !fn_decl.function.is_async {
+        return ctx.lower_generator(fn_decl);
+    }
+    // A top-level `async function` (P4.3 M4) compiles its body to a generator
+    // state machine (`await` == `yield`) with a wrapper that spawns it as a
+    // promise; `lower_generator` handles both, keyed on `function.is_async`.
+    // (An `async function*` — an async generator — stays out of scope and is
+    // rejected by `reject_unsupported_function` below.)
+    if fn_decl.function.is_async && !fn_decl.function.is_generator {
+        return ctx.lower_generator(fn_decl);
+    }
+    let block = fn_decl
+        .function
+        .body
+        .as_ref()
+        .ok_or_else(|| anyhow!("function declaration requires a body"))?;
+    reject_unsupported_function(&fn_decl.function)?;
+    let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
+    let (func, _env) = ctx.build_function_body(&param_pats, BodyKind::Block(&block.stmts))?;
+    Ok(func)
+}
+
+/// Reject the out-of-scope function forms — `async function` and generator
+/// (`function*`) — that the S13 function-value lowering would otherwise compile
+/// as an *ordinary* function and run to a **wrong result** (an `async` body
+/// yields a `Promise`, a `function*` yields a generator object; neither is
+/// modeled). Deferred to S14+; a clear compile error is emitted instead of
+/// silently mis-handling them. See DESIGN §S13 out-of-scope note.
+pub(super) fn reject_unsupported_function(function: &swc_ecma_ast::Function) -> anyhow::Result<()> {
+    if function.is_async {
+        return Err(
+            CompileError::spanned(function.span(), "async functions are unsupported").into(),
+        );
+    }
+    if function.is_generator {
+        return Err(
+            CompileError::spanned(function.span(), "generator functions are unsupported").into(),
+        );
+    }
+    Ok(())
+}
+
+impl LowerCtx<'_> {
+    /// Lower the parameters, env slot, capture-boxing prologue, and body of a
+    /// function/arrow into the current frame, returning the [`IrFunction`] and
+    /// this frame's environment layout (the captured binding ids it references,
+    /// in env-slot order). Operates on the current top frame (the caller pushes
+    /// one for a nested function; a top-level function uses the initial frame).
+    #[allow(clippy::too_many_lines)]
+    fn build_function_body(
+        &mut self,
+        param_pats: &[&Pat],
+        body_kind: BodyKind<'_>,
+    ) -> anyhow::Result<(IrFunction, Vec<u32>)> {
+        // Parameters bind to locals `0..`; a captured parameter is a boxed cell.
+        // A `Pat::Assign` (`a = default`) binds its `Pat::Ident` like a plain
+        // parameter and records the default expression for the prologue guard.
+        let mut boxed_params = Vec::new();
+        let mut defaults: Vec<(u32, &Expr)> = Vec::new();
+        // A trailing rest parameter (P1.4): its binding ident and its start
+        // position `p` (the number of preceding positional parameters). It binds a
+        // synthesized array rather than a single positional slot, so it is built
+        // after the slots are laid out (below), not declared inline here.
+        let mut rest: Option<(&swc_ecma_ast::BindingIdent, u32)> = None;
+        // Destructuring parameters (P1.6): each holds the temp positional slot the
+        // incoming argument lands in, the pattern to destructure it with, and an
+        // optional parameter-level default (`f([a,b] = [1,2])`). Destructured in
+        // the prologue (below) by reusing `lower_binding_pattern`.
+        let mut destructure: Vec<(u32, &Pat, Option<&Expr>)> = Vec::new();
+        for (i, pat) in param_pats.iter().enumerate() {
+            let (ident, default) = match pat {
+                Pat::Ident(ident) => (ident, None),
+                Pat::Assign(assign) => match assign.left.as_ref() {
+                    Pat::Ident(ident) => (ident, Some(assign.right.as_ref())),
+                    // A destructuring pattern with a parameter-level default binds
+                    // the argument to a fresh temp slot (guarded by the default),
+                    // then destructures it in the prologue.
+                    left @ (Pat::Array(_) | Pat::Object(_)) => {
+                        let temp = self.fresh();
+                        destructure.push((temp, left, Some(assign.right.as_ref())));
+                        continue;
+                    }
+                    _ => {
+                        return Err(CompileError::spanned(
+                            assign.left.span(),
+                            "unsupported parameter pattern",
+                        )
+                        .into());
+                    }
+                },
+                // A destructuring parameter (`f([a,b])`, `g({x,y})`): bind the
+                // incoming argument to a fresh temp positional slot, destructured
+                // into the named locals in the prologue.
+                Pat::Array(_) | Pat::Object(_) => {
+                    let temp = self.fresh();
+                    destructure.push((temp, *pat, None));
+                    continue;
+                }
+                Pat::Rest(rest_pat) => {
+                    // A rest parameter must be the final parameter.
+                    if i + 1 != param_pats.len() {
+                        return Err(CompileError::spanned(
+                            rest_pat.span(),
+                            "rest parameter must be last",
+                        )
+                        .into());
+                    }
+                    let Pat::Ident(ident) = rest_pat.arg.as_ref() else {
+                        return Err(CompileError::spanned(
+                            rest_pat.arg.span(),
+                            "unsupported rest parameter pattern",
+                        )
+                        .into());
+                    };
+                    rest = Some((ident, u32::try_from(i).unwrap_or(u32::MAX)));
+                    continue;
+                }
+                _ => {
+                    return Err(
+                        CompileError::spanned(pat.span(), "unsupported parameter pattern").into(),
+                    );
+                }
+            };
+            let local = self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
+            if self.is_cell(local) {
+                boxed_params.push(local);
+            }
+            if let Some(default) = default {
+                defaults.push((local, default));
+            }
+        }
+        // Pad the surplus argument slots to `K = max_arity`, then reserve the two
+        // trailing ABI slots: the env slot (local `K`) and the argument-count slot
+        // (local `K + 1`).
+        let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
+        while self.frame().next < k {
+            self.fresh();
+        }
+        self.fresh();
+        self.fresh();
+        let params = self.frame().next;
+
+        // Mark this frame as a function scope so a body `this` binds here (P2.1);
+        // the `this` slot itself is allocated lazily, only if the body reads it.
+        self.frame().allows_this = true;
+
+        // Prologue: move each captured parameter's incoming value into a fresh
+        // cell, so reads/writes (and the closure) share it by reference.
+        let mut body = Vec::new();
+        for local in boxed_params {
+            body.push(IrStmt::Expr(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::CellNew(Box::new(IrNode::Local(local)))),
+            }));
+        }
+
+        // Default-parameter guards, IN PARAMETER ORDER (after capture-boxing so a
+        // defaulted cell param reads/writes its boxed cell).
+        self.lower_default_guards(defaults, &mut body)?;
+
+        // Trailing rest parameter (P1.4): gather the surplus arguments into a
+        // real array bound to the rest name (after the fixed params / defaults).
+        if let Some((rest_ident, p)) = rest {
+            self.lower_rest_param(rest_ident, p, k, &mut body);
+        }
+
+        // Destructuring parameters (P1.6): each temp slot holds the incoming
+        // argument; apply an optional parameter-level default, then destructure it
+        // into the named locals by reusing the P1.1/P1.2 `lower_binding_pattern`
+        // helper (which handles nested patterns, holes, defaults, and rest).
+        for (temp, pat, default) in destructure {
+            if let Some(default) = default {
+                let default_value = self.lower_expr(default)?;
+                body.push(IrStmt::If {
+                    cond: IrNode::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(IrNode::Local(temp)),
+                        rhs: Box::new(IrNode::Undefined),
+                    },
+                    then_body: vec![IrStmt::Expr(IrNode::Assign {
+                        local: temp,
+                        value: Box::new(default_value),
+                    })],
+                    else_body: Vec::new(),
+                });
+            }
+            self.lower_binding_pattern(pat, IrNode::Local(temp), true, &mut body)?;
+        }
+
+        match body_kind {
+            BodyKind::Block(stmts) => {
+                for stmt in stmts {
+                    self.lower_stmt(stmt, &mut body)?;
+                }
+            }
+            BodyKind::Expr(expr) => {
+                let node = self.lower_expr(expr)?;
+                body.push(IrStmt::Return(Some(node)));
+            }
+        }
+
+        // If the body read `this`, prepend the prologue snapshot as the VERY FIRST
+        // statement (P2.1): `this_slot = __this`, so a nested `this.other()` that
+        // re-sets the global cannot disturb this frame's own receiver. A function
+        // that never reads `this` needs no snapshot (its slot was never allocated),
+        // leaving its IR unchanged.
+        if let Some(this_local) = self.frame().this_local {
+            body.insert(
+                0,
+                IrStmt::Expr(IrNode::Assign {
+                    local: this_local,
+                    value: Box::new(IrNode::ThisGlobal),
+                }),
+            );
+        }
+
+        let locals = self.frame().next;
+        let env_layout = self.frame().env.clone();
+        Ok((
+            IrFunction {
+                params,
+                locals,
+                body,
+                machine: None,
+            },
+            env_layout,
+        ))
+    }
+
+    /// Emit the default-parameter guards (P1.1) in parameter order: each emits
+    /// `if (param === undefined) param = <default>`. The default is evaluated per
+    /// call only on the undefined path and may reference earlier params, which are
+    /// already bound (and, if defaulted, already guarded before it). A cell param
+    /// reads/writes through its boxed cell.
+    fn lower_default_guards(
+        &mut self,
+        defaults: Vec<(u32, &Expr)>,
+        body: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        for (local, default) in defaults {
+            let cell = self.is_cell(local);
+            let read = if cell {
+                IrNode::CellGet(Box::new(IrNode::Local(local)))
+            } else {
+                IrNode::Local(local)
+            };
+            let default_value = self.lower_expr(default)?;
+            let write = if cell {
+                IrNode::CellSet {
+                    cell: Box::new(IrNode::Local(local)),
+                    value: Box::new(default_value),
+                }
+            } else {
+                IrNode::Assign {
+                    local,
+                    value: Box::new(default_value),
+                }
+            };
+            body.push(IrStmt::If {
+                cond: IrNode::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(read),
+                    rhs: Box::new(IrNode::Undefined),
+                },
+                then_body: vec![IrStmt::Expr(write)],
+                else_body: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Emit the prologue for a trailing rest parameter (P1.4): collect
+    /// `[arg_p, .., arg_{argc-1}]` into a REAL array bound to the rest name.
+    ///
+    /// `argc` (local `k + 1`, a number jsval) is the actual source argument count,
+    /// so each positional slot `j in p..k` is appended only when `j < argc` —
+    /// excluding the `undefined` padding beyond the real arguments. The array is
+    /// built in a plain temp local (`ArrayPush` needs a plain array binding), then
+    /// bound to the rest name, boxed into a cell when the binding is captured.
+    fn lower_rest_param(
+        &mut self,
+        rest_ident: &swc_ecma_ast::BindingIdent,
+        p: u32,
+        k: u32,
+        body: &mut Vec<IrStmt>,
+    ) {
+        let argc = IrNode::Local(k + 1);
+        let tmp = self.fresh();
+        body.push(IrStmt::Decl {
+            local: tmp,
+            init: IrNode::Array(Vec::new()),
+        });
+        for j in p..k {
+            body.push(IrStmt::If {
+                cond: IrNode::Binary {
+                    op: BinOp::Lt,
+                    lhs: Box::new(IrNode::Num(f64::from(j))),
+                    rhs: Box::new(argc.clone()),
+                },
+                then_body: vec![IrStmt::Expr(IrNode::ArrayPush {
+                    local: tmp,
+                    value: Box::new(IrNode::Local(j)),
+                })],
+                else_body: Vec::new(),
+            });
+        }
+        let rest_local = self.declare(rest_ident.id.sym.as_ref(), true, binding_id(rest_ident));
+        let init = if self.is_cell(rest_local) {
+            IrNode::CellNew(Box::new(IrNode::Local(tmp)))
+        } else {
+            IrNode::Local(tmp)
+        };
+        body.push(IrStmt::Decl {
+            local: rest_local,
+            init,
+        });
+    }
+
+    /// Lift a function/arrow to a top-level [`IrFunction`] (registered in the
+    /// funcref table) and produce the [`IrNode::FuncValue`] that builds its
+    /// value at the use site, with the capture sources for its environment.
+    pub(super) fn lower_lifted_function(
+        &mut self,
+        param_pats: &[&Pat],
+        body_kind: BodyKind<'_>,
+    ) -> anyhow::Result<IrNode> {
+        // Reserve this function's table slot before lowering its body, so any
+        // function nested in the body takes a later slot.
+        let pos = {
+            let mut arrows = self.shared.arrows.borrow_mut();
+            let pos = arrows.len();
+            arrows.push(IrFunction {
+                params: 0,
+                locals: 0,
+                body: Vec::new(),
+                machine: None,
+            });
+            pos
+        };
+        let table_index = self.shared.arrow_base - 1 + u32::try_from(pos).unwrap_or(u32::MAX);
+
+        self.push_frame();
+        let built = self.build_function_body(param_pats, body_kind);
+        let (func, env_layout) = match built {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.pop_frame();
+                return Err(e);
+            }
+        };
+        self.pop_frame();
+        self.shared.arrows.borrow_mut()[pos] = func;
+
+        // Build the capture sources in the enclosing frame (now the top frame).
+        let captures = env_layout
+            .iter()
+            .map(|&id| self.capture_source(id))
+            .collect();
+        Ok(IrNode::FuncValue {
+            table_index,
+            captures,
+        })
+    }
+
+    /// Lower a nested `function foo(){ .. }` declaration (S13.4): lift its body
+    /// to a top-level function (registered in the funcref table, may capture
+    /// enclosing bindings like an arrow) and bind `foo` to the resulting function
+    /// value in the current scope. `foo` is not visible inside its own body
+    /// (lowered before the name is bound), so name-recursion of a nested
+    /// declaration is unsupported.
+    pub(super) fn lower_nested_fn_decl(
+        &mut self,
+        fn_decl: &FnDecl,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let block = fn_decl
+            .function
+            .body
+            .as_ref()
+            .ok_or_else(|| anyhow!("function declaration requires a body"))?;
+        reject_unsupported_function(&fn_decl.function)?;
+        let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
+        let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&block.stmts))?;
+        let local = self.declare(fn_decl.ident.sym.as_ref(), true, fn_decl.ident.span.lo.0);
+        let init = if self.is_cell(local) {
+            IrNode::CellNew(Box::new(value))
+        } else {
+            value
+        };
+        out.push(IrStmt::Decl { local, init });
+        Ok(())
+    }
+
+    /// Lower an arrow function `(a, b) => a + b` / `x => x * x` / `(n) => { .. }`
+    /// into a first-class function value (S13.4). It lifts to a top-level
+    /// [`IrFunction`] registered in the funcref table and the use-site produces an
+    /// [`IrNode::FuncValue`], capturing (by reference, through boxed cells) any
+    /// enclosing bindings the body references. An expression body (`=> expr`)
+    /// desugars to `return expr`; a block body (`=> { .. }`) lowers its statements
+    /// directly. Single-parameter (`x => ..`) and parenthesized zero/multi-parameter
+    /// forms all lower the same way. Arrows carry no `this`/`arguments`.
+    pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr) -> anyhow::Result<IrNode> {
+        // `async`/generator arrows are out of scope (S14+): reject rather than
+        // silently compile the body as a plain arrow (wrong result).
+        if arrow.is_async {
+            return Err(
+                CompileError::spanned(arrow.span(), "async functions are unsupported").into(),
+            );
+        }
+        if arrow.is_generator {
+            return Err(
+                CompileError::spanned(arrow.span(), "generator functions are unsupported").into(),
+            );
+        }
+        let param_pats: Vec<&Pat> = arrow.params.iter().collect();
+        let body_kind = match arrow.body.as_ref() {
+            BlockStmtOrExpr::BlockStmt(block) => BodyKind::Block(&block.stmts),
+            BlockStmtOrExpr::Expr(expr) => BodyKind::Expr(expr),
+        };
+        self.lower_lifted_function(&param_pats, body_kind)
+    }
+}

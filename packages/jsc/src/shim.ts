@@ -1,0 +1,723 @@
+/**
+ * The JS runtime shim: the `importObject` that backs the emitted module's host
+ * env imports (`print` / `__convert` / `__method`) plus the bump-allocator they
+ * share. A port of `crates/jsc-core/src/run/harness.rs` (import wiring) and
+ * `run/host.rs` (handlers + allocator). ACCEPTED TEMPORARY DEBT (see README):
+ * this duplicates Rust host semantics against the emitted module's memory.
+ */
+
+import {
+  CONVERT_OP_PARSE_FLOAT,
+  CONVERT_OP_PARSE_INT,
+  CONVERT_OP_TO_NUMBER,
+  CONVERT_OP_TO_STRING,
+  FALSE,
+  HEADER_SIZE,
+  HEAP,
+  HEAP_PTR_EXPORT_NAME,
+  MEMORY_EXPORT_NAME,
+  METHOD_OP_CHAR_AT,
+  METHOD_OP_ENDS_WITH,
+  METHOD_OP_INCLUDES,
+  METHOD_OP_INDEX_OF,
+  METHOD_OP_JOIN,
+  METHOD_OP_PAD_END,
+  METHOD_OP_PAD_START,
+  METHOD_OP_REPEAT,
+  METHOD_OP_SLICE,
+  METHOD_OP_SPLIT,
+  METHOD_OP_STARTS_WITH,
+  METHOD_OP_SUBSTRING,
+  METHOD_OP_TO_LOWER,
+  METHOD_OP_TO_UPPER,
+  METHOD_OP_TRIM,
+  METHOD_OP_TRIM_END,
+  METHOD_OP_TRIM_START,
+  PRINT_FLAG_END,
+  PRINT_FLAG_SEP,
+  QNAN,
+  TRUE,
+  TYPE_ARRAY,
+  TYPE_STRING,
+  U32_MASK,
+  UNDEFINED,
+} from './abi.js'
+import {
+  asU64,
+  decode,
+  f64ToBits,
+  formatValue,
+  parseFloatStr,
+  parseIntStr,
+  valueToNumber,
+} from './value.js'
+
+/** The wired shim: the `importObject`, the accumulated stdout, and instance binding. */
+export interface Shim {
+  /** Passed as the import object to `WebAssembly.instantiate`. */
+  imports: WebAssembly.Imports
+  /** Everything `console.log` printed, in execution order (mirrors `run_capturing`). */
+  stdout: () => string
+  /** Bind the instantiated module so the imports can read/grow its memory. */
+  bindInstance: (instance: WebAssembly.Instance) => void
+}
+
+const utf8Encode = new TextEncoder()
+const utf8Decoder = new TextDecoder()
+
+/** Decode UTF-8 bytes, lossily replacing invalid sequences (matches `from_utf8_lossy`). */
+function utf8Decode(bytes: Uint8Array): string {
+  return utf8Decoder.decode(bytes)
+}
+
+/** Build a fresh shim. One per `run()` call so stdout does not bleed across runs. */
+export function createShim(): Shim {
+  let instance: WebAssembly.Instance | null = null
+  let out = ''
+
+  /** The module's linear memory, or `undefined` before binding / when absent. */
+  function memory(): WebAssembly.Memory | undefined {
+    return instance?.exports[MEMORY_EXPORT_NAME] as
+      | WebAssembly.Memory
+      | undefined
+  }
+
+  /** A live view of linear memory (recreated each call: the buffer detaches on grow). */
+  function memView(): Uint8Array {
+    const mem = memory()
+    return mem ? new Uint8Array(mem.buffer) : new Uint8Array(0)
+  }
+
+  /**
+   * Bump-allocate a pre-built heap `block` in guest memory and return its base
+   * offset, or `null` when the exports are missing or the write fails. Mirrors
+   * `host.rs::host_alloc`: read `__heap_ptr`, grow memory if the block overflows,
+   * write the bytes, and advance the global.
+   */
+  function hostAlloc(block: Uint8Array): bigint | null {
+    const mem = memory()
+    const global = instance?.exports[HEAP_PTR_EXPORT_NAME] as
+      | WebAssembly.Global
+      | undefined
+    if (!mem || !global) return null
+    const base = (global.value as number) >>> 0
+    const end = base + block.length
+    const cur = mem.buffer.byteLength
+    if (end > cur) {
+      const pages = Math.ceil((end - cur) / 0x1_0000)
+      try {
+        mem.grow(pages)
+      } catch {
+        return null
+      }
+    }
+    new Uint8Array(mem.buffer).set(block, base)
+    global.value = end
+    return BigInt(base)
+  }
+
+  /** Bump-allocate a heap STRING block holding `text` (mirrors `host.rs::host_alloc_string`). */
+  function hostAllocString(text: string): bigint | null {
+    const bytes = utf8Encode.encode(text)
+    const block = new Uint8Array(HEADER_SIZE + 4 + bytes.length)
+    block[0] = TYPE_STRING
+    // len:u32 LE at HEADER_SIZE, utf8 payload after it.
+    new DataView(block.buffer).setUint32(HEADER_SIZE, bytes.length, true)
+    block.set(bytes, HEADER_SIZE + 4)
+    return hostAlloc(block)
+  }
+
+  /** `array.join(sep)` — allocates the joined heap string (mirrors `host.rs::array_join`). */
+  function arrayJoin(
+    mem: Uint8Array,
+    ptr: number,
+    sepBits: bigint,
+  ): bigint | null {
+    const base = hostAllocString(arrayJoinText(mem, ptr, sepBits))
+    return base === null ? null : HEAP | base
+  }
+
+  /** `array.slice(a, b)` — allocates a NEW heap array (mirrors `host.rs::array_slice`). */
+  function arraySlice(
+    mem: Uint8Array,
+    ptr: number,
+    a: bigint,
+    b: bigint,
+  ): bigint | null {
+    const len = blockLen(mem, ptr)
+    const start = sliceIndex(a, mem, 0, len)
+    const end = Math.max(sliceIndex(b, mem, len, len), start)
+    const count = end - start
+    const block = new Uint8Array(HEADER_SIZE + 4 + 8 * count)
+    block[0] = TYPE_ARRAY
+    const dv = new DataView(block.buffer)
+    dv.setUint32(HEADER_SIZE, count, true)
+    let off = HEADER_SIZE + 4
+    for (let i = start; i < end; i++) {
+      const elem = arrayElemBits(mem, ptr, i)
+      if (elem === null) return null
+      dv.setBigUint64(off, elem, true)
+      off += 8
+    }
+    const base = hostAlloc(block)
+    return base === null ? null : HEAP | base
+  }
+
+  /** `string.slice(a, b)` — allocates a NEW substring by BYTE index (mirrors `string_slice`). */
+  function stringSlice(
+    mem: Uint8Array,
+    ptr: number,
+    a: bigint,
+    b: bigint,
+  ): bigint | null {
+    const bytes = stringBytes(mem, ptr)
+    if (bytes === null) return null
+    const len = bytes.length
+    const start = sliceIndex(a, mem, 0, len)
+    const end = Math.max(sliceIndex(b, mem, len, len), start)
+    const base = hostAllocString(utf8Decode(bytes.subarray(start, end)))
+    return base === null ? null : HEAP | base
+  }
+
+  /** `string.trim`/`trimStart`/`trimEnd` — NEW string minus ASCII whitespace (mirrors `string_trim`). */
+  function stringTrim(mem: Uint8Array, ptr: number, op: number): bigint | null {
+    const bytes = stringBytes(mem, ptr)
+    if (bytes === null) return null
+    const trimStart = op !== METHOD_OP_TRIM_END
+    const trimEnd = op !== METHOD_OP_TRIM_START
+    const base = hostAllocString(
+      utf8Decode(trimBytes(bytes, trimStart, trimEnd)),
+    )
+    return base === null ? null : HEAP | base
+  }
+
+  /** `string.repeat(n)` — NEW string of `n` copies (mirrors `string_repeat`). */
+  function stringRepeat(
+    mem: Uint8Array,
+    ptr: number,
+    arg0: bigint,
+  ): bigint | null {
+    const bytes = stringBytes(mem, ptr)
+    if (bytes === null) return null
+    // A negative/NaN (=> 0) count yields "" (JS throws a RangeError — a
+    // documented limitation).
+    const n = Math.max(truncToInt(valueToNumber(decode(arg0, mem))), 0)
+    const out = new Uint8Array(bytes.length * n)
+    for (let i = 0; i < n; i++) out.set(bytes, i * bytes.length)
+    const base = hostAllocString(utf8Decode(out))
+    return base === null ? null : HEAP | base
+  }
+
+  /** `string.padStart`/`padEnd(len, pad)` — NEW padded string (mirrors `string_pad`). */
+  function stringPad(
+    mem: Uint8Array,
+    ptr: number,
+    arg0: bigint,
+    arg1: bigint,
+    op: number,
+  ): bigint | null {
+    const bytes = stringBytes(mem, ptr)
+    if (bytes === null) return null
+    const target = truncToInt(valueToNumber(decode(arg0, mem)))
+    // The pad string defaults to a single space when omitted.
+    const padValue = decode(arg1, mem)
+    const pad =
+      padValue.kind === 'undefined'
+        ? utf8Encode.encode(' ')
+        : utf8Encode.encode(formatValue(padValue))
+    const base = hostAllocString(
+      padBytes(bytes, target, pad, op === METHOD_OP_PAD_START),
+    )
+    return base === null ? null : HEAP | base
+  }
+
+  /** `string.substring(a, b)` — NEW `[a, b)` BYTE slice (mirrors `string_substring`). */
+  function stringSubstring(
+    mem: Uint8Array,
+    ptr: number,
+    arg0: bigint,
+    arg1: bigint,
+  ): bigint | null {
+    const bytes = stringBytes(mem, ptr)
+    if (bytes === null) return null
+    const len = bytes.length
+    const a = substringIndex(arg0, mem, 0, len)
+    const b = substringIndex(arg1, mem, len, len)
+    const lo = Math.min(a, b)
+    const hi = Math.max(a, b)
+    const base = hostAllocString(utf8Decode(bytes.subarray(lo, hi)))
+    return base === null ? null : HEAP | base
+  }
+
+  /** `string.split(sep)` — NEW array of substrings (mirrors `string_split`). */
+  function stringSplit(
+    mem: Uint8Array,
+    ptr: number,
+    sepBits: bigint,
+  ): bigint | null {
+    const bytes = stringBytes(mem, ptr)
+    if (bytes === null) return null
+    const sepValue = decode(sepBits, mem)
+    let pieces: Uint8Array[]
+    if (sepValue.kind === 'undefined') {
+      // An omitted separator yields a single-element array of the whole string.
+      pieces = [bytes]
+    } else {
+      const sep = utf8Encode.encode(formatValue(sepValue))
+      pieces =
+        sep.length === 0
+          ? // An empty separator splits into one element per byte.
+            Array.from(bytes, (byte) => Uint8Array.of(byte))
+          : splitOn(bytes, sep)
+    }
+    // Allocate each piece as a heap string first (the pieces are independent
+    // views/copies), then build the backing array block from their bits.
+    const elems: bigint[] = []
+    for (const piece of pieces) {
+      const base = hostAllocString(utf8Decode(piece))
+      if (base === null) return null
+      elems.push(HEAP | base)
+    }
+    const block = new Uint8Array(HEADER_SIZE + 4 + 8 * elems.length)
+    block[0] = TYPE_ARRAY
+    const dv = new DataView(block.buffer)
+    dv.setUint32(HEADER_SIZE, elems.length, true)
+    let off = HEADER_SIZE + 4
+    for (const bits of elems) {
+      dv.setBigUint64(off, bits, true)
+      off += 8
+    }
+    const base = hostAlloc(block)
+    return base === null ? null : HEAP | base
+  }
+
+  /**
+   * Dispatch a `__method` call (mirrors `host.rs::method_dispatch`): snapshot
+   * memory, read the receiver's TYPE BYTE, and perform the array/string method,
+   * returning the result jsval bits (or `null` to yield `undefined`).
+   */
+  function methodDispatch(
+    recv: bigint,
+    op: number,
+    arg0: bigint,
+    arg1: bigint,
+  ): bigint | null {
+    // Snapshot memory (a copy) so reads below are stable across a later
+    // `hostAlloc` that may grow/detach the buffer — mirrors the Rust snapshot.
+    const mem = memView().slice()
+    const ptr = heapPtr(recv)
+    const typeByte = ptr === null ? undefined : mem[ptr]
+    switch (op) {
+      case METHOD_OP_INDEX_OF:
+        if (ptr !== null && typeByte === TYPE_ARRAY)
+          return arrayIndexOf(mem, ptr, arg0)
+        if (ptr !== null && typeByte === TYPE_STRING)
+          return stringIndexOf(mem, ptr, arg0)
+        return null
+      case METHOD_OP_INCLUDES:
+        if (ptr !== null && typeByte === TYPE_ARRAY) {
+          return arrayIndexOf(mem, ptr, arg0) === f64ToBits(-1) ? FALSE : TRUE
+        }
+        // `str.includes(sub)` — substring containment (an empty `sub` => true).
+        if (ptr !== null && typeByte === TYPE_STRING) {
+          const hay = stringBytes(mem, ptr)
+          if (hay === null) return null
+          return byteContains(hay, argBytes(arg0, mem)) ? TRUE : FALSE
+        }
+        return null
+      case METHOD_OP_JOIN:
+        if (ptr !== null && typeByte === TYPE_ARRAY)
+          return arrayJoin(mem, ptr, arg0)
+        return null
+      case METHOD_OP_SLICE:
+        if (ptr !== null && typeByte === TYPE_ARRAY)
+          return arraySlice(mem, ptr, arg0, arg1)
+        if (ptr !== null && typeByte === TYPE_STRING)
+          return stringSlice(mem, ptr, arg0, arg1)
+        return null
+      case METHOD_OP_TO_UPPER:
+      case METHOD_OP_TO_LOWER: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const bytes = stringBytes(mem, ptr)
+        if (bytes === null) return null
+        const mapped = bytes.map((byte) =>
+          op === METHOD_OP_TO_UPPER ? asciiUpper(byte) : asciiLower(byte),
+        )
+        const base = hostAllocString(utf8Decode(mapped))
+        return base === null ? null : HEAP | base
+      }
+      case METHOD_OP_CHAR_AT: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const bytes = stringBytes(mem, ptr)
+        if (bytes === null) return null
+        const i = truncToInt(valueToNumber(decode(arg0, mem)))
+        // Out-of-range (a negative index) => "".
+        const text =
+          i >= 0 && i < bytes.length ? utf8Decode(bytes.subarray(i, i + 1)) : ''
+        const base = hostAllocString(text)
+        return base === null ? null : HEAP | base
+      }
+      case METHOD_OP_TRIM:
+      case METHOD_OP_TRIM_START:
+      case METHOD_OP_TRIM_END:
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        return stringTrim(mem, ptr, op)
+      case METHOD_OP_REPEAT:
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        return stringRepeat(mem, ptr, arg0)
+      case METHOD_OP_STARTS_WITH:
+      case METHOD_OP_ENDS_WITH: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const hay = stringBytes(mem, ptr)
+        if (hay === null) return null
+        const needle = argBytes(arg0, mem)
+        const hit =
+          op === METHOD_OP_STARTS_WITH
+            ? startsWithBytes(hay, needle)
+            : endsWithBytes(hay, needle)
+        return hit ? TRUE : FALSE
+      }
+      case METHOD_OP_PAD_START:
+      case METHOD_OP_PAD_END:
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        return stringPad(mem, ptr, arg0, arg1, op)
+      case METHOD_OP_SUBSTRING:
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        return stringSubstring(mem, ptr, arg0, arg1)
+      case METHOD_OP_SPLIT:
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        return stringSplit(mem, ptr, arg0)
+      default:
+        return null
+    }
+  }
+
+  const print = (bits: bigint, flag: number): void => {
+    let piece: string
+    if (flag === PRINT_FLAG_SEP || flag === PRINT_FLAG_END) {
+      const text = formatValue(decode(asU64(bits), memView()))
+      piece = flag === PRINT_FLAG_SEP ? `${text} ` : `${text}\n`
+    } else {
+      // Newline-only (zero-argument `console.log()`).
+      piece = '\n'
+    }
+    out += piece
+  }
+
+  const convert = (bits: bigint, op: number): bigint => {
+    const u = asU64(bits)
+    const value = decode(u, memView())
+    switch (op) {
+      case CONVERT_OP_TO_NUMBER:
+        return f64ToBits(valueToNumber(value))
+      case CONVERT_OP_PARSE_INT:
+        return f64ToBits(parseIntStr(formatValue(value)))
+      case CONVERT_OP_PARSE_FLOAT:
+        return f64ToBits(parseFloatStr(formatValue(value)))
+      case CONVERT_OP_TO_STRING: {
+        // A string argument is returned unchanged (no allocation).
+        if (value.kind === 'string') return u
+        const base = hostAllocString(formatValue(value))
+        return base === null ? UNDEFINED : HEAP | base
+      }
+      default:
+        return UNDEFINED
+    }
+  }
+
+  const method = (
+    recv: bigint,
+    op: number,
+    arg0: bigint,
+    arg1: bigint,
+  ): bigint =>
+    methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED
+
+  const imports: WebAssembly.Imports = {
+    env: {
+      print,
+      __convert: convert,
+      __method: method,
+    },
+  }
+
+  return {
+    imports,
+    stdout: () => out,
+    bindInstance: (bound) => {
+      instance = bound
+    },
+  }
+}
+
+// ---- pure helpers ported from host.rs (no allocation) ---------------------
+
+/** The linear-memory byte offset of a heap jsval, or `null` for a non-heap value. */
+function heapPtr(bits: bigint): number | null {
+  if ((bits & QNAN) === QNAN && ((bits >> 48n) & 0b111n) === 0b101n) {
+    return Number(bits & U32_MASK)
+  }
+  return null
+}
+
+/** The `u32` `len` header of an array/string block at `ptr + HEADER_SIZE`. */
+function blockLen(mem: Uint8Array, ptr: number): number {
+  const at = ptr + HEADER_SIZE
+  if (at + 4 > mem.length) return 0
+  return (
+    (mem[at]! |
+      (mem[at + 1]! << 8) |
+      (mem[at + 2]! << 16) |
+      (mem[at + 3]! << 24)) >>>
+    0
+  )
+}
+
+/** The raw jsval bits of array element `i`, or `null` when out of range. */
+function arrayElemBits(mem: Uint8Array, ptr: number, i: number): bigint | null {
+  const start = ptr + HEADER_SIZE + 4 + 8 * i
+  if (start + 8 > mem.length) return null
+  let value = 0n
+  for (let k = 7; k >= 0; k--) value = (value << 8n) | BigInt(mem[start + k]!)
+  return value
+}
+
+/** The UTF-8 payload bytes of a heap STRING block, or `null` when truncated. */
+function stringBytes(mem: Uint8Array, ptr: number): Uint8Array | null {
+  const len = blockLen(mem, ptr)
+  const start = ptr + HEADER_SIZE + 4
+  if (start + len > mem.length) return null
+  return mem.subarray(start, start + len)
+}
+
+/** Truncate a JS number toward zero to an integer (matches `host.rs::trunc_to_int`). */
+function truncToInt(n: number): number {
+  return Math.trunc(n)
+}
+
+/** Number jsval bits for a non-negative sequence index (lossless `u32 -> f64`). */
+function indexBits(i: number): bigint {
+  return f64ToBits(i >>> 0)
+}
+
+function asciiUpper(b: number): number {
+  return b >= 0x61 && b <= 0x7a ? b - 0x20 : b
+}
+
+function asciiLower(b: number): number {
+  return b >= 0x41 && b <= 0x5a ? b + 0x20 : b
+}
+
+/**
+ * JS strict equality (`===`) between two raw jsval bits (mirrors
+ * `host.rs::strict_eq_bits`): numbers by `f64` value, strings by content, and
+ * everything else by identical raw bits.
+ */
+function strictEqBits(a: bigint, b: bigint, mem: Uint8Array): boolean {
+  const va = decode(a, mem)
+  const vb = decode(b, mem)
+  if (va.kind === 'number' && vb.kind === 'number') return va.value === vb.value
+  if (va.kind === 'string' && vb.kind === 'string') return va.value === vb.value
+  return a === b
+}
+
+/** `array.indexOf(x)`: first index whose element `=== x`, or `-1`. */
+function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
+  const len = blockLen(mem, ptr)
+  for (let i = 0; i < len; i++) {
+    const elem = arrayElemBits(mem, ptr, i)
+    if (elem !== null && strictEqBits(elem, needle, mem)) return indexBits(i)
+  }
+  return f64ToBits(-1)
+}
+
+/** `string.indexOf(sub)`: first BYTE index where `sub` occurs (empty => 0), or `-1`. */
+function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
+  const hay = stringBytes(mem, ptr)
+  if (hay === null) return f64ToBits(-1)
+  const subValue = decode(sub, mem)
+  if (subValue.kind !== 'string') return f64ToBits(-1)
+  const needle = utf8Encode.encode(subValue.value)
+  if (needle.length === 0) return indexBits(0)
+  for (let i = 0; i + needle.length <= hay.length; i++) {
+    let match = true
+    for (let k = 0; k < needle.length; k++) {
+      if (hay[i + k] !== needle[k]) {
+        match = false
+        break
+      }
+    }
+    if (match) return indexBits(i)
+  }
+  return f64ToBits(-1)
+}
+
+/**
+ * The joined text of `array.join(sep)` (`","` when `sep` is `undefined`);
+ * `null`/`undefined` elements stringify to `""`. Mirrors the pure part of
+ * `host.rs::array_join` (allocation is done by the caller).
+ */
+function arrayJoinText(mem: Uint8Array, ptr: number, sepBits: bigint): string {
+  const sepValue = decode(sepBits, mem)
+  const sep = sepValue.kind === 'undefined' ? ',' : formatValue(sepValue)
+  const len = blockLen(mem, ptr)
+  const pieces: string[] = []
+  for (let i = 0; i < len; i++) {
+    const elem = arrayElemBits(mem, ptr, i)
+    const v = elem === null ? null : decode(elem, mem)
+    pieces.push(
+      v === null || v.kind === 'null' || v.kind === 'undefined'
+        ? ''
+        : formatValue(v),
+    )
+  }
+  return pieces.join(sep)
+}
+
+/**
+ * Resolve one JS slice endpoint against a sequence `len` (mirrors
+ * `host.rs::slice_index`): `undefined` uses `fallback`, otherwise the argument is
+ * truncated, offset from the end when negative, and clamped to `0..=len`.
+ */
+function sliceIndex(
+  bits: bigint,
+  mem: Uint8Array,
+  fallback: number,
+  len: number,
+): number {
+  const decoded = decode(bits, mem)
+  if (decoded.kind === 'undefined') return fallback
+  const n = truncToInt(valueToNumber(decoded))
+  const idx = n < 0 ? Math.max(len + n, 0) : Math.min(n, len)
+  return Math.max(idx, 0)
+}
+
+/** Whether `b` is ASCII whitespace (matches Rust `u8::is_ascii_whitespace`). */
+function isAsciiWhitespace(b: number): boolean {
+  return b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0c || b === 0x0d
+}
+
+/**
+ * Coerce a method argument's raw bits to its JS string form as bytes (mirrors
+ * `host.rs::arg_bytes`): a string yields its payload, everything else its
+ * `formatValue` rendering.
+ */
+function argBytes(bits: bigint, mem: Uint8Array): Uint8Array {
+  return utf8Encode.encode(formatValue(decode(bits, mem)))
+}
+
+/** Whether `hay` contains the contiguous `needle` (empty => true; mirrors `byte_contains`). */
+function byteContains(hay: Uint8Array, needle: Uint8Array): boolean {
+  if (needle.length === 0) return true
+  for (let i = 0; i + needle.length <= hay.length; i++) {
+    let match = true
+    for (let k = 0; k < needle.length; k++) {
+      if (hay[i + k] !== needle[k]) {
+        match = false
+        break
+      }
+    }
+    if (match) return true
+  }
+  return false
+}
+
+/** Whether `hay` begins with `needle`. */
+function startsWithBytes(hay: Uint8Array, needle: Uint8Array): boolean {
+  if (needle.length > hay.length) return false
+  for (let i = 0; i < needle.length; i++) if (hay[i] !== needle[i]) return false
+  return true
+}
+
+/** Whether `hay` ends with `needle`. */
+function endsWithBytes(hay: Uint8Array, needle: Uint8Array): boolean {
+  if (needle.length > hay.length) return false
+  const off = hay.length - needle.length
+  for (let i = 0; i < needle.length; i++)
+    if (hay[off + i] !== needle[i]) return false
+  return true
+}
+
+/** Slice `bytes` minus leading/trailing ASCII whitespace (mirrors `host.rs::trim_bytes`). */
+function trimBytes(
+  bytes: Uint8Array,
+  trimStart: boolean,
+  trimEnd: boolean,
+): Uint8Array {
+  let start = 0
+  let end = bytes.length
+  if (trimStart) while (start < end && isAsciiWhitespace(bytes[start]!)) start++
+  if (trimEnd) while (end > start && isAsciiWhitespace(bytes[end - 1]!)) end--
+  return bytes.subarray(start, end)
+}
+
+/**
+ * Pad `bytes` to BYTE length `target` with `pad` repeated (mirrors
+ * `host.rs::pad_bytes`); the receiver is returned unchanged when already long
+ * enough or `pad` is empty.
+ */
+function padBytes(
+  bytes: Uint8Array,
+  target: number,
+  pad: Uint8Array,
+  atStart: boolean,
+): string {
+  const need = Math.max(Math.max(target, 0) - bytes.length, 0)
+  if (need === 0 || pad.length === 0) return utf8Decode(bytes)
+  const filler = new Uint8Array(need)
+  for (let i = 0; i < need; i++) filler[i] = pad[i % pad.length]!
+  const out = new Uint8Array(bytes.length + need)
+  if (atStart) {
+    out.set(filler, 0)
+    out.set(bytes, need)
+  } else {
+    out.set(bytes, 0)
+    out.set(filler, bytes.length)
+  }
+  return utf8Decode(out)
+}
+
+/**
+ * Resolve one `substring` endpoint against a BYTE `len` (mirrors
+ * `host.rs::substring_index`): `undefined` uses `fallback`, otherwise the
+ * argument is truncated and clamped to `0..=len` (no negative-from-end offset).
+ */
+function substringIndex(
+  bits: bigint,
+  mem: Uint8Array,
+  fallback: number,
+  len: number,
+): number {
+  const decoded = decode(bits, mem)
+  if (decoded.kind === 'undefined') return fallback
+  const n = truncToInt(valueToNumber(decoded))
+  return Math.min(Math.max(n, 0), len)
+}
+
+/**
+ * Split `hay` on each non-overlapping occurrence of the non-empty `sep`, keeping
+ * empty pieces (mirrors `host.rs::split_on`).
+ */
+function splitOn(hay: Uint8Array, sep: Uint8Array): Uint8Array[] {
+  const out: Uint8Array[] = []
+  let start = 0
+  let i = 0
+  while (i + sep.length <= hay.length) {
+    let match = true
+    for (let k = 0; k < sep.length; k++) {
+      if (hay[i + k] !== sep[k]) {
+        match = false
+        break
+      }
+    }
+    if (match) {
+      out.push(hay.subarray(start, i))
+      i += sep.length
+      start = i
+    } else {
+      i++
+    }
+  }
+  out.push(hay.subarray(start))
+  return out
+}
