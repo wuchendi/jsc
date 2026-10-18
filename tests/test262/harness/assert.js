@@ -2,10 +2,20 @@
 // jsc functions cannot carry properties yet, so `assert.<name>` helpers are
 // top-level functions named `assert_<name>`; the runner rewrites every
 // `assert.<name>(` call in the test source accordingly.
-// jsc also rejects calling a top-level function that references a top-level
-// binding (here: the Test262Error class) from another top-level function, so
-// no helper that throws Test262Error calls another such helper; shared logic
-// lives in helpers that only touch their arguments.
+// It also defines compareArray / compareArray_format / assert_compareArray
+// (as upstream does; compareArray.js is an empty include).
+// jsc rejects a top-level function that references a top-level binding when it
+// is called from another top-level function, and miscompiles such a call from
+// a nested arrow/function expression (the callee may not throw). So every
+// assertion function and helper here is a leaf over its arguments and
+// builtins only: failures throw `new Error("Test262Error: " + message)`
+// instead of `new Test262Error(message)`. The one exception is
+// assert_throws_Test262Error, which must reference the Test262Error class for
+// `instanceof` and is therefore still affected by that jsc bug when called
+// from a nested function.
+// jsc also requires exact arity when calling a capture-free top-level
+// function, so every optional `message` parameter defaults to `undefined`
+// (same behaviour as omitting it).
 
 function isNegativeZero(value) {
   return value === 0 && 1 / value === -Infinity;
@@ -28,14 +38,14 @@ function assert__toString(value) {
   return String(value);
 }
 
-function assert(mustBeTrue, message) {
+function assert(mustBeTrue, message = undefined) {
   if (mustBeTrue === true) {
     return;
   }
   if (message === undefined) {
     message = "Expected true but got " + assert__toString(mustBeTrue);
   }
-  throw new Test262Error(message);
+  throw new Error("Test262Error: " + message);
 }
 
 function assert__isSameValue(a, b) {
@@ -47,7 +57,7 @@ function assert__isSameValue(a, b) {
   return a !== a && b !== b;
 }
 
-function assert_sameValue(actual, expected, message) {
+function assert_sameValue(actual, expected, message = undefined) {
   if (assert__isSameValue(actual, expected)) {
     return;
   }
@@ -57,10 +67,10 @@ function assert_sameValue(actual, expected, message) {
     message += " ";
   }
   message += "Expected SameValue(«" + assert__toString(actual) + "», «" + assert__toString(expected) + "») to be true";
-  throw new Test262Error(message);
+  throw new Error("Test262Error: " + message);
 }
 
-function assert_notSameValue(actual, unexpected, message) {
+function assert_notSameValue(actual, unexpected, message = undefined) {
   if (!assert__isSameValue(actual, unexpected)) {
     return;
   }
@@ -70,7 +80,7 @@ function assert_notSameValue(actual, unexpected, message) {
     message += " ";
   }
   message += "Expected SameValue(«" + assert__toString(actual) + "», «" + assert__toString(unexpected) + "») to be false";
-  throw new Test262Error(message);
+  throw new Error("Test262Error: " + message);
 }
 
 function assert__throwsMessage(message) {
@@ -104,13 +114,13 @@ function assert__runThrows(func, name) {
 // expose `.constructor`, and builtin error constructors are not first-class
 // values, so on jsc this only works once those land; until then use the
 // `assert_throws_<Name>` variants below.
-function assert_throws(expectedErrorConstructor, func, message) {
+function assert_throws(expectedErrorConstructor, func, message = undefined) {
   let r = assert__runThrows(func, expectedErrorConstructor.name);
   if (r.failure !== "") {
-    throw new Test262Error(assert__throwsMessage(message) + r.failure);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + r.failure);
   }
   if (r.thrown.constructor !== expectedErrorConstructor) {
-    throw new Test262Error(assert__throwsMessage(message) + "Expected a " + expectedErrorConstructor.name + " but got a " + r.thrown.constructor.name);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + "Expected a " + expectedErrorConstructor.name + " but got a " + r.thrown.constructor.name);
   }
 }
 
@@ -121,42 +131,75 @@ function assert_throws(expectedErrorConstructor, func, message) {
 // names its constructor directly. Builtin variants also compare `.name` so a
 // TypeError/RangeError does not satisfy an expected plain Error, keeping
 // upstream's exact-constructor semantics.
-function assert_throws_Test262Error(func, message) {
+function assert_throws_Test262Error(func, message = undefined) {
   let r = assert__runThrows(func, "Test262Error");
   if (r.failure !== "") {
-    throw new Test262Error(assert__throwsMessage(message) + r.failure);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + r.failure);
   }
   if (!(r.thrown instanceof Test262Error)) {
-    throw new Test262Error(assert__throwsMessage(message) + "Expected a Test262Error but got a " + r.thrown.name);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + "Expected a Test262Error but got a " + r.thrown.name);
   }
 }
 
-function assert_throws_Error(func, message) {
+function assert_throws_Error(func, message = undefined) {
   let r = assert__runThrows(func, "Error");
   if (r.failure !== "") {
-    throw new Test262Error(assert__throwsMessage(message) + r.failure);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + r.failure);
   }
   if (!(r.thrown instanceof Error) || r.thrown.name !== "Error") {
-    throw new Test262Error(assert__throwsMessage(message) + "Expected a Error but got a " + r.thrown.name);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + "Expected a Error but got a " + r.thrown.name);
   }
 }
 
-function assert_throws_TypeError(func, message) {
+function assert_throws_TypeError(func, message = undefined) {
   let r = assert__runThrows(func, "TypeError");
   if (r.failure !== "") {
-    throw new Test262Error(assert__throwsMessage(message) + r.failure);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + r.failure);
   }
   if (!(r.thrown instanceof TypeError) || r.thrown.name !== "TypeError") {
-    throw new Test262Error(assert__throwsMessage(message) + "Expected a TypeError but got a " + r.thrown.name);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + "Expected a TypeError but got a " + r.thrown.name);
   }
 }
 
-function assert_throws_RangeError(func, message) {
+function assert_throws_RangeError(func, message = undefined) {
   let r = assert__runThrows(func, "RangeError");
   if (r.failure !== "") {
-    throw new Test262Error(assert__throwsMessage(message) + r.failure);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + r.failure);
   }
   if (!(r.thrown instanceof RangeError) || r.thrown.name !== "RangeError") {
-    throw new Test262Error(assert__throwsMessage(message) + "Expected a RangeError but got a " + r.thrown.name);
+    throw new Error("Test262Error: " + assert__throwsMessage(message) + "Expected a RangeError but got a " + r.thrown.name);
   }
+}
+
+function compareArray(a, b) {
+  if (b.length !== a.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (!assert__isSameValue(b[i], a[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function compareArray_format(arrayLike) {
+  let parts = [];
+  for (let i = 0; i < arrayLike.length; i++) {
+    parts.push(String(arrayLike[i]));
+  }
+  return "[" + parts.join(", ") + "]";
+}
+
+function assert_compareArray(actual, expected, message = undefined) {
+  message = message === undefined ? "" : message;
+  if (isPrimitive(actual)) {
+    throw new Error("Test262Error: Actual argument [" + actual + "] shouldn't be primitive. " + String(message));
+  } else if (isPrimitive(expected)) {
+    throw new Error("Test262Error: Expected argument [" + expected + "] shouldn't be primitive. " + String(message));
+  }
+  if (compareArray(actual, expected)) {
+    return;
+  }
+  throw new Error("Test262Error: Actual " + compareArray_format(actual) + " and expected " + compareArray_format(expected) + " should have the same contents. " + String(message));
 }
