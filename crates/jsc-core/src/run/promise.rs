@@ -22,6 +22,7 @@ use wasmtime::{AsContextMut, Caller, Func, Global, Instance, Memory, Store, Stor
 
 use crate::abi;
 
+use super::host::heap_reserve;
 use super::{
     HEADER_SIZE, HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED, TYPE_FUNCTION,
     TYPE_PROMISE,
@@ -673,20 +674,16 @@ fn write_settlement<W: Write + Send + 'static>(
 }
 
 /// Bump-allocate `block` in guest memory via the exported `__heap_ptr` global
-/// (mirroring the guest `__alloc`), growing linear memory if needed. Returns the
-/// block's base offset, or `None` when a read/write/grow fails.
+/// (mirroring the guest `__alloc`), growing linear memory via [`heap_reserve`].
+/// Returns the block's base offset, or `None` when a read/write/grow fails (a
+/// failed grow leaves the out-of-memory sentinel for the run stage to report).
 fn heap_alloc<W: Write + Send + 'static>(
     mut ctx: StoreContextMut<'_, Host<W>>,
     handles: &Handles,
     block: &[u8],
 ) -> Option<u64> {
-    let base = usize::try_from(handles.heap_ptr.get(&mut ctx).i32()?).ok()?;
-    let end = base.checked_add(block.len())?;
-    let cur = handles.memory.data_size(&ctx);
-    if end > cur {
-        let pages = (end - cur).div_ceil(0x1_0000);
-        handles.memory.grow(&mut ctx, pages as u64).ok()?;
-    }
+    let base = heap_reserve(&mut ctx, handles.heap_ptr, handles.memory, block.len())?;
+    let end = base + block.len();
     handles.memory.write(&mut ctx, base, block).ok()?;
     handles
         .heap_ptr

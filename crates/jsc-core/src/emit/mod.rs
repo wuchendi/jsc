@@ -892,11 +892,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         module.section(&tables);
     }
 
-    // Memory section: one linear memory (min 1 page, no max), exported below.
+    // Memory section: one linear memory (min 1 page, capped at
+    // `abi::MEMORY_MAX_PAGES`; `__alloc` grows it on demand), exported below.
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
         minimum: 1,
-        maximum: None,
+        maximum: Some(abi::MEMORY_MAX_PAGES),
         memory64: false,
         shared: false,
         page_size_log2: None,

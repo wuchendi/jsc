@@ -7,7 +7,8 @@ use std::io::Write;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
 
 use super::host::{
-    host_alloc_string, method_dispatch, parse_float_str, parse_int_str, value_to_number,
+    heap_exhausted, host_alloc_string, method_dispatch, parse_float_str, parse_int_str,
+    value_to_number,
 };
 use super::promise::{self, Host};
 use crate::abi;
@@ -37,6 +38,24 @@ const UNDEFINED_BITS: u64 = abi::UNDEFINED;
 /// threw an exception that was never caught.
 const EXC_PENDING_EXPORT_NAME: &str = abi::EXC_PENDING_EXPORT_NAME;
 const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
+
+/// The rendered error for a program that exhausted the capped linear memory.
+const OUT_OF_MEMORY: &str = "Uncaught RangeError: out of memory";
+
+/// Pass a host import's result `bits` through, or trap the guest when the import
+/// (or an earlier allocation) left the out-of-memory sentinel in `__heap_ptr`;
+/// the run stage then reports [`OUT_OF_MEMORY`].
+fn oom_guard<W>(caller: &mut Caller<'_, W>, bits: i64) -> wasmtime::Result<i64> {
+    match caller
+        .get_export(abi::HEAP_PTR_EXPORT_NAME)
+        .and_then(wasmtime::Extern::into_global)
+    {
+        Some(global) if heap_exhausted(&mut *caller, global) => {
+            Err(wasmtime::Error::msg(OUT_OF_MEMORY))
+        }
+        _ => Ok(bits),
+    }
+}
 
 /// Load `wasm`, instantiate it, and call the exported `main` function.
 ///
@@ -131,7 +150,7 @@ fn run_with_sink<W: Write + Send + 'static>(
     linker.func_wrap(
         "env",
         "__convert",
-        |mut caller: Caller<'_, Host<W>>, bits: i64, op: i32| -> i64 {
+        |mut caller: Caller<'_, Host<W>>, bits: i64, op: i32| -> wasmtime::Result<i64> {
             let ubits = bits.cast_unsigned();
             // Decode the argument (heap-string operands need the memory snapshot).
             let value = match caller
@@ -141,7 +160,7 @@ fn run_with_sink<W: Write + Send + 'static>(
                 Some(mem) => decode(ubits, mem.data(&caller)),
                 None => decode(ubits, &[]),
             };
-            match op {
+            let result = match op {
                 CONVERT_OP_TO_NUMBER => value_to_number(&value).to_bits().cast_signed(),
                 // `parseInt`/`parseFloat` operate on the argument's string form.
                 CONVERT_OP_PARSE_INT => {
@@ -154,20 +173,21 @@ fn run_with_sink<W: Write + Send + 'static>(
                     // A string argument is returned unchanged (no allocation);
                     // anything else is formatted and allocated as a heap string.
                     if matches!(value, Value::Str(_)) {
-                        return bits;
+                        return Ok(bits);
                     }
                     let text = format_value(&value);
                     match host_alloc_string(&mut caller, &text) {
                         Some(base) => (HEAP | base).cast_signed(),
-                        // Allocation failed (missing export / OOM): yield
-                        // `undefined` rather than trapping the guest.
+                        // Allocation failed: out of memory traps via
+                        // `oom_guard`; a missing export yields `undefined`.
                         None => UNDEFINED_BITS.cast_signed(),
                     }
                 }
                 // An unknown op flag never reaches here from `crate::emit`; yield
                 // `undefined` to keep the import total.
                 _ => UNDEFINED_BITS.cast_signed(),
-            }
+            };
+            oom_guard(&mut caller, result)
         },
     )?;
     // The `__method` import backs the non-callback array/string methods (S14.6):
@@ -180,10 +200,16 @@ fn run_with_sink<W: Write + Send + 'static>(
     linker.func_wrap(
         "env",
         "__method",
-        |mut caller: Caller<'_, Host<W>>, recv: i64, op: i32, arg0: i64, arg1: i64| -> i64 {
-            method_dispatch(&mut caller, recv.cast_unsigned(), op, arg0, arg1)
+        |mut caller: Caller<'_, Host<W>>,
+         recv: i64,
+         op: i32,
+         arg0: i64,
+         arg1: i64|
+         -> wasmtime::Result<i64> {
+            let result = method_dispatch(&mut caller, recv.cast_unsigned(), op, arg0, arg1)
                 .unwrap_or(UNDEFINED_BITS)
-                .cast_signed()
+                .cast_signed();
+            oom_guard(&mut caller, result)
         },
     )?;
     // The host promise imports (P4.1): `__promise` backs Promise.resolve/reject,
@@ -192,21 +218,24 @@ fn run_with_sink<W: Write + Send + 'static>(
     linker.func_wrap(
         "env",
         "__promise",
-        |mut caller: Caller<'_, Host<W>>, op: i32, a: i64, b: i64| -> i64 {
-            promise::dispatch(&mut caller, op, a.cast_unsigned(), b.cast_unsigned()).cast_signed()
+        |mut caller: Caller<'_, Host<W>>, op: i32, a: i64, b: i64| -> wasmtime::Result<i64> {
+            let result = promise::dispatch(&mut caller, op, a.cast_unsigned(), b.cast_unsigned())
+                .cast_signed();
+            oom_guard(&mut caller, result)
         },
     )?;
     linker.func_wrap(
         "env",
         "__then",
-        |mut caller: Caller<'_, Host<W>>, p: i64, on_f: i64, on_r: i64| -> i64 {
-            promise::then(
+        |mut caller: Caller<'_, Host<W>>, p: i64, on_f: i64, on_r: i64| -> wasmtime::Result<i64> {
+            let result = promise::then(
                 &mut caller,
                 p.cast_unsigned(),
                 on_f.cast_unsigned(),
                 on_r.cast_unsigned(),
             )
-            .cast_signed()
+            .cast_signed();
+            oom_guard(&mut caller, result)
         },
     )?;
     // The `__now` import (P-series `Date`): the host wall clock backing
@@ -220,7 +249,19 @@ fn run_with_sink<W: Write + Send + 'static>(
     })?;
     let instance = linker.instantiate(&mut store, &module)?;
     let main = instance.get_typed_func::<(), i64>(&mut store, "main")?;
-    let result = main.call(&mut store, ())?;
+    // Out of memory (the sticky `__heap_ptr` sentinel, set by a failed guest or
+    // host grow) wins over the trap or result it caused: report it as an
+    // uncaught `RangeError` with no trap backtrace.
+    let exhausted = |store: &mut Store<Host<W>>| {
+        instance
+            .get_global(&mut *store, abi::HEAP_PTR_EXPORT_NAME)
+            .is_some_and(|g| heap_exhausted(&mut *store, g))
+    };
+    let called = main.call(&mut store, ());
+    if exhausted(&mut store) {
+        return Err(anyhow::anyhow!(OUT_OF_MEMORY));
+    }
+    let result = called?;
     // Drain any microtasks scheduled by `.then`/`.catch`/`.finally` but never
     // awaited (P4.1), UNLESS `main` itself completed abruptly with a pending
     // exception (an uncaught throw or a top-level `await` rejection) — in which
@@ -231,6 +272,9 @@ fn run_with_sink<W: Write + Send + 'static>(
         .unwrap_or(0);
     if main_pending == 0 {
         promise::drain_after_main(&mut store, &instance);
+        if exhausted(&mut store) {
+            return Err(anyhow::anyhow!(OUT_OF_MEMORY));
+        }
     }
     // Snapshot linear memory AFTER the drain so any promise settled by a microtask
     // renders its final state and pointer jsvals resolve against current memory.
