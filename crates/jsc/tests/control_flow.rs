@@ -8,17 +8,17 @@ use common::jsc;
 fn c_style_for_via_eval() {
     // Brace body, `for`-`let` binding.
     assert_eq!(
-        jsc(&["-e", "let s=0; for (let i=0;i<5;i=i+1) { s = s + i } s"]),
+        jsc(&["-p", "let s=0; for (let i=0;i<5;i=i+1) { s = s + i } s"]),
         "10"
     );
     // Single-statement (no-brace) body.
     assert_eq!(
-        jsc(&["-e", "let s=0; for (let i=0;i<5;i=i+1) s = s + i; s"]),
+        jsc(&["-p", "let s=0; for (let i=0;i<5;i=i+1) s = s + i; s"]),
         "10"
     );
     // Empty init and empty update sections.
     assert_eq!(
-        jsc(&["-e", "let i=0; let s=0; for(;i<3;){ s=s+1; i=i+1 } s"]),
+        jsc(&["-p", "let i=0; let s=0; for(;i<3;){ s=s+1; i=i+1 } s"]),
         "3"
     );
 }
@@ -29,7 +29,7 @@ fn switch_case_via_eval() {
     // Matching case with `break`.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=2; let r=0; switch(x){ case 1: r=10; break; case 2: r=42; break; default: r=99 } r"
         ]),
         "42"
@@ -37,7 +37,7 @@ fn switch_case_via_eval() {
     // `default` runs when no case matches.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=9; let r=0; switch(x){ case 1: r=10; break; default: r=99 } r"
         ]),
         "99"
@@ -45,7 +45,7 @@ fn switch_case_via_eval() {
     // Empty case falls through to the next case body.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=1; let r=0; switch(x){ case 1: case 2: r=42; break; default: r=0 } r"
         ]),
         "42"
@@ -53,7 +53,7 @@ fn switch_case_via_eval() {
     // A case without `break` falls through into the following case body.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=1; let r=0; switch(x){ case 1: r=1; case 2: r=r+40; break; default: } r"
         ]),
         "41"
@@ -61,7 +61,7 @@ fn switch_case_via_eval() {
     // `default` in the middle falls through into the following case (source order).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=5; let r=0; switch(x){ case 1: r=1; break; default: r=r+3; case 2: r=r+4; break } r"
         ]),
         "7"
@@ -69,7 +69,7 @@ fn switch_case_via_eval() {
     // No match and no `default`: the switch is a no-op.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=7; let r=0; switch(x){ case 1: r=1; break; case 2: r=2; break } r"
         ]),
         "0"
@@ -77,7 +77,7 @@ fn switch_case_via_eval() {
     // `break` nested inside an `if` still exits the switch.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=1; let r=0; switch(x){ case 1: if(x>0){ r=42; break } r=5; break; default: r=9 } r"
         ]),
         "42"
@@ -85,7 +85,7 @@ fn switch_case_via_eval() {
     // Strict-equality matching on a string discriminant.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x=\"b\"; let r=0; switch(x){ case \"a\": r=1; break; case \"b\": r=2; break } r"
         ]),
         "2"
@@ -97,18 +97,18 @@ fn switch_case_via_eval() {
 fn for_of_via_eval() {
     // Milestone 1: iterate array elements, accumulating their sum.
     assert_eq!(
-        jsc(&["-e", "let s=0; for (const v of [10,20,30]) { s = s + v } s"]),
+        jsc(&["-p", "let s=0; for (const v of [10,20,30]) { s = s + v } s"]),
         "60"
     );
     // Milestone 2: iterate a string's characters, rebuilding it.
     assert_eq!(
-        jsc(&["-e", r#"let r=""; for (const c of "abc") { r = r + c } r"#]),
+        jsc(&["-p", r#"let r=""; for (const c of "abc") { r = r + c } r"#]),
         "abc"
     );
     // Milestone 3: `break` exits the loop early.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=0; for (const v of [1,2,3,4]) { if (v===3) break; s=s+v } s"
         ]),
         "3"
@@ -116,20 +116,20 @@ fn for_of_via_eval() {
     // Milestone 4: `continue` skips an iteration but still advances the index.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=0; for (const v of [1,2,3,4]) { if (v===2) continue; s=s+v } s"
         ]),
         "8"
     );
     // Single-statement (no-brace) body, and a `let` binding.
     assert_eq!(
-        jsc(&["-e", "let s=0; for (let v of [1,2,3]) s = s + v; s"]),
+        jsc(&["-p", "let s=0; for (let v of [1,2,3]) s = s + v; s"]),
         "6"
     );
     // The loop binding is scoped to the loop and does not leak past it.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let last=0; for (const v of [7,8,9]) { last = v } last"
         ]),
         "9"
@@ -141,17 +141,17 @@ fn for_of_via_eval() {
 #[test]
 fn block_scoping_via_eval() {
     // Inner `let x` shadows the outer; the outer binding survives the block.
-    assert_eq!(jsc(&["-e", "let x=1; { let x=2; } x"]), "1");
+    assert_eq!(jsc(&["-p", "let x=1; { let x=2; } x"]), "1");
     // The inner block sees its own binding while it is in scope.
-    assert_eq!(jsc(&["-e", "let x=1; let r=0; { let x=2; r=x } r"]), "2");
+    assert_eq!(jsc(&["-p", "let x=1; let r=0; { let x=2; r=x } r"]), "2");
     // Sibling blocks reuse a name for distinct bindings.
     assert_eq!(
-        jsc(&["-e", "let r=0; { let x=1; r=r+x } { let x=2; r=r+x } r"]),
+        jsc(&["-p", "let r=0; { let x=1; r=r+x } { let x=2; r=r+x } r"]),
         "3"
     );
     // A `for`-let binding is scoped to the loop and does not leak past it.
     assert_eq!(
-        jsc(&["-e", "let s=0; for (let i=0;i<3;i=i+1) { s = s + i } s"]),
+        jsc(&["-p", "let s=0; for (let i=0;i<3;i=i+1) { s = s + i } s"]),
         "3"
     );
 }
@@ -162,16 +162,16 @@ fn block_scoping_via_eval() {
 fn do_while_via_eval() {
     // Body runs while the condition holds, accumulating across iterations.
     assert_eq!(
-        jsc(&["-e", "let i=0,s=0; do { s=s+i; i=i+1 } while (i<3); s"]),
+        jsc(&["-p", "let i=0,s=0; do { s=s+i; i=i+1 } while (i<3); s"]),
         "3"
     );
     // The body runs at least once even when the condition is immediately false.
-    assert_eq!(jsc(&["-e", "let n=0; do { n=n+1 } while (false); n"]), "1");
+    assert_eq!(jsc(&["-p", "let n=0; do { n=n+1 } while (false); n"]), "1");
     // `continue` in a `do`-`while` jumps to the condition test (re-evaluated),
     // still terminating the loop.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let i=0,s=0; do { i=i+1; if (i===2) continue; s=s+i } while (i<4); s"
         ]),
         "8"
@@ -179,7 +179,7 @@ fn do_while_via_eval() {
     // `break` exits the `do`-`while` immediately.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let n=0; do { n=n+1; if (n===2) break } while (true); n"
         ]),
         "2"
@@ -194,7 +194,7 @@ fn labeled_break_continue_via_eval() {
     // `break LABEL` from an inner loop exits the labeled outer loop entirely.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let n=0; outer: for(let i=0;i<3;i=i+1){ for(let j=0;j<3;j=j+1){ if(j===1) break outer; n=n+1 } } n"
         ]),
         "1"
@@ -202,7 +202,7 @@ fn labeled_break_continue_via_eval() {
     // `continue LABEL` skips to the labeled outer loop's next iteration.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let n=0; outer: for(let i=0;i<3;i=i+1){ for(let j=0;j<3;j=j+1){ if(j===1) continue outer; n=n+1 } } n"
         ]),
         "3"
@@ -211,7 +211,7 @@ fn labeled_break_continue_via_eval() {
     // plain `break`.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=0; L: for(let i=0;i<10;i=i+1){ if(i===5) break L; s=s+1 } s"
         ]),
         "5"
@@ -219,7 +219,7 @@ fn labeled_break_continue_via_eval() {
     // A label may name a `do`-`while`, and `break LABEL` exits it.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let n=0; L: do { n=n+1; if(n===3) break L } while(true); n"
         ]),
         "3"
@@ -227,7 +227,7 @@ fn labeled_break_continue_via_eval() {
     // `break LABEL` still runs an intervening `finally` on the way out (S15.3).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let n=0,f=0; outer: for(let i=0;i<3;i=i+1){ for(let j=0;j<3;j=j+1){ try { if(j===1) break outer; n=n+1 } finally { f=f+1 } } } n*10+f"
         ]),
         "12"

@@ -1,84 +1,142 @@
 #![forbid(unsafe_code)]
 //! `jsc` command-line entry point.
 //!
-//! A thin [`clap`] shell over [`jsc_core`]. It reads a JavaScript source string
-//! either inline (`-e`) or from a file, then either runs it (`--emit run`,
-//! the default) and prints the result value, or emits the raw WebAssembly
-//! module bytes to stdout (`--emit wasm`).
+//! A thin [`clap`] shell over [`jsc_core`] with node-like modes:
+//!
+//! - `jsc FILE` / `jsc -e SRC` — compile and run; only `console` output is
+//!   printed.
+//! - `jsc -p SRC` — compile and run, then print the completion value.
+//! - `jsc build FILE -o OUT.wasm` — emit the WebAssembly module (`-o -` writes
+//!   to stdout).
+//!
+//! Exit codes: `0` success, `1` uncaught exception / runtime or I/O failure,
+//! `2` compile error.
 
 use std::io::Write as _;
+use std::process::ExitCode;
 
-use anyhow::anyhow;
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand};
 
-/// Compile and run a numeric JavaScript expression.
+/// Compile JavaScript/TypeScript to WebAssembly and run it, node-style.
 #[derive(Parser)]
 #[command(name = "jsc", version, about)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 #[command(group(
-    clap::ArgGroup::new("source").required(true).args(["eval", "file"])
+    clap::ArgGroup::new("source").required(true).args(["eval", "print", "file"])
 ))]
 struct Cli {
-    /// Evaluate an inline expression string.
-    #[arg(short, long, value_name = "EXPR", allow_hyphen_values = true)]
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Run an inline source string, printing only console output.
+    #[arg(short, long, value_name = "SRC", allow_hyphen_values = true)]
     eval: Option<String>,
 
-    /// Read JavaScript source from a file.
+    /// Run an inline source string and print its completion value.
+    #[arg(short, long, value_name = "SRC", allow_hyphen_values = true)]
+    print: Option<String>,
+
+    /// Run a JavaScript source file, printing only console output.
     #[arg(value_name = "FILE")]
     file: Option<String>,
-
-    /// What to produce: run the program or emit the WebAssembly module.
-    #[arg(long, value_enum, default_value_t = Emit::Run)]
-    emit: Emit,
 }
 
-/// Output mode selected by `--emit`.
-#[derive(Clone, Copy, ValueEnum)]
-enum Emit {
-    /// Execute the program and print the numeric result.
-    Run,
-    /// Write the raw WebAssembly module bytes to stdout.
-    Wasm,
+#[derive(Subcommand)]
+enum Command {
+    /// Compile FILE to a WebAssembly module.
+    Build {
+        /// JavaScript source file to compile.
+        #[arg(value_name = "FILE")]
+        file: String,
+
+        /// Output path for the module bytes; `-` writes to stdout.
+        #[arg(short, long, value_name = "OUT", allow_hyphen_values = true)]
+        output: String,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+/// A failed CLI run, carrying the process exit code it maps to.
+enum Failure {
+    /// Parse or lower failed (exit 2).
+    Compile(anyhow::Error),
+    /// Uncaught exception, runtime trap, or I/O failure (exit 1).
+    Runtime(anyhow::Error),
+}
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    // `label` names the source in diagnostics: `<eval>` for inline `-e` input,
-    // the real path for a file.
-    let (src, label) = match (cli.eval, cli.file) {
-        (Some(expr), None) => (expr, "<eval>".to_owned()),
-        (None, Some(path)) => (std::fs::read_to_string(&path)?, path),
-        // The `source` ArgGroup guarantees exactly one is present.
-        _ => return Err(anyhow!("exactly one of --eval or FILE must be provided")),
+    let result = match cli.command {
+        Some(Command::Build { file, output }) => build(&file, &output),
+        None => run(cli.eval, cli.print, cli.file),
     };
-
-    match cli.emit {
-        Emit::Run => match jsc_core::run::compile_and_run(&src) {
-            Ok(value) => println!("{}", jsc_core::run::format_value(&value)),
-            Err(err) => {
-                // A spanned CompileError renders a source-pointing caret block;
-                // span-less or other errors fall through to anyhow's default
-                // message-and-nonzero-exit behavior (unchanged).
-                let rendered = err
-                    .downcast_ref::<jsc_core::error::CompileError>()
-                    .and_then(|ce| ce.render(&src, &label));
-                if let Some(block) = rendered {
-                    eprintln!("{block}");
-                    std::process::exit(1);
-                }
-                return Err(err);
-            }
-        },
-        Emit::Wasm => {
-            let program = jsc_core::frontend::parse(&src)?;
-            let ir = jsc_core::codegen::lower(&program)?;
-            let wasm = jsc_core::emit::emit(&ir);
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            handle.write_all(&wasm)?;
-            handle.flush()?;
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Failure::Compile(err)) => {
+            eprintln!("{err:#}");
+            ExitCode::from(2)
+        }
+        Err(Failure::Runtime(err)) => {
+            eprintln!("{err:#}");
+            ExitCode::from(1)
         }
     }
+}
 
+/// Run the `-e` / `-p` / FILE form. The `source` `ArgGroup` guarantees exactly one
+/// source is present.
+fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Result<(), Failure> {
+    // `label` names the source in diagnostics: `<eval>` for inline input, the
+    // real path for a file.
+    let (src, label, print_value) = match (eval, print, file) {
+        (Some(src), None, None) => (src, "<eval>".to_owned(), false),
+        (None, Some(src), None) => (src, "<eval>".to_owned(), true),
+        (None, None, Some(path)) => (read_source(&path)?, path, false),
+        _ => {
+            return Err(Failure::Runtime(anyhow::anyhow!(
+                "exactly one of --eval, --print or FILE must be provided"
+            )));
+        }
+    };
+    let wasm = compile(&src, &label)?;
+    // `console.log` streams to the real stdout while the module runs.
+    let (bits, memory) = jsc_core::run::run(&wasm).map_err(Failure::Runtime)?;
+    if print_value {
+        let value = jsc_core::run::decode(bits, &memory);
+        println!("{}", jsc_core::run::format_value(&value));
+    }
     Ok(())
+}
+
+/// `jsc build FILE -o OUT`: write the module bytes to OUT (`-` = stdout).
+fn build(path: &str, output: &str) -> Result<(), Failure> {
+    let src = read_source(path)?;
+    let wasm = compile(&src, path)?;
+    let written = if output == "-" {
+        let mut handle = std::io::stdout().lock();
+        handle.write_all(&wasm).and_then(|()| handle.flush())
+    } else {
+        std::fs::write(output, &wasm)
+    };
+    written.map_err(|err| Failure::Runtime(anyhow::anyhow!("cannot write {output}: {err}")))
+}
+
+fn read_source(path: &str) -> Result<String, Failure> {
+    std::fs::read_to_string(path)
+        .map_err(|err| Failure::Runtime(anyhow::anyhow!("cannot read {path}: {err}")))
+}
+
+/// Parse, lower, and emit `src`. A spanned `CompileError` is replaced by its
+/// rendered caret block (labelled `label`); a span-less one keeps its message.
+fn compile(src: &str, label: &str) -> Result<Vec<u8>, Failure> {
+    let lowered =
+        jsc_core::frontend::parse(src).and_then(|program| jsc_core::codegen::lower(&program));
+    match lowered {
+        Ok(ir) => Ok(jsc_core::emit::emit(&ir)),
+        Err(err) => {
+            let rendered = err
+                .downcast_ref::<jsc_core::error::CompileError>()
+                .and_then(|ce| ce.render(src, label));
+            Err(Failure::Compile(rendered.map_or(err, anyhow::Error::msg)))
+        }
+    }
 }

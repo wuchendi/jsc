@@ -11,14 +11,14 @@ use common::jsc;
 fn closures_via_eval() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "function adder(x){ return y => x + y } let a5 = adder(5); a5(37)"
         ]),
         "42"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "function counter(){ let c=0; return function(){ c=c+1; return c } } \
              let n=counter(); n(); n(); n()"
         ]),
@@ -26,7 +26,7 @@ fn closures_via_eval() {
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "function adder(x){ return y => x + y } let a=adder(5); let b=adder(100); a(1)+b(1)"
         ]),
         "107"
@@ -41,17 +41,17 @@ fn closures_via_eval() {
 fn function_declaration_captures_enclosing_binding_via_eval() {
     // Read a `let` and a `const`.
     assert_eq!(
-        jsc(&["-e", "let n=41; function f(){ return n+1 } f()"]),
+        jsc(&["-p", "let n=41; function f(){ return n+1 } f()"]),
         "42"
     );
     assert_eq!(
-        jsc(&["-e", "const k=42; function f(){ return k } f()"]),
+        jsc(&["-p", "const k=42; function f(){ return k } f()"]),
         "42"
     );
     // Read AND write a shared cell across calls.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=0; function add(x){ s = s + x } add(40); add(2); s"
         ]),
         "42"
@@ -59,7 +59,7 @@ fn function_declaration_captures_enclosing_binding_via_eval() {
     // A nested `function` inside a top-level `function` still captures locally.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "function outer(){ let c=0; function inc(){ c=c+1; return c } inc(); return inc() } \
              outer()"
         ]),
@@ -68,7 +68,7 @@ fn function_declaration_captures_enclosing_binding_via_eval() {
     // A non-capturing declaration keeps working (direct call, hoisted).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "function g(){ return 7 } function f(){ return g() } f()"
         ]),
         "7"
@@ -76,7 +76,7 @@ fn function_declaration_captures_enclosing_binding_via_eval() {
     // A class method reads an enclosing top-level binding.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let base=40; class C { add(x){ return base + x } } new C().add(2)"
         ]),
         "42"
