@@ -119,7 +119,7 @@ mod tests {
         }
     }
 
-    const UNCAUGHT: &str = "Error: Uncaught TypeError: x is not a function\n";
+    const UNCAUGHT: &str = "Uncaught TypeError: x is not a function\n";
 
     #[test]
     fn positive() {
@@ -191,19 +191,18 @@ mod tests {
     #[test]
     fn observed_jsc_stderr() {
         let t262 = neg("runtime", "Test262Error");
-        let class_instance =
-            "Error: Uncaught { @@prototype: { toString: [Function (anonymous)] }, message: top }\n";
+        let class_instance = "Uncaught { @@prototype: {}, message: top }\n";
         assert_eq!(uncaught_name(class_instance), Some("{"));
         assert_eq!(
             classify(Status::Exited(1), class_instance, Some(&t262)),
             Outcome::Fail
         );
-        let harness = "Error: Uncaught Error: Test262Error: Expected SameValue\n";
+        let harness = "Uncaught Error: Test262Error: Expected SameValue\n";
         assert_eq!(uncaught_name(harness), Some("Error"));
         assert_eq!(
             classify(Status::Exited(1), harness, Some(&neg("runtime", "Error"))),
             Outcome::Pass
         );
-        assert_eq!(uncaught_name("Error: Uncaught str\n"), Some("str"));
+        assert_eq!(uncaught_name("Uncaught str\n"), Some("str"));
     }
 }
