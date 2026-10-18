@@ -229,3 +229,52 @@ fn p1_5_call_spread_via_eval() {
         "42"
     );
 }
+
+/// A direct call to a declared function follows JS arity semantics: a missing
+/// argument is `undefined` (a default still applies), and surplus arguments are
+/// evaluated left-to-right for their side effects and otherwise ignored.
+#[test]
+fn direct_calls_tolerate_missing_and_extra_arguments() {
+    let cases = [
+        ("function f(a,b){ return b } f(1)", "undefined"),
+        ("function f(a,b){ return typeof b } f(1)", "undefined"),
+        ("function f(a,b){ return a } f()", "undefined"),
+        ("function g(a){ return a } g(1, 2, 3)", "1"),
+        ("let n=0; function g(a){ return a } g(1, n++, n++); n", "2"),
+        (
+            "let s=''; function t(c){ s += c; return c } function g(a){ return a } g(t('a'), t('b'), t('c')); s",
+            "abc",
+        ),
+        ("function d(a, b = 7){ return a + b } d(1)", "8"),
+        (
+            "function d(a, b = 7){ return a + b } d(1, undefined, 99)",
+            "8",
+        ),
+        (
+            "function r(a, ...rest){ return rest.length } r(1, 2, 3)",
+            "2",
+        ),
+        // Recursion passing fewer arguments than declared.
+        (
+            "function sum(n, acc){ if (acc === undefined) acc = 0; return n === 0 ? acc : sum(n - 1, acc + n) } sum(4)",
+            "10",
+        ),
+        // Nested direct calls with fewer and more arguments.
+        (
+            "function a(x, y){ return y === undefined ? x : x + y } function b(x){ return a(x) + a(x, 1, 2) } b(5)",
+            "11",
+        ),
+        // An arrow and an object method calling a declared function with extras.
+        (
+            "function id(x){ return x } let h = () => id(3, 4, 5); h()",
+            "3",
+        ),
+        (
+            "function id(x){ return x } let o = { m(){ return id(6, 7) } }; o.m()",
+            "6",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(jsc(&["-p", src]), want, "{src}");
+    }
+}
