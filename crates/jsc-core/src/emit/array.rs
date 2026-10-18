@@ -5,7 +5,7 @@ use super::*;
 /// `0b101`, type byte `TYPE_ARRAY`) on the stack. `__alloc(HEADER_SIZE + 4 + 8*n)`
 /// reserves the block; the type byte, the u32 `len` header, and each element jsval
 /// are then written at `dst + HEADER_SIZE + 4 + 8*k` (mirroring the
-/// alloc→write→rebox shape of the S10 string cousin).
+/// alloc→write→rebox shape of the string literal emission).
 ///
 /// `dst` is kept on the operand stack (never in a persistent local) so nested
 /// array literals compose: an element expression may itself build an array,
@@ -21,7 +21,7 @@ pub(super) fn emit_array_node(
     // The i32 scratch local (declared just past the three i64 scratch locals) is
     // used only transiently, to duplicate `dst` before each write.
     let dst = scratch + 3;
-    // S13.1 block header: the u32 len header sits at `+HEADER_SIZE`; elements at
+    // Block header: the u32 len header sits at `+HEADER_SIZE`; elements at
     // `+HEADER_SIZE+4+8*k`.
     let header = MemArg {
         offset: HEADER_SIZE as u64,
@@ -72,7 +72,7 @@ pub(super) fn emit_array_node(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit an array literal with a spread `[0, ...a, 9]` (P1.5), leaving the built
+/// Emit an array literal with a spread `[0, ...a, 9]`, leaving the built
 /// array's heap jsval on the stack. Because a spread source's length is only
 /// known at runtime, the array is grown incrementally: a fresh empty array is
 /// initialized, then each part is appended left-to-right — a plain [`Item`] via
@@ -132,7 +132,7 @@ pub(super) fn emit_array_spread(
                 // normalized to an array first: a STRING is exploded into a fresh
                 // array of one-char strings via `__str_to_array` (so `[...str]`
                 // spreads its characters instead of reinterpreting UTF-8 bytes as
-                // jsvals); a GENERATOR (P4.2 M3) is drained via `__gen_to_array`,
+                // jsvals); a GENERATOR is drained via `__gen_to_array`,
                 // selected by an `IsGenerator` test; any other source (an array) is
                 // passed straight through. `base` (i32) stays beneath on the
                 // operand stack throughout. When the program declares no functions
@@ -168,7 +168,7 @@ pub(super) fn emit_array_spread(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit `array.push(value)` (S14.4), leaving the new length (a number jsval) on
+/// Emit `array.push(value)`, leaving the new length (a number jsval) on
 /// the stack. The old block base is read from `local`, `__array_push` grows and
 /// copies it (appending `value`), and `local` is REBOUND (`local.set`) to the
 /// reallocated block so later reads / `.length` observe the growth. The new length
@@ -211,7 +211,7 @@ pub(super) fn emit_array_push_node(
     function.instruction(&Instruction::I64ReinterpretF64);
 }
 
-/// Emit `array.pop()` (S14.4), leaving the removed last element (or `undefined`
+/// Emit `array.pop()`, leaving the removed last element (or `undefined`
 /// for an empty array) on the stack. No realloc: the block base read from `local`
 /// is decremented IN PLACE — its u32 length header drops by one and the removed
 /// element jsval at the old last slot is yielded — so the local keeps its pointer.
@@ -284,7 +284,7 @@ pub(super) fn emit_hof_index(function: &mut Function, idx: u32) {
     function.instruction(&Instruction::I64ReinterpretF64);
 }
 
-/// Emit the trailing half of a higher-order callback invocation (S14.5): pad the
+/// Emit the trailing half of a higher-order callback invocation: pad the
 /// remaining positional slots to the shared funcref arity with `undefined`, push
 /// the callback's own environment (at `+HEADER_SIZE+4`) as the env-last argument
 /// and its funcref-table index (at `+HEADER_SIZE`), and `call_indirect`. The real
@@ -300,8 +300,8 @@ pub(super) fn emit_hof_invoke(
     for _ in real_args..helpers.max_args {
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
-    // A higher-order callback is invoked with no receiver, so `this = undefined`
-    // (P2.1); the real positional args are already on the stack, so resetting the
+    // A higher-order callback is invoked with no receiver, so `this = undefined`;
+    // the real positional args are already on the stack, so resetting the
     // carrier here (stack-neutral) does not disturb them.
     emit_reset_this(function);
     function.instruction(&Instruction::LocalGet(cb));
@@ -329,12 +329,12 @@ pub(super) fn emit_hof_invoke(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Emit an array higher-order method `array.map/filter/reduce/forEach(callback)`
-/// (S14.5), leaving the method's result jsval on the stack. The receiver is
+/// Emit an array higher-order method `array.map/filter/reduce/forEach(callback)`,
+/// leaving the method's result jsval on the stack. The receiver is
 /// evaluated once into the i32 base scratch local `arr` (not rebound), its u32
 /// length header into `len`, and the callback function value's base into `cb`; a
 /// counted loop over `0..len` then invokes the callback per element through the
-/// S13 `call_indirect` ABI (env-last) via [`emit_hof_invoke`]:
+/// uniform `call_indirect` ABI (env-last) via [`emit_hof_invoke`]:
 ///
 /// - `Map` fills a fresh same-length array `res[i] = fn(element_i, i)`.
 /// - `Filter` grows a fresh array via `__array_push` for JS-truthy `fn(element_i, i)`.

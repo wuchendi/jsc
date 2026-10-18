@@ -43,7 +43,7 @@ pub(crate) fn assert_output(src: &str, expected: &str) {
     assert_eq!(output, expected, "printed output for source `{src}`");
 }
 
-// --- S14.2: Math.* methods + PI / E ------------------------------------------
+// --- Math.* methods + PI / E -------------------------------------------------
 
 /// Compile + run `src`, asserting its completion value is the number `expected`.
 pub(crate) fn assert_number(src: &str, expected: f64) {
@@ -60,7 +60,7 @@ pub(crate) fn assert_number(src: &str, expected: f64) {
     );
 }
 
-// --- S14.3: conversions String/Number/Boolean/parseInt/parseFloat -------------
+// --- conversions String/Number/Boolean/parseInt/parseFloat --------------------
 
 /// Compile + run `src`, asserting its completion value is the string `expected`.
 pub(crate) fn assert_string(src: &str, expected: &str) {
@@ -94,7 +94,7 @@ pub(crate) fn assert_bool(src: &str, expected: bool) {
 
 /// Compile + run `src`, asserting its completion value is the `typeof`-result
 /// type string `expected`. A `typeof` result is an ordinary heap string
-/// (`Value::Str`) — its immediate encoding was retired.
+/// (`Value::Str`) — there is no immediate encoding.
 pub(crate) fn assert_type_str(src: &str, expected: &str) {
     let result = compile_and_run(src);
     assert!(

@@ -1,16 +1,16 @@
-//! Integration tests: `class` declarations, constructors, and `new` (P2.2) via the CLI.
+//! Integration tests: `class` declarations, constructors, and `new` via the CLI.
 
 mod common;
 use common::jsc;
 
-/// The P2.2 milestones run inline with `-p` through the built binary.
+/// Class basics run inline with `-p` through the built binary.
 ///
 /// A single class (no inheritance) with a constructor: `new A(args)` allocates a
 /// fresh instance, binds `this` to it, runs the constructor for its side effects,
 /// and evaluates to the instance. A class with no constructor gets a default
 /// no-op one, and every instance is a plain object (`typeof` "object").
 #[test]
-fn class_milestones_via_eval() {
+fn class_basics_via_eval() {
     // Constructor stores a parameter onto `this`; the field reads back.
     assert_eq!(
         jsc(&[
@@ -100,7 +100,7 @@ fn class_instance_is_a_plain_object_via_eval() {
 /// A class declared inside a function is bound in that function's scope; `new`
 /// works from there and the instance escapes as the function's return value. A
 /// constructor that reads (but does not arithmetically combine) a captured outer
-/// binding sees it through the P1 closure environment.
+/// binding sees it through the closure environment.
 #[test]
 fn class_in_function_scope_via_eval() {
     assert_eq!(
@@ -128,7 +128,7 @@ fn class_in_function_scope_via_eval() {
     );
 }
 
-/// G1: the class NAME is resolvable inside its own constructor and method
+/// The class NAME is resolvable inside its own constructor and method
 /// bodies, so `new C()` works everywhere — not only at the class's declaration
 /// scope. The name is captured through the same boxed-cell path an arrow uses,
 /// and reads back the fully-built class value when the method later runs.
@@ -172,11 +172,11 @@ fn class_name_resolvable_in_method_bodies() {
     );
 }
 
-/// P2.3 milestones: instance methods live on the class's ONE shared prototype
+/// Instance methods live on the class's ONE shared prototype
 /// object, resolved by the own→prototype fallback when the method name is absent
 /// as an own property of the instance. Own fields still take precedence.
 #[test]
-fn class_method_milestones_via_eval() {
+fn class_methods_via_eval() {
     // A method reads an own field set by the constructor.
     assert_eq!(
         jsc(&[
@@ -236,12 +236,11 @@ fn class_method_args_and_precedence_via_eval() {
     );
 }
 
-/// P2.2b regression: a constructor field init `this.x = a+b` combines its
-/// parameters through the child scratch base. Before the fix the arithmetic RHS
-/// clobbered the stashed `this` receiver/key, leaving the field `undefined`; the
-/// dedicated high slots keep the receiver intact across the RHS.
+/// Regression: a constructor field init `this.x = a+b` combines its parameters
+/// through the child scratch base; the dedicated high slots keep the stashed
+/// `this` receiver/key intact across the arithmetic RHS.
 #[test]
-fn p2_2b_ctor_field_computed_init_via_eval() {
+fn ctor_field_computed_init_via_eval() {
     assert_eq!(
         jsc(&[
             "-p",
@@ -251,12 +250,12 @@ fn p2_2b_ctor_field_computed_init_via_eval() {
     );
 }
 
-/// P2.4 milestones: instance field declarations (`field = init`). A field is an
+/// Instance field declarations (`field = init`). A field is an
 /// instance-level own property initialized on construction, BEFORE the
 /// constructor body runs. The instance shape is the union of the field names and
 /// the constructor's `this.<f> = ..` assignments (no dynamic key growth).
 #[test]
-fn class_field_milestones_via_eval() {
+fn class_fields_via_eval() {
     // A single field with a constant initializer, no constructor: a default
     // constructor is synthesized from the field initializers.
     assert_eq!(jsc(&["-p", "class A{ v = 42 } new A().v"]), "42");
@@ -290,7 +289,7 @@ fn class_field_milestones_via_eval() {
     );
 }
 
-/// P2.4: a later field initializer may read an earlier field through `this`
+/// A later field initializer may read an earlier field through `this`
 /// (field inits are evaluated in declaration order), an uninitialized field (`f;`)
 /// reads back `undefined`, and a field-only class (no constructor) still yields a
 /// plain object.
@@ -319,12 +318,12 @@ fn class_field_ordering_and_undefined_via_eval() {
     );
 }
 
-/// P2.5 FINAL acceptance: the full P2.1..P2.4 sanity list runs end-to-end with no
-/// output drift — object-literal methods (P2.1), `class`/`constructor`/`new` (P2.2),
-/// prototype-shared methods (P2.3), and class fields (P2.4) together.
+/// Combined acceptance list run end-to-end with no output drift: object-literal
+/// methods, `class`/`constructor`/`new`, prototype-shared methods, and class
+/// fields together.
 #[test]
-fn p2_full_regression_acceptance_via_eval() {
-    // P2.1 — object-literal methods bind `this`.
+fn objects_and_classes_acceptance_via_eval() {
+    // Object-literal methods bind `this`.
     assert_eq!(
         jsc(&["-p", "let o={n:41, inc(){return this.n+1}}; o.inc()"]),
         "42"
@@ -337,7 +336,7 @@ fn p2_full_regression_acceptance_via_eval() {
         "40"
     );
     assert_eq!(jsc(&["-p", "let n=7; let o={n}; o.n"]), "7");
-    // P2.2 — class, constructor, new.
+    // Class, constructor, new.
     assert_eq!(
         jsc(&[
             "-p",
@@ -356,7 +355,7 @@ fn p2_full_regression_acceptance_via_eval() {
         jsc(&["-p", "class A{constructor(x){this.v=x}} typeof (new A(1))"]),
         "object"
     );
-    // P2.3 — prototype-shared methods, including a method calling another method.
+    // Prototype-shared methods, including a method calling another method.
     assert_eq!(
         jsc(&[
             "-p",
@@ -371,7 +370,7 @@ fn p2_full_regression_acceptance_via_eval() {
         ]),
         "42"
     );
-    // P2.4 — class fields, including a field init reading an earlier field.
+    // Class fields, including a field init reading an earlier field.
     assert_eq!(jsc(&["-p", "class A{ v = 42 } new A().v"]), "42");
     assert_eq!(
         jsc(&[
@@ -422,12 +421,12 @@ fn class_method_news_own_class_and_captures_enclosing_binding_via_eval() {
     );
 }
 
-/// The E-series `extends` milestones: a derived class inherits its parent's
+/// `extends`: a derived class inherits its parent's
 /// methods through the shared-prototype chain, `super(..)` runs the parent
 /// constructor on the same instance, `super.m(..)` calls the parent's method, and
 /// `instanceof` walks the whole prototype chain.
 #[test]
-fn class_extends_milestones_via_eval() {
+fn class_extends_via_eval() {
     // super(n) forwards to the parent constructor, which sets the inherited field.
     assert_eq!(
         jsc(&[
@@ -616,7 +615,7 @@ fn class_static_field_computed_init_via_eval() {
     );
 }
 
-/// Instance accessors (P2b). A `get x(){}` / `set x(v){}` lives on the shared
+/// Instance accessors. A `get x(){}` / `set x(v){}` lives on the shared
 /// prototype as a `TYPE_ACCESSOR` box: reading `obj.x` invokes the getter with
 /// `this` = the instance; writing `obj.x = v` invokes the setter. A half-declared
 /// accessor degrades cleanly — reading a set-only property is `undefined`, and

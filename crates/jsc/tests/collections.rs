@@ -1,4 +1,4 @@
-//! Integration tests: `Map` and `Set` collection utilities via the CLI (P3.5).
+//! Integration tests: `Map` and `Set` collection utilities via the CLI.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -20,12 +20,12 @@ fn jsc_reject(src: &str) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// The P3.5 Map/Set milestones run inline with `-p` through the built binary.
+/// Map/Set basics run inline with `-p` through the built binary.
 ///
-/// Covers the collection wave end to end: `Map` set/get sum, `has`, `size`, `Set`
+/// Covers collections end to end: `Map` set/get sum, `has`, `size`, `Set`
 /// add dedup + `size`, `Set` `has`, and `typeof (new Map())`.
 #[test]
-fn map_set_milestones_via_eval() {
+fn map_set_basics_via_eval() {
     assert_eq!(
         jsc(&[
             "-p",

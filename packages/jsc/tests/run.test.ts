@@ -45,7 +45,7 @@ it('dispatches a host array method that allocates a heap string', async () => {
   expect((await run("[1,2,3].join('-')")).result).toBe('1-2-3')
 })
 
-it('dispatches the M2 string methods through the shim', async () => {
+it('dispatches the string methods through the shim', async () => {
   expect((await run("'  hi  '.trim()")).result).toBe('hi')
   expect((await run("'ab'.repeat(3)")).result).toBe('ababab')
   expect((await run("'hello'.startsWith('he')")).result).toBe('true')

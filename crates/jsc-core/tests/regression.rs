@@ -1,10 +1,10 @@
-//! Integration tests: S8..S12 feature regression under the S13 jsval ABI.
+//! Integration tests: core language feature regression under the jsval ABI.
 
 mod common;
 use common::{assert_eval, assert_rejected};
 
 #[test]
-fn s8_s12_regression_end_to_end() {
+fn core_features_regression_end_to_end() {
     assert_eval("40 + 2", "42");
     assert_eval(
         "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)",

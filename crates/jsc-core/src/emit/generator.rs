@@ -1,4 +1,4 @@
-//! Emit the wasm for generators (P4.2 M2 + M3): the `MakeGenerator` constructor
+//! Emit the wasm for generators: the `MakeGenerator` constructor
 //! body, the `gen.next(v)` driver, and the state-machine dispatch function.
 //!
 //! A `function*` compiles to two ordinary uniform-ABI functions. The CONSTRUCTOR
@@ -7,7 +7,7 @@
 //! returns it without running the body. The STATE MACHINE ([`emit_generator_sm`])
 //! is a `loop { br_table (gen.state) }` dispatch over the CFG basic blocks;
 //! `Yield`/`Return` blocks `return`, while `Jump`/`Branch` blocks store the next
-//! state and re-dispatch (M3). `gen.next(v)` ([`emit_gen_resume`]) drives it
+//! state and re-dispatch. `gen.next(v)` ([`emit_gen_resume`]) drives it
 //! through `call_indirect`, resuming at `state` and reaching the frame's cells
 //! through the ordinary closure `EnvLoad` path.
 
@@ -310,7 +310,7 @@ fn emit_result_object(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit a generator STATE MACHINE function (P4.2 M2). Its wasm parameters are the
+/// Emit a generator STATE MACHINE function. Its wasm parameters are the
 /// uniform ABI `(sent = local 0, gen = local 1, …, env, argc)`; the body is a
 /// `br_table` dispatch on `gen.state` (read from local 1) into one block per
 /// segment. Each segment runs its straight-line statements and ends by either
@@ -347,7 +347,7 @@ pub(super) fn emit_generator_sm(
     let gen_local = 1;
 
     // A `loop` wraps the whole dispatch so a `Jump`/`Branch` terminator can store
-    // the next block index and `br` back to re-dispatch (M3 CFG flattening). Inside
+    // the next block index and `br` back to re-dispatch (CFG flattening). Inside
     // it, one `block` per basic block plus a trailing out-of-range default, then a
     // `br_table` on `gen.state`. Branching to block label `i` lands just past its
     // `End`, where block `i`'s code begins; the code ends by `return`ing (a `yield`
@@ -411,7 +411,7 @@ pub(super) fn emit_generator_sm(
     function
 }
 
-/// Emit a basic block's terminator (P4.2 M2/M3). `loop_rel` is the `br` immediate
+/// Emit a basic block's terminator. `loop_rel` is the `br` immediate
 /// that re-dispatches (targets the enclosing state-machine loop); `n` is the block
 /// count (the out-of-range default state used to mark completion).
 #[allow(clippy::too_many_arguments)]
@@ -471,7 +471,7 @@ fn emit_segment_term(
     }
 }
 
-/// Emit the `__gen_to_array(gen) -> array` helper (P4.2 M3): drive the generator
+/// Emit the `__gen_to_array(gen) -> array` helper: drive the generator
 /// to exhaustion via `call_indirect`, collecting each yielded value into a fresh
 /// growable array (the generator's `return` value is NOT included, matching the
 /// iterator protocol). Backs `[...gen]` / `f(...gen)` spread.
@@ -572,7 +572,7 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
     function
 }
 
-/// Emit the `__async_step(gen, sent) -> value` trampoline (P4.3 M4): advance an
+/// Emit the `__async_step(gen, sent) -> value` trampoline: advance an
 /// `async function` body's generator state machine by one suspend. It
 /// `call_indirect`s the SM with `(sent, gen, …, env = gen.env, argc = 2)` under
 /// the uniform ABI — exactly like [`emit_gen_resume`]'s drive step — and returns

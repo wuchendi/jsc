@@ -32,7 +32,7 @@ fn starts_with_wasm_magic() {
 
 #[test]
 fn exports_a_memory_named_memory() {
-    // S10.1: every emitted module carries a linear memory exported as
+    // Every emitted module carries a linear memory exported as
     // "memory" (index 0), which the run stage reads back to resolve pointers.
     let bytes = emit(&expr_program(IrNode::Num(42.0)));
     validate(&bytes);
@@ -81,7 +81,7 @@ fn compile_and_run_string_literal_end_to_end() {
 
 #[test]
 fn string_literal_round_trips_to_a_heap_string() {
-    // S10.2: a string literal lowers to a heap-pointer jsval backed by a data
+    // A string literal lowers to a heap-pointer jsval backed by a data
     // segment; running the module and decoding against its memory yields the
     // text (unquoted via `format_value`).
     let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
@@ -163,7 +163,7 @@ fn str_index_builds_fresh_one_char_string() {
 
 #[test]
 fn array_literal_round_trips_to_a_heap_array() {
-    // S11.1: `[1, 2, 3]` lowers to a heap array (type byte TYPE_ARRAY); running the
+    // `[1, 2, 3]` lowers to a heap array (type byte TYPE_ARRAY); running the
     // module and decoding against its memory yields the element values.
     let node = IrNode::Array(vec![IrNode::Num(1.0), IrNode::Num(2.0), IrNode::Num(3.0)]);
     let bytes = emit(&expr_program(node));
@@ -193,7 +193,7 @@ fn empty_array_literal_round_trips() {
 
 #[test]
 fn array_element_assignment_writes_slot_and_yields_value() {
-    // S11.2: `let a = [10, 20]; a[1] = 5; a[0] + a[1]` => 15. The write must
+    // `let a = [10, 20]; a[1] = 5; a[0] + a[1]` => 15. The write must
     // land in the existing slot; the read-back sum confirms it.
     let program = IrProgram {
         locals: 1,
@@ -250,7 +250,7 @@ fn array_element_assignment_expression_is_the_stored_value() {
 
 #[test]
 fn object_property_assignment_static_member_updates_in_place() {
-    // S11.4: `o.x = 42` scans for key "x" and stores into its value slot.
+    // `o.x = 42` scans for key "x" and stores into its value slot.
     let value = crate::run::compile_and_run("let o = {x: 10}; o.x = 42; o.x")
         .expect("pipeline should succeed");
     assert_eq!(value, crate::run::Value::Number(42.0));
@@ -343,7 +343,7 @@ fn string_literal_emits_data_segment_and_advances_heap_ptr() {
                 data_segments = reader.count();
             }
             wasmparser::Payload::GlobalSection(reader) => {
-                // The heap pointer is the FIRST global; the S15.1
+                // The heap pointer is the FIRST global; the
                 // exception-unwinding globals follow it and are ignored here.
                 let heap_ptr = reader
                     .into_iter()
@@ -366,7 +366,7 @@ fn string_literal_emits_data_segment_and_advances_heap_ptr() {
 #[test]
 fn no_literals_keeps_heap_ptr_at_base() {
     // With no string literals, the bump allocator still starts at HEAP_BASE.
-    // The heap pointer is the FIRST global; the S15.1 exception-unwinding
+    // The heap pointer is the FIRST global; the exception-unwinding
     // globals ($exc_pending = 0, $exc_value = 0) follow it and are ignored here.
     let bytes = emit(&expr_program(IrNode::Num(42.0)));
     validate(&bytes);
@@ -516,7 +516,7 @@ fn emits_valid_module_with_switch() {
 
 #[test]
 fn emits_valid_module_with_boxed_condition() {
-    // S9.4: `if (true) { 1 } else { 2 }` — the generalized `emit_cond` must
+    // `if (true) { 1 } else { 2 }` — the generalized `emit_cond` must
     // stay valid wasm when the condition is a boxed (non-number) jsval.
     let program = IrProgram {
         locals: 0,
@@ -533,7 +533,7 @@ fn emits_valid_module_with_boxed_condition() {
 
 #[test]
 fn emits_valid_module_with_strict_equality() {
-    // S9.5: `1 === 2` and `null !== undefined` — the strict-equality path uses
+    // `1 === 2` and `null !== undefined` — the strict-equality path uses
     // both scratch locals, select, and mixed f64/i64 bit ops.
     for op in [BinOp::Eq, BinOp::Ne] {
         let program = expr_program(IrNode::Binary {
@@ -547,7 +547,7 @@ fn emits_valid_module_with_strict_equality() {
 
 #[test]
 fn emits_valid_module_with_ternary() {
-    // S9.5: `true ? 42 : 0` — the ternary lowers to a typed `if`/`else`.
+    // `true ? 42 : 0` — the ternary lowers to a typed `if`/`else`.
     let program = expr_program(IrNode::Ternary {
         cond: Box::new(IrNode::Bool(true)),
         then_branch: Box::new(IrNode::Num(42.0)),
@@ -558,7 +558,7 @@ fn emits_valid_module_with_ternary() {
 
 #[test]
 fn emits_valid_module_with_string_concatenation() {
-    // S10.4: `"foo" + "bar"` — the `+` dispatch uses both scratch locals, a
+    // `"foo" + "bar"` — the `+` dispatch uses both scratch locals, a
     // typed `if`, and a call into the appended `__concat` helper.
     let bytes = emit(&expr_program(IrNode::Binary {
         op: BinOp::Add,
@@ -575,7 +575,7 @@ fn emits_valid_module_with_string_concatenation() {
 
 #[test]
 fn heap_blocks_write_the_type_byte_header() {
-    // S13.1: every heap block begins with its TYPE BYTE at the base offset. Run
+    // Every heap block begins with its TYPE BYTE at the base offset. Run
     // a literal, take the low 32 bits of the returned jsval as the block base,
     // and assert the byte there is the expected kind (0 string / 1 array / 2
     // object) with the three padding bytes zeroed.
@@ -601,7 +601,7 @@ fn heap_blocks_write_the_type_byte_header() {
 fn emits_valid_module_with_function_and_call() {
     // `function add(a, b) { return a + b } add(40, 2)` under the uniform ABI
     // (env-last): locals 0/1 are the argument slots, local 2 is the env slot,
-    // local 3 is the argument-count slot (P1.4).
+    // local 3 is the argument-count slot.
     let program = IrProgram {
         locals: 0,
         module_cells: 0,

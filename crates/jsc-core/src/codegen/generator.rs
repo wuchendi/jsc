@@ -1,5 +1,5 @@
 //! Lower a `function*` declaration into a generator constructor plus a state
-//! machine (P4.2 M2 + M3).
+//! machine.
 //!
 //! A `function*` becomes TWO ordinary uniform-ABI functions. The generator body
 //! is lowered in an `env_backed` frame, so every local resolves to a boxed cell
@@ -7,7 +7,7 @@
 //! that lets a local survive across a `yield`. The lowered statement list is then
 //! turned into a CONTROL-FLOW GRAPH of basic blocks ([`build_segments`]): a run of
 //! straight-line statements is one block, and `if`/`while`/`for` crossing a
-//! `yield` are flattened into blocks linked by `Jump`/`Branch`/`Yield` (M3), so
+//! `yield` are flattened into blocks linked by `Jump`/`Branch`/`Yield`, so
 //! control can suspend anywhere. The CONSTRUCTOR (an [`IrNode::MakeGenerator`])
 //! builds the frame and handle without running the body; the STATE MACHINE
 //! dispatches on `gen.state` over the blocks.
@@ -33,9 +33,9 @@ use super::capture::binding_id;
 impl LowerCtx<'_> {
     /// Lower a top-level `function*` declaration into its CONSTRUCTOR
     /// [`IrFunction`], registering the state-machine function in the arrow
-    /// accumulator (P4.2 M2). Called from [`lower_function`] for a generator.
+    /// accumulator. Called from [`lower_function`] for a generator.
     ///
-    /// Also lowers a top-level `async function` (P4.3 M4), keyed on
+    /// Also lowers a top-level `async function`, keyed on
     /// `fn_decl.function.is_async`: the body is compiled to the SAME generator
     /// state machine (`await e` lowers to `yield e`; see
     /// [`LowerCtx::lower_generator_body`]), but the function the name binds to is a
@@ -99,7 +99,7 @@ impl LowerCtx<'_> {
         // The constructor: `return MakeGenerator(...)`, reading each parameter from
         // its uniform-ABI argument slot to seed the frame's leading cells. An
         // `async function` wraps the handle in `AsyncSpawn` so the wrapper returns
-        // the spawned result promise instead of the raw generator (P4.3 M4).
+        // the spawned result promise instead of the raw generator.
         let slots: Vec<IrNode> = (0..nparams).map(IrNode::Local).collect();
         let make = IrNode::MakeGenerator {
             sm_table_index,
@@ -120,7 +120,7 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Desugar a `yield* iterable;` statement (P4.2 M3) into the driving loop
+    /// Desugar a `yield* iterable;` statement into the driving loop
     ///
     /// ```text
     /// let $it = iterable; let $r = $it.next();
@@ -186,7 +186,7 @@ impl LowerCtx<'_> {
 
     /// Lower the parameters and body of a generator into the current (already
     /// pushed, `env_backed`) frame, returning the lowered statements and the
-    /// parameter count. Rejects the M2-out-of-scope forms with spans.
+    /// parameter count. Rejects the unsupported forms with spans.
     fn lower_generator_body(
         &mut self,
         function: &swc_ecma_ast::Function,
@@ -198,14 +198,14 @@ impl LowerCtx<'_> {
         // argc), so a `fresh` temp never aliases `sent` (local 0) or the env slot.
         self.frame().next = uniform_params;
 
-        // An `async function` body lowers `await e` to a generator `yield e`
-        // (P4.3 M4); a plain `function*` keeps `await` a parse error, so the flag
+        // An `async function` body lowers `await e` to a generator `yield e`;
+        // a plain `function*` keeps `await` a parse error, so the flag
         // stays off. Restored before returning on the success path (a compile
         // error aborts the whole function, so the leak on the error path is inert).
         let prev_async = self.async_body;
         self.async_body = function.is_async;
 
-        // M2 supports simple-identifier parameters only.
+        // Only simple-identifier parameters are supported.
         let mut nparams = 0u32;
         for param in &function.params {
             let Pat::Ident(ident) = &param.pat else {
@@ -240,7 +240,7 @@ impl LowerCtx<'_> {
     }
 }
 
-/// Build the generator's control-flow graph of basic blocks (P4.2 M3). A run of
+/// Build the generator's control-flow graph of basic blocks. A run of
 /// yield-free, control-flow-free statements is one block; `if`/`while`/`for`
 /// (which desugar to [`IrStmt::If`]/[`IrStmt::While`]) crossing a `yield` are
 /// flattened into blocks linked by `Jump`/`Branch`/`Yield` terminators, so
@@ -395,9 +395,7 @@ impl CfgBuilder<'_> {
                 else_body,
             } => {
                 if node_contains_yield(cond) {
-                    return Err(
-                        self.unsupported("a `yield` in an `if` condition is not supported (M3)")
-                    );
+                    return Err(self.unsupported("a `yield` in an `if` condition is not supported"));
                 }
                 let then_b = self.new_block();
                 let else_b = self.new_block();
@@ -423,9 +421,8 @@ impl CfgBuilder<'_> {
                 label,
             } => {
                 if node_contains_yield(cond) || update.iter().any(stmt_contains_yield) {
-                    return Err(self.unsupported(
-                        "a `yield` in a loop condition or update is not supported (M3)",
-                    ));
+                    return Err(self
+                        .unsupported("a `yield` in a loop condition or update is not supported"));
                 }
                 // In a generator every source variable is an env cell (never a raw
                 // `Local`); a raw `Local` in a flattened loop's condition is a
@@ -487,9 +484,7 @@ impl CfgBuilder<'_> {
             }
             // A `yield` inside a `switch` — deferred.
             IrStmt::Switch { .. } => {
-                return Err(
-                    self.unsupported("a `yield` inside a `switch` is not supported yet (M3)")
-                );
+                return Err(self.unsupported("a `yield` inside a `switch` is not supported"));
             }
             // A `yield` nested inside a larger expression (a call argument, an
             // operand, …) — the segmentation only splits at statement granularity.
@@ -612,12 +607,12 @@ fn stmt_contains_break_or_continue(stmt: &IrStmt) -> bool {
 }
 
 /// Reject a `yield` whose operand itself contains a `yield` (`yield yield x`),
-/// which the M2 single-suspend segmentation cannot model.
+/// which the single-suspend segmentation cannot model.
 fn reject_nested_yield(value: &IrNode, fn_decl: &FnDecl) -> anyhow::Result<()> {
     if node_contains_yield(value) {
         return Err(CompileError::spanned(
             fn_decl.function.span(),
-            "a `yield` operand may not itself contain a `yield` (M2)",
+            "a `yield` operand may not itself contain a `yield`",
         )
         .into());
     }
@@ -671,8 +666,8 @@ fn stmt_contains_yield(stmt: &IrStmt) -> bool {
 }
 
 /// Whether a statement contains a `return` anywhere (recursively). A `return`
-/// nested inside inline control flow in a generator is an M2-unsupported form
-/// (its `done`/state bookkeeping needs the M3 CFG lowering).
+/// nested inside inline control flow in a generator is an unsupported form
+/// (its `done`/state bookkeeping needs the CFG lowering).
 fn stmt_contains_return(stmt: &IrStmt) -> bool {
     match stmt {
         IrStmt::Return(_) => true,
@@ -753,7 +748,7 @@ fn node_contains_yield(node: &IrNode) -> bool {
 
 /// Whether a statement contains a first-class function value (a nested arrow /
 /// function expression / class). Used to reject nested closures in a generator
-/// body (M2). Recurses through the same statement/expression shapes as
+/// body. Recurses through the same statement/expression shapes as
 /// [`stmt_contains_yield`].
 fn stmt_has_func_value(stmt: &IrStmt) -> bool {
     match stmt {

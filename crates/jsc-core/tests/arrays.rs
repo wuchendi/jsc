@@ -5,42 +5,42 @@ use jsc_core::run::{Value, compile_and_run, format_value};
 mod common;
 use common::{assert_bool, assert_number, assert_string};
 
-// --- S14.4 array growth: push / pop -------------------------------------------
+// --- array growth: push / pop -------------------------------------------------
 
 /// `push` grows the array and the SAME binding observes the new `.length`.
 #[test]
-fn array_push_grows_length_milestone() {
+fn array_push_grows_length() {
     assert_number("let a=[1,2]; a.push(3); a.length", 3.0);
 }
 
 /// `push` appends the value at the new last index, visible through the binding.
 #[test]
-fn array_push_appends_element_milestone() {
+fn array_push_appends_element() {
     assert_number("let a=[1,2]; a.push(3); a[2]", 3.0);
 }
 
 /// `pop` returns the removed last element.
 #[test]
-fn array_pop_returns_last_milestone() {
+fn array_pop_returns_last() {
     assert_number("let a=[1,2,3]; a.pop()", 3.0);
 }
 
 /// After `pop`, the binding's `.length` shrinks by one.
 #[test]
-fn array_pop_shrinks_length_milestone() {
+fn array_pop_shrinks_length() {
     assert_number("let a=[1,2,3]; a.pop(); a.length", 2.0);
 }
 
 /// `push` onto an empty literal array stores and reads back the element.
 #[test]
-fn array_push_onto_empty_milestone() {
+fn array_push_onto_empty() {
     assert_number("let a=[]; a.push(7); a[0]", 7.0);
     assert_number("let a=[]; a.push(7); a.length", 1.0);
 }
 
 /// `push` returns the NEW length (JS semantics).
 #[test]
-fn array_push_returns_new_length_milestone() {
+fn array_push_returns_new_length() {
     assert_number("let a=[1]; a.push(2)", 2.0);
 }
 
@@ -125,11 +125,11 @@ fn array_method_arity_errors() {
     );
 }
 
-// --- S14.5 array higher-order methods (map/filter/reduce/forEach) --------------
+// --- array higher-order methods (map/filter/reduce/forEach) --------------------
 
 /// Each acceptance bullet: `map`/`filter`/`reduce`/`forEach` over a literal array.
 #[test]
-fn array_hof_milestone() {
+fn array_hof() {
     assert_number("[1,2,3].map(x => x*2)[2]", 6.0);
     assert_number("[1,2,3,4].filter(x => x > 2).length", 2.0);
     assert_number("[1,2,3,4].reduce((a,b) => a+b, 0)", 10.0);
@@ -250,12 +250,12 @@ fn array_hof_arity_errors() {
     );
 }
 
-// --- S14.6: non-callback array/string methods --------------------------------
+// --- non-callback array/string methods ---------------------------------------
 
 /// Array `indexOf`/`includes`: `indexOf` yields the first strict-equal index (or
 /// `-1`), `includes` is `indexOf(x) !== -1` as a boolean.
 #[test]
-fn array_index_of_and_includes_milestone() {
+fn array_index_of_and_includes() {
     assert_number("[10,20,30].indexOf(20)", 1.0);
     assert_number("[10,20,30].indexOf(99)", -1.0);
     assert_bool("[1,2,3].includes(2)", true);
@@ -268,7 +268,7 @@ fn array_index_of_and_includes_milestone() {
 /// `join(sep)` concatenates `String(element)` separated by `sep` (`","` when
 /// omitted); an empty array is `""` and `null`/`undefined` elements render `""`.
 #[test]
-fn array_join_milestone() {
+fn array_join() {
     assert_string("[1,2,3].join(\"-\")", "1-2-3");
     assert_string("[1,2,3].join()", "1,2,3");
     assert_string("[].join(\"-\")", "");
@@ -279,7 +279,7 @@ fn array_join_milestone() {
 /// Array `slice(a, b)` builds a NEW array of `[a, b)` with JS negative/clamp
 /// semantics; `b` omitted slices to the end.
 #[test]
-fn array_slice_milestone() {
+fn array_slice() {
     assert_number("[1,2,3,4].slice(1,3).length", 2.0);
     assert_number("[1,2,3,4].slice(1,3)[0]", 2.0);
     assert_number("[1,2,3,4].slice(1,3)[1]", 3.0);

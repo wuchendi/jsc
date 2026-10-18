@@ -28,10 +28,10 @@ Both `compile` and `run` are async: the wasm-bindgen glue (wasm-pack
 - `run(src)` throws `Error("Uncaught <value>")` when the program throws an
   exception that is never caught.
 
-## Known debt
+## Host parity
 
-`run()` executes the emitted module in a **TypeScript shim** that duplicates
-Rust runtime semantics:
+`run()` executes the emitted module in a **TypeScript shim** instead of the
+Rust `wasmtime` harness. The shim reimplements the Rust runtime side:
 
 - `src/value.ts` ports the NaN-box decoder and value formatter from
   `crates/jsc-core/src/run/value.rs`.
@@ -42,7 +42,9 @@ Rust runtime semantics:
 - `src/abi.ts` copies the runtime ABI constants from
   `crates/jsc-core/src/abi.rs`.
 
-These are hand-maintained duplicates of the Rust single-source-of-truth, so a
-change on the Rust side can silently drift the shim. This is **accepted
-temporary debt**, to be paid down by a later D1/C4 campaign (e.g. by running the
-same wasm-side decode/host logic instead of re-implementing it in TS).
+The shim provides the same six `env` imports as the Rust harness, so any
+module the compiler emits instantiates in both. The Rust files are the source of
+truth; the TS ports are maintained by hand, so a Rust-side change to the ABI,
+value encoding, or host behaviour must be mirrored here or the shim drifts
+silently. `tests/run.test.ts` exercises the shim end to end against the
+compiled `jsc-wasm` module.
