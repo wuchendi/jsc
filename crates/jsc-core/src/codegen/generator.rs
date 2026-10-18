@@ -395,9 +395,7 @@ impl CfgBuilder<'_> {
                 else_body,
             } => {
                 if node_contains_yield(cond) {
-                    return Err(
-                        self.unsupported("a `yield` in an `if` condition is not supported (M3)")
-                    );
+                    return Err(self.unsupported("a `yield` in an `if` condition is not supported"));
                 }
                 let then_b = self.new_block();
                 let else_b = self.new_block();
@@ -423,9 +421,8 @@ impl CfgBuilder<'_> {
                 label,
             } => {
                 if node_contains_yield(cond) || update.iter().any(stmt_contains_yield) {
-                    return Err(self.unsupported(
-                        "a `yield` in a loop condition or update is not supported (M3)",
-                    ));
+                    return Err(self
+                        .unsupported("a `yield` in a loop condition or update is not supported"));
                 }
                 // In a generator every source variable is an env cell (never a raw
                 // `Local`); a raw `Local` in a flattened loop's condition is a
@@ -487,9 +484,7 @@ impl CfgBuilder<'_> {
             }
             // A `yield` inside a `switch` — deferred.
             IrStmt::Switch { .. } => {
-                return Err(
-                    self.unsupported("a `yield` inside a `switch` is not supported yet (M3)")
-                );
+                return Err(self.unsupported("a `yield` inside a `switch` is not supported"));
             }
             // A `yield` nested inside a larger expression (a call argument, an
             // operand, …) — the segmentation only splits at statement granularity.
@@ -617,7 +612,7 @@ fn reject_nested_yield(value: &IrNode, fn_decl: &FnDecl) -> anyhow::Result<()> {
     if node_contains_yield(value) {
         return Err(CompileError::spanned(
             fn_decl.function.span(),
-            "a `yield` operand may not itself contain a `yield` (M2)",
+            "a `yield` operand may not itself contain a `yield`",
         )
         .into());
     }

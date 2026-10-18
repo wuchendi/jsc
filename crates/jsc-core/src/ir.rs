@@ -102,9 +102,10 @@ pub enum MathOp {
     /// wasm `f64.max`, which propagates NaN and orders `+0 > -0` like JS.
     Max,
     /// `Math.pow(base, exp)` — base raised to exp. wasm has no `f64` pow, so it is
-    /// emitted as an inline squaring-free multiply loop over the truncated integer
-    /// exponent (correct for integer exponents, including negatives; a fractional
-    /// exponent is truncated — a documented limitation).
+    /// emitted inline: a multiply loop over `trunc(|exp|)` (exact for integer
+    /// exponents), then the fractional part applied bit by bit via successive
+    /// `f64.sqrt` roots of `base`. A negative exponent reciprocates the result; a
+    /// negative base with a fractional exponent yields `NaN`.
     Pow,
 }
 
