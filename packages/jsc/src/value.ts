@@ -6,11 +6,16 @@
  */
 
 import {
+  DATE_MS_OFFSET,
   HEADER_SIZE,
+  PROMISE_FULFILLED,
+  PROMISE_REJECTED,
   QNAN,
   TYPE_ARRAY,
+  TYPE_DATE,
   TYPE_FUNCTION,
   TYPE_OBJECT,
+  TYPE_PROMISE,
   TYPE_STRING,
   TYPEOF_STRINGS,
   U32_MASK,
@@ -28,6 +33,8 @@ export type Value =
   | { kind: 'array'; items: Value[] }
   | { kind: 'object'; entries: [string, Value][] }
   | { kind: 'function' }
+  | { kind: 'promise'; state: number; value: Value }
+  | { kind: 'date'; ms: number }
 
 // A single scratch buffer for f64 <-> u64 bit reinterpretation, reused so we do
 // not allocate a DataView per decode.
@@ -116,9 +123,37 @@ function decodeHeap(bits: bigint, mem: Uint8Array): Value {
       return decodeObject(ptr, mem)
     case TYPE_FUNCTION:
       return { kind: 'function' }
+    case TYPE_PROMISE:
+      return decodePromise(ptr, mem)
+    case TYPE_DATE:
+      return decodeDate(ptr, mem)
     default:
       return { kind: 'undefined' }
   }
+}
+
+/**
+ * Resolve a heap promise block at `ptr` (mirrors `value.rs::decode_promise`):
+ * the `i32` state at `ptr + HEADER_SIZE` and the settled `i64` value after it. A
+ * truncated block reads as pending with an `undefined` value.
+ */
+function decodePromise(ptr: number, mem: Uint8Array): Value {
+  const state = readU32(mem, ptr + HEADER_SIZE)
+  const bits = readU64(mem, ptr + HEADER_SIZE + 4)
+  return {
+    kind: 'promise',
+    state: state === undefined ? 0 : state | 0,
+    value: bits === undefined ? { kind: 'undefined' } : decode(bits, mem),
+  }
+}
+
+/**
+ * Resolve a heap `Date` block at `ptr` by reading its `f64` ms payload (mirrors
+ * `value.rs::decode_date`); a truncated block reads as `NaN` (`Invalid Date`).
+ */
+function decodeDate(ptr: number, mem: Uint8Array): Value {
+  const bits = readU64(mem, ptr + DATE_MS_OFFSET)
+  return { kind: 'date', ms: bits === undefined ? Number.NaN : bitsToF64(bits) }
 }
 
 /** Resolve a heap string block at `ptr`: `[len:u32][utf8]` at `ptr + HEADER_SIZE`. */
@@ -199,7 +234,64 @@ export function formatValue(value: Value): string {
         : `{ ${value.entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(', ')} }`
     case 'function':
       return '[Function (anonymous)]'
+    case 'promise':
+      if (value.state === PROMISE_FULFILLED)
+        return `Promise { ${formatValue(value.value)} }`
+      if (value.state === PROMISE_REJECTED)
+        return `Promise { <rejected> ${formatValue(value.value)} }`
+      return 'Promise { <pending> }'
+    case 'date':
+      return formatDateIso(value.ms)
   }
+}
+
+/**
+ * Render a millisecond epoch timestamp as `YYYY-MM-DDTHH:MM:SS.mmmZ` (mirrors
+ * `value.rs::format_date_iso`, Howard Hinnant's `civil_from_days`); a
+ * non-finite timestamp renders as `Invalid Date`. Ported rather than delegated
+ * to `Date.prototype.toISOString`, which uses extended `±YYYYYY` years and
+ * throws out of range.
+ */
+function formatDateIso(ms: number): string {
+  if (!Number.isFinite(ms)) return 'Invalid Date'
+  const totalMs = Math.floor(ms)
+  const days = Math.floor(totalMs / 86_400_000)
+  let tod = totalMs - days * 86_400_000
+  const millis = tod % 1000
+  tod = Math.trunc(tod / 1000)
+  const secs = tod % 60
+  tod = Math.trunc(tod / 60)
+  const mins = tod % 60
+  const hours = Math.trunc(tod / 60)
+
+  const z = days + 719_468
+  const era = Math.trunc((z >= 0 ? z : z - 146_096) / 146_097)
+  const doe = z - era * 146_097
+  const yoe = Math.trunc(
+    (doe -
+      Math.trunc(doe / 1460) +
+      Math.trunc(doe / 36_524) -
+      Math.trunc(doe / 146_096)) /
+      365,
+  )
+  const doy = doe - (365 * yoe + Math.trunc(yoe / 4) - Math.trunc(yoe / 100))
+  const mp = Math.trunc((5 * doy + 2) / 153)
+  const day = doy - Math.trunc((153 * mp + 2) / 5) + 1
+  const month = mp < 10 ? mp + 3 : mp - 9
+  const year = yoe + era * 400 + (month <= 2 ? 1 : 0)
+
+  return `${padSigned(year, 4)}-${pad2(month)}-${pad2(day)}T${pad2(hours)}:${pad2(mins)}:${pad2(secs)}.${String(millis).padStart(3, '0')}Z`
+}
+
+/** Zero-pad to two digits (Rust `{:02}` for a non-negative integer). */
+function pad2(n: number): string {
+  return String(n).padStart(2, '0')
+}
+
+/** Zero-pad to `width` chars counting the sign (Rust `{:0width}` for a signed integer). */
+function padSigned(n: number, width: number): string {
+  const sign = n < 0 ? '-' : ''
+  return sign + String(Math.abs(n)).padStart(width - sign.length, '0')
 }
 
 /**
