@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest'
 
 import { compile, run } from '../src/index.js'
+import { createShim } from '../src/shim.js'
 
 // Expected `result` strings are the EXACT output of `cargo run -p jsc -- -e <prog>`
 // (jsc-core's `format_value`); the shim must reproduce them byte for byte.
@@ -53,4 +54,75 @@ it('dispatches the M2 string methods through the shim', async () => {
   expect((await run("'5'.padStart(3,'0')")).result).toBe('005')
   expect((await run("'hello'.substring(3,1)")).result).toBe('el')
   expect((await run("'a,b,c'.split(',').length")).result).toBe('3')
+})
+
+it('links every emitted module against the shim (no LinkError)', async () => {
+  expect((await run('1+1')).result).toBe('2')
+})
+
+it('provides every env import an emitted module declares', async () => {
+  const module = await WebAssembly.compile(
+    (await compile('1')) as Uint8Array<ArrayBuffer>,
+  )
+  const provided = Object.keys(createShim().imports.env ?? {})
+  for (const imp of WebAssembly.Module.imports(module)) {
+    expect(imp.module).toBe('env')
+    expect(provided).toContain(imp.name)
+  }
+})
+
+it('runs a Promise chain through the microtask queue', async () => {
+  const chain = await run(
+    'Promise.resolve(1).then(x => x + 1).then(x => console.log(x))',
+  )
+  expect(chain.stdout).toBe('2\n')
+  expect(chain.result).toBe('Promise { undefined }')
+  const caught = await run(
+    'Promise.reject("bad").catch(e => console.log("caught", e))',
+  )
+  expect(caught.stdout).toBe('caught bad\n')
+  expect((await run('Promise.reject(3).catch(e=>e)')).result).toBe(
+    'Promise { 3 }',
+  )
+  const fin = await run('Promise.resolve(1).finally(()=>console.log("fin"))')
+  expect(fin.stdout).toBe('fin\n')
+  expect(fin.result).toBe('Promise { 1 }')
+})
+
+it('renders promises by settlement', async () => {
+  expect((await run('Promise.resolve(42)')).result).toBe('Promise { 42 }')
+  expect(
+    (await run('const p = Promise.resolve(1).then(x=>x+1); p')).result,
+  ).toBe('Promise { 2 }')
+})
+
+it('runs microtasks after synchronous code', async () => {
+  const { stdout, result } = await run(
+    'Promise.resolve(1).then(()=>console.log("micro")); console.log("sync")',
+  )
+  expect(stdout).toBe('sync\nmicro\n')
+  expect(result).toBe('undefined')
+})
+
+it('runs async/await with top-level await', async () => {
+  const { stdout, result } = await run(
+    'async function f(){ const v = await Promise.resolve(5); console.log("in", v); return v*2 } console.log("sync"); const r = await f(); console.log("r", r); r',
+  )
+  expect(stdout).toBe('sync\nin 5\nr 10\n')
+  expect(result).toBe('10')
+})
+
+it('backs Date.now() with the host clock', async () => {
+  expect((await run('typeof Date.now()')).result).toBe('number')
+  const before = Date.now()
+  const now = Number((await run('Date.now()')).result)
+  expect(now).toBeGreaterThanOrEqual(before)
+  expect(now).toBeLessThanOrEqual(Date.now())
+  expect((await run('new Date(0)')).result).toBe('1970-01-01T00:00:00.000Z')
+})
+
+it('rejects run() on an unhandled top-level await rejection', async () => {
+  await expect(run('await Promise.reject("boom")')).rejects.toThrow(
+    /^Uncaught boom$/,
+  )
 })

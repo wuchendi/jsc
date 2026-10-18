@@ -87,6 +87,18 @@ export async function run(src: string): Promise<RunResult> {
   const main = instance.exports.main as () => bigint
   const bits = asU64(main())
 
+  // Drain microtasks scheduled but never awaited, UNLESS `main` completed
+  // abruptly with a pending exception (mirrors `harness.rs`'s after-`main`
+  // `drain_after_main`).
+  const pendingGlobal = instance.exports[EXC_PENDING_EXPORT_NAME] as
+    | WebAssembly.Global
+    | undefined
+  const excPending = (): number =>
+    pendingGlobal ? Number(pendingGlobal.value) : 0
+  if (excPending() === 0) shim.drainAfterMain()
+
+  // View linear memory AFTER the drain so a promise settled by a microtask
+  // renders its final state (the buffer may also have grown/detached).
   const mem = instance.exports[MEMORY_EXPORT_NAME] as
     | WebAssembly.Memory
     | undefined
@@ -94,11 +106,7 @@ export async function run(src: string): Promise<RunResult> {
 
   // Uncaught-exception check (S15.1): a set `$exc_pending` after `main` means an
   // exception propagated all the way out. Render `$exc_value` and surface it.
-  const pendingGlobal = instance.exports[EXC_PENDING_EXPORT_NAME] as
-    | WebAssembly.Global
-    | undefined
-  const pending = pendingGlobal ? Number(pendingGlobal.value) : 0
-  if (pending !== 0) {
+  if (excPending() !== 0) {
     const valueGlobal = instance.exports[EXC_VALUE_EXPORT_NAME] as
       | WebAssembly.Global
       | undefined
