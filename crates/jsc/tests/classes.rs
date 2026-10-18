@@ -761,3 +761,31 @@ fn class_throwing_accessor_via_eval() {
         "set-boom"
     );
 }
+
+/// Class constructors and methods tolerate missing and extra arguments: a
+/// missing one is `undefined`, a surplus one is ignored.
+#[test]
+fn class_calls_tolerate_missing_and_extra_arguments() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "class P { constructor(x, y){ this.y = y } } typeof new P(1).y"
+        ]),
+        "undefined"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "class P { constructor(x){ this.x = x } } new P(1, 2, 3).x"
+        ]),
+        "1"
+    );
+    assert_eq!(
+        jsc(&["-p", "class C { m(a, b){ return b } } new C().m(1)"]),
+        "undefined"
+    );
+    assert_eq!(
+        jsc(&["-p", "class C { m(a){ return a } } new C().m(4, 5)"]),
+        "4"
+    );
+}

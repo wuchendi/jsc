@@ -439,6 +439,16 @@ pub enum IrNode {
     /// `env + HEADER_SIZE + 4 + 8*slot`. Used inside a closure body to reach a
     /// captured binding's cell.
     EnvLoad(u32),
+    /// Load the boxed-cell pointer of **module cell** `slot`: a top-level binding
+    /// referenced by a top-level function lives in a cell whose pointer is held in
+    /// a dedicated wasm global, so every function — top-level declaration, arrow,
+    /// method — reaches it without a closure env. `main`'s prologue allocates each
+    /// cell holding the TDZ hole (see [`IrNode::IsHole`]) before any user code.
+    ModuleCell(u32),
+    /// Whether the sub-expression's value is the TDZ hole a module cell holds until
+    /// its binding's declaration runs, as a boolean jsval. Guards accesses to a
+    /// module binding from a function body, which may run before the declaration.
+    IsHole(Box<IrNode>),
     /// A `yield expr` expression (P4.2 M2). Produced by lowering a generator
     /// body; the generator segmentation pass CONSUMES every `Yield`, turning it
     /// into a state-machine suspend point, so a `Yield` that survives to the
@@ -1289,6 +1299,8 @@ pub struct IrProgram {
     pub stmts: Vec<IrStmt>,
     /// The user-defined functions (wasm indices `1..=functions.len()`).
     pub functions: Vec<IrFunction>,
+    /// The number of module cells ([`IrNode::ModuleCell`] slots `0..module_cells`).
+    pub module_cells: u32,
 }
 
 #[cfg(test)]

@@ -14,8 +14,14 @@ pub(super) fn emit_node(
 ) {
     match node {
         IrNode::Num(value) => {
-            // A number jsval is the literal's raw f64 bits in the i64 carrier.
-            function.instruction(&Instruction::I64Const(value.to_bits().cast_signed()));
+            // A number jsval is the literal's raw f64 bits in the i64 carrier; a
+            // NaN constant (e.g. a folded `-NaN`) is the canonical QNAN bits.
+            let bits = if value.is_nan() {
+                QNAN_BITS
+            } else {
+                value.to_bits().cast_signed()
+            };
+            function.instruction(&Instruction::I64Const(bits));
         }
         IrNode::Str(text) => {
             // A string literal is a heap-pointer jsval: the pointer header OR'd
@@ -95,6 +101,21 @@ pub(super) fn emit_node(
             emit_cell_set(cell, value, function, scratch, strings, helpers);
         }
         IrNode::EnvLoad(slot) => emit_env_load(*slot, function, helpers),
+        IrNode::ModuleCell(slot) => {
+            function.instruction(&Instruction::GlobalGet(MODULE_CELL_GLOBAL_BASE + slot));
+        }
+        IrNode::IsHole(operand) => {
+            // Compare the raw bits to the TDZ hole and box the i32 result as a
+            // boolean jsval (the i32 scratch carries the cond past the two consts).
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Const(TDZ_HOLE_BITS));
+            function.instruction(&Instruction::I64Eq);
+            function.instruction(&Instruction::LocalSet(scratch + 21));
+            function.instruction(&Instruction::I64Const(TRUE_BITS));
+            function.instruction(&Instruction::I64Const(FALSE_BITS));
+            function.instruction(&Instruction::LocalGet(scratch + 21));
+            function.instruction(&Instruction::Select);
+        }
         // The value passed to `.next(v)` is the state machine's first wasm
         // parameter (local 0, `sent`) — P4.2 M2.
         IrNode::SentValue => {
@@ -257,7 +278,9 @@ pub(super) fn emit_node(
         IrNode::Binary { op, lhs, rhs } => {
             emit_binary(*op, lhs, rhs, function, scratch, strings, helpers);
         }
-        IrNode::IncDec { local, inc, prefix } => emit_inc_dec(*local, *inc, *prefix, function),
+        IrNode::IncDec { local, inc, prefix } => {
+            emit_inc_dec(*local, *inc, *prefix, function, helpers);
+        }
         // The promise-creation primitives (P4.1): push the `__promise` op flag,
         // the value operand, and an unused `b` slot, then call the host import. It
         // returns the fresh (or, for `resolve` of a promise, adopted) promise jsval.

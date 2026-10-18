@@ -506,7 +506,18 @@ impl LowerCtx<'_> {
         // closures (built while evaluating `class_value`) capture the already-bound
         // cell pointer — a self-reference like `new C()` inside a method reads it
         // back. When uncaptured, the value binds directly like the pre-G1 path.
-        if self.is_cell(local) {
+        if let Some(slot) = self.module_slot_for_local(local) {
+            // A module binding: the module cell is pre-allocated, so the ctor/method
+            // bodies already reach it; just store the class value (as a `Decl`, so
+            // it never becomes `main`'s completion value).
+            out.push(IrStmt::Decl {
+                local,
+                init: IrNode::CellSet {
+                    cell: Box::new(IrNode::ModuleCell(slot)),
+                    value: Box::new(class_value),
+                },
+            });
+        } else if self.is_cell(local) {
             out.push(IrStmt::Decl {
                 local,
                 init: IrNode::CellNew(Box::new(IrNode::Undefined)),
@@ -687,6 +698,17 @@ impl LowerCtx<'_> {
                 cell: Box::new(IrNode::EnvLoad(slot)),
                 value: Box::new(init),
             }));
+        } else if let Some(slot) = self.module_slot_for_local(local) {
+            // A module binding initializes its pre-allocated module cell. Bound as
+            // a `Decl` of its (otherwise unused) local, not an expression
+            // statement, so it never becomes `main`'s completion value.
+            out.push(IrStmt::Decl {
+                local,
+                init: IrNode::CellSet {
+                    cell: Box::new(IrNode::ModuleCell(slot)),
+                    value: Box::new(init),
+                },
+            });
         } else if self.is_cell(local) {
             out.push(IrStmt::Decl {
                 local,

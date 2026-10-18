@@ -59,6 +59,22 @@ pub(super) fn emit_main(
     // Fresh unwinding state for this function body (S15.2): no active `try`
     // handler, control-nesting depth 0.
     helpers.unwind.borrow_mut().reset();
+    // Allocate every module cell holding the TDZ hole before any user code, so a
+    // hoisted top-level function called before the binding's declaration runs
+    // reaches a valid cell and its access guard throws.
+    for slot in 0..program.module_cells {
+        let global = MODULE_CELL_GLOBAL_BASE + slot;
+        emit_cell_new(&IrNode::Undefined, &mut function, scratch, strings, helpers);
+        function.instruction(&Instruction::GlobalSet(global));
+        function.instruction(&Instruction::GlobalGet(global));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I64Const(TDZ_HOLE_BITS));
+        function.instruction(&Instruction::I64Store(MemArg {
+            offset: HEADER_SIZE as u64,
+            align: 3,
+            memory_index: 0,
+        }));
+    }
 
     let last_expr = program
         .stmts

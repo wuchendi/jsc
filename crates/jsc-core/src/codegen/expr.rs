@@ -173,8 +173,15 @@ impl LowerCtx<'_> {
                         }),
                     }
                 }
-                // Unary plus on a numeric operand is a no-op.
-                UnaryOp::Plus => self.lower_expr(&u.arg),
+                // Unary plus is ToNumber (the same conversion as `Number(x)`),
+                // a no-op on a numeric literal.
+                UnaryOp::Plus => match self.lower_expr(&u.arg)? {
+                    num @ IrNode::Num(_) => Ok(num),
+                    other => Ok(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumber,
+                        arg: Box::new(other),
+                    }),
+                },
                 // `typeof operand` inspects the operand's runtime type.
                 UnaryOp::TypeOf => Ok(IrNode::TypeOf(Box::new(self.lower_expr(&u.arg)?))),
                 // `!operand` is logical NOT: boolean inverse of truthiness.
@@ -394,16 +401,9 @@ impl LowerCtx<'_> {
                 "undefined" => Ok(IrNode::Undefined),
                 "NaN" => Ok(IrNode::Num(f64::NAN)),
                 "Infinity" => Ok(IrNode::Num(f64::INFINITY)),
-                _ => match self.demoted_sibling_error(name, span, "referenced") {
-                    // A demoted closure (G2) referenced as a value from a sibling
-                    // top-level function, which cannot reach it (see `lower_call`).
-                    Some(err) => Err(err),
-                    None => Err(CompileError::spanned(
-                        span,
-                        format!("undeclared variable: {name}"),
-                    )
-                    .into()),
-                },
+                _ => {
+                    Err(CompileError::spanned(span, format!("undeclared variable: {name}")).into())
+                }
             }
         }
     }
@@ -715,25 +715,9 @@ impl LowerCtx<'_> {
                 args,
             })
         } else if let Some(sig) = self.shared.funcs.get(name) {
-            // A rest parameter (P1.4) accepts any number of trailing arguments, so
-            // only the lower bound (required, non-defaulted leading params) applies.
-            if args.len() < sig.required || (!sig.has_rest && args.len() > sig.params) {
-                let expected = if sig.has_rest {
-                    format!("at least {}", sig.required)
-                } else if sig.required == sig.params {
-                    sig.params.to_string()
-                } else {
-                    format!("{}-{}", sig.required, sig.params)
-                };
-                return Err(CompileError::spanned(
-                    call.span(),
-                    format!(
-                        "function {name} expects {expected} argument(s), got {}",
-                        args.len()
-                    ),
-                )
-                .into());
-            }
+            // JS arity semantics: the uniform ABI pads missing arguments with
+            // `undefined` (so defaults apply), and surplus arguments are evaluated
+            // for their side effects and ignored (or gathered by a rest parameter).
             Ok(IrNode::Call {
                 func: sig.index,
                 args,
@@ -744,8 +728,6 @@ impl LowerCtx<'_> {
             // function (checked above), so a user `let String = ..` / `function
             // String(){}` shadows it. Arity is validated here.
             lower_convert_call(op, name, args, ident.span())
-        } else if let Some(err) = self.demoted_sibling_error(name, ident.span(), "called") {
-            Err(err)
         } else {
             Err(
                 CompileError::spanned(ident.span(), format!("call to undeclared function: {name}"))
@@ -791,23 +773,6 @@ impl LowerCtx<'_> {
                 promise,
                 on_finally: Box::new(args.next().unwrap_or(IrNode::Undefined)),
             },
-        })
-    }
-
-    /// The error for a call to / reference of a demoted G2 closure from a sibling
-    /// top-level function, which cannot reach it (the closure is bound only within
-    /// `main`). `None` unless the current context is a non-capturing top-level
-    /// function body and `name` is a demoted declaration. `verb` is `called` or
-    /// `referenced`, so the diagnostic reads naturally at each use site.
-    fn demoted_sibling_error(&self, name: &str, span: Span, verb: &str) -> Option<anyhow::Error> {
-        (self.top_level_fn && self.shared.demoted_fns.contains(name)).then(|| {
-            CompileError::spanned(
-                span,
-                format!(
-                    "{name} closes over enclosing vars, cannot be {verb} from another top-level function"
-                ),
-            )
-            .into()
         })
     }
 
@@ -1419,13 +1384,16 @@ impl LowerCtx<'_> {
                 inc,
                 prefix: update.prefix,
             }),
-            // A captured cell: `x = cell + delta` (prefix yields new); postfix
-            // yields the old value as `new - delta`.
+            // A captured cell: `x = ToNumber(cell) + delta` (prefix yields new);
+            // postfix yields the old value as `new - delta`.
             AccessKind::Cell(ptr) => {
                 let delta = if inc { 1.0 } else { -1.0 };
                 let new_value = IrNode::Binary {
                     op: BinOp::Add,
-                    lhs: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                    lhs: Box::new(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumber,
+                        arg: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                    }),
                     rhs: Box::new(IrNode::Num(delta)),
                 };
                 let store = IrNode::CellSet {
