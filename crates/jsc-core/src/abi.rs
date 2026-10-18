@@ -28,6 +28,10 @@
 //! | `0b110` | retired                                             |
 //! | `0b111` | retired                                             |
 //!
+//! Invariant: the number NaN is ALWAYS exactly the [`QNAN`] bits. Every site that
+//! reboxes an `f64` as a jsval maps any NaN (sign-bit or payload-carrying, as wasm
+//! arithmetic may produce) to [`QNAN`], so NaN tests may compare bits directly.
+//!
 //! ## Heap-block layout
 //!
 //! Every heap block opens with a [`HEADER_SIZE`]-byte header: a `TYPE_*` byte at

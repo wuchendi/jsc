@@ -8,7 +8,13 @@ use super::*;
 /// `old ± 1` (unboxed to `f64`, stepped, reboxed). `prefix` yields the NEW value
 /// via `local.tee`; postfix pushes the OLD value first and then stores the
 /// update, so the old value remains on the stack as the expression's result.
-pub(super) fn emit_inc_dec(local: u32, inc: bool, prefix: bool, function: &mut Function) {
+pub(super) fn emit_inc_dec(
+    local: u32,
+    inc: bool,
+    prefix: bool,
+    function: &mut Function,
+    helpers: Helpers<'_>,
+) {
     let step = if inc {
         Instruction::F64Add
     } else {
@@ -20,7 +26,7 @@ pub(super) fn emit_inc_dec(local: u32, inc: bool, prefix: bool, function: &mut F
         function.instruction(&Instruction::F64ReinterpretI64);
         function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
         function.instruction(&step);
-        function.instruction(&Instruction::I64ReinterpretF64);
+        emit_box_f64(function, helpers);
         function.instruction(&Instruction::LocalTee(local));
     } else {
         // Yield the old value (left on the stack), then store `old ± 1`.
@@ -29,7 +35,7 @@ pub(super) fn emit_inc_dec(local: u32, inc: bool, prefix: bool, function: &mut F
         function.instruction(&Instruction::F64ReinterpretI64);
         function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
         function.instruction(&step);
-        function.instruction(&Instruction::I64ReinterpretF64);
+        emit_box_f64(function, helpers);
         function.instruction(&Instruction::LocalSet(local));
     }
 }
@@ -67,7 +73,7 @@ pub(super) fn emit_mod(
     function.instruction(&Instruction::F64Mul);
     // a - b * trunc(a / b)
     function.instruction(&Instruction::F64Sub);
-    function.instruction(&Instruction::I64ReinterpretF64);
+    emit_box_f64(function, helpers);
 }
 
 /// Emit a `Math.*` built-in call, leaving its number-jsval result on the stack
@@ -112,7 +118,7 @@ pub(super) fn emit_math_call(
                 }
                 _ => unreachable!("outer match restricts op to the unary methods"),
             };
-            function.instruction(&Instruction::I64ReinterpretF64);
+            emit_box_f64(function, helpers);
         }
         // Variadic min/max: seed with the identity infinity, then fold the native
         // pairwise op over each argument. `f64.min`/`f64.max` already match JS on
@@ -133,7 +139,7 @@ pub(super) fn emit_math_call(
                     function.instruction(&Instruction::F64Max);
                 }
             }
-            function.instruction(&Instruction::I64ReinterpretF64);
+            emit_box_f64(function, helpers);
         }
         MathOp::Pow => emit_pow(&args[0], &args[1], function, scratch, strings, helpers),
     }
@@ -223,8 +229,10 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::End); // loop
     function.instruction(&Instruction::End); // block
 
-    // The accumulator holds the folded result as a number jsval (f64 bits).
+    // The accumulator holds the folded result's f64 bits; rebox it as a number.
     function.instruction(&Instruction::LocalGet(acc));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    emit_box_f64(function, helpers);
 }
 
 /// Emit `Math.pow(base, exp)`, leaving a number jsval on the stack (S14.2).
@@ -398,6 +406,8 @@ pub(super) fn emit_pow(
     function.instruction(&Instruction::End);
 
     function.instruction(&Instruction::LocalGet(s_res));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    emit_box_f64(function, helpers);
 }
 
 /// Emit a conversion built-in call, leaving its result jsval on the stack (S14.3).
@@ -540,7 +550,7 @@ fn emit_add(
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Add);
-    function.instruction(&Instruction::I64ReinterpretF64);
+    emit_box_f64(function, helpers);
     function.instruction(&Instruction::End);
 }
 
@@ -571,7 +581,7 @@ pub(super) fn emit_binary(
                 _ => unreachable!("only sub/mul/div reach here"),
             };
             function.instruction(&arith);
-            function.instruction(&Instruction::I64ReinterpretF64);
+            emit_box_f64(function, helpers);
         }
         // Remainder: wasm has no `f64.rem`; delegate to the dedicated emitter.
         BinOp::Mod => emit_mod(lhs, rhs, function, scratch, strings, helpers),

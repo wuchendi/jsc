@@ -1991,19 +1991,22 @@ pub(super) fn emit_json_str(
     function
 }
 
-/// Emit the `__js_eq(a: i64, b: i64) -> i32` strict-equality helper (P3.5).
+/// Emit the `__same_value_zero(a: i64, b: i64) -> i32` Map/Set key-equality
+/// helper (P3.5).
 ///
-/// The equality kernel of [`emit_strict_eq`], packaged so the `__map_*` linear
-/// scans can call it per candidate: two heap STRINGS compare by byte content (via
-/// `__str_eq` at `str_eq_index`), two NUMBERS as `f64` (so `NaN !== NaN` and `+0
-/// === -0`), and everything else by raw identity bits (different types differ in
-/// tag, and two distinct heap objects/arrays are reference-unequal). The string
+/// `SameValueZero`, the key comparison of the `__map_*` linear scans: two heap
+/// STRINGS compare by byte content (via `__str_eq` at `str_eq_index`), and
+/// everything else matches on `f64` equality OR identical raw bits. Two numbers
+/// hence match when `f64`-equal (`+0` and `-0`) or both NaN — the number NaN is
+/// always the canonical bits (see [`emit_box_f64`]); a non-number's `f64` view
+/// is a NaN that never compares equal, so it falls to identity (different types
+/// differ in tag, distinct heap objects/arrays are reference-unequal). The string
 /// path is guarded by an `if` so `__str_eq` never runs on a non-pointer. The two
 /// `i64` params occupy locals 0/1; no extra locals.
-pub(super) fn emit_js_eq(str_eq_index: u32) -> Function {
+pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
     let mut function = Function::new(vec![]);
     let (a, b) = (0, 1);
-    // both strings ? __str_eq : (both numbers ? f64_eq : identity bits).
+    // both strings ? __str_eq : (f64_eq | identity bits).
     emit_is_string(&mut function, a);
     emit_is_string(&mut function, b);
     function.instruction(&Instruction::I32And);
@@ -2014,21 +2017,15 @@ pub(super) fn emit_js_eq(str_eq_index: u32) -> Function {
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(str_eq_index));
     function.instruction(&Instruction::Else);
-    // val1 = f64 equality.
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Eq);
-    // val2 = identity (raw i64 bits) equality.
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
-    // cond = is_number(a) & is_number(b).
-    emit_is_number(&mut function, a);
-    emit_is_number(&mut function, b);
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function
@@ -2242,11 +2239,11 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
 /// `handle` is the base of a `TYPE_MAP`/`TYPE_SET` block; its `entries` slot (at
 /// `+HEADER_SIZE+4`) holds the backing array jsval. Reads the array's u32 `len`
 /// header, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
-/// returning the byte ADDRESS of the first slot whose value is `__js_eq` (at
-/// `js_eq_index`) to `key`, or `-1` on a miss. The value slot sits 8 bytes past the
+/// returning the byte ADDRESS of the first slot whose value is `__same_value_zero` (at
+/// `svz_index`) to `key`, or `-1` on a miss. The value slot sits 8 bytes past the
 /// returned address. Params occupy locals 0/1; four extra `i32` locals hold the
 /// backing base, its length, the loop index, and the current slot address.
-pub(super) fn emit_map_find(js_eq_index: u32) -> Function {
+pub(super) fn emit_map_find(svz_index: u32) -> Function {
     let mut function = Function::new(vec![(4, ValType::I32)]);
     let (handle, key, arr, len, i, slot) = (0, 1, 2, 3, 4, 5);
     let header = MemArg {
@@ -2291,11 +2288,11 @@ pub(super) fn emit_map_find(js_eq_index: u32) -> Function {
     function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(slot));
-    // if __js_eq(load_i64(slot), key) { return slot }.
+    // if __same_value_zero(load_i64(slot), key) { return slot }.
     function.instruction(&Instruction::LocalGet(slot));
     function.instruction(&Instruction::I64Load(elem));
     function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::Call(js_eq_index));
+    function.instruction(&Instruction::Call(svz_index));
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(slot));
     function.instruction(&Instruction::Return);
