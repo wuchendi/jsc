@@ -201,7 +201,7 @@ pub(super) fn emit_node(
             emit_object_rest_node(source, exclude, function, scratch, strings, helpers);
         }
         IrNode::Index { obj, index } => {
-            emit_index_node(obj, index, function, scratch, strings, helpers);
+            emit_index_node(obj, index, true, function, scratch, strings, helpers);
             // P2b: a member/computed read whose object arm resolved (through the
             // prototype chain) to an accessor box invokes the getter with `this` =
             // the receiver, which `emit_index_node` leaves in `scratch + 17`.
@@ -240,7 +240,7 @@ pub(super) fn emit_node(
             emit_map_method_node(node, function, scratch, strings, helpers);
         }
         IrNode::IndexSet { obj, index, value } => {
-            emit_index_set_node(obj, index, value, function, scratch, strings, helpers);
+            emit_index_set_node(obj, index, value, true, function, scratch, strings, helpers);
         }
         node @ IrNode::IndexOpSet { .. } => {
             emit_index_op_set_node(node, function, scratch, strings, helpers);
@@ -471,18 +471,29 @@ pub(super) fn emit_method_call_user(
     // evaluation, the member read, and the `__this` set).
     emit_node(obj, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(obj_local));
+    // A nullish receiver throws on the method lookup, before any argument runs.
+    // The key is only evaluated here on the throw path.
+    emit_nullish_guard(function, obj_local, key, false, scratch, strings, helpers);
 
     // K padded argument slots (deepest on the stack). Nested method calls here set
     // `__this`, but it is overwritten below after all arguments are evaluated.
     emit_call_args(args, function, scratch, strings, helpers);
 
     // Evaluate the callee — the function value at `receiver[key]` — via the
-    // ordinary object-member read, and stash the full jsval in a scratch i64.
-    let callee = IrNode::Index {
-        obj: Box::new(IrNode::Local(obj_local)),
-        index: key.clone(),
-    };
-    emit_node(&callee, function, scratch, strings, helpers);
+    // ordinary object-member read (already nullish-guarded above), and stash the
+    // full jsval in a scratch i64.
+    emit_index_node(
+        &IrNode::Local(obj_local),
+        key,
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    if helpers.has_accessors {
+        emit_accessor_get(function, scratch, helpers);
+    }
     // The general i64 scratch slot (+0) is free here: the member read has already
     // left its result on the stack, and nothing below reads +0 before this call.
     let callee_val = scratch;
@@ -563,7 +574,7 @@ pub(super) fn emit_method_call_user(
 /// The getter is a throwing call, so every enclosing `if` opened here is tracked
 /// with [`enter_frame`]/[`leave_frame`] — a getter that throws inside a `try`
 /// then computes the right handler-relative `br` depth (S15.2).
-fn emit_accessor_get(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
+pub(super) fn emit_accessor_get(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
     // `+18` (the index READ key slot) is free once the object arm has resolved, so
     // it stashes the resolved value; `+17` still holds the receiver.
     let val = scratch + 18;
@@ -1232,6 +1243,20 @@ pub(super) fn emit_call_indirect(
     emit_call_args(args, function, scratch, strings, helpers);
     // Evaluate the callee once; stash its block base.
     emit_node(callee, function, scratch, strings, helpers);
+    // A program that declares no function has no funcref table, so the callee
+    // can never be a function value: throw the branded not-a-function TypeError
+    // instead of emitting an invalid `call_indirect`. The transfer leaves the
+    // stack polymorphic, so the discarded operands need no cleanup.
+    if !helpers.has_funcs {
+        emit_node(&internal_type_error(), function, scratch, strings, helpers);
+        function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
+        emit_throw_return(function, helpers);
+        return;
+    }
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
     // A plain indirect call binds `this = undefined` (P2.1) — method calls take the

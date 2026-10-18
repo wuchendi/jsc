@@ -1322,9 +1322,14 @@ fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Help
 /// than `+0`/`+1`: the `index` sub-expression is emitted with base `scratch` and
 /// reuses `+0..+13`, so a computed index (e.g. `a[i+1]`) would otherwise clobber
 /// the already-stashed receiver before the load reads it back.
+///
+/// A receiver that may be `null`/`undefined` (see [`never_nullish`]) is guarded
+/// by [`emit_nullish_guard`] once both operands are stashed; `checked = false`
+/// skips the guard for a caller that already ran it on the same receiver.
 pub(super) fn emit_index_node(
     obj: &IrNode,
     index: &IrNode,
+    checked: bool,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -1338,6 +1343,17 @@ pub(super) fn emit_index_node(
     function.instruction(&Instruction::LocalSet(s0));
     emit_node(index, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
+    if checked && !never_nullish(obj) {
+        emit_nullish_guard(
+            function,
+            s0,
+            &IrNode::Local(s1),
+            false,
+            scratch,
+            strings,
+            helpers,
+        );
+    }
 
     // A `Map`/`Set` handle intercepts property reads FIRST (P3.5): the only bare
     // member read reaching here on a collection is `.size` (its `.get`/`.set`/… are
@@ -1505,10 +1521,15 @@ pub(super) fn emit_object_key_node(
 /// receiver/key before the store reads them back. These are DISJOINT from the
 /// read path's `+17`/`+18`, so a value child that is itself an index read (e.g.
 /// `o.v = a[0]`) is safe as well.
+///
+/// Like the read side, a possibly-nullish receiver is guarded (after all three
+/// operands are evaluated, matching JS `PutValue` order) unless `checked` is
+/// `false`.
 pub(super) fn emit_index_set_node(
     obj: &IrNode,
     index: &IrNode,
     value: &IrNode,
+    checked: bool,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -1525,6 +1546,17 @@ pub(super) fn emit_index_set_node(
     function.instruction(&Instruction::LocalSet(s1));
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(sval));
+    if checked && !never_nullish(obj) {
+        emit_nullish_guard(
+            function,
+            s0,
+            &IrNode::Local(s1),
+            true,
+            scratch,
+            strings,
+            helpers,
+        );
+    }
 
     // Runtime type-byte dispatch (if/else so only the matching path runs): object
     // → key scan store; anything else → the array element store. `obj` is a heap
@@ -1714,15 +1746,39 @@ pub(super) fn emit_index_op_set_node(
     function.instruction(&Instruction::LocalSet(obj_local));
     emit_node(index, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(idx_local));
+    // The current-value read throws on a nullish base before `rhs` runs; the read
+    // and store below reuse the same receiver, so they skip their own guards.
+    if !never_nullish(obj) {
+        emit_nullish_guard(
+            function,
+            obj_local,
+            &IrNode::Local(idx_local),
+            false,
+            scratch,
+            strings,
+            helpers,
+        );
+    }
 
     // new = current_member op rhs. The member read reuses the runtime type-byte
-    // dispatch and reads its operands from the stable temps.
+    // dispatch, reads its operands from the stable temps, and is staged in
+    // `new_local` (before `rhs` runs) so the combine reads it back as a `Local`.
+    emit_index_node(
+        &IrNode::Local(obj_local),
+        &IrNode::Local(idx_local),
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    if helpers.has_accessors {
+        emit_accessor_get(function, scratch, helpers);
+    }
+    function.instruction(&Instruction::LocalSet(new_local));
     let new_value = IrNode::Binary {
         op,
-        lhs: Box::new(IrNode::Index {
-            obj: Box::new(IrNode::Local(obj_local)),
-            index: Box::new(IrNode::Local(idx_local)),
-        }),
+        lhs: Box::new(IrNode::Local(new_local)),
         rhs: rhs.clone(),
     };
     emit_node(&new_value, function, scratch, strings, helpers);
@@ -1734,9 +1790,152 @@ pub(super) fn emit_index_op_set_node(
         &IrNode::Local(obj_local),
         &IrNode::Local(idx_local),
         &IrNode::Local(new_local),
+        false,
         function,
         scratch,
         strings,
         helpers,
     );
+}
+
+/// Whether `node` provably never evaluates to `null`/`undefined`, so a member
+/// access on it needs no nullish-receiver guard: literals and freshly built
+/// heap values (object/array literals, `new` instances, collections, function
+/// values) are always real receivers.
+fn never_nullish(node: &IrNode) -> bool {
+    matches!(
+        node,
+        IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Object(_)
+            | IrNode::Array(_)
+            | IrNode::ArraySpread(_)
+            | IrNode::New { .. }
+            | IrNode::MapNew { .. }
+            | IrNode::DateNew { .. }
+            | IrNode::FuncValue { .. }
+    )
+}
+
+/// Emit the nullish-receiver guard for a member access on the receiver stashed
+/// in local `recv`: if it is `null` or `undefined` — one NaN-box tag compare,
+/// since the two share every bit above bit 48 except the low tag bit — call the
+/// out-of-line `__nullish_throw(recv, key, set)` and unwind like `throw`. `key`
+/// is evaluated only on that throw path. The not-nullish path falls through with
+/// the stack untouched.
+pub(super) fn emit_nullish_guard(
+    function: &mut Function,
+    recv: u32,
+    key: &IrNode,
+    set: bool,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    function.instruction(&Instruction::LocalGet(recv));
+    function.instruction(&Instruction::I64Const(49));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Const(NULL_BITS >> 49));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // The `if` opens a control frame around the throw transfer (S15.2).
+    enter_frame(helpers);
+    function.instruction(&Instruction::LocalGet(recv));
+    emit_node(key, function, scratch, strings, helpers);
+    function.instruction(&Instruction::I32Const(i32::from(set)));
+    function.instruction(&Instruction::Call(helpers.nullish_throw));
+    emit_throw_return(function, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// `__nullish_throw(recv: i64, key: i64, set: i32)`: build the branded
+/// `TypeError` for a member read (`set == 0`) or write (`set == 1`) on a
+/// `null`/`undefined` `recv`, stash it in `$exc_value`, set the pending flag and
+/// clear any routed completion. The message is spliced from the
+/// [`NULLISH_ERROR_STRS`] fragments plus `String(key)`:
+/// `Cannot read properties of null (reading 'x')`, with `.stack` prefixed
+/// `TypeError: `.
+pub(super) fn emit_nullish_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+    // Params occupy locals 0..3; the full `emit_main` scratch layout follows (so
+    // `emit_node` can build the error object as it would in `main`), then the
+    // message and stack string jsvals.
+    let (recv, key, set) = (0, 1, 2);
+    let scratch = 3;
+    let msg = scratch + 24;
+    let stack = msg + 1;
+    let mut function = Function::new(vec![
+        (3, ValType::I64),
+        (1, ValType::I32),
+        (3, ValType::I64),
+        (1, ValType::I32),
+        (5, ValType::I32),
+        (1, ValType::I64),
+        (7, ValType::I64),
+        (1, ValType::I32),
+        (2, ValType::I64),
+        (2, ValType::I64),
+    ]);
+    let at = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE);
+    let select = |function: &mut Function, if_set: &str, if_read: &str| {
+        function.instruction(&Instruction::I32Const(at(if_set)));
+        function.instruction(&Instruction::I32Const(at(if_read)));
+        function.instruction(&Instruction::LocalGet(set));
+        function.instruction(&Instruction::Select);
+    };
+    let concat = |function: &mut Function| {
+        function.instruction(&Instruction::Call(helpers.concat));
+    };
+
+    // msg = prefix + (null|undefined) + mid + String(key) + "')"
+    select(&mut function, NULLISH_SET_PREFIX, NULLISH_READ_PREFIX);
+    function.instruction(&Instruction::I32Const(at("null")));
+    function.instruction(&Instruction::I32Const(at("undefined")));
+    function.instruction(&Instruction::LocalGet(recv));
+    function.instruction(&Instruction::I64Const(NULL_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::Select);
+    concat(&mut function);
+    select(&mut function, NULLISH_SET_MID, NULLISH_READ_MID);
+    concat(&mut function);
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
+    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::I32WrapI64);
+    concat(&mut function);
+    function.instruction(&Instruction::I32Const(at(NULLISH_SUFFIX)));
+    concat(&mut function);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(msg));
+
+    // stack = "TypeError: " + msg
+    function.instruction(&Instruction::I32Const(at(TYPE_ERROR_STACK_PREFIX)));
+    function.instruction(&Instruction::LocalGet(msg));
+    function.instruction(&Instruction::I32WrapI64);
+    concat(&mut function);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(stack));
+
+    let error = IrNode::Object(vec![
+        ("name".to_owned(), IrNode::Str("TypeError".to_owned())),
+        ("message".to_owned(), IrNode::Local(msg)),
+        ("stack".to_owned(), IrNode::Local(stack)),
+        (
+            abi::ERROR_KIND_KEY.to_owned(),
+            IrNode::Num(abi::ERROR_KIND_TYPE),
+        ),
+    ]);
+    emit_node(&error, &mut function, scratch, strings, helpers);
+    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
+    function.instruction(&Instruction::End);
+    function
 }

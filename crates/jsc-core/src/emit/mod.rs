@@ -401,6 +401,42 @@ fn internal_type_error() -> IrNode {
     ])
 }
 
+/// The message fragments `__nullish_throw` splices into the V8-style text of the
+/// `TypeError` raised by a member read/write on a `null`/`undefined` receiver:
+/// `Cannot read properties of <null|undefined> (reading '<key>')` (or the
+/// `set`/`setting` form for a write), with `.stack` prefixed `TypeError: `.
+const NULLISH_READ_PREFIX: &str = "Cannot read properties of ";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_SET_PREFIX: &str = "Cannot set properties of ";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_READ_MID: &str = " (reading '";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_SET_MID: &str = " (setting '";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_SUFFIX: &str = "')";
+/// See [`NULLISH_READ_PREFIX`].
+const TYPE_ERROR_STACK_PREFIX: &str = "TypeError: ";
+
+/// The static strings `__nullish_throw` needs — the error object's keys, kind
+/// marker key and `name`, the receiver words, and the message fragments. Seeded
+/// by [`collect_node`] at every guarded member read/write/method-call site so
+/// their `[len][utf8]` blobs exist when the guard throws.
+const NULLISH_ERROR_STRS: [&str; 13] = [
+    "name",
+    "message",
+    "stack",
+    abi::ERROR_KIND_KEY,
+    "TypeError",
+    "null",
+    "undefined",
+    NULLISH_READ_PREFIX,
+    NULLISH_SET_PREFIX,
+    NULLISH_READ_MID,
+    NULLISH_SET_MID,
+    NULLISH_SUFFIX,
+    TYPE_ERROR_STACK_PREFIX,
+];
+
 /// The `JSON.parse` syntax-error `.name`, `.message`, and `.stack` text. jsc has
 /// no `SyntaxError` error KIND, so the thrown object is branded as a base `Error`
 /// (`e instanceof Error` holds) while its `.name` reads `SyntaxError` and it
@@ -601,6 +637,12 @@ struct Helpers<'a> {
     /// before `invoke1`; a stub (returns an empty array) when the program declares
     /// no functions (no generator can exist, so it is never called).
     gen_to_array: u32,
+    /// `__nullish_throw(recv: i64, key: i64, set: i32)`: build the V8-style
+    /// `TypeError` for a member read (`set == 0`) or write (`set == 1`) on a
+    /// `null`/`undefined` receiver and leave it in flight (`$exc_pending` set).
+    /// The out-of-line half of the nullish-receiver guard (see
+    /// [`object::emit_nullish_guard`]).
+    nullish_throw: u32,
     /// `__invoke1(fn: i64, arg: i64) -> i64` (P4.1): the callback trampoline the
     /// host promise engine calls re-entrantly. Exported under
     /// [`INVOKE_EXPORT_NAME`].
@@ -1023,6 +1065,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // `__gen_to_array` (P4.2 M3) — the generator-spread drain — precedes the
     // trampoline so every later index stays stable.
     code.function(&generator::emit_gen_to_array(helpers));
+    code.function(&emit_nullish_throw(&offsets, helpers));
     // The `__invoke1` callback trampoline (P4.1) is appended after every helper so
     // every helper index stays stable; the `__async_step` trampoline (P4.3 M4)
     // follows it (always, so its index is deterministic), then the two
