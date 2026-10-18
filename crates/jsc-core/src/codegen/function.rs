@@ -13,14 +13,12 @@ use crate::error::CompileError;
 /// (`undefined` for a non-capturing function), and body-declared locals follow.
 /// Every function therefore shares the one wasm signature
 /// `(a0..a_{K-1}, env) -> i64`, so a single `call_indirect` type serves them
-/// all. A top-level function does not close over `main`'s locals, so its
-/// environment layout is always empty. The body may call any function in
+/// all. A top-level function does not close over `main`'s locals (top-level
+/// bindings it references live in module cells), so its environment layout is
+/// always empty. The body may call any function in
 /// `funcs`, including itself (recursion).
 pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::Result<IrFunction> {
     let mut ctx = LowerCtx::new(shared);
-    // Mark this as an independent top-level function frame so a call to a demoted
-    // sibling closure (G2) — unreachable from here — is a precise error.
-    ctx.top_level_fn = true;
     // A top-level `function*` lowers to a generator constructor + state machine
     // (P4.2 M2), not an ordinary function body.
     if fn_decl.function.is_generator && !fn_decl.function.is_async {

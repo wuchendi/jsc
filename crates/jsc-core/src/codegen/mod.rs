@@ -68,7 +68,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
 
     // Pass 1a: collect EVERY top-level function declaration and the non-function
     // statements, so capture analysis can see the whole program before deciding
-    // which declarations close over `main`'s bindings.
+    // which of `main`'s bindings the declarations reference.
     let mut all_fn_decls: Vec<&FnDecl> = Vec::new();
     let mut scan_top_stmts: Vec<&Stmt> = Vec::new();
     for stmt in &body {
@@ -79,23 +79,18 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         }
     }
 
-    // Capture analysis (S13.4 + G2): which bindings are boxed into cells, and
-    // which top-level functions close over an enclosing `main` binding. Runs
-    // before any body is lowered so a captured binding's declaration knows to
-    // allocate its cell up front, and so Pass 1b can partition the declarations.
+    // Capture analysis (S13.4): which bindings are boxed into cells, and which
+    // top-level bindings are referenced from top-level functions (module
+    // bindings). Runs before any body is lowered so a captured binding's
+    // declaration knows to allocate its cell up front.
     let analysis = analyze_captures(&scan_top_stmts, &all_fn_decls);
 
-    // Pass 1b: partition the hoisted function declarations. A NON-capturing
-    // declaration keeps the direct-call fast path (registered in `funcs`, its
-    // own function, hoisted). A CAPTURING declaration (G2) is DEMOTED: left in
-    // `top_stmts` at its source position so `lower_stmt` routes it through
-    // `lower_nested_fn_decl` (a boxed cell in `main`, indirect env-last call).
-    // A demoted declaration loses hoisting (lowered at its source position);
-    // this is the intended narrowing.
+    // Pass 1b: register every hoisted top-level function declaration for the
+    // direct-call fast path. A declaration referencing top-level bindings reaches
+    // them through module cells, so it needs no closure environment.
     let mut funcs: HashMap<String, FnSig> = HashMap::new();
     let mut fn_decls: Vec<&FnDecl> = Vec::new();
     let mut top_stmts: Vec<&Stmt> = Vec::new();
-    let mut demoted_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Index 0 is `main`, so user functions are numbered from 1 upward.
     let mut next_index: u32 = 1;
     for stmt in &body {
@@ -104,11 +99,6 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             continue;
         };
         let name = fn_decl.ident.sym.as_ref().to_string();
-        if analysis.capturing_fns.contains(&fn_decl.ident.span.lo.0) {
-            demoted_fns.insert(name);
-            top_stmts.push(stmt);
-            continue;
-        }
         if funcs
             .insert(name.clone(), FnSig { index: next_index })
             .is_some()
@@ -155,28 +145,51 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         max_arity,
         captured: analysis.captured,
         classes: RefCell::new(HashMap::new()),
-        demoted_fns,
+        module_slots: analysis
+            .module_names
+            .iter()
+            .zip(0u32..)
+            .map(|(name, slot)| (name.clone(), slot))
+            .collect(),
+        module_mutable: RefCell::new(HashMap::new()),
         object_shapes: analysis.object_shapes,
     };
 
-    // Pass 2: lower each function body over its own locals, laid out for the
-    // uniform ABI (`max_arity` argument slots, the env slot, then body locals).
-    let mut functions = Vec::with_capacity(fn_decls.len());
-    for fn_decl in &fn_decls {
-        functions.push(lower_function(fn_decl, &shared)?);
-    }
-
-    // The top-level statements become `main`'s body, lowered in a single
+    // Pass 2: the top-level statements become `main`'s body, lowered in a single
     // function frame (`main` has no env parameter; captured top-level bindings
-    // still become boxed cells sourced from its locals).
+    // still become boxed cells sourced from its locals). `main` is lowered BEFORE
+    // the declaration bodies so every class shape and module-binding mutability
+    // they consult is already recorded.
     let mut ctx = LowerCtx::new(&shared);
+    ctx.main_ctx = true;
     let mut stmts = Vec::new();
+    // A `var` module binding is initialized to `undefined` (hoisted, no TDZ):
+    // clear its module cell's TDZ hole before any user code runs.
+    for (name, slot) in analysis.module_names.iter().zip(0u32..) {
+        if analysis.module_vars.contains(name) {
+            let local = ctx.fresh();
+            stmts.push(IrStmt::Decl {
+                local,
+                init: IrNode::CellSet {
+                    cell: Box::new(IrNode::ModuleCell(slot)),
+                    value: Box::new(IrNode::Undefined),
+                },
+            });
+        }
+    }
     for stmt in top_stmts {
         ctx.lower_stmt(stmt, &mut stmts)?;
     }
     let locals = ctx.frame().next;
     // Release the shared borrow so the arrow accumulator can be moved out.
     drop(ctx);
+
+    // Pass 3: lower each function body over its own locals, laid out for the
+    // uniform ABI (`max_arity` argument slots, the env slot, then body locals).
+    let mut functions = Vec::with_capacity(fn_decls.len());
+    for fn_decl in &fn_decls {
+        functions.push(lower_function(fn_decl, &shared)?);
+    }
 
     // Lifted arrow functions follow the declarations in the functions vector, so
     // their positions match the funcref table indices handed out at their use
@@ -187,6 +200,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         locals,
         stmts,
         functions,
+        module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
     })
 }
 
@@ -230,12 +244,14 @@ struct Shared<'a> {
     /// order, matching this build-then-read ordering. Interior mutability lets the
     /// immutable-borrow lowering walk register new classes.
     classes: RefCell<HashMap<String, ClassInfo>>,
-    /// Names of the top-level function declarations demoted to closures (G2).
-    /// They are bound (as boxed cells) only within `main`; a top-level function
-    /// that references one is a SIBLING that cannot reach it, so a call/reference
-    /// to a name in this set from a top-level function body is rejected with a
-    /// span instead of the generic "undeclared" diagnostic.
-    demoted_fns: std::collections::HashSet<String>,
+    /// Module-cell slot of each module binding name (see
+    /// [`CaptureAnalysis::module_names`]). A `main` declaration of one of these
+    /// names in its outermost scope stores into the module cell; a top-level
+    /// function body reaches it through [`IrNode::ModuleCell`].
+    module_slots: HashMap<String, u32>,
+    /// Mutability of each module binding, recorded as `main` declares it (`main`
+    /// is lowered before the top-level function bodies that read it).
+    module_mutable: RefCell<HashMap<String, bool>>,
     /// The provably-fixed object shape of each qualifying binding (see
     /// [`CaptureAnalysis::object_shapes`]): [`binding_id`] mapped to the own keys
     /// of the object literal it holds. A user method call whose receiver resolves
@@ -269,14 +285,14 @@ struct CaptureResolver {
     frames: Vec<Vec<HashMap<String, u32>>>,
     /// Binding ids referenced across a function boundary.
     captured: std::collections::HashSet<u32>,
-    /// The [`binding_id`] of the top-level function declaration currently being
-    /// analyzed (G2), or `None` while analyzing `main`'s own statements. A
-    /// reference reaching the `main` frame while this is set marks that
-    /// declaration as capturing.
-    current_top_fn: Option<u32>,
-    /// Ids of the top-level function declarations whose bodies close over a
-    /// `main` binding (G2), and must therefore be demoted to closures.
-    capturing_fns: std::collections::HashSet<u32>,
+    /// Whether a top-level function declaration's body is being analyzed (rather
+    /// than `main`'s own statements). A reference reaching the `main` frame while
+    /// this is set records a module binding.
+    in_top_fn: bool,
+    /// Names of `main`'s outermost-scope bindings referenced from a top-level
+    /// function declaration, in first-reference order (see
+    /// [`CaptureAnalysis::module_names`]).
+    module_names: Vec<String>,
     /// Names that are the target of an assignment (`x = ..`, `x op= ..`, `++x`,
     /// `x--`, or a destructuring assignment) ANYWHERE in the program. A
     /// name-based over-approximation used to disqualify object-shape candidates:
@@ -296,14 +312,20 @@ struct CaptureResolver {
 }
 
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
-/// which top-level function declarations must be demoted to closures (G2).
+/// which top-level bindings live in module cells.
 struct CaptureAnalysis {
     /// Binding ids captured by a nested function (boxed into cells, S13.4).
     captured: std::collections::HashSet<u32>,
-    /// [`binding_id`]s of the top-level function declarations that close over an
-    /// enclosing `main` binding, and must be demoted from the direct-call fast
-    /// path to a closure (G2).
-    capturing_fns: std::collections::HashSet<u32>,
+    /// Names of `main`'s outermost-scope bindings referenced from a top-level
+    /// function declaration, in first-reference order. Each is stored in a
+    /// module cell (slot = position here) so the hoisted declaration — and
+    /// anything it is called from — reaches it without a closure environment.
+    module_names: Vec<String>,
+    /// The [`module_names`] declared by a top-level `var` (hoisted and
+    /// initialized to `undefined`, so they carry no TDZ).
+    ///
+    /// [`module_names`]: CaptureAnalysis::module_names
+    module_vars: std::collections::HashSet<String>,
     /// The provably-fixed object shape of each qualifying binding: its
     /// [`binding_id`] mapped to the own keys of the object literal it is
     /// initialized with. A binding qualifies when it is a `let`/`const`
@@ -346,6 +368,9 @@ struct Binding {
     mutable: bool,
     cell: bool,
     id: u32,
+    /// The module-cell slot of a module binding (see [`Shared::module_slots`]):
+    /// its value lives in that cell rather than a wasm local. `None` otherwise.
+    module: Option<u32>,
     /// For a binding in an `env_backed` frame (a generator local, P4.2 M2): the
     /// environment slot holding its boxed cell, reached via `EnvLoad`. `None` for
     /// every ordinary binding (whose cell, if any, lives in a wasm local).
@@ -432,11 +457,10 @@ struct LowerCtx<'a> {
     /// Shared lowering state (function signatures, uniform arity, the
     /// lifted-function accumulator, and the captured-binding set).
     shared: &'a Shared<'a>,
-    /// Whether this context lowers a NON-capturing top-level function body (its
-    /// own independent frame, with no `main` beneath it). Set only by
-    /// [`lower_function`]. Used to report a call to a demoted sibling function
-    /// (G2) with a precise span diagnostic rather than "undeclared".
-    top_level_fn: bool,
+    /// Whether this context lowers `main` (frame 0 is `main`'s frame) rather than
+    /// a top-level function declaration body. Only `main` declares module
+    /// bindings; a function body resolves them through module cells.
+    main_ctx: bool,
     /// Whether the body currently being lowered is an `async function` body
     /// (P4.3 M4). When set, an `await e` lowers to a generator `yield e` (the
     /// async body is compiled as a state machine, driven by the host async

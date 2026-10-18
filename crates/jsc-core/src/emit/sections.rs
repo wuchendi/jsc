@@ -290,7 +290,7 @@ pub(super) fn build_type_and_function_sections<'a>(
 /// pending-completion kind (`$cf_kind`, i32) and routed return value
 /// (`$cf_value`, i64) — carry a `return`/`break`/`continue` through the `finally`
 /// clauses it must run (S15.3).
-pub(super) fn build_globals(heap_ptr_init: i32) -> GlobalSection {
+pub(super) fn build_globals(heap_ptr_init: i32, module_cells: u32) -> GlobalSection {
     let mut globals = GlobalSection::new();
     let mut_i32 = |init| {
         (
@@ -340,6 +340,12 @@ pub(super) fn build_globals(heap_ptr_init: i32) -> GlobalSection {
     // zero-initialized and set at each `__json_parse` entry.
     for _ in 0..3 {
         let (ty, init) = mut_i32(0);
+        globals.global(ty, &init);
+    }
+    // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
+    // `main`'s prologue before any user code runs.
+    for _ in 0..module_cells {
+        let (ty, init) = mut_i64();
         globals.global(ty, &init);
     }
     globals
@@ -550,6 +556,7 @@ pub(super) fn collect_node<'a>(
         }
         IrNode::StrLen(operand)
         | IrNode::Not(operand)
+        | IrNode::IsHole(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
@@ -862,6 +869,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::Undefined
         | IrNode::Local(_)
         | IrNode::EnvLoad(_)
+        | IrNode::ModuleCell(_)
         | IrNode::SentValue
         | IrNode::ExcValue
         | IrNode::ThisGlobal

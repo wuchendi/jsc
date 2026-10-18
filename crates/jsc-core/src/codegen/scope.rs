@@ -28,7 +28,7 @@ impl<'a> LowerCtx<'a> {
         Self {
             frames: vec![Frame::new()],
             shared,
-            top_level_fn: false,
+            main_ctx: false,
             async_body: false,
             current_super: None,
             static_init_class: None,
@@ -143,10 +143,24 @@ impl<'a> LowerCtx<'a> {
     pub(super) fn declare(&mut self, name: &str, mutable: bool, id: u32) -> u32 {
         let idx = self.fresh();
         let env_backed = self.frame().env_backed;
+        // A module binding (declared in `main`'s outermost scope and referenced by
+        // a top-level function) lives in its module cell, not a local.
+        let module = if self.main_ctx && self.frames.len() == 1 && self.frames[0].scopes.len() == 1
+        {
+            self.shared.module_slots.get(name).copied()
+        } else {
+            None
+        };
+        if module.is_some() {
+            self.shared
+                .module_mutable
+                .borrow_mut()
+                .insert(name.to_owned(), mutable);
+        }
         // An `env_backed` (generator) frame boxes EVERY binding into an env cell so
         // it survives across a `yield`; an ordinary frame boxes only the bindings
         // capture analysis flagged (S13.4).
-        let cell = env_backed || self.shared.captured.contains(&id);
+        let cell = module.is_none() && (env_backed || self.shared.captured.contains(&id));
         // In an `env_backed` frame the cell lives at a fresh env slot (reached via
         // `EnvLoad`), not in a wasm local; the constructor pre-creates it.
         let env_slot = if env_backed {
@@ -167,6 +181,7 @@ impl<'a> LowerCtx<'a> {
                 mutable,
                 cell,
                 id,
+                module,
                 env_slot,
             },
         );
@@ -214,6 +229,54 @@ impl<'a> LowerCtx<'a> {
             .rev()
             .find_map(|scope| scope.values().find(|b| b.local == local))
             .and_then(|b| b.env_slot)
+    }
+
+    /// The module-cell slot of the binding holding `local` in the current frame,
+    /// when it is a module binding (see [`Shared::module_slots`]).
+    pub(super) fn module_slot_for_local(&self, local: u32) -> Option<u32> {
+        self.frames
+            .last()?
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.values().find(|b| b.local == local))
+            .and_then(|b| b.module)
+    }
+
+    /// Resolve a module binding from a top-level function body, where `main`'s
+    /// frame is absent. The body may run before the binding's declaration (the
+    /// function is hoisted), so the cell pointer is guarded: while the cell still
+    /// holds the TDZ hole, any read or write throws a `ReferenceError`.
+    fn resolve_module(&self, name: &str) -> Option<Resolved> {
+        if self.main_ctx {
+            return None;
+        }
+        let slot = *self.shared.module_slots.get(name)?;
+        let mutable = *self.shared.module_mutable.borrow().get(name)?;
+        let message = format!("Cannot access '{name}' before initialization");
+        let error = IrNode::Object(vec![
+            ("name".to_owned(), IrNode::Str("ReferenceError".to_owned())),
+            ("message".to_owned(), IrNode::Str(message.clone())),
+            (
+                "stack".to_owned(),
+                IrNode::Str(format!("ReferenceError: {message}")),
+            ),
+            (
+                crate::abi::ERROR_KIND_KEY.to_owned(),
+                IrNode::Num(crate::abi::ERROR_KIND_ERROR),
+            ),
+        ]);
+        let guarded = IrNode::Ternary {
+            cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
+                IrNode::ModuleCell(slot),
+            ))))),
+            then_branch: Box::new(IrNode::Throw(Box::new(error))),
+            else_branch: Box::new(IrNode::ModuleCell(slot)),
+        };
+        Some(Resolved {
+            kind: AccessKind::Cell(guarded),
+            mutable,
+        })
     }
 
     /// Mark the current frame `env_backed`: every binding it declares becomes an
@@ -270,10 +333,17 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Resolve a name to a [`Resolved`] access, or `None` if it is not bound in
-    /// any frame (the caller then tries top-level functions / `undefined`).
+    /// any frame nor a module binding (the caller then tries top-level functions /
+    /// `undefined`).
     pub(super) fn resolve(&mut self, name: &str) -> Option<Resolved> {
-        let (fi, binding) = self.find_binding(name)?;
-        let kind = if fi == self.top() {
+        let Some((fi, binding)) = self.find_binding(name) else {
+            return self.resolve_module(name);
+        };
+        let kind = if let Some(slot) = binding.module {
+            // `main` (or an arrow/method nested in it) reads its module binding
+            // directly: `main` code only runs after the declaration.
+            AccessKind::Cell(IrNode::ModuleCell(slot))
+        } else if fi == self.top() {
             if let Some(slot) = binding.env_slot {
                 // A generator local (P4.2 M2): its cell lives in this frame's own
                 // environment, reached via `EnvLoad`, so it survives a `yield`.

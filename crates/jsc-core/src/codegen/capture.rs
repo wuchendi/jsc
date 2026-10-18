@@ -10,17 +10,16 @@ pub(super) fn binding_id(ident: &swc_ecma_ast::BindingIdent) -> u32 {
     ident.id.span.lo.0
 }
 
-/// Compute the capture analysis (S13.4 + G2): the set of captured binding ids
-/// and the set of top-level function declarations that close over an enclosing
-/// `main` binding.
+/// Compute the capture analysis (S13.4): the set of captured binding ids and the
+/// names of the top-level bindings referenced by top-level function declarations.
 ///
 /// A binding is captured when it is referenced from inside a nested
 /// function/arrow, i.e. the reference resolves across at least one function
 /// boundary. Top-level function declarations are analyzed NESTED under the
-/// `main` frame (G2): a reference inside a declaration's body (or anything
-/// nested in it) that resolves into `main`'s scope marks both the binding
-/// captured AND the declaration itself as capturing, so lowering can demote it
-/// to a closure. Top-level function NAMES are not entered as bindings, so a
+/// `main` frame: a reference inside a declaration's body (or anything nested in
+/// it) that resolves into `main`'s outermost scope records the name as a
+/// **module binding**, which lowering stores in a module cell reachable from
+/// every function. Top-level function NAMES are not entered as bindings, so a
 /// call to a sibling top-level function is a static reference, not a capture.
 /// Nested arrows and function expressions/declarations push a further scope.
 pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> CaptureAnalysis {
@@ -32,9 +31,9 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
     // Analyze each top-level function body NESTED under `main` (frame 0), after
     // all of `main`'s own bindings are declared (so a captured `let`/`const`
     // resolves regardless of source order, matching function-declaration
-    // hoisting). A reference reaching `main` marks the enclosing declaration.
+    // hoisting). A reference reaching `main` records a module binding.
+    resolver.in_top_fn = true;
     for fn_decl in fn_decls {
-        resolver.current_top_fn = Some(fn_decl.ident.span.lo.0);
         resolver.enter_function();
         for param in &fn_decl.function.params {
             resolver.declare_param(&param.pat);
@@ -45,7 +44,6 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
             }
         }
         resolver.exit_function();
-        resolver.current_top_fn = None;
     }
     resolver.exit_function();
     // Finalize the object shapes: keep only the candidates whose binding name is
@@ -56,10 +54,51 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         .filter(|(_, name, _)| !resolver.assigned.contains(name))
         .map(|(id, _, keys)| (id, keys))
         .collect();
+    // The `var`-declared module bindings (hoisted, initialized to `undefined`).
+    let mut module_vars = std::collections::HashSet::new();
+    for stmt in top_stmts {
+        if let Stmt::Decl(Decl::Var(v)) = stmt
+            && v.kind == VarDeclKind::Var
+        {
+            for d in &v.decls {
+                pat_names(&d.name, &mut module_vars);
+            }
+        }
+    }
+    module_vars.retain(|name| resolver.module_names.contains(name));
     CaptureAnalysis {
         captured: resolver.captured,
-        capturing_fns: resolver.capturing_fns,
+        module_vars,
+        module_names: resolver.module_names,
         object_shapes,
+    }
+}
+
+/// Collect every identifier a (possibly destructuring) binding pattern binds.
+fn pat_names(pat: &Pat, names: &mut std::collections::HashSet<String>) {
+    match pat {
+        Pat::Ident(ident) => {
+            names.insert(ident.id.sym.as_ref().to_owned());
+        }
+        Pat::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                pat_names(elem, names);
+            }
+        }
+        Pat::Object(obj) => {
+            for prop in &obj.props {
+                match prop {
+                    ObjectPatProp::KeyValue(kv) => pat_names(&kv.value, names),
+                    ObjectPatProp::Assign(assign) => {
+                        names.insert(assign.key.id.sym.as_ref().to_owned());
+                    }
+                    ObjectPatProp::Rest(rest) => pat_names(&rest.arg, names),
+                }
+            }
+        }
+        Pat::Rest(rest) => pat_names(&rest.arg, names),
+        Pat::Assign(assign) => pat_names(&assign.left, names),
+        Pat::Expr(_) | Pat::Invalid(_) => {}
     }
 }
 
@@ -209,8 +248,8 @@ impl CaptureResolver {
 
     /// Resolve a name reference; if it binds in an enclosing function frame,
     /// mark that binding captured. When the reference reaches the `main` frame
-    /// (0) from within a top-level function declaration, that declaration is
-    /// also marked capturing (G2), so lowering demotes it to a closure.
+    /// (0) from within a top-level function declaration, the name is also
+    /// recorded as a module binding.
     fn reference(&mut self, name: &str) {
         let top = self.frames.len().saturating_sub(1);
         for (fi, frame) in self.frames.iter().enumerate().rev() {
@@ -218,10 +257,9 @@ impl CaptureResolver {
                 if let Some(&id) = scope.get(name) {
                     if fi != top {
                         self.captured.insert(id);
-                        if fi == 0
-                            && let Some(fn_id) = self.current_top_fn
+                        if fi == 0 && self.in_top_fn && !self.module_names.iter().any(|n| n == name)
                         {
-                            self.capturing_fns.insert(fn_id);
+                            self.module_names.push(name.to_owned());
                         }
                     }
                     return;
@@ -232,6 +270,7 @@ impl CaptureResolver {
 
     /// Analyze a statement for scoping and references, mirroring
     /// [`LowerCtx::lower_stmt`].
+    #[allow(clippy::too_many_lines)]
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expr(e) => self.expr(&e.expr),
@@ -272,6 +311,12 @@ impl CaptureResolver {
                 self.expr(&w.test);
                 self.stmt(&w.body);
             }
+            Stmt::DoWhile(w) => {
+                self.stmt(&w.body);
+                self.expr(&w.test);
+            }
+            Stmt::Labeled(l) => self.stmt(&l.body),
+            Stmt::ForIn(f) => self.loop_head(&f.left, &f.right, &f.body),
             Stmt::For(f) => {
                 self.push_scope();
                 if let Some(VarDeclOrExpr::VarDecl(v)) = &f.init {
@@ -295,7 +340,7 @@ impl CaptureResolver {
                 self.stmt(&f.body);
                 self.pop_scope();
             }
-            Stmt::ForOf(f) => self.for_of(f),
+            Stmt::ForOf(f) => self.loop_head(&f.left, &f.right, &f.body),
             Stmt::Switch(s) => {
                 self.expr(&s.discriminant);
                 for case in &s.cases {
@@ -390,24 +435,34 @@ impl CaptureResolver {
                     }
                     self.exit_function();
                 }
+                // A field initializer runs in its own `this`-binding scope, so a
+                // binding it references from an enclosing scope is captured.
+                ClassMember::ClassProp(p) => {
+                    if let Some(value) = &p.value {
+                        self.enter_function();
+                        self.expr(value);
+                        self.exit_function();
+                    }
+                }
                 _ => {}
             }
         }
     }
 
-    /// Analyze a `for-of` loop, mirroring [`LowerCtx::lower_for_of`]: the head
-    /// opens a scope holding the loop binding, rebound each iteration from the
-    /// iterable's elements, so a nested closure referencing it marks it captured.
-    fn for_of(&mut self, f: &swc_ecma_ast::ForOfStmt) {
+    /// Analyze a `for-of` / `for-in` loop, mirroring [`LowerCtx::lower_for_of`] /
+    /// [`LowerCtx::lower_for_in`]: the head opens a scope holding the loop
+    /// binding, rebound each iteration, so a nested closure referencing it marks
+    /// it captured.
+    fn loop_head(&mut self, left: &ForHead, right: &Expr, body: &Stmt) {
         self.push_scope();
-        self.expr(&f.right);
-        if let ForHead::VarDecl(v) = &f.left
+        self.expr(right);
+        if let ForHead::VarDecl(v) = left
             && let [declarator] = v.decls.as_slice()
             && let Pat::Ident(ident) = &declarator.name
         {
             self.declare(ident.id.sym.as_ref(), binding_id(ident));
         }
-        self.stmt(&f.body);
+        self.stmt(body);
         self.pop_scope();
     }
 
@@ -423,6 +478,7 @@ impl CaptureResolver {
 
     /// Analyze an expression's references, entering a fresh frame for arrows and
     /// function expressions.
+    #[allow(clippy::too_many_lines)]
     fn expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Ident(ident) => self.reference(ident.sym.as_ref()),
@@ -501,6 +557,22 @@ impl CaptureResolver {
             // captures analyzed. Without this the awaited sub-tree is invisible to
             // capture analysis and a closure's captured binding is never boxed.
             Expr::Await(a) => self.expr(&a.arg),
+            Expr::Yield(y) => {
+                if let Some(arg) = &y.arg {
+                    self.expr(arg);
+                }
+            }
+            Expr::Tpl(t) => {
+                for e in &t.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::Seq(s) => {
+                for e in &s.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::OptChain(c) => self.opt_chain(c),
             Expr::Array(a) => {
                 for e in a.elems.iter().flatten() {
                     self.expr(&e.expr);
@@ -526,6 +598,24 @@ impl CaptureResolver {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Analyze an optional chain's base (`o?.p`, `o?.[k]`, `f?.(args)`).
+    fn opt_chain(&mut self, chain: &OptChainExpr) {
+        match chain.base.as_ref() {
+            OptChainBase::Member(m) => {
+                self.expr(&m.obj);
+                if let MemberProp::Computed(k) = &m.prop {
+                    self.expr(&k.expr);
+                }
+            }
+            OptChainBase::Call(call) => {
+                self.expr(&call.callee);
+                for arg in &call.args {
+                    self.expr(&arg.expr);
+                }
+            }
         }
     }
 

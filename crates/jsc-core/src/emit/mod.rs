@@ -209,6 +209,16 @@ const JSON_POS_GLOBAL: u32 = 7;
 /// See [`JSON_DATA_GLOBAL`].
 const JSON_LEN_GLOBAL: u32 = 8;
 
+/// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
+/// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
+/// the `JSON.parse` cursor globals and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 9;
+
+/// The TDZ hole a module cell holds until its binding is initialized
+/// (`IrNode::IsHole`): an `undefined`-tagged NaN box with a nonzero payload, which
+/// no JS value ever produces.
+const TDZ_HOLE_BITS: i64 = abi::UNDEFINED.cast_signed() | 1;
+
 /// [`CF_KIND_GLOBAL`] value for a pending `return` (payload in
 /// [`CF_VALUE_GLOBAL`]).
 const CF_RETURN: i32 = 1;
@@ -949,7 +959,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
 
     // Global section: the bump-allocator heap pointer plus the S15.1
     // exception-unwinding globals (see [`build_globals`]).
-    module.section(&build_globals(heap_ptr_init));
+    module.section(&build_globals(heap_ptr_init, program.module_cells));
 
     // Export section: `main` as function index IMPORT_FUNC_COUNT (the first
     // DEFINED function, after the imports), memory index 0 as "memory" (function

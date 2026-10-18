@@ -95,6 +95,21 @@ pub(super) fn emit_node(
             emit_cell_set(cell, value, function, scratch, strings, helpers);
         }
         IrNode::EnvLoad(slot) => emit_env_load(*slot, function, helpers),
+        IrNode::ModuleCell(slot) => {
+            function.instruction(&Instruction::GlobalGet(MODULE_CELL_GLOBAL_BASE + slot));
+        }
+        IrNode::IsHole(operand) => {
+            // Compare the raw bits to the TDZ hole and box the i32 result as a
+            // boolean jsval (the i32 scratch carries the cond past the two consts).
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Const(TDZ_HOLE_BITS));
+            function.instruction(&Instruction::I64Eq);
+            function.instruction(&Instruction::LocalSet(scratch + 21));
+            function.instruction(&Instruction::I64Const(TRUE_BITS));
+            function.instruction(&Instruction::I64Const(FALSE_BITS));
+            function.instruction(&Instruction::LocalGet(scratch + 21));
+            function.instruction(&Instruction::Select);
+        }
         // The value passed to `.next(v)` is the state machine's first wasm
         // parameter (local 0, `sent`) — P4.2 M2.
         IrNode::SentValue => {
