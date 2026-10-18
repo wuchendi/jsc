@@ -3,6 +3,18 @@
 //! Both exit-code conventions are accepted: compile errors exit 2 (or exit
 //! nonzero with stderr starting `error:`), uncaught exceptions exit 1 with
 //! `Uncaught` on stderr.
+//!
+//! # Uncaught error names
+//!
+//! For `negative: { phase: runtime }` tests the expected constructor name is
+//! matched against the token after `Uncaught ` on stderr. jsc prints builtin
+//! errors as `Error: Uncaught TypeError: msg`, so builtin names match. An
+//! uncaught user class instance prints as an object literal
+//! (`Error: Uncaught { @@prototype: ..., message: x }`) without its class
+//! name, so runtime-negative tests expecting `Test262Error` cannot match and
+//! count as failures until jsc names class instances. Harness assertion
+//! failures throw `new Error("Test262Error: ...")` and therefore report the
+//! name `Error`.
 
 use crate::frontmatter::Negative;
 
@@ -174,5 +186,24 @@ mod tests {
         );
         assert_eq!(classify(Status::Exited(0), "", Some(&n)), Outcome::Fail);
         assert_eq!(classify(Status::TimedOut, "", Some(&n)), Outcome::Timeout);
+    }
+
+    #[test]
+    fn observed_jsc_stderr() {
+        let t262 = neg("runtime", "Test262Error");
+        let class_instance =
+            "Error: Uncaught { @@prototype: { toString: [Function (anonymous)] }, message: top }\n";
+        assert_eq!(uncaught_name(class_instance), Some("{"));
+        assert_eq!(
+            classify(Status::Exited(1), class_instance, Some(&t262)),
+            Outcome::Fail
+        );
+        let harness = "Error: Uncaught Error: Test262Error: Expected SameValue\n";
+        assert_eq!(uncaught_name(harness), Some("Error"));
+        assert_eq!(
+            classify(Status::Exited(1), harness, Some(&neg("runtime", "Error"))),
+            Outcome::Pass
+        );
+        assert_eq!(uncaught_name("Error: Uncaught str\n"), Some("str"));
     }
 }

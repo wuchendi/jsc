@@ -40,6 +40,21 @@ pub fn diff(baseline: &BTreeSet<String>, passing: &BTreeSet<String>, filter: &[S
     }
 }
 
+/// New baseline after a run: with no `filter`, exactly `passing`; otherwise
+/// the `baseline` entries outside the filter prefixes plus `passing`.
+pub fn merge(
+    baseline: &BTreeSet<String>,
+    passing: &BTreeSet<String>,
+    filter: &[String],
+) -> BTreeSet<String> {
+    baseline
+        .iter()
+        .filter(|p| !filter.is_empty() && !filter.iter().any(|f| p.starts_with(f.as_str())))
+        .chain(passing)
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +74,16 @@ mod tests {
         assert_eq!(all.regressed, ["x/b.js", "y/c.js"]);
         assert_eq!(all.newly_passing, ["x/new.js"]);
         assert_eq!(diff(&base, &pass, &["x/".to_owned()]).regressed, ["x/b.js"]);
+    }
+
+    #[test]
+    fn merge_scoped() {
+        let base = parse("x/a.js\nx/b.js\ny/c.js\n");
+        let pass = parse("x/a.js\nx/new.js\n");
+        assert_eq!(merge(&base, &pass, &[]), pass);
+        assert_eq!(
+            render(&merge(&base, &pass, &["x/".to_owned()])),
+            "x/a.js\nx/new.js\ny/c.js\n"
+        );
     }
 }
