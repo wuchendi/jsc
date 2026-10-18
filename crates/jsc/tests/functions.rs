@@ -3,7 +3,7 @@
 mod common;
 use common::jsc;
 
-/// S13.2 — first-class function values run end to end through the built binary:
+/// First-class function values run end to end through the built binary:
 /// a function bound to a variable and called indirectly, a function passed as an
 /// argument, and `typeof` over a function value.
 #[test]
@@ -25,7 +25,7 @@ fn function_values_via_eval() {
     );
 }
 
-/// S13.4 — arrow functions run end to end through the built binary: multi-param
+/// Arrow functions run end to end through the built binary: multi-param
 /// and single-param expression bodies, a block body with an explicit `return`,
 /// an arrow passed straight as a callback, and `typeof` over an arrow.
 #[test]
@@ -43,14 +43,14 @@ fn arrow_functions_via_eval() {
     assert_eq!(jsc(&["-p", "typeof (x=>x)"]), "function");
 }
 
-/// S13.7 — the S13 acceptance milestones as one consolidated end-to-end gate
-/// through the built binary: a function bound to a variable and called
+/// Functions, arrows, closures, and member compound assignment as one
+/// consolidated end-to-end gate through the built binary: a function bound to a variable and called
 /// indirectly, a function passed as an argument, arrow functions (multi- and
 /// single-param), a returned closure capturing a parameter, a stateful counter
 /// closure mutating a shared cell across calls, and member-target compound
 /// assignment on an array element and an object property.
 #[test]
-fn s13_acceptance_milestones() {
+fn functions_and_closures_acceptance() {
     // First-class function values: bind-and-call, pass-as-argument.
     assert_eq!(
         jsc(&["-p", "function add(a,b){return a+b} let f=add; f(40,2)"]),
@@ -88,7 +88,7 @@ fn s13_acceptance_milestones() {
     assert_eq!(jsc(&["-p", "let o={x:1}; o.x+=41; o.x"]), "42");
 }
 
-/// P1.3 — default parameters: a missing or explicitly-`undefined` argument
+/// Default parameters: a missing or explicitly-`undefined` argument
 /// triggers the default, which is evaluated per call and may reference earlier
 /// (already-bound) parameters. An explicit non-undefined argument is kept.
 #[test]
@@ -108,12 +108,12 @@ fn default_parameters() {
     );
 }
 
-/// P1.6 — destructuring patterns as function parameters: an array pattern and an
+/// Destructuring patterns as function parameters: an array pattern and an
 /// object pattern bind their elements/properties, composing with nested defaults,
 /// renames, nested patterns, a whole-pattern default, and arrows.
 #[test]
 fn parameter_destructuring() {
-    // Array-pattern and object-pattern parameters (the core milestones).
+    // Array-pattern and object-pattern parameters (the core cases).
     assert_eq!(
         jsc(&["-p", "function f([a,b]){ return a+b } f([40,2])"]),
         "42"
@@ -151,7 +151,7 @@ fn parameter_destructuring() {
     assert_eq!(jsc(&["-p", "let f=([a,b])=>a+b; f([40,2])"]), "42");
 }
 
-/// P1.4 — a trailing rest parameter gathers every argument from its position
+/// A trailing rest parameter gathers every argument from its position
 /// onward into a REAL array: its `.length` reflects the actual argument count
 /// (0 when none are passed), it composes with preceding fixed parameters, and it
 /// is a normal array on which `.map`/indexing work.
@@ -193,11 +193,11 @@ fn rest_parameters() {
     );
 }
 
-/// P1.5 — spread `...` in call arguments through the CLI: the arguments are
-/// materialized into a runtime array and spread into the uniform ABI (P1.4), so
+/// Spread `...` in call arguments through the CLI: the arguments are
+/// materialized into a runtime array and spread into the uniform ABI, so
 /// a direct, indirect, or rest-parameter callee receives the expanded values.
 #[test]
-fn p1_5_call_spread_via_eval() {
+fn call_spread_via_eval() {
     assert_eq!(
         jsc(&["-p", "function add(a,b,c){return a+b+c} add(...[10,20,12])"]),
         "42"

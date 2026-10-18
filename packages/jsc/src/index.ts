@@ -104,7 +104,7 @@ export async function run(src: string): Promise<RunResult> {
     | undefined
   const memBytes = mem ? new Uint8Array(mem.buffer) : new Uint8Array(0)
 
-  // Uncaught-exception check (S15.1): a set `$exc_pending` after `main` means an
+  // Uncaught-exception check: a set `$exc_pending` after `main` means an
   // exception propagated all the way out. Render `$exc_value` and surface it.
   if (excPending() !== 0) {
     const valueGlobal = instance.exports[EXC_VALUE_EXPORT_NAME] as

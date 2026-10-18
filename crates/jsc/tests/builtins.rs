@@ -3,14 +3,14 @@
 mod common;
 use common::{jsc, jsc_raw_stdout};
 
-/// S14.1 — `console.log` writes to the process's real stdout DURING execution.
+/// `console.log` writes to the process's real stdout DURING execution.
 ///
 /// The printed lines are single-space separated with one trailing newline per
 /// call, and each argument is formatted exactly as `-p` formats a completion
 /// value (numbers bare, strings unquoted, Node-style arrays). `-e` prints only
 /// the logged lines; `-p` prints the completion value AFTER them.
 #[test]
-fn s14_console_log_streams_to_stdout() {
+fn console_log_streams_to_stdout() {
     // Single number argument.
     assert_eq!(jsc_raw_stdout(&["-e", "console.log(40 + 2)"]), "42\n");
     // Unquoted string.
@@ -29,10 +29,10 @@ fn s14_console_log_streams_to_stdout() {
     );
 }
 
-/// S14.2 — `Math.*` methods and `Math.PI`/`Math.E` compute end-to-end through the
+/// `Math.*` methods and `Math.PI`/`Math.E` compute end-to-end through the
 /// CLI, formatting their numeric result exactly like any other final value.
 #[test]
-fn s14_math_methods_via_eval() {
+fn math_methods_via_eval() {
     assert_eq!(jsc(&["-p", "Math.floor(3.7)"]), "3");
     assert_eq!(jsc(&["-p", "Math.ceil(3.2)"]), "4");
     assert_eq!(jsc(&["-p", "Math.round(2.5)"]), "3");
@@ -47,11 +47,11 @@ fn s14_math_methods_via_eval() {
     assert_eq!(jsc(&["-p", "typeof Math.PI"]), "number");
 }
 
-/// S14.3 — `String`/`Number`/`Boolean`/`parseInt`/`parseFloat` conversions compute
+/// `String`/`Number`/`Boolean`/`parseInt`/`parseFloat` conversions compute
 /// end-to-end through the CLI, formatting their result exactly like any other
 /// final value.
 #[test]
-fn s14_conversions_via_eval() {
+fn conversions_via_eval() {
     // String(x): number form matches `format_number`, and the result is a string.
     assert_eq!(jsc(&["-p", "String(42)"]), "42");
     assert_eq!(jsc(&["-p", "String(3.5)"]), "3.5");
@@ -78,7 +78,7 @@ fn s14_conversions_via_eval() {
     );
 }
 
-/// P-series — `new Date(ms)` from an explicit timestamp renders as its ISO 8601
+/// `new Date(ms)` from an explicit timestamp renders as its ISO 8601
 /// UTC string, `.getTime()` reads the millisecond payload back, and pre-epoch
 /// timestamps and `Number`-coerced arguments are handled.
 #[test]
@@ -105,7 +105,7 @@ fn date_from_timestamp_renders_iso() {
     assert_eq!(jsc(&["-p", "({}).getTime()"]), "NaN");
 }
 
-/// P-series — `Date.now()` and `new Date()` read the host wall clock, and both a
+/// `Date.now()` and `new Date()` read the host wall clock, and both a
 /// `Date` value and `Date.now()` carry the expected runtime type. The clock is
 /// non-deterministic, so these assert structural properties, not exact values.
 #[test]
@@ -126,7 +126,7 @@ fn date_now_reads_host_clock() {
     assert_eq!(jsc(&["-p", "5 instanceof Date"]), "false");
 }
 
-/// P-series — the guest-side `Date` field methods computed from the stored ms:
+/// The guest-side `Date` field methods computed from the stored ms:
 /// `valueOf`, the UTC calendar getters (`getFullYear`/`getMonth` 0-based/`getDate`/
 /// `getDay` 0=Sunday), the UTC time getters, and `toISOString`.
 #[test]
@@ -179,7 +179,7 @@ fn date_field_methods() {
     assert_eq!(jsc(&["-p", "new Date(NaN).toISOString()"]), "Invalid Date");
 }
 
-/// P-series — the `Date` field-method names still work as ordinary user object
+/// The `Date` field-method names work as ordinary user object
 /// methods on a non-Date receiver (the runtime TYPE-BYTE dispatch falls back to a
 /// plain method call), so claiming the names does not shadow user methods.
 #[test]
@@ -207,7 +207,7 @@ fn date_method_names_fall_back_to_user_methods() {
     );
 }
 
-/// P-series — the `Date` builtins are shadowable, and only the timestamp
+/// The `Date` builtins are shadowable, and only the timestamp
 /// constructor forms are accepted (the calendar-field form is rejected).
 #[test]
 fn date_shadowing_and_arity() {
