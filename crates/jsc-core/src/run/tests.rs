@@ -14,7 +14,7 @@ fn assert_number(src: &str, expected: f64) {
 }
 
 #[test]
-fn addition_mvp_milestone() {
+fn addition_mvp() {
     assert_number("40 + 2", 42.0);
 }
 
@@ -33,8 +33,8 @@ fn renders_non_integer_result() {
 }
 
 #[test]
-fn locals_milestone() {
-    // S8.2 milestone: a declaration plus a reference to the local.
+fn locals() {
+    // A declaration plus a reference to the local.
     assert_number("let x = 40; x + 2", 42.0);
 }
 
@@ -64,8 +64,8 @@ fn unary_negation() {
 }
 
 #[test]
-fn while_loop_milestone() {
-    // S8.3 milestone: accumulate 0..10 with a `while` loop and comparison.
+fn while_loop() {
+    // Accumulate 0..10 with a `while` loop and comparison.
     assert_number(
         "let i=0; let s=0; while(i<10){ s = s + i; i = i + 1 } s",
         45.0,
@@ -78,13 +78,13 @@ fn if_else_selects_branch() {
 }
 
 #[test]
-fn function_call_milestone() {
+fn function_call() {
     assert_number("function add(a, b) { return a + b } add(40, 2)", 42.0);
 }
 
 #[test]
-fn recursive_fib_milestone() {
-    // S8.4 milestone: recursion through a two-branch `return`.
+fn recursive_fib() {
+    // Recursion through a two-branch `return`.
     assert_number(
         "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)",
         55.0,
@@ -102,7 +102,7 @@ fn function_with_local_and_forward_call() {
 
 #[test]
 fn comparison_yields_boolean_number() {
-    // S9.5: === / !== now decode to real booleans (was numeric 1.0/0.0).
+    // === / !== decode to real booleans.
     assert_eq!(
         compile_and_run("3 === 3").expect("pipeline should succeed"),
         Value::Bool(true)
@@ -145,14 +145,14 @@ fn relational_operators_yield_booleans() {
 
 #[test]
 fn ternary_selects_branch_by_truthiness() {
-    // Mixed-type milestone: a boolean `===` result drives the ternary.
+    // A boolean `===` result drives the ternary.
     assert_number("let b = true; let n = b === true ? 42 : 0; n", 42.0);
     assert_number("false ? 1 : 2", 2.0);
 }
 
 #[test]
 fn truthy_boolean_true_selects_then() {
-    // S9.4: a boolean condition uses JS truthiness, not number-only.
+    // A boolean condition uses JS truthiness, not number-only.
     assert_number("let r = 0; if (true) { r = 1 } else { r = 2 } r", 1.0);
 }
 
@@ -273,15 +273,14 @@ fn decode_canonical_nan_is_number() {
 
 #[test]
 fn decode_retired_typeof_tag_is_nan_number() {
-    // Tag 0b100 was the `typeof` type-string immediate; `typeof` now yields a real
-    // heap string, so the tag is retired and decodes as a NaN number (decode stays
-    // total, like the other retired tags).
+    // Tag 0b100 is unused (`typeof` yields a real heap string), so it decodes as a
+    // NaN number (decode stays total, like the other unused tags).
     assert!(matches!(decode(0x7FFC_0000_0000_0001, &[]), Value::Number(n) if n.is_nan()));
 }
 
 #[test]
 fn decode_pointer_reads_string_from_memory() {
-    // A hand-built heap string block (S13.1): "hi" laid out as
+    // A hand-built heap string block: "hi" laid out as
     // [type=0][pad×3][len=2 LE][b'h', b'i'] at base offset 8.
     let mut memory = vec![0u8; 8];
     memory.extend_from_slice(&[TYPE_STRING, 0, 0, 0]); // header
@@ -295,14 +294,14 @@ fn decode_pointer_reads_string_from_memory() {
 #[test]
 fn decode_out_of_range_pointer_is_undefined() {
     // A heap pointer past the end of memory must not panic — its type byte
-    // can't be read, so decode stays total by yielding `undefined` (S13.1).
+    // can't be read, so decode stays total by yielding `undefined`.
     let bits = 0x7FFD_0000_0000_0000_u64 | 0x270F;
     assert_eq!(decode(bits, &[]), Value::Undefined);
 }
 
 #[test]
 fn decode_reads_type_byte_to_pick_the_arm() {
-    // S13.1: the single heap tag dispatches on the block's TYPE BYTE. The same
+    // The single heap tag dispatches on the block's TYPE BYTE. The same
     // base offset decodes as a string, array, or object purely by that byte.
     let base = 8usize;
     let bits = 0x7FFD_0000_0000_0000_u64 | base as u64;
@@ -371,7 +370,7 @@ fn format_value_covers_every_arm() {
 
 #[test]
 fn string_concatenation_allocates_result() {
-    // S10.4: two heap strings concatenate into a fresh heap string.
+    // Two heap strings concatenate into a fresh heap string.
     let value = compile_and_run("\"foo\" + \"bar\"").expect("pipeline should succeed");
     assert_eq!(value, Value::Str("foobar".to_owned()));
     assert_eq!(format_value(&value), "foobar");
@@ -412,7 +411,7 @@ fn format_number_still_renders_numbers() {
 
 #[test]
 fn string_strict_equality_by_content() {
-    // S10.5: `===` / `!==` on heap strings compares byte content, not identity.
+    // `===` / `!==` on heap strings compares byte content, not identity.
     assert_bool("\"a\" === \"a\"", true);
     assert_bool("\"a\" === \"b\"", false);
     assert_bool("\"a\" !== \"b\"", true);
@@ -429,7 +428,7 @@ fn concat_result_equals_literal_by_content() {
 
 #[test]
 fn string_relational_lexicographic() {
-    // S10.5: `< > <= >=` on heap strings compare lexicographically by bytes.
+    // `< > <= >=` on heap strings compare lexicographically by bytes.
     assert_bool("\"a\" < \"b\"", true);
     assert_bool("\"b\" < \"a\"", false);
     assert_bool("\"abc\" < \"abd\"", true);
@@ -442,7 +441,7 @@ fn string_relational_lexicographic() {
 
 #[test]
 fn empty_string_is_falsy() {
-    // S10.5: `""` (length 0) is falsy; a non-empty string is truthy. The `if`
+    // `""` (length 0) is falsy; a non-empty string is truthy. The `if`
     // is a statement, so capture the taken branch in a variable and read it.
     assert_number(
         "let s = \"\"; let r = 0; if (s) { r = 1 } else { r = 2 } r",
@@ -461,21 +460,21 @@ fn string_truthiness_in_ternary() {
 }
 
 #[test]
-fn array_index_read_milestone() {
-    // S11.1: element reads dispatch on the array tag and sum numerically.
+fn array_index_read() {
+    // Element reads dispatch on the array tag and sum numerically.
     assert_number("let a=[1,2,3]; a[0]+a[2]", 4.0);
 }
 
 #[test]
-fn array_length_milestone() {
-    // `.length` reads the same u32 header S10 strings use.
+fn array_length() {
+    // `.length` reads the same u32 header strings use.
     assert_number("[1,2,3].length", 3.0);
     assert_number("let a=[]; a.length", 0.0);
 }
 
 #[test]
 fn typeof_array_is_object() {
-    // S11.1: `typeof []` is "object" (the array tag maps to index 3).
+    // `typeof []` is "object" (the array tag maps to index 3).
     let value = compile_and_run("typeof []").expect("pipeline should succeed");
     assert_eq!(value, Value::Str("object".to_owned()));
     assert_eq!(format_value(&value), "object");
@@ -517,14 +516,14 @@ fn array_decodes_and_formats() {
 }
 
 #[test]
-fn object_property_read_milestone() {
-    // S11.3: `.a` reads dispatch on the object tag and sum numerically.
+fn object_property_read() {
+    // `.a` reads dispatch on the object tag and sum numerically.
     assert_number("let o={a:1,b:2}; o.a+o.b", 3.0);
     assert_number("let o={x:10}; o.x", 10.0);
 }
 
 #[test]
-fn object_computed_read_milestone() {
+fn object_computed_read() {
     // `o["a"]` shares the `Index` dispatch with `o.a`.
     assert_number("let o={a:1}; o[\"a\"]", 1.0);
 }
@@ -544,7 +543,7 @@ fn object_missing_key_is_undefined() {
 
 #[test]
 fn typeof_object_is_object() {
-    // S11.3: `typeof {}` is "object" (the object tag maps to index 3).
+    // `typeof {}` is "object" (the object tag maps to index 3).
     let value = compile_and_run("typeof {}").expect("pipeline should succeed");
     assert_eq!(value, Value::Str("object".to_owned()));
     assert_eq!(format_value(&value), "object");
@@ -561,7 +560,7 @@ fn object_is_always_truthy() {
 
 #[test]
 fn object_literal_roundtrips_to_heap_object() {
-    // S11.3: a `{a:1}` literal round-trips through the whole pipeline to a
+    // A `{a:1}` literal round-trips through the whole pipeline to a
     // heap object with one decoded entry. Bound to a local so the `{..}`
     // parses as an object expression rather than a block statement.
     let value = compile_and_run("let o={a:1}; o").expect("pipeline should succeed");
@@ -593,7 +592,7 @@ fn object_decodes_and_formats() {
 #[test]
 fn decode_object_reads_entries_from_memory() {
     // A hand-built heap object `{a: 7}` at base offset 20, with its key string
-    // "a" as a block at base offset 8 (S13.1 headers):
+    // "a" as a block at base offset 8 (with headers):
     //   key   : [type=0][pad×3][len=1]['a']  (base 8, 9 bytes -> ends at 17)
     //   object: [type=2][pad×3][n=1][key_ptr][7.0]  (base 20)
     let mut memory = vec![0u8; 8];
@@ -620,7 +619,7 @@ fn decode_object_reads_entries_from_memory() {
 
 #[test]
 fn decode_array_reads_elements_from_memory() {
-    // A hand-built heap array `[1, 2]` at base offset 8 (S13.1 header):
+    // A hand-built heap array `[1, 2]` at base offset 8 (with header):
     // [type=1][pad×3][len=2][1.0 bits][2.0 bits].
     let mut memory = vec![0u8; 8];
     memory.extend_from_slice(&[TYPE_ARRAY, 0, 0, 0]);
@@ -641,9 +640,9 @@ fn assert_string(src: &str, expected: &str) {
     assert_eq!(value, Value::Str(expected.to_owned()), "from {src:?}");
 }
 
-// S12.1 — logical NOT `!` (boolean inverse of truthiness).
+// Logical NOT `!` (boolean inverse of truthiness).
 #[test]
-fn logical_not_milestone() {
+fn logical_not() {
     assert_bool("!true", false);
     assert_bool("!false", true);
     assert_bool("!0", true);
@@ -658,9 +657,9 @@ fn logical_not_milestone() {
     assert_bool("!!5", true);
 }
 
-// S12.1 — `&&` short-circuit with VALUE semantics (yields the operand jsval).
+// `&&` short-circuit with VALUE semantics (yields the operand jsval).
 #[test]
-fn logical_and_milestone() {
+fn logical_and() {
     assert_number("1 && 2", 2.0);
     assert_number("0 && 2", 0.0);
     assert_number("4 && 5", 5.0);
@@ -669,9 +668,9 @@ fn logical_and_milestone() {
     assert_bool("false && true", false);
 }
 
-// S12.1 — `||` short-circuit with VALUE semantics.
+// `||` short-circuit with VALUE semantics.
 #[test]
-fn logical_or_milestone() {
+fn logical_or() {
     assert_number("0 || 3", 3.0);
     assert_number("4 || 5", 4.0);
     assert_number("1 || 2", 1.0);
@@ -679,9 +678,9 @@ fn logical_or_milestone() {
     assert_string("\"a\" || \"b\"", "a");
 }
 
-// S12.1 — `??` nullish coalescing (only `null`/`undefined` trigger the rhs).
+// `??` nullish coalescing (only `null`/`undefined` trigger the rhs).
 #[test]
-fn nullish_coalescing_milestone() {
+fn nullish_coalescing() {
     assert_number("null ?? 5", 5.0);
     assert_number("undefined ?? 5", 5.0);
     assert_number("4 ?? 5", 4.0);
@@ -690,7 +689,7 @@ fn nullish_coalescing_milestone() {
     assert_string("\"\" ?? \"x\"", "");
 }
 
-// S12.1 — short-circuit must NOT evaluate the rhs when it short-circuits.
+// Short-circuit must NOT evaluate the rhs when it short-circuits.
 #[test]
 fn short_circuit_skips_rhs_side_effect() {
     // `false && (x = 1)` never runs the assignment, so `x` stays 0.
@@ -704,7 +703,7 @@ fn short_circuit_skips_rhs_side_effect() {
     assert_number("let v = 0; 0 ?? (v = 1); v", 0.0);
 }
 
-// S12.1 — nested logicals reuse the single temp local correctly.
+// Nested logicals reuse the single temp local correctly.
 #[test]
 fn nested_logical_operators() {
     assert_number("1 && 2 && 3", 3.0);
@@ -715,9 +714,9 @@ fn nested_logical_operators() {
     assert_number("0 || 2 && 3", 3.0);
 }
 
-// S12.2 — compound assignment `+= -= *= /= %=` over a local (read once).
+// Compound assignment `+= -= *= /= %=` over a local (read once).
 #[test]
-fn compound_assignment_milestone() {
+fn compound_assignment() {
     assert_number("let x = 40; x += 2; x", 42.0);
     assert_number("let y = 10; y *= 4; y", 40.0);
     assert_number("let z = 10; z -= 3; z", 7.0);
@@ -725,15 +724,15 @@ fn compound_assignment_milestone() {
     assert_number("let q = 20; q /= 4; q", 5.0);
 }
 
-// S12.2 — `+=` reuses the `+` overload, so a string lhs concatenates.
+// `+=` reuses the `+` overload, so a string lhs concatenates.
 #[test]
 fn string_compound_assignment() {
     assert_string("let s = \"foo\"; s += \"bar\"; s", "foobar");
 }
 
-// S13.5 — compound assignment on member targets `a[i] op= e` / `o.k op= e`.
+// Compound assignment on member targets `a[i] op= e` / `o.k op= e`.
 #[test]
-fn member_compound_assignment_milestone() {
+fn member_compound_assignment() {
     // Array element target.
     assert_number("let a = [10, 20]; a[0] += 5; a[0]", 15.0);
     assert_number("let a = [3]; a[0] *= 14; a[0]", 42.0);
@@ -743,7 +742,7 @@ fn member_compound_assignment_milestone() {
     assert_number("let o = {n: 100}; o[\"n\"] -= 58; o.n", 42.0);
 }
 
-// S13.5 — all five compound operators are supported on member targets.
+// All five compound operators are supported on member targets.
 #[test]
 fn member_compound_assignment_all_operators() {
     assert_number("let a = [40]; a[0] += 2; a[0]", 42.0);
@@ -753,14 +752,14 @@ fn member_compound_assignment_all_operators() {
     assert_number("let o = {v: 17}; o.v %= 5; o.v", 2.0);
 }
 
-// S13.5 — `+=` on a string member reuses the `+` overload (concatenation).
+// `+=` on a string member reuses the `+` overload (concatenation).
 #[test]
 fn member_string_compound_assignment() {
     assert_string("let o = {s: \"foo\"}; o.s += \"bar\"; o.s", "foobar");
     assert_string("let a = [\"foo\"]; a[0] += \"baz\"; a[0]", "foobaz");
 }
 
-// S13.5 — the index sub-expression is evaluated EXACTLY ONCE. A postfix
+// The index sub-expression is evaluated EXACTLY ONCE. A postfix
 // `i++` index bumps `i` each time it runs; if it ran twice (once for the read,
 // once for the store) the write would land on `a[1]` and `i` would reach 2.
 #[test]
@@ -770,7 +769,7 @@ fn member_compound_assignment_evaluates_index_once() {
     assert_number(src, 1701.0);
 }
 
-// S12.2 — `%` (BinOp::Mod) as a standalone operator, incl. JS sign semantics.
+// `%` (BinOp::Mod) as a standalone operator, incl. JS sign semantics.
 #[test]
 fn modulo_operator() {
     assert_number("17 % 5", 2.0);
@@ -780,9 +779,9 @@ fn modulo_operator() {
     assert_number("7 % -3", 1.0);
 }
 
-// S12.2 — `++`/`--` in both prefix and postfix forms.
+// `++`/`--` in both prefix and postfix forms.
 #[test]
-fn increment_decrement_milestone() {
+fn increment_decrement() {
     // Statement-position update mutates the local.
     assert_number("let x = 41; x++; x", 42.0);
     assert_number("let i = 5; --i", 4.0);
@@ -795,9 +794,9 @@ fn increment_decrement_milestone() {
     assert_number("let g = 5; let h = --g; h", 4.0);
 }
 
-// S12.4 — `switch`/`case`/`default`/`break` with JS fall-through.
+// `switch`/`case`/`default`/`break` with JS fall-through.
 #[test]
-fn switch_case_milestone() {
+fn switch_case() {
     // A matching case with `break` selects its body.
     assert_number(
         "let x=2; let r=0; switch(x){ case 1: r=10; break; case 2: r=42; break; default: r=99 } r",
@@ -820,7 +819,7 @@ fn switch_case_milestone() {
     );
 }
 
-// S12.4 — `default` between cases; fall-through follows source order.
+// `default` between cases; fall-through follows source order.
 #[test]
 fn switch_default_in_middle_falls_through() {
     assert_number(
@@ -829,7 +828,7 @@ fn switch_default_in_middle_falls_through() {
     );
 }
 
-// S12.4 — no match and no `default` leaves the discriminant handling a no-op;
+// No match and no `default` leaves the discriminant handling a no-op;
 // `break` nested inside an `if` still exits the switch.
 #[test]
 fn switch_no_match_and_nested_break() {
@@ -843,7 +842,7 @@ fn switch_no_match_and_nested_break() {
     );
 }
 
-// S12.4 — strict-equality (`===`) dispatch works on a string discriminant.
+// Strict-equality (`===`) dispatch works on a string discriminant.
 #[test]
 fn switch_string_discriminant() {
     assert_number(
@@ -852,7 +851,7 @@ fn switch_string_discriminant() {
     );
 }
 
-// S12.5 — block scoping for `let`/`const`.
+// Block scoping for `let`/`const`.
 
 #[test]
 fn inner_block_shadow_does_not_leak() {
@@ -908,10 +907,9 @@ fn block_local_not_visible_after_block() {
     );
 }
 
-// S13.1 — header-byte heap-tag refactor: every heap kind now shares the one
-// NaN-box pointer tag `0b101`, discriminated by a TYPE BYTE in the block
-// header. `typeof` and a full value round-trip must be preserved for all three
-// user-visible heap kinds through the new single-tag + header layout.
+// Every heap kind shares the one NaN-box pointer tag `0b101`, discriminated
+// by a TYPE BYTE in the block header. `typeof` and a full value round-trip must be preserved for all three
+// user-visible heap kinds through the single-tag + header layout.
 #[test]
 fn heap_type_byte_typeof_and_value_roundtrip() {
     // String: typeof "string" and the text round-trips through the header.
@@ -946,17 +944,17 @@ fn heap_type_byte_typeof_and_value_roundtrip() {
     );
 }
 
-// S13.2 — first-class function values: a function declaration used in value
+// First-class function values: a function declaration used in value
 // position becomes a callable heap value (table index + env), called through
 // `call_indirect` when the callee is a variable/parameter/returned value.
 #[test]
-fn first_class_function_value_milestone() {
+fn first_class_function_value() {
     // Bind a function to a variable and call it indirectly.
     assert_number("function add(a,b){return a+b} let f = add; f(40,2)", 42.0);
 }
 
 #[test]
-fn function_passed_as_argument_milestone() {
+fn function_passed_as_argument() {
     // Pass a function value as an argument and call it inside the callee.
     assert_number(
         "function apply(f,x){return f(x)} function dbl(n){return n*2} apply(dbl,21)",
@@ -997,29 +995,29 @@ fn indirect_call_pads_and_ignores_arity() {
     assert_eq!(value, Value::Undefined);
 }
 
-// S13.4 — arrow functions: an arrow expression is a first-class function
+// Arrow functions: an arrow expression is a first-class function
 // value (same heap repr and uniform ABI as a `function` declaration), with an
 // expression body (implicit return) or a block body.
 #[test]
-fn arrow_multi_param_expression_body_milestone() {
+fn arrow_multi_param_expression_body() {
     // Parenthesized multi-parameter arrow with an implicit-return body.
     assert_number("let add = (a,b) => a+b; add(40,2)", 42.0);
 }
 
 #[test]
-fn arrow_single_unparenthesized_param_milestone() {
+fn arrow_single_unparenthesized_param() {
     // Single parameter without parentheses, expression body.
     assert_number("let sq = x => x*x; sq(7)", 49.0);
 }
 
 #[test]
-fn arrow_block_body_milestone() {
+fn arrow_block_body() {
     // Block body with a local declaration and an explicit `return`.
     assert_number("let f = (n) => { let t = n*2; return t+1 }; f(20)", 41.0);
 }
 
 #[test]
-fn arrow_passed_as_argument_milestone() {
+fn arrow_passed_as_argument() {
     // An arrow passed straight into a higher-order function and called there.
     assert_number("function apply(f,x){return f(x)} apply(x=>x*3, 14)", 42.0);
 }
@@ -1042,10 +1040,10 @@ fn arrow_wider_arity_fixes_uniform_abi() {
     assert_number("let f=(a,b,c)=>a+b+c; let g=x=>x; f(1,2,3)+g(36)", 42.0);
 }
 
-// S13.4 — closures: a nested function/arrow captures enclosing bindings by
+// Closures: a nested function/arrow captures enclosing bindings by
 // reference through a heap environment of boxed cells.
 #[test]
-fn closure_read_capture_milestone() {
+fn closure_read_capture() {
     // `adder(5)` returns an arrow that captures `x`; `a5(37)` reads the
     // captured `x` (= 5) from its cell and adds 37.
     assert_number(
@@ -1055,7 +1053,7 @@ fn closure_read_capture_milestone() {
 }
 
 #[test]
-fn closure_mutable_cell_milestone() {
+fn closure_mutable_cell() {
     // `counter` returns a function that increments a shared captured `c`;
     // three calls yield 1, 2, 3, so the third returns 3.
     assert_number(
@@ -1142,7 +1140,7 @@ fn non_capturing_function_is_unaffected() {
 
 #[test]
 fn function_value_decode_reads_type_byte() {
-    // A hand-built function block at base offset 8 (S13.2 layout):
+    // A hand-built function block at base offset 8:
     // [type=3][pad×3][func_idx:u32=0][env:i64=undefined].
     let mut memory = vec![0u8; 8];
     memory.extend_from_slice(&[TYPE_FUNCTION, 0, 0, 0]);
@@ -1152,7 +1150,7 @@ fn function_value_decode_reads_type_byte() {
     assert_eq!(decode(bits, &memory), Value::Function);
 }
 
-// S13.1 — the type byte, not the (now single) NaN-box tag, distinguishes a
+// The type byte, not the (single) NaN-box tag, distinguishes a
 // heap string from an array/object: `"a" + "b"` still concatenates, while
 // `[1] === [1]` compares by reference (different blocks) and is `false`.
 #[test]
@@ -1165,10 +1163,10 @@ fn heap_type_byte_disambiguates_string_from_array_object() {
     assert_number("let o = {v: [7, 8]}; o.v[1]", 8.0);
 }
 
-// P3.1 — `for-in` over an object's own enumerable string keys, in insertion
+// `for-in` over an object's own enumerable string keys, in insertion
 // order; the loop binding is each KEY as a string.
 #[test]
-fn for_in_object_keys_milestone() {
+fn for_in_object_keys() {
     // Concatenating the keys of `{a:1, b:2}` yields "ab" (insertion order).
     assert_string(
         "let ks=\"\"; for (const k in {a:1,b:2}) { ks = ks + k } ks",
@@ -1177,7 +1175,7 @@ fn for_in_object_keys_milestone() {
 }
 
 #[test]
-fn for_in_object_value_lookup_milestone() {
+fn for_in_object_value_lookup() {
     // The key binds to a string, so `o[k]` reads each value back: 10 + 32 = 42.
     assert_number(
         "let s=0; let o={x:10,y:32}; for (const k in o) { s = s + o[k] } s",

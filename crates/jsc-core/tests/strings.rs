@@ -6,7 +6,7 @@ use common::{assert_bool, assert_number, assert_output, assert_string};
 
 /// String `toUpperCase`/`toLowerCase` are ASCII case folds producing NEW strings.
 #[test]
-fn string_case_fold_milestone() {
+fn string_case_fold() {
     assert_string("\"abc\".toUpperCase()", "ABC");
     assert_string("\"ABC\".toLowerCase()", "abc");
     assert_string("\"Hi There\".toUpperCase()", "HI THERE");
@@ -16,7 +16,7 @@ fn string_case_fold_milestone() {
 /// String `indexOf(sub)` is the first BYTE index of `sub` (empty `sub` => `0`),
 /// or `-1` when absent.
 #[test]
-fn string_index_of_milestone() {
+fn string_index_of() {
     assert_number("\"hello\".indexOf(\"ll\")", 2.0);
     assert_number("\"hello\".indexOf(\"z\")", -1.0);
     assert_number("\"hello\".indexOf(\"\")", 0.0);
@@ -26,7 +26,7 @@ fn string_index_of_milestone() {
 /// String `slice(a, b)` is the substring `[a, b)` by BYTE index (JS negative/clamp
 /// semantics; `b` omitted => to end), a NEW string.
 #[test]
-fn string_slice_milestone() {
+fn string_slice() {
     assert_string("\"HELLO\".slice(1,3)", "EL");
     assert_string("\"hello\".slice(-3)", "llo");
     assert_string("\"hello\".slice(1)", "ello");
@@ -36,7 +36,7 @@ fn string_slice_milestone() {
 /// String `charAt(i)` is a one-char string at byte index `i`, or `""` when out of
 /// range (including negative / non-existent indices).
 #[test]
-fn string_char_at_milestone() {
+fn string_char_at() {
     assert_string("\"abc\".charAt(1)", "b");
     assert_string("\"abc\".charAt(0)", "a");
     assert_string("\"abc\".charAt(9)", "");
@@ -98,9 +98,9 @@ fn method_arity_errors() {
 }
 
 /// String `trim`/`trimStart`/`trimEnd` remove ASCII whitespace, producing NEW
-/// strings; interior whitespace and non-whitespace are untouched (M2).
+/// strings; interior whitespace and non-whitespace are untouched.
 #[test]
-fn string_trim_milestone() {
+fn string_trim() {
     assert_string("\"  hi  \".trim()", "hi");
     assert_string("\"\\t\\nhi\\r\\n\".trim()", "hi");
     assert_string("\"  a b  \".trimStart()", "a b  ");
@@ -110,9 +110,9 @@ fn string_trim_milestone() {
 }
 
 /// String `repeat(n)` concatenates `n` copies; `0` and a negative/NaN count both
-/// yield `""` (JS throws a `RangeError` for negatives — a documented limitation) (M2).
+/// yield `""` (JS throws a `RangeError` for negatives — a documented limitation).
 #[test]
-fn string_repeat_milestone() {
+fn string_repeat() {
     assert_string("\"ab\".repeat(3)", "ababab");
     assert_string("\"x\".repeat(1)", "x");
     assert_string("\"ab\".repeat(0)", "");
@@ -121,9 +121,9 @@ fn string_repeat_milestone() {
 }
 
 /// String `startsWith`/`endsWith` are boolean prefix/suffix tests; the argument is
-/// coerced to its string form (M2).
+/// coerced to its string form.
 #[test]
-fn string_starts_ends_with_milestone() {
+fn string_starts_ends_with() {
     assert_bool("\"hello\".startsWith(\"he\")", true);
     assert_bool("\"hello\".startsWith(\"lo\")", false);
     assert_bool("\"hello\".endsWith(\"lo\")", true);
@@ -134,9 +134,9 @@ fn string_starts_ends_with_milestone() {
 }
 
 /// String `includes(sub)` is boolean substring containment (empty `sub` => true) —
-/// the array/string overload dispatches on the receiver's TYPE BYTE (M2).
+/// the array/string overload dispatches on the receiver's TYPE BYTE.
 #[test]
-fn string_includes_milestone() {
+fn string_includes() {
     assert_bool("\"hello\".includes(\"ell\")", true);
     assert_bool("\"hello\".includes(\"z\")", false);
     assert_bool("\"hello\".includes(\"\")", true);
@@ -146,9 +146,9 @@ fn string_includes_milestone() {
 }
 
 /// String `padStart`/`padEnd` pad to a BYTE length with a repeated pad string
-/// (default `" "`); an already-long-enough receiver is returned unchanged (M2).
+/// (default `" "`); an already-long-enough receiver is returned unchanged.
 #[test]
-fn string_pad_milestone() {
+fn string_pad() {
     assert_string("\"5\".padStart(3,\"0\")", "005");
     assert_string("\"5\".padStart(3)", "  5");
     assert_string("\"5\".padEnd(3,\"*\")", "5**");
@@ -158,9 +158,9 @@ fn string_pad_milestone() {
 }
 
 /// String `substring(a, b)` is the `[a, b)` BYTE slice with negatives/NaN clamped
-/// to `0` and the endpoints swapped when `a > b` (M2).
+/// to `0` and the endpoints swapped when `a > b`.
 #[test]
-fn string_substring_milestone() {
+fn string_substring() {
     assert_string("\"hello\".substring(1,3)", "el");
     assert_string("\"hello\".substring(3,1)", "el");
     assert_string("\"hello\".substring(-2,3)", "hel");
@@ -169,9 +169,9 @@ fn string_substring_milestone() {
 }
 
 /// String `split(sep)` yields an array of substrings: omitted `sep` => the whole
-/// string, `""` => one element per byte, otherwise split on each occurrence (M2).
+/// string, `""` => one element per byte, otherwise split on each occurrence.
 #[test]
-fn string_split_milestone() {
+fn string_split() {
     assert_number("\"a,b,c\".split(\",\").length", 3.0);
     assert_string("\"a,b,c\".split(\",\")[1]", "b");
     assert_string("\"a,,b\".split(\",\")[1]", "");
@@ -183,7 +183,7 @@ fn string_split_milestone() {
     assert_string("\"a-b-c\".split(\"-\").join(\"+\")", "a+b+c");
 }
 
-/// The M2 methods compose with bound-variable receivers and each other (M2).
+/// The string methods compose with bound-variable receivers and each other.
 #[test]
 fn string_methods_compose() {
     assert_string("let s=\"  Hello  \"; s.trim().toUpperCase()", "HELLO");
@@ -191,9 +191,9 @@ fn string_methods_compose() {
     assert_string("\"ab\".repeat(2).slice(1,3)", "ba");
 }
 
-/// Arity mismatches on the M2 methods are compile errors (M2).
+/// Arity mismatches on the string methods are compile errors.
 #[test]
-fn m2_method_arity_errors() {
+fn string_method_arity_errors() {
     assert!(
         compile_and_run("\"x\".trim(1)").is_err(),
         "trim takes no arguments"
@@ -216,8 +216,8 @@ fn m2_method_arity_errors() {
     );
 }
 
-/// M3 capstone smoke: a classic for-loop `FizzBuzz` that leans on `trim` (M2) to
-/// strip per-line padding — the original motivation for the string-method wave.
+/// Smoke test: a classic for-loop `FizzBuzz` that leans on `trim` to
+/// strip per-line padding.
 /// It composes for/if/`%`/`===`, string concatenation, `String(i)`, `.trim()`,
 /// and `console.log`, and must print the canonical 1..15 `FizzBuzz` lines.
 #[test]

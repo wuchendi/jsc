@@ -1,8 +1,8 @@
 /**
  * A TypeScript port of `crates/jsc-core/src/run/value.rs` (NaN-box decoder and
  * the Node-style value formatter) plus the numeric coercions from
- * `run/host.rs`. ACCEPTED TEMPORARY DEBT (see README): this duplicates Rust
- * runtime semantics so the browser shim can render emitted-module values.
+ * `run/host.rs`. It duplicates Rust runtime semantics (see README, "Host
+ * parity") so the browser shim can render emitted-module values.
  */
 
 import {

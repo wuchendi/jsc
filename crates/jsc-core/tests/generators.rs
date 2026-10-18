@@ -1,4 +1,4 @@
-//! Generator integration tests (P4.2 M2 — state-machine transform).
+//! Generator integration tests (state-machine transform).
 //!
 //! Covers the user-approved v1 cut: `function*` declarations with `yield` in
 //! statement / `x = yield` / `return yield` positions, `.next(v)` returning
@@ -162,7 +162,7 @@ fn a_generator_handle_renders_as_a_generator_object() {
     );
 }
 
-// --- M3: control flow crossing a yield (CFG flattening) ---------------------
+// --- control flow crossing a yield (CFG flattening) -------------------------
 
 #[test]
 fn yields_from_a_for_loop() {
@@ -233,7 +233,7 @@ fn continue_skips_an_iteration_of_a_yielding_loop() {
     );
 }
 
-// --- M3: consuming a generator with for-of ----------------------------------
+// --- consuming a generator with for-of --------------------------------------
 
 #[test]
 fn for_of_drives_a_generator() {
@@ -358,6 +358,35 @@ fn rejects_yield_inside_switch_or_in_a_condition() {
 }
 
 #[test]
+fn unsupported_yield_positions_name_the_construct() {
+    let cases = [
+        (
+            "function* g(){ if (yield 1) {} }",
+            "a `yield` in an `if` condition is not supported",
+        ),
+        (
+            "function* g(){ let i = 0; while (yield i) { i++; } }",
+            "a `yield` in a loop condition or update is not supported",
+        ),
+        (
+            "function* g(){ switch (1) { case 1: yield 1; } }",
+            "a `yield` inside a `switch` is not supported",
+        ),
+        (
+            "function* g(){ yield (yield 1); }",
+            "a `yield` operand may not itself contain a `yield`",
+        ),
+    ];
+    for (src, expected) in cases {
+        let msg = jsc_core::run::compile_and_run(src)
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+        assert_eq!(msg, expected, "diagnostic for `{src}`");
+    }
+}
+
+#[test]
 fn rejects_a_yield_nested_in_a_larger_expression() {
     assert_rejected("function* g(){ let x = (yield 1) + 2; }");
     assert_rejected("function* g(){ foo(yield 1); }");
@@ -400,7 +429,7 @@ fn rejects_a_nested_closure_in_a_generator() {
 
 #[test]
 fn rejects_a_generator_expression() {
-    // Only top-level `function*` DECLARATIONS are supported in M2.
+    // Only top-level `function*` DECLARATIONS are supported.
     assert_rejected("let g = function*(){ yield 1 }; g().next();");
 }
 

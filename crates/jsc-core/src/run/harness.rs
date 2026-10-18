@@ -15,12 +15,12 @@ use crate::abi;
 
 use super::{HEAP, Value, decode, format_value};
 
-/// The `print` host-import flags (S14.1, see [`abi`]): a value plus a trailing
+/// The `print` host-import flags (see [`abi`]): a value plus a trailing
 /// space, or a value plus a newline.
 const PRINT_FLAG_SEP: i32 = abi::PRINT_FLAG_SEP;
 const PRINT_FLAG_END: i32 = abi::PRINT_FLAG_END;
 
-/// The `__convert` host-import op flags (S14.3, see [`abi`]): stringify the
+/// The `__convert` host-import op flags (see [`abi`]): stringify the
 /// argument, coerce it to a number, or parse a leading int/float from its string
 /// form.
 const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
@@ -39,7 +39,7 @@ fn number_bits(n: f64) -> i64 {
 const UNDEFINED_BITS: u64 = abi::UNDEFINED;
 
 /// The names under which `crate::emit` exports the exception-unwinding globals
-/// (S15.1, see [`abi`]): the pending flag (`$exc_pending`, i32) and the in-flight
+/// (see [`abi`]): the pending flag (`$exc_pending`, i32) and the in-flight
 /// value (`$exc_value`, i64). After `main` returns, a set flag means the program
 /// threw an exception that was never caught.
 const EXC_PENDING_EXPORT_NAME: &str = abi::EXC_PENDING_EXPORT_NAME;
@@ -79,13 +79,13 @@ fn oom_guard<W>(caller: &mut Caller<'_, W>, bits: i64) -> wasmtime::Result<i64> 
 /// call traps.
 pub fn run(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>)> {
     // Default sink: `console.log` output streams to the process's real stdout
-    // during execution (S14.1).
+    // during execution.
     let (bits, memory, _out) = run_with_sink(wasm, std::io::stdout())?;
     Ok((bits, memory))
 }
 
 /// Like [`run`], but capture `console.log` output into a string instead of
-/// writing to stdout (S14.1). Returns the raw `main` result bits, the linear
+/// writing to stdout. Returns the raw `main` result bits, the linear
 /// memory snapshot, and everything `console.log` printed (in execution order).
 ///
 /// Used by [`compile_and_run_capturing`] and the test suite to assert printed
@@ -100,7 +100,7 @@ pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
 }
 
 /// Instantiate `wasm` with a `wasmtime::Linker` that supplies the host `print`
-/// import (backing `console.log`, S14.1), call `main`, and return its result
+/// import (backing `console.log`), call `main`, and return its result
 /// bits, a linear-memory snapshot, and the output sink `out`.
 ///
 /// The `print` import reads the caller's linear memory via [`Caller`] and reuses
@@ -147,8 +147,8 @@ fn run_with_sink<W: Write + Send + 'static>(
             let _ = caller.data_mut().sink.write_all(piece.as_bytes());
         },
     )?;
-    // The `__convert` import backs `String`/`Number`/`parseInt`/`parseFloat`
-    // (S14.3). It decodes the argument jsval (reading linear memory for heap-string
+    // The `__convert` import backs `String`/`Number`/`parseInt`/`parseFloat`.
+    // It decodes the argument jsval (reading linear memory for heap-string
     // operands), reuses `format_value`/`value_to_number` and the parse helpers, and
     // returns the converted jsval. `String` allocates a fresh heap string in guest
     // memory via the exported heap-pointer global; the rest return an immediate
@@ -192,7 +192,7 @@ fn run_with_sink<W: Write + Send + 'static>(
             oom_guard(&mut caller, result)
         },
     )?;
-    // The `__method` import backs the non-callback array/string methods (S14.6):
+    // The `__method` import backs the non-callback array/string methods:
     // `indexOf`/`includes`/`join`/`slice` on arrays and
     // `toUpperCase`/`toLowerCase`/`indexOf`/`slice`/`charAt` on strings. It
     // snapshots linear memory to decode the receiver + arguments, branches on the
@@ -214,7 +214,7 @@ fn run_with_sink<W: Write + Send + 'static>(
             oom_guard(&mut caller, result)
         },
     )?;
-    // The host promise imports (P4.1): `__promise` backs Promise.resolve/reject,
+    // The host promise imports: `__promise` backs Promise.resolve/reject,
     // top-level `await`, and `p.finally`; `__then` backs `p.then`/`p.catch`. Both
     // drive the host promise engine (`super::promise`).
     linker.func_wrap(
@@ -240,7 +240,7 @@ fn run_with_sink<W: Write + Send + 'static>(
             oom_guard(&mut caller, result)
         },
     )?;
-    // The `__now` import (P-series `Date`): the host wall clock backing
+    // The `__now` import (`Date`): the host wall clock backing
     // `Date.now()` / `new Date()`, returning milliseconds since the Unix epoch as
     // an f64. A clock stepped backwards before the epoch yields `0` rather than
     // trapping.
@@ -265,7 +265,7 @@ fn run_with_sink<W: Write + Send + 'static>(
     }
     let result = called?;
     // Drain any microtasks scheduled by `.then`/`.catch`/`.finally` but never
-    // awaited (P4.1), UNLESS `main` itself completed abruptly with a pending
+    // awaited, UNLESS `main` itself completed abruptly with a pending
     // exception (an uncaught throw or a top-level `await` rejection) — in which
     // case the program has already terminated and the queue must not run.
     let main_pending = instance
@@ -284,7 +284,7 @@ fn run_with_sink<W: Write + Send + 'static>(
         Some(mem) => mem.data(&store).to_vec(),
         None => Vec::new(),
     };
-    // Uncaught-exception check (S15.1): if `main` returned with `$exc_pending`
+    // Uncaught-exception check: if `main` returned with `$exc_pending`
     // set, the program threw an exception that propagated all the way out. Render
     // the in-flight `$exc_value` (resolving heap pointers against the snapshot)
     // and surface it as a distinct error instead of a normal result — never a
@@ -324,7 +324,7 @@ pub fn compile_and_run(src: &str) -> anyhow::Result<Value> {
 }
 
 /// Compile and run JavaScript `src`, capturing everything `console.log` prints
-/// (S14.1) instead of writing it to stdout.
+/// instead of writing it to stdout.
 ///
 /// Returns the program's final [`Value`] (the last expression statement's value)
 /// paired with the captured `console.log` output, in execution order. This is

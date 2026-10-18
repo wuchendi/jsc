@@ -75,7 +75,7 @@ pub enum LogicalOp {
     Nullish,
 }
 
-/// A `Math.*` built-in method (S14.2). `Math` is not a real binding — these are
+/// A `Math.*` built-in method. `Math` is not a real binding — these are
 /// recognized syntactically from a `Math.<name>(..)` member callee at codegen and
 /// lowered to native wasm `f64` ops (or an inline loop, for [`MathOp::Pow`]). The
 /// `Math.PI` / `Math.E` constants are property READS and lower directly to
@@ -102,16 +102,17 @@ pub enum MathOp {
     /// wasm `f64.max`, which propagates NaN and orders `+0 > -0` like JS.
     Max,
     /// `Math.pow(base, exp)` — base raised to exp. wasm has no `f64` pow, so it is
-    /// emitted as an inline squaring-free multiply loop over the truncated integer
-    /// exponent (correct for integer exponents, including negatives; a fractional
-    /// exponent is truncated — a documented limitation).
+    /// emitted inline: a multiply loop over `trunc(|exp|)` (exact for integer
+    /// exponents), then the fractional part applied bit by bit via successive
+    /// `f64.sqrt` roots of `base`. A negative exponent reciprocates the result; a
+    /// negative base with a fractional exponent yields `NaN`.
     Pow,
 }
 
-/// An array higher-order method (S14.5): `map`/`filter`/`reduce`/`forEach`.
+/// An array higher-order method: `map`/`filter`/`reduce`/`forEach`.
 /// Recognized syntactically from a `<expr>.<name>(callback[, init])` member callee
 /// at codegen (kept distinct from `x[i]` element indexing), each invoking the
-/// callback function value per element via the S13 `call_indirect` ABI.
+/// callback function value per element via the `call_indirect` ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayHofOp {
     /// `arr.map(fn)` — a NEW array of the same length where `result[i] =
@@ -128,7 +129,7 @@ pub enum ArrayHofOp {
     ForEach,
 }
 
-/// A conversion built-in (S14.3): `String`/`Number`/`Boolean`/`parseInt`/
+/// A conversion built-in: `String`/`Number`/`Boolean`/`parseInt`/
 /// `parseFloat`. Recognized syntactically from a bare-identifier callee at codegen
 /// (only when nothing of the same name shadows it), each taking one argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +150,7 @@ pub enum ConvertOp {
     ParseFloat,
 }
 
-/// A non-callback array/string method (S14.6). Recognized syntactically from a
+/// A non-callback array/string method. Recognized syntactically from a
 /// `<expr>.<name>(args)` member callee at codegen (kept distinct from `x[i]`
 /// element indexing), each dispatched host-side through the `__method` import.
 /// `IndexOf` and `Slice` exist on BOTH arrays and strings, so the host branches
@@ -215,7 +216,7 @@ pub enum MethodOp {
     Split,
 }
 
-/// An `Object.*` collection built-in (P3.2): `Object.keys`/`values`/`entries`.
+/// An `Object.*` collection built-in: `Object.keys`/`values`/`entries`.
 /// `Object` is not a real binding — these are recognized syntactically from an
 /// `Object.<name>(arg)` member callee at codegen (only when nothing named
 /// `Object` shadows it) and each takes exactly one object argument, returning a
@@ -259,7 +260,7 @@ pub enum InstanceOfKind {
     Array,
     /// `instanceof Function` — the receiver is a heap `TYPE_FUNCTION` value.
     Function,
-    /// `instanceof Date` — the receiver is a heap `TYPE_DATE` block (P-series).
+    /// `instanceof Date` — the receiver is a heap `TYPE_DATE` block.
     Date,
     /// `instanceof Object` — the receiver is any heap pointer that is not a
     /// primitive string.
@@ -273,7 +274,7 @@ pub enum InstanceOfKind {
     Class(Box<IrNode>),
 }
 
-/// A `Map`/`Set` instance method (P3.5). Recognized syntactically from a
+/// A `Map`/`Set` instance method. Recognized syntactically from a
 /// `<expr>.<name>(args)` member callee at codegen; because these names
 /// (`set`/`get`/`has`/`add`/`delete`) can ALSO be ordinary object/class methods
 /// (e.g. `class C { add(x) {..} }`), the lowered [`IrNode::MapMethod`] dispatches
@@ -296,7 +297,7 @@ pub enum MapOp {
     Delete,
 }
 
-/// A `Date` instance method (P-series). Like [`MapOp`], these names can ALSO be
+/// A `Date` instance method. Like [`MapOp`], these names can ALSO be
 /// ordinary user methods, so the lowered [`IrNode::DateMethod`] dispatches at
 /// RUNTIME on the receiver's TYPE BYTE: a `TYPE_DATE` block computes the field
 /// GUEST-side from its stored f64 epoch-ms, and anything else falls back to a
@@ -329,7 +330,7 @@ pub enum DateOp {
 /// One element of a spread-capable sequence — an array literal or a call's
 /// argument list — that contains at least one `...` source. The whole sequence
 /// is materialized at runtime (its length is not known until then), appending
-/// each part left-to-right (P1.5).
+/// each part left-to-right.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpreadElem {
     /// A plain element/argument `e`, appended as a single value.
@@ -339,7 +340,7 @@ pub enum SpreadElem {
     Spread(IrNode),
 }
 
-/// How a spread call reaches its callee (P1.5), mirroring the direct/indirect
+/// How a spread call reaches its callee, mirroring the direct/indirect
 /// split of [`IrNode::Call`] / [`IrNode::CallIndirect`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpreadCallee {
@@ -358,8 +359,8 @@ pub enum IrNode {
     /// A string literal. It lowers to a heap-pointer jsval (single heap tag
     /// `0b101`) whose payload is the compile-time byte offset of the literal's
     /// block base in the emitted linear memory's static data. The block is
-    /// `[type=0][pad×3][len:u32][utf8]` — a `HEADER_SIZE`-byte type header (S13.1)
-    /// in front of the S10 `[len][utf8]` payload.
+    /// `[type=0][pad×3][len:u32][utf8]` — a `HEADER_SIZE`-byte type header
+    /// in front of the `[len][utf8]` payload.
     Str(String),
     /// A boolean literal (`true`/`false`).
     Bool(bool),
@@ -401,10 +402,10 @@ pub enum IrNode {
     /// A first-class **function value** built from a function declaration named
     /// in value position (`let f = add;`, `return add;`, passing `add` as an
     /// argument), from an arrow, or from a function expression. It lowers to a
-    /// heap block (type byte `3`, S13.2) holding the function's
+    /// heap block (type byte `3`) holding the function's
     /// **funcref-table index** and an environment slot. For a non-capturing
     /// function `captures` is empty and the env slot is `undefined`; for a
-    /// **closure** (S13.4) `captures` lists the source expressions — one per env
+    /// **closure** `captures` lists the source expressions — one per env
     /// slot, in slot order — that each yield a boxed-cell pointer, and the env
     /// slot points at a freshly built environment block holding those cells.
     FuncValue {
@@ -417,15 +418,15 @@ pub enum IrNode {
         captures: Vec<IrNode>,
     },
     /// Allocate a **boxed cell** (heap block, type byte `5`) holding the value of
-    /// the sub-expression, and yield the cell's heap-pointer jsval (S13.4). A
+    /// the sub-expression, and yield the cell's heap-pointer jsval. A
     /// captured `let`/`const`/parameter binding is stored through such a cell so
     /// that a closure capturing it shares its mutations by reference.
     CellNew(Box<IrNode>),
     /// Read the value stored in a boxed cell: evaluate the sub-expression to a
-    /// cell pointer, then load the `jsval` at `cell + HEADER_SIZE` (S13.4).
+    /// cell pointer, then load the `jsval` at `cell + HEADER_SIZE`.
     CellGet(Box<IrNode>),
     /// Store `value` into the boxed cell named by `cell` and yield the stored
-    /// value (S13.4). Both sub-expressions are cell/local reads with no side
+    /// value. Both sub-expressions are cell/local reads with no side
     /// effects, so evaluating `cell` twice (as some desugarings do) is safe.
     CellSet {
         /// The expression yielding the target cell pointer.
@@ -434,7 +435,7 @@ pub enum IrNode {
         value: Box<IrNode>,
     },
     /// Load the boxed-cell pointer at environment slot `slot` of the currently
-    /// executing closure (S13.4): the environment jsval is the last wasm
+    /// executing closure: the environment jsval is the last wasm
     /// parameter (the uniform ABI's `env` slot); this reads the cell pointer at
     /// `env + HEADER_SIZE + 4 + 8*slot`. Used inside a closure body to reach a
     /// captured binding's cell.
@@ -449,16 +450,16 @@ pub enum IrNode {
     /// its binding's declaration runs, as a boolean jsval. Guards accesses to a
     /// module binding from a function body, which may run before the declaration.
     IsHole(Box<IrNode>),
-    /// A `yield expr` expression (P4.2 M2). Produced by lowering a generator
+    /// A `yield expr` expression. Produced by lowering a generator
     /// body; the generator segmentation pass CONSUMES every `Yield`, turning it
     /// into a state-machine suspend point, so a `Yield` that survives to the
     /// backend is an unsupported yield position (rejected by codegen before emit).
     Yield(Box<IrNode>),
     /// Read the value passed to the generator's `.next(v)` for the `yield` that is
-    /// resuming (P4.2 M2): the state machine's first wasm parameter (local `0`,
+    /// resuming: the state machine's first wasm parameter (local `0`,
     /// `sent`). Emitted at the start of a resumed segment to bind `x = yield …`.
     SentValue,
-    /// Build a `Generator` handle (P4.2 M2): allocate the [`abi::TYPE_GENERATOR`]
+    /// Build a `Generator` handle: allocate the [`abi::TYPE_GENERATOR`]
     /// block, allocate `total` boxed cells for the frame (the first `slots.len()`
     /// initialized from the constructor's argument expressions, the rest to
     /// `undefined`), stash them in a `TYPE_ENV` frame block stored in the handle's
@@ -473,11 +474,11 @@ pub enum IrNode {
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
     },
-    /// Whether the sub-expression is a generator handle (P4.2 M3): yields a
+    /// Whether the sub-expression is a generator handle: yields a
     /// boolean jsval. Used by `for-of`/spread to branch between driving a
     /// generator via `.next()` and the ordinary array/string index walk.
     IsGenerator(Box<IrNode>),
-    /// Drive a generator one step — `gen.next(sent)` (P4.2 M2). Evaluate `gen` to
+    /// Drive a generator one step — `gen.next(sent)`. Evaluate `gen` to
     /// a handle, `call_indirect` its state machine with `(sent, gen)`, then build
     /// the `{ value, done }` result object from the returned value and the
     /// handle's `done` flag. A non-generator receiver throws a `TypeError`.
@@ -502,33 +503,33 @@ pub enum IrNode {
     },
     /// The unary `typeof` operator applied to a sub-expression. It yields a
     /// boxed type-string immediate (tag `0b100`) naming the operand's runtime
-    /// type (`"number"`/`"boolean"`/`"object"`/`"undefined"` in the S9 subset).
+    /// type (`"number"`/`"boolean"`/`"object"`/`"undefined"`).
     TypeOf(Box<IrNode>),
     /// An array literal `[e0, e1, ..]`. It lowers to a heap array (single heap tag
     /// `0b101`, type byte `1`): `__alloc(HEADER_SIZE + 4 + 8*n)`, the type byte, a
     /// u32 `len` header of `n`, then each element jsval stored at
-    /// `ptr + HEADER_SIZE + 4 + 8*k` (S11 payload shifted by the S13.1 header).
+    /// `ptr + HEADER_SIZE + 4 + 8*k`.
     /// Elements are evaluated left-to-right.
     Array(Vec<IrNode>),
-    /// An array literal containing at least one spread element `[0, ...a, 9]`
-    /// (P1.5). Built at runtime: start from a fresh empty array and, left-to-
+    /// An array literal containing at least one spread element `[0, ...a, 9]`.
+    /// Built at runtime: start from a fresh empty array and, left-to-
     /// right, append each plain element (via `__array_push`) or every element of
     /// each spread source (via `__array_concat`). Yields the finished array's
     /// heap jsval.
     ArraySpread(Vec<SpreadElem>),
-    /// A call whose argument list contains a spread `f(...a)` / `add(1, ...xs)`
-    /// (P1.5). The arguments are first materialized into a heap array (the same
+    /// A call whose argument list contains a spread `f(...a)` / `add(1, ...xs)`.
+    /// The arguments are first materialized into a heap array (the same
     /// build as [`IrNode::ArraySpread`], carried by `args`); the call then
     /// spreads that array's elements into the uniform ABI's fixed `K` positional
     /// slots (padding with `undefined`, dropping any beyond `K`) and passes the
-    /// array's length as the dynamic `argc` (P1.4).
+    /// array's length as the dynamic `argc`.
     CallSpread {
         /// How to reach the callee (direct index or computed value).
         target: SpreadCallee,
         /// The argument array to spread — an [`IrNode::ArraySpread`].
         args: Box<IrNode>,
     },
-    /// `Math.max(...)` / `Math.min(...)` with a spread argument (P1.5). Builds
+    /// `Math.max(...)` / `Math.min(...)` with a spread argument. Builds
     /// the argument array (like [`IrNode::ArraySpread`], carried by `args`) then
     /// folds `f64.max` / `f64.min` over its elements from the identity
     /// (`-Infinity` / `+Infinity`), yielding a number jsval.
@@ -542,10 +543,10 @@ pub enum IrNode {
     /// lowers to a heap object (single heap tag `0b101`, type byte `2`):
     /// `__alloc(HEADER_SIZE + 4 + 16*n)`, the type byte, a u32 `n` header, then
     /// each entry's key heap-string pointer at `ptr + HEADER_SIZE + 4 + 16*k` and
-    /// value jsval at `+8` (S11 payload shifted by the S13.1 header). Keys are
+    /// value jsval at `+8`. Keys are
     /// interned as static strings; value expressions are evaluated left-to-right.
     Object(Vec<(String, IrNode)>),
-    /// An object rest binding `let {a, ...rest} = obj` (P1.2). Builds a NEW heap
+    /// An object rest binding `let {a, ...rest} = obj`. Builds a NEW heap
     /// object holding every own key of `source` EXCEPT the statically-known
     /// destructured keys in `exclude`. `source` is evaluated once (a hidden temp
     /// read); `exclude` is an [`IrNode::Array`] of [`IrNode::Str`] key names. It
@@ -559,8 +560,8 @@ pub enum IrNode {
         exclude: Box<IrNode>,
     },
     /// The `.length` member of a string or array: reads the u32 `len` header at
-    /// the operand's block base `+ HEADER_SIZE` and produces it as a number jsval
-    /// (S10/S11). The operand is assumed to be a string or array pointer (both
+    /// the operand's block base `+ HEADER_SIZE` and produces it as a number jsval.
+    /// The operand is assumed to be a string or array pointer (both
     /// carry the same u32 header at that offset).
     StrLen(Box<IrNode>),
     /// The nullish-receiver guard of a builtin member access (`recv.length`,
@@ -574,8 +575,8 @@ pub enum IrNode {
         /// The property name the access reads (for the error message).
         key: String,
     },
-    /// Computed indexing `obj[index]`, dispatched at runtime on `obj`'s TYPE BYTE
-    /// (S13.1). A string block (type `0`) allocates and returns a fresh
+    /// Computed indexing `obj[index]`, dispatched at runtime on `obj`'s TYPE BYTE.
+    /// A string block (type `0`) allocates and returns a fresh
     /// one-character heap string holding the BYTE at `index`; an array block (type
     /// `1`) loads and returns the element jsval at `ptr + HEADER_SIZE + 4 +
     /// 8*index`; an object block (type `2`) linear-scans its entries for a key
@@ -595,7 +596,7 @@ pub enum IrNode {
     /// the class's shared `@@prototype` (alongside the plain method values), so a
     /// member READ that resolves to this box invokes `getter()` with `this` = the
     /// receiver, and a member WRITE invokes `setter(value)`. Both halves are
-    /// ordinary lifted function values that read `this` through the P2.1 carrier,
+    /// ordinary lifted function values that read `this` through the `this` carrier,
     /// exactly like a method. Built ONCE per accessor property at class-definition
     /// time — never copied per instance.
     MakeAccessor {
@@ -606,11 +607,11 @@ pub enum IrNode {
         /// declares only a getter.
         setter: Box<IrNode>,
     },
-    /// Computed element assignment `obj[index] = value` (S11). It stores `value`
+    /// Computed element assignment `obj[index] = value`. It stores `value`
     /// into the EXISTING slot at `ptr + HEADER_SIZE + 4 + 8*index` of the array
     /// `obj` and yields `value` (JS: `a[i] = v` evaluates to `v`). `obj` is assumed
     /// to be an array block (type byte `1`) and `index` a number in bounds — no
-    /// bounds check and no growth (growing an array is deferred to S12+). An object
+    /// bounds check and no growth. An object
     /// target (type byte `2`) dispatches to the key-scan store instead.
     IndexSet {
         /// The array being written (a heap array-pointer jsval).
@@ -621,7 +622,7 @@ pub enum IrNode {
         value: Box<IrNode>,
     },
     /// Compound element assignment `obj[index] op= rhs` (`+=`/`-=`/`*=`/`/=`/`%=`)
-    /// on an array element or object member (S13.5). `obj` and `index` are each
+    /// on an array element or object member. `obj` and `index` are each
     /// evaluated EXACTLY ONCE into the fresh temp locals `obj_local`/`idx_local`,
     /// the current member value is read back through those temps, combined with
     /// `rhs` via `op` (reusing the [`IrNode::Binary`] overload — so `+=` on a
@@ -647,7 +648,7 @@ pub enum IrNode {
         /// Whether this is a plain compound assignment or a member `++`/`--`.
         kind: OpSetKind,
     },
-    /// `array.push(value)` on a plain-local array binding (S14.4). Growing the
+    /// `array.push(value)` on a plain-local array binding. Growing the
     /// fixed-size array block: a runtime helper allocates a new block of `len + 1`
     /// capacity, copies the header + existing elements, appends `value`, and bumps
     /// the length; the `local` is then REBOUND (`local.set`) to the new block base
@@ -661,7 +662,7 @@ pub enum IrNode {
         /// The value appended at the new last slot.
         value: Box<IrNode>,
     },
-    /// `array.pop()` on a plain-local array binding (S14.4). Shrinks the block in
+    /// `array.pop()` on a plain-local array binding. Shrinks the block in
     /// place: the u32 length header is decremented and the removed last element
     /// jsval is yielded (no realloc, the local keeps its pointer). An empty array
     /// yields `undefined`.
@@ -669,11 +670,11 @@ pub enum IrNode {
         /// The wasm local holding the array whose block is decremented in place.
         local: u32,
     },
-    /// An array higher-order method call `array.map/filter/reduce/forEach(...)`
-    /// (S14.5). The `array` receiver is evaluated once into a scratch base (it is
+    /// An array higher-order method call `array.map/filter/reduce/forEach(...)`.
+    /// The `array` receiver is evaluated once into a scratch base (it is
     /// NOT rebound — unlike [`IrNode::ArrayPush`] — so any array expression works),
     /// then a counted wasm loop over its length invokes the `callback` FUNCTION
-    /// value per element through the S13 `call_indirect` ABI (env-last): the
+    /// value per element through the `call_indirect` ABI (env-last): the
     /// positional args are `(element, index)` for `Map`/`Filter`/`ForEach` and
     /// `(acc, element, index)` for `Reduce`, padded with `undefined` to the shared
     /// funcref arity. `Map` fills a fresh same-length array; `Filter` grows a fresh
@@ -690,7 +691,7 @@ pub enum IrNode {
         /// others).
         init: Option<Box<IrNode>>,
     },
-    /// A non-callback array/string method call `recv.method(args)` (S14.6). The
+    /// A non-callback array/string method call `recv.method(args)`. The
     /// receiver is evaluated once, then the whole operation runs host-side through
     /// the `__method` import, which decodes the receiver (reading linear memory)
     /// and branches on its runtime TYPE BYTE for the overloaded `IndexOf`/`Slice`
@@ -737,7 +738,7 @@ pub enum IrNode {
         /// (yields the old value).
         prefix: bool,
     },
-    /// A `console.log(a0, a1, ..)` call (S14.1). It is NOT a user-function call:
+    /// A `console.log(a0, a1, ..)` call. It is NOT a user-function call:
     /// it lowers to a sequence of calls to the host `print` import, one per
     /// argument, then yields the `undefined` jsval (its expression value). The
     /// backend formats each argument's jsval on the host side (reusing
@@ -748,7 +749,7 @@ pub enum IrNode {
         /// The argument expressions, in source order (0..N).
         args: Vec<IrNode>,
     },
-    /// A `Math.<name>(a0, a1, ..)` built-in method call (S14.2). `Math` is not a
+    /// A `Math.<name>(a0, a1, ..)` built-in method call. `Math` is not a
     /// real binding: this is recognized syntactically at codegen and lowered to
     /// native wasm `f64` ops (or an inline loop for [`MathOp::Pow`]). Arguments
     /// are evaluated left-to-right; the numeric result is a reboxed number jsval.
@@ -761,7 +762,7 @@ pub enum IrNode {
         args: Vec<IrNode>,
     },
     /// A conversion built-in call `String(x)` / `Number(x)` / `Boolean(x)` /
-    /// `parseInt(s)` / `parseFloat(s)` (S14.3). These are bare global function
+    /// `parseInt(s)` / `parseFloat(s)`. These are bare global function
     /// names, not real bindings: they are recognized syntactically at codegen
     /// (only when nothing of the same name shadows them) and take exactly one
     /// argument. `Boolean` lowers to inline JS-truthiness wasm; the other four
@@ -785,21 +786,20 @@ pub enum IrNode {
         /// The expression evaluated when `cond` is falsy.
         else_branch: Box<IrNode>,
     },
-    /// A `throw expr` operation (S15.1). The sub-expression is evaluated to a
+    /// A `throw expr` operation. The sub-expression is evaluated to a
     /// jsval, stashed into the `$exc_value` module global, and the `$exc_pending`
     /// global is set to `1` to mark an exception in flight; control then transfers
-    /// to the nearest handler. In S15.1 there is no `try` yet, so this always
-    /// unwinds to the enclosing function boundary (an early `return` of the
-    /// function's dummy result). It never produces a real value — a `throw`
-    /// diverges — but as an [`IrNode`] it nominally leaves an (unreachable) jsval
-    /// on the stack so it composes in expression position.
+    /// to the nearest handler: the enclosing `try` or, absent one, the enclosing
+    /// function boundary (an early `return` of the function's dummy result). It
+    /// never produces a real value — a `throw` diverges — but as an [`IrNode`] it
+    /// nominally leaves an (unreachable) jsval on the stack so it composes in expression position.
     Throw(Box<IrNode>),
-    /// The in-flight thrown value: reads the `$exc_value` module global as a jsval
-    /// (S15.2). Only meaningful on a `catch` entry path, where the handler binds it
+    /// The in-flight thrown value: reads the `$exc_value` module global as a jsval.
+    /// Only meaningful on a `catch` entry path, where the handler binds it
     /// to the catch parameter (see [`IrStmt::Try`]); the value is written by
     /// [`IrNode::Throw`] and stays valid until the next throw overwrites it.
     ExcValue,
-    /// A user method call `obj.m(args)` binding `this = obj` (P2.1). Distinct from
+    /// A user method call `obj.m(args)` binding `this = obj`. Distinct from
     /// [`IrNode::CallIndirect`] (which resets `this` to `undefined`) and from the
     /// builtin [`IrNode::MethodCall`] (array/string host methods). `obj` is
     /// evaluated ONCE into the fresh temp `obj_local`; the callee is the function
@@ -820,7 +820,7 @@ pub enum IrNode {
         /// evaluation and the `__this` set.
         obj_local: u32,
     },
-    /// Read the `__this` wasm global (P2.1). Emitted ONLY in a function/arrow
+    /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
     /// slot, so a nested method call that re-sets the global does not disturb this
     /// frame's already-captured `this`.
@@ -844,7 +844,7 @@ pub enum IrNode {
         /// `__this` for the call.
         this_local: u32,
     },
-    /// A class instantiation `new A(args)` (P2.2). Allocates the fresh `instance`
+    /// A class instantiation `new A(args)`. Allocates the fresh `instance`
     /// object (pre-shaped with the reserved prototype link plus one slot per field
     /// the constructor assigns via `this.<field> = ..`, since the object model has
     /// no dynamic key growth), binds `this = instance`, runs the constructor
@@ -867,10 +867,10 @@ pub enum IrNode {
         instance_local: u32,
     },
     /// The enumerable KEY at position `index` of `obj`, produced as a heap STRING
-    /// jsval (P3.1). This is the key-table iteration primitive `for-in` desugars
-    /// to (and that P3.2 `Object.keys` / P3.4 `JSON.stringify` reuse): a counted
+    /// jsval. This is the key-table iteration primitive `for-in` desugars
+    /// to (and that `Object.keys` / `JSON.stringify` reuse): a counted
     /// loop over `0 <= index < StrLen(obj)` reads each key through this node.
-    /// Dispatches at RUNTIME on `obj`'s TYPE BYTE (S13.1): an object
+    /// Dispatches at RUNTIME on `obj`'s TYPE BYTE: an object
     /// (`TYPE_OBJECT`) returns the key heap-string jsval already stored at entry
     /// `index` (`ptr + HEADER_SIZE + 4 + 16*index`), in insertion order; anything
     /// else (an array, or a string) treats `index` as a numeric position and
@@ -883,7 +883,7 @@ pub enum IrNode {
         /// The position of the key to read (a number jsval, `0..length`).
         index: Box<IrNode>,
     },
-    /// An `Object.keys/values/entries(arg)` collection built-in call (P3.2). The
+    /// An `Object.keys/values/entries(arg)` collection built-in call. The
     /// `arg` object is evaluated once to a heap-object jsval, then a runtime helper
     /// (`__obj_keys`/`__obj_values`/`__obj_entries`) linear-scans its key table —
     /// skipping the reserved hidden `@@`-prefixed keys — and builds a fresh growable
@@ -895,7 +895,7 @@ pub enum IrNode {
         /// The single object argument, evaluated once to a heap-object jsval.
         arg: Box<IrNode>,
     },
-    /// A `key in obj` membership test (P3.3), yielding a `true`/`false` jsval. Both
+    /// A `key in obj` membership test, yielding a `true`/`false` jsval. Both
     /// operands are evaluated once to heap jsvals; a runtime helper (`__obj_has`)
     /// linear-scans `obj`'s own key table for a key whose byte content equals the
     /// `key` heap-string (own keys only — the prototype chain is NOT walked).
@@ -920,7 +920,7 @@ pub enum IrNode {
         /// What the right-hand side names.
         kind: InstanceOfKind,
     },
-    /// A `delete obj.k` property removal (P3.3), always yielding a `true` jsval.
+    /// A `delete obj.k` property removal, always yielding a `true` jsval.
     /// Both operands are evaluated once to heap jsvals; a runtime helper
     /// (`__obj_delete`) linear-scans `obj`'s own key table for the `key`
     /// heap-string and, on a match, compacts the entry out (shifts the trailing
@@ -932,7 +932,7 @@ pub enum IrNode {
         /// The property-key operand (a heap-string jsval).
         key: Box<IrNode>,
     },
-    /// A `JSON.stringify(arg)` serialization call (P3.4), yielding a heap-string
+    /// A `JSON.stringify(arg)` serialization call, yielding a heap-string
     /// jsval (or `undefined` when `arg` is itself `undefined`/a function). The
     /// `arg` value is evaluated once and serialized entirely in-wasm by a recursive
     /// runtime helper (`__json_str`): numbers/booleans/`null` render literally
@@ -946,7 +946,7 @@ pub enum IrNode {
         /// The single value argument, evaluated once and serialized.
         arg: Box<IrNode>,
     },
-    /// A `JSON.parse(text)` call (un-defers the P3.4 backlog item). `arg` is
+    /// A `JSON.parse(text)` call. `arg` is
     /// coerced to a string (via the `__convert` `ToString` import) and handed to
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
     /// guest value tree — including OBJECTS with **runtime-unknown keys**, built by
@@ -960,7 +960,7 @@ pub enum IrNode {
         /// The single text argument, evaluated once and parsed.
         arg: Box<IrNode>,
     },
-    /// A `new Map()` / `new Set()` construction (P3.5). Allocates a fresh handle
+    /// A `new Map()` / `new Set()` construction. Allocates a fresh handle
     /// block (type byte `TYPE_MAP` or `TYPE_SET`) with a zero `size` header and a
     /// freshly bump-allocated empty growable backing array, and yields the handle
     /// heap jsval. Only the empty-constructor form is in scope — `new Map([[k, v]])`
@@ -971,7 +971,7 @@ pub enum IrNode {
         /// thus the render label) differs.
         set: bool,
     },
-    /// A `Map`/`Set` method call `recv.<op>(args)` (P3.5). `recv` is evaluated ONCE
+    /// A `Map`/`Set` method call `recv.<op>(args)`. `recv` is evaluated ONCE
     /// into `recv_local`, then a RUNTIME dispatch on its TYPE BYTE selects the path:
     /// a `TYPE_MAP`/`TYPE_SET` handle runs the collection op (`op`) over the shared
     /// flattened `(key, value)` backing via the `__map_*` runtime helpers; any other
@@ -994,15 +994,15 @@ pub enum IrNode {
         /// Fresh temp local for the fallback user method call's own receiver stash.
         fallback_obj_local: u32,
     },
-    /// `Promise.resolve(v)` (P4.1): build a promise already fulfilled with `v`
+    /// `Promise.resolve(v)`: build a promise already fulfilled with `v`
     /// (or return `v` unchanged when it is itself a promise). Lowers to the host
     /// `__promise` import with [`crate::abi::PROMISE_OP_RESOLVE`].
     PromiseResolve(Box<IrNode>),
-    /// `Promise.reject(v)` (P4.1): build a promise already rejected with reason
+    /// `Promise.reject(v)`: build a promise already rejected with reason
     /// `v`. Lowers to the host `__promise` import with
     /// [`crate::abi::PROMISE_OP_REJECT`].
     PromiseReject(Box<IrNode>),
-    /// `p.then(onF, onR)` / `p.catch(onR)` (P4.1): register the reactions on `p`
+    /// `p.then(onF, onR)` / `p.catch(onR)`: register the reactions on `p`
     /// and yield the chained result promise. A missing handler is `undefined`
     /// (passthrough). Lowers to the host `__then` import.
     PromiseThen {
@@ -1013,7 +1013,7 @@ pub enum IrNode {
         /// The rejection handler (`undefined` when absent).
         on_rejected: Box<IrNode>,
     },
-    /// `p.finally(fn)` (P4.1): run `fn` on settlement and pass `p`'s original
+    /// `p.finally(fn)`: run `fn` on settlement and pass `p`'s original
     /// settlement through to the chained result promise. Lowers to the host
     /// `__promise` import with [`crate::abi::PROMISE_OP_FINALLY`].
     PromiseFinally {
@@ -1022,14 +1022,14 @@ pub enum IrNode {
         /// The finalizer callback, run for its side effect on settlement.
         on_finally: Box<IrNode>,
     },
-    /// Top-level `await p` (P4.1): drive the host microtask queue until `p`
+    /// Top-level `await p`: drive the host microtask queue until `p`
     /// settles, then yield its fulfillment value (or unwind its rejection through
     /// the exception globals). Lowers to the host `__promise` import with
     /// [`crate::abi::PROMISE_OP_AWAIT`]. Only reachable at the top level — an
     /// `await` inside a function body is a parse error (async functions stay
     /// unsupported).
     Await(Box<IrNode>),
-    /// `new Promise(executor)` (P4.1): allocate a fresh pending promise `P`
+    /// `new Promise(executor)`: allocate a fresh pending promise `P`
     /// (stashed in `p_local`), build `resolve`/`reject` FUNCTION values bound to
     /// `P` (via the settler funcref slots), call `executor(resolve, reject)`
     /// synchronously — a throwing executor rejects `P` — and yield `P`. The
@@ -1041,7 +1041,7 @@ pub enum IrNode {
         /// A dedicated local (not scratch) holding `P` across the executor call.
         p_local: u32,
     },
-    /// Spawn an `async function` body (P4.3 M4): the operand is a
+    /// Spawn an `async function` body: the operand is a
     /// [`IrNode::MakeGenerator`] building the handle for the body compiled as a
     /// generator state machine (`await` == `yield`). Lowers to the host
     /// `__promise` import with [`crate::abi::PROMISE_OP_ASYNC_SPAWN`], which
@@ -1049,7 +1049,7 @@ pub enum IrNode {
     /// promise. Emitted as the whole body of the wrapper function the `async`
     /// name binds to (`return AsyncSpawn(MakeGenerator{..})`).
     AsyncSpawn(Box<IrNode>),
-    /// `new Date()` / `new Date(ms)` (P-series). Allocates a fresh `TYPE_DATE`
+    /// `new Date()` / `new Date(ms)`. Allocates a fresh `TYPE_DATE`
     /// block whose f64 payload is the timestamp in milliseconds since the Unix
     /// epoch, and yields the handle heap jsval. `ms` is `None` for the no-argument
     /// form (the payload is the host clock, the `__now` import); otherwise it is
@@ -1060,17 +1060,17 @@ pub enum IrNode {
         /// The millisecond timestamp expression, or `None` for the host clock.
         ms: Option<Box<IrNode>>,
     },
-    /// `Date.now()` (P-series): the host wall-clock time in milliseconds since the
+    /// `Date.now()`: the host wall-clock time in milliseconds since the
     /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
     DateNow,
-    /// `d.getTime()` (P-series): the millisecond timestamp of a `TYPE_DATE`
+    /// `d.getTime()`: the millisecond timestamp of a `TYPE_DATE`
     /// receiver as a number jsval. `recv` is evaluated once; a non-`Date` receiver
     /// yields `NaN` (jsc models no method-receiver `TypeError` here).
     DateGetTime {
         /// The receiver expression (evaluated once).
         recv: Box<IrNode>,
     },
-    /// A `Date` instance method `recv.<op>(args)` (P-series). Like
+    /// A `Date` instance method `recv.<op>(args)`. Like
     /// [`IrNode::MapMethod`], `recv` is evaluated ONCE into `recv_local`, then a
     /// RUNTIME dispatch on its TYPE BYTE selects the path: a `TYPE_DATE` block
     /// computes the field (`op`) GUEST-side from its stored f64 epoch-ms; any other
@@ -1170,10 +1170,10 @@ pub enum IrStmt {
     /// loop; `Some(id)` is a labeled `continue LABEL` targeting the loop whose
     /// [`IrStmt::While::label`] equals `id`. Only valid inside a loop (not a bare
     /// `switch`). Like `break`, it runs any intervening `finally` clauses on the
-    /// way to its target (S15.3).
+    /// way to its target.
     Continue(Option<u32>),
     /// A `try { body } catch (e) { catch_body } finally { finally_body }`
-    /// statement (S15.2/S15.3). The `body` runs inside an active exception
+    /// statement. The `body` runs inside an active exception
     /// handler: a `throw` (or a propagated callee exception) reached while it
     /// executes transfers control to `catch_body` (when present) instead of
     /// unwinding out of the function. On a normal (non-throwing) completion of
@@ -1188,7 +1188,7 @@ pub enum IrStmt {
     /// normal fall-through AND every exceptional exit (a `throw` not caught here,
     /// a re-throw from `catch`, or a throw when there is no `catch`); if an
     /// exception is still pending after it, it re-propagates to the next outer
-    /// handler / function boundary (S15.3).
+    /// handler / function boundary.
     Try {
         /// The guarded statements, run under the active handler.
         body: Vec<IrStmt>,
@@ -1233,18 +1233,18 @@ pub struct IrFunction {
     /// The function body's statements, in source order. Empty for a generator
     /// state-machine function (its code comes from [`Self::machine`] instead).
     pub body: Vec<IrStmt>,
-    /// When `Some`, this function is a generator **state machine** (P4.2 M2): its
+    /// When `Some`, this function is a generator **state machine**: its
     /// wasm parameters are `(sent, gen, …, env)` under the uniform ABI and its
     /// body is a `switch (gen.state)` dispatch over these `GenSegment`s rather
     /// than [`Self::body`]. `None` for every ordinary function.
     pub machine: Option<Vec<GenSegment>>,
 }
 
-/// One basic block of a generator state machine (P4.2 M2/M3): a run of
+/// One basic block of a generator state machine: a run of
 /// straight-line statements ending in a [`GenTerm`]. The block index IS a
 /// `gen.state` value; the state machine's `br_table` dispatch enters a block by
 /// its index and control flows between blocks by storing the next index into
-/// `gen.state` (M3 CFG flattening lets `if`/`while`/`for` cross a `yield`).
+/// `gen.state` (CFG flattening lets `if`/`while`/`for` cross a `yield`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenSegment {
     /// The statements to run on entry to this block (including any prologue
@@ -1254,7 +1254,7 @@ pub struct GenSegment {
     pub term: GenTerm,
 }
 
-/// The terminator of a [`GenSegment`] (P4.2 M2/M3).
+/// The terminator of a [`GenSegment`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenTerm {
     /// `yield value`: store `resume` into `gen.state`, then return `value` from
@@ -1270,9 +1270,9 @@ pub enum GenTerm {
     /// return `value` (`undefined` when `None`).
     Return(Option<IrNode>),
     /// Unconditional control transfer to block `target`: store `target` into
-    /// `gen.state` and re-dispatch (M3).
+    /// `gen.state` and re-dispatch.
     Jump(u32),
-    /// Conditional transfer (M3): evaluate `cond`; go to block `then_block` when
+    /// Conditional transfer: evaluate `cond`; go to block `then_block` when
     /// truthy, else `else_block`.
     Branch {
         /// The condition (truthy → `then_block`).

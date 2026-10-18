@@ -5,31 +5,31 @@ use jsc_core::run::compile_and_run_capturing;
 mod common;
 use common::{assert_bool, assert_number, assert_rejected, assert_str, assert_uncaught};
 
-// --- S15.1 milestones ---------------------------------------------------------
+// --- uncaught throw ---------------------------------------------------------
 
 /// `throw 42` at the top level unwinds out of `main` and surfaces `Uncaught 42`.
 #[test]
-fn throw_number_literal_uncaught_milestone() {
+fn throw_number_literal_uncaught() {
     assert_uncaught("throw 42", "42");
 }
 
 /// `throw "boom"` renders the thrown string unquoted (matching `format_value`).
 #[test]
-fn throw_string_literal_uncaught_milestone() {
+fn throw_string_literal_uncaught() {
     assert_uncaught("throw \"boom\"", "boom");
 }
 
 /// A `throw` inside a callee propagates back through the (direct) call that
 /// invoked it: `f()` unwinds and the program surfaces `Uncaught 42`.
 #[test]
-fn throw_propagates_through_one_call_milestone() {
+fn throw_propagates_through_one_call() {
     assert_uncaught("function f(){ throw 42 } f()", "42");
 }
 
 /// A `throw` propagates through TWO frames: `g()` calls `f()`, which throws; the
 /// exception unwinds out of both and surfaces `Uncaught 42`.
 #[test]
-fn throw_propagates_through_two_calls_milestone() {
+fn throw_propagates_through_two_calls() {
     assert_uncaught("function f(){ throw 42 } function g(){ f() } g()", "42");
 }
 
@@ -67,20 +67,20 @@ fn side_effect_before_throw() {
     assert_eq!(err.to_string(), "Uncaught 7");
 }
 
-// --- S15.2 milestones: try/catch ----------------------------------------------
+// --- try/catch ----------------------------------------------------------------
 
 /// `try { throw 42 } catch (e) { e }` catches the thrown number and binds it to
 /// the catch parameter. The completion value is routed to a top-level `r` (the
 /// engine's program value is its last expression statement, and a `try` is a
 /// statement), so the caught `42` is observable as the program result.
 #[test]
-fn try_catch_number_milestone() {
+fn try_catch_number() {
     assert_number("let r = 0; try { throw 42 } catch (e) { r = e } r", 42.0);
 }
 
 /// A thrown string is caught and bound to the catch parameter unchanged.
 #[test]
-fn try_catch_string_milestone() {
+fn try_catch_string() {
     assert_str(
         "let r = 0; try { throw \"boom\" } catch (e) { r = e } r",
         "boom",
@@ -90,14 +90,14 @@ fn try_catch_string_milestone() {
 /// The no-throw path skips the catch entirely: `body` completes normally, so the
 /// handler never runs and its assignment is not observed.
 #[test]
-fn try_no_throw_skips_catch_milestone() {
+fn try_no_throw_skips_catch() {
     assert_number("let r = 0; try { r = 42 } catch (e) { r = -1 } r", 42.0);
 }
 
 /// A `throw` two call frames deep unwinds out of `f` and `g` (each to its own
 /// function boundary) and is finally caught at the `try` around `g()` in `main`.
 #[test]
-fn try_catch_across_call_frames_milestone() {
+fn try_catch_across_call_frames() {
     assert_number(
         "function f(){ throw 42 } function g(){ f() } \
          let r = 0; try { g() } catch (e) { r = e } r",
@@ -108,7 +108,7 @@ fn try_catch_across_call_frames_milestone() {
 /// Nested `try`: the inner handler catches the inner throw (relative `br` to the
 /// nearest landing pad), and the outer handler is never reached.
 #[test]
-fn nested_try_inner_catches_milestone() {
+fn nested_try_inner_catches() {
     assert_number(
         "let r = 0; try { try { throw 1 } catch (e) { r = e + 41 } } catch (e) { r = -1 } r",
         42.0,
@@ -118,7 +118,7 @@ fn nested_try_inner_catches_milestone() {
 /// The catch parameter is the thrown jsval itself, so `typeof e` observes its
 /// real runtime type (`"string"` for a thrown string).
 #[test]
-fn catch_binding_is_thrown_jsval_milestone() {
+fn catch_binding_is_thrown_jsval() {
     assert_str(
         "let r = 0; try { throw \"x\" } catch (e) { r = typeof e } r",
         "string",
@@ -161,9 +161,9 @@ fn throw_in_hof_callback_inside_try_is_caught() {
 }
 
 /// An uncaught `throw` (no enclosing `try`) still unwinds all the way out and
-/// surfaces `Uncaught <value>` — the S15.1 fallback path is intact.
+/// surfaces `Uncaught <value>`.
 #[test]
-fn uncaught_still_surfaces_milestone() {
+fn uncaught_still_surfaces() {
     assert_uncaught("throw 7", "7");
 }
 
@@ -174,7 +174,7 @@ fn escaping_rethrow_is_uncaught() {
     assert_uncaught("try { throw 1 } catch (e) { throw 99 }", "99");
 }
 
-// --- S15.3 milestones: finally ------------------------------------------------
+// --- finally ------------------------------------------------------------------
 
 /// `try`/`finally` (no `catch`), normal fall-through: the finally runs after the
 /// body and its side effects are observable.
@@ -273,12 +273,12 @@ fn finally_all_three_shape() {
     );
 }
 
-// --- S15.4 milestones: Error/TypeError/RangeError objects ---------------------
+// --- Error/TypeError/RangeError objects ---------------------------------------
 
 /// `new Error(msg)` is a plain heap object carrying `.name`/`.message`; a thrown
 /// Error is caught and its `.message` read back unchanged.
 #[test]
-fn error_thrown_message_milestone() {
+fn error_thrown_message() {
     assert_str(
         "let r = 0; try { throw new Error(\"bad\") } catch (e) { r = e.message } r",
         "bad",
@@ -288,14 +288,14 @@ fn error_thrown_message_milestone() {
 /// `typeof (new Error(..))` is "object": an Error reuses the OBJECT heap
 /// representation, so `typeof` needs no special case.
 #[test]
-fn error_typeof_object_milestone() {
+fn error_typeof_object() {
     assert_str("typeof (new Error(\"x\"))", "object");
 }
 
 /// The `.name` of each of the three built-in constructors equals the
 /// constructor identifier.
 #[test]
-fn error_name_property_milestone() {
+fn error_name_property() {
     assert_str("new Error(\"bad\").name", "Error");
     assert_str("new TypeError(\"t\").name", "TypeError");
     assert_str("new RangeError(\"r\").name", "RangeError");
@@ -303,21 +303,21 @@ fn error_name_property_milestone() {
 
 /// `.message` reads the first constructor argument verbatim.
 #[test]
-fn error_message_property_milestone() {
+fn error_message_property() {
     assert_str("new RangeError(\"r\").message", "r");
 }
 
 /// `new Error()` with no argument defaults `.message` to the empty string
 /// (matching JS), not `undefined`.
 #[test]
-fn error_default_empty_message_milestone() {
+fn error_default_empty_message() {
     assert_str("new Error().message", "");
 }
 
 /// `.stack` is the single-line `"<name>: <message>"` for each kind (jsc keeps no
 /// runtime call frames, so there is no trailing "    at ..." section).
 #[test]
-fn error_stack_property_milestone() {
+fn error_stack_property() {
     assert_str("new Error(\"boom\").stack", "Error: boom");
     assert_str("new TypeError(\"t\").stack", "TypeError: t");
     assert_str("new RangeError(\"r\").stack", "RangeError: r");
@@ -326,13 +326,13 @@ fn error_stack_property_milestone() {
 /// `new Error()` with no message has `.stack` equal to just the name — no
 /// trailing ": ".
 #[test]
-fn error_stack_no_message_milestone() {
+fn error_stack_no_message() {
     assert_str("new Error().stack", "Error");
 }
 
 /// A caught error exposes `.stack` on the catch binding, unchanged by the throw.
 #[test]
-fn error_stack_readable_after_catch_milestone() {
+fn error_stack_readable_after_catch() {
     assert_str(
         "let r = 0; try { throw new RangeError(\"r\") } catch (e) { r = e.stack } r",
         "RangeError: r",
@@ -342,7 +342,7 @@ fn error_stack_readable_after_catch_milestone() {
 /// The hidden `@@errorkind` marker is invisible to `Object.keys` — an error's
 /// own enumerable keys are exactly `name`, `message`, `stack`.
 #[test]
-fn error_kind_marker_hidden_from_keys_milestone() {
+fn error_kind_marker_hidden_from_keys() {
     assert_str(
         "Object.keys(new Error(\"x\")).join(\",\")",
         "name,message,stack",
@@ -351,7 +351,7 @@ fn error_kind_marker_hidden_from_keys_milestone() {
 
 /// Each error kind is `instanceof` its own constructor.
 #[test]
-fn instanceof_exact_kind_milestone() {
+fn instanceof_exact_kind() {
     assert_bool("new Error(\"x\") instanceof Error", true);
     assert_bool("new TypeError(\"x\") instanceof TypeError", true);
     assert_bool("new RangeError(\"x\") instanceof RangeError", true);
@@ -360,7 +360,7 @@ fn instanceof_exact_kind_milestone() {
 /// A `TypeError`/`RangeError` is also `instanceof Error` (the base of the
 /// hierarchy), but a base `Error` is NOT `instanceof` a subtype.
 #[test]
-fn instanceof_hierarchy_milestone() {
+fn instanceof_hierarchy() {
     assert_bool("new TypeError(\"x\") instanceof Error", true);
     assert_bool("new RangeError(\"x\") instanceof Error", true);
     assert_bool("new Error(\"x\") instanceof TypeError", false);
@@ -372,7 +372,7 @@ fn instanceof_hierarchy_milestone() {
 /// A non-object operand — number, string, boolean, `null`, `undefined`, array —
 /// is never an instance and never traps.
 #[test]
-fn instanceof_non_object_is_false_milestone() {
+fn instanceof_non_object_is_false() {
     assert_bool("5 instanceof Error", false);
     assert_bool("\"oops\" instanceof Error", false);
     assert_bool("true instanceof Error", false);
@@ -384,7 +384,7 @@ fn instanceof_non_object_is_false_milestone() {
 /// A plain object that merely LOOKS like an error (same visible keys) lacks the
 /// hidden `@@errorkind` marker, so it is not `instanceof Error`.
 #[test]
-fn instanceof_plain_object_is_false_milestone() {
+fn instanceof_plain_object_is_false() {
     assert_bool("({}) instanceof Error", false);
     assert_bool(
         "({ name: \"Error\", message: \"x\" }) instanceof Error",
@@ -395,7 +395,7 @@ fn instanceof_plain_object_is_false_milestone() {
 /// `instanceof` sees through a `throw`/`catch`: the caught binding keeps its
 /// error identity and hierarchy.
 #[test]
-fn instanceof_on_caught_error_milestone() {
+fn instanceof_on_caught_error() {
     assert_bool(
         "let r = false; try { throw new TypeError(\"x\") } catch (e) { r = e instanceof TypeError } r",
         true,
@@ -414,7 +414,7 @@ fn instanceof_on_caught_error_milestone() {
 /// own class (a single `@@prototype`-pointer hop), whether written directly or
 /// through a binding, but not `instanceof` an unrelated class or a builtin error.
 #[test]
-fn instanceof_user_class_milestone() {
+fn instanceof_user_class() {
     assert_bool("class C {} new C() instanceof C", true);
     assert_bool("class C {} let c = new C(); c instanceof C", true);
     assert_bool("class C {} class D {} new C() instanceof D", false);
@@ -425,7 +425,7 @@ fn instanceof_user_class_milestone() {
 /// A user class named `Error` SHADOWS the builtin: `instanceof Error` then means
 /// the user class (user-class dispatch is checked before the builtin errors).
 #[test]
-fn instanceof_user_class_shadows_builtin_milestone() {
+fn instanceof_user_class_shadows_builtin() {
     assert_bool(
         "class Error { m() { return 1 } } new Error() instanceof Error",
         true,
@@ -434,7 +434,7 @@ fn instanceof_user_class_shadows_builtin_milestone() {
 
 /// A non-object left operand is never `instanceof` a user class, and never traps.
 #[test]
-fn instanceof_user_class_non_object_is_false_milestone() {
+fn instanceof_user_class_non_object_is_false() {
     assert_bool("class C {} 5 instanceof C", false);
     assert_bool("class C {} null instanceof C", false);
     assert_bool("class C {} [1, 2] instanceof C", false);
@@ -457,7 +457,7 @@ fn instanceof_unsupported_rhs_rejected() {
 
 /// The `Date` builtin accepts only the timestamp constructor forms and a
 /// zero-argument `Date.now()`; the calendar-field constructor, extra arguments,
-/// and a spread argument are rejected at compile time (P-series).
+/// and a spread argument are rejected at compile time.
 #[test]
 fn date_unsupported_forms_rejected() {
     assert_rejected("new Date(2024, 0, 1)");
@@ -469,7 +469,7 @@ fn date_unsupported_forms_rejected() {
 /// A thrown `TypeError` is caught and both its `.name` and `.message` are
 /// readable from the catch binding.
 #[test]
-fn typeerror_thrown_name_and_message_milestone() {
+fn typeerror_thrown_name_and_message() {
     assert_str(
         "let r = 0; try { throw new TypeError(\"nope\") } catch (e) { r = e.name } r",
         "TypeError",
@@ -483,7 +483,7 @@ fn typeerror_thrown_name_and_message_milestone() {
 /// An Error thrown across a call frame propagates unchanged to an outer
 /// `try`/`catch`, where its `.message` reads back intact.
 #[test]
-fn error_propagates_across_call_milestone() {
+fn error_propagates_across_call() {
     assert_str(
         "let r = 0; function f(){ throw new Error(\"x\") } \
          try { f() } catch (e) { r = e.message } r",
@@ -494,7 +494,7 @@ fn error_propagates_across_call_milestone() {
 /// An Error flows through a `finally` clause unchanged: the caught `.message`
 /// survives the finally block running.
 #[test]
-fn error_flows_through_finally_milestone() {
+fn error_flows_through_finally() {
     assert_str(
         "let r = 0; let f = 0; \
          try { throw new RangeError(\"oops\") } catch (e) { r = e.message } finally { f = 1 } r",
@@ -504,22 +504,21 @@ fn error_flows_through_finally_milestone() {
 
 /// An uncaught Error unwinds out of `main`; the run stage renders the thrown
 /// object as its single-line stack (`"<name>: <message>"`), the way a JS console
-/// prints an error, rather than as a plain `{ ... }` object (E-series identity).
+/// prints an error, rather than as a plain `{ ... }` object.
 #[test]
 fn error_uncaught_surfaces() {
     assert_uncaught("throw new Error(\"boom\")", "Error: boom");
 }
 
-// --- S15.5 milestones: integration hardening ----------------------------------
+// --- integration hardening ----------------------------------------------------
 //
 // The individual pieces (throw / try / catch / finally / Error) are covered
 // above. This section stress-tests their COMBINATION across deep call chains,
 // nested trys at multiple depths, rethrow / throw-in-catch / throw-in-finally,
 // HOF callbacks, recursion, loops, switch, and Error objects flowing through all
-// of it. Every test drives the full source -> value pipeline. As merged, the
-// system passes all of these with no codegen change required.
+// of it. Every test drives the full source -> value pipeline.
 
-/// Campaign headline: an inner `catch` that re-throws a TRANSFORMED value reaches
+/// Headline: an inner `catch` that re-throws a TRANSFORMED value reaches
 /// the OUTER catch with the transformed value. `throw 1` -> inner catch `throw
 /// e + 41` -> outer catch binds `42`.
 #[test]
@@ -747,15 +746,15 @@ fn typeerror_deep_through_finally_name_and_message() {
 
 // 9. Uncaught still surfaces after all this ------------------------------------
 
-/// An uncaught numeric throw still surfaces as `Uncaught <value>` — the S15.1
-/// fallback path is intact after all the integration machinery.
+/// An uncaught numeric throw still surfaces as `Uncaught <value>` — the
+/// top-level fallback path holds alongside all the integration machinery.
 #[test]
 fn uncaught_number_still_surfaces_after_integration() {
     assert_uncaught("function f(){ throw 13 } f()", "13");
 }
 
 /// An uncaught Error object thrown across a call frame surfaces as its
-/// single-line stack (`"<name>: <message>"`), matching the E-series error render.
+/// single-line stack (`"<name>: <message>"`), matching the console error render.
 #[test]
 fn uncaught_error_still_surfaces_after_integration() {
     assert_uncaught(
@@ -764,9 +763,9 @@ fn uncaught_error_still_surfaces_after_integration() {
     );
 }
 
-// 9b. E-series: error identity through throw/catch integration -----------------
+// 9b. Error identity through throw/catch integration -----------------
 
-/// A single flow exercises the whole E-series surface at once: a `TypeError` is
+/// A single flow exercises the whole error-identity surface at once: a `TypeError` is
 /// thrown across a call frame, caught, and its identity (`instanceof` up the
 /// hierarchy), `.name`, `.message`, and `.stack` are all read back from the
 /// catch binding and concatenated.
@@ -827,18 +826,18 @@ fn mixed_nested_finally_ordering_via_array() {
     );
 }
 
-// --- S15.6 milestones: finally on return/break/continue ------------------------
+// --- finally on return/break/continue ------------------------------------------
 //
 // A `finally` runs on EVERY exit edge of the guarded region, not just normal
 // completion and throw: a `return`, `break`, or `continue` that leaves the `try`
-// must route THROUGH each intervening finalizer first (S15.3). An abrupt
+// must route THROUGH each intervening finalizer first. An abrupt
 // completion inside the `finally` itself (return/break/continue/throw) OVERRIDES
 // the pending one. Each test drives the full source -> value pipeline.
 
 /// Headline: a `return` in the `try` body is overridden by a `return` in the
 /// `finally` — `f()` yields `2`, not `1`.
 #[test]
-fn finally_return_overrides_try_return_milestone() {
+fn finally_return_overrides_try_return() {
     assert_number(
         "function f(){ try { return 1 } finally { return 2 } } f()",
         2.0,
@@ -848,7 +847,7 @@ fn finally_return_overrides_try_return_milestone() {
 /// A `break` out of a loop runs the `finally` on the way out: the side effect is
 /// observed exactly once and the loop is abandoned (`s == 10`, one iteration).
 #[test]
-fn finally_runs_on_break_milestone() {
+fn finally_runs_on_break() {
     assert_number(
         "let s = 0; for (let i = 0; i < 3; i = i + 1) { try { break } finally { s = s + 10 } } s",
         10.0,
@@ -858,7 +857,7 @@ fn finally_runs_on_break_milestone() {
 /// A `continue` runs the `finally` each iteration AND still advances the loop
 /// variable (the desugared `for` update): three iterations, `s == 3`.
 #[test]
-fn finally_runs_on_continue_milestone() {
+fn finally_runs_on_continue() {
     assert_number(
         "let s = 0; for (let i = 0; i < 3; i = i + 1) { try { continue } finally { s = s + 1 } } s",
         3.0,
@@ -870,7 +869,7 @@ fn finally_runs_on_continue_milestone() {
 /// `r + log == 12`. (A `let`-bound arrow captures `log`; a `function`
 /// declaration does not capture in this engine.)
 #[test]
-fn finally_return_runs_side_effect_milestone() {
+fn finally_return_runs_side_effect() {
     assert_number(
         "let log = 0; \
          let g = () => { try { return 7 } finally { log = 5 } }; \

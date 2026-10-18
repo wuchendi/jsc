@@ -10,7 +10,7 @@ pub(super) fn binding_id(ident: &swc_ecma_ast::BindingIdent) -> u32 {
     ident.id.span.lo.0
 }
 
-/// Compute the capture analysis (S13.4): the set of captured binding ids and the
+/// Compute the capture analysis: the set of captured binding ids and the
 /// names of the top-level bindings referenced by top-level function declarations.
 ///
 /// A binding is captured when it is referenced from inside a nested
@@ -130,8 +130,8 @@ impl CaptureResolver {
     }
 
     /// Declare a function/arrow parameter binding for capture analysis: a plain
-    /// `Pat::Ident` or the inner ident of a trailing rest parameter (`...rest`,
-    /// P1.4), so a nested closure referencing the rest binding marks it captured.
+    /// `Pat::Ident` or the inner ident of a trailing rest parameter (`...rest`),
+    /// so a nested closure referencing the rest binding marks it captured.
     fn declare_param(&mut self, pat: &Pat) {
         match pat {
             Pat::Ident(ident) => self.declare(ident.id.sym.as_ref(), binding_id(ident)),
@@ -359,7 +359,7 @@ impl CaptureResolver {
             }
             Stmt::Throw(t) => self.expr(&t.arg),
             Stmt::Try(t) => {
-                // The guarded block is its own scope (S15.2).
+                // The guarded block is its own scope.
                 self.analyze_scoped(&t.block.stmts);
                 if let Some(handler) = &t.handler {
                     // The catch clause scope binds the (optional) parameter before
@@ -373,7 +373,7 @@ impl CaptureResolver {
                     }
                     self.pop_scope();
                 }
-                // The finally block is its own scope (S15.3).
+                // The finally block is its own scope.
                 if let Some(finalizer) = &t.finalizer {
                     self.analyze_scoped(&finalizer.stmts);
                 }
@@ -382,9 +382,9 @@ impl CaptureResolver {
         }
     }
 
-    /// Analyze a class declaration (P2.2): bind the class name in the enclosing
+    /// Analyze a class declaration: bind the class name in the enclosing
     /// scope FIRST, so a `new C()` inside the constructor or a method body resolves
-    /// to it and is marked captured across the function boundary (G1). Each
+    /// to it and is marked captured across the function boundary. Each
     /// constructor and instance-method body is then a fresh function frame (like a
     /// nested fn declaration), so a binding it references from an enclosing scope
     /// (including the class name) is captured.
@@ -417,7 +417,7 @@ impl CaptureResolver {
                     }
                     self.exit_function();
                 }
-                // A method body is a fresh function frame (P2.1), mirroring the
+                // A method body is a fresh function frame, mirroring the
                 // constructor. Inlined (rather than the `function` helper) so a
                 // derived class can reference its superclass inside the frame.
                 ClassMember::Method(m) => {
@@ -542,7 +542,7 @@ impl CaptureResolver {
                     self.expr(&c.expr);
                 }
             }
-            // `new A(args)` (P2.2): reference the class binding (so a captured `A`
+            // `new A(args)`: reference the class binding (so a captured `A`
             // is marked) and analyze each argument.
             Expr::New(n) => {
                 self.expr(&n.callee);
@@ -552,7 +552,7 @@ impl CaptureResolver {
                     }
                 }
             }
-            // `await e` (P4.1): descend into the awaited expression so a closure
+            // `await e`: descend into the awaited expression so a closure
             // nested under it (e.g. `new Promise((res) => ...)`) still has its
             // captures analyzed. Without this the awaited sub-tree is invisible to
             // capture analysis and a closure's captured binding is never boxed.
@@ -585,7 +585,7 @@ impl CaptureResolver {
                             Prop::KeyValue(kv) => self.expr(&kv.value),
                             // Shorthand `{n}` references the outer binding `n`.
                             Prop::Shorthand(ident) => self.reference(ident.sym.as_ref()),
-                            // A method body is a fresh function frame (P2.1), so a
+                            // A method body is a fresh function frame, so a
                             // binding it references from an enclosing scope is
                             // captured — mirror the arrow/function analysis.
                             Prop::Method(method) => self.function(
