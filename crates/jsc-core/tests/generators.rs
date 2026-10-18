@@ -358,6 +358,35 @@ fn rejects_yield_inside_switch_or_in_a_condition() {
 }
 
 #[test]
+fn unsupported_yield_positions_name_the_construct() {
+    let cases = [
+        (
+            "function* g(){ if (yield 1) {} }",
+            "a `yield` in an `if` condition is not supported",
+        ),
+        (
+            "function* g(){ let i = 0; while (yield i) { i++; } }",
+            "a `yield` in a loop condition or update is not supported",
+        ),
+        (
+            "function* g(){ switch (1) { case 1: yield 1; } }",
+            "a `yield` inside a `switch` is not supported",
+        ),
+        (
+            "function* g(){ yield (yield 1); }",
+            "a `yield` operand may not itself contain a `yield`",
+        ),
+    ];
+    for (src, expected) in cases {
+        let msg = jsc_core::run::compile_and_run(src)
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+        assert_eq!(msg, expected, "diagnostic for `{src}`");
+    }
+}
+
+#[test]
 fn rejects_a_yield_nested_in_a_larger_expression() {
     assert_rejected("function* g(){ let x = (yield 1) + 2; }");
     assert_rejected("function* g(){ foo(yield 1); }");
