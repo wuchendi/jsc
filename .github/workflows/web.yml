@@ -1,9 +1,24 @@
 name: Web
 
 # Frontend/JS-side quality gate for the monorepo (packages/jsc + apps/jsc-web).
-# MANUAL only — run it from the Actions tab (workflow_dispatch) when you want to
-# check the JS/TS side. The push/PR Rust gate lives in ci.yml.
+# Runs on push to main and on pull requests when JS/TS or wasm inputs change
+# (paths allowlist below), and manually via workflow_dispatch. The Rust
+# workspace gate lives in ci.yml.
 on:
+  push:
+    branches: [main]
+    paths: &web-paths
+      - "crates/**"
+      - "packages/**"
+      - "apps/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/web.yml"
+  pull_request:
+    paths: *web-paths
   workflow_dispatch:
 
 env:
