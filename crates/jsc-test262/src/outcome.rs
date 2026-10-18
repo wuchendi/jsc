@@ -8,9 +8,9 @@
 //!
 //! For `negative: { phase: runtime }` tests the expected constructor name is
 //! matched against the token after `Uncaught ` on stderr. jsc prints builtin
-//! errors as `Error: Uncaught TypeError: msg`, so builtin names match. An
-//! uncaught user class instance prints as an object literal
-//! (`Error: Uncaught { @@prototype: ..., message: x }`) without its class
+//! errors as `Uncaught TypeError: msg`, so builtin names match. An uncaught
+//! user class instance prints as an object literal
+//! (`Uncaught { @@prototype: ..., message: x }`) without its class
 //! name, so runtime-negative tests expecting `Test262Error` cannot match and
 //! count as failures until jsc names class instances. Harness assertion
 //! failures throw `new Error("Test262Error: ...")` and therefore report the
