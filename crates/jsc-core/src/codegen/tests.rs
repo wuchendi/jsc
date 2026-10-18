@@ -1079,35 +1079,29 @@ fn let_stays_mutable() {
 }
 
 #[test]
-fn capturing_top_level_function_is_demoted_to_closure() {
-    // A top-level `function` reading an enclosing `let` is demoted (G2): it is
-    // bound in `main` as a `FuncValue` with a non-empty capture list, and its
-    // lowered body reads the captured cell through the environment.
+fn capturing_top_level_function_reads_module_cell() {
+    // A top-level `function` reading a top-level `let` stays a hoisted top-level
+    // function called directly; the `let` lives in module cell 0, which the
+    // function body reaches without a closure environment.
     let program = lower_src("let n=41; function f(){ return n+1 } f()").expect("lower");
-    // main: `let n` (boxed cell), the demoted `f` binding, then the `f()` call.
-    let Some(IrStmt::Decl {
-        init: IrNode::FuncValue { captures, .. },
-        ..
-    }) = program.stmts.iter().find(|s| {
-        matches!(
-            s,
-            IrStmt::Decl {
-                init: IrNode::FuncValue { .. },
-                ..
-            }
-        )
-    })
-    else {
-        unreachable!("expected `f` bound to a FuncValue in main");
-    };
-    assert_eq!(captures.len(), 1, "f captures the enclosing `n` cell");
-    // The call is indirect (through the bound closure), not a direct `Call`.
+    assert_eq!(program.module_cells, 1);
+    assert_eq!(program.functions.len(), 1);
     assert!(
         program
             .stmts
             .iter()
-            .any(|s| matches!(s, IrStmt::Expr(IrNode::CallIndirect { .. }))),
-        "a demoted function is called indirectly"
+            .any(|s| matches!(s, IrStmt::Expr(IrNode::Call { func: 1, .. }))),
+        "the capturing function keeps the direct call"
+    );
+    assert!(
+        matches!(
+            program.stmts.first(),
+            Some(IrStmt::Decl {
+                init: IrNode::CellSet { cell, .. },
+                ..
+            }) if **cell == IrNode::ModuleCell(0)
+        ),
+        "`let n` initializes its module cell"
     );
 }
 
@@ -1126,22 +1120,10 @@ fn non_capturing_top_level_function_keeps_direct_call() {
 }
 
 #[test]
-fn rejects_capturing_function_called_from_sibling() {
-    // A demoted closure (G2) is bound only within `main`; a sibling top-level
-    // function cannot reach it — rejected with a precise span diagnostic.
-    let err = format!(
-        "{:#}",
-        lower_src("let n=1; function f(){ return n } function g(){ return f() } g()").unwrap_err()
-    );
-    assert!(err.contains("closes over enclosing vars"), "{err}");
-}
-
-#[test]
-fn rejects_capturing_function_used_before_its_binding() {
-    // A demoted closure loses hoisting: calling it before its captured binding
-    // is declared is an error (INTENDED narrowing).
-    assert!(
-        lower_src("f(); let n=41; function f(){ return n }").is_err(),
-        "a demoted function used before its binding is an error"
-    );
+fn capturing_function_callable_from_sibling_and_before_its_binding() {
+    // Module cells make a capturing function reachable from a sibling top-level
+    // function, and keep it hoisted (an early call hits the runtime TDZ guard).
+    lower_src("let n=1; function f(){ return n } function g(){ return f() } g()")
+        .expect("sibling call lowers");
+    lower_src("f(); let n=41; function f(){ return n }").expect("hoisted call lowers");
 }
