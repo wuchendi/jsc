@@ -117,11 +117,13 @@ pub(super) fn build_type_and_function_sections<'a>(
         // `__gen_to_array` (P4.2 M3) is appended after the Map/Set helpers and
         // before `__invoke1`.
         gen_to_array: obj_get_index + 29,
+        // `__nullish_throw` (the nullish-receiver guard's error build) follows it.
+        nullish_throw: obj_get_index + 30,
         // The `__invoke1` callback trampoline (P4.1) is appended after every helper
         // above; the `__async_step` trampoline (P4.3 M4) follows it, then the two
         // `new Promise` settler functions.
-        invoke1: obj_get_index + 30,
-        async_step: obj_get_index + 31,
+        invoke1: obj_get_index + 31,
+        async_step: obj_get_index + 32,
         // The settler funcref-TABLE slots sit right after the `n` user-function
         // slots (`0..n`), so slots `n` and `n + 1`. `0` when there are no functions
         // (no table — and `new Promise` cannot occur without an executor function).
@@ -218,6 +220,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I64], &[ValType::I64]);
         // `__gen_to_array(gen: i64) -> i64` (P4.2 M3), before the trampoline.
         helper(&[ValType::I64], &[ValType::I64]);
+        // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
+        helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
         // The `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline (P4.1).
         helper(&[ValType::I64, ValType::I64], &[ValType::I64]);
         // The `__async_step(gen: i64, sent: i64) -> i64` trampoline (P4.3 M4).
@@ -238,29 +242,29 @@ pub(super) fn build_type_and_function_sections<'a>(
     // function: `print(bits: i64, flag: i32) -> ()`,
     // `__convert(bits: i64, op: i32) -> i64`, and
     // `__method(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64`.
-    let print_type = helper_type_base + 37;
+    let print_type = helper_type_base + 38;
     types.ty().function([ValType::I64, ValType::I32], []);
-    let convert_type = helper_type_base + 38;
+    let convert_type = helper_type_base + 39;
     types
         .ty()
         .function([ValType::I64, ValType::I32], [ValType::I64]);
-    let method_type = helper_type_base + 39;
+    let method_type = helper_type_base + 40;
     types.ty().function(
         [ValType::I64, ValType::I32, ValType::I64, ValType::I64],
         [ValType::I64],
     );
     // The host promise import types (P4.1): `__promise(op: i32, a: i64, b: i64) ->
     // i64` and `__then(p: i64, on_f: i64, on_r: i64) -> i64`.
-    let promise_type = helper_type_base + 40;
+    let promise_type = helper_type_base + 41;
     types
         .ty()
         .function([ValType::I32, ValType::I64, ValType::I64], [ValType::I64]);
-    let then_type = helper_type_base + 41;
+    let then_type = helper_type_base + 42;
     types
         .ty()
         .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
     // The host wall-clock import type (P-series `Date`): `__now() -> f64`.
-    let now_type = helper_type_base + 42;
+    let now_type = helper_type_base + 43;
     types.ty().function([], [ValType::F64]);
 
     (
@@ -492,9 +496,24 @@ pub(super) fn collect_node<'a>(
             collect_node(lhs, order, seen);
             collect_node(rhs, order, seen);
         }
-        // `ArrayPush` carries only its pushed value (its local read/rebind has no
-        // string literals); it collects like an `Assign`'s value.
-        IrNode::Assign { value, .. } | IrNode::ArrayPush { value, .. } => {
+        // The nullish guard interns its error strings and the read key.
+        IrNode::NullishCheck { value, key } => {
+            seed_nullish_strs(order, seen);
+            if seen.insert(key.as_str()) {
+                order.push(key.as_str());
+            }
+            collect_node(value, order, seen);
+        }
+        // `ArrayPush` carries only its pushed value plus the receiver guard's
+        // strings (its local read/rebind has no string literals).
+        IrNode::ArrayPush { value, .. } => {
+            seed_nullish_strs(order, seen);
+            if seen.insert("push") {
+                order.push("push");
+            }
+            collect_node(value, order, seen);
+        }
+        IrNode::Assign { value, .. } => {
             collect_node(value, order, seen);
         }
         // A direct call and a `console.log` both just collect their argument
@@ -505,8 +524,14 @@ pub(super) fn collect_node<'a>(
             }
         }
         // An indirect call and a `super(..)`/`super.m(..)` `ThisCall` both intern
-        // their callee expression and every argument.
+        // their callee expression and every argument, plus the not-a-function
+        // TypeError strings (a function-less program's indirect call throws it).
         IrNode::CallIndirect { callee, args } | IrNode::ThisCall { callee, args, .. } => {
+            for s in INTERNAL_TYPE_ERROR_STRS {
+                if seen.insert(s) {
+                    order.push(s);
+                }
+            }
             collect_node(callee, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
@@ -600,6 +625,7 @@ pub(super) fn collect_node<'a>(
                     order.push(s);
                 }
             }
+            seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(key, order, seen);
             for arg in args {
@@ -622,7 +648,12 @@ pub(super) fn collect_node<'a>(
             collect_node(source, order, seen);
             collect_node(exclude, order, seen);
         }
-        IrNode::Index { obj, index } | IrNode::ObjectKey { obj, index } => {
+        IrNode::Index { obj, index } => {
+            seed_nullish_strs(order, seen);
+            collect_node(obj, order, seen);
+            collect_node(index, order, seen);
+        }
+        IrNode::ObjectKey { obj, index } => {
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
         }
@@ -689,6 +720,7 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::IndexSet { obj, index, value } => {
+            seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
             collect_node(value, order, seen);
@@ -696,6 +728,7 @@ pub(super) fn collect_node<'a>(
         IrNode::IndexOpSet {
             obj, index, rhs, ..
         } => {
+            seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
             collect_node(rhs, order, seen);
@@ -816,8 +849,14 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::DateGetTime { recv } => collect_node(recv, order, seen),
-        IrNode::ArrayPop { .. }
-        | IrNode::Num(_)
+        // `pop` only needs its receiver guard's strings.
+        IrNode::ArrayPop { .. } => {
+            seed_nullish_strs(order, seen);
+            if seen.insert("pop") {
+                order.push("pop");
+            }
+        }
+        IrNode::Num(_)
         | IrNode::Bool(_)
         | IrNode::Null
         | IrNode::Undefined
@@ -830,6 +869,16 @@ pub(super) fn collect_node<'a>(
         | IrNode::MapNew { .. }
         | IrNode::DateNow
         | IrNode::IncDec { .. } => {}
+    }
+}
+
+/// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] so `__nullish_throw`
+/// finds their `[len][utf8]` blobs in the data segment; see [`collect_node`].
+fn seed_nullish_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
+    for s in NULLISH_ERROR_STRS {
+        if seen.insert(s) {
+            order.push(s);
+        }
     }
 }
 

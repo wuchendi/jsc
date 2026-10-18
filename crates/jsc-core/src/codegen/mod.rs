@@ -32,7 +32,8 @@ use swc_ecma_ast::{
 
 use crate::ir::{
     ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, SpreadCallee, SpreadElem,
+    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, SpreadCallee,
+    SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
@@ -175,7 +176,6 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         captured: analysis.captured,
         classes: RefCell::new(HashMap::new()),
         demoted_fns,
-        generic_method_sites: RefCell::new(Vec::new()),
         object_shapes: analysis.object_shapes,
     };
 
@@ -202,17 +202,6 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     // their positions match the funcref table indices handed out at their use
     // sites.
     functions.extend(shared.arrows.into_inner());
-
-    // M1: a generic user-method call `obj.m(args)` lowers to a `call_indirect`
-    // through the funcref table, which the backend only emits when the program
-    // defines at least one function/method. When NONE exist, no object could
-    // carry a method, so every recorded call site is provably an unknown method —
-    // reject the first with a span diagnostic instead of emitting invalid wasm.
-    if functions.is_empty()
-        && let Some((span, name)) = shared.generic_method_sites.into_inner().into_iter().next()
-    {
-        return Err(unknown_method_error(span, name.as_deref()));
-    }
 
     Ok(IrProgram {
         locals,
@@ -267,14 +256,6 @@ struct Shared<'a> {
     /// to a name in this set from a top-level function body is rejected with a
     /// span instead of the generic "undeclared" diagnostic.
     demoted_fns: std::collections::HashSet<String>,
-    /// Every generic user-method call site `obj.m(args)` recorded during lowering
-    /// (M1): its member span and the method name when statically known. A generic
-    /// method call lowers to an [`IrNode::MethodCallUser`] whose `call_indirect`
-    /// needs the funcref table — which only exists when the program defines at
-    /// least one function/method. If NO functions are defined, every recorded site
-    /// is provably an unknown method, so [`lower`] rejects the first one with a
-    /// span diagnostic rather than emitting invalid wasm.
-    generic_method_sites: RefCell<Vec<(swc_common::Span, Option<String>)>>,
     /// The provably-fixed object shape of each qualifying binding (see
     /// [`CaptureAnalysis::object_shapes`]): [`binding_id`] mapped to the own keys
     /// of the object literal it holds. A user method call whose receiver resolves

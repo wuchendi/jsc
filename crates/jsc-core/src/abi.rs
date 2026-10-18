@@ -364,6 +364,17 @@ pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";
 /// the host `__convert`/`__method` imports can allocate in guest memory (S14.3).
 pub(crate) const HEAP_PTR_EXPORT_NAME: &str = "__heap_ptr";
 
+/// The linear-memory cap in 64 KiB wasm pages (512 MiB), declared as the
+/// module's memory `maximum`: a guest `__alloc` or host allocation that cannot
+/// grow memory within it is out of memory.
+pub(crate) const MEMORY_MAX_PAGES: u64 = 8192;
+
+/// The sticky out-of-memory sentinel stored in the heap-pointer global when an
+/// allocation cannot grow memory (as `i32`, i.e. `0xFFFF_FFFF`). Every later
+/// allocation fails against it, and the run stage reports it as
+/// `Uncaught RangeError: out of memory`.
+pub(crate) const HEAP_PTR_OOM: i32 = -1;
+
 /// The name under which the pending-exception flag global (`$exc_pending`, i32)
 /// is exported so the run stage can detect an uncaught exception after `main`
 /// returns (S15.1). `0` = none, `1` = an exception is propagating.
