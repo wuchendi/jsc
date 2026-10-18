@@ -5,24 +5,24 @@ use jsc_core::run::{Value, compile_and_run, compile_and_run_capturing, format_va
 mod common;
 use common::assert_output;
 
-// --- S14.1 milestones ---------------------------------------------------------
+// --- console.log ------------------------------------------------------------
 
 /// `console.log(40 + 2)` prints the number `42` on its own line.
 #[test]
-fn console_log_number_milestone() {
+fn console_log_number() {
     assert_output("console.log(40 + 2)", "42\n");
 }
 
 /// `console.log("hi")` prints the string UNQUOTED.
 #[test]
-fn console_log_string_unquoted_milestone() {
+fn console_log_string_unquoted() {
     assert_output("console.log(\"hi\")", "hi\n");
 }
 
 /// `console.log(1, 2, 3)` prints its arguments single-space separated with one
 /// trailing newline.
 #[test]
-fn console_log_multi_arg_milestone() {
+fn console_log_multi_arg() {
     assert_output("console.log(1, 2, 3)", "1 2 3\n");
 }
 

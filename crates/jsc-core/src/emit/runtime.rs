@@ -78,7 +78,7 @@ pub(super) fn emit_alloc() -> Function {
     function
 }
 
-/// Emit the `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline (P4.1).
+/// Emit the `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline.
 ///
 /// The host promise engine calls this exported function re-entrantly to run a
 /// `.then`/`.catch`/`.finally` reaction's guest callback `fn` with the settled
@@ -141,7 +141,7 @@ pub(super) fn emit_invoke1(helpers: Helpers<'_>) -> Function {
     function
 }
 
-/// Emit a `new Promise` settler function (P4.1): the `resolve` (`op` =
+/// Emit a `new Promise` settler function: the `resolve` (`op` =
 /// `PROMISE_OP_SETTLE_FULFILL`) or `reject` (`PROMISE_OP_SETTLE_REJECT`) half of
 /// an executor's callback pair.
 ///
@@ -175,7 +175,7 @@ pub(super) fn emit_settler(op: i32, helpers: Helpers<'_>) -> Function {
 /// Emit the `__concat(a: i32, b: i32) -> i32` string concatenator.
 ///
 /// `a`/`b` are base offsets of two `[type=0][pad×3][len:u32 LE][utf8]` heap
-/// strings (S13.1). It reads each length header (at `+HEADER_SIZE`), allocates
+/// strings. It reads each length header (at `+HEADER_SIZE`), allocates
 /// `HEADER_SIZE + 4 + lenA + lenB` bytes via `__alloc` (at `alloc_index`), writes
 /// the `TYPE_STRING` type byte and the combined length header, copies both UTF-8
 /// payloads (from `+HEADER_SIZE+4`) into place with `memory.copy`, and returns the
@@ -271,7 +271,7 @@ pub(super) fn emit_str_eq() -> Function {
     let mut function = Function::new(vec![(2, ValType::I32)]);
     let (a, b, len, i) = (0, 1, 2, 3);
     // The u32 length header sits at `+HEADER_SIZE`; the UTF-8 payload at
-    // `+HEADER_SIZE+4` (S13.1 block header).
+    // `+HEADER_SIZE+4` (block header).
     let header = MemArg {
         offset: HEADER_SIZE as u64,
         align: 2,
@@ -349,7 +349,7 @@ pub(super) fn emit_str_cmp() -> Function {
     let (a, b, len_a, len_b, min, i) = (0, 1, 2, 3, 4, 5);
     let (byte_a, byte_b) = (6, 7);
     // The u32 length header sits at `+HEADER_SIZE`; the UTF-8 payload at
-    // `+HEADER_SIZE+4` (S13.1 block header).
+    // `+HEADER_SIZE+4` (block header).
     let header = MemArg {
         offset: HEADER_SIZE as u64,
         align: 2,
@@ -445,7 +445,7 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let (ptr, i, dst) = (0, 1, 2);
     // The u32 length header sits at `+HEADER_SIZE`; the UTF-8 payload at
-    // `+HEADER_SIZE+4` (S13.1 block header).
+    // `+HEADER_SIZE+4` (block header).
     let header = MemArg {
         offset: HEADER_SIZE as u64,
         align: 2,
@@ -500,7 +500,7 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
 /// offset `+12`. The stored key's low 32 bits are the candidate key string
 /// offset, compared by byte content against `key_ptr` via `__str_eq` (at
 /// `str_eq_index`). The first match's value jsval is returned. On an own miss, the
-/// PROTOTYPE FALLBACK (P2.3) kicks in when `proto_key` is `Some(off)` — the
+/// PROTOTYPE FALLBACK kicks in when `proto_key` is `Some(off)` — the
 /// interned byte offset of the reserved `@@prototype` key: a second scan reads the
 /// object's own `@@prototype` slot, and if it holds a heap pointer (a class's
 /// shared prototype object) the lookup recurses into it via `self_index` (this
@@ -510,8 +510,8 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
 /// own (the miss there yields `undefined`, stopping the chain). If no key resolves
 /// — own or through the chain — the `undefined` bits are returned. When
 /// `proto_key` is `None` (a program with no class, so `@@prototype` is never
-/// interned) the fallback is omitted entirely, preserving the pre-P2.3
-/// plain-object behavior. Params occupy locals 0/1; two extra `i32` locals hold
+/// interned) the fallback is omitted entirely, leaving the
+/// plain own-key lookup. Params occupy locals 0/1; two extra `i32` locals hold
 /// `n` and the loop index `k`, plus (with the fallback) one `i64` local for the
 /// resolved prototype value. Modeled on [`emit_str_eq`].
 // A single flat instruction stream (the own scan plus the optional prototype-
@@ -527,7 +527,7 @@ pub(super) fn emit_obj_get(str_eq_index: u32, self_index: u32, proto_key: Option
     let (obj_ptr, key_ptr, n, k) = (0, 1, 2, 3);
     // The resolved prototype value (i64), used only when the fallback is emitted.
     let proto = 4;
-    // S13.1 block header shifts every slot by HEADER_SIZE: `n` at `+HEADER_SIZE`,
+    // The block header shifts every slot by HEADER_SIZE: `n` at `+HEADER_SIZE`,
     // entry `k` key at `+HEADER_SIZE+4+16*k`, its value at `+8` from the key.
     let header = MemArg {
         offset: HEADER_SIZE as u64,
@@ -667,7 +667,7 @@ pub(super) fn emit_obj_get(str_eq_index: u32, self_index: u32, proto_key: Option
 pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
     let mut function = Function::new(vec![(2, ValType::I32)]);
     let (obj_ptr, key_ptr, val, n, k) = (0, 1, 2, 3, 4);
-    // S13.1 block header shifts every slot by HEADER_SIZE: `n` at `+HEADER_SIZE`,
+    // The block header shifts every slot by HEADER_SIZE: `n` at `+HEADER_SIZE`,
     // entry `k` key at `+HEADER_SIZE+4+16*k`, its value at `+8` from the key.
     let header = MemArg {
         offset: HEADER_SIZE as u64,
@@ -732,8 +732,7 @@ pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
     function
 }
 
-/// Emit the `__obj_rest(obj_ptr: i32, excl_ptr: i32) -> i32` object-rest builder
-/// (P1.2).
+/// Emit the `__obj_rest(obj_ptr: i32, excl_ptr: i32) -> i32` object-rest builder.
 ///
 /// `obj_ptr` is the base offset of a `[n:u32][(key_ptr:i64, val:i64) × n]` heap
 /// object; `excl_ptr` is the base offset of a `[len:u32][key_ptr:i64 × len]` heap
@@ -753,7 +752,7 @@ pub(super) fn emit_obj_rest(alloc_index: u32, str_eq_index: u32) -> Function {
     let mut function = Function::new(vec![(8, ValType::I32)]);
     let (obj_ptr, excl_ptr, n, excl, dst) = (0, 1, 2, 3, 4);
     let (m, k, key, excluded, j) = (5, 6, 7, 8, 9);
-    // S13.1 block header: `n`/`len` at `+HEADER_SIZE`; object entry `k` key at
+    // Block header: `n`/`len` at `+HEADER_SIZE`; object entry `k` key at
     // `+HEADER_SIZE+4+16*k`, its value at `+8` from the key; array element `j` at
     // `+HEADER_SIZE+4+8*j`.
     let header = MemArg {
@@ -905,7 +904,7 @@ pub(super) fn emit_obj_rest(alloc_index: u32, str_eq_index: u32) -> Function {
     function
 }
 
-/// Emit the `__array_push(base: i32, value: i64) -> i32` array grower (S14.4).
+/// Emit the `__array_push(base: i32, value: i64) -> i32` array grower.
 ///
 /// The bump allocator has no free list, so growing a fixed-size array block means
 /// allocating a fresh, larger block and abandoning the old one. It reads the u32
@@ -981,7 +980,7 @@ pub(super) fn emit_array_push(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the `__array_concat(dst: i32, src: i32) -> i32` array joiner (P1.5).
+/// Emit the `__array_concat(dst: i32, src: i32) -> i32` array joiner.
 ///
 /// Like [`emit_array_push`], the bump allocator has no free list, so appending
 /// one array's elements to another means allocating a fresh block. It reads the
@@ -1067,7 +1066,7 @@ pub(super) fn emit_array_concat(alloc_index: u32) -> Function {
     function
 }
 
-/// The four common object/array block `MemArg`s (P3.2 helpers): the u32 `n`/`len`
+/// The four common object/array block `MemArg`s: the u32 `n`/`len`
 /// header at `+HEADER_SIZE`; an object entry's key at `+HEADER_SIZE+4` and value
 /// at `+HEADER_SIZE+12` (16 bytes apart); an array element at `+HEADER_SIZE+4`.
 fn obj_block_memargs() -> (MemArg, MemArg, MemArg, MemArg) {
@@ -1115,7 +1114,7 @@ fn emit_array_slot_addr(function: &mut Function, dst: u32, m: u32) {
 }
 
 /// Emit the reserved-key guard `i32.wrap(key)`'s first payload byte `!= '@'`,
-/// leaving a `1`/`0` i32 on the stack (P3.2). The reserved hidden object keys
+/// leaving a `1`/`0` i32 on the stack. The reserved hidden object keys
 /// (`@@prototype`/`@@constructor`) are the only keys beginning with `@`, and no
 /// JS identifier may start with it, so a `'@'` first byte marks a key that
 /// `Object.keys`/`values`/`entries` must skip. `key` (an i64 heap-string jsval)
@@ -1132,7 +1131,7 @@ fn emit_key_not_reserved(function: &mut Function, key: u32) {
     function.instruction(&Instruction::I32Ne);
 }
 
-/// Emit the `__obj_keys(obj_ptr: i32) -> array_base: i32` enumerator (P3.2).
+/// Emit the `__obj_keys(obj_ptr: i32) -> array_base: i32` enumerator.
 ///
 /// Bump-allocates a fresh `TYPE_ARRAY` block of capacity `n` (the object's entry
 /// count), linear-scans the source entries `0..n`, and appends each non-reserved
@@ -1206,7 +1205,7 @@ pub(super) fn emit_obj_keys(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the `__obj_values(obj_ptr: i32) -> array_base: i32` enumerator (P3.2).
+/// Emit the `__obj_values(obj_ptr: i32) -> array_base: i32` enumerator.
 ///
 /// Like [`emit_obj_keys`] but each surviving entry contributes its VALUE jsval
 /// (loaded from the `+val_slot`) rather than its key; the key is still read to run
@@ -1276,7 +1275,7 @@ pub(super) fn emit_obj_values(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the `__obj_entries(obj_ptr: i32) -> array_base: i32` enumerator (P3.2).
+/// Emit the `__obj_entries(obj_ptr: i32) -> array_base: i32` enumerator.
 ///
 /// Like [`emit_obj_keys`] but each surviving entry contributes a FRESH two-element
 /// `[key, value]` array (bump-allocated inside the loop) whose reboxed heap jsval
@@ -1374,7 +1373,7 @@ pub(super) fn emit_obj_entries(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the `__obj_has(obj_ptr: i32, key_ptr: i32) -> i32` own-key probe (P3.3).
+/// Emit the `__obj_has(obj_ptr: i32, key_ptr: i32) -> i32` own-key probe.
 ///
 /// `obj_ptr` is the base offset of a `[n:u32][(key_ptr:i64, val:i64) × n]` heap
 /// object; `key_ptr` is the base offset of the `[len:u32][utf8]` key to look for.
@@ -1428,7 +1427,7 @@ pub(super) fn emit_obj_has(str_eq_index: u32) -> Function {
     function
 }
 
-/// Emit the `__obj_delete(obj_ptr: i32, key_ptr: i32)` property remover (P3.3).
+/// Emit the `__obj_delete(obj_ptr: i32, key_ptr: i32)` property remover.
 ///
 /// `obj_ptr` is the base offset of a `[n:u32][(key_ptr:i64, val:i64) × n]` heap
 /// object; `key_ptr` is the base offset of the `[len:u32][utf8]` key to remove.
@@ -1534,7 +1533,7 @@ fn byte_store() -> MemArg {
 }
 
 /// Emit `store8(dst + payload + o, c); o += 1` — append the constant byte `c` to a
-/// heap-string block being built at `dst`, advancing the write cursor `o` (P3.4).
+/// heap-string block being built at `dst`, advancing the write cursor `o`.
 fn json_put_const(function: &mut Function, dst: u32, o: u32, payload: i32, c: i32) {
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(payload));
@@ -1550,7 +1549,7 @@ fn json_put_const(function: &mut Function, dst: u32, o: u32, payload: i32, c: i3
 }
 
 /// Emit `store8(dst + payload + o, <local val>); o += 1` — like [`json_put_const`]
-/// but the byte comes from local `val` (P3.4).
+/// but the byte comes from local `val`.
 fn json_put_local(function: &mut Function, dst: u32, o: u32, payload: i32, val: u32) {
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(payload));
@@ -1565,7 +1564,7 @@ fn json_put_local(function: &mut Function, dst: u32, o: u32, payload: i32, val: 
     function.instruction(&Instruction::LocalSet(o));
 }
 
-/// Emit the `__json_escape(str_ptr: i32) -> str_base: i32` helper (P3.4): build a
+/// Emit the `__json_escape(str_ptr: i32) -> str_base: i32` helper: build a
 /// FRESH heap string that is the JSON-quoted + escaped form of the `[len][utf8]`
 /// string at `str_ptr` — a leading `"`, each source byte emitted verbatim except
 /// `"`/`\` and the whitespace controls (`\b \t \n \f \r`) which become their
@@ -1726,7 +1725,7 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
 }
 
 /// Emit the recursive `__json_str(v: i64) -> str_base: i32` serializer backing
-/// `JSON.stringify` (P3.4). Returns the base offset of a heap string holding `v`'s
+/// `JSON.stringify`. Returns the base offset of a heap string holding `v`'s
 /// JSON form, composing pieces with `__concat` (`concat_index`):
 ///
 /// - number: `__convert(v, TO_STRING)` when finite (reusing the EXISTING host
@@ -1992,7 +1991,7 @@ pub(super) fn emit_json_str(
 }
 
 /// Emit the `__same_value_zero(a: i64, b: i64) -> i32` Map/Set key-equality
-/// helper (P3.5).
+/// helper.
 ///
 /// `SameValueZero`, the key comparison of the `__map_*` linear scans: two heap
 /// STRINGS compare by byte content (via `__str_eq` at `str_eq_index`), and
@@ -2234,7 +2233,7 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
     function
 }
 
-/// Emit the `__map_find(handle: i32, key: i64) -> i32` Map/Set lookup (P3.5).
+/// Emit the `__map_find(handle: i32, key: i64) -> i32` Map/Set lookup.
 ///
 /// `handle` is the base of a `TYPE_MAP`/`TYPE_SET` block; its `entries` slot (at
 /// `+HEADER_SIZE+4`) holds the backing array jsval. Reads the array's u32 `len`
@@ -2312,8 +2311,8 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
     function
 }
 
-/// Emit the `__map_set(handle: i32, key: i64, val: i64)` Map/Set insert-or-update
-/// (P3.5). Looks the key up with `__map_find` (at `map_find_index`): on a hit it
+/// Emit the `__map_set(handle: i32, key: i64, val: i64)` Map/Set insert-or-update.
+/// Looks the key up with `__map_find` (at `map_find_index`): on a hit it
 /// overwrites the value slot (8 bytes past the found key slot); on a miss it appends
 /// `key` then `val` to the growable backing via `__array_push` (at
 /// `array_push_index`) — reboxing and REWRITING the handle's `entries` slot in place
@@ -2388,7 +2387,7 @@ pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Functi
     function
 }
 
-/// Emit the `__map_get(handle: i32, key: i64) -> i64` Map value reader (P3.5): the
+/// Emit the `__map_get(handle: i32, key: i64) -> i64` Map value reader: the
 /// value stored 8 bytes past the key slot `__map_find` (at `map_find_index`)
 /// resolves, or the `undefined` bits on a miss. Params occupy locals 0/1; one extra
 /// `i32` local holds the found address.
@@ -2416,8 +2415,8 @@ pub(super) fn emit_map_get(map_find_index: u32) -> Function {
     function
 }
 
-/// Emit the `__map_has(handle: i32, key: i64) -> i32` Map/Set membership probe
-/// (P3.5): `1` iff `__map_find` (at `map_find_index`) hits, else `0`. Params occupy
+/// Emit the `__map_has(handle: i32, key: i64) -> i32` Map/Set membership probe:
+/// `1` iff `__map_find` (at `map_find_index`) hits, else `0`. Params occupy
 /// locals 0/1; no extra locals.
 pub(super) fn emit_map_has(map_find_index: u32) -> Function {
     let mut function = Function::new(vec![]);
@@ -2430,7 +2429,7 @@ pub(super) fn emit_map_has(map_find_index: u32) -> Function {
     function
 }
 
-/// Emit the `__map_delete(handle: i32, key: i64) -> i32` Map/Set remover (P3.5).
+/// Emit the `__map_delete(handle: i32, key: i64) -> i32` Map/Set remover.
 ///
 /// Looks the key up with `__map_find` (at `map_find_index`); on a miss returns `0`.
 /// On a hit it COMPACTS the two-slot `(key, value)` entry out of the backing array —

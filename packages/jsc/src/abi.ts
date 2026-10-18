@@ -2,8 +2,8 @@
  * The runtime ABI, ported verbatim from `crates/jsc-core/src/abi.rs` — the
  * single source of truth on the Rust side. This TS copy DUPLICATES those
  * numbers so the browser shim can decode emitted-module values and back the
- * host imports without a Rust runtime. ACCEPTED TEMPORARY DEBT (see README):
- * a drift here silently mis-decodes; keep it in lock-step with `abi.rs`.
+ * host imports without a Rust runtime (see README, "Host parity"): a drift
+ * here silently mis-decodes; keep it in lock-step with `abi.rs`.
  *
  * A jsval is a 64-bit carrier (`bigint` on the JS side). Any value without the
  * full {@link QNAN} mask set is an ordinary IEEE-754 `f64`; with the mask set,
@@ -58,9 +58,9 @@ export const DATE_MS_OFFSET = HEADER_SIZE + 4
 export const MEMORY_EXPORT_NAME = 'memory'
 /** Export name of the bump-allocator heap-pointer global (host allocation). */
 export const HEAP_PTR_EXPORT_NAME = '__heap_ptr'
-/** Export name of the pending-exception flag global (`i32`, S15.1). */
+/** Export name of the pending-exception flag global (`i32`). */
 export const EXC_PENDING_EXPORT_NAME = '__exc_pending'
-/** Export name of the in-flight exception value global (`i64`, S15.1). */
+/** Export name of the in-flight exception value global (`i64`). */
 export const EXC_VALUE_EXPORT_NAME = '__exc_value'
 /** Export name of the `__invoke1(callback, arg)` callback trampoline (promise reactions). */
 export const INVOKE_EXPORT_NAME = '__invoke1'

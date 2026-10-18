@@ -1,10 +1,10 @@
 //! Integration tests: array and object destructuring in `let`/`const`/`var`
-//! declarations (P1.1/P1.2), exercised end to end through the built `jsc` binary.
+//! declarations, exercised end to end through the built `jsc` binary.
 
 mod common;
 use common::jsc;
 
-/// P1.1 milestones: array destructuring in declarations desugars to indexed
+/// Array destructuring in declarations desugars to indexed
 /// reads off the initializer — plain elements, holes, defaults, rest, `const`,
 /// and nested patterns.
 #[test]
@@ -23,7 +23,7 @@ fn array_destructuring_declarations_via_eval() {
     assert_eq!(jsc(&["-p", "let [[a]] = [[5]]; a"]), "5");
 }
 
-/// P1.2 milestones: object destructuring in declarations desugars to keyed reads
+/// Object destructuring in declarations desugars to keyed reads
 /// off the initializer — shorthand binds, renamed binds, defaults, a rest that
 /// collects the remaining own keys into a new object, and nested patterns.
 #[test]

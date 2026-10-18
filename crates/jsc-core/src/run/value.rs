@@ -21,30 +21,30 @@ pub enum Value {
     Null,
     /// The `undefined` value.
     Undefined,
-    /// A heap string, read from linear memory via a pointer jsval (S10). A
-    /// `typeof` result is an ordinary heap string too (its immediate encoding was
-    /// retired), so it decodes here.
+    /// A heap string, read from linear memory via a pointer jsval. A
+    /// `typeof` result is an ordinary heap string too (there is no immediate
+    /// encoding), so it decodes here.
     Str(String),
-    /// A heap array, read from linear memory via an array-pointer jsval (S11).
+    /// A heap array, read from linear memory via an array-pointer jsval.
     /// Elements are decoded recursively, so arrays nest.
     Array(Vec<Value>),
-    /// A heap object, read from linear memory via an object-pointer jsval (S11).
+    /// A heap object, read from linear memory via an object-pointer jsval.
     /// Entries preserve insertion order; keys are heap strings and values are
     /// decoded recursively, so objects nest.
     Object(Vec<(String, Value)>),
     /// A first-class function value, read from linear memory via a
-    /// function-pointer jsval (type byte `3`, S13.2). The backing block holds a
+    /// function-pointer jsval (type byte `3`). The backing block holds a
     /// funcref-table index and an environment slot; a returned bare function
     /// value only needs to decode without panicking (it renders as
     /// `[Function (anonymous)]`).
     Function,
-    /// A `Map` handle (type byte `6`, P3.5). Only its logical entry count (`size`)
+    /// A `Map` handle (type byte `6`). Only its logical entry count (`size`)
     /// is decoded — the backing entries are not walked — so it renders as `Map(N)`.
     Map(usize),
-    /// A `Set` handle (type byte `7`, P3.5). Like [`Value::Map`], only its `size`
+    /// A `Set` handle (type byte `7`). Like [`Value::Map`], only its `size`
     /// is decoded; it renders as `Set(N)`.
     Set(usize),
-    /// A `Promise` (type byte `8`, P4.1). `state` is the settlement kind
+    /// A `Promise` (type byte `8`). `state` is the settlement kind
     /// (`0` pending / `1` fulfilled / `2` rejected) and `value` its settled
     /// fulfillment/rejection value (`undefined` while pending), decoded
     /// recursively. Renders Node-console style: `Promise { <pending> }`,
@@ -55,11 +55,11 @@ pub enum Value {
         /// The settled value (meaningful when fulfilled/rejected).
         value: Box<Value>,
     },
-    /// A `Generator` handle (type byte `9`, P4.2 M2). Only the handle is decoded —
+    /// A `Generator` handle (type byte `9`). Only the handle is decoded —
     /// its state machine and frame are not walked — so it renders as
     /// `Object [Generator]`, matching Node's `console.log` of a generator object.
     Generator,
-    /// A `Date` (type byte `10`, P-series). The f64 payload is the millisecond
+    /// A `Date` (type byte `10`). The f64 payload is the millisecond
     /// timestamp since the Unix epoch. Renders as an ISO 8601 UTC string
     /// (`1970-01-01T00:00:00.000Z`), or `Invalid Date` when the timestamp is not
     /// finite — matching Node's `console.log` of a `Date`.
@@ -84,10 +84,9 @@ pub fn decode(bits: u64, memory: &[u8]) -> Value {
         0b001 => Value::Bool(bits & 1 != 0),
         0b010 => Value::Null,
         0b011 => Value::Undefined,
-        // Single heap tag (S13.1): read the block's TYPE BYTE to pick the arm.
+        // Single heap tag: read the block's TYPE BYTE to pick the arm.
         0b101 => decode_heap(bits, memory),
-        // Tags 0b100 (the retired `typeof` type-string immediate — `typeof` now
-        // yields a real heap string), 0b110/0b111 (retired since S13.1), and 0b000
+        // Tags 0b100, 0b110 and 0b111 (unused), and 0b000
         // (the canonical number NaN). Any such pattern decodes as a NaN number,
         // keeping decode total without a panic.
         _ => Value::Number(f64::from_bits(bits)),
@@ -96,7 +95,7 @@ pub fn decode(bits: u64, memory: &[u8]) -> Value {
 
 /// Resolve a heap pointer jsval (single tag `0b101`) into a [`Value`] by reading
 /// the TYPE BYTE at the block base (the low 32 bits of `bits`) and dispatching to
-/// the string / array / object / function decoder (S13.1+). A function block
+/// the string / array / object / function decoder. A function block
 /// decodes to [`Value::Function`]; an unknown or out-of-range type byte decodes
 /// as `undefined`, keeping decode total.
 fn decode_heap(bits: u64, memory: &[u8]) -> Value {
@@ -116,7 +115,7 @@ fn decode_heap(bits: u64, memory: &[u8]) -> Value {
 }
 
 /// Resolve a heap `Date` block at base `ptr` into a [`Value::Date`] by reading its
-/// f64 `ms` payload (P-series). A truncated block reads as `Date(NaN)` (rendered
+/// f64 `ms` payload. A truncated block reads as `Date(NaN)` (rendered
 /// `Invalid Date`), keeping decode total.
 fn decode_date(ptr: usize, memory: &[u8]) -> Value {
     let start = ptr + DATE_MS_OFFSET;
@@ -127,7 +126,7 @@ fn decode_date(ptr: usize, memory: &[u8]) -> Value {
     Value::Date(ms)
 }
 
-/// Resolve a heap promise block at base `ptr` into a [`Value::Promise`] (P4.1):
+/// Resolve a heap promise block at base `ptr` into a [`Value::Promise`]:
 /// the i32 `state` at `ptr + HEADER_SIZE` and the i64 settled `value` at
 /// `ptr + HEADER_SIZE + 4` (decoded recursively). Defensive: a truncated block
 /// reads as pending with an `undefined` value.
@@ -149,7 +148,7 @@ fn decode_promise(ptr: usize, memory: &[u8]) -> Value {
 }
 
 /// Read the u32 `size` header of a Map/Set handle block at base `ptr` (at
-/// `ptr + HEADER_SIZE`), the logical entry count (P3.5). Defensive: an out-of-range
+/// `ptr + HEADER_SIZE`), the logical entry count. Defensive: an out-of-range
 /// header yields `0`, so a malformed pointer never panics.
 fn decode_size(ptr: usize, memory: &[u8]) -> usize {
     let at = ptr + HEADER_SIZE;
@@ -364,7 +363,7 @@ pub fn format_value(value: &Value) -> String {
         // decoded), e.g. `Map(2)` / `Set(0)`.
         Value::Map(size) => format!("Map({size})"),
         Value::Set(size) => format!("Set({size})"),
-        // A promise renders Node-console style by settlement (P4.1).
+        // A promise renders Node-console style by settlement.
         Value::Promise { state, value } => {
             if *state == PROMISE_FULFILLED {
                 format!("Promise {{ {} }}", format_value(value))
@@ -374,9 +373,9 @@ pub fn format_value(value: &Value) -> String {
                 "Promise { <pending> }".to_owned()
             }
         }
-        // A generator handle renders Node-console style (P4.2 M2).
+        // A generator handle renders Node-console style.
         Value::Generator => "Object [Generator]".to_owned(),
-        // A Date renders as its ISO 8601 UTC string (P-series).
+        // A Date renders as its ISO 8601 UTC string.
         Value::Date(ms) => format_date_iso(*ms),
     }
 }

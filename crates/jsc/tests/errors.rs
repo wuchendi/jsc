@@ -5,7 +5,7 @@ use std::process::Command;
 mod common;
 use common::jsc;
 
-/// S12.6 — reassigning a `const` binding is a compile error: the CLI exits
+/// Reassigning a `const` binding is a compile error: the CLI exits
 /// 2 and reports the constant on stderr.
 #[test]
 fn const_reassignment_fails_at_compile_time() {
@@ -24,11 +24,10 @@ fn const_reassignment_fails_at_compile_time() {
     );
 }
 
-/// S13.7 — reassigning a `const` remains a compile error end to end (the CLI
-/// exits 2 and names the constant), confirming S13's member-compound and
-/// closure work did not weaken the S12 immutability check.
+/// Reassigning a `const` declared with a different name is likewise a compile
+/// error end to end: the CLI exits 2 and names the constant.
 #[test]
-fn s13_const_reassignment_still_errors() {
+fn const_reassignment_of_other_binding_errors() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "const x = 1; x = 2; x"])
         .output()
@@ -109,8 +108,8 @@ fn undeclared_identifier_renders_caret_at_column_one() {
 }
 
 /// A codegen-rejected *unsupported construct* (an `async` ARROW — a top-level
-/// `async function` declaration is supported since P4.3 M4, but the arrow form is
-/// not) now carries the offending node's span: the diagnostic points a caret at
+/// `async function` declaration is supported, but the arrow form is not)
+/// carries the offending node's span: the diagnostic points a caret at
 /// the construct.
 #[test]
 fn unsupported_construct_renders_caret_diagnostic() {
@@ -230,10 +229,10 @@ fn compile_errors_render_locator_and_caret() {
     }
 }
 
-/// S15 — the exception system (`throw`/`try`/`catch`/`finally`/`Error`) driven
-/// through the real CLI on the `-p` path, one milestone per assertion.
+/// The exception system (`throw`/`try`/`catch`/`finally`/`Error`) driven
+/// through the real CLI on the `-p` path, one behaviour per assertion.
 #[test]
-fn s15_exceptions_via_eval() {
+fn exceptions_via_eval() {
     // try/catch binds the thrown number and, separately, the thrown string.
     assert_eq!(
         jsc(&["-p", "let r = 0; try { throw 42 } catch (e) { r = e } r"]),
@@ -294,11 +293,11 @@ fn s15_exceptions_via_eval() {
     );
 }
 
-/// S15 — an UNCAUGHT `throw` (no enclosing handler) must fail the process: the
+/// An UNCAUGHT `throw` (no enclosing handler) must fail the process: the
 /// CLI exits 1 and reports the unwound value as `Uncaught <value>` on
 /// stderr, never printing a normal result to stdout.
 #[test]
-fn s15_uncaught_throw_exits_one() {
+fn uncaught_throw_exits_one() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "throw 42"])
         .output()
@@ -318,11 +317,11 @@ fn s15_uncaught_throw_exits_one() {
     );
 }
 
-/// P2.1 — out-of-scope object method forms (getter/setter, computed method name,
+/// Out-of-scope object method forms (getter/setter, computed method name,
 /// async/generator methods) are rejected at compile time with exit code 2 and
 /// an explanatory message.
 #[test]
-fn p2_unsupported_object_methods_error() {
+fn unsupported_object_methods_error() {
     let cases = [
         ("let o={get x(){return 1}}; o.x", "getter"),
         ("let o={set x(v){}}; 1", "setter"),
@@ -347,17 +346,17 @@ fn p2_unsupported_object_methods_error() {
     }
 }
 
-/// P2.2/P2.3 — out-of-scope class forms are rejected at compile time with a
+/// Out-of-scope class forms are rejected at compile time with a
 /// non-zero exit and an explanatory, spanned message. A class with a constructor,
 /// plain instance methods, and `static` members is supported (see the classes
 /// suite); inheritance, decorators, and every out-of-scope method/field form
 /// (getter, setter, private, computed, async, generator) stay out of scope.
 #[test]
-fn p2_unsupported_class_forms_error() {
+fn unsupported_class_forms_error() {
     let cases = [
         ("class A extends B {} 1", "extends"),
         ("class A{ [k] = 1 } 1", "computed"),
-        // Instance accessors are supported (P2b); a STATIC getter/setter is not.
+        // Instance accessors are supported; a STATIC getter/setter is not.
         ("class A{ static get v(){return 1} } 1", "getter"),
         ("class A{ static set v(x){} } 1", "setter"),
         // A computed instance accessor is still rejected.

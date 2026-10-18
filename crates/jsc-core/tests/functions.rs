@@ -72,15 +72,15 @@ fn function_value_typeof_and_truthiness() {
 }
 
 // ---------------------------------------------------------------------------
-// Full S13 acceptance list, end to end (plan §10 milestones + S8–S12 regression).
+// Function, closure, and member-assignment acceptance list, end to end.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn s13_milestones_end_to_end() {
-    // Member-compound assignment (S13.2).
+fn functions_and_closures_end_to_end() {
+    // Member-compound assignment.
     assert_eval("let a = [10, 20]; a[0] += 5; a[0]", "15");
     assert_eval("let o = { x: 1 }; o.x += 41; o.x", "42");
-    // First-class function values (S13.3).
+    // First-class function values.
     assert_eval(
         "function add(a, b) { return a + b } let f = add; f(40, 2)",
         "42",
@@ -89,10 +89,10 @@ fn s13_milestones_end_to_end() {
         "function apply(f, x) { return f(x) } function dbl(n) { return n * 2 } apply(dbl, 21)",
         "42",
     );
-    // Arrow functions (S13.4).
+    // Arrow functions.
     assert_eval("let add = (a, b) => a + b; add(40, 2)", "42");
     assert_eval("let sq = x => x * x; sq(7)", "49");
-    // Return-fn closure (S13.5) + mutable counter (S13.6).
+    // Return-fn closure + mutable counter.
     assert_eval(
         "function adder(x) { return y => x + y } let a5 = adder(5); a5(37)",
         "42",

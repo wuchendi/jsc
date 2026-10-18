@@ -3,12 +3,12 @@
 mod common;
 use common::jsc;
 
-/// The S11 array milestones run inline with `-p` through the built binary.
+/// Array basics run inline with `-p` through the built binary.
 ///
-/// Covers the array wave end to end: element read + sum, `.length`, `typeof`,
+/// Covers arrays end to end: element read + sum, `.length`, `typeof`,
 /// a `while`-driven sum over `.length`, and the empty array.
 #[test]
-fn array_milestones_via_eval() {
+fn array_basics_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[1,2,3]; a[0]+a[2]"]), "4");
     assert_eq!(jsc(&["-p", "[1,2,3].length"]), "3");
     assert_eq!(jsc(&["-p", "typeof []"]), "object");
@@ -22,7 +22,7 @@ fn array_milestones_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[]; a.length"]), "0");
 }
 
-/// S11.2: `arr[i] = v` stores into an existing slot and the assignment
+/// `arr[i] = v` stores into an existing slot and the assignment
 /// expression evaluates to the stored value.
 #[test]
 fn array_element_assignment_via_eval() {
@@ -31,11 +31,11 @@ fn array_element_assignment_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[0]; let x=(a[0]=7); x"]), "7");
 }
 
-/// S14.4 — `Array.prototype.push`/`pop` grow and shrink a bound array end-to-end
+/// `Array.prototype.push`/`pop` grow and shrink a bound array end-to-end
 /// through the CLI: the binding observes the new length and elements after growth,
 /// and `pop` returns the removed element while decrementing the length in place.
 #[test]
-fn s14_array_push_pop_via_eval() {
+fn array_push_pop_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[1,2]; a.push(3); a.length"]), "3");
     assert_eq!(jsc(&["-p", "let a=[1,2]; a.push(3); a[2]"]), "3");
     assert_eq!(jsc(&["-p", "let a=[1,2,3]; a.pop()"]), "3");
@@ -50,11 +50,11 @@ fn s14_array_push_pop_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[1,2]; a.push(3); a"]), "[ 1, 2, 3 ]");
 }
 
-/// S14.5 — array higher-order methods `map`/`filter`/`reduce`/`forEach` end-to-end
-/// through the CLI: callbacks invoke per element via the S13 `call_indirect` ABI,
+/// Array higher-order methods `map`/`filter`/`reduce`/`forEach` end-to-end
+/// through the CLI: callbacks invoke per element via the `call_indirect` ABI,
 /// closures capturing an outer binding mutate it, and results chain.
 #[test]
-fn s14_array_higher_order_via_eval() {
+fn array_higher_order_via_eval() {
     assert_eq!(jsc(&["-p", "[1,2,3].map(x => x*2)[2]"]), "6");
     assert_eq!(jsc(&["-p", "[1,2,3,4].filter(x => x > 2).length"]), "2");
     assert_eq!(jsc(&["-p", "[1,2,3,4].reduce((a,b) => a+b, 0)"]), "10");
@@ -76,12 +76,12 @@ fn s14_array_higher_order_via_eval() {
     assert_eq!(jsc(&["-p", "[1,2,3].forEach(x => x)"]), "undefined");
 }
 
-/// S14.6 — non-callback array/string methods end-to-end through the CLI:
+/// Non-callback array/string methods end-to-end through the CLI:
 /// `indexOf`/`includes`/`join`/`slice` on arrays and
 /// `toUpperCase`/`toLowerCase`/`indexOf`/`slice`/`charAt` on strings, with the
 /// overloaded `indexOf`/`slice` dispatched on the receiver's runtime type.
 #[test]
-fn s14_array_and_string_methods_via_eval() {
+fn array_and_string_methods_via_eval() {
     assert_eq!(jsc(&["-p", "[10,20,30].indexOf(20)"]), "1");
     assert_eq!(jsc(&["-p", "[10,20,30].indexOf(99)"]), "-1");
     assert_eq!(jsc(&["-p", "[1,2,3].includes(2)"]), "true");
@@ -100,11 +100,11 @@ fn s14_array_and_string_methods_via_eval() {
     assert_eq!(jsc(&["-p", "[1,2,3,4].slice(1,3).join(\"-\")"]), "2-3");
 }
 
-/// P1.5 — spread `...` in array literals through the CLI: a spread source's
+/// Spread `...` in array literals through the CLI: a spread source's
 /// elements are appended at runtime, interleaved with plain elements, so the
 /// result length and indexing are only known after the build.
 #[test]
-fn p1_5_array_spread_via_eval() {
+fn array_spread_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[1,2]; [...a,3].length"]), "3");
     assert_eq!(jsc(&["-p", "let a=[1,2],b=[3]; [...a,...b][2]"]), "3");
     assert_eq!(jsc(&["-p", "[0,...[1,2],9][3]"]), "9");
@@ -122,8 +122,8 @@ fn p1_5_array_spread_via_eval() {
 }
 
 /// Spreading a STRING into an array literal explodes it into its characters
-/// (one-byte heap strings), fixing the pre-existing bug where `[...str]` read the
-/// string's UTF-8 bytes as jsvals. The character walk is byte-indexed, matching
+/// (one-byte heap strings) rather than reading the string's UTF-8 bytes as
+/// jsvals. The character walk is byte-indexed, matching
 /// for-of / indexing over a string.
 #[test]
 fn string_spread_explodes_chars() {
@@ -138,12 +138,12 @@ fn string_spread_explodes_chars() {
     assert_eq!(jsc(&["-p", "[...\"hi\"].join(\"-\")"]), "h-i");
 }
 
-/// P2.2b regression: an element WRITE with a computed RHS, and a computed-index
+/// Regression: an element WRITE with a computed RHS, and a computed-index
 /// READ, must not clobber the stashed receiver. Both the RHS and the index
-/// sub-expression are emitted with the child scratch base; the receiver/key now
+/// sub-expression are emitted with the child scratch base; the receiver/key
 /// live in dedicated high slots so they survive the child evaluation.
 #[test]
-fn p2_2b_index_computed_rhs_and_index_no_clobber() {
+fn index_computed_rhs_and_index_no_clobber() {
     // Computed RHS on an element store.
     assert_eq!(jsc(&["-p", "let a=[0,0]; a[1]=3+4; a[1]"]), "7");
     // Computed index on a READ.

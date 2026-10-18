@@ -159,7 +159,7 @@ impl<'a> LowerCtx<'a> {
         }
         // An `env_backed` (generator) frame boxes EVERY binding into an env cell so
         // it survives across a `yield`; an ordinary frame boxes only the bindings
-        // capture analysis flagged (S13.4).
+        // capture analysis flagged.
         let cell = module.is_none() && (env_backed || self.shared.captured.contains(&id));
         // In an `env_backed` frame the cell lives at a fresh env slot (reached via
         // `EnvLoad`), not in a wasm local; the constructor pre-creates it.
@@ -192,7 +192,7 @@ impl<'a> LowerCtx<'a> {
         idx
     }
 
-    /// Resolve `this` for the current frame (P2.1): allocate the frame's `this`
+    /// Resolve `this` for the current frame: allocate the frame's `this`
     /// slot on first use (so a `this`-free function keeps its original local
     /// layout) and return its local index, or `None` in a non-function scope (the
     /// top-level `main` frame), where `this` has no binding. A prologue snapshot of
@@ -216,7 +216,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// The environment slot of the binding holding `local` in the current frame,
-    /// when that frame is `env_backed` (a generator, P4.2 M2). `None` for an
+    /// when that frame is `env_backed` (a generator). `None` for an
     /// ordinary frame or a non-binding local.
     pub(super) fn env_slot_for_local(&self, local: u32) -> Option<u32> {
         let frame = self.frames.last()?;
@@ -281,13 +281,13 @@ impl<'a> LowerCtx<'a> {
 
     /// Mark the current frame `env_backed`: every binding it declares becomes an
     /// env cell reached via `EnvLoad`, and [`Self::env_layout`] returns the frame
-    /// slots. Used to lower a generator body (P4.2 M2).
+    /// slots. Used to lower a generator body.
     pub(super) fn set_env_backed(&mut self) {
         self.frame().env_backed = true;
     }
 
     /// The number of environment slots the current frame has allocated (its
-    /// generator frame size, P4.2 M2).
+    /// generator frame size).
     pub(super) fn env_len(&self) -> usize {
         self.frames.last().map_or(0, |f| f.env.len())
     }
@@ -345,7 +345,7 @@ impl<'a> LowerCtx<'a> {
             AccessKind::Cell(IrNode::ModuleCell(slot))
         } else if fi == self.top() {
             if let Some(slot) = binding.env_slot {
-                // A generator local (P4.2 M2): its cell lives in this frame's own
+                // A generator local: its cell lives in this frame's own
                 // environment, reached via `EnvLoad`, so it survives a `yield`.
                 AccessKind::Cell(IrNode::EnvLoad(slot))
             } else if binding.cell {

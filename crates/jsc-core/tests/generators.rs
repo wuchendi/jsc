@@ -1,4 +1,4 @@
-//! Generator integration tests (P4.2 M2 — state-machine transform).
+//! Generator integration tests (state-machine transform).
 //!
 //! Covers the user-approved v1 cut: `function*` declarations with `yield` in
 //! statement / `x = yield` / `return yield` positions, `.next(v)` returning
@@ -162,7 +162,7 @@ fn a_generator_handle_renders_as_a_generator_object() {
     );
 }
 
-// --- M3: control flow crossing a yield (CFG flattening) ---------------------
+// --- control flow crossing a yield (CFG flattening) -------------------------
 
 #[test]
 fn yields_from_a_for_loop() {
@@ -233,7 +233,7 @@ fn continue_skips_an_iteration_of_a_yielding_loop() {
     );
 }
 
-// --- M3: consuming a generator with for-of ----------------------------------
+// --- consuming a generator with for-of --------------------------------------
 
 #[test]
 fn for_of_drives_a_generator() {
@@ -400,7 +400,7 @@ fn rejects_a_nested_closure_in_a_generator() {
 
 #[test]
 fn rejects_a_generator_expression() {
-    // Only top-level `function*` DECLARATIONS are supported in M2.
+    // Only top-level `function*` DECLARATIONS are supported.
     assert_rejected("let g = function*(){ yield 1 }; g().next();");
 }
 

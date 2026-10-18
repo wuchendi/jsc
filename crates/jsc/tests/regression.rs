@@ -1,14 +1,14 @@
-//! Integration tests: cross-wave regression and acceptance gates via the CLI.
+//! Integration tests: cross-feature regression and acceptance gates via the CLI.
 #![allow(clippy::expect_used)]
 
 use std::process::Command;
 mod common;
 use common::{jsc, jsc_raw_stdout};
 
-/// The full pre-S10 milestone set still holds after the string layer landed.
+/// The core non-string programs hold alongside the string layer.
 ///
 /// Numbers, `while`-sum, recursive `fib`, `typeof` over non-string types,
-/// `null === null`, and a boolean-driven ternary all survive S10 unchanged.
+/// `null === null`, and a boolean-driven ternary.
 #[test]
 fn regression_survives_strings() {
     assert_eq!(jsc(&["-p", "40 + 2"]), "42");
@@ -31,10 +31,10 @@ fn regression_survives_strings() {
     assert_eq!(jsc(&["-p", "let b=true; b === true ? 42 : 0"]), "42");
 }
 
-/// The string milestones still dispatch correctly after arrays landed.
+/// String programs dispatch correctly alongside arrays.
 ///
-/// `s[i]` and `.length` share syntax with arrays but must keep routing to the
-/// string path at runtime; concatenation and strict equality are unchanged.
+/// `s[i]` and `.length` share syntax with arrays but must route to the string
+/// path at runtime; concatenation and strict equality behave as for strings.
 #[test]
 fn regression_survives_arrays() {
     assert_eq!(jsc(&["-p", r#""abc"[1]"#]), "b");
@@ -84,11 +84,11 @@ fn regression_survives_objects() {
     assert_eq!(jsc(&["-p", "null===null"]), "true");
 }
 
-/// The full S11 + prior-milestone set stays green after nesting integration.
+/// The base language holds alongside nested values.
 ///
-/// One assertion per earlier wave — arrays, objects (read/assign/computed),
+/// One assertion per feature area — arrays, objects (read/assign/computed),
 /// strings, numbers, `fib`, `typeof`, and strict equality — so a nesting change
-/// that regressed any base behavior is caught here.
+/// that regresses any base behavior is caught here.
 #[test]
 fn regression_survives_nesting() {
     // Objects: read, computed read, property assign.
@@ -116,13 +116,12 @@ fn regression_survives_nesting() {
     assert_eq!(jsc(&["-p", "null===null"]), "true");
 }
 
-/// S13.7 — a regression sampling across every earlier wave, confirming the S13
-/// tag refactor and function/closure additions left the prior language intact:
-/// numbers, recursion, `for`-sum, `switch`, block scope, `typeof`, strict
-/// equality, logical/coalescing operators, compound assignment, and the string /
-/// array / object basics all still render their expected values.
+/// A regression sampling across the language: numbers, recursion, `for`-sum,
+/// `switch`, block scope, `typeof`, strict equality, logical/coalescing
+/// operators, compound assignment, and the string / array / object basics all
+/// render their expected values.
 #[test]
-fn s13_regression_sampling() {
+fn language_regression_sampling() {
     // Numbers and recursion.
     assert_eq!(jsc(&["-p", "40 + 2"]), "42");
     assert_eq!(
@@ -162,14 +161,14 @@ fn s13_regression_sampling() {
     assert_eq!(jsc(&["-p", "let o={v:[7,8]}; o.v[1]"]), "8");
 }
 
-/// S14.7 — the full S14 milestone matrix as one consolidated end-to-end gate through
-/// the built binary. The `console.log` milestones assert **stdout** byte-for-byte; the
-/// value milestones assert the decoded final value. Covers every S14 feature group:
+/// The built-in library matrix as one consolidated end-to-end gate through the
+/// built binary. The `console.log` cases assert **stdout** byte-for-byte; the
+/// value cases assert the decoded final value. Covers every built-in group:
 /// `console.log`, `Math`, conversions, array growth (`push`/`pop`), the higher-order
 /// callback methods (`map`/`filter`/`reduce`/`forEach`), and the array/string method
 /// surface.
 #[test]
-fn s14_acceptance_milestones() {
+fn builtins_acceptance() {
     // console.log — printed output, independent of the final-expression value.
     assert_eq!(jsc_raw_stdout(&["-e", "console.log(40 + 2)"]), "42\n");
     assert_eq!(jsc_raw_stdout(&["-e", r#"console.log("hi")"#]), "hi\n");
@@ -204,13 +203,12 @@ fn s14_acceptance_milestones() {
     assert_eq!(jsc(&["-p", r#""HELLO".slice(1,3)"#]), "EL");
 }
 
-/// S14.7 — the S8–S13 regression list must still hold through the built binary after
-/// the whole S14 built-in library landed: numbers, recursion, closures, statement
-/// forms, heap basics, and the operator/typeof/strict-equality surface. S14 adds no
-/// value-level encoding change, so every earlier program renders result-for-result
-/// identically.
+/// The core language regression list holds through the built binary alongside
+/// the built-in library: numbers, recursion, closures, statement forms, heap
+/// basics, and the operator/typeof/strict-equality surface all render
+/// result-for-result as expected.
 #[test]
-fn s14_full_regression() {
+fn core_language_regression() {
     // Numbers and recursion.
     assert_eq!(jsc(&["-p", "40 + 2"]), "42");
     assert_eq!(

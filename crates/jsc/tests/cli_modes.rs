@@ -49,10 +49,10 @@ fn file_run_without_console_prints_nothing() {
     assert_eq!(jsc_raw_stdout(&[path.to_str().expect("utf-8 path")]), "");
 }
 
-/// S14.7 — a `console.log`-driven program runs from a source *file*; only the
+/// A `console.log`-driven program runs from a source *file*; only the
 /// printed lines reach stdout (no trailing completion value).
 #[test]
-fn s14_console_log_acceptance_via_file() {
+fn console_log_program_via_file() {
     let path = temp_source(
         "s14_log.js",
         "let a=[1,2]; a.push(3); console.log(a.length); console.log(a); \
