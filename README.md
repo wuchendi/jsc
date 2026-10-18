@@ -1,104 +1,132 @@
 # jsc
 
-A from-scratch, ahead-of-time **JavaScript → WebAssembly** compiler in Rust. No JIT, no interpreter — `jsc` parses your source, lowers it through a small IR, emits a real `.wasm` module, and runs it, all in one process.
+An ahead-of-time JavaScript/TypeScript → WebAssembly compiler in Rust, conformance tracked by [test262](https://github.com/tc39/test262).
 
 ```console
-$ jsc -e "[1,2,3,4].filter(x => x % 2 === 0).map(x => x * 10).reduce((a,b) => a+b, 0)"
+$ jsc -p "[1,2,3,4].filter(x => x % 2 === 0).map(x => x * 10).reduce((a,b) => a+b, 0)"
 60
 
-$ jsc -e 'function counter(){ let c = 0; return () => ++c } let n = counter(); n(); n(); n()'
-3
-
-$ jsc -e 'let xs = [1,2,3]; console.log("sum", xs.reduce((a,b)=>a+b,0)); xs.map(x => x*x)'
+$ jsc -e 'console.log("sum", [1,2,3].reduce((a,b) => a+b, 0))'
 sum 6
-[ 1, 4, 9 ]
 ```
 
-## Why
+## What it is
 
-`jsc` is a **teaching compiler** — small enough to read end to end, real enough to compile closures, arrays, and exceptions down to WebAssembly. It's built to show how a dynamic language actually reaches a static target:
-
-- **Real backend, not a tree-walker.** Every program becomes a validated `wasm` module (via [`wasm-encoder`](https://crates.io/crates/wasm-encoder)) and runs on [`wasmtime`](https://wasmtime.dev/) — you can dump the bytes with `--emit wasm`.
-- **One value, cleverly packed.** All runtime values are a single **NaN-boxed `i64`**: numbers ride as raw `f64` bits; `true`/`false`/`null`/`undefined` and heap pointers are tagged in the quiet-NaN space. No tagged unions, no per-type boxing.
-- **A real heap.** Strings, arrays, objects, functions, and closure environments live in a **bump-allocated linear-memory heap** behind a 4-byte type-byte header.
-- **Closures that actually close.** First-class functions compile to a `funcref` table + `call_indirect` with a uniform env-last ABI; captured variables are boxed cells, captured by reference.
-- **A front end you don't have to write.** Parsing is [`swc`](https://swc.rs/) (the same parser production tools use); `jsc` owns everything after the AST.
-
-It is a deliberately bounded subset (see [Non-goals](#non-goals)), documented campaign by campaign in [`DESIGN.md`](DESIGN.md).
+- **A compiler, not an interpreter.** Every program becomes a validated WebAssembly module (emitted with [`wasm-encoder`](https://crates.io/crates/wasm-encoder)). The CLI runs it on [`wasmtime`](https://wasmtime.dev/) or writes the bytes out with `jsc build`.
+- **An embeddable library.** The whole pipeline lives in the `jsc-core` crate; `jsc` is a thin CLI over it.
+- **An in-browser compiler.** `crates/jsc-wasm` compiles `jsc-core` itself to wasm (wasm-bindgen); the `@cdlab/jsc` package (`packages/jsc`) wraps it with `compile(src)` / `run(src)` for the browser and Node, and `apps/jsc-web` is a playground built on that package.
+- **TypeScript by type stripping only** — no type checking. Today the frontend parses ECMAScript only; see [Current limitations](#current-limitations).
 
 ## Install
 
-From source (needs Rust 1.96+):
+From source (Rust 1.96+):
 
 ```bash
 git clone https://github.com/cdLab996/jsc.git
 cd jsc
 cargo install --path crates/jsc      # installs the `jsc` binary
-# or just: cargo build --release     # -> target/release/jsc
+# or: cargo build --release          # -> target/release/jsc
 ```
 
-A prebuilt static Linux x86_64 binary is attached to each [GitHub Release](https://github.com/cdLab996/jsc/releases) (push a `v*` tag to build it). On macOS and Windows, build from source — `cargo` cross-compiles cleanly.
+Pushing a `v*` tag builds a static Linux x86_64 binary (`jsc-linux-x64.tar.gz`) and attaches it to a [GitHub Release](https://github.com/cdLab996/jsc/releases); other platforms build from source.
+
+The browser package: `bun install`, then `bun run build:wasm` (builds `crates/jsc-wasm` into `packages/jsc/wasm`) and `bun run dev:web` for the playground.
 
 ## Usage
 
+`jsc` follows `node`'s command-line shape:
+
 ```bash
-jsc -e "40 + 2"                         # evaluate an inline program
-jsc path/to/program.js                  # run a program from a file
-jsc -e "40 + 2" --emit wasm > out.wasm  # emit the raw WebAssembly module instead of running
+jsc program.js                    # compile and run a file; prints only console output
+jsc -e 'console.log(40 + 2)'      # compile and run an inline source string
+jsc -p '40 + 2'                   # run inline source and print its completion value
+jsc build program.js -o out.wasm  # write the WebAssembly module (-o - writes to stdout)
 ```
 
-`jsc` prints the program's **final expression value** — numbers bare, strings unquoted, arrays and objects Node-style. `console.log(...)` streams to stdout **during** execution (via a host import), before that final line. An **uncaught exception** prints `Uncaught <value>` to stderr and exits non-zero:
+`console.log` streams to stdout while the module runs; `-p` prints the completion value afterwards, Node-style (`[ 1, 4, 9 ]`). Exactly one of FILE, `-e`, `-p` is accepted.
+
+| Exit code | Meaning |
+| --------- | ------- |
+| `0` | success |
+| `1` | uncaught exception (`Uncaught <value>` on stderr), runtime trap, or I/O failure |
+| `2` | compile error (a caret diagnostic pointing at the source span) or invalid command line |
 
 ```console
-$ jsc -e 'let r = 0; try { throw new Error("boom") } catch (e) { r = e.message } r'
-boom
-
-$ jsc -e 'throw "kaboom"'
-Error: Uncaught kaboom
+$ jsc -e 'throw new TypeError("boom")'
+Uncaught TypeError: boom
 $ echo $?
 1
 ```
+
+## Conformance
+
+test262 is the primary metric. `crates/jsc-test262` runs the official suite at a pinned commit against the release `jsc` binary:
+
+- `scripts/test262-fetch.sh` checks out tc39/test262 into `.tmp/test262`.
+- `tests/test262/harness/` holds the harness includes; `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module`, `async`, or `noStrict` are ineligible as well.
+- `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records the pass count per commit.
+
+Current result (last row of `tests/test262/history.tsv`): **4860 pass / 22992 eligible (21.1%) / 47665 total**.
+
+```bash
+bash scripts/test262-fetch.sh
+cargo build --release -p jsc
+cargo run --release -p jsc-test262                      # full run with a per-directory report
+cargo run --release -p jsc-test262 -- built-ins/Array   # only tests under a path prefix
+cargo run --release -p jsc-test262 -- --check           # fail if any baseline test regressed
+cargo run --release -p jsc-test262 -- --update-baseline # rewrite baseline.txt
+cargo run --release -p jsc-test262 -- --history         # append a row to history.tsv
+```
+
+CI (`.github/workflows/`):
+
+- `ci.yml` — on push to `main` and on pull requests that touch Rust paths (`crates/**`, Cargo manifests and lockfile, toolchain/lint configs, `tests/test262/**`, `scripts/test262-fetch.sh`): `cargo fmt --check`, `typos`, `cargo clippy` (warnings denied), `cargo nextest`, doctests, `cargo shear`, `cargo deny`; plus a test262 job that runs `jsc-test262 --check` against the baseline.
+- `web.yml` — on push to `main` and pull requests that touch `crates/**`, `packages/**`, `apps/**`, `scripts/**`, Cargo or bun manifests (and manual dispatch): builds `@cdlab/jsc`, runs `biome` lint, builds the playground, and runs the package tests.
+- `release.yml` — on `v*` tags (and manual dispatch): builds the static musl binary and publishes the release.
 
 ## Supported language
 
 | Area | What works |
 | ---- | ---------- |
-| **Values** | `number` (f64), `boolean`, `undefined`, `null`; heap `string`, `array`, `object`, `function`, `Map`, `Set`, `Promise`, `Date`, generator |
-| **Operators** | `+ - * / % **`, `< <= > >=`, `== != === !==`, `&& \|\| ! ??`, `typeof`, `instanceof`, unary `-`/`!`, string `+`, compound `+= … **=`, `++`/`--` |
-| **Bindings** | `let` / `const` with **block scoping**; reassigning a `const` is a **compile error**; array/object **destructuring** with defaults & rest; **spread** `...` (arrays, calls, strings) |
-| **Control flow** | `if`/`else`, `for`, `while`, `for-of`, `for-in`, `switch`/`case`/`default`/`break`, ternary `?:`, optional chaining `?.` |
-| **Functions** | declarations, arrow functions, **closures** (capture-by-reference), recursion, higher-order, default & rest params; **`function*`/`yield`/`yield*`** generators; **`async`/`await`** |
-| **Classes** | fields, methods, `constructor`, **`extends`/`super`**, **static** methods & fields, instance **getters/setters**, multi-hop `instanceof` |
-| **Built-ins** | `console.log`; `Math.*`; `String`/`Number`/`Boolean`/`parseInt`/`parseFloat`; array `push`/`pop`/`map`/`filter`/`reduce`/`forEach`/`indexOf`/`includes`/`join`/`slice`; string `toUpperCase`/`toLowerCase`/`indexOf`/`slice`/`charAt`/`trim`/`repeat`/`startsWith`/`endsWith`/`padStart`/`padEnd`/`substring`/`split`; `Object.keys`/`values`/`entries`, `in`, `delete`; `Map`/`Set`; `JSON.stringify`/`parse`; `Date` (`now`/`getTime`/`getFullYear`…/`toISOString`) |
-| **Async** | `Promise` (`new Promise`, `resolve`/`reject`, `.then`/`.catch`), a microtask queue drained at program end, top-level `await`, and `async`/`await` functions |
-| **Errors** | `throw`, `try`/`catch`/`finally` (`finally` runs on every exit); `Error`/`TypeError`/`RangeError` with `.name`/`.message`/`.stack` and real `instanceof` identity; the engine's own `TypeError` is catchable |
+| **Values** | `number`, `boolean`, `undefined`, `null`, `string`, arrays, objects, functions, `Map`, `Set`, `Promise`, `Date`, generators |
+| **Operators** | arithmetic, comparison, `==`/`===` and negations, logical and `??`, `typeof`, `instanceof`, `in`, `delete`, compound assignment, `++`/`--`, optional chaining `?.`; ToNumber coercion for arithmetic, unary, update and relational operators |
+| **Bindings** | block-scoped `let`/`const` (assigning a `const` is a compile error); array/object destructuring with defaults and rest; spread in array literals and calls |
+| **Control flow** | `if`, `for`, `while`, `for-of`, `for-in`, `switch`, labels, ternary |
+| **Functions** | declarations, arrows, closures (capture by reference), default and rest parameters; missing arguments are `undefined`, extra arguments are ignored; `function*` generators; `async` functions and top-level `await` |
+| **Classes** | fields, methods, constructors, `extends`/`super`, static methods and fields, instance getters/setters |
+| **Built-ins** | `console.log`, `Math`, `String`/`Number`/`Boolean`, `parseInt`/`parseFloat`, common array and string methods, `Object.keys`/`values`/`entries`, `Map`/`Set`, `JSON.parse`/`stringify`, `Date` |
+| **Async** | `Promise` (`new Promise`, `resolve`/`reject`, `.then`/`.catch`) with a microtask queue |
+| **Errors** | `throw`, `try`/`catch`/`finally`; `Error`/`TypeError`/`RangeError` with `.name`, `.message`, `.stack` and `instanceof`; member access on `null`/`undefined` throws a catchable `TypeError`; running out of memory throws `RangeError` |
+
+Unsupported syntax, and unknown methods on statically known receivers, are rejected at compile time with a source-span diagnostic; an unknown method on a dynamically shaped receiver throws `TypeError` at run time.
 
 ## How it works
 
 ```
-source ──swc──▶ AST ──codegen──▶ IR ──emit──▶ .wasm ──wasmtime──▶ result
-        frontend.rs    codegen/      ir.rs   emit/          run/
+source ──swc──▶ AST ──codegen──▶ IR ──emit──▶ .wasm ──run──▶ result
 ```
 
-The compiler core is the **`jsc-core`** crate; **`jsc`** is a thin `clap` CLI over it.
+- **frontend** — parses source with [`swc`](https://swc.rs/).
+- **codegen** — lowers the AST to a small IR: scopes, closure capture analysis, generator/async state machines. Top-level bindings captured by top-level functions live in module cells.
+- **emit** — IR → wasm. Every value is a NaN-boxed `i64` (numbers are raw `f64` bits, with NaN canonicalized on every rebox through `__box_f64`; other kinds are tagged in the quiet-NaN space). Strings, arrays, objects, closures and environments live in linear memory behind a type-byte header, allocated by `__alloc`, a bump allocator that grows memory on demand up to 512 MiB. Exceptions use manual unwinding (no wasm exception-handling proposal). `Map`/`Set` keys compare with SameValueZero (`__same_value_zero`).
+- **run** — instantiates the module on `wasmtime`, provides the host imports, drains the microtask queue, and formats the result.
 
-- **`frontend`** — wraps `swc` to turn source text into an AST.
-- **`ir`** — a small enum IR the AST lowers into.
-- **`codegen`** — AST → IR: scopes, operators, functions, closure capture analysis.
-- **`emit`** — IR → WebAssembly bytes with `wasm-encoder`: the NaN-box value model, the linear-memory heap + bump allocator, and the runtime helpers.
-- **`run`** — loads the module on `wasmtime`, wires the host imports (`console.log`, conversions, array/string methods, the promise engine, the wall clock), drains the microtask queue, and formats the result.
+Details are in [DESIGN.md](DESIGN.md).
 
-Exceptions use a portable **manual-unwinding** model (two module globals + a codegen handler-label stack + a call-site check-and-propagate) rather than the wasm exception-handling proposal. See [`DESIGN.md`](DESIGN.md) for the bit layout, heap format, ABI, and per-campaign notes.
+## Current limitations
 
-## Non-goals
+- **Frontend parses ECMAScript only.** TypeScript type annotations are not stripped yet; the parser runs in ES mode.
+- **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
+- **Fixed-shape objects.** Computed keys (`{[k]: v}`), object spread, object-literal accessors and private class fields are rejected; adding a property to an existing object or assigning past the end of an array is a silent no-op.
+- **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
+- **Not self-contained.** The module imports six host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
+- **Byte strings.** Strings are byte sequences, not UTF-16: `"é".length` is `2`.
+- **Missing built-ins.** No `RegExp` (regex literals are rejected), `Symbol`, `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval`, or `Function.prototype.call`/`apply`/`bind`; no ES modules.
+- **Restricted forms.** Class and generator expressions, async arrows and async generators are rejected.
 
-`jsc` targets a growing-but-fixed subset; these remain **out of scope**:
+## Roadmap
 
-- No **`RegExp`**; no `Symbol`, `Proxy`, `Reflect`, `WeakMap`/`WeakRef`, or `BigInt`.
-- **Computed property keys** `{[k]: v}`, **static** accessors, and **object-literal** getters/setters are rejected (the object model is fixed-shape); array **out-of-bounds assignment** does not grow the array.
-- The emitted `.wasm` **declares host imports** (`console.log`, conversions, the promise/date/JSON helpers) satisfied by jsc's `wasmtime` host — it is **not** self-contained; there is **no GC** (bump-allocated, no free).
-- Accessors and the engine's built-in errors dispatch on **statically-known** shapes where noted; a few low-level faults are still wasm traps rather than catchable exceptions.
-- Strings are ASCII-first (byte-indexed `.length`); no full UTF-16/Unicode semantics. `.stack` is a single `"Name: message"` line (no frames).
+A generic object model with a dynamic property-lookup fallback, UTF-16 strings, a JavaScript prelude for built-ins, self-contained WASI modules, GC, and ES modules.
 
 ## License
 
