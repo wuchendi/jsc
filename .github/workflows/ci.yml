@@ -5,7 +5,8 @@
 #
 # This gate only checks the Rust workspace, so it runs only when Rust-relevant
 # files change (paths allowlist below). Changes to the JS/TS monorepo
-# (package.json, apps/**, packages/**, scripts/**) and docs do NOT trigger it.
+# (package.json, apps/**, packages/**, scripts/**) and docs do NOT trigger it,
+# except scripts/test262-fetch.sh, which pins the test262 checkout.
 
 name: CI
 
@@ -21,6 +22,8 @@ on:
       - "rustfmt.toml"
       - "deny.toml"
       - "_typos.toml"
+      - "tests/test262/**"
+      - "scripts/test262-fetch.sh"
       - ".github/workflows/ci.yml"
   pull_request:
     paths: *rust-paths
@@ -75,6 +78,38 @@ jobs:
       # cargo-deny reads manifests/lockfile only — no workspace compile needed.
       - name: Supply-chain (cargo-deny)
         run: cargo deny check
+
+  test262:
+    name: test262 (baseline regression gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install toolchain 1.96.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # The pinned test262 SHA lives in the fetch script, so key on its hash.
+      - name: Cache test262 checkout
+        uses: actions/cache@v4
+        with:
+          path: .tmp/test262
+          key: test262-${{ hashFiles('scripts/test262-fetch.sh') }}
+
+      - name: Fetch test262
+        run: bash scripts/test262-fetch.sh
+
+      - name: Build jsc (release)
+        run: cargo build --release -p jsc
+
+      # Fails if any test passing in tests/test262/baseline.txt regressed.
+      - name: Check against baseline
+        run: cargo run --release -p jsc-test262 -- --check
 
   # NOTE: portable musl / multi-platform release binaries are built by
   # release.yml on `v*` tags (and manual dispatch), not on every push.
