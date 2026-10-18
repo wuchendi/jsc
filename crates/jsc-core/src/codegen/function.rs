@@ -19,12 +19,12 @@ use crate::error::CompileError;
 /// `funcs`, including itself (recursion).
 pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::Result<IrFunction> {
     let mut ctx = LowerCtx::new(shared);
-    // A top-level `function*` lowers to a generator constructor + state machine
-    // (P4.2 M2), not an ordinary function body.
+    // A top-level `function*` lowers to a generator constructor + state machine,
+    // not an ordinary function body.
     if fn_decl.function.is_generator && !fn_decl.function.is_async {
         return ctx.lower_generator(fn_decl);
     }
-    // A top-level `async function` (P4.3 M4) compiles its body to a generator
+    // A top-level `async function` compiles its body to a generator
     // state machine (`await` == `yield`) with a wrapper that spawns it as a
     // promise; `lower_generator` handles both, keyed on `function.is_async`.
     // (An `async function*` — an async generator — stays out of scope and is
@@ -44,11 +44,11 @@ pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::R
 }
 
 /// Reject the out-of-scope function forms — `async function` and generator
-/// (`function*`) — that the S13 function-value lowering would otherwise compile
+/// (`function*`) — that the function-value lowering would otherwise compile
 /// as an *ordinary* function and run to a **wrong result** (an `async` body
 /// yields a `Promise`, a `function*` yields a generator object; neither is
-/// modeled). Deferred to S14+; a clear compile error is emitted instead of
-/// silently mis-handling them. See DESIGN §S13 out-of-scope note.
+/// modeled). A clear compile error is emitted instead of silently
+/// mis-handling them. See DESIGN.md.
 pub(super) fn reject_unsupported_function(function: &swc_ecma_ast::Function) -> anyhow::Result<()> {
     if function.is_async {
         return Err(
@@ -80,12 +80,12 @@ impl LowerCtx<'_> {
         // parameter and records the default expression for the prologue guard.
         let mut boxed_params = Vec::new();
         let mut defaults: Vec<(u32, &Expr)> = Vec::new();
-        // A trailing rest parameter (P1.4): its binding ident and its start
+        // A trailing rest parameter: its binding ident and its start
         // position `p` (the number of preceding positional parameters). It binds a
         // synthesized array rather than a single positional slot, so it is built
         // after the slots are laid out (below), not declared inline here.
         let mut rest: Option<(&swc_ecma_ast::BindingIdent, u32)> = None;
-        // Destructuring parameters (P1.6): each holds the temp positional slot the
+        // Destructuring parameters: each holds the temp positional slot the
         // incoming argument lands in, the pattern to destructure it with, and an
         // optional parameter-level default (`f([a,b] = [1,2])`). Destructured in
         // the prologue (below) by reusing `lower_binding_pattern`.
@@ -163,7 +163,7 @@ impl LowerCtx<'_> {
         self.fresh();
         let params = self.frame().next;
 
-        // Mark this frame as a function scope so a body `this` binds here (P2.1);
+        // Mark this frame as a function scope so a body `this` binds here;
         // the `this` slot itself is allocated lazily, only if the body reads it.
         self.frame().allows_this = true;
 
@@ -181,15 +181,15 @@ impl LowerCtx<'_> {
         // defaulted cell param reads/writes its boxed cell).
         self.lower_default_guards(defaults, &mut body)?;
 
-        // Trailing rest parameter (P1.4): gather the surplus arguments into a
+        // Trailing rest parameter: gather the surplus arguments into a
         // real array bound to the rest name (after the fixed params / defaults).
         if let Some((rest_ident, p)) = rest {
             self.lower_rest_param(rest_ident, p, k, &mut body);
         }
 
-        // Destructuring parameters (P1.6): each temp slot holds the incoming
+        // Destructuring parameters: each temp slot holds the incoming
         // argument; apply an optional parameter-level default, then destructure it
-        // into the named locals by reusing the P1.1/P1.2 `lower_binding_pattern`
+        // into the named locals by reusing the `lower_binding_pattern`
         // helper (which handles nested patterns, holes, defaults, and rest).
         for (temp, pat, default) in destructure {
             if let Some(default) = default {
@@ -223,7 +223,7 @@ impl LowerCtx<'_> {
         }
 
         // If the body read `this`, prepend the prologue snapshot as the VERY FIRST
-        // statement (P2.1): `this_slot = __this`, so a nested `this.other()` that
+        // statement: `this_slot = __this`, so a nested `this.other()` that
         // re-sets the global cannot disturb this frame's own receiver. A function
         // that never reads `this` needs no snapshot (its slot was never allocated),
         // leaving its IR unchanged.
@@ -250,7 +250,7 @@ impl LowerCtx<'_> {
         ))
     }
 
-    /// Emit the default-parameter guards (P1.1) in parameter order: each emits
+    /// Emit the default-parameter guards in parameter order: each emits
     /// `if (param === undefined) param = <default>`. The default is evaluated per
     /// call only on the undefined path and may reference earlier params, which are
     /// already bound (and, if defaulted, already guarded before it). A cell param
@@ -292,7 +292,7 @@ impl LowerCtx<'_> {
         Ok(())
     }
 
-    /// Emit the prologue for a trailing rest parameter (P1.4): collect
+    /// Emit the prologue for a trailing rest parameter: collect
     /// `[arg_p, .., arg_{argc-1}]` into a REAL array bound to the rest name.
     ///
     /// `argc` (local `k + 1`, a number jsval) is the actual source argument count,
@@ -385,7 +385,7 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower a nested `function foo(){ .. }` declaration (S13.4): lift its body
+    /// Lower a nested `function foo(){ .. }` declaration: lift its body
     /// to a top-level function (registered in the funcref table, may capture
     /// enclosing bindings like an arrow) and bind `foo` to the resulting function
     /// value in the current scope. `foo` is not visible inside its own body
@@ -415,7 +415,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower an arrow function `(a, b) => a + b` / `x => x * x` / `(n) => { .. }`
-    /// into a first-class function value (S13.4). It lifts to a top-level
+    /// into a first-class function value. It lifts to a top-level
     /// [`IrFunction`] registered in the funcref table and the use-site produces an
     /// [`IrNode::FuncValue`], capturing (by reference, through boxed cells) any
     /// enclosing bindings the body references. An expression body (`=> expr`)
@@ -423,7 +423,7 @@ impl LowerCtx<'_> {
     /// directly. Single-parameter (`x => ..`) and parenthesized zero/multi-parameter
     /// forms all lower the same way. Arrows carry no `this`/`arguments`.
     pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr) -> anyhow::Result<IrNode> {
-        // `async`/generator arrows are out of scope (S14+): reject rather than
+        // `async`/generator arrows are out of scope: reject rather than
         // silently compile the body as a plain arrow (wrong result).
         if arrow.is_async {
             return Err(

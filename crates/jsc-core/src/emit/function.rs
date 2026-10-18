@@ -20,14 +20,14 @@ pub(super) fn emit_main(
     // allocation pointer while an array/object/function/cell/env block is written;
     // three more i64 scratch locals (`+4`/`+5`/`+6`) hold a short-circuit
     // operator's left operand, a `CellSet` value across its store, and a
-    // closure environment pointer across a function-value build (S13.4); and a
+    // closure environment pointer across a function-value build; and a
     // final i32 scratch local (`+7`) holds an indirect call's callee block base.
     // Five further i32 scratch locals (`+8`..`+12`) and one i64 (`+13`) drive an
-    // array higher-order loop (S14.5): receiver base, length, index, callback base,
+    // array higher-order loop: receiver base, length, index, callback base,
     // result base, and the accumulator / truthiness temp.
     // Five more i64 scratch locals (`+14`..`+18`) are DEDICATED HIGH slots for the
     // member/index WRITE (`+14` receiver, `+15` key/index, `+16` value) and the
-    // computed-index READ (`+17` receiver, `+18` key/index) stash (P2.2b). They sit
+    // computed-index READ (`+17` receiver, `+18` key/index) stash. They sit
     // ABOVE the `+0..+13` slots that child sub-expressions reuse, so a computed RHS
     // or index (e.g. `o.v = 3+4`, `a[i+1]`) can no longer clobber the stashed
     // receiver/key/value before the store/load reads them back. Get and set use
@@ -36,10 +36,10 @@ pub(super) fn emit_main(
     // `a[i] = (b[j] = k)`) still shares these fixed slots and is out of scope — a
     // full fix needs a depth-indexed scratch allocator.
     // Two more i64 slots (`+19` current prototype, `+20` target prototype) walk the
-    // `@@prototype` chain for a multi-hop `instanceof` (E-series `extends`).
+    // `@@prototype` chain for a multi-hop `instanceof` (`extends`).
     // One i32 (`+21`) holds a generator frame/env base and two i64 (`+22`/`+23`)
     // hold the generator handle and its state-machine result across a `gen.next()`
-    // driver / `MakeGenerator` construction (P4.2 M2).
+    // driver / `MakeGenerator` construction.
     // Six more i64 slots (`+24`..`+29`) are the `Date` field-method scratch: the
     // guest-side civil-from-days / time-of-day arithmetic runs entirely over these
     // (a `Date` method takes no arguments, so no child sub-expression is live).
@@ -56,7 +56,7 @@ pub(super) fn emit_main(
         (6, ValType::I64),
     ]);
     let scratch = program.locals;
-    // Fresh unwinding state for this function body (S15.2): no active `try`
+    // Fresh unwinding state for this function body: no active `try`
     // handler, control-nesting depth 0.
     helpers.unwind.borrow_mut().reset();
     // Allocate every module cell holding the TDZ hole before any user code, so a
@@ -114,15 +114,15 @@ pub(super) fn emit_function(
     // value of `obj[i] = v`, one i32 (`+3`) for block allocation, three i64
     // (`+4`/`+5`/`+6`) for a short-circuit operand / `CellSet` value / closure
     // environment pointer, one i32 (`+7`) for an indirect call's callee base, the
-    // five i32 (`+8`..`+12`) plus one i64 (`+13`) array higher-order loop slots
-    // (S14.5), five i64 (`+14`..`+18`) dedicated high slots for the member/index
-    // WRITE (`+14`/`+15`/`+16`) and computed-index READ (`+17`/`+18`) stash (P2.2b),
+    // five i32 (`+8`..`+12`) plus one i64 (`+13`) array higher-order loop slots,
+    // five i64 (`+14`..`+18`) dedicated high slots for the member/index
+    // WRITE (`+14`/`+15`/`+16`) and computed-index READ (`+17`/`+18`) stash,
     // which sit above the child-reused `+0..+13` slots so a computed RHS/index
     // cannot clobber the stashed receiver/key/value, and two i64 (`+19`/`+20`) for
-    // the multi-hop `instanceof` prototype-chain walk (E-series), one i32
+    // the multi-hop `instanceof` prototype-chain walk, one i32
     // (`+21`) plus two i64 (`+22`/`+23`) for the generator frame base / handle /
-    // state-machine result (P4.2 M2), and six i64 (`+24`..`+29`) for the `Date`
-    // field-method arithmetic (P-series). See [`emit_main`] for the full rationale
+    // state-machine result, and six i64 (`+24`..`+29`) for the `Date`
+    // field-method arithmetic. See [`emit_main`] for the full rationale
     // and the same-kind-nesting limitation.
     let mut function = Function::new(vec![
         (declared + 3, ValType::I64),
@@ -137,7 +137,7 @@ pub(super) fn emit_function(
         (6, ValType::I64),
     ]);
     let scratch = func.locals;
-    // Fresh unwinding state for this function body (S15.2).
+    // Fresh unwinding state for this function body.
     helpers.unwind.borrow_mut().reset();
     emit_stmts(
         &func.body,
@@ -153,30 +153,25 @@ pub(super) fn emit_function(
     function
 }
 
-/// Emit the unwinding transfer for an in-flight exception (S15.1).
+/// Emit the unwinding transfer for an in-flight exception.
 ///
 /// This is the single primitive both `throw` and every call-site propagation
-/// check funnel through, so the unwinding policy lives in one place. In S15.1
-/// there is no `try` construct yet, so an exception always unwinds to the
+/// check funnel through, so the unwinding policy lives in one place.
+///
+/// # Handler-label stack
+///
+/// The emit context threads a stack of active handler landing-pad labels (the
+/// `Unwind` handler entries). When that stack is non-empty this
+/// helper `br`s to the top handler (the nearest enclosing `try`) so control lands
+/// in its catch-dispatch block. With an empty stack the exception unwinds to the
 /// enclosing function boundary: it emits the function's dummy result (every jsval
 /// function returns `i64`, so the `undefined` bit-pattern) and a `return`,
 /// popping the current frame. A callee thus returns to its caller, whose own
 /// post-call check (see [`emit_propagate_if_pending`]) re-fires and unwinds one
 /// frame further, until `main` returns and the run stage surfaces the exception.
-///
-/// # Handler-label-stack seam (S15.2/S15.3)
-///
-/// `try`/`catch` will introduce a stack of active handler landing-pad labels (a
-/// `Vec<u32>` of block-relative wasm labels) threaded through the emit context.
-/// When that stack is non-empty this helper must instead `br` to the top handler
-/// (the nearest enclosing `try`) so control lands in its `catch` block rather
-/// than returning; only an empty stack falls back to the function-boundary
-/// `return` emitted here. S15.1 always behaves as if the stack were empty. The
-/// change is confined to this one helper plus wherever the label stack is pushed
-/// (the future `IrStmt::Try` emission) and threaded — no call site needs to know
-/// which unwinding target is active.
+/// No call site needs to know which unwinding target is active.
 pub(super) fn emit_throw_return(function: &mut Function, helpers: Helpers<'_>) {
-    // The nearest enclosing `try`'s catch-dispatch block (S15.2), as a `br`
+    // The nearest enclosing `try`'s catch-dispatch block, as a `br`
     // immediate relative to the current control-nesting depth, or `None` when no
     // `try` is active in this function.
     let target = {
@@ -188,7 +183,7 @@ pub(super) fn emit_throw_return(function: &mut Function, helpers: Helpers<'_>) {
         // catch arm then observes `$exc_pending` set and runs the `catch` body.
         function.instruction(&Instruction::Br(rel));
     } else {
-        // No handler: unwind to the function boundary (S15.1) — emit the dummy
+        // No handler: unwind to the function boundary — emit the dummy
         // `i64` result and `return`, popping this frame so the caller's own
         // post-call check re-fires one frame further out.
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -197,7 +192,7 @@ pub(super) fn emit_throw_return(function: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Enter a wasm control frame (`block`/`loop`/`if`) that may wrap a throw or a
-/// throwing-call site: bump the tracked nesting depth (S15.2) so a `throw`
+/// throwing-call site: bump the tracked nesting depth so a `throw`
 /// reached inside computes the correct handler-relative `br`. Every
 /// [`enter_frame`] must be balanced by a [`leave_frame`].
 pub(super) fn enter_frame(helpers: Helpers<'_>) {
@@ -209,8 +204,8 @@ pub(super) fn leave_frame(helpers: Helpers<'_>) {
     helpers.unwind.borrow_mut().depth -= 1;
 }
 
-/// Emit a post-call check that unwinds if a callee left an exception in flight
-/// (S15.1). Inserted after every user-function / callback invocation (but not
+/// Emit a post-call check that unwinds if a callee left an exception in flight.
+/// Inserted after every user-function / callback invocation (but not
 /// after pure host builtins, which cannot throw): the callee's `i64` result is
 /// already on top of the stack, so this reads `$exc_pending` and, when set,
 /// runs [`emit_throw_return`] to unwind one more frame. On the no-exception path
@@ -220,14 +215,14 @@ pub(super) fn emit_propagate_if_pending(function: &mut Function, helpers: Helper
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::If(BlockType::Empty));
     // The `if` opens a control frame around the throw transfer; count it so a
-    // `br` to an enclosing `try` handler uses the right relative depth (S15.2).
+    // `br` to an enclosing `try` handler uses the right relative depth.
     enter_frame(helpers);
     emit_throw_return(function, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
 
-/// The nearest enclosing `try` FINALLY landing pad (S15.3) as a relative `br`
+/// The nearest enclosing `try` FINALLY landing pad as a relative `br`
 /// immediate at the current control-nesting depth, or `None` when no `finally` is
 /// active in this function. A `return`/`break`/`continue` that must run a finally
 /// `br`s here (mirrors [`emit_throw_return`]'s handler lookup, but over the
@@ -237,7 +232,7 @@ fn nearest_finalizer_rel(helpers: Helpers<'_>) -> Option<u32> {
     unwind.finalizers.last().map(|&entry| unwind.depth - entry)
 }
 
-/// Emit a `return` transfer that runs every enclosing `finally` first (S15.3).
+/// Emit a `return` transfer that runs every enclosing `finally` first.
 ///
 /// The return value is already on top of the stack. When a `finally` is active
 /// the value is stashed in `$cf_value`, the completion kind recorded in
@@ -267,12 +262,12 @@ pub(super) fn emit_return_transfer(function: &mut Function, helpers: Helpers<'_>
 }
 
 /// Emit a `break`/`continue` transfer that runs any enclosing `finally` between
-/// here and the loop target first (S15.3). `label` is the relative `br` immediate
+/// here and the loop target first. `label` is the relative `br` immediate
 /// of the ultimate target (the loop's break or continue block); `kind` is
 /// [`CF_BREAK`] or [`CF_CONTINUE`]. `target` is the labeled-loop id when this is a
 /// labeled `break`/`continue` (`Some(id)`) or `None` for the nearest loop; it is
 /// stashed in [`CF_VALUE_GLOBAL`] so a resume after an intervening `finally`
-/// re-issues toward the SAME loop (S12.6). A finalizer strictly INSIDE the loop
+/// re-issues toward the SAME loop. A finalizer strictly INSIDE the loop
 /// (relative depth below `label`, so encountered before the target when
 /// unwinding) is run first via the pending-completion channel; a finalizer
 /// outside the loop — or none — means the target is branched to directly. The
@@ -337,7 +332,7 @@ pub(super) fn labeled_target_rel(helpers: Helpers<'_>, id: u32, want_continue: b
 }
 
 /// Resume a `return`/`break`/`continue` that was routed through the `finally`
-/// just emitted (S15.3). Placed right after [`emit_propagate_if_pending`] (which
+/// just emitted. Placed right after [`emit_propagate_if_pending`] (which
 /// handles a pending throw): reads `$cf_kind` and, for the pending kind, re-issues
 /// the transfer FROM THIS lexical point — routing to the next outer finalizer
 /// when one still intervenes, or reaching the ultimate target (function boundary
@@ -365,13 +360,13 @@ pub(super) fn emit_resume_pending_completion(
 
     // Pending break/continue: re-issue toward the loop target in scope here — the
     // nearest loop (unlabeled) or, disambiguated by the stashed `$cf_value`, an
-    // enclosing labeled loop (S12.6).
+    // enclosing labeled loop.
     emit_loop_resume(function, helpers, CF_BREAK, break_label, false);
     emit_loop_resume(function, helpers, CF_CONTINUE, continue_label, true);
 }
 
 /// Emit the resume dispatch for one abrupt-loop kind (`break` or `continue`) after
-/// a `finally` (S15.3/S12.6). When no labeled loop is active this is the original
+/// a `finally`. When no labeled loop is active this is the original
 /// single re-issue toward `nearest_label` (the nearest loop's target in scope
 /// here). Inside a labeled loop it becomes a guarded dispatch: one `if` re-issuing
 /// toward the nearest loop (`$cf_value == 0`), plus one per active labeled loop
@@ -434,7 +429,7 @@ fn emit_loop_resume(
 
 /// Emit `if ($cf_kind == kind [&& $cf_value == v]) { body }`, opening one control
 /// frame around `body` (which is expected to diverge via a loop transfer). The
-/// optional `$cf_value` guard `v` disambiguates the labeled-loop target (S12.6);
+/// optional `$cf_value` guard `v` disambiguates the labeled-loop target;
 /// omitting it reproduces the original unguarded kind check.
 fn emit_kind_guard(
     function: &mut Function,

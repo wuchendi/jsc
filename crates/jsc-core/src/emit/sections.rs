@@ -55,7 +55,7 @@ pub(super) fn build_type_and_function_sections<'a>(
     }
 
     // Every DEFINED function index is shifted up by IMPORT_FUNC_COUNT because the
-    // host `print` import occupies the lowest function indices (S14.1): `main` is
+    // host `print` import occupies the lowest function indices: `main` is
     // function `IMPORT_FUNC_COUNT`, user function `i` is `i + 1 + IMPORT_FUNC_COUNT`,
     // and the helpers follow.
     let alloc_index = IMPORT_FUNC_COUNT + 1 + u32::try_from(n).unwrap_or(u32::MAX);
@@ -71,9 +71,9 @@ pub(super) fn build_type_and_function_sections<'a>(
         print: 0,
         convert: 1,
         method: 2,
-        // The host promise imports (P4.1) follow the S14 imports in declaration
+        // The host promise imports follow the `print`/`__convert`/`__method` imports in declaration
         // order: `__promise` index 3, `__then` index 4. The host wall clock
-        // (`__now`, P-series `Date`) is appended last, index 5.
+        // (`__now`, backing `Date`) is appended last, index 5.
         promise: 3,
         then: 4,
         now: 5,
@@ -114,7 +114,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         json_object: obj_get_index + 26,
         array_to_object: obj_get_index + 27,
         json_parse: obj_get_index + 28,
-        // `__gen_to_array` (P4.2 M3) is appended after the Map/Set helpers and
+        // `__gen_to_array` is appended after the Map/Set helpers and
         // before `__invoke1`.
         gen_to_array: obj_get_index + 29,
         // `__nullish_throw` (the nullish-receiver guard's error build) follows it.
@@ -123,8 +123,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         box_f64: obj_get_index + 31,
         // `__to_number` (the shared ToNumber coercion) follows it.
         to_number: obj_get_index + 32,
-        // The `__invoke1` callback trampoline (P4.1) is appended after every helper
-        // above; the `__async_step` trampoline (P4.3 M4) follows it, then the two
+        // The `__invoke1` callback trampoline is appended after every helper
+        // above; the `__async_step` trampoline follows it, then the two
         // `new Promise` settler functions.
         invoke1: obj_get_index + 33,
         async_step: obj_get_index + 34,
@@ -173,26 +173,26 @@ pub(super) fn build_type_and_function_sections<'a>(
         // `__obj_set(obj_ptr: i32, key_ptr: i32, val: i64)`.
         helper(&[ValType::I32, ValType::I32], &[ValType::I64]);
         helper(&[ValType::I32, ValType::I32, ValType::I64], &[]);
-        // `__array_push(base: i32, value: i64) -> new_base: i32` (S14.4).
+        // `__array_push(base: i32, value: i64) -> new_base: i32`.
         helper(&[ValType::I32, ValType::I64], &[ValType::I32]);
-        // `__obj_rest(obj_ptr: i32, excl_ptr: i32) -> new_base: i32` (P1.2).
+        // `__obj_rest(obj_ptr: i32, excl_ptr: i32) -> new_base: i32`.
         helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        // `__array_concat(dst: i32, src: i32) -> new_base: i32` (P1.5).
+        // `__array_concat(dst: i32, src: i32) -> new_base: i32`.
         helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
         // `__obj_keys`/`__obj_values`/`__obj_entries(obj_ptr: i32) -> array_base:
-        // i32` are appended LAST (P3.2), each `(i32) -> i32`.
+        // i32` are appended LAST, each `(i32) -> i32`.
         helper(&[ValType::I32], &[ValType::I32]);
         helper(&[ValType::I32], &[ValType::I32]);
         helper(&[ValType::I32], &[ValType::I32]);
         // `__obj_has(obj_ptr: i32, key_ptr: i32) -> i32` and
-        // `__obj_delete(obj_ptr: i32, key_ptr: i32) -> ()` (P3.3).
+        // `__obj_delete(obj_ptr: i32, key_ptr: i32) -> ()`.
         helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
         helper(&[ValType::I32, ValType::I32], &[]);
         // `__json_escape(str_ptr: i32) -> str_base: i32` and the recursive
-        // `__json_str(v: i64) -> str_base: i32` serializer (P3.4).
+        // `__json_str(v: i64) -> str_base: i32` serializer.
         helper(&[ValType::I32], &[ValType::I32]);
         helper(&[ValType::I64], &[ValType::I32]);
-        // The Map/Set runtime helpers (P3.5): `__same_value_zero(a: i64, b: i64) -> i32`,
+        // The Map/Set runtime helpers: `__same_value_zero(a: i64, b: i64) -> i32`,
         // `__map_find(handle: i32, key: i64) -> i32`,
         // `__map_set(handle: i32, key: i64, val: i64)`,
         // `__map_get(handle: i32, key: i64) -> i64`,
@@ -222,7 +222,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[], &[ValType::I64]);
         helper(&[ValType::I32], &[ValType::I32]);
         helper(&[ValType::I64], &[ValType::I64]);
-        // `__gen_to_array(gen: i64) -> i64` (P4.2 M3), before the trampoline.
+        // `__gen_to_array(gen: i64) -> i64`, before the trampoline.
         helper(&[ValType::I64], &[ValType::I64]);
         // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
         helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
@@ -230,12 +230,12 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::F64], &[ValType::I64]);
         // `__to_number(v: i64) -> i64`.
         helper(&[ValType::I64], &[ValType::I64]);
-        // The `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline (P4.1).
+        // The `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline.
         helper(&[ValType::I64, ValType::I64], &[ValType::I64]);
-        // The `__async_step(gen: i64, sent: i64) -> i64` trampoline (P4.3 M4).
+        // The `__async_step(gen: i64, sent: i64) -> i64` trampoline.
         helper(&[ValType::I64, ValType::I64], &[ValType::I64]);
     }
-    // The two `new Promise` settler functions (P4.1) reuse the uniform function
+    // The two `new Promise` settler functions reuse the uniform function
     // type (type 1) — they are called through the funcref table like any function
     // value — so they add a FunctionSection entry but NO new type. Emitted only
     // when there are functions (the table exists and `new Promise` can occur).
@@ -244,7 +244,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         functions.function(fn_type);
     }
 
-    // Append the host import types LAST (S14.1/S14.3/S14.6) so they never disturb
+    // Append the host import types LAST so they never disturb
     // the main/uniform/helper type indices above. All three are declared in the
     // IMPORT section (not the FunctionSection), so each adds a type but no defined
     // function: `print(bits: i64, flag: i32) -> ()`,
@@ -261,7 +261,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         [ValType::I64, ValType::I32, ValType::I64, ValType::I64],
         [ValType::I64],
     );
-    // The host promise import types (P4.1): `__promise(op: i32, a: i64, b: i64) ->
+    // The host promise import types: `__promise(op: i32, a: i64, b: i64) ->
     // i64` and `__then(p: i64, on_f: i64, on_r: i64) -> i64`.
     let promise_type = helper_type_base + 43;
     types
@@ -271,7 +271,7 @@ pub(super) fn build_type_and_function_sections<'a>(
     types
         .ty()
         .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
-    // The host wall-clock import type (P-series `Date`): `__now() -> f64`.
+    // The host wall-clock import type (backing `Date`): `__now() -> f64`.
     let now_type = helper_type_base + 45;
     types.ty().function([], [ValType::F64]);
 
@@ -291,13 +291,13 @@ pub(super) fn build_type_and_function_sections<'a>(
 /// Build the module's global section: the mutable bump-allocator heap pointer
 /// (`$__heap_ptr`, index [`HEAP_PTR_GLOBAL`], starting at `heap_ptr_init` — the
 /// first free offset after all static string-literal data so the allocator never
-/// overwrites them), followed by the S15.1 exception-unwinding globals — the
+/// overwrites them), followed by the exception-unwinding globals — the
 /// pending flag (`$exc_pending`, i32) and the in-flight value (`$exc_value`, i64),
 /// both zero-initialized. A `throw` sets the latter two; every throwing call site
 /// checks the flag to unwind. Two further zero-initialized globals — the
 /// pending-completion kind (`$cf_kind`, i32) and routed return value
 /// (`$cf_value`, i64) — carry a `return`/`break`/`continue` through the `finally`
-/// clauses it must run (S15.3).
+/// clauses it must run.
 pub(super) fn build_globals(heap_ptr_init: i32, module_cells: u32) -> GlobalSection {
     let mut globals = GlobalSection::new();
     let mut_i32 = |init| {
@@ -326,14 +326,14 @@ pub(super) fn build_globals(heap_ptr_init: i32, module_cells: u32) -> GlobalSect
     globals.global(pending_ty, &pending_init);
     let (exc_val_ty, exc_val_init) = mut_i64();
     globals.global(exc_val_ty, &exc_val_init);
-    // The pending-completion globals (S15.3): the kind ($cf_kind, i32) and the
+    // The pending-completion globals: the kind ($cf_kind, i32) and the
     // routed return value ($cf_value, i64), driving a return/break/continue
     // through the `finally` clauses it must run. Internal, not exported.
     let (cf_kind_ty, cf_kind_init) = mut_i32(0);
     globals.global(cf_kind_ty, &cf_kind_init);
     let (cf_val_ty, cf_val_init) = mut_i64();
     globals.global(cf_val_ty, &cf_val_init);
-    // The `this`-binding carrier ($__this, i64, index THIS_GLOBAL) — P2.1. Init to
+    // The `this`-binding carrier ($__this, i64, index THIS_GLOBAL). Init to
     // the `undefined` bits (NOT zero) so `this` reads `undefined` before any method
     // call sets it. Internal, not exported.
     globals.global(
@@ -373,7 +373,7 @@ pub(super) fn emit_data_section(offsets: &HashMap<String, i32>) -> Option<DataSe
     let header_size = HEADER_SIZE as usize;
     for (text, offset) in segments {
         let mut blob = Vec::with_capacity(header_size + 4 + text.len());
-        // S13.1 block header: the TYPE_STRING type byte at offset 0, then padding
+        // Block header: the TYPE_STRING type byte at offset 0, then padding
         // up to HEADER_SIZE (a byte-for-byte match of a runtime-allocated string).
         blob.push(u8::try_from(TYPE_STRING).unwrap_or(0));
         blob.resize(header_size, 0);
@@ -403,8 +403,8 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
         for stmt in &func.body {
             collect_stmt(stmt, &mut order, &mut seen);
         }
-        // A generator state machine carries its code in segments, not `body`
-        // (P4.2 M2): walk each segment's statements and its terminator value.
+        // A generator state machine carries its code in segments, not `body`:
+        // walk each segment's statements and its terminator value.
         if let Some(segments) = &func.machine {
             for segment in segments {
                 for stmt in &segment.stmts {
@@ -426,7 +426,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     let mut next = HEAP_BASE;
     for text in order {
         offsets.insert(text.to_owned(), next);
-        // Each blob is `[type=0][pad×3][len:u32][utf8]` (S13.1 header): the block
+        // Each blob is `[type=0][pad×3][len:u32][utf8]` (block header): the block
         // header, the 4-byte length header, plus the byte length.
         let blob_len = HEADER_SIZE + 4 + i32::try_from(text.len()).unwrap_or(i32::MAX);
         next = next.saturating_add(blob_len);
@@ -568,7 +568,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
-        // A generator `yield e` / `IsGenerator` carries only its operand (P4.2).
+        // A generator `yield e` / `IsGenerator` carries only its operand.
         | IrNode::Yield(operand)
         | IrNode::IsGenerator(operand)
         | IrNode::ConvertCall { arg: operand, .. }
@@ -633,7 +633,7 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::MethodCallUser { obj, key, args, .. } => {
-            // Seed the G2 runtime callee-is-a-function guard's branded TypeError
+            // Seed the runtime callee-is-a-function guard's branded TypeError
             // strings so their data-segment blobs exist when the guard throws.
             for s in INTERNAL_TYPE_ERROR_STRS {
                 if seen.insert(s) {
@@ -672,7 +672,7 @@ pub(super) fn collect_node<'a>(
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
         }
-        // An instance accessor (P2b): recurse into the getter/setter function values
+        // An instance accessor: recurse into the getter/setter function values
         // and intern the sentinel that GATES the member read/write invocation paths
         // (present in the string table iff the program builds any accessor box).
         IrNode::MakeAccessor { getter, setter } => {
@@ -717,7 +717,7 @@ pub(super) fn collect_node<'a>(
             collect_node(arg, order, seen);
             // Seed the serializer's literal token strings (`null`/`true`/`false`
             // and the structural punctuation) so their `[len][utf8]` blocks exist
-            // in the data segment for `__json_str` to splice via `__concat` (P3.4).
+            // in the data segment for `__json_str` to splice via `__concat`.
             for tok in JSON_TOKEN_STRS {
                 if seen.insert(tok) {
                     order.push(tok);
@@ -769,7 +769,7 @@ pub(super) fn collect_node<'a>(
                 order.push(method_name.as_str());
             }
             // The unknown-collection-method fallback lowers to a user method call,
-            // which the G2 guard protects — seed its TypeError strings too.
+            // which the runtime callee guard protects — seed its TypeError strings too.
             for s in INTERNAL_TYPE_ERROR_STRS {
                 if seen.insert(s) {
                     order.push(s);
@@ -790,7 +790,7 @@ pub(super) fn collect_node<'a>(
             if seen.insert(method_name.as_str()) {
                 order.push(method_name.as_str());
             }
-            // The non-Date fallback lowers to a user method call (G2 guard) — seed
+            // The non-Date fallback lowers to a guarded user method call — seed
             // its TypeError strings too.
             for s in INTERNAL_TYPE_ERROR_STRS {
                 if seen.insert(s) {
@@ -807,7 +807,7 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
-        // The promise primitives (P4.1) carry only sub-expressions to walk.
+        // The promise primitives carry only sub-expressions to walk.
         IrNode::PromiseResolve(operand)
         | IrNode::PromiseReject(operand)
         | IrNode::Await(operand) => collect_node(operand, order, seen),
@@ -830,7 +830,7 @@ pub(super) fn collect_node<'a>(
         // `new Promise(executor)` carries only the executor sub-expression to walk
         // (the settler functions are runtime-emitted, no literals).
         IrNode::PromiseCtor { executor, .. } => collect_node(executor, order, seen),
-        // `AsyncSpawn` (P4.3 M4) wraps the inner `MakeGenerator` — walk it so the
+        // `AsyncSpawn` wraps the inner `MakeGenerator` — walk it so the
         // constructor's per-parameter argument reads are interned.
         IrNode::AsyncSpawn(make_generator) => collect_node(make_generator, order, seen),
         // `MakeGenerator` carries the constructor's per-parameter argument reads.
@@ -841,7 +841,7 @@ pub(super) fn collect_node<'a>(
         }
         // `gen.next(sent)` builds a `{ value, done }` result object, so both keys'
         // `[len][utf8]` blobs must live in the data segment; a non-generator
-        // receiver throws a branded `TypeError`, so seed its strings too (P4.2 M2).
+        // receiver throws a branded `TypeError`, so seed its strings too.
         IrNode::GenResume { handle, sent } => {
             for key in ["value", "done"] {
                 if seen.insert(key) {
@@ -856,7 +856,7 @@ pub(super) fn collect_node<'a>(
             collect_node(handle, order, seen);
             collect_node(sent, order, seen);
         }
-        // The `Date` builtins (P-series) carry no string literals; recurse into
+        // The `Date` builtins carry no string literals; recurse into
         // the timestamp / receiver sub-expressions (`Date.now()` has neither).
         IrNode::DateNew { ms } => {
             if let Some(ms) = ms {

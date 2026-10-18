@@ -9,7 +9,7 @@ use crate::abi;
 
 use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, format_value};
 
-/// The `__method` op flags (S14.6, see [`abi`]): the non-callback array/string
+/// The `__method` op flags (see [`abi`]): the non-callback array/string
 /// methods, dispatched host-side. `IndexOf`/`Slice` exist on both arrays and
 /// strings, so the handler branches on the receiver's runtime TYPE BYTE.
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
@@ -35,7 +35,7 @@ const TRUE_BITS: u64 = abi::TRUE;
 const FALSE_BITS: u64 = abi::FALSE;
 
 /// The name under which `crate::emit` exports the bump-allocator heap pointer
-/// global (S14.3, see [`abi::HEAP_PTR_EXPORT_NAME`]) so the `__convert` import can
+/// global (see [`abi::HEAP_PTR_EXPORT_NAME`]) so the `__convert` import can
 /// bump-allocate a heap string.
 const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
 
@@ -46,7 +46,7 @@ const HEAP_PTR_OOM: i32 = abi::HEAP_PTR_OOM;
 const PAGE_SIZE: usize = 0x1_0000;
 
 /// Bump-allocate a heap STRING block holding `text` in the caller's guest memory
-/// and return its base offset (S14.3), or `None` if the required exports are
+/// and return its base offset, or `None` if the required exports are
 /// missing or the write fails.
 ///
 /// The block is laid out exactly like a runtime-allocated string —
@@ -71,7 +71,7 @@ pub(super) fn host_alloc_string<W: Send + 'static>(
 /// Bump-allocate a pre-built heap `block` (its leading TYPE BYTE, header, and
 /// payload already laid out exactly like a guest-allocated block) in the caller's
 /// guest memory and return its base offset, or `None` when the required exports
-/// are missing or the write fails (S14.3/S14.6).
+/// are missing or the write fails.
 ///
 /// It reads the exported `__heap_ptr` global as the free offset, grows linear
 /// memory if the block would overflow it, writes the bytes, and advances the
@@ -133,7 +133,7 @@ pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bo
     global.get(&mut store).i32() == Some(HEAP_PTR_OOM)
 }
 
-/// Dispatch a `__method` host-import call (S14.6): snapshot linear memory, read
+/// Dispatch a `__method` host-import call: snapshot linear memory, read
 /// the receiver's raw jsval bits, and perform the requested array/string method,
 /// returning the result jsval bits (or `None` to yield `undefined` — a
 /// type-mismatched receiver or a failed allocation).
@@ -246,7 +246,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
 }
 
 /// The linear-memory byte offset of a heap jsval (single heap tag `0b101`), or
-/// `None` for any non-heap value. Mirrors `emit::HEAP_BITS` / the S13.1 layout.
+/// `None` for any non-heap value. Mirrors `emit::HEAP_BITS` / the heap block layout.
 fn heap_ptr(bits: u64) -> Option<usize> {
     if bits & QNAN == QNAN && (bits >> 48) & 0b111 == 0b101 {
         usize::try_from(bits & 0xFFFF_FFFF).ok()
@@ -673,7 +673,7 @@ fn split_on(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Coerce a decoded [`Value`] to a JS number (S14.3, the `Number(x)` subset):
+/// Coerce a decoded [`Value`] to a JS number (the `Number(x)` subset):
 /// number is identity, `true`/`false` are `1`/`0`, `null` is `0`, `undefined` is
 /// `NaN`, and a string is full-string parsed via [`str_to_number`]. Array/object/
 /// function operands are out of scope and yield `NaN`.
@@ -695,7 +695,7 @@ pub(super) fn value_to_number(value: &Value) -> f64 {
     }
 }
 
-/// Parse a whole string as a JS `Number(str)` (S14.3): leading/trailing ASCII
+/// Parse a whole string as a JS `Number(str)`: leading/trailing ASCII
 /// whitespace is trimmed, an empty/whitespace-only string is `0`, and anything the
 /// remaining text does not parse as a full number is `NaN`. The grammar is JS
 /// `StringToNumber`: an unsigned `0x`/`0o`/`0b` integer literal, a signed
@@ -739,7 +739,7 @@ fn str_to_number(s: &str) -> f64 {
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// Parse a leading base-10 integer from `s` (S14.3, the `parseInt` subset): skip
+/// Parse a leading base-10 integer from `s` (the `parseInt` subset): skip
 /// leading ASCII whitespace, honor an optional `+`/`-` sign, then consume ASCII
 /// digits until the first non-digit. Yields `NaN` when no digit follows the sign.
 /// The radix argument is not supported (base-10 only).
@@ -768,7 +768,7 @@ pub(super) fn parse_int_str(s: &str) -> f64 {
     sign * value
 }
 
-/// Parse a leading decimal float from `s` (S14.3, the `parseFloat` subset): skip
+/// Parse a leading decimal float from `s` (the `parseFloat` subset): skip
 /// leading ASCII whitespace, then take the longest prefix matching an optional
 /// sign, integer/fraction digits (at least one digit overall), and an optional
 /// `e`/`E` exponent. Yields `NaN` when no such prefix exists.

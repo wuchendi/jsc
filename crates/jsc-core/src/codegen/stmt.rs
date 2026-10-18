@@ -11,7 +11,7 @@ impl LowerCtx<'_> {
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt, out: &mut Vec<IrStmt>) -> anyhow::Result<()> {
         match stmt {
             Stmt::Expr(expr_stmt) => {
-                // `yield* iterable;` (P4.2 M3) delegates to an inner generator: it
+                // `yield* iterable;` delegates to an inner generator: it
                 // desugars to a driving loop rather than a single expression.
                 if let Expr::Yield(yield_expr) = expr_stmt.expr.as_ref()
                     && yield_expr.delegate
@@ -25,9 +25,9 @@ impl LowerCtx<'_> {
             // `undefined` (a `const` with no initializer is a parser error).
             Stmt::Decl(Decl::Var(var_decl)) => self.lower_var_decl(var_decl, out),
             // A nested `function foo(){ .. }` declaration lowers to a first-class
-            // function value bound to `foo` in the current scope (S13.4).
+            // function value bound to `foo` in the current scope.
             Stmt::Decl(Decl::Fn(fn_decl)) => self.lower_nested_fn_decl(fn_decl, out),
-            // A `class A { constructor(..){ .. } }` declaration (P2.2) lowers to a
+            // A `class A { constructor(..){ .. } }` declaration lowers to a
             // class value (constructor function + shared prototype) bound to `A`.
             Stmt::Decl(Decl::Class(class_decl)) => self.lower_class_decl(class_decl, out),
             // A bare block `{ .. }` introduces a new lexical scope: its
@@ -93,7 +93,7 @@ impl LowerCtx<'_> {
                 out.push(IrStmt::Return(value));
                 Ok(())
             }
-            // `throw expr;` (S15.1): lower the operand and wrap it in an
+            // `throw expr;`: lower the operand and wrap it in an
             // [`IrNode::Throw`], emitted as a bare expression statement. The node
             // diverges (it sets the pending-exception globals and unwinds), so any
             // statements after it in the same block are dead — matching JS.
@@ -102,9 +102,8 @@ impl LowerCtx<'_> {
                 out.push(IrStmt::Expr(IrNode::Throw(Box::new(value))));
                 Ok(())
             }
-            // `try { .. } catch (e) { .. }` (S15.2). A `finally` clause — or a
-            // `try` with only a `finally` and no `catch` — is deferred to S15.3;
-            // reject it explicitly rather than silently dropping it.
+            // `try { .. } catch (e) { .. } finally { .. }` (either clause may be
+            // absent, but not both), lowered by `lower_try`.
             Stmt::Try(try_stmt) => self.lower_try(try_stmt, out),
             // Attach the offending statement's source range so a diagnostic
             // renderer can point at it, and describe the construct in plain
@@ -139,31 +138,31 @@ impl LowerCtx<'_> {
                     self.push_binding(local, init, out);
                 }
                 // A destructuring pattern (`let [a, b] = ..`) desugars to indexed
-                // reads off a hidden temp holding the initializer (P1.1).
+                // reads off a hidden temp holding the initializer.
                 other => self.lower_binding_pattern(other, init, mutable, out)?,
             }
         }
         Ok(())
     }
 
-    /// Lower a `class A { constructor(x){ this.v = x } }` declaration (P2.2) into
+    /// Lower a `class A { constructor(x){ this.v = x } }` declaration into
     /// a class value bound to `A`. The class value is a heap object holding two
     /// reserved entries: the lowered CONSTRUCTOR function value (an ordinary
-    /// uniform-ABI function that reads `this`, reusing the P1 lifting / P2.1
-    /// this-binding), and a single shared PROTOTYPE object (empty in P2.2, filled
-    /// with methods in P2.3) allocated once here. The class's instance shape — the
+    /// uniform-ABI function that reads `this`, reusing the function lifting and
+    /// `this`-binding), and a single shared PROTOTYPE object holding the methods,
+    /// allocated once here. The class's instance shape — the
     /// field names the constructor assigns via `this.<field> = ..` — is registered
     /// in [`Shared::classes`] so a later `new A(args)` can pre-slot the instance,
     /// since the object model has no dynamic key growth. The instance shape is the
     /// UNION of the constructor's `this.<field> = ..` assignments and the class's
-    /// instance FIELD declarations (P2.4), whose initializers run before the
+    /// instance FIELD declarations, whose initializers run before the
     /// constructor body (see the field-desugar below).
     ///
     /// Instance getter/setter accessors (`get x(){}` / `set x(v){}`) are supported
     /// (P2b): they lower to a `TYPE_ACCESSOR` box on the shared prototype.
     /// Out-of-scope class forms are still rejected WITH SPANS: decorators, and
     /// unsupported members — methods that are async / generator / computed, a
-    /// STATIC getter/setter, fields that are static / computed (P2.4), and private /
+    /// STATIC getter/setter, fields that are static / computed, and private /
     /// static-block forms. A class EXPRESSION (`let C = class{}`) never reaches
     /// here — it is rejected in expression position.
     #[allow(clippy::too_many_lines)]
@@ -203,8 +202,8 @@ impl LowerCtx<'_> {
             );
         }
 
-        // Find the (at most one) constructor, collect the instance methods (P2.3),
-        // and collect the instance field declarations (P2.4); every other member is
+        // Find the (at most one) constructor, collect the instance methods,
+        // and collect the instance field declarations; every other member is
         // out of scope. Static members (`static m(){}` / `static f = init`) are
         // collected separately and stored directly on the class VALUE object below,
         // so `C.m()` / `C.f` read them off the class. Computed names and out-of-scope
@@ -273,7 +272,7 @@ impl LowerCtx<'_> {
         // the already-initialized fields. A class with fields but NO explicit
         // constructor synthesizes a default constructor whose body is exactly these
         // field initializers; a class with neither gets an empty function. The
-        // combined body reads `this` through the P2.1 machinery like any method, and
+        // combined body reads `this` through the `this`-binding machinery like any method, and
         // the instance shape (below) is the union of the field names and the
         // constructor's own `this.<f> = ..` assignments — dedup handled by
         // `collect_instance_fields`.
@@ -325,7 +324,7 @@ impl LowerCtx<'_> {
 
         // Bind the class name and record its instance shape BEFORE lowering the
         // constructor and method bodies, so a `new C()` referencing the class from
-        // inside any of them resolves to this binding (G1). When a body captures the
+        // inside any of them resolves to this binding. When a body captures the
         // name it is boxed into a cell (like a `let`); the cell is allocated empty
         // below and filled with the class value, so the ctor/method closures capture
         // a live cell pointer that a later `new C()` reads back.
@@ -364,8 +363,8 @@ impl LowerCtx<'_> {
             self.lower_lifted_function(&param_pats, BodyKind::Block(&combined_stmts))?
         };
 
-        // Lower each instance method (P2.3) to a first-class function value that
-        // reads `this` through the P2.1 machinery, exactly like the constructor.
+        // Lower each instance method to a first-class function value that
+        // reads `this` through the `this`-binding machinery, exactly like the constructor.
         // They are stored ONCE, on the class's single shared prototype object,
         // under the method name — never copied per instance. Pre-slotting the
         // prototype with one entry per method name (the `IrNode::Object` shape)
@@ -505,7 +504,7 @@ impl LowerCtx<'_> {
         // cell empty first and store the class value into it, so the ctor/method
         // closures (built while evaluating `class_value`) capture the already-bound
         // cell pointer — a self-reference like `new C()` inside a method reads it
-        // back. When uncaptured, the value binds directly like the pre-G1 path.
+        // back. When uncaptured, the value binds directly.
         if let Some(slot) = self.module_slot_for_local(local) {
             // A module binding: the module cell is pre-allocated, so the ctor/method
             // bodies already reach it; just store the class value (as a `Decl`, so
@@ -560,8 +559,8 @@ impl LowerCtx<'_> {
     /// `source` ONCE into a hidden temp local and binds each element from an
     /// indexed read, handling holes (skipped indices), defaults (`[a = 9]`), a
     /// trailing rest (`[a, ...r]`), and nested patterns (`[[a]]`) by recursion.
-    /// `mutable` is the binding mutability (`false` for `const`). Factored so the
-    /// later parameter/object-destructuring milestones can reuse it.
+    /// `mutable` is the binding mutability (`false` for `const`). Shared by
+    /// parameter and object destructuring.
     pub(super) fn lower_binding_pattern(
         &mut self,
         pat: &Pat,
@@ -603,7 +602,7 @@ impl LowerCtx<'_> {
             // An object pattern (`let {x, y: b, z = 7, ...rest} = ..`) evaluates
             // `source` ONCE into a hidden temp local, then binds each property from
             // a keyed read (`temp.key`); a trailing rest collects every remaining
-            // own key into a new object (P1.2).
+            // own key into a new object.
             Pat::Object(obj) => {
                 let temp = self.fresh();
                 out.push(IrStmt::Decl {
@@ -689,8 +688,8 @@ impl LowerCtx<'_> {
 
     /// Emit the initializing statement for a freshly [`Self::declare`]d `local`
     /// holding `init`. An ordinary binding becomes a `Decl` (boxing a captured
-    /// binding into a fresh cell); a generator local (an `env_backed` frame, P4.2
-    /// M2) instead stores into its pre-existing frame cell via `CellSet`, since
+    /// binding into a fresh cell); a generator local (an `env_backed` frame)
+    /// instead stores into its pre-existing frame cell via `CellSet`, since
     /// the generator constructor already allocated every frame cell.
     pub(super) fn push_binding(&mut self, local: u32, init: IrNode, out: &mut Vec<IrStmt>) {
         if let Some(slot) = self.env_slot_for_local(local) {
@@ -834,8 +833,8 @@ impl LowerCtx<'_> {
         Ok(())
     }
 
-    /// Lower a `try { .. } catch (e) { .. } finally { .. }` statement
-    /// (S15.2/S15.3). The guarded block, the catch clause, and the finally clause
+    /// Lower a `try { .. } catch (e) { .. } finally { .. }` statement.
+    /// The guarded block, the catch clause, and the finally clause
     /// each open their own lexical scope (block-scoped bindings do not leak),
     /// mirroring [`Stmt::Block`]. The catch parameter binds to a fresh local
     /// initialized from the in-flight exception value: its binding is emitted as
@@ -1176,7 +1175,7 @@ impl LowerCtx<'_> {
         self.push_scope();
         let result = (|| {
             // Evaluate the iterable ONCE into a temp. At runtime it is either a
-            // GENERATOR (driven via the iterator protocol, P4.2 M3) or an
+            // GENERATOR (driven via the iterator protocol) or an
             // array/string (the ordinary index walk); a runtime `IsGenerator` test
             // selects between the two — the index branch is unchanged.
             let iter = self.lower_expr(&for_of.right)?;
@@ -1257,7 +1256,7 @@ impl LowerCtx<'_> {
         Ok(out)
     }
 
-    /// Lower the GENERATOR-drive branch of a `for-of` (P4.2 M3): consume the handle
+    /// Lower the GENERATOR-drive branch of a `for-of`: consume the handle
     /// via the iterator protocol —
     ///
     /// ```text
@@ -1313,8 +1312,8 @@ impl LowerCtx<'_> {
         Ok(out)
     }
 
-    /// Lower a `for (const k in EXPR) body` over an object's own enumerable keys
-    /// (P3.1), desugared to a counted index loop lowered to [`IrStmt::While`] — the
+    /// Lower a `for (const k in EXPR) body` over an object's own enumerable keys,
+    /// desugared to a counted index loop lowered to [`IrStmt::While`] — the
     /// same shape as [`Self::lower_for_of`], but the loop binding is each KEY (a
     /// heap STRING) rather than each element. `EXPR` is evaluated ONCE into a temp
     /// local, its key count cached ONCE ([`IrNode::StrLen`] reads the u32 header,
@@ -1504,7 +1503,7 @@ fn index_num(i: usize) -> IrNode {
     IrNode::Num(f64::from(u32::try_from(i).unwrap_or(u32::MAX)))
 }
 
-/// Reject an out-of-scope class method form WITH a span (P2.3). Plain instance
+/// Reject an out-of-scope class method form WITH a span. Plain instance
 /// methods and `static` methods are supported; getters/setters, computed names,
 /// and async/generator methods are not (static or not). An INSTANCE getter/setter
 /// is peeled off before this call (P2b — see [`reject_out_of_scope_accessor`]), so
@@ -1557,7 +1556,7 @@ fn reject_class_member(member: &ClassMember) -> anyhow::Error {
     CompileError::spanned(span, msg).into()
 }
 
-/// Reject an out-of-scope class-field form WITH a span (P2.4). Plain instance
+/// Reject an out-of-scope class-field form WITH a span. Plain instance
 /// fields (`f = init` / `f;`) and `static` fields are supported; computed field
 /// names are not (static or not). (Private fields arrive as
 /// [`ClassMember::PrivateProp`] and are rejected by [`reject_class_member`].)
@@ -1575,7 +1574,7 @@ fn reject_out_of_scope_field(p: &ClassProp) -> anyhow::Result<()> {
 /// into the synthetic statement `this.f = <init>` (`this.f = undefined` when the
 /// field carries no initializer). These synthetic statements are prepended to the
 /// constructor body so field initializers run — in class-body source order —
-/// BEFORE the constructor body (P2.4), and reuse the ordinary `this.<field> = ..`
+/// BEFORE the constructor body, and reuse the ordinary `this.<field> = ..`
 /// lowering (member write in the constructor's `this` context) and field-shape
 /// scan. The field name is extracted via [`prop_key_name`] (identifier/string
 /// keys; a computed name is already rejected upstream by
@@ -1612,14 +1611,14 @@ fn field_init_stmt(prop: &ClassProp) -> anyhow::Result<Stmt> {
     }))
 }
 
-/// Collect the instance field names a constructor assigns via `this.<name> = ..`
-/// (P2.2), in first-seen order with duplicates removed. The object model cannot
+/// Collect the instance field names a constructor assigns via `this.<name> = ..`,
+/// in first-seen order with duplicates removed. The object model cannot
 /// grow keys at runtime, so `new` must pre-slot exactly these fields on the fresh
 /// instance (a superset is harmless — surplus slots read back `undefined`, which
 /// is the correct JS value for an unset field). The scan walks the constructor's
 /// statements and expressions but does NOT descend into nested `function`/arrow
 /// bodies: a nested `function` rebinds `this`, and an arrow-captured `this.f = ..`
-/// running later is a documented P2.2 gap.
+/// running later is a documented gap.
 fn collect_instance_fields(stmts: &[Stmt]) -> Vec<String> {
     let mut fields = Vec::new();
     for stmt in stmts {

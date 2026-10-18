@@ -1,4 +1,4 @@
-//! The host-side promise engine (P4.1): the microtask queue, the per-promise
+//! The host-side promise engine: the microtask queue, the per-promise
 //! reaction lists, and the settle/drain machinery backing `Promise.resolve` /
 //! `Promise.reject` / `p.then` / `p.catch` / `p.finally` and top-level `await`.
 //!
@@ -64,7 +64,7 @@ struct Reaction {
     on_rejected: u64,
     result: u32,
     finally: bool,
-    /// An `async function` continuation (P4.3 M4): `Some(gen_handle)` when this reaction
+    /// An `async function` continuation: `Some(gen_handle)` when this reaction
     /// resumes an async body's generator `gen_handle` on fulfillment (sending the settled
     /// value) or rejects its result promise on rejection, rather than running a
     /// guest callback. `result` is then the async body's result promise.
@@ -82,7 +82,7 @@ struct Job {
     value: u64,
     result: u32,
     finally: bool,
-    /// An `async function` continuation (P4.3 M4); see [`Reaction::async_gen`].
+    /// An `async function` continuation; see [`Reaction::async_gen`].
     async_gen: Option<u64>,
 }
 
@@ -115,7 +115,7 @@ struct Handles {
     /// The `__invoke1` callback trampoline. `None` when the program declares no
     /// user functions (so no reaction can carry a callback).
     invoke1: Option<Func>,
-    /// The `__async_step(gen_handle, sent)` generator-step trampoline (P4.3 M4) the async
+    /// The `__async_step(gen_handle, sent)` generator-step trampoline the async
     /// driver calls to advance an `async function` body one suspend. `None` when
     /// the export is absent (no `async function` in the program).
     async_step: Option<Func>,
@@ -179,7 +179,7 @@ pub(super) fn dispatch<W: Write + Send + 'static>(
         }
         x if x == abi::PROMISE_OP_FINALLY => finally(ctx, &handles, a, b),
         x if x == abi::PROMISE_OP_AWAIT => await_promise(ctx, &handles, a),
-        // `new Promise` support (P4.1): allocate a pending promise, or settle a
+        // `new Promise` support: allocate a pending promise, or settle a
         // promise from a `resolve`/`reject` settler call.
         x if x == abi::PROMISE_OP_NEW => {
             alloc_promise(ctx, &handles, PROMISE_PENDING, UNDEFINED).unwrap_or(UNDEFINED)
@@ -196,7 +196,7 @@ pub(super) fn dispatch<W: Write + Send + 'static>(
             }
             UNDEFINED
         }
-        // Spawn an `async function` body (P4.3 M4): `a` is the generator handle.
+        // Spawn an `async function` body: `a` is the generator handle.
         x if x == abi::PROMISE_OP_ASYNC_SPAWN => spawn_async(ctx, &handles, a),
         _ => UNDEFINED,
     }
@@ -233,7 +233,7 @@ pub(super) fn then<W: Write + Send + 'static>(
     result
 }
 
-/// Drain any microtasks still queued after `main` returns (P4.1): the reactions
+/// Drain any microtasks still queued after `main` returns: the reactions
 /// scheduled by `.then`/`.catch`/`.finally` that were never awaited. Runs until
 /// the queue is empty so a program that only chains (no top-level `await`) still
 /// observes its callbacks.
@@ -318,14 +318,13 @@ fn await_promise<W: Write + Send + 'static>(
             let _ = handles.exc_pending.set(&mut ctx, Val::I32(1));
             UNDEFINED
         }
-        // Still pending after the queue drained: a deadlocked promise. Cannot
-        // arise from the P4.1 surface (no `new Promise` executor yet), so this is
-        // an unreachable defensive fallback rather than a hang.
+        // Still pending after the queue drained: a deadlocked promise. It resolves
+        // to `undefined` as a defensive fallback rather than a hang.
         _ => UNDEFINED,
     }
 }
 
-/// Spawn an `async function` body (P4.3 M4): allocate the result promise, drive
+/// Spawn an `async function` body: allocate the result promise, drive
 /// the body's generator through its first step synchronously, and return the
 /// result promise — pending if the body suspended on an `await`, already settled
 /// if it ran straight to completion or threw synchronously. `gen_handle` is the freshly
@@ -349,8 +348,8 @@ fn spawn_async<W: Write + Send + 'static>(
     result
 }
 
-/// Advance an `async function` body's generator by one step and route the outcome
-/// (P4.3 M4). `sent` resumes the pending `await` (`undefined` for the first step).
+/// Advance an `async function` body's generator by one step and route the outcome.
+/// `sent` resumes the pending `await` (`undefined` for the first step).
 /// If the step threw, reject the result promise; if the body completed (`done`),
 /// fulfill it with the returned value; otherwise the yielded value is the awaited
 /// operand — register a continuation that resumes the body (fulfill) or rejects
@@ -387,7 +386,7 @@ fn drive_async<W: Write + Send + 'static>(
 }
 
 /// Advance the async body's generator one suspend by re-entering the guest through
-/// the exported `__async_step(gen_handle, sent)` trampoline (P4.3 M4). Returns the state
+/// the exported `__async_step(gen_handle, sent)` trampoline. Returns the state
 /// machine's value bits and whether it threw — detected by `__exc_pending`, which
 /// (with `__exc_value`) is cleared here so a surfaced rejection does not leak into
 /// the next step. Mirrors [`invoke1`].
@@ -432,7 +431,7 @@ fn async_step<W: Write + Send + 'static>(
     (result, false)
 }
 
-/// Read an async-body generator handle's `done` flag (P4.3 M4): `true` once the
+/// Read an async-body generator handle's `done` flag: `true` once the
 /// state machine has completed (fall-through or `return`). A non-heap value or a
 /// truncated block reads as not-done.
 fn read_gen_done(mem: &[u8], gen_handle: u64) -> bool {
@@ -463,7 +462,7 @@ fn run_job<W: Write + Send + 'static>(
     handles: &Handles,
     job: Job,
 ) {
-    // An `async function` continuation (P4.3 M4): the awaited value has settled.
+    // An `async function` continuation: the awaited value has settled.
     // On fulfillment, resume the body's generator with the settled value (which
     // may suspend again on the next `await` or complete and settle the result);
     // on rejection, reject the async body's result promise (no `try`/`catch`
