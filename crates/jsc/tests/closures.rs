@@ -3,7 +3,7 @@
 mod common;
 use common::jsc;
 
-/// S13.4 — closures run end to end through the built binary: a returned arrow
+/// Closures run end to end through the built binary: a returned arrow
 /// that captures a parameter by reference, a returned function that increments a
 /// shared captured cell across calls, and two closures from one factory holding
 /// independent cells.
@@ -33,9 +33,9 @@ fn closures_via_eval() {
     );
 }
 
-/// G2 — a top-level `function` declaration whose body reads (and writes) an
+/// A top-level `function` declaration whose body reads (and writes) an
 /// enclosing top-level `let`/`const` closes over it, running end to end through
-/// the built binary. A non-capturing declaration still runs unchanged, and a
+/// the built binary. A non-capturing declaration also runs, and a
 /// class method reads an enclosing top-level binding the same way.
 #[test]
 fn function_declaration_captures_enclosing_binding_via_eval() {

@@ -79,7 +79,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         }
     }
 
-    // Capture analysis (S13.4): which bindings are boxed into cells, and which
+    // Capture analysis: which bindings are boxed into cells, and which
     // top-level bindings are referenced from top-level functions (module
     // bindings). Runs before any body is lowered so a captured binding's
     // declaration knows to allocate its cell up front.
@@ -113,15 +113,15 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         fn_decls.push(fn_decl);
     }
 
-    // The fixed positional-argument arity `K` of the S13.2 uniform ABI: the
+    // The fixed positional-argument arity `K` of the uniform ABI: the
     // widest source arity across *every* function — top-level declarations AND
-    // any nested arrow function (S13.4), which lift to Table-registered functions
+    // any nested arrow function, which lift to Table-registered functions
     // sharing the same signature. Scanning the whole program up front fixes `K`
     // before any body is lowered, so a single `call_indirect` type serves them
     // all and no arrow's params can overflow the fixed argument slots.
-    // A generator's — and an `async function`'s (P4.3 M4) — state machine is
+    // A generator's — and an `async function`'s — state machine is
     // driven with two positional arguments (`sent`, the handle), so `K` must be at
-    // least 2 for the second slot to exist (P4.2 M2), regardless of the widest
+    // least 2 for the second slot to exist, regardless of the widest
     // source arity.
     let has_state_machine = fn_decls
         .iter()
@@ -204,7 +204,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     })
 }
 
-/// Build the M1 unknown-method span diagnostic. Names the method when it was
+/// Build the unknown-method span diagnostic. Names the method when it was
 /// statically known at the call site (`obj.m()` or `obj["m"]()`); falls back to a
 /// generic message for a computed call whose key is only known at runtime.
 pub(super) fn unknown_method_error(span: swc_common::Span, name: Option<&str>) -> anyhow::Error {
@@ -221,7 +221,7 @@ pub(super) fn unknown_method_error(span: swc_common::Span, name: Option<&str>) -
 struct Shared<'a> {
     /// Top-level function signatures, keyed by name.
     funcs: &'a HashMap<String, FnSig>,
-    /// Arrow functions lifted to top level (S13.4). Each use-site of an arrow
+    /// Arrow functions lifted to top level. Each use-site of an arrow
     /// appends its lowered [`IrFunction`] here and emits a
     /// [`IrNode::FuncValue`] referencing its funcref table slot. Interior
     /// mutability lets the immutable-borrow lowering walk register new functions.
@@ -235,9 +235,9 @@ struct Shared<'a> {
     max_arity: usize,
     /// The binding ids (see [`binding_id`]) of every binding captured by a
     /// nested function, computed by [`analyze_captures`]. A declared binding
-    /// whose id is in this set is boxed into a heap cell (S13.4).
+    /// whose id is in this set is boxed into a heap cell.
     captured: std::collections::HashSet<u32>,
-    /// Class declarations lowered so far, keyed by name (P2.2). A `class A`
+    /// Class declarations lowered so far, keyed by name. A `class A`
     /// declaration records its instance shape here as it is lowered; a later
     /// `new A(args)` reads the shape back to pre-slot the fresh instance. Classes
     /// are not hoisted (TDZ), so a `new` always follows its declaration in source
@@ -261,7 +261,7 @@ struct Shared<'a> {
     object_shapes: HashMap<u32, Vec<String>>,
 }
 
-/// The lowered shape of a `class` declaration (P2.2): the instance field names the
+/// The lowered shape of a `class` declaration: the instance field names the
 /// constructor assigns via `this.<field> = ..`, in first-seen order. `new A(args)`
 /// pre-allocates the instance object with one slot per field (initialized to
 /// `undefined`), because the object model has no dynamic key growth — a fresh
@@ -314,7 +314,7 @@ struct CaptureResolver {
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
 /// which top-level bindings live in module cells.
 struct CaptureAnalysis {
-    /// Binding ids captured by a nested function (boxed into cells, S13.4).
+    /// Binding ids captured by a nested function (boxed into cells).
     captured: std::collections::HashSet<u32>,
     /// Names of `main`'s outermost-scope bindings referenced from a top-level
     /// function declaration, in first-reference order. Each is stored in a
@@ -360,7 +360,7 @@ enum BodyKind<'a> {
 }
 
 /// A resolved name binding within a function frame: its wasm local, whether it
-/// may be reassigned, whether it is a **boxed cell** (S13.4, captured by a
+/// may be reassigned, whether it is a **boxed cell** (captured by a
 /// nested function), and its [`binding_id`].
 #[derive(Clone, Copy)]
 struct Binding {
@@ -371,7 +371,7 @@ struct Binding {
     /// The module-cell slot of a module binding (see [`Shared::module_slots`]):
     /// its value lives in that cell rather than a wasm local. `None` otherwise.
     module: Option<u32>,
-    /// For a binding in an `env_backed` frame (a generator local, P4.2 M2): the
+    /// For a binding in an `env_backed` frame (a generator local): the
     /// environment slot holding its boxed cell, reached via `EnvLoad`. `None` for
     /// every ordinary binding (whose cell, if any, lives in a wasm local).
     env_slot: Option<u32>,
@@ -412,7 +412,7 @@ struct Frame {
     by_id: HashMap<u32, u32>,
     /// When set, EVERY binding declared in this frame is a boxed cell reached
     /// through the frame's own environment (an `EnvLoad`), not a wasm local — the
-    /// generator state-machine model (P4.2 M2). The persistent frame of cells is
+    /// generator state-machine model. The persistent frame of cells is
     /// built once by the generator constructor and threaded in as the env
     /// parameter, so a local survives across a `yield` (a `call_indirect` return).
     env_backed: bool,
@@ -430,18 +430,18 @@ struct Frame {
     labels: Vec<(String, u32)>,
     /// The next loop-id to hand out for a labeled loop in this frame.
     next_label: u32,
-    /// Whether this frame is a function scope that binds `this` (P2.1). `true` for
+    /// Whether this frame is a function scope that binds `this`. `true` for
     /// every lowered function/arrow/method body, `false` for the top-level `main`
     /// frame — so a top-level `this` is rejected.
     allows_this: bool,
     /// The wasm local this frame's function snapshots the `__this` global into at
-    /// entry (P2.1), allocated lazily on the first `this` read (`None` until then,
+    /// entry, allocated lazily on the first `this` read (`None` until then,
     /// and for a function that never reads `this`). An `Expr::This` in this frame
     /// reads this local.
     this_local: Option<u32>,
 }
 
-/// Lowering context: a stack of function frames (S13.4). Each frame maps
+/// Lowering context: a stack of function frames. Each frame maps
 /// declared names to their [`Binding`] over its own wasm locals; name
 /// resolution walks the innermost frame's scopes outward, then continues into
 /// enclosing frames. A name resolving in an enclosing frame is a **captured**
@@ -461,8 +461,8 @@ struct LowerCtx<'a> {
     /// a top-level function declaration body. Only `main` declares module
     /// bindings; a function body resolves them through module cells.
     main_ctx: bool,
-    /// Whether the body currently being lowered is an `async function` body
-    /// (P4.3 M4). When set, an `await e` lowers to a generator `yield e` (the
+    /// Whether the body currently being lowered is an `async function` body.
+    /// When set, an `await e` lowers to a generator `yield e` (the
     /// async body is compiled as a state machine, driven by the host async
     /// engine) rather than a top-level `Await`. Set/cleared by
     /// [`LowerCtx::lower_generator_body`] around an async body.

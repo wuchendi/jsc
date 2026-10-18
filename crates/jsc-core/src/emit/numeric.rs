@@ -81,8 +81,7 @@ pub(super) fn emit_mod(
     emit_box_f64(function, helpers);
 }
 
-/// Emit a `Math.*` built-in call, leaving its number-jsval result on the stack
-/// (S14.2).
+/// Emit a `Math.*` built-in call, leaving its number-jsval result on the stack.
 ///
 /// The unary ops unbox their single argument to `f64`, apply a native wasm op, and
 /// rebox. `Round` uses JS semantics `floor(x + 0.5)`. `Min`/`Max` fold the native
@@ -150,7 +149,7 @@ pub(super) fn emit_math_call(
     }
 }
 
-/// Emit `Math.max(...)` / `Math.min(...)` with a spread argument (P1.5), leaving
+/// Emit `Math.max(...)` / `Math.min(...)` with a spread argument, leaving
 /// a number jsval on the stack. The `args` node (an [`IrNode::ArraySpread`]) is
 /// materialized into a heap array; a counted loop then folds `f64.max`/`f64.min`
 /// over its elements from the identity infinity — matching the fixed-arity
@@ -240,11 +239,11 @@ pub(super) fn emit_math_spread(
     emit_box_f64(function, helpers);
 }
 
-/// Emit `Math.pow(base, exp)`, leaving a number jsval on the stack (S14.2).
+/// Emit `Math.pow(base, exp)`, leaving a number jsval on the stack.
 ///
 /// wasm has no `f64` power op, so `base^|exp|` is built in two import-free stages:
 /// the integer part multiplies `base` into an accumulator once per unit of
-/// `trunc(|exp|)` (exact for integer exponents, e.g. the milestone's `pow(2, 10)`),
+/// `trunc(|exp|)` (exact for integer exponents, e.g. `pow(2, 10)`),
 /// and the fractional part `f = |exp| - trunc(|exp|)` (`0 ≤ f < 1`) is applied by
 /// the classic bit-by-bit square-root method: successive `f64.sqrt` yields
 /// `base^(1/2^i)`, and each `1` bit of `f`'s binary expansion multiplies it in
@@ -417,7 +416,7 @@ pub(super) fn emit_pow(
     emit_box_f64(function, helpers);
 }
 
-/// Emit a conversion built-in call, leaving its result jsval on the stack (S14.3).
+/// Emit a conversion built-in call, leaving its result jsval on the stack.
 ///
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
 /// between the boxed `true`/`false` jsvals, no host call. The other four delegate
@@ -464,7 +463,7 @@ pub(super) fn emit_convert_call(
     function.instruction(&Instruction::Call(helpers.convert));
 }
 
-/// Emit a non-callback array/string method call `IrNode::MethodCall` (S14.6),
+/// Emit a non-callback array/string method call `IrNode::MethodCall`,
 /// leaving its result jsval on the stack. The receiver is pushed, then the
 /// `METHOD_OP_*` flag, then the two fixed argument slots (each the lowered
 /// argument, or `undefined` when the method takes fewer), then a `call` of the

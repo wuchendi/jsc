@@ -3,8 +3,9 @@
  * env imports (`print` / `__convert` / `__method` / `__promise` / `__then` /
  * `__now`) plus the bump-allocator they share. A port of
  * `crates/jsc-core/src/run/harness.rs` (import wiring), `run/host.rs` (handlers +
- * allocator), and `run/promise.rs` (the promise engine + microtask queue). ACCEPTED TEMPORARY DEBT (see README):
- * this duplicates Rust host semantics against the emitted module's memory.
+ * allocator), and `run/promise.rs` (the promise engine + microtask queue). It
+ * duplicates Rust host semantics against the emitted module's memory (see
+ * README, "Host parity").
  */
 
 import {

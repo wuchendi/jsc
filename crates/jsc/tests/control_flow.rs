@@ -3,7 +3,7 @@
 mod common;
 use common::jsc;
 
-/// S12.3 — C-style `for (init; cond; update) body` end to end via the CLI.
+/// C-style `for (init; cond; update) body` end to end via the CLI.
 #[test]
 fn c_style_for_via_eval() {
     // Brace body, `for`-`let` binding.
@@ -23,7 +23,7 @@ fn c_style_for_via_eval() {
     );
 }
 
-/// S12.4 — `switch`/`case`/`default`/`break` with JS fall-through, end to end.
+/// `switch`/`case`/`default`/`break` with JS fall-through, end to end.
 #[test]
 fn switch_case_via_eval() {
     // Matching case with `break`.
@@ -92,20 +92,20 @@ fn switch_case_via_eval() {
     );
 }
 
-/// P0.3 — `for (const v of ITER) body` over arrays and strings, end to end.
+/// `for (const v of ITER) body` over arrays and strings, end to end.
 #[test]
 fn for_of_via_eval() {
-    // Milestone 1: iterate array elements, accumulating their sum.
+    // Iterate array elements, accumulating their sum.
     assert_eq!(
         jsc(&["-p", "let s=0; for (const v of [10,20,30]) { s = s + v } s"]),
         "60"
     );
-    // Milestone 2: iterate a string's characters, rebuilding it.
+    // Iterate a string's characters, rebuilding it.
     assert_eq!(
         jsc(&["-p", r#"let r=""; for (const c of "abc") { r = r + c } r"#]),
         "abc"
     );
-    // Milestone 3: `break` exits the loop early.
+    // `break` exits the loop early.
     assert_eq!(
         jsc(&[
             "-p",
@@ -113,7 +113,7 @@ fn for_of_via_eval() {
         ]),
         "3"
     );
-    // Milestone 4: `continue` skips an iteration but still advances the index.
+    // `continue` skips an iteration but still advances the index.
     assert_eq!(
         jsc(&[
             "-p",
@@ -136,7 +136,7 @@ fn for_of_via_eval() {
     );
 }
 
-/// S12.5 — lexical block scoping (`{}` pushes a scope; `for`-let block-scoped),
+/// Lexical block scoping (`{}` pushes a scope; `for`-let block-scoped),
 /// end to end via the CLI. An inner `let` shadows an outer one and does not leak.
 #[test]
 fn block_scoping_via_eval() {
@@ -156,7 +156,7 @@ fn block_scoping_via_eval() {
     );
 }
 
-/// S12.6 — `do { .. } while (cond)` end to end via the CLI. The body always runs
+/// `do { .. } while (cond)` end to end via the CLI. The body always runs
 /// once before the condition is tested, and a `continue` jumps to the condition.
 #[test]
 fn do_while_via_eval() {
@@ -186,7 +186,7 @@ fn do_while_via_eval() {
     );
 }
 
-/// S12.6 — labeled `break`/`continue` end to end via the CLI. A label names its
+/// Labeled `break`/`continue` end to end via the CLI. A label names its
 /// immediately-nested loop; `break LABEL`/`continue LABEL` from inside a nested
 /// loop target that OUTER loop.
 #[test]
@@ -224,7 +224,7 @@ fn labeled_break_continue_via_eval() {
         ]),
         "3"
     );
-    // `break LABEL` still runs an intervening `finally` on the way out (S15.3).
+    // `break LABEL` still runs an intervening `finally` on the way out.
     assert_eq!(
         jsc(&[
             "-p",

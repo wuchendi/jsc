@@ -26,19 +26,18 @@
 //! tag 0b001 -> boolean (value in bit 0):  FALSE=0x7FF9.., TRUE=0x7FF9..1
 //! tag 0b010 -> null       = 0x7FFA_0000_0000_0000
 //! tag 0b011 -> undefined  = 0x7FFB_0000_0000_0000
-//! tag 0b100 -> retired (was a typeof-result string immediate; `typeof` now yields
-//!              a real interned heap string)
+//! tag 0b100 -> unused (`typeof` yields a real interned heap string)
 //! tag 0b101 -> heap pointer: low 32 bits are the byte offset of a heap BLOCK
-//!              base. Since S13.1 this is the SINGLE heap tag for every heap kind;
-//!              the concrete kind is a TYPE BYTE at offset 0 of the block (tags
-//!              0b110/0b111 are retired). See the block-header layout below.
+//!              base. This is the SINGLE heap tag for every heap kind; the
+//!              concrete kind is a TYPE BYTE at offset 0 of the block (tags
+//!              0b110/0b111 are unused). See the block-header layout below.
 //! ```
 //!
-//! # Heap block header (S13.1)
+//! # Heap block header
 //!
 //! Every heap block begins with a `HEADER_SIZE`-byte header: byte `0` is the TYPE
 //! BYTE (0 string, 1 array, 2 object, 3 function), bytes `1..4` are padding, and
-//! the per-type payload (unchanged in shape from S10/S11) begins at offset
+//! the per-type payload begins at offset
 //! `HEADER_SIZE`:
 //!
 //! ```text
@@ -70,10 +69,10 @@ const QNAN: u64 = abi::QNAN;
 
 /// The NaN-boxed heap-pointer header (single heap tag `0b101`, see [`abi::HEAP`]):
 /// a heap jsval is `HEAP | (ptr as u32)`. Used by the `__convert` host import
-/// (S14.3) to box a freshly allocated heap string.
+/// to box a freshly allocated heap string.
 const HEAP: u64 = abi::HEAP;
 
-/// The size in bytes of every heap block's leading header (S13.1, see
+/// The size in bytes of every heap block's leading header (see
 /// [`abi::HEADER_SIZE`]): the TYPE BYTE at offset 0 plus 3 padding bytes. The
 /// per-type payload begins here.
 const HEADER_SIZE: usize = abi::HEADER_SIZE as usize;
@@ -89,10 +88,10 @@ const TYPE_PROMISE: u8 = abi::TYPE_PROMISE;
 const TYPE_GENERATOR: u8 = abi::TYPE_GENERATOR;
 const TYPE_DATE: u8 = abi::TYPE_DATE;
 
-/// Byte offset of a `Date` block's f64 `ms` payload (P-series); see [`abi`].
+/// Byte offset of a `Date` block's f64 `ms` payload; see [`abi`].
 const DATE_MS_OFFSET: usize = abi::DATE_MS_OFFSET as usize;
 
-/// Promise `state` header values (P4.1); see [`abi`].
+/// Promise `state` header values; see [`abi`].
 const PROMISE_PENDING: i32 = abi::PROMISE_PENDING;
 const PROMISE_FULFILLED: i32 = abi::PROMISE_FULFILLED;
 const PROMISE_REJECTED: i32 = abi::PROMISE_REJECTED;

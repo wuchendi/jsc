@@ -1,9 +1,9 @@
-//! Integration tests: promises, microtasks, and top-level `await` (P4.1).
+//! Integration tests: promises, microtasks, and top-level `await`.
 //!
-//! The P4.1 surface is `Promise.resolve`/`Promise.reject`, `new Promise(executor)`,
+//! The covered surface is `Promise.resolve`/`Promise.reject`, `new Promise(executor)`,
 //! `p.then`/`p.catch`/`p.finally`, a FIFO microtask queue drained by top-level
-//! `await` and after `main`, and promise value rendering. `Promise.all`/`race` and
-//! `async function` bodies remain out of scope (M2+).
+//! `await` and after `main`, and promise value rendering. `async function` bodies are
+//! covered in the async/await section; `Promise.all`/`race` are out of scope.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -247,7 +247,7 @@ fn unknown_promise_static_is_rejected() {
     assert_rejected("Promise.all([])");
 }
 
-// --- P4.3 M4: async/await (generator + promise driven) ------------------------
+// --- async/await (generator + promise driven) ---------------------------------
 
 /// An `async function` returns a promise; with no `await`, the body runs to
 /// completion synchronously and the promise is already fulfilled with the return

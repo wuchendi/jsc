@@ -60,14 +60,14 @@ pub(super) fn emit_node(
             // never captures) and the argument count, then a plain `call`. The
             // callee leaves its boxed jsval result.
             emit_call_args(args, function, scratch, strings, helpers);
-            // A plain call binds `this = undefined` (P2.1): reset the carrier after
+            // A plain call binds `this = undefined`: reset the carrier after
             // every argument is evaluated, so a method call in an argument does not
             // leak its receiver into this callee.
             emit_reset_this(function);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
             emit_argc(args.len(), function);
             // `func` is codegen's index (main = 0, user functions 1..=n); the host
-            // import shifts every defined function up by IMPORT_FUNC_COUNT (S14.1).
+            // import shifts every defined function up by IMPORT_FUNC_COUNT.
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             // A user function can throw; unwind if it left an exception in flight.
             emit_propagate_if_pending(function, helpers);
@@ -117,7 +117,7 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::Select);
         }
         // The value passed to `.next(v)` is the state machine's first wasm
-        // parameter (local 0, `sent`) — P4.2 M2.
+        // parameter (local 0, `sent`).
         IrNode::SentValue => {
             function.instruction(&Instruction::LocalGet(0));
         }
@@ -220,7 +220,7 @@ pub(super) fn emit_node(
             emit_this_call(node, function, scratch, strings, helpers);
         }
         IrNode::ThisGlobal => {
-            // Snapshot read of the `this`-binding carrier (P2.1); emitted only in a
+            // Snapshot read of the `this`-binding carrier; emitted only in a
             // function/arrow prologue.
             function.instruction(&Instruction::GlobalGet(THIS_GLOBAL));
         }
@@ -232,7 +232,7 @@ pub(super) fn emit_node(
         }
         IrNode::Index { obj, index } => {
             emit_index_node(obj, index, true, function, scratch, strings, helpers);
-            // P2b: a member/computed read whose object arm resolved (through the
+            // A member/computed read whose object arm resolved (through the
             // prototype chain) to an accessor box invokes the getter with `this` =
             // the receiver, which `emit_index_node` leaves in `scratch + 17`.
             if helpers.has_accessors {
@@ -281,7 +281,7 @@ pub(super) fn emit_node(
         IrNode::IncDec { local, inc, prefix } => {
             emit_inc_dec(*local, *inc, *prefix, function, helpers);
         }
-        // The promise-creation primitives (P4.1): push the `__promise` op flag,
+        // The promise-creation primitives: push the `__promise` op flag,
         // the value operand, and an unused `b` slot, then call the host import. It
         // returns the fresh (or, for `resolve` of a promise, adopted) promise jsval.
         IrNode::PromiseResolve(value) => {
@@ -353,7 +353,7 @@ pub(super) fn emit_node(
         IrNode::PromiseCtor { executor, p_local } => {
             emit_promise_ctor(executor, *p_local, function, scratch, strings, helpers);
         }
-        // Spawn an `async function` body (P4.3 M4): build the generator (the inner
+        // Spawn an `async function` body: build the generator (the inner
         // `MakeGenerator`) and hand it to the host async engine, which allocates
         // the result promise, drives the first step, and returns the promise.
         IrNode::AsyncSpawn(make_generator) => {
@@ -367,7 +367,7 @@ pub(super) fn emit_node(
                 helpers,
             );
         }
-        // The `Date` builtins (P-series): allocate/read a `TYPE_DATE` block's f64
+        // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
         // millisecond payload. `DateNew`/`DateNow` seed from `ms` or the host clock;
         // `DateGetTime` reads the payload back (or `NaN` for a non-Date receiver).
         IrNode::DateNew { ms } => {
@@ -411,13 +411,13 @@ pub(super) fn emit_node(
         }
         IrNode::Throw(value) => {
             // Evaluate the operand, stash it in `$exc_value`, raise `$exc_pending`,
-            // then unwind to the enclosing handler (S15.1: the function boundary).
+            // then unwind to the enclosing handler (the function boundary when none is active).
             emit_node(value, function, scratch, strings, helpers);
             function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
             // A throw is an abrupt completion that REPLACES any pending
-            // return/break/continue that a `finally` was mid-routing (S15.3), so
+            // return/break/continue that a `finally` was mid-routing, so
             // clear `$cf_kind` to keep at most one completion in flight.
             function.instruction(&Instruction::I32Const(0));
             function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
@@ -428,7 +428,7 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
         IrNode::ExcValue => {
-            // The in-flight thrown value (S15.2): read the `$exc_value` global.
+            // The in-flight thrown value: read the `$exc_value` global.
             // Emitted on a `catch` entry path to bind the catch parameter.
             function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
         }
@@ -462,7 +462,7 @@ pub(super) fn emit_call_args(
     }
 }
 
-/// Emit `__this = undefined` (P2.1): a plain (non-method) call resets the
+/// Emit `__this = undefined`: a plain (non-method) call resets the
 /// this-binding carrier so the callee's prologue snapshots `undefined`. Placed
 /// right before the `call`/`call_indirect`, after every argument has been
 /// evaluated, so a nested method call in an argument does not leak its receiver.
@@ -472,7 +472,7 @@ pub(super) fn emit_reset_this(function: &mut Function) {
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 }
 
-/// Emit a user method call `obj.m(args)` binding `this = obj` (P2.1), leaving the
+/// Emit a user method call `obj.m(args)` binding `this = obj`, leaving the
 /// callee's boxed jsval result on the stack. The receiver is evaluated once into
 /// the stable frame local `obj_local`; the `K` padded argument slots are pushed
 /// (env-last ABI); the callee — the function value at member `key` of the
@@ -537,9 +537,9 @@ pub(super) fn emit_method_call_user(
         return;
     }
 
-    // Runtime guard (G2): the resolved member MUST be a function value. For a
+    // Runtime guard: the resolved member MUST be a function value. For a
     // dynamic-shape receiver — a `new`-instance, a reassigned binding, a computed
-    // key, or a call result — the compile-time unknown-method guards (M1/G1)
+    // key, or a call result — the compile-time unknown-method guards
     // cannot prove the method absent, so `receiver[key]` may read `undefined` (or
     // any non-function). Dispatching that as a funcref index is undefined
     // behaviour; instead throw a clean `TypeError` and unwind to the nearest
@@ -548,7 +548,7 @@ pub(super) fn emit_method_call_user(
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     // The `if` opens a control frame around the throw transfer; count it so the
-    // handler-relative `br` uses the right nesting depth (S15.2).
+    // handler-relative `br` uses the right nesting depth.
     enter_frame(helpers);
     // Throw a real branded TypeError object (not a bare string): build it inline
     // and stash it in `$exc_value`. This branch only runs on the throw path, so
@@ -598,7 +598,7 @@ pub(super) fn emit_method_call_user(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Emit the P2b accessor-get postlude for a member/computed READ: the resolved
+/// Emit the accessor-get postlude for a member/computed READ: the resolved
 /// value is on top of the stack and the receiver sits in `scratch + 17` (where
 /// [`emit_index_node`] stashed it). If the resolved value is a `TYPE_ACCESSOR`
 /// box, invoke its getter (a zero-argument function value) with `this` = the
@@ -611,7 +611,7 @@ pub(super) fn emit_method_call_user(
 ///
 /// The getter is a throwing call, so every enclosing `if` opened here is tracked
 /// with [`enter_frame`]/[`leave_frame`] — a getter that throws inside a `try`
-/// then computes the right handler-relative `br` depth (S15.2).
+/// then computes the right handler-relative `br` depth.
 pub(super) fn emit_accessor_get(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
     // `+18` (the index READ key slot) is free once the object arm has resolved, so
     // it stashes the resolved value; `+17` still holds the receiver.
@@ -679,7 +679,7 @@ pub(super) fn emit_accessor_get(function: &mut Function, scratch: u32, helpers: 
     function.instruction(&Instruction::End);
 }
 
-/// Emit a `super(args)` / `super.m(args)` call (E-series `IrNode::ThisCall`),
+/// Emit a `super(args)` / `super.m(args)` call (`IrNode::ThisCall`),
 /// leaving the callee's boxed result on the stack. Mirrors [`emit_method_call_user`]
 /// but binds `this` to the ENCLOSING instance (`this_local`, the current method's
 /// snapshotted `this`) rather than a member receiver, so a parent constructor's
@@ -713,7 +713,7 @@ pub(super) fn emit_this_call(
     let callee_val = scratch;
     function.instruction(&Instruction::LocalSet(callee_val));
 
-    // Runtime guard (G2): the callee MUST be a function value — a `super.m` that
+    // Runtime guard: the callee MUST be a function value — a `super.m` that
     // resolves to `undefined` (missing method) throws a branded TypeError instead
     // of dispatching a bogus funcref index. Identical to the method-call guard.
     emit_is_function(function, callee_val);
@@ -763,7 +763,7 @@ pub(super) fn emit_this_call(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Emit a class instantiation `new A(args)` (P2.2), leaving the fresh instance
+/// Emit a class instantiation `new A(args)`, leaving the fresh instance
 /// jsval on the stack. Mirrors [`emit_method_call_user`]'s `this`-binding call
 /// shape: the instance is allocated ONCE into the stable frame local
 /// `instance_local`; the `K` padded argument slots are pushed (env-last ABI); the
@@ -835,7 +835,7 @@ pub(super) fn emit_new(
     function.instruction(&Instruction::LocalGet(instance_local));
 }
 
-/// Push the trailing `argc` argument of a uniform-ABI call frame (P1.4): the
+/// Push the trailing `argc` argument of a uniform-ABI call frame: the
 /// actual source argument `count` as a NUMBER jsval (its `f64` bit pattern),
 /// letting a callee's rest parameter collect exactly the real arguments. Pushed
 /// after the env slot, before the funcref index for an indirect call.
@@ -921,7 +921,7 @@ pub(super) fn emit_func_value(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit a closure environment block (S13.4), leaving its heap jsval on the
+/// Emit a closure environment block, leaving its heap jsval on the
 /// stack: `__alloc(HEADER_SIZE + 4 + 8*count)`, the `TYPE_ENV` type byte, the
 /// u32 `count`, then each captured cell pointer at `+HEADER_SIZE+4+8*i`. Each
 /// capture source expression is a side-effect-free cell-pointer read (a `Local`
@@ -1097,7 +1097,7 @@ pub(super) fn emit_cell_set(
 /// The callee is evaluated **after** the arguments and its base then read twice
 /// (env, then index) with no intervening evaluation, so a nested indirect call
 /// in an argument cannot clobber the stashed base.
-/// Emit a call to the host `__promise(op, a, b) -> i64` import (P4.1): push the
+/// Emit a call to the host `__promise(op, a, b) -> i64` import: push the
 /// `op` flag, then evaluate `a` and `b` into the two jsval slots, then `call`.
 /// Used by `Promise.resolve`/`reject` (`b` unused), `await` (`b` unused), and
 /// `p.finally` (`a` = the promise, `b` = the finalizer).
@@ -1116,7 +1116,7 @@ pub(super) fn emit_promise_call(
     function.instruction(&Instruction::Call(helpers.promise));
 }
 
-/// Emit `new Promise(executor)` (P4.1), leaving the fresh promise's jsval on the
+/// Emit `new Promise(executor)`, leaving the fresh promise's jsval on the
 /// stack.
 ///
 /// Steps: (1) `P = __promise(NEW)`, stashed in the dedicated `p_local`; (2) build
@@ -1219,7 +1219,7 @@ pub(super) fn emit_promise_ctor(
     function.instruction(&Instruction::LocalGet(p_local));
 }
 
-/// Emit a `new Promise` settler FUNCTION value (P4.1), leaving its heap jsval on
+/// Emit a `new Promise` settler FUNCTION value, leaving its heap jsval on
 /// the stack: a `TYPE_FUNCTION` block whose funcref-table index is the settler
 /// slot `table_index` and whose ENV slot holds the bound promise (read from
 /// `p_local`) rather than a closure environment. Mirrors [`emit_func_value`] but
@@ -1291,7 +1291,7 @@ pub(super) fn emit_call_indirect(
     }
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
-    // A plain indirect call binds `this = undefined` (P2.1) — method calls take the
+    // A plain indirect call binds `this = undefined` — method calls take the
     // dedicated `emit_method_call_user` path instead.
     emit_reset_this(function);
     // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
@@ -1337,12 +1337,12 @@ fn emit_throw_not_a_function(
     emit_throw_return(function, helpers);
 }
 
-/// Emit a call whose argument list contains a spread `f(...a)` (P1.5), leaving
+/// Emit a call whose argument list contains a spread `f(...a)`, leaving
 /// the callee's boxed jsval result on the stack. The `args` node (an
 /// [`IrNode::ArraySpread`]) is materialized into a heap array; its elements are
 /// then spread into the uniform ABI's fixed `K` positional slots (padding with
 /// `undefined`, dropping any beyond `K`) with the array's length passed as the
-/// dynamic `argc` (P1.4). A `Direct` target `call`s a known function index; an
+/// dynamic `argc`. A `Direct` target `call`s a known function index; an
 /// `Indirect` target evaluates the callee first (JS order) and `call_indirect`s.
 pub(super) fn emit_call_spread(
     target: &SpreadCallee,
@@ -1363,7 +1363,7 @@ pub(super) fn emit_call_spread(
         SpreadCallee::Direct(func) => {
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             emit_spread_arg_slots(base, len, function, helpers);
-            // A plain (non-method) call binds `this = undefined` (P2.1).
+            // A plain (non-method) call binds `this = undefined`.
             emit_reset_this(function);
             // A top-level declaration never captures, so its env slot is `undefined`.
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -1380,7 +1380,7 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::LocalSet(cb));
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             emit_spread_arg_slots(base, len, function, helpers);
-            // A plain indirect call binds `this = undefined` (P2.1).
+            // A plain indirect call binds `this = undefined`.
             emit_reset_this(function);
             // Trailing env argument: the callee's own environment (+HEADER_SIZE+4).
             function.instruction(&Instruction::LocalGet(cb));
@@ -1453,7 +1453,7 @@ fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: 
 }
 
 /// Push a spread call's dynamic argument count `len` as a NUMBER jsval (its
-/// `f64` bit pattern), so a callee's rest parameter (P1.4) collects exactly the
+/// `f64` bit pattern), so a callee's rest parameter collects exactly the
 /// real spread arguments.
 fn emit_spread_argc(len: u32, function: &mut Function) {
     function.instruction(&Instruction::LocalGet(len));
@@ -1461,7 +1461,7 @@ fn emit_spread_argc(len: u32, function: &mut Function) {
     function.instruction(&Instruction::I64ReinterpretF64);
 }
 
-/// Emit a `console.log(a0, .., a_{n-1})` expression (S14.1), leaving the
+/// Emit a `console.log(a0, .., a_{n-1})` expression, leaving the
 /// `undefined` jsval (its expression value) on the stack.
 ///
 /// Each argument is evaluated left-to-right and passed to the host `print`
@@ -1509,7 +1509,7 @@ pub(super) fn emit_console_log(
 /// special-casing anywhere). The six words are interned by `collect_node` whenever
 /// a program uses `typeof`, so this allocates nothing per call.
 ///
-/// Since S13.1 the concrete heap kind is a TYPE BYTE, not the NaN-box tag, so
+/// The concrete heap kind is a TYPE BYTE, not the NaN-box tag, so
 /// `typeof` splits on whether the value is a heap pointer (single tag `0b101`):
 ///
 /// - **Heap pointer** — read the type byte and map it to the `TYPEOF_STRINGS`

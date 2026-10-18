@@ -3,12 +3,12 @@
 mod common;
 use common::jsc;
 
-/// The S11.3 object milestones run inline with `-p` through the built binary.
+/// Object basics run inline with `-p` through the built binary.
 ///
-/// Covers the object wave end to end: `.a` read + sum, computed `["a"]` read,
+/// Covers objects end to end: `.a` read + sum, computed `["a"]` read,
 /// a string-literal key, and `typeof {}`.
 #[test]
-fn object_milestones_via_eval() {
+fn object_basics_via_eval() {
     assert_eq!(jsc(&["-p", "let o={a:1,b:2}; o.a+o.b"]), "3");
     assert_eq!(jsc(&["-p", "let o={a:1}; o[\"a\"]"]), "1");
     assert_eq!(jsc(&["-p", "let o={x:10}; o.x"]), "10");
@@ -16,7 +16,7 @@ fn object_milestones_via_eval() {
     assert_eq!(jsc(&["-p", "let o={\"k\":5}; o.k"]), "5");
 }
 
-/// S11.4: `o.a = v` / `o["a"] = v` store into an EXISTING key's value slot; the
+/// `o.a = v` / `o["a"] = v` store into an EXISTING key's value slot; the
 /// assignment expression evaluates to the stored value, and a missing key is a
 /// documented no-op that must not corrupt existing entries.
 #[test]
@@ -27,12 +27,12 @@ fn object_property_assignment_via_eval() {
     assert_eq!(jsc(&["-p", "let o={a:1}; o.b=5; o.a"]), "1");
 }
 
-/// S11.5: nested arrays and objects compose — arrays and objects store full
+/// Nested arrays and objects compose — arrays and objects store full
 /// jsvals as elements/values, so a literal nested inside another composes with
 /// no special casing. Covers every nesting direction end to end.
 #[test]
 fn nested_values_compose_via_eval() {
-    // Object holding an array (the S11 milestone), read through both hops.
+    // Object holding an array, read through both hops.
     assert_eq!(jsc(&["-p", "let o={v:[7,8]}; o.v[1]"]), "8");
     // Array of objects — index then property, on each element.
     assert_eq!(jsc(&["-p", "let a=[{n:1},{n:2}]; a[0].n + a[1].n"]), "3");
@@ -44,7 +44,7 @@ fn nested_values_compose_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[[1,2],[3,4]]; a[1][0]"]), "3");
 }
 
-/// S11.5: mutation reaches through a nesting hop and the write sticks.
+/// Mutation reaches through a nesting hop and the write sticks.
 ///
 /// The target slot lives inside a heap value that is itself an element/value of
 /// the outer container; the assignment must land in the inner container.
@@ -56,7 +56,7 @@ fn nested_mutation_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[{n:1}]; a[0].n=7; a[0].n"]), "7");
 }
 
-/// S11.5: a `while` loop sums a numeric array nested inside an object.
+/// A `while` loop sums a numeric array nested inside an object.
 ///
 /// Combines nested read (`o.xs[i]`), nested `.length`, and loop control — the
 /// integration angle for arrays reached through a property.
@@ -71,7 +71,7 @@ fn nested_array_while_sum_via_eval() {
     );
 }
 
-/// S11.5: a nested result formats recursively without panicking.
+/// A nested result formats recursively without panicking.
 ///
 /// The exact spacing is not the contract here — the point is that the recursive
 /// decode/format walks nested heap values and round-trips their shape.
@@ -89,18 +89,18 @@ fn nested_values_print_recursively() {
     assert_eq!(jsc(&["-p", "[[1,2],[3,4]]"]), "[ [ 1, 2 ], [ 3, 4 ] ]");
 }
 
-/// P0.4 optional chaining `?.`: a `?.` link short-circuits the WHOLE chain to
+/// Optional chaining `?.`: a `?.` link short-circuits the WHOLE chain to
 /// `undefined` when its base is null/undefined, and reads through normally
 /// otherwise. Member (`?.b`), index (`?.[i]`), and mixed optional/non-optional
 /// links are exercised end to end.
 #[test]
 fn optional_chaining_short_circuits() {
-    // A null base short-circuits to `undefined` (milestone 1).
+    // A null base short-circuits to `undefined`.
     assert_eq!(
         jsc(&["-p", "let o=null; let r=o?.x; typeof r"]),
         "undefined"
     );
-    // A non-null chain reads each link normally (milestone 2).
+    // A non-null chain reads each link normally.
     assert_eq!(jsc(&["-p", "let o={a:{b:42}}; o?.a?.b"]), "42");
     // The `?.` short-circuit skips every FOLLOWING link (no `.a.b.c` deref on a
     // null base), yielding `undefined` rather than crashing.
@@ -115,19 +115,19 @@ fn optional_chaining_short_circuits() {
     assert_eq!(jsc(&["-p", "let s=\"abc\"; s?.length"]), "3");
 }
 
-/// P2.1 `this` + method calls on object literals: a method `obj.m(args)` binds
+/// `this` + method calls on object literals: a method `obj.m(args)` binds
 /// `this = obj`, method values are functions, and shorthand properties (`{n}`)
 /// desugar to `{n: n}`. The nested-`this` case exercises the per-function local
 /// snapshot: a method calling another method through `this` must keep its own
 /// `this` after the nested call clobbers the `__this` global.
 #[test]
 fn this_and_method_calls_on_objects() {
-    // Milestone 1: a method reads `this`.
+    // A method reads `this`.
     assert_eq!(
         jsc(&["-p", "let o={n:41, inc(){return this.n+1}}; o.inc()"]),
         "42"
     );
-    // Milestone 2: a method calls another method via `this` — the caller's `this`
+    // A method calls another method via `this` — the caller's `this`
     // survives the nested clobber (41*... here 5*8).
     assert_eq!(
         jsc(&[
@@ -136,9 +136,9 @@ fn this_and_method_calls_on_objects() {
         ]),
         "40"
     );
-    // Milestone 3: shorthand property `{n}` ≡ `{n: n}`.
+    // Shorthand property `{n}` ≡ `{n: n}`.
     assert_eq!(jsc(&["-p", "let n=7; let o={n}; o.n"]), "7");
-    // Milestone 4: a method value is a function.
+    // A method value is a function.
     assert_eq!(
         jsc(&["-p", "let o={inc(){return 1}}; typeof (o.inc)"]),
         "function"
@@ -154,7 +154,7 @@ fn this_and_method_calls_on_objects() {
     );
 }
 
-/// P2.1 nested `this` chaining through several method hops: each frame snapshots
+/// Nested `this` chaining through several method hops: each frame snapshots
 /// its own receiver, so `this` stays stable across intervening method calls.
 #[test]
 fn this_chained_through_method_hops() {
@@ -175,12 +175,12 @@ fn this_chained_through_method_hops() {
     );
 }
 
-/// P2.2b regression: a member WRITE with a computed RHS must not clobber the
-/// stashed receiver/key. The RHS is emitted with the child scratch base, so
-/// before the fix `o.v = 3+4` reused the same low slots that held the receiver
-/// and produced garbage; the receiver/key now live in dedicated high slots.
+/// Regression: a member WRITE with a computed RHS must not clobber the stashed
+/// receiver/key. The RHS is emitted with the child scratch base, so the
+/// receiver/key live in dedicated high slots that the RHS evaluation (e.g.
+/// `o.v = 3+4`) cannot reuse.
 #[test]
-fn p2_2b_member_set_computed_rhs_no_clobber() {
+fn member_set_computed_rhs_no_clobber() {
     // Arithmetic RHS: the classic reproduction.
     assert_eq!(jsc(&["-p", "let o={v:1}; o.v = 3+4; o.v"]), "7");
     // RHS that READS the same object (member read inside the RHS).
@@ -188,11 +188,11 @@ fn p2_2b_member_set_computed_rhs_no_clobber() {
     // RHS that is itself an index READ of a DIFFERENT object: get/set use
     // disjoint high slots, so the receiver stash survives.
     assert_eq!(jsc(&["-p", "let o={v:1}; let a=[7]; o.v = a[0]; o.v"]), "7");
-    // Literal RHS (uses no scratch) must still work — no regression.
+    // Literal RHS (uses no scratch).
     assert_eq!(jsc(&["-p", "let o={v:1}; o.v = 9; o.v"]), "9");
 }
 
-/// P3.2: `Object.keys` / `Object.values` / `Object.entries` build a fresh
+/// `Object.keys` / `Object.values` / `Object.entries` build a fresh
 /// growable array from the object's runtime key table, in insertion order, via
 /// the in-wasm `__obj_keys`/`__obj_values`/`__obj_entries` helpers.
 #[test]
@@ -213,7 +213,7 @@ fn object_keys_values_entries_via_eval() {
     assert_eq!(jsc(&["-p", "Object.entries({a:1})[0][1]"]), "1");
 }
 
-/// P3.2: the enumerators skip the reserved hidden `@@`-prefixed keys, so a class
+/// The enumerators skip the reserved hidden `@@`-prefixed keys, so a class
 /// instance (which carries a `@@prototype` link) enumerates only its own fields.
 #[test]
 fn object_keys_skip_reserved_keys() {
@@ -235,7 +235,7 @@ fn object_keys_skip_reserved_keys() {
     assert_eq!(jsc(&["-p", "Object.keys({}).length"]), "0");
 }
 
-/// P3.2: `Object` is a syntactic built-in gated on `resolve("Object") == None`, so
+/// `Object` is a syntactic built-in gated on `resolve("Object") == None`, so
 /// a user binding shadows it; an unknown static and a wrong arity are rejected.
 #[test]
 fn object_builtin_shadowing_and_rejections() {
@@ -260,7 +260,7 @@ fn object_builtin_shadowing_and_rejections() {
     assert!(jsc_stderr("Object.keys()").contains("expects 1 argument"));
 }
 
-/// P3.3: the `key in obj` operator is an OWN-key membership test, lowered to the
+/// The `key in obj` operator is an OWN-key membership test, lowered to the
 /// in-wasm `__obj_has` linear scan (byte-content key compare, no prototype walk).
 #[test]
 fn in_operator_own_key_membership() {
@@ -272,7 +272,7 @@ fn in_operator_own_key_membership() {
     assert_eq!(jsc(&["-p", "'a' in {}"]), "false");
 }
 
-/// P3.3: `delete obj.k` removes an own property (compacting it out of the runtime
+/// `delete obj.k` removes an own property (compacting it out of the runtime
 /// key table) and always evaluates to `true`; a later read yields `undefined`,
 /// `in` yields `false`, and every enumerator skips the removed key.
 #[test]
@@ -302,7 +302,7 @@ fn delete_removes_own_property() {
         ]),
         "a,c"
     );
-    // for-in (P3.1) skips the deleted key.
+    // for-in skips the deleted key.
     assert_eq!(
         jsc(&[
             "-p",
@@ -314,7 +314,7 @@ fn delete_removes_own_property() {
     assert_eq!(jsc(&["-p", "let o={a:1}; delete o.z; 'a' in o"]), "true");
 }
 
-/// P3.3: `delete` requires a member reference; a bare `delete x` is rejected.
+/// `delete` requires a member reference; a bare `delete x` is rejected.
 #[test]
 fn delete_non_member_is_rejected() {
     use std::process::Command;
@@ -331,10 +331,10 @@ fn delete_non_member_is_rejected() {
     );
 }
 
-/// P3.4: the `JSON.stringify` milestones — a number, a quoted string, an array,
+/// `JSON.stringify` basics — a number, a quoted string, an array,
 /// and an object — serialized entirely in-wasm.
 #[test]
-fn json_stringify_milestones() {
+fn json_stringify_basics() {
     assert_eq!(jsc(&["-p", "JSON.stringify(42)"]), "42");
     // The result is the 4-char string `"hi"` (quote, h, i, quote), printed raw.
     assert_eq!(jsc(&["-p", "JSON.stringify(\"hi\")"]), "\"hi\"");
@@ -347,7 +347,7 @@ fn json_stringify_milestones() {
     assert_eq!(jsc(&["-p", "typeof JSON.stringify(42)"]), "string");
 }
 
-/// P3.4: primitive serialization — booleans, `null`, floats, and non-finite
+/// Primitive serialization — booleans, `null`, floats, and non-finite
 /// numbers (which JSON renders as `null`).
 #[test]
 fn json_stringify_primitives() {
@@ -361,7 +361,7 @@ fn json_stringify_primitives() {
     assert_eq!(jsc(&["-p", "JSON.stringify(0/0)"]), "null");
 }
 
-/// P3.4: string escaping — `"`, `\`, and the whitespace control characters get
+/// String escaping — `"`, `\`, and the whitespace control characters get
 /// their JSON backslash escapes; a bare control byte becomes `\u00XX`.
 #[test]
 fn json_stringify_escapes() {
@@ -373,7 +373,7 @@ fn json_stringify_escapes() {
     assert_eq!(jsc(&["-p", "JSON.stringify(\"\\u0001\")"]), "\"\\u0001\"");
 }
 
-/// P3.4: nested containers recurse, and `undefined`/function values are handled
+/// Nested containers recurse, and `undefined`/function values are handled
 /// per JS — omitted as object values, rendered as `null` as array elements.
 #[test]
 fn json_stringify_nested_and_holes() {
@@ -407,7 +407,7 @@ fn json_stringify_nested_and_holes() {
     );
 }
 
-/// P3.4: `JSON` is a syntactic built-in, shadowable like `Object`/`Math`; a
+/// `JSON` is a syntactic built-in, shadowable like `Object`/`Math`; a
 /// user binding named `JSON` wins and is not treated as the built-in.
 #[test]
 fn json_shadowing() {
@@ -416,7 +416,7 @@ fn json_shadowing() {
 }
 
 /// `JSON.parse` parses scalars, arrays, and objects with RUNTIME-unknown keys via
-/// the in-wasm recursive-descent parser (un-defers the P3.4 backlog item).
+/// the in-wasm recursive-descent parser.
 #[test]
 fn json_parse_scalars_and_composites() {
     // Scalars.
