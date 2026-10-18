@@ -28,6 +28,12 @@ const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
 const CONVERT_OP_PARSE_INT: i32 = abi::CONVERT_OP_PARSE_INT;
 const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 
+/// Box a host-computed `f64` as a number jsval's raw bits, mapping every NaN to
+/// the canonical [`abi::QNAN`] (the guest-side twin of `emit::emit_box_f64`).
+fn number_bits(n: f64) -> i64 {
+    if n.is_nan() { abi::QNAN } else { n.to_bits() }.cast_signed()
+}
+
 /// The NaN-boxed `undefined` jsval bits (see [`abi::UNDEFINED`]), returned by the
 /// `__method` host import for a type-mismatched receiver or a failed allocation.
 const UNDEFINED_BITS: u64 = abi::UNDEFINED;
@@ -161,14 +167,10 @@ fn run_with_sink<W: Write + Send + 'static>(
                 None => decode(ubits, &[]),
             };
             let result = match op {
-                CONVERT_OP_TO_NUMBER => value_to_number(&value).to_bits().cast_signed(),
+                CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
                 // `parseInt`/`parseFloat` operate on the argument's string form.
-                CONVERT_OP_PARSE_INT => {
-                    parse_int_str(&format_value(&value)).to_bits().cast_signed()
-                }
-                CONVERT_OP_PARSE_FLOAT => parse_float_str(&format_value(&value))
-                    .to_bits()
-                    .cast_signed(),
+                CONVERT_OP_PARSE_INT => number_bits(parse_int_str(&format_value(&value))),
+                CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&format_value(&value))),
                 CONVERT_OP_TO_STRING => {
                     // A string argument is returned unchanged (no allocation);
                     // anything else is formatted and allocated as a heap string.

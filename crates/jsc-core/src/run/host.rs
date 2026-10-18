@@ -168,14 +168,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             _ => None,
         },
         METHOD_OP_INCLUDES => match type_byte {
-            Some(TYPE_ARRAY) => {
-                let idx = array_index_of(&mem, ptr?, arg0.cast_unsigned());
-                Some(if idx == (-1.0_f64).to_bits() {
-                    FALSE_BITS
-                } else {
-                    TRUE_BITS
-                })
-            }
+            Some(TYPE_ARRAY) => Some(bool_bits(array_includes(&mem, ptr?, arg0.cast_unsigned()))),
             // `str.includes(sub)` — substring containment (an empty `sub` => true).
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
@@ -330,6 +323,21 @@ fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
         }
     }
     not_found_bits()
+}
+
+/// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
+/// except that `NaN` matches `NaN`.
+fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
+    let len = block_len(mem, ptr).unwrap_or(0);
+    (0..len).any(|i| {
+        array_elem_bits(mem, ptr, i).is_some_and(|elem| {
+            strict_eq_bits(elem, needle, mem)
+                || matches!(
+                    (decode(elem, mem), decode(needle, mem)),
+                    (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
+                )
+        })
+    })
 }
 
 /// `string.indexOf(sub)`: the number bits of the first BYTE index where `sub`
@@ -689,11 +697,44 @@ pub(super) fn value_to_number(value: &Value) -> f64 {
 
 /// Parse a whole string as a JS `Number(str)` (S14.3): leading/trailing ASCII
 /// whitespace is trimmed, an empty/whitespace-only string is `0`, and anything the
-/// remaining text does not parse as a full number is `NaN`.
+/// remaining text does not parse as a full number is `NaN`. The grammar is JS
+/// `StringToNumber`: an unsigned `0x`/`0o`/`0b` integer literal, a signed
+/// `Infinity`, or a signed decimal literal (Rust's `inf`/`nan` spellings are not
+/// JS and yield `NaN`).
 fn str_to_number(s: &str) -> f64 {
     let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
     if trimmed.is_empty() {
         return 0.0;
+    }
+    let radix = match trimmed.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = &trimmed[2..];
+        if digits.is_empty() {
+            return f64::NAN;
+        }
+        return digits
+            .chars()
+            .try_fold(0.0, |acc, c| {
+                c.to_digit(radix)
+                    .map(|d| acc * f64::from(radix) + f64::from(d))
+            })
+            .unwrap_or(f64::NAN);
+    }
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if unsigned == "Infinity" {
+        return if trimmed.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if !unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return f64::NAN;
     }
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }

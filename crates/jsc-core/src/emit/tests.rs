@@ -12,6 +12,7 @@ fn expr_program(node: IrNode) -> IrProgram {
         locals: 0,
         stmts: vec![IrStmt::Expr(node)],
         functions: Vec::new(),
+        module_cells: 0,
     }
 }
 
@@ -219,6 +220,7 @@ fn array_element_assignment_writes_slot_and_yields_value() {
             }),
         ],
         functions: Vec::new(),
+        module_cells: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
@@ -301,6 +303,7 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
             }),
         ],
         functions: Vec::new(),
+        module_cells: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
@@ -423,6 +426,7 @@ fn emits_valid_module_with_locals() {
             }),
         ],
         functions: Vec::new(),
+        module_cells: 0,
     };
     validate(&emit(&program));
 }
@@ -457,6 +461,7 @@ fn emits_valid_module_with_while_loop() {
             IrStmt::Expr(IrNode::Local(0)),
         ],
         functions: Vec::new(),
+        module_cells: 0,
     };
     validate(&emit(&program));
 }
@@ -504,6 +509,7 @@ fn emits_valid_module_with_switch() {
             IrStmt::Expr(IrNode::Local(1)),
         ],
         functions: Vec::new(),
+        module_cells: 0,
     };
     validate(&emit(&program));
 }
@@ -520,6 +526,7 @@ fn emits_valid_module_with_boxed_condition() {
             else_body: vec![IrStmt::Expr(IrNode::Num(2.0))],
         }],
         functions: Vec::new(),
+        module_cells: 0,
     };
     validate(&emit(&program));
 }
@@ -597,6 +604,7 @@ fn emits_valid_module_with_function_and_call() {
     // local 3 is the argument-count slot (P1.4).
     let program = IrProgram {
         locals: 0,
+        module_cells: 0,
         stmts: vec![IrStmt::Expr(IrNode::Call {
             func: 1,
             args: vec![IrNode::Num(40.0), IrNode::Num(2.0)],
@@ -624,6 +632,7 @@ fn emits_valid_module_with_function_value_and_indirect_call() {
     // argc is local 2).
     let program = IrProgram {
         locals: 1,
+        module_cells: 0,
         stmts: vec![
             IrStmt::Decl {
                 local: 0,
