@@ -121,11 +121,13 @@ pub(super) fn build_type_and_function_sections<'a>(
         nullish_throw: obj_get_index + 30,
         // `__box_f64` (the canonical-NaN number rebox) follows it.
         box_f64: obj_get_index + 31,
+        // `__to_number` (the shared ToNumber coercion) follows it.
+        to_number: obj_get_index + 32,
         // The `__invoke1` callback trampoline (P4.1) is appended after every helper
         // above; the `__async_step` trampoline (P4.3 M4) follows it, then the two
         // `new Promise` settler functions.
-        invoke1: obj_get_index + 32,
-        async_step: obj_get_index + 33,
+        invoke1: obj_get_index + 33,
+        async_step: obj_get_index + 34,
         // The settler funcref-TABLE slots sit right after the `n` user-function
         // slots (`0..n`), so slots `n` and `n + 1`. `0` when there are no functions
         // (no table — and `new Promise` cannot occur without an executor function).
@@ -226,6 +228,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
         // `__box_f64(x: f64) -> i64`.
         helper(&[ValType::F64], &[ValType::I64]);
+        // `__to_number(v: i64) -> i64`.
+        helper(&[ValType::I64], &[ValType::I64]);
         // The `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline (P4.1).
         helper(&[ValType::I64, ValType::I64], &[ValType::I64]);
         // The `__async_step(gen: i64, sent: i64) -> i64` trampoline (P4.3 M4).
@@ -246,29 +250,29 @@ pub(super) fn build_type_and_function_sections<'a>(
     // function: `print(bits: i64, flag: i32) -> ()`,
     // `__convert(bits: i64, op: i32) -> i64`, and
     // `__method(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64`.
-    let print_type = helper_type_base + 39;
+    let print_type = helper_type_base + 40;
     types.ty().function([ValType::I64, ValType::I32], []);
-    let convert_type = helper_type_base + 40;
+    let convert_type = helper_type_base + 41;
     types
         .ty()
         .function([ValType::I64, ValType::I32], [ValType::I64]);
-    let method_type = helper_type_base + 41;
+    let method_type = helper_type_base + 42;
     types.ty().function(
         [ValType::I64, ValType::I32, ValType::I64, ValType::I64],
         [ValType::I64],
     );
     // The host promise import types (P4.1): `__promise(op: i32, a: i64, b: i64) ->
     // i64` and `__then(p: i64, on_f: i64, on_r: i64) -> i64`.
-    let promise_type = helper_type_base + 42;
+    let promise_type = helper_type_base + 43;
     types
         .ty()
         .function([ValType::I32, ValType::I64, ValType::I64], [ValType::I64]);
-    let then_type = helper_type_base + 43;
+    let then_type = helper_type_base + 44;
     types
         .ty()
         .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
     // The host wall-clock import type (P-series `Date`): `__now() -> f64`.
-    let now_type = helper_type_base + 44;
+    let now_type = helper_type_base + 45;
     types.ty().function([], [ValType::F64]);
 
     (

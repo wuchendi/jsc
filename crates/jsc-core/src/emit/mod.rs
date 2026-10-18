@@ -657,6 +657,10 @@ struct Helpers<'a> {
     /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
     /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).
     box_f64: u32,
+    /// `__to_number(v: i64) -> i64`: the JS `ToNumber` of any jsval (`ToPrimitive` of
+    /// an array is its `join()` string; see [`value::emit_to_number_helper`]).
+    /// Call sites skip it for number operands (see [`value::emit_coerce_number`]).
+    to_number: u32,
     /// `__invoke1(fn: i64, arg: i64) -> i64` (P4.1): the callback trampoline the
     /// host promise engine calls re-entrantly. Exported under
     /// [`INVOKE_EXPORT_NAME`].
@@ -1087,6 +1091,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // `new Promise` settler functions (only when there are functions — the table
     // exists then).
     code.function(&emit_box_f64_helper());
+    code.function(&emit_to_number_helper(helpers));
     code.function(&emit_invoke1(helpers));
     code.function(&generator::emit_async_step(helpers));
     if has_funcs {

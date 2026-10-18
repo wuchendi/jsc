@@ -697,11 +697,44 @@ pub(super) fn value_to_number(value: &Value) -> f64 {
 
 /// Parse a whole string as a JS `Number(str)` (S14.3): leading/trailing ASCII
 /// whitespace is trimmed, an empty/whitespace-only string is `0`, and anything the
-/// remaining text does not parse as a full number is `NaN`.
+/// remaining text does not parse as a full number is `NaN`. The grammar is JS
+/// `StringToNumber`: an unsigned `0x`/`0o`/`0b` integer literal, a signed
+/// `Infinity`, or a signed decimal literal (Rust's `inf`/`nan` spellings are not
+/// JS and yield `NaN`).
 fn str_to_number(s: &str) -> f64 {
     let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
     if trimmed.is_empty() {
         return 0.0;
+    }
+    let radix = match trimmed.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = &trimmed[2..];
+        if digits.is_empty() {
+            return f64::NAN;
+        }
+        return digits
+            .chars()
+            .try_fold(0.0, |acc, c| {
+                c.to_digit(radix)
+                    .map(|d| acc * f64::from(radix) + f64::from(d))
+            })
+            .unwrap_or(f64::NAN);
+    }
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if unsigned == "Infinity" {
+        return if trimmed.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if !unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return f64::NAN;
     }
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }
