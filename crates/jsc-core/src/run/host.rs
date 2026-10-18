@@ -168,14 +168,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             _ => None,
         },
         METHOD_OP_INCLUDES => match type_byte {
-            Some(TYPE_ARRAY) => {
-                let idx = array_index_of(&mem, ptr?, arg0.cast_unsigned());
-                Some(if idx == (-1.0_f64).to_bits() {
-                    FALSE_BITS
-                } else {
-                    TRUE_BITS
-                })
-            }
+            Some(TYPE_ARRAY) => Some(bool_bits(array_includes(&mem, ptr?, arg0.cast_unsigned()))),
             // `str.includes(sub)` — substring containment (an empty `sub` => true).
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
@@ -330,6 +323,21 @@ fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
         }
     }
     not_found_bits()
+}
+
+/// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
+/// except that `NaN` matches `NaN`.
+fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
+    let len = block_len(mem, ptr).unwrap_or(0);
+    (0..len).any(|i| {
+        array_elem_bits(mem, ptr, i).is_some_and(|elem| {
+            strict_eq_bits(elem, needle, mem)
+                || matches!(
+                    (decode(elem, mem), decode(needle, mem)),
+                    (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
+                )
+        })
+    })
 }
 
 /// `string.indexOf(sub)`: the number bits of the first BYTE index where `sub`

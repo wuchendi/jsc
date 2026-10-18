@@ -1,13 +1,39 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Rebox the `f64` on top of the stack as a number jsval (via `__box_f64`).
+/// Every site that turns an `f64` (arithmetic, `Math.*`, a stored `Date` payload,
+/// a host-imported clock) back into a jsval goes through here, so the number NaN
+/// is ALWAYS exactly the canonical [`abi::QNAN`] bits: wasm arithmetic may yield
+/// any NaN (`0/0` sets the sign bit on x86; a NaN operand such as `undefined`
+/// propagates its tag payload), and a raw reinterpret would leak those bits as a
+/// different value. Integer conversions (`f64.convert_i32_u`, ...) can never be
+/// NaN and reinterpret directly.
+pub(super) fn emit_box_f64(function: &mut Function, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::Call(helpers.box_f64));
+}
+
+/// Emit the `__box_f64(x: f64) -> i64` helper backing [`emit_box_f64`]:
+/// `x == x ? reinterpret(x) : QNAN`.
+pub(super) fn emit_box_f64_helper() -> Function {
+    let mut function = Function::new(vec![]);
+    function.instruction(&Instruction::LocalGet(0));
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::I64Const(QNAN_BITS));
+    function.instruction(&Instruction::LocalGet(0));
+    function.instruction(&Instruction::LocalGet(0));
+    function.instruction(&Instruction::F64Eq);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::End);
+    function
+}
+
 /// Push `1` if the jsval in `local` is a number, else `0`. Every boxed
 /// non-number (boolean/null/undefined/heap pointer) has a clear sign bit, the
 /// QNAN mask set and a nonzero tag, so its bits read as a signed `i64` strictly
-/// greater than `QNAN | 0x0000_FFFF_FFFF_FFFF` (the largest tag-`0b000` NaN). A
-/// number is every value at or below that bound: ordinary `f64`s, the canonical
-/// NaN, and any other NaN wasm arithmetic may produce (e.g. `0/0` yields the
-/// sign-bit-set `0xFFF8_..` NaN on x86).
+/// greater than `QNAN | 0x0000_FFFF_FFFF_FFFF`. A number is every value at or
+/// below that bound: ordinary `f64`s and the canonical NaN (the only NaN a
+/// number jsval can hold — see [`emit_box_f64`]).
 pub(super) fn emit_is_number(function: &mut Function, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I64Const(QNAN_BITS | 0x0000_FFFF_FFFF_FFFF));

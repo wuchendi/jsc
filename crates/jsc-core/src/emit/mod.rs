@@ -209,6 +209,16 @@ const JSON_POS_GLOBAL: u32 = 7;
 /// See [`JSON_DATA_GLOBAL`].
 const JSON_LEN_GLOBAL: u32 = 8;
 
+/// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
+/// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
+/// the `JSON.parse` cursor globals and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 9;
+
+/// The TDZ hole a module cell holds until its binding is initialized
+/// (`IrNode::IsHole`): an `undefined`-tagged NaN box with a nonzero payload, which
+/// no JS value ever produces.
+const TDZ_HOLE_BITS: i64 = abi::UNDEFINED.cast_signed() | 1;
+
 /// [`CF_KIND_GLOBAL`] value for a pending `return` (payload in
 /// [`CF_VALUE_GLOBAL`]).
 const CF_RETURN: i32 = 1;
@@ -644,6 +654,9 @@ struct Helpers<'a> {
     /// The out-of-line half of the nullish-receiver guard (see
     /// [`object::emit_nullish_guard`]).
     nullish_throw: u32,
+    /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
+    /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).
+    box_f64: u32,
     /// `__invoke1(fn: i64, arg: i64) -> i64` (P4.1): the callback trampoline the
     /// host promise engine calls re-entrantly. Exported under
     /// [`INVOKE_EXPORT_NAME`].
@@ -724,13 +737,13 @@ struct Helpers<'a> {
     /// finite-number formatting to the existing `__convert` import, and calling
     /// itself for nested array/object elements. Backs [`crate::ir::IrNode::JsonStringify`].
     json_str: u32,
-    /// `__js_eq(a: i64, b: i64) -> i32` (P3.5): strict `===` over two jsvals (two
-    /// heap strings compare by byte content, two numbers as `f64`, everything else
-    /// by identity bits). The equality kernel of `emit_strict_eq`, packaged as a
-    /// helper so the `__map_*` linear scans can call it per candidate.
-    js_eq: u32,
+    /// `__same_value_zero(a: i64, b: i64) -> i32` (P3.5): `SameValueZero` over two
+    /// jsvals (two heap strings compare by byte content, two numbers as `f64` or
+    /// identical bits — so `NaN` matches `NaN` and `+0` matches `-0` — everything
+    /// else by identity bits). The key equality of the `__map_*` linear scans.
+    same_value_zero: u32,
     /// `__map_find(handle: i32, key: i64) -> i32` (P3.5): the byte address of the
-    /// matching key slot in a Map/Set's backing array (a `__js_eq` linear scan over
+    /// matching key slot in a Map/Set's backing array (a `__same_value_zero` linear scan over
     /// the even element slots), or `-1` on a miss. Shared by get/has/set/delete.
     map_find: u32,
     /// `__map_set(handle: i32, key: i64, val: i64)` (P3.5): update the existing
@@ -949,7 +962,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
 
     // Global section: the bump-allocator heap pointer plus the S15.1
     // exception-unwinding globals (see [`build_globals`]).
-    module.section(&build_globals(heap_ptr_init));
+    module.section(&build_globals(heap_ptr_init, program.module_cells));
 
     // Export section: `main` as function index IMPORT_FUNC_COUNT (the first
     // DEFINED function, after the imports), memory index 0 as "memory" (function
@@ -1044,8 +1057,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         helpers.json_escape,
         JsonTokens::resolve(&offsets),
     ));
-    code.function(&emit_js_eq(helpers.str_eq));
-    code.function(&emit_map_find(helpers.js_eq));
+    code.function(&emit_same_value_zero(helpers.str_eq));
+    code.function(&emit_map_find(helpers.same_value_zero));
     code.function(&emit_map_set(helpers.map_find, helpers.array_push));
     code.function(&emit_map_get(helpers.map_find));
     code.function(&emit_map_has(helpers.map_find));
@@ -1073,6 +1086,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // follows it (always, so its index is deterministic), then the two
     // `new Promise` settler functions (only when there are functions — the table
     // exists then).
+    code.function(&emit_box_f64_helper());
     code.function(&emit_invoke1(helpers));
     code.function(&generator::emit_async_step(helpers));
     if has_funcs {
