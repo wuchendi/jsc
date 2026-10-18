@@ -2,18 +2,78 @@
 use super::*;
 
 /// Emit the `__alloc(size: i32) -> i32` bump allocator: return the current
-/// `__heap_ptr`, then advance it by `size`. Bump only — no free, no bounds
-/// check. The single `i32` parameter occupies local 0; no extra locals are
-/// declared.
+/// `__heap_ptr`, then advance it by `size`, growing linear memory on demand.
+///
+/// The end offset is computed in `i64` (both operands zero-extended), so it can
+/// never wrap; the fast path is one compare against `memory.size * 64 KiB`. On
+/// overflow the cold path grows by `max(needed, current)` pages (at least
+/// doubling), falling back to exactly the needed pages. When even that fails
+/// (the module's memory `maximum` is reached) it stores the sticky
+/// [`abi::HEAP_PTR_OOM`] sentinel in `__heap_ptr` and traps; the run stage maps
+/// the sentinel to `Uncaught RangeError: out of memory`. The sentinel also makes
+/// every later allocation fail. The `i32` param is local 0; extra locals hold the
+/// old pointer (i32), the end offset (i64), and the needed page count (i32).
 pub(super) fn emit_alloc() -> Function {
-    let mut function = Function::new(vec![]);
-    // Push the current heap pointer as the return value.
+    let mut function = Function::new(vec![
+        (1, ValType::I32),
+        (1, ValType::I64),
+        (1, ValType::I32),
+    ]);
+    let (size, old, end, need) = (0, 1, 2, 3);
+    // old = __heap_ptr; end = u64(old) + u64(size).
     function.instruction(&Instruction::GlobalGet(HEAP_PTR_GLOBAL));
-    // __heap_ptr += size.
-    function.instruction(&Instruction::GlobalGet(HEAP_PTR_GLOBAL));
-    function.instruction(&Instruction::LocalGet(0));
-    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(old));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::LocalGet(size));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Add);
+    function.instruction(&Instruction::LocalTee(end));
+    // if end > memory.size << 16: grow.
+    function.instruction(&Instruction::MemorySize(0));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(16));
+    function.instruction(&Instruction::I64Shl);
+    function.instruction(&Instruction::I64GtU);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // need = ceil(end / 64 KiB) - memory.size (fits i32: end < 2^33).
+    function.instruction(&Instruction::LocalGet(end));
+    function.instruction(&Instruction::I64Const(0xFFFF));
+    function.instruction(&Instruction::I64Add);
+    function.instruction(&Instruction::I64Const(16));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::MemorySize(0));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::LocalSet(need));
+    // Try memory.grow(max(need, memory.size)).
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::MemorySize(0));
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::MemorySize(0));
+    function.instruction(&Instruction::I32GtU);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::MemoryGrow(0));
+    function.instruction(&Instruction::I32Const(-1));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // Doubling failed: fall back to exactly `need` pages.
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::MemoryGrow(0));
+    function.instruction(&Instruction::I32Const(-1));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // Out of memory: store the sticky sentinel and trap.
+    function.instruction(&Instruction::I32Const(abi::HEAP_PTR_OOM));
     function.instruction(&Instruction::GlobalSet(HEAP_PTR_GLOBAL));
+    function.instruction(&Instruction::Unreachable);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    // __heap_ptr = end; return old.
+    function.instruction(&Instruction::LocalGet(end));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::GlobalSet(HEAP_PTR_GLOBAL));
+    function.instruction(&Instruction::LocalGet(old));
     function.instruction(&Instruction::End);
     function
 }

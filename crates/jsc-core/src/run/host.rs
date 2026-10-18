@@ -3,7 +3,7 @@
 //! `wasmtime::Caller`, decoding the guest's linear memory and (for the methods
 //! that build a fresh value) allocating a new heap block back into it.
 
-use wasmtime::{Caller, Val};
+use wasmtime::{AsContextMut, Caller, Global, Memory, Val};
 
 use crate::abi;
 
@@ -38,6 +38,12 @@ const FALSE_BITS: u64 = abi::FALSE;
 /// global (S14.3, see [`abi::HEAP_PTR_EXPORT_NAME`]) so the `__convert` import can
 /// bump-allocate a heap string.
 const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
+
+/// The out-of-memory heap-pointer sentinel; see [`abi::HEAP_PTR_OOM`].
+const HEAP_PTR_OOM: i32 = abi::HEAP_PTR_OOM;
+
+/// The size in bytes of one wasm page.
+const PAGE_SIZE: usize = 0x1_0000;
 
 /// Bump-allocate a heap STRING block holding `text` in the caller's guest memory
 /// and return its base offset (S14.3), or `None` if the required exports are
@@ -78,22 +84,53 @@ fn host_alloc<W: Send + 'static>(caller: &mut Caller<'_, W>, block: &[u8]) -> Op
     let mem = caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)?;
-    let base = usize::try_from(global.get(&mut *caller).i32()?).ok()?;
-
-    let end = base.checked_add(block.len())?;
-    // Grow memory (one wasm page = 64 KiB) if the block would overflow it. The
-    // guest `__alloc` never bounds-checks, but the host must not write past the
-    // current size.
-    let cur = mem.data_size(&*caller);
-    if end > cur {
-        let pages = (end - cur).div_ceil(0x1_0000);
-        mem.grow(&mut *caller, pages as u64).ok()?;
-    }
+    let base = heap_reserve(&mut *caller, global, mem, block.len())?;
+    let end = base + block.len();
     mem.write(&mut *caller, base, block).ok()?;
     global
         .set(&mut *caller, Val::I32(i32::try_from(end).ok()?))
         .ok()?;
     Some(base as u64)
+}
+
+/// Ensure `len` bytes starting at the current `__heap_ptr` fit in linear memory,
+/// growing it with the guest `__alloc` policy (by `max(needed, current)` pages,
+/// falling back to exactly the needed pages), and return the start offset.
+///
+/// When memory cannot grow (the module's `maximum` is reached) or the pointer
+/// already holds the sticky [`abi::HEAP_PTR_OOM`] sentinel, the sentinel is
+/// (re)stored and `None` is returned; the run stage reports it as
+/// `Uncaught RangeError: out of memory`.
+pub(super) fn heap_reserve(
+    mut store: impl AsContextMut,
+    global: Global,
+    mem: Memory,
+    len: usize,
+) -> Option<usize> {
+    // The sentinel (and any other negative pointer) fails the conversion.
+    let ptr = global.get(&mut store).i32()?;
+    let reserved = usize::try_from(ptr).ok().and_then(|base| {
+        let end = base.checked_add(len)?;
+        let cur = mem.data_size(&store);
+        if end > cur {
+            let cur_pages = (cur / PAGE_SIZE) as u64;
+            let need = (end - cur).div_ceil(PAGE_SIZE) as u64;
+            if mem.grow(&mut store, need.max(cur_pages)).is_err() {
+                mem.grow(&mut store, need).ok()?;
+            }
+        }
+        Some(base)
+    });
+    if reserved.is_none() {
+        let _ = global.set(&mut store, Val::I32(HEAP_PTR_OOM));
+    }
+    reserved
+}
+
+/// Whether the heap-pointer global holds the out-of-memory sentinel: some guest
+/// or host allocation could not grow linear memory.
+pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bool {
+    global.get(&mut store).i32() == Some(HEAP_PTR_OOM)
 }
 
 /// Dispatch a `__method` host-import call (S14.6): snapshot linear memory, read
