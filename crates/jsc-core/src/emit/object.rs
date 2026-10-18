@@ -6,7 +6,7 @@ use super::*;
 /// 16*n)` reserves the block; the type byte, the u32 `n` header, then each entry's
 /// key heap-string pointer jsval at `dst + HEADER_SIZE + 4 + 16*k` and value jsval
 /// at `+8` are written. Keys reuse the interned static-string data via `HEAP_BITS
-/// | key_offset` (S10). Mirrors [`emit_array_node`]'s alloc→write→rebox shape,
+/// | key_offset`. Mirrors [`emit_array_node`]'s alloc→write→rebox shape,
 /// keeping `dst` on the operand stack so nested objects/arrays in the value
 /// expressions compose.
 pub(super) fn emit_object_node(
@@ -19,7 +19,7 @@ pub(super) fn emit_object_node(
     // The i32 scratch local (declared just past the three i64 scratch locals) is
     // used only transiently, to duplicate `dst` before each write.
     let dst = scratch + 3;
-    // S13.1 block header: the u32 `n` header sits at `+HEADER_SIZE`; entry `k`'s
+    // Block header: the u32 `n` header sits at `+HEADER_SIZE`; entry `k`'s
     // key at `+HEADER_SIZE+4+16*k` and value at `+8` from the key.
     let header = MemArg {
         offset: HEADER_SIZE as u64,
@@ -82,7 +82,7 @@ pub(super) fn emit_object_node(
 }
 
 /// Emit a [`crate::ir::IrNode::MakeAccessor`] — build a `TYPE_ACCESSOR` heap block
-/// holding the getter and setter FUNCTION VALUES (P2b), leaving its heap jsval on
+/// holding the getter and setter FUNCTION VALUES, leaving its heap jsval on
 /// the stack. An [`ACCESSOR_BLOCK_SIZE`] block is bump-allocated; the type byte,
 /// the getter jsval (at [`ACCESSOR_GET_OFFSET`]), and the setter jsval (at
 /// [`ACCESSOR_SET_OFFSET`]) are written, then the base is reboxed as a heap jsval.
@@ -147,7 +147,7 @@ pub(super) fn emit_make_accessor_node(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit an `Object.keys/values/entries(arg)` collection built-in (P3.2), leaving
+/// Emit an `Object.keys/values/entries(arg)` collection built-in, leaving
 /// the fresh growable Array's heap jsval on the stack. `arg` is lowered and
 /// unwrapped to its object block base offset, passed to the matching
 /// `__obj_keys`/`__obj_values`/`__obj_entries` runtime helper, and its returned
@@ -176,7 +176,7 @@ pub(super) fn emit_object_builtin_node(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit a `key in obj` membership test (P3.3), leaving a `true`/`false` jsval on
+/// Emit a `key in obj` membership test, leaving a `true`/`false` jsval on
 /// the stack. `obj` and `key` are each lowered and unwrapped to their block base
 /// offsets, passed to the `__obj_has` runtime helper (own-key scan), and its `1`/
 /// `0` i32 result is boxed into a boolean jsval (`FALSE_BITS | bit`, matching the
@@ -201,7 +201,7 @@ pub(super) fn emit_object_has_node(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit an `x instanceof RHS` identity test (E-series), leaving a `true`/`false`
+/// Emit an `x instanceof RHS` identity test, leaving a `true`/`false`
 /// jsval on the stack. The operand `value` is evaluated once into a dedicated
 /// high scratch slot and gated by [`emit_is_object`]: only a heap OBJECT can be
 /// an instance, so a non-heap or non-object operand (number, `null`, array,
@@ -380,7 +380,7 @@ fn emit_type_byte_instanceof(function: &mut Function, v: u32, type_byte: i32, ne
     function.instruction(&Instruction::End);
 }
 
-/// Emit a `delete obj.k` property removal (P3.3), leaving a `true` jsval on the
+/// Emit a `delete obj.k` property removal, leaving a `true` jsval on the
 /// stack (`delete` always evaluates to `true` here). `obj` and `key` are each
 /// lowered and unwrapped to their block base offsets and passed to the
 /// `__obj_delete` runtime helper (which compacts the entry out on a match, or is a
@@ -403,7 +403,7 @@ pub(super) fn emit_object_delete_node(
     function.instruction(&Instruction::I64Const(TRUE_BITS));
 }
 
-/// Emit a `JSON.stringify(arg)` call (P3.4), leaving the serialized heap-string
+/// Emit a `JSON.stringify(arg)` call, leaving the serialized heap-string
 /// jsval on the stack (or the `undefined` jsval when `arg` is itself `undefined`
 /// or a function value — both stringify to `undefined`, not a string, in JS). The
 /// argument is lowered once and stashed in the first i64 scratch slot so the
@@ -437,7 +437,7 @@ pub(super) fn emit_json_stringify_node(
     function.instruction(&Instruction::End);
 }
 
-/// Emit a `new Map()` / `new Set()` construction (P3.5), leaving the fresh handle
+/// Emit a `new Map()` / `new Set()` construction, leaving the fresh handle
 /// jsval on the stack. Two blocks are bump-allocated: an empty growable backing
 /// array (`TYPE_ARRAY`, len 0) and the handle itself (`TYPE_MAP`/`TYPE_SET`), whose
 /// `size` header starts at 0 and whose `entries` slot holds the backing array's
@@ -515,7 +515,7 @@ fn date_ms_slot() -> MemArg {
     }
 }
 
-/// Emit `new Date()` / `new Date(ms)` (P-series), leaving the fresh `TYPE_DATE`
+/// Emit `new Date()` / `new Date(ms)`, leaving the fresh `TYPE_DATE`
 /// handle jsval on the stack. A [`DATE_BLOCK_SIZE`] block is bump-allocated; its
 /// type byte is written and its f64 payload set to the millisecond timestamp —
 /// either `ms` (a number jsval, whose raw i64 IS the f64 bit pattern, reinterpreted
@@ -562,14 +562,14 @@ pub(super) fn emit_date_new_node(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit `Date.now()` (P-series): call the host `__now` clock (an f64 ms count) and
+/// Emit `Date.now()`: call the host `__now` clock (an f64 ms count) and
 /// reinterpret it to a number jsval (a number's raw i64 IS its f64 bit pattern).
 pub(super) fn emit_date_now_node(function: &mut Function, helpers: Helpers<'_>) {
     function.instruction(&Instruction::Call(helpers.now));
     emit_box_f64(function, helpers);
 }
 
-/// Emit `d.getTime()` (P-series), leaving the receiver's millisecond timestamp as
+/// Emit `d.getTime()`, leaving the receiver's millisecond timestamp as
 /// a number jsval on the stack. The receiver is evaluated once and stashed; a
 /// `TYPE_DATE` receiver's f64 payload is read back (reinterpreted to a number
 /// jsval), and any other receiver yields the canonical number `NaN`.
@@ -613,7 +613,7 @@ const MS_PER_DAY: i64 = 86_400_000;
 /// exponent bit is set (`bits & MASK == MASK`), tested directly on the i64 bits.
 const F64_EXP_MASK: i64 = 0x7FF0_0000_0000_0000;
 
-/// Emit a `Date` field method call `recv.<op>(args)` (P-series), leaving the op's
+/// Emit a `Date` field method call `recv.<op>(args)`, leaving the op's
 /// result jsval on the stack. Mirrors [`emit_map_method_node`]: the receiver is
 /// evaluated once into `recv_local`, then a runtime TYPE-BYTE dispatch splits the
 /// paths — a `TYPE_DATE` block computes the field GUEST-side from its stored f64
@@ -981,7 +981,7 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
     }
 }
 
-/// Emit `toISOString()` (P-series), leaving a fresh 24-byte heap string jsval
+/// Emit `toISOString()`, leaving a fresh 24-byte heap string jsval
 /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`, UTC) on the stack. The date/time fields are derived
 /// from the finite payload BITS in `bits`; a fixed-width buffer is bump-allocated
 /// and each separator/digit written at its known payload offset. Years outside
@@ -1100,7 +1100,7 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
     }
 }
 
-/// Emit a `Map`/`Set` method call `recv.<op>(args)` (P3.5), leaving the op's result
+/// Emit a `Map`/`Set` method call `recv.<op>(args)`, leaving the op's result
 /// jsval on the stack. The receiver is evaluated once into `recv_local`, then a
 /// runtime TYPE-BYTE dispatch splits the paths: a `TYPE_MAP`/`TYPE_SET` handle runs
 /// the collection op through the `__map_*` helpers (`.set`/`.add` yield the handle;
@@ -1160,7 +1160,7 @@ pub(super) fn emit_map_method_node(
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     } else {
         // Fallback: an ordinary user method call `recv.<name>(args)` binding
-        // `this = recv`, reusing the P2.1 method-call machinery.
+        // `this = recv`, reusing the method-call machinery.
         let fallback = IrNode::MethodCallUser {
             obj: Box::new(IrNode::Local(recv_local)),
             key: Box::new(IrNode::Str(method_name.clone())),
@@ -1237,7 +1237,7 @@ fn emit_map_op(
     }
 }
 
-/// Emit an object-rest binding `{...rest} = source` (P1.2), leaving the fresh
+/// Emit an object-rest binding `{...rest} = source`, leaving the fresh
 /// object jsval on the stack. `source` (the hidden temp holding the initializer)
 /// and `exclude` (an [`IrNode::Array`] of the destructured key strings) are each
 /// lowered and unwrapped to their block base offsets, passed to the `__obj_rest`
@@ -1307,7 +1307,7 @@ fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Help
 }
 
 /// Emit a computed-index expression `obj[index]`, dispatching at RUNTIME on
-/// `obj`'s TYPE BYTE (S13.1) and leaving the resulting jsval on the stack. An
+/// `obj`'s TYPE BYTE and leaving the resulting jsval on the stack. An
 /// object (`TYPE_OBJECT`) scans its entries via `__obj_get`; an array
 /// (`TYPE_ARRAY`) loads the element jsval at `ptr + HEADER_SIZE + 4 + 8*index`
 /// (already boxed — not reboxed); anything else is the string path, which
@@ -1318,7 +1318,7 @@ fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Help
 /// path re-runs them; the branch reads the stashed bits. `obj` is a heap pointer
 /// at runtime, so reading its type byte is safe.
 ///
-/// The stash uses the DEDICATED HIGH scratch slots `+17`/`+18` (P2.2b) rather
+/// The stash uses the DEDICATED HIGH scratch slots `+17`/`+18` rather
 /// than `+0`/`+1`: the `index` sub-expression is emitted with base `scratch` and
 /// reuses `+0..+13`, so a computed index (e.g. `a[i+1]`) would otherwise clobber
 /// the already-stashed receiver before the load reads it back.
@@ -1355,7 +1355,7 @@ pub(super) fn emit_index_node(
         );
     }
 
-    // A `Map`/`Set` handle intercepts property reads FIRST (P3.5): the only bare
+    // A `Map`/`Set` handle intercepts property reads FIRST: the only bare
     // member read reaching here on a collection is `.size` (its `.get`/`.set`/… are
     // method calls, lowered separately), so any index on a `TYPE_MAP`/`TYPE_SET`
     // block yields its `size` header (a number jsval), never the string/object path.
@@ -1447,7 +1447,7 @@ pub(super) fn emit_index_node(
 }
 
 /// Emit an [`IrNode::ObjectKey`] — the key at `index` of `obj` as a heap-string
-/// jsval (P3.1) — dispatching at RUNTIME on `obj`'s TYPE BYTE (S13.1). An object
+/// jsval — dispatching at RUNTIME on `obj`'s TYPE BYTE. An object
 /// (`TYPE_OBJECT`) loads the key jsval already stored at entry `index`
 /// (`ptr + HEADER_SIZE + 4 + 16*index`, mirroring [`emit_obj_get`]'s key slot);
 /// anything else (an array, or a string) coerces the numeric `index` to its
@@ -1502,9 +1502,9 @@ pub(super) fn emit_object_key_node(
     function.instruction(&Instruction::End);
 }
 
-/// Emit a computed assignment `obj[index] = value` (S11), storing `value` into
+/// Emit a computed assignment `obj[index] = value`, storing `value` into
 /// an EXISTING slot and leaving `value` on the stack as the expression's result.
-/// The operation runtime-dispatches on `obj`'s TYPE BYTE (S13.1), mirroring the
+/// The operation runtime-dispatches on `obj`'s TYPE BYTE, mirroring the
 /// read side [`emit_index_node`]: an array (`TYPE_ARRAY`) stores the element jsval
 /// at `ptr + HEADER_SIZE + 4 + 8*index`; an object (`TYPE_OBJECT`) treats `index`
 /// as a heap-string key and calls `__obj_set` to store into the matching entry. No
@@ -1514,7 +1514,7 @@ pub(super) fn emit_object_key_node(
 /// scratch i64 locals so neither branch re-runs them; both branches leave the
 /// stashed `value` on the stack.
 ///
-/// The stash uses the DEDICATED HIGH scratch slots `+14`/`+15`/`+16` (P2.2b)
+/// The stash uses the DEDICATED HIGH scratch slots `+14`/`+15`/`+16`
 /// rather than `+0`/`+1`/`+2`: the `index` and `value` sub-expressions are
 /// emitted with base `scratch` and reuse `+0..+13`, so a computed RHS (e.g.
 /// `o.v = 3+4`, `this.x = a+b`) would otherwise clobber the already-stashed
@@ -1564,11 +1564,11 @@ pub(super) fn emit_index_set_node(
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
     // OBJECT: the index jsval is a heap-string key pointer. When the program has
-    // accessors (P2b), first resolve the key THROUGH the prototype chain: a write
+    // accessors, first resolve the key THROUGH the prototype chain: a write
     // that lands on an accessor property invokes its setter instead of storing a
     // data slot (a set-only-... err get-only accessor silently ignores the write).
     // Otherwise the plain `__obj_set(obj_ptr, key_ptr, val)` store (a no-op if the
-    // key is absent) is used, byte-identical to the pre-P2b path.
+    // key is absent) is used, exactly as in an accessor-free program.
     if helpers.has_accessors {
         emit_index_set_object_accessor(function, scratch, s0, s1, sval, helpers);
     } else {
@@ -1602,7 +1602,7 @@ pub(super) fn emit_index_set_node(
     function.instruction(&Instruction::LocalGet(sval));
 }
 
-/// Emit the P2b accessor-aware OBJECT store for `obj[key] = value` (the object arm
+/// Emit the accessor-aware OBJECT store for `obj[key] = value` (the object arm
 /// of [`emit_index_set_node`], only on the `has_accessors` path). `s0`/`s1`/`sval`
 /// are the stashed receiver / key / value slots. The key is resolved THROUGH the
 /// prototype chain via `__obj_get`: if it lands on a `TYPE_ACCESSOR` box with a
@@ -1613,7 +1613,7 @@ pub(super) fn emit_index_set_node(
 /// Every enclosing `if` opened here is tracked with [`enter_frame`]/[`leave_frame`]
 /// — including the caller's `TYPE_OBJECT` dispatch `if`, which physically encloses
 /// this code — so a setter that throws inside a `try` computes the right
-/// handler-relative `br` depth (S15.2). The trailing `leave_frame` balances that
+/// handler-relative `br` depth. The trailing `leave_frame` balances that
 /// outer `if`; the array `else` arm emits no transfer, so leaving its (unused)
 /// depth uncounted is harmless.
 fn emit_index_set_object_accessor(
@@ -1710,12 +1710,12 @@ fn emit_index_set_object_accessor(
     leave_frame(helpers);
 }
 
-/// Emit a compound element/member assignment `obj[index] op= rhs` (S13.5).
+/// Emit a compound element/member assignment `obj[index] op= rhs`.
 ///
 /// `obj` and `index` are evaluated exactly once into the stable temp locals
 /// `obj_local`/`idx_local` (not scratch, which the read below clobbers), so no
 /// sub-expression side effect runs twice. The new value — current member read
-/// through those temps, combined with `rhs` via `op` (reusing the S12 [`Binary`]
+/// through those temps, combined with `rhs` via `op` (reusing the [`Binary`]
 /// overload, so `+=` on a string member concatenates) — is staged in `new_local`,
 /// then the store is delegated to [`emit_index_set_node`] over the three stable
 /// temps. Delegating with a `Local` `value` keeps the store's scratch intact.
@@ -1885,7 +1885,7 @@ pub(super) fn emit_nullish_guard(
     function.instruction(&Instruction::I64Const(NULL_BITS >> 49));
     function.instruction(&Instruction::I64Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // The `if` opens a control frame around the throw transfer (S15.2).
+    // The `if` opens a control frame around the throw transfer.
     enter_frame(helpers);
     function.instruction(&Instruction::LocalGet(recv));
     emit_node(key, function, scratch, strings, helpers);

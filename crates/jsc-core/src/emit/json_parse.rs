@@ -1,13 +1,12 @@
 //! In-wasm `JSON.parse` — a recursive-descent parser emitted as a family of
-//! runtime helpers, un-deferring the P3.4 backlog item.
+//! runtime helpers.
 //!
 //! # Why this is possible under the fixed-shape object model
 //!
-//! P3.4 deferred `JSON.parse` because object keys are interned compile-time
-//! string pointers and `__obj_set` can only write into slots the compile-time
-//! field scan reserved — it cannot *add* a key. But that blocks only *mutating*
-//! an existing object; it never blocked *allocating a fresh* object with a
-//! runtime-determined entry table. And every object consumer (`__obj_get`,
+//! Object keys are interned compile-time string pointers and `__obj_set` can
+//! only write into slots the compile-time field scan reserved — it cannot *add*
+//! a key. That restricts only *mutating* an existing object, not *allocating a
+//! fresh* object with a runtime-determined entry table. And every object consumer (`__obj_get`,
 //! `__obj_has`, `for-in`, `Object.keys`) matches keys by **byte content**
 //! (`__str_eq`), so a parsed object whose keys are runtime heap strings resolves
 //! correctly against a literal key access like `parsed.name` (which interns
@@ -28,7 +27,7 @@
 //!
 //! Malformed (or unsupported — a `\u` escape) input calls `__json_throw`, which
 //! stashes a branded `Error` in `$exc_value`, sets `$exc_pending`, and unwinds via
-//! the S15 mechanism. Each helper checks `$exc_pending` after a recursive call and
+//! the exception-unwinding mechanism. Each helper checks `$exc_pending` after a recursive call and
 //! propagates; the emit-context [`emit_json_parse_node`] issues the final
 //! post-call `emit_propagate_if_pending` so a `try`/`catch` around `JSON.parse`
 //! catches it.
