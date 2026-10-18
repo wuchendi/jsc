@@ -1523,13 +1523,11 @@ pub(super) fn emit_object_key_node(
 /// `o.v = a[0]`) is safe as well.
 ///
 /// Like the read side, a possibly-nullish receiver is guarded (after all three
-/// operands are evaluated, matching JS `PutValue` order) unless `checked` is
-/// `false`.
+/// operands are evaluated, matching JS `PutValue` order).
 pub(super) fn emit_index_set_node(
     obj: &IrNode,
     index: &IrNode,
     value: &IrNode,
-    checked: bool,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -1546,7 +1544,7 @@ pub(super) fn emit_index_set_node(
     function.instruction(&Instruction::LocalSet(s1));
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(sval));
-    if checked && !never_nullish(obj) {
+    if !never_nullish(obj) {
         emit_nullish_guard(
             function,
             s0,
@@ -1747,7 +1745,7 @@ pub(super) fn emit_index_op_set_node(
     emit_node(index, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(idx_local));
     // The current-value read throws on a nullish base before `rhs` runs; the read
-    // and store below reuse the same receiver, so they skip their own guards.
+    // below reuses the same receiver, so it skips its own guard.
     if !never_nullish(obj) {
         emit_nullish_guard(
             function,
@@ -1790,7 +1788,6 @@ pub(super) fn emit_index_op_set_node(
         &IrNode::Local(obj_local),
         &IrNode::Local(idx_local),
         &IrNode::Local(new_local),
-        false,
         function,
         scratch,
         strings,

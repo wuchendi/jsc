@@ -240,7 +240,7 @@ pub(super) fn emit_node(
             emit_map_method_node(node, function, scratch, strings, helpers);
         }
         IrNode::IndexSet { obj, index, value } => {
-            emit_index_set_node(obj, index, value, true, function, scratch, strings, helpers);
+            emit_index_set_node(obj, index, value, function, scratch, strings, helpers);
         }
         node @ IrNode::IndexOpSet { .. } => {
             emit_index_op_set_node(node, function, scratch, strings, helpers);
