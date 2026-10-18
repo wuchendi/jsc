@@ -855,14 +855,6 @@ fn nested_function_declaration_lowers_to_bound_func_value() {
 }
 
 #[test]
-fn rejects_call_arity_mismatch() {
-    assert!(
-        lower_src("function f(a){ return a } f(1, 2)").is_err(),
-        "wrong argument count is an error"
-    );
-}
-
-#[test]
 fn rejects_call_to_undeclared_function() {
     assert!(
         lower_src("missing(1)").is_err(),

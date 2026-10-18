@@ -708,25 +708,9 @@ impl LowerCtx<'_> {
                 args,
             })
         } else if let Some(sig) = self.shared.funcs.get(name) {
-            // A rest parameter (P1.4) accepts any number of trailing arguments, so
-            // only the lower bound (required, non-defaulted leading params) applies.
-            if args.len() < sig.required || (!sig.has_rest && args.len() > sig.params) {
-                let expected = if sig.has_rest {
-                    format!("at least {}", sig.required)
-                } else if sig.required == sig.params {
-                    sig.params.to_string()
-                } else {
-                    format!("{}-{}", sig.required, sig.params)
-                };
-                return Err(CompileError::spanned(
-                    call.span(),
-                    format!(
-                        "function {name} expects {expected} argument(s), got {}",
-                        args.len()
-                    ),
-                )
-                .into());
-            }
+            // JS arity semantics: the uniform ABI pads missing arguments with
+            // `undefined` (so defaults apply), and surplus arguments are evaluated
+            // for their side effects and ignored (or gathered by a rest parameter).
             Ok(IrNode::Call {
                 func: sig.index,
                 args,

@@ -99,28 +99,8 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             continue;
         };
         let name = fn_decl.ident.sym.as_ref().to_string();
-        let params = fn_decl.function.params.len();
-        let required = fn_decl
-            .function
-            .params
-            .iter()
-            .take_while(|p| !matches!(p.pat, Pat::Assign(_) | Pat::Rest(_)))
-            .count();
-        let has_rest = fn_decl
-            .function
-            .params
-            .last()
-            .is_some_and(|p| matches!(p.pat, Pat::Rest(_)));
         if funcs
-            .insert(
-                name.clone(),
-                FnSig {
-                    index: next_index,
-                    params,
-                    required,
-                    has_rest,
-                },
-            )
+            .insert(name.clone(), FnSig { index: next_index })
             .is_some()
         {
             return Err(CompileError::spanned(
@@ -368,19 +348,6 @@ enum AnalyzeBody<'a> {
 struct FnSig {
     /// The callee's wasm function index (`>= 1`; `0` is `main`).
     index: u32,
-    /// The declared parameter count (the maximum accepted call arity).
-    params: usize,
-    /// The number of required arguments: leading parameters before the first one
-    /// with a default (`a = expr`) or the trailing rest parameter (`...rest`). A
-    /// call may supply `required..=params` args (or more when [`has_rest`]); the
-    /// surplus slots are padded with `undefined` by the uniform ABI.
-    ///
-    /// [`has_rest`]: FnSig::has_rest
-    required: usize,
-    /// Whether the final parameter is a rest parameter (`...rest`, P1.4), which
-    /// lifts the upper bound on call arity — any surplus arguments are gathered
-    /// into the rest array rather than rejected.
-    has_rest: bool,
 }
 
 /// The body shape of a function/arrow being lowered: an ordinary statement
