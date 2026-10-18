@@ -237,7 +237,7 @@ fn rejects_length_assignment() {
 
 #[test]
 fn lowers_shorthand_object_property() {
-    // Shorthand `{a}` ≡ `{a: a}` is supported since P2.1.
+    // Shorthand `{a}` ≡ `{a: a}` is supported.
     assert!(
         lower_src("let a = 1; let o = {a}; o").is_ok(),
         "shorthand object property should lower"
@@ -409,7 +409,7 @@ fn lowers_standalone_mod_operator() {
 #[test]
 fn lowers_element_compound_assignment_as_indexopset() {
     // `a[0] += 1` lowers to an `IndexOpSet` evaluating base+index once into
-    // fresh temps (S13.5).
+    // fresh temps.
     let program = lower_src("let a = [1, 2]; a[0] += 1").expect("should lower");
     assert_eq!(
         program.stmts[1],
@@ -502,25 +502,24 @@ fn declaration_without_initializer_binds_undefined() {
 
 #[test]
 fn rejects_unsupported_operator() {
-    // `%` is supported since S12 and `**` (exponentiation) since P0.2; bitwise
+    // `%` and `**` (exponentiation) are supported; bitwise
     // `&` (and the other bitwise/shift operators) remains unsupported.
     assert!(lower_src("2 & 3").is_err(), "bitwise AND is unsupported");
 }
 
 #[test]
 fn rejects_async_and_unsupported_generator_functions() {
-    // S13.6 boundary hardening: an `async` function EXPRESSION / ARROW would
-    // otherwise lower as an ordinary function and run to a wrong result, so each
-    // must be a clear compile error. A TOP-LEVEL `async function` declaration is
-    // now supported (P4.3 M4) and a TOP-LEVEL `function*` declaration since P4.2
-    // M2; a generator EXPRESSION / ARROW and an `async` generator remain out of
-    // scope.
+    // An `async` function EXPRESSION / ARROW would otherwise lower as an
+    // ordinary function and run to a wrong result, so each must be a clear
+    // compile error. A TOP-LEVEL `async function` declaration and a TOP-LEVEL
+    // `function*` declaration are supported; a generator EXPRESSION / ARROW and
+    // an `async` generator remain out of scope.
     let msg = |src: &str| format!("{:#}", lower_src(src).unwrap_err());
     assert!(msg("let f = async function(){ return 1 };").contains("async"));
     assert!(msg("let f = async () => 1;").contains("async"));
     assert!(msg("let g = function*(){ return 1 };").contains("generator"));
-    // A top-level `function* g(){}` declaration compiles (M2), as does a top-level
-    // `async function f(){}` declaration (M4).
+    // A top-level `function* g(){}` declaration compiles, as does a top-level
+    // `async function f(){}` declaration.
     assert!(lower_src("function* g(){ yield 1 } g().next();").is_ok());
     assert!(lower_src("async function f(){ return 1 } f();").is_ok());
 }
@@ -561,7 +560,7 @@ fn lowers_function_declaration_and_call() {
     assert_eq!(program.functions.len(), 1);
     let func = &program.functions[0];
     // Uniform ABI (env-last): `max_arity` (= 2) argument slots (locals 0, 1),
-    // then the env slot (local 2) and the argument-count slot (local 3, P1.4),
+    // then the env slot (local 2) and the argument-count slot (local 3),
     // so `a`/`b` are locals 0/1 and `params` is 4.
     assert_eq!(func.params, 4);
     assert_eq!(func.locals, 4);
@@ -714,7 +713,7 @@ fn arrow_single_and_parenthesized_params_bind_identically() {
 #[test]
 fn arrow_arity_widens_the_uniform_abi() {
     // A three-parameter arrow widens `K` to 3, so every lifted function has
-    // `params = 3 args + env + argc = 5` (P1.4), shared across mixed-arity arrows.
+    // `params = 3 args + env + argc = 5`, shared across mixed-arity arrows.
     let program = lower_src("let f=(a,b,c)=>a+b+c; let g=x=>x").expect("lower");
     assert_eq!(program.functions.len(), 2);
     assert!(program.functions.iter().all(|f| f.params == 5));
@@ -781,8 +780,8 @@ fn mutable_capture_reads_and_writes_the_same_cell() {
         .expect("lower");
     let counter = &program.functions[0];
     // `let c = 0` boxes the initializer. With zero parameters the uniform ABI
-    // reserves the env slot at local 0 and the argument-count slot at local 1
-    // (P1.4), so the body's `c` is local 2.
+    // reserves the env slot at local 0 and the argument-count slot at local 1,
+    // so the body's `c` is local 2.
     assert_eq!(
         counter.body[0],
         IrStmt::Decl {
