@@ -202,3 +202,6 @@ apps/*/dist/
 # bun / vite caches
 .vite/
 *.tsbuildinfo
+
+# Local scratch: test262 checkout (scripts/test262-fetch.sh) and other tool output
+.tmp/
