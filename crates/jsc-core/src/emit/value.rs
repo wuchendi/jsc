@@ -1,22 +1,17 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// Push `1` if the jsval in `local` is a number, else `0`. A number is any value
-/// without the full QNAN mask set, plus the canonical number NaN (`bits ==
-/// QNAN`); every boxed non-number (boolean/null/undefined/type-string) has the
-/// QNAN mask set with a nonzero tag and so is excluded.
+/// Push `1` if the jsval in `local` is a number, else `0`. Every boxed
+/// non-number (boolean/null/undefined/heap pointer) has a clear sign bit, the
+/// QNAN mask set and a nonzero tag, so its bits read as a signed `i64` strictly
+/// greater than `QNAN | 0x0000_FFFF_FFFF_FFFF` (the largest tag-`0b000` NaN). A
+/// number is every value at or below that bound: ordinary `f64`s, the canonical
+/// NaN, and any other NaN wasm arithmetic may produce (e.g. `0/0` yields the
+/// sign-bit-set `0xFFF8_..` NaN on x86).
 pub(super) fn emit_is_number(function: &mut Function, local: u32) {
-    // (bits & QNAN) != QNAN
     function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I64Const(QNAN_BITS));
-    function.instruction(&Instruction::I64And);
-    function.instruction(&Instruction::I64Const(QNAN_BITS));
-    function.instruction(&Instruction::I64Ne);
-    // | (bits == QNAN)  — the canonical number NaN
-    function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I64Const(QNAN_BITS));
-    function.instruction(&Instruction::I64Eq);
-    function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::I64Const(QNAN_BITS | 0x0000_FFFF_FFFF_FFFF));
+    function.instruction(&Instruction::I64LeS);
 }
 
 /// Push `1` if the jsval in `local` is `null` or `undefined`, else `0`. Both are
