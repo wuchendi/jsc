@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Ensure the wasm artifact for @cdlab/jsc exists and is not stale.
-# A missing artifact triggers a rebuild via build-wasm.sh. A stale artifact
-# (Rust inputs newer than the artifact) only prints a warning: staleness is
-# non-fatal so existing local flows keep working.
+# A missing artifact, or one older than its Rust inputs, is rebuilt via
+# build-wasm.sh. A fresh artifact is left alone.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -10,6 +9,7 @@ cd "$(dirname "$0")/.."
 WASM_FILE="packages/jsc/wasm/jsc_wasm_bg.wasm"
 
 if [ ! -f "$WASM_FILE" ]; then
+  echo "ensure-wasm: rebuilding (missing: $WASM_FILE)"
   bash scripts/build-wasm.sh
   exit 0
 fi
@@ -21,14 +21,6 @@ if [ -z "$newer" ] && [ Cargo.lock -nt "$WASM_FILE" ]; then
 fi
 
 if [ -n "$newer" ]; then
-  {
-    echo
-    echo "=================== WARNING: STALE WASM ARTIFACT ==================="
-    echo "Rust sources changed after the wasm artifact was built"
-    echo "($newer is newer than $WASM_FILE)."
-    echo "Checks will run against STALE wasm. Rebuild with:"
-    echo "    bash scripts/build-wasm.sh"
-    echo "===================================================================="
-    echo
-  } >&2
+  echo "ensure-wasm: rebuilding (stale: $newer)"
+  bash scripts/build-wasm.sh
 fi
