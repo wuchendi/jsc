@@ -566,7 +566,7 @@ pub(super) fn emit_date_new_node(
 /// reinterpret it to a number jsval (a number's raw i64 IS its f64 bit pattern).
 pub(super) fn emit_date_now_node(function: &mut Function, helpers: Helpers<'_>) {
     function.instruction(&Instruction::Call(helpers.now));
-    function.instruction(&Instruction::I64ReinterpretF64);
+    emit_box_f64(function, helpers);
 }
 
 /// Emit `d.getTime()` (P-series), leaving the receiver's millisecond timestamp as
@@ -599,7 +599,7 @@ pub(super) fn emit_date_get_time_node(
     function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::F64Load(date_ms_slot()));
-    function.instruction(&Instruction::I64ReinterpretF64);
+    emit_box_f64(function, helpers);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I64Const(QNAN_BITS));
     function.instruction(&Instruction::End);
@@ -695,7 +695,7 @@ fn emit_date_field(
         function.instruction(&Instruction::LocalGet(recv_local));
         function.instruction(&Instruction::I32WrapI64);
         function.instruction(&Instruction::F64Load(date_ms_slot()));
-        function.instruction(&Instruction::I64ReinterpretF64);
+        emit_box_f64(function, helpers);
         return;
     }
     // Stash the payload BITS (`D0`) and gate on finiteness.

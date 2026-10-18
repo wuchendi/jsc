@@ -94,7 +94,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         obj_delete: obj_get_index + 9,
         json_escape: obj_get_index + 10,
         json_str: obj_get_index + 11,
-        js_eq: obj_get_index + 12,
+        same_value_zero: obj_get_index + 12,
         map_find: obj_get_index + 13,
         map_set: obj_get_index + 14,
         map_get: obj_get_index + 15,
@@ -119,11 +119,13 @@ pub(super) fn build_type_and_function_sections<'a>(
         gen_to_array: obj_get_index + 29,
         // `__nullish_throw` (the nullish-receiver guard's error build) follows it.
         nullish_throw: obj_get_index + 30,
+        // `__box_f64` (the canonical-NaN number rebox) follows it.
+        box_f64: obj_get_index + 31,
         // The `__invoke1` callback trampoline (P4.1) is appended after every helper
         // above; the `__async_step` trampoline (P4.3 M4) follows it, then the two
         // `new Promise` settler functions.
-        invoke1: obj_get_index + 31,
-        async_step: obj_get_index + 32,
+        invoke1: obj_get_index + 32,
+        async_step: obj_get_index + 33,
         // The settler funcref-TABLE slots sit right after the `n` user-function
         // slots (`0..n`), so slots `n` and `n + 1`. `0` when there are no functions
         // (no table — and `new Promise` cannot occur without an executor function).
@@ -188,7 +190,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         // `__json_str(v: i64) -> str_base: i32` serializer (P3.4).
         helper(&[ValType::I32], &[ValType::I32]);
         helper(&[ValType::I64], &[ValType::I32]);
-        // The Map/Set runtime helpers (P3.5): `__js_eq(a: i64, b: i64) -> i32`,
+        // The Map/Set runtime helpers (P3.5): `__same_value_zero(a: i64, b: i64) -> i32`,
         // `__map_find(handle: i32, key: i64) -> i32`,
         // `__map_set(handle: i32, key: i64, val: i64)`,
         // `__map_get(handle: i32, key: i64) -> i64`,
@@ -222,6 +224,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I64], &[ValType::I64]);
         // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
         helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
+        // `__box_f64(x: f64) -> i64`.
+        helper(&[ValType::F64], &[ValType::I64]);
         // The `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline (P4.1).
         helper(&[ValType::I64, ValType::I64], &[ValType::I64]);
         // The `__async_step(gen: i64, sent: i64) -> i64` trampoline (P4.3 M4).
@@ -242,29 +246,29 @@ pub(super) fn build_type_and_function_sections<'a>(
     // function: `print(bits: i64, flag: i32) -> ()`,
     // `__convert(bits: i64, op: i32) -> i64`, and
     // `__method(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64`.
-    let print_type = helper_type_base + 38;
+    let print_type = helper_type_base + 39;
     types.ty().function([ValType::I64, ValType::I32], []);
-    let convert_type = helper_type_base + 39;
+    let convert_type = helper_type_base + 40;
     types
         .ty()
         .function([ValType::I64, ValType::I32], [ValType::I64]);
-    let method_type = helper_type_base + 40;
+    let method_type = helper_type_base + 41;
     types.ty().function(
         [ValType::I64, ValType::I32, ValType::I64, ValType::I64],
         [ValType::I64],
     );
     // The host promise import types (P4.1): `__promise(op: i32, a: i64, b: i64) ->
     // i64` and `__then(p: i64, on_f: i64, on_r: i64) -> i64`.
-    let promise_type = helper_type_base + 41;
+    let promise_type = helper_type_base + 42;
     types
         .ty()
         .function([ValType::I32, ValType::I64, ValType::I64], [ValType::I64]);
-    let then_type = helper_type_base + 42;
+    let then_type = helper_type_base + 43;
     types
         .ty()
         .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
     // The host wall-clock import type (P-series `Date`): `__now() -> f64`.
-    let now_type = helper_type_base + 43;
+    let now_type = helper_type_base + 44;
     types.ty().function([], [ValType::F64]);
 
     (
