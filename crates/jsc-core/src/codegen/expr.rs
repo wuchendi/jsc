@@ -173,8 +173,15 @@ impl LowerCtx<'_> {
                         }),
                     }
                 }
-                // Unary plus on a numeric operand is a no-op.
-                UnaryOp::Plus => self.lower_expr(&u.arg),
+                // Unary plus is ToNumber (the same conversion as `Number(x)`),
+                // a no-op on a numeric literal.
+                UnaryOp::Plus => match self.lower_expr(&u.arg)? {
+                    num @ IrNode::Num(_) => Ok(num),
+                    other => Ok(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumber,
+                        arg: Box::new(other),
+                    }),
+                },
                 // `typeof operand` inspects the operand's runtime type.
                 UnaryOp::TypeOf => Ok(IrNode::TypeOf(Box::new(self.lower_expr(&u.arg)?))),
                 // `!operand` is logical NOT: boolean inverse of truthiness.
@@ -1377,13 +1384,16 @@ impl LowerCtx<'_> {
                 inc,
                 prefix: update.prefix,
             }),
-            // A captured cell: `x = cell + delta` (prefix yields new); postfix
-            // yields the old value as `new - delta`.
+            // A captured cell: `x = ToNumber(cell) + delta` (prefix yields new);
+            // postfix yields the old value as `new - delta`.
             AccessKind::Cell(ptr) => {
                 let delta = if inc { 1.0 } else { -1.0 };
                 let new_value = IrNode::Binary {
                     op: BinOp::Add,
-                    lhs: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                    lhs: Box::new(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumber,
+                        arg: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                    }),
                     rhs: Box::new(IrNode::Num(delta)),
                 };
                 let store = IrNode::CellSet {
