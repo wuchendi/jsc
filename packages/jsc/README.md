@@ -35,8 +35,9 @@ Rust runtime semantics:
 
 - `src/value.ts` ports the NaN-box decoder and value formatter from
   `crates/jsc-core/src/run/value.rs`.
-- `src/shim.ts` ports the host imports (`print` / `__convert` / `__method`) and
-  the bump-allocator from `crates/jsc-core/src/run/host.rs` +
+- `src/shim.ts` ports the host imports (`print` / `__convert` / `__method` /
+  `__promise` / `__then` / `__now`), the bump-allocator, and the promise engine
+  (microtask queue) from `crates/jsc-core/src/run/host.rs` + `run/promise.rs` +
   `run/harness.rs`.
 - `src/abi.ts` copies the runtime ABI constants from
   `crates/jsc-core/src/abi.rs`.
