@@ -1,6 +1,6 @@
 use super::lower;
 use crate::frontend::parse;
-use crate::ir::{BinOp, IrNode, IrStmt};
+use crate::ir::{BinOp, IrNode, IrStmt, OpSetKind};
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
     lower(&parse(src)?)
@@ -421,6 +421,7 @@ fn lowers_element_compound_assignment_as_indexopset() {
             obj_local: 1,
             idx_local: 2,
             new_local: 3,
+            kind: OpSetKind::Compound,
         })
     );
 }
@@ -439,6 +440,7 @@ fn lowers_static_property_compound_assignment_as_indexopset() {
             obj_local: 1,
             idx_local: 2,
             new_local: 3,
+            kind: OpSetKind::Compound,
         })
     );
 }
@@ -453,10 +455,21 @@ fn rejects_length_compound_assignment() {
 }
 
 #[test]
-fn rejects_update_of_non_identifier() {
-    assert!(
-        lower_src("let a = [1]; a[0]++").is_err(),
-        "increment of a non-identifier is unsupported"
+fn lowers_member_update_as_indexopset() {
+    // `a[0]++` lowers to a postfix-update `IndexOpSet` adding 1.
+    let program = lower_src("let a = [1]; a[0]++").expect("should lower");
+    assert_eq!(
+        program.stmts[1],
+        IrStmt::Expr(IrNode::IndexOpSet {
+            obj: Box::new(IrNode::Local(0)),
+            index: Box::new(IrNode::Num(0.0)),
+            op: BinOp::Add,
+            rhs: Box::new(IrNode::Num(1.0)),
+            obj_local: 1,
+            idx_local: 2,
+            new_local: 3,
+            kind: OpSetKind::PostfixUpdate,
+        })
     );
 }
 

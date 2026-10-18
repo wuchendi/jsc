@@ -545,6 +545,7 @@ fn node_reads_raw_local(node: &IrNode) -> bool {
         | IrNode::CellNew(inner)
         | IrNode::CellGet(inner)
         | IrNode::StrLen(inner)
+        | IrNode::NullishCheck { value: inner, .. }
         | IrNode::Throw(inner)
         | IrNode::Yield(inner)
         | IrNode::Await(inner)
@@ -719,6 +720,7 @@ fn node_contains_yield(node: &IrNode) -> bool {
         | IrNode::CellNew(inner)
         | IrNode::CellGet(inner)
         | IrNode::StrLen(inner)
+        | IrNode::NullishCheck { value: inner, .. }
         | IrNode::Throw(inner)
         | IrNode::IsGenerator(inner)
         | IrNode::Await(inner) => node_contains_yield(inner),
@@ -809,6 +811,7 @@ fn node_has_func_value(node: &IrNode) -> bool {
         | IrNode::CellNew(inner)
         | IrNode::CellGet(inner)
         | IrNode::StrLen(inner)
+        | IrNode::NullishCheck { value: inner, .. }
         | IrNode::Throw(inner)
         | IrNode::Yield(inner)
         | IrNode::Await(inner)
