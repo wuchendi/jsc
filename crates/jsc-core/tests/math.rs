@@ -7,7 +7,7 @@ use common::{assert_eval, assert_number, assert_output};
 
 /// Each acceptance bullet: the primary result of every recognized `Math.*` method.
 #[test]
-fn math_methods_milestone() {
+fn math_methods() {
     assert_number("Math.floor(3.7)", 3.0);
     assert_number("Math.max(1, 42)", 42.0);
     assert_number("Math.sqrt(1764)", 42.0);
@@ -119,7 +119,7 @@ fn math_unknown_method_and_arity_errors() {
     );
 }
 
-/// `Math.*` results flow through `console.log` like any number (S14.1 parity).
+/// `Math.*` results flow through `console.log` like any number.
 #[test]
 fn math_through_console_log() {
     assert_output("console.log(Math.max(1, 42), Math.floor(3.7))", "42 3\n");

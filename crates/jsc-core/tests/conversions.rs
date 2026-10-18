@@ -9,7 +9,7 @@ use common::{
 /// `String(42)` yields the string `"42"` (same form as `format_number`), and its
 /// runtime type is "string".
 #[test]
-fn string_conversion_milestone() {
+fn string_conversion() {
     assert_string("String(42)", "42");
     assert_type_str("typeof String(42)", "string");
     assert_string("String(3.5)", "3.5");
@@ -29,7 +29,7 @@ fn string_conversion_milestone() {
 /// empty => 0; non-numeric => NaN), booleans map to 1/0, null => 0, undefined =>
 /// NaN, and numbers pass through.
 #[test]
-fn number_conversion_milestone() {
+fn number_conversion() {
     assert_number("Number(\"42\")", 42.0);
     assert_number("Number(\"  3.5 \")", 3.5);
     assert_number("Number(\"\")", 0.0);
@@ -48,7 +48,7 @@ fn number_conversion_milestone() {
 /// false; everything else (non-empty strings, arrays, objects, nonzero numbers) is
 /// true.
 #[test]
-fn boolean_conversion_milestone() {
+fn boolean_conversion() {
     assert_bool("Boolean(0)", false);
     assert_bool("Boolean(\"\")", false);
     assert_bool("Boolean(\"x\")", true);
@@ -67,7 +67,7 @@ fn boolean_conversion_milestone() {
 /// `parseInt(s)` parses a leading base-10 integer, skipping whitespace and honoring
 /// a sign, stopping at the first non-digit; no digits yields NaN.
 #[test]
-fn parse_int_milestone() {
+fn parse_int() {
     assert_number("parseInt(\"42px\")", 42.0);
     assert_nan("parseInt(\"abc\")");
     assert_number("parseInt(\"  -7z\")", -7.0);
@@ -82,7 +82,7 @@ fn parse_int_milestone() {
 // `3.14` is an acceptance-criteria input, not an approximation of PI.
 #[allow(clippy::approx_constant)]
 #[test]
-fn parse_float_milestone() {
+fn parse_float() {
     assert_number("parseFloat(\"3.14xyz\")", 3.14);
     assert_number("parseFloat(\"  .5\")", 0.5);
     assert_number("parseFloat(\"1e3\")", 1000.0);
@@ -125,7 +125,7 @@ fn conversion_arity_errors() {
     );
 }
 
-/// Conversion results flow through `console.log` like any value (S14.1 parity).
+/// Conversion results flow through `console.log` like any value.
 #[test]
 fn conversions_through_console_log() {
     assert_output(
