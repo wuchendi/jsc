@@ -1,14 +1,14 @@
-//! Integration tests: number pipeline milestones via the CLI.
+//! Integration tests: number programs via the CLI.
 
 mod common;
 use common::jsc;
 
-/// The S8 milestone programs, run inline with `-p`, print their numbers.
+/// Basic number programs, run inline with `-p`, print their numbers.
 ///
-/// One program per language wave: a bare expression, a `while` loop with a
-/// comparison, and a function call — all multi-statement except the first.
+/// A bare expression, a `while` loop with a comparison, and a function call —
+/// all multi-statement except the first.
 #[test]
-fn milestones_via_eval() {
+fn number_programs_via_eval() {
     assert_eq!(jsc(&["-p", "40 + 2"]), "42");
     assert_eq!(
         jsc(&["-p", "function add(a, b) { return a + b } add(40, 2)"]),
@@ -23,10 +23,9 @@ fn milestones_via_eval() {
     );
 }
 
-/// Prior-milestone number programs still render `42`/`45`/`55` on the binary.
+/// Number programs render `42`/`45`/`55` on the binary.
 ///
-/// S9 migrated the whole pipeline onto an i64 NaN-boxed jsval carrier; this
-/// guards that the number path survived the carrier change unchanged.
+/// Guards the number path through the i64 NaN-boxed jsval carrier.
 #[test]
 fn number_regression_survives_jsval() {
     assert_eq!(jsc(&["-p", "40+2"]), "42");

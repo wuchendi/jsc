@@ -132,7 +132,7 @@ fn ternary_selects_branch() {
     );
 }
 
-/// S12.1 logical operators (`!`, `&&`, `||`, `??`) render correctly end to end,
+/// Logical operators (`!`, `&&`, `||`, `??`) render correctly end to end,
 /// with JS short-circuit + value semantics.
 #[test]
 fn logical_operators_via_eval() {
@@ -156,7 +156,7 @@ fn logical_operators_via_eval() {
     assert_eq!(jsc(&["-p", "let y=0; true || (y = 1); y"]), "0");
 }
 
-/// S12.2 — compound assignment `+= -= *= /= %=` end to end via the CLI.
+/// Compound assignment `+= -= *= /= %=` end to end via the CLI.
 #[test]
 fn compound_assignment_via_eval() {
     assert_eq!(jsc(&["-p", "let x=40; x += 2; x"]), "42");
@@ -168,7 +168,7 @@ fn compound_assignment_via_eval() {
     assert_eq!(jsc(&["-p", r#"let s="foo"; s += "bar"; s"#]), "foobar");
 }
 
-/// S12.2 — `++`/`--` in prefix and postfix forms end to end via the CLI.
+/// `++`/`--` in prefix and postfix forms end to end via the CLI.
 #[test]
 fn increment_decrement_via_eval() {
     assert_eq!(jsc(&["-p", "let x=41; x++; x"]), "42");
@@ -180,11 +180,11 @@ fn increment_decrement_via_eval() {
     assert_eq!(jsc(&["-p", "17 % 5"]), "2");
 }
 
-/// S13.5 — compound assignment on member targets (`a[i] op= e`, `o.k op= e`,
+/// Compound assignment on member targets (`a[i] op= e`, `o.k op= e`,
 /// `o[k] op= e`) end to end through the built binary.
 #[test]
 fn member_compound_assignment_via_eval() {
-    // Array element and object-member targets for the milestone cases.
+    // Array element and object-member targets.
     assert_eq!(jsc(&["-p", "let a=[10,20]; a[0]+=5; a[0]"]), "15");
     assert_eq!(jsc(&["-p", "let o={x:1}; o.x+=41; o.x"]), "42");
     assert_eq!(jsc(&["-p", r#"let o={n:100}; o["n"]-=58; o.n"#]), "42");
@@ -205,7 +205,7 @@ fn member_compound_assignment_via_eval() {
     );
 }
 
-/// P0.2 — exponentiation `**` (lowered to the `Math.pow` power op) and its
+/// Exponentiation `**` (lowered to the `Math.pow` power op) and its
 /// compound form `**=`, end to end through the built binary.
 #[test]
 fn exponentiation_via_eval() {
@@ -223,19 +223,19 @@ fn exponentiation_via_eval() {
     assert_eq!(jsc(&["-p", "(-2) ** 0.5"]), "NaN");
 }
 
-/// P0.4 — logical assignment `??=` / `||=` / `&&=`, end to end. Each desugars to
+/// Logical assignment `??=` / `||=` / `&&=`, end to end. Each desugars to
 /// a conditional assign reusing the short-circuit `??`/`||`/`&&` semantics, so
 /// the RHS is evaluated only when the assign actually happens.
 #[test]
 fn logical_assignment_via_eval() {
-    // `??=` assigns only when the target is null/undefined (milestone 3); an
+    // `??=` assigns only when the target is null/undefined; an
     // uninitialized `let x;` starts `undefined`.
     assert_eq!(jsc(&["-p", "let x; x ??= 42; x"]), "42");
     assert_eq!(jsc(&["-p", "let x=5; x ??= 9; x"]), "5");
-    // `||=` assigns only when the target is falsy (milestones 4 and 5).
+    // `||=` assigns only when the target is falsy.
     assert_eq!(jsc(&["-p", "let x=1; x ||= 9; x"]), "1");
     assert_eq!(jsc(&["-p", "let x=0; x ||= 9; x"]), "9");
-    // `&&=` assigns only when the target is truthy (milestone 6).
+    // `&&=` assigns only when the target is truthy.
     assert_eq!(jsc(&["-p", "let x=5; x &&= 7; x"]), "7");
     assert_eq!(jsc(&["-p", "let x=0; x &&= 7; x"]), "0");
     // The RHS is NOT evaluated when the assign is skipped: a truthy `||=` target

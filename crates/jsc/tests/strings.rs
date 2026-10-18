@@ -1,16 +1,16 @@
-//! Integration tests: string milestones and truthiness via the CLI.
+//! Integration tests: string basics and truthiness via the CLI.
 
 use std::process::Command;
 mod common;
 use common::jsc;
 
-/// The S10 string milestones run inline with `-p` through the built binary.
+/// String basics run inline with `-p` through the built binary.
 ///
-/// Covers every string wave end to end: `typeof`, `.length`, `+` concat,
+/// Covers strings end to end: `typeof`, `.length`, `+` concat,
 /// strict `===`/`!==`, single-char indexing, and a length-of-concat chain.
 /// Concatenated output prints raw (no surrounding quotes).
 #[test]
-fn string_milestones_via_eval() {
+fn string_basics_via_eval() {
     assert_eq!(jsc(&["-p", r#"typeof "hi""#]), "string");
     assert_eq!(jsc(&["-p", r#""foo".length"#]), "3");
     assert_eq!(jsc(&["-p", r#""foo" + "bar""#]), "foobar");
@@ -37,10 +37,10 @@ fn string_truthiness_selects_branch() {
     );
 }
 
-/// P0.1 — template literals lower to `+` concatenation, reusing the string
+/// Template literals lower to `+` concatenation, reusing the string
 /// coercion path so interpolated numbers render like `"n="+42`.
 ///
-/// Covers all five milestones: interpolated arithmetic, a variable read, the
+/// Covers interpolated arithmetic, a variable read, the
 /// no-interpolation and empty forms, adjacent exprs with empty middle quasis,
 /// and a nested template inside an interpolation.
 #[test]
@@ -60,10 +60,10 @@ fn template_literals_lower_to_concat() {
     assert_eq!(jsc(&["-p", r"`${5}`"]), "5");
 }
 
-/// M2 — the added string methods run inline with `-p` end to end: trimming,
+/// String methods run inline with `-p` end to end: trimming,
 /// repeat, prefix/suffix and substring tests, padding, substring, and split.
 #[test]
-fn m2_string_methods_via_eval() {
+fn string_methods_via_eval() {
     assert_eq!(jsc(&["-p", r#""  hi  ".trim()"#]), "hi");
     assert_eq!(jsc(&["-p", r#""ab".repeat(3)"#]), "ababab");
     assert_eq!(jsc(&["-p", r#""hello".startsWith("he")"#]), "true");
@@ -76,7 +76,7 @@ fn m2_string_methods_via_eval() {
     assert_eq!(jsc(&["-p", r#""  hi  ".trim().toUpperCase()"#]), "HI");
 }
 
-/// P0.1 — tagged templates remain unsupported: the CLI exits 2 and the
+/// Tagged templates are unsupported: the CLI exits 2 and the
 /// diagnostic names them.
 #[test]
 fn tagged_template_is_rejected() {
