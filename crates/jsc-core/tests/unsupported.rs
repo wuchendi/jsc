@@ -137,8 +137,8 @@ fn rejects_unknown_array_method() {
 
 #[test]
 fn rejects_unknown_object_method() {
-    // No function anywhere in the program => no funcref table => no object could
-    // carry a method, so `o.foo()` is provably an unknown method.
+    // The receiver's own-key set is statically known (G1) and lacks the method,
+    // so `o.foo()` is provably an unknown method.
     assert_unknown_method("let o = {}; o.foo()", "foo");
     assert_unknown_method("let o = { a: 1 }; o.bar()", "bar");
     assert_unknown_method("let o = {}; o[\"baz\"]()", "baz");
@@ -259,8 +259,16 @@ fn rejects_unknown_method_even_with_functions_present() {
 }
 
 #[test]
-fn rejects_unknown_collection_method() {
+fn unknown_method_in_function_free_program_throws_typeerror() {
     // Genuine Map/Set methods work (see the collections suite); an unrecognized
-    // one on a collection-only program is still a clean unknown-method error.
-    assert_unknown_method("let m = new Map(); m.clear()", "clear");
+    // one is a runtime TypeError even when the program declares no function (no
+    // funcref table), never a compile-time rejection or invalid wasm.
+    assert_uncaught(
+        "let m = new Map(); m.clear()",
+        "TypeError: called value is not a function",
+    );
+    assert_uncaught(
+        "let o = { a: 1 }; o = { b: 2 }; o.zzz()",
+        "TypeError: called value is not a function",
+    );
 }

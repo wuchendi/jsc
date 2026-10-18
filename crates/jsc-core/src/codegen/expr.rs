@@ -91,9 +91,9 @@ impl LowerCtx<'_> {
                 }
             }
             Expr::Member(member) => match &member.prop {
-                MemberProp::Ident(id) if id.sym.as_ref() == "length" => {
-                    Ok(IrNode::StrLen(Box::new(self.lower_expr(&member.obj)?)))
-                }
+                MemberProp::Ident(id) if id.sym.as_ref() == "length" => Ok(IrNode::StrLen(
+                    Box::new(nullish_check(self.lower_expr(&member.obj)?, "length")),
+                )),
                 // `obj.a` ≡ `obj["a"]`: reuse the runtime `Index` dispatch, with
                 // the property name lowered to a heap-string key.
                 MemberProp::Ident(id) => Ok(IrNode::Index {
@@ -339,7 +339,7 @@ impl LowerCtx<'_> {
         match link {
             ChainLink::Member { prop, span, .. } => match prop {
                 MemberProp::Ident(id) if id.sym.as_ref() == "length" => {
-                    Ok(IrNode::StrLen(Box::new(obj)))
+                    Ok(IrNode::StrLen(Box::new(nullish_check(obj, "length"))))
                 }
                 MemberProp::Ident(id) => Ok(IrNode::Index {
                     obj: Box::new(obj),
@@ -642,7 +642,7 @@ impl LowerCtx<'_> {
                     CompileError::spanned(member.span(), "getTime() takes no arguments").into(),
                 );
             }
-            let recv = Box::new(self.lower_expr(&member.obj)?);
+            let recv = Box::new(nullish_check(self.lower_expr(&member.obj)?, "getTime"));
             return Ok(IrNode::DateGetTime { recv });
         }
         // The `Date` field methods `d.valueOf()` / `d.getFullYear()` / … (P-series).
@@ -983,7 +983,7 @@ impl LowerCtx<'_> {
         obj: &Expr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let array = Box::new(self.lower_expr(obj)?);
+        let array = Box::new(nullish_check(self.lower_expr(obj)?, method));
         match method {
             "reduce" => {
                 let [callback, init] = <[IrNode; 2]>::try_from(args).map_err(|args| {
@@ -1073,7 +1073,7 @@ impl LowerCtx<'_> {
         }
         Ok(IrNode::MethodCall {
             op,
-            recv: Box::new(self.lower_expr(obj)?),
+            recv: Box::new(nullish_check(self.lower_expr(obj)?, method)),
             args,
         })
     }
@@ -1092,7 +1092,7 @@ impl LowerCtx<'_> {
         obj: &Expr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let recv = self.lower_expr(obj)?;
+        let recv = nullish_check(self.lower_expr(obj)?, method);
         let recv_local = self.fresh();
         let fallback_obj_local = self.fresh();
         Ok(IrNode::MapMethod {
@@ -1116,7 +1116,7 @@ impl LowerCtx<'_> {
         obj: &Expr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let recv = self.lower_expr(obj)?;
+        let recv = nullish_check(self.lower_expr(obj)?, method);
         let recv_local = self.fresh();
         let fallback_obj_local = self.fresh();
         Ok(IrNode::DateMethod {
@@ -1160,7 +1160,7 @@ impl LowerCtx<'_> {
         let name = member_method_name(member);
         // M1: reaching this generic path means the name matched none of the
         // built-in string/array/Map/Set methods. A receiver whose type is a
-        // statically-known PRIMITIVE (string/number/boolean/null literal) or an
+        // statically-known PRIMITIVE (string/number/boolean literal) or an
         // ARRAY literal can never carry a user-defined method, so the call is
         // provably unknown — reject it with a span diagnostic instead of emitting
         // a `call_indirect` the wasm validator (or runtime) would reject.
@@ -1190,14 +1190,6 @@ impl LowerCtx<'_> {
                 .into());
             }
         };
-        // M1: record this site so `lower` can reject it if the program turns out
-        // to define no functions at all (no funcref table => any method call is an
-        // unknown method). Programs that DO define a function keep the runtime
-        // dispatch (a genuine object/class method resolves through the table).
-        self.shared
-            .generic_method_sites
-            .borrow_mut()
-            .push((member.span(), name));
         let obj = self.lower_expr(&member.obj)?;
         let obj_local = self.fresh();
         Ok(IrNode::MethodCallUser {
@@ -1364,6 +1356,7 @@ impl LowerCtx<'_> {
                             obj_local,
                             idx_local,
                             new_local,
+                            kind: OpSetKind::Compound,
                         })
                     }
                     // `obj[i] = v` reuses the runtime `IndexSet` type-byte dispatch.
@@ -1382,16 +1375,24 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower an increment/decrement `++x`/`x++`/`--x`/`x--`. Only an assignable
-    /// identifier target is supported; the `.prefix` flag selects the produced
-    /// value (new for prefix, old for postfix). A plain local becomes an
-    /// [`IrNode::IncDec`]; a captured (boxed-cell) target desugars to a
-    /// read-modify-write through its cell.
+    /// Lower an increment/decrement `++x`/`x++`/`--x`/`x--`. The target is an
+    /// assignable identifier or a member `o.p` / `o[k]`; the `.prefix` flag
+    /// selects the produced value (new for prefix, old for postfix). A plain local
+    /// becomes an [`IrNode::IncDec`]; a captured (boxed-cell) target desugars to a
+    /// read-modify-write through its cell; a member target is an
+    /// [`IrNode::IndexOpSet`] (see [`Self::lower_member_update`]).
     fn lower_update(&mut self, update: &UpdateExpr) -> anyhow::Result<IrNode> {
-        let Expr::Ident(ident) = update.arg.as_ref() else {
+        let target = match update.arg.as_ref() {
+            Expr::Paren(p) => p.expr.as_ref(),
+            other => other,
+        };
+        if let Expr::Member(member) = target {
+            return self.lower_member_update(update, member);
+        }
+        let Expr::Ident(ident) = target else {
             return Err(CompileError::spanned(
                 update.arg.span(),
-                "increment/decrement target must be an identifier",
+                "increment/decrement target must be an identifier or member",
             )
             .into());
         };
@@ -1442,6 +1443,54 @@ impl LowerCtx<'_> {
                 }
             }
         }
+    }
+
+    /// Lower a member update `o.p++` / `--o[k]` to an [`IrNode::IndexOpSet`] that
+    /// adds `1` / `-1` to the current value converted with `ToNumber` (so a string
+    /// member `"4"` becomes `5`, never `"41"`). The base and key are evaluated
+    /// once; a postfix update yields the old numeric value. A nullish base throws
+    /// the member READ `TypeError`, as in V8.
+    fn lower_member_update(
+        &mut self,
+        update: &UpdateExpr,
+        member: &swc_ecma_ast::MemberExpr,
+    ) -> anyhow::Result<IrNode> {
+        let obj = self.lower_expr(&member.obj)?;
+        let index = match &member.prop {
+            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
+            MemberProp::Ident(id) if id.sym.as_ref() != "length" => {
+                IrNode::Str(id.sym.as_ref().to_owned())
+            }
+            _ => {
+                return Err(CompileError::spanned(
+                    member.span(),
+                    "unsupported increment/decrement target",
+                )
+                .into());
+            }
+        };
+        let delta = if matches!(update.op, UpdateOp::PlusPlus) {
+            1.0
+        } else {
+            -1.0
+        };
+        let obj_local = self.fresh();
+        let idx_local = self.fresh();
+        let new_local = self.fresh();
+        Ok(IrNode::IndexOpSet {
+            obj: Box::new(obj),
+            index: Box::new(index),
+            op: BinOp::Add,
+            rhs: Box::new(IrNode::Num(delta)),
+            obj_local,
+            idx_local,
+            new_local,
+            kind: if update.prefix {
+                OpSetKind::PrefixUpdate
+            } else {
+                OpSetKind::PostfixUpdate
+            },
+        })
     }
 
     fn lower_array(&mut self, arr: &ArrayLit) -> anyhow::Result<IrNode> {
@@ -1924,6 +1973,16 @@ fn prop_name_key(name: &PropName) -> anyhow::Result<String> {
     }
 }
 
+/// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a
+/// `null`/`undefined` receiver throws `Cannot read properties of .. (reading
+/// '<key>')` instead of reading through a bogus pointer.
+fn nullish_check(value: IrNode, key: &str) -> IrNode {
+    IrNode::NullishCheck {
+        value: Box::new(value),
+        key: key.to_owned(),
+    }
+}
+
 /// The statically-known method name of a member callee (M1): `obj.m` and the
 /// string-literal computed form `obj["m"]` both name `m`; a dynamic computed key
 /// `obj[k]` is only known at runtime, so it has no static name.
@@ -1939,15 +1998,14 @@ fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
 }
 
 /// Whether the receiver's type is a statically-known primitive (string / number /
-/// boolean / null / template string) or an array literal (M1). Such a receiver
+/// boolean / template string) or an array literal (M1). A `null` receiver is not
+/// listed: its method lookup throws a runtime `TypeError` instead. Such a receiver
 /// can never carry a user-defined method, so a method name that reached the
 /// generic user-method path (i.e. matched no built-in) is provably unknown.
 fn static_primitive_receiver(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(p) => static_primitive_receiver(&p.expr),
-        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_) | Lit::Null(_))
-        | Expr::Tpl(_)
-        | Expr::Array(_) => true,
+        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_)) | Expr::Tpl(_) | Expr::Array(_) => true,
         _ => false,
     }
 }

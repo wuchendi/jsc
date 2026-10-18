@@ -1734,6 +1734,7 @@ pub(super) fn emit_index_op_set_node(
         obj_local,
         idx_local,
         new_local,
+        kind,
     } = node
     else {
         unreachable!("emit_index_op_set_node is only called with an IndexOpSet node")
@@ -1779,6 +1780,31 @@ pub(super) fn emit_index_op_set_node(
         lhs: Box::new(IrNode::Local(new_local)),
         rhs: rhs.clone(),
     };
+    // A member `++`/`--` converts the current value with ToNumber first.
+    if *kind != OpSetKind::Compound {
+        let old_num = IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            arg: Box::new(IrNode::Local(new_local)),
+        };
+        emit_node(&old_num, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(new_local));
+    }
+    // A postfix update yields the OLD numeric value: store `old op rhs`, then drop
+    // the stored value in favour of `new_local`.
+    if *kind == OpSetKind::PostfixUpdate {
+        emit_index_set_node(
+            &IrNode::Local(obj_local),
+            &IrNode::Local(idx_local),
+            &new_value,
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+        function.instruction(&Instruction::Drop);
+        function.instruction(&Instruction::LocalGet(new_local));
+        return;
+    }
     emit_node(&new_value, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(new_local));
 
@@ -1813,6 +1839,29 @@ fn never_nullish(node: &IrNode) -> bool {
             | IrNode::DateNew { .. }
             | IrNode::FuncValue { .. }
     )
+}
+
+/// Emit an [`IrNode::NullishCheck`]: evaluate `value`, throw the read
+/// `TypeError` naming `key` if it is `null`/`undefined`, else leave it on the
+/// stack. A statically non-nullish value is emitted bare. The value is stashed in
+/// the general i64 scratch slot (`+0`), which only the guard's throw path could
+/// disturb.
+pub(super) fn emit_nullish_check_node(
+    value: &IrNode,
+    key: &str,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(value, function, scratch, strings, helpers);
+    if never_nullish(value) {
+        return;
+    }
+    function.instruction(&Instruction::LocalSet(scratch));
+    let key = IrNode::Str(key.to_owned());
+    emit_nullish_guard(function, scratch, &key, false, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalGet(scratch));
 }
 
 /// Emit the nullish-receiver guard for a member access on the receiver stashed

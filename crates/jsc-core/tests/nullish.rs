@@ -46,16 +46,22 @@ fn computed_read_uses_key_string() {
     );
 }
 
-// A program that declares no function rejects every generic method call at
-// compile time (M1), so these declare one to reach the runtime path.
 #[test]
 fn method_call_on_nullish_throws() {
     assert_uncaught(
-        "function g() {} let n = null; n.f()",
+        "let n = null; n.f()",
         "TypeError: Cannot read properties of null (reading 'f')",
     );
     assert_uncaught(
-        "function g() {} let x = {}; x.y.f()",
+        "null.f()",
+        "TypeError: Cannot read properties of null (reading 'f')",
+    );
+    assert_uncaught(
+        "undefined.f()",
+        "TypeError: Cannot read properties of undefined (reading 'f')",
+    );
+    assert_uncaught(
+        "let x = {}; x.y.f()",
         "TypeError: Cannot read properties of undefined (reading 'f')",
     );
 }
@@ -137,4 +143,72 @@ fn non_nullish_receivers_unchanged() {
     assert_str("let s = \"hi\"; s[0]", "h");
     assert_number("let m = new Map(); m.set(1, 2); m.size", 1.0);
     assert_number("let o = { a: 1 }; o.a += 2; o.a", 3.0);
+}
+
+#[test]
+fn member_update_expressions() {
+    assert_number("let o = { p: 1 }; o.p++", 1.0);
+    assert_number("let o = { p: 1 }; o.p++; o.p", 2.0);
+    assert_number("let o = { p: 2 }; ++o.p", 3.0);
+    assert_number("let o = { p: 2 }; ++o.p; o.p", 3.0);
+    assert_number("let o = { p: 5 }; o['p']--", 5.0);
+    assert_number("let o = { p: 5 }; o['p']--; o.p", 4.0);
+    assert_number("let o = { p: 5 }; --o.p", 4.0);
+    assert_number("let a = [7, 8]; a[0]++; a[0]", 8.0);
+    assert_number("let a = [7, 8]; let k = 1; a[k]--", 8.0);
+    assert_number("let a = [7, 8]; let k = 1; a[k]--; a[1]", 7.0);
+    assert_number("let o = { p: \"4\" }; o.p++; o.p", 5.0);
+    assert_number("let o = { p: \"4\" }; o.p++", 4.0);
+    assert_number(
+        "let i = 0; let o = { p: 1 }; function k() { i = i + 1; return \"p\"; } o[k()]++; i",
+        1.0,
+    );
+}
+
+#[test]
+fn member_update_on_nullish_throws_read_error() {
+    assert_uncaught(
+        "let x = {}; x.y.z++",
+        "TypeError: Cannot read properties of undefined (reading 'z')",
+    );
+    assert_uncaught(
+        "let n = null; --n.p",
+        "TypeError: Cannot read properties of null (reading 'p')",
+    );
+}
+
+#[test]
+fn length_and_builtin_methods_on_nullish_throw() {
+    assert_uncaught(
+        "let n = null; n.length",
+        "TypeError: Cannot read properties of null (reading 'length')",
+    );
+    assert_uncaught(
+        "let x = {}; x.y.length",
+        "TypeError: Cannot read properties of undefined (reading 'length')",
+    );
+    assert_uncaught(
+        "let u; u.push(1)",
+        "TypeError: Cannot read properties of undefined (reading 'push')",
+    );
+    assert_uncaught(
+        "let n = null; n.toUpperCase()",
+        "TypeError: Cannot read properties of null (reading 'toUpperCase')",
+    );
+    assert_uncaught(
+        "let n = null; n.map((v) => v)",
+        "TypeError: Cannot read properties of null (reading 'map')",
+    );
+    assert_uncaught(
+        "let n = null; n.get(1)",
+        "TypeError: Cannot read properties of null (reading 'get')",
+    );
+    assert_uncaught(
+        "let n = null; n.getTime()",
+        "TypeError: Cannot read properties of null (reading 'getTime')",
+    );
+    assert_bool(
+        "let r = false; try { let n = null; n.length } catch (e) { r = e instanceof TypeError } r",
+        true,
+    );
 }

@@ -7,6 +7,19 @@
 //! function needs. These are pure data types with no parsing or codegen
 //! behaviour of their own.
 
+/// The flavour of an [`IrNode::IndexOpSet`] read-modify-write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpSetKind {
+    /// `obj[index] op= rhs`: combine the current value as-is; yield the new value.
+    Compound,
+    /// `++obj[index]` / `--obj[index]`: convert the current value with `ToNumber`
+    /// before combining; yield the new value.
+    PrefixUpdate,
+    /// `obj[index]++` / `obj[index]--`: like [`Self::PrefixUpdate`], but yield the
+    /// OLD value converted to a number.
+    PostfixUpdate,
+}
+
 /// A binary operator over jsval operands.
 ///
 /// Arithmetic operators (`Add`..`Mod`) unbox their operands to `f64` and produce
@@ -540,6 +553,17 @@ pub enum IrNode {
     /// (S10/S11). The operand is assumed to be a string or array pointer (both
     /// carry the same u32 header at that offset).
     StrLen(Box<IrNode>),
+    /// The nullish-receiver guard of a builtin member access (`recv.length`,
+    /// `recv.push(..)`, `recv.get(..)`, ...): yields `value` unchanged, but throws
+    /// the branded `TypeError` `Cannot read properties of <null|undefined>
+    /// (reading '<key>')` when it is `null`/`undefined`. Wrapped around the
+    /// receiver by codegen; elided at emit for a statically non-nullish value.
+    NullishCheck {
+        /// The receiver expression being guarded.
+        value: Box<IrNode>,
+        /// The property name the access reads (for the error message).
+        key: String,
+    },
     /// Computed indexing `obj[index]`, dispatched at runtime on `obj`'s TYPE BYTE
     /// (S13.1). A string block (type `0`) allocates and returns a fresh
     /// one-character heap string holding the BYTE at `index`; an array block (type
@@ -610,6 +634,8 @@ pub enum IrNode {
         idx_local: u32,
         /// Fresh temp local holding the computed new member value.
         new_local: u32,
+        /// Whether this is a plain compound assignment or a member `++`/`--`.
+        kind: OpSetKind,
     },
     /// `array.push(value)` on a plain-local array binding (S14.4). Growing the
     /// fixed-size array block: a runtime helper allocates a new block of `len + 1`

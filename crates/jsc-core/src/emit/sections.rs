@@ -496,9 +496,24 @@ pub(super) fn collect_node<'a>(
             collect_node(lhs, order, seen);
             collect_node(rhs, order, seen);
         }
-        // `ArrayPush` carries only its pushed value (its local read/rebind has no
-        // string literals); it collects like an `Assign`'s value.
-        IrNode::Assign { value, .. } | IrNode::ArrayPush { value, .. } => {
+        // The nullish guard interns its error strings and the read key.
+        IrNode::NullishCheck { value, key } => {
+            seed_nullish_strs(order, seen);
+            if seen.insert(key.as_str()) {
+                order.push(key.as_str());
+            }
+            collect_node(value, order, seen);
+        }
+        // `ArrayPush` carries only its pushed value plus the receiver guard's
+        // strings (its local read/rebind has no string literals).
+        IrNode::ArrayPush { value, .. } => {
+            seed_nullish_strs(order, seen);
+            if seen.insert("push") {
+                order.push("push");
+            }
+            collect_node(value, order, seen);
+        }
+        IrNode::Assign { value, .. } => {
             collect_node(value, order, seen);
         }
         // A direct call and a `console.log` both just collect their argument
@@ -834,8 +849,14 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::DateGetTime { recv } => collect_node(recv, order, seen),
-        IrNode::ArrayPop { .. }
-        | IrNode::Num(_)
+        // `pop` only needs its receiver guard's strings.
+        IrNode::ArrayPop { .. } => {
+            seed_nullish_strs(order, seen);
+            if seen.insert("pop") {
+                order.push("pop");
+            }
+        }
+        IrNode::Num(_)
         | IrNode::Bool(_)
         | IrNode::Null
         | IrNode::Undefined
