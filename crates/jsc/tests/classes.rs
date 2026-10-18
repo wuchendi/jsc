@@ -3,7 +3,7 @@
 mod common;
 use common::jsc;
 
-/// The P2.2 milestones run inline with `-e` through the built binary.
+/// The P2.2 milestones run inline with `-p` through the built binary.
 ///
 /// A single class (no inheritance) with a constructor: `new A(args)` allocates a
 /// fresh instance, binds `this` to it, runs the constructor for its side effects,
@@ -14,7 +14,7 @@ fn class_milestones_via_eval() {
     // Constructor stores a parameter onto `this`; the field reads back.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(x){this.v=x}} let a=new A(42); a.v"
         ]),
         "42"
@@ -22,18 +22,18 @@ fn class_milestones_via_eval() {
     // Two fields set from constant initializers, summed after construction.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class P{constructor(){this.x=40; this.y=2}} let p=new P(); p.x+p.y"
         ]),
         "42"
     );
     // A fresh instance is an object.
     assert_eq!(
-        jsc(&["-e", "class A{constructor(x){this.v=x}} typeof (new A(1))"]),
+        jsc(&["-p", "class A{constructor(x){this.v=x}} typeof (new A(1))"]),
         "object"
     );
     // An empty class (no constructor => default no-op ctor) still yields an object.
-    assert_eq!(jsc(&["-e", "class E{} let e=new E(); typeof e"]), "object");
+    assert_eq!(jsc(&["-p", "class E{} let e=new E(); typeof e"]), "object");
 }
 
 /// A multi-parameter constructor stores each argument onto its own field; the
@@ -42,7 +42,7 @@ fn class_milestones_via_eval() {
 fn class_multi_field_constructor_via_eval() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class Point{constructor(a,b){this.x=a; this.y=b}} let p=new Point(3,4); p.x+p.y"
         ]),
         "7"
@@ -50,7 +50,7 @@ fn class_multi_field_constructor_via_eval() {
     // A field left unset by the constructor reads back `undefined`.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(){this.a=1}} let o=new A(); typeof o.b"
         ]),
         "undefined"
@@ -65,7 +65,7 @@ fn class_instance_is_a_plain_object_via_eval() {
     // The instance's fields are writable after construction (`a.v = 99`).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(){this.v=1}} let a=new A(); a.v=99; a.v"
         ]),
         "99"
@@ -73,7 +73,7 @@ fn class_instance_is_a_plain_object_via_eval() {
     // An instance held by an object, reached through a property hop.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(x){this.v=x}} let o={a:new A(7)}; o.a.v"
         ]),
         "7"
@@ -81,7 +81,7 @@ fn class_instance_is_a_plain_object_via_eval() {
     // A conditional field assignment in the constructor still slots the field.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(c){if(c){this.v=5}else{this.v=0}}} let a=new A(1); a.v"
         ]),
         "5"
@@ -89,7 +89,7 @@ fn class_instance_is_a_plain_object_via_eval() {
     // One instance passed as another constructor's argument, read through two hops.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class B{constructor(n){this.n=n}} class A{constructor(b){this.b=b}} \
              let a=new A(new B(3)); a.b.n"
         ]),
@@ -105,7 +105,7 @@ fn class_instance_is_a_plain_object_via_eval() {
 fn class_in_function_scope_via_eval() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "function mk(x){ class A{constructor(v){this.v=v}} return new A(x); } mk(9).v"
         ]),
         "9"
@@ -113,7 +113,7 @@ fn class_in_function_scope_via_eval() {
     // The constructor captures an outer binding and stores it onto `this`.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let base=40; class A{constructor(){this.v=base}} let a=new A(); a.v"
         ]),
         "40"
@@ -121,7 +121,7 @@ fn class_in_function_scope_via_eval() {
     // `new` reached through an arrow that captures the class binding.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(x){this.v=x}} let f=()=>new A(8); f().v"
         ]),
         "8"
@@ -137,7 +137,7 @@ fn class_name_resolvable_in_method_bodies() {
     // A method constructs a fresh instance of its own class and returns it.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(v){this.v=v} mk(){return new C(this.v+1)}} new C(41).mk().v"
         ]),
         "42"
@@ -145,7 +145,7 @@ fn class_name_resolvable_in_method_bodies() {
     // A method that recurses through `new` of its own class (5! = 120).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class F{constructor(n){this.n=n} fact(){ if(this.n<=1){return 1} \
              return this.n * new F(this.n-1).fact() }} new F(5).fact()"
         ]),
@@ -155,7 +155,7 @@ fn class_name_resolvable_in_method_bodies() {
     // walked back by field hops: 3 + 2 + 1 == 6.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class N{constructor(v){this.v=v; this.next=undefined} \
              cons(v){let n=new N(v); n.next=this; return n}} \
              let a=new N(1); let b=a.cons(2); let c=b.cons(3); c.v+c.next.v+c.next.next.v"
@@ -165,7 +165,7 @@ fn class_name_resolvable_in_method_bodies() {
     // The builtin `new TypeError(..)` path is unchanged inside a method body.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){} boom(){ return (new TypeError('x')).message }} new C().boom()"
         ]),
         "x"
@@ -180,7 +180,7 @@ fn class_method_milestones_via_eval() {
     // A method reads an own field set by the constructor.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){this.n=41} inc(){return this.n+1}} new C().inc()"
         ]),
         "42"
@@ -189,7 +189,7 @@ fn class_method_milestones_via_eval() {
     // `this` still bound to the same instance.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){this.a=6} two(){return this.a} big(){return this.two()*7}} \
              new C().big()"
         ]),
@@ -198,7 +198,7 @@ fn class_method_milestones_via_eval() {
     // Multiple instances share the one method but observe their own state.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(x){this.n=x} get2(){return this.n}} \
              let a=new C(5); let b=new C(9); a.get2()+b.get2()"
         ]),
@@ -206,7 +206,7 @@ fn class_method_milestones_via_eval() {
     );
     // A method value read off an instance is a function.
     assert_eq!(
-        jsc(&["-e", "class C{m(){return 1}} typeof (new C().m)"]),
+        jsc(&["-p", "class C{m(){return 1}} typeof (new C().m)"]),
         "function"
     );
 }
@@ -219,7 +219,7 @@ fn class_method_args_and_precedence_via_eval() {
     // Method arguments flow through the uniform ABI like any call.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){this.base=10} add(x){return this.base+x}} new C().add(5)"
         ]),
         "15"
@@ -228,7 +228,7 @@ fn class_method_args_and_precedence_via_eval() {
     // method returns the function; reading an own field returns the field value.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){this.v=3} m(){return this.v*2}} \
              let c=new C(); c.v + c.m()"
         ]),
@@ -244,7 +244,7 @@ fn class_method_args_and_precedence_via_eval() {
 fn p2_2b_ctor_field_computed_init_via_eval() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class P{constructor(a,b){this.x=a+b}} let p=new P(3,4); p.x"
         ]),
         "7"
@@ -259,12 +259,12 @@ fn p2_2b_ctor_field_computed_init_via_eval() {
 fn class_field_milestones_via_eval() {
     // A single field with a constant initializer, no constructor: a default
     // constructor is synthesized from the field initializers.
-    assert_eq!(jsc(&["-e", "class A{ v = 42 } new A().v"]), "42");
+    assert_eq!(jsc(&["-p", "class A{ v = 42 } new A().v"]), "42");
     // The field initializer runs BEFORE the constructor body: the constructor
     // observes the already-initialized `base` and bumps it.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{ base = 40; constructor(){ this.base = this.base + 2 } } new A().base"
         ]),
         "42"
@@ -273,7 +273,7 @@ fn class_field_milestones_via_eval() {
     // prototype.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{ n = 41; inc(){ return this.n + 1 } } new A().inc()"
         ]),
         "42"
@@ -282,7 +282,7 @@ fn class_field_milestones_via_eval() {
     // independent instances.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class P{ x = 40; y = 2; constructor(k){ this.x = this.x + k } } \
              new P(0).x + new P(0).y"
         ]),
@@ -298,21 +298,21 @@ fn class_field_milestones_via_eval() {
 fn class_field_ordering_and_undefined_via_eval() {
     // A later field reads an earlier one through `this` (declaration order).
     assert_eq!(
-        jsc(&["-e", "class A{ a = 40; b = this.a + 2 } new A().b"]),
+        jsc(&["-p", "class A{ a = 40; b = this.a + 2 } new A().b"]),
         "42"
     );
     // An uninitialized field initializes to `undefined`.
     assert_eq!(
-        jsc(&["-e", "class A{ x; } typeof (new A().x)"]),
+        jsc(&["-p", "class A{ x; } typeof (new A().x)"]),
         "undefined"
     );
     // A field-only class is still a plain object.
-    assert_eq!(jsc(&["-e", "class A{ v = 1 } typeof (new A())"]), "object");
+    assert_eq!(jsc(&["-p", "class A{ v = 1 } typeof (new A())"]), "object");
     // The union shape: a field the constructor never assigns coexists with a field
     // only the constructor assigns.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ a = 5; constructor(){ this.b = 7 } } let c=new C(); c.a + c.b"
         ]),
         "12"
@@ -326,56 +326,56 @@ fn class_field_ordering_and_undefined_via_eval() {
 fn p2_full_regression_acceptance_via_eval() {
     // P2.1 — object-literal methods bind `this`.
     assert_eq!(
-        jsc(&["-e", "let o={n:41, inc(){return this.n+1}}; o.inc()"]),
+        jsc(&["-p", "let o={n:41, inc(){return this.n+1}}; o.inc()"]),
         "42"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let o={a:2,b:3, sum(){return this.a+this.b}, scaled(){return this.sum()*8}}; o.scaled()"
         ]),
         "40"
     );
-    assert_eq!(jsc(&["-e", "let n=7; let o={n}; o.n"]), "7");
+    assert_eq!(jsc(&["-p", "let n=7; let o={n}; o.n"]), "7");
     // P2.2 — class, constructor, new.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(x){this.v=x}} let a=new A(42); a.v"
         ]),
         "42"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class P{constructor(){this.x=40; this.y=2}} let p=new P(); p.x+p.y"
         ]),
         "42"
     );
     assert_eq!(
-        jsc(&["-e", "class A{constructor(x){this.v=x}} typeof (new A(1))"]),
+        jsc(&["-p", "class A{constructor(x){this.v=x}} typeof (new A(1))"]),
         "object"
     );
     // P2.3 — prototype-shared methods, including a method calling another method.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){this.n=41} inc(){return this.n+1}} new C().inc()"
         ]),
         "42"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){this.a=6} two(){return this.a} big(){return this.two()*7}} new C().big()"
         ]),
         "42"
     );
     // P2.4 — class fields, including a field init reading an earlier field.
-    assert_eq!(jsc(&["-e", "class A{ v = 42 } new A().v"]), "42");
+    assert_eq!(jsc(&["-p", "class A{ v = 42 } new A().v"]), "42");
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{ base = 40; constructor(){ this.base = this.base + 2 } } new A().base"
         ]),
         "42"
@@ -394,7 +394,7 @@ fn class_method_news_own_class_and_captures_enclosing_binding_via_eval() {
     // path, and 40 + 2 == 42.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let base=40; class C{ constructor(v){this.v=v} mk(){ return new C(base + this.v) } } \
              new C(2).mk().v"
         ]),
@@ -404,7 +404,7 @@ fn class_method_news_own_class_and_captures_enclosing_binding_via_eval() {
     // two calls bump the shared cell to 2, observed after the calls return.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let count=0; class C{ constructor(){} bump(){ count = count + 1; return new C() } } \
              let c=new C(); c.bump(); c.bump(); count"
         ]),
@@ -414,7 +414,7 @@ fn class_method_news_own_class_and_captures_enclosing_binding_via_eval() {
     // resolves the class name, `total` reads the captured const (10 + 32 == 42).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "const bonus=10; class C{ constructor(n){this.n=n} mk(){ return new C(this.n) } \
              total(){ return bonus + this.mk().n } } new C(32).total()"
         ]),
@@ -431,7 +431,7 @@ fn class_extends_milestones_via_eval() {
     // super(n) forwards to the parent constructor, which sets the inherited field.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(n){this.n=n}} class B extends A{constructor(n){super(n)}} \
              new B(\"x\").n",
         ]),
@@ -441,7 +441,7 @@ fn class_extends_milestones_via_eval() {
     // ctor): the argument reaches the parent field and inherited methods resolve.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(n){this.n=n} dbl(){return this.n*2}} class B extends A{} \
              new B(5).dbl()",
         ]),
@@ -450,7 +450,7 @@ fn class_extends_milestones_via_eval() {
     // A method override shadows the inherited one; `super.m()` still reaches it.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{greet(){return \"A\"}} class B extends A{greet(){return super.greet()+\"B\"}} \
              new B().greet()",
         ]),
@@ -459,7 +459,7 @@ fn class_extends_milestones_via_eval() {
     // A three-level `super` chain accumulates through each ancestor.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{m(){return 1}} class B extends A{m(){return super.m()+10}} \
              class C extends B{m(){return super.m()+100}} new C().m()",
         ]),
@@ -468,7 +468,7 @@ fn class_extends_milestones_via_eval() {
     // Own and inherited fields coexist on the instance shape.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{constructor(a){this.a=a}} \
              class B extends A{constructor(a,b){super(a); this.b=b}} \
              let o=new B(1,2); o.a+o.b",
@@ -478,7 +478,7 @@ fn class_extends_milestones_via_eval() {
     // An inherited method reads a field set by the parent constructor.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class Animal{constructor(nm){this.name=nm} speak(){return this.name+\" noise\"}} \
              class Dog extends Animal{speak(){return this.name+\" barks\"}} \
              new Dog(\"Rex\").speak()",
@@ -493,29 +493,29 @@ fn class_extends_milestones_via_eval() {
 fn class_extends_instanceof_via_eval() {
     let prelude = "class A{} class B extends A{} class C extends B{} class Z{} ";
     assert_eq!(
-        jsc(&["-e", &format!("{prelude} new C() instanceof A")]),
+        jsc(&["-p", &format!("{prelude} new C() instanceof A")]),
         "true"
     );
     assert_eq!(
-        jsc(&["-e", &format!("{prelude} new C() instanceof B")]),
+        jsc(&["-p", &format!("{prelude} new C() instanceof B")]),
         "true"
     );
     assert_eq!(
-        jsc(&["-e", &format!("{prelude} new C() instanceof C")]),
+        jsc(&["-p", &format!("{prelude} new C() instanceof C")]),
         "true"
     );
     assert_eq!(
-        jsc(&["-e", &format!("{prelude} new A() instanceof C")]),
+        jsc(&["-p", &format!("{prelude} new A() instanceof C")]),
         "false"
     );
     assert_eq!(
-        jsc(&["-e", &format!("{prelude} new C() instanceof Z")]),
+        jsc(&["-p", &format!("{prelude} new C() instanceof Z")]),
         "false"
     );
     // A non-instance left operand never matches (no trap).
-    assert_eq!(jsc(&["-e", &format!("{prelude} 5 instanceof A")]), "false");
+    assert_eq!(jsc(&["-p", &format!("{prelude} 5 instanceof A")]), "false");
     assert_eq!(
-        jsc(&["-e", &format!("{prelude} typeof new C() === \"object\"")]),
+        jsc(&["-p", &format!("{prelude} typeof new C() === \"object\"")]),
         "true"
     );
 }
@@ -528,24 +528,24 @@ fn class_extends_instanceof_via_eval() {
 fn class_static_members_via_eval() {
     // A static method called off the class name.
     assert_eq!(
-        jsc(&["-e", "class C{ static make(){ return 42 } } C.make()"]),
+        jsc(&["-p", "class C{ static make(){ return 42 } } C.make()"]),
         "42"
     );
     // A static method with parameters.
     assert_eq!(
-        jsc(&["-e", "class M{ static add(a,b){ return a+b } } M.add(3,4)"]),
+        jsc(&["-p", "class M{ static add(a,b){ return a+b } } M.add(3,4)"]),
         "7"
     );
     // A static field read off the class name.
-    assert_eq!(jsc(&["-e", "class C{ static count = 7 } C.count"]), "7");
+    assert_eq!(jsc(&["-p", "class C{ static count = 7 } C.count"]), "7");
     // A static field with an expression initializer, evaluated once at definition.
-    assert_eq!(jsc(&["-e", "class C{ static v = 3*10 + 2 } C.v"]), "32");
+    assert_eq!(jsc(&["-p", "class C{ static v = 3*10 + 2 } C.v"]), "32");
     // An uninitialized static field reads back `undefined`.
-    assert_eq!(jsc(&["-e", "class C{ static f; } typeof C.f"]), "undefined");
+    assert_eq!(jsc(&["-p", "class C{ static f; } typeof C.f"]), "undefined");
     // A static method reads a static field through `this` (bound to the class).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ static n = 5; static getN(){ return this.n } } C.getN()"
         ]),
         "5"
@@ -553,7 +553,7 @@ fn class_static_members_via_eval() {
     // A static method calls a sibling static through the class name.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ static a(){ return 10 } static b(){ return C.a()+5 } } C.b()"
         ]),
         "15"
@@ -562,7 +562,7 @@ fn class_static_members_via_eval() {
     // on the same class, read from their respective receivers.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(){this.x=1} static y=2; inst(){return this.x} static st(){return this.y} } \
              let c=new C(); c.inst()+C.st()"
         ]),
@@ -578,30 +578,30 @@ fn class_static_members_via_eval() {
 fn class_static_field_computed_init_via_eval() {
     // References an earlier static through the class name.
     assert_eq!(
-        jsc(&["-e", "class C{ static a = 1; static b = C.a + 1 } C.b"]),
+        jsc(&["-p", "class C{ static a = 1; static b = C.a + 1 } C.b"]),
         "2"
     );
     assert_eq!(
-        jsc(&["-e", "class C{ static a = 2; static b = C.a * 3 } C.b"]),
+        jsc(&["-p", "class C{ static a = 2; static b = C.a * 3 } C.b"]),
         "6"
     );
     // Chained: each line sees the previous one already assigned.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ static a=1; static b=C.a+1; static c=C.b+1 } C.c"
         ]),
         "3"
     );
     // `this` inside a static initializer is the class.
     assert_eq!(
-        jsc(&["-e", "class C{ static a = 5; static b = this.a + 10 } C.b"]),
+        jsc(&["-p", "class C{ static a = 5; static b = this.a + 10 } C.b"]),
         "15"
     );
     // A literal initializer alongside a computed one: both resolve, in order.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ static a=1; static b=\"x\"; static c=C.a+2 } C.a + C.c"
         ]),
         "4"
@@ -609,7 +609,7 @@ fn class_static_field_computed_init_via_eval() {
     // A computed static is still NOT visible on an instance.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ static a=1; static b=C.a+1 } typeof (new C()).b"
         ]),
         "undefined"
@@ -626,7 +626,7 @@ fn class_instance_accessor_via_eval() {
     // A getter computes from fields.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(w,h){this.w=w; this.h=h} get area(){return this.w*this.h} } \
              new C(3,4).area"
         ]),
@@ -635,7 +635,7 @@ fn class_instance_accessor_via_eval() {
     // A getter+setter pair: the setter transforms and stores; the getter reads back.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(){this._v=0} get v(){return this._v} set v(x){this._v=x*2} } \
              let c=new C(); c.v=5; c.v"
         ]),
@@ -644,7 +644,7 @@ fn class_instance_accessor_via_eval() {
     // Assigning a get-only accessor is silently ignored (non-strict semantics).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ get x(){return 7} } let c=new C(); c.x=99; c.x"
         ]),
         "7"
@@ -652,7 +652,7 @@ fn class_instance_accessor_via_eval() {
     // Reading a set-only accessor yields `undefined`.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(){this.k=1} set y(v){this.k=v} } typeof (new C()).y"
         ]),
         "undefined"
@@ -660,7 +660,7 @@ fn class_instance_accessor_via_eval() {
     // A setter's side effect is observable through a plain field.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(){this.k=0} set y(v){this.k=v+1} } let c=new C(); c.y=41; c.k"
         ]),
         "42"
@@ -668,7 +668,7 @@ fn class_instance_accessor_via_eval() {
     // A computed member read `c[key]` also fires the getter.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ get z(){return 42} } let c=new C(); let k=\"z\"; c[k]"
         ]),
         "42"
@@ -676,7 +676,7 @@ fn class_instance_accessor_via_eval() {
     // Two accessors with distinct names coexist on one prototype.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(){this._a=1;this._b=2} get a(){return this._a} get b(){return this._b} } \
              let c=new C(); c.a+\",\"+c.b"
         ]),
@@ -686,7 +686,7 @@ fn class_instance_accessor_via_eval() {
     // the setter.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(){this._n=10} get n(){return this._n} set n(v){this._n=v} } \
              let c=new C(); c.n += 5; c.n"
         ]),
@@ -695,7 +695,7 @@ fn class_instance_accessor_via_eval() {
     // A getter body may call an instance method.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ constructor(){this.r=2} area(){return this.r*this.r} get a2(){return this.area()+1} } \
              new C().a2"
         ]),
@@ -705,7 +705,7 @@ fn class_instance_accessor_via_eval() {
     // getter, then calls its result.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ get f(){ return function(){ return 99 } } } new C().f()"
         ]),
         "99"
@@ -719,7 +719,7 @@ fn class_inherited_accessor_via_eval() {
     // A subclass instance reads a getter defined on the parent's prototype.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{ get name(){return \"A\"+this.n} } class B extends A{ constructor(){super(); this.n=5} } \
              new B().name"
         ]),
@@ -728,7 +728,7 @@ fn class_inherited_accessor_via_eval() {
     // A getter+setter pair inherited from the base drives a subclass field.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class A{ get v(){return this._v} set v(x){this._v=x+1} } \
              class B extends A{ constructor(){super(); this._v=0} } \
              let b=new B(); b.v=10; b.v"
@@ -745,7 +745,7 @@ fn class_throwing_accessor_via_eval() {
     // routed into a binding read as the trailing expression).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ get bad(){ throw new Error(\"boom\") } } let c=new C(); \
              let m=\"none\"; try { c.bad } catch(e){ m=e.message } m"
         ]),
@@ -754,7 +754,7 @@ fn class_throwing_accessor_via_eval() {
     // A throwing setter is caught by an enclosing `try`.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{ set bad(v){ throw new Error(\"set-boom\") } } let c=new C(); \
              let m=\"none\"; try { c.bad=1 } catch(e){ m=e.message } m"
         ]),
