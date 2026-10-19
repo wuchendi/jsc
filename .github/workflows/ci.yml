@@ -37,7 +37,7 @@ jobs:
     name: rust (fmt + clippy + test + deny + shear + typos)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Toolchain is pinned to 1.99.1 (matches rust-toolchain.toml / MSRV).
       - name: Install toolchain 1.99.1
@@ -84,7 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install toolchain 1.99.1
         uses: dtolnay/rust-toolchain@master
@@ -96,7 +96,7 @@ jobs:
 
       # The pinned test262 SHA lives in the fetch script, so key on its hash.
       - name: Cache test262 checkout
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .tmp/test262
           key: test262-${{ hashFiles('scripts/test262-fetch.sh') }}
