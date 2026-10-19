@@ -72,9 +72,37 @@ fn parse_int() {
     assert_nan("parseInt(\"abc\")");
     assert_number("parseInt(\"  -7z\")", -7.0);
     assert_number("parseInt(\"3.9\")", 3.0);
-    // The radix argument is accepted but ignored (base-10 only).
-    assert_number("parseInt(\"42\", 16)", 42.0);
+    assert_number("parseInt(\"1e3\")", 1.0);
+    // `parseInt("-0")` is -0 (the sign applies to a zero value).
+    assert_number("1 / parseInt(\"-0\")", f64::NEG_INFINITY);
     assert_type_str("typeof parseInt(\"1\")", "number");
+}
+
+/// `parseInt(s, radix)` honors the radix: `ToInt32(radix)` of 0 (or an omitted /
+/// `undefined` radix) means 10 unless a `0x` prefix selects 16; 16 also strips an
+/// optional `0x` prefix; a radix outside 2..=36 yields NaN; letters are
+/// case-insensitive digits.
+#[test]
+fn parse_int_radix() {
+    assert_number("parseInt(\"ff\", 16)", 255.0);
+    assert_number("parseInt(\"0xff\")", 255.0);
+    assert_number("parseInt(\"0XFF\")", 255.0);
+    assert_number("parseInt(\"0xff\", 16)", 255.0);
+    assert_number("parseInt(\"0xff\", 10)", 0.0);
+    assert_number("parseInt(\"101\", 2)", 5.0);
+    assert_number("parseInt(\"z\", 36)", 35.0);
+    assert_number("parseInt(\"Z\", 36)", 35.0);
+    assert_nan("parseInt(\"12\", 1)");
+    assert_nan("parseInt(\"12\", 37)");
+    assert_number("parseInt(\"12\", 0)", 12.0);
+    assert_number("parseInt(\"12\", undefined)", 12.0);
+    assert_number("parseInt(\"  -7f\", 16)", -127.0);
+    assert_nan("parseInt(\"9\", 8)");
+    assert_nan("parseInt(\"0x\")");
+    // The radix goes through ToInt32: 2^32 + 16 wraps to 16, "16" coerces.
+    assert_number("parseInt(\"ff\", 4294967312)", 255.0);
+    assert_number("parseInt(\"ff\", \"16\")", 255.0);
+    assert_number("parseInt(\"11\", 2.9)", 3.0);
 }
 
 /// `parseFloat(s)` parses a leading decimal float, including a fraction or

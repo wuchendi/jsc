@@ -206,3 +206,21 @@ fn missing_file_fails() {
     assert!(!output.status.success());
     assert!(!output.stderr.is_empty(), "expected an I/O error message");
 }
+
+/// `jsc FILE` with an unhandled rejection prints the console output that ran,
+/// then exits 1 with `Uncaught (in promise) <value>` on stderr.
+#[test]
+fn file_run_unhandled_rejection_exits_one() {
+    let path = temp_source(
+        "unhandled.js",
+        "console.log(\"before\"); Promise.reject(new Error(\"late\"));",
+    );
+    let output = jsc_output(&[path.to_str().expect("utf-8 path")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "before\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Uncaught (in promise) Error: late"),
+        "got: {stderr}"
+    );
+}

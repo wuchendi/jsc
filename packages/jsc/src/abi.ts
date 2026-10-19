@@ -78,8 +78,6 @@ export const PRINT_FLAG_NEWLINE = 2
 export const CONVERT_OP_TO_STRING = 0
 /** `__convert` op: coerce the argument to a number (`Number(x)`). */
 export const CONVERT_OP_TO_NUMBER = 1
-/** `__convert` op: parse a leading integer (`parseInt(x)`). */
-export const CONVERT_OP_PARSE_INT = 2
 /** `__convert` op: parse a leading float (`parseFloat(x)`). */
 export const CONVERT_OP_PARSE_FLOAT = 3
 

@@ -443,3 +443,47 @@ fn unsupported_class_forms_error() {
         );
     }
 }
+
+/// An unhandled promise rejection fails the process after the microtask queue
+/// drains: exit 1 with `Uncaught (in promise) <value>` on stderr.
+#[test]
+fn unhandled_rejection_exits_one() {
+    let cases = [
+        (
+            "Promise.reject(new Error(\"x\"))",
+            "Uncaught (in promise) Error: x",
+        ),
+        (
+            "async function f() { throw new TypeError(\"t\") } f()",
+            "Uncaught (in promise) TypeError: t",
+        ),
+        ("Promise.reject(1)", "Uncaught (in promise) 1"),
+    ];
+    for (src, needle) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+            .args(["-e", src])
+            .output()
+            .expect("failed to spawn jsc binary");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{src}` must make jsc exit 1"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(needle),
+            "stderr for `{src}` should contain `{needle}`, got: {stderr}"
+        );
+    }
+}
+
+/// A handled rejection exits 0 with nothing on stderr.
+#[test]
+fn handled_rejection_exits_zero() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "Promise.reject(1).catch(() => {})"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert_eq!(output.status.code(), Some(0), "a caught rejection exits 0");
+    assert!(output.stderr.is_empty(), "stderr must be empty");
+}

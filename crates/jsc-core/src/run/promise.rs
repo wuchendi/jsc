@@ -15,7 +15,7 @@
 //! the event loop. Reaction callbacks are guest functions, so the engine runs
 //! them by RE-ENTERING the guest through the exported `__invoke1` trampoline.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 
 use wasmtime::{AsContextMut, Caller, Func, Global, Instance, Memory, Store, StoreContextMut, Val};
@@ -86,12 +86,19 @@ struct Job {
     async_gen: Option<u64>,
 }
 
-/// The host promise engine: the FIFO microtask queue and the reaction lists of
-/// each still-pending promise (keyed by block base offset).
+/// The host promise engine: the FIFO microtask queue, the reaction lists of
+/// each still-pending promise (keyed by block base offset), and the
+/// unhandled-rejection tracking reported after the final drain.
 #[derive(Default)]
 pub(super) struct PromiseEngine {
     queue: VecDeque<Job>,
     reactions: HashMap<u32, Vec<Reaction>>,
+    /// Every promise that has been rejected, by block base. Blocks are
+    /// bump-allocated, so ascending base order is creation order.
+    rejected: BTreeSet<u32>,
+    /// Every promise that has had a reaction registered on it (then / catch /
+    /// finally, `await`, or adoption into another promise).
+    handled: HashSet<u32>,
 }
 
 impl std::fmt::Debug for PromiseEngine {
@@ -99,6 +106,8 @@ impl std::fmt::Debug for PromiseEngine {
         f.debug_struct("PromiseEngine")
             .field("queued", &self.queue.len())
             .field("pending", &self.reactions.len())
+            .field("rejected", &self.rejected.len())
+            .field("handled", &self.handled.len())
             .finish()
     }
 }
@@ -237,14 +246,22 @@ pub(super) fn then<W: Write + Send + 'static>(
 /// scheduled by `.then`/`.catch`/`.finally` that were never awaited. Runs until
 /// the queue is empty so a program that only chains (no top-level `await`) still
 /// observes its callbacks.
+///
+/// Returns the reason of the first (in creation order) rejected promise that
+/// never had a handler attached, or `None` when every rejection was handled.
 pub(super) fn drain_after_main<W: Write + Send + 'static>(
     store: &mut Store<Host<W>>,
     instance: &Instance,
-) {
-    let Some(handles) = Handles::from_instance(store, instance) else {
-        return;
-    };
+) -> Option<u64> {
+    let handles = Handles::from_instance(store, instance)?;
     drain(store.as_context_mut(), &handles);
+    let engine = &store.data().engine;
+    let base = engine
+        .rejected
+        .iter()
+        .copied()
+        .find(|base| !engine.handled.contains(base))?;
+    Some(read_value(handles.memory.data(&*store), base))
 }
 
 /// `Promise.resolve(a)`: `a` itself when it is already a promise, else a fresh
@@ -306,6 +323,7 @@ fn await_promise<W: Write + Send + 'static>(
     let Some(base) = as_promise(handles.memory.data(&ctx), p) else {
         return p;
     };
+    ctx.data_mut().engine.handled.insert(base);
     drain(ctx.as_context_mut(), handles);
     let mem = handles.memory.data(&ctx);
     match read_state(mem, base) {
@@ -512,6 +530,9 @@ fn settle<W: Write + Send + 'static>(
         return;
     }
     write_settlement(ctx.as_context_mut(), handles, base, state, value);
+    if state == PROMISE_REJECTED {
+        ctx.data_mut().engine.rejected.insert(base);
+    }
     let reactions = ctx
         .data_mut()
         .engine
@@ -564,6 +585,8 @@ fn register_source<W: Write + Send + 'static>(
         return;
     };
     let state = read_state(mem, base);
+    let value = read_value(mem, base);
+    ctx.data_mut().engine.handled.insert(base);
     if state == PROMISE_PENDING {
         ctx.data_mut()
             .engine
@@ -579,7 +602,6 @@ fn register_source<W: Write + Send + 'static>(
             });
         return;
     }
-    let value = read_value(mem, base);
     let callback = if state == PROMISE_FULFILLED {
         on_fulfilled
     } else {
@@ -643,7 +665,7 @@ fn invoke1<W: Write + Send + 'static>(
 /// Bump-allocate a fresh `[type][pad×3][state:i32][value:i64]` promise block in
 /// guest memory and return its heap jsval, or `None` on a failed allocation.
 fn alloc_promise<W: Write + Send + 'static>(
-    ctx: StoreContextMut<'_, Host<W>>,
+    mut ctx: StoreContextMut<'_, Host<W>>,
     handles: &Handles,
     state: i32,
     value: u64,
@@ -653,7 +675,14 @@ fn alloc_promise<W: Write + Send + 'static>(
     block.resize(HEADER_SIZE, 0);
     block.extend_from_slice(&state.to_le_bytes());
     block.extend_from_slice(&value.to_le_bytes());
-    heap_alloc(ctx, handles, &block).map(|base| HEAP | base)
+    let base = heap_alloc(ctx.as_context_mut(), handles, &block)?;
+    if state == PROMISE_REJECTED {
+        ctx.data_mut()
+            .engine
+            .rejected
+            .insert(u32::try_from(base).ok()?);
+    }
+    Some(HEAP | base)
 }
 
 /// Write a promise block's settlement (`state` + `value`) into guest memory.
