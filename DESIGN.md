@@ -109,7 +109,7 @@ the JS side.
 ```
 jsc/
 ├── Cargo.toml                 # workspace, shared lints, [profile.release], [profile.dist]
-├── rust-toolchain.toml        # channel 1.96.0 (+ rustfmt, clippy)
+├── rust-toolchain.toml        # channel 1.99.1 (+ rustfmt, clippy)
 ├── crates/
 │   ├── jsc-core/              # library: the compiler pipeline
 │   │   ├── src/
@@ -156,8 +156,9 @@ jsc/
 **`jsc-core`.** The library. `#![forbid(unsafe_code)]`. The default feature
 `native-run` pulls in `wasmtime` (`cranelift`, `runtime`, `std`); building with
 `default-features = false` leaves frontend + codegen + emit only. Dependencies:
-`swc_ecma_parser 42`, `swc_ecma_ast 26`, `swc_common 24`, `wasm-encoder 0.253`,
-`anyhow`, optional `wasmtime 46`.
+`swc_ecma_parser 46`, `swc_ecma_ast 29`, `swc_common 26`,
+`swc_ecma_transforms_base 50`, `swc_ecma_transforms_typescript 56`,
+`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 49`.
 
 **`jsc`.** A thin `clap` shell (§9). `#![forbid(unsafe_code)]`.
 
@@ -182,7 +183,7 @@ missing or stale.
 
 ### Workspace constraints
 
-- **Toolchain.** Rust edition 2024, MSRV 1.96, pinned to `1.96.0` by
+- **Toolchain.** Rust edition 2024, MSRV 1.99, pinned to `1.99.1` by
   `rust-toolchain.toml`.
 - **Safety.** `unsafe_code = "forbid"` in `[workspace.lints.rust]` (relaxed to
   `deny` only in `jsc-wasm`).
@@ -911,7 +912,7 @@ finds a regression, and `2` on a setup error.
 
 ## 11. CI gates
 
-All workflows use Rust toolchain `1.96.0`.
+All workflows use Rust toolchain `1.99.1`.
 
 ### `ci.yml` — Rust gate
 
