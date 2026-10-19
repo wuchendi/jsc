@@ -70,7 +70,10 @@ fn primitive_compound_and_update_throw() {
 fn literal_primitive_write_throws() {
     assert_type_error("(5).x=1;", "Cannot create property 'x' on number '5'");
     assert_type_error("\"abc\".x=1;", "Cannot create property 'x' on string 'abc'");
-    assert_type_error("false.x=1;", "Cannot create property 'x' on boolean 'false'");
+    assert_type_error(
+        "false.x=1;",
+        "Cannot create property 'x' on boolean 'false'",
+    );
 }
 
 #[test]

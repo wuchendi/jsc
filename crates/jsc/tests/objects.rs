@@ -534,10 +534,22 @@ fn json_parse_rejects_malformed_input() {
 fn primitive_receiver_via_eval() {
     for (src, message) in [
         ("let n=5; n.x=1", "Cannot create property 'x' on number '5'"),
-        ("let s=\"abc\"; s[\"x\"]=1", "Cannot create property 'x' on string 'abc'"),
-        ("let b=true; b.x+=1", "Cannot create property 'x' on boolean 'true'"),
-        ("let u; u.x=1", "Cannot set properties of undefined (setting 'x')"),
-        ("let u=null; u.x", "Cannot read properties of null (reading 'x')"),
+        (
+            "let s=\"abc\"; s[\"x\"]=1",
+            "Cannot create property 'x' on string 'abc'",
+        ),
+        (
+            "let b=true; b.x+=1",
+            "Cannot create property 'x' on boolean 'true'",
+        ),
+        (
+            "let u; u.x=1",
+            "Cannot set properties of undefined (setting 'x')",
+        ),
+        (
+            "let u=null; u.x",
+            "Cannot read properties of null (reading 'x')",
+        ),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_jsc"))
             .args(["-p", src])
