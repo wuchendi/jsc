@@ -632,15 +632,41 @@ pub(super) fn emit_method_call(
     function.instruction(&Instruction::Call(helpers.method));
 }
 
-/// Emit the `+` operator, a runtime type dispatch. If EITHER operand is a string,
-/// the OTHER is coerced to its string form (via the host `__convert` to-string op)
-/// and the two are concatenated into a freshly allocated heap string; when neither
-/// is a string it falls through to numeric addition. Both operands are stashed so
-/// their tags can be inspected.
-///
-/// Numeric coercion of non-string operands in the ELSE (numeric-add) branch — the
-/// full JS ToPrimitive/ToNumber path so `1 + null` is `1` — remains unsupported;
-/// only the "either side is a string" concat path coerces.
+/// Push the `ToString(ToPrimitive(v))` heap-string base (i32) of the `+`
+/// operand in `local`. An array's primitive is its `join()` string (via the host
+/// `__method` join op); every other value goes through the host `__convert`
+/// to-string op, which returns a string unchanged and stringifies the rest.
+fn emit_add_operand_to_string(function: &mut Function, local: u32, helpers: Helpers<'_>) {
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32Const(METHOD_OP_JOIN));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Call(helpers.method));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
+    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32WrapI64);
+}
+
+/// Emit the `+` operator, a runtime type dispatch following `ToPrimitive`: every
+/// heap value (string, array, object, function, Date, Map/Set, promise, error)
+/// has a string primitive, so if EITHER operand is a heap pointer both sides are
+/// converted to strings ([`emit_add_operand_to_string`]) and concatenated into a
+/// freshly allocated heap string. Only when both operands are non-heap
+/// primitives (number/boolean/null/undefined) does it apply `ToNumber` to both
+/// and add. User `valueOf`/`toString`/`Symbol.toPrimitive` overrides are not
+/// consulted.
 fn emit_add(
     lhs: &IrNode,
     rhs: &IrNode,
@@ -656,30 +682,24 @@ fn emit_add(
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
 
-    // either_string = is_string(s0) | is_string(s1). Since every heap kind now
-    // shares tag 0b101, this reads each operand's TYPE BYTE (gated by is_pointer)
-    // so `[1]+[2]` is numeric add, not a bogus concat.
-    emit_is_string(function, s0);
-    emit_is_string(function, s1);
+    // either_heap = is_pointer(s0) | is_pointer(s1).
+    emit_is_pointer(function, s0);
+    emit_is_pointer(function, s1);
     function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // THEN: coerce each operand to a heap string (`__convert` returns a string
-    // operand unchanged, and stringifies number/bool/null/undefined), concat the
-    // two, and rebox the result base offset as a heap jsval.
-    function.instruction(&Instruction::LocalGet(s0));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
+    // THEN: stringify both operands, concat, and rebox the result base offset as
+    // a heap jsval.
+    emit_add_operand_to_string(function, s0, helpers);
+    emit_add_operand_to_string(function, s1, helpers);
     function.instruction(&Instruction::Call(helpers.concat));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::Else);
-    // ELSE: numeric add — unbox both operands to f64, add, rebox.
+    // ELSE: numeric add — ToNumber both operands (`null` -> 0, booleans ->
+    // 0/1, `undefined` -> NaN), unbox to f64, add, rebox.
+    emit_coerce_number(function, s0, helpers);
+    emit_coerce_number(function, s1, helpers);
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(s1));
