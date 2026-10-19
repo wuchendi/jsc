@@ -81,7 +81,7 @@ fn print_prints_completion_value() {
 
 /// A `try` statement's completion value is its block's (or, after a throw, its
 /// catch clause's) value; a `finally` value is discarded, and an empty `try`
-/// yields `undefined` (UpdateEmpty), overriding an earlier statement's value.
+/// yields `undefined` (`UpdateEmpty`), overriding an earlier statement's value.
 #[test]
 fn print_try_completion_value() {
     for (src, expected) in [
