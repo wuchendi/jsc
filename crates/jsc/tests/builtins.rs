@@ -70,6 +70,10 @@ fn conversions_via_eval() {
     // parseInt / parseFloat: leading numeric prefix.
     assert_eq!(jsc(&["-p", r#"parseInt("42px")"#]), "42");
     assert_eq!(jsc(&["-p", r#"parseInt("abc")"#]), "NaN");
+    assert_eq!(jsc(&["-p", r#"parseInt("ff", 16)"#]), "255");
+    assert_eq!(jsc(&["-p", r#"parseInt("0xff")"#]), "255");
+    assert_eq!(jsc(&["-p", r#"parseInt("101", 2)"#]), "5");
+    assert_eq!(jsc(&["-p", r#"parseInt("12", 37)"#]), "NaN");
     assert_eq!(jsc(&["-p", r#"parseFloat("3.14xyz")"#]), "3.14");
     // Shadowable by a user binding of the same name.
     assert_eq!(

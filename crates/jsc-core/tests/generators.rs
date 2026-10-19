@@ -586,3 +586,50 @@ fn for_let_loop_with_yield_in_generator() {
         "0\n1\n2\n",
     );
 }
+
+/// `.next` is only the generator step for a generator receiver: an object or
+/// class instance with its own `next` method gets an ordinary method call
+/// (`this` bound, every argument passed).
+#[test]
+fn a_user_next_method_is_called_on_a_non_generator() {
+    assert_number("const o = { next() { return 7; } }; o.next()", 7.0);
+    assert_number(
+        "const o = { next(a, b, c) { return a + b + c; } }; o.next(1, 2, 3)",
+        6.0,
+    );
+    assert_number(
+        "class C { constructor() { this.n = 10; } next(x) { return this.n + x; } }
+         const c = new C(); c.next(5)",
+        15.0,
+    );
+    assert_number(
+        "const it = { i: 0, next() { this.i = this.i + 1; return { value: this.i, done: this.i > 2 }; } };
+         it.next(); it.next().value",
+        2.0,
+    );
+}
+
+/// A user iterator object and a generator mix in one program: each `.next()`
+/// dispatches on its own receiver.
+#[test]
+fn user_next_and_generator_next_coexist() {
+    assert_number(
+        "function* g(){ yield 40 }
+         const o = { next() { return 2; } };
+         g().next().value + o.next()",
+        42.0,
+    );
+}
+
+/// A nullish `.next()` receiver throws the ordinary member-read `TypeError`.
+#[test]
+fn a_nullish_next_receiver_throws_a_type_error() {
+    assert_uncaught(
+        "let u; u.next();",
+        "TypeError: Cannot read properties of undefined (reading 'next')",
+    );
+    assert_uncaught(
+        "let n = null; n.next();",
+        "TypeError: Cannot read properties of null (reading 'next')",
+    );
+}

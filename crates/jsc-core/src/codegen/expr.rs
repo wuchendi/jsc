@@ -161,14 +161,16 @@ impl LowerCtx<'_> {
             Expr::Unary(u) => match u.op {
                 // Unary minus is constant-folded when the operand lowers to a
                 // literal (`-5` becomes `Num(-5.0)`); otherwise it is
-                // represented as `0 - operand`.
+                // represented as `-0 - operand`, which flips the sign of zero
+                // (`-0 - +0` is `-0`, `-0 - -0` is `+0`) and negates any other
+                // number.
                 UnaryOp::Minus => {
                     let operand = self.lower_expr(&u.arg)?;
                     match operand {
                         IrNode::Num(v) => Ok(IrNode::Num(-v)),
                         other => Ok(IrNode::Binary {
                             op: BinOp::Sub,
-                            lhs: Box::new(IrNode::Num(0.0)),
+                            lhs: Box::new(IrNode::Num(-0.0)),
                             rhs: Box::new(other),
                         }),
                     }
@@ -180,6 +182,7 @@ impl LowerCtx<'_> {
                     other => Ok(IrNode::ConvertCall {
                         op: ConvertOp::ToNumber,
                         arg: Box::new(other),
+                        radix: None,
                     }),
                 },
                 // `typeof operand` inspects the operand's runtime type.
@@ -630,9 +633,8 @@ impl LowerCtx<'_> {
             return Ok(IrNode::DateNow);
         }
         // `d.getTime()`: the millisecond timestamp of a Date receiver.
-        // Claimed for ANY receiver (a non-Date yields `NaN`, mirroring the
-        // promise/generator instance methods); a user method named `getTime` is a
-        // documented out-of-scope collision.
+        // Claimed for ANY receiver (a non-Date yields `NaN`); a user method named
+        // `getTime` is a documented out-of-scope collision.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
             && id.sym.as_ref() == "getTime"
@@ -655,16 +657,16 @@ impl LowerCtx<'_> {
         {
             return self.lower_date_method(op, id.sym.as_ref(), &member.obj, args);
         }
-        // `p.then(onF, onR)` / `p.catch(onR)` / `p.finally(fn)` are the promise
-        // instance methods. They are claimed for ANY receiver here (the
-        // host `__then`/`__promise` engine treats a non-promise receiver as an
-        // already-fulfilled value): a user object method named `then`/`catch`/
-        // `finally` is a documented out-of-scope collision.
+        // `p.then(onF, onR)` / `p.catch(onR)` / `p.finally(fn)` and `gen.next(v)`
+        // are the promise / generator instance methods. Like the Map/Set methods,
+        // these names can ALSO be ordinary user methods (thenables, iterator
+        // objects), so the lowered node dispatches at runtime on the receiver's
+        // TYPE BYTE and keeps a user-method fallback — safe to claim the name here.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
-            && matches!(id.sym.as_ref(), "then" | "catch" | "finally")
+            && let Some(op) = receiver_method_op(id.sym.as_ref())
         {
-            return self.lower_promise_method(id.sym.as_ref(), &member.obj, args, member.span());
+            return self.lower_receiver_method(op, &member.obj, args);
         }
         // `map.set/get/has/delete(..)` / `set.add/has/delete(..)` are Map/Set
         // methods. Unlike the builtins above these names can ALSO be ordinary
@@ -676,18 +678,6 @@ impl LowerCtx<'_> {
             && let Some(op) = map_set_method_op(id.sym.as_ref())
         {
             return self.lower_map_method(op, id.sym.as_ref(), &member.obj, args);
-        }
-        // `gen.next(v)` drives a generator one step. Like the promise
-        // instance methods, `next` is claimed for ANY receiver — a non-generator
-        // throws a `TypeError` at runtime — so a user method named `next` is a
-        // documented out-of-scope collision. `.return`/`.throw` are unsupported.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && id.sym.as_ref() == "next"
-        {
-            let handle = Box::new(self.lower_expr(&member.obj)?);
-            let sent = Box::new(args.into_iter().next().unwrap_or(IrNode::Undefined));
-            return Ok(IrNode::GenResume { handle, sent });
         }
         // Any remaining member callee `obj.m(args)` / `obj[k](args)` is a USER
         // method call: it reads the function value at the member and binds
@@ -736,43 +726,26 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a `p.then(onF, onR)` / `p.catch(onR)` / `p.finally(fn)` promise
-    /// instance method to its promise node. The receiver `obj` is lowered
-    /// once; each missing handler becomes `undefined` (a passthrough reaction). An
-    /// arity beyond the method's maximum is a compile error.
-    fn lower_promise_method(
+    /// Lower a promise / generator instance method `recv.<op>(args)` into an
+    /// [`IrNode::ReceiverMethod`]. Mirrors [`Self::lower_map_method`]: the receiver
+    /// is lowered once and two fresh temps are reserved for the runtime TYPE-BYTE
+    /// dispatch. No arity check: the argument list is threaded verbatim to the
+    /// user-method fallback, which may take any number of arguments.
+    fn lower_receiver_method(
         &mut self,
-        name: &str,
+        op: ReceiverOp,
         obj: &Expr,
         args: Vec<IrNode>,
-        span: Span,
     ) -> anyhow::Result<IrNode> {
-        let max = if name == "then" { 2 } else { 1 };
-        if args.len() > max {
-            return Err(CompileError::spanned(
-                span,
-                format!("{name} expects 0-{max} argument(s), got {}", args.len()),
-            )
-            .into());
-        }
-        let promise = Box::new(self.lower_expr(obj)?);
-        let mut args = args.into_iter();
-        Ok(match name {
-            "then" => IrNode::PromiseThen {
-                promise,
-                on_fulfilled: Box::new(args.next().unwrap_or(IrNode::Undefined)),
-                on_rejected: Box::new(args.next().unwrap_or(IrNode::Undefined)),
-            },
-            "catch" => IrNode::PromiseThen {
-                promise,
-                on_fulfilled: Box::new(IrNode::Undefined),
-                on_rejected: Box::new(args.next().unwrap_or(IrNode::Undefined)),
-            },
-            // `finally`.
-            _ => IrNode::PromiseFinally {
-                promise,
-                on_finally: Box::new(args.next().unwrap_or(IrNode::Undefined)),
-            },
+        let recv = self.lower_expr(obj)?;
+        let recv_local = self.fresh();
+        let fallback_obj_local = self.fresh();
+        Ok(IrNode::ReceiverMethod {
+            op,
+            recv: Box::new(recv),
+            args,
+            recv_local,
+            fallback_obj_local,
         })
     }
 
@@ -1399,6 +1372,7 @@ impl LowerCtx<'_> {
                     lhs: Box::new(IrNode::ConvertCall {
                         op: ConvertOp::ToNumber,
                         arg: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                        radix: None,
                     }),
                     rhs: Box::new(IrNode::Num(delta)),
                 };
@@ -1781,6 +1755,7 @@ impl LowerCtx<'_> {
                 let ms = IrNode::ConvertCall {
                     op: ConvertOp::ToNumber,
                     arg: Box::new(self.lower_expr(&arg.expr)?),
+                    radix: None,
                 };
                 Ok(IrNode::DateNew {
                     ms: Some(Box::new(ms)),
@@ -1997,4 +1972,18 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
     }
+}
+
+/// Map a method name to its [`ReceiverOp`], or `None` when the name is not a
+/// promise / generator instance method. Recognized purely syntactically from a
+/// `<expr>.<name>(..)` member callee; the lowered node dispatches on the
+/// receiver's runtime TYPE BYTE and falls back to a user method call.
+fn receiver_method_op(name: &str) -> Option<ReceiverOp> {
+    Some(match name {
+        "then" => ReceiverOp::Then,
+        "catch" => ReceiverOp::Catch,
+        "finally" => ReceiverOp::Finally,
+        "next" => ReceiverOp::Next,
+        _ => return None,
+    })
 }

@@ -279,6 +279,20 @@ fn direct_calls_tolerate_missing_and_extra_arguments() {
     }
 }
 
+/// User methods named `next`/`then` are ordinary method calls on non-generator,
+/// non-promise receivers.
+#[test]
+fn user_next_and_then_methods_via_eval() {
+    assert_eq!(
+        jsc(&["-p", "const o = { next() { return 7; } }; o.next()"]),
+        "7"
+    );
+    assert_eq!(
+        jsc(&["-p", "const t = { then(a) { return a + 1; } }; t.then(1)"]),
+        "2"
+    );
+}
+
 /// Nested function declarations are hoisted to the top of their enclosing
 /// function body (or block): callable and readable as a value before their
 /// textual position, mutually recursive with sibling declarations, recursive by

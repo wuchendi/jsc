@@ -92,7 +92,7 @@ JS source ──▶ swc AST ──▶ IR ──────────▶ wasm 
    function bodies, the runtime helper functions, the funcref table, memory,
    globals, exports, data segments for interned strings.
 4. **run** (`run/`, feature `native-run`) — instantiates the module on wasmtime
-   with a `Linker` that supplies the six host imports (§6), calls `main`,
+   with a `Linker` that supplies the seven host imports (§6), calls `main`,
    drains the microtask queue, checks for an uncaught exception, and decodes the
    result jsval against a snapshot of linear memory.
 
@@ -171,7 +171,7 @@ block labelled `<source>`. Its lint table mirrors the workspace's but relaxes
 
 **`@cdlab/jsc`** (`packages/jsc`). `compile(src)` returns module bytes from the
 wasm-bindgen artifact; `run(src)` compiles, instantiates the module against a
-TypeScript host shim (`shim.ts`, which implements the same six `env` imports and
+TypeScript host shim (`shim.ts`, which implements the same seven `env` imports and
 promise engine as `run/`), calls `main`, and returns `{ result, stdout }`.
 `abi.ts` and `value.ts` are ports of `abi.rs` and `run/value.rs`. The wasm
 artifact is gitignored; `scripts/ensure-wasm.sh` rebuilds it (via
@@ -262,9 +262,9 @@ a number jsval. A single signature lets `call_indirect` serve every function.
 
 | index | function |
 |---|---|
-| `0`–`5` | host imports `print`, `__convert`, `__method`, `__promise`, `__then`, `__now` |
-| `6` | `main` (exported as `"main"`) |
-| `7 … 6+n` | the `n` user functions |
+| `0`–`6` | host imports `print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int` |
+| `7` | `main` (exported as `"main"`) |
+| `8 … 7+n` | the `n` user functions |
 | then | runtime helpers, in a fixed order: `__alloc`, `__concat`, `__str_eq`, `__str_cmp`, `__str_index`, `__obj_get`, `__obj_set`, `__array_push`, `__obj_rest`, `__array_concat`, `__obj_keys`, `__obj_values`, `__obj_entries`, `__obj_has`, `__obj_delete`, `__json_escape`, `__json_str`, `__same_value_zero`, `__map_find`, `__map_set`, `__map_get`, `__map_has`, `__map_delete`, `__loose_eq`, `__str_to_array`, the `JSON.parse` family (`__json_ws`, `__json_throw`, `__json_string`, `__json_number`, `__json_value`, `__json_array`, `__json_object`, `__array_to_object`, `__json_parse`), `__gen_to_array`, `__nullish_throw`, `__box_f64`, `__to_number` |
 | last | `__invoke1`, `__async_step`, and the two `new Promise` settler functions |
 
@@ -407,17 +407,18 @@ allocation-heavy programs consume memory monotonically up to the 512 MiB cap.
 
 ### 6.1 Host imports
 
-Every module imports exactly six functions from the `"env"` namespace
-(`abi::IMPORT_MODULE`), declared in this order (function indices `0`–`5`):
+Every module imports exactly seven functions from the `"env"` namespace
+(`abi::IMPORT_MODULE`), declared in this order (function indices `0`–`6`):
 
 | # | import | signature | backs |
 |---|---|---|---|
 | 0 | `print` | `(bits: i64, flag: i32) -> ()` | `console.log` |
-| 1 | `__convert` | `(bits: i64, op: i32) -> i64` | `String`, `Number`/ToNumber, `parseInt`, `parseFloat` |
+| 1 | `__convert` | `(bits: i64, op: i32) -> i64` | `String`, `Number`/ToNumber, `parseFloat` |
 | 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | non-callback array/string methods |
 | 3 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn |
 | 4 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `.then` / `.catch` |
 | 5 | `__now` | `() -> f64` | `Date.now()`, `new Date()` |
+| 6 | `__parse_int` | `(s: i64, radix: i64) -> i64` | `parseInt` |
 
 The native host is `run/harness.rs` (wasmtime `Linker::func_wrap`); the browser
 host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
@@ -429,7 +430,7 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   `format_value` used for the CLI's `-p` output.
 - **`__convert` ops.** `0` ToString (a string argument is returned unchanged;
   otherwise the formatted text is allocated as a heap string), `1` ToNumber,
-  `2` parseInt (base 10), `3` parseFloat.
+  `3` parseFloat.
 - **`__method` ops.** `0` `indexOf`, `1` `includes`, `2` `join`, `3` `slice`,
   `4` `toUpperCase`, `5` `toLowerCase`, `6` `charAt`, `7` `trim`, `8` `trimStart`,
   `9` `trimEnd`, `10` `repeat`, `11` `startsWith`, `12` `endsWith`,
@@ -618,8 +619,8 @@ A `for` loop with a `let` head is scoped to the loop; `continue` still runs the
 update clause. Labels may only be applied to loops.
 
 The CLI's `-p` mode prints the value of the **last expression statement**
-evaluated by `main`; statement completion values of `try`, `switch`, and loops
-are not tracked.
+evaluated by `main`; `try` statements contribute their completion values, while
+those of `switch` and loops are not tracked.
 
 ### 7.4 Functions
 
@@ -1007,23 +1008,19 @@ Each item below is current behaviour of this tree.
 - TDZ is enforced only for module cells; reading a block-scoped binding before
   its declaration inside the same function reads the earlier binding or
   `undefined` instead of throwing.
-- `-p` completion values come from expression statements only (§7.3).
+- `-p` completion values come from expression statements and `try`
+  statements; `switch` and loops contribute none.
 
 **Values & operators**
 
 - Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
   `slice`, `charAt`, `split("")`, string spread, and `for-of` over a string all
   work per byte (`"é".length` is `2`). Case mapping and trimming are ASCII-only.
-- Binary `+` without a string operand does not apply ToNumber to non-number
-  operands (`1 + null`, `1 + true`, `true + true` yield `NaN`); other numeric
-  operators do.
-- String conversion of objects and arrays uses the console formatter
-  (`"" + [1, 2]` is `"[ 1, 2 ]"`, `"" + {}` is `"{}"`), not
-  `Array.prototype.join` / `"[object Object]"`.
+- String conversion of plain objects uses the console formatter
+  (`({}) + 1` is `"{}1"`), not `"[object Object]"`.
 - Loose equality does not apply ToPrimitive to objects (`[] == 0` is `false`).
 - No bitwise or shift operators (`& | ^ ~ << >> >>>` and their compound forms),
   no comma/sequence expressions, no `void`.
-- `parseInt` ignores a radix argument (always base 10).
 - Not available: `RegExp` (literals and constructor), `Symbol`, `BigInt`,
   `Proxy`, `Reflect`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays,
   `ArrayBuffer`, `Intl`, `eval`, `arguments`. `Object`, `Array`, `Number`, etc.
@@ -1041,8 +1038,6 @@ Each item below is current behaviour of this tree.
   one-element array throws `Cannot grow array by index assignment yet`); a
   non-index key (`a.foo = 1`, `a[-1] = 1`) throws the add-property error;
   `.length` is read-only.
-- A named property read on a string receiver goes through index dispatch rather
-  than returning `undefined` (`"abc".foo` reads a character).
 - Built-in prototypes are not modelled: there is no generic method lookup, so
   unrecognized built-in methods (`sort`, `find`, `flat`, `at`, `charCodeAt`,
   `toFixed`, `toString`, …) are rejected; `Function.prototype.call/apply/bind`
@@ -1054,12 +1049,14 @@ Each item below is current behaviour of this tree.
 
 **Functions & classes**
 
+- Destructuring assignment works only as an expression statement or a
+  pattern `for-of` head (`for ([a] of xs)`); it is rejected in expression
+  position (`x = [a] = b`), and a bare-identifier head (`for (a of xs)`) is
+  rejected.
 - Arrows do not capture lexical `this`; an arrow sees the `this` of the call
   that invoked it (usually `undefined`).
 - Closures created in a C-style `for (let i …)` loop share one `i` binding
   rather than capturing a per-iteration copy.
-- Function declarations nested inside another function are not hoisted and
-  cannot call themselves by name.
 - A spread call delivers at most `K` arguments (the program's maximum declared
   arity or call-site argument count); surplus spread elements are dropped.
 - `array.push` takes exactly one argument; `reduce` requires an initial value.
@@ -1071,21 +1068,20 @@ Each item below is current behaviour of this tree.
 **Generators & async**
 
 - Generators and async functions must be top-level declarations: no nested
-  declarations, expressions, arrows, or methods; no `async function*`.
-- `.next(…)` is reserved for generators; a user object's own `next` method
-  cannot be called (§7.8).
+  generator/async declarations, expressions, arrows, or methods; no
+  `async function*`.
 - `yield`/`await` are not allowed inside `try`/`catch`/`finally`, inside
   `switch`, in a loop or `if` condition, nested inside a larger expression, or in
-  the body of a `for-of`/`for-in` inside a generator; generator bodies cannot
-  contain nested closures; parameters must be simple identifiers.
+  the body of a `for-of`/`for-in` inside a generator; parameters must be simple
+  identifiers.
 - `.return()` / `.throw()` on generators are not available; `yield*` delegates
-  only to generators.
+  to arrays, strings and generators but does not thread sent or return values.
 - No `Promise.all` / `race` / `allSettled` / `any`; no thenable assimilation of
-  non-promise objects; no unhandled-rejection reporting.
+  non-promise objects.
 
 **Runtime**
 
-- The emitted module imports six host functions from `env` (§6.1); it is not
+- The emitted module imports seven host functions from `env` (§6.1); it is not
   self-contained and cannot run without jsc's wasmtime host or the
   `@cdlab/jsc` shim. Runtime semantics are implemented three times (guest wasm,
   the Rust host, the TypeScript shim).

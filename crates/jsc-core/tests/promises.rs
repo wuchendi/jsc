@@ -8,6 +8,7 @@
 
 mod common;
 use common::{assert_eval, assert_output, assert_rejected, assert_uncaught};
+use jsc_core::run::compile_and_run;
 
 // --- Microtask ordering -------------------------------------------------------
 
@@ -166,7 +167,7 @@ fn finally_runs_on_rejection() {
 fn promise_rendering() {
     assert_output("console.log(Promise.resolve(7));", "Promise { 7 }\n");
     assert_output(
-        "console.log(Promise.reject(\"e\"));",
+        "const p = Promise.reject(\"e\"); console.log(p); p.catch(() => {});",
         "Promise { <rejected> e }\n",
     );
     // A `.then` result is still pending when logged (its reaction is a queued
@@ -407,6 +408,147 @@ fn for_let_loop_with_await_in_async_function() {
          f().then(v => console.log(v));",
         "012\n",
     );
+}
+
+/// `.then`/`.catch`/`.finally` are only the promise methods for a promise
+/// receiver: an object or class instance with a same-named method gets an
+/// ordinary method call (`this` bound, every argument passed).
+#[test]
+fn user_then_catch_finally_methods_are_called_on_non_promises() {
+    assert_eval("const t = { then(a) { return a + 1; } }; t.then(1)", "2");
+    assert_eval(
+        "const t = { then(a, b, c) { return a + b + c; } }; t.then(1, 2, 3)",
+        "6",
+    );
+    assert_eval(
+        "const o = { catch(e) { return e * 2; }, finally() { return \"f\"; } }; o.catch(4) + o.finally()",
+        "8f",
+    );
+    assert_eval(
+        "class T { constructor() { this.k = 3; } then(f) { return f(this.k); } }
+         new T().then(v => v * 2)",
+        "6",
+    );
+}
+
+/// A nullish `.then`/`.catch`/`.finally` receiver throws the ordinary
+/// member-read `TypeError`.
+#[test]
+fn nullish_promise_method_receiver_throws_a_type_error() {
+    assert_uncaught(
+        "let n = null; n.then();",
+        "TypeError: Cannot read properties of null (reading 'then')",
+    );
+    assert_uncaught(
+        "let u; u.catch(() => 1);",
+        "TypeError: Cannot read properties of undefined (reading 'catch')",
+    );
+    assert_uncaught(
+        "let u; u.finally();",
+        "TypeError: Cannot read properties of undefined (reading 'finally')",
+    );
+}
+
+/// A non-promise primitive without a `then` method throws "not a function".
+#[test]
+fn then_on_a_primitive_throws_a_type_error() {
+    assert_uncaught(
+        "let x = 5; x.then();",
+        "TypeError: called value is not a function",
+    );
+}
+
+// --- Unhandled rejections -----------------------------------------------------
+
+/// Run `src` and assert it fails with `Uncaught (in promise) <expected>`.
+fn assert_unhandled(src: &str, expected: &str) {
+    let err = compile_and_run(src).expect_err("program should report an unhandled rejection");
+    assert_eq!(
+        err.to_string(),
+        format!("Uncaught (in promise) {expected}"),
+        "unhandled-rejection message for source `{src}`"
+    );
+}
+
+/// A rejection that never gets a handler fails the run, rendered like an
+/// uncaught exception (Error objects as `Name: message`, primitives as-is).
+#[test]
+fn unhandled_rejection_is_reported() {
+    assert_unhandled("Promise.reject(new Error(\"x\")); 0", "Error: x");
+    assert_unhandled("Promise.reject(new TypeError(\"t\")); 0", "TypeError: t");
+    assert_unhandled("Promise.reject(1); 0", "1");
+    assert_unhandled("new Promise((res, rej) => rej(\"s\")); 0", "s");
+}
+
+/// A `.then` without a rejection handler forwards the rejection to its result
+/// promise, which is itself unhandled.
+#[test]
+fn unhandled_rejection_through_then_passthrough() {
+    assert_unhandled("Promise.reject(2).then(v => v); 0", "2");
+}
+
+/// A throwing `.then` callback rejects the chained promise; unhandled, it fails.
+#[test]
+fn unhandled_rejection_from_throwing_reaction() {
+    assert_unhandled(
+        "Promise.resolve(1).then(v => { throw \"bang\"; }); 0",
+        "bang",
+    );
+}
+
+/// An async function that throws and is never awaited fails the run.
+#[test]
+fn unhandled_async_throw_is_reported() {
+    assert_unhandled(
+        "async function f() { throw new Error(\"a\"); } f(); 0",
+        "Error: a",
+    );
+    assert_unhandled(
+        "async function f() { await Promise.reject(\"r\"); } f(); 0",
+        "r",
+    );
+}
+
+/// The FIRST unhandled rejection (creation order) is the one reported.
+#[test]
+fn first_unhandled_rejection_wins() {
+    assert_unhandled("Promise.reject(\"a\"); Promise.reject(\"b\"); 0", "a");
+}
+
+/// A handler (catch / then / finally+catch / await / adoption) marks the
+/// rejection handled, including one attached later in the same run.
+#[test]
+fn handled_rejections_complete_normally() {
+    assert_eval("Promise.reject(1).catch(() => {}); 0", "0");
+    assert_eval("Promise.reject(1).then(v => v, e => e); 0", "0");
+    assert_eval(
+        "Promise.reject(1).finally(() => {}).catch(() => {}); 0",
+        "0",
+    );
+    assert_eval(
+        "const p = Promise.reject(1); Promise.resolve(0).then(() => p.catch(() => {})); 0",
+        "0",
+    );
+    assert_eval(
+        "async function f() { throw 1; } async function g() { await f(); } \
+         g().catch(() => {}); 0",
+        "0",
+    );
+    assert_eval(
+        "async function f() { throw 1; } f().catch(() => {}); 0",
+        "0",
+    );
+    assert_eval(
+        "new Promise((res) => res(Promise.reject(1))).catch(() => {}); 0",
+        "0",
+    );
+}
+
+/// A synchronous uncaught exception takes precedence over a pending unhandled
+/// rejection.
+#[test]
+fn sync_uncaught_beats_unhandled_rejection() {
+    assert_uncaught("Promise.reject(1); throw 2;", "2");
 }
 
 /// A closure created before an `await` captures the async frame's parameter
