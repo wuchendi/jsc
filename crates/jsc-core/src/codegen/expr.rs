@@ -161,14 +161,16 @@ impl LowerCtx<'_> {
             Expr::Unary(u) => match u.op {
                 // Unary minus is constant-folded when the operand lowers to a
                 // literal (`-5` becomes `Num(-5.0)`); otherwise it is
-                // represented as `0 - operand`.
+                // represented as `-0 - operand`, which flips the sign of zero
+                // (`-0 - +0` is `-0`, `-0 - -0` is `+0`) and negates any other
+                // number.
                 UnaryOp::Minus => {
                     let operand = self.lower_expr(&u.arg)?;
                     match operand {
                         IrNode::Num(v) => Ok(IrNode::Num(-v)),
                         other => Ok(IrNode::Binary {
                             op: BinOp::Sub,
-                            lhs: Box::new(IrNode::Num(0.0)),
+                            lhs: Box::new(IrNode::Num(-0.0)),
                             rhs: Box::new(other),
                         }),
                     }
