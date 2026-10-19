@@ -885,10 +885,10 @@ Errors are printed to stderr.
 
   | commit | pass | eligible | total |
   |---|---|---|---|
-  | `f4f6bb2` | 4860 | 22992 | 47665 |
+  | `67d7221` | 5230 | 22992 | 47665 |
 
-  i.e. **4860 / 22992 eligible tests pass (≈ 21.1 %)**, out of 47665 tests in the
-  pinned checkout; `baseline.txt` holds the same 4860 paths.
+  i.e. **5230 / 22992 eligible tests pass (≈ 22.7 %)**, out of 47665 tests in the
+  pinned checkout; `baseline.txt` holds the same 5230 paths.
 
 **Running it** (from the repository root):
 
