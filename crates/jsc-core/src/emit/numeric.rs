@@ -525,7 +525,8 @@ pub(super) fn emit_pow(
 /// Emit a conversion built-in call, leaving its result jsval on the stack.
 ///
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
-/// between the boxed `true`/`false` jsvals, no host call. The other four delegate
+/// between the boxed `true`/`false` jsvals, no host call. `parseInt` calls the
+/// host `__parse_int` import with the string and radix jsvals. The rest delegate
 /// to the host `__convert` import — the argument jsval and a `CONVERT_OP_*` flag
 /// are pushed, and the import returns the converted jsval (a fresh heap string for
 /// `String`, a number for the rest), reusing the run stage's `format_value`/parse
@@ -533,6 +534,7 @@ pub(super) fn emit_pow(
 pub(super) fn emit_convert_call(
     op: ConvertOp,
     arg: &IrNode,
+    radix: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -556,12 +558,23 @@ pub(super) fn emit_convert_call(
         function.instruction(&Instruction::LocalGet(scratch));
         return;
     }
+    if matches!(op, ConvertOp::ParseInt) {
+        // `__parse_int(s, radix)`: an omitted radix is passed as `undefined`.
+        emit_node(arg, function, scratch, strings, helpers);
+        match radix {
+            Some(radix) => emit_node(radix, function, scratch, strings, helpers),
+            None => {
+                function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+            }
+        }
+        function.instruction(&Instruction::Call(helpers.parse_int));
+        return;
+    }
     let flag = match op {
         ConvertOp::ToString => CONVERT_OP_TO_STRING,
-        ConvertOp::ParseInt => CONVERT_OP_PARSE_INT,
         ConvertOp::ParseFloat => CONVERT_OP_PARSE_FLOAT,
-        ConvertOp::ToBoolean | ConvertOp::ToNumber => {
-            unreachable!("ToBoolean/ToNumber handled above")
+        ConvertOp::ToBoolean | ConvertOp::ToNumber | ConvertOp::ParseInt => {
+            unreachable!("ToBoolean/ToNumber/ParseInt handled above")
         }
     };
     emit_node(arg, function, scratch, strings, helpers);

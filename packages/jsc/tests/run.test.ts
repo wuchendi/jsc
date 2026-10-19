@@ -56,6 +56,17 @@ it('dispatches the string methods through the shim', async () => {
   expect((await run("'a,b,c'.split(',').length")).result).toBe('3')
 })
 
+it('parses parseInt with a radix through the shim', async () => {
+  expect((await run("parseInt('ff', 16)")).result).toBe('255')
+  expect((await run("parseInt('0xff')")).result).toBe('255')
+  expect((await run("parseInt('0xff', 10)")).result).toBe('0')
+  expect((await run("parseInt('101', 2)")).result).toBe('5')
+  expect((await run("parseInt('z', 36)")).result).toBe('35')
+  expect((await run("parseInt('12', 37)")).result).toBe('NaN')
+  expect((await run("parseInt('  -7f', 16)")).result).toBe('-127')
+  expect((await run("1 / parseInt('-0')")).result).toBe('-Infinity')
+})
+
 it('links every emitted module against the shim (no LinkError)', async () => {
   expect((await run('1+1')).result).toBe('2')
 })

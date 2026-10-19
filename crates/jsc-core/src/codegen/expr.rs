@@ -182,6 +182,7 @@ impl LowerCtx<'_> {
                     other => Ok(IrNode::ConvertCall {
                         op: ConvertOp::ToNumber,
                         arg: Box::new(other),
+                        radix: None,
                     }),
                 },
                 // `typeof operand` inspects the operand's runtime type.
@@ -1364,6 +1365,7 @@ impl LowerCtx<'_> {
                     lhs: Box::new(IrNode::ConvertCall {
                         op: ConvertOp::ToNumber,
                         arg: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                        radix: None,
                     }),
                     rhs: Box::new(IrNode::Num(delta)),
                 };
@@ -1746,6 +1748,7 @@ impl LowerCtx<'_> {
                 let ms = IrNode::ConvertCall {
                     op: ConvertOp::ToNumber,
                     arg: Box::new(self.lower_expr(&arg.expr)?),
+                    radix: None,
                 };
                 Ok(IrNode::DateNew {
                     ms: Some(Box::new(ms)),

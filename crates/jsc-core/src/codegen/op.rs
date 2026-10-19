@@ -137,16 +137,16 @@ pub(super) fn convert_builtin_op(name: &str) -> Option<ConvertOp> {
 
 /// Lower a recognized conversion built-in call to an [`IrNode::ConvertCall`],
 /// validating its argument count. All five take one argument; `parseInt`
-/// additionally accepts an (ignored) radix second argument. A wrong arity is a
-/// compile error matching the existing direct-call error style.
+/// additionally accepts a radix second argument. A wrong arity is a compile
+/// error matching the existing direct-call error style.
 pub(super) fn lower_convert_call(
     op: ConvertOp,
     name: &str,
     args: Vec<IrNode>,
     span: Span,
 ) -> anyhow::Result<IrNode> {
-    // `parseInt(s, radix)` is accepted with the radix ignored (base-10 only, a
-    // documented limitation); everything else takes exactly one argument.
+    // `parseInt(s, radix)` takes an optional radix; everything else takes
+    // exactly one argument.
     let ok = if matches!(op, ConvertOp::ParseInt) {
         args.len() == 1 || args.len() == 2
     } else {
@@ -164,16 +164,17 @@ pub(super) fn lower_convert_call(
         )
         .into());
     }
-    // Take the first argument (dropping an ignored `parseInt` radix). The arity
+    // Take the first argument and the optional `parseInt` radix. The arity
     // check above guarantees at least one; `ok_or_else` keeps the error total
     // without an `expect`.
+    let mut args = args.into_iter();
     let arg = args
-        .into_iter()
         .next()
         .ok_or_else(|| anyhow!("{name} requires an argument"))?;
     Ok(IrNode::ConvertCall {
         op,
         arg: Box::new(arg),
+        radix: args.next().map(Box::new),
     })
 }
 
