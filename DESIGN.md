@@ -101,7 +101,7 @@ the JS side.
 ```
 jsc/
 ├── Cargo.toml                 # workspace, shared lints, [profile.release], [profile.dist]
-├── rust-toolchain.toml        # channel 1.96.0 (+ rustfmt, clippy)
+├── rust-toolchain.toml        # channel 1.99.1 (+ rustfmt, clippy)
 ├── crates/
 │   ├── jsc-core/              # library: the compiler pipeline
 │   │   ├── src/
@@ -174,7 +174,7 @@ missing or stale.
 
 ### Workspace constraints
 
-- **Toolchain.** Rust edition 2024, MSRV 1.96, pinned to `1.96.0` by
+- **Toolchain.** Rust edition 2024, MSRV 1.99, pinned to `1.99.1` by
   `rust-toolchain.toml`.
 - **Safety.** `unsafe_code = "forbid"` in `[workspace.lints.rust]` (relaxed to
   `deny` only in `jsc-wasm`).
@@ -903,7 +903,7 @@ finds a regression, and `2` on a setup error.
 
 ## 11. CI gates
 
-All workflows use Rust toolchain `1.96.0`.
+All workflows use Rust toolchain `1.99.1`.
 
 ### `ci.yml` — Rust gate
 
