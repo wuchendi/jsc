@@ -98,7 +98,10 @@ fn print_try_completion_value() {
         ("try { 4 } catch (e) {} let y = 0", "4"),
         ("try { 4 } catch (e) {} 6", "6"),
         ("try { 1; if (false) {} } catch (e) {}", "undefined"),
-        ("try { [1, 2].map((x) => { x; return x }) } catch (e) {}", "[ 1, 2 ]"),
+        (
+            "try { [1, 2].map((x) => { x; return x }) } catch (e) {}",
+            "[ 1, 2 ]",
+        ),
     ] {
         assert_eq!(jsc(&["-p", src]), expected, "{src}");
     }

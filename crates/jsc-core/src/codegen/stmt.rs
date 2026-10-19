@@ -883,9 +883,8 @@ impl LowerCtx<'_> {
         // completion local that every expression statement of its block and catch
         // clause stores into; it is reset to `undefined` on entry (an empty `try`
         // yields `undefined`) and pushed as `main`'s value after the statement.
-        let outermost = self.main_ctx
-            && self.frames.len() == 1
-            && self.shared.completion.get().is_none();
+        let outermost =
+            self.main_ctx && self.frames.len() == 1 && self.shared.completion.get().is_none();
         if outermost {
             let local = self.fresh();
             self.shared.completion.set(Some(local));
