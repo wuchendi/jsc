@@ -123,17 +123,27 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Desugar a `yield* iterable;` statement into the driving loop
+    /// Desugar a `yield* iterable;` statement over the same iterables `for-of`
+    /// walks, dispatching on the operand's runtime kind (like
+    /// [`Self::lower_for_of`]'s `IsGenerator` test):
     ///
     /// ```text
-    /// let $it = iterable; let $r = $it.next();
-    /// while (!$r.done) { yield $r.value; $r = $it.next(); }
+    /// let $it = iterable;
+    /// if (IsGenerator($it)) {
+    ///   let $r = $it.next();
+    ///   while (!$r.done) { yield $r.value; $r = $it.next(); }
+    /// } else if ($it instanceof Array || typeof $it === "string") {
+    ///   let $i = 0;
+    ///   while ($i < $it.length) { yield $it[$i]; $i = $i + 1; }
+    /// } else {
+    ///   throw new TypeError("yield* operand is not iterable");
+    /// }
     /// ```
     ///
-    /// which the CFG builder then flattens (the `while` crosses the `yield`). The
-    /// operand must be a generator — `$it.next()` throws a `TypeError` otherwise
-    /// (`yield*` over an array/string awaits the general iterator protocol). The
-    /// two temporaries are generator locals (env cells), so they survive the
+    /// which the CFG builder then flattens (the loops cross the `yield`). A string
+    /// yields one character per element, as `for-of` does; the array walk re-reads
+    /// the length each step, so elements pushed during delegation are delegated
+    /// too. The temporaries are generator locals (env cells), so they survive the
     /// suspend. Only the delegate's per-value forwarding is modeled; threading the
     /// sent value / final value back through `yield*` is out of scope.
     pub(super) fn lower_yield_delegate(
@@ -151,40 +161,107 @@ impl LowerCtx<'_> {
         // generator frame (no enclosing closure references them), so any distinct
         // values work; the `@@`-prefixed names cannot collide with a user binding.
         let base = yield_expr.span.lo.0;
-        let it_name = format!("@@ys_it_{base}");
-        let r_name = format!("@@ys_r_{base}");
-        let it_local = self.declare(&it_name, true, base);
-        self.push_binding(it_local, iter_val, out);
-        let r_local = self.declare(&r_name, true, base.wrapping_add(1));
-
-        let (Some(it_res), Some(r_res)) = (self.resolve(&it_name), self.resolve(&r_name)) else {
-            unreachable!("`$it`/`$r` were just declared in this frame")
-        };
-        let (it_kind, r_kind) = (it_res.kind, r_res.kind);
-        let next_of_it = |kind: AccessKind| IrNode::GenResume {
-            handle: Box::new(Self::read_of(kind)),
+        let source = self.delegate_temp(&format!("@@ys_it_{base}"), base, iter_val, out);
+        let mut gen_body = Vec::new();
+        let step = self.delegate_temp(
+            &format!("@@ys_r_{base}"),
+            base.wrapping_add(1),
+            IrNode::Undefined,
+            &mut gen_body,
+        );
+        let mut index_body = Vec::new();
+        let cursor = self.delegate_temp(
+            &format!("@@ys_i_{base}"),
+            base.wrapping_add(2),
+            IrNode::Num(0.0),
+            &mut index_body,
+        );
+        let read = |kind: &AccessKind| Self::read_of(kind.clone());
+        let next_of_source = || IrNode::GenResume {
+            handle: Box::new(read(&source)),
             sent: Box::new(IrNode::Undefined),
         };
-        let member = |kind: AccessKind, key: &str| IrNode::Index {
-            obj: Box::new(Self::read_of(kind)),
+        let field = |kind: &AccessKind, key: &str| IrNode::Index {
+            obj: Box::new(read(kind)),
             index: Box::new(IrNode::Str(key.to_owned())),
         };
 
-        // $r = $it.next();
-        self.push_binding(r_local, next_of_it(it_kind.clone()), out);
-        // while (!$r.done) { yield $r.value; $r = $it.next(); }
-        let cond = IrNode::Not(Box::new(member(r_kind.clone(), "done")));
-        let body = vec![
-            IrStmt::Expr(IrNode::Yield(Box::new(member(r_kind.clone(), "value")))),
-            IrStmt::Expr(Self::write_of(r_kind, next_of_it(it_kind))),
-        ];
-        out.push(IrStmt::While {
-            cond,
-            body,
+        // Generator: $r = $it.next(); while (!$r.done) { yield $r.value; $r = $it.next(); }
+        gen_body.push(IrStmt::Expr(Self::write_of(step.clone(), next_of_source())));
+        gen_body.push(IrStmt::While {
+            cond: IrNode::Not(Box::new(field(&step, "done"))),
+            body: vec![
+                IrStmt::Expr(IrNode::Yield(Box::new(field(&step, "value")))),
+                IrStmt::Expr(Self::write_of(step.clone(), next_of_source())),
+            ],
             update: Vec::new(),
             label: None,
         });
+
+        // Array/string: while ($i < $it.length) { yield $it[$i]; $i = $i + 1; }
+        index_body.push(IrStmt::While {
+            cond: IrNode::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(read(&cursor)),
+                rhs: Box::new(IrNode::StrLen(Box::new(read(&source)))),
+            },
+            body: vec![
+                IrStmt::Expr(IrNode::Yield(Box::new(IrNode::Index {
+                    obj: Box::new(read(&source)),
+                    index: Box::new(read(&cursor)),
+                }))),
+                IrStmt::Expr(Self::write_of(
+                    cursor.clone(),
+                    IrNode::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(read(&cursor)),
+                        rhs: Box::new(IrNode::Num(1.0)),
+                    },
+                )),
+            ],
+            update: Vec::new(),
+            label: None,
+        });
+
+        let is_indexable = IrNode::Logical {
+            op: LogicalOp::Or,
+            lhs: Box::new(IrNode::InstanceOf {
+                value: Box::new(read(&source)),
+                kind: InstanceOfKind::Array,
+            }),
+            rhs: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::TypeOf(Box::new(read(&source)))),
+                rhs: Box::new(IrNode::Str("string".to_owned())),
+            }),
+        };
+        out.push(IrStmt::If {
+            cond: IrNode::IsGenerator(Box::new(read(&source))),
+            then_body: gen_body,
+            else_body: vec![IrStmt::If {
+                cond: is_indexable,
+                then_body: index_body,
+                else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(not_iterable_error())))],
+            }],
+        });
         Ok(())
+    }
+
+    /// Declare a `yield*` generator-local temporary named `name`, bind it to
+    /// `init` in `out`, and return its access kind.
+    fn delegate_temp(
+        &mut self,
+        name: &str,
+        id: u32,
+        init: IrNode,
+        out: &mut Vec<IrStmt>,
+    ) -> AccessKind {
+        let local = self.declare(name, true, id);
+        self.push_binding(local, init, out);
+        let Some(resolved) = self.resolve(name) else {
+            unreachable!("a `yield*` temporary was just declared in this frame")
+        };
+        resolved.kind
     }
 
     /// Lower the parameters and body of a generator into the current (already
@@ -736,4 +813,21 @@ fn node_contains_yield(node: &IrNode) -> bool {
         }
         _ => false,
     }
+}
+
+/// The `TypeError` a `yield*` over a non-iterable operand throws.
+fn not_iterable_error() -> IrNode {
+    let message = "yield* operand is not iterable";
+    IrNode::Object(vec![
+        ("name".to_owned(), IrNode::Str("TypeError".to_owned())),
+        ("message".to_owned(), IrNode::Str(message.to_owned())),
+        (
+            "stack".to_owned(),
+            IrNode::Str(format!("TypeError: {message}")),
+        ),
+        (
+            crate::abi::ERROR_KIND_KEY.to_owned(),
+            IrNode::Num(crate::abi::ERROR_KIND_TYPE),
+        ),
+    ])
 }
