@@ -339,6 +339,45 @@ fn uncaught_throw_exits_one() {
     );
 }
 
+/// An UNCAUGHT absent-property write fails the process like any uncaught
+/// `TypeError`: exit 1 with the message on stderr.
+#[test]
+fn uncaught_absent_property_write_exits_one() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "let o = {}; o.x = 1; console.log(\"unreachable\")"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert!(
+        output.status.code() == Some(1),
+        "an uncaught absent-property write must make jsc exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Uncaught TypeError: Cannot add property 'x': dynamic properties are not supported yet"
+        ),
+        "stderr should report the TypeError, got: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "nothing after the failed write should run"
+    );
+}
+
+/// The add-property `TypeError` unwinds through `finally` and nested function
+/// frames to the nearest handler.
+#[test]
+fn absent_property_write_unwinds_through_finally_and_calls() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let log=\"\"; function f(o){ try { o.x = 1; log+=\"no\" } finally { log+=\"f\" } } \
+             try { f({a:1}) } catch(e) { log+=\"|\"+e.name } log"
+        ]),
+        "f|TypeError"
+    );
+}
+
 /// Out-of-scope object method forms (getter/setter, computed method name,
 /// async/generator methods) are rejected at compile time with exit code 2 and
 /// an explanatory message.

@@ -31,6 +31,47 @@ fn array_element_assignment_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[0]; let x=(a[0]=7); x"]), "7");
 }
 
+/// Wrap `body` so the script yields `"<instanceof TypeError>|<message>"` for the
+/// error it throws (or `"none"` when it completes normally).
+fn caught(body: &str) -> String {
+    let src = format!(
+        "let r=\"none\"; try {{ {body} }} catch(e) {{ r=(e instanceof TypeError)+\"|\"+e.message }} r"
+    );
+    jsc(&["-p", &src])
+}
+
+/// Arrays do not grow by index assignment yet: an integer index at or past the
+/// length throws, any other key (non-number, negative, fractional, NaN) is an
+/// absent property and throws the add-property error. Nothing is written and
+/// in-bounds stores are unaffected.
+#[test]
+fn array_out_of_bounds_and_non_index_writes_throw() {
+    let grow = "true|Cannot grow array by index assignment yet";
+    assert_eq!(caught("let a = [1, 2]; a[2] = 3"), grow);
+    assert_eq!(caught("let a = [1, 2]; a[100] = 3"), grow);
+    assert_eq!(caught("let a = []; a[0] = 1"), grow);
+    assert_eq!(caught("let a = [1, 2, 3]; a.pop(); a[2] = 9"), grow);
+    let add = |key: &str| {
+        format!("true|Cannot add property '{key}': dynamic properties are not supported yet")
+    };
+    assert_eq!(caught("let a = [1]; a.foo = 1"), add("foo"));
+    assert_eq!(caught("let a = [1]; a[\"foo\"] = 1"), add("foo"));
+    assert_eq!(caught("let a = [1]; a[-1] = 1"), add("-1"));
+    assert_eq!(caught("let a = [1, 2]; a[0.5] = 1"), add("0.5"));
+    assert_eq!(caught("let a = [1]; a[NaN] = 1"), add("NaN"));
+    // A rejected write leaves every element and the length untouched.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a=[1,2]; try { a[2]=3 } catch(e) {} try { a[-1]=7 } catch(e) {} a"
+        ]),
+        "[ 1, 2 ]"
+    );
+    // In-bounds stores (including via compound/update forms) are unchanged.
+    assert_eq!(jsc(&["-p", "let a=[1,2]; a[1]+=5; a[0]++; a"]), "[ 2, 7 ]");
+    assert_eq!(jsc(&["-p", "let a=[1,2]; let i=1; a[i]=4; a[1]"]), "4");
+}
+
 /// `Array.prototype.push`/`pop` grow and shrink a bound array end-to-end
 /// through the CLI: the binding observes the new length and elements after growth,
 /// and `pop` returns the removed element while decrementing the length in place.

@@ -119,15 +119,17 @@ pub(super) fn build_type_and_function_sections<'a>(
         gen_to_array: obj_get_index + 29,
         // `__nullish_throw` (the nullish-receiver guard's error build) follows it.
         nullish_throw: obj_get_index + 30,
+        // `__prop_throw` (the absent-property / array-grow error build) follows it.
+        prop_throw: obj_get_index + 31,
         // `__box_f64` (the canonical-NaN number rebox) follows it.
-        box_f64: obj_get_index + 31,
+        box_f64: obj_get_index + 32,
         // `__to_number` (the shared ToNumber coercion) follows it.
-        to_number: obj_get_index + 32,
+        to_number: obj_get_index + 33,
         // The `__invoke1` callback trampoline is appended after every helper
         // above; the `__async_step` trampoline follows it, then the two
         // `new Promise` settler functions.
-        invoke1: obj_get_index + 33,
-        async_step: obj_get_index + 34,
+        invoke1: obj_get_index + 34,
+        async_step: obj_get_index + 35,
         // The settler funcref-TABLE slots sit right after the `n` user-function
         // slots (`0..n`), so slots `n` and `n + 1`. `0` when there are no functions
         // (no table — and `new Promise` cannot occur without an executor function).
@@ -170,9 +172,9 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
         helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
         // `__obj_get(obj_ptr: i32, key_ptr: i32) -> i64` and
-        // `__obj_set(obj_ptr: i32, key_ptr: i32, val: i64)`.
+        // `__obj_set(obj_ptr: i32, key_ptr: i32, val: i64) -> hit: i32`.
         helper(&[ValType::I32, ValType::I32], &[ValType::I64]);
-        helper(&[ValType::I32, ValType::I32, ValType::I64], &[]);
+        helper(&[ValType::I32, ValType::I32, ValType::I64], &[ValType::I32]);
         // `__array_push(base: i32, value: i64) -> new_base: i32`.
         helper(&[ValType::I32, ValType::I64], &[ValType::I32]);
         // `__obj_rest(obj_ptr: i32, excl_ptr: i32) -> new_base: i32`.
@@ -226,6 +228,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I64], &[ValType::I64]);
         // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
         helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
+        // `__prop_throw(key: i64, grow: i32) -> ()`.
+        helper(&[ValType::I64, ValType::I32], &[]);
         // `__box_f64(x: f64) -> i64`.
         helper(&[ValType::F64], &[ValType::I64]);
         // `__to_number(v: i64) -> i64`.
@@ -250,29 +254,29 @@ pub(super) fn build_type_and_function_sections<'a>(
     // function: `print(bits: i64, flag: i32) -> ()`,
     // `__convert(bits: i64, op: i32) -> i64`, and
     // `__method(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64`.
-    let print_type = helper_type_base + 40;
+    let print_type = helper_type_base + 41;
     types.ty().function([ValType::I64, ValType::I32], []);
-    let convert_type = helper_type_base + 41;
+    let convert_type = helper_type_base + 42;
     types
         .ty()
         .function([ValType::I64, ValType::I32], [ValType::I64]);
-    let method_type = helper_type_base + 42;
+    let method_type = helper_type_base + 43;
     types.ty().function(
         [ValType::I64, ValType::I32, ValType::I64, ValType::I64],
         [ValType::I64],
     );
     // The host promise import types: `__promise(op: i32, a: i64, b: i64) ->
     // i64` and `__then(p: i64, on_f: i64, on_r: i64) -> i64`.
-    let promise_type = helper_type_base + 43;
+    let promise_type = helper_type_base + 44;
     types
         .ty()
         .function([ValType::I32, ValType::I64, ValType::I64], [ValType::I64]);
-    let then_type = helper_type_base + 44;
+    let then_type = helper_type_base + 45;
     types
         .ty()
         .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
     // The host wall-clock import type (backing `Date`): `__now() -> f64`.
-    let now_type = helper_type_base + 45;
+    let now_type = helper_type_base + 46;
     types.ty().function([], [ValType::F64]);
 
     (
@@ -736,6 +740,7 @@ pub(super) fn collect_node<'a>(
         }
         IrNode::IndexSet { obj, index, value } => {
             seed_nullish_strs(order, seen);
+            seed_prop_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
             collect_node(value, order, seen);
@@ -744,6 +749,7 @@ pub(super) fn collect_node<'a>(
             obj, index, rhs, ..
         } => {
             seed_nullish_strs(order, seen);
+            seed_prop_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
             collect_node(rhs, order, seen);
@@ -892,6 +898,16 @@ pub(super) fn collect_node<'a>(
 /// finds their `[len][utf8]` blobs in the data segment; see [`collect_node`].
 fn seed_nullish_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
     for s in NULLISH_ERROR_STRS {
+        if seen.insert(s) {
+            order.push(s);
+        }
+    }
+}
+
+/// Seed the member-store guard's [`PROP_ERROR_STRS`] so `__prop_throw` finds
+/// their `[len][utf8]` blobs in the data segment; see [`collect_node`].
+fn seed_prop_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
+    for s in PROP_ERROR_STRS {
         if seen.insert(s) {
             order.push(s);
         }

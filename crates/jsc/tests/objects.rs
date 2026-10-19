@@ -16,15 +16,61 @@ fn object_basics_via_eval() {
     assert_eq!(jsc(&["-p", "let o={\"k\":5}; o.k"]), "5");
 }
 
-/// `o.a = v` / `o["a"] = v` store into an EXISTING key's value slot; the
-/// assignment expression evaluates to the stored value, and a missing key is a
-/// documented no-op that must not corrupt existing entries.
+/// `o.a = v` / `o["a"] = v` store into an EXISTING key's value slot and the
+/// assignment expression evaluates to the stored value.
 #[test]
 fn object_property_assignment_via_eval() {
     assert_eq!(jsc(&["-p", "let o={x:10}; o.x=42; o.x"]), "42");
     assert_eq!(jsc(&["-p", "let o={a:1}; o[\"a\"]=7; o.a"]), "7");
     assert_eq!(jsc(&["-p", "let o={a:0}; let x=(o.a=9); x"]), "9");
-    assert_eq!(jsc(&["-p", "let o={a:1}; o.b=5; o.a"]), "1");
+    assert_eq!(jsc(&["-p", "let o={a:1}; o.a+=2; o.a++; o.a"]), "4");
+}
+
+/// Wrap `body` so the script yields `"<instanceof TypeError>|<name>|<message>"`
+/// for the error it throws (or `"none"` when it completes normally).
+fn caught(body: &str) -> String {
+    let src = format!(
+        "let r=\"none\"; try {{ {body} }} catch(e) {{ r=(e instanceof TypeError)+\"|\"+e.name+\"|\"+e.message }} r"
+    );
+    jsc(&["-p", &src])
+}
+
+/// The expected [`caught`] output for writing the absent property `key`.
+fn add_property_error(key: &str) -> String {
+    format!("true|TypeError|Cannot add property '{key}': dynamic properties are not supported yet")
+}
+
+/// Objects are fixed-shape: writing a key the receiver does not own throws a
+/// catchable `TypeError` through every write form (dot, computed, compound,
+/// update), and the existing entries stay intact.
+#[test]
+fn object_absent_property_write_throws_type_error() {
+    let x = add_property_error("x");
+    assert_eq!(caught("let o = {}; o.x = 1"), x);
+    assert_eq!(caught("let o = {}; o[\"k\"] = 1"), add_property_error("k"));
+    assert_eq!(caught("let o = {a: 1}; let k = \"x\"; o[k] = 1"), x);
+    assert_eq!(caught("let o = {a: 1}; o.x += 1"), x);
+    assert_eq!(caught("let o = {a: 1}; o.x++"), x);
+    assert_eq!(
+        caught("let o = JSON.parse('{\"a\":1}'); o.b = 2"),
+        add_property_error("b")
+    );
+    assert_eq!(
+        caught("let o = {a: 1}; delete o.a; o.a = 2"),
+        add_property_error("a")
+    );
+    assert_eq!(
+        caught("var NS; (function(NS){ NS.v = 7 })(NS || (NS = {}))"),
+        add_property_error("v")
+    );
+    // The failed write leaves the object untouched.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let o={a:1}; try { o.b=5 } catch(e) {} o.a + \"|\" + o.b"
+        ]),
+        "1|undefined"
+    );
 }
 
 /// Nested arrays and objects compose — arrays and objects store full

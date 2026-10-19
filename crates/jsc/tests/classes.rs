@@ -788,3 +788,56 @@ fn class_calls_tolerate_missing_and_extra_arguments() {
         "4"
     );
 }
+
+/// Instances are fixed-shape: writing a field the constructor never set — or a
+/// method name that lives only as a data property on the prototype — throws a
+/// `TypeError`, while accessor setters keep running and get-only accessors keep
+/// silently ignoring the write.
+#[test]
+fn class_instance_absent_property_write_throws() {
+    let wrap = |body: &str| {
+        format!(
+            "let r=\"none\"; try {{ {body} }} catch(e) {{ r=(e instanceof TypeError)+\"|\"+e.message }} r"
+        )
+    };
+    let add = |key: &str| {
+        format!("true|Cannot add property '{key}': dynamic properties are not supported yet")
+    };
+    assert_eq!(
+        jsc(&[
+            "-p",
+            &wrap("class C { constructor(){ this.a = 1 } } let c = new C(); c.z = 3")
+        ]),
+        add("z")
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            &wrap("class C { m(){ return 1 } } let c = new C(); c.m = 5")
+        ]),
+        add("m")
+    );
+    // Setter still invoked; get-only accessor still ignored (no throw).
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "class C{ constructor(){this.k=0} set y(v){this.k=v+1} } let c=new C(); c.y=41; c.k"
+        ]),
+        "42"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            &wrap("class C{ get x(){return 7} } let c=new C(); c.x=99; r=c.x")
+        ]),
+        "7"
+    );
+    // With accessors in the program, a plain absent write still throws.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            &wrap("class C{ constructor(){this.k=0} set y(v){this.k=v} } let c=new C(); c.w=1")
+        ]),
+        add("w")
+    );
+}

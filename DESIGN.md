@@ -645,7 +645,7 @@ are not tracked.
   reads `undefined`.
 - **Fixed shape.** An object's key set is decided when it is allocated (an object
   literal's keys, or a class's field scan). Assignment updates existing keys;
-  assigning a key the object does not have is a silent no-op (§13). `delete`
+  assigning a key the object does not have throws a `TypeError` (§13). `delete`
   removes keys.
 - **Destructuring.** Array patterns (holes, defaults, rest, nesting) and object
   patterns (rename, defaults, nesting, rest via `__obj_rest`) in declarations
@@ -886,10 +886,10 @@ Errors are printed to stderr.
 
   | commit | pass | eligible | total |
   |---|---|---|---|
-  | `67d7221` | 5230 | 22992 | 47665 |
+  | `5a97d3c` | 5195 | 22992 | 47665 |
 
-  i.e. **5230 / 22992 eligible tests pass (≈ 22.7 %)**, out of 47665 tests in the
-  pinned checkout; `baseline.txt` holds the same 5230 paths.
+  i.e. **5195 / 22992 eligible tests pass (≈ 22.6 %)**, out of 47665 tests in the
+  pinned checkout; `baseline.txt` holds the same 5195 paths.
 
 **Running it** (from the repository root):
 
@@ -1033,10 +1033,14 @@ Each item below is current behaviour of this tree.
 **Object model**
 
 - Objects are fixed-shape: computed keys (`{[k]: v}`) and numeric literal keys
-  are rejected, and assigning a property the object was not allocated with is a
-  silent no-op (`let o = {}; o.k = 1; o.k` is `undefined`).
-- Array assignment past the end does not grow the array (`a[5] = 2` on a
-  one-element array is ignored); `.length` is read-only.
+  are rejected, and writing a property the object was not allocated with throws
+  a `TypeError` (`let o = {}; o.k = 1` throws `Cannot add property 'k': dynamic
+  properties are not supported yet`). Dynamic properties arrive with the wave-2
+  object model.
+- Array assignment past the end throws a `TypeError` (`a[5] = 2` on a
+  one-element array throws `Cannot grow array by index assignment yet`); a
+  non-index key (`a.foo = 1`, `a[-1] = 1`) throws the add-property error;
+  `.length` is read-only.
 - A named property read on a string receiver goes through index dispatch rather
   than returning `undefined` (`"abc".foo` reads a character).
 - Built-in prototypes are not modelled: there is no generic method lookup, so
