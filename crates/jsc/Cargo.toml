@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 jsc-core = { path = "../jsc-core" }
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+clap = { version = "4.6.7", features = ["derive"] }
+anyhow = "1.0.104"
 
 [lints]
 workspace = true

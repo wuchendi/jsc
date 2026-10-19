@@ -14,15 +14,15 @@ default = ["native-run"]
 native-run = ["dep:wasmtime"]
 
 [dependencies]
-anyhow          = "1"
+anyhow          = "1.0.104"
 swc_common      = "24"
 swc_ecma_ast    = "26"
 swc_ecma_parser = "42"
-wasm-encoder    = "0.253"
+wasm-encoder    = "0.262.0"
 wasmtime        = { version = "49.0.3", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
 
 [dev-dependencies]
-wasmparser = "0.253"
+wasmparser = "0.262.0"
 
 [lints]
 workspace = true
