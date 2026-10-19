@@ -1008,7 +1008,8 @@ Each item below is current behaviour of this tree.
 - TDZ is enforced only for module cells; reading a block-scoped binding before
   its declaration inside the same function reads the earlier binding or
   `undefined` instead of throwing.
-- `-p` completion values come from expression statements only (§7.3).
+- `-p` completion values come from expression statements and `try`
+  statements; `switch` and loops contribute none.
 
 **Values & operators**
 
@@ -1048,12 +1049,14 @@ Each item below is current behaviour of this tree.
 
 **Functions & classes**
 
+- Destructuring assignment works only as an expression statement or a
+  pattern `for-of` head (`for ([a] of xs)`); it is rejected in expression
+  position (`x = [a] = b`), and a bare-identifier head (`for (a of xs)`) is
+  rejected.
 - Arrows do not capture lexical `this`; an arrow sees the `this` of the call
   that invoked it (usually `undefined`).
 - Closures created in a C-style `for (let i …)` loop share one `i` binding
   rather than capturing a per-iteration copy.
-- Function declarations nested inside another function are not hoisted and
-  cannot call themselves by name.
 - A spread call delivers at most `K` arguments (the program's maximum declared
   arity or call-site argument count); surplus spread elements are dropped.
 - `array.push` takes exactly one argument; `reduce` requires an initial value.
@@ -1065,13 +1068,14 @@ Each item below is current behaviour of this tree.
 **Generators & async**
 
 - Generators and async functions must be top-level declarations: no nested
-  declarations, expressions, arrows, or methods; no `async function*`.
+  generator/async declarations, expressions, arrows, or methods; no
+  `async function*`.
 - `yield`/`await` are not allowed inside `try`/`catch`/`finally`, inside
   `switch`, in a loop or `if` condition, nested inside a larger expression, or in
-  the body of a `for-of`/`for-in` inside a generator; generator bodies cannot
-  contain nested closures; parameters must be simple identifiers.
+  the body of a `for-of`/`for-in` inside a generator; parameters must be simple
+  identifiers.
 - `.return()` / `.throw()` on generators are not available; `yield*` delegates
-  only to generators.
+  to arrays, strings and generators but does not thread sent or return values.
 - No `Promise.all` / `race` / `allSettled` / `any`; no thenable assimilation of
   non-promise objects.
 
