@@ -292,3 +292,85 @@ fn user_next_and_then_methods_via_eval() {
         "2"
     );
 }
+
+/// Nested function declarations are hoisted to the top of their enclosing
+/// function body (or block): callable and readable as a value before their
+/// textual position, mutually recursive with sibling declarations, recursive by
+/// their own name, and able to capture enclosing bindings declared later.
+#[test]
+fn nested_function_declarations_are_hoisted() {
+    // Call before the declaration.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ return h(); function h(){ return 3 } } console.log(f())"
+        ]),
+        "3"
+    );
+    // Mutual recursion between sibling nested declarations.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(n){ return even(n); function even(k){ return k===0 ? true : odd(k-1) } \
+             function odd(k){ return k===0 ? false : even(k-1) } } console.log(f(10))"
+        ]),
+        "true"
+    );
+    // Referenced as a value before the declaration.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ const g = h; return g(); function h(){ return 'v' } } console.log(f())"
+        ]),
+        "v"
+    );
+    // Captures a `let` declared after the use site, read after its initialization.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ let r = h; let x = 5; return r(); function h(){ return x } } \
+             console.log(f())"
+        ]),
+        "5"
+    );
+    // Block-level declaration hoists to the top of its block.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ { return h(); function h(){ return 1 } } } console.log(f())"
+        ]),
+        "1"
+    );
+    // Inside an arrow body.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const a = () => { return h(); function h(){ return 2 } }; console.log(a())"
+        ]),
+        "2"
+    );
+    // A hoisted nested declaration recurses through its own name.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ return fact(5); function fact(n){ return n <= 1 ? 1 : n * fact(n-1) } } \
+             console.log(f())"
+        ]),
+        "120"
+    );
+    // A hoisted declaration in a loop body sees that iteration's bindings.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ let s = 0; for (let i = 0; i < 3; i++) { s += g(); let k = i * 10; \
+             function g(){ return i } } return s } console.log(f())"
+        ]),
+        "3"
+    );
+    // A hoisted declaration in a top-level `try` block leaves the block's
+    // completion value to its last expression statement.
+    assert_eq!(
+        jsc(&["-p", "try { f(); function f(){} 5 } catch (e) {}"]),
+        "5"
+    );
+}

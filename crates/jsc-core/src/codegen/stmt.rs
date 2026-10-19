@@ -9,6 +9,21 @@ impl LowerCtx<'_> {
     /// Lower one statement, appending the resulting [`IrStmt`](s) to `out`.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt, out: &mut Vec<IrStmt>) -> anyhow::Result<()> {
+        // Inside a tracked top-level `try`, a compound statement completes with
+        // `undefined` when its body produces no value (UpdateEmpty).
+        if matches!(
+            stmt,
+            Stmt::If(_)
+                | Stmt::While(_)
+                | Stmt::DoWhile(_)
+                | Stmt::For(_)
+                | Stmt::ForOf(_)
+                | Stmt::ForIn(_)
+                | Stmt::Labeled(_)
+                | Stmt::Switch(_)
+        ) {
+            self.reset_completion(out);
+        }
         match stmt {
             Stmt::Expr(expr_stmt) => {
                 // `yield* iterable;` delegates to an inner generator: it
@@ -18,14 +33,30 @@ impl LowerCtx<'_> {
                 {
                     return self.lower_yield_delegate(yield_expr, out);
                 }
-                out.push(IrStmt::Expr(self.lower_expr(&expr_stmt.expr)?));
+                // `[a, o.b] = rhs;` / `({k: o.p} = rhs);` desugars to a sequence of
+                // statements, so it is lowered here rather than as an expression.
+                if let Expr::Assign(assign) = strip_parens(&expr_stmt.expr)
+                    && assign.op == AssignOp::Assign
+                    && let AssignTarget::Pat(pat) = &assign.left
+                {
+                    return self.lower_destructuring_assign(pat, &assign.right, out);
+                }
+                let value = self.lower_expr(&expr_stmt.expr)?;
+                out.push(IrStmt::Expr(match self.completion_local() {
+                    Some(local) => IrNode::Assign {
+                        local,
+                        value: Box::new(value),
+                    },
+                    None => value,
+                }));
                 Ok(())
             }
             // `let`/`const`/`var` declarations. An uninitialized `let x;` binds
             // `undefined` (a `const` with no initializer is a parser error).
             Stmt::Decl(Decl::Var(var_decl)) => self.lower_var_decl(var_decl, out),
-            // A nested `function foo(){ .. }` declaration lowers to a first-class
-            // function value bound to `foo` in the current scope.
+            // A nested `function foo(){ .. }` declaration reached outside a
+            // hoisting statement list (see `lower_stmts`) lowers in place to a
+            // first-class function value bound to `foo` in the current scope.
             Stmt::Decl(Decl::Fn(fn_decl)) => self.lower_nested_fn_decl(fn_decl, out),
             // A `class A { constructor(..){ .. } }` declaration lowers to a
             // class value (constructor function + shared prototype) bound to `A`.
@@ -36,12 +67,7 @@ impl LowerCtx<'_> {
             // the block. Inner bindings shadow outer ones and do not leak out.
             Stmt::Block(block) => {
                 self.push_scope();
-                let result = (|| {
-                    for inner in &block.stmts {
-                        self.lower_stmt(inner, out)?;
-                    }
-                    Ok(())
-                })();
+                let result = self.lower_stmts(&block.stmts, out);
                 self.pop_scope();
                 result
             }
@@ -110,6 +136,110 @@ impl LowerCtx<'_> {
             // English rather than leaking the raw swc AST debug form.
             other => Err(CompileError::spanned(other.span(), unsupported_stmt_msg(other)).into()),
         }
+    }
+
+    /// Lower a function body or block statement list into `out`, hoisting its
+    /// function declarations: every declaration is bound and initialized before
+    /// any statement of the list runs, so it can be called or read before its
+    /// textual position, recurse through its own name, and be mutually
+    /// recursive with its siblings.
+    ///
+    /// The declaration names are bound first (so the statements resolve them),
+    /// then the other statements are lowered, and only then the declaration
+    /// bodies — once every binding of the list is declared, so a body may
+    /// capture a `let`/`const` declared later. Such a captured binding's cell is
+    /// created up front (holding `undefined` until its declaration runs) so the
+    /// hoisted closures share it; its declaration then stores into that cell.
+    ///
+    /// A generator (`env_backed`) frame keeps the in-order lowering.
+    pub(super) fn lower_stmts(
+        &mut self,
+        stmts: &[Stmt],
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let fns: Vec<&FnDecl> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Decl(Decl::Fn(f)) => Some(f),
+                _ => None,
+            })
+            .collect();
+        if fns.is_empty() || self.frame().env_backed {
+            for stmt in stmts {
+                self.lower_stmt(stmt, out)?;
+            }
+            return Ok(());
+        }
+        let mut prefix = Vec::new();
+        let fn_locals: Vec<u32> = fns
+            .iter()
+            .map(|f| self.declare(f.ident.sym.as_ref(), true, f.ident.span.lo.0))
+            .collect();
+        for &local in &fn_locals {
+            if self.is_cell(local) {
+                prefix.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(IrNode::Undefined)),
+                });
+            }
+        }
+        let mut rest = Vec::new();
+        for stmt in stmts {
+            if !matches!(stmt, Stmt::Decl(Decl::Fn(_))) {
+                self.lower_stmt(stmt, &mut rest)?;
+            }
+        }
+        // Hoist the cell of every captured binding the list declares: create it
+        // in the prefix and turn its declaration into a store into that cell.
+        for local in self.innermost_cell_locals() {
+            if fn_locals.contains(&local) {
+                continue;
+            }
+            for stmt in &mut rest {
+                let IrStmt::Decl {
+                    local: decl_local,
+                    init: IrNode::CellNew(value),
+                } = stmt
+                else {
+                    continue;
+                };
+                if *decl_local != local {
+                    continue;
+                }
+                let value = std::mem::replace(value.as_mut(), IrNode::Undefined);
+                *stmt = IrStmt::Decl {
+                    local: self.fresh(),
+                    init: IrNode::CellSet {
+                        cell: Box::new(IrNode::Local(local)),
+                        value: Box::new(value),
+                    },
+                };
+                prefix.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(IrNode::Undefined)),
+                });
+                break;
+            }
+        }
+        for (fn_decl, local) in fns.into_iter().zip(fn_locals) {
+            let value = self.lower_nested_fn_value(fn_decl)?;
+            // A store into the pre-created cell is bound as a `Decl` of a
+            // scratch local so it never becomes `main`'s completion value.
+            prefix.push(if self.is_cell(local) {
+                IrStmt::Decl {
+                    local: self.fresh(),
+                    init: IrNode::CellSet {
+                        cell: Box::new(IrNode::Local(local)),
+                        value: Box::new(value),
+                    },
+                }
+            } else {
+                IrStmt::Decl { local, init: value }
+            });
+        }
+        out.extend(prefix);
+        out.extend(rest);
+        Ok(())
     }
 
     /// Lower a `let`/`const`/`var` declaration. A declarator with no initializer
@@ -761,6 +891,14 @@ impl LowerCtx<'_> {
         mutable: bool,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
+        let rest = self.collect_array_rest(temp, start, out);
+        self.lower_binding_pattern(target, IrNode::Local(rest), mutable, out)
+    }
+
+    /// Emit the loop collecting `temp[start..temp.length]` into a fresh array
+    /// local and return that local (shared by rest bindings and rest assignment
+    /// targets).
+    fn collect_array_rest(&mut self, temp: u32, start: usize, out: &mut Vec<IrStmt>) -> u32 {
         // The rest array grows via `push`, so it must be a plain local.
         let rest = self.fresh();
         out.push(IrStmt::Decl {
@@ -798,7 +936,284 @@ impl LowerCtx<'_> {
             update,
             label: None,
         });
-        self.lower_binding_pattern(target, IrNode::Local(rest), mutable, out)
+        rest
+    }
+
+    /// Lower a destructuring ASSIGNMENT statement `pattern = rhs` (object or array
+    /// assignment pattern). The RHS is evaluated once into a hidden temp, each
+    /// target is assigned in source order, and the statement's value is the RHS.
+    fn lower_destructuring_assign(
+        &mut self,
+        pat: &AssignTargetPat,
+        rhs: &Expr,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let init = self.lower_expr(rhs)?;
+        let temp = self.fresh();
+        out.push(IrStmt::Decl { local: temp, init });
+        match pat {
+            AssignTargetPat::Array(arr) => self.assign_array_pat(arr, temp, out)?,
+            AssignTargetPat::Object(obj) => self.assign_object_pat(obj, temp, out)?,
+            AssignTargetPat::Invalid(invalid) => {
+                return Err(
+                    CompileError::spanned(invalid.span(), "invalid assignment target").into(),
+                );
+            }
+        }
+        // The statement's value is the RHS (stored into a tracked completion).
+        out.push(IrStmt::Expr(match self.completion_local() {
+            Some(local) => IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Local(temp)),
+            },
+            None => IrNode::Local(temp),
+        }));
+        Ok(())
+    }
+
+    /// Assign `value` to a destructuring-assignment `target`: a nested pattern
+    /// recurses through a hidden temp; a simple target (identifier or member) is
+    /// resolved and written.
+    fn assign_to_target(
+        &mut self,
+        target: &Pat,
+        value: IrNode,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        match target {
+            Pat::Array(arr) => {
+                let temp = self.fresh();
+                out.push(IrStmt::Decl {
+                    local: temp,
+                    init: value,
+                });
+                self.assign_array_pat(arr, temp, out)
+            }
+            Pat::Object(obj) => {
+                let temp = self.fresh();
+                out.push(IrStmt::Decl {
+                    local: temp,
+                    init: value,
+                });
+                self.assign_object_pat(obj, temp, out)
+            }
+            _ => {
+                let target = self.prepare_assign_ref(target, out)?;
+                out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
+                Ok(())
+            }
+        }
+    }
+
+    /// Assign each element of an array assignment pattern from `temp[i]`; a hole
+    /// skips its index and a trailing rest collects the remaining elements.
+    fn assign_array_pat(
+        &mut self,
+        arr: &ArrayPat,
+        temp: u32,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        for (i, elem) in arr.elems.iter().enumerate() {
+            let Some(elem) = elem else { continue };
+            if let Pat::Rest(rest) = elem {
+                self.assign_element(&rest.arg, out, |this, out| {
+                    IrNode::Local(this.collect_array_rest(temp, i, out))
+                })?;
+                continue;
+            }
+            self.assign_element(elem, out, |_, _| IrNode::Index {
+                obj: Box::new(IrNode::Local(temp)),
+                index: Box::new(index_num(i)),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Assign each property of an object assignment pattern from `temp.key`; a
+    /// trailing rest collects every remaining own key into a new object.
+    fn assign_object_pat(
+        &mut self,
+        obj: &ObjectPat,
+        temp: u32,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let read = |key: &str| IrNode::Index {
+            obj: Box::new(IrNode::Local(temp)),
+            index: Box::new(IrNode::Str(key.to_owned())),
+        };
+        let mut bound_keys: Vec<String> = Vec::new();
+        for prop in &obj.props {
+            match prop {
+                ObjectPatProp::KeyValue(kv) => {
+                    let key = prop_key_name(&kv.key)?;
+                    let value = read(&key);
+                    bound_keys.push(key);
+                    self.assign_element(&kv.value, out, |_, _| value)?;
+                }
+                // Shorthand `{x}` / `{x = 7}` assigns the binding named by the key.
+                ObjectPatProp::Assign(assign) => {
+                    let key = assign.key.id.sym.as_ref().to_owned();
+                    let target = self.assignable_binding(&assign.key.id)?;
+                    let value = self.apply_default(read(&key), assign.value.as_deref(), out)?;
+                    bound_keys.push(key);
+                    out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
+                }
+                ObjectPatProp::Rest(rest) => {
+                    let exclude =
+                        IrNode::Array(bound_keys.iter().cloned().map(IrNode::Str).collect());
+                    self.assign_element(&rest.arg, out, |_, _| IrNode::ObjectRest {
+                        source: Box::new(IrNode::Local(temp)),
+                        exclude: Box::new(exclude),
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Assign one pattern element (optionally `target = default`) from the value
+    /// produced by `fetch`. A simple target's reference (member object, then key)
+    /// is evaluated BEFORE the value is fetched, matching JS evaluation order.
+    fn assign_element(
+        &mut self,
+        target: &Pat,
+        out: &mut Vec<IrStmt>,
+        fetch: impl FnOnce(&mut Self, &mut Vec<IrStmt>) -> IrNode,
+    ) -> anyhow::Result<()> {
+        let (target, default) = match target {
+            Pat::Assign(assign) => (assign.left.as_ref(), Some(assign.right.as_ref())),
+            other => (other, None),
+        };
+        if matches!(target, Pat::Array(_) | Pat::Object(_)) {
+            let read = fetch(self, out);
+            let value = self.apply_default(read, default, out)?;
+            return self.assign_to_target(target, value, out);
+        }
+        let target = self.prepare_assign_ref(target, out)?;
+        let read = fetch(self, out);
+        let value = self.apply_default(read, default, out)?;
+        out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
+        Ok(())
+    }
+
+    /// Apply an optional destructuring default: `read` is stashed once and the
+    /// default replaces it only when it is `undefined`. The result is stashed in
+    /// a temp too, so a `yield` in the default sits in a declaration (which the
+    /// generator segmentation diagnoses) rather than inside a member store.
+    fn apply_default(
+        &mut self,
+        read: IrNode,
+        default: Option<&Expr>,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<IrNode> {
+        let Some(default) = default else {
+            return Ok(read);
+        };
+        let value = self.fresh();
+        out.push(IrStmt::Decl {
+            local: value,
+            init: read,
+        });
+        let default = self.lower_expr(default)?;
+        let result = self.fresh();
+        out.push(IrStmt::Decl {
+            local: result,
+            init: IrNode::Ternary {
+                cond: Box::new(IrNode::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(IrNode::Local(value)),
+                    rhs: Box::new(IrNode::Undefined),
+                }),
+                then_branch: Box::new(default),
+                else_branch: Box::new(IrNode::Local(value)),
+            },
+        });
+        Ok(IrNode::Local(result))
+    }
+
+    /// Evaluate the reference of a simple destructuring-assignment target: an
+    /// assignable binding, or a member whose object (and computed key) are
+    /// stashed in hidden temps so they run exactly once, before the value.
+    fn prepare_assign_ref(
+        &mut self,
+        target: &Pat,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<AssignRef> {
+        let expr = match target {
+            Pat::Ident(ident) => return self.assignable_binding(&ident.id),
+            Pat::Expr(expr) => strip_parens(expr),
+            other => {
+                return Err(CompileError::spanned(
+                    other.span(),
+                    "unsupported destructuring assignment target",
+                )
+                .into());
+            }
+        };
+        match expr {
+            Expr::Ident(ident) => self.assignable_binding(ident),
+            Expr::Member(m) => {
+                let init = self.lower_expr(&m.obj)?;
+                let obj = self.fresh();
+                out.push(IrStmt::Decl { local: obj, init });
+                let key = match &m.prop {
+                    MemberProp::Computed(c) => {
+                        let init = self.lower_expr(&c.expr)?;
+                        let key = self.fresh();
+                        out.push(IrStmt::Decl { local: key, init });
+                        IrNode::Local(key)
+                    }
+                    MemberProp::Ident(id) if id.sym.as_ref() != "length" => {
+                        IrNode::Str(id.sym.as_ref().to_owned())
+                    }
+                    _ => {
+                        return Err(CompileError::spanned(
+                            m.span(),
+                            "unsupported assignment target",
+                        )
+                        .into());
+                    }
+                };
+                Ok(AssignRef::Member { obj, key })
+            }
+            other => Err(CompileError::spanned(
+                other.span(),
+                "unsupported destructuring assignment target",
+            )
+            .into()),
+        }
+    }
+
+    /// Resolve `ident` as an assignable (declared, non-`const`) binding.
+    fn assignable_binding(&mut self, ident: &Ident) -> anyhow::Result<AssignRef> {
+        let name = ident.sym.as_ref();
+        let Some(resolved) = self.resolve(name) else {
+            return Err(CompileError::spanned(
+                ident.span(),
+                format!("undeclared variable: {name}"),
+            )
+            .into());
+        };
+        if !resolved.mutable {
+            return Err(CompileError::spanned(
+                ident.span(),
+                format!("cannot assign to constant binding: {name}"),
+            )
+            .into());
+        }
+        Ok(AssignRef::Binding(resolved.kind))
+    }
+
+    /// The store of `value` into a prepared assignment reference.
+    fn write_assign_ref(target: AssignRef, value: IrNode) -> IrNode {
+        match target {
+            AssignRef::Binding(kind) => Self::write_of(kind, value),
+            AssignRef::Member { obj, key } => IrNode::IndexSet {
+                obj: Box::new(IrNode::Local(obj)),
+                index: Box::new(key),
+                value: Box::new(value),
+            },
+        }
     }
 
     /// Lower a `switch (disc) { case E: .. default: .. }` statement. The
@@ -857,16 +1272,39 @@ impl LowerCtx<'_> {
             return Err(anyhow!("try without catch or finally"));
         }
 
+        // The completion value (for `-p`): a top-level `try` in `main` opens a
+        // completion local that every expression statement of its block and catch
+        // clause stores into; it is reset to `undefined` on entry (an empty `try`
+        // yields `undefined`) and pushed as `main`'s value after the statement.
+        let outermost =
+            self.main_ctx && self.frames.len() == 1 && self.shared.completion.get().is_none();
+        if outermost {
+            let local = self.fresh();
+            self.shared.completion.set(Some(local));
+        }
+        self.reset_completion(out);
+        let result = self.lower_try_clauses(try_stmt, out);
+        if outermost
+            && let Some(local) = self.shared.completion.take()
+            && result.is_ok()
+        {
+            out.push(IrStmt::Expr(IrNode::Local(local)));
+        }
+        result
+    }
+
+    /// Lower the clauses of a `try` statement (see [`Self::lower_try`]) and push
+    /// the resulting [`IrStmt::Try`].
+    fn lower_try_clauses(
+        &mut self,
+        try_stmt: &swc_ecma_ast::TryStmt,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
         // The guarded block: its own lexical scope, statements lowered inline
         // (blocks share the function's wasm locals, like `Stmt::Block`).
         self.push_scope();
         let mut body = Vec::new();
-        let body_result = (|| -> anyhow::Result<()> {
-            for inner in &try_stmt.block.stmts {
-                self.lower_stmt(inner, &mut body)?;
-            }
-            Ok(())
-        })();
+        let body_result = self.lower_stmts(&try_stmt.block.stmts, &mut body);
         self.pop_scope();
         body_result?;
 
@@ -890,10 +1328,9 @@ impl LowerCtx<'_> {
                         // the parameter is captured (mirrors a captured `let`).
                         self.push_binding(local, IrNode::ExcValue, &mut catch_body);
                     }
-                    for inner in &handler.body.stmts {
-                        self.lower_stmt(inner, &mut catch_body)?;
-                    }
-                    Ok(())
+                    // The catch clause's value replaces the guarded block's.
+                    self.reset_completion(&mut catch_body);
+                    self.lower_stmts(&handler.body.stmts, &mut catch_body)
                 })();
                 self.pop_scope();
                 catch_result?;
@@ -903,16 +1340,14 @@ impl LowerCtx<'_> {
         };
 
         // The finally clause (when present): its own lexical scope, like the body.
+        // Its value is discarded, so completion tracking is suspended inside it.
         let finally_body = match &try_stmt.finalizer {
             Some(block) => {
                 self.push_scope();
+                let completion = self.shared.completion.take();
                 let mut finally_body = Vec::new();
-                let finally_result = (|| -> anyhow::Result<()> {
-                    for inner in &block.stmts {
-                        self.lower_stmt(inner, &mut finally_body)?;
-                    }
-                    Ok(())
-                })();
+                let finally_result = self.lower_stmts(&block.stmts, &mut finally_body);
+                self.shared.completion.set(completion);
                 self.pop_scope();
                 finally_result?;
                 Some(finally_body)
@@ -926,6 +1361,27 @@ impl LowerCtx<'_> {
             finally_body,
         });
         Ok(())
+    }
+
+    /// The `main` local the current expression statement's completion value is
+    /// stored into: set only inside a top-level `try` (see [`Self::lower_try`])
+    /// and only in `main`'s own frame — a nested function body never writes it.
+    fn completion_local(&self) -> Option<u32> {
+        if self.main_ctx && self.frames.len() == 1 {
+            self.shared.completion.get()
+        } else {
+            None
+        }
+    }
+
+    /// Reset the tracked completion value to `undefined` (a no-op when untracked).
+    fn reset_completion(&self, out: &mut Vec<IrStmt>) {
+        if let Some(local) = self.completion_local() {
+            out.push(IrStmt::Expr(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Undefined),
+            }));
+        }
     }
 
     /// Lower a `while (cond) body`. `label`, when `Some`, is the loop id that a
@@ -1138,9 +1594,10 @@ impl LowerCtx<'_> {
     /// it (mirroring [`Self::lower_for`]). The `for-of` head opens a lexical
     /// scope, so the binding is not visible after the loop.
     ///
-    /// Only `const`/`let` single-identifier heads over arrays/strings are
-    /// supported; a destructuring/assignment head, `for await`, or `using` head is
-    /// a spanned error.
+    /// The head is a `const`/`let` single-identifier binding, or a member /
+    /// destructuring assignment target (`o.x`, `[o.a, b]`) written each
+    /// iteration; a bare identifier assignment head, a declared destructuring
+    /// pattern, `for await`, or a `using` head is a spanned error.
     fn lower_for_of(
         &mut self,
         for_of: &swc_ecma_ast::ForOfStmt,
@@ -1152,8 +1609,9 @@ impl LowerCtx<'_> {
                 CompileError::spanned(for_of.span(), "for-await-of is not supported").into(),
             );
         }
-        // The head must declare a single `const`/`let` identifier binding.
-        let (ident, mutable) = match &for_of.left {
+        // The head declares a single `const`/`let` identifier binding, or is a
+        // member / destructuring assignment target (`o.x`, `[o.a, o.b]`).
+        let head = match &for_of.left {
             ForHead::VarDecl(var_decl) => {
                 let [declarator] = var_decl.decls.as_slice() else {
                     return Err(CompileError::spanned(
@@ -1169,8 +1627,10 @@ impl LowerCtx<'_> {
                     )
                     .into());
                 };
-                (ident, var_decl.kind != VarDeclKind::Const)
+                ForOfHead::Decl(ident, var_decl.kind != VarDeclKind::Const)
             }
+            // A bare identifier head (`for (x of ..)`) stays rejected.
+            ForHead::Pat(pat) if !is_ident_target(pat) => ForOfHead::Assign(pat),
             other => {
                 return Err(CompileError::spanned(
                     other.span(),
@@ -1205,10 +1665,8 @@ impl LowerCtx<'_> {
                 local: iter_local,
                 init: iter,
             });
-            let gen_body =
-                self.lower_for_of_generator(ident, mutable, iter_local, &for_of.body, label)?;
-            let index_body =
-                self.lower_for_of_index(ident, mutable, iter_local, &for_of.body, label)?;
+            let gen_body = self.lower_for_of_generator(head, iter_local, &for_of.body, label)?;
+            let index_body = self.lower_for_of_index(head, iter_local, &for_of.body, label)?;
             out.push(IrStmt::If {
                 cond: IrNode::IsGenerator(Box::new(IrNode::Local(iter_local))),
                 then_body: gen_body,
@@ -1226,8 +1684,7 @@ impl LowerCtx<'_> {
     /// so a `continue` still advances it. Returns the branch statements.
     fn lower_for_of_index(
         &mut self,
-        ident: &swc_ecma_ast::BindingIdent,
-        mutable: bool,
+        head: ForOfHead<'_>,
         iter_local: u32,
         for_body: &Stmt,
         label: Option<u32>,
@@ -1248,7 +1705,7 @@ impl LowerCtx<'_> {
             lhs: Box::new(IrNode::Local(idx_local)),
             rhs: Box::new(IrNode::Local(len_local)),
         };
-        let local = self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident));
+        let target = self.declare_for_of_head(head);
         self.breakable_inc();
         self.loopable_inc();
         let mut body = Vec::new();
@@ -1256,8 +1713,8 @@ impl LowerCtx<'_> {
             obj: Box::new(IrNode::Local(iter_local)),
             index: Box::new(IrNode::Local(idx_local)),
         };
-        self.push_binding(local, elem, &mut body);
-        self.lower_stmt(for_body, &mut body)?;
+        self.bind_for_of_target(target, elem, &mut body)?;
+        self.lower_for_of_body(for_body, &mut body)?;
         self.loopable_dec();
         self.breakable_dec();
         let update = vec![IrStmt::Expr(IrNode::Assign {
@@ -1288,8 +1745,7 @@ impl LowerCtx<'_> {
     /// — with `$r` refreshed in the loop's `update` slot so a `continue` advances it.
     fn lower_for_of_generator(
         &mut self,
-        ident: &swc_ecma_ast::BindingIdent,
-        mutable: bool,
+        head: ForOfHead<'_>,
         iter_local: u32,
         for_body: &Stmt,
         label: Option<u32>,
@@ -1308,7 +1764,7 @@ impl LowerCtx<'_> {
             local: r_local,
             init: next(),
         });
-        let local = self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident));
+        let target = self.declare_for_of_head(head);
         self.breakable_inc();
         self.loopable_inc();
         let mut body = Vec::new();
@@ -1317,8 +1773,8 @@ impl LowerCtx<'_> {
             then_body: vec![IrStmt::Break(None)],
             else_body: Vec::new(),
         });
-        self.push_binding(local, member(r_local, "value"), &mut body);
-        self.lower_stmt(for_body, &mut body)?;
+        self.bind_for_of_target(target, member(r_local, "value"), &mut body)?;
+        self.lower_for_of_body(for_body, &mut body)?;
         self.loopable_dec();
         self.breakable_dec();
         out.push(IrStmt::While {
@@ -1331,6 +1787,42 @@ impl LowerCtx<'_> {
             label,
         });
         Ok(out)
+    }
+
+    /// Lower a `for-of` body; an empty body (`for (o.x of xs);`) lowers to
+    /// nothing.
+    fn lower_for_of_body(&mut self, for_body: &Stmt, body: &mut Vec<IrStmt>) -> anyhow::Result<()> {
+        if matches!(for_body, Stmt::Empty(_)) {
+            return Ok(());
+        }
+        self.lower_stmt(for_body, body)
+    }
+
+    /// Declare a `for-of` head's loop binding; an assignment head declares nothing.
+    fn declare_for_of_head<'a>(&mut self, head: ForOfHead<'a>) -> ForOfTarget<'a> {
+        match head {
+            ForOfHead::Decl(ident, mutable) => {
+                ForOfTarget::Local(self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident)))
+            }
+            ForOfHead::Assign(pat) => ForOfTarget::Assign(pat),
+        }
+    }
+
+    /// Bind (or assign) the current element `elem` to a `for-of` target as the
+    /// first body statement(s).
+    fn bind_for_of_target(
+        &mut self,
+        target: ForOfTarget<'_>,
+        elem: IrNode,
+        body: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        match target {
+            ForOfTarget::Local(local) => {
+                self.push_binding(local, elem, body);
+                Ok(())
+            }
+            ForOfTarget::Assign(pat) => self.assign_to_target(pat, elem, body),
+        }
     }
 
     /// Lower a `for (const k in EXPR) body` over an object's own enumerable keys,
@@ -1520,6 +2012,40 @@ fn prop_key_name(key: &PropName) -> anyhow::Result<String> {
 
 /// A non-negative array index `i` as an [`IrNode::Num`], converted losslessly
 /// (avoiding a precision-losing `as f64` cast).
+/// The evaluated reference of a simple destructuring-assignment target.
+enum AssignRef {
+    /// An assignable binding.
+    Binding(AccessKind),
+    /// A member `obj[key]`: the object stashed in a local, the key either a
+    /// static string or a stashed local.
+    Member { obj: u32, key: IrNode },
+}
+
+/// The head of a `for-of` loop: a fresh `const`/`let` binding (with its
+/// mutability), or an assignment target written each iteration.
+#[derive(Clone, Copy)]
+enum ForOfHead<'a> {
+    Decl(&'a swc_ecma_ast::BindingIdent, bool),
+    Assign(&'a Pat),
+}
+
+/// A declared `for-of` head: the per-iteration binding local, or the
+/// assignment target.
+#[derive(Clone, Copy)]
+enum ForOfTarget<'a> {
+    Local(u32),
+    Assign(&'a Pat),
+}
+
+/// Whether an assignment-target pattern is a bare identifier (`x` / `(x)`).
+fn is_ident_target(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ident(_) => true,
+        Pat::Expr(expr) => matches!(strip_parens(expr), Expr::Ident(_)),
+        _ => false,
+    }
+}
+
 fn index_num(i: usize) -> IrNode {
     IrNode::Num(f64::from(u32::try_from(i).unwrap_or(u32::MAX)))
 }

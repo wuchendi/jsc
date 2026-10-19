@@ -79,6 +79,34 @@ fn print_prints_completion_value() {
     assert_eq!(jsc_raw_stdout(&["-p", "console.log(1); 2"]), "1\n2\n");
 }
 
+/// A `try` statement's completion value is its block's (or, after a throw, its
+/// catch clause's) value; a `finally` value is discarded, and an empty `try`
+/// yields `undefined` (`UpdateEmpty`), overriding an earlier statement's value.
+#[test]
+fn print_try_completion_value() {
+    for (src, expected) in [
+        ("try { 1 } catch (e) {}", "1"),
+        ("try { throw 1 } catch (e) { 2 }", "2"),
+        ("try { 1 } finally { 3 }", "1"),
+        ("try { throw 0 } catch (e) { 2 } finally { 3 }", "2"),
+        ("1; try {} catch (e) {}", "undefined"),
+        ("try { 1; 2 } catch (e) {}", "2"),
+        ("try { if (true) { 5 } } catch (e) {}", "5"),
+        ("try { try { 7 } finally { 8 } } catch (e) {}", "7"),
+        ("try { 1; throw 0 } catch (e) {}", "undefined"),
+        ("try { 1; let x = 2 } catch (e) {}", "1"),
+        ("try { 4 } catch (e) {} let y = 0", "4"),
+        ("try { 4 } catch (e) {} 6", "6"),
+        ("try { 1; if (false) {} } catch (e) {}", "undefined"),
+        (
+            "try { [1, 2].map((x) => { x; return x }) } catch (e) {}",
+            "[ 1, 2 ]",
+        ),
+    ] {
+        assert_eq!(jsc(&["-p", src]), expected, "{src}");
+    }
+}
+
 /// `-p` accepts a value that starts with `-`; without `allow_hyphen_values` clap
 /// treats `-1 * 2` as an unknown flag and the parse fails before evaluation.
 #[test]

@@ -10,7 +10,7 @@
 //! function declarations, calls, and `return`. Anything else yields an error
 //! rather than a panic.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use std::collections::HashMap;
 
@@ -151,8 +151,9 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             .zip(0u32..)
             .map(|(name, slot)| (name.clone(), slot))
             .collect(),
-        module_mutable: RefCell::new(HashMap::new()),
+        module_mutable: analysis.module_mutable,
         object_shapes: analysis.object_shapes,
+        completion: Cell::new(None),
     };
 
     // Pass 2: the top-level statements become `main`'s body, lowered in a single
@@ -249,9 +250,8 @@ struct Shared<'a> {
     /// names in its outermost scope stores into the module cell; a top-level
     /// function body reaches it through [`IrNode::ModuleCell`].
     module_slots: HashMap<String, u32>,
-    /// Mutability of each module binding, recorded as `main` declares it (`main`
-    /// is lowered before the top-level function bodies that read it).
-    module_mutable: RefCell<HashMap<String, bool>>,
+    /// Mutability of each module binding (see [`CaptureAnalysis::module_mutable`]).
+    module_mutable: HashMap<String, bool>,
     /// The provably-fixed object shape of each qualifying binding (see
     /// [`CaptureAnalysis::object_shapes`]): [`binding_id`] mapped to the own keys
     /// of the object literal it holds. A user method call whose receiver resolves
@@ -259,6 +259,12 @@ struct Shared<'a> {
     /// statically-known name is absent from the shape is rejected as an unknown
     /// method, closing the wrong-value dispatch this static-shape guard targets.
     object_shapes: HashMap<u32, Vec<String>>,
+    /// The `main` local tracking the completion value (for `-p`) of the
+    /// top-level `try` statement being lowered, or `None` outside one. While set,
+    /// every expression statement in `main`'s own frame stores its value here
+    /// (see [`LowerCtx::completion_local`]), so a value produced inside a nested
+    /// statement body reaches `main`'s result.
+    completion: Cell<Option<u32>>,
 }
 
 /// The lowered shape of a `class` declaration: the instance field names the
@@ -290,9 +296,14 @@ struct CaptureResolver {
     /// this is set records a module binding.
     in_top_fn: bool,
     /// Names of `main`'s outermost-scope bindings referenced from a top-level
-    /// function declaration, in first-reference order (see
+    /// function declaration, or from a closure in `main` ahead of their
+    /// declaration, in first-reference order (see
     /// [`CaptureAnalysis::module_names`]).
     module_names: Vec<String>,
+    /// Every binding `main`'s outermost scope declares, mapped to its mutability
+    /// (`false` for `const`). Collected before the walk so a forward reference
+    /// from a closure resolves to a module binding.
+    top_bindings: HashMap<String, bool>,
     /// Names that are the target of an assignment (`x = ..`, `x op= ..`, `++x`,
     /// `x--`, or a destructuring assignment) ANYWHERE in the program. A
     /// name-based over-approximation used to disqualify object-shape candidates:
@@ -326,6 +337,12 @@ struct CaptureAnalysis {
     ///
     /// [`module_names`]: CaptureAnalysis::module_names
     module_vars: std::collections::HashSet<String>,
+    /// Mutability of each [`module_names`] binding, known from its top-level
+    /// declaration kind (`const` is immutable), so a closure lowered before the
+    /// declaration (a forward reference) still resolves it.
+    ///
+    /// [`module_names`]: CaptureAnalysis::module_names
+    module_mutable: HashMap<String, bool>,
     /// The provably-fixed object shape of each qualifying binding: its
     /// [`binding_id`] mapped to the own keys of the object literal it is
     /// initialized with. A binding qualifies when it is a `let`/`const`
