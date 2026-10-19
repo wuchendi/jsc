@@ -422,6 +422,76 @@ fn yield_delegate_over_a_looping_generator() {
 }
 
 #[test]
+fn yield_delegate_over_an_array_and_a_string() {
+    assert_output(
+        "function* g(){ yield* [1,2]; yield* \"ab\" } console.log([...g()].join(\",\"))",
+        "1,2,a,b\n",
+    );
+}
+
+#[test]
+fn yield_delegate_spread_of_an_inner_generator() {
+    assert_output(
+        "function* inner(){ yield 1; yield 2 }
+         function* g(){ yield* inner(); yield 3 }
+         console.log([...g()])",
+        "[ 1, 2, 3 ]\n",
+    );
+}
+
+#[test]
+fn yield_delegate_dispatches_on_the_runtime_operand() {
+    assert_output(
+        "function* inner(){ yield 5 }
+         function* g(x){ yield* x }
+         console.log([...g([7,8])], [...g(\"hi\")].join(\",\"), [...g(inner())])",
+        "[ 7, 8 ] h,i [ 5 ]\n",
+    );
+}
+
+#[test]
+fn yield_delegate_over_an_array_reads_a_live_length() {
+    assert_output(
+        "function* g(x){ yield* x }
+         let a = [1, 2, 3];
+         let out = \"\";
+         for (const v of g(a)) { if (v === 1) { a.pop(); } out = out + v; }
+         console.log(out);",
+        "12\n",
+    );
+}
+
+#[test]
+fn for_of_over_a_delegating_generator() {
+    assert_output(
+        "function* g(){ yield* [1,2]; yield* \"c\" }
+         let out = \"\";
+         for (const v of g()) { out = out + v; }
+         console.log(out);",
+        "12c\n",
+    );
+}
+
+#[test]
+fn yield_delegate_over_a_non_iterable_throws_a_type_error() {
+    assert_uncaught(
+        "function* g(){ yield* 5 } [...g()]",
+        "TypeError: yield* operand is not iterable",
+    );
+}
+
+#[test]
+fn yield_delegate_non_iterable_type_error_is_catchable() {
+    assert_bool(
+        "function* g(x){ yield* x }
+         let caught = false;
+         try { [...g({ a: 1 })]; } catch (e) { caught = e instanceof TypeError; }
+         caught",
+        true,
+    );
+}
+
+#[test]
 fn a_nested_arrow_in_a_generator_is_callable() {
     assert_output(
         "function* g(){ const f = () => 1; yield f() } console.log([...g()])",
