@@ -1331,9 +1331,16 @@ impl LowerCtx<'_> {
                     }),
                 }
             }
-            _ => Err(CompileError::spanned(
+            // A destructuring assignment desugars to statements, so it is only
+            // lowered in statement position (see `lower_stmt`).
+            AssignTarget::Pat(_) => Err(CompileError::spanned(
                 assign.left.span(),
-                "assignment target must be an identifier",
+                "destructuring assignment is only supported as an expression statement",
+            )
+            .into()),
+            AssignTarget::Simple(_) => Err(CompileError::spanned(
+                assign.left.span(),
+                "unsupported assignment target",
             )
             .into()),
         }
