@@ -405,6 +405,11 @@ impl LowerCtx<'_> {
         let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
         let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&block.stmts))?;
         let local = self.declare(fn_decl.ident.sym.as_ref(), true, fn_decl.ident.span.lo.0);
+        // A generator frame's binding lives in its env cell (`push_binding`).
+        if self.env_slot_for_local(local).is_some() {
+            self.push_binding(local, value, out);
+            return Ok(());
+        }
         let init = if self.is_cell(local) {
             IrNode::CellNew(Box::new(value))
         } else {
