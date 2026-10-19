@@ -1,5 +1,6 @@
 [package]
 name         = "jsc"
+description  = "Command-line ahead-of-time JavaScript/TypeScript to WebAssembly compiler"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

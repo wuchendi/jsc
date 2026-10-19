@@ -1,7 +1,7 @@
 {
   "name": "@cdlab/jsc",
   "version": "0.0.0",
-  "description": "Compile JavaScript to WebAssembly and run it in a JS shim, browser and Node.",
+  "description": "Compile JavaScript to WebAssembly and run it in the browser or Node.",
   "type": "module",
   "private": true,
   "license": "Apache-2.0",

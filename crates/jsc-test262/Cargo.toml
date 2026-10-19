@@ -1,5 +1,6 @@
 [package]
 name         = "jsc-test262"
+description  = "test262 subset runner and baseline regression gate for jsc"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
