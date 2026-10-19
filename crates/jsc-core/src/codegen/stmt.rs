@@ -32,8 +32,6 @@ impl LowerCtx<'_> {
             // `let`/`const`/`var` declarations. An uninitialized `let x;` binds
             // `undefined` (a `const` with no initializer is a parser error).
             Stmt::Decl(Decl::Var(var_decl)) => self.lower_var_decl(var_decl, out),
-            // An empty statement (`for (..);`) lowers to nothing.
-            Stmt::Empty(_) => Ok(()),
             // A nested `function foo(){ .. }` declaration lowers to a first-class
             // function value bound to `foo` in the current scope.
             Stmt::Decl(Decl::Fn(fn_decl)) => self.lower_nested_fn_decl(fn_decl, out),
@@ -1546,7 +1544,7 @@ impl LowerCtx<'_> {
             index: Box::new(IrNode::Local(idx_local)),
         };
         self.bind_for_of_target(target, elem, &mut body)?;
-        self.lower_stmt(for_body, &mut body)?;
+        self.lower_for_of_body(for_body, &mut body)?;
         self.loopable_dec();
         self.breakable_dec();
         let update = vec![IrStmt::Expr(IrNode::Assign {
@@ -1606,7 +1604,7 @@ impl LowerCtx<'_> {
             else_body: Vec::new(),
         });
         self.bind_for_of_target(target, member(r_local, "value"), &mut body)?;
-        self.lower_stmt(for_body, &mut body)?;
+        self.lower_for_of_body(for_body, &mut body)?;
         self.loopable_dec();
         self.breakable_dec();
         out.push(IrStmt::While {
@@ -1619,6 +1617,15 @@ impl LowerCtx<'_> {
             label,
         });
         Ok(out)
+    }
+
+    /// Lower a `for-of` body; an empty body (`for (o.x of xs);`) lowers to
+    /// nothing.
+    fn lower_for_of_body(&mut self, for_body: &Stmt, body: &mut Vec<IrStmt>) -> anyhow::Result<()> {
+        if matches!(for_body, Stmt::Empty(_)) {
+            return Ok(());
+        }
+        self.lower_stmt(for_body, body)
     }
 
     /// Declare a `for-of` head's loop binding; an assignment head declares nothing.
