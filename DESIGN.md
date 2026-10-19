@@ -44,9 +44,11 @@ wasm module whose exported `main` function runs the top-level code.
   stage) to wasm via `wasm-bindgen`; the `@cdlab/jsc` package (`packages/jsc`)
   wraps it with a TypeScript host shim, and `apps/jsc-web` is a browser
   playground on top of that package.
-- **Input language.** ECMAScript source parsed by swc's ES syntax. The CLI's
-  help text names TypeScript, but the frontend is configured with
-  `Syntax::Es`, so TypeScript type syntax is not accepted (§13).
+- **Input language.** JavaScript, or TypeScript reduced to JavaScript by type
+  stripping (no type checking). `frontend::parse(src, dialect)` takes a
+  `Dialect`: the CLI selects `Dialect::Ts` for `.ts` / `.mts` / `.cts` files,
+  rejects `.tsx`, and uses `Dialect::Js` for every other file and for `-e` /
+  `-p`; `jsc-wasm` and the test262 harness always use `Dialect::Js`.
 - **Semantics target.** Full JavaScript semantics is the direction; the compiled
   subset follows strict-mode rules (§7, §13). Conformance is measured by the
   test262 runner (§10).
@@ -74,8 +76,14 @@ JS source ──▶ swc AST ──▶ IR ──────────▶ wasm 
 ```
 
 1. **frontend** (`frontend.rs`) — hands the source to `swc_ecma_parser` with
-   `Syntax::Es(EsSyntax::default())` and returns a `swc_ecma_ast::Program`. A
-   parse failure becomes a spanned `CompileError` (§8).
+   `Syntax::Es(EsSyntax::default())` (`Dialect::Js`) or
+   `Syntax::Typescript(TsSyntax::default())` (`Dialect::Ts`) and returns a
+   `swc_ecma_ast::Program`. A fatal parse error, or else the first recoverable
+   error swc collected (e.g. a strict-mode early error), becomes a spanned
+   `CompileError` (§8). `Dialect::Ts` programs then run through swc's
+   `resolver` and TypeScript `strip` pass, so codegen only sees plain
+   ECMAScript. `strip` lowers `enum` and `namespace` to `var`-based code that
+   codegen rejects (`undeclared variable`, §13).
 2. **codegen** (`codegen/`) — walks the AST and builds an `IrProgram`: the `main`
    entry (top-level statements), the lifted user functions, and per-program
    facts (uniform arity `K`, module-cell count). This stage owns scoping,
@@ -988,8 +996,9 @@ Each item below is current behaviour of this tree.
 
 **Input & semantics model**
 
-- The frontend parses ECMAScript only (`Syntax::Es`); TypeScript syntax is not
-  accepted.
+- TypeScript is type-stripped, never type-checked; `.tsx`/JSX is rejected, and
+  `enum` / `namespace` are compile errors (their stripped `var` forms are not
+  resolved by codegen).
 - A single script is compiled; there are no ES modules (`import`/`export`) and
   no `import()`.
 - Strict-mode semantics only: sloppy-mode constructs (`with`, implicit globals)

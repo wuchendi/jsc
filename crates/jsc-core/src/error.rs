@@ -261,7 +261,8 @@ mod tests {
     fn unsupported_statement_error_carries_a_span() {
         // End-to-end proof that the converted codegen site attaches a real node
         // span: `debugger;` is an unsupported statement.
-        let program = crate::frontend::parse("debugger;").expect("parses");
+        let program =
+            crate::frontend::parse("debugger;", crate::frontend::Dialect::Js).expect("parses");
         let err = crate::codegen::lower(&program).expect_err("should reject");
         let compile_err = err
             .downcast_ref::<CompileError>()

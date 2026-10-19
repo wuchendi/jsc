@@ -316,7 +316,7 @@ fn run_with_sink<W: Write + Send + 'static>(
 /// Returns an error if the source fails to parse, cannot be lowered to the
 /// supported IR, or if executing the emitted module fails.
 pub fn compile_and_run(src: &str) -> anyhow::Result<Value> {
-    let program = crate::frontend::parse(src)?;
+    let program = crate::frontend::parse(src, crate::frontend::Dialect::Js)?;
     let ir = crate::codegen::lower(&program)?;
     let wasm = crate::emit::emit(&ir);
     let (bits, memory) = run(&wasm)?;
@@ -334,7 +334,7 @@ pub fn compile_and_run(src: &str) -> anyhow::Result<Value> {
 ///
 /// Returns an error under the same conditions as [`compile_and_run`].
 pub fn compile_and_run_capturing(src: &str) -> anyhow::Result<(Value, String)> {
-    let program = crate::frontend::parse(src)?;
+    let program = crate::frontend::parse(src, crate::frontend::Dialect::Js)?;
     let ir = crate::codegen::lower(&program)?;
     let wasm = crate::emit::emit(&ir);
     let (bits, memory, output) = run_capturing(&wasm)?;
