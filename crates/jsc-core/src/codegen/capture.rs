@@ -209,23 +209,29 @@ impl CaptureResolver {
     }
 
     /// Record every simple-identifier binding within an assignment/destructuring
-    /// pattern as reassigned.
+    /// pattern as referenced and reassigned; member targets and defaults are
+    /// analyzed as ordinary expressions.
     fn mark_pat(&mut self, pat: &Pat) {
         match pat {
-            Pat::Ident(ident) => {
-                self.assigned.insert(ident.id.sym.as_ref().to_owned());
-            }
+            Pat::Ident(ident) => self.mark_assigned(&ident.id),
             Pat::Array(arr) => self.mark_array_pat(arr),
             Pat::Object(obj) => self.mark_object_pat(obj),
             Pat::Rest(rest) => self.mark_pat(&rest.arg),
-            Pat::Assign(assign) => self.mark_pat(&assign.left),
-            Pat::Expr(expr) => {
-                if let Expr::Ident(ident) = expr.as_ref() {
-                    self.assigned.insert(ident.sym.as_ref().to_owned());
-                }
+            Pat::Assign(assign) => {
+                self.mark_pat(&assign.left);
+                self.expr(&assign.right);
             }
+            Pat::Expr(expr) => match strip_parens(expr) {
+                Expr::Ident(ident) => self.mark_assigned(ident),
+                other => self.expr(other),
+            },
             Pat::Invalid(_) => {}
         }
+    }
+
+    fn mark_assigned(&mut self, ident: &Ident) {
+        self.reference(ident.sym.as_ref());
+        self.assigned.insert(ident.sym.as_ref().to_owned());
     }
 
     fn mark_array_pat(&mut self, arr: &ArrayPat) {
@@ -239,7 +245,10 @@ impl CaptureResolver {
             match prop {
                 ObjectPatProp::KeyValue(kv) => self.mark_pat(&kv.value),
                 ObjectPatProp::Assign(assign) => {
-                    self.assigned.insert(assign.key.id.sym.as_ref().to_owned());
+                    self.mark_assigned(&assign.key.id);
+                    if let Some(default) = &assign.value {
+                        self.expr(default);
+                    }
                 }
                 ObjectPatProp::Rest(rest) => self.mark_pat(&rest.arg),
             }
@@ -461,6 +470,8 @@ impl CaptureResolver {
             && let Pat::Ident(ident) = &declarator.name
         {
             self.declare(ident.id.sym.as_ref(), binding_id(ident));
+        } else if let ForHead::Pat(pat) = left {
+            self.mark_pat(pat);
         }
         self.stmt(body);
         self.pop_scope();
