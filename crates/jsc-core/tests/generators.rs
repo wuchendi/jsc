@@ -4,8 +4,8 @@
 //! statement / `x = yield` / `return yield` positions, `.next(v)` returning
 //! `{ value, done }`, a persistent frame that survives across suspends, and the
 //! diagnostics for the out-of-scope forms (CUT A: yield in try/catch/finally;
-//! CUT B: yield inside control flow; nested-expression yield; `yield*`; nested
-//! closures; a non-generator `.next()` receiver).
+//! CUT B: yield inside control flow; nested-expression yield; `yield*`; a
+//! non-generator `.next()` receiver).
 
 mod common;
 
@@ -422,9 +422,62 @@ fn yield_delegate_over_a_looping_generator() {
 }
 
 #[test]
-fn rejects_a_nested_closure_in_a_generator() {
-    assert_rejected("function* g(){ let f = () => 1; yield f(); }");
-    assert_rejected("function* g(){ function h(){ return 1 } yield h(); }");
+fn a_nested_arrow_in_a_generator_is_callable() {
+    assert_output(
+        "function* g(){ const f = () => 1; yield f() } console.log([...g()])",
+        "[ 1 ]\n",
+    );
+}
+
+#[test]
+fn a_nested_function_declaration_in_a_generator_is_callable() {
+    assert_output(
+        "function* g(){ function h(){ return 2 } yield h(); } console.log([...g()])",
+        "[ 2 ]\n",
+    );
+}
+
+/// A closure and the generator body share the local's cell, so a write made by
+/// the closure after one `yield` is observed by the body after the next.
+#[test]
+fn a_closure_mutating_a_generator_local_is_shared_across_yields() {
+    assert_output(
+        "function* g(){ let n = 1; const inc = () => { n = n + 10; }; yield n; inc(); yield n; inc(); yield n; }
+         console.log([...g()])",
+        "[ 1, 11, 21 ]\n",
+    );
+}
+
+#[test]
+fn a_closure_captures_a_generator_parameter() {
+    assert_output(
+        "function* g(p){ const get = () => p; yield get(); p = p * 2; yield get(); }
+         console.log([...g(5)])",
+        "[ 5, 10 ]\n",
+    );
+}
+
+#[test]
+fn array_map_with_a_closure_over_a_generator_local() {
+    assert_output(
+        "function* g(arr){ let k = 100; yield arr.map(x => x + k); k = 1; yield arr.map(x => x + k); }
+         for (const v of g([1, 2])) console.log(v);",
+        "[ 101, 102 ]\n[ 2, 3 ]\n",
+    );
+}
+
+/// A closure yielded out of the generator keeps the frame's cell alive and
+/// still observes it after the generator has finished.
+#[test]
+fn a_closure_escaping_a_generator_outlives_it() {
+    assert_output(
+        "function* g(){ let c = 0; const f = () => { c = c + 1; return c; }; yield f; c = 40; }
+         const it = g();
+         const f = it.next().value;
+         console.log(it.next().done);
+         console.log(f(), f());",
+        "true\n41 42\n",
+    );
 }
 
 #[test]
