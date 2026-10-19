@@ -498,7 +498,7 @@ fn user_next_and_generator_next_coexist() {
     );
 }
 
-/// A nullish `.next()` receiver throws the ordinary member-read TypeError.
+/// A nullish `.next()` receiver throws the ordinary member-read `TypeError`.
 #[test]
 fn a_nullish_next_receiver_throws_a_type_error() {
     assert_uncaught(

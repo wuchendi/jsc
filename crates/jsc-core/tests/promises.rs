@@ -431,7 +431,7 @@ fn user_then_catch_finally_methods_are_called_on_non_promises() {
 }
 
 /// A nullish `.then`/`.catch`/`.finally` receiver throws the ordinary
-/// member-read TypeError.
+/// member-read `TypeError`.
 #[test]
 fn nullish_promise_method_receiver_throws_a_type_error() {
     assert_uncaught(
