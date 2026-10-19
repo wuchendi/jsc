@@ -149,7 +149,7 @@ jsc/
 `native-run` pulls in `wasmtime` (`cranelift`, `runtime`, `std`); building with
 `default-features = false` leaves frontend + codegen + emit only. Dependencies:
 `swc_ecma_parser 42`, `swc_ecma_ast 26`, `swc_common 24`, `wasm-encoder 0.253`,
-`anyhow`, optional `wasmtime 46`.
+`anyhow`, optional `wasmtime 49`.
 
 **`jsc`.** A thin `clap` shell (§9). `#![forbid(unsafe_code)]`.
 

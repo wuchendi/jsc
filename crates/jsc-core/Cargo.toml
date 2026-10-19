@@ -19,7 +19,7 @@ swc_common      = "24"
 swc_ecma_ast    = "26"
 swc_ecma_parser = "42"
 wasm-encoder    = "0.253"
-wasmtime        = { version = "46", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
+wasmtime        = { version = "49.0.3", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
 
 [dev-dependencies]
 wasmparser = "0.253"
