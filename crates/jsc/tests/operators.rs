@@ -254,7 +254,7 @@ fn binary_plus_coerces_primitives() {
     assert_eq!(jsc(&["-p", "true + true === 2"]), "true");
     assert_eq!(jsc(&["-p", "false + 1 === 1"]), "true");
     assert_eq!(jsc(&["-p", "undefined + 1"]), "NaN");
-    assert_eq!(jsc(&["-p", "\"a\" + null === \"anull\""]), "true");
+    assert_eq!(jsc(&["-p", "\"x\" + null === \"xnull\""]), "true");
     assert_eq!(jsc(&["-p", "\"a\" + true === \"atrue\""]), "true");
     assert_eq!(jsc(&["-p", "\"a\" + undefined === \"aundefined\""]), "true");
     assert_eq!(jsc(&["-p", "1 + \"2\" === \"12\""]), "true");
