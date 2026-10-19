@@ -1057,6 +1057,14 @@ impl LowerCtx<'_> {
     /// defaults to `true`. The `for` head opens a lexical scope, so a `let`/`const` init
     /// binding is block-scoped to the loop and is not visible after it
     /// (referencing it there is a compile error).
+    ///
+    /// Each iteration gets its own copy of a captured `let`/`const` binding
+    /// (CreatePerIterationEnvironment): the binding's cell is replaced by a fresh
+    /// cell holding the current value once after the init and again at the start
+    /// of the `update` slot, before the update expression. Closures created in an
+    /// iteration keep that iteration's cell, while the update (also run on
+    /// `continue`) advances the next iteration's copy. Uncaptured bindings are
+    /// plain locals and need no copy.
     fn lower_for(
         &mut self,
         for_stmt: &swc_ecma_ast::ForStmt,
@@ -1065,10 +1073,14 @@ impl LowerCtx<'_> {
     ) -> anyhow::Result<()> {
         self.push_scope();
         let result = (|| {
+            let mut per_iteration = Vec::new();
             if let Some(init) = &for_stmt.init {
                 match init {
                     VarDeclOrExpr::VarDecl(var_decl) => {
                         self.lower_stmt(&Stmt::Decl(Decl::Var(var_decl.clone())), out)?;
+                        if var_decl.kind != VarDeclKind::Var {
+                            per_iteration = self.innermost_cell_locals();
+                        }
                     }
                     VarDeclOrExpr::Expr(expr) => {
                         out.push(IrStmt::Expr(self.lower_expr(expr)?));
@@ -1086,10 +1098,19 @@ impl LowerCtx<'_> {
             self.breakable_dec();
             // The update runs after the body AND on every `continue`, so it lives
             // in the loop's `update` slot rather than being appended to `body`.
-            let update = match &for_stmt.update {
-                Some(update) => vec![IrStmt::Expr(self.lower_expr(update)?)],
-                None => Vec::new(),
+            let copy = |local: u32| {
+                IrStmt::Expr(IrNode::Assign {
+                    local,
+                    value: Box::new(IrNode::CellNew(Box::new(IrNode::CellGet(Box::new(
+                        IrNode::Local(local),
+                    ))))),
+                })
             };
+            out.extend(per_iteration.iter().copied().map(copy));
+            let mut update: Vec<IrStmt> = per_iteration.iter().copied().map(copy).collect();
+            if let Some(expr) = &for_stmt.update {
+                update.push(IrStmt::Expr(self.lower_expr(expr)?));
+            }
             out.push(IrStmt::While {
                 cond,
                 body,

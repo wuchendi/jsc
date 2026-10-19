@@ -397,3 +397,14 @@ fn async_non_declaration_forms_rejected() {
     assert_rejected("let f = async () => 1; f()");
     assert_rejected("async function* f() { yield 1 } f().next()");
 }
+
+/// A C-style `for (let ...)` loop with an `await` in its body inside an async
+/// function still runs each iteration in order.
+#[test]
+fn for_let_loop_with_await_in_async_function() {
+    assert_output(
+        "async function f(){ let s = \"\"; for (let i=0;i<3;i++) { const v = await Promise.resolve(i); s = s + v; } return s; }
+         f().then(v => console.log(v));",
+        "012\n",
+    );
+}
