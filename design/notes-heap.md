@@ -399,6 +399,15 @@ NOT applied in:
   (member dispatch passes any string key to `__obj_get`/`__obj_set`,
   `core/emit/object.rs:1388-1396`, `:1574-1588`).
 
+Observed at `b1dc6b9` (debug build, `jsc -e`):
+
+- `class A { constructor(){ this.x = 1 } m(){} }; console.log(new A())` prints
+  `{ @@prototype: { m: [Function (anonymous)] }, x: 1 }`.
+- `for (const k in new A())` yields `@@prototype` then `x`.
+- `const {x, ...r} = new A()` gives `r` = `{ @@prototype: … }` while
+  `Object.keys(r).length` is `0`.
+- `"@@prototype" in new A()` is `true`.
+
 ---
 
 ## 4. Allocator
@@ -512,6 +521,8 @@ and `DATE_MS_OFFSET` (`pkg/abi.ts:33-55`).
 - `decode` recursion has no cycle guard (`core/run/value.rs:185-236`,
   `pkg/value.ts:172-199`), so a cyclic object graph rendered by `print`
   recurses without bound.
+  Observed: `const o = {self: null}; o.self = o; console.log(o)` aborts the
+  native host with `fatal runtime error: stack overflow`.
 
 ---
 
