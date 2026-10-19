@@ -21,8 +21,8 @@ use swc_common::Spanned;
 use crate::error::CompileError;
 
 use swc_ecma_ast::{
-    ArrayLit, ArrayPat, ArrowExpr, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinaryOp,
-    BlockStmtOrExpr, Callee, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl, Expr,
+    ArrayLit, ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget,
+    AssignTargetPat, BinaryOp, Callee, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl, Expr,
     ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, IdentName, Lit, MemberExpr, MemberProp,
     MethodKind, ObjectLit, ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr,
     ParamOrTsParamProp, Pat, Program, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt,

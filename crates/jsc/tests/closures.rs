@@ -159,3 +159,132 @@ fn top_level_function_capturing_class_throws_from_callback() {
         "{output:?}"
     );
 }
+
+/// A closure created in a C-style `for (let ...)` loop captures that
+/// iteration's binding, not one cell shared by every iteration. The update runs
+/// on the next iteration's copy, so a body mutation is still seen by it.
+#[test]
+fn for_let_closures_capture_per_iteration_binding() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (let i=0;i<3;i++) fs.push(() => i); \
+             fs[0]()+\",\"+fs[1]()+\",\"+fs[2]()"
+        ]),
+        "0,1,2"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (let i=0;i<3;i++) { fs.push(() => i); i++; } \
+             fs[0]()+\",\"+fs[1]()+\",\"+fs.length"
+        ]),
+        "1,3,2"
+    );
+}
+
+/// A setter closure writes only its own iteration's copy: called after the loop
+/// it leaves the other iterations' values alone, and called inside the body it
+/// feeds that iteration's update.
+#[test]
+fn for_let_setter_closure_mutates_its_iteration_only() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; let gs=[]; \
+             for (let i=0;i<3;i++) { fs.push(() => i); gs.push(v => { i = v; }); } \
+             gs[0](100); fs[0]()+\",\"+fs[1]()+\",\"+fs[2]()"
+        ]),
+        "100,1,2"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (let i=0;i<3;i++) { let s = v => { i = v; }; s(i+1); fs.push(() => i); } \
+             fs[0]()+\",\"+fs[1]()+\",\"+fs.length"
+        ]),
+        "1,3,2"
+    );
+}
+
+/// Nested `for (let ...)` loops each copy their own binding per iteration.
+#[test]
+fn nested_for_let_closures_are_distinct() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (let i=0;i<2;i++) for (let j=0;j<2;j++) fs.push(() => i*10+j); \
+             fs[0]()+\",\"+fs[1]()+\",\"+fs[2]()+\",\"+fs[3]()"
+        ]),
+        "0,1,10,11"
+    );
+}
+
+/// `continue` still advances to a fresh copy, and `break` leaves the last
+/// closure holding the break iteration's value.
+#[test]
+fn for_let_closures_across_continue_and_break() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (let i=0;i<4;i++) { fs.push(() => i); if (i<2) continue; } \
+             fs[0]()+\",\"+fs[1]()+\",\"+fs[2]()+\",\"+fs[3]()"
+        ]),
+        "0,1,2,3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (let i=0;i<6;i++) { if (i%2) continue; fs.push(() => i); if (i==4) break; } \
+             fs[0]()+\",\"+fs[1]()+\",\"+fs[2]()+\",\"+fs.length"
+        ]),
+        "0,2,4,3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let last; for (let i=0;;i++) { last = () => i; if (i==2) break; } last()"
+        ]),
+        "2"
+    );
+}
+
+/// A captured `const` loop binding and multiple `let` declarators.
+#[test]
+fn for_const_and_multi_declarator_closures() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (const x = 5;;) { fs.push(() => x); break; } fs[0]()"
+        ]),
+        "5"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (let i=0, j=10; i<3; i++) { fs.push(() => i+\":\"+j); j--; } \
+             fs[0]()+\",\"+fs[2]()"
+        ]),
+        "0:9,2:7"
+    );
+}
+
+/// `for-of` and `for-in` already bind a fresh binding per iteration.
+#[test]
+fn for_of_and_for_in_closures_capture_per_iteration_binding() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (const x of [1,2,3]) fs.push(() => x); \
+             fs[0]()+\",\"+fs[1]()+\",\"+fs[2]()"
+        ]),
+        "1,2,3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let fs=[]; for (const k in {a:1,b:2}) fs.push(() => k); fs[0]()+\",\"+fs[1]()"
+        ]),
+        "a,b"
+    );
+}

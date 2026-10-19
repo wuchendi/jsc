@@ -15,7 +15,7 @@ sum 6
 - **A compiler, not an interpreter.** Every program becomes a validated WebAssembly module (emitted with [`wasm-encoder`](https://crates.io/crates/wasm-encoder)). The CLI runs it on [`wasmtime`](https://wasmtime.dev/) or writes the bytes out with `jsc build`.
 - **An embeddable library.** The whole pipeline lives in the `jsc-core` crate; `jsc` is a thin CLI over it.
 - **An in-browser compiler.** `crates/jsc-wasm` compiles `jsc-core` itself to wasm (wasm-bindgen); the `@cdlab/jsc` package (`packages/jsc`) wraps it with `compile(src)` / `run(src)` for the browser and Node, and `apps/jsc-web` is a playground built on that package.
-- **TypeScript by type stripping only** — no type checking. Today the frontend parses ECMAScript only; see [Current limitations](#current-limitations).
+- **TypeScript by type stripping only** — no type checking. `.ts` / `.mts` / `.cts` files have their types removed by swc's TypeScript strip pass before codegen; see [TypeScript](#typescript).
 
 ## Install
 
@@ -41,6 +41,7 @@ jsc program.js                    # compile and run a file; prints only console 
 jsc -e 'console.log(40 + 2)'      # compile and run an inline source string
 jsc -p '40 + 2'                   # run inline source and print its completion value
 jsc build program.js -o out.wasm  # write the WebAssembly module (-o - writes to stdout)
+jsc program.ts                    # TypeScript: types are stripped, not checked
 ```
 
 `console.log` streams to stdout while the module runs; `-p` prints the completion value afterwards, Node-style (`[ 1, 4, 9 ]`). Exactly one of FILE, `-e`, `-p` is accepted.
@@ -58,6 +59,16 @@ $ echo $?
 1
 ```
 
+### TypeScript
+
+The dialect is chosen by FILE extension:
+
+- `.ts`, `.mts`, `.cts` — TypeScript. swc parses the file as TypeScript and its strip pass erases type syntax (annotations, `interface`, `type`, generics, `as`, `!`); nothing is type-checked.
+- `.tsx` — rejected (exit `2`); JSX is not supported.
+- any other extension, and all `-e` / `-p` input — JavaScript, so type syntax there is a compile error.
+
+`enum` and `namespace` are not supported: the strip pass lowers them to `var`-based JavaScript that codegen rejects with an `undeclared variable` compile error. Invalid input in either dialect — including errors swc recovers from, such as strict-mode early errors — is a compile error (exit `2`). The `@cdlab/jsc` package compiles JavaScript only.
+
 ## Conformance
 
 test262 is the primary metric. `crates/jsc-test262` runs the official suite at a pinned commit against the release `jsc` binary:
@@ -66,7 +77,7 @@ test262 is the primary metric. `crates/jsc-test262` runs the official suite at a
 - `tests/test262/harness/` holds the harness includes; `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module`, `async`, or `noStrict` are ineligible as well.
 - `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records the pass count per commit.
 
-Current result (last row of `tests/test262/history.tsv`): **4860 pass / 22992 eligible (21.1%) / 47665 total**.
+Current result (last row of `tests/test262/history.tsv`): **5230 pass / 22992 eligible (22.7%) / 47665 total**.
 
 ```bash
 bash scripts/test262-fetch.sh
@@ -115,7 +126,6 @@ Details are in [DESIGN.md](DESIGN.md).
 
 ## Current limitations
 
-- **Frontend parses ECMAScript only.** TypeScript type annotations are not stripped yet; the parser runs in ES mode.
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
 - **Fixed-shape objects.** Computed keys (`{[k]: v}`), object spread, object-literal accessors and private class fields are rejected; adding a property to an existing object or assigning past the end of an array is a silent no-op.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.

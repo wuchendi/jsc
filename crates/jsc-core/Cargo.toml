@@ -14,12 +14,14 @@ default = ["native-run"]
 native-run = ["dep:wasmtime"]
 
 [dependencies]
-anyhow          = "1.0.104"
-swc_common      = "24"
-swc_ecma_ast    = "26"
-swc_ecma_parser = "42"
-wasm-encoder    = "0.262.0"
-wasmtime        = { version = "49.0.3", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
+anyhow                         = "1.0.104"
+swc_common                     = "26"
+swc_ecma_ast                   = "29"
+swc_ecma_parser                = "46"
+swc_ecma_transforms_base       = "50"
+swc_ecma_transforms_typescript = "56"
+wasm-encoder                   = "0.262.0"
+wasmtime                       = { version = "49.0.3", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
 
 [dev-dependencies]
 wasmparser = "0.262.0"
