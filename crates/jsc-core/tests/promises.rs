@@ -414,14 +414,12 @@ fn for_let_loop_with_await_in_async_function() {
 
 /// Run `src` and assert it fails with `Uncaught (in promise) <expected>`.
 fn assert_unhandled(src: &str, expected: &str) {
-    match compile_and_run(src) {
-        Ok(v) => panic!("`{src}` should report an unhandled rejection, got value {v:?}"),
-        Err(err) => assert_eq!(
-            err.to_string(),
-            format!("Uncaught (in promise) {expected}"),
-            "unhandled-rejection message for source `{src}`"
-        ),
-    }
+    let err = compile_and_run(src).expect_err("program should report an unhandled rejection");
+    assert_eq!(
+        err.to_string(),
+        format!("Uncaught (in promise) {expected}"),
+        "unhandled-rejection message for source `{src}`"
+    );
 }
 
 /// A rejection that never gets a handler fails the run, rendered like an
