@@ -242,3 +242,20 @@ fn logical_assignment_via_eval() {
     // leaves the side-effecting right operand (`y=5`) unrun, so `y` stays `0`.
     assert_eq!(jsc(&["-p", "let x=1; let y=0; x ||= (y=5); y"]), "0");
 }
+
+/// Binary `+` without a string operand is ToNumber addition; with one it is
+/// string concatenation.
+#[test]
+fn binary_plus_coerces_primitives() {
+    assert_eq!(jsc(&["-p", "1 + null === 1"]), "true");
+    assert_eq!(jsc(&["-p", "null + 1 === 1"]), "true");
+    assert_eq!(jsc(&["-p", "null + null === 0"]), "true");
+    assert_eq!(jsc(&["-p", "true + 1 === 2"]), "true");
+    assert_eq!(jsc(&["-p", "true + true === 2"]), "true");
+    assert_eq!(jsc(&["-p", "false + 1 === 1"]), "true");
+    assert_eq!(jsc(&["-p", "undefined + 1"]), "NaN");
+    assert_eq!(jsc(&["-p", "\"a\" + null === \"anull\""]), "true");
+    assert_eq!(jsc(&["-p", "\"a\" + true === \"atrue\""]), "true");
+    assert_eq!(jsc(&["-p", "\"a\" + undefined === \"aundefined\""]), "true");
+    assert_eq!(jsc(&["-p", "1 + \"2\" === \"12\""]), "true");
+}
