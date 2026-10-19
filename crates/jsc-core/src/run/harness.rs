@@ -272,12 +272,15 @@ fn run_with_sink<W: Write + Send + 'static>(
         .get_global(&mut store, EXC_PENDING_EXPORT_NAME)
         .and_then(|g| g.get(&mut store).i32())
         .unwrap_or(0);
-    if main_pending == 0 {
-        promise::drain_after_main(&mut store, &instance);
+    let unhandled = if main_pending == 0 {
+        let unhandled = promise::drain_after_main(&mut store, &instance);
         if exhausted(&mut store) {
             return Err(anyhow::anyhow!(OUT_OF_MEMORY));
         }
-    }
+        unhandled
+    } else {
+        None
+    };
     // Snapshot linear memory AFTER the drain so any promise settled by a microtask
     // renders its final state and pointer jsvals resolve against current memory.
     let memory = match instance.get_memory(&mut store, "memory") {
@@ -301,6 +304,12 @@ fn run_with_sink<W: Write + Send + 'static>(
             .cast_unsigned();
         let rendered = format_value(&decode(value_bits, &memory));
         return Err(anyhow::anyhow!("Uncaught {rendered}"));
+    }
+    // Unhandled-rejection check: a rejected promise that never got a handler
+    // (reported after the queue drained, so a late `.catch` still counts).
+    if let Some(value_bits) = unhandled {
+        let rendered = format_value(&decode(value_bits, &memory));
+        return Err(anyhow::anyhow!("Uncaught (in promise) {rendered}"));
     }
     Ok((result.cast_unsigned(), memory, store.into_data().sink))
 }

@@ -121,6 +121,25 @@ it('backs Date.now() with the host clock', async () => {
   expect((await run('new Date(0)')).result).toBe('1970-01-01T00:00:00.000Z')
 })
 
+it('rejects run() on an unhandled promise rejection', async () => {
+  await expect(run('Promise.reject(new Error("x")); 0')).rejects.toThrow(
+    /^Uncaught \(in promise\) Error: x$/,
+  )
+  await expect(
+    run('async function f() { throw new TypeError("t") } f(); 0'),
+  ).rejects.toThrow(/^Uncaught \(in promise\) TypeError: t$/)
+  await expect(run('Promise.reject("a"); Promise.reject("b"); 0')).rejects.toThrow(
+    /^Uncaught \(in promise\) a$/,
+  )
+  await expect(run('Promise.reject(1); throw 2')).rejects.toThrow(
+    /^Uncaught 2$/,
+  )
+  const late = await run(
+    'const p = Promise.reject(1); Promise.resolve(0).then(() => p.catch(() => {})); 0',
+  )
+  expect(late.result).toBe('0')
+})
+
 it('rejects run() on an unhandled top-level await rejection', async () => {
   await expect(run('await Promise.reject("boom")')).rejects.toThrow(
     /^Uncaught boom$/,
