@@ -10,7 +10,7 @@
 //! function declarations, calls, and `return`. Anything else yields an error
 //! rather than a panic.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use std::collections::HashMap;
 
@@ -153,6 +153,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             .collect(),
         module_mutable: RefCell::new(HashMap::new()),
         object_shapes: analysis.object_shapes,
+        completion: Cell::new(None),
     };
 
     // Pass 2: the top-level statements become `main`'s body, lowered in a single
@@ -259,6 +260,12 @@ struct Shared<'a> {
     /// statically-known name is absent from the shape is rejected as an unknown
     /// method, closing the wrong-value dispatch this static-shape guard targets.
     object_shapes: HashMap<u32, Vec<String>>,
+    /// The `main` local tracking the completion value (for `-p`) of the
+    /// top-level `try` statement being lowered, or `None` outside one. While set,
+    /// every expression statement in `main`'s own frame stores its value here
+    /// (see [`LowerCtx::completion_local`]), so a value produced inside a nested
+    /// statement body reaches `main`'s result.
+    completion: Cell<Option<u32>>,
 }
 
 /// The lowered shape of a `class` declaration: the instance field names the

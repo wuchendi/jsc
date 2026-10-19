@@ -9,6 +9,21 @@ impl LowerCtx<'_> {
     /// Lower one statement, appending the resulting [`IrStmt`](s) to `out`.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt, out: &mut Vec<IrStmt>) -> anyhow::Result<()> {
+        // Inside a tracked top-level `try`, a compound statement completes with
+        // `undefined` when its body produces no value (UpdateEmpty).
+        if matches!(
+            stmt,
+            Stmt::If(_)
+                | Stmt::While(_)
+                | Stmt::DoWhile(_)
+                | Stmt::For(_)
+                | Stmt::ForOf(_)
+                | Stmt::ForIn(_)
+                | Stmt::Labeled(_)
+                | Stmt::Switch(_)
+        ) {
+            self.reset_completion(out);
+        }
         match stmt {
             Stmt::Expr(expr_stmt) => {
                 // `yield* iterable;` delegates to an inner generator: it
@@ -18,7 +33,14 @@ impl LowerCtx<'_> {
                 {
                     return self.lower_yield_delegate(yield_expr, out);
                 }
-                out.push(IrStmt::Expr(self.lower_expr(&expr_stmt.expr)?));
+                let value = self.lower_expr(&expr_stmt.expr)?;
+                out.push(IrStmt::Expr(match self.completion_local() {
+                    Some(local) => IrNode::Assign {
+                        local,
+                        value: Box::new(value),
+                    },
+                    None => value,
+                }));
                 Ok(())
             }
             // `let`/`const`/`var` declarations. An uninitialized `let x;` binds
@@ -857,6 +879,35 @@ impl LowerCtx<'_> {
             return Err(anyhow!("try without catch or finally"));
         }
 
+        // The completion value (for `-p`): a top-level `try` in `main` opens a
+        // completion local that every expression statement of its block and catch
+        // clause stores into; it is reset to `undefined` on entry (an empty `try`
+        // yields `undefined`) and pushed as `main`'s value after the statement.
+        let outermost = self.main_ctx
+            && self.frames.len() == 1
+            && self.shared.completion.get().is_none();
+        if outermost {
+            let local = self.fresh();
+            self.shared.completion.set(Some(local));
+        }
+        self.reset_completion(out);
+        let result = self.lower_try_clauses(try_stmt, out);
+        if outermost
+            && let Some(local) = self.shared.completion.take()
+            && result.is_ok()
+        {
+            out.push(IrStmt::Expr(IrNode::Local(local)));
+        }
+        result
+    }
+
+    /// Lower the clauses of a `try` statement (see [`Self::lower_try`]) and push
+    /// the resulting [`IrStmt::Try`].
+    fn lower_try_clauses(
+        &mut self,
+        try_stmt: &swc_ecma_ast::TryStmt,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
         // The guarded block: its own lexical scope, statements lowered inline
         // (blocks share the function's wasm locals, like `Stmt::Block`).
         self.push_scope();
@@ -890,6 +941,8 @@ impl LowerCtx<'_> {
                         // the parameter is captured (mirrors a captured `let`).
                         self.push_binding(local, IrNode::ExcValue, &mut catch_body);
                     }
+                    // The catch clause's value replaces the guarded block's.
+                    self.reset_completion(&mut catch_body);
                     for inner in &handler.body.stmts {
                         self.lower_stmt(inner, &mut catch_body)?;
                     }
@@ -903,9 +956,11 @@ impl LowerCtx<'_> {
         };
 
         // The finally clause (when present): its own lexical scope, like the body.
+        // Its value is discarded, so completion tracking is suspended inside it.
         let finally_body = match &try_stmt.finalizer {
             Some(block) => {
                 self.push_scope();
+                let completion = self.shared.completion.take();
                 let mut finally_body = Vec::new();
                 let finally_result = (|| -> anyhow::Result<()> {
                     for inner in &block.stmts {
@@ -913,6 +968,7 @@ impl LowerCtx<'_> {
                     }
                     Ok(())
                 })();
+                self.shared.completion.set(completion);
                 self.pop_scope();
                 finally_result?;
                 Some(finally_body)
@@ -926,6 +982,27 @@ impl LowerCtx<'_> {
             finally_body,
         });
         Ok(())
+    }
+
+    /// The `main` local the current expression statement's completion value is
+    /// stored into: set only inside a top-level `try` (see [`Self::lower_try`])
+    /// and only in `main`'s own frame — a nested function body never writes it.
+    fn completion_local(&self) -> Option<u32> {
+        if self.main_ctx && self.frames.len() == 1 {
+            self.shared.completion.get()
+        } else {
+            None
+        }
+    }
+
+    /// Reset the tracked completion value to `undefined` (a no-op when untracked).
+    fn reset_completion(&self, out: &mut Vec<IrStmt>) {
+        if let Some(local) = self.completion_local() {
+            out.push(IrStmt::Expr(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Undefined),
+            }));
+        }
     }
 
     /// Lower a `while (cond) body`. `label`, when `Some`, is the loop id that a
