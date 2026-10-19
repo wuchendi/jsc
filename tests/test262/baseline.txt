@@ -124,6 +124,7 @@ built-ins/Math/ceil/S15.8.2.6_A3.js
 built-ins/Math/ceil/S15.8.2.6_A4.js
 built-ins/Math/ceil/S15.8.2.6_A5.js
 built-ins/Math/ceil/S15.8.2.6_A6.js
+built-ins/Math/ceil/S15.8.2.6_A7.js
 built-ins/Math/floor/S15.8.2.9_A1.js
 built-ins/Math/floor/S15.8.2.9_A2.js
 built-ins/Math/floor/S15.8.2.9_A3.js
@@ -137,6 +138,7 @@ built-ins/Math/max/zeros.js
 built-ins/Math/min/15.8.2.12-1.js
 built-ins/Math/min/S15.8.2.12_A1.js
 built-ins/Math/min/zeros.js
+built-ins/Math/pow/int32_min-exponent.js
 built-ins/Math/round/S15.8.2.15_A1.js
 built-ins/Math/round/S15.8.2.15_A2.js
 built-ins/Math/round/S15.8.2.15_A4.js
@@ -253,6 +255,9 @@ built-ins/Set/prototype/has/returns-true-when-value-present-number.js
 built-ins/Set/prototype/has/returns-true-when-value-present-string.js
 built-ins/Set/prototype/has/returns-true-when-value-present-undefined.js
 built-ins/Set/prototype/size/returns-count-of-present-values-before-after-add-delete.js
+built-ins/String/15.5.5.5.2-1-2.js
+built-ins/String/15.5.5.5.2-3-2.js
+built-ins/String/15.5.5.5.2-3-6.js
 built-ins/String/15.5.5.5.2-3-7.js
 built-ins/String/15.5.5.5.2-3-8.js
 built-ins/String/15.5.5.5.2-7-2.js
@@ -291,7 +296,6 @@ built-ins/String/prototype/endsWith/String.prototype.endsWith_Success.js
 built-ins/String/prototype/endsWith/searchstring-found-without-position.js
 built-ins/String/prototype/endsWith/searchstring-not-found-without-position.js
 built-ins/String/prototype/includes/String.prototype.includes_SuccessNoLocation.js
-built-ins/String/prototype/includes/String.prototype.includes_lengthProp.js
 built-ins/String/prototype/includes/searchstring-found-without-position.js
 built-ins/String/prototype/includes/searchstring-not-found-without-position.js
 built-ins/String/prototype/indexOf/S15.5.4.7_A2_T1.js
@@ -402,19 +406,41 @@ built-ins/parseInt/S15.1.2.2_A1_T1.js
 built-ins/parseInt/S15.1.2.2_A1_T2.js
 built-ins/parseInt/S15.1.2.2_A1_T3.js
 built-ins/parseInt/S15.1.2.2_A2_T1.js
+built-ins/parseInt/S15.1.2.2_A2_T10.js
 built-ins/parseInt/S15.1.2.2_A2_T10_U180E.js
 built-ins/parseInt/S15.1.2.2_A2_T2.js
+built-ins/parseInt/S15.1.2.2_A2_T3.js
 built-ins/parseInt/S15.1.2.2_A2_T4.js
+built-ins/parseInt/S15.1.2.2_A2_T5.js
 built-ins/parseInt/S15.1.2.2_A2_T6.js
 built-ins/parseInt/S15.1.2.2_A2_T7.js
+built-ins/parseInt/S15.1.2.2_A2_T8.js
+built-ins/parseInt/S15.1.2.2_A2_T9.js
+built-ins/parseInt/S15.1.2.2_A3.1_T1.js
 built-ins/parseInt/S15.1.2.2_A3.1_T2.js
 built-ins/parseInt/S15.1.2.2_A3.1_T3.js
 built-ins/parseInt/S15.1.2.2_A3.2_T2.js
+built-ins/parseInt/S15.1.2.2_A3.2_T3.js
 built-ins/parseInt/S15.1.2.2_A4.1_T1.js
 built-ins/parseInt/S15.1.2.2_A4.1_T2.js
+built-ins/parseInt/S15.1.2.2_A4.2_T1.js
+built-ins/parseInt/S15.1.2.2_A4.2_T2.js
 built-ins/parseInt/S15.1.2.2_A5.1_T1.js
+built-ins/parseInt/S15.1.2.2_A5.2_T1.js
+built-ins/parseInt/S15.1.2.2_A5.2_T2.js
+built-ins/parseInt/S15.1.2.2_A6.1_T1.js
+built-ins/parseInt/S15.1.2.2_A6.1_T2.js
+built-ins/parseInt/S15.1.2.2_A6.1_T3.js
+built-ins/parseInt/S15.1.2.2_A6.1_T4.js
+built-ins/parseInt/S15.1.2.2_A6.1_T5.js
+built-ins/parseInt/S15.1.2.2_A6.1_T6.js
 built-ins/parseInt/S15.1.2.2_A7.1_T1.js
 built-ins/parseInt/S15.1.2.2_A7.1_T2.js
+built-ins/parseInt/S15.1.2.2_A7.2_T1.js
+built-ins/parseInt/S15.1.2.2_A7.2_T2.js
+built-ins/parseInt/S15.1.2.2_A7.2_T3.js
+built-ins/parseInt/S15.1.2.2_A7.3_T1.js
+built-ins/parseInt/S15.1.2.2_A7.3_T2.js
 built-ins/parseInt/S15.1.2.2_A7.3_T3.js
 harness/assert-notsamevalue-notsame.js
 harness/assert-notsamevalue-objects.js
@@ -693,6 +719,7 @@ language/expressions/arrow-function/dstr/ary-ptrn-rest-init-obj.js
 language/expressions/arrow-function/dstr/ary-ptrn-rest-not-final-ary.js
 language/expressions/arrow-function/dstr/ary-ptrn-rest-not-final-id.js
 language/expressions/arrow-function/dstr/ary-ptrn-rest-not-final-obj.js
+language/expressions/arrow-function/dstr/ary-ptrn-rest-obj-id.js
 language/expressions/arrow-function/dstr/dflt-ary-name-iter-val.js
 language/expressions/arrow-function/dstr/dflt-ary-ptrn-elem-ary-elem-init.js
 language/expressions/arrow-function/dstr/dflt-ary-ptrn-elem-ary-elem-iter.js
@@ -712,6 +739,7 @@ language/expressions/arrow-function/dstr/dflt-ary-ptrn-rest-init-obj.js
 language/expressions/arrow-function/dstr/dflt-ary-ptrn-rest-not-final-ary.js
 language/expressions/arrow-function/dstr/dflt-ary-ptrn-rest-not-final-id.js
 language/expressions/arrow-function/dstr/dflt-ary-ptrn-rest-not-final-obj.js
+language/expressions/arrow-function/dstr/dflt-ary-ptrn-rest-obj-id.js
 language/expressions/arrow-function/dstr/dflt-obj-ptrn-id-init-skipped.js
 language/expressions/arrow-function/dstr/dflt-obj-ptrn-id-trailing-comma.js
 language/expressions/arrow-function/dstr/dflt-obj-ptrn-prop-ary-trailing-comma.js
@@ -2111,6 +2139,7 @@ language/expressions/exponentiation/exp-operator-syntax-error-plus-unary-express
 language/expressions/exponentiation/exp-operator-syntax-error-typeof-unary-expression-base.js
 language/expressions/exponentiation/exp-operator-syntax-error-void-unary-expression-base.js
 language/expressions/exponentiation/exp-operator.js
+language/expressions/exponentiation/int32_min-exponent.js
 language/expressions/function/S10.1.1_A1_T2.js
 language/expressions/function/array-destructuring-param-strict-body.js
 language/expressions/function/dflt-params-abrupt.js
@@ -2137,6 +2166,7 @@ language/expressions/function/dstr/ary-ptrn-rest-init-obj.js
 language/expressions/function/dstr/ary-ptrn-rest-not-final-ary.js
 language/expressions/function/dstr/ary-ptrn-rest-not-final-id.js
 language/expressions/function/dstr/ary-ptrn-rest-not-final-obj.js
+language/expressions/function/dstr/ary-ptrn-rest-obj-id.js
 language/expressions/function/dstr/dflt-ary-name-iter-val.js
 language/expressions/function/dstr/dflt-ary-ptrn-elem-ary-elem-init.js
 language/expressions/function/dstr/dflt-ary-ptrn-elem-ary-elem-iter.js
@@ -2156,6 +2186,7 @@ language/expressions/function/dstr/dflt-ary-ptrn-rest-init-obj.js
 language/expressions/function/dstr/dflt-ary-ptrn-rest-not-final-ary.js
 language/expressions/function/dstr/dflt-ary-ptrn-rest-not-final-id.js
 language/expressions/function/dstr/dflt-ary-ptrn-rest-not-final-obj.js
+language/expressions/function/dstr/dflt-ary-ptrn-rest-obj-id.js
 language/expressions/function/dstr/dflt-obj-ptrn-id-init-skipped.js
 language/expressions/function/dstr/dflt-obj-ptrn-id-trailing-comma.js
 language/expressions/function/dstr/dflt-obj-ptrn-prop-ary-trailing-comma.js
@@ -2392,6 +2423,7 @@ language/expressions/object/dstr/meth-ary-ptrn-rest-init-obj.js
 language/expressions/object/dstr/meth-ary-ptrn-rest-not-final-ary.js
 language/expressions/object/dstr/meth-ary-ptrn-rest-not-final-id.js
 language/expressions/object/dstr/meth-ary-ptrn-rest-not-final-obj.js
+language/expressions/object/dstr/meth-ary-ptrn-rest-obj-id.js
 language/expressions/object/dstr/meth-dflt-ary-name-iter-val.js
 language/expressions/object/dstr/meth-dflt-ary-ptrn-elem-ary-elem-init.js
 language/expressions/object/dstr/meth-dflt-ary-ptrn-elem-ary-elem-iter.js
@@ -2414,6 +2446,7 @@ language/expressions/object/dstr/meth-dflt-ary-ptrn-rest-init-obj.js
 language/expressions/object/dstr/meth-dflt-ary-ptrn-rest-not-final-ary.js
 language/expressions/object/dstr/meth-dflt-ary-ptrn-rest-not-final-id.js
 language/expressions/object/dstr/meth-dflt-ary-ptrn-rest-not-final-obj.js
+language/expressions/object/dstr/meth-dflt-ary-ptrn-rest-obj-id.js
 language/expressions/object/dstr/meth-dflt-obj-init-null.js
 language/expressions/object/dstr/meth-dflt-obj-init-undefined.js
 language/expressions/object/dstr/meth-dflt-obj-ptrn-id-init-skipped.js
@@ -2750,6 +2783,7 @@ language/expressions/template-literal/unicode-escape-no-hex-err.js
 language/expressions/this/S11.1.1_A1.js
 language/expressions/typeof/boolean.js
 language/expressions/typeof/number.js
+language/expressions/unary-minus/11.4.7-4-1.js
 language/expressions/unary-plus/11.4.6-2-1.js
 language/expressions/unary-plus/S9.3_A4.1_T2.js
 language/expressions/yield/captured-free-vars.js
@@ -4185,6 +4219,7 @@ language/statements/const/dstr/ary-ptrn-rest-init-obj.js
 language/statements/const/dstr/ary-ptrn-rest-not-final-ary.js
 language/statements/const/dstr/ary-ptrn-rest-not-final-id.js
 language/statements/const/dstr/ary-ptrn-rest-not-final-obj.js
+language/statements/const/dstr/ary-ptrn-rest-obj-id.js
 language/statements/const/dstr/obj-ptrn-id-init-skipped.js
 language/statements/const/dstr/obj-ptrn-id-init-throws.js
 language/statements/const/dstr/obj-ptrn-id-trailing-comma.js
@@ -4585,6 +4620,7 @@ language/statements/for/dstr/const-ary-ptrn-rest-init-obj.js
 language/statements/for/dstr/const-ary-ptrn-rest-not-final-ary.js
 language/statements/for/dstr/const-ary-ptrn-rest-not-final-id.js
 language/statements/for/dstr/const-ary-ptrn-rest-not-final-obj.js
+language/statements/for/dstr/const-ary-ptrn-rest-obj-id.js
 language/statements/for/dstr/const-obj-ptrn-id-init-skipped.js
 language/statements/for/dstr/const-obj-ptrn-id-init-throws.js
 language/statements/for/dstr/const-obj-ptrn-id-trailing-comma.js
@@ -4617,6 +4653,7 @@ language/statements/for/dstr/let-ary-ptrn-rest-init-obj.js
 language/statements/for/dstr/let-ary-ptrn-rest-not-final-ary.js
 language/statements/for/dstr/let-ary-ptrn-rest-not-final-id.js
 language/statements/for/dstr/let-ary-ptrn-rest-not-final-obj.js
+language/statements/for/dstr/let-ary-ptrn-rest-obj-id.js
 language/statements/for/dstr/let-obj-ptrn-id-init-skipped.js
 language/statements/for/dstr/let-obj-ptrn-id-init-throws.js
 language/statements/for/dstr/let-obj-ptrn-id-trailing-comma.js
@@ -4645,6 +4682,7 @@ language/statements/for/dstr/var-ary-ptrn-rest-init-obj.js
 language/statements/for/dstr/var-ary-ptrn-rest-not-final-ary.js
 language/statements/for/dstr/var-ary-ptrn-rest-not-final-id.js
 language/statements/for/dstr/var-ary-ptrn-rest-not-final-obj.js
+language/statements/for/dstr/var-ary-ptrn-rest-obj-id.js
 language/statements/for/dstr/var-obj-ptrn-id-init-skipped.js
 language/statements/for/dstr/var-obj-ptrn-id-trailing-comma.js
 language/statements/for/dstr/var-obj-ptrn-prop-ary-trailing-comma.js
@@ -4857,6 +4895,7 @@ language/statements/let/dstr/ary-ptrn-rest-init-obj.js
 language/statements/let/dstr/ary-ptrn-rest-not-final-ary.js
 language/statements/let/dstr/ary-ptrn-rest-not-final-id.js
 language/statements/let/dstr/ary-ptrn-rest-not-final-obj.js
+language/statements/let/dstr/ary-ptrn-rest-obj-id.js
 language/statements/let/dstr/obj-ptrn-id-init-skipped.js
 language/statements/let/dstr/obj-ptrn-id-init-throws.js
 language/statements/let/dstr/obj-ptrn-id-trailing-comma.js
@@ -5076,6 +5115,7 @@ language/statements/variable/dstr/ary-ptrn-rest-init-obj.js
 language/statements/variable/dstr/ary-ptrn-rest-not-final-ary.js
 language/statements/variable/dstr/ary-ptrn-rest-not-final-id.js
 language/statements/variable/dstr/ary-ptrn-rest-not-final-obj.js
+language/statements/variable/dstr/ary-ptrn-rest-obj-id.js
 language/statements/variable/dstr/obj-ptrn-elem-id-static-init-await-invalid.js
 language/statements/variable/dstr/obj-ptrn-id-init-skipped.js
 language/statements/variable/dstr/obj-ptrn-id-init-throws.js
