@@ -447,6 +447,31 @@ const NULLISH_ERROR_STRS: [&str; 13] = [
     TYPE_ERROR_STACK_PREFIX,
 ];
 
+/// The message fragments `__prop_throw` splices into the `TypeError` raised by
+/// a member store whose key the fixed-shape receiver does not own:
+/// `Cannot add property '<key>': dynamic properties are not supported yet`.
+const PROP_ADD_PREFIX: &str = "Cannot add property '";
+/// See [`PROP_ADD_PREFIX`].
+const PROP_ADD_SUFFIX: &str = "': dynamic properties are not supported yet";
+/// The `TypeError` message `__prop_throw` raises for an array index store at or
+/// past the current length.
+const ARRAY_GROW_MSG: &str = "Cannot grow array by index assignment yet";
+
+/// The static strings `__prop_throw` needs — the error object's keys, kind
+/// marker key and `name`, and the message fragments. Seeded by [`collect_node`]
+/// at every member store site so their `[len][utf8]` blobs exist when it throws.
+const PROP_ERROR_STRS: [&str; 9] = [
+    "name",
+    "message",
+    "stack",
+    abi::ERROR_KIND_KEY,
+    "TypeError",
+    PROP_ADD_PREFIX,
+    PROP_ADD_SUFFIX,
+    ARRAY_GROW_MSG,
+    TYPE_ERROR_STACK_PREFIX,
+];
+
 /// The `JSON.parse` syntax-error `.name`, `.message`, and `.stack` text. jsc has
 /// no `SyntaxError` error KIND, so the thrown object is branded as a base `Error`
 /// (`e instanceof Error` holds) while its `.name` reads `SyntaxError` and it
@@ -653,6 +678,12 @@ struct Helpers<'a> {
     /// The out-of-line half of the nullish-receiver guard (see
     /// [`object::emit_nullish_guard`]).
     nullish_throw: u32,
+    /// `__prop_throw(key: i64, grow: i32)`: build the `TypeError` for a member
+    /// store the fixed-shape receiver cannot take — an absent property
+    /// (`grow == 0`, message names `String(key)`) or an array index at/past the
+    /// length (`grow == 1`) — and leave it in flight (`$exc_pending` set). The
+    /// out-of-line half of [`object::emit_index_set_node`]'s miss paths.
+    prop_throw: u32,
     /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
     /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).
     box_f64: u32,
@@ -695,9 +726,10 @@ struct Helpers<'a> {
     /// a key whose byte content equals `key_ptr`, returning the matching value
     /// jsval or the `undefined` bits.
     obj_get: u32,
-    /// `__obj_set(obj_ptr, key_ptr, val)`: linear-scan an object's entries for a
-    /// key whose byte content equals `key_ptr` and store `val` into its value
-    /// slot. A no-op when no key matches (existing keys only).
+    /// `__obj_set(obj_ptr, key_ptr, val) -> hit`: linear-scan an object's entries
+    /// for a key whose byte content equals `key_ptr`, store `val` into its value
+    /// slot and return `1`. Returns `0` without writing when no key matches
+    /// (existing keys only); the caller then raises the add-property `TypeError`.
     obj_set: u32,
     /// `__array_push(base, value) -> new_base`: bump-allocate a new array
     /// block of `len + 1` element capacity, copy the header + existing elements,
@@ -1084,6 +1116,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // trampoline so every later index stays stable.
     code.function(&generator::emit_gen_to_array(helpers));
     code.function(&emit_nullish_throw(&offsets, helpers));
+    code.function(&emit_prop_throw(&offsets, helpers));
     // The `__invoke1` callback trampoline is appended after every helper so
     // every helper index stays stable; the `__async_step` trampoline
     // follows it (always, so its index is deterministic), then the two
