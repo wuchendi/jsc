@@ -630,9 +630,8 @@ impl LowerCtx<'_> {
             return Ok(IrNode::DateNow);
         }
         // `d.getTime()`: the millisecond timestamp of a Date receiver.
-        // Claimed for ANY receiver (a non-Date yields `NaN`, mirroring the
-        // promise/generator instance methods); a user method named `getTime` is a
-        // documented out-of-scope collision.
+        // Claimed for ANY receiver (a non-Date yields `NaN`); a user method named
+        // `getTime` is a documented out-of-scope collision.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
             && id.sym.as_ref() == "getTime"
