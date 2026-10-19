@@ -71,3 +71,14 @@ fn string_side_still_concatenates() {
     assert_string("\"a\" + null", "anull");
     assert_string("1 + \"2\"", "12");
 }
+
+/// A heap operand takes the concat path (`ToPrimitive` yields a string): an
+/// array becomes its `join()` string, even when the other side is not a string.
+#[test]
+fn array_operand_concatenates() {
+    assert_string("[1] + 1", "11");
+    assert_string("1 + [2,3]", "12,3");
+    assert_string("[] + []", "");
+    assert_string("null + []", "null");
+    assert_string("true + [1]", "true1");
+}

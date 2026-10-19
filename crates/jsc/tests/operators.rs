@@ -258,4 +258,10 @@ fn binary_plus_coerces_primitives() {
     assert_eq!(jsc(&["-p", "\"a\" + true === \"atrue\""]), "true");
     assert_eq!(jsc(&["-p", "\"a\" + undefined === \"aundefined\""]), "true");
     assert_eq!(jsc(&["-p", "1 + \"2\" === \"12\""]), "true");
+    // An array operand is `ToPrimitive`d to its `join()` string, so `+` concatenates.
+    assert_eq!(jsc(&["-p", "[1] + 1 === \"11\""]), "true");
+    assert_eq!(jsc(&["-p", "1 + [2,3] === \"12,3\""]), "true");
+    assert_eq!(jsc(&["-p", "[] + [] === \"\""]), "true");
+    assert_eq!(jsc(&["-p", "null + [] === \"null\""]), "true");
+    assert_eq!(jsc(&["-p", "true + [1] === \"true1\""]), "true");
 }
