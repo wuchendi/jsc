@@ -77,7 +77,7 @@ test262 is the primary metric. `crates/jsc-test262` runs the official suite at a
 - `tests/test262/harness/` holds the harness includes; `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module`, `async`, or `noStrict` are ineligible as well.
 - `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records the pass count per commit.
 
-Current result (last row of `tests/test262/history.tsv`): **4860 pass / 22992 eligible (21.1%) / 47665 total**.
+Current result (last row of `tests/test262/history.tsv`): **5230 pass / 22992 eligible (22.7%) / 47665 total**.
 
 ```bash
 bash scripts/test262-fetch.sh
