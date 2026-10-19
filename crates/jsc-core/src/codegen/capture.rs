@@ -485,8 +485,8 @@ impl CaptureResolver {
             Expr::Paren(p) => self.expr(&p.expr),
             Expr::Arrow(a) => {
                 let body = match a.body.as_ref() {
-                    BlockStmtOrExpr::BlockStmt(b) => AnalyzeBody::Block(&b.stmts),
-                    BlockStmtOrExpr::Expr(e) => AnalyzeBody::Expr(e),
+                    ArrowFunctionBody::FunctionBody(b) => AnalyzeBody::Block(&b.stmts),
+                    ArrowFunctionBody::Expr(e) => AnalyzeBody::Expr(e),
                 };
                 self.arrow_or_fn(&a.params, body);
             }
