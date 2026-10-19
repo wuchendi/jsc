@@ -77,7 +77,7 @@ test262 is the primary metric. `crates/jsc-test262` runs the official suite at a
 - `tests/test262/harness/` holds the harness includes; `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module`, `async`, or `noStrict` are ineligible as well.
 - `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records the pass count per commit.
 
-Current result (last row of `tests/test262/history.tsv`): **5230 pass / 22992 eligible (22.7%) / 47665 total**.
+Current result (last row of `tests/test262/history.tsv`): **5195 pass / 22992 eligible (22.6%) / 47665 total**.
 
 ```bash
 bash scripts/test262-fetch.sh
@@ -127,7 +127,7 @@ Details are in [DESIGN.md](DESIGN.md).
 ## Current limitations
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
-- **Fixed-shape objects.** Computed keys (`{[k]: v}`), object spread, object-literal accessors and private class fields are rejected; adding a property to an existing object or assigning past the end of an array is a silent no-op.
+- **Fixed-shape objects.** Computed keys (`{[k]: v}`), object spread, object-literal accessors and private class fields are rejected; writing a property an object does not have, or assigning past the end of an array, throws a `TypeError`; dynamic properties arrive with the wave-2 object model.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
 - **Not self-contained.** The module imports six host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
 - **Byte strings.** Strings are byte sequences, not UTF-16: `"é".length` is `2`.
