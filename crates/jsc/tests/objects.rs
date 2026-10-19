@@ -527,3 +527,31 @@ fn json_parse_rejects_malformed_input() {
         assert_eq!(jsc(&["-p", src]), "1", "expected `{src}` to throw");
     }
 }
+
+/// A property write on a primitive receiver is an uncaught `TypeError` (exit 1)
+/// with the strict-mode message; unknown primitive reads print `undefined`.
+#[test]
+fn primitive_receiver_via_eval() {
+    for (src, message) in [
+        ("let n=5; n.x=1", "Cannot create property 'x' on number '5'"),
+        ("let s=\"abc\"; s[\"x\"]=1", "Cannot create property 'x' on string 'abc'"),
+        ("let b=true; b.x+=1", "Cannot create property 'x' on boolean 'true'"),
+        ("let u; u.x=1", "Cannot set properties of undefined (setting 'x')"),
+        ("let u=null; u.x", "Cannot read properties of null (reading 'x')"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_jsc"))
+            .args(["-p", src])
+            .output()
+            .expect("failed to spawn jsc binary");
+        assert_eq!(output.status.code(), Some(1), "exit code for `{src}`");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("Uncaught TypeError: {message}")),
+            "stderr for `{src}`: {stderr}"
+        );
+    }
+    assert_eq!(jsc(&["-p", "let n=5; n.x"]), "undefined");
+    assert_eq!(jsc(&["-p", "\"abc\".foo"]), "undefined");
+    assert_eq!(jsc(&["-p", "\"abc\"[1]"]), "b");
+    assert_eq!(jsc(&["-p", "\"abc\".length"]), "3");
+}
