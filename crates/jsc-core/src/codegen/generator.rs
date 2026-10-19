@@ -17,8 +17,11 @@
 //!
 //! Still rejected (deferred): a `yield` inside `try`/`catch`/`finally` (handler
 //! state across a suspend), inside a `switch`, in a loop/if CONDITION, or nested
-//! in a larger expression; generator expressions/arrows/methods; nested closures
-//! in a generator body; and non-simple parameters.
+//! in a larger expression; generator expressions/arrows/methods; and non-simple parameters.
+//!
+//! A closure nested in the body captures the frame's env cells by reference
+//! (see [`LowerCtx::capture_source`]), so it shares them with the body across
+//! suspends and keeps them alive after the generator finishes.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -222,17 +225,6 @@ impl LowerCtx<'_> {
         let mut body = Vec::new();
         for stmt in &block.stmts {
             self.lower_stmt(stmt, &mut body)?;
-        }
-
-        // A nested closure inside a generator would capture the frame's cells
-        // through the ordinary env path, which this model does not wire up —
-        // reject it. Detected by any function value in the body.
-        if body.iter().any(stmt_has_func_value) {
-            return Err(CompileError::spanned(
-                function.span(),
-                "a nested function/arrow inside a generator is not supported",
-            )
-            .into());
         }
 
         self.async_body = prev_async;
@@ -741,98 +733,6 @@ fn node_contains_yield(node: &IrNode) -> bool {
         IrNode::Index { obj, index } => node_contains_yield(obj) || node_contains_yield(index),
         IrNode::GenResume { handle, sent } => {
             node_contains_yield(handle) || node_contains_yield(sent)
-        }
-        _ => false,
-    }
-}
-
-/// Whether a statement contains a first-class function value (a nested arrow /
-/// function expression / class). Used to reject nested closures in a generator
-/// body. Recurses through the same statement/expression shapes as
-/// [`stmt_contains_yield`].
-fn stmt_has_func_value(stmt: &IrStmt) -> bool {
-    match stmt {
-        IrStmt::Expr(node) => node_has_func_value(node),
-        IrStmt::Decl { init, .. } => node_has_func_value(init),
-        IrStmt::Return(value) => value.as_ref().is_some_and(node_has_func_value),
-        IrStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            node_has_func_value(cond)
-                || then_body.iter().any(stmt_has_func_value)
-                || else_body.iter().any(stmt_has_func_value)
-        }
-        IrStmt::While {
-            cond, body, update, ..
-        } => {
-            node_has_func_value(cond)
-                || body.iter().any(stmt_has_func_value)
-                || update.iter().any(stmt_has_func_value)
-        }
-        IrStmt::Switch { disc, cases, .. } => {
-            node_has_func_value(disc)
-                || cases.iter().any(|c| {
-                    c.test.as_ref().is_some_and(node_has_func_value)
-                        || c.body.iter().any(stmt_has_func_value)
-                })
-        }
-        IrStmt::Try {
-            body,
-            catch_body,
-            finally_body,
-        } => {
-            body.iter().any(stmt_has_func_value)
-                || catch_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_has_func_value))
-                || finally_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_has_func_value))
-        }
-        IrStmt::Break(_) | IrStmt::Continue(_) => false,
-    }
-}
-
-/// Whether an expression is or contains a first-class function value.
-fn node_has_func_value(node: &IrNode) -> bool {
-    match node {
-        IrNode::FuncValue { .. } => true,
-        IrNode::Binary { lhs, rhs, .. } | IrNode::Logical { lhs, rhs, .. } => {
-            node_has_func_value(lhs) || node_has_func_value(rhs)
-        }
-        IrNode::Not(inner)
-        | IrNode::CellNew(inner)
-        | IrNode::CellGet(inner)
-        | IrNode::StrLen(inner)
-        | IrNode::NullishCheck { value: inner, .. }
-        | IrNode::Throw(inner)
-        | IrNode::Yield(inner)
-        | IrNode::Await(inner)
-        | IrNode::IsGenerator(inner) => node_has_func_value(inner),
-        IrNode::CellSet { cell, value } => node_has_func_value(cell) || node_has_func_value(value),
-        IrNode::Assign { value, .. } => node_has_func_value(value),
-        IrNode::Ternary {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            node_has_func_value(cond)
-                || node_has_func_value(then_branch)
-                || node_has_func_value(else_branch)
-        }
-        IrNode::Call { args, .. } | IrNode::ConsoleLog { args } => {
-            args.iter().any(node_has_func_value)
-        }
-        IrNode::CallIndirect { callee, args } => {
-            node_has_func_value(callee) || args.iter().any(node_has_func_value)
-        }
-        IrNode::Array(elems) => elems.iter().any(node_has_func_value),
-        IrNode::Object(entries) => entries.iter().any(|(_, v)| node_has_func_value(v)),
-        IrNode::Index { obj, index } => node_has_func_value(obj) || node_has_func_value(index),
-        IrNode::GenResume { handle, sent } => {
-            node_has_func_value(handle) || node_has_func_value(sent)
         }
         _ => false,
     }

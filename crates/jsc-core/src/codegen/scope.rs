@@ -406,10 +406,16 @@ impl<'a> LowerCtx<'a> {
     /// binding `id`, evaluated in the current (enclosing) frame while building an
     /// inner function's environment: a `Local` when this frame declares the
     /// cell, else an `EnvLoad` from this frame's own environment (routing the
-    /// capture transitively out to the declaring frame).
+    /// capture transitively out to the declaring frame). An `env_backed`
+    /// (generator) frame keeps its own cells in its environment, not in locals.
     pub(super) fn capture_source(&mut self, id: u32) -> IrNode {
         let top = self.top();
         if let Some(&local) = self.frames[top].by_id.get(&id) {
+            if self.frames[top].env_backed
+                && let Some(&slot) = self.frames[top].env_index.get(&id)
+            {
+                return IrNode::EnvLoad(slot);
+            }
             return IrNode::Local(local);
         }
         let declaring = (0..top).find(|&fi| self.frames[fi].by_id.contains_key(&id));
