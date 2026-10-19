@@ -121,8 +121,8 @@ fn scan_expr_arity(expr: &Expr) -> usize {
         Expr::Arrow(a) => {
             let own = a.params.len();
             let body = match &*a.body {
-                BlockStmtOrExpr::BlockStmt(b) => scan_stmts_arity(&b.stmts),
-                BlockStmtOrExpr::Expr(e) => scan_expr_arity(e),
+                ArrowFunctionBody::FunctionBody(b) => scan_stmts_arity(&b.stmts),
+                ArrowFunctionBody::Expr(e) => scan_expr_arity(e),
             };
             own.max(body)
         }
