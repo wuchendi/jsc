@@ -354,7 +354,9 @@ export function parseIntStr(str: string, radix: number): number {
   // accumulate digit by digit.
   let value = 0
   if (base === 10) value = Number(digits)
-  else for (let i = 0; i < end; i++) value = value * base + digitValue(s.charCodeAt(i))
+  else
+    for (let i = 0; i < end; i++)
+      value = value * base + digitValue(s.charCodeAt(i))
   return sign * value
 }
 
