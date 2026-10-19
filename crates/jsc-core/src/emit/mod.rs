@@ -35,8 +35,8 @@ use wasm_encoder::{
 use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, SpreadCallee,
-    SpreadElem,
+    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, ReceiverOp,
+    SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -53,7 +53,7 @@ const PRINT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const PRINT_IMPORT_NAME: &str = abi::PRINT_IMPORT_NAME;
 
 /// The module and field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseInt`/`parseFloat` conversions. It receives the
+/// `String`/`Number`/`parseFloat` conversions. It receives the
 /// argument jsval plus a `CONVERT_OP_*` flag and returns the converted jsval,
 /// reusing the run stage's `format_value`/parse helpers (and allocating a heap
 /// string in guest memory for `String`).
@@ -63,7 +63,6 @@ const CONVERT_IMPORT_NAME: &str = abi::CONVERT_IMPORT_NAME;
 /// `__convert` op flags; see [`abi`].
 const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
 const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
-const CONVERT_OP_PARSE_INT: i32 = abi::CONVERT_OP_PARSE_INT;
 const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 
 /// The module and field name of the host `__method` import backing the
@@ -86,6 +85,8 @@ const THEN_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const THEN_IMPORT_NAME: &str = abi::THEN_IMPORT_NAME;
 const NOW_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const NOW_IMPORT_NAME: &str = abi::NOW_IMPORT_NAME;
+const PARSE_INT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
+const PARSE_INT_IMPORT_NAME: &str = abi::PARSE_INT_IMPORT_NAME;
 
 /// `__promise` op flags; see [`abi`].
 const PROMISE_OP_RESOLVE: i32 = abi::PROMISE_OP_RESOLVE;
@@ -148,8 +149,9 @@ const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
 ///
 /// Two more imports — `__promise` (index 3) and `__then` (index 4) — back the
 /// host promise engine, and `__now` (index 5) is the host wall clock backing
-/// `Date.now()` / `new Date()`, so the count is `6`.
-const IMPORT_FUNC_COUNT: u32 = 6;
+/// `Date.now()` / `new Date()`, and `__parse_int` (index 6) backs
+/// `parseInt(s, radix)`, so the count is `7`.
+const IMPORT_FUNC_COUNT: u32 = 7;
 
 /// `print` import flags; see [`abi`]: a value plus a trailing space, a
 /// value plus a newline, or a newline alone for zero-argument `console.log()`.
@@ -427,11 +429,17 @@ const NULLISH_SUFFIX: &str = "')";
 /// See [`NULLISH_READ_PREFIX`].
 const TYPE_ERROR_STACK_PREFIX: &str = "TypeError: ";
 
+/// The computed key `recv["length"]` that a string/array index read resolves to
+/// the length header. Seeded with [`NULLISH_ERROR_STRS`], since every guarded
+/// index read site seeds those.
+const INDEX_LENGTH_KEY: &str = "length";
+
 /// The static strings `__nullish_throw` needs — the error object's keys, kind
 /// marker key and `name`, the receiver words, and the message fragments. Seeded
 /// by [`collect_node`] at every guarded member read/write/method-call site so
 /// their `[len][utf8]` blobs exist when the guard throws.
-const NULLISH_ERROR_STRS: [&str; 13] = [
+const NULLISH_ERROR_STRS: [&str; 14] = [
+    INDEX_LENGTH_KEY,
     "name",
     "message",
     "stack",
@@ -457,10 +465,28 @@ const PROP_ADD_SUFFIX: &str = "': dynamic properties are not supported yet";
 /// past the current length.
 const ARRAY_GROW_MSG: &str = "Cannot grow array by index assignment yet";
 
+/// The message fragments `__prop_throw` splices into the strict-mode
+/// `TypeError` raised by a member store on a primitive receiver:
+/// `Cannot create property '<key>' on <number|string|boolean> '<String(recv)>'`.
+const PRIM_CREATE_PREFIX: &str = "Cannot create property '";
+/// See [`PRIM_CREATE_PREFIX`].
+const PRIM_CREATE_MID: &str = "' on ";
+/// See [`PRIM_CREATE_PREFIX`].
+const PRIM_CREATE_QUOTE: &str = " '";
+/// See [`PRIM_CREATE_PREFIX`].
+const PRIM_CREATE_SUFFIX: &str = "'";
+
+/// `__prop_throw`'s `mode` argument: an absent property on a fixed-shape object.
+const PROP_THROW_ADD: i32 = 0;
+/// `__prop_throw`'s `mode` argument: an array index store at/past the length.
+const PROP_THROW_GROW: i32 = 1;
+/// `__prop_throw`'s `mode` argument: any store on a primitive receiver.
+const PROP_THROW_PRIMITIVE: i32 = 2;
+
 /// The static strings `__prop_throw` needs — the error object's keys, kind
 /// marker key and `name`, and the message fragments. Seeded by [`collect_node`]
 /// at every member store site so their `[len][utf8]` blobs exist when it throws.
-const PROP_ERROR_STRS: [&str; 9] = [
+const PROP_ERROR_STRS: [&str; 16] = [
     "name",
     "message",
     "stack",
@@ -470,6 +496,13 @@ const PROP_ERROR_STRS: [&str; 9] = [
     PROP_ADD_SUFFIX,
     ARRAY_GROW_MSG,
     TYPE_ERROR_STACK_PREFIX,
+    PRIM_CREATE_PREFIX,
+    PRIM_CREATE_MID,
+    PRIM_CREATE_QUOTE,
+    PRIM_CREATE_SUFFIX,
+    "number",
+    "string",
+    "boolean",
 ];
 
 /// The `JSON.parse` syntax-error `.name`, `.message`, and `.stack` text. jsc has
@@ -649,8 +682,7 @@ struct Helpers<'a> {
     /// `call`s of it.
     print: u32,
     /// The host `__convert` import's function index. Always `1` (the
-    /// second import); `String`/`Number`/`parseInt`/`parseFloat` lower to `call`s
-    /// of it.
+    /// second import); `String`/`Number`/`parseFloat` lower to `call`s of it.
     convert: u32,
     /// The host `__method` import's function index. Always `2` (the third
     /// import); the non-callback array/string methods lower to `call`s of it.
@@ -666,6 +698,9 @@ struct Helpers<'a> {
     /// sixth import); `Date.now()` / `new Date()` lower to `call`s of it. The
     /// import returns an f64 (ms since the Unix epoch).
     now: u32,
+    /// The host `__parse_int(s: i64, radix: i64) -> i64` import's function
+    /// index. Always `6` (the seventh import); `parseInt` lowers to `call`s of it.
+    parse_int: u32,
     /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
     /// array — the drain backing `[...gen]` / `f(...gen)` spread. Emitted just
@@ -678,11 +713,12 @@ struct Helpers<'a> {
     /// The out-of-line half of the nullish-receiver guard (see
     /// [`object::emit_nullish_guard`]).
     nullish_throw: u32,
-    /// `__prop_throw(key: i64, grow: i32)`: build the `TypeError` for a member
-    /// store the fixed-shape receiver cannot take — an absent property
-    /// (`grow == 0`, message names `String(key)`) or an array index at/past the
-    /// length (`grow == 1`) — and leave it in flight (`$exc_pending` set). The
-    /// out-of-line half of [`object::emit_index_set_node`]'s miss paths.
+    /// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the `TypeError` for
+    /// a member store the receiver cannot take — an absent property
+    /// ([`PROP_THROW_ADD`], message names `String(key)`), an array index at/past
+    /// the length ([`PROP_THROW_GROW`]), or any store on a primitive `recv`
+    /// ([`PROP_THROW_PRIMITIVE`]) — and leave it in flight (`$exc_pending` set).
+    /// The out-of-line half of [`object::emit_index_set_node`]'s miss paths.
     prop_throw: u32,
     /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
     /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).
@@ -914,6 +950,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         promise_type,
         then_type,
         now_type,
+        parse_int_type,
     ) = build_type_and_function_sections(program, &unwind, has_accessors);
     module.section(&types);
 
@@ -959,6 +996,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         NOW_IMPORT_MODULE,
         NOW_IMPORT_NAME,
         EntityType::Function(now_type),
+    );
+    // The host `parseInt` import (index 6): `__parse_int(s, radix) -> i64`.
+    imports.import(
+        PARSE_INT_IMPORT_MODULE,
+        PARSE_INT_IMPORT_NAME,
+        EntityType::Function(parse_int_type),
     );
     module.section(&imports);
 

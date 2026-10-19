@@ -109,3 +109,10 @@ fn nan_infinity_global_bindings() {
     assert_eq!(jsc(&["-p", "-Infinity"]), "-Infinity");
     assert_eq!(jsc(&["-p", "NaN"]), "NaN");
 }
+
+/// `**` with an int32-min exponent terminates on the binary instead of hanging.
+#[test]
+fn pow_int32_min_exponent_terminates() {
+    assert_eq!(jsc(&["-p", "2 ** -2147483648"]), "0");
+    assert_eq!(jsc(&["-p", "Math.pow(0.5, -2147483648)"]), "Infinity");
+}

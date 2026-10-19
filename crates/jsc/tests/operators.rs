@@ -265,3 +265,16 @@ fn binary_plus_coerces_primitives() {
     assert_eq!(jsc(&["-p", "null + [] === \"null\""]), "true");
     assert_eq!(jsc(&["-p", "true + [1] === \"true1\""]), "true");
 }
+
+/// Unary minus on a non-literal operand negates the sign of zero: `-(+0)` is
+/// `-0` and `-(-0)` is `+0`, observable through `1 / x`.
+#[test]
+fn unary_minus_negates_signed_zero() {
+    assert_eq!(jsc(&["-p", "let z = 0; 1 / -z"]), "-Infinity");
+    assert_eq!(jsc(&["-p", "let m = -0; 1 / -m"]), "Infinity");
+    // ToNumber of the operand happens first: `-"0"` is `-0`.
+    assert_eq!(jsc(&["-p", "let s = \"0\"; 1 / -s"]), "-Infinity");
+    assert_eq!(jsc(&["-p", "let n = 5; -n === -5"]), "true");
+    // A literal `-0` is still constant-folded to `-0`.
+    assert_eq!(jsc(&["-p", "1 / -0"]), "-Infinity");
+}

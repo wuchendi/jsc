@@ -56,6 +56,17 @@ it('dispatches the string methods through the shim', async () => {
   expect((await run("'a,b,c'.split(',').length")).result).toBe('3')
 })
 
+it('parses parseInt with a radix through the shim', async () => {
+  expect((await run("parseInt('ff', 16)")).result).toBe('255')
+  expect((await run("parseInt('0xff')")).result).toBe('255')
+  expect((await run("parseInt('0xff', 10)")).result).toBe('0')
+  expect((await run("parseInt('101', 2)")).result).toBe('5')
+  expect((await run("parseInt('z', 36)")).result).toBe('35')
+  expect((await run("parseInt('12', 37)")).result).toBe('NaN')
+  expect((await run("parseInt('  -7f', 16)")).result).toBe('-127')
+  expect((await run("1 / parseInt('-0')")).result).toBe('-Infinity')
+})
+
 it('links every emitted module against the shim (no LinkError)', async () => {
   expect((await run('1+1')).result).toBe('2')
 })
@@ -119,6 +130,25 @@ it('backs Date.now() with the host clock', async () => {
   expect(now).toBeGreaterThanOrEqual(before)
   expect(now).toBeLessThanOrEqual(Date.now())
   expect((await run('new Date(0)')).result).toBe('1970-01-01T00:00:00.000Z')
+})
+
+it('rejects run() on an unhandled promise rejection', async () => {
+  await expect(run('Promise.reject("x"); 0')).rejects.toThrow(
+    /^Uncaught \(in promise\) x$/,
+  )
+  await expect(run('async function f() { throw "t" } f(); 0')).rejects.toThrow(
+    /^Uncaught \(in promise\) t$/,
+  )
+  await expect(
+    run('Promise.reject("a"); Promise.reject("b"); 0'),
+  ).rejects.toThrow(/^Uncaught \(in promise\) a$/)
+  await expect(run('Promise.reject(1); throw 2')).rejects.toThrow(
+    /^Uncaught 2$/,
+  )
+  const late = await run(
+    'const p = Promise.reject(1); Promise.resolve(0).then(() => p.catch(() => {})); 0',
+  )
+  expect(late.result).toBe('0')
 })
 
 it('rejects run() on an unhandled top-level await rejection', async () => {

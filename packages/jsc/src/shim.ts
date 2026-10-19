@@ -1,7 +1,7 @@
 /**
  * The JS runtime shim: the `importObject` that backs the emitted module's host
  * env imports (`print` / `__convert` / `__method` / `__promise` / `__then` /
- * `__now`) plus the bump-allocator they share. A port of
+ * `__now` / `__parse_int`) plus the bump-allocator they share. A port of
  * `crates/jsc-core/src/run/harness.rs` (import wiring), `run/host.rs` (handlers +
  * allocator), and `run/promise.rs` (the promise engine + microtask queue). It
  * duplicates Rust host semantics against the emitted module's memory (see
@@ -11,7 +11,6 @@
 import {
   ASYNC_STEP_EXPORT_NAME,
   CONVERT_OP_PARSE_FLOAT,
-  CONVERT_OP_PARSE_INT,
   CONVERT_OP_TO_NUMBER,
   CONVERT_OP_TO_STRING,
   EXC_PENDING_EXPORT_NAME,
@@ -80,7 +79,11 @@ export interface Shim {
   stdout: () => string
   /** Bind the instantiated module so the imports can read/grow its memory. */
   bindInstance: (instance: WebAssembly.Instance) => void
-  /** Drain the microtask queue to empty (mirrors `promise.rs::drain_after_main`). */
+  /**
+   * Drain the microtask queue to empty, then throw
+   * `Error("Uncaught (in promise) <value>")` for the first rejected promise that
+   * never got a handler (mirrors `promise.rs::drain_after_main`).
+   */
   drainAfterMain: () => void
 }
 
@@ -450,6 +453,10 @@ export function createShim(): Shim {
   const queue: Job[] = []
   /** Reactions of each still-pending promise, keyed by block base offset. */
   const reactions = new Map<number, Reaction[]>()
+  /** Every rejected promise, by block base (ascending base = creation order). */
+  const rejected = new Set<number>()
+  /** Every promise that had a reaction registered (then/catch/finally, await, adoption). */
+  const handled = new Set<number>()
 
   /** An exported global by name, or `undefined` when absent. */
   function exportGlobal(name: string): WebAssembly.Global | undefined {
@@ -476,7 +483,9 @@ export function createShim(): Shim {
     dv.setInt32(HEADER_SIZE, state, true)
     dv.setBigUint64(HEADER_SIZE + 4, value, true)
     const base = hostAlloc(block)
-    return base === null ? null : HEAP | base
+    if (base === null) return null
+    if (state === PROMISE_REJECTED) rejected.add(Number(base))
+    return HEAP | base
   }
 
   /** Write a promise block's settlement into guest memory (mirrors `write_settlement`). */
@@ -526,6 +535,7 @@ export function createShim(): Shim {
       return
     }
     writeSettlement(base, state, value)
+    if (state === PROMISE_REJECTED) rejected.add(base)
     const pendingReactions = reactions.get(base) ?? []
     reactions.delete(base)
     for (const r of pendingReactions) {
@@ -567,6 +577,7 @@ export function createShim(): Shim {
       return
     }
     const state = readState(mem, base)
+    handled.add(base)
     if (state === PROMISE_PENDING) {
       const list = reactions.get(base) ?? []
       list.push({
@@ -646,6 +657,7 @@ export function createShim(): Shim {
   function awaitPromise(p: bigint): bigint {
     const base = asPromise(memView(), p)
     if (base === null) return p
+    handled.add(base)
     drain()
     const mem = memView()
     const state = readState(mem, base)
@@ -729,8 +741,6 @@ export function createShim(): Shim {
     switch (op) {
       case CONVERT_OP_TO_NUMBER:
         return f64ToBits(valueToNumber(value))
-      case CONVERT_OP_PARSE_INT:
-        return f64ToBits(parseIntStr(formatValue(value)))
       case CONVERT_OP_PARSE_FLOAT:
         return f64ToBits(parseFloatStr(formatValue(value)))
       case CONVERT_OP_TO_STRING: {
@@ -763,6 +773,14 @@ export function createShim(): Shim {
         promiseThen(asU64(p), asU64(onF), asU64(onR)),
       // The host wall clock backing `Date.now()` / `new Date()` (ms since epoch).
       __now: (): number => Date.now(),
+      // `parseInt(s, radix)` (an omitted radix arrives as `undefined`).
+      __parse_int: (s: bigint, radix: bigint): bigint =>
+        f64ToBits(
+          parseIntStr(
+            formatValue(decode(asU64(s), memView())),
+            valueToNumber(decode(asU64(radix), memView())),
+          ),
+        ),
     },
   }
 
@@ -772,7 +790,17 @@ export function createShim(): Shim {
     bindInstance: (bound) => {
       instance = bound
     },
-    drainAfterMain: drain,
+    drainAfterMain: () => {
+      drain()
+      const unhandled = [...rejected]
+        .filter((base) => !handled.has(base))
+        .sort((a, b) => a - b)[0]
+      if (unhandled === undefined) return
+      const mem = memView()
+      throw new Error(
+        `Uncaught (in promise) ${formatValue(decode(readValue(mem, unhandled), mem))}`,
+      )
+    },
   }
 }
 
