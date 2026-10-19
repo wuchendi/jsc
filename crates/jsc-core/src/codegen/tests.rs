@@ -1,9 +1,9 @@
 use super::lower;
-use crate::frontend::parse;
+use crate::frontend::{Dialect, parse};
 use crate::ir::{BinOp, IrNode, IrStmt, OpSetKind};
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
-    lower(&parse(src)?)
+    lower(&parse(src, Dialect::Js)?)
 }
 
 /// Lower a single-expression-statement program and return its expression.
