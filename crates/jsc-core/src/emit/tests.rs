@@ -580,8 +580,10 @@ fn heap_blocks_write_the_type_byte_header() {
     // and assert the byte there is the expected kind (0 string / 1 array / 2
     // object) with the three padding bytes zeroed.
     for (src, expected_type) in [("\"hi\"", 0u8), ("[7, 8]", 1u8), ("let o = {a: 1}; o", 2u8)] {
-        let program =
-            crate::codegen::lower(&crate::frontend::parse(src).expect("parse")).expect("lower");
+        let program = crate::codegen::lower(
+            &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
+        )
+        .expect("lower");
         let bytes = emit(&program);
         validate(&bytes);
         let (bits, memory) = crate::run::run(&bytes).expect("module should run");
@@ -675,8 +677,11 @@ fn emits_valid_closure_module_with_cells_and_env() {
     // module (boxed cell `CellNew`/`CellGet`, environment block, and
     // env-slot function value) must be a valid wasm module.
     let program = crate::codegen::lower(
-        &crate::frontend::parse("function adder(x){ return y => x + y } adder(5)(37)")
-            .expect("parse"),
+        &crate::frontend::parse(
+            "function adder(x){ return y => x + y } adder(5)(37)",
+            crate::frontend::Dialect::Js,
+        )
+        .expect("parse"),
     )
     .expect("lower");
     let bytes = emit(&program);
