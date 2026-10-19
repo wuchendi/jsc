@@ -243,7 +243,7 @@ fn logical_assignment_via_eval() {
     assert_eq!(jsc(&["-p", "let x=1; let y=0; x ||= (y=5); y"]), "0");
 }
 
-/// Binary `+` without a string operand is ToNumber addition; with one it is
+/// Binary `+` without a string operand is `ToNumber` addition; with one it is
 /// string concatenation.
 #[test]
 fn binary_plus_coerces_primitives() {

@@ -46,7 +46,7 @@ fn coercion_composes_and_preserves_order() {
     assert!(compile_and_run("\"x\" + 8").is_ok());
 }
 
-/// With no string operand, `+` applies ToNumber to both sides: `null` is `0`,
+/// With no string operand, `+` applies `ToNumber` to both sides: `null` is `0`,
 /// booleans are `0`/`1`, and `undefined` is `NaN`.
 #[test]
 fn non_string_primitives_add_numerically() {
@@ -63,7 +63,7 @@ fn non_string_primitives_add_numerically() {
     );
 }
 
-/// A string on either side still concatenates, after the other side's ToString.
+/// A string on either side still concatenates, after the other side's `ToString`.
 #[test]
 fn string_side_still_concatenates() {
     assert_string("\"a\" + true", "atrue");
