@@ -353,4 +353,10 @@ fn nested_function_declarations_are_hoisted() {
         ]),
         "3"
     );
+    // A hoisted declaration in a top-level `try` block leaves the block's
+    // completion value to its last expression statement.
+    assert_eq!(
+        jsc(&["-p", "try { f(); function f(){} 5 } catch (e) {}"]),
+        "5"
+    );
 }
