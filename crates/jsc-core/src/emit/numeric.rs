@@ -560,7 +560,10 @@ fn emit_add(
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::Else);
-    // ELSE: numeric add — unbox both operands to f64, add, rebox.
+    // ELSE: numeric add — ToNumber both operands (`null` -> 0, booleans ->
+    // 0/1, `undefined` -> NaN), unbox to f64, add, rebox.
+    emit_coerce_number(function, s0, helpers);
+    emit_coerce_number(function, s1, helpers);
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(s1));
