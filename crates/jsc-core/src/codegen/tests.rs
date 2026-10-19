@@ -1118,3 +1118,20 @@ fn capturing_function_callable_from_sibling_and_before_its_binding() {
         .expect("sibling call lowers");
     lower_src("f(); let n=41; function f(){ return n }").expect("hoisted call lowers");
 }
+
+/// An uncaptured C-style `for (let ...)` binding needs no per-iteration copy, so
+/// the loop lowers without any cell; a captured one is boxed once by its
+/// declaration and copied into a fresh cell after the init and in the update.
+#[test]
+fn for_let_per_iteration_copy_only_when_captured() {
+    let plain =
+        lower_src("let s = 0; for (let i=0;i<3;i++) { s = s + i; } s").expect("should lower");
+    assert!(!format!("{plain:?}").contains("CellNew"), "{plain:?}");
+    let captured =
+        lower_src("let f; for (let i=0;i<3;i++) { f = () => i; } f()").expect("should lower");
+    assert_eq!(
+        format!("{captured:?}").matches("CellNew").count(),
+        3,
+        "{captured:?}"
+    );
+}

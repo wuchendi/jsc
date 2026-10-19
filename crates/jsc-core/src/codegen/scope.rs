@@ -61,6 +61,22 @@ impl<'a> LowerCtx<'a> {
         self.frame().scopes.push(HashMap::new());
     }
 
+    /// The locals of the innermost scope's bindings that are boxed cells in an
+    /// ordinary frame (no env or module slot), in ascending local order.
+    pub(super) fn innermost_cell_locals(&mut self) -> Vec<u32> {
+        let frame = self.frame();
+        let mut locals: Vec<u32> = frame
+            .scopes
+            .last()
+            .into_iter()
+            .flat_map(|scope| scope.values())
+            .filter(|b| b.cell && b.env_slot.is_none() && b.module.is_none())
+            .map(|b| b.local)
+            .collect();
+        locals.sort_unstable();
+        locals
+    }
+
     /// Leave the innermost lexical scope, discarding its name bindings.
     pub(super) fn pop_scope(&mut self) {
         self.frame().scopes.pop();
