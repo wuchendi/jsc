@@ -106,6 +106,8 @@ impl std::fmt::Debug for PromiseEngine {
         f.debug_struct("PromiseEngine")
             .field("queued", &self.queue.len())
             .field("pending", &self.reactions.len())
+            .field("rejected", &self.rejected.len())
+            .field("handled", &self.handled.len())
             .finish()
     }
 }
