@@ -269,6 +269,9 @@ pub(super) fn emit_node(
         node @ IrNode::MapMethod { .. } => {
             emit_map_method_node(node, function, scratch, strings, helpers);
         }
+        node @ IrNode::ReceiverMethod { .. } => {
+            emit_receiver_method_node(node, function, scratch, strings, helpers);
+        }
         IrNode::IndexSet { obj, index, value } => {
             emit_index_set_node(obj, index, value, function, scratch, strings, helpers);
         }

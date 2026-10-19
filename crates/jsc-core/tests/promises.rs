@@ -408,3 +408,51 @@ fn for_let_loop_with_await_in_async_function() {
         "012\n",
     );
 }
+
+/// `.then`/`.catch`/`.finally` are only the promise methods for a promise
+/// receiver: an object or class instance with a same-named method gets an
+/// ordinary method call (`this` bound, every argument passed).
+#[test]
+fn user_then_catch_finally_methods_are_called_on_non_promises() {
+    assert_eval("const t = { then(a) { return a + 1; } }; t.then(1)", "2");
+    assert_eval(
+        "const t = { then(a, b, c) { return a + b + c; } }; t.then(1, 2, 3)",
+        "6",
+    );
+    assert_eval(
+        "const o = { catch(e) { return e * 2; }, finally() { return \"f\"; } }; o.catch(4) + o.finally()",
+        "8f",
+    );
+    assert_eval(
+        "class T { constructor() { this.k = 3; } then(f) { return f(this.k); } }
+         new T().then(v => v * 2)",
+        "6",
+    );
+}
+
+/// A nullish `.then`/`.catch`/`.finally` receiver throws the ordinary
+/// member-read `TypeError`.
+#[test]
+fn nullish_promise_method_receiver_throws_a_type_error() {
+    assert_uncaught(
+        "let n = null; n.then();",
+        "TypeError: Cannot read properties of null (reading 'then')",
+    );
+    assert_uncaught(
+        "let u; u.catch(() => 1);",
+        "TypeError: Cannot read properties of undefined (reading 'catch')",
+    );
+    assert_uncaught(
+        "let u; u.finally();",
+        "TypeError: Cannot read properties of undefined (reading 'finally')",
+    );
+}
+
+/// A non-promise primitive without a `then` method throws "not a function".
+#[test]
+fn then_on_a_primitive_throws_a_type_error() {
+    assert_uncaught(
+        "let x = 5; x.then();",
+        "TypeError: called value is not a function",
+    );
+}

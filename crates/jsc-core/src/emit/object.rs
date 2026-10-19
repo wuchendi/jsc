@@ -1173,6 +1173,108 @@ pub(super) fn emit_map_method_node(
     function.instruction(&Instruction::End);
 }
 
+/// Emit a promise / generator instance method call `recv.<op>(args)`, leaving
+/// its result jsval on the stack. The receiver is evaluated once into
+/// `recv_local`, then a runtime TYPE-BYTE dispatch splits the paths: a
+/// `TYPE_PROMISE` receiver of `then`/`catch`/`finally` registers its reactions
+/// (the host `__then` / `__promise` engine), a `TYPE_GENERATOR` receiver of `next`
+/// drives the state machine one step; any other receiver falls back to an
+/// ordinary user method call `recv.<name>(args)` — nullish-guarded, binding
+/// `this = recv`, every argument passed. Surplus builtin-path arguments are
+/// evaluated for their side effects and dropped.
+pub(super) fn emit_receiver_method_node(
+    node: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let IrNode::ReceiverMethod {
+        op,
+        recv,
+        args,
+        recv_local,
+        fallback_obj_local,
+    } = node
+    else {
+        unreachable!("emit_receiver_method_node is only called with a ReceiverMethod node")
+    };
+    let recv_local = *recv_local;
+
+    // Evaluate the receiver ONCE into a stable frame local.
+    emit_node(recv, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(recv_local));
+
+    // is_builtin = is_pointer(recv) && type_byte == TYPE_PROMISE / TYPE_GENERATOR.
+    // The pointer gate keeps the type-byte load off a non-heap receiver.
+    let type_byte = if matches!(op, ReceiverOp::Next) {
+        TYPE_GENERATOR
+    } else {
+        i32::from(abi::TYPE_PROMISE)
+    };
+    emit_is_pointer(function, recv_local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, recv_local);
+    function.instruction(&Instruction::I32Const(type_byte));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    // Either arm may wrap a throwing sub-call, one frame deeper (mirrors Ternary).
+    enter_frame(helpers);
+    let arg = |i: usize| Box::new(args.get(i).cloned().unwrap_or(IrNode::Undefined));
+    let recv_node = Box::new(IrNode::Local(recv_local));
+    let (builtin, used) = match op {
+        ReceiverOp::Then => (
+            IrNode::PromiseThen {
+                promise: recv_node,
+                on_fulfilled: arg(0),
+                on_rejected: arg(1),
+            },
+            2,
+        ),
+        ReceiverOp::Catch => (
+            IrNode::PromiseThen {
+                promise: recv_node,
+                on_fulfilled: Box::new(IrNode::Undefined),
+                on_rejected: arg(0),
+            },
+            1,
+        ),
+        ReceiverOp::Finally => (
+            IrNode::PromiseFinally {
+                promise: recv_node,
+                on_finally: arg(0),
+            },
+            1,
+        ),
+        ReceiverOp::Next => (
+            IrNode::GenResume {
+                handle: recv_node,
+                sent: arg(0),
+            },
+            1,
+        ),
+    };
+    emit_node(&builtin, function, scratch, strings, helpers);
+    for extra in args.iter().skip(used) {
+        emit_node(extra, function, scratch, strings, helpers);
+        function.instruction(&Instruction::Drop);
+    }
+    function.instruction(&Instruction::Else);
+    let fallback = IrNode::MethodCallUser {
+        obj: Box::new(IrNode::Local(recv_local)),
+        key: Box::new(IrNode::Str(op.name().to_owned())),
+        args: args.clone(),
+        obj_local: *fallback_obj_local,
+    };
+    emit_method_call_user(&fallback, function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
 /// Emit the `TYPE_MAP`/`TYPE_SET` collection-op path of [`emit_map_method_node`],
 /// leaving the op's result jsval on the stack. `handle` holds the receiver jsval;
 /// its wrapped base is the first argument to each `__map_*` helper. A missing key/
