@@ -619,8 +619,8 @@ A `for` loop with a `let` head is scoped to the loop; `continue` still runs the
 update clause. Labels may only be applied to loops.
 
 The CLI's `-p` mode prints the value of the **last expression statement**
-evaluated by `main`; statement completion values of `try`, `switch`, and loops
-are not tracked.
+evaluated by `main`; `try` statements contribute their completion values, while
+those of `switch` and loops are not tracked.
 
 ### 7.4 Functions
 
