@@ -24,6 +24,29 @@ pub(super) fn binding_id(ident: &swc_ecma_ast::BindingIdent) -> u32 {
 /// Nested arrows and function expressions/declarations push a further scope.
 pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> CaptureAnalysis {
     let mut resolver = CaptureResolver::default();
+    // `main`'s outermost-scope bindings and their mutability, known up front so a
+    // closure referencing one declared LATER in the program resolves to it.
+    for stmt in top_stmts {
+        match stmt {
+            Stmt::Decl(Decl::Var(v)) => {
+                let mut names = std::collections::HashSet::new();
+                for d in &v.decls {
+                    pat_names(&d.name, &mut names);
+                }
+                for name in names {
+                    resolver
+                        .top_bindings
+                        .insert(name, v.kind != VarDeclKind::Const);
+                }
+            }
+            Stmt::Decl(Decl::Class(c)) => {
+                resolver
+                    .top_bindings
+                    .insert(c.ident.sym.as_ref().to_owned(), true);
+            }
+            _ => {}
+        }
+    }
     resolver.enter_function();
     for stmt in top_stmts {
         resolver.stmt(stmt);
@@ -34,14 +57,10 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
     // hoisting). A reference reaching `main` records a module binding.
     resolver.in_top_fn = true;
     for fn_decl in fn_decls {
-        resolver.enter_function();
-        for param in &fn_decl.function.params {
-            resolver.declare_param(&param.pat);
-        }
-        if let Some(block) = &fn_decl.function.body {
-            resolver.stmts(&block.stmts);
-        }
-        resolver.exit_function();
+        resolver.function(
+            &fn_decl.function.params,
+            fn_decl.function.body.as_ref().map(|b| &b.stmts),
+        );
     }
     resolver.exit_function();
     // Finalize the object shapes: keep only the candidates whose binding name is
@@ -64,9 +83,18 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         }
     }
     module_vars.retain(|name| resolver.module_names.contains(name));
+    let module_mutable = resolver
+        .module_names
+        .iter()
+        .map(|name| {
+            let mutable = resolver.top_bindings.get(name).copied().unwrap_or(true);
+            (name.clone(), mutable)
+        })
+        .collect();
     CaptureAnalysis {
         captured: resolver.captured,
         module_vars,
+        module_mutable,
         module_names: resolver.module_names,
         object_shapes,
     }
@@ -128,11 +156,17 @@ impl CaptureResolver {
     }
 
     /// Declare a function/arrow parameter binding for capture analysis: a plain
-    /// `Pat::Ident` or the inner ident of a trailing rest parameter (`...rest`),
-    /// so a nested closure referencing the rest binding marks it captured.
+    /// `Pat::Ident`, a defaulted ident (`a = d`, whose default is analyzed first in
+    /// the function's frame, so an outer binding it reads is captured), or the
+    /// inner ident of a trailing rest parameter (`...rest`), so a nested closure
+    /// referencing the rest binding marks it captured.
     fn declare_param(&mut self, pat: &Pat) {
         match pat {
             Pat::Ident(ident) => self.declare(ident.id.sym.as_ref(), binding_id(ident)),
+            Pat::Assign(assign) => {
+                self.expr(&assign.right);
+                self.declare_param(&assign.left);
+            }
             Pat::Rest(rest) => {
                 if let Pat::Ident(ident) = rest.arg.as_ref() {
                     self.declare(ident.id.sym.as_ref(), binding_id(ident));
@@ -256,7 +290,10 @@ impl CaptureResolver {
     /// Resolve a name reference; if it binds in an enclosing function frame,
     /// mark that binding captured. When the reference reaches the `main` frame
     /// (0) from within a top-level function declaration, the name is also
-    /// recorded as a module binding.
+    /// recorded as a module binding. A closure nested in `main` referencing a
+    /// `main` outermost-scope binding not yet declared (it appears LATER in the
+    /// program) records a module binding too: the closure reaches it through the
+    /// TDZ-guarded module cell.
     fn reference(&mut self, name: &str) {
         let top = self.frames.len().saturating_sub(1);
         for (fi, frame) in self.frames.iter().enumerate().rev() {
@@ -264,14 +301,22 @@ impl CaptureResolver {
                 if let Some(&id) = scope.get(name) {
                     if fi != top {
                         self.captured.insert(id);
-                        if fi == 0 && self.in_top_fn && !self.module_names.iter().any(|n| n == name)
-                        {
-                            self.module_names.push(name.to_owned());
+                        if fi == 0 && self.in_top_fn {
+                            self.add_module_name(name);
                         }
                     }
                     return;
                 }
             }
+        }
+        if top > 0 && !self.in_top_fn && self.top_bindings.contains_key(name) {
+            self.add_module_name(name);
+        }
+    }
+
+    fn add_module_name(&mut self, name: &str) {
+        if !self.module_names.iter().any(|n| n == name) {
+            self.module_names.push(name.to_owned());
         }
     }
 
