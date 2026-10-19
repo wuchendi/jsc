@@ -884,7 +884,7 @@ fn lowers_c_style_for_to_init_and_while() {
         unreachable!("expected a while statement");
     };
     // The body is empty; the update expression lives in the `update` slot.
-    assert!(body.is_empty());
+    assert_eq!(body.as_slice(), []);
     assert_eq!(update.len(), 1);
     assert!(matches!(update[0], IrStmt::Expr(_)));
 }
@@ -924,7 +924,7 @@ fn lowers_switch_with_default_and_break() {
     assert!(cases[1].test.is_some());
     assert!(cases[2].test.is_none());
     // The first clause is empty (fall-through); the second holds the `break`.
-    assert!(cases[0].body.is_empty());
+    assert_eq!(cases[0].body.as_slice(), []);
     assert_eq!(cases[1].body, vec![IrStmt::Break(None)]);
 }
 

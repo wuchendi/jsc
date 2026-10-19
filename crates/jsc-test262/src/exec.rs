@@ -163,6 +163,6 @@ mod tests {
             let out = pool(&items, jobs, |i, x| (i, x * 2));
             assert_eq!(out, items.iter().map(|x| (*x, x * 2)).collect::<Vec<_>>());
         }
-        assert!(pool(&Vec::<u8>::new(), 4, |_, x| *x).is_empty());
+        assert_eq!(pool(&Vec::<u8>::new(), 4, |_, x| *x), Vec::<u8>::new());
     }
 }

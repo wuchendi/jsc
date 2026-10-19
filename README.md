@@ -19,7 +19,7 @@ sum 6
 
 ## Install
 
-From source (Rust 1.96+):
+From source (Rust 1.99+):
 
 ```bash
 git clone https://github.com/cdLab996/jsc.git
