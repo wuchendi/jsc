@@ -68,7 +68,7 @@ fn non_string_primitives_add_numerically() {
 fn string_side_still_concatenates() {
     assert_string("\"a\" + true", "atrue");
     assert_string("\"a\" + undefined", "aundefined");
-    assert_string("\"a\" + null", "anull");
+    assert_string("\"x\" + null", "xnull");
     assert_string("1 + \"2\"", "12");
 }
 
