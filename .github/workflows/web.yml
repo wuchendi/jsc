@@ -29,7 +29,7 @@ jobs:
     name: biome + typecheck + build + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The @cdlab/jsc package loads a wasm-bindgen artifact that is gitignored,
       # so build it first (needs Rust + wasm-pack).
