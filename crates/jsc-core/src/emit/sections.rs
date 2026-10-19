@@ -786,6 +786,28 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
+        // A promise / generator method threads its method name (the user-method
+        // fallback key) into the string table; the generator path builds a
+        // `{ value, done }` result, and the guarded fallback throws a nullish /
+        // not-a-function TypeError — seed all of those strings too.
+        IrNode::ReceiverMethod { op, recv, args, .. } => {
+            let keys: &[&'static str] = if matches!(op, ReceiverOp::Next) {
+                &["value", "done"]
+            } else {
+                &[]
+            };
+            let name = [op.name()];
+            for &s in name.iter().chain(keys).chain(&INTERNAL_TYPE_ERROR_STRS) {
+                if seen.insert(s) {
+                    order.push(s);
+                }
+            }
+            seed_nullish_strs(order, seen);
+            collect_node(recv, order, seen);
+            for arg in args {
+                collect_node(arg, order, seen);
+            }
+        }
         IrNode::DateMethod {
             op,
             recv,
