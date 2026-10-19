@@ -5,8 +5,8 @@ use std::process::Command;
 mod common;
 use common::jsc;
 
-/// S12.6 — reassigning a `const` binding is a compile error: the CLI exits
-/// non-zero and reports the constant on stderr.
+/// Reassigning a `const` binding is a compile error: the CLI exits
+/// 2 and reports the constant on stderr.
 #[test]
 fn const_reassignment_fails_at_compile_time() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
@@ -14,8 +14,8 @@ fn const_reassignment_fails_at_compile_time() {
         .output()
         .expect("failed to spawn jsc binary");
     assert!(
-        !output.status.success(),
-        "reassigning a const must make jsc exit non-zero"
+        output.status.code() == Some(2),
+        "reassigning a const must make jsc exit 2"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -24,18 +24,17 @@ fn const_reassignment_fails_at_compile_time() {
     );
 }
 
-/// S13.7 — reassigning a `const` remains a compile error end to end (the CLI
-/// exits non-zero and names the constant), confirming S13's member-compound and
-/// closure work did not weaken the S12 immutability check.
+/// Reassigning a `const` declared with a different name is likewise a compile
+/// error end to end: the CLI exits 2 and names the constant.
 #[test]
-fn s13_const_reassignment_still_errors() {
+fn const_reassignment_of_other_binding_errors() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "const x = 1; x = 2; x"])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(
-        !output.status.success(),
-        "reassigning a const must make jsc exit non-zero"
+        output.status.code() == Some(2),
+        "reassigning a const must make jsc exit 2"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -46,14 +45,14 @@ fn s13_const_reassignment_still_errors() {
 
 /// The diagnostic renderer points a caret at the offending source: a spanned
 /// `CompileError` (const-reassignment) prints a rustc/swc-style block on stderr
-/// with `<eval>:LINE:COL` and a `^` caret, and the CLI exits non-zero.
+/// with `<eval>:LINE:COL` and a `^` caret, and the CLI exits 2.
 #[test]
 fn const_reassignment_renders_caret_diagnostic() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "const c = 1; c = 2"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(!output.status.success(), "must exit non-zero");
+    assert!(output.status.code() == Some(2), "must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("error: cannot assign to constant binding: c"),
@@ -81,7 +80,7 @@ fn unsupported_statement_renders_caret_diagnostic() {
         .args(["-e", "debugger"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(!output.status.success(), "must exit non-zero");
+    assert!(output.status.code() == Some(2), "must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--> <eval>:1:"), "got: {stderr}");
     assert!(stderr.contains('^'), "got: {stderr}");
@@ -96,7 +95,7 @@ fn undeclared_identifier_renders_caret_at_column_one() {
         .args(["-e", "NaN2 + 1"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(!output.status.success(), "must exit non-zero");
+    assert!(output.status.code() == Some(2), "must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(":1:1"),
@@ -109,8 +108,8 @@ fn undeclared_identifier_renders_caret_at_column_one() {
 }
 
 /// A codegen-rejected *unsupported construct* (an `async` ARROW — a top-level
-/// `async function` declaration is supported since P4.3 M4, but the arrow form is
-/// not) now carries the offending node's span: the diagnostic points a caret at
+/// `async function` declaration is supported, but the arrow form is not)
+/// carries the offending node's span: the diagnostic points a caret at
 /// the construct.
 #[test]
 fn unsupported_construct_renders_caret_diagnostic() {
@@ -118,7 +117,7 @@ fn unsupported_construct_renders_caret_diagnostic() {
         .args(["-e", "let f = async () => 1;"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(!output.status.success(), "must exit non-zero");
+    assert!(output.status.code() == Some(2), "must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(":1:"),
@@ -142,7 +141,7 @@ fn for_of_renders_clean_message_without_ast_debug() {
         .args(["-e", "for (x of [1,2]) x"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(!output.status.success(), "must exit non-zero");
+    assert!(output.status.code() == Some(2), "must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("for-of requires a `const`/`let` loop variable"),
@@ -177,7 +176,7 @@ fn parse_error_renders_caret_diagnostic() {
         .args(["-e", "let x = ("])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(!output.status.success(), "must exit non-zero");
+    assert!(output.status.code() == Some(2), "must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(":1:"),
@@ -190,6 +189,28 @@ fn parse_error_renders_caret_diagnostic() {
     assert!(
         !stderr.contains("failed to parse source"),
         "the old locationless message must be gone, got: {stderr}"
+    );
+}
+
+/// A *recoverable* swc parse error (a TS annotation in plain JS) is not
+/// silently accepted: the CLI exits 2 with a caret diagnostic and prints
+/// nothing on stdout.
+#[test]
+fn recoverable_parse_error_renders_caret_diagnostic() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-p", "let x: number = 1; x"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert!(output.status.code() == Some(2), "must exit 2");
+    assert!(output.stdout.is_empty(), "stdout must stay empty");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--> <eval>:1:"),
+        "stderr should carry a 1-based location, got: {stderr}"
+    );
+    assert!(
+        stderr.contains('^'),
+        "stderr should draw a caret under the parse error, got: {stderr}"
     );
 }
 
@@ -215,8 +236,8 @@ fn compile_errors_render_locator_and_caret() {
             .output()
             .expect("failed to spawn jsc binary");
         assert!(
-            !output.status.success(),
-            "{what} (`{src}`) must make jsc exit non-zero"
+            output.status.code() == Some(2),
+            "{what} (`{src}`) must make jsc exit 2"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -230,36 +251,36 @@ fn compile_errors_render_locator_and_caret() {
     }
 }
 
-/// S15 — the exception system (`throw`/`try`/`catch`/`finally`/`Error`) driven
-/// through the real CLI on the `-e` path, one milestone per assertion.
+/// The exception system (`throw`/`try`/`catch`/`finally`/`Error`) driven
+/// through the real CLI on the `-p` path, one behaviour per assertion.
 #[test]
-fn s15_exceptions_via_eval() {
+fn exceptions_via_eval() {
     // try/catch binds the thrown number and, separately, the thrown string.
     assert_eq!(
-        jsc(&["-e", "let r = 0; try { throw 42 } catch (e) { r = e } r"]),
+        jsc(&["-p", "let r = 0; try { throw 42 } catch (e) { r = e } r"]),
         "42"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             r#"let r = 0; try { throw "boom" } catch (e) { r = e } r"#
         ]),
         "boom"
     );
     // No-throw path: the catch is skipped and the try's own value flows out.
     assert_eq!(
-        jsc(&["-e", "let r = 42; try { r = r } catch (e) { r = -1 } r"]),
+        jsc(&["-p", "let r = 42; try { r = r } catch (e) { r = -1 } r"]),
         "42"
     );
     // finally on the normal path runs (x ends 42) ...
     assert_eq!(
-        jsc(&["-e", "let x = 40; try { x = 40 } finally { x = x + 2 } x"]),
+        jsc(&["-p", "let x = 40; try { x = 40 } finally { x = x + 2 } x"]),
         "42"
     );
     // ... and finally still runs after a caught throw (x ends 42).
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let x = 0; try { throw 1 } catch (e) { x = 40 } finally { x = x + 2 } x"
         ]),
         "42"
@@ -267,7 +288,7 @@ fn s15_exceptions_via_eval() {
     // Propagation across functions: f throws, g calls f, an outer try catches.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "function f(){ throw 42 } function g(){ f() } \
              let r = 0; try { g() } catch (e) { r = e } r"
         ]),
@@ -276,17 +297,17 @@ fn s15_exceptions_via_eval() {
     // new Error(msg): `.message` reads the argument back; a thrown Error is caught.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             r#"let r = 0; try { throw new Error("bad") } catch (e) { r = e.message } r"#
         ]),
         "bad"
     );
     // An Error reuses the OBJECT heap representation, so `typeof` is "object".
-    assert_eq!(jsc(&["-e", r#"typeof (new Error("x"))"#]), "object");
+    assert_eq!(jsc(&["-p", r#"typeof (new Error("x"))"#]), "object");
     // Nested try + rethrow: inner catch transforms the value, outer catch binds 42.
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let r = 0; try { try { throw 1 } catch (e) { throw e + 41 } } \
              catch (e) { r = e } r"
         ]),
@@ -294,18 +315,18 @@ fn s15_exceptions_via_eval() {
     );
 }
 
-/// S15 — an UNCAUGHT `throw` (no enclosing handler) must fail the process: the
-/// CLI exits non-zero and reports the unwound value as `Uncaught <value>` on
+/// An UNCAUGHT `throw` (no enclosing handler) must fail the process: the
+/// CLI exits 1 and reports the unwound value as `Uncaught <value>` on
 /// stderr, never printing a normal result to stdout.
 #[test]
-fn s15_uncaught_throw_exits_nonzero() {
+fn uncaught_throw_exits_one() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "throw 42"])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(
-        !output.status.success(),
-        "an uncaught throw must make jsc exit non-zero"
+        output.status.code() == Some(1),
+        "an uncaught throw must make jsc exit 1"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -318,11 +339,50 @@ fn s15_uncaught_throw_exits_nonzero() {
     );
 }
 
-/// P2.1 — out-of-scope object method forms (getter/setter, computed method name,
-/// async/generator methods) are rejected at compile time with a non-zero exit and
+/// An UNCAUGHT absent-property write fails the process like any uncaught
+/// `TypeError`: exit 1 with the message on stderr.
+#[test]
+fn uncaught_absent_property_write_exits_one() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "let o = {}; o.x = 1; console.log(\"unreachable\")"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert!(
+        output.status.code() == Some(1),
+        "an uncaught absent-property write must make jsc exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Uncaught TypeError: Cannot add property 'x': dynamic properties are not supported yet"
+        ),
+        "stderr should report the TypeError, got: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "nothing after the failed write should run"
+    );
+}
+
+/// The add-property `TypeError` unwinds through `finally` and nested function
+/// frames to the nearest handler.
+#[test]
+fn absent_property_write_unwinds_through_finally_and_calls() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let log=\"\"; function f(o){ try { o.x = 1; log+=\"no\" } finally { log+=\"f\" } } \
+             try { f({a:1}) } catch(e) { log+=\"|\"+e.name } log"
+        ]),
+        "f|TypeError"
+    );
+}
+
+/// Out-of-scope object method forms (getter/setter, computed method name,
+/// async/generator methods) are rejected at compile time with exit code 2 and
 /// an explanatory message.
 #[test]
-fn p2_unsupported_object_methods_error() {
+fn unsupported_object_methods_error() {
     let cases = [
         ("let o={get x(){return 1}}; o.x", "getter"),
         ("let o={set x(v){}}; 1", "setter"),
@@ -336,8 +396,8 @@ fn p2_unsupported_object_methods_error() {
             .output()
             .expect("failed to spawn jsc binary");
         assert!(
-            !output.status.success(),
-            "`{src}` must make jsc exit non-zero"
+            output.status.code() == Some(2),
+            "`{src}` must make jsc exit 2"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -347,17 +407,17 @@ fn p2_unsupported_object_methods_error() {
     }
 }
 
-/// P2.2/P2.3 — out-of-scope class forms are rejected at compile time with a
+/// Out-of-scope class forms are rejected at compile time with a
 /// non-zero exit and an explanatory, spanned message. A class with a constructor,
 /// plain instance methods, and `static` members is supported (see the classes
 /// suite); inheritance, decorators, and every out-of-scope method/field form
 /// (getter, setter, private, computed, async, generator) stay out of scope.
 #[test]
-fn p2_unsupported_class_forms_error() {
+fn unsupported_class_forms_error() {
     let cases = [
         ("class A extends B {} 1", "extends"),
         ("class A{ [k] = 1 } 1", "computed"),
-        // Instance accessors are supported (P2b); a STATIC getter/setter is not.
+        // Instance accessors are supported; a STATIC getter/setter is not.
         ("class A{ static get v(){return 1} } 1", "getter"),
         ("class A{ static set v(x){} } 1", "setter"),
         // A computed instance accessor is still rejected.
@@ -373,8 +433,8 @@ fn p2_unsupported_class_forms_error() {
             .output()
             .expect("failed to spawn jsc binary");
         assert!(
-            !output.status.success(),
-            "`{src}` must make jsc exit non-zero"
+            output.status.code() == Some(2),
+            "`{src}` must make jsc exit 2"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

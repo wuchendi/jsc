@@ -1,9 +1,24 @@
 name: Web
 
 # Frontend/JS-side quality gate for the monorepo (packages/jsc + apps/jsc-web).
-# MANUAL only — run it from the Actions tab (workflow_dispatch) when you want to
-# check the JS/TS side. The push/PR Rust gate lives in ci.yml.
+# Runs on push to main and on pull requests when JS/TS or wasm inputs change
+# (paths allowlist below), and manually via workflow_dispatch. The Rust
+# workspace gate lives in ci.yml.
 on:
+  push:
+    branches: [main]
+    paths: &web-paths
+      - "crates/**"
+      - "packages/**"
+      - "apps/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/web.yml"
+  pull_request:
+    paths: *web-paths
   workflow_dispatch:
 
 env:
@@ -14,14 +29,14 @@ jobs:
     name: biome + typecheck + build + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The @cdlab/jsc package loads a wasm-bindgen artifact that is gitignored,
       # so build it first (needs Rust + wasm-pack).
-      - name: Install toolchain 1.96.0 (+ wasm target)
+      - name: Install toolchain 1.99.1 (+ wasm target)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.96.0
+          toolchain: 1.99.1
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2

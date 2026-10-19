@@ -3,13 +3,13 @@
 //! `wasmtime::Caller`, decoding the guest's linear memory and (for the methods
 //! that build a fresh value) allocating a new heap block back into it.
 
-use wasmtime::{Caller, Val};
+use wasmtime::{AsContextMut, Caller, Global, Memory, Val};
 
 use crate::abi;
 
 use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, format_value};
 
-/// The `__method` op flags (S14.6, see [`abi`]): the non-callback array/string
+/// The `__method` op flags (see [`abi`]): the non-callback array/string
 /// methods, dispatched host-side. `IndexOf`/`Slice` exist on both arrays and
 /// strings, so the handler branches on the receiver's runtime TYPE BYTE.
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
@@ -35,12 +35,18 @@ const TRUE_BITS: u64 = abi::TRUE;
 const FALSE_BITS: u64 = abi::FALSE;
 
 /// The name under which `crate::emit` exports the bump-allocator heap pointer
-/// global (S14.3, see [`abi::HEAP_PTR_EXPORT_NAME`]) so the `__convert` import can
+/// global (see [`abi::HEAP_PTR_EXPORT_NAME`]) so the `__convert` import can
 /// bump-allocate a heap string.
 const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
 
+/// The out-of-memory heap-pointer sentinel; see [`abi::HEAP_PTR_OOM`].
+const HEAP_PTR_OOM: i32 = abi::HEAP_PTR_OOM;
+
+/// The size in bytes of one wasm page.
+const PAGE_SIZE: usize = 0x1_0000;
+
 /// Bump-allocate a heap STRING block holding `text` in the caller's guest memory
-/// and return its base offset (S14.3), or `None` if the required exports are
+/// and return its base offset, or `None` if the required exports are
 /// missing or the write fails.
 ///
 /// The block is laid out exactly like a runtime-allocated string —
@@ -65,7 +71,7 @@ pub(super) fn host_alloc_string<W: Send + 'static>(
 /// Bump-allocate a pre-built heap `block` (its leading TYPE BYTE, header, and
 /// payload already laid out exactly like a guest-allocated block) in the caller's
 /// guest memory and return its base offset, or `None` when the required exports
-/// are missing or the write fails (S14.3/S14.6).
+/// are missing or the write fails.
 ///
 /// It reads the exported `__heap_ptr` global as the free offset, grows linear
 /// memory if the block would overflow it, writes the bytes, and advances the
@@ -78,17 +84,8 @@ fn host_alloc<W: Send + 'static>(caller: &mut Caller<'_, W>, block: &[u8]) -> Op
     let mem = caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)?;
-    let base = usize::try_from(global.get(&mut *caller).i32()?).ok()?;
-
-    let end = base.checked_add(block.len())?;
-    // Grow memory (one wasm page = 64 KiB) if the block would overflow it. The
-    // guest `__alloc` never bounds-checks, but the host must not write past the
-    // current size.
-    let cur = mem.data_size(&*caller);
-    if end > cur {
-        let pages = (end - cur).div_ceil(0x1_0000);
-        mem.grow(&mut *caller, pages as u64).ok()?;
-    }
+    let base = heap_reserve(&mut *caller, global, mem, block.len())?;
+    let end = base + block.len();
     mem.write(&mut *caller, base, block).ok()?;
     global
         .set(&mut *caller, Val::I32(i32::try_from(end).ok()?))
@@ -96,7 +93,47 @@ fn host_alloc<W: Send + 'static>(caller: &mut Caller<'_, W>, block: &[u8]) -> Op
     Some(base as u64)
 }
 
-/// Dispatch a `__method` host-import call (S14.6): snapshot linear memory, read
+/// Ensure `len` bytes starting at the current `__heap_ptr` fit in linear memory,
+/// growing it with the guest `__alloc` policy (by `max(needed, current)` pages,
+/// falling back to exactly the needed pages), and return the start offset.
+///
+/// When memory cannot grow (the module's `maximum` is reached) or the pointer
+/// already holds the sticky [`abi::HEAP_PTR_OOM`] sentinel, the sentinel is
+/// (re)stored and `None` is returned; the run stage reports it as
+/// `Uncaught RangeError: out of memory`.
+pub(super) fn heap_reserve(
+    mut store: impl AsContextMut,
+    global: Global,
+    mem: Memory,
+    len: usize,
+) -> Option<usize> {
+    // The sentinel (and any other negative pointer) fails the conversion.
+    let ptr = global.get(&mut store).i32()?;
+    let reserved = usize::try_from(ptr).ok().and_then(|base| {
+        let end = base.checked_add(len)?;
+        let cur = mem.data_size(&store);
+        if end > cur {
+            let cur_pages = (cur / PAGE_SIZE) as u64;
+            let need = (end - cur).div_ceil(PAGE_SIZE) as u64;
+            if mem.grow(&mut store, need.max(cur_pages)).is_err() {
+                mem.grow(&mut store, need).ok()?;
+            }
+        }
+        Some(base)
+    });
+    if reserved.is_none() {
+        let _ = global.set(&mut store, Val::I32(HEAP_PTR_OOM));
+    }
+    reserved
+}
+
+/// Whether the heap-pointer global holds the out-of-memory sentinel: some guest
+/// or host allocation could not grow linear memory.
+pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bool {
+    global.get(&mut store).i32() == Some(HEAP_PTR_OOM)
+}
+
+/// Dispatch a `__method` host-import call: snapshot linear memory, read
 /// the receiver's raw jsval bits, and perform the requested array/string method,
 /// returning the result jsval bits (or `None` to yield `undefined` — a
 /// type-mismatched receiver or a failed allocation).
@@ -131,14 +168,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             _ => None,
         },
         METHOD_OP_INCLUDES => match type_byte {
-            Some(TYPE_ARRAY) => {
-                let idx = array_index_of(&mem, ptr?, arg0.cast_unsigned());
-                Some(if idx == (-1.0_f64).to_bits() {
-                    FALSE_BITS
-                } else {
-                    TRUE_BITS
-                })
-            }
+            Some(TYPE_ARRAY) => Some(bool_bits(array_includes(&mem, ptr?, arg0.cast_unsigned()))),
             // `str.includes(sub)` — substring containment (an empty `sub` => true).
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
@@ -216,7 +246,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
 }
 
 /// The linear-memory byte offset of a heap jsval (single heap tag `0b101`), or
-/// `None` for any non-heap value. Mirrors `emit::HEAP_BITS` / the S13.1 layout.
+/// `None` for any non-heap value. Mirrors `emit::HEAP_BITS` / the heap block layout.
 fn heap_ptr(bits: u64) -> Option<usize> {
     if bits & QNAN == QNAN && (bits >> 48) & 0b111 == 0b101 {
         usize::try_from(bits & 0xFFFF_FFFF).ok()
@@ -293,6 +323,21 @@ fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
         }
     }
     not_found_bits()
+}
+
+/// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
+/// except that `NaN` matches `NaN`.
+fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
+    let len = block_len(mem, ptr).unwrap_or(0);
+    (0..len).any(|i| {
+        array_elem_bits(mem, ptr, i).is_some_and(|elem| {
+            strict_eq_bits(elem, needle, mem)
+                || matches!(
+                    (decode(elem, mem), decode(needle, mem)),
+                    (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
+                )
+        })
+    })
 }
 
 /// `string.indexOf(sub)`: the number bits of the first BYTE index where `sub`
@@ -628,7 +673,7 @@ fn split_on(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Coerce a decoded [`Value`] to a JS number (S14.3, the `Number(x)` subset):
+/// Coerce a decoded [`Value`] to a JS number (the `Number(x)` subset):
 /// number is identity, `true`/`false` are `1`/`0`, `null` is `0`, `undefined` is
 /// `NaN`, and a string is full-string parsed via [`str_to_number`]. Array/object/
 /// function operands are out of scope and yield `NaN`.
@@ -650,18 +695,51 @@ pub(super) fn value_to_number(value: &Value) -> f64 {
     }
 }
 
-/// Parse a whole string as a JS `Number(str)` (S14.3): leading/trailing ASCII
+/// Parse a whole string as a JS `Number(str)`: leading/trailing ASCII
 /// whitespace is trimmed, an empty/whitespace-only string is `0`, and anything the
-/// remaining text does not parse as a full number is `NaN`.
+/// remaining text does not parse as a full number is `NaN`. The grammar is JS
+/// `StringToNumber`: an unsigned `0x`/`0o`/`0b` integer literal, a signed
+/// `Infinity`, or a signed decimal literal (Rust's `inf`/`nan` spellings are not
+/// JS and yield `NaN`).
 fn str_to_number(s: &str) -> f64 {
     let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
     if trimmed.is_empty() {
         return 0.0;
     }
+    let radix = match trimmed.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = &trimmed[2..];
+        if digits.is_empty() {
+            return f64::NAN;
+        }
+        return digits
+            .chars()
+            .try_fold(0.0, |acc, c| {
+                c.to_digit(radix)
+                    .map(|d| acc * f64::from(radix) + f64::from(d))
+            })
+            .unwrap_or(f64::NAN);
+    }
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if unsigned == "Infinity" {
+        return if trimmed.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if !unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return f64::NAN;
+    }
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// Parse a leading base-10 integer from `s` (S14.3, the `parseInt` subset): skip
+/// Parse a leading base-10 integer from `s` (the `parseInt` subset): skip
 /// leading ASCII whitespace, honor an optional `+`/`-` sign, then consume ASCII
 /// digits until the first non-digit. Yields `NaN` when no digit follows the sign.
 /// The radix argument is not supported (base-10 only).
@@ -690,7 +768,7 @@ pub(super) fn parse_int_str(s: &str) -> f64 {
     sign * value
 }
 
-/// Parse a leading decimal float from `s` (S14.3, the `parseFloat` subset): skip
+/// Parse a leading decimal float from `s` (the `parseFloat` subset): skip
 /// leading ASCII whitespace, then take the longest prefix matching an optional
 /// sign, integer/fraction digits (at least one digit overall), and an optional
 /// `e`/`E` exponent. Yields `NaN` when no such prefix exists.

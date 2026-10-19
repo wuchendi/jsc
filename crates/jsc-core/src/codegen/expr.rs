@@ -23,14 +23,14 @@ impl LowerCtx<'_> {
             // global `undefined`; a function name in value position becomes a
             // first-class function value; a bare, otherwise undeclared
             // `undefined` lowers to the `undefined` literal. A captured binding
-            // reads through its boxed cell (S13.4).
+            // reads through its boxed cell.
             Expr::Ident(ident) => self.lower_ident(ident.sym.as_ref(), ident.span),
             Expr::Paren(p) => self.lower_expr(&p.expr),
-            // An arrow function lifts to a top-level function value (S13.4).
+            // An arrow function lifts to a top-level function value.
             Expr::Arrow(arrow) => self.lower_arrow(arrow),
             // A function expression `function (..) { .. }` lifts the same way as
-            // an arrow (its optional name is not bound). Used by the `counter`
-            // closure milestone's `return function(){ .. }`.
+            // an arrow (its optional name is not bound), e.g. a closure factory's
+            // `return function(){ .. }`.
             Expr::Fn(fn_expr) => {
                 let block = fn_expr
                     .function
@@ -45,9 +45,9 @@ impl LowerCtx<'_> {
             Expr::Assign(assign) => self.lower_assign(assign),
             Expr::Update(update) => self.lower_update(update),
             Expr::Call(call) => self.lower_call(call),
-            // `await p`: at the top level (P4.1), drive the microtask queue until
+            // `await p`: at the top level, drive the microtask queue until
             // `p` settles, then yield its value (or unwind its rejection). Inside
-            // an `async function` body (P4.3 M4), the body is compiled as a
+            // an `async function` body, the body is compiled as a
             // generator state machine, so `await e` becomes a `yield e` — the host
             // async engine resumes the machine with the awaited settled value.
             Expr::Await(await_expr) => {
@@ -58,10 +58,10 @@ impl LowerCtx<'_> {
                     Ok(IrNode::Await(Box::new(arg)))
                 }
             }
-            // `yield e` / `yield` (P4.2 M2): lower the operand and wrap it. The
+            // `yield e` / `yield`: lower the operand and wrap it. The
             // generator segmentation pass consumes every `Yield`; one that reaches
             // the backend means an unsupported yield position (rejected there).
-            // `yield*` (delegate) is deferred to M3.
+            // `yield*` (delegate) is a statement, lowered by `lower_yield_delegate`.
             Expr::Yield(yield_expr) if !yield_expr.delegate => {
                 let arg = match &yield_expr.arg {
                     Some(arg) => self.lower_expr(arg)?,
@@ -79,7 +79,7 @@ impl LowerCtx<'_> {
             // indexes a string/array/object at runtime.
             // `Math.PI` / `Math.E` are constant property READS (no call), not
             // object indexing: `Math` is not a real binding, so when nothing named
-            // `Math` is in scope they lower to their `f64` literal (S14.2).
+            // `Math` is in scope they lower to their `f64` literal.
             Expr::Member(member)
                 if math_member_name(member).is_some_and(|n| n == "PI" || n == "E")
                     && self.resolve("Math").is_none() =>
@@ -91,9 +91,9 @@ impl LowerCtx<'_> {
                 }
             }
             Expr::Member(member) => match &member.prop {
-                MemberProp::Ident(id) if id.sym.as_ref() == "length" => {
-                    Ok(IrNode::StrLen(Box::new(self.lower_expr(&member.obj)?)))
-                }
+                MemberProp::Ident(id) if id.sym.as_ref() == "length" => Ok(IrNode::StrLen(
+                    Box::new(nullish_check(self.lower_expr(&member.obj)?, "length")),
+                )),
                 // `obj.a` ≡ `obj["a"]`: reuse the runtime `Index` dispatch, with
                 // the property name lowered to a heap-string key.
                 MemberProp::Ident(id) => Ok(IrNode::Index {
@@ -115,7 +115,7 @@ impl LowerCtx<'_> {
             // An object literal `{a: e0, ..}` lowers to a heap object.
             Expr::Object(obj) => self.lower_object(obj),
             // `new Error(msg)` / `new TypeError(msg)` / `new RangeError(msg)`
-            // (S15.4) lower to a plain heap object `{ name, message }`.
+            // lower to a plain heap object `{ name, message }`.
             Expr::New(new_expr) => self.lower_new(new_expr),
             Expr::Cond(cond) => Ok(IrNode::Ternary {
                 cond: Box::new(self.lower_expr(&cond.test)?),
@@ -132,7 +132,7 @@ impl LowerCtx<'_> {
                 op: MathOp::Pow,
                 args: vec![self.lower_expr(&b.left)?, self.lower_expr(&b.right)?],
             }),
-            // `key in obj` (P3.3): an own-key membership test, lowered to a runtime
+            // `key in obj`: an own-key membership test, lowered to a runtime
             // key-table scan. `left` is the property key, `right` the object.
             Expr::Bin(b) if matches!(b.op, BinaryOp::In) => Ok(IrNode::ObjectHas {
                 key: Box::new(self.lower_expr(&b.left)?),
@@ -173,14 +173,21 @@ impl LowerCtx<'_> {
                         }),
                     }
                 }
-                // Unary plus on a numeric operand is a no-op.
-                UnaryOp::Plus => self.lower_expr(&u.arg),
+                // Unary plus is ToNumber (the same conversion as `Number(x)`),
+                // a no-op on a numeric literal.
+                UnaryOp::Plus => match self.lower_expr(&u.arg)? {
+                    num @ IrNode::Num(_) => Ok(num),
+                    other => Ok(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumber,
+                        arg: Box::new(other),
+                    }),
+                },
                 // `typeof operand` inspects the operand's runtime type.
                 UnaryOp::TypeOf => Ok(IrNode::TypeOf(Box::new(self.lower_expr(&u.arg)?))),
                 // `!operand` is logical NOT: boolean inverse of truthiness.
                 UnaryOp::Bang => Ok(IrNode::Not(Box::new(self.lower_expr(&u.arg)?))),
                 // `delete obj.k` / `delete obj[k]` removes an own property and
-                // yields `true` (P3.3). Only a member reference is supported; a
+                // yields `true`. Only a member reference is supported; a
                 // bare `delete x` (a no-op in non-strict JS) is rejected.
                 UnaryOp::Delete => match &*u.arg {
                     Expr::Member(member) => {
@@ -214,10 +221,10 @@ impl LowerCtx<'_> {
                 .into()),
             },
             // A template literal `` `a${x}b` `` folds into left-associated `+`
-            // concatenations, reusing the string-coercion path (S10). Tagged
+            // concatenations, reusing the string-coercion path. Tagged
             // templates stay unsupported (handled by the fallback below).
             Expr::Tpl(tpl) => self.lower_tpl(tpl),
-            // `this` reads the current function's snapshotted `this` slot (P2.1),
+            // `this` reads the current function's snapshotted `this` slot,
             // allocated on first use; outside any function (the top-level `main`
             // frame) there is no `this` binding, so it stays unsupported. Inside a
             // deferred `static` field initializer (P2b) `this` is the class itself,
@@ -339,7 +346,7 @@ impl LowerCtx<'_> {
         match link {
             ChainLink::Member { prop, span, .. } => match prop {
                 MemberProp::Ident(id) if id.sym.as_ref() == "length" => {
-                    Ok(IrNode::StrLen(Box::new(obj)))
+                    Ok(IrNode::StrLen(Box::new(nullish_check(obj, "length"))))
                 }
                 MemberProp::Ident(id) => Ok(IrNode::Index {
                     obj: Box::new(obj),
@@ -380,7 +387,7 @@ impl LowerCtx<'_> {
     /// function value; the bare `undefined`/`NaN`/`Infinity` globals lower to
     /// their canonical literals (`NaN`/`Infinity` are read-only global number
     /// bindings, sharing the computed-`0/0` value path). A captured binding
-    /// reads through its boxed cell (S13.4).
+    /// reads through its boxed cell.
     pub(super) fn lower_ident(&mut self, name: &str, span: Span) -> anyhow::Result<IrNode> {
         if let Some(resolved) = self.resolve(name) {
             Ok(Self::read_of(resolved.kind))
@@ -394,16 +401,9 @@ impl LowerCtx<'_> {
                 "undefined" => Ok(IrNode::Undefined),
                 "NaN" => Ok(IrNode::Num(f64::NAN)),
                 "Infinity" => Ok(IrNode::Num(f64::INFINITY)),
-                _ => match self.demoted_sibling_error(name, span, "referenced") {
-                    // A demoted closure (G2) referenced as a value from a sibling
-                    // top-level function, which cannot reach it (see `lower_call`).
-                    Some(err) => Err(err),
-                    None => Err(CompileError::spanned(
-                        span,
-                        format!("undeclared variable: {name}"),
-                    )
-                    .into()),
-                },
+                _ => {
+                    Err(CompileError::spanned(span, format!("undeclared variable: {name}")).into())
+                }
             }
         }
     }
@@ -525,7 +525,7 @@ impl LowerCtx<'_> {
         if let Expr::SuperProp(super_prop) = callee_expr.as_ref() {
             return self.lower_super_method_call(call, super_prop);
         }
-        // A spread argument `f(...a)` (P1.5) makes the call's argument count only
+        // A spread argument `f(...a)` makes the call's argument count only
         // known at runtime, so it takes a dedicated lowering path.
         if call.args.iter().any(|arg| arg.spread.is_some()) {
             return self.lower_spread_call(call, callee_expr);
@@ -535,14 +535,14 @@ impl LowerCtx<'_> {
         for arg in &call.args {
             args.push(self.lower_expr(&arg.expr)?);
         }
-        // `console.log(..)` is a host print, not a user-function call (S14.1). It
+        // `console.log(..)` is a host print, not a user-function call. It
         // is recognized by its `console.log` member callee (a `console` identifier
         // that resolves to no binding) and lowered to `IrNode::ConsoleLog` so the
         // backend emits calls to the host `print` import.
         if is_console_log(callee_expr) && self.resolve("console").is_none() {
             return Ok(IrNode::ConsoleLog { args });
         }
-        // `Math.<name>(..)` is a built-in method, not a user-function call (S14.2).
+        // `Math.<name>(..)` is a built-in method, not a user-function call.
         // Like `console`, `Math` is not a real binding: recognize it syntactically
         // (only when nothing named `Math` shadows it) and lower to an `IrNode::MathCall`
         // whose arity is validated here.
@@ -551,7 +551,7 @@ impl LowerCtx<'_> {
         {
             return lower_math_call(name, args, callee_expr.span());
         }
-        // `array.push(x)` / `array.pop()` are growing array methods (S14.4),
+        // `array.push(x)` / `array.pop()` are growing array methods,
         // dispatched syntactically by method name (kept distinct from `x[i]`
         // element indexing). The receiver must be a simple bound array variable so
         // `push` can rebind it to the reallocated block.
@@ -562,7 +562,7 @@ impl LowerCtx<'_> {
             return self.lower_array_method(id.sym.as_ref(), &member.obj, args);
         }
         // `array.map/filter/reduce/forEach(callback[, init])` are higher-order array
-        // methods (S14.5), dispatched syntactically by method name (kept distinct
+        // methods, dispatched syntactically by method name (kept distinct
         // from `x[i]` element indexing). Unlike push/pop the receiver is any array
         // expression (a literal or a binding); it is evaluated once and not rebound.
         if let Expr::Member(member) = callee_expr.as_ref()
@@ -572,7 +572,7 @@ impl LowerCtx<'_> {
             return self.lower_array_hof(id.sym.as_ref(), &member.obj, args);
         }
         // `array/string.indexOf/includes/join/slice/toUpperCase/toLowerCase/charAt(..)`
-        // are non-callback array/string methods (S14.6), dispatched syntactically by
+        // are non-callback array/string methods, dispatched syntactically by
         // method name (kept distinct from `x[i]` element indexing). The receiver is
         // any array/string expression, evaluated once; the whole operation runs
         // host-side, branching on the receiver's runtime TYPE BYTE for the
@@ -584,7 +584,7 @@ impl LowerCtx<'_> {
             return self.lower_method_call(op, id.sym.as_ref(), &member.obj, args);
         }
         // `Object.keys/values/entries(o)` are collection built-ins, not user-method
-        // calls (P3.2). Like `Math`, `Object` is not a real binding: recognize it
+        // calls. Like `Math`, `Object` is not a real binding: recognize it
         // syntactically (only when nothing named `Object` shadows it) and lower to
         // an `IrNode::ObjectBuiltin` whose method name and arity are validated here.
         if let Some(name) = object_method_name(callee_expr)
@@ -593,7 +593,7 @@ impl LowerCtx<'_> {
             return lower_object_call(name, args, callee_expr.span());
         }
         // `JSON.stringify(v)` / `JSON.parse(s)` are collection built-ins, not
-        // user-method calls (P3.4). Like `Object`, `JSON` is not a real binding:
+        // user-method calls. Like `Object`, `JSON` is not a real binding:
         // recognize it syntactically (only when nothing named `JSON` shadows it)
         // and lower to an `IrNode::JsonStringify` (or reject `parse`/unknown names).
         if let Some(name) = json_method_name(callee_expr)
@@ -602,7 +602,7 @@ impl LowerCtx<'_> {
             return lower_json_call(name, args, callee_expr.span());
         }
         // `Promise.resolve(v)` / `Promise.reject(v)` are the promise-creation
-        // statics (P4.1). Like `Object`/`JSON`, `Promise` is not a real binding:
+        // statics. Like `Object`/`JSON`, `Promise` is not a real binding:
         // recognize it syntactically (only when nothing named `Promise` shadows
         // it) and lower to the corresponding promise node.
         if let Some(name) = promise_static_method_name(callee_expr)
@@ -610,7 +610,7 @@ impl LowerCtx<'_> {
         {
             return lower_promise_static(name, args, callee_expr.span());
         }
-        // `Date.now()` (P-series): the host wall clock as a number. Like the other
+        // `Date.now()`: the host wall clock as a number. Like the other
         // statics, `Date` is not a real binding; recognize `Date.now` syntactically
         // (only when nothing named `Date` shadows it) and reject any argument.
         if let Expr::Member(member) = callee_expr.as_ref()
@@ -629,7 +629,7 @@ impl LowerCtx<'_> {
             }
             return Ok(IrNode::DateNow);
         }
-        // `d.getTime()` (P-series): the millisecond timestamp of a Date receiver.
+        // `d.getTime()`: the millisecond timestamp of a Date receiver.
         // Claimed for ANY receiver (a non-Date yields `NaN`, mirroring the
         // promise/generator instance methods); a user method named `getTime` is a
         // documented out-of-scope collision.
@@ -642,10 +642,10 @@ impl LowerCtx<'_> {
                     CompileError::spanned(member.span(), "getTime() takes no arguments").into(),
                 );
             }
-            let recv = Box::new(self.lower_expr(&member.obj)?);
+            let recv = Box::new(nullish_check(self.lower_expr(&member.obj)?, "getTime"));
             return Ok(IrNode::DateGetTime { recv });
         }
-        // The `Date` field methods `d.valueOf()` / `d.getFullYear()` / … (P-series).
+        // The `Date` field methods `d.valueOf()` / `d.getFullYear()` / ….
         // Like the Map/Set methods, these names can ALSO be ordinary user methods,
         // so the lowered node dispatches at runtime on the receiver's TYPE BYTE and
         // keeps a user-method fallback — safe to claim the name here.
@@ -656,7 +656,7 @@ impl LowerCtx<'_> {
             return self.lower_date_method(op, id.sym.as_ref(), &member.obj, args);
         }
         // `p.then(onF, onR)` / `p.catch(onR)` / `p.finally(fn)` are the promise
-        // instance methods (P4.1). They are claimed for ANY receiver here (the
+        // instance methods. They are claimed for ANY receiver here (the
         // host `__then`/`__promise` engine treats a non-promise receiver as an
         // already-fulfilled value): a user object method named `then`/`catch`/
         // `finally` is a documented out-of-scope collision.
@@ -667,7 +667,7 @@ impl LowerCtx<'_> {
             return self.lower_promise_method(id.sym.as_ref(), &member.obj, args, member.span());
         }
         // `map.set/get/has/delete(..)` / `set.add/has/delete(..)` are Map/Set
-        // methods (P3.5). Unlike the builtins above these names can ALSO be ordinary
+        // methods. Unlike the builtins above these names can ALSO be ordinary
         // object/class methods, so the lowered node keeps a user-method-call fallback
         // and dispatches at runtime on the receiver's TYPE BYTE — it is safe to claim
         // the name here.
@@ -677,10 +677,10 @@ impl LowerCtx<'_> {
         {
             return self.lower_map_method(op, id.sym.as_ref(), &member.obj, args);
         }
-        // `gen.next(v)` drives a generator one step (P4.2 M2). Like the promise
+        // `gen.next(v)` drives a generator one step. Like the promise
         // instance methods, `next` is claimed for ANY receiver — a non-generator
         // throws a `TypeError` at runtime — so a user method named `next` is a
-        // documented out-of-scope collision. `.return`/`.throw` are deferred to M3.
+        // documented out-of-scope collision. `.return`/`.throw` are unsupported.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
             && id.sym.as_ref() == "next"
@@ -691,7 +691,7 @@ impl LowerCtx<'_> {
         }
         // Any remaining member callee `obj.m(args)` / `obj[k](args)` is a USER
         // method call: it reads the function value at the member and binds
-        // `this = obj` for the call (P2.1). This must come after the builtin-method
+        // `this = obj` for the call. This must come after the builtin-method
         // checks above (which return early for the recognized names) so only
         // genuine object methods reach here.
         if let Expr::Member(member) = callee_expr.as_ref() {
@@ -715,37 +715,19 @@ impl LowerCtx<'_> {
                 args,
             })
         } else if let Some(sig) = self.shared.funcs.get(name) {
-            // A rest parameter (P1.4) accepts any number of trailing arguments, so
-            // only the lower bound (required, non-defaulted leading params) applies.
-            if args.len() < sig.required || (!sig.has_rest && args.len() > sig.params) {
-                let expected = if sig.has_rest {
-                    format!("at least {}", sig.required)
-                } else if sig.required == sig.params {
-                    sig.params.to_string()
-                } else {
-                    format!("{}-{}", sig.required, sig.params)
-                };
-                return Err(CompileError::spanned(
-                    call.span(),
-                    format!(
-                        "function {name} expects {expected} argument(s), got {}",
-                        args.len()
-                    ),
-                )
-                .into());
-            }
+            // JS arity semantics: the uniform ABI pads missing arguments with
+            // `undefined` (so defaults apply), and surplus arguments are evaluated
+            // for their side effects and ignored (or gathered by a rest parameter).
             Ok(IrNode::Call {
                 func: sig.index,
                 args,
             })
         } else if let Some(op) = convert_builtin_op(name) {
-            // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`
-            // (S14.3). Reached only when the name is NOT a binding or a user
+            // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
+            // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
             // String(){}` shadows it. Arity is validated here.
             lower_convert_call(op, name, args, ident.span())
-        } else if let Some(err) = self.demoted_sibling_error(name, ident.span(), "called") {
-            Err(err)
         } else {
             Err(
                 CompileError::spanned(ident.span(), format!("call to undeclared function: {name}"))
@@ -755,7 +737,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a `p.then(onF, onR)` / `p.catch(onR)` / `p.finally(fn)` promise
-    /// instance method (P4.1) to its promise node. The receiver `obj` is lowered
+    /// instance method to its promise node. The receiver `obj` is lowered
     /// once; each missing handler becomes `undefined` (a passthrough reaction). An
     /// arity beyond the method's maximum is a compile error.
     fn lower_promise_method(
@@ -794,27 +776,10 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// The error for a call to / reference of a demoted G2 closure from a sibling
-    /// top-level function, which cannot reach it (the closure is bound only within
-    /// `main`). `None` unless the current context is a non-capturing top-level
-    /// function body and `name` is a demoted declaration. `verb` is `called` or
-    /// `referenced`, so the diagnostic reads naturally at each use site.
-    fn demoted_sibling_error(&self, name: &str, span: Span, verb: &str) -> Option<anyhow::Error> {
-        (self.top_level_fn && self.shared.demoted_fns.contains(name)).then(|| {
-            CompileError::spanned(
-                span,
-                format!(
-                    "{name} closes over enclosing vars, cannot be {verb} from another top-level function"
-                ),
-            )
-            .into()
-        })
-    }
-
-    /// Lower a call whose argument list contains a spread `f(...a)` (P1.5). The
+    /// Lower a call whose argument list contains a spread `f(...a)`. The
     /// argument parts are materialized into a runtime array (an
     /// [`IrNode::ArraySpread`]); the call then spreads that array into the
-    /// uniform ABI's fixed `K` positional slots plus the dynamic `argc` (P1.4).
+    /// uniform ABI's fixed `K` positional slots plus the dynamic `argc`.
     ///
     /// Only the variadic `Math.max`/`Math.min` built-ins and ordinary
     /// direct/indirect function calls accept a spread. Every other call form
@@ -907,13 +872,13 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a growing array method call `array.push(x)` / `array.pop()` (S14.4).
+    /// Lower a growing array method call `array.push(x)` / `array.pop()`.
     /// The receiver must be a simple identifier bound to a **plain local** array so
     /// `push` can rebind it (`local.set`) to the reallocated block. A temp /
-    /// expression receiver, or a captured (boxed-cell) array, is rejected for this
-    /// milestone — captured arrays do not round-trip through the runtime index/length
-    /// path in the current subset, so growing one is out of scope. Arities are
-    /// validated here (`push` takes one argument, `pop` none).
+    /// expression receiver, or a captured (boxed-cell) array, is rejected —
+    /// captured arrays do not round-trip through the runtime index/length path,
+    /// so growing one is out of scope. Arities are validated here (`push` takes
+    /// one argument, `pop` none).
     fn lower_array_method(
         &mut self,
         method: &str,
@@ -969,21 +934,20 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a higher-order array method call `array.map/filter/reduce/forEach(...)`
-    /// (S14.5). The receiver is lowered as a plain expression (evaluated once into a
+    /// Lower a higher-order array method call `array.map/filter/reduce/forEach(...)`.
+    /// The receiver is lowered as a plain expression (evaluated once into a
     /// scratch base at emit time — no rebinding), and the callback is a function
-    /// value invoked per element via the S13 `call_indirect` ABI. `map`, `filter`,
+    /// value invoked per element via the `call_indirect` ABI. `map`, `filter`,
     /// and `forEach` take exactly one argument (the callback); `reduce` requires two
     /// (the callback and the initial accumulator — a no-init `reduce` is rejected
-    /// rather than defaulting to the first element, out of scope for this
-    /// milestone). Arities are validated here.
+    /// rather than defaulting to the first element, out of scope). Arities are validated here.
     fn lower_array_hof(
         &mut self,
         method: &str,
         obj: &Expr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let array = Box::new(self.lower_expr(obj)?);
+        let array = Box::new(nullish_check(self.lower_expr(obj)?, method));
         match method {
             "reduce" => {
                 let [callback, init] = <[IrNode; 2]>::try_from(args).map_err(|args| {
@@ -1027,8 +991,8 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a non-callback array/string method call
-    /// `recv.indexOf/includes/join/slice/toUpperCase/toLowerCase/charAt(args)`
-    /// (S14.6). The receiver is lowered as a plain expression (evaluated once,
+    /// `recv.indexOf/includes/join/slice/toUpperCase/toLowerCase/charAt(args)`.
+    /// The receiver is lowered as a plain expression (evaluated once,
     /// host-side); arities are validated here and the result is an
     /// [`IrNode::MethodCall`] whose emit pads to two fixed argument slots. The
     /// receiver's array-vs-string kind is unknown at compile time — the host
@@ -1073,13 +1037,13 @@ impl LowerCtx<'_> {
         }
         Ok(IrNode::MethodCall {
             op,
-            recv: Box::new(self.lower_expr(obj)?),
+            recv: Box::new(nullish_check(self.lower_expr(obj)?, method)),
             args,
         })
     }
 
     /// Lower a `Map`/`Set` method call `recv.<op>(args)` into an
-    /// [`IrNode::MapMethod`] (P3.5). The receiver is lowered once; two fresh temps
+    /// [`IrNode::MapMethod`]. The receiver is lowered once; two fresh temps
     /// are allocated — one holding the receiver across the runtime TYPE-BYTE dispatch,
     /// one for the user-method-call fallback's own receiver stash. No arity check is
     /// enforced: the argument list is threaded verbatim to the fallback (which may be
@@ -1092,7 +1056,7 @@ impl LowerCtx<'_> {
         obj: &Expr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let recv = self.lower_expr(obj)?;
+        let recv = nullish_check(self.lower_expr(obj)?, method);
         let recv_local = self.fresh();
         let fallback_obj_local = self.fresh();
         Ok(IrNode::MapMethod {
@@ -1105,7 +1069,7 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower a `Date` field method `recv.<method>(args)` (P-series) into an
+    /// Lower a `Date` field method `recv.<method>(args)` into an
     /// [`IrNode::DateMethod`]. Mirrors [`Self::lower_map_method`]: the receiver is
     /// lowered once and two fresh temps are reserved for the runtime TYPE-BYTE
     /// dispatch (the `TYPE_DATE` compute path and the user-method fallback).
@@ -1116,7 +1080,7 @@ impl LowerCtx<'_> {
         obj: &Expr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let recv = self.lower_expr(obj)?;
+        let recv = nullish_check(self.lower_expr(obj)?, method);
         let recv_local = self.fresh();
         let fallback_obj_local = self.fresh();
         Ok(IrNode::DateMethod {
@@ -1146,7 +1110,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a user method call `obj.m(args)` / `obj[k](args)` into an
-    /// [`IrNode::MethodCallUser`] binding `this = obj` (P2.1). The receiver is
+    /// [`IrNode::MethodCallUser`] binding `this = obj`. The receiver is
     /// evaluated once into a fresh temp; the callee is the function value at the
     /// member `key`; the `__this` global is set to the receiver just before the
     /// indirect call. A private-name member (`obj.#m`) is unsupported.
@@ -1158,9 +1122,9 @@ impl LowerCtx<'_> {
         // The statically-known method name, if any: `obj.m` and `obj["m"]` name
         // `m`; a dynamic computed key `obj[k]` is unknown until runtime.
         let name = member_method_name(member);
-        // M1: reaching this generic path means the name matched none of the
+        // Reaching this generic path means the name matched none of the
         // built-in string/array/Map/Set methods. A receiver whose type is a
-        // statically-known PRIMITIVE (string/number/boolean/null literal) or an
+        // statically-known PRIMITIVE (string/number/boolean literal) or an
         // ARRAY literal can never carry a user-defined method, so the call is
         // provably unknown — reject it with a span diagnostic instead of emitting
         // a `call_indirect` the wasm validator (or runtime) would reject.
@@ -1190,14 +1154,6 @@ impl LowerCtx<'_> {
                 .into());
             }
         };
-        // M1: record this site so `lower` can reject it if the program turns out
-        // to define no functions at all (no funcref table => any method call is an
-        // unknown method). Programs that DO define a function keep the runtime
-        // dispatch (a genuine object/class method resolves through the table).
-        self.shared
-            .generic_method_sites
-            .borrow_mut()
-            .push((member.span(), name));
         let obj = self.lower_expr(&member.obj)?;
         let obj_local = self.fresh();
         Ok(IrNode::MethodCallUser {
@@ -1218,8 +1174,8 @@ impl LowerCtx<'_> {
     /// expression is outside the supported subset.
     /// Lower an assignment `target = value`. An identifier target is a local
     /// assign; a computed-member target `obj[i] = v` is an in-place array element
-    /// store (S11). A static-member target `obj.a = v` is object territory
-    /// (S11.4), still unsupported here.
+    /// store. A static-member target `obj.a = v` is object territory,
+    /// still unsupported here.
     #[allow(clippy::too_many_lines)]
     fn lower_assign(&mut self, assign: &AssignExpr) -> anyhow::Result<IrNode> {
         // `x **= e` desugars to `x = x ** e` — a `MathOp::Pow` (not a `BinOp`), so
@@ -1349,7 +1305,7 @@ impl LowerCtx<'_> {
                 };
                 let rhs = self.lower_expr(&assign.right)?;
                 match compound_op {
-                    // `obj[i] op= e` (S13.5): read the current member once, apply
+                    // `obj[i] op= e`: read the current member once, apply
                     // `op`, store back. Base and key are stashed in fresh temps so
                     // each side effect runs exactly once.
                     Some(op) => {
@@ -1364,6 +1320,7 @@ impl LowerCtx<'_> {
                             obj_local,
                             idx_local,
                             new_local,
+                            kind: OpSetKind::Compound,
                         })
                     }
                     // `obj[i] = v` reuses the runtime `IndexSet` type-byte dispatch.
@@ -1382,16 +1339,24 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower an increment/decrement `++x`/`x++`/`--x`/`x--`. Only an assignable
-    /// identifier target is supported; the `.prefix` flag selects the produced
-    /// value (new for prefix, old for postfix). A plain local becomes an
-    /// [`IrNode::IncDec`]; a captured (boxed-cell) target desugars to a
-    /// read-modify-write through its cell.
+    /// Lower an increment/decrement `++x`/`x++`/`--x`/`x--`. The target is an
+    /// assignable identifier or a member `o.p` / `o[k]`; the `.prefix` flag
+    /// selects the produced value (new for prefix, old for postfix). A plain local
+    /// becomes an [`IrNode::IncDec`]; a captured (boxed-cell) target desugars to a
+    /// read-modify-write through its cell; a member target is an
+    /// [`IrNode::IndexOpSet`] (see [`Self::lower_member_update`]).
     fn lower_update(&mut self, update: &UpdateExpr) -> anyhow::Result<IrNode> {
-        let Expr::Ident(ident) = update.arg.as_ref() else {
+        let target = match update.arg.as_ref() {
+            Expr::Paren(p) => p.expr.as_ref(),
+            other => other,
+        };
+        if let Expr::Member(member) = target {
+            return self.lower_member_update(update, member);
+        }
+        let Expr::Ident(ident) = target else {
             return Err(CompileError::spanned(
                 update.arg.span(),
-                "increment/decrement target must be an identifier",
+                "increment/decrement target must be an identifier or member",
             )
             .into());
         };
@@ -1418,13 +1383,16 @@ impl LowerCtx<'_> {
                 inc,
                 prefix: update.prefix,
             }),
-            // A captured cell: `x = cell + delta` (prefix yields new); postfix
-            // yields the old value as `new - delta`.
+            // A captured cell: `x = ToNumber(cell) + delta` (prefix yields new);
+            // postfix yields the old value as `new - delta`.
             AccessKind::Cell(ptr) => {
                 let delta = if inc { 1.0 } else { -1.0 };
                 let new_value = IrNode::Binary {
                     op: BinOp::Add,
-                    lhs: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                    lhs: Box::new(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumber,
+                        arg: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                    }),
                     rhs: Box::new(IrNode::Num(delta)),
                 };
                 let store = IrNode::CellSet {
@@ -1444,8 +1412,56 @@ impl LowerCtx<'_> {
         }
     }
 
+    /// Lower a member update `o.p++` / `--o[k]` to an [`IrNode::IndexOpSet`] that
+    /// adds `1` / `-1` to the current value converted with `ToNumber` (so a string
+    /// member `"4"` becomes `5`, never `"41"`). The base and key are evaluated
+    /// once; a postfix update yields the old numeric value. A nullish base throws
+    /// the member READ `TypeError`, as in V8.
+    fn lower_member_update(
+        &mut self,
+        update: &UpdateExpr,
+        member: &swc_ecma_ast::MemberExpr,
+    ) -> anyhow::Result<IrNode> {
+        let obj = self.lower_expr(&member.obj)?;
+        let index = match &member.prop {
+            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
+            MemberProp::Ident(id) if id.sym.as_ref() != "length" => {
+                IrNode::Str(id.sym.as_ref().to_owned())
+            }
+            _ => {
+                return Err(CompileError::spanned(
+                    member.span(),
+                    "unsupported increment/decrement target",
+                )
+                .into());
+            }
+        };
+        let delta = if matches!(update.op, UpdateOp::PlusPlus) {
+            1.0
+        } else {
+            -1.0
+        };
+        let obj_local = self.fresh();
+        let idx_local = self.fresh();
+        let new_local = self.fresh();
+        Ok(IrNode::IndexOpSet {
+            obj: Box::new(obj),
+            index: Box::new(index),
+            op: BinOp::Add,
+            rhs: Box::new(IrNode::Num(delta)),
+            obj_local,
+            idx_local,
+            new_local,
+            kind: if update.prefix {
+                OpSetKind::PrefixUpdate
+            } else {
+                OpSetKind::PostfixUpdate
+            },
+        })
+    }
+
     fn lower_array(&mut self, arr: &ArrayLit) -> anyhow::Result<IrNode> {
-        // A spread element `[...a, b]` (P1.5) makes the array's length only known
+        // A spread element `[...a, b]` makes the array's length only known
         // at runtime, so it lowers to the runtime-built `ArraySpread`; a plain
         // literal keeps the fixed-size `Array` path.
         if arr
@@ -1489,7 +1505,7 @@ impl LowerCtx<'_> {
     /// [`IrNode::Object`], evaluating each value expression left-to-right. Key-value
     /// entries, shorthand properties (`{n}` ≡ `{n: n}`), and method/shorthand-method
     /// properties (`{m(){..}}` ≡ `{m: function(){..}}`, a first-class function value
-    /// carrying `this`, P2.1) are in scope with a static identifier or string key.
+    /// carrying `this`) are in scope with a static identifier or string key.
     /// Computed keys, spread, and getter/setter/computed/async/generator methods are
     /// rejected with spans.
     ///
@@ -1522,7 +1538,7 @@ impl LowerCtx<'_> {
                     entries.push((key, value));
                 }
                 // A method / shorthand method `{m(){..}}` lifts to a first-class
-                // function value (like an arrow) that carries `this` (P2.1).
+                // function value (like an arrow) that carries `this`.
                 Prop::Method(method) => {
                     reject_unsupported_function(&method.function)?;
                     let key = prop_name_key(&method.key)?;
@@ -1555,7 +1571,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a `new <Id>(args)` expression for the three built-in error
-    /// constructors `Error` / `TypeError` / `RangeError` (S15.4). Each lowers to
+    /// constructors `Error` / `TypeError` / `RangeError`. Each lowers to
     /// the SAME IR as the plain object literal
     /// `{ name: "<Id>", message: <arg0> }`, so `.name`/`.message` are ordinary
     /// property reads, `typeof` is "object", and the value throws/propagates
@@ -1640,12 +1656,12 @@ impl LowerCtx<'_> {
             .into());
         };
         let name = callee.sym.as_ref();
-        // A `new A(args)` on a user class declared earlier (P2.2) takes the class
+        // A `new A(args)` on a user class declared earlier takes the class
         // instantiation path; the builtin Error constructors fall through below.
         if self.shared.classes.borrow().contains_key(name) {
             return self.lower_new_class(name, callee.span, new_expr);
         }
-        // `new Map()` / `new Set()` (P3.5): a fresh empty collection handle. Like the
+        // `new Map()` / `new Set()`: a fresh empty collection handle. Like the
         // other builtins, `Map`/`Set` are not real bindings, so a user `let Map = ..`
         // shadows them. Only the empty constructor is in scope — arguments (e.g.
         // `new Map([[k, v]])`) are rejected.
@@ -1663,13 +1679,13 @@ impl LowerCtx<'_> {
             }
             return Ok(IrNode::MapNew { set: name == "Set" });
         }
-        // `new Promise(executor)` (P4.1): the executor form of the Promise
+        // `new Promise(executor)`: the executor form of the Promise
         // constructor. Like `Map`/`Set`, `Promise` is not a real binding, so a
         // user `let Promise = ..` shadows it.
         if name == "Promise" && self.resolve("Promise").is_none() {
             return self.lower_new_promise(callee.span, new_expr);
         }
-        // `new Date()` / `new Date(ms)` (P-series). Like the other builtins, `Date`
+        // `new Date()` / `new Date(ms)`. Like the other builtins, `Date`
         // is not a real binding, so a user `let Date = ..` shadows it.
         if name == "Date" && self.resolve("Date").is_none() {
             return self.lower_new_date(callee.span, new_expr);
@@ -1734,7 +1750,7 @@ impl LowerCtx<'_> {
         ]))
     }
 
-    /// Lower `new Date()` / `new Date(ms)` (P-series) into an [`IrNode::DateNew`].
+    /// Lower `new Date()` / `new Date(ms)` into an [`IrNode::DateNew`].
     /// The no-argument form seeds the payload from the host clock (`ms: None`); a
     /// single argument is coerced to a number (`Number(arg)`) so any operand stores
     /// its numeric value. Two-or-more arguments (the calendar-field form) and a
@@ -1772,7 +1788,7 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower `new Promise(executor)` (P4.1) into an [`IrNode::PromiseCtor`]. The
+    /// Lower `new Promise(executor)` into an [`IrNode::PromiseCtor`]. The
     /// single argument is the executor function (spread / wrong arity rejected); a
     /// dedicated local is reserved to hold the fresh promise across the executor
     /// call so the surrounding scratch cannot clobber it.
@@ -1806,7 +1822,7 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower `new A(args)` on a user class `A` (P2.2) into an [`IrNode::New`]. The
+    /// Lower `new A(args)` on a user class `A` into an [`IrNode::New`]. The
     /// class binding `A` is read (a side-effect-free local/cell read) to reach its
     /// reserved constructor and prototype entries; the fresh instance is an object
     /// pre-slotted with the reserved prototype link (pointing at the class's shared
@@ -1924,7 +1940,17 @@ fn prop_name_key(name: &PropName) -> anyhow::Result<String> {
     }
 }
 
-/// The statically-known method name of a member callee (M1): `obj.m` and the
+/// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a
+/// `null`/`undefined` receiver throws `Cannot read properties of .. (reading
+/// '<key>')` instead of reading through a bogus pointer.
+fn nullish_check(value: IrNode, key: &str) -> IrNode {
+    IrNode::NullishCheck {
+        value: Box::new(value),
+        key: key.to_owned(),
+    }
+}
+
+/// The statically-known method name of a member callee: `obj.m` and the
 /// string-literal computed form `obj["m"]` both name `m`; a dynamic computed key
 /// `obj[k]` is only known at runtime, so it has no static name.
 fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
@@ -1939,15 +1965,14 @@ fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
 }
 
 /// Whether the receiver's type is a statically-known primitive (string / number /
-/// boolean / null / template string) or an array literal (M1). Such a receiver
+/// boolean / template string) or an array literal. A `null` receiver is not
+/// listed: its method lookup throws a runtime `TypeError` instead. Such a receiver
 /// can never carry a user-defined method, so a method name that reached the
 /// generic user-method path (i.e. matched no built-in) is provably unknown.
 fn static_primitive_receiver(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(p) => static_primitive_receiver(&p.expr),
-        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_) | Lit::Null(_))
-        | Expr::Tpl(_)
-        | Expr::Array(_) => true,
+        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_)) | Expr::Tpl(_) | Expr::Array(_) => true,
         _ => false,
     }
 }

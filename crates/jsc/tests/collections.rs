@@ -1,4 +1,4 @@
-//! Integration tests: `Map` and `Set` collection utilities via the CLI (P3.5).
+//! Integration tests: `Map` and `Set` collection utilities via the CLI.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -6,7 +6,7 @@ use std::process::Command;
 
 use common::jsc;
 
-/// Run `jsc -e <src>` expecting a non-zero exit, returning its stderr so a
+/// Run `jsc -e <src>` expecting compile-error exit 2, returning its stderr so a
 /// rejection message can be asserted.
 fn jsc_reject(src: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
@@ -14,48 +14,48 @@ fn jsc_reject(src: &str) -> String {
         .output()
         .expect("failed to spawn jsc binary");
     assert!(
-        !output.status.success(),
-        "jsc -e {src:?} unexpectedly succeeded"
+        output.status.code() == Some(2),
+        "jsc -e {src:?} should exit 2 (compile error)"
     );
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// The P3.5 Map/Set milestones run inline with `-e` through the built binary.
+/// Map/Set basics run inline with `-p` through the built binary.
 ///
-/// Covers the collection wave end to end: `Map` set/get sum, `has`, `size`, `Set`
+/// Covers collections end to end: `Map` set/get sum, `has`, `size`, `Set`
 /// add dedup + `size`, `Set` `has`, and `typeof (new Map())`.
 #[test]
-fn map_set_milestones_via_eval() {
+fn map_set_basics_via_eval() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(\"a\",40); m.set(\"b\",2); m.get(\"a\")+m.get(\"b\")"
         ]),
         "42"
     );
     assert_eq!(
-        jsc(&["-e", "let m=new Map(); m.set(\"a\",40); m.has(\"a\")"]),
+        jsc(&["-p", "let m=new Map(); m.set(\"a\",40); m.has(\"a\")"]),
         "true"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(\"a\",40); m.set(\"b\",2); m.size"
         ]),
         "2"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=new Set(); s.add(1); s.add(1); s.add(2); s.size"
         ]),
         "2"
     );
     assert_eq!(
-        jsc(&["-e", "let s=new Set(); s.add(1); s.add(2); s.has(2)"]),
+        jsc(&["-p", "let s=new Set(); s.add(1); s.add(2); s.has(2)"]),
         "true"
     );
-    assert_eq!(jsc(&["-e", "typeof (new Map())"]), "object");
+    assert_eq!(jsc(&["-p", "typeof (new Map())"]), "object");
 }
 
 /// A `Map`'s `set` updates an existing key in place (no duplicate, `size`
@@ -65,29 +65,29 @@ fn map_set_milestones_via_eval() {
 fn map_update_and_miss_via_eval() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(\"a\",1); m.set(\"a\",9); m.get(\"a\")"
         ]),
         "9"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(\"a\",1); m.set(\"a\",9); m.size"
         ]),
         "1"
     );
     assert_eq!(
-        jsc(&["-e", "let m=new Map(); m.set(\"a\",1); m.get(\"x\")"]),
+        jsc(&["-p", "let m=new Map(); m.set(\"a\",1); m.get(\"x\")"]),
         "undefined"
     );
     assert_eq!(
-        jsc(&["-e", "let m=new Map(); m.set(\"a\",1); m.has(\"x\")"]),
+        jsc(&["-p", "let m=new Map(); m.set(\"a\",1); m.has(\"x\")"]),
         "false"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(1,\"x\"); m.set(2,\"y\"); m.get(1)+m.get(2)"
         ]),
         "xy"
@@ -100,23 +100,23 @@ fn map_update_and_miss_via_eval() {
 #[test]
 fn map_delete_via_eval() {
     assert_eq!(
-        jsc(&["-e", "let m=new Map(); m.set(\"a\",1); m.delete(\"a\")"]),
+        jsc(&["-p", "let m=new Map(); m.set(\"a\",1); m.delete(\"a\")"]),
         "true"
     );
     assert_eq!(
-        jsc(&["-e", "let m=new Map(); m.set(\"a\",1); m.delete(\"x\")"]),
+        jsc(&["-p", "let m=new Map(); m.set(\"a\",1); m.delete(\"x\")"]),
         "false"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(\"a\",1); m.delete(\"a\"); m.size"
         ]),
         "0"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(\"a\",1); m.set(\"b\",2); m.set(\"c\",3); m.delete(\"b\"); \
              m.get(\"a\")+m.get(\"c\")+\"/\"+m.size"
         ]),
@@ -124,7 +124,7 @@ fn map_delete_via_eval() {
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let m=new Map(); m.set(\"a\",1); m.delete(\"a\"); m.set(\"a\",5); m.get(\"a\")"
         ]),
         "5"
@@ -137,21 +137,21 @@ fn map_delete_via_eval() {
 fn set_ops_via_eval() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=new Set(); s.add(1); s.add(2); s.delete(1); s.has(1)"
         ]),
         "false"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=new Set(); s.add(1); s.add(2); s.delete(1); s.size"
         ]),
         "1"
     );
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "let s=new Set(); s.add(\"x\"); s.add(\"x\"); s.add(\"y\"); s.size"
         ]),
         "2"
@@ -162,14 +162,14 @@ fn set_ops_via_eval() {
 /// render with their entry count.
 #[test]
 fn map_set_render_and_chain_via_eval() {
-    assert_eq!(jsc(&["-e", "new Map()"]), "Map(0)");
-    assert_eq!(jsc(&["-e", "new Set()"]), "Set(0)");
+    assert_eq!(jsc(&["-p", "new Map()"]), "Map(0)");
+    assert_eq!(jsc(&["-p", "new Set()"]), "Set(0)");
     assert_eq!(
-        jsc(&["-e", "let s=new Set(); s.add(1); s.add(2); s"]),
+        jsc(&["-p", "let s=new Set(); s.add(1); s.add(2); s"]),
         "Set(2)"
     );
     assert_eq!(
-        jsc(&["-e", "let m=new Map(); m.set(\"a\",1).set(\"b\",2); m.size"]),
+        jsc(&["-p", "let m=new Map(); m.set(\"a\",1).set(\"b\",2); m.size"]),
         "2"
     );
 }
@@ -180,12 +180,12 @@ fn map_set_render_and_chain_via_eval() {
 fn method_name_fallback_to_user_method() {
     assert_eq!(
         jsc(&[
-            "-e",
+            "-p",
             "class C{constructor(){this.base=10} add(x){return this.base+x}} new C().add(5)"
         ]),
         "15"
     );
-    assert_eq!(jsc(&["-e", "let o={get(){return 7}}; o.get()"]), "7");
+    assert_eq!(jsc(&["-p", "let o={get(){return 7}}; o.get()"]), "7");
 }
 
 /// Out-of-scope forms are rejected with a span: constructor arguments beyond the

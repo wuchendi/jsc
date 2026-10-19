@@ -24,7 +24,7 @@ pub(super) fn scan_stmt_arity(stmt: &Stmt) -> usize {
                 .map_or(0, |b| scan_stmts_arity(&b.stmts));
             own.max(body)
         }
-        // A class declaration (P2.2): its constructor AND every method/getter/setter
+        // A class declaration: its constructor AND every method/getter/setter
         // lift to functions, so each one's own param count and body must widen `K`
         // like any function/arrow. A setter (P2b) matters especially — it is invoked
         // with one argument by `obj.x = v`, an assignment no call-site arity scan
@@ -121,8 +121,8 @@ fn scan_expr_arity(expr: &Expr) -> usize {
         Expr::Arrow(a) => {
             let own = a.params.len();
             let body = match &*a.body {
-                BlockStmtOrExpr::BlockStmt(b) => scan_stmts_arity(&b.stmts),
-                BlockStmtOrExpr::Expr(e) => scan_expr_arity(e),
+                ArrowFunctionBody::FunctionBody(b) => scan_stmts_arity(&b.stmts),
+                ArrowFunctionBody::Expr(e) => scan_expr_arity(e),
             };
             own.max(body)
         }
@@ -153,10 +153,10 @@ fn scan_expr_arity(expr: &Expr) -> usize {
             }
             // The uniform ABI pads every call to `K` positional slots, so a call
             // passing more arguments than any function's declared arity must still
-            // widen `K` — otherwise a trailing rest parameter (P1.4) would receive
+            // widen `K` — otherwise a trailing rest parameter would receive
             // only `K` of them, the surplus having been dropped at the call site.
             m = m.max(c.args.len());
-            // An array higher-order method (S14.5) invokes its callback with extra
+            // An array higher-order method invokes its callback with extra
             // positional args beyond the callback's own arity — `(element, index)`
             // for map/filter/forEach and `(acc, element, index)` for reduce. Widen
             // the uniform ABI so those pushes never overflow the shared funcref
@@ -181,7 +181,7 @@ fn scan_expr_arity(expr: &Expr) -> usize {
             }
             r
         }
-        // `new A(args)` (P2.2) invokes the constructor through the uniform ABI, so
+        // `new A(args)` invokes the constructor through the uniform ABI, so
         // `K` must cover the argument count (like a plain call) and any arrow arg.
         Expr::New(n) => {
             let mut m = 0;
@@ -191,7 +191,7 @@ fn scan_expr_arity(expr: &Expr) -> usize {
                     m = m.max(scan_expr_arity(&arg.expr));
                 }
             }
-            // `new Promise(executor)` (P4.1) invokes the executor with TWO
+            // `new Promise(executor)` invokes the executor with TWO
             // synthetic arguments (`resolve`, `reject`) through the uniform ABI, so
             // `K` must be at least 2 regardless of the executor's declared arity.
             // Over-counting under a shadowed `Promise` is harmless (widens `K`).
@@ -202,7 +202,7 @@ fn scan_expr_arity(expr: &Expr) -> usize {
             }
             m
         }
-        // `await e` (P4.1): scan the awaited expression so a `new Promise` executor
+        // `await e`: scan the awaited expression so a `new Promise` executor
         // (or any function) nested under it still widens the uniform ABI arity.
         Expr::Await(a) => scan_expr_arity(&a.arg),
         Expr::Array(a) => a
@@ -218,7 +218,7 @@ fn scan_expr_arity(expr: &Expr) -> usize {
             .filter_map(|p| match p {
                 PropOrSpread::Prop(prop) => match prop.as_ref() {
                     Prop::KeyValue(kv) => Some(scan_expr_arity(&kv.value)),
-                    // A method (P2.1) lifts to a function; its own param count and
+                    // A method lifts to a function; its own param count and
                     // body must widen `K` like any arrow/function.
                     Prop::Method(method) => {
                         let own = method.function.params.len();

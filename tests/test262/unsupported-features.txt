@@ -1,0 +1,78 @@
+# test262 features jsc certainly does not implement; tests tagged with any of
+# them are skipped. One feature name per line (see test262 features.txt);
+# a trailing `*` is a prefix match. Only list a feature when it is entirely
+# missing (probed against jsc); partially working features stay enabled so
+# their failures are counted. Remove entries as support lands.
+
+# Symbols (no `Symbol` global; well-known symbols are unavailable)
+Symbol*
+symbols-as-weakmap-keys
+
+# Proxy / Reflect (no globals)
+Proxy
+proxy-missing-checks
+Reflect*
+
+# BigInt (literals rejected at compile time)
+BigInt
+
+# Regular expressions (literals and the RegExp constructor are rejected)
+regexp-*
+RegExp.escape
+legacy-regexp
+
+# Binary data: typed arrays, buffers, DataView, Atomics (no constructors)
+TypedArray*
+Int8Array
+Int16Array
+Int32Array
+Uint8Array
+Uint8ClampedArray
+Uint16Array
+Uint32Array
+Float16Array
+Float32Array
+Float64Array
+uint8array-base64
+stable-typedarray-sort
+ArrayBuffer
+arraybuffer-transfer
+resizable-arraybuffer
+immutable-arraybuffer
+align-detached-buffer-semantics-with-web-reality
+DataView*
+SharedArrayBuffer
+Atomics*
+
+# Weak references and GC-observable behaviour (no constructors / no host hook)
+WeakMap
+WeakSet
+WeakRef
+FinalizationRegistry
+host-gc-required
+
+# Temporal and ECMA-402 (no globals)
+Temporal
+canonical-tz
+Intl*
+intl-normative-optional
+
+# Realms and host hooks jsc has no notion of
+ShadowRealm
+cross-realm
+IsHTMLDDA
+
+# Not implemented by design or not yet attempted
+tail-call-optimization
+decorators
+explicit-resource-management
+
+# Module loading extensions (jsc compiles a single script; no import())
+dynamic-import
+import-attributes
+json-modules
+source-phase-imports*
+import-defer
+export-defer
+import-text
+import-bytes

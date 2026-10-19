@@ -36,7 +36,7 @@ fn partial_eq_distinguishes_operators() {
 #[test]
 fn debug_output_is_non_empty() {
     let node = IrNode::Num(3.5);
-    assert!(!format!("{node:?}").is_empty());
+    assert_ne!(format!("{node:?}"), "");
 }
 
 #[test]

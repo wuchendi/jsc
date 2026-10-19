@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
-members  = ["crates/jsc-core", "crates/jsc", "crates/jsc-wasm"]
+members  = ["crates/jsc-core", "crates/jsc", "crates/jsc-wasm", "crates/jsc-test262"]
 exclude  = ["tmp"]
 
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 license      = "Apache-2.0"
 publish      = false
 

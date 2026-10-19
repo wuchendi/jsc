@@ -4,23 +4,31 @@ use super::*;
 /// Emit a binary operation, leaving its jsval result on the stack. Arithmetic
 /// unboxes to `f64` and reboxes a number; relational operators box a boolean
 /// jsval; `Eq`/`Ne` are strict equality (see [`emit_strict_eq`]).
-/// Emit an increment/decrement of `local` (`++`/`--`). The updated value is
-/// `old ± 1` (unboxed to `f64`, stepped, reboxed). `prefix` yields the NEW value
-/// via `local.tee`; postfix pushes the OLD value first and then stores the
-/// update, so the old value remains on the stack as the expression's result.
-pub(super) fn emit_inc_dec(local: u32, inc: bool, prefix: bool, function: &mut Function) {
+/// Emit an increment/decrement of `local` (`++`/`--`). The local is first
+/// replaced by its `ToNumber`, then the updated value is `old ± 1` (unboxed to
+/// `f64`, stepped, reboxed). `prefix` yields the NEW value via `local.tee`;
+/// postfix pushes the (numeric) OLD value first and then stores the update, so
+/// the old value remains on the stack as the expression's result.
+pub(super) fn emit_inc_dec(
+    local: u32,
+    inc: bool,
+    prefix: bool,
+    function: &mut Function,
+    helpers: Helpers<'_>,
+) {
     let step = if inc {
         Instruction::F64Add
     } else {
         Instruction::F64Sub
     };
+    emit_coerce_number(function, local, helpers);
     if prefix {
         // new = old ± 1; store and yield the new value.
         function.instruction(&Instruction::LocalGet(local));
         function.instruction(&Instruction::F64ReinterpretI64);
         function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
         function.instruction(&step);
-        function.instruction(&Instruction::I64ReinterpretF64);
+        emit_box_f64(function, helpers);
         function.instruction(&Instruction::LocalTee(local));
     } else {
         // Yield the old value (left on the stack), then store `old ± 1`.
@@ -29,15 +37,16 @@ pub(super) fn emit_inc_dec(local: u32, inc: bool, prefix: bool, function: &mut F
         function.instruction(&Instruction::F64ReinterpretI64);
         function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
         function.instruction(&step);
-        function.instruction(&Instruction::I64ReinterpretF64);
+        emit_box_f64(function, helpers);
         function.instruction(&Instruction::LocalSet(local));
     }
 }
 
 /// Emit the numeric remainder `lhs % rhs`. wasm has no `f64.rem`, so compute the
 /// JS truncated remainder `a - b * trunc(a / b)` (which takes the dividend's
-/// sign). Both operands are stashed in the scratch locals so each can be read
-/// twice; the `f64` result is reboxed as a number jsval.
+/// sign). Both operands are stashed in the scratch locals (coerced with
+/// `ToNumber`) so each can be read twice; the `f64` result is reboxed as a number
+/// jsval.
 pub(super) fn emit_mod(
     lhs: &IrNode,
     rhs: &IrNode,
@@ -52,6 +61,8 @@ pub(super) fn emit_mod(
     emit_node(rhs, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
+    emit_coerce_number(function, s0, helpers);
+    emit_coerce_number(function, s1, helpers);
     // a
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::F64ReinterpretI64);
@@ -67,11 +78,10 @@ pub(super) fn emit_mod(
     function.instruction(&Instruction::F64Mul);
     // a - b * trunc(a / b)
     function.instruction(&Instruction::F64Sub);
-    function.instruction(&Instruction::I64ReinterpretF64);
+    emit_box_f64(function, helpers);
 }
 
-/// Emit a `Math.*` built-in call, leaving its number-jsval result on the stack
-/// (S14.2).
+/// Emit a `Math.*` built-in call, leaving its number-jsval result on the stack.
 ///
 /// The unary ops unbox their single argument to `f64`, apply a native wasm op, and
 /// rebox. `Round` uses JS semantics `floor(x + 0.5)`. `Min`/`Max` fold the native
@@ -112,7 +122,7 @@ pub(super) fn emit_math_call(
                 }
                 _ => unreachable!("outer match restricts op to the unary methods"),
             };
-            function.instruction(&Instruction::I64ReinterpretF64);
+            emit_box_f64(function, helpers);
         }
         // Variadic min/max: seed with the identity infinity, then fold the native
         // pairwise op over each argument. `f64.min`/`f64.max` already match JS on
@@ -133,13 +143,13 @@ pub(super) fn emit_math_call(
                     function.instruction(&Instruction::F64Max);
                 }
             }
-            function.instruction(&Instruction::I64ReinterpretF64);
+            emit_box_f64(function, helpers);
         }
         MathOp::Pow => emit_pow(&args[0], &args[1], function, scratch, strings, helpers),
     }
 }
 
-/// Emit `Math.max(...)` / `Math.min(...)` with a spread argument (P1.5), leaving
+/// Emit `Math.max(...)` / `Math.min(...)` with a spread argument, leaving
 /// a number jsval on the stack. The `args` node (an [`IrNode::ArraySpread`]) is
 /// materialized into a heap array; a counted loop then folds `f64.max`/`f64.min`
 /// over its elements from the identity infinity — matching the fixed-arity
@@ -223,15 +233,17 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::End); // loop
     function.instruction(&Instruction::End); // block
 
-    // The accumulator holds the folded result as a number jsval (f64 bits).
+    // The accumulator holds the folded result's f64 bits; rebox it as a number.
     function.instruction(&Instruction::LocalGet(acc));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    emit_box_f64(function, helpers);
 }
 
-/// Emit `Math.pow(base, exp)`, leaving a number jsval on the stack (S14.2).
+/// Emit `Math.pow(base, exp)`, leaving a number jsval on the stack.
 ///
 /// wasm has no `f64` power op, so `base^|exp|` is built in two import-free stages:
 /// the integer part multiplies `base` into an accumulator once per unit of
-/// `trunc(|exp|)` (exact for integer exponents, e.g. the milestone's `pow(2, 10)`),
+/// `trunc(|exp|)` (exact for integer exponents, e.g. `pow(2, 10)`),
 /// and the fractional part `f = |exp| - trunc(|exp|)` (`0 ≤ f < 1`) is applied by
 /// the classic bit-by-bit square-root method: successive `f64.sqrt` yields
 /// `base^(1/2^i)`, and each `1` bit of `f`'s binary expansion multiplies it in
@@ -269,6 +281,8 @@ pub(super) fn emit_pow(
     emit_node(exp, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s_cnt));
     function.instruction(&Instruction::LocalSet(s_base));
+    emit_coerce_number(function, s_base, helpers);
+    emit_coerce_number(function, s_cnt, helpers);
 
     // neg = exp < 0.
     function.instruction(&Instruction::LocalGet(s_cnt));
@@ -398,9 +412,11 @@ pub(super) fn emit_pow(
     function.instruction(&Instruction::End);
 
     function.instruction(&Instruction::LocalGet(s_res));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    emit_box_f64(function, helpers);
 }
 
-/// Emit a conversion built-in call, leaving its result jsval on the stack (S14.3).
+/// Emit a conversion built-in call, leaving its result jsval on the stack.
 ///
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
 /// between the boxed `true`/`false` jsvals, no host call. The other four delegate
@@ -425,19 +441,29 @@ pub(super) fn emit_convert_call(
         function.instruction(&Instruction::Select);
         return;
     }
+    if matches!(op, ConvertOp::ToNumber) {
+        // The shared ToNumber: a number passes through, anything else is
+        // converted by `__to_number`.
+        emit_node(arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_coerce_number(function, scratch, helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        return;
+    }
     let flag = match op {
         ConvertOp::ToString => CONVERT_OP_TO_STRING,
-        ConvertOp::ToNumber => CONVERT_OP_TO_NUMBER,
         ConvertOp::ParseInt => CONVERT_OP_PARSE_INT,
         ConvertOp::ParseFloat => CONVERT_OP_PARSE_FLOAT,
-        ConvertOp::ToBoolean => unreachable!("ToBoolean handled inline above"),
+        ConvertOp::ToBoolean | ConvertOp::ToNumber => {
+            unreachable!("ToBoolean/ToNumber handled above")
+        }
     };
     emit_node(arg, function, scratch, strings, helpers);
     function.instruction(&Instruction::I32Const(flag));
     function.instruction(&Instruction::Call(helpers.convert));
 }
 
-/// Emit a non-callback array/string method call `IrNode::MethodCall` (S14.6),
+/// Emit a non-callback array/string method call `IrNode::MethodCall`,
 /// leaving its result jsval on the stack. The receiver is pushed, then the
 /// `METHOD_OP_*` flag, then the two fixed argument slots (each the lowered
 /// argument, or `undefined` when the method takes fewer), then a `call` of the
@@ -540,7 +566,7 @@ fn emit_add(
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Add);
-    function.instruction(&Instruction::I64ReinterpretF64);
+    emit_box_f64(function, helpers);
     function.instruction(&Instruction::End);
 }
 
@@ -557,12 +583,20 @@ pub(super) fn emit_binary(
         // `+` is a runtime type dispatch (string concat vs numeric add); see
         // [`emit_add`].
         BinOp::Add => emit_add(lhs, rhs, function, scratch, strings, helpers),
-        // Subtraction/multiplication/division stay numeric-only: unbox each
-        // operand to f64, compute, rebox as a number.
+        // Subtraction/multiplication/division: stash both operands, coerce
+        // each with ToNumber, unbox to f64, compute, rebox as a number.
         BinOp::Sub | BinOp::Mul | BinOp::Div => {
+            let s0 = scratch;
+            let s1 = scratch + 1;
             emit_node(lhs, function, scratch, strings, helpers);
-            function.instruction(&Instruction::F64ReinterpretI64);
             emit_node(rhs, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalSet(s1));
+            function.instruction(&Instruction::LocalSet(s0));
+            emit_coerce_number(function, s0, helpers);
+            emit_coerce_number(function, s1, helpers);
+            function.instruction(&Instruction::LocalGet(s0));
+            function.instruction(&Instruction::F64ReinterpretI64);
+            function.instruction(&Instruction::LocalGet(s1));
             function.instruction(&Instruction::F64ReinterpretI64);
             let arith = match op {
                 BinOp::Sub => Instruction::F64Sub,
@@ -571,13 +605,13 @@ pub(super) fn emit_binary(
                 _ => unreachable!("only sub/mul/div reach here"),
             };
             function.instruction(&arith);
-            function.instruction(&Instruction::I64ReinterpretF64);
+            emit_box_f64(function, helpers);
         }
         // Remainder: wasm has no `f64.rem`; delegate to the dedicated emitter.
         BinOp::Mod => emit_mod(lhs, rhs, function, scratch, strings, helpers),
         // Relational: a runtime type dispatch. Two heap strings compare
-        // lexicographically by bytes (`__str_cmp`); anything else unboxes each
-        // operand to `f64` and compares numerically. Either path yields an i32
+        // lexicographically by bytes (`__str_cmp`); anything else coerces each
+        // operand with ToNumber and compares the `f64`s. Either path yields an i32
         // wasm bool that is boxed as a boolean jsval (TRUE/FALSE) via `select`.
         BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
             let s0 = scratch;
@@ -612,7 +646,9 @@ pub(super) fn emit_binary(
             };
             function.instruction(&str_cmp);
             function.instruction(&Instruction::Else);
-            // ELSE: numeric compare — unbox both operands to f64.
+            // ELSE: numeric compare — ToNumber both operands, unbox to f64.
+            emit_coerce_number(function, s0, helpers);
+            emit_coerce_number(function, s1, helpers);
             function.instruction(&Instruction::LocalGet(s0));
             function.instruction(&Instruction::F64ReinterpretI64);
             function.instruction(&Instruction::LocalGet(s1));

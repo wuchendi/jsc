@@ -28,7 +28,7 @@ impl<'a> LowerCtx<'a> {
         Self {
             frames: vec![Frame::new()],
             shared,
-            top_level_fn: false,
+            main_ctx: false,
             async_body: false,
             current_super: None,
             static_init_class: None,
@@ -59,6 +59,22 @@ impl<'a> LowerCtx<'a> {
     /// Enter a new lexical scope (a `{ .. }` block or a `for` head).
     pub(super) fn push_scope(&mut self) {
         self.frame().scopes.push(HashMap::new());
+    }
+
+    /// The locals of the innermost scope's bindings that are boxed cells in an
+    /// ordinary frame (no env or module slot), in ascending local order.
+    pub(super) fn innermost_cell_locals(&mut self) -> Vec<u32> {
+        let frame = self.frame();
+        let mut locals: Vec<u32> = frame
+            .scopes
+            .last()
+            .into_iter()
+            .flat_map(|scope| scope.values())
+            .filter(|b| b.cell && b.env_slot.is_none() && b.module.is_none())
+            .map(|b| b.local)
+            .collect();
+        locals.sort_unstable();
+        locals
     }
 
     /// Leave the innermost lexical scope, discarding its name bindings.
@@ -143,10 +159,24 @@ impl<'a> LowerCtx<'a> {
     pub(super) fn declare(&mut self, name: &str, mutable: bool, id: u32) -> u32 {
         let idx = self.fresh();
         let env_backed = self.frame().env_backed;
+        // A module binding (declared in `main`'s outermost scope and referenced by
+        // a top-level function) lives in its module cell, not a local.
+        let module = if self.main_ctx && self.frames.len() == 1 && self.frames[0].scopes.len() == 1
+        {
+            self.shared.module_slots.get(name).copied()
+        } else {
+            None
+        };
+        if module.is_some() {
+            self.shared
+                .module_mutable
+                .borrow_mut()
+                .insert(name.to_owned(), mutable);
+        }
         // An `env_backed` (generator) frame boxes EVERY binding into an env cell so
         // it survives across a `yield`; an ordinary frame boxes only the bindings
-        // capture analysis flagged (S13.4).
-        let cell = env_backed || self.shared.captured.contains(&id);
+        // capture analysis flagged.
+        let cell = module.is_none() && (env_backed || self.shared.captured.contains(&id));
         // In an `env_backed` frame the cell lives at a fresh env slot (reached via
         // `EnvLoad`), not in a wasm local; the constructor pre-creates it.
         let env_slot = if env_backed {
@@ -167,6 +197,7 @@ impl<'a> LowerCtx<'a> {
                 mutable,
                 cell,
                 id,
+                module,
                 env_slot,
             },
         );
@@ -177,7 +208,7 @@ impl<'a> LowerCtx<'a> {
         idx
     }
 
-    /// Resolve `this` for the current frame (P2.1): allocate the frame's `this`
+    /// Resolve `this` for the current frame: allocate the frame's `this`
     /// slot on first use (so a `this`-free function keeps its original local
     /// layout) and return its local index, or `None` in a non-function scope (the
     /// top-level `main` frame), where `this` has no binding. A prologue snapshot of
@@ -201,7 +232,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// The environment slot of the binding holding `local` in the current frame,
-    /// when that frame is `env_backed` (a generator, P4.2 M2). `None` for an
+    /// when that frame is `env_backed` (a generator). `None` for an
     /// ordinary frame or a non-binding local.
     pub(super) fn env_slot_for_local(&self, local: u32) -> Option<u32> {
         let frame = self.frames.last()?;
@@ -216,15 +247,63 @@ impl<'a> LowerCtx<'a> {
             .and_then(|b| b.env_slot)
     }
 
+    /// The module-cell slot of the binding holding `local` in the current frame,
+    /// when it is a module binding (see [`Shared::module_slots`]).
+    pub(super) fn module_slot_for_local(&self, local: u32) -> Option<u32> {
+        self.frames
+            .last()?
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.values().find(|b| b.local == local))
+            .and_then(|b| b.module)
+    }
+
+    /// Resolve a module binding from a top-level function body, where `main`'s
+    /// frame is absent. The body may run before the binding's declaration (the
+    /// function is hoisted), so the cell pointer is guarded: while the cell still
+    /// holds the TDZ hole, any read or write throws a `ReferenceError`.
+    fn resolve_module(&self, name: &str) -> Option<Resolved> {
+        if self.main_ctx {
+            return None;
+        }
+        let slot = *self.shared.module_slots.get(name)?;
+        let mutable = *self.shared.module_mutable.borrow().get(name)?;
+        let message = format!("Cannot access '{name}' before initialization");
+        let error = IrNode::Object(vec![
+            ("name".to_owned(), IrNode::Str("ReferenceError".to_owned())),
+            ("message".to_owned(), IrNode::Str(message.clone())),
+            (
+                "stack".to_owned(),
+                IrNode::Str(format!("ReferenceError: {message}")),
+            ),
+            (
+                crate::abi::ERROR_KIND_KEY.to_owned(),
+                IrNode::Num(crate::abi::ERROR_KIND_ERROR),
+            ),
+        ]);
+        let guarded = IrNode::Ternary {
+            cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
+                IrNode::ModuleCell(slot),
+            ))))),
+            then_branch: Box::new(IrNode::Throw(Box::new(error))),
+            else_branch: Box::new(IrNode::ModuleCell(slot)),
+        };
+        Some(Resolved {
+            kind: AccessKind::Cell(guarded),
+            mutable,
+        })
+    }
+
     /// Mark the current frame `env_backed`: every binding it declares becomes an
     /// env cell reached via `EnvLoad`, and [`Self::env_layout`] returns the frame
-    /// slots. Used to lower a generator body (P4.2 M2).
+    /// slots. Used to lower a generator body.
     pub(super) fn set_env_backed(&mut self) {
         self.frame().env_backed = true;
     }
 
     /// The number of environment slots the current frame has allocated (its
-    /// generator frame size, P4.2 M2).
+    /// generator frame size).
     pub(super) fn env_len(&self) -> usize {
         self.frames.last().map_or(0, |f| f.env.len())
     }
@@ -270,12 +349,19 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Resolve a name to a [`Resolved`] access, or `None` if it is not bound in
-    /// any frame (the caller then tries top-level functions / `undefined`).
+    /// any frame nor a module binding (the caller then tries top-level functions /
+    /// `undefined`).
     pub(super) fn resolve(&mut self, name: &str) -> Option<Resolved> {
-        let (fi, binding) = self.find_binding(name)?;
-        let kind = if fi == self.top() {
+        let Some((fi, binding)) = self.find_binding(name) else {
+            return self.resolve_module(name);
+        };
+        let kind = if let Some(slot) = binding.module {
+            // `main` (or an arrow/method nested in it) reads its module binding
+            // directly: `main` code only runs after the declaration.
+            AccessKind::Cell(IrNode::ModuleCell(slot))
+        } else if fi == self.top() {
             if let Some(slot) = binding.env_slot {
-                // A generator local (P4.2 M2): its cell lives in this frame's own
+                // A generator local: its cell lives in this frame's own
                 // environment, reached via `EnvLoad`, so it survives a `yield`.
                 AccessKind::Cell(IrNode::EnvLoad(slot))
             } else if binding.cell {

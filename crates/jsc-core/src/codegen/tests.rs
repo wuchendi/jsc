@@ -1,9 +1,9 @@
 use super::lower;
-use crate::frontend::parse;
-use crate::ir::{BinOp, IrNode, IrStmt};
+use crate::frontend::{Dialect, parse};
+use crate::ir::{BinOp, IrNode, IrStmt, OpSetKind};
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
-    lower(&parse(src)?)
+    lower(&parse(src, Dialect::Js)?)
 }
 
 /// Lower a single-expression-statement program and return its expression.
@@ -237,7 +237,7 @@ fn rejects_length_assignment() {
 
 #[test]
 fn lowers_shorthand_object_property() {
-    // Shorthand `{a}` ≡ `{a: a}` is supported since P2.1.
+    // Shorthand `{a}` ≡ `{a: a}` is supported.
     assert!(
         lower_src("let a = 1; let o = {a}; o").is_ok(),
         "shorthand object property should lower"
@@ -409,7 +409,7 @@ fn lowers_standalone_mod_operator() {
 #[test]
 fn lowers_element_compound_assignment_as_indexopset() {
     // `a[0] += 1` lowers to an `IndexOpSet` evaluating base+index once into
-    // fresh temps (S13.5).
+    // fresh temps.
     let program = lower_src("let a = [1, 2]; a[0] += 1").expect("should lower");
     assert_eq!(
         program.stmts[1],
@@ -421,6 +421,7 @@ fn lowers_element_compound_assignment_as_indexopset() {
             obj_local: 1,
             idx_local: 2,
             new_local: 3,
+            kind: OpSetKind::Compound,
         })
     );
 }
@@ -439,6 +440,7 @@ fn lowers_static_property_compound_assignment_as_indexopset() {
             obj_local: 1,
             idx_local: 2,
             new_local: 3,
+            kind: OpSetKind::Compound,
         })
     );
 }
@@ -453,10 +455,21 @@ fn rejects_length_compound_assignment() {
 }
 
 #[test]
-fn rejects_update_of_non_identifier() {
-    assert!(
-        lower_src("let a = [1]; a[0]++").is_err(),
-        "increment of a non-identifier is unsupported"
+fn lowers_member_update_as_indexopset() {
+    // `a[0]++` lowers to a postfix-update `IndexOpSet` adding 1.
+    let program = lower_src("let a = [1]; a[0]++").expect("should lower");
+    assert_eq!(
+        program.stmts[1],
+        IrStmt::Expr(IrNode::IndexOpSet {
+            obj: Box::new(IrNode::Local(0)),
+            index: Box::new(IrNode::Num(0.0)),
+            op: BinOp::Add,
+            rhs: Box::new(IrNode::Num(1.0)),
+            obj_local: 1,
+            idx_local: 2,
+            new_local: 3,
+            kind: OpSetKind::PostfixUpdate,
+        })
     );
 }
 
@@ -489,25 +502,24 @@ fn declaration_without_initializer_binds_undefined() {
 
 #[test]
 fn rejects_unsupported_operator() {
-    // `%` is supported since S12 and `**` (exponentiation) since P0.2; bitwise
+    // `%` and `**` (exponentiation) are supported; bitwise
     // `&` (and the other bitwise/shift operators) remains unsupported.
     assert!(lower_src("2 & 3").is_err(), "bitwise AND is unsupported");
 }
 
 #[test]
 fn rejects_async_and_unsupported_generator_functions() {
-    // S13.6 boundary hardening: an `async` function EXPRESSION / ARROW would
-    // otherwise lower as an ordinary function and run to a wrong result, so each
-    // must be a clear compile error. A TOP-LEVEL `async function` declaration is
-    // now supported (P4.3 M4) and a TOP-LEVEL `function*` declaration since P4.2
-    // M2; a generator EXPRESSION / ARROW and an `async` generator remain out of
-    // scope.
+    // An `async` function EXPRESSION / ARROW would otherwise lower as an
+    // ordinary function and run to a wrong result, so each must be a clear
+    // compile error. A TOP-LEVEL `async function` declaration and a TOP-LEVEL
+    // `function*` declaration are supported; a generator EXPRESSION / ARROW and
+    // an `async` generator remain out of scope.
     let msg = |src: &str| format!("{:#}", lower_src(src).unwrap_err());
     assert!(msg("let f = async function(){ return 1 };").contains("async"));
     assert!(msg("let f = async () => 1;").contains("async"));
     assert!(msg("let g = function*(){ return 1 };").contains("generator"));
-    // A top-level `function* g(){}` declaration compiles (M2), as does a top-level
-    // `async function f(){}` declaration (M4).
+    // A top-level `function* g(){}` declaration compiles, as does a top-level
+    // `async function f(){}` declaration.
     assert!(lower_src("function* g(){ yield 1 } g().next();").is_ok());
     assert!(lower_src("async function f(){ return 1 } f();").is_ok());
 }
@@ -548,7 +560,7 @@ fn lowers_function_declaration_and_call() {
     assert_eq!(program.functions.len(), 1);
     let func = &program.functions[0];
     // Uniform ABI (env-last): `max_arity` (= 2) argument slots (locals 0, 1),
-    // then the env slot (local 2) and the argument-count slot (local 3, P1.4),
+    // then the env slot (local 2) and the argument-count slot (local 3),
     // so `a`/`b` are locals 0/1 and `params` is 4.
     assert_eq!(func.params, 4);
     assert_eq!(func.locals, 4);
@@ -701,7 +713,7 @@ fn arrow_single_and_parenthesized_params_bind_identically() {
 #[test]
 fn arrow_arity_widens_the_uniform_abi() {
     // A three-parameter arrow widens `K` to 3, so every lifted function has
-    // `params = 3 args + env + argc = 5` (P1.4), shared across mixed-arity arrows.
+    // `params = 3 args + env + argc = 5`, shared across mixed-arity arrows.
     let program = lower_src("let f=(a,b,c)=>a+b+c; let g=x=>x").expect("lower");
     assert_eq!(program.functions.len(), 2);
     assert!(program.functions.iter().all(|f| f.params == 5));
@@ -768,8 +780,8 @@ fn mutable_capture_reads_and_writes_the_same_cell() {
         .expect("lower");
     let counter = &program.functions[0];
     // `let c = 0` boxes the initializer. With zero parameters the uniform ABI
-    // reserves the env slot at local 0 and the argument-count slot at local 1
-    // (P1.4), so the body's `c` is local 2.
+    // reserves the env slot at local 0 and the argument-count slot at local 1,
+    // so the body's `c` is local 2.
     assert_eq!(
         counter.body[0],
         IrStmt::Decl {
@@ -842,14 +854,6 @@ fn nested_function_declaration_lowers_to_bound_func_value() {
 }
 
 #[test]
-fn rejects_call_arity_mismatch() {
-    assert!(
-        lower_src("function f(a){ return a } f(1, 2)").is_err(),
-        "wrong argument count is an error"
-    );
-}
-
-#[test]
 fn rejects_call_to_undeclared_function() {
     assert!(
         lower_src("missing(1)").is_err(),
@@ -880,7 +884,7 @@ fn lowers_c_style_for_to_init_and_while() {
         unreachable!("expected a while statement");
     };
     // The body is empty; the update expression lives in the `update` slot.
-    assert!(body.is_empty());
+    assert_eq!(body.as_slice(), []);
     assert_eq!(update.len(), 1);
     assert!(matches!(update[0], IrStmt::Expr(_)));
 }
@@ -920,7 +924,7 @@ fn lowers_switch_with_default_and_break() {
     assert!(cases[1].test.is_some());
     assert!(cases[2].test.is_none());
     // The first clause is empty (fall-through); the second holds the `break`.
-    assert!(cases[0].body.is_empty());
+    assert_eq!(cases[0].body.as_slice(), []);
     assert_eq!(cases[1].body, vec![IrStmt::Break(None)]);
 }
 
@@ -1066,35 +1070,29 @@ fn let_stays_mutable() {
 }
 
 #[test]
-fn capturing_top_level_function_is_demoted_to_closure() {
-    // A top-level `function` reading an enclosing `let` is demoted (G2): it is
-    // bound in `main` as a `FuncValue` with a non-empty capture list, and its
-    // lowered body reads the captured cell through the environment.
+fn capturing_top_level_function_reads_module_cell() {
+    // A top-level `function` reading a top-level `let` stays a hoisted top-level
+    // function called directly; the `let` lives in module cell 0, which the
+    // function body reaches without a closure environment.
     let program = lower_src("let n=41; function f(){ return n+1 } f()").expect("lower");
-    // main: `let n` (boxed cell), the demoted `f` binding, then the `f()` call.
-    let Some(IrStmt::Decl {
-        init: IrNode::FuncValue { captures, .. },
-        ..
-    }) = program.stmts.iter().find(|s| {
-        matches!(
-            s,
-            IrStmt::Decl {
-                init: IrNode::FuncValue { .. },
-                ..
-            }
-        )
-    })
-    else {
-        unreachable!("expected `f` bound to a FuncValue in main");
-    };
-    assert_eq!(captures.len(), 1, "f captures the enclosing `n` cell");
-    // The call is indirect (through the bound closure), not a direct `Call`.
+    assert_eq!(program.module_cells, 1);
+    assert_eq!(program.functions.len(), 1);
     assert!(
         program
             .stmts
             .iter()
-            .any(|s| matches!(s, IrStmt::Expr(IrNode::CallIndirect { .. }))),
-        "a demoted function is called indirectly"
+            .any(|s| matches!(s, IrStmt::Expr(IrNode::Call { func: 1, .. }))),
+        "the capturing function keeps the direct call"
+    );
+    assert!(
+        matches!(
+            program.stmts.first(),
+            Some(IrStmt::Decl {
+                init: IrNode::CellSet { cell, .. },
+                ..
+            }) if **cell == IrNode::ModuleCell(0)
+        ),
+        "`let n` initializes its module cell"
     );
 }
 
@@ -1113,22 +1111,27 @@ fn non_capturing_top_level_function_keeps_direct_call() {
 }
 
 #[test]
-fn rejects_capturing_function_called_from_sibling() {
-    // A demoted closure (G2) is bound only within `main`; a sibling top-level
-    // function cannot reach it — rejected with a precise span diagnostic.
-    let err = format!(
-        "{:#}",
-        lower_src("let n=1; function f(){ return n } function g(){ return f() } g()").unwrap_err()
-    );
-    assert!(err.contains("closes over enclosing vars"), "{err}");
+fn capturing_function_callable_from_sibling_and_before_its_binding() {
+    // Module cells make a capturing function reachable from a sibling top-level
+    // function, and keep it hoisted (an early call hits the runtime TDZ guard).
+    lower_src("let n=1; function f(){ return n } function g(){ return f() } g()")
+        .expect("sibling call lowers");
+    lower_src("f(); let n=41; function f(){ return n }").expect("hoisted call lowers");
 }
 
+/// An uncaptured C-style `for (let ...)` binding needs no per-iteration copy, so
+/// the loop lowers without any cell; a captured one is boxed once by its
+/// declaration and copied into a fresh cell after the init and in the update.
 #[test]
-fn rejects_capturing_function_used_before_its_binding() {
-    // A demoted closure loses hoisting: calling it before its captured binding
-    // is declared is an error (INTENDED narrowing).
-    assert!(
-        lower_src("f(); let n=41; function f(){ return n }").is_err(),
-        "a demoted function used before its binding is an error"
+fn for_let_per_iteration_copy_only_when_captured() {
+    let plain =
+        lower_src("let s = 0; for (let i=0;i<3;i++) { s = s + i; } s").expect("should lower");
+    assert!(!format!("{plain:?}").contains("CellNew"), "{plain:?}");
+    let captured =
+        lower_src("let f; for (let i=0;i<3;i++) { f = () => i; } f()").expect("should lower");
+    assert_eq!(
+        format!("{captured:?}").matches("CellNew").count(),
+        3,
+        "{captured:?}"
     );
 }

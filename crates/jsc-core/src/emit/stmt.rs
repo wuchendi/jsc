@@ -33,8 +33,8 @@ pub(super) fn emit_stmt(
                 // result stays satisfied.
                 function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
             }
-            // Route through every enclosing `finally` before the actual return
-            // (S15.3); with none active this is a plain `return`.
+            // Route through every enclosing `finally` before the actual return;
+            // with none active this is a plain `return`.
             emit_return_transfer(function, helpers);
         }
         IrStmt::If {
@@ -45,7 +45,7 @@ pub(super) fn emit_stmt(
             emit_cond(cond, function, scratch, strings, helpers);
             function.instruction(&Instruction::If(BlockType::Empty));
             // The `if`/`else` frame sits one level inside `break_label` (and one
-            // deeper for a throw's handler-relative `br`, S15.2).
+            // deeper for a throw's handler-relative `br`).
             enter_frame(helpers);
             emit_stmts(
                 then_body,
@@ -131,11 +131,11 @@ pub(super) fn emit_stmt(
 }
 
 /// Emit a `break`/`continue` (`kind` = [`CF_BREAK`]/[`CF_CONTINUE`]), running any
-/// intervening `finally` on the way to its target (S15.3). `target` is the labeled
+/// intervening `finally` on the way to its target. `target` is the labeled
 /// loop id for `break LABEL`/`continue LABEL` (`Some`) or `None` for the nearest
 /// enclosing loop/switch; `nearest` is that nearest target's relative label,
 /// threaded through the emit context (`None` for a labeled transfer, which derives
-/// its relative depth from the recorded label entry instead — S12.6).
+/// its relative depth from the recorded label entry instead).
 /// `want_continue` selects the labeled loop's continue vs break landing block. An
 /// out-of-context unlabeled `break`/`continue` is rejected during lowering.
 fn emit_abrupt_loop(
@@ -169,7 +169,7 @@ fn emit_abrupt_loop(
 /// Relative depths from inside `C`: `C`=0 (continue), `L`=1, `B`=2 (break).
 ///
 /// `label` is the loop id when this loop is the target of a labeled `break`/
-/// `continue` (S12.6): the absolute depths just inside `B` and `C` are registered
+/// `continue`: the absolute depths just inside `B` and `C` are registered
 /// for the body so a labeled transfer anywhere within (even from a nested loop)
 /// resolves to the right relative `br` immediate. It is popped after the body.
 #[allow(clippy::too_many_arguments)]
@@ -194,7 +194,7 @@ fn emit_while(
     function.instruction(&Instruction::Block(BlockType::Empty));
     enter_frame(helpers); // C (continue target)
     // Register the labeled-loop landing blocks (absolute depths) for the body so a
-    // labeled `break`/`continue` targeting this loop resolves against them (S12.6).
+    // labeled `break`/`continue` targeting this loop resolves against them.
     if let Some(id) = label {
         let continue_entry = helpers.unwind.borrow().depth;
         helpers.unwind.borrow_mut().labels.push(LabelTarget {
@@ -230,7 +230,7 @@ fn emit_while(
     function.instruction(&Instruction::End); // B
 }
 
-/// Emit a `try`/`catch`/`finally` statement (S15.2/S15.3).
+/// Emit a `try`/`catch`/`finally` statement.
 ///
 /// With no `finally` the structure is one `block $catch_dispatch` wrapping the
 /// guarded `body`, immediately followed by an `if (global.get $exc_pending)`
@@ -254,7 +254,7 @@ fn emit_while(
 /// dispatch which runs the handler. The handler is popped before the dispatch so
 /// a re-throw inside `catch_body` propagates to the NEXT outer handler.
 ///
-/// # `finally` (S15.3)
+/// # `finally`
 ///
 /// When a `finally` is present the whole catch-dispatch unit is wrapped in an
 /// outer `block $finally_target` so EVERY exit edge — normal fall-through and
@@ -285,7 +285,7 @@ fn emit_while(
 /// the next outer handler (replacing any in-flight exception, standard JS) rather
 /// than back into itself.
 ///
-/// # `return`/`break`/`continue` through `finally` (S15.3)
+/// # `return`/`break`/`continue` through `finally`
 ///
 /// The SAME `$finally_target` block also catches a `return`/`break`/`continue`
 /// that must run this `finally` first: it is pushed onto the finalizer stack (see
@@ -309,7 +309,7 @@ pub(super) fn emit_try(
     continue_label: Option<u32>,
 ) {
     let Some(finally_body) = finally_body else {
-        // No `finally`: the plain S15.2 catch unit (a `catch` is always present
+        // No `finally`: the plain catch unit (a `catch` is always present
         // in this shape). `body` sits one block deeper than the `try` statement.
         let Some(catch_body) = catch_body else {
             unreachable!("try with neither catch nor finally");
@@ -394,13 +394,13 @@ pub(super) fn emit_try(
     // the next outer handler (or the function boundary).
     emit_propagate_if_pending(function, helpers);
     // Resume a `return`/`break`/`continue` routed through this finally, unless the
-    // finally itself completed abruptly and superseded it (S15.3).
+    // finally itself completed abruptly and superseded it.
     emit_resume_pending_completion(function, helpers, break_label, continue_label);
 }
 
 /// Emit the `block $catch_dispatch { body } if $exc_pending { clear; catch_body }`
-/// unit shared by a plain `try`/`catch` (S15.2) and by a `try`/`catch`/`finally`
-/// (S15.3, nested inside the finally landing block). `break_label`/`continue_label`
+/// unit shared by a plain `try`/`catch` and by a `try`/`catch`/`finally`
+/// (nested inside the finally landing block). `break_label`/`continue_label`
 /// are relative to the control depth just OUTSIDE this unit's catch-dispatch block.
 /// Only the catch-dispatch (a throw target) is pushed on the handler stack — NOT
 /// the finalizer stack — so a `return`/`break`/`continue` in `body` skips this
@@ -605,7 +605,7 @@ pub(super) fn emit_cond(
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::I32And);
 
-    // boxed_truthy: a heap pointer (single tag 0b101) reads its TYPE BYTE (S13.1)
+    // boxed_truthy: a heap pointer (single tag 0b101) reads its TYPE BYTE
     //   is_string ? (string length != 0) : 1   (array/object/function are truthy)
     // otherwise a non-heap boxed value:
     //   is_boolean ? (bits & 1) : 0.
@@ -721,7 +721,7 @@ pub(super) fn emit_logical(
         function.instruction(&Instruction::I32Eqz);
     }
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // The right operand runs one frame deeper and may throw (S15.2).
+    // The right operand runs one frame deeper and may throw.
     enter_frame(helpers);
     emit_node(rhs, function, scratch, strings, helpers);
     function.instruction(&Instruction::Else);

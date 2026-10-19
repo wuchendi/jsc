@@ -1,9 +1,9 @@
-//! Integration tests: promises, microtasks, and top-level `await` (P4.1).
+//! Integration tests: promises, microtasks, and top-level `await`.
 //!
-//! The P4.1 surface is `Promise.resolve`/`Promise.reject`, `new Promise(executor)`,
+//! The covered surface is `Promise.resolve`/`Promise.reject`, `new Promise(executor)`,
 //! `p.then`/`p.catch`/`p.finally`, a FIFO microtask queue drained by top-level
-//! `await` and after `main`, and promise value rendering. `Promise.all`/`race` and
-//! `async function` bodies remain out of scope (M2+).
+//! `await` and after `main`, and promise value rendering. `async function` bodies are
+//! covered in the async/await section; `Promise.all`/`race` are out of scope.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -247,7 +247,7 @@ fn unknown_promise_static_is_rejected() {
     assert_rejected("Promise.all([])");
 }
 
-// --- P4.3 M4: async/await (generator + promise driven) ------------------------
+// --- async/await (generator + promise driven) ---------------------------------
 
 /// An `async function` returns a promise; with no `await`, the body runs to
 /// completion synchronously and the promise is already fulfilled with the return
@@ -396,4 +396,15 @@ fn async_non_declaration_forms_rejected() {
     assert_rejected("let f = async function () { return 1 }; f()");
     assert_rejected("let f = async () => 1; f()");
     assert_rejected("async function* f() { yield 1 } f().next()");
+}
+
+/// A C-style `for (let ...)` loop with an `await` in its body inside an async
+/// function still runs each iteration in order.
+#[test]
+fn for_let_loop_with_await_in_async_function() {
+    assert_output(
+        "async function f(){ let s = \"\"; for (let i=0;i<3;i++) { const v = await Promise.resolve(i); s = s + v; } return s; }
+         f().then(v => console.log(v));",
+        "012\n",
+    );
 }

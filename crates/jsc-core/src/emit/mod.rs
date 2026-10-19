@@ -35,7 +35,8 @@ use wasm_encoder::{
 use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, SpreadCallee, SpreadElem,
+    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, SpreadCallee,
+    SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -43,30 +44,30 @@ const EXPORT_NAME: &str = "main";
 
 /// The name under which the module's linear memory is exported (see
 /// [`abi::MEMORY_EXPORT_NAME`]). [`crate::run`] reads it back to resolve heap
-/// pointers (S10+).
+/// pointers.
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
-/// The module and field name of the host `print` import backing `console.log`
-/// (S14.1). [`crate::run`] supplies this function through a `wasmtime::Linker`.
+/// The module and field name of the host `print` import backing `console.log`.
+/// [`crate::run`] supplies this function through a `wasmtime::Linker`.
 const PRINT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const PRINT_IMPORT_NAME: &str = abi::PRINT_IMPORT_NAME;
 
 /// The module and field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseInt`/`parseFloat` conversions (S14.3). It receives the
+/// `String`/`Number`/`parseInt`/`parseFloat` conversions. It receives the
 /// argument jsval plus a `CONVERT_OP_*` flag and returns the converted jsval,
 /// reusing the run stage's `format_value`/parse helpers (and allocating a heap
 /// string in guest memory for `String`).
 const CONVERT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const CONVERT_IMPORT_NAME: &str = abi::CONVERT_IMPORT_NAME;
 
-/// `__convert` op flags (S14.3); see [`abi`].
+/// `__convert` op flags; see [`abi`].
 const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
 const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
 const CONVERT_OP_PARSE_INT: i32 = abi::CONVERT_OP_PARSE_INT;
 const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 
 /// The module and field name of the host `__method` import backing the
-/// non-callback array/string methods (S14.6). It receives the receiver jsval, a
+/// non-callback array/string methods. It receives the receiver jsval, a
 /// `METHOD_OP_*` flag, and two argument jsval slots (padded with `undefined` when
 /// the method takes fewer), branches on the receiver's runtime TYPE BYTE for the
 /// overloaded `indexOf`/`slice`, and returns the result jsval (allocating a heap
@@ -74,7 +75,7 @@ const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 const METHOD_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const METHOD_IMPORT_NAME: &str = abi::METHOD_IMPORT_NAME;
 
-/// The module and field names of the host promise imports (P4.1): `__promise`
+/// The module and field names of the host promise imports: `__promise`
 /// backs the single-value primitives (`Promise.resolve`/`reject`, top-level
 /// `await`, `p.finally`) and `__then` backs `p.then`/`p.catch`. [`crate::run`]
 /// supplies both through a `wasmtime::Linker`, driving the host-side promise
@@ -86,7 +87,7 @@ const THEN_IMPORT_NAME: &str = abi::THEN_IMPORT_NAME;
 const NOW_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const NOW_IMPORT_NAME: &str = abi::NOW_IMPORT_NAME;
 
-/// `__promise` op flags (P4.1); see [`abi`].
+/// `__promise` op flags; see [`abi`].
 const PROMISE_OP_RESOLVE: i32 = abi::PROMISE_OP_RESOLVE;
 const PROMISE_OP_REJECT: i32 = abi::PROMISE_OP_REJECT;
 const PROMISE_OP_AWAIT: i32 = abi::PROMISE_OP_AWAIT;
@@ -96,15 +97,15 @@ const PROMISE_OP_SETTLE_FULFILL: i32 = abi::PROMISE_OP_SETTLE_FULFILL;
 const PROMISE_OP_SETTLE_REJECT: i32 = abi::PROMISE_OP_SETTLE_REJECT;
 const PROMISE_OP_ASYNC_SPAWN: i32 = abi::PROMISE_OP_ASYNC_SPAWN;
 
-/// The export name of the `__invoke1` callback trampoline (P4.1) the host
+/// The export name of the `__invoke1` callback trampoline the host
 /// promise engine calls re-entrantly to run a reaction's guest callback.
 const INVOKE_EXPORT_NAME: &str = abi::INVOKE_EXPORT_NAME;
 
-/// The export name of the `__async_step` generator-step trampoline (P4.3 M4) the
+/// The export name of the `__async_step` generator-step trampoline the
 /// host async engine calls to advance an `async function` body's state machine.
 const ASYNC_STEP_EXPORT_NAME: &str = abi::ASYNC_STEP_EXPORT_NAME;
 
-/// `__method` op flags (S14.6); see [`abi`].
+/// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
 const METHOD_OP_JOIN: i32 = abi::METHOD_OP_JOIN;
@@ -125,33 +126,32 @@ const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
 
 /// The name under which the bump-allocator heap pointer global is exported so the
 /// host `__convert` import can bump-allocate a heap string in guest memory when
-/// lowering `String(x)` (S14.3).
+/// lowering `String(x)`.
 const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
 
 /// The name under which the pending-exception flag global (`$exc_pending`, i32) is
-/// exported so the run stage can detect an uncaught exception after `main` returns
-/// (S15.1). `0` = no exception in flight, `1` = an exception is propagating.
+/// exported so the run stage can detect an uncaught exception after `main` returns.
+/// `0` = no exception in flight, `1` = an exception is propagating.
 const EXC_PENDING_EXPORT_NAME: &str = abi::EXC_PENDING_EXPORT_NAME;
 
 /// The name under which the in-flight exception value global (`$exc_value`, i64) is
-/// exported so the run stage can render an uncaught exception (S15.1). Holds the
+/// exported so the run stage can render an uncaught exception. Holds the
 /// thrown jsval bits; only meaningful while `$exc_pending` is `1`.
 const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
 
 /// The number of imported functions the module declares: the host `print`
-/// function occupies function index `0` (S14.1), the host `__convert` function
-/// index `1` (S14.3), and the host `__method` function index `2` (S14.6), so
+/// function occupies function index `0`, the host `__convert` function
+/// index `1`, and the host `__method` function index `2`, so
 /// every DEFINED function — `main`, the user functions, and the runtime helpers —
 /// plus the funcref-table element indices and the exported `main` index all shift
 /// up by this count.
 ///
-/// P4.1 adds two more imports — `__promise` (index 3) and `__then` (index 4) —
-/// backing the host promise engine. The P-series `Date` wave adds `__now` (index
-/// 5), the host wall clock backing `Date.now()` / `new Date()`, so the count is
-/// now `6`.
+/// Two more imports — `__promise` (index 3) and `__then` (index 4) — back the
+/// host promise engine, and `__now` (index 5) is the host wall clock backing
+/// `Date.now()` / `new Date()`, so the count is `6`.
 const IMPORT_FUNC_COUNT: u32 = 6;
 
-/// `print` import flags (S14.1); see [`abi`]: a value plus a trailing space, a
+/// `print` import flags; see [`abi`]: a value plus a trailing space, a
 /// value plus a newline, or a newline alone for zero-argument `console.log()`.
 const PRINT_FLAG_SEP: i32 = abi::PRINT_FLAG_SEP;
 const PRINT_FLAG_END: i32 = abi::PRINT_FLAG_END;
@@ -162,26 +162,26 @@ const HEAP_PTR_GLOBAL: u32 = 0;
 
 /// The wasm global index of the pending-exception flag (`$exc_pending`, i32,
 /// init 0). Set to `1` by a `throw` and checked at every throwing call site to
-/// unwind an in-flight exception out through the frames (S15.1).
+/// unwind an in-flight exception out through the frames.
 const EXC_PENDING_GLOBAL: u32 = 1;
 
 /// The wasm global index of the in-flight exception value (`$exc_value`, i64,
 /// init 0). A `throw` stashes the thrown jsval here before setting
-/// [`EXC_PENDING_GLOBAL`] (S15.1).
+/// [`EXC_PENDING_GLOBAL`].
 const EXC_VALUE_GLOBAL: u32 = 2;
 
 /// The wasm global index of the pending-completion kind (`$cf_kind`, i32, init
 /// 0): `0` none, [`CF_RETURN`], [`CF_BREAK`], or [`CF_CONTINUE`]. Set when a
 /// `return`/`break`/`continue` must route THROUGH one or more enclosing `finally`
-/// clauses before reaching its target (S15.3); each finalizer's post-body
+/// clauses before reaching its target; each finalizer's post-body
 /// dispatch reads it to resume (or, if the finally completed abruptly, replace)
 /// the pending completion. Internal — never exported.
 const CF_KIND_GLOBAL: u32 = 3;
 
 /// The wasm global index of the pending `return` value (`$cf_value`, i64, init
 /// 0): the jsval a routed `return` carries across the `finally` clauses it must
-/// run before returning (S15.3). A routed `break`/`continue` (which carries no
-/// value) reuses this slot for its labeled-loop TARGET (S12.6): `0` for an
+/// run before returning. A routed `break`/`continue` (which carries no
+/// value) reuses this slot for its labeled-loop TARGET: `0` for an
 /// unlabeled `break`/`continue` (nearest loop), or the loop id `+ 1` for a
 /// labeled one, so a resume after the `finally` re-issues toward the right loop.
 /// Only one completion is pending at a time (disambiguated by [`CF_KIND_GLOBAL`]),
@@ -189,10 +189,10 @@ const CF_KIND_GLOBAL: u32 = 3;
 const CF_VALUE_GLOBAL: u32 = 4;
 
 /// The wasm global index of the `this`-binding carrier (`$__this`, i64, init
-/// `undefined`) — P2.1. A method call sets it to the receiver just before the
+/// `undefined`). A method call sets it to the receiver just before the
 /// `call_indirect`; every function/arrow prologue snapshots it into a local
 /// `this` slot; a plain call resets it to `undefined`. See
-/// [`abi::THIS_GLOBAL_INDEX`]; it follows the S15.3 completion globals.
+/// [`abi::THIS_GLOBAL_INDEX`]; it follows the pending-completion globals.
 const THIS_GLOBAL: u32 = abi::THIS_GLOBAL_INDEX;
 
 /// The `JSON.parse` recursive-descent cursor globals (all i32, appended after
@@ -207,6 +207,16 @@ const JSON_DATA_GLOBAL: u32 = 6;
 const JSON_POS_GLOBAL: u32 = 7;
 /// See [`JSON_DATA_GLOBAL`].
 const JSON_LEN_GLOBAL: u32 = 8;
+
+/// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
+/// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
+/// the `JSON.parse` cursor globals and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 9;
+
+/// The TDZ hole a module cell holds until its binding is initialized
+/// (`IrNode::IsHole`): an `undefined`-tagged NaN box with a nonzero payload, which
+/// no JS value ever produces.
+const TDZ_HOLE_BITS: i64 = abi::UNDEFINED.cast_signed() | 1;
 
 /// [`CF_KIND_GLOBAL`] value for a pending `return` (payload in
 /// [`CF_VALUE_GLOBAL`]).
@@ -225,36 +235,36 @@ const CF_CONTINUE: i32 = 3;
 const HEAP_BASE: i32 = 8;
 
 /// The NaN-boxed heap-pointer header (see [`abi::HEAP`]): the SINGLE tag for
-/// every heap value (S13.1). A heap jsval is `HEAP_BITS | (ptr as u32)`, carrying
+/// every heap value. A heap jsval is `HEAP_BITS | (ptr as u32)`, carrying
 /// the block base's byte offset in its low 32 bits; the block's concrete kind is
 /// the TYPE BYTE at offset `0` (see [`HEADER_SIZE`] and the `TYPE_*` constants).
 const HEAP_BITS: i64 = abi::HEAP.cast_signed();
 
-/// The size in bytes of every heap block's leading header (S13.1; see
+/// The size in bytes of every heap block's leading header (see
 /// [`abi::HEADER_SIZE`]). Byte `0` is the TYPE BYTE; bytes `1..4` are reserved
 /// padding so the per-type payload begins 4-byte aligned at [`HEADER_SIZE`].
 const HEADER_SIZE: i32 = abi::HEADER_SIZE.cast_signed();
 
 /// The count of trailing (env, argc) parameters appended after the `K` positional
-/// argument slots in the uniform function ABI (P1.4; see
+/// argument slots in the uniform function ABI (see
 /// [`abi::ABI_TRAILING_PARAMS`]). The shared signature is
 /// `(a0..a_{K-1}, env, argc) -> i64`.
 const ABI_TRAILING_PARAMS: u32 = abi::ABI_TRAILING_PARAMS;
 
-/// Type byte for a heap string block: `[type=0][pad×3][len:u32][utf8]` (S10 payload
-/// shifted by [`HEADER_SIZE`]). Maps to `typeof` "string".
+/// Type byte for a heap string block: `[type=0][pad×3][len:u32][utf8]` (payload
+/// after the [`HEADER_SIZE`] header). Maps to `typeof` "string".
 const TYPE_STRING: i32 = abi::TYPE_STRING as i32;
 
 /// Type byte for a heap array block: `[type=1][pad×3][len:u32][elem:i64 × len]`
-/// (S11 payload shifted by [`HEADER_SIZE`]). Maps to `typeof` "object".
+/// (payload after the [`HEADER_SIZE`] header). Maps to `typeof` "object".
 const TYPE_ARRAY: i32 = abi::TYPE_ARRAY as i32;
 
 /// Type byte for a heap object block:
-/// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]` (S11 payload shifted by
-/// [`HEADER_SIZE`]). Maps to `typeof` "object".
+/// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]` (payload after the
+/// [`HEADER_SIZE`] header). Maps to `typeof` "object".
 const TYPE_OBJECT: i32 = abi::TYPE_OBJECT as i32;
 
-/// Type byte for the first-class function value (S13.2): a block laid out as
+/// Type byte for the first-class function value: a block laid out as
 /// `[type=3][pad×3][func_idx:u32][env:i64]` — the funcref-table index and the
 /// closure environment (`undefined` until closures land). Maps to `typeof`
 /// "function".
@@ -264,7 +274,7 @@ const TYPE_FUNCTION: i32 = abi::TYPE_FUNCTION as i32;
 /// u32 funcref-table index, and an i64 environment slot.
 const FUNC_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8;
 
-/// Type byte and field offsets of a `Generator` handle block (P4.2 M2). See
+/// Type byte and field offsets of a `Generator` handle block. See
 /// [`abi::TYPE_GENERATOR`] for the full layout.
 const TYPE_GENERATOR: i32 = abi::TYPE_GENERATOR as i32;
 const GEN_SM_IDX_OFFSET: u64 = abi::GEN_SM_IDX_OFFSET as u64;
@@ -273,12 +283,12 @@ const GEN_DONE_OFFSET: u64 = abi::GEN_DONE_OFFSET as u64;
 const GEN_ENV_OFFSET: u64 = abi::GEN_ENV_OFFSET as u64;
 const GEN_BLOCK_SIZE: i32 = HEADER_SIZE + 12 + 8;
 
-/// Type byte for a closure **environment** block (S13.4, internal): a block laid
+/// Type byte for a closure **environment** block (internal): a block laid
 /// out as `[type=4][pad×3][count:u32][cell_ptr:i64 × count]` holding the boxed
 /// cells a closure captured. Never surfaces as a user value.
 const TYPE_ENV: i32 = abi::TYPE_ENV as i32;
 
-/// Type byte for a **boxed cell** (S13.4, internal): a one-slot block
+/// Type byte for a **boxed cell** (internal): a one-slot block
 /// `[type=5][pad×3][value:i64]` holding a captured binding's value. Reads/writes
 /// of a captured variable go through the cell so closures share mutations by
 /// reference. Never surfaces as a user value.
@@ -288,12 +298,12 @@ const TYPE_CELL: i32 = abi::TYPE_CELL as i32;
 /// i64 value slot.
 const CELL_BLOCK_SIZE: i32 = HEADER_SIZE + 8;
 
-/// Type byte for a `Map` handle block (P3.5): `[type=6][pad×3][size:u32][entries:i64]`
+/// Type byte for a `Map` handle block: `[type=6][pad×3][size:u32][entries:i64]`
 /// — the logical entry count and a heap jsval pointing at the growable backing.
 /// Maps to `typeof` "object". See [`abi::TYPE_MAP`].
 const TYPE_MAP: i32 = abi::TYPE_MAP as i32;
 
-/// Type byte for a `Set` handle block (P3.5): the same layout as [`TYPE_MAP`], with
+/// Type byte for a `Set` handle block: the same layout as [`TYPE_MAP`], with
 /// the backing's value slots always `undefined`. Maps to `typeof` "object". See
 /// [`abi::TYPE_SET`].
 const TYPE_SET: i32 = abi::TYPE_SET as i32;
@@ -303,7 +313,7 @@ const TYPE_SET: i32 = abi::TYPE_SET as i32;
 /// backing-array jsval at `+HEADER_SIZE+4`.
 const MAP_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8;
 
-/// Type byte and payload offset of a `Date` block (P-series):
+/// Type byte and payload offset of a `Date` block:
 /// `[type=10][pad×3][pad×4][ms:f64]`. Maps to `typeof` "object". See
 /// [`abi::TYPE_DATE`].
 const TYPE_DATE: i32 = abi::TYPE_DATE as i32;
@@ -313,7 +323,7 @@ const DATE_MS_OFFSET: u64 = abi::DATE_MS_OFFSET as u64;
 /// bytes for 8-byte alignment, and the 8-byte `ms` timestamp slot.
 const DATE_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8;
 
-/// The TYPE BYTE of an instance-accessor block (P2b). See [`abi::TYPE_ACCESSOR`].
+/// The TYPE BYTE of an instance-accessor block. See [`abi::TYPE_ACCESSOR`].
 const TYPE_ACCESSOR: i32 = abi::TYPE_ACCESSOR as i32;
 const ACCESSOR_GET_OFFSET: u64 = abi::ACCESSOR_GET_OFFSET as u64;
 const ACCESSOR_SET_OFFSET: u64 = abi::ACCESSOR_SET_OFFSET as u64;
@@ -323,13 +333,13 @@ const ACCESSOR_SET_OFFSET: u64 = abi::ACCESSOR_SET_OFFSET as u64;
 /// slots.
 const ACCESSOR_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8 + 8;
 
-/// The fixed byte length of a `toISOString()` result (`YYYY-MM-DDTHH:MM:SS.mmmZ`,
-/// P-series) — always 24 for a 4-digit year, the in-scope range.
+/// The fixed byte length of a `toISOString()` result (`YYYY-MM-DDTHH:MM:SS.mmmZ`)
+/// — always 24 for a 4-digit year, the in-scope range.
 const ISO_STRING_LEN: i32 = 24;
 
 /// The string a `Date` field method yields for a non-finite (`NaN`/`Infinity`)
 /// timestamp: `toISOString()` returns this instead of an ISO string (interned as a
-/// data-segment literal, like the `typeof` words), P-series.
+/// data-segment literal, like the `typeof` words).
 const INVALID_DATE: &str = "Invalid Date";
 
 /// The NaN-boxed `undefined` jsval as an `i64` carrier (see [`abi::UNDEFINED`]).
@@ -343,17 +353,17 @@ const FALSE_BITS: i64 = abi::FALSE.cast_signed();
 /// The NaN-boxed `true` jsval (see [`abi::TRUE`]).
 const TRUE_BITS: i64 = abi::TRUE.cast_signed();
 
-/// The message thrown by the runtime callee-is-a-function guard (G2) in
+/// The message thrown by the runtime callee-is-a-function guard in
 /// [`emit_method_call_user`] when a method call's resolved member is NOT a
 /// function value. This is the dynamic-shape complement of the compile-time
-/// unknown-method diagnostics (M1 static-primitive / G1 static-object-shape):
+/// unknown-method diagnostics (static-primitive and static-object-shape receivers):
 /// a `new`-instance, reassigned binding, computed key, or call-result receiver
 /// whose member reads `undefined` (or a non-function) can only be caught at
 /// runtime, so instead of dispatching that value as a bogus funcref index
 /// (undefined behaviour — a wrong result or a cryptic wasm trap) the guard
-/// raises a clean exception — a real branded `TypeError` object (E-series), so
+/// raises a clean exception — a real branded `TypeError` object, so
 /// `catch (e) { e instanceof TypeError }` holds — surfaced when uncaught as
-/// `Uncaught TypeError: called value is not a function` (§S15). This is the
+/// `Uncaught TypeError: called value is not a function`. This is the
 /// error's `.message` (no `TypeError:` prefix); the prefixed first line lives in
 /// [`NOT_A_FUNCTION_STACK`]. The object's static strings are interned into the
 /// data segment by [`collect_node`] at every method-call site.
@@ -365,7 +375,7 @@ const NOT_A_FUNCTION_STACK: &str = "TypeError: called value is not a function";
 
 /// The static strings the internal-`TypeError` object (see [`internal_type_error`])
 /// embeds — its keys, kind marker key, `name`, `.message`, and `.stack`. They
-/// must be interned wherever the G2 guard can fire so their `[len][utf8]` blobs
+/// must be interned wherever the runtime callee guard can fire so their `[len][utf8]` blobs
 /// exist in the data segment; [`collect_node`] seeds them at each guarded call.
 const INTERNAL_TYPE_ERROR_STRS: [&str; 7] = [
     "name",
@@ -377,7 +387,7 @@ const INTERNAL_TYPE_ERROR_STRS: [&str; 7] = [
     NOT_A_FUNCTION_STACK,
 ];
 
-/// Build the branded `TypeError` object the G2 runtime guard throws: a plain
+/// Build the branded `TypeError` object the runtime callee guard throws: a plain
 /// object carrying `name`/`message`/`stack` plus the hidden `@@errorkind` marker,
 /// identical in shape to `new TypeError("called value is not a function")` so it
 /// is `instanceof TypeError`/`Error`, reads its `.name`/`.message`/`.stack`, and
@@ -400,6 +410,67 @@ fn internal_type_error() -> IrNode {
         ),
     ])
 }
+
+/// The message fragments `__nullish_throw` splices into the V8-style text of the
+/// `TypeError` raised by a member read/write on a `null`/`undefined` receiver:
+/// `Cannot read properties of <null|undefined> (reading '<key>')` (or the
+/// `set`/`setting` form for a write), with `.stack` prefixed `TypeError: `.
+const NULLISH_READ_PREFIX: &str = "Cannot read properties of ";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_SET_PREFIX: &str = "Cannot set properties of ";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_READ_MID: &str = " (reading '";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_SET_MID: &str = " (setting '";
+/// See [`NULLISH_READ_PREFIX`].
+const NULLISH_SUFFIX: &str = "')";
+/// See [`NULLISH_READ_PREFIX`].
+const TYPE_ERROR_STACK_PREFIX: &str = "TypeError: ";
+
+/// The static strings `__nullish_throw` needs — the error object's keys, kind
+/// marker key and `name`, the receiver words, and the message fragments. Seeded
+/// by [`collect_node`] at every guarded member read/write/method-call site so
+/// their `[len][utf8]` blobs exist when the guard throws.
+const NULLISH_ERROR_STRS: [&str; 13] = [
+    "name",
+    "message",
+    "stack",
+    abi::ERROR_KIND_KEY,
+    "TypeError",
+    "null",
+    "undefined",
+    NULLISH_READ_PREFIX,
+    NULLISH_SET_PREFIX,
+    NULLISH_READ_MID,
+    NULLISH_SET_MID,
+    NULLISH_SUFFIX,
+    TYPE_ERROR_STACK_PREFIX,
+];
+
+/// The message fragments `__prop_throw` splices into the `TypeError` raised by
+/// a member store whose key the fixed-shape receiver does not own:
+/// `Cannot add property '<key>': dynamic properties are not supported yet`.
+const PROP_ADD_PREFIX: &str = "Cannot add property '";
+/// See [`PROP_ADD_PREFIX`].
+const PROP_ADD_SUFFIX: &str = "': dynamic properties are not supported yet";
+/// The `TypeError` message `__prop_throw` raises for an array index store at or
+/// past the current length.
+const ARRAY_GROW_MSG: &str = "Cannot grow array by index assignment yet";
+
+/// The static strings `__prop_throw` needs — the error object's keys, kind
+/// marker key and `name`, and the message fragments. Seeded by [`collect_node`]
+/// at every member store site so their `[len][utf8]` blobs exist when it throws.
+const PROP_ERROR_STRS: [&str; 9] = [
+    "name",
+    "message",
+    "stack",
+    abi::ERROR_KIND_KEY,
+    "TypeError",
+    PROP_ADD_PREFIX,
+    PROP_ADD_SUFFIX,
+    ARRAY_GROW_MSG,
+    TYPE_ERROR_STACK_PREFIX,
+];
 
 /// The `JSON.parse` syntax-error `.name`, `.message`, and `.stack` text. jsc has
 /// no `SyntaxError` error KIND, so the thrown object is branded as a base `Error`
@@ -444,8 +515,8 @@ fn json_syntax_error() -> IrNode {
 /// The NaN-boxed `null` jsval (see [`abi::NULL`]).
 const NULL_BITS: i64 = abi::NULL.cast_signed();
 
-/// The literal token strings the in-wasm `JSON.stringify` serializer concatenates
-/// (P3.4): the three literal keywords plus the structural punctuation. They are
+/// The literal token strings the in-wasm `JSON.stringify` serializer concatenates:
+/// the three literal keywords plus the structural punctuation. They are
 /// interned like any static string (seeded into the string table when a program
 /// contains a `JsonStringify` node, see `collect_node`) so the `__json_str` helper
 /// can splice their `[len][utf8]` blocks with `__concat`. The layout mirrors
@@ -453,7 +524,7 @@ const NULL_BITS: i64 = abi::NULL.cast_signed();
 const JSON_TOKEN_STRS: [&str; 9] = ["null", "true", "false", "[", "]", "{", "}", ",", ":"];
 
 /// The compile-time byte offsets of the [`JSON_TOKEN_STRS`] blocks in linear
-/// memory (P3.4), baked into the `__json_str` serializer so it can splice each
+/// memory, baked into the `__json_str` serializer so it can splice each
 /// token with `__concat`. Resolved from the string-offset map; a missing token
 /// (only possible when the program has no `JsonStringify` node, so `__json_str` is
 /// dead code) falls back to [`HEAP_BASE`] to keep the emitted helper valid.
@@ -496,11 +567,11 @@ const QNAN_BITS: i64 = abi::QNAN.cast_signed();
 /// functions of the module (after `main` and every user function) so
 /// user-function indices `1..=n` stay stable. Threaded together through the
 /// emitters so a lowered expression can call whichever helper it needs.
-/// Per-function exception-unwinding state threaded through emission (S15.2).
+/// Per-function exception-unwinding state threaded through emission.
 ///
 /// A `throw` (and every guarded call-site propagation check) transfers control
 /// to the nearest enclosing `try`'s catch-dispatch `block` by a wasm `br`; with
-/// no enclosing `try` it falls back to the S15.1 function-boundary `return`.
+/// no enclosing `try` it falls back to the function-boundary `return`.
 /// Because a `br`'s immediate is *relative* to the current control-nesting
 /// depth, we track that depth explicitly and record, for each active handler,
 /// the depth captured just inside its dispatch block — the `br` immediate at a
@@ -526,7 +597,7 @@ struct Unwind {
     /// `br` immediate `depth - entry`.
     handlers: Vec<u32>,
     /// Active `try` FINALLY landing pads, innermost last — a subset of the
-    /// exceptional edges that carries a `finally` (S15.3). Each entry is the
+    /// exceptional edges that carries a `finally`. Each entry is the
     /// [`depth`](Self::depth) captured just inside that `try`'s outer
     /// `$finally_target` block, so a `return`/`break`/`continue` that must run the
     /// finally reaches it with the relative `br` immediate `depth - entry`. Unlike
@@ -534,15 +605,15 @@ struct Unwind {
     /// `return` does not run a `catch`), so it names exactly the finalizers a
     /// non-throw abrupt completion must traverse.
     finalizers: Vec<u32>,
-    /// Active labeled loops enclosing the point being emitted, innermost last
-    /// (S12.6). Each records the loop's `break`/`continue` landing blocks as
+    /// Active labeled loops enclosing the point being emitted, innermost last.
+    /// Each records the loop's `break`/`continue` landing blocks as
     /// absolute [`depth`](Self::depth)s, so a labeled `break`/`continue` reaches
     /// its target with the relative `br` immediate `depth - entry` — exactly the
     /// [`handlers`](Self::handlers)/[`finalizers`](Self::finalizers) scheme.
     labels: Vec<LabelTarget>,
 }
 
-/// A labeled loop's abrupt-exit landing blocks (S12.6), keyed by the loop id an
+/// A labeled loop's abrupt-exit landing blocks, keyed by the loop id an
 /// [`IrStmt::Break`]/[`IrStmt::Continue`] carries. Depths are absolute (see
 /// [`Unwind::depth`]); the `br` immediate at a use site is `depth - entry`.
 struct LabelTarget {
@@ -567,52 +638,71 @@ impl Unwind {
 
 #[derive(Clone, Copy)]
 struct Helpers<'a> {
-    /// Per-function exception-unwinding state (S15.2): the active `try` handler
+    /// Per-function exception-unwinding state: the active `try` handler
     /// landing pads and the current control-nesting depth. A shared `&RefCell`
     /// so the `Copy` `Helpers` threaded through emission can still mutate it in
     /// place (push/pop a handler, bump/restore the depth) without re-plumbing a
     /// `&mut` through every helper.
     unwind: &'a RefCell<Unwind>,
-    /// The host `print` import's function index (S14.1). Imports occupy the
+    /// The host `print` import's function index. Imports occupy the
     /// lowest function indices, so this is always `0`; `console.log` lowers to
     /// `call`s of it.
     print: u32,
-    /// The host `__convert` import's function index (S14.3). Always `1` (the
+    /// The host `__convert` import's function index. Always `1` (the
     /// second import); `String`/`Number`/`parseInt`/`parseFloat` lower to `call`s
     /// of it.
     convert: u32,
-    /// The host `__method` import's function index (S14.6). Always `2` (the third
+    /// The host `__method` import's function index. Always `2` (the third
     /// import); the non-callback array/string methods lower to `call`s of it.
     method: u32,
-    /// The host `__promise` import's function index (P4.1). Always `3` (the fourth
+    /// The host `__promise` import's function index. Always `3` (the fourth
     /// import); `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
     /// `call`s of it.
     promise: u32,
-    /// The host `__then` import's function index (P4.1). Always `4` (the fifth
+    /// The host `__then` import's function index. Always `4` (the fifth
     /// import); `p.then`/`p.catch` lower to `call`s of it.
     then: u32,
-    /// The host `__now` import's function index (P-series `Date`). Always `5` (the
+    /// The host `__now` import's function index (backing `Date`). Always `5` (the
     /// sixth import); `Date.now()` / `new Date()` lower to `call`s of it. The
     /// import returns an f64 (ms since the Unix epoch).
     now: u32,
-    /// `__gen_to_array(gen: i64) -> i64` (P4.2 M3): drive a generator to
+    /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
     /// array — the drain backing `[...gen]` / `f(...gen)` spread. Emitted just
     /// before `invoke1`; a stub (returns an empty array) when the program declares
     /// no functions (no generator can exist, so it is never called).
     gen_to_array: u32,
-    /// `__invoke1(fn: i64, arg: i64) -> i64` (P4.1): the callback trampoline the
+    /// `__nullish_throw(recv: i64, key: i64, set: i32)`: build the V8-style
+    /// `TypeError` for a member read (`set == 0`) or write (`set == 1`) on a
+    /// `null`/`undefined` receiver and leave it in flight (`$exc_pending` set).
+    /// The out-of-line half of the nullish-receiver guard (see
+    /// [`object::emit_nullish_guard`]).
+    nullish_throw: u32,
+    /// `__prop_throw(key: i64, grow: i32)`: build the `TypeError` for a member
+    /// store the fixed-shape receiver cannot take — an absent property
+    /// (`grow == 0`, message names `String(key)`) or an array index at/past the
+    /// length (`grow == 1`) — and leave it in flight (`$exc_pending` set). The
+    /// out-of-line half of [`object::emit_index_set_node`]'s miss paths.
+    prop_throw: u32,
+    /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
+    /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).
+    box_f64: u32,
+    /// `__to_number(v: i64) -> i64`: the JS `ToNumber` of any jsval (`ToPrimitive` of
+    /// an array is its `join()` string; see [`value::emit_to_number_helper`]).
+    /// Call sites skip it for number operands (see [`value::emit_coerce_number`]).
+    to_number: u32,
+    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline the
     /// host promise engine calls re-entrantly. Exported under
     /// [`INVOKE_EXPORT_NAME`].
     invoke1: u32,
-    /// `__async_step(gen: i64, sent: i64) -> i64` (P4.3 M4): the generator
+    /// `__async_step(gen: i64, sent: i64) -> i64`: the generator
     /// single-step trampoline the host async engine calls to advance an
     /// `async function` body's state machine by one suspend. Appended right after
     /// `invoke1` (so it always exists, index `invoke1 + 1`, even when the program
     /// declares no functions — a stub then), exported under
     /// [`ASYNC_STEP_EXPORT_NAME`].
     async_step: u32,
-    /// The funcref-TABLE slots of the two `new Promise` settler functions (P4.1):
+    /// The funcref-TABLE slots of the two `new Promise` settler functions:
     /// `resolve` (fulfills the bound promise) and `reject`. A `new Promise`
     /// executor receives function values pointing at these slots with the target
     /// promise in their env slot. `0` when the program declares no functions (no
@@ -620,7 +710,7 @@ struct Helpers<'a> {
     settle_resolve_slot: u32,
     settle_reject_slot: u32,
     /// `__alloc(size) -> i32`: bump-allocate `size` bytes, returning the offset.
-    /// Called inline by array literals (S11).
+    /// Called inline by array literals.
     alloc: u32,
     /// `__concat(a, b) -> i32`: allocate and build the concatenation of two heap
     /// strings.
@@ -636,71 +726,72 @@ struct Helpers<'a> {
     /// a key whose byte content equals `key_ptr`, returning the matching value
     /// jsval or the `undefined` bits.
     obj_get: u32,
-    /// `__obj_set(obj_ptr, key_ptr, val)`: linear-scan an object's entries for a
-    /// key whose byte content equals `key_ptr` and store `val` into its value
-    /// slot. A no-op when no key matches (existing keys only).
+    /// `__obj_set(obj_ptr, key_ptr, val) -> hit`: linear-scan an object's entries
+    /// for a key whose byte content equals `key_ptr`, store `val` into its value
+    /// slot and return `1`. Returns `0` without writing when no key matches
+    /// (existing keys only); the caller then raises the add-property `TypeError`.
     obj_set: u32,
-    /// `__array_push(base, value) -> new_base` (S14.4): bump-allocate a new array
+    /// `__array_push(base, value) -> new_base`: bump-allocate a new array
     /// block of `len + 1` element capacity, copy the header + existing elements,
     /// append `value`, bump the u32 length header, and return the new block base.
     array_push: u32,
-    /// `__obj_rest(obj_ptr, excl_ptr) -> new_base` (P1.2): bump-allocate a fresh
+    /// `__obj_rest(obj_ptr, excl_ptr) -> new_base`: bump-allocate a fresh
     /// object holding every source key EXCEPT those in the `excl_ptr` key array,
     /// and return the new block base.
     obj_rest: u32,
-    /// `__array_concat(dst, src) -> new_base` (P1.5): bump-allocate a new array
+    /// `__array_concat(dst, src) -> new_base`: bump-allocate a new array
     /// block holding every element of `dst` followed by every element of `src`,
     /// and return the new block base. Used to append a spread source's elements
     /// when building a spread array literal or spread call argument list.
     array_concat: u32,
-    /// `__obj_keys(obj_ptr) -> array_base` (P3.2): bump-allocate a fresh array
+    /// `__obj_keys(obj_ptr) -> array_base`: bump-allocate a fresh array
     /// holding the object's own enumerable key strings (reserved `@@`-prefixed
     /// keys skipped), in insertion order, and return the new block base.
     obj_keys: u32,
-    /// `__obj_values(obj_ptr) -> array_base` (P3.2): like [`Self::obj_keys`] but
+    /// `__obj_values(obj_ptr) -> array_base`: like [`Self::obj_keys`] but
     /// the array holds each entry's value jsval instead of its key.
     obj_values: u32,
-    /// `__obj_entries(obj_ptr) -> array_base` (P3.2): like [`Self::obj_keys`] but
+    /// `__obj_entries(obj_ptr) -> array_base`: like [`Self::obj_keys`] but
     /// each element is a fresh two-element `[key, value]` array.
     obj_entries: u32,
-    /// `__obj_has(obj_ptr, key_ptr) -> i32` (P3.3): `1` iff the object has an OWN
+    /// `__obj_has(obj_ptr, key_ptr) -> i32`: `1` iff the object has an OWN
     /// key whose byte content equals `key_ptr` (no prototype walk). Backs `in`.
     obj_has: u32,
-    /// `__obj_delete(obj_ptr, key_ptr)` (P3.3): remove the OWN entry whose key byte
+    /// `__obj_delete(obj_ptr, key_ptr)`: remove the OWN entry whose key byte
     /// content equals `key_ptr` by compacting it out (shift trailing entries down,
     /// decrement the `n` header); a no-op on a miss. Backs `delete obj.k`.
     obj_delete: u32,
-    /// `__json_escape(str_ptr) -> str_base` (P3.4): bump-allocate a fresh heap
+    /// `__json_escape(str_ptr) -> str_base`: bump-allocate a fresh heap
     /// string that is the JSON-quoted + escaped form of the source string (leading
     /// and trailing `"`, with `"`/`\`/control bytes escaped). Called by
     /// [`Self::json_str`] for string values and object keys.
     json_escape: u32,
-    /// `__json_str(v) -> str_base` (P3.4): the recursive `JSON.stringify` serializer
+    /// `__json_str(v) -> str_base`: the recursive `JSON.stringify` serializer
     /// — returns the heap-string base offset of `v`'s JSON form, composing pieces
     /// with `__concat`, delegating string escaping to [`Self::json_escape`] and
     /// finite-number formatting to the existing `__convert` import, and calling
     /// itself for nested array/object elements. Backs [`crate::ir::IrNode::JsonStringify`].
     json_str: u32,
-    /// `__js_eq(a: i64, b: i64) -> i32` (P3.5): strict `===` over two jsvals (two
-    /// heap strings compare by byte content, two numbers as `f64`, everything else
-    /// by identity bits). The equality kernel of `emit_strict_eq`, packaged as a
-    /// helper so the `__map_*` linear scans can call it per candidate.
-    js_eq: u32,
-    /// `__map_find(handle: i32, key: i64) -> i32` (P3.5): the byte address of the
-    /// matching key slot in a Map/Set's backing array (a `__js_eq` linear scan over
+    /// `__same_value_zero(a: i64, b: i64) -> i32`: `SameValueZero` over two
+    /// jsvals (two heap strings compare by byte content, two numbers as `f64` or
+    /// identical bits — so `NaN` matches `NaN` and `+0` matches `-0` — everything
+    /// else by identity bits). The key equality of the `__map_*` linear scans.
+    same_value_zero: u32,
+    /// `__map_find(handle: i32, key: i64) -> i32`: the byte address of the
+    /// matching key slot in a Map/Set's backing array (a `__same_value_zero` linear scan over
     /// the even element slots), or `-1` on a miss. Shared by get/has/set/delete.
     map_find: u32,
-    /// `__map_set(handle: i32, key: i64, val: i64)` (P3.5): update the existing
+    /// `__map_set(handle: i32, key: i64, val: i64)`: update the existing
     /// entry for `key`, or append `(key, val)` to the growable backing (via
     /// `__array_push`), rewriting the handle's `entries`/`size` in place. Backs
     /// `map.set` and (with an `undefined` value) `set.add`.
     map_set: u32,
-    /// `__map_get(handle: i32, key: i64) -> i64` (P3.5): the value stored under
+    /// `__map_get(handle: i32, key: i64) -> i64`: the value stored under
     /// `key` (`__map_find` + load), or the `undefined` bits on a miss.
     map_get: u32,
-    /// `__map_has(handle: i32, key: i64) -> i32` (P3.5): `1` iff `__map_find` hits.
+    /// `__map_has(handle: i32, key: i64) -> i32`: `1` iff `__map_find` hits.
     map_has: u32,
-    /// `__map_delete(handle: i32, key: i64) -> i32` (P3.5): compact the matching
+    /// `__map_delete(handle: i32, key: i64) -> i32`: compact the matching
     /// entry out of the backing (shift trailing pairs down, drop `size`/`len` by
     /// one entry) and return `1`, or `0` on a miss.
     map_delete: u32,
@@ -741,7 +832,7 @@ struct Helpers<'a> {
     /// provably cannot be a generator — [`generator::emit_gen_resume`] then throws
     /// a `TypeError` unconditionally instead of emitting an invalid indirect call.
     has_funcs: bool,
-    /// Whether the program lowers any instance accessor (P2b — the
+    /// Whether the program lowers any instance accessor (the
     /// [`abi::ACCESSOR_MARKER_KEY`] sentinel is interned). When `false`, the member
     /// read/write paths omit the accessor get/set invocation entirely, so an
     /// accessor-free program keeps byte-identical emission (mirrors the `@@prototype`
@@ -806,10 +897,10 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // [`build_type_and_function_sections`]).
     let n = program.functions.len();
     let has_funcs = n > 0;
-    // Per-function exception-unwinding state (S15.2), reset at each function body.
+    // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
-    // Instance accessors (P2b) are gated on the sentinel key `collect_node` interns
+    // Instance accessors are gated on the sentinel key `collect_node` interns
     // whenever it walks a `MakeAccessor` node — the same presence-in-the-string-table
     // idiom the `@@prototype` prototype-fallback gate uses.
     let has_accessors = offsets.contains_key(crate::abi::ACCESSOR_MARKER_KEY);
@@ -826,10 +917,10 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     ) = build_type_and_function_sections(program, &unwind, has_accessors);
     module.section(&types);
 
-    // Import section: the host `print` function backing `console.log` (S14.1, index
-    // 0), the host `__convert` function backing the conversions (S14.3, index 1),
-    // and the host `__method` function backing the array/string methods (S14.6,
-    // index 2). Imports occupy the lowest function indices, so every defined
+    // Import section: the host `print` function backing `console.log` (index 0),
+    // the host `__convert` function backing the conversions (index 1), and the
+    // host `__method` function backing the array/string methods (index 2).
+    // Imports occupy the lowest function indices, so every defined
     // function/element/export index is shifted by IMPORT_FUNC_COUNT (accounted for
     // in `build_type_and_function_sections` and below). This follows the type
     // section and precedes the function section (wasm section order); the order of
@@ -850,7 +941,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         METHOD_IMPORT_NAME,
         EntityType::Function(method_type),
     );
-    // The host promise imports (P4.1, indices 3/4): `__promise(op, a, b) -> i64`
+    // The host promise imports (indices 3/4): `__promise(op, a, b) -> i64`
     // and `__then(p, on_f, on_r) -> i64`, backing the host promise engine.
     imports.import(
         PROMISE_IMPORT_MODULE,
@@ -862,7 +953,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         THEN_IMPORT_NAME,
         EntityType::Function(then_type),
     );
-    // The host wall-clock import (P-series `Date`, index 5): `__now() -> f64`,
+    // The host wall-clock import (backing `Date`, index 5): `__now() -> f64`,
     // milliseconds since the Unix epoch, backing `Date.now()` / `new Date()`.
     imports.import(
         NOW_IMPORT_MODULE,
@@ -873,12 +964,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
 
     module.section(&functions);
 
-    // Table section: a funcref table listing every user function (S13.2) so a
+    // Table section: a funcref table listing every user function so a
     // function value can be called through `call_indirect`. Table slot `i` holds
     // wasm function index `i + 1`; the element segment (below, after exports)
     // populates it. Omitted entirely when the program declares no functions.
     if has_funcs {
-        // `n` user-function slots plus the two `new Promise` settler slots (P4.1),
+        // `n` user-function slots plus the two `new Promise` settler slots,
         // which occupy slots `n` and `n + 1`.
         let table_len = (n + 2) as u64;
         let mut tables = TableSection::new();
@@ -892,20 +983,21 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         module.section(&tables);
     }
 
-    // Memory section: one linear memory (min 1 page, no max), exported below.
+    // Memory section: one linear memory (min 1 page, capped at
+    // `abi::MEMORY_MAX_PAGES`; `__alloc` grows it on demand), exported below.
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
         minimum: 1,
-        maximum: None,
+        maximum: Some(abi::MEMORY_MAX_PAGES),
         memory64: false,
         shared: false,
         page_size_log2: None,
     });
     module.section(&memories);
 
-    // Global section: the bump-allocator heap pointer plus the S15.1
+    // Global section: the bump-allocator heap pointer plus the
     // exception-unwinding globals (see [`build_globals`]).
-    module.section(&build_globals(heap_ptr_init));
+    module.section(&build_globals(heap_ptr_init, program.module_cells));
 
     // Export section: `main` as function index IMPORT_FUNC_COUNT (the first
     // DEFINED function, after the imports), memory index 0 as "memory" (function
@@ -913,10 +1005,10 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     let mut exports = ExportSection::new();
     exports.export(EXPORT_NAME, ExportKind::Func, IMPORT_FUNC_COUNT);
     exports.export(MEMORY_EXPORT_NAME, ExportKind::Memory, 0);
-    // The bump-allocator heap pointer global is exported (S14.3) so the host
+    // The bump-allocator heap pointer global is exported so the host
     // `__convert` import can bump-allocate a heap string when lowering `String(x)`.
     exports.export(HEAP_PTR_EXPORT_NAME, ExportKind::Global, HEAP_PTR_GLOBAL);
-    // The exception-unwinding globals are exported (S15.1) so the run stage can
+    // The exception-unwinding globals are exported so the run stage can
     // detect and render an uncaught exception after `main` returns.
     exports.export(
         EXC_PENDING_EXPORT_NAME,
@@ -924,11 +1016,11 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         EXC_PENDING_GLOBAL,
     );
     exports.export(EXC_VALUE_EXPORT_NAME, ExportKind::Global, EXC_VALUE_GLOBAL);
-    // The `__invoke1` callback trampoline (P4.1) is exported so the host promise
+    // The `__invoke1` callback trampoline is exported so the host promise
     // engine can run a `.then`/`.catch`/`.finally` reaction's guest callback
     // re-entrantly. It is the LAST defined function (appended after every helper).
     exports.export(INVOKE_EXPORT_NAME, ExportKind::Func, helpers.invoke1);
-    // The `__async_step` trampoline (P4.3 M4) is exported so the host async engine
+    // The `__async_step` trampoline is exported so the host async engine
     // can drive an `async function` body's state machine one suspend at a time.
     exports.export(ASYNC_STEP_EXPORT_NAME, ExportKind::Func, helpers.async_step);
     module.section(&exports);
@@ -946,7 +1038,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         let mut func_indices: Vec<u32> = (1..=u32::try_from(n).unwrap_or(u32::MAX))
             .map(|i| i + IMPORT_FUNC_COUNT)
             .collect();
-        // The two `new Promise` settler functions (P4.1) fill the trailing table
+        // The two `new Promise` settler functions fill the trailing table
         // slots `n`/`n + 1`; they are the last two DEFINED functions, right after
         // the `__invoke1` and `__async_step` trampolines.
         func_indices.push(helpers.async_step + 1);
@@ -965,7 +1057,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     let mut code = CodeSection::new();
     code.function(&emit_main(program, &offsets, helpers));
     for func in &program.functions {
-        // A generator state machine (P4.2 M2) emits a `switch (gen.state)` dispatch
+        // A generator state machine emits a `switch (gen.state)` dispatch
         // over its segments rather than a straight-line body.
         if func.machine.is_some() {
             code.function(&generator::emit_generator_sm(func, &offsets, helpers));
@@ -1000,8 +1092,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         helpers.json_escape,
         JsonTokens::resolve(&offsets),
     ));
-    code.function(&emit_js_eq(helpers.str_eq));
-    code.function(&emit_map_find(helpers.js_eq));
+    code.function(&emit_same_value_zero(helpers.str_eq));
+    code.function(&emit_map_find(helpers.same_value_zero));
     code.function(&emit_map_set(helpers.map_find, helpers.array_push));
     code.function(&emit_map_get(helpers.map_find));
     code.function(&emit_map_has(helpers.map_find));
@@ -1020,14 +1112,18 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_json_object(helpers.alloc, helpers));
     code.function(&emit_array_to_object(helpers.alloc));
     code.function(&emit_json_parse(helpers));
-    // `__gen_to_array` (P4.2 M3) — the generator-spread drain — precedes the
+    // `__gen_to_array` — the generator-spread drain — precedes the
     // trampoline so every later index stays stable.
     code.function(&generator::emit_gen_to_array(helpers));
-    // The `__invoke1` callback trampoline (P4.1) is appended after every helper so
-    // every helper index stays stable; the `__async_step` trampoline (P4.3 M4)
+    code.function(&emit_nullish_throw(&offsets, helpers));
+    code.function(&emit_prop_throw(&offsets, helpers));
+    // The `__invoke1` callback trampoline is appended after every helper so
+    // every helper index stays stable; the `__async_step` trampoline
     // follows it (always, so its index is deterministic), then the two
     // `new Promise` settler functions (only when there are functions — the table
     // exists then).
+    code.function(&emit_box_f64_helper());
+    code.function(&emit_to_number_helper(helpers));
     code.function(&emit_invoke1(helpers));
     code.function(&generator::emit_async_step(helpers));
     if has_funcs {

@@ -21,8 +21,8 @@ use swc_common::Spanned;
 use crate::error::CompileError;
 
 use swc_ecma_ast::{
-    ArrayLit, ArrayPat, ArrowExpr, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinaryOp,
-    BlockStmtOrExpr, Callee, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl, Expr,
+    ArrayLit, ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget,
+    AssignTargetPat, BinaryOp, Callee, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl, Expr,
     ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, IdentName, Lit, MemberExpr, MemberProp,
     MethodKind, ObjectLit, ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr,
     ParamOrTsParamProp, Pat, Program, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt,
@@ -32,7 +32,8 @@ use swc_ecma_ast::{
 
 use crate::ir::{
     ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, SpreadCallee, SpreadElem,
+    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, SpreadCallee,
+    SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
@@ -67,7 +68,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
 
     // Pass 1a: collect EVERY top-level function declaration and the non-function
     // statements, so capture analysis can see the whole program before deciding
-    // which declarations close over `main`'s bindings.
+    // which of `main`'s bindings the declarations reference.
     let mut all_fn_decls: Vec<&FnDecl> = Vec::new();
     let mut scan_top_stmts: Vec<&Stmt> = Vec::new();
     for stmt in &body {
@@ -78,23 +79,18 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         }
     }
 
-    // Capture analysis (S13.4 + G2): which bindings are boxed into cells, and
-    // which top-level functions close over an enclosing `main` binding. Runs
-    // before any body is lowered so a captured binding's declaration knows to
-    // allocate its cell up front, and so Pass 1b can partition the declarations.
+    // Capture analysis: which bindings are boxed into cells, and which
+    // top-level bindings are referenced from top-level functions (module
+    // bindings). Runs before any body is lowered so a captured binding's
+    // declaration knows to allocate its cell up front.
     let analysis = analyze_captures(&scan_top_stmts, &all_fn_decls);
 
-    // Pass 1b: partition the hoisted function declarations. A NON-capturing
-    // declaration keeps the direct-call fast path (registered in `funcs`, its
-    // own function, hoisted). A CAPTURING declaration (G2) is DEMOTED: left in
-    // `top_stmts` at its source position so `lower_stmt` routes it through
-    // `lower_nested_fn_decl` (a boxed cell in `main`, indirect env-last call).
-    // A demoted declaration loses hoisting (lowered at its source position);
-    // this is the intended narrowing.
+    // Pass 1b: register every hoisted top-level function declaration for the
+    // direct-call fast path. A declaration referencing top-level bindings reaches
+    // them through module cells, so it needs no closure environment.
     let mut funcs: HashMap<String, FnSig> = HashMap::new();
     let mut fn_decls: Vec<&FnDecl> = Vec::new();
     let mut top_stmts: Vec<&Stmt> = Vec::new();
-    let mut demoted_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Index 0 is `main`, so user functions are numbered from 1 upward.
     let mut next_index: u32 = 1;
     for stmt in &body {
@@ -103,33 +99,8 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             continue;
         };
         let name = fn_decl.ident.sym.as_ref().to_string();
-        if analysis.capturing_fns.contains(&fn_decl.ident.span.lo.0) {
-            demoted_fns.insert(name);
-            top_stmts.push(stmt);
-            continue;
-        }
-        let params = fn_decl.function.params.len();
-        let required = fn_decl
-            .function
-            .params
-            .iter()
-            .take_while(|p| !matches!(p.pat, Pat::Assign(_) | Pat::Rest(_)))
-            .count();
-        let has_rest = fn_decl
-            .function
-            .params
-            .last()
-            .is_some_and(|p| matches!(p.pat, Pat::Rest(_)));
         if funcs
-            .insert(
-                name.clone(),
-                FnSig {
-                    index: next_index,
-                    params,
-                    required,
-                    has_rest,
-                },
-            )
+            .insert(name.clone(), FnSig { index: next_index })
             .is_some()
         {
             return Err(CompileError::spanned(
@@ -142,15 +113,15 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         fn_decls.push(fn_decl);
     }
 
-    // The fixed positional-argument arity `K` of the S13.2 uniform ABI: the
+    // The fixed positional-argument arity `K` of the uniform ABI: the
     // widest source arity across *every* function — top-level declarations AND
-    // any nested arrow function (S13.4), which lift to Table-registered functions
+    // any nested arrow function, which lift to Table-registered functions
     // sharing the same signature. Scanning the whole program up front fixes `K`
     // before any body is lowered, so a single `call_indirect` type serves them
     // all and no arrow's params can overflow the fixed argument slots.
-    // A generator's — and an `async function`'s (P4.3 M4) — state machine is
+    // A generator's — and an `async function`'s — state machine is
     // driven with two positional arguments (`sent`, the handle), so `K` must be at
-    // least 2 for the second slot to exist (P4.2 M2), regardless of the widest
+    // least 2 for the second slot to exist, regardless of the widest
     // source arity.
     let has_state_machine = fn_decls
         .iter()
@@ -174,23 +145,38 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         max_arity,
         captured: analysis.captured,
         classes: RefCell::new(HashMap::new()),
-        demoted_fns,
-        generic_method_sites: RefCell::new(Vec::new()),
+        module_slots: analysis
+            .module_names
+            .iter()
+            .zip(0u32..)
+            .map(|(name, slot)| (name.clone(), slot))
+            .collect(),
+        module_mutable: RefCell::new(HashMap::new()),
         object_shapes: analysis.object_shapes,
     };
 
-    // Pass 2: lower each function body over its own locals, laid out for the
-    // uniform ABI (`max_arity` argument slots, the env slot, then body locals).
-    let mut functions = Vec::with_capacity(fn_decls.len());
-    for fn_decl in &fn_decls {
-        functions.push(lower_function(fn_decl, &shared)?);
-    }
-
-    // The top-level statements become `main`'s body, lowered in a single
+    // Pass 2: the top-level statements become `main`'s body, lowered in a single
     // function frame (`main` has no env parameter; captured top-level bindings
-    // still become boxed cells sourced from its locals).
+    // still become boxed cells sourced from its locals). `main` is lowered BEFORE
+    // the declaration bodies so every class shape and module-binding mutability
+    // they consult is already recorded.
     let mut ctx = LowerCtx::new(&shared);
+    ctx.main_ctx = true;
     let mut stmts = Vec::new();
+    // A `var` module binding is initialized to `undefined` (hoisted, no TDZ):
+    // clear its module cell's TDZ hole before any user code runs.
+    for (name, slot) in analysis.module_names.iter().zip(0u32..) {
+        if analysis.module_vars.contains(name) {
+            let local = ctx.fresh();
+            stmts.push(IrStmt::Decl {
+                local,
+                init: IrNode::CellSet {
+                    cell: Box::new(IrNode::ModuleCell(slot)),
+                    value: Box::new(IrNode::Undefined),
+                },
+            });
+        }
+    }
     for stmt in top_stmts {
         ctx.lower_stmt(stmt, &mut stmts)?;
     }
@@ -198,30 +184,27 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     // Release the shared borrow so the arrow accumulator can be moved out.
     drop(ctx);
 
+    // Pass 3: lower each function body over its own locals, laid out for the
+    // uniform ABI (`max_arity` argument slots, the env slot, then body locals).
+    let mut functions = Vec::with_capacity(fn_decls.len());
+    for fn_decl in &fn_decls {
+        functions.push(lower_function(fn_decl, &shared)?);
+    }
+
     // Lifted arrow functions follow the declarations in the functions vector, so
     // their positions match the funcref table indices handed out at their use
     // sites.
     functions.extend(shared.arrows.into_inner());
 
-    // M1: a generic user-method call `obj.m(args)` lowers to a `call_indirect`
-    // through the funcref table, which the backend only emits when the program
-    // defines at least one function/method. When NONE exist, no object could
-    // carry a method, so every recorded call site is provably an unknown method —
-    // reject the first with a span diagnostic instead of emitting invalid wasm.
-    if functions.is_empty()
-        && let Some((span, name)) = shared.generic_method_sites.into_inner().into_iter().next()
-    {
-        return Err(unknown_method_error(span, name.as_deref()));
-    }
-
     Ok(IrProgram {
         locals,
         stmts,
         functions,
+        module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
     })
 }
 
-/// Build the M1 unknown-method span diagnostic. Names the method when it was
+/// Build the unknown-method span diagnostic. Names the method when it was
 /// statically known at the call site (`obj.m()` or `obj["m"]()`); falls back to a
 /// generic message for a computed call whose key is only known at runtime.
 pub(super) fn unknown_method_error(span: swc_common::Span, name: Option<&str>) -> anyhow::Error {
@@ -238,7 +221,7 @@ pub(super) fn unknown_method_error(span: swc_common::Span, name: Option<&str>) -
 struct Shared<'a> {
     /// Top-level function signatures, keyed by name.
     funcs: &'a HashMap<String, FnSig>,
-    /// Arrow functions lifted to top level (S13.4). Each use-site of an arrow
+    /// Arrow functions lifted to top level. Each use-site of an arrow
     /// appends its lowered [`IrFunction`] here and emits a
     /// [`IrNode::FuncValue`] referencing its funcref table slot. Interior
     /// mutability lets the immutable-borrow lowering walk register new functions.
@@ -252,29 +235,23 @@ struct Shared<'a> {
     max_arity: usize,
     /// The binding ids (see [`binding_id`]) of every binding captured by a
     /// nested function, computed by [`analyze_captures`]. A declared binding
-    /// whose id is in this set is boxed into a heap cell (S13.4).
+    /// whose id is in this set is boxed into a heap cell.
     captured: std::collections::HashSet<u32>,
-    /// Class declarations lowered so far, keyed by name (P2.2). A `class A`
+    /// Class declarations lowered so far, keyed by name. A `class A`
     /// declaration records its instance shape here as it is lowered; a later
     /// `new A(args)` reads the shape back to pre-slot the fresh instance. Classes
     /// are not hoisted (TDZ), so a `new` always follows its declaration in source
     /// order, matching this build-then-read ordering. Interior mutability lets the
     /// immutable-borrow lowering walk register new classes.
     classes: RefCell<HashMap<String, ClassInfo>>,
-    /// Names of the top-level function declarations demoted to closures (G2).
-    /// They are bound (as boxed cells) only within `main`; a top-level function
-    /// that references one is a SIBLING that cannot reach it, so a call/reference
-    /// to a name in this set from a top-level function body is rejected with a
-    /// span instead of the generic "undeclared" diagnostic.
-    demoted_fns: std::collections::HashSet<String>,
-    /// Every generic user-method call site `obj.m(args)` recorded during lowering
-    /// (M1): its member span and the method name when statically known. A generic
-    /// method call lowers to an [`IrNode::MethodCallUser`] whose `call_indirect`
-    /// needs the funcref table — which only exists when the program defines at
-    /// least one function/method. If NO functions are defined, every recorded site
-    /// is provably an unknown method, so [`lower`] rejects the first one with a
-    /// span diagnostic rather than emitting invalid wasm.
-    generic_method_sites: RefCell<Vec<(swc_common::Span, Option<String>)>>,
+    /// Module-cell slot of each module binding name (see
+    /// [`CaptureAnalysis::module_names`]). A `main` declaration of one of these
+    /// names in its outermost scope stores into the module cell; a top-level
+    /// function body reaches it through [`IrNode::ModuleCell`].
+    module_slots: HashMap<String, u32>,
+    /// Mutability of each module binding, recorded as `main` declares it (`main`
+    /// is lowered before the top-level function bodies that read it).
+    module_mutable: RefCell<HashMap<String, bool>>,
     /// The provably-fixed object shape of each qualifying binding (see
     /// [`CaptureAnalysis::object_shapes`]): [`binding_id`] mapped to the own keys
     /// of the object literal it holds. A user method call whose receiver resolves
@@ -284,7 +261,7 @@ struct Shared<'a> {
     object_shapes: HashMap<u32, Vec<String>>,
 }
 
-/// The lowered shape of a `class` declaration (P2.2): the instance field names the
+/// The lowered shape of a `class` declaration: the instance field names the
 /// constructor assigns via `this.<field> = ..`, in first-seen order. `new A(args)`
 /// pre-allocates the instance object with one slot per field (initialized to
 /// `undefined`), because the object model has no dynamic key growth — a fresh
@@ -308,14 +285,14 @@ struct CaptureResolver {
     frames: Vec<Vec<HashMap<String, u32>>>,
     /// Binding ids referenced across a function boundary.
     captured: std::collections::HashSet<u32>,
-    /// The [`binding_id`] of the top-level function declaration currently being
-    /// analyzed (G2), or `None` while analyzing `main`'s own statements. A
-    /// reference reaching the `main` frame while this is set marks that
-    /// declaration as capturing.
-    current_top_fn: Option<u32>,
-    /// Ids of the top-level function declarations whose bodies close over a
-    /// `main` binding (G2), and must therefore be demoted to closures.
-    capturing_fns: std::collections::HashSet<u32>,
+    /// Whether a top-level function declaration's body is being analyzed (rather
+    /// than `main`'s own statements). A reference reaching the `main` frame while
+    /// this is set records a module binding.
+    in_top_fn: bool,
+    /// Names of `main`'s outermost-scope bindings referenced from a top-level
+    /// function declaration, in first-reference order (see
+    /// [`CaptureAnalysis::module_names`]).
+    module_names: Vec<String>,
     /// Names that are the target of an assignment (`x = ..`, `x op= ..`, `++x`,
     /// `x--`, or a destructuring assignment) ANYWHERE in the program. A
     /// name-based over-approximation used to disqualify object-shape candidates:
@@ -335,14 +312,20 @@ struct CaptureResolver {
 }
 
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
-/// which top-level function declarations must be demoted to closures (G2).
+/// which top-level bindings live in module cells.
 struct CaptureAnalysis {
-    /// Binding ids captured by a nested function (boxed into cells, S13.4).
+    /// Binding ids captured by a nested function (boxed into cells).
     captured: std::collections::HashSet<u32>,
-    /// [`binding_id`]s of the top-level function declarations that close over an
-    /// enclosing `main` binding, and must be demoted from the direct-call fast
-    /// path to a closure (G2).
-    capturing_fns: std::collections::HashSet<u32>,
+    /// Names of `main`'s outermost-scope bindings referenced from a top-level
+    /// function declaration, in first-reference order. Each is stored in a
+    /// module cell (slot = position here) so the hoisted declaration — and
+    /// anything it is called from — reaches it without a closure environment.
+    module_names: Vec<String>,
+    /// The [`module_names`] declared by a top-level `var` (hoisted and
+    /// initialized to `undefined`, so they carry no TDZ).
+    ///
+    /// [`module_names`]: CaptureAnalysis::module_names
+    module_vars: std::collections::HashSet<String>,
     /// The provably-fixed object shape of each qualifying binding: its
     /// [`binding_id`] mapped to the own keys of the object literal it is
     /// initialized with. A binding qualifies when it is a `let`/`const`
@@ -365,19 +348,6 @@ enum AnalyzeBody<'a> {
 struct FnSig {
     /// The callee's wasm function index (`>= 1`; `0` is `main`).
     index: u32,
-    /// The declared parameter count (the maximum accepted call arity).
-    params: usize,
-    /// The number of required arguments: leading parameters before the first one
-    /// with a default (`a = expr`) or the trailing rest parameter (`...rest`). A
-    /// call may supply `required..=params` args (or more when [`has_rest`]); the
-    /// surplus slots are padded with `undefined` by the uniform ABI.
-    ///
-    /// [`has_rest`]: FnSig::has_rest
-    required: usize,
-    /// Whether the final parameter is a rest parameter (`...rest`, P1.4), which
-    /// lifts the upper bound on call arity — any surplus arguments are gathered
-    /// into the rest array rather than rejected.
-    has_rest: bool,
 }
 
 /// The body shape of a function/arrow being lowered: an ordinary statement
@@ -390,7 +360,7 @@ enum BodyKind<'a> {
 }
 
 /// A resolved name binding within a function frame: its wasm local, whether it
-/// may be reassigned, whether it is a **boxed cell** (S13.4, captured by a
+/// may be reassigned, whether it is a **boxed cell** (captured by a
 /// nested function), and its [`binding_id`].
 #[derive(Clone, Copy)]
 struct Binding {
@@ -398,7 +368,10 @@ struct Binding {
     mutable: bool,
     cell: bool,
     id: u32,
-    /// For a binding in an `env_backed` frame (a generator local, P4.2 M2): the
+    /// The module-cell slot of a module binding (see [`Shared::module_slots`]):
+    /// its value lives in that cell rather than a wasm local. `None` otherwise.
+    module: Option<u32>,
+    /// For a binding in an `env_backed` frame (a generator local): the
     /// environment slot holding its boxed cell, reached via `EnvLoad`. `None` for
     /// every ordinary binding (whose cell, if any, lives in a wasm local).
     env_slot: Option<u32>,
@@ -439,7 +412,7 @@ struct Frame {
     by_id: HashMap<u32, u32>,
     /// When set, EVERY binding declared in this frame is a boxed cell reached
     /// through the frame's own environment (an `EnvLoad`), not a wasm local — the
-    /// generator state-machine model (P4.2 M2). The persistent frame of cells is
+    /// generator state-machine model. The persistent frame of cells is
     /// built once by the generator constructor and threaded in as the env
     /// parameter, so a local survives across a `yield` (a `call_indirect` return).
     env_backed: bool,
@@ -457,18 +430,18 @@ struct Frame {
     labels: Vec<(String, u32)>,
     /// The next loop-id to hand out for a labeled loop in this frame.
     next_label: u32,
-    /// Whether this frame is a function scope that binds `this` (P2.1). `true` for
+    /// Whether this frame is a function scope that binds `this`. `true` for
     /// every lowered function/arrow/method body, `false` for the top-level `main`
     /// frame — so a top-level `this` is rejected.
     allows_this: bool,
     /// The wasm local this frame's function snapshots the `__this` global into at
-    /// entry (P2.1), allocated lazily on the first `this` read (`None` until then,
+    /// entry, allocated lazily on the first `this` read (`None` until then,
     /// and for a function that never reads `this`). An `Expr::This` in this frame
     /// reads this local.
     this_local: Option<u32>,
 }
 
-/// Lowering context: a stack of function frames (S13.4). Each frame maps
+/// Lowering context: a stack of function frames. Each frame maps
 /// declared names to their [`Binding`] over its own wasm locals; name
 /// resolution walks the innermost frame's scopes outward, then continues into
 /// enclosing frames. A name resolving in an enclosing frame is a **captured**
@@ -484,13 +457,12 @@ struct LowerCtx<'a> {
     /// Shared lowering state (function signatures, uniform arity, the
     /// lifted-function accumulator, and the captured-binding set).
     shared: &'a Shared<'a>,
-    /// Whether this context lowers a NON-capturing top-level function body (its
-    /// own independent frame, with no `main` beneath it). Set only by
-    /// [`lower_function`]. Used to report a call to a demoted sibling function
-    /// (G2) with a precise span diagnostic rather than "undeclared".
-    top_level_fn: bool,
-    /// Whether the body currently being lowered is an `async function` body
-    /// (P4.3 M4). When set, an `await e` lowers to a generator `yield e` (the
+    /// Whether this context lowers `main` (frame 0 is `main`'s frame) rather than
+    /// a top-level function declaration body. Only `main` declares module
+    /// bindings; a function body resolves them through module cells.
+    main_ctx: bool,
+    /// Whether the body currently being lowered is an `async function` body.
+    /// When set, an `await e` lowers to a generator `yield e` (the
     /// async body is compiled as a state machine, driven by the host async
     /// engine) rather than a top-level `Await`. Set/cleared by
     /// [`LowerCtx::lower_generator_body`] around an async body.

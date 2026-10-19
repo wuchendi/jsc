@@ -23,9 +23,9 @@ wasm-opt = ["-Oz"]
 # module bytes with no runtime — exactly what a wasm32 boundary needs.
 # `anyhow` is the error type jsc-core's `parse`/`lower` surface; the boundary
 # holds one to downcast for the spanned `CompileError` diagnostic.
-anyhow       = "1"
+anyhow       = "1.0.104"
 jsc-core     = { path = "../jsc-core", default-features = false }
-wasm-bindgen = "0.2"
+wasm-bindgen = "0.2.129"
 
 # Replicate the workspace lint policy but relax `unsafe_code` from `forbid` to
 # `deny`: the `#[wasm_bindgen]` export glue expands to `unsafe` FFI shims we do

@@ -4,9 +4,9 @@ mod common;
 use common::{assert_rejected, assert_uncaught};
 
 /// Assert `src` is rejected at COMPILE time with a clean unknown-method
-/// diagnostic (M1): the error names the unsupported method and, critically, is
+/// diagnostic: the error names the unsupported method and, critically, is
 /// NEVER the wasm-validator failure `failed to compile: wasm...` that a malformed
-/// `call_indirect` used to produce.
+/// `call_indirect` would produce.
 fn assert_unknown_method(src: &str, method: &str) {
     let result = jsc_core::run::compile_and_run(src);
     let msg = match &result {
@@ -30,12 +30,12 @@ fn assert_unknown_method(src: &str, method: &str) {
 
 // ---------------------------------------------------------------------------
 // Out-of-scope boundary: each of these must be REJECTED, never mis-evaluated.
-// (See DESIGN.md §S13 "S13.6 boundary hardening" for the full catalogue + gaps.)
+// (See DESIGN.md for the full catalogue + gaps.)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn rejects_async_functions() {
-    // Top-level `async function` DECLARATIONS are supported since P4.3 M4 (see the
+    // Top-level `async function` DECLARATIONS are supported (see the
     // promises suite); an async FUNCTION EXPRESSION, an async ARROW, and an async
     // GENERATOR remain out of scope.
     assert_rejected("let f = async function () { return 1 }; f()");
@@ -45,8 +45,8 @@ fn rejects_async_functions() {
 
 #[test]
 fn rejects_generator_functions() {
-    // Top-level `function*` DECLARATIONS are supported since P4.2 M2 (see the
-    // generators suite); a generator EXPRESSION and the out-of-scope M2 yield
+    // Top-level `function*` DECLARATIONS are supported (see the
+    // generators suite); a generator EXPRESSION and the out-of-scope yield
     // forms remain rejected.
     assert_rejected("let g = function* () { return 1 }; g()");
     assert_rejected("function* g() { yield (yield 1) } g().next()");
@@ -55,14 +55,14 @@ fn rejects_generator_functions() {
 
 #[test]
 fn rejects_spread() {
-    // Call-argument and array-literal spread are supported since P1.5; only
+    // Call-argument and array-literal spread are supported; only
     // object spread remains out of scope.
     assert_rejected("let o = { a: 1 }; let p = { ...o }; p.a");
 }
 
 #[test]
 fn rejects_top_level_this() {
-    // Object methods and shorthand methods are supported since P2.1 (see the
+    // Object methods and shorthand methods are supported (see the
     // objects suite), but a top-level `this` — outside any function, so with no
     // receiver binding — remains rejected.
     assert_rejected("this");
@@ -73,8 +73,8 @@ fn rejects_top_level_this() {
 
 #[test]
 fn rejects_class_expressions() {
-    // A single class declaration with a constructor is supported since P2.2, and
-    // `extends`/`super` since the E-series (see the classes suite), but a class
+    // A single class declaration with a constructor is supported, as are
+    // `extends`/`super` (see the classes suite), but a class
     // EXPRESSION (`let C = class{}`) remains out of scope.
     assert_rejected("let C = class {}; new C()");
     assert_rejected("let C = class { constructor() {} }; new C()");
@@ -83,7 +83,7 @@ fn rejects_class_expressions() {
     assert_rejected("class B extends Missing {} new B()");
     assert_rejected("let X = 1; class B extends X {} new B()");
     assert_rejected("class A {} class B extends A { x = 1 } new B()");
-    // Plain instance methods (P2.3), plain instance fields (P2.4), and `static`
+    // Plain instance methods, plain instance fields, and `static`
     // members are supported (see the classes suite); computed field forms remain
     // out of scope.
     assert_rejected("class A { [k] = 1 } new A()");
@@ -91,8 +91,8 @@ fn rejects_class_expressions() {
 
 #[test]
 fn rejects_unsupported_for_of_and_for_in() {
-    // `for-of` over arrays/strings with a `const`/`let` head is supported (P0.3)
-    // and `for-in` over objects/arrays is supported (P3.1), but these unsupported
+    // `for-of` over arrays/strings with a `const`/`let` head is supported
+    // and `for-in` over objects/arrays is supported, but these unsupported
     // forms still trap: an assignment-target head, a statically non-iterable
     // `for-of` head, and a statically non-enumerable `for-in` head.
     assert_rejected("for (x of [1, 2, 3]) { x }");
@@ -110,7 +110,7 @@ fn rejects_function_prototype_methods() {
 }
 
 // ---------------------------------------------------------------------------
-// M1: an unknown / not-yet-implemented method must be rejected at COMPILE time
+// An unknown / not-yet-implemented method must be rejected at COMPILE time
 // with a clean span diagnostic — NEVER a `call_indirect` that the wasm validator
 // rejects with `failed to compile: wasm[0]::function[..]`.
 // ---------------------------------------------------------------------------
@@ -118,8 +118,8 @@ fn rejects_function_prototype_methods() {
 #[test]
 fn rejects_unknown_string_method() {
     // A string-literal receiver can carry only the built-in string methods; any
-    // other name is a statically-provable unknown method. (Names here stay
-    // genuinely unknown even after M2 adds trim/repeat/padStart/split.)
+    // other name is a statically-provable unknown method. (Names here are
+    // genuinely unknown; trim/repeat/padStart/split are built in.)
     assert_unknown_method("\"x\".zzz()", "zzz");
     assert_unknown_method("\"hi\".charCodeAt(0)", "charCodeAt");
     assert_unknown_method("\"x\".normalize()", "normalize");
@@ -137,8 +137,8 @@ fn rejects_unknown_array_method() {
 
 #[test]
 fn rejects_unknown_object_method() {
-    // No function anywhere in the program => no funcref table => no object could
-    // carry a method, so `o.foo()` is provably an unknown method.
+    // The receiver's own-key set is statically known and lacks the method,
+    // so `o.foo()` is provably an unknown method.
     assert_unknown_method("let o = {}; o.foo()", "foo");
     assert_unknown_method("let o = { a: 1 }; o.bar()", "bar");
     assert_unknown_method("let o = {}; o[\"baz\"]()", "baz");
@@ -146,12 +146,12 @@ fn rejects_unknown_object_method() {
 
 #[test]
 fn rejects_unknown_method_on_static_object_shape() {
-    // G1 static-shape guard: even when the program defines functions (so a funcref
+    // Static-shape guard: even when the program defines functions (so a funcref
     // table DOES exist) and the receiver object literally CARRIES methods, a method
     // name absent from the receiver's statically-known own-key set is provably
-    // unknown — the object model has no dynamic key growth, so it used to read
-    // `undefined` and dispatch it as a bogus funcref index (a wrong value). It is
-    // now a clean span diagnostic.
+    // unknown — the object model has no dynamic key growth — so instead of reading
+    // `undefined` and dispatching it as a bogus funcref index (a wrong value), it is
+    // a clean span diagnostic.
     assert_unknown_method("let o = { f() { return 1 } }; o.bar()", "bar");
     assert_unknown_method("const o = { f() { return 1 } }; o.bar()", "bar");
     // A direct object-literal receiver is checked in place.
@@ -188,14 +188,14 @@ fn keeps_dynamic_shape_receivers_at_runtime() {
 
 #[test]
 fn dynamic_shape_unknown_method_throws_typeerror() {
-    // G2 runtime guard: a dynamic-shape receiver whose method is genuinely absent
-    // can only be caught at runtime (the compile-time M1/G1 guards can't prove it).
+    // Runtime guard: a dynamic-shape receiver whose method is genuinely absent
+    // can only be caught at runtime (the compile-time guards can't prove it).
     // Instead of reading `undefined` and dispatching it as a bogus funcref index (a
-    // wrong value or a cryptic wasm trap), the call now throws a clean TypeError.
+    // wrong value or a cryptic wasm trap), the call throws a clean TypeError.
     const MSG: &str = "TypeError: called value is not a function";
     // A `new`-instance receiver has no statically-known object-literal shape —
     // both when bound to a variable and as a direct `new C().bar()` expression
-    // (G1 explicitly defers class instances to this runtime guard).
+    // (the static-shape guard explicitly defers class instances to this runtime guard).
     assert_uncaught("class A { f() { return 1 } } let a = new A(); a.bar()", MSG);
     assert_uncaught("class C { f() { return 1 } } new C().bar()", MSG);
     // A function parameter's shape is unknown at the call site.
@@ -213,14 +213,14 @@ fn dynamic_shape_unknown_method_throws_typeerror() {
         "class C { run() { return this.nope() } f() { return 1 } } new C().run()",
         MSG,
     );
-    // A reassigned binding drops its static shape => runtime dispatch, now guarded.
+    // A reassigned binding drops its static shape => guarded runtime dispatch.
     assert_uncaught(
         "let o = { f() { return 1 } }; o = { g() { return 2 } }; o.zzz()",
         MSG,
     );
     // A computed key is unknown until runtime.
     assert_uncaught("let o = { f() { return 1 } }; o[\"z\" + \"z\"]()", MSG);
-    // The thrown value is now a real branded TypeError object (E-series), so
+    // The thrown value is a real branded TypeError object, so
     // `try`/`catch` can observe its identity and read its fields.
     assert_eq!(
         jsc_core::run::compile_and_run(
@@ -259,8 +259,16 @@ fn rejects_unknown_method_even_with_functions_present() {
 }
 
 #[test]
-fn rejects_unknown_collection_method() {
+fn unknown_method_in_function_free_program_throws_typeerror() {
     // Genuine Map/Set methods work (see the collections suite); an unrecognized
-    // one on a collection-only program is still a clean unknown-method error.
-    assert_unknown_method("let m = new Map(); m.clear()", "clear");
+    // one is a runtime TypeError even when the program declares no function (no
+    // funcref table), never a compile-time rejection or invalid wasm.
+    assert_uncaught(
+        "let m = new Map(); m.clear()",
+        "TypeError: called value is not a function",
+    );
+    assert_uncaught(
+        "let o = { a: 1 }; o = { b: 2 }; o.zzz()",
+        "TypeError: called value is not a function",
+    );
 }
