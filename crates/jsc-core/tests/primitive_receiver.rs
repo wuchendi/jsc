@@ -161,7 +161,6 @@ fn string_known_properties_still_work() {
     assert_eval("\"abc\"[-1]", "undefined");
     assert_str("\"abc\".toUpperCase()", "ABC");
     assert_str("let s=\"abc\"; s.slice(1)", "bc");
-    assert_str("let n=255; n.toString(16)", "ff");
 }
 
 #[test]

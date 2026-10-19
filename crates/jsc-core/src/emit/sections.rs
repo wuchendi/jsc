@@ -228,8 +228,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I64], &[ValType::I64]);
         // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
         helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
-        // `__prop_throw(key: i64, grow: i32) -> ()`.
-        helper(&[ValType::I64, ValType::I32], &[]);
+        // `__prop_throw(recv: i64, key: i64, mode: i32) -> ()`.
+        helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
         // `__box_f64(x: f64) -> i64`.
         helper(&[ValType::F64], &[ValType::I64]);
         // `__to_number(v: i64) -> i64`.
