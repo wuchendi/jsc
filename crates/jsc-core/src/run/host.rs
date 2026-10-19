@@ -755,7 +755,7 @@ pub(super) fn parse_int_str(s: &str, radix: f64) -> f64 {
     let (mut radix, strip_prefix) = if r == 0.0 {
         (10, true)
     } else {
-        match (2_u32..=36).find(|&k| f64::from(k) == r) {
+        match (2_u32..=36).find(|&k| f64::from(k).total_cmp(&r).is_eq()) {
             Some(k) => (k, k == 16),
             None => return f64::NAN,
         }
