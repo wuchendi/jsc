@@ -437,8 +437,8 @@ impl LowerCtx<'_> {
         }
         let param_pats: Vec<&Pat> = arrow.params.iter().collect();
         let body_kind = match arrow.body.as_ref() {
-            BlockStmtOrExpr::BlockStmt(block) => BodyKind::Block(&block.stmts),
-            BlockStmtOrExpr::Expr(expr) => BodyKind::Expr(expr),
+            ArrowFunctionBody::FunctionBody(block) => BodyKind::Block(&block.stmts),
+            ArrowFunctionBody::Expr(expr) => BodyKind::Expr(expr),
         };
         self.lower_lifted_function(&param_pats, body_kind)
     }

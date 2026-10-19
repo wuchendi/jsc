@@ -15,9 +15,9 @@ native-run = ["dep:wasmtime"]
 
 [dependencies]
 anyhow          = "1"
-swc_common      = "24"
-swc_ecma_ast    = "26"
-swc_ecma_parser = "42"
+swc_common      = "26"
+swc_ecma_ast    = "29"
+swc_ecma_parser = "46"
 wasm-encoder    = "0.253"
 wasmtime        = { version = "46", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
 
