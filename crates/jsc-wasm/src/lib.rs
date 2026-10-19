@@ -31,7 +31,7 @@ pub fn compile(src: &str) -> Result<Vec<u8>, JsError> {
 /// The pipeline itself: parse, lower, emit. Kept separate so [`compile`] only
 /// concerns itself with turning the error into a `JsError`.
 fn compile_inner(src: &str) -> anyhow::Result<Vec<u8>> {
-    let program = jsc_core::frontend::parse(src)?;
+    let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js)?;
     let ir = jsc_core::codegen::lower(&program)?;
     Ok(jsc_core::emit::emit(&ir))
 }

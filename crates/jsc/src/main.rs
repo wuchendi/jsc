@@ -9,6 +9,10 @@
 //! - `jsc build FILE -o OUT.wasm` — emit the WebAssembly module (`-o -` writes
 //!   to stdout).
 //!
+//! FILE sources ending in `.ts`, `.mts` or `.cts` are compiled as TypeScript
+//! (types are stripped); `.tsx` is rejected; every other FILE and all `-e` /
+//! `-p` input is JavaScript.
+//!
 //! Exit codes: `0` success, `1` uncaught exception / runtime or I/O failure,
 //! `2` compile error.
 
@@ -16,6 +20,7 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use jsc_core::frontend::Dialect;
 
 /// Compile JavaScript/TypeScript to WebAssembly and run it, node-style.
 #[derive(Parser)]
@@ -36,7 +41,7 @@ struct Cli {
     #[arg(short, long, value_name = "SRC", allow_hyphen_values = true)]
     print: Option<String>,
 
-    /// Run a JavaScript source file, printing only console output.
+    /// Run a JavaScript or TypeScript source file, printing only console output.
     #[arg(value_name = "FILE")]
     file: Option<String>,
 }
@@ -45,7 +50,7 @@ struct Cli {
 enum Command {
     /// Compile FILE to a WebAssembly module.
     Build {
-        /// JavaScript source file to compile.
+        /// JavaScript or TypeScript source file to compile.
         #[arg(value_name = "FILE")]
         file: String,
 
@@ -87,17 +92,20 @@ fn main() -> ExitCode {
 fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Result<(), Failure> {
     // `label` names the source in diagnostics: `<eval>` for inline input, the
     // real path for a file.
-    let (src, label, print_value) = match (eval, print, file) {
-        (Some(src), None, None) => (src, "<eval>".to_owned(), false),
-        (None, Some(src), None) => (src, "<eval>".to_owned(), true),
-        (None, None, Some(path)) => (read_source(&path)?, path, false),
+    let (src, label, dialect, print_value) = match (eval, print, file) {
+        (Some(src), None, None) => (src, "<eval>".to_owned(), Dialect::Js, false),
+        (None, Some(src), None) => (src, "<eval>".to_owned(), Dialect::Js, true),
+        (None, None, Some(path)) => {
+            let dialect = file_dialect(&path)?;
+            (read_source(&path)?, path, dialect, false)
+        }
         _ => {
             return Err(Failure::Runtime(anyhow::anyhow!(
                 "exactly one of --eval, --print or FILE must be provided"
             )));
         }
     };
-    let wasm = compile(&src, &label)?;
+    let wasm = compile(&src, dialect, &label)?;
     // `console.log` streams to the real stdout while the module runs.
     let (bits, memory) = jsc_core::run::run(&wasm).map_err(Failure::Runtime)?;
     if print_value {
@@ -109,8 +117,9 @@ fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Res
 
 /// `jsc build FILE -o OUT`: write the module bytes to OUT (`-` = stdout).
 fn build(path: &str, output: &str) -> Result<(), Failure> {
+    let dialect = file_dialect(path)?;
     let src = read_source(path)?;
-    let wasm = compile(&src, path)?;
+    let wasm = compile(&src, dialect, path)?;
     let written = if output == "-" {
         let mut handle = std::io::stdout().lock();
         handle.write_all(&wasm).and_then(|()| handle.flush())
@@ -125,11 +134,26 @@ fn read_source(path: &str) -> Result<String, Failure> {
         .map_err(|err| Failure::Runtime(anyhow::anyhow!("cannot read {path}: {err}")))
 }
 
-/// Parse, lower, and emit `src`. A spanned `CompileError` is replaced by its
+/// Pick the source dialect from FILE's extension: `.ts` / `.mts` / `.cts` are
+/// TypeScript, `.tsx` is a compile error, anything else is JavaScript.
+fn file_dialect(path: &str) -> Result<Dialect, Failure> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str);
+    match ext {
+        Some("ts" | "mts" | "cts") => Ok(Dialect::Ts),
+        Some("tsx") => Err(Failure::Compile(anyhow::anyhow!(
+            "{path}: JSX/TSX is not supported"
+        ))),
+        _ => Ok(Dialect::Js),
+    }
+}
+
+/// Parse `src` as `dialect`, lower, and emit it. A spanned `CompileError` is replaced by its
 /// rendered caret block (labelled `label`); a span-less one keeps its message.
-fn compile(src: &str, label: &str) -> Result<Vec<u8>, Failure> {
-    let lowered =
-        jsc_core::frontend::parse(src).and_then(|program| jsc_core::codegen::lower(&program));
+fn compile(src: &str, dialect: Dialect, label: &str) -> Result<Vec<u8>, Failure> {
+    let lowered = jsc_core::frontend::parse(src, dialect)
+        .and_then(|program| jsc_core::codegen::lower(&program));
     match lowered {
         Ok(ir) => Ok(jsc_core::emit::emit(&ir)),
         Err(err) => {
