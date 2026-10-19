@@ -452,3 +452,14 @@ fn a_non_generator_next_type_error_is_catchable() {
         true,
     );
 }
+
+/// A C-style `for (let ...)` loop with a `yield` in its body still produces the
+/// right sequence (generator frames keep every binding in an env cell).
+#[test]
+fn for_let_loop_with_yield_in_generator() {
+    assert_output(
+        "function* g(){ for (let i=0;i<3;i++) { yield i; } }
+         for (const v of g()) console.log(v);",
+        "0\n1\n2\n",
+    );
+}
