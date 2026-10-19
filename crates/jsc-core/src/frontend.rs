@@ -14,8 +14,9 @@ use crate::error::CompileError;
 /// Parse JavaScript `src` into an swc [`Program`].
 ///
 /// The returned [`swc_ecma_ast::Program`] is swc's top-level AST node — either
-/// a `Module` or a `Script` depending on the source. Parse failures are mapped
-/// into [`anyhow::Error`] rather than panicking.
+/// a `Module` or a `Script` depending on the source. Both fatal and recoverable
+/// swc parse errors reject the source as a spanned [`CompileError`] rather
+/// than panicking or silently accepting invalid input.
 pub fn parse(src: &str) -> anyhow::Result<Program> {
     let cm: Lrc<SourceMap> = Lrc::default();
     let fm = cm.new_source_file(Lrc::new(FileName::Anon), src.to_string());
@@ -31,11 +32,18 @@ pub fn parse(src: &str) -> anyhow::Result<Program> {
     // Route swc parser failures through the SAME spanned-diagnostic path as
     // codegen rejections: the parser error carries a source span (via
     // `Spanned`) and a human-readable `kind().msg()`, so the CLI can render a
-    // caret block pointing at the offending location. If the parser produced
-    // several errors, this surfaces the first (most-relevant) fatal one.
-    parser
-        .parse_program()
-        .map_err(|e| CompileError::spanned(e.span(), e.kind().msg().into_owned()).into())
+    // caret block pointing at the offending location. A fatal error wins (it
+    // is the most relevant); otherwise swc may still have collected
+    // recoverable errors (e.g. strict-mode early errors), and the first one in
+    // source order rejects the program.
+    let to_compile_error = |e: swc_ecma_parser::error::Error| {
+        CompileError::spanned(e.span(), e.kind().msg().into_owned())
+    };
+    let program = parser.parse_program().map_err(to_compile_error)?;
+    match parser.take_errors().into_iter().next() {
+        Some(e) => Err(to_compile_error(e).into()),
+        None => Ok(program),
+    }
 }
 
 #[cfg(test)]

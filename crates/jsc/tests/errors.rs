@@ -192,6 +192,28 @@ fn parse_error_renders_caret_diagnostic() {
     );
 }
 
+/// A *recoverable* swc parse error (a TS annotation in plain JS) is not
+/// silently accepted: the CLI exits 2 with a caret diagnostic and prints
+/// nothing on stdout.
+#[test]
+fn recoverable_parse_error_renders_caret_diagnostic() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-p", "let x: number = 1; x"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert!(output.status.code() == Some(2), "must exit 2");
+    assert!(output.stdout.is_empty(), "stdout must stay empty");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--> <eval>:1:"),
+        "stderr should carry a 1-based location, got: {stderr}"
+    );
+    assert!(
+        stderr.contains('^'),
+        "stderr should draw a caret under the parse error, got: {stderr}"
+    );
+}
+
 /// Consolidated diagnostics contract (§9): a table of distinct compile-error
 /// classes — a `const` reassignment, an undeclared variable, a `for-of` loop,
 /// and an swc parse error — each renders the rustc/swc-style block, so every
