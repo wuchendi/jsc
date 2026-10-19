@@ -167,12 +167,6 @@ impl<'a> LowerCtx<'a> {
         } else {
             None
         };
-        if module.is_some() {
-            self.shared
-                .module_mutable
-                .borrow_mut()
-                .insert(name.to_owned(), mutable);
-        }
         // An `env_backed` (generator) frame boxes EVERY binding into an env cell so
         // it survives across a `yield`; an ordinary frame boxes only the bindings
         // capture analysis flagged.
@@ -260,15 +254,16 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Resolve a module binding from a top-level function body, where `main`'s
-    /// frame is absent. The body may run before the binding's declaration (the
-    /// function is hoisted), so the cell pointer is guarded: while the cell still
-    /// holds the TDZ hole, any read or write throws a `ReferenceError`.
+    /// frame is absent, or from a closure nested in `main` lowered before the
+    /// binding's declaration (a forward reference). Either may run before the
+    /// declaration, so the cell pointer is guarded: while the cell still holds the
+    /// TDZ hole, any read or write throws a `ReferenceError`.
     fn resolve_module(&self, name: &str) -> Option<Resolved> {
-        if self.main_ctx {
+        if self.main_ctx && self.frames.len() == 1 {
             return None;
         }
         let slot = *self.shared.module_slots.get(name)?;
-        let mutable = *self.shared.module_mutable.borrow().get(name)?;
+        let mutable = *self.shared.module_mutable.get(name)?;
         let message = format!("Cannot access '{name}' before initialization");
         let error = IrNode::Object(vec![
             ("name".to_owned(), IrNode::Str("ReferenceError".to_owned())),
@@ -406,10 +401,16 @@ impl<'a> LowerCtx<'a> {
     /// binding `id`, evaluated in the current (enclosing) frame while building an
     /// inner function's environment: a `Local` when this frame declares the
     /// cell, else an `EnvLoad` from this frame's own environment (routing the
-    /// capture transitively out to the declaring frame).
+    /// capture transitively out to the declaring frame). An `env_backed`
+    /// (generator) frame keeps its own cells in its environment, not in locals.
     pub(super) fn capture_source(&mut self, id: u32) -> IrNode {
         let top = self.top();
         if let Some(&local) = self.frames[top].by_id.get(&id) {
+            if self.frames[top].env_backed
+                && let Some(&slot) = self.frames[top].env_index.get(&id)
+            {
+                return IrNode::EnvLoad(slot);
+            }
             return IrNode::Local(local);
         }
         let declaring = (0..top).find(|&fi| self.frames[fi].by_id.contains_key(&id));

@@ -550,3 +550,42 @@ fn handled_rejections_complete_normally() {
 fn sync_uncaught_beats_unhandled_rejection() {
     assert_uncaught("Promise.reject(1); throw 2;", "2");
 }
+
+/// A closure created before an `await` captures the async frame's parameter
+/// cell and reads it after resumption.
+#[test]
+fn closure_created_before_await_captures_param() {
+    assert_output(
+        "async function a(n){ const f = () => n; await 0; return f() } a(3).then(v=>console.log(v))",
+        "3\n",
+    );
+}
+
+#[test]
+fn closure_created_after_await_captures_param() {
+    assert_output(
+        "async function a(n){ await 0; const f = () => n; return f() } a(3).then(v=>console.log(v))",
+        "3\n",
+    );
+}
+
+/// A closure and the async body share a local's cell across an `await`.
+#[test]
+fn closure_shares_async_local_across_await() {
+    assert_output(
+        "async function a(){ let s = 1; const bump = () => { s = s * 3; }; bump(); await 0; bump(); await 0; return s; }
+         a().then(v => console.log(v));",
+        "9\n",
+    );
+}
+
+/// A closure passed as a `.then` reaction inside an async body captures its
+/// local and runs after the function has already returned.
+#[test]
+fn closure_over_async_local_runs_as_reaction() {
+    assert_output(
+        "async function a(){ let tag = \"x\"; await 0; Promise.resolve(1).then(v => console.log(tag, v)); tag = \"y\"; }
+         a();",
+        "y 1\n",
+    );
+}

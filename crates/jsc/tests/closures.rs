@@ -288,3 +288,64 @@ fn for_of_and_for_in_closures_capture_per_iteration_binding() {
         "a,b"
     );
 }
+
+/// An arrow in top-level code referencing a top-level binding declared LATER
+/// resolves to the module binding: it reads the value once initialized, and
+/// throws the TDZ `ReferenceError` when called before the declaration runs
+/// (checked via `.name`: `instanceof ReferenceError` is not lowered yet). A
+/// function declaration referencing a later top-level `const` keeps working.
+#[test]
+fn top_level_closure_forward_reference() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const f = () => later; const later = 4; console.log(f())"
+        ]),
+        "4"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const f = () => later; \
+             try { f() } catch (e) { console.log(e.name, e instanceof Error) } \
+             const later = 1"
+        ]),
+        "ReferenceError true"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ return k } const k = 9; console.log(f())"
+        ]),
+        "9"
+    );
+}
+
+/// A top-level binding referenced only from a parameter default initializer
+/// (of a top-level declaration, an arrow, or a nested function expression) is
+/// captured like a body reference.
+#[test]
+fn param_default_captures_top_level_binding() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const d = 7; function f(a = d){ return a } console.log(f())"
+        ]),
+        "7"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let d = 1; const g = (a = d) => a; d = 2; console.log(g())"
+        ]),
+        "2"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const d = 3; function outer(){ return function(a = d){ return a }() } \
+             console.log(outer())"
+        ]),
+        "3"
+    );
+}
