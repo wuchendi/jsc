@@ -33,10 +33,10 @@ jobs:
 
       # The @cdlab/jsc package loads a wasm-bindgen artifact that is gitignored,
       # so build it first (needs Rust + wasm-pack).
-      - name: Install toolchain 1.96.0 (+ wasm target)
+      - name: Install toolchain 1.99.1 (+ wasm target)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.96.0
+          toolchain: 1.99.1
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
