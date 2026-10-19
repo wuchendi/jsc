@@ -190,7 +190,7 @@ impl LowerCtx<'_> {
     fn lower_generator_body(
         &mut self,
         function: &swc_ecma_ast::Function,
-        block: &swc_ecma_ast::BlockStmt,
+        block: &swc_ecma_ast::FunctionBody,
         uniform_params: u32,
     ) -> anyhow::Result<(Vec<IrStmt>, u32)> {
         self.set_env_backed();
