@@ -273,12 +273,15 @@ fn object_property_assignment_expression_is_the_stored_value() {
 }
 
 #[test]
-fn object_property_assignment_missing_key_is_a_noop() {
-    // Existing keys only: `o.b = 5` on an object without `b` writes nothing
-    // and must not corrupt the existing `a` entry.
-    let value = crate::run::compile_and_run("let o = {a: 1}; o.b = 5; o.a")
-        .expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Number(1.0));
+fn object_property_assignment_missing_key_throws() {
+    // Fixed-shape objects: `o.b = 5` on an object without `b` raises the
+    // add-property `TypeError` instead of writing anything.
+    let err = crate::run::compile_and_run("let o = {a: 1}; o.b = 5; o.a")
+        .expect_err("absent-key write should throw");
+    assert_eq!(
+        err.to_string(),
+        "Uncaught TypeError: Cannot add property 'b': dynamic properties are not supported yet"
+    );
 }
 
 #[test]
@@ -311,6 +314,35 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
     assert_eq!(
         crate::run::decode(bits, &memory),
         crate::run::Value::Number(42.0)
+    );
+}
+
+#[test]
+fn object_property_assignment_via_indexset_ir_missing_key_throws() {
+    // Direct IR: an `IndexSet` whose key the object lacks leaves the
+    // add-property `TypeError` in flight (`__obj_set` reports the miss).
+    let program = IrProgram {
+        locals: 1,
+        stmts: vec![
+            IrStmt::Decl {
+                local: 0,
+                init: IrNode::Object(vec![("x".to_owned(), IrNode::Num(10.0))]),
+            },
+            IrStmt::Expr(IrNode::IndexSet {
+                obj: Box::new(IrNode::Local(0)),
+                index: Box::new(IrNode::Str("y".to_owned())),
+                value: Box::new(IrNode::Num(42.0)),
+            }),
+        ],
+        functions: Vec::new(),
+        module_cells: 0,
+    };
+    let bytes = emit(&program);
+    validate(&bytes);
+    let err = crate::run::run(&bytes).expect_err("absent-key write should throw");
+    assert_eq!(
+        err.to_string(),
+        "Uncaught TypeError: Cannot add property 'y': dynamic properties are not supported yet"
     );
 }
 

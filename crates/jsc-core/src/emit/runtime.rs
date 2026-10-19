@@ -653,7 +653,8 @@ pub(super) fn emit_obj_get(str_eq_index: u32, self_index: u32, proto_key: Option
     function
 }
 
-/// Emit the `__obj_set(obj_ptr: i32, key_ptr: i32, val: i64)` property writer.
+/// Emit the `__obj_set(obj_ptr: i32, key_ptr: i32, val: i64) -> i32` property
+/// writer.
 ///
 /// `obj_ptr` is the byte offset of a `[n:u32][key_ptr:i64, val:i64]..` heap
 /// object; `key_ptr` is the byte offset of the `[len:u32][utf8]` key to store
@@ -661,9 +662,11 @@ pub(super) fn emit_obj_get(str_eq_index: u32, self_index: u32, proto_key: Option
 /// [`emit_obj_get`]: entry `k` lives at `obj_ptr + 16*k`, its key jsval at offset
 /// `+4`, its value jsval at offset `+12`. On the first key whose byte content
 /// equals `key_ptr` (via `__str_eq` at `str_eq_index`), `val` is stored into that
-/// entry's value slot and the scan stops. If no key matches, nothing is written
-/// (existing keys only — growth is deferred). Params occupy locals 0/1/2; two
-/// extra `i32` locals hold `n` and the loop index `k`.
+/// entry's value slot and `1` is returned. If no key matches, nothing is written
+/// (existing keys only — growth is deferred) and `0` is returned; the caller
+/// branches on that flag into the out-of-line `__prop_throw`, so a hit costs
+/// the store plus one caller-side `i32.eqz`/`if`. Params occupy locals 0/1/2;
+/// two extra `i32` locals hold `n` and the loop index `k`.
 pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
     let mut function = Function::new(vec![(2, ValType::I32)]);
     let (obj_ptr, key_ptr, val, n, k) = (0, 1, 2, 3, 4);
@@ -693,7 +696,7 @@ pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
     // Scan entries; `k` starts at 0 (the fresh local's default).
     function.instruction(&Instruction::Block(BlockType::Empty));
     function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if k >= n { break -> no match, no-op }.
+    // if k >= n { break -> no match }.
     function.instruction(&Instruction::LocalGet(k));
     function.instruction(&Instruction::LocalGet(n));
     function.instruction(&Instruction::I32GeU);
@@ -706,7 +709,7 @@ pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I64Load(key_slot));
     function.instruction(&Instruction::I32WrapI64);
-    // if __str_eq(candidate_key, key_ptr) { store val at obj_ptr + 16*k + 12; stop }.
+    // if __str_eq(candidate_key, key_ptr) { store val at obj_ptr + 16*k + 12; return 1 }.
     function.instruction(&Instruction::LocalGet(key_ptr));
     function.instruction(&Instruction::Call(str_eq_index));
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -717,6 +720,7 @@ pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(val));
     function.instruction(&Instruction::I64Store(val_slot));
+    function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
     // k += 1; continue.
@@ -728,6 +732,8 @@ pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
     function.instruction(&Instruction::End); // loop
     function.instruction(&Instruction::End); // block
 
+    // No key matched: report the miss.
+    function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
     function
 }
@@ -1456,7 +1462,7 @@ pub(super) fn emit_obj_delete(str_eq_index: u32) -> Function {
     // Scan entries; `k` starts at 0 (the fresh local's default).
     function.instruction(&Instruction::Block(BlockType::Empty));
     function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if k >= n { break -> no match, no-op }.
+    // if k >= n { break -> no match }.
     function.instruction(&Instruction::LocalGet(k));
     function.instruction(&Instruction::LocalGet(n));
     function.instruction(&Instruction::I32GeU);
