@@ -278,3 +278,17 @@ fn direct_calls_tolerate_missing_and_extra_arguments() {
         assert_eq!(jsc(&["-p", src]), want, "{src}");
     }
 }
+
+/// User methods named `next`/`then` are ordinary method calls on non-generator,
+/// non-promise receivers.
+#[test]
+fn user_next_and_then_methods_via_eval() {
+    assert_eq!(
+        jsc(&["-p", "const o = { next() { return 7; } }; o.next()"]),
+        "7"
+    );
+    assert_eq!(
+        jsc(&["-p", "const t = { then(a) { return a + 1; } }; t.then(1)"]),
+        "2"
+    );
+}

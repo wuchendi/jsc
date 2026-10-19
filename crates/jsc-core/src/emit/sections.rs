@@ -27,6 +27,7 @@ pub(super) fn build_type_and_function_sections<'a>(
     u32,
     u32,
     u32,
+    u32,
 ) {
     let mut types = TypeSection::new();
     let mut functions = FunctionSection::new();
@@ -73,10 +74,12 @@ pub(super) fn build_type_and_function_sections<'a>(
         method: 2,
         // The host promise imports follow the `print`/`__convert`/`__method` imports in declaration
         // order: `__promise` index 3, `__then` index 4. The host wall clock
-        // (`__now`, backing `Date`) is appended last, index 5.
+        // (`__now`, backing `Date`) is index 5, and `__parse_int` (backing
+        // `parseInt`) is appended last, index 6.
         promise: 3,
         then: 4,
         now: 5,
+        parse_int: 6,
         alloc: alloc_index,
         concat: concat_index,
         str_eq: str_eq_index,
@@ -228,8 +231,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I64], &[ValType::I64]);
         // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
         helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
-        // `__prop_throw(key: i64, grow: i32) -> ()`.
-        helper(&[ValType::I64, ValType::I32], &[]);
+        // `__prop_throw(recv: i64, key: i64, mode: i32) -> ()`.
+        helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
         // `__box_f64(x: f64) -> i64`.
         helper(&[ValType::F64], &[ValType::I64]);
         // `__to_number(v: i64) -> i64`.
@@ -278,6 +281,11 @@ pub(super) fn build_type_and_function_sections<'a>(
     // The host wall-clock import type (backing `Date`): `__now() -> f64`.
     let now_type = helper_type_base + 46;
     types.ty().function([], [ValType::F64]);
+    // The host `parseInt` import type: `__parse_int(s: i64, radix: i64) -> i64`.
+    let parse_int_type = helper_type_base + 47;
+    types
+        .ty()
+        .function([ValType::I64, ValType::I64], [ValType::I64]);
 
     (
         types,
@@ -289,6 +297,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         promise_type,
         then_type,
         now_type,
+        parse_int_type,
     )
 }
 
@@ -575,9 +584,14 @@ pub(super) fn collect_node<'a>(
         // A generator `yield e` / `IsGenerator` carries only its operand.
         | IrNode::Yield(operand)
         | IrNode::IsGenerator(operand)
-        | IrNode::ConvertCall { arg: operand, .. }
         | IrNode::ObjectBuiltin { arg: operand, .. } => {
             collect_node(operand, order, seen);
+        }
+        IrNode::ConvertCall { arg, radix, .. } => {
+            collect_node(arg, order, seen);
+            if let Some(radix) = radix {
+                collect_node(radix, order, seen);
+            }
         }
         IrNode::FuncValue { captures, .. } => {
             for capture in captures {
@@ -781,6 +795,28 @@ pub(super) fn collect_node<'a>(
                     order.push(s);
                 }
             }
+            collect_node(recv, order, seen);
+            for arg in args {
+                collect_node(arg, order, seen);
+            }
+        }
+        // A promise / generator method threads its method name (the user-method
+        // fallback key) into the string table; the generator path builds a
+        // `{ value, done }` result, and the guarded fallback throws a nullish /
+        // not-a-function TypeError — seed all of those strings too.
+        IrNode::ReceiverMethod { op, recv, args, .. } => {
+            let keys: &[&'static str] = if matches!(op, ReceiverOp::Next) {
+                &["value", "done"]
+            } else {
+                &[]
+            };
+            let name = [op.name()];
+            for &s in name.iter().chain(keys).chain(&INTERNAL_TYPE_ERROR_STRS) {
+                if seen.insert(s) {
+                    order.push(s);
+                }
+            }
+            seed_nullish_strs(order, seen);
             collect_node(recv, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);

@@ -327,6 +327,37 @@ pub enum DateOp {
     ToIsoString,
 }
 
+/// A promise / generator instance method claimed from a `<expr>.<name>(args)`
+/// member callee at codegen. These names (`then`/`catch`/`finally`/`next`) are
+/// just as common as ordinary user methods (thenables, iterator objects), so the
+/// lowered [`IrNode::ReceiverMethod`] dispatches at RUNTIME on the receiver's TYPE
+/// BYTE: a promise (resp. generator) takes the builtin path, anything else falls
+/// back to a plain user method call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverOp {
+    /// `p.then(onF, onR)` on a `TYPE_PROMISE` receiver.
+    Then,
+    /// `p.catch(onR)` on a `TYPE_PROMISE` receiver.
+    Catch,
+    /// `p.finally(fn)` on a `TYPE_PROMISE` receiver.
+    Finally,
+    /// `gen.next(v)` on a `TYPE_GENERATOR` receiver.
+    Next,
+}
+
+impl ReceiverOp {
+    /// The source method name, used as the member key of the user-method fallback.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Then => "then",
+            Self::Catch => "catch",
+            Self::Finally => "finally",
+            Self::Next => "next",
+        }
+    }
+}
+
 /// One element of a spread-capable sequence — an array literal or a call's
 /// argument list — that contains at least one `...` source. The whole sequence
 /// is materialized at runtime (its length is not known until then), appending
@@ -765,15 +796,19 @@ pub enum IrNode {
     /// `parseInt(s)` / `parseFloat(s)`. These are bare global function
     /// names, not real bindings: they are recognized syntactically at codegen
     /// (only when nothing of the same name shadows them) and take exactly one
-    /// argument. `Boolean` lowers to inline JS-truthiness wasm; the other four
-    /// delegate to the host `__convert` import, which reuses the run stage's
-    /// `format_value`/parse helpers (so `String(42) == "42"`, matching
+    /// argument (`parseInt` also an optional radix). `Boolean` lowers to inline
+    /// JS-truthiness wasm; `parseInt` calls the host `__parse_int` import; the
+    /// other three delegate to the host `__convert` import, which reuses the run
+    /// stage's `format_value`/parse helpers (so `String(42) == "42"`, matching
     /// `format_number`).
     ConvertCall {
         /// Which conversion this call performs.
         op: ConvertOp,
-        /// The single argument expression, evaluated once to a jsval.
+        /// The first argument expression, evaluated once to a jsval.
         arg: Box<IrNode>,
+        /// The `parseInt` radix argument, evaluated after `arg`; `None` for an
+        /// omitted radix and for every other conversion.
+        radix: Option<Box<IrNode>>,
     },
     /// The conditional (ternary) operator `cond ? then_branch : else_branch`.
     /// `cond` is evaluated under JS truthiness; the selected branch's jsval is
@@ -989,6 +1024,27 @@ pub enum IrNode {
         /// The source method name (`"set"`/`"get"`/…), used as the member key of
         /// the user-method fallback and interned as a static string.
         method_name: String,
+        /// Fresh temp local holding the evaluated receiver across the dispatch.
+        recv_local: u32,
+        /// Fresh temp local for the fallback user method call's own receiver stash.
+        fallback_obj_local: u32,
+    },
+    /// A promise / generator instance method call `recv.<op>(args)`. Like
+    /// [`IrNode::MapMethod`], `recv` is evaluated ONCE into `recv_local`, then a
+    /// RUNTIME dispatch on its TYPE BYTE selects the path: a `TYPE_PROMISE`
+    /// receiver of `then`/`catch`/`finally` runs [`IrNode::PromiseThen`] /
+    /// [`IrNode::PromiseFinally`], a `TYPE_GENERATOR` receiver of `next` runs
+    /// [`IrNode::GenResume`]; any other receiver falls back to an ordinary user
+    /// method call `recv.<op name>(args)` (binding `this = recv`, nullish-guarded),
+    /// so a thenable or iterator object of the same shape still works.
+    ReceiverMethod {
+        /// Which builtin method the promise / generator path performs.
+        op: ReceiverOp,
+        /// The receiver expression (evaluated once into `recv_local`).
+        recv: Box<IrNode>,
+        /// The call arguments in source order; the builtin path uses the leading
+        /// handler / sent-value slots, the user-method fallback receives them all.
+        args: Vec<IrNode>,
         /// Fresh temp local holding the evaluated receiver across the dispatch.
         recv_local: u32,
         /// Fresh temp local for the fallback user method call's own receiver stash.

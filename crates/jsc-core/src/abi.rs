@@ -278,7 +278,7 @@ pub(crate) const IMPORT_MODULE: &str = "env";
 pub(crate) const PRINT_IMPORT_NAME: &str = "print";
 
 /// The field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseInt`/`parseFloat` conversions.
+/// `String`/`Number`/`parseFloat` conversions.
 pub(crate) const CONVERT_IMPORT_NAME: &str = "__convert";
 
 /// The field name of the host `__method` import backing the non-callback
@@ -301,6 +301,11 @@ pub(crate) const THEN_IMPORT_NAME: &str = "__then";
 /// `Date.now()` / `new Date()`. It takes no arguments and returns the current
 /// wall-clock time as an f64 count of milliseconds since the Unix epoch.
 pub(crate) const NOW_IMPORT_NAME: &str = "__now";
+
+/// The field name of the host `__parse_int` import backing `parseInt(s, radix)`.
+/// It receives the string and radix jsvals (`undefined` for an omitted radix) and
+/// returns the parsed number jsval.
+pub(crate) const PARSE_INT_IMPORT_NAME: &str = "__parse_int";
 
 /// `__promise` op flag: `Promise.resolve(a)` — a promise already fulfilled
 /// with `a` (or `a` itself when it is already a promise).
@@ -402,9 +407,6 @@ pub(crate) const CONVERT_OP_TO_STRING: i32 = 0;
 
 /// `__convert` op flag: coerce the argument to a number (`Number(x)`).
 pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
-
-/// `__convert` op flag: parse a leading integer (`parseInt(x)`).
-pub(crate) const CONVERT_OP_PARSE_INT: i32 = 2;
 
 /// `__convert` op flag: parse a leading float (`parseFloat(x)`).
 pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;

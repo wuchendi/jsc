@@ -45,3 +45,40 @@ fn coercion_composes_and_preserves_order() {
     // A program can run these to completion without error.
     assert!(compile_and_run("\"x\" + 8").is_ok());
 }
+
+/// With no string operand, `+` applies `ToNumber` to both sides: `null` is `0`,
+/// booleans are `0`/`1`, and `undefined` is `NaN`.
+#[test]
+fn non_string_primitives_add_numerically() {
+    assert_number("1 + null", 1.0);
+    assert_number("null + 1", 1.0);
+    assert_number("null + null", 0.0);
+    assert_number("true + 1", 2.0);
+    assert_number("true + true", 2.0);
+    assert_number("false + 1", 1.0);
+    let result = compile_and_run("undefined + 1");
+    assert!(
+        matches!(result, Ok(jsc_core::run::Value::Number(n)) if n.is_nan()),
+        "`undefined + 1` should be NaN, got {result:?}"
+    );
+}
+
+/// A string on either side still concatenates, after the other side's `ToString`.
+#[test]
+fn string_side_still_concatenates() {
+    assert_string("\"a\" + true", "atrue");
+    assert_string("\"a\" + undefined", "aundefined");
+    assert_string("\"a\" + null", "anull");
+    assert_string("1 + \"2\"", "12");
+}
+
+/// A heap operand takes the concat path (`ToPrimitive` yields a string): an
+/// array becomes its `join()` string, even when the other side is not a string.
+#[test]
+fn array_operand_concatenates() {
+    assert_string("[1] + 1", "11");
+    assert_string("1 + [2,3]", "12,3");
+    assert_string("[] + []", "");
+    assert_string("null + []", "null");
+    assert_string("true + [1]", "true1");
+}
