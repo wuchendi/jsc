@@ -290,6 +290,41 @@ pub(super) fn emit_pow(
         function.instruction(&Instruction::F64Mul);
         set(function, local);
     }
+    /// `res = base^cnt` for an integer `cnt` in `[0, f64::MAX]` by
+    /// square-and-multiply over a halving counter (consumes `base` and `cnt`).
+    fn int_pow(function: &mut Function, res: u32, base: u32, cnt: u32) {
+        function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
+        set(function, res);
+        // while cnt >= 1 { if cnt is odd { result *= base }; base *= base;
+        // cnt = floor(cnt / 2) }
+        function.instruction(&Instruction::Block(BlockType::Empty));
+        function.instruction(&Instruction::Loop(BlockType::Empty));
+        get(function, cnt);
+        function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
+        function.instruction(&Instruction::F64Lt);
+        function.instruction(&Instruction::BrIf(1));
+        // odd: floor(cnt * 0.5) * 2 != cnt.
+        get(function, cnt);
+        function.instruction(&Instruction::F64Const(Ieee64::from(0.5)));
+        function.instruction(&Instruction::F64Mul);
+        function.instruction(&Instruction::F64Floor);
+        function.instruction(&Instruction::F64Const(Ieee64::from(2.0)));
+        function.instruction(&Instruction::F64Mul);
+        get(function, cnt);
+        function.instruction(&Instruction::F64Ne);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        mul_into(function, res, base);
+        function.instruction(&Instruction::End);
+        mul_into(function, base, base);
+        get(function, cnt);
+        function.instruction(&Instruction::F64Const(Ieee64::from(0.5)));
+        function.instruction(&Instruction::F64Mul);
+        function.instruction(&Instruction::F64Floor);
+        set(function, cnt);
+        function.instruction(&Instruction::Br(0));
+        function.instruction(&Instruction::End); // loop
+        function.instruction(&Instruction::End); // block
+    }
     let f64c = |function: &mut Function, v: f64| {
         function.instruction(&Instruction::F64Const(Ieee64::from(v)));
     };
@@ -298,14 +333,16 @@ pub(super) fn emit_pow(
     // scratch at `scratch + 3` (unused during pow, which never allocates) holds the
     // negative-exponent flag. `scratch + 4` (the short-circuit-operand temp, dead
     // on any path that evaluates a `**` sub-expression) holds the fractional part,
-    // and `scratch + 24` (a `Date` field-method slot; no child sub-expression is
-    // live while pow runs) keeps the original base for the fractional stage.
+    // and `scratch + 24` / `+25` (`Date` field-method slots; no child
+    // sub-expression is live while pow runs) keep the original base and integer
+    // count for the fractional stage and the underflow fallback.
     let s_base = scratch;
     let s_res = scratch + 1;
     let s_cnt = scratch + 2;
     let s_neg = scratch + 3;
     let s_frac = scratch + 4;
     let s_orig = scratch + 24;
+    let s_cnt0 = scratch + 25;
 
     // Evaluate both operands onto the stack FIRST, then stash (exp is on top), so a
     // nested `**`/`Math.pow` inside `exp` finishes before any scratch local is set
@@ -394,41 +431,45 @@ pub(super) fn emit_pow(
     set(function, s_base);
     function.instruction(&Instruction::End);
 
-    // orig = base (the squaring loop below consumes `base`); result = 1.0.
+    // orig = base (the squaring loop below consumes `base`).
     function.instruction(&Instruction::LocalGet(s_base));
     function.instruction(&Instruction::LocalSet(s_orig));
-    f64c(function, 1.0);
-    set(function, s_res);
 
-    // while cnt >= 1 { if cnt is odd { result *= base }; base *= base;
-    // cnt = floor(cnt / 2) }
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    get(function, s_cnt);
-    f64c(function, 1.0);
+    // Keep the integer count for the underflow fallback below.
+    function.instruction(&Instruction::LocalGet(s_cnt));
+    function.instruction(&Instruction::LocalSet(s_cnt0));
+    int_pow(function, s_res, s_base, s_cnt);
+
+    // A negative integer exponent whose positive power overflowed (e.g.
+    // `2 ** -1074`, where `2^1074` is Infinity) would reciprocate to 0; rebuild it
+    // as `(1 / orig)^cnt` instead, which reaches the subnormal range, and skip the
+    // reciprocal.
+    function.instruction(&Instruction::LocalGet(s_neg));
+    get(function, s_frac);
+    f64c(function, 0.0);
+    function.instruction(&Instruction::F64Eq);
+    function.instruction(&Instruction::I32And);
+    get(function, s_res);
+    function.instruction(&Instruction::F64Abs);
+    f64c(function, f64::INFINITY);
+    function.instruction(&Instruction::F64Eq);
+    function.instruction(&Instruction::I32And);
+    get(function, s_orig);
+    function.instruction(&Instruction::F64Abs);
+    f64c(function, f64::INFINITY);
     function.instruction(&Instruction::F64Lt);
-    function.instruction(&Instruction::BrIf(1));
-    // odd: floor(cnt * 0.5) * 2 != cnt.
-    get(function, s_cnt);
-    f64c(function, 0.5);
-    function.instruction(&Instruction::F64Mul);
-    function.instruction(&Instruction::F64Floor);
-    f64c(function, 2.0);
-    function.instruction(&Instruction::F64Mul);
-    get(function, s_cnt);
-    function.instruction(&Instruction::F64Ne);
+    function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Empty));
-    mul_into(function, s_res, s_base);
+    f64c(function, 1.0);
+    get(function, s_orig);
+    function.instruction(&Instruction::F64Div);
+    set(function, s_base);
+    function.instruction(&Instruction::LocalGet(s_cnt0));
+    function.instruction(&Instruction::LocalSet(s_cnt));
+    int_pow(function, s_res, s_base, s_cnt);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(s_neg));
     function.instruction(&Instruction::End);
-    mul_into(function, s_base, s_base);
-    get(function, s_cnt);
-    f64c(function, 0.5);
-    function.instruction(&Instruction::F64Mul);
-    function.instruction(&Instruction::F64Floor);
-    set(function, s_cnt);
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
 
     // Fractional part: if frac > 0, apply orig^frac by the bit-by-bit sqrt method.
     // `mul` (reusing s_base) starts at sqrt(orig) = orig^(1/2) and is square-rooted

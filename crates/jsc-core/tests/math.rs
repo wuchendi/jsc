@@ -105,7 +105,8 @@ fn math_pow_large_exponents_terminate() {
     assert_eval("Math.pow(2, -2147483648)", "0");
     assert_eval("Math.pow(-2, 1e308)", "Infinity");
     assert_eval("Math.pow(0.5, 1e308)", "0");
-    assert_eval("Math.pow(2, 1074) === Infinity", "false");
+    assert_eval("Math.pow(2, 1023) === Infinity", "false");
+    assert_eval("2 ** 1024", "Infinity");
     assert_eval("2 ** -1074 > 0", "true");
     assert_eval("1.5 ** 3", "3.375");
     assert_eval("4 ** 2.5", "32");
