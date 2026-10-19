@@ -153,6 +153,11 @@ fn for_of_member_and_pattern_assignment_heads() {
 #[test]
 fn destructuring_assignment_completion_is_rhs() {
     assert_eq!(jsc(&["-p", "const o={a:0}; [o.a] = [4]"]), "[ 4 ]");
+    // Inside a top-level `try`, the RHS is the tracked completion value.
+    assert_eq!(
+        jsc(&["-p", "const o={a:0}; try { [o.a] = [4] } catch (e) {}"]),
+        "[ 4 ]"
+    );
 }
 
 /// Writing an unknown property on a fixed-shape object still throws.

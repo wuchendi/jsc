@@ -211,11 +211,7 @@ impl LowerCtx<'_> {
         }
 
         match body_kind {
-            BodyKind::Block(stmts) => {
-                for stmt in stmts {
-                    self.lower_stmt(stmt, &mut body)?;
-                }
-            }
+            BodyKind::Block(stmts) => self.lower_stmts(stmts, &mut body)?,
             BodyKind::Expr(expr) => {
                 let node = self.lower_expr(expr)?;
                 body.push(IrStmt::Return(Some(node)));
@@ -385,26 +381,22 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower a nested `function foo(){ .. }` declaration: lift its body
-    /// to a top-level function (registered in the funcref table, may capture
-    /// enclosing bindings like an arrow) and bind `foo` to the resulting function
-    /// value in the current scope. `foo` is not visible inside its own body
-    /// (lowered before the name is bound), so name-recursion of a nested
-    /// declaration is unsupported.
+    /// Lower a nested `function foo(){ .. }` declaration in place (outside a
+    /// hoisting statement list, see [`Self::lower_stmts`]): bind `foo` to its
+    /// function value in the current scope. `foo` is not visible inside its own
+    /// body here (lowered before the name is bound).
     pub(super) fn lower_nested_fn_decl(
         &mut self,
         fn_decl: &FnDecl,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let block = fn_decl
-            .function
-            .body
-            .as_ref()
-            .ok_or_else(|| anyhow!("function declaration requires a body"))?;
-        reject_unsupported_function(&fn_decl.function)?;
-        let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
-        let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&block.stmts))?;
+        let value = self.lower_nested_fn_value(fn_decl)?;
         let local = self.declare(fn_decl.ident.sym.as_ref(), true, fn_decl.ident.span.lo.0);
+        // A generator frame's binding lives in its env cell (`push_binding`).
+        if self.env_slot_for_local(local).is_some() {
+            self.push_binding(local, value, out);
+            return Ok(());
+        }
         let init = if self.is_cell(local) {
             IrNode::CellNew(Box::new(value))
         } else {
@@ -412,6 +404,20 @@ impl LowerCtx<'_> {
         };
         out.push(IrStmt::Decl { local, init });
         Ok(())
+    }
+
+    /// Lift a nested function declaration's body to a top-level function
+    /// (registered in the funcref table, may capture enclosing bindings like an
+    /// arrow) and return the [`IrNode::FuncValue`] building its value.
+    pub(super) fn lower_nested_fn_value(&mut self, fn_decl: &FnDecl) -> anyhow::Result<IrNode> {
+        let block = fn_decl
+            .function
+            .body
+            .as_ref()
+            .ok_or_else(|| anyhow!("function declaration requires a body"))?;
+        reject_unsupported_function(&fn_decl.function)?;
+        let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
+        self.lower_lifted_function(&param_pats, BodyKind::Block(&block.stmts))
     }
 
     /// Lower an arrow function `(a, b) => a + b` / `x => x * x` / `(n) => { .. }`

@@ -39,9 +39,7 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
             resolver.declare_param(&param.pat);
         }
         if let Some(block) = &fn_decl.function.body {
-            for stmt in &block.stmts {
-                resolver.stmt(stmt);
-            }
+            resolver.stmts(&block.stmts);
         }
         resolver.exit_function();
     }
@@ -293,8 +291,9 @@ impl CaptureResolver {
                 }
             }
             Stmt::Decl(Decl::Fn(f)) => {
-                // A nested function declaration: analyze its body in a fresh
-                // frame, then bind its name in the enclosing scope.
+                // A nested function declaration outside a hoisting statement list
+                // (see `stmts`): analyze its body in a fresh frame, then bind its
+                // name in the enclosing scope.
                 self.function(
                     &f.function.params,
                     f.function.body.as_ref().map(|b| &b.stmts),
@@ -302,13 +301,7 @@ impl CaptureResolver {
                 self.declare(f.ident.sym.as_ref(), f.ident.span.lo.0);
             }
             Stmt::Decl(Decl::Class(c)) => self.class_decl(c),
-            Stmt::Block(b) => {
-                self.push_scope();
-                for s in &b.stmts {
-                    self.stmt(s);
-                }
-                self.pop_scope();
-            }
+            Stmt::Block(b) => self.analyze_scoped(&b.stmts),
             Stmt::If(i) => {
                 self.expr(&i.test);
                 self.stmt(&i.cons);
@@ -377,9 +370,7 @@ impl CaptureResolver {
                     if let Some(Pat::Ident(ident)) = &handler.param {
                         self.declare(ident.id.sym.as_ref(), binding_id(ident));
                     }
-                    for s in &handler.body.stmts {
-                        self.stmt(s);
-                    }
+                    self.stmts(&handler.body.stmts);
                     self.pop_scope();
                 }
                 // The finally block is its own scope.
@@ -420,9 +411,7 @@ impl CaptureResolver {
                         self.reference(sup);
                     }
                     if let Some(body) = &ctor.body {
-                        for s in &body.stmts {
-                            self.stmt(s);
-                        }
+                        self.stmts(&body.stmts);
                     }
                     self.exit_function();
                 }
@@ -438,9 +427,7 @@ impl CaptureResolver {
                         self.reference(sup);
                     }
                     if let Some(body) = &m.function.body {
-                        for s in &body.stmts {
-                            self.stmt(s);
-                        }
+                        self.stmts(&body.stmts);
                     }
                     self.exit_function();
                 }
@@ -481,10 +468,37 @@ impl CaptureResolver {
     /// `finally` body), so block-scoped bindings do not leak outward.
     fn analyze_scoped(&mut self, stmts: &[Stmt]) {
         self.push_scope();
-        for s in stmts {
-            self.stmt(s);
-        }
+        self.stmts(stmts);
         self.pop_scope();
+    }
+
+    /// Analyze a function body or block statement list in the current scope,
+    /// mirroring [`LowerCtx::lower_stmts`]: its function declarations are
+    /// hoisted, so their names are bound before any statement and their bodies
+    /// are analyzed last, after every binding of the list is declared (a body
+    /// may capture a `let`/`const` declared later in the list, or a sibling).
+    fn stmts(&mut self, stmts: &[Stmt]) {
+        let fns: Vec<&FnDecl> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Decl(Decl::Fn(f)) => Some(f),
+                _ => None,
+            })
+            .collect();
+        for f in &fns {
+            self.declare(f.ident.sym.as_ref(), f.ident.span.lo.0);
+        }
+        for s in stmts {
+            if !matches!(s, Stmt::Decl(Decl::Fn(_))) {
+                self.stmt(s);
+            }
+        }
+        for f in fns {
+            self.function(
+                &f.function.params,
+                f.function.body.as_ref().map(|b| &b.stmts),
+            );
+        }
     }
 
     /// Analyze an expression's references, entering a fresh frame for arrows and
@@ -637,11 +651,7 @@ impl CaptureResolver {
             self.declare_param(param);
         }
         match body {
-            AnalyzeBody::Block(stmts) => {
-                for s in stmts {
-                    self.stmt(s);
-                }
-            }
+            AnalyzeBody::Block(stmts) => self.stmts(stmts),
             AnalyzeBody::Expr(e) => self.expr(e),
         }
         self.exit_function();
@@ -655,9 +665,7 @@ impl CaptureResolver {
             self.declare_param(&param.pat);
         }
         if let Some(stmts) = body {
-            for s in stmts {
-                self.stmt(s);
-            }
+            self.stmts(stmts);
         }
         self.exit_function();
     }

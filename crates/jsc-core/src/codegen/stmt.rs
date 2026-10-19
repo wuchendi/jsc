@@ -9,6 +9,21 @@ impl LowerCtx<'_> {
     /// Lower one statement, appending the resulting [`IrStmt`](s) to `out`.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt, out: &mut Vec<IrStmt>) -> anyhow::Result<()> {
+        // Inside a tracked top-level `try`, a compound statement completes with
+        // `undefined` when its body produces no value (UpdateEmpty).
+        if matches!(
+            stmt,
+            Stmt::If(_)
+                | Stmt::While(_)
+                | Stmt::DoWhile(_)
+                | Stmt::For(_)
+                | Stmt::ForOf(_)
+                | Stmt::ForIn(_)
+                | Stmt::Labeled(_)
+                | Stmt::Switch(_)
+        ) {
+            self.reset_completion(out);
+        }
         match stmt {
             Stmt::Expr(expr_stmt) => {
                 // `yield* iterable;` delegates to an inner generator: it
@@ -26,14 +41,22 @@ impl LowerCtx<'_> {
                 {
                     return self.lower_destructuring_assign(pat, &assign.right, out);
                 }
-                out.push(IrStmt::Expr(self.lower_expr(&expr_stmt.expr)?));
+                let value = self.lower_expr(&expr_stmt.expr)?;
+                out.push(IrStmt::Expr(match self.completion_local() {
+                    Some(local) => IrNode::Assign {
+                        local,
+                        value: Box::new(value),
+                    },
+                    None => value,
+                }));
                 Ok(())
             }
             // `let`/`const`/`var` declarations. An uninitialized `let x;` binds
             // `undefined` (a `const` with no initializer is a parser error).
             Stmt::Decl(Decl::Var(var_decl)) => self.lower_var_decl(var_decl, out),
-            // A nested `function foo(){ .. }` declaration lowers to a first-class
-            // function value bound to `foo` in the current scope.
+            // A nested `function foo(){ .. }` declaration reached outside a
+            // hoisting statement list (see `lower_stmts`) lowers in place to a
+            // first-class function value bound to `foo` in the current scope.
             Stmt::Decl(Decl::Fn(fn_decl)) => self.lower_nested_fn_decl(fn_decl, out),
             // A `class A { constructor(..){ .. } }` declaration lowers to a
             // class value (constructor function + shared prototype) bound to `A`.
@@ -44,12 +67,7 @@ impl LowerCtx<'_> {
             // the block. Inner bindings shadow outer ones and do not leak out.
             Stmt::Block(block) => {
                 self.push_scope();
-                let result = (|| {
-                    for inner in &block.stmts {
-                        self.lower_stmt(inner, out)?;
-                    }
-                    Ok(())
-                })();
+                let result = self.lower_stmts(&block.stmts, out);
                 self.pop_scope();
                 result
             }
@@ -118,6 +136,110 @@ impl LowerCtx<'_> {
             // English rather than leaking the raw swc AST debug form.
             other => Err(CompileError::spanned(other.span(), unsupported_stmt_msg(other)).into()),
         }
+    }
+
+    /// Lower a function body or block statement list into `out`, hoisting its
+    /// function declarations: every declaration is bound and initialized before
+    /// any statement of the list runs, so it can be called or read before its
+    /// textual position, recurse through its own name, and be mutually
+    /// recursive with its siblings.
+    ///
+    /// The declaration names are bound first (so the statements resolve them),
+    /// then the other statements are lowered, and only then the declaration
+    /// bodies — once every binding of the list is declared, so a body may
+    /// capture a `let`/`const` declared later. Such a captured binding's cell is
+    /// created up front (holding `undefined` until its declaration runs) so the
+    /// hoisted closures share it; its declaration then stores into that cell.
+    ///
+    /// A generator (`env_backed`) frame keeps the in-order lowering.
+    pub(super) fn lower_stmts(
+        &mut self,
+        stmts: &[Stmt],
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let fns: Vec<&FnDecl> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Decl(Decl::Fn(f)) => Some(f),
+                _ => None,
+            })
+            .collect();
+        if fns.is_empty() || self.frame().env_backed {
+            for stmt in stmts {
+                self.lower_stmt(stmt, out)?;
+            }
+            return Ok(());
+        }
+        let mut prefix = Vec::new();
+        let fn_locals: Vec<u32> = fns
+            .iter()
+            .map(|f| self.declare(f.ident.sym.as_ref(), true, f.ident.span.lo.0))
+            .collect();
+        for &local in &fn_locals {
+            if self.is_cell(local) {
+                prefix.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(IrNode::Undefined)),
+                });
+            }
+        }
+        let mut rest = Vec::new();
+        for stmt in stmts {
+            if !matches!(stmt, Stmt::Decl(Decl::Fn(_))) {
+                self.lower_stmt(stmt, &mut rest)?;
+            }
+        }
+        // Hoist the cell of every captured binding the list declares: create it
+        // in the prefix and turn its declaration into a store into that cell.
+        for local in self.innermost_cell_locals() {
+            if fn_locals.contains(&local) {
+                continue;
+            }
+            for stmt in &mut rest {
+                let IrStmt::Decl {
+                    local: decl_local,
+                    init: IrNode::CellNew(value),
+                } = stmt
+                else {
+                    continue;
+                };
+                if *decl_local != local {
+                    continue;
+                }
+                let value = std::mem::replace(value.as_mut(), IrNode::Undefined);
+                *stmt = IrStmt::Decl {
+                    local: self.fresh(),
+                    init: IrNode::CellSet {
+                        cell: Box::new(IrNode::Local(local)),
+                        value: Box::new(value),
+                    },
+                };
+                prefix.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(IrNode::Undefined)),
+                });
+                break;
+            }
+        }
+        for (fn_decl, local) in fns.into_iter().zip(fn_locals) {
+            let value = self.lower_nested_fn_value(fn_decl)?;
+            // A store into the pre-created cell is bound as a `Decl` of a
+            // scratch local so it never becomes `main`'s completion value.
+            prefix.push(if self.is_cell(local) {
+                IrStmt::Decl {
+                    local: self.fresh(),
+                    init: IrNode::CellSet {
+                        cell: Box::new(IrNode::Local(local)),
+                        value: Box::new(value),
+                    },
+                }
+            } else {
+                IrStmt::Decl { local, init: value }
+            });
+        }
+        out.extend(prefix);
+        out.extend(rest);
+        Ok(())
     }
 
     /// Lower a `let`/`const`/`var` declaration. A declarator with no initializer
@@ -838,7 +960,14 @@ impl LowerCtx<'_> {
                 );
             }
         }
-        out.push(IrStmt::Expr(IrNode::Local(temp)));
+        // The statement's value is the RHS (stored into a tracked completion).
+        out.push(IrStmt::Expr(match self.completion_local() {
+            Some(local) => IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Local(temp)),
+            },
+            None => IrNode::Local(temp),
+        }));
         Ok(())
     }
 
@@ -1143,16 +1272,39 @@ impl LowerCtx<'_> {
             return Err(anyhow!("try without catch or finally"));
         }
 
+        // The completion value (for `-p`): a top-level `try` in `main` opens a
+        // completion local that every expression statement of its block and catch
+        // clause stores into; it is reset to `undefined` on entry (an empty `try`
+        // yields `undefined`) and pushed as `main`'s value after the statement.
+        let outermost =
+            self.main_ctx && self.frames.len() == 1 && self.shared.completion.get().is_none();
+        if outermost {
+            let local = self.fresh();
+            self.shared.completion.set(Some(local));
+        }
+        self.reset_completion(out);
+        let result = self.lower_try_clauses(try_stmt, out);
+        if outermost
+            && let Some(local) = self.shared.completion.take()
+            && result.is_ok()
+        {
+            out.push(IrStmt::Expr(IrNode::Local(local)));
+        }
+        result
+    }
+
+    /// Lower the clauses of a `try` statement (see [`Self::lower_try`]) and push
+    /// the resulting [`IrStmt::Try`].
+    fn lower_try_clauses(
+        &mut self,
+        try_stmt: &swc_ecma_ast::TryStmt,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
         // The guarded block: its own lexical scope, statements lowered inline
         // (blocks share the function's wasm locals, like `Stmt::Block`).
         self.push_scope();
         let mut body = Vec::new();
-        let body_result = (|| -> anyhow::Result<()> {
-            for inner in &try_stmt.block.stmts {
-                self.lower_stmt(inner, &mut body)?;
-            }
-            Ok(())
-        })();
+        let body_result = self.lower_stmts(&try_stmt.block.stmts, &mut body);
         self.pop_scope();
         body_result?;
 
@@ -1176,10 +1328,9 @@ impl LowerCtx<'_> {
                         // the parameter is captured (mirrors a captured `let`).
                         self.push_binding(local, IrNode::ExcValue, &mut catch_body);
                     }
-                    for inner in &handler.body.stmts {
-                        self.lower_stmt(inner, &mut catch_body)?;
-                    }
-                    Ok(())
+                    // The catch clause's value replaces the guarded block's.
+                    self.reset_completion(&mut catch_body);
+                    self.lower_stmts(&handler.body.stmts, &mut catch_body)
                 })();
                 self.pop_scope();
                 catch_result?;
@@ -1189,16 +1340,14 @@ impl LowerCtx<'_> {
         };
 
         // The finally clause (when present): its own lexical scope, like the body.
+        // Its value is discarded, so completion tracking is suspended inside it.
         let finally_body = match &try_stmt.finalizer {
             Some(block) => {
                 self.push_scope();
+                let completion = self.shared.completion.take();
                 let mut finally_body = Vec::new();
-                let finally_result = (|| -> anyhow::Result<()> {
-                    for inner in &block.stmts {
-                        self.lower_stmt(inner, &mut finally_body)?;
-                    }
-                    Ok(())
-                })();
+                let finally_result = self.lower_stmts(&block.stmts, &mut finally_body);
+                self.shared.completion.set(completion);
                 self.pop_scope();
                 finally_result?;
                 Some(finally_body)
@@ -1212,6 +1361,27 @@ impl LowerCtx<'_> {
             finally_body,
         });
         Ok(())
+    }
+
+    /// The `main` local the current expression statement's completion value is
+    /// stored into: set only inside a top-level `try` (see [`Self::lower_try`])
+    /// and only in `main`'s own frame — a nested function body never writes it.
+    fn completion_local(&self) -> Option<u32> {
+        if self.main_ctx && self.frames.len() == 1 {
+            self.shared.completion.get()
+        } else {
+            None
+        }
+    }
+
+    /// Reset the tracked completion value to `undefined` (a no-op when untracked).
+    fn reset_completion(&self, out: &mut Vec<IrStmt>) {
+        if let Some(local) = self.completion_local() {
+            out.push(IrStmt::Expr(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Undefined),
+            }));
+        }
     }
 
     /// Lower a `while (cond) body`. `label`, when `Some`, is the loop id that a
