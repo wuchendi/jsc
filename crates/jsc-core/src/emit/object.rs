@@ -1871,6 +1871,7 @@ pub(super) fn emit_index_op_set_node(
         let old_num = IrNode::ConvertCall {
             op: ConvertOp::ToNumber,
             arg: Box::new(IrNode::Local(new_local)),
+            radix: None,
         };
         emit_node(&old_num, function, scratch, strings, helpers);
         function.instruction(&Instruction::LocalSet(new_local));

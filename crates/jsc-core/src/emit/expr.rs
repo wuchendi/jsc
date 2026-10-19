@@ -78,8 +78,16 @@ pub(super) fn emit_node(
         IrNode::MathCall { op, args } => {
             emit_math_call(*op, args, function, scratch, strings, helpers);
         }
-        IrNode::ConvertCall { op, arg } => {
-            emit_convert_call(*op, arg, function, scratch, strings, helpers);
+        IrNode::ConvertCall { op, arg, radix } => {
+            emit_convert_call(
+                *op,
+                arg,
+                radix.as_deref(),
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
         }
         IrNode::FuncValue {
             table_index,

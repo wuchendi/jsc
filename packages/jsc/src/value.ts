@@ -324,23 +324,46 @@ function strToNumber(s: string): number {
   return Number(trimmed)
 }
 
-/** Parse a leading base-10 integer (the `parseInt` subset from `host.rs::parse_int_str`). */
-export function parseIntStr(s: string): number {
-  let i = 0
-  while (i < s.length && isAsciiWhitespace(s[i]!)) i++
+/**
+ * `parseInt(s, radix)` on the already-stringified `s` and number-coerced `radix`
+ * (mirrors `host.rs::parse_int_str`): skip leading JS whitespace, an optional
+ * sign, then parse the longest radix-`ToInt32(radix)` digit prefix (`0` means 10,
+ * or 16 after a `0x` prefix; `16` also strips `0x`; outside `2..=36` is NaN).
+ */
+export function parseIntStr(str: string, radix: number): number {
+  let s = str.replace(/^\s+/, '')
   let sign = 1
-  if (i < s.length && (s[i] === '+' || s[i] === '-')) {
-    if (s[i] === '-') sign = -1
-    i++
+  if (s.startsWith('-')) {
+    sign = -1
+    s = s.slice(1)
+  } else if (s.startsWith('+')) {
+    s = s.slice(1)
   }
-  const start = i
+  const r = radix | 0
+  let base = r === 0 ? 10 : r
+  if (base < 2 || base > 36) return Number.NaN
+  if ((r === 0 || r === 16) && /^0x/i.test(s)) {
+    s = s.slice(2)
+    base = 16
+  }
+  let end = 0
+  while (end < s.length && digitValue(s.charCodeAt(end)) < base) end++
+  const digits = s.slice(0, end)
+  if (digits.length === 0) return Number.NaN
+  // Base 10 goes through the correctly rounded decimal parser; other radices
+  // accumulate digit by digit.
   let value = 0
-  while (i < s.length && isAsciiDigit(s[i]!)) {
-    value = value * 10 + (s.charCodeAt(i) - 48)
-    i++
-  }
-  if (i === start) return Number.NaN
+  if (base === 10) value = Number(digits)
+  else for (let i = 0; i < end; i++) value = value * base + digitValue(s.charCodeAt(i))
   return sign * value
+}
+
+/** The value of an ASCII digit or (case-insensitive) letter, or 36 for any other code unit. */
+function digitValue(code: number): number {
+  if (code >= 48 && code <= 57) return code - 48
+  const lower = code | 0x20
+  if (lower >= 97 && lower <= 122) return lower - 87
+  return 36
 }
 
 /** Parse a leading decimal float (the `parseFloat` subset from `host.rs::parse_float_str`). */

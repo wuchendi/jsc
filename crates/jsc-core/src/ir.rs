@@ -765,15 +765,19 @@ pub enum IrNode {
     /// `parseInt(s)` / `parseFloat(s)`. These are bare global function
     /// names, not real bindings: they are recognized syntactically at codegen
     /// (only when nothing of the same name shadows them) and take exactly one
-    /// argument. `Boolean` lowers to inline JS-truthiness wasm; the other four
-    /// delegate to the host `__convert` import, which reuses the run stage's
-    /// `format_value`/parse helpers (so `String(42) == "42"`, matching
+    /// argument (`parseInt` also an optional radix). `Boolean` lowers to inline
+    /// JS-truthiness wasm; `parseInt` calls the host `__parse_int` import; the
+    /// other three delegate to the host `__convert` import, which reuses the run
+    /// stage's `format_value`/parse helpers (so `String(42) == "42"`, matching
     /// `format_number`).
     ConvertCall {
         /// Which conversion this call performs.
         op: ConvertOp,
-        /// The single argument expression, evaluated once to a jsval.
+        /// The first argument expression, evaluated once to a jsval.
         arg: Box<IrNode>,
+        /// The `parseInt` radix argument, evaluated after `arg`; `None` for an
+        /// omitted radix and for every other conversion.
+        radix: Option<Box<IrNode>>,
     },
     /// The conditional (ternary) operator `cond ? then_branch : else_branch`.
     /// `cond` is evaluated under JS truthiness; the selected branch's jsval is

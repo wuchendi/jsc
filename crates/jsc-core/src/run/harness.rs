@@ -21,11 +21,10 @@ const PRINT_FLAG_SEP: i32 = abi::PRINT_FLAG_SEP;
 const PRINT_FLAG_END: i32 = abi::PRINT_FLAG_END;
 
 /// The `__convert` host-import op flags (see [`abi`]): stringify the
-/// argument, coerce it to a number, or parse a leading int/float from its string
+/// argument, coerce it to a number, or parse a leading float from its string
 /// form.
 const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
 const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
-const CONVERT_OP_PARSE_INT: i32 = abi::CONVERT_OP_PARSE_INT;
 const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 
 /// Box a host-computed `f64` as a number jsval's raw bits, mapping every NaN to
@@ -108,8 +107,8 @@ pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
 /// program value. `out` is any [`Write`] sink (real stdout, or an in-memory
 /// buffer for capture); it is threaded through the [`Store`] and handed back so
 /// captured output can be recovered.
-// One straight-line harness: engine setup, the six host imports (print,
-// __convert, __method, __promise, __then, __now), the call, and the after-`main`
+// One straight-line harness: engine setup, the seven host imports (print,
+// __convert, __method, __promise, __then, __now, __parse_int), the call, and the after-`main`
 // microtask drain — length reflects the import roster, not branching.
 #[allow(clippy::too_many_lines)]
 fn run_with_sink<W: Write + Send + 'static>(
@@ -147,7 +146,7 @@ fn run_with_sink<W: Write + Send + 'static>(
             let _ = caller.data_mut().sink.write_all(piece.as_bytes());
         },
     )?;
-    // The `__convert` import backs `String`/`Number`/`parseInt`/`parseFloat`.
+    // The `__convert` import backs `String`/`Number`/`parseFloat`.
     // It decodes the argument jsval (reading linear memory for heap-string
     // operands), reuses `format_value`/`value_to_number` and the parse helpers, and
     // returns the converted jsval. `String` allocates a fresh heap string in guest
@@ -168,8 +167,7 @@ fn run_with_sink<W: Write + Send + 'static>(
             };
             let result = match op {
                 CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
-                // `parseInt`/`parseFloat` operate on the argument's string form.
-                CONVERT_OP_PARSE_INT => number_bits(parse_int_str(&format_value(&value))),
+                // `parseFloat` operates on the argument's string form.
                 CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&format_value(&value))),
                 CONVERT_OP_TO_STRING => {
                     // A string argument is returned unchanged (no allocation);
@@ -249,6 +247,21 @@ fn run_with_sink<W: Write + Send + 'static>(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
     })?;
+    // The `__parse_int` import (`parseInt(s, radix)`): parse the string form of
+    // `s` in the radix `ToNumber(radix)` (`undefined` for an omitted radix).
+    linker.func_wrap(
+        "env",
+        "__parse_int",
+        |mut caller: Caller<'_, Host<W>>, bits: i64, radix: i64| -> i64 {
+            let mem = caller
+                .get_export("memory")
+                .and_then(wasmtime::Extern::into_memory);
+            let data = mem.map_or(&[][..], |m| m.data(&caller));
+            let text = format_value(&decode(bits.cast_unsigned(), data));
+            let radix = value_to_number(&decode(radix.cast_unsigned(), data));
+            number_bits(parse_int_str(&text, radix))
+        },
+    )?;
     let instance = linker.instantiate(&mut store, &module)?;
     let main = instance.get_typed_func::<(), i64>(&mut store, "main")?;
     // Out of memory (the sticky `__heap_ptr` sentinel, set by a failed guest or

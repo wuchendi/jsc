@@ -1,7 +1,7 @@
 /**
  * The JS runtime shim: the `importObject` that backs the emitted module's host
  * env imports (`print` / `__convert` / `__method` / `__promise` / `__then` /
- * `__now`) plus the bump-allocator they share. A port of
+ * `__now` / `__parse_int`) plus the bump-allocator they share. A port of
  * `crates/jsc-core/src/run/harness.rs` (import wiring), `run/host.rs` (handlers +
  * allocator), and `run/promise.rs` (the promise engine + microtask queue). It
  * duplicates Rust host semantics against the emitted module's memory (see
@@ -11,7 +11,6 @@
 import {
   ASYNC_STEP_EXPORT_NAME,
   CONVERT_OP_PARSE_FLOAT,
-  CONVERT_OP_PARSE_INT,
   CONVERT_OP_TO_NUMBER,
   CONVERT_OP_TO_STRING,
   EXC_PENDING_EXPORT_NAME,
@@ -729,8 +728,6 @@ export function createShim(): Shim {
     switch (op) {
       case CONVERT_OP_TO_NUMBER:
         return f64ToBits(valueToNumber(value))
-      case CONVERT_OP_PARSE_INT:
-        return f64ToBits(parseIntStr(formatValue(value)))
       case CONVERT_OP_PARSE_FLOAT:
         return f64ToBits(parseFloatStr(formatValue(value)))
       case CONVERT_OP_TO_STRING: {
@@ -763,6 +760,14 @@ export function createShim(): Shim {
         promiseThen(asU64(p), asU64(onF), asU64(onR)),
       // The host wall clock backing `Date.now()` / `new Date()` (ms since epoch).
       __now: (): number => Date.now(),
+      // `parseInt(s, radix)` (an omitted radix arrives as `undefined`).
+      __parse_int: (s: bigint, radix: bigint): bigint =>
+        f64ToBits(
+          parseIntStr(
+            formatValue(decode(asU64(s), memView())),
+            valueToNumber(decode(asU64(radix), memView())),
+          ),
+        ),
     },
   }
 

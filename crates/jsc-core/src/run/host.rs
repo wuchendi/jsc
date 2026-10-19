@@ -739,33 +739,64 @@ fn str_to_number(s: &str) -> f64 {
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// Parse a leading base-10 integer from `s` (the `parseInt` subset): skip
-/// leading ASCII whitespace, honor an optional `+`/`-` sign, then consume ASCII
-/// digits until the first non-digit. Yields `NaN` when no digit follows the sign.
-/// The radix argument is not supported (base-10 only).
-pub(super) fn parse_int_str(s: &str) -> f64 {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let mut sign = 1.0;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        if bytes[i] == b'-' {
-            sign = -1.0;
+/// `parseInt(s, radix)` on the already-stringified `s` and the already
+/// number-coerced `radix`: skip leading JS whitespace, honor an optional `+`/`-`
+/// sign, then take `R = ToInt32(radix)`. `R == 0` means 10 unless a `0x`/`0X`
+/// prefix selects 16; `R == 16` also strips an optional `0x` prefix; any other
+/// `R` outside `2..=36` yields `NaN`. The longest prefix of radix-`R` digits
+/// (letters case-insensitive) is the value; no digits yields `NaN`.
+pub(super) fn parse_int_str(s: &str, radix: f64) -> f64 {
+    let s = s.trim_start_matches(is_js_whitespace);
+    let (sign, mut s) = match s.strip_prefix('-') {
+        Some(rest) => (-1.0, rest),
+        None => (1.0, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let r = to_int32(radix);
+    let (mut radix, strip_prefix) = if r == 0.0 {
+        (10, true)
+    } else {
+        match (2_u32..=36).find(|&k| f64::from(k) == r) {
+            Some(k) => (k, k == 16),
+            None => return f64::NAN,
         }
-        i += 1;
+    };
+    if strip_prefix && let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        s = rest;
+        radix = 16;
     }
-    let start = i;
-    let mut value = 0.0_f64;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value * 10.0 + f64::from(bytes[i] - b'0');
-        i += 1;
-    }
-    if i == start {
+    let end = s.find(|c: char| !c.is_digit(radix)).unwrap_or(s.len());
+    let digits = &s[..end];
+    if digits.is_empty() {
         return f64::NAN;
     }
+    // Base 10 goes through the correctly rounded decimal parser; other radices
+    // accumulate digit by digit.
+    let value = if radix == 10 {
+        digits.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        digits.chars().fold(0.0, |acc, c| {
+            acc * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0))
+        })
+    };
     sign * value
+}
+
+/// JS `StrWhiteSpaceChar`: the `WhiteSpace` and `LineTerminator` code points
+/// (Unicode `White_Space` minus U+0085, plus U+FEFF).
+fn is_js_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// JS `ToInt32` of a number, returned as the (integral) f64 in
+/// `-2^31..2^31`: non-finite values map to 0, otherwise the truncated value
+/// wraps modulo 2^32.
+fn to_int32(n: f64) -> f64 {
+    const TWO_32: f64 = 4_294_967_296.0;
+    if !n.is_finite() {
+        return 0.0;
+    }
+    let m = n.trunc().rem_euclid(TWO_32);
+    if m >= TWO_32 / 2.0 { m - TWO_32 } else { m }
 }
 
 /// Parse a leading decimal float from `s` (the `parseFloat` subset): skip

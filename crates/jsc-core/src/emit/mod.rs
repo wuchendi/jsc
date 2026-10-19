@@ -53,7 +53,7 @@ const PRINT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const PRINT_IMPORT_NAME: &str = abi::PRINT_IMPORT_NAME;
 
 /// The module and field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseInt`/`parseFloat` conversions. It receives the
+/// `String`/`Number`/`parseFloat` conversions. It receives the
 /// argument jsval plus a `CONVERT_OP_*` flag and returns the converted jsval,
 /// reusing the run stage's `format_value`/parse helpers (and allocating a heap
 /// string in guest memory for `String`).
@@ -63,7 +63,6 @@ const CONVERT_IMPORT_NAME: &str = abi::CONVERT_IMPORT_NAME;
 /// `__convert` op flags; see [`abi`].
 const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
 const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
-const CONVERT_OP_PARSE_INT: i32 = abi::CONVERT_OP_PARSE_INT;
 const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 
 /// The module and field name of the host `__method` import backing the
@@ -86,6 +85,8 @@ const THEN_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const THEN_IMPORT_NAME: &str = abi::THEN_IMPORT_NAME;
 const NOW_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const NOW_IMPORT_NAME: &str = abi::NOW_IMPORT_NAME;
+const PARSE_INT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
+const PARSE_INT_IMPORT_NAME: &str = abi::PARSE_INT_IMPORT_NAME;
 
 /// `__promise` op flags; see [`abi`].
 const PROMISE_OP_RESOLVE: i32 = abi::PROMISE_OP_RESOLVE;
@@ -148,8 +149,9 @@ const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
 ///
 /// Two more imports — `__promise` (index 3) and `__then` (index 4) — back the
 /// host promise engine, and `__now` (index 5) is the host wall clock backing
-/// `Date.now()` / `new Date()`, so the count is `6`.
-const IMPORT_FUNC_COUNT: u32 = 6;
+/// `Date.now()` / `new Date()`, and `__parse_int` (index 6) backs
+/// `parseInt(s, radix)`, so the count is `7`.
+const IMPORT_FUNC_COUNT: u32 = 7;
 
 /// `print` import flags; see [`abi`]: a value plus a trailing space, a
 /// value plus a newline, or a newline alone for zero-argument `console.log()`.
@@ -649,8 +651,7 @@ struct Helpers<'a> {
     /// `call`s of it.
     print: u32,
     /// The host `__convert` import's function index. Always `1` (the
-    /// second import); `String`/`Number`/`parseInt`/`parseFloat` lower to `call`s
-    /// of it.
+    /// second import); `String`/`Number`/`parseFloat` lower to `call`s of it.
     convert: u32,
     /// The host `__method` import's function index. Always `2` (the third
     /// import); the non-callback array/string methods lower to `call`s of it.
@@ -666,6 +667,9 @@ struct Helpers<'a> {
     /// sixth import); `Date.now()` / `new Date()` lower to `call`s of it. The
     /// import returns an f64 (ms since the Unix epoch).
     now: u32,
+    /// The host `__parse_int(s: i64, radix: i64) -> i64` import's function
+    /// index. Always `6` (the seventh import); `parseInt` lowers to `call`s of it.
+    parse_int: u32,
     /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
     /// array — the drain backing `[...gen]` / `f(...gen)` spread. Emitted just
@@ -914,6 +918,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         promise_type,
         then_type,
         now_type,
+        parse_int_type,
     ) = build_type_and_function_sections(program, &unwind, has_accessors);
     module.section(&types);
 
@@ -959,6 +964,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         NOW_IMPORT_MODULE,
         NOW_IMPORT_NAME,
         EntityType::Function(now_type),
+    );
+    // The host `parseInt` import (index 6): `__parse_int(s, radix) -> i64`.
+    imports.import(
+        PARSE_INT_IMPORT_MODULE,
+        PARSE_INT_IMPORT_NAME,
+        EntityType::Function(parse_int_type),
     );
     module.section(&imports);
 
