@@ -228,8 +228,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         helper(&[ValType::I64], &[ValType::I64]);
         // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
         helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
-        // `__prop_throw(key: i64, grow: i32) -> ()`.
-        helper(&[ValType::I64, ValType::I32], &[]);
+        // `__prop_throw(recv: i64, key: i64, mode: i32) -> ()`.
+        helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
         // `__box_f64(x: f64) -> i64`.
         helper(&[ValType::F64], &[ValType::I64]);
         // `__to_number(v: i64) -> i64`.
@@ -781,6 +781,28 @@ pub(super) fn collect_node<'a>(
                     order.push(s);
                 }
             }
+            collect_node(recv, order, seen);
+            for arg in args {
+                collect_node(arg, order, seen);
+            }
+        }
+        // A promise / generator method threads its method name (the user-method
+        // fallback key) into the string table; the generator path builds a
+        // `{ value, done }` result, and the guarded fallback throws a nullish /
+        // not-a-function TypeError — seed all of those strings too.
+        IrNode::ReceiverMethod { op, recv, args, .. } => {
+            let keys: &[&'static str] = if matches!(op, ReceiverOp::Next) {
+                &["value", "done"]
+            } else {
+                &[]
+            };
+            let name = [op.name()];
+            for &s in name.iter().chain(keys).chain(&INTERNAL_TYPE_ERROR_STRS) {
+                if seen.insert(s) {
+                    order.push(s);
+                }
+            }
+            seed_nullish_strs(order, seen);
             collect_node(recv, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);

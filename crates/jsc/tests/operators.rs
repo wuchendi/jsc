@@ -242,3 +242,16 @@ fn logical_assignment_via_eval() {
     // leaves the side-effecting right operand (`y=5`) unrun, so `y` stays `0`.
     assert_eq!(jsc(&["-p", "let x=1; let y=0; x ||= (y=5); y"]), "0");
 }
+
+/// Unary minus on a non-literal operand negates the sign of zero: `-(+0)` is
+/// `-0` and `-(-0)` is `+0`, observable through `1 / x`.
+#[test]
+fn unary_minus_negates_signed_zero() {
+    assert_eq!(jsc(&["-p", "let z = 0; 1 / -z"]), "-Infinity");
+    assert_eq!(jsc(&["-p", "let m = -0; 1 / -m"]), "Infinity");
+    // ToNumber of the operand happens first: `-"0"` is `-0`.
+    assert_eq!(jsc(&["-p", "let s = \"0\"; 1 / -s"]), "-Infinity");
+    assert_eq!(jsc(&["-p", "let n = 5; -n === -5"]), "true");
+    // A literal `-0` is still constant-folded to `-0`.
+    assert_eq!(jsc(&["-p", "1 / -0"]), "-Infinity");
+}

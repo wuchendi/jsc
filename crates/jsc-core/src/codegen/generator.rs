@@ -742,6 +742,9 @@ fn node_contains_yield(node: &IrNode) -> bool {
         IrNode::GenResume { handle, sent } => {
             node_contains_yield(handle) || node_contains_yield(sent)
         }
+        IrNode::ReceiverMethod { recv, args, .. } => {
+            node_contains_yield(recv) || args.iter().any(node_contains_yield)
+        }
         _ => false,
     }
 }

@@ -35,8 +35,8 @@ use wasm_encoder::{
 use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, SpreadCallee,
-    SpreadElem,
+    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, ReceiverOp,
+    SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -427,11 +427,17 @@ const NULLISH_SUFFIX: &str = "')";
 /// See [`NULLISH_READ_PREFIX`].
 const TYPE_ERROR_STACK_PREFIX: &str = "TypeError: ";
 
+/// The computed key `recv["length"]` that a string/array index read resolves to
+/// the length header. Seeded with [`NULLISH_ERROR_STRS`], since every guarded
+/// index read site seeds those.
+const INDEX_LENGTH_KEY: &str = "length";
+
 /// The static strings `__nullish_throw` needs — the error object's keys, kind
 /// marker key and `name`, the receiver words, and the message fragments. Seeded
 /// by [`collect_node`] at every guarded member read/write/method-call site so
 /// their `[len][utf8]` blobs exist when the guard throws.
-const NULLISH_ERROR_STRS: [&str; 13] = [
+const NULLISH_ERROR_STRS: [&str; 14] = [
+    INDEX_LENGTH_KEY,
     "name",
     "message",
     "stack",
@@ -457,10 +463,28 @@ const PROP_ADD_SUFFIX: &str = "': dynamic properties are not supported yet";
 /// past the current length.
 const ARRAY_GROW_MSG: &str = "Cannot grow array by index assignment yet";
 
+/// The message fragments `__prop_throw` splices into the strict-mode
+/// `TypeError` raised by a member store on a primitive receiver:
+/// `Cannot create property '<key>' on <number|string|boolean> '<String(recv)>'`.
+const PRIM_CREATE_PREFIX: &str = "Cannot create property '";
+/// See [`PRIM_CREATE_PREFIX`].
+const PRIM_CREATE_MID: &str = "' on ";
+/// See [`PRIM_CREATE_PREFIX`].
+const PRIM_CREATE_QUOTE: &str = " '";
+/// See [`PRIM_CREATE_PREFIX`].
+const PRIM_CREATE_SUFFIX: &str = "'";
+
+/// `__prop_throw`'s `mode` argument: an absent property on a fixed-shape object.
+const PROP_THROW_ADD: i32 = 0;
+/// `__prop_throw`'s `mode` argument: an array index store at/past the length.
+const PROP_THROW_GROW: i32 = 1;
+/// `__prop_throw`'s `mode` argument: any store on a primitive receiver.
+const PROP_THROW_PRIMITIVE: i32 = 2;
+
 /// The static strings `__prop_throw` needs — the error object's keys, kind
 /// marker key and `name`, and the message fragments. Seeded by [`collect_node`]
 /// at every member store site so their `[len][utf8]` blobs exist when it throws.
-const PROP_ERROR_STRS: [&str; 9] = [
+const PROP_ERROR_STRS: [&str; 16] = [
     "name",
     "message",
     "stack",
@@ -470,6 +494,13 @@ const PROP_ERROR_STRS: [&str; 9] = [
     PROP_ADD_SUFFIX,
     ARRAY_GROW_MSG,
     TYPE_ERROR_STACK_PREFIX,
+    PRIM_CREATE_PREFIX,
+    PRIM_CREATE_MID,
+    PRIM_CREATE_QUOTE,
+    PRIM_CREATE_SUFFIX,
+    "number",
+    "string",
+    "boolean",
 ];
 
 /// The `JSON.parse` syntax-error `.name`, `.message`, and `.stack` text. jsc has
@@ -678,11 +709,12 @@ struct Helpers<'a> {
     /// The out-of-line half of the nullish-receiver guard (see
     /// [`object::emit_nullish_guard`]).
     nullish_throw: u32,
-    /// `__prop_throw(key: i64, grow: i32)`: build the `TypeError` for a member
-    /// store the fixed-shape receiver cannot take — an absent property
-    /// (`grow == 0`, message names `String(key)`) or an array index at/past the
-    /// length (`grow == 1`) — and leave it in flight (`$exc_pending` set). The
-    /// out-of-line half of [`object::emit_index_set_node`]'s miss paths.
+    /// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the `TypeError` for
+    /// a member store the receiver cannot take — an absent property
+    /// ([`PROP_THROW_ADD`], message names `String(key)`), an array index at/past
+    /// the length ([`PROP_THROW_GROW`]), or any store on a primitive `recv`
+    /// ([`PROP_THROW_PRIMITIVE`]) — and leave it in flight (`$exc_pending` set).
+    /// The out-of-line half of [`object::emit_index_set_node`]'s miss paths.
     prop_throw: u32,
     /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
     /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).

@@ -269,6 +269,9 @@ pub(super) fn emit_node(
         node @ IrNode::MapMethod { .. } => {
             emit_map_method_node(node, function, scratch, strings, helpers);
         }
+        node @ IrNode::ReceiverMethod { .. } => {
+            emit_receiver_method_node(node, function, scratch, strings, helpers);
+        }
         IrNode::IndexSet { obj, index, value } => {
             emit_index_set_node(obj, index, value, function, scratch, strings, helpers);
         }
@@ -1014,9 +1017,11 @@ pub(super) fn emit_cell_new(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit `<string>.length` / `<array>.length`: the operand is a heap-pointer
-/// jsval whose low 32 bits are the block base; read the u32 `len` header at
-/// `base + HEADER_SIZE` and rebox it as a number jsval.
+/// Emit `<string>.length` / `<array>.length`: for a heap-pointer operand (low
+/// 32 bits are the block base) read the u32 `len` header at
+/// `base + HEADER_SIZE` and rebox it as a number jsval; a primitive operand
+/// yields `undefined` without touching memory. The operand is stashed in the
+/// general i64 scratch slot (`+0`).
 pub(super) fn emit_str_len(
     operand: &IrNode,
     function: &mut Function,
@@ -1025,6 +1030,12 @@ pub(super) fn emit_str_len(
     helpers: Helpers<'_>,
 ) {
     emit_node(operand, function, scratch, strings, helpers);
+    // A primitive operand (number/boolean) has no header to read: its `.length`
+    // is `undefined`.
+    function.instruction(&Instruction::LocalSet(scratch));
+    emit_is_pointer(function, scratch);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
         offset: HEADER_SIZE as u64,
@@ -1033,6 +1044,9 @@ pub(super) fn emit_str_len(
     }));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::End);
 }
 
 /// Load a boxed cell's value: given a cell heap jsval on the stack, wrap it to a
