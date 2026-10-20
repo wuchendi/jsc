@@ -305,12 +305,13 @@ fn decode_reads_type_byte_to_pick_the_arm() {
     // base offset decodes as a string, array, or object purely by that byte.
     let base = 8usize;
     let bits = 0x7FFD_0000_0000_0000_u64 | base as u64;
-    // type=array: [type=1][pad×3][len=1][42.0].
+    // type=array: a handle `[42.0]` with its element store right after it.
     let mut mem = vec![0u8; base];
-    mem.extend_from_slice(&[TYPE_ARRAY, 0, 0, 0]);
-    mem.extend_from_slice(&1u32.to_le_bytes());
-    mem.extend_from_slice(&42.0_f64.to_bits().to_le_bytes());
-    assert_eq!(decode(bits, &mem), Value::Array(vec![Value::Number(42.0)]));
+    push_array(&mut mem, &[42.0_f64.to_bits()]);
+    assert_eq!(
+        decode(bits, &mem),
+        Value::Array(vec![Value::Number(42.0)], Vec::new())
+    );
     // Flip only the type byte to string: [type=0][pad×3][len=1]['x'] would need
     // a 1-byte payload, so rebuild the block accordingly.
     let mut mem = vec![0u8; base];
@@ -502,16 +503,15 @@ fn array_decodes_and_formats() {
     let value = compile_and_run("[1,2,3]").expect("pipeline should succeed");
     assert_eq!(
         value,
-        Value::Array(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0)
-        ])
+        Value::Array(
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+            Vec::new()
+        )
     );
     assert_eq!(format_value(&value), "[ 1, 2, 3 ]");
 
     let empty = compile_and_run("[]").expect("pipeline should succeed");
-    assert_eq!(empty, Value::Array(Vec::new()));
+    assert_eq!(empty, Value::Array(Vec::new(), Vec::new()));
     assert_eq!(format_value(&empty), "[]");
 }
 
@@ -625,20 +625,36 @@ fn decode_object_reads_entries_from_memory() {
     );
 }
 
+/// Append a hand-built array handle holding `elems` at the end of `memory`
+/// (`[type=1][…][props=0][proto=null][len][elems]`), followed by its
+/// `TYPE_ELEMS` store (`[type=13][…][cap][elem × cap]`).
+fn push_array(memory: &mut Vec<u8>, elems: &[u64]) {
+    let base = memory.len();
+    let len = u32::try_from(elems.len()).expect("len");
+    let store = u32::try_from(base + 24).expect("store");
+    memory.extend_from_slice(&[TYPE_ARRAY, 0, 0, 0]);
+    memory.extend_from_slice(&0u32.to_le_bytes());
+    memory.extend_from_slice(&0x7FFA_0000_0000_0000_u64.to_le_bytes());
+    memory.extend_from_slice(&len.to_le_bytes());
+    memory.extend_from_slice(&store.to_le_bytes());
+    memory.extend_from_slice(&[crate::abi::TYPE_ELEMS, 0, 0, 0]);
+    memory.extend_from_slice(&len.to_le_bytes());
+    for bits in elems {
+        memory.extend_from_slice(&bits.to_le_bytes());
+    }
+}
+
 #[test]
 fn decode_array_reads_elements_from_memory() {
-    // A hand-built heap array `[1, 2]` at base offset 8 (with header):
-    // [type=1][pad×3][len=2][1.0 bits][2.0 bits].
+    // A hand-built heap array `[1, 2]` at base offset 8: the handle, then its
+    // element store.
     let mut memory = vec![0u8; 8];
-    memory.extend_from_slice(&[TYPE_ARRAY, 0, 0, 0]);
-    memory.extend_from_slice(&2u32.to_le_bytes());
-    memory.extend_from_slice(&1.0_f64.to_bits().to_le_bytes());
-    memory.extend_from_slice(&2.0_f64.to_bits().to_le_bytes());
+    push_array(&mut memory, &[1.0_f64.to_bits(), 2.0_f64.to_bits()]);
     // Array jsval: single heap tag 0b101 (HEAP_BITS) with block base offset 8.
     let bits = 0x7FFD_0000_0000_0000_u64 | 0x8;
     assert_eq!(
         decode(bits, &memory),
-        Value::Array(vec![Value::Number(1.0), Value::Number(2.0)])
+        Value::Array(vec![Value::Number(1.0), Value::Number(2.0)], Vec::new())
     );
 }
 
@@ -936,7 +952,7 @@ fn heap_type_byte_typeof_and_value_roundtrip() {
     );
     assert_eq!(
         compile_and_run("let a = [7, 8]; a").expect("pipeline should succeed"),
-        Value::Array(vec![Value::Number(7.0), Value::Number(8.0)])
+        Value::Array(vec![Value::Number(7.0), Value::Number(8.0)], Vec::new())
     );
     // Object: typeof "object" and the entries round-trip.
     assert_eq!(

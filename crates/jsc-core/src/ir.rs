@@ -486,6 +486,10 @@ pub enum IrNode {
     Null,
     /// The `undefined` value (the global identifier `undefined`).
     Undefined,
+    /// An elision in an array literal (`[1, , 3]`): the raw [`crate::abi::HOLE`]
+    /// element bits. Only ever an element of [`IrNode::Array`] or an item of
+    /// [`IrNode::ArraySpread`], so it never reaches JS as a value.
+    ArrayHole,
     /// A binary operation applied to two sub-expressions.
     Binary {
         /// The operator to apply.
@@ -638,10 +642,11 @@ pub enum IrNode {
     /// type (`"number"`/`"boolean"`/`"object"`/`"undefined"`).
     TypeOf(Box<IrNode>),
     /// An array literal `[e0, e1, ..]`. It lowers to a heap array (single heap tag
-    /// `0b101`, type byte `1`): `__alloc(HEADER_SIZE + 4 + 8*n)`, the type byte, a
-    /// u32 `len` header of `n`, then each element jsval stored at
-    /// `ptr + HEADER_SIZE + 4 + 8*k`.
-    /// Elements are evaluated left-to-right.
+    /// `0b101`, type byte `1`): a `cap = n` `TYPE_ELEMS` store holding each
+    /// element jsval at `store + 8 + 8*k`, then the 24-byte array handle (object
+    /// prefix, `len = n`, `elems = store`).
+    /// Elements are evaluated left-to-right; an elision is an
+    /// [`IrNode::ArrayHole`] element.
     Array(Vec<IrNode>),
     /// An array literal containing at least one spread element `[0, ...a, 9]`.
     /// Built at runtime: start from a fresh empty array and, left-to-
@@ -716,8 +721,8 @@ pub enum IrNode {
         exclude: Box<IrNode>,
     },
     /// The `.length` member, dispatched on the receiver kind (DF2): a string or
-    /// array reads its u32 `len` header at the block base `+ HEADER_SIZE` as a
-    /// number jsval; any other heap value reads its `length` property through
+    /// array reads its u32 length (a string's at `+ HEADER_SIZE`, an array
+    /// handle's at `+ ARRAY_LEN_OFFSET`) as a number jsval; any other heap value reads its `length` property through
     /// `__get`; a primitive yields `undefined`. Codegen wraps the receiver in a
     /// [`IrNode::NullishCheck`].
     StrLen(Box<IrNode>),
@@ -796,31 +801,36 @@ pub enum IrNode {
         /// Whether this is a plain compound assignment or a member `++`/`--`.
         kind: OpSetKind,
     },
-    /// `array.push(value)` on a plain-local array binding. Growing the
-    /// fixed-size array block: a runtime helper allocates a new block of `len + 1`
-    /// capacity, copies the header + existing elements, appends `value`, and bumps
-    /// the length; the `local` is then REBOUND (`local.set`) to the new block base
-    /// so subsequent reads / `.length` observe the growth. Yields the new length as
-    /// a number jsval (JS semantics). Only a plain local receiver is supported — a
-    /// captured (boxed-cell) array is rejected at codegen.
+    /// `array.push(value)` on the array handle held in a wasm local. Appends
+    /// `value` to the handle in place (`__array_push`, amortized store growth;
+    /// the handle never moves, so every alias observes it). Yields the new
+    /// length as a number jsval (JS semantics). Codegen evaluates any receiver
+    /// expression into the local and guards it against `null`/`undefined`
+    /// before this node runs.
     ArrayPush {
-        /// The wasm local holding the array; read for the old block, rebound to the
-        /// reallocated one.
+        /// The wasm local holding the array handle.
         local: u32,
         /// The value appended at the new last slot.
         value: Box<IrNode>,
+        /// The `TypeError` (`<recv>.push is not a function`) thrown, after
+        /// `value` is evaluated, when the local is not a `TYPE_ARRAY` handle;
+        /// `None` for a compiler-built receiver that is always an array.
+        not_array: Option<CalleeError>,
     },
-    /// `array.pop()` on a plain-local array binding. Shrinks the block in
-    /// place: the u32 length header is decremented and the removed last element
-    /// jsval is yielded (no realloc, the local keeps its pointer). An empty array
-    /// yields `undefined`.
+    /// `array.pop()` on the array handle held in a wasm local (receiver
+    /// evaluation and guards as for [`IrNode::ArrayPush`]). Shrinks the handle
+    /// in place: its u32 length is decremented and the removed last element
+    /// jsval is yielded. An empty array yields `undefined`.
     ArrayPop {
         /// The wasm local holding the array whose block is decremented in place.
         local: u32,
+        /// The `TypeError` (`<recv>.pop is not a function`) thrown when the
+        /// local is not a `TYPE_ARRAY` handle.
+        not_array: CalleeError,
     },
     /// An array higher-order method call `array.map/filter/reduce/forEach(...)`.
-    /// The `array` receiver is evaluated once into a scratch base (it is
-    /// NOT rebound — unlike [`IrNode::ArrayPush`] — so any array expression works),
+    /// The `array` receiver is evaluated once into a scratch base (so any array
+    /// expression works),
     /// then a counted wasm loop over its length invokes the `callback` FUNCTION
     /// value per element through the `call_indirect` ABI (env-last): the
     /// positional args are `(element, index)` for `Map`/`Filter`/`ForEach` and
@@ -1024,8 +1034,9 @@ pub enum IrNode {
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
     /// operands evaluated only for their side effects: surplus `Error(..)`
-    /// arguments, and the target and arguments of a `new` that then throws
-    /// `is not a constructor`.
+    /// arguments, the target and arguments of a `new` that then throws
+    /// `is not a constructor`, and the nullish-guarded receiver of a
+    /// `push`/`pop`.
     Seq(Vec<IrNode>),
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
@@ -1531,6 +1542,7 @@ impl IrNode {
             | IrNode::Bool(_)
             | IrNode::Null
             | IrNode::Undefined
+            | IrNode::ArrayHole
             | IrNode::Local(_)
             | IrNode::EnvLoad(_)
             | IrNode::ModuleCell(_)
@@ -1672,6 +1684,7 @@ impl IrNode {
             | IrNode::Bool(_)
             | IrNode::Null
             | IrNode::Undefined
+            | IrNode::ArrayHole
             | IrNode::Local(_)
             | IrNode::EnvLoad(_)
             | IrNode::ModuleCell(_)

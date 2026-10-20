@@ -29,6 +29,64 @@ it('formats arrays Node-console style', async () => {
   expect((await run('[1,2,3]')).result).toBe('[ 1, 2, 3 ]')
 })
 
+it('formats array holes and named properties Node-console style', async () => {
+  expect((await run('[1,,3]')).result).toBe('[ 1, <1 empty item>, 3 ]')
+  expect((await run('[,,1]')).result).toBe('[ <2 empty items>, 1 ]')
+  expect((await run('[,]')).result).toBe('[ <1 empty item> ]')
+  expect((await run('let a=[1]; a[3]=4; a')).result).toBe(
+    '[ 1, <2 empty items>, 4 ]',
+  )
+  expect((await run('let a=[1,2]; a.foo=1; a')).result).toBe('[ 1, 2, foo: 1 ]')
+  expect((await run('let a=[1,,3]; delete a[0]; a')).result).toBe(
+    '[ <2 empty items>, 3 ]',
+  )
+  expect((await run("[1,,3].join('-')")).result).toBe('1--3')
+  expect((await run('[1,,3].includes(undefined)')).result).toBe('true')
+  expect((await run('[1,,3].indexOf(undefined)')).result).toBe('-1')
+  expect((await run('[1,,3].slice(0)')).result).toBe('[ 1, <1 empty item>, 3 ]')
+  expect((await run('String([1,,3])')).result).toBe('1,,3')
+})
+
+it('writes array length and renders sparse arrays like the host', async () => {
+  expect((await run('let a=[1,2,3]; a.length=0; a')).result).toBe('[]')
+  expect((await run('let a=[1]; a.length=5; a')).result).toBe(
+    '[ 1, <4 empty items> ]',
+  )
+  expect((await run('let a=[1,2,3]; a.length-=1; a.push(9); a')).result).toBe(
+    '[ 1, 2, 9 ]',
+  )
+  expect(
+    (
+      await run(
+        "let r=''; try { [].length = -1 } catch (e) { r = (e instanceof RangeError) + '|' + e.message } r",
+      )
+    ).result,
+  ).toBe('true|Invalid array length')
+  expect((await run('const a=[]; a[1e6]=1; a')).result).toBe(
+    '[ <1000000 empty items>, 1 ]',
+  )
+  expect(
+    (
+      await run(
+        'const a=[]; a[1e6]=1; a.length + "|" + a[1e6] + "|" + Object.keys(a)',
+      )
+    ).result,
+  ).toBe('1000001|1|1000000')
+  expect((await run('let a=[1,2]; a[5000]=3; a.foo=4; a')).result).toBe(
+    '[ 1, 2, <4998 empty items>, 3, foo: 4 ]',
+  )
+  expect(
+    (
+      await run(
+        'let a=[1]; a[3000]=2; a.indexOf(2) + "|" + a.includes(undefined) + "|" + a.join("") + "|" + String(a).length',
+      )
+    ).result,
+  ).toBe('3000|true|12|3002')
+  expect((await run('let a=[1]; a[3000]=2; a.slice(2999)')).result).toBe(
+    '[ <1 empty item>, 2 ]',
+  )
+})
+
 it('formats objects Node-console style', async () => {
   expect((await run('({a:1,b:2})')).result).toBe('{ a: 1, b: 2 }')
 })
@@ -54,6 +112,15 @@ it('dispatches the string methods through the shim', async () => {
   expect((await run("'5'.padStart(3,'0')")).result).toBe('005')
   expect((await run("'hello'.substring(3,1)")).result).toBe('el')
   expect((await run("'a,b,c'.split(',').length")).result).toBe('3')
+})
+
+it('reads and builds array handles through the shim', async () => {
+  const src =
+    'let a = [1, [2, 3], {x: [4]}]; let b = a; for (let i = 0; i < 9; i++) a.push(i); ' +
+    "console.log(b.length, b[1], b[11], 'x,y'.split(','), a.slice(1, 3), a.indexOf(8), a.includes(5))"
+  expect((await run(src)).stdout).toBe(
+    '12 [ 2, 3 ] 8 [ x, y ] [ [ 2, 3 ], { x: [ 4 ] } ] 11 true\n',
+  )
 })
 
 it('parses parseInt with a radix through the shim', async () => {
@@ -181,6 +248,10 @@ it('renders cyclic structures Node-console style', async () => {
   const cases: [string, string][] = [
     [
       'let a = [1, 0]; a[1] = a; console.log(a)',
+      '<ref *1> [ 1, [Circular *1] ]\n',
+    ],
+    [
+      'const a = [1]; a.push(a); console.log(a)',
       '<ref *1> [ 1, [Circular *1] ]\n',
     ],
     [
