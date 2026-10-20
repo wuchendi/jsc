@@ -598,81 +598,23 @@ fn is_inline(stmt: &IrStmt) -> bool {
 /// Whether an expression reads a raw wasm `Local` — which, in a generator body
 /// (where every source variable is an env cell), means a compiler temporary. Used
 /// to detect a `for-of`/`for-in` loop (whose hidden index/length live in raw
-/// temps) crossing a `yield`. Walks the same node shapes as [`node_contains_yield`].
+/// temps) crossing a `yield`. Per-node scratch temps (`obj_local`, ...) are
+/// written and read within one evaluation, so they do not count.
 fn node_reads_raw_local(node: &IrNode) -> bool {
-    match node {
-        IrNode::Local(_) | IrNode::Assign { .. } => true,
-        IrNode::Binary { lhs, rhs, .. } | IrNode::Logical { lhs, rhs, .. } => {
-            node_reads_raw_local(lhs) || node_reads_raw_local(rhs)
-        }
-        IrNode::Not(inner)
-        | IrNode::CellNew(inner)
-        | IrNode::CellGet(inner)
-        | IrNode::StrLen(inner)
-        | IrNode::NullishCheck { value: inner, .. }
-        | IrNode::Throw(inner)
-        | IrNode::Yield(inner)
-        | IrNode::Await(inner)
-        | IrNode::IsGenerator(inner) => node_reads_raw_local(inner),
-        IrNode::CellSet { cell, value } => {
-            node_reads_raw_local(cell) || node_reads_raw_local(value)
-        }
-        IrNode::Ternary {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            node_reads_raw_local(cond)
-                || node_reads_raw_local(then_branch)
-                || node_reads_raw_local(else_branch)
-        }
-        IrNode::Call { args, .. } | IrNode::ConsoleLog { args } => {
-            args.iter().any(node_reads_raw_local)
-        }
-        IrNode::CallIndirect { callee, args } => {
-            node_reads_raw_local(callee) || args.iter().any(node_reads_raw_local)
-        }
-        IrNode::Array(elems) => elems.iter().any(node_reads_raw_local),
-        IrNode::Object(entries) => entries.iter().any(|(_, v)| node_reads_raw_local(v)),
-        IrNode::Index { obj, index } => node_reads_raw_local(obj) || node_reads_raw_local(index),
-        _ => false,
-    }
+    matches!(
+        node,
+        IrNode::Local(_)
+            | IrNode::Assign { .. }
+            | IrNode::IncDec { .. }
+            | IrNode::ArrayPush { .. }
+            | IrNode::ArrayPop { .. }
+    ) || node.any_child(node_reads_raw_local)
 }
 
 /// Whether a statement contains a `break`/`continue` anywhere (recursively).
 fn stmt_contains_break_or_continue(stmt: &IrStmt) -> bool {
-    match stmt {
-        IrStmt::Break(_) | IrStmt::Continue(_) => true,
-        IrStmt::Expr(_) | IrStmt::Decl { .. } | IrStmt::Return(_) => false,
-        IrStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            then_body.iter().any(stmt_contains_break_or_continue)
-                || else_body.iter().any(stmt_contains_break_or_continue)
-        }
-        IrStmt::While { body, update, .. } => {
-            body.iter().any(stmt_contains_break_or_continue)
-                || update.iter().any(stmt_contains_break_or_continue)
-        }
-        IrStmt::Switch { cases, .. } => cases
-            .iter()
-            .any(|c| c.body.iter().any(stmt_contains_break_or_continue)),
-        IrStmt::Try {
-            body,
-            catch_body,
-            finally_body,
-        } => {
-            body.iter().any(stmt_contains_break_or_continue)
-                || catch_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_contains_break_or_continue))
-                || finally_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_contains_break_or_continue))
-        }
-    }
+    matches!(stmt, IrStmt::Break(_) | IrStmt::Continue(_))
+        || stmt.any_stmt(stmt_contains_break_or_continue)
 }
 
 /// Reject a `yield` whose operand itself contains a `yield` (`yield yield x`),
@@ -690,132 +632,20 @@ fn reject_nested_yield(value: &IrNode, fn_decl: &FnDecl) -> anyhow::Result<()> {
 
 /// Whether a statement contains a `yield` anywhere (recursively).
 fn stmt_contains_yield(stmt: &IrStmt) -> bool {
-    match stmt {
-        IrStmt::Expr(node) => node_contains_yield(node),
-        IrStmt::Decl { init, .. } => node_contains_yield(init),
-        IrStmt::Return(value) => value.as_ref().is_some_and(node_contains_yield),
-        IrStmt::If {
-            cond,
-            then_body,
-            else_body,
-        } => {
-            node_contains_yield(cond)
-                || then_body.iter().any(stmt_contains_yield)
-                || else_body.iter().any(stmt_contains_yield)
-        }
-        IrStmt::While {
-            cond, body, update, ..
-        } => {
-            node_contains_yield(cond)
-                || body.iter().any(stmt_contains_yield)
-                || update.iter().any(stmt_contains_yield)
-        }
-        IrStmt::Switch { disc, cases, .. } => {
-            node_contains_yield(disc)
-                || cases.iter().any(|c| {
-                    c.test.as_ref().is_some_and(node_contains_yield)
-                        || c.body.iter().any(stmt_contains_yield)
-                })
-        }
-        IrStmt::Try {
-            body,
-            catch_body,
-            finally_body,
-        } => {
-            body.iter().any(stmt_contains_yield)
-                || catch_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_contains_yield))
-                || finally_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_contains_yield))
-        }
-        IrStmt::Break(_) | IrStmt::Continue(_) => false,
-    }
+    stmt.any_node(node_contains_yield) || stmt.any_stmt(stmt_contains_yield)
 }
 
 /// Whether a statement contains a `return` anywhere (recursively). A `return`
 /// nested inside inline control flow in a generator is an unsupported form
 /// (its `done`/state bookkeeping needs the CFG lowering).
 fn stmt_contains_return(stmt: &IrStmt) -> bool {
-    match stmt {
-        IrStmt::Return(_) => true,
-        IrStmt::Expr(_) | IrStmt::Decl { .. } | IrStmt::Break(_) | IrStmt::Continue(_) => false,
-        IrStmt::If {
-            then_body,
-            else_body,
-            ..
-        } => {
-            then_body.iter().any(stmt_contains_return) || else_body.iter().any(stmt_contains_return)
-        }
-        IrStmt::While { body, update, .. } => {
-            body.iter().any(stmt_contains_return) || update.iter().any(stmt_contains_return)
-        }
-        IrStmt::Switch { cases, .. } => cases
-            .iter()
-            .any(|c| c.body.iter().any(stmt_contains_return)),
-        IrStmt::Try {
-            body,
-            catch_body,
-            finally_body,
-        } => {
-            body.iter().any(stmt_contains_return)
-                || catch_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_contains_return))
-                || finally_body
-                    .as_ref()
-                    .is_some_and(|b| b.iter().any(stmt_contains_return))
-        }
-    }
+    matches!(stmt, IrStmt::Return(_)) || stmt.any_stmt(stmt_contains_return)
 }
 
-/// Whether an expression contains a `yield` anywhere (recursively). Only the node
-/// shapes a generator body can produce need to be walked precisely; the rest fall
-/// through the catch-all, which is sound because a `yield` in any un-walked
-/// position is itself an unsupported form the segmentation rejects.
+/// Whether an expression contains a `yield` anywhere (recursively), through every
+/// child position (see [`IrNode::any_child`]).
 fn node_contains_yield(node: &IrNode) -> bool {
-    match node {
-        IrNode::Yield(_) => true,
-        IrNode::Binary { lhs, rhs, .. } | IrNode::Logical { lhs, rhs, .. } => {
-            node_contains_yield(lhs) || node_contains_yield(rhs)
-        }
-        IrNode::Not(inner)
-        | IrNode::CellNew(inner)
-        | IrNode::CellGet(inner)
-        | IrNode::StrLen(inner)
-        | IrNode::NullishCheck { value: inner, .. }
-        | IrNode::Throw(inner)
-        | IrNode::IsGenerator(inner)
-        | IrNode::Await(inner) => node_contains_yield(inner),
-        IrNode::CellSet { cell, value } => node_contains_yield(cell) || node_contains_yield(value),
-        IrNode::Assign { value, .. } => node_contains_yield(value),
-        IrNode::Ternary {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            node_contains_yield(cond)
-                || node_contains_yield(then_branch)
-                || node_contains_yield(else_branch)
-        }
-        IrNode::Call { args, .. } | IrNode::ConsoleLog { args } => {
-            args.iter().any(node_contains_yield)
-        }
-        IrNode::CallIndirect { callee, args } => {
-            node_contains_yield(callee) || args.iter().any(node_contains_yield)
-        }
-        IrNode::Array(elems) => elems.iter().any(node_contains_yield),
-        IrNode::Object(entries) => entries.iter().any(|(_, v)| node_contains_yield(v)),
-        IrNode::Index { obj, index } => node_contains_yield(obj) || node_contains_yield(index),
-        IrNode::GenResume { handle, sent } => {
-            node_contains_yield(handle) || node_contains_yield(sent)
-        }
-        IrNode::ReceiverMethod { recv, args, .. } => {
-            node_contains_yield(recv) || args.iter().any(node_contains_yield)
-        }
-        _ => false,
-    }
+    matches!(node, IrNode::Yield(_)) || node.any_child(node_contains_yield)
 }
 
 /// The `TypeError` a `yield*` over a non-iterable operand throws.

@@ -1359,5 +1359,184 @@ pub struct IrProgram {
     pub module_cells: u32,
 }
 
+impl IrNode {
+    /// Whether `f` holds for any DIRECT child expression. Exhaustive over every
+    /// variant (no wildcard), so a new variant must classify its children before
+    /// the tree walkers built on this compile.
+    #[allow(clippy::too_many_lines)]
+    pub fn any_child(&self, mut f: impl FnMut(&IrNode) -> bool) -> bool {
+        match self {
+            IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::Local(_)
+            | IrNode::EnvLoad(_)
+            | IrNode::ModuleCell(_)
+            | IrNode::SentValue
+            | IrNode::ExcValue
+            | IrNode::ThisGlobal
+            | IrNode::ArrayPop { .. }
+            | IrNode::IncDec { .. }
+            | IrNode::MapNew { .. }
+            | IrNode::DateNow => false,
+            IrNode::Assign { value: inner, .. }
+            | IrNode::CellNew(inner)
+            | IrNode::CellGet(inner)
+            | IrNode::IsHole(inner)
+            | IrNode::Yield(inner)
+            | IrNode::IsGenerator(inner)
+            | IrNode::TypeOf(inner)
+            | IrNode::StrLen(inner)
+            | IrNode::NullishCheck { value: inner, .. }
+            | IrNode::ArrayPush { value: inner, .. }
+            | IrNode::Not(inner)
+            | IrNode::Throw(inner)
+            | IrNode::ObjectBuiltin { arg: inner, .. }
+            | IrNode::InstanceOf { value: inner, .. }
+            | IrNode::JsonStringify { arg: inner }
+            | IrNode::JsonParse { arg: inner }
+            | IrNode::PromiseResolve(inner)
+            | IrNode::PromiseReject(inner)
+            | IrNode::Await(inner)
+            | IrNode::PromiseCtor {
+                executor: inner, ..
+            }
+            | IrNode::AsyncSpawn(inner)
+            | IrNode::DateGetTime { recv: inner }
+            | IrNode::MathSpread { args: inner, .. } => f(inner),
+            IrNode::Binary { lhs: a, rhs: b, .. }
+            | IrNode::Logical { lhs: a, rhs: b, .. }
+            | IrNode::CellSet { cell: a, value: b }
+            | IrNode::GenResume { handle: a, sent: b }
+            | IrNode::ObjectRest {
+                source: a,
+                exclude: b,
+            }
+            | IrNode::Index { obj: a, index: b }
+            | IrNode::MakeAccessor {
+                getter: a,
+                setter: b,
+            }
+            | IrNode::ArrayHof {
+                array: a,
+                callback: b,
+                init: None,
+                ..
+            }
+            | IrNode::ObjectKey { obj: a, index: b }
+            | IrNode::ObjectHas { key: a, obj: b }
+            | IrNode::ObjectDelete { obj: a, key: b }
+            | IrNode::PromiseFinally {
+                promise: a,
+                on_finally: b,
+            } => f(a) || f(b),
+            IrNode::IndexOpSet {
+                obj, index, rhs, ..
+            } => f(obj) || f(index) || f(rhs),
+            IrNode::IndexSet { obj, index, value } => f(obj) || f(index) || f(value),
+            IrNode::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => f(cond) || f(then_branch) || f(else_branch),
+            IrNode::PromiseThen {
+                promise,
+                on_fulfilled,
+                on_rejected,
+            } => f(promise) || f(on_fulfilled) || f(on_rejected),
+            IrNode::ArrayHof {
+                array,
+                callback,
+                init: Some(init),
+                ..
+            } => f(array) || f(callback) || f(init),
+            IrNode::ConvertCall { arg, radix, .. } => f(arg) || radix.as_deref().is_some_and(f),
+            IrNode::DateNew { ms } => ms.as_deref().is_some_and(f),
+            IrNode::Call { args, .. }
+            | IrNode::FuncValue { captures: args, .. }
+            | IrNode::MakeGenerator { slots: args, .. }
+            | IrNode::Array(args)
+            | IrNode::ConsoleLog { args }
+            | IrNode::MathCall { args, .. } => args.iter().any(f),
+            IrNode::CallIndirect { callee: recv, args }
+            | IrNode::MethodCall { recv, args, .. }
+            | IrNode::ThisCall {
+                callee: recv, args, ..
+            }
+            | IrNode::MapMethod { recv, args, .. }
+            | IrNode::ReceiverMethod { recv, args, .. }
+            | IrNode::DateMethod { recv, args, .. } => f(recv) || args.iter().any(f),
+            IrNode::MethodCallUser { obj, key, args, .. } => f(obj) || f(key) || args.iter().any(f),
+            IrNode::New {
+                instance,
+                ctor,
+                args,
+                ..
+            } => f(instance) || f(ctor) || args.iter().any(f),
+            IrNode::Object(entries) => entries.iter().any(|(_, value)| f(value)),
+            IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
+                SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
+            }),
+            IrNode::CallSpread { target, args } => {
+                matches!(target, SpreadCallee::Indirect(callee) if f(callee)) || f(args)
+            }
+        }
+    }
+}
+
+impl IrStmt {
+    /// Whether `f` holds for any DIRECT child expression (not descending into
+    /// nested statements). Exhaustive over every variant, like
+    /// [`IrNode::any_child`].
+    pub fn any_node(&self, mut f: impl FnMut(&IrNode) -> bool) -> bool {
+        match self {
+            IrStmt::Decl { init: node, .. }
+            | IrStmt::Expr(node)
+            | IrStmt::If { cond: node, .. }
+            | IrStmt::While { cond: node, .. } => f(node),
+            IrStmt::Return(value) => value.as_ref().is_some_and(f),
+            IrStmt::Switch { disc, cases, .. } => {
+                f(disc)
+                    || cases
+                        .iter()
+                        .any(|case| case.test.as_ref().is_some_and(&mut f))
+            }
+            IrStmt::Break(_) | IrStmt::Continue(_) | IrStmt::Try { .. } => false,
+        }
+    }
+
+    /// Whether `f` holds for any DIRECT child statement (one nesting level).
+    /// Exhaustive over every variant, like [`IrNode::any_child`].
+    pub fn any_stmt(&self, f: impl FnMut(&IrStmt) -> bool) -> bool {
+        match self {
+            IrStmt::Decl { .. }
+            | IrStmt::Expr(_)
+            | IrStmt::Return(_)
+            | IrStmt::Break(_)
+            | IrStmt::Continue(_) => false,
+            IrStmt::If {
+                then_body: a,
+                else_body: b,
+                ..
+            }
+            | IrStmt::While {
+                body: a, update: b, ..
+            } => a.iter().chain(b).any(f),
+            IrStmt::Switch { cases, .. } => cases.iter().flat_map(|case| &case.body).any(f),
+            IrStmt::Try {
+                body,
+                catch_body,
+                finally_body,
+            } => body
+                .iter()
+                .chain(catch_body.iter().flatten())
+                .chain(finally_body.iter().flatten())
+                .any(f),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
