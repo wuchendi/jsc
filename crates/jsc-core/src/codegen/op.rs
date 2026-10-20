@@ -312,11 +312,9 @@ pub(super) fn json_method_name(callee: &Expr) -> Option<&str> {
 
 /// Lower a recognized `JSON.<name>(arg)` call. `JSON.stringify(v)` lowers to
 /// an [`IrNode::JsonStringify`] (exactly one argument; the `replacer`/`space`
-/// second/third arguments are unsupported and rejected). `JSON.parse` is DEFERRED:
-/// producing objects with runtime-unknown keys conflicts with the fixed-shape
-/// object model (keys are interned static-string pointers; `__obj_set` cannot add
-/// keys), so it is rejected with a span rather than silently dropped. Any other
-/// `JSON.<name>` is likewise rejected by name.
+/// second/third arguments are unsupported and rejected); `JSON.parse(text)`
+/// lowers to an [`IrNode::JsonParse`]. Any other `JSON.<name>` is rejected by
+/// name.
 pub(super) fn lower_json_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
     match name {
         "stringify" => {

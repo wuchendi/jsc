@@ -63,14 +63,6 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         );
     }
     resolver.exit_function();
-    // Finalize the object shapes: keep only the candidates whose binding name is
-    // never reassigned, so the recorded literal shape is provably fixed.
-    let object_shapes = resolver
-        .shape_candidates
-        .into_iter()
-        .filter(|(_, name, _)| !resolver.assigned.contains(name))
-        .map(|(id, _, keys)| (id, keys))
-        .collect();
     // The `var`-declared module bindings (hoisted, initialized to `undefined`).
     let mut module_vars = std::collections::HashSet::new();
     for stmt in top_stmts {
@@ -96,7 +88,6 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         module_vars,
         module_mutable,
         module_names: resolver.module_names,
-        object_shapes,
     }
 }
 
@@ -213,25 +204,8 @@ impl CaptureResolver {
         }
     }
 
-    /// Record a `let`/`const` binding initialized directly with an all-static-key
-    /// object literal as an object-shape candidate (static-shape unknown-method
-    /// guard). Only simple identifier bindings qualify; `var` is excluded because
-    /// its hoisting/redeclaration makes a single fixed shape unsound. The candidate
-    /// is dropped later if the name is ever reassigned (see [`analyze_captures`]).
-    fn record_shape_candidate(&mut self, kind: VarDeclKind, name: &Pat, init: &Expr) {
-        if !matches!(kind, VarDeclKind::Let | VarDeclKind::Const) {
-            return;
-        }
-        let Pat::Ident(ident) = name else { return };
-        if let Some(keys) = object_literal_keys(strip_parens(init)) {
-            self.shape_candidates
-                .push((binding_id(ident), ident.id.sym.as_ref().to_owned(), keys));
-        }
-    }
-
     /// Record every simple-identifier target of a destructuring assignment
-    /// (`[o] = ..`, `({o} = ..)`) as reassigned, so a rebound binding cannot keep a
-    /// trusted object shape.
+    /// (`[o] = ..`, `({o} = ..)`) as referenced.
     fn mark_assign_target_pat(&mut self, pat: &AssignTargetPat) {
         match pat {
             AssignTargetPat::Array(arr) => self.mark_array_pat(arr),
@@ -241,7 +215,7 @@ impl CaptureResolver {
     }
 
     /// Record every simple-identifier binding within an assignment/destructuring
-    /// pattern as referenced and reassigned; member targets and defaults are
+    /// pattern as referenced; member targets and defaults are
     /// analyzed as ordinary expressions.
     fn mark_pat(&mut self, pat: &Pat) {
         match pat {
@@ -263,7 +237,6 @@ impl CaptureResolver {
 
     fn mark_assigned(&mut self, ident: &Ident) {
         self.reference(ident.sym.as_ref());
-        self.assigned.insert(ident.sym.as_ref().to_owned());
     }
 
     fn mark_array_pat(&mut self, arr: &ArrayPat) {
@@ -330,7 +303,6 @@ impl CaptureResolver {
                 for d in &v.decls {
                     if let Some(init) = &d.init {
                         self.expr(init);
-                        self.record_shape_candidate(v.kind, &d.name, init);
                     }
                     self.declare_pat(&d.name);
                 }
@@ -569,7 +541,6 @@ impl CaptureResolver {
             Expr::Assign(a) => {
                 if let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &a.left {
                     self.reference(ident.id.sym.as_ref());
-                    self.assigned.insert(ident.id.sym.as_ref().to_owned());
                 } else if let AssignTarget::Simple(SimpleAssignTarget::Member(m)) = &a.left {
                     self.expr(&m.obj);
                     if let MemberProp::Computed(c) = &m.prop {
@@ -577,17 +548,12 @@ impl CaptureResolver {
                     }
                 } else if let AssignTarget::Pat(pat) = &a.left {
                     // A destructuring assignment (`[o] = ..`, `({o} = ..)`) rebinds
-                    // its targets — record every simple-ident target as reassigned.
+                    // its targets — record every simple-ident target as referenced.
                     self.mark_assign_target_pat(pat);
                 }
                 self.expr(&a.right);
             }
-            Expr::Update(u) => {
-                if let Expr::Ident(ident) = u.arg.as_ref() {
-                    self.assigned.insert(ident.sym.as_ref().to_owned());
-                }
-                self.expr(&u.arg);
-            }
+            Expr::Update(u) => self.expr(&u.arg),
             Expr::Bin(b) => {
                 self.expr(&b.left);
                 self.expr(&b.right);
@@ -716,42 +682,7 @@ impl CaptureResolver {
     }
 }
 
-/// The own keys of an object literal when every property has a statically-known
-/// string key, or `None` when any property makes the shape non-enumerable at
-/// compile time (a spread, a computed/numeric key, or a getter/setter). Mirrors
-/// the key set [`LowerCtx::lower_object`] materializes, so a name absent here is
-/// provably absent from the runtime object (the object model has no dynamic key
-/// growth).
-pub(super) fn object_literal_keys(expr: &Expr) -> Option<Vec<String>> {
-    let Expr::Object(obj) = expr else { return None };
-    let mut keys = Vec::with_capacity(obj.props.len());
-    for prop in &obj.props {
-        let PropOrSpread::Prop(prop) = prop else {
-            return None;
-        };
-        let key = match prop.as_ref() {
-            Prop::KeyValue(kv) => static_prop_key(&kv.key)?,
-            Prop::Shorthand(ident) => ident.sym.as_ref().to_owned(),
-            Prop::Method(method) => static_prop_key(&method.key)?,
-            Prop::Getter(_) | Prop::Setter(_) | Prop::Assign(_) => return None,
-        };
-        keys.push(key);
-    }
-    Some(keys)
-}
-
-/// The static string key of a property name (an identifier or string literal),
-/// or `None` for a computed or numeric key that is not known at compile time.
-fn static_prop_key(name: &PropName) -> Option<String> {
-    match name {
-        PropName::Ident(id) => Some(id.sym.as_ref().to_owned()),
-        PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
-        _ => None,
-    }
-}
-
-/// Strip redundant parentheses from an expression, so a parenthesized object
-/// literal initializer (`const o = ({..})`) is still recognized as a shape.
+/// Strip redundant parentheses from an expression.
 pub(super) fn strip_parens(expr: &Expr) -> &Expr {
     match expr {
         Expr::Paren(p) => strip_parens(&p.expr),

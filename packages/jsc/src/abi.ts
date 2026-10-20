@@ -31,7 +31,7 @@ export const HEADER_SIZE = 4
 export const TYPE_STRING = 0
 /** TYPE BYTE of a heap array block: `[type=1][pad×3][len:u32][elem:i64 × len]`. */
 export const TYPE_ARRAY = 1
-/** TYPE BYTE of a heap object block: `[type=2][pad×3][n:u32][(key:i64, val:i64) × n]`. */
+/** TYPE BYTE of an ordinary object block: the object-family prefix; properties live in its `props` table. */
 export const TYPE_OBJECT = 2
 /** TYPE BYTE of a first-class function value. Renders as `[Function (anonymous)]`. */
 export const TYPE_FUNCTION = 3
@@ -46,8 +46,42 @@ export const TYPE_GENERATOR = 9
 /** TYPE BYTE of a `Date` block (prefix, then `ms:f64`). */
 export const TYPE_DATE = 10
 
+/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`). */
+export const HEADER_FLAGS_OFFSET = 2
+/** String `flags` bit: the content is a canonical array index. */
+export const STR_FLAG_ARRAY_INDEX = 2
+
+/** Byte offset of the object-family prefix's `props:u32` slot (the `TYPE_PROPS` table, `0` = none). */
+export const OBJ_PROPS_OFFSET = HEADER_SIZE
 /** Byte size of the object-family prefix (header, `props:u32`, `proto:i64`); payloads start here. */
 export const OBJ_PREFIX_SIZE = 16
+
+/** Byte offset (from a property table base) of the `tflags` byte. */
+export const PROPS_TFLAGS_OFFSET = 2
+/** Byte offset (from a property table base) of the `count` of used slots (`u32`, tombstones included). */
+export const PROPS_COUNT_OFFSET = 4
+/** Byte size of a property table header; entry `k` starts at `PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k`. */
+export const PROPS_HEADER_SIZE = 16
+/** Byte size of one property table entry. */
+export const PROP_ENTRY_SIZE = 16
+/** Byte offset (within an entry) of the interned key string base (`u32`, `0` = tombstone). */
+export const PROP_KEY_OFFSET = 0
+/** Byte offset (within an entry) of the `attrs` (`u32`). */
+export const PROP_ATTRS_OFFSET = 4
+/** Byte offset (within an entry) of the value (`i64`; an accessor pair pointer when `ATTR_ACCESSOR`). */
+export const PROP_VALUE_OFFSET = 8
+/** Property table `tflags` bit: some key is a canonical array index (list integer keys first). */
+export const PROPS_HAS_INDEX_KEYS = 1
+/** Property `attrs` bit: the key is listed by enumeration and rendering. */
+export const ATTR_ENUMERABLE = 2
+/** Property `attrs` bit: the value is a getter/setter pair. */
+export const ATTR_ACCESSOR = 8
+/** Byte offset (from an accessor pair block base) of the getter jsval. */
+export const ACCESSOR_GET_OFFSET = HEADER_SIZE + 4
+/** Byte offset (from an accessor pair block base) of the setter jsval. */
+export const ACCESSOR_SET_OFFSET = HEADER_SIZE + 12
+/** The non-enumerable property key branding an Error object. */
+export const ERROR_KIND_KEY = '@@errorkind'
 
 /** {@link TYPE_PROMISE} `state`: the promise is unsettled. */
 export const PROMISE_PENDING = 0

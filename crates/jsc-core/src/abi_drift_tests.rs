@@ -4,6 +4,12 @@
 //! the TS file, or a differing value fails the test.
 
 use super::{
+    ACCESSOR_GET_OFFSET, ACCESSOR_SET_OFFSET, ATTR_ACCESSOR, ATTR_ENUMERABLE, ERROR_KIND_KEY,
+    HEADER_FLAGS_OFFSET, OBJ_PROPS_OFFSET, PROP_ATTRS_OFFSET, PROP_ENTRY_SIZE, PROP_KEY_OFFSET,
+    PROP_VALUE_OFFSET, PROPS_COUNT_OFFSET, PROPS_HAS_INDEX_KEYS, PROPS_HEADER_SIZE,
+    PROPS_TFLAGS_OFFSET, STR_FLAG_ARRAY_INDEX,
+};
+use super::{
     ASYNC_STEP_EXPORT_NAME, CONVERT_OP_PARSE_FLOAT, CONVERT_OP_TO_NUMBER, CONVERT_OP_TO_STRING,
     DATE_MS_OFFSET, EXC_PENDING_EXPORT_NAME, EXC_VALUE_EXPORT_NAME, FALSE, GEN_DONE_OFFSET,
     HEADER_SIZE, HEAP, HEAP_PTR_EXPORT_NAME, HEAP_PTR_OOM, INVOKE_EXPORT_NAME, MEMORY_EXPORT_NAME,
@@ -58,7 +64,23 @@ fn expected() -> Vec<(&'static str, Val)> {
         ("TYPE_PROMISE", int(TYPE_PROMISE)),
         ("TYPE_GENERATOR", int(TYPE_GENERATOR)),
         ("TYPE_DATE", int(TYPE_DATE)),
+        ("HEADER_FLAGS_OFFSET", int(HEADER_FLAGS_OFFSET)),
+        ("STR_FLAG_ARRAY_INDEX", int(STR_FLAG_ARRAY_INDEX)),
+        ("OBJ_PROPS_OFFSET", int(OBJ_PROPS_OFFSET)),
         ("OBJ_PREFIX_SIZE", int(OBJ_PREFIX_SIZE)),
+        ("PROPS_TFLAGS_OFFSET", int(PROPS_TFLAGS_OFFSET)),
+        ("PROPS_COUNT_OFFSET", int(PROPS_COUNT_OFFSET)),
+        ("PROPS_HEADER_SIZE", int(PROPS_HEADER_SIZE)),
+        ("PROP_ENTRY_SIZE", int(PROP_ENTRY_SIZE)),
+        ("PROP_KEY_OFFSET", int(PROP_KEY_OFFSET)),
+        ("PROP_ATTRS_OFFSET", int(PROP_ATTRS_OFFSET)),
+        ("PROP_VALUE_OFFSET", int(PROP_VALUE_OFFSET)),
+        ("PROPS_HAS_INDEX_KEYS", int(PROPS_HAS_INDEX_KEYS)),
+        ("ATTR_ENUMERABLE", int(ATTR_ENUMERABLE)),
+        ("ATTR_ACCESSOR", int(ATTR_ACCESSOR)),
+        ("ACCESSOR_GET_OFFSET", int(ACCESSOR_GET_OFFSET)),
+        ("ACCESSOR_SET_OFFSET", int(ACCESSOR_SET_OFFSET)),
+        ("ERROR_KIND_KEY", s(ERROR_KIND_KEY)),
         ("PROMISE_PENDING", int(PROMISE_PENDING)),
         ("PROMISE_FULFILLED", int(PROMISE_FULFILLED)),
         ("PROMISE_REJECTED", int(PROMISE_REJECTED)),
@@ -286,4 +308,48 @@ fn object_family_layout_matches_design() {
     ] {
         assert_eq!(size % super::BLOCK_ALIGN, 0);
     }
+}
+
+/// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
+/// `design/object-model.md` 2.1-2.3.
+#[test]
+fn property_table_layout_matches_design() {
+    use super::{
+        ATTR_CONFIGURABLE, ATTR_WRITABLE, ATTRS_DEFAULT, OBJ_FLAG_NOT_EXTENSIBLE, PROPS_CAP_OFFSET,
+        PROPS_HAS_NON_ENUM, PROPS_LIVE_OFFSET, STR_FLAG_INTERNED, TYPE_PROPS,
+    };
+    assert_eq!(TYPE_PROPS, 12);
+    assert_eq!(
+        [
+            PROPS_TFLAGS_OFFSET,
+            PROPS_COUNT_OFFSET,
+            PROPS_CAP_OFFSET,
+            PROPS_LIVE_OFFSET,
+            PROPS_HEADER_SIZE
+        ],
+        [2, 4, 8, 12, 16]
+    );
+    assert_eq!(
+        [
+            PROP_ENTRY_SIZE,
+            PROP_KEY_OFFSET,
+            PROP_ATTRS_OFFSET,
+            PROP_VALUE_OFFSET
+        ],
+        [16, 0, 4, 8]
+    );
+    assert_eq!(
+        [
+            ATTR_WRITABLE,
+            ATTR_ENUMERABLE,
+            ATTR_CONFIGURABLE,
+            ATTR_ACCESSOR
+        ],
+        [1, 2, 4, 8]
+    );
+    assert_eq!(ATTRS_DEFAULT, 0b0111);
+    assert_eq!([PROPS_HAS_INDEX_KEYS, PROPS_HAS_NON_ENUM], [1, 2]);
+    assert_eq!([STR_FLAG_INTERNED, STR_FLAG_ARRAY_INDEX], [1, 2]);
+    assert_eq!(OBJ_FLAG_NOT_EXTENSIBLE, 1);
+    assert_eq!(HEADER_FLAGS_OFFSET, 2);
 }

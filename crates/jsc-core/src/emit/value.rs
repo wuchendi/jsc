@@ -219,21 +219,3 @@ pub(super) fn emit_is_generator(function: &mut Function, local: u32) {
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
 }
-
-/// Push `1` if the jsval in `local` is an ACCESSOR box (type byte `11`), else `0`
-/// (instance getters/setters). Same shape as [`emit_is_function`], guarding
-/// the type-byte read behind [`emit_is_pointer`]. Used by the member read/write
-/// paths to detect that a property resolved (through the prototype chain) to an
-/// accessor and must be dispatched as a getter/setter call rather than a plain
-/// data value. The operand may be ANY resolved value (a number, `undefined`, an
-/// object, …), so the pointer gate is essential.
-pub(super) fn emit_is_accessor(function: &mut Function, local: u32) {
-    emit_is_pointer(function, local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_ACCESSOR));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-}
