@@ -46,10 +46,8 @@ fn rejects_async_functions() {
 #[test]
 fn rejects_generator_functions() {
     // Top-level `function*` DECLARATIONS are supported (see the
-    // generators suite); a generator EXPRESSION and the out-of-scope yield
-    // forms remain rejected.
+    // generators suite); a generator EXPRESSION remains rejected.
     assert_rejected("let g = function* () { return 1 }; g()");
-    assert_rejected("function* g() { try { yield 1 } catch (e) {} } g().next()");
 }
 
 #[test]

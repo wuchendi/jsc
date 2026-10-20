@@ -1521,6 +1521,15 @@ pub struct GenSegment {
     pub stmts: Vec<IrStmt>,
     /// How the block ends.
     pub term: GenTerm,
+    /// The block a throw anywhere in this block (its statements or its
+    /// terminator) transfers to — the enclosing `try`'s catch entry, or its
+    /// finally-on-throw entry — with the exception still pending. `None` lets the
+    /// exception escape the state machine (completing the generator).
+    pub handler: Option<u32>,
+    /// Whether this block is a handler landing target: it is entered with an
+    /// exception pending, which it clears on entry (the thrown value stays
+    /// readable through [`IrNode::ExcValue`]).
+    pub catches: bool,
 }
 
 /// The terminator of a [`GenSegment`].

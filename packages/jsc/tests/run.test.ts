@@ -190,6 +190,47 @@ it('runs async/await with top-level await', async () => {
   expect(result).toBe('10')
 })
 
+it('throws a rejected await into the async body like the Rust host', async () => {
+  expect(
+    (
+      await run(
+        'async function f(){ try { await Promise.reject(new Error("boom")) } catch (e) { return "caught " + e.message } } f().then(v => console.log(v))',
+      )
+    ).stdout,
+  ).toBe('caught boom\n')
+  expect(
+    (
+      await run(
+        'async function f(){ try { await Promise.reject("r") } finally { console.log("fin") } } f().catch(e => console.log("rejected", e))',
+      )
+    ).stdout,
+  ).toBe('fin\nrejected r\n')
+  expect(
+    (
+      await run(
+        'async function f(){ try { await Promise.reject(42) } catch (e) { console.log(e, typeof e) } } f()',
+      )
+    ).stdout,
+  ).toBe('42 number\n')
+  expect(
+    (
+      await run(
+        'async function f(){ let log = ""; try { await Promise.reject("a") } catch (e) { log = log + e } try { const v = await Promise.resolve("b"); log = log + v; const w = await 3; log = log + w } catch (e) { log = log + "!" } return log } f().then(v => console.log(v))',
+      )
+    ).stdout,
+  ).toBe('ab3\n')
+  expect(
+    (
+      await run(
+        'async function f(){ try { await Promise.reject(1) } catch (e) { return e + 1 } } await f()',
+      )
+    ).result,
+  ).toBe('2')
+  await expect(
+    run('async function f() { await Promise.reject("nope"); return 1 } f(); 0'),
+  ).rejects.toThrow(/^Uncaught \(in promise\) nope$/)
+})
+
 it('backs Date.now() with the host clock', async () => {
   expect((await run('typeof Date.now()')).result).toBe('number')
   const before = Date.now()

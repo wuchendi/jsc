@@ -3,9 +3,10 @@
 //! Covers the user-approved v1 cut: `function*` declarations with `yield` in
 //! statement / `x = yield` / `return yield` positions, `.next(v)` returning
 //! `{ value, done }`, a persistent frame that survives across suspends, and the
-//! diagnostics for the out-of-scope forms (CUT A: yield in try/catch/finally;
-//! yield inside a `switch`; a non-generator `.next()` receiver). A `yield` nested
-//! in an expression is linearized with JS evaluation order.
+//! diagnostics for the out-of-scope forms (a non-generator `.next()` receiver).
+//! A `yield` may sit in a `try`, `catch` or `finally` clause. A `yield` nested in an expression is
+//! linearized with JS evaluation order; a `yield` inside `for-of`/`for-in`/
+//! `switch` crosses the loop/switch temporaries through frame cells.
 
 mod common;
 
@@ -334,50 +335,341 @@ fn a_for_in_without_a_yield_runs_inline() {
     );
 }
 
+// --- A `yield` inside for-of / for-in / switch -----------------------------
+
+#[test]
+fn yield_in_a_for_of_body_over_an_array() {
+    assert_output(
+        "function* g(xs){ for (const x of xs) { yield x * 2 } }
+         console.log([...g([1, 2, 3])].join(\",\"));",
+        "2,4,6\n",
+    );
+}
+
+#[test]
+fn yield_in_a_for_of_body_over_a_string() {
+    assert_output(
+        "function* g(s){ for (const c of s) { yield c + c } }
+         console.log([...g(\"abc\")].join(\"\"));",
+        "aabbcc\n",
+    );
+}
+
+#[test]
+fn yield_in_a_for_of_body_over_another_generator() {
+    assert_output(
+        "function* inner(){ yield 1; yield 2; yield 3; }
+         function* outer(){ for (const x of inner()) { yield x * 10; } yield 0; }
+         console.log([...outer()].join(\",\"));",
+        "10,20,30,0\n",
+    );
+}
+
+#[test]
+fn yield_star_in_a_for_of_body() {
+    assert_output(
+        "function* inner(n){ for (let i = 0; i < n; i++) yield n; }
+         function* g(xs){ for (const x of xs) { yield* inner(x); yield \"|\"; } }
+         console.log([...g([1, 2, 3])].join(\"\"));",
+        "1|22|333|\n",
+    );
+}
+
+#[test]
+fn yield_in_a_for_in_body() {
+    assert_output(
+        "function* keys(o){ for (const k in o) { yield k + \"=\" + o[k]; } }
+         console.log([...keys({ a: 1, b: 2, c: 3 })].join(\" \"));",
+        "a=1 b=2 c=3\n",
+    );
+}
+
+#[test]
+fn yield_in_a_for_of_body_with_break_continue_and_return() {
+    assert_output(
+        "function* g(xs){ for (const x of xs) { if (x === 2) continue; if (x === 5) break; yield x; } yield 99; }
+         function* h(xs){ for (const x of xs) { yield x; if (x === 2) return 7; } yield 99; }
+         console.log([...g([1, 2, 3, 4, 5, 6])].join(\",\"));
+         let it = h([1, 2, 3]);
+         let a = it.next(); let b = it.next(); let c = it.next(); let d = it.next();
+         console.log(a.value, b.value, c.value, c.done, d.done);",
+        "1,3,4,99\n1 2 7 true true\n",
+    );
+}
+
+#[test]
+fn yield_in_nested_for_of_loops_with_labels() {
+    assert_output(
+        "function* g(){
+           outer: for (const a of [1, 2, 3]) {
+             for (const b of \"xyz\") {
+               if (b === \"z\") continue outer;
+               if (a === 3) break outer;
+               yield a + b;
+             }
+           }
+           yield \"end\";
+         }
+         console.log([...g()].join(\" \"));",
+        "1x 1y 2x 2y end\n",
+    );
+}
+
+#[test]
+fn yield_in_a_for_of_iterable_expression() {
+    assert_output(
+        "function* g(){ let s = 0; for (const x of (yield \"need\")) { s = s + x; yield s; } return s; }
+         let it = g();
+         console.log(it.next().value);
+         console.log(it.next([4, 5]).value, it.next().value, it.next().value);",
+        "need\n4 9 9\n",
+    );
+}
+
+#[test]
+fn yield_in_a_for_of_body_receives_sent_values() {
+    assert_output(
+        "function* g(xs){ let out = \"\"; for (const x of xs) { out = out + x + (yield x); } return out; }
+         let it = g([\"a\", \"b\"]);
+         it.next(); it.next(1);
+         console.log(it.next(2).value);",
+        "a1b2\n",
+    );
+}
+
+#[test]
+fn yield_in_switch_cases_with_fallthrough_and_break() {
+    assert_output(
+        "function* g(x){
+           switch (x) {
+             case 1: yield \"one\";
+             case 2: yield \"two\"; break;
+             case 3: yield \"three\";
+           }
+           yield \"after\";
+         }
+         console.log([...g(1)].join(\",\"), [...g(2)].join(\",\"), [...g(3)].join(\",\"), [...g(9)].join(\",\"));",
+        "one,two,after two,after three,after after\n",
+    );
+}
+
+#[test]
+fn yield_in_switch_with_default_in_the_middle() {
+    assert_output(
+        "function* g(x){
+           switch (x) {
+             case 1: yield 1; break;
+             default: yield \"d\";
+             case 2: yield 2; break;
+             case 3: yield 3;
+           }
+         }
+         console.log([...g(1)].join(\",\"), [...g(2)].join(\",\"), [...g(7)].join(\",\"), [...g(3)].join(\",\"));",
+        "1 2 d,2 3\n",
+    );
+}
+
+#[test]
+fn yield_in_switch_discriminant_and_case_tests() {
+    assert_output(
+        "function* g(){
+           switch (yield \"disc\") {
+             case (yield \"t1\"): yield \"matched1\"; break;
+             case (yield \"t2\"): yield \"matched2\"; break;
+           }
+           return \"done\";
+         }
+         let it = g();
+         let out = [it.next().value, it.next(5).value, it.next(4).value, it.next(5).value, it.next().value];
+         console.log(out.join(\",\"));",
+        "disc,t1,t2,matched2,done\n",
+    );
+}
+
+#[test]
+fn switch_in_a_loop_continue_and_break_targets() {
+    assert_output(
+        "function* g(xs){
+           for (const x of xs) {
+             switch (x) {
+               case \"skip\": yield \"s\"; continue;
+               case \"stop\": yield \"t\"; break;
+               default: yield x;
+             }
+             yield \"|\";
+             if (x === \"stop\") break;
+           }
+           yield \"end\";
+         }
+         console.log([...g([\"a\", \"skip\", \"b\", \"stop\", \"c\"])].join(\"\"));",
+        "a|sb|t|end\n",
+    );
+}
+
+#[test]
+fn a_switch_with_break_but_no_yield_inside_a_generator() {
+    assert_output(
+        "function* g(x){ let r = 0; switch (x) { case 1: r = 10; break; default: r = 20; } yield r; }
+         console.log(g(1).next().value, g(2).next().value);",
+        "10 20\n",
+    );
+}
+
+// --- yield/await inside try/catch/finally ------------------------------------
+
+#[test]
+fn yield_in_try_completes_normally() {
+    assert_output(
+        "function* g(){ try { yield 1; yield 2; } catch (e) { yield 99; } yield 3; }
+         console.log([...g()].join());",
+        "1,2,3\n",
+    );
+}
+
+#[test]
+fn a_throw_after_resume_is_caught_by_the_catch() {
+    assert_output(
+        "function* g(){ try { yield 1; throw new Error(\"x\") } catch (e) { yield e.message } }
+         console.log(JSON.stringify([...g()]));",
+        "[1,\"x\"]\n",
+    );
+}
+
+#[test]
+fn yield_inside_catch() {
+    assert_output(
+        "function* g(){ try { throw 5; } catch (e) { yield e; yield e + 1; } yield 0; }
+         console.log([...g()].join());",
+        "5,6,0\n",
+    );
+}
+
+#[test]
+fn yield_inside_finally_on_normal_completion() {
+    assert_output(
+        "function* g(){ try { yield 1; } finally { yield 2; console.log(\"fin\"); } yield 3; }
+         console.log([...g()].join());",
+        "fin\n1,2,3\n",
+    );
+}
+
+#[test]
+fn finally_runs_on_throw_then_rethrows_to_an_outer_try() {
+    assert_output(
+        "function* g(){
+           try { try { yield 1; throw new Error(\"boom\"); } finally { yield 2; } }
+           catch (e) { yield e.message; }
+         }
+         console.log([...g()].join());",
+        "1,2,boom\n",
+    );
+}
+
+#[test]
+fn finally_rethrow_escapes_the_generator_uncaught() {
+    assert_uncaught(
+        "function* g(){ try { yield 1; throw new Error(\"out\"); } finally { console.log(\"fin\"); } }
+         let it = g(); it.next(); it.next();",
+        "Error: out",
+    );
+}
+
+#[test]
+fn a_throw_out_of_the_generator_completes_it() {
+    assert_output(
+        "function* g(){ yield 1; throw new Error(\"x\"); yield 2; }
+         let it = g(); it.next();
+         try { it.next(); } catch (e) { console.log(e.message); }
+         let r = it.next(); console.log(r.value, r.done);",
+        "x\nundefined true\n",
+    );
+}
+
+#[test]
+fn return_inside_try_runs_finally_and_keeps_the_value() {
+    assert_output(
+        "function* g(){ try { yield 1; return 7; } finally { yield 2; console.log(\"fin\"); } }
+         let it = g();
+         let a = it.next(); console.log(a.value, a.done);
+         let b = it.next(); console.log(b.value, b.done);
+         let c = it.next(); console.log(c.value, c.done);
+         let d = it.next(); console.log(d.value, d.done);",
+        "1 false\n2 false\nfin\n7 true\nundefined true\n",
+    );
+}
+
+#[test]
+fn break_and_continue_out_of_a_try_in_a_loop_run_finally() {
+    assert_output(
+        "function* g(){
+           for (let i = 0; i < 5; i++) {
+             try {
+               if (i === 1) continue;
+               if (i === 3) break;
+               yield i;
+             } finally { yield \"f\" + i; }
+           }
+           yield \"end\";
+         }
+         console.log([...g()].join());",
+        "0,f0,f1,2,f2,f3,end\n",
+    );
+}
+
+#[test]
+fn nested_try_finally_runs_inner_then_outer() {
+    assert_output(
+        "function* g(){
+           try {
+             try { yield 1; return 9; } finally { yield \"inner\"; }
+           } finally { yield \"outer\"; }
+         }
+         let it = g(); let out = [];
+         for (let r = it.next(); ; r = it.next()) { out.push(r.value); if (r.done) break; }
+         console.log(out.join());",
+        "1,inner,outer,9\n",
+    );
+}
+
+#[test]
+fn a_callee_exception_after_resume_lands_in_the_right_handler() {
+    assert_output(
+        "function boom(){ throw new Error(\"callee\"); }
+         function* g(){
+           try {
+             try { yield 1; } catch (e) { yield \"wrong\"; }
+             yield 2;
+             boom();
+           } catch (e) { yield e.message; }
+         }
+         console.log([...g()].join());",
+        "1,2,callee\n",
+    );
+}
+
+#[test]
+fn an_exception_from_an_inner_generator_is_caught_across_resumes() {
+    assert_output(
+        "function* inner(){ yield 1; throw new Error(\"inner\"); }
+         function* outer(){
+           let it = inner();
+           try { yield it.next().value; yield it.next().value; } catch (e) { yield e.message; }
+         }
+         console.log([...outer()].join());",
+        "1,inner\n",
+    );
+}
+
+#[test]
+fn async_await_in_try_then_catch_resolves() {
+    assert_output(
+        "async function f(){ try { await 1; throw new Error(\"e\") } catch (x) { return x.message } }
+         f().then(v => console.log(v));",
+        "e\n",
+    );
+}
+
 // --- Diagnostics: the still-out-of-scope forms ------------------------------
-
-#[test]
-fn rejects_for_of_with_a_yield_body_inside_a_generator() {
-    // The `for-of` hidden index/length temporaries do not persist across a suspend
-    // (deferred); an indexed `for` over `.length` is the supported workaround.
-    assert_rejected("function* g(){ let a = [1, 2]; for (const x of a) { yield x; } }");
-    assert_rejected("function* g(){ let o = { a: 1 }; for (const k in o) { yield k; } }");
-}
-
-#[test]
-fn cut_a_rejects_yield_inside_try() {
-    // Exception-handler state across a suspend is out of scope.
-    assert_rejected("function* g(){ try { yield 1; } catch (e) {} }");
-    assert_rejected("function* g(){ try { doThing(); } finally { yield 1; } }");
-}
-
-#[test]
-fn rejects_yield_inside_switch() {
-    assert_rejected("function* g(){ switch (1) { case 1: yield 1; } }");
-}
-
-#[test]
-fn unsupported_yield_positions_name_the_construct() {
-    let cases = [
-        (
-            "function* g(){ switch (1) { case 1: yield 1; } }",
-            "a `yield` inside a `switch` is not supported",
-        ),
-        (
-            "function* g(){ try { yield 1; } catch (e) {} }",
-            "a `yield` inside try/catch/finally is not supported",
-        ),
-    ];
-    for (src, expected) in cases {
-        let msg = jsc_core::run::compile_and_run(src)
-            .err()
-            .map(|err| err.to_string())
-            .unwrap_or_default();
-        assert_eq!(msg, expected, "diagnostic for `{src}`");
-    }
-}
-
-// --- A `yield` nested in an expression -----------------------------------
 
 #[test]
 fn a_nested_yield_preserves_evaluation_order() {
