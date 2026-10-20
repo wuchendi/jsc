@@ -109,6 +109,10 @@ pub(crate) const CLASS_ORDINARY: u8 = 0;
 /// `name`.
 pub(crate) const CLASS_ERROR: u8 = 1;
 
+/// [`TYPE_OBJECT`] `class` byte: an (unmapped) `arguments` object. It owns
+/// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
+pub(crate) const CLASS_ARGUMENTS: u8 = 2;
+
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.

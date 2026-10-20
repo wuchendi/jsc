@@ -453,6 +453,9 @@ impl LowerCtx<'_> {
                 "undefined" => Ok(IrNode::Undefined),
                 "NaN" => Ok(IrNode::Num(f64::NAN)),
                 "Infinity" => Ok(IrNode::Num(f64::INFINITY)),
+                "arguments" => self
+                    .resolve_arguments()
+                    .map_err(|msg| CompileError::spanned(span, msg).into()),
                 _ => {
                     Err(CompileError::spanned(span, format!("undeclared variable: {name}")).into())
                 }
@@ -911,15 +914,19 @@ impl LowerCtx<'_> {
         }
 
         let Expr::Ident(ident) = callee_expr else {
-            // The member-callee built-ins (`console.log`, array/string methods)
-            // do not accept a spread; a genuine computed callee is an indirect
-            // spread call through the funcref table.
-            if let Expr::Member(_) = callee_expr {
-                return Err(CompileError::spanned(
-                    call.span(),
-                    "spread arguments are unsupported for this call target",
-                )
-                .into());
+            // A member callee `obj.m(...xs)` is a method call binding `this =
+            // obj`: the receiver is stored into a temp, then the method read from
+            // it. Any other computed callee is an indirect spread call through the
+            // funcref table.
+            if let Expr::Member(member) = callee_expr {
+                if spread_rejecting_member(callee_expr, member) {
+                    return Err(CompileError::spanned(
+                        call.span(),
+                        "spread arguments are unsupported for this builtin method",
+                    )
+                    .into());
+                }
+                return self.lower_spread_method_call(member, args);
             }
             return Ok(IrNode::CallSpread {
                 target: SpreadCallee::Indirect(
@@ -959,6 +966,47 @@ impl LowerCtx<'_> {
                     .into(),
             )
         }
+    }
+
+    /// Lower a spread method call `obj.m(...args)` / `obj[k](...args)` (the
+    /// argument array already built into `args`): JS order evaluates the
+    /// receiver, then the member, then the arguments, and binds `this = obj`.
+    fn lower_spread_method_call(
+        &mut self,
+        member: &swc_ecma_ast::MemberExpr,
+        args: Box<IrNode>,
+    ) -> anyhow::Result<IrNode> {
+        let key = match &member.prop {
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
+            MemberProp::PrivateName(_) => {
+                return Err(CompileError::spanned(
+                    member.span(),
+                    "private fields are not supported",
+                )
+                .into());
+            }
+        };
+        let obj = self.lower_expr(&member.obj)?;
+        let this_local = self.fresh();
+        let callee = IrNode::Seq(vec![
+            IrNode::Assign {
+                local: this_local,
+                value: Box::new(obj),
+            },
+            IrNode::Index {
+                obj: Box::new(IrNode::Local(this_local)),
+                index: Box::new(key),
+            },
+        ]);
+        Ok(IrNode::CallSpread {
+            target: SpreadCallee::Method {
+                callee: Box::new(callee),
+                this_local,
+                not_callable: not_a_function(member_source_name(member).as_deref()),
+            },
+            args,
+        })
     }
 
     /// Lower a growing array method call `array.push(x)` / `array.pop()`.
@@ -2194,6 +2242,22 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
 /// promise / generator instance method. Recognized purely syntactically from a
 /// `<expr>.<name>(..)` member callee; the lowered node dispatches on the
 /// receiver's runtime TYPE BYTE and falls back to a user method call.
+/// Whether a spread call through the member callee `callee` (= `member`) hits
+/// a builtin dispatched by name with no user-method fallback (`console.log`,
+/// the `Object`/`JSON`/`Promise` statics, the array/string methods,
+/// `getTime`), which take no spread.
+fn spread_rejecting_member(callee: &Expr, member: &swc_ecma_ast::MemberExpr) -> bool {
+    is_console_log(callee)
+        || object_method_name(callee).is_some()
+        || json_method_name(callee).is_some()
+        || promise_static_method_name(callee).is_some()
+        || matches!(&member.prop, MemberProp::Ident(id) if {
+            let name = id.sym.as_ref();
+            matches!(name, "push" | "pop" | "map" | "filter" | "reduce" | "forEach" | "getTime")
+                || non_callback_method_op(name).is_some()
+        })
+}
+
 fn receiver_method_op(name: &str) -> Option<ReceiverOp> {
     Some(match name {
         "then" => ReceiverOp::Then,

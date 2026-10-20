@@ -52,6 +52,8 @@ export const HEADER_FLAGS_OFFSET = 2
 export const HEADER_CLASS_OFFSET = 3
 /** `TYPE_OBJECT` `class` byte of an Error instance (its kind is its prototype). */
 export const CLASS_ERROR = 1
+/** `TYPE_OBJECT` `class` byte of an (unmapped) `arguments` object. */
+export const CLASS_ARGUMENTS = 2
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
 

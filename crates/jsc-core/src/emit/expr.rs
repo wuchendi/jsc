@@ -65,7 +65,7 @@ pub(super) fn emit_node(
             // leak its receiver into this callee.
             emit_reset_this(function);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-            emit_argc(args.len(), function);
+            emit_argc(call_argc(args.len(), helpers), function);
             // `func` is codegen's index (main = 0, user functions 1..=n); the host
             // import shifts every defined function up by IMPORT_FUNC_COUNT.
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
@@ -279,6 +279,9 @@ pub(super) fn emit_node(
         }
         IrNode::NewTargetGlobal => {
             function.instruction(&Instruction::GlobalGet(NEW_TARGET_GLOBAL));
+        }
+        IrNode::SpreadArgsGlobal => {
+            function.instruction(&Instruction::GlobalGet(SPREAD_ARGS_GLOBAL));
         }
         IrNode::IsConstructCall(argc) => {
             function.instruction(&Instruction::I64Const(TRUE_BITS));
@@ -655,7 +658,7 @@ pub(super) fn emit_method_call_user(
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
-    emit_argc(args.len(), function);
+    emit_argc(call_argc(args.len(), helpers), function);
     // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
@@ -748,9 +751,9 @@ pub(super) fn emit_this_call(
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     if *construct {
-        emit_construct_argc(args.len(), function);
+        emit_construct_argc(call_argc(args.len(), helpers), function);
     } else {
-        emit_argc(args.len(), function);
+        emit_argc(call_argc(args.len(), helpers), function);
     }
     // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
@@ -871,9 +874,10 @@ pub(super) fn emit_construct(
         memory_index: 0,
     }));
     if spread.is_some() {
+        emit_publish_spread_args(base, function);
         emit_spread_construct_argc(len, function);
     } else {
-        emit_construct_argc(args.len(), function);
+        emit_construct_argc(call_argc(args.len(), helpers), function);
     }
     function.instruction(&Instruction::LocalGet(f));
     function.instruction(&Instruction::I32WrapI64);
@@ -935,6 +939,13 @@ fn emit_spread_construct_argc(len: u32, function: &mut Function) {
     function.instruction(&Instruction::F64Add);
     function.instruction(&Instruction::F64Neg);
     function.instruction(&Instruction::I64ReinterpretF64);
+}
+
+/// The `argc` a plain (non-spread) call with `count` source arguments passes:
+/// clamped to the `K` slots it fills, so a count above `K` only ever comes
+/// from a spread call, which publishes its overflow in `$__spread_args`.
+pub(super) fn call_argc(count: usize, helpers: Helpers<'_>) -> usize {
+    count.min(helpers.max_args as usize)
 }
 
 /// Push the trailing `argc` argument of a uniform-ABI call frame: the
@@ -1483,7 +1494,7 @@ pub(super) fn emit_call_indirect(
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
-    emit_argc(args.len(), function);
+    emit_argc(call_argc(args.len(), helpers), function);
     // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
@@ -1587,18 +1598,23 @@ pub(super) fn emit_call_spread(
             emit_reset_this(function);
             // A top-level declaration never captures, so its env slot is `undefined`.
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+            emit_publish_spread_args(base, function);
             emit_spread_argc(len, function);
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             emit_propagate_if_pending(function, helpers);
         }
-        SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } => {
+        SpreadCallee::Indirect(callee, _)
+        | SpreadCallee::This { callee, .. }
+        | SpreadCallee::Method { callee, .. } => {
             let cb = scratch + 7;
             let text = match target {
-                SpreadCallee::Indirect(_, not_callable) => callee_error_text(not_callable),
+                SpreadCallee::Indirect(_, not_callable)
+                | SpreadCallee::Method { not_callable, .. } => callee_error_text(not_callable),
                 _ => EXPRESSION_NOT_A_FUNCTION,
             };
-            // The callee is evaluated first (JS order) and its base stashed, then
-            // the argument array is built and read.
+            // The callee is evaluated first (JS order) and kept on the operand
+            // stack while the argument array is built (a call nested in the
+            // arguments reuses the scratch locals), then stashed.
             emit_node(callee, function, scratch, strings, helpers);
             // No funcref table (a function-less program): the callee can never
             // be a function value, so throw instead of an invalid `call_indirect`.
@@ -1606,7 +1622,8 @@ pub(super) fn emit_call_spread(
                 emit_throw_not_a_function(function, text, scratch, strings, helpers);
                 return;
             }
-            // IsCallable (DF4), checked while the full callee jsval is at hand.
+            emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
+            // IsCallable (DF4), checked after the arguments (spec order).
             if !is_static_function(callee) {
                 function.instruction(&Instruction::LocalSet(scratch));
                 emit_callable_guard(function, text, scratch, scratch, strings, helpers);
@@ -1614,11 +1631,13 @@ pub(super) fn emit_call_spread(
             }
             function.instruction(&Instruction::I32WrapI64);
             function.instruction(&Instruction::LocalSet(cb));
-            emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             emit_spread_arg_slots(base, len, function, helpers);
             // A plain indirect call binds `this = undefined`; `super(...)`
-            // keeps the enclosing constructor's `this`.
-            if let SpreadCallee::This { this_local, .. } = target {
+            // keeps the enclosing constructor's `this`; a method call binds the
+            // receiver.
+            if let SpreadCallee::This { this_local, .. } | SpreadCallee::Method { this_local, .. } =
+                target
+            {
                 function.instruction(&Instruction::LocalGet(*this_local));
                 function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
             } else {
@@ -1631,6 +1650,7 @@ pub(super) fn emit_call_spread(
                 align: 3,
                 memory_index: 0,
             }));
+            emit_publish_spread_args(base, function);
             // `super(...)` passes the construct marker.
             if matches!(target, SpreadCallee::This { .. }) {
                 emit_spread_construct_argc(len, function);
@@ -1678,8 +1698,8 @@ fn emit_spread_args_setup(
 
 /// Push the uniform ABI's `K` positional slots from a spread call's argument
 /// array: slot `i` is `array[i]` (the i64 at `base + HEADER_SIZE + 4 + 8*i`)
-/// when `i < len`, else `undefined`. Any element beyond `K` is left in the
-/// array and never read (JS ignores extra arguments a function does not bind).
+/// when `i < len`, else `undefined`. Any element beyond `K` stays in the array,
+/// which [`emit_publish_spread_args`] hands to the callee.
 fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: Helpers<'_>) {
     for i in 0..helpers.max_args {
         // len > i ? array[i] : undefined.
@@ -1697,6 +1717,18 @@ fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: 
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         function.instruction(&Instruction::End);
     }
+}
+
+/// Publish a spread call's argument array (block base in `base`) in
+/// `$__spread_args` right before the call, after every argument and the callee
+/// were evaluated, so a callee gathering its arguments reads the ones beyond
+/// `K` from it (only when its argument count exceeds `K`). Stack-neutral.
+fn emit_publish_spread_args(base: u32, function: &mut Function) {
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::GlobalSet(SPREAD_ARGS_GLOBAL));
 }
 
 /// Push a spread call's dynamic argument count `len` as a NUMBER jsval (its
