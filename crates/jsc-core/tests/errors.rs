@@ -1027,7 +1027,7 @@ fn no_throw_programs_unaffected() {
 
 // --- IsCallable check before an indirect call (DF4) ---------------------------
 
-/// The branded TypeError every non-callable callee raises.
+/// The branded `TypeError` every non-callable callee raises.
 const NOT_A_FUNCTION: &str = "TypeError: called value is not a function";
 
 /// A plain indirect call on a non-function value throws instead of dispatching
@@ -1086,7 +1086,7 @@ fn promise_executor_and_new_non_function_throw() {
 }
 
 /// A non-callable `.then` reaction is a passthrough (the host engine skips it),
-/// not a TypeError.
+/// not a `TypeError`.
 #[test]
 fn promise_non_function_reaction_passes_through() {
     assert_output(
@@ -1095,7 +1095,7 @@ fn promise_non_function_reaction_passes_through() {
     );
 }
 
-/// The not-a-function TypeError is a real, catchable TypeError.
+/// The not-a-function `TypeError` is a real, catchable `TypeError`.
 #[test]
 fn non_function_call_is_catchable() {
     assert_output(

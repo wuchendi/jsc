@@ -1347,7 +1347,7 @@ fn emit_throw_not_a_function(
     emit_throw_return(function, helpers);
 }
 
-/// Emit the IsCallable check guarding an indirect call (DF4): unless the jsval in
+/// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in
 /// `local` is a heap FUNCTION value, throw the branded not-a-function `TypeError`
 /// (see [`emit_throw_not_a_function`]) and unwind. Stack-neutral on the
 /// not-thrown path. The throw path builds the error object in the low scratch
@@ -1372,7 +1372,7 @@ pub(super) fn emit_callable_guard(
 }
 
 /// Whether `callee` is a function literal, so its value is statically a
-/// function and an indirect call through it needs no IsCallable check.
+/// function and an indirect call through it needs no `IsCallable` check.
 pub(super) fn is_static_function(callee: &IrNode) -> bool {
     matches!(callee, IrNode::FuncValue { .. })
 }
