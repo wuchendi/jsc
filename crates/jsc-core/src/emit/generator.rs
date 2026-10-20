@@ -20,7 +20,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-use crate::ir::GenTerm;
+use crate::ir::{GenSegment, GenTerm};
 
 /// Emit `IrNode::MakeGenerator`: build a generator handle and its frame, leaving
 /// the handle jsval on the stack. Allocates a `TYPE_ENV` frame of `total` boxed
@@ -332,7 +332,9 @@ pub(super) fn emit_generator_sm(
     let targets: Vec<u32> = (0..n).collect();
     function.instruction(&Instruction::BrTable(targets.into(), n));
 
-    for segment in segments {
+    let resumes = resume_blocks(segments);
+
+    for (index, segment) in (0u32..).zip(segments) {
         // Close this block's dispatch frame; its code follows the `End`.
         function.instruction(&Instruction::End);
         leave_frame(helpers);
@@ -345,6 +347,11 @@ pub(super) fn emit_generator_sm(
         if segment.catches {
             function.instruction(&Instruction::I32Const(0));
             function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
+        }
+        // A resume entered with the exception pending throws into this block's
+        // active handler (its landing pad, or the outermost one).
+        if resumes.contains(&index) {
+            emit_propagate_if_pending(&mut function, helpers);
         }
         emit_stmts(
             &segment.stmts,
@@ -400,6 +407,18 @@ pub(super) fn emit_generator_sm(
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
     function
+}
+
+/// The blocks a suspend resumes into: the resumer may enter one with an
+/// exception pending (a rejected `await`), which must throw at the suspend point.
+fn resume_blocks(segments: &[GenSegment]) -> HashSet<u32> {
+    segments
+        .iter()
+        .filter_map(|segment| match segment.term {
+            GenTerm::Yield { resume, .. } => Some(resume),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Emit a basic block's terminator. `loop_rel` is the `br` immediate

@@ -61,9 +61,9 @@ struct Reaction {
     result: u32,
     finally: bool,
     /// An `async function` continuation: `Some(gen_handle)` when this reaction
-    /// resumes an async body's generator `gen_handle` on fulfillment (sending the settled
-    /// value) or rejects its result promise on rejection, rather than running a
-    /// guest callback. `result` is then the async body's result promise.
+    /// resumes an async body's generator `gen_handle` with the settlement (sending
+    /// the fulfillment value, or throwing the rejection reason into the body),
+    /// rather than running a guest callback. `result` is then the async body's result promise.
     async_gen: Option<u64>,
 }
 
@@ -365,11 +365,12 @@ fn spawn_async<W: Write + Send + 'static>(
 }
 
 /// Advance an `async function` body's generator by one step and route the outcome.
-/// `sent` resumes the pending `await` (`undefined` for the first step).
+/// `sent` resumes the pending `await` (`undefined` for the first step, or for a
+/// rejected `await` resumed with its reason pending as an exception).
 /// If the step threw, reject the result promise; if the body completed (`done`),
 /// fulfill it with the returned value; otherwise the yielded value is the awaited
-/// operand — register a continuation that resumes the body (fulfill) or rejects
-/// the result (reject) when the operand settles.
+/// operand — register a continuation that resumes the body when the operand
+/// settles.
 fn drive_async<W: Write + Send + 'static>(
     mut ctx: StoreContextMut<'_, Host<W>>,
     handles: &Handles,
@@ -481,14 +482,20 @@ fn run_job<W: Write + Send + 'static>(
     // An `async function` continuation: the awaited value has settled.
     // On fulfillment, resume the body's generator with the settled value (which
     // may suspend again on the next `await` or complete and settle the result);
-    // on rejection, reject the async body's result promise (no `try`/`catch`
-    // around `await` is supported, so the rejection propagates straight out).
+    // on rejection, resume it with the reason pending as an exception, so the
+    // `await` throws into the body's active `catch`/`finally` (or, uncaught,
+    // completes the body and rejects the result).
     if let Some(gen_handle) = job.async_gen {
-        if job.state == PROMISE_FULFILLED {
-            drive_async(ctx, handles, gen_handle, job.result, job.value);
+        let sent = if job.state == PROMISE_FULFILLED {
+            job.value
         } else {
-            settle(ctx, handles, job.result, PROMISE_REJECTED, job.value);
-        }
+            let _ = handles
+                .exc_value
+                .set(&mut ctx, Val::I64(job.value.cast_signed()));
+            let _ = handles.exc_pending.set(&mut ctx, Val::I32(1));
+            UNDEFINED
+        };
+        drive_async(ctx, handles, gen_handle, job.result, sent);
         return;
     }
     let is_fn = as_function(handles.memory.data(&ctx), job.callback);
