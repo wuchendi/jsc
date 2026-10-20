@@ -1820,8 +1820,8 @@ pub(super) fn emit_call_spread(
 }
 
 /// Build a spread call's argument array (the `args` [`IrNode::ArraySpread`]) and
-/// stash its element-store base into `base` and its element count into `len`.
-/// The array is fresh and private, so its store never moves.
+/// stash its handle base into `base` and its element count into `len`. The
+/// array is fresh, private and dense (spreading reads holes as `undefined`).
 fn emit_spread_args_setup(
     args: &IrNode,
     base: u32,
@@ -1836,14 +1836,12 @@ fn emit_spread_args_setup(
     function.instruction(&Instruction::LocalTee(base));
     function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::LocalSet(len));
-    function.instruction(&Instruction::LocalGet(base));
-    emit_array_elems(function);
-    function.instruction(&Instruction::LocalSet(base));
 }
 
 /// Push the uniform ABI's `K` positional slots from a spread call's argument
-/// array: slot `i` is `array[i]` (the i64 at `store + ELEMS_DATA_OFFSET + 8*i`)
-/// when `i < len`, else `undefined`. Any element beyond `K` stays in the array,
+/// array (handle base in `base`): slot `i` is `array[i]` (the i64 at
+/// `store + ELEMS_DATA_OFFSET + 8*i`, `store` the handle's element store) when
+/// `i < len`, else `undefined`. Any element beyond `K` stays in the array,
 /// which [`emit_publish_spread_args`] hands to the callee.
 fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: Helpers<'_>) {
     for i in 0..helpers.max_args {
@@ -1853,6 +1851,7 @@ fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: 
         function.instruction(&Instruction::I32GtU);
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         function.instruction(&Instruction::LocalGet(base));
+        emit_array_elems(function);
         function.instruction(&Instruction::I64Load(elem_slot(u64::from(i))));
         function.instruction(&Instruction::Else);
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -1860,7 +1859,7 @@ fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: 
     }
 }
 
-/// Publish a spread call's argument array (block base in `base`) in
+/// Publish a spread call's argument array (handle base in `base`) in
 /// `$__spread_args` right before the call, after every argument and the callee
 /// were evaluated, so a callee gathering its arguments reads the ones beyond
 /// `K` from it (only when its argument count exceeds `K`). Stack-neutral.

@@ -291,3 +291,63 @@ fn plain_call_ignores_stale_spread_arguments() {
         "1:1 false\n"
     );
 }
+
+/// Spread calls read their argument array through the array handle's element
+/// store: an array grown by `push` (its store reallocated) spreads into plain,
+/// method, `new` and `super(..)` calls, `arguments` and rest parameters, all
+/// beyond the `K` slots; the rest array is itself a growable array.
+#[test]
+fn spread_of_grown_array() {
+    let grown = "let a = []; for (let i = 0; i < 20; i++) a.push(i);";
+    assert_eq!(
+        run(&format!(
+            "{grown} function f(...r){{ return r.length }} console.log(f(...a), Math.max(...a))"
+        )),
+        "20 19\n"
+    );
+    assert_eq!(
+        run(&format!(
+            "{grown} const o = {{ m(...r){{ return r[19] + r.length }} }}; console.log(o.m(...a))"
+        )),
+        "39\n"
+    );
+    assert_eq!(
+        run(&format!(
+            "{grown} class C {{ constructor(...r){{ this.n = r.length; this.l = r[19] }} }} \
+             const c = new C(...a); console.log(c.n, c.l)"
+        )),
+        "20 19\n"
+    );
+    assert_eq!(
+        run(&format!(
+            "{grown} class B {{ constructor(...r){{ this.n = r.length; this.l = r[19] }} }} \
+             class D extends B {{ constructor(){{ super(...a) }} }} const d = new D(); console.log(d.n, d.l)"
+        )),
+        "20 19\n"
+    );
+    assert_eq!(
+        run(&format!(
+            "{grown} function f(){{ return arguments.length + ':' + arguments[19] }} console.log(f(...a))"
+        )),
+        "20:19\n"
+    );
+    assert_eq!(
+        run(&format!(
+            "{grown} function f(...r){{ r.push(99); return r.length + ':' + r[20] }} console.log(f(...a))"
+        )),
+        "21:99\n"
+    );
+}
+
+/// A hole in a spread source reaches the callee as `undefined`.
+#[test]
+fn spread_of_array_with_holes() {
+    assert_eq!(
+        run("function f(a, b, c){ return [a, b, c] } console.log(f(...[1, , 3]))"),
+        "[ 1, undefined, 3 ]\n"
+    );
+    assert_eq!(
+        run("let h = [0]; h[3] = 3; function f(...r){ return r } console.log(f(...h))"),
+        "[ 0, undefined, undefined, 3 ]\n"
+    );
+}
