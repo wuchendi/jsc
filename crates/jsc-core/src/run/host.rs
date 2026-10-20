@@ -7,7 +7,7 @@ use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
-use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, format_value};
+use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
 /// methods, dispatched host-side. `IndexOf`/`Slice` exist on both arrays and
@@ -329,9 +329,11 @@ fn string_index_of(mem: &[u8], ptr: usize, sub: u64) -> u64 {
     }
 }
 
-/// `array.join(sep)`: build a heap string of `String(element)` for each element
+/// `array.join(sep)`: build a heap string of `ToString(element)` for each element
 /// joined by `sep` (`","` when `sep` is `undefined`); `null`/`undefined` elements
-/// render as `""` (JS join semantics). Returns the result's heap jsval bits.
+/// and cycle back-references render as `""` (JS join semantics). The receiver
+/// is decoded as a whole so a self-reference is caught by the decoder's cycle
+/// guard. Returns the result's heap jsval bits.
 fn array_join<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     mem: &[u8],
@@ -340,17 +342,22 @@ fn array_join<W: Send + 'static>(
 ) -> Option<u64> {
     let sep = match decode(sep_bits, mem) {
         Value::Undefined => ",".to_owned(),
-        other => format_value(&other),
+        other => to_js_string(&other),
     };
-    let len = block_len(mem, ptr).unwrap_or(0);
-    let pieces: Vec<String> = (0..len)
-        .map(
-            |i| match array_elem_bits(mem, ptr, i).map(|b| decode(b, mem)) {
-                // `null`/`undefined` elements stringify to "" in JS join.
-                Some(Value::Null | Value::Undefined) | None => String::new(),
-                Some(v) => format_value(&v),
-            },
-        )
+    let elems = match decode(HEAP | u64::try_from(ptr).ok()?, mem) {
+        Value::Array(elems) => elems,
+        Value::Ref(_, inner) => match *inner {
+            Value::Array(elems) => elems,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let pieces: Vec<String> = elems
+        .iter()
+        .map(|elem| match elem {
+            Value::Null | Value::Undefined => String::new(),
+            other => to_js_string(other),
+        })
         .collect();
     alloc_string(caller, &pieces.join(&sep)).map(|base| HEAP | base)
 }
@@ -477,7 +484,7 @@ fn string_pad<W: Send + 'static>(
     // The pad string defaults to a single space when omitted.
     let pad = match decode(arg1.cast_unsigned(), mem) {
         Value::Undefined => " ".to_owned(),
-        other => format_value(&other),
+        other => to_js_string(&other),
     };
     let text = pad_bytes(&bytes, target, pad.as_bytes(), op == METHOD_OP_PAD_START);
     alloc_string(caller, &text).map(|base| HEAP | base)
@@ -508,10 +515,10 @@ fn bool_bits(b: bool) -> u64 {
 }
 
 /// Coerce a method argument's raw jsval bits to its JS string form as bytes: a
-/// string yields its payload, everything else its `format_value` rendering (so
+/// string yields its payload, everything else its JS `ToString` text (so
 /// `"5".startsWith(5)` matches on `"5"`). Used by the string search/split methods.
 fn arg_bytes(bits: i64, mem: &[u8]) -> Vec<u8> {
-    format_value(&decode(bits.cast_unsigned(), mem)).into_bytes()
+    to_js_string(&decode(bits.cast_unsigned(), mem)).into_bytes()
 }
 
 /// Whether `hay` contains the contiguous byte sequence `needle` (an empty
@@ -590,7 +597,7 @@ fn string_split<W: Send + 'static>(
         // An omitted separator yields a single-element array of the whole string.
         Value::Undefined => vec![bytes.clone()],
         other => {
-            let sep = format_value(&other).into_bytes();
+            let sep = to_js_string(&other).into_bytes();
             if sep.is_empty() {
                 // An empty separator splits into one element per byte.
                 bytes.iter().map(|b| vec![*b]).collect()

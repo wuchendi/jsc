@@ -87,6 +87,9 @@ built-ins/Date/prototype/getSeconds/this-value-invalid-date.js
 built-ins/Date/prototype/getTime/this-value-invalid-date.js
 built-ins/Date/prototype/toISOString/15.9.5.43-0-5.js
 built-ins/Date/year-zero.js
+built-ins/Function/15.3.5.4_2-15gs.js
+built-ins/Function/15.3.5.4_2-17gs.js
+built-ins/Function/15.3.5.4_2-19gs.js
 built-ins/Function/15.3.5.4_2-24gs.js
 built-ins/Function/15.3.5.4_2-25gs.js
 built-ins/Function/15.3.5.4_2-26gs.js
@@ -287,6 +290,7 @@ built-ins/String/S15.5.1.1_A1_T17.js
 built-ins/String/S15.5.1.1_A1_T18.js
 built-ins/String/S15.5.1.1_A1_T2.js
 built-ins/String/S15.5.1.1_A1_T4.js
+built-ins/String/S15.5.1.1_A1_T7.js
 built-ins/String/S15.5.5_A1_T2.js
 built-ins/String/S9.8.1_A10.js
 built-ins/String/S9.8.1_A2.js
@@ -883,6 +887,7 @@ language/expressions/arrow-function/syntax/early-errors/asi-restriction-invalid-
 language/expressions/arrow-function/syntax/early-errors/asi-restriction-invalid.js
 language/expressions/arrow-function/syntax/early-errors/use-strict-with-non-simple-param.js
 language/expressions/arrow-function/syntax/variations.js
+language/expressions/arrow-function/throw-new.js
 language/expressions/assignment/S11.13.1_A3.1.js
 language/expressions/assignment/S11.13.1_A3.2.js
 language/expressions/assignment/S11.13.1_A4_T1.js
@@ -2464,6 +2469,12 @@ language/expressions/multiplication/S11.5.1_A2.4_T2.js
 language/expressions/multiplication/line-terminator.js
 language/expressions/new.target/escaped-new.js
 language/expressions/new.target/escaped-target.js
+language/expressions/new/S11.2.2_A3_T1.js
+language/expressions/new/S11.2.2_A3_T2.js
+language/expressions/new/S11.2.2_A3_T3.js
+language/expressions/new/S11.2.2_A3_T4.js
+language/expressions/new/S11.2.2_A3_T5.js
+language/expressions/new/ctorExpr-isCtor-after-args-eval-fn-wrapup.js
 language/expressions/object/11.1.5-1gs.js
 language/expressions/object/11.1.5-2gs.js
 language/expressions/object/S11.1.5_A3.js
@@ -2804,6 +2815,7 @@ language/expressions/object/method-definition/meth-params-trailing-comma-multipl
 language/expressions/object/method-definition/meth-params-trailing-comma-single.js
 language/expressions/object/method-definition/meth-rest-param-strict-body.js
 language/expressions/object/method-definition/meth-rest-params-trailing-comma-early-error.js
+language/expressions/object/method-definition/name-invoke-ctor.js
 language/expressions/object/method-definition/name-params.js
 language/expressions/object/method-definition/name-prop-name-eval-error.js
 language/expressions/object/method-definition/name-super-call-body.js
@@ -5140,6 +5152,8 @@ language/statements/function/S13.2.1_A9.1_T1.js
 language/statements/function/S13.2.1_A9.1_T2.js
 language/statements/function/S13.2.1_A9_T1.js
 language/statements/function/S13.2.1_A9_T2.js
+language/statements/function/S13.2.2_A11.js
+language/statements/function/S13.2.2_A9.js
 language/statements/function/S13.2_A1_T1.js
 language/statements/function/S13.2_A1_T2.js
 language/statements/function/S13.2_A3.js
@@ -5274,6 +5288,7 @@ language/statements/generators/dstr/dflt-ary-ptrn-rest-init-obj.js
 language/statements/generators/dstr/dflt-ary-ptrn-rest-not-final-ary.js
 language/statements/generators/dstr/dflt-ary-ptrn-rest-not-final-id.js
 language/statements/generators/dstr/dflt-ary-ptrn-rest-not-final-obj.js
+language/statements/generators/invoke-as-constructor.js
 language/statements/generators/no-yield.js
 language/statements/generators/object-destructuring-param-strict-body.js
 language/statements/generators/param-dflt-yield.js

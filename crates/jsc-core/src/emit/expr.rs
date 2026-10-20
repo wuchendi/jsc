@@ -120,8 +120,20 @@ pub(super) fn emit_node(
         } => {
             emit_define_props_node(obj, *local, entries, function, scratch, strings, helpers);
         }
-        IrNode::CallIndirect { callee, args } => {
-            emit_call_indirect(callee, args, function, scratch, strings, helpers);
+        IrNode::CallIndirect {
+            callee,
+            args,
+            not_callable,
+        } => {
+            emit_call_indirect(
+                callee,
+                args,
+                not_callable,
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
         }
         IrNode::CellNew(value) => {
             emit_cell_new(value, function, scratch, strings, helpers);
@@ -201,6 +213,14 @@ pub(super) fn emit_node(
         }
         IrNode::Array(elems) => {
             emit_array_node(elems, function, scratch, strings, helpers);
+        }
+        IrNode::Seq(nodes) => {
+            for (i, node) in nodes.iter().enumerate() {
+                if i > 0 {
+                    function.instruction(&Instruction::Drop);
+                }
+                emit_node(node, function, scratch, strings, helpers);
+            }
         }
         IrNode::ArraySpread(parts) => {
             emit_array_spread(parts, function, scratch, strings, helpers);
@@ -534,6 +554,7 @@ pub(super) fn emit_method_call_user(
         key,
         args,
         obj_local,
+        not_callable,
     } = node
     else {
         unreachable!("emit_method_call_user is only called with a MethodCallUser node")
@@ -571,7 +592,13 @@ pub(super) fn emit_method_call_user(
     // No funcref table (a function-less program): the member can never be a
     // function value, so throw instead of emitting an invalid `call_indirect`.
     if !helpers.has_funcs {
-        emit_throw_not_a_function(function, scratch, strings, helpers);
+        emit_throw_not_a_function(
+            function,
+            callee_error_text(not_callable),
+            scratch,
+            strings,
+            helpers,
+        );
         return;
     }
 
@@ -582,7 +609,14 @@ pub(super) fn emit_method_call_user(
     // any non-function). Dispatching that as a funcref index is undefined
     // behaviour; instead throw a clean `TypeError` and unwind to the nearest
     // handler (or the program boundary), exactly like `throw`.
-    emit_callable_guard(function, callee_val, scratch, strings, helpers);
+    emit_callable_guard(
+        function,
+        callee_error_text(not_callable),
+        callee_val,
+        scratch,
+        strings,
+        helpers,
+    );
 
     // Not-thrown path: proceed with the callee's block base (its wrapped pointer).
     function.instruction(&Instruction::LocalGet(callee_val));
@@ -654,7 +688,14 @@ pub(super) fn emit_this_call(
     // Runtime guard: the callee MUST be a function value — a `super.m` that
     // resolves to `undefined` (missing method) throws a TypeError instead
     // of dispatching a bogus funcref index. Identical to the method-call guard.
-    emit_callable_guard(function, callee_val, scratch, strings, helpers);
+    emit_callable_guard(
+        function,
+        EXPRESSION_NOT_A_FUNCTION,
+        callee_val,
+        scratch,
+        strings,
+        helpers,
+    );
 
     // Not-thrown path: proceed with the callee's block base (its wrapped pointer).
     function.instruction(&Instruction::LocalGet(callee_val));
@@ -710,6 +751,7 @@ pub(super) fn emit_new(
         ctor,
         args,
         instance_local,
+        not_callable,
     } = node
     else {
         unreachable!("emit_new is only called with a New node")
@@ -729,7 +771,14 @@ pub(super) fn emit_new(
     // which must throw rather than dispatch (DF4).
     emit_node(ctor, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
-    emit_callable_guard(function, scratch, scratch, strings, helpers);
+    emit_callable_guard(
+        function,
+        callee_error_text(not_callable),
+        scratch,
+        scratch,
+        strings,
+        helpers,
+    );
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
@@ -1105,7 +1154,13 @@ pub(super) fn emit_promise_ctor(
     // Allocating P first is unobservable, so it is skipped.
     if !helpers.has_funcs {
         emit_node(executor, function, scratch, strings, helpers);
-        emit_throw_not_a_function(function, scratch, strings, helpers);
+        emit_throw_not_a_function(
+            function,
+            EXPRESSION_NOT_A_FUNCTION,
+            scratch,
+            strings,
+            helpers,
+        );
         return;
     }
 
@@ -1149,7 +1204,14 @@ pub(super) fn emit_promise_ctor(
     emit_node(executor, function, scratch, strings, helpers);
     if !is_static_function(executor) {
         function.instruction(&Instruction::LocalSet(scratch));
-        emit_callable_guard(function, scratch, scratch, strings, helpers);
+        emit_callable_guard(
+            function,
+            EXPRESSION_NOT_A_FUNCTION,
+            scratch,
+            scratch,
+            strings,
+            helpers,
+        );
         function.instruction(&Instruction::LocalGet(scratch));
     }
     function.instruction(&Instruction::I32WrapI64);
@@ -1246,6 +1308,7 @@ fn emit_settler_value(
 pub(super) fn emit_call_indirect(
     callee: &IrNode,
     args: &[IrNode],
+    not_callable: &CalleeError,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -1261,7 +1324,13 @@ pub(super) fn emit_call_indirect(
     // instead of emitting an invalid `call_indirect`. The transfer leaves the
     // stack polymorphic, so the discarded operands need no cleanup.
     if !helpers.has_funcs {
-        emit_throw_not_a_function(function, scratch, strings, helpers);
+        emit_throw_not_a_function(
+            function,
+            callee_error_text(not_callable),
+            scratch,
+            strings,
+            helpers,
+        );
         return;
     }
     // IsCallable (DF4): a non-function callee throws instead of dispatching its
@@ -1269,7 +1338,14 @@ pub(super) fn emit_call_indirect(
     // every argument is already on the stack.
     if !is_static_function(callee) {
         function.instruction(&Instruction::LocalSet(scratch));
-        emit_callable_guard(function, scratch, scratch, strings, helpers);
+        emit_callable_guard(
+            function,
+            callee_error_text(not_callable),
+            scratch,
+            scratch,
+            strings,
+            helpers,
+        );
         function.instruction(&Instruction::LocalGet(scratch));
     }
     function.instruction(&Instruction::I32WrapI64);
@@ -1301,17 +1377,25 @@ pub(super) fn emit_call_indirect(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Throw the not-a-function `TypeError` (see [`internal_type_error`]) and
-/// unwind to the nearest handler. Used where a program with no funcref table
-/// would otherwise need a `call_indirect`; the transfer leaves the stack
-/// polymorphic, so any discarded operands need no cleanup.
+/// Throw the not-a-function `TypeError` with `text` (see
+/// [`callee_type_error`]) and unwind to the nearest handler. Used by the
+/// callable guards and where a program with no funcref table would otherwise
+/// need a `call_indirect`; the transfer leaves the stack polymorphic, so any
+/// discarded operands need no cleanup.
 pub(super) fn emit_throw_not_a_function(
     function: &mut Function,
+    text: CalleeErrorText<'_>,
     scratch: u32,
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    emit_node(&internal_type_error(), function, scratch, strings, helpers);
+    emit_node(
+        &callee_type_error(text),
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
     function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
@@ -1321,13 +1405,14 @@ pub(super) fn emit_throw_not_a_function(
 }
 
 /// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in
-/// `local` is a heap FUNCTION value, throw the not-a-function `TypeError`
-/// (see [`emit_throw_not_a_function`]) and unwind. Stack-neutral on the
+/// `local` is a heap FUNCTION value, throw the not-a-function `TypeError` with
+/// `text` (see [`emit_throw_not_a_function`]) and unwind. Stack-neutral on the
 /// not-thrown path. The throw path builds the error object in the low scratch
 /// slots, so `local` may itself be a scratch slot the caller re-reads afterwards
 /// — that read only runs when nothing was thrown.
 pub(super) fn emit_callable_guard(
     function: &mut Function,
+    text: CalleeErrorText<'_>,
     local: u32,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -1339,7 +1424,7 @@ pub(super) fn emit_callable_guard(
     // The `if` opens a control frame around the throw transfer; count it so the
     // handler-relative `br` uses the right nesting depth.
     enter_frame(helpers);
-    emit_throw_not_a_function(function, scratch, strings, helpers);
+    emit_throw_not_a_function(function, text, scratch, strings, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
@@ -1384,21 +1469,25 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             emit_propagate_if_pending(function, helpers);
         }
-        SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } => {
+        SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } => {
             let cb = scratch + 7;
+            let text = match target {
+                SpreadCallee::Indirect(_, not_callable) => callee_error_text(not_callable),
+                _ => EXPRESSION_NOT_A_FUNCTION,
+            };
             // The callee is evaluated first (JS order) and its base stashed, then
             // the argument array is built and read.
             emit_node(callee, function, scratch, strings, helpers);
             // No funcref table (a function-less program): the callee can never
             // be a function value, so throw instead of an invalid `call_indirect`.
             if !helpers.has_funcs {
-                emit_throw_not_a_function(function, scratch, strings, helpers);
+                emit_throw_not_a_function(function, text, scratch, strings, helpers);
                 return;
             }
             // IsCallable (DF4), checked while the full callee jsval is at hand.
             if !is_static_function(callee) {
                 function.instruction(&Instruction::LocalSet(scratch));
-                emit_callable_guard(function, scratch, scratch, strings, helpers);
+                emit_callable_guard(function, text, scratch, scratch, strings, helpers);
                 function.instruction(&Instruction::LocalGet(scratch));
             }
             function.instruction(&Instruction::I32WrapI64);

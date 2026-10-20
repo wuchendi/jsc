@@ -554,6 +554,46 @@ export function formatValue(value: Value): string {
   }
 }
 
+/**
+ * The JS `ToString` text of a decoded {@link Value} (mirrors
+ * `value.rs::to_js_string`): arrays join their elements with `,` (nullish
+ * elements and cycle back-references are empty), plain objects and instances
+ * are `[object Object]`, errors use `Error.prototype.toString`, Map/Set/
+ * promise/generator their tags; functions and Dates keep the console text.
+ */
+export function toJsString(value: Value): string {
+  switch (value.kind) {
+    case 'array':
+      return value.items
+        .map((v) =>
+          v.kind === 'null' || v.kind === 'undefined' ? '' : toJsString(v),
+        )
+        .join(',')
+    case 'object':
+    case 'instance':
+      return '[object Object]'
+    case 'error':
+      if (value.message === '') return value.name
+      if (value.name === '') return value.message
+      return `${value.name}: ${value.message}`
+    case 'map':
+      return '[object Map]'
+    case 'set':
+      return '[object Set]'
+    case 'promise':
+      return '[object Promise]'
+    case 'generator':
+      return '[object Generator]'
+    case 'accessor':
+    case 'circular':
+      return ''
+    case 'ref':
+      return toJsString(value.value)
+    default:
+      return formatValue(value)
+  }
+}
+
 /** Render own properties Node-console style: `{ a: 1 }`, `{}` when empty. */
 function formatEntries(entries: [string, Value][]): string {
   return entries.length === 0

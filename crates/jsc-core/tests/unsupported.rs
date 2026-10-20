@@ -136,12 +136,23 @@ fn rejects_unknown_array_method() {
 fn unknown_object_method_throws_at_runtime() {
     // Objects are dynamic: a method absent from the receiver reads `undefined`,
     // so calling it is an uncaught `TypeError` at run time, not a compile error.
-    const MSG: &str = "TypeError: called value is not a function";
-    assert_uncaught("let o = {}; o.foo()", MSG);
-    assert_uncaught("let o = { a: 1 }; o.bar()", MSG);
-    assert_uncaught("let o = {}; o[\"baz\"]()", MSG);
-    assert_uncaught("let o = { f() { return 1 } }; o.bar()", MSG);
-    assert_uncaught("({ f() { return 1 } }).bar()", MSG);
+    assert_uncaught("let o = {}; o.foo()", "TypeError: o.foo is not a function");
+    assert_uncaught(
+        "let o = { a: 1 }; o.bar()",
+        "TypeError: o.bar is not a function",
+    );
+    assert_uncaught(
+        "let o = {}; o[\"baz\"]()",
+        "TypeError: o.baz is not a function",
+    );
+    assert_uncaught(
+        "let o = { f() { return 1 } }; o.bar()",
+        "TypeError: o.bar is not a function",
+    );
+    assert_uncaught(
+        "({ f() { return 1 } }).bar()",
+        "TypeError: expression is not a function",
+    );
 }
 
 #[test]
@@ -190,34 +201,42 @@ fn dynamic_shape_unknown_method_throws_typeerror() {
     // can only be caught at runtime (the compile-time guards can't prove it).
     // Instead of reading `undefined` and dispatching it as a bogus funcref index (a
     // wrong value or a cryptic wasm trap), the call throws a clean TypeError.
-    const MSG: &str = "TypeError: called value is not a function";
     // A `new`-instance receiver has no statically-known object-literal shape —
     // both when bound to a variable and as a direct `new C().bar()` expression
     // (the static-shape guard explicitly defers class instances to this runtime guard).
-    assert_uncaught("class A { f() { return 1 } } let a = new A(); a.bar()", MSG);
-    assert_uncaught("class C { f() { return 1 } } new C().bar()", MSG);
+    assert_uncaught(
+        "class A { f() { return 1 } } let a = new A(); a.bar()",
+        "TypeError: a.bar is not a function",
+    );
+    assert_uncaught(
+        "class C { f() { return 1 } } new C().bar()",
+        "TypeError: expression is not a function",
+    );
     // A function parameter's shape is unknown at the call site.
     assert_uncaught(
         "function g(o) { return o.bar() } class C { f() { return 1 } } g(new C())",
-        MSG,
+        "TypeError: o.bar is not a function",
     );
     // An array element receiver is a runtime read.
     assert_uncaught(
         "class C { f() { return 1 } } let arr = [new C()]; arr[0].bar()",
-        MSG,
+        "TypeError: expression is not a function",
     );
     // A dynamic `this.m()` inside a method whose target method is absent.
     assert_uncaught(
         "class C { run() { return this.nope() } f() { return 1 } } new C().run()",
-        MSG,
+        "TypeError: this.nope is not a function",
     );
     // A reassigned binding drops its static shape => guarded runtime dispatch.
     assert_uncaught(
         "let o = { f() { return 1 } }; o = { g() { return 2 } }; o.zzz()",
-        MSG,
+        "TypeError: o.zzz is not a function",
     );
     // A computed key is unknown until runtime.
-    assert_uncaught("let o = { f() { return 1 } }; o[\"z\" + \"z\"]()", MSG);
+    assert_uncaught(
+        "let o = { f() { return 1 } }; o[\"z\" + \"z\"]()",
+        "TypeError: expression is not a function",
+    );
     // The thrown value is a real branded TypeError object, so
     // `try`/`catch` can observe its identity and read its fields.
     assert_eq!(
@@ -244,7 +263,7 @@ fn dynamic_shape_unknown_method_throws_typeerror() {
              try { a.bar() } catch (e) { m = e.message } m"
         )
         .expect("the guard's TypeError message must be readable"),
-        jsc_core::run::Value::Str("called value is not a function".to_owned()),
+        jsc_core::run::Value::Str("a.bar is not a function".to_owned()),
     );
 }
 
@@ -263,10 +282,16 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
     // funcref table), never a compile-time rejection or invalid wasm.
     assert_uncaught(
         "let m = new Map(); m.clear()",
-        "TypeError: called value is not a function",
+        "TypeError: m.clear is not a function",
     );
     assert_uncaught(
         "let o = { a: 1 }; o = { b: 2 }; o.zzz()",
-        "TypeError: called value is not a function",
+        "TypeError: o.zzz is not a function",
+    );
+    // A builtin-named method's user-method fallback throws too.
+    assert_uncaught("let o = {}; o.get(1)", "TypeError: o.get is not a function");
+    assert_uncaught(
+        "let o = {}; o.getFullYear()",
+        "TypeError: o.getFullYear is not a function",
     );
 }

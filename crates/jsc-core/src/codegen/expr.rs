@@ -367,6 +367,7 @@ impl LowerCtx<'_> {
                 Ok(IrNode::CallIndirect {
                     callee: Box::new(obj),
                     args: lowered,
+                    not_callable: not_a_function(None),
                 })
             }
         }
@@ -732,6 +733,7 @@ impl LowerCtx<'_> {
             return Ok(IrNode::CallIndirect {
                 callee: Box::new(self.lower_expr(callee_expr)?),
                 args,
+                not_callable: not_a_function(source_name(callee_expr).as_deref()),
             });
         };
         let name = ident.sym.as_ref();
@@ -742,6 +744,7 @@ impl LowerCtx<'_> {
             Ok(IrNode::CallIndirect {
                 callee: Box::new(Self::read_of(resolved.kind)),
                 args,
+                not_callable: CalleeError::not_a_function(name),
             })
         } else if let Some(sig) = self.shared.funcs.get(name) {
             // JS arity semantics: the uniform ABI pads missing arguments with
@@ -752,10 +755,8 @@ impl LowerCtx<'_> {
                 args,
             })
         } else if let Some(kind) = ErrorKind::from_name(name) {
-            // `Error(m)` without `new` constructs too (design 4.7); like
-            // `new Error(m)`, only the first argument is used.
-            let message = args.into_iter().next();
-            Ok(self.lower_error_construct(kind, message))
+            // `Error(m)` without `new` constructs too (design 4.7).
+            Ok(self.lower_error_construct(kind, args))
         } else if let Some(op) = convert_builtin_op(name) {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
@@ -790,6 +791,7 @@ impl LowerCtx<'_> {
             args,
             recv_local,
             fallback_obj_local,
+            not_callable: method_not_a_function(obj, op.name()),
         })
     }
 
@@ -856,7 +858,10 @@ impl LowerCtx<'_> {
                 .into());
             }
             return Ok(IrNode::CallSpread {
-                target: SpreadCallee::Indirect(Box::new(self.lower_expr(callee_expr)?)),
+                target: SpreadCallee::Indirect(
+                    Box::new(self.lower_expr(callee_expr)?),
+                    not_a_function(source_name(callee_expr).as_deref()),
+                ),
                 args,
             });
         };
@@ -864,7 +869,10 @@ impl LowerCtx<'_> {
         if let Some(resolved) = self.resolve(name) {
             // A binding holding a function value: an indirect spread call.
             Ok(IrNode::CallSpread {
-                target: SpreadCallee::Indirect(Box::new(Self::read_of(resolved.kind))),
+                target: SpreadCallee::Indirect(
+                    Box::new(Self::read_of(resolved.kind)),
+                    CalleeError::not_a_function(name),
+                ),
                 args,
             })
         } else if let Some(sig) = self.shared.funcs.get(name) {
@@ -1083,6 +1091,7 @@ impl LowerCtx<'_> {
             method_name: method.to_owned(),
             recv_local,
             fallback_obj_local,
+            not_callable: method_not_a_function(obj, method),
         })
     }
 
@@ -1107,6 +1116,7 @@ impl LowerCtx<'_> {
             method_name: method.to_owned(),
             recv_local,
             fallback_obj_local,
+            not_callable: method_not_a_function(obj, method),
         })
     }
 
@@ -1150,6 +1160,7 @@ impl LowerCtx<'_> {
             key: Box::new(key),
             args,
             obj_local,
+            not_callable: not_a_function(member_source_name(member).as_deref()),
         })
     }
 
@@ -1707,12 +1718,13 @@ impl LowerCtx<'_> {
 
     fn lower_new(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
         let Expr::Ident(callee) = new_expr.callee.as_ref() else {
-            return Err(CompileError::spanned(
-                new_expr.callee.span(),
-                "unsupported `new` target: only the Error, TypeError, and RangeError \
-                 constructors are supported",
-            )
-            .into());
+            let target = self.lower_expr(&new_expr.callee)?;
+            let args = self.lower_new_args(new_expr)?;
+            return Ok(Self::not_a_constructor(
+                target,
+                args,
+                source_name(&new_expr.callee).as_deref(),
+            ));
         };
         let name = callee.sym.as_ref();
         // A `new A(args)` on a user class declared earlier takes the class
@@ -1749,29 +1761,73 @@ impl LowerCtx<'_> {
         if name == "Date" && self.resolve("Date").is_none() {
             return self.lower_new_date(callee.span, new_expr);
         }
+        let args = self.lower_new_args(new_expr)?;
         let Some(kind) = ErrorKind::from_name(name) else {
-            return Err(CompileError::spanned(
-                callee.span(),
-                format!("unsupported constructor: {name}"),
-            )
-            .into());
+            let target = self.lower_ident(name, callee.span)?;
+            return Ok(Self::not_a_constructor(target, args, Some(name)));
         };
-        let args = new_expr.args.as_deref().unwrap_or(&[]);
-        // `message` is arg0 (spread rejected), or absent when no argument is given.
-        let message = match args.first() {
-            Some(arg) => {
-                if arg.spread.is_some() {
-                    return Err(CompileError::spanned(
-                        arg.span(),
-                        "spread arguments are unsupported",
-                    )
-                    .into());
-                }
-                Some(self.lower_expr(&arg.expr)?)
+        Ok(self.lower_error_construct(kind, args))
+    }
+
+    /// Lower the arguments of `new X(args)` (spread rejected).
+    fn lower_new_args(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<Vec<IrNode>> {
+        let mut args = Vec::new();
+        for arg in new_expr.args.as_deref().unwrap_or(&[]) {
+            if arg.spread.is_some() {
+                return Err(
+                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
+                );
             }
-            None => None,
-        };
-        Ok(self.lower_error_construct(kind, message))
+            args.push(self.lower_expr(&arg.expr)?);
+        }
+        Ok(args)
+    }
+
+    /// `new target(args)` on a value that is not a recorded class or supported
+    /// builtin: evaluate the target and the arguments, then throw
+    /// `<name> is not a constructor`. Plain `function` declarations land here
+    /// too until construct is implemented (S3).
+    fn not_a_constructor(target: IrNode, args: Vec<IrNode>, name: Option<&str>) -> IrNode {
+        let error = CalleeError::not_a_constructor(name.unwrap_or(CalleeError::EXPRESSION));
+        let thrown = IrNode::Throw(Box::new(IrNode::error_object(
+            ErrorKind::TypeError,
+            None,
+            Some(IrNode::Str(error.message)),
+            IrNode::Str(error.stack),
+        )));
+        IrNode::Seq(
+            std::iter::once(target)
+                .chain(args)
+                .chain([thrown])
+                .collect(),
+        )
+    }
+
+    /// Build the Error instance `<kind>(args)` / `new <kind>(args)` constructs:
+    /// the first argument is the message (see [`Self::lower_error_object`]);
+    /// surplus arguments are evaluated after it, left to right, for their side
+    /// effects only.
+    fn lower_error_construct(&mut self, kind: ErrorKind, args: Vec<IrNode>) -> IrNode {
+        let mut args = args.into_iter();
+        let mut message = args.next();
+        let extra: Vec<IrNode> = args.collect();
+        if extra.is_empty() {
+            return self.lower_error_object(kind, message);
+        }
+        // A non-literal message is evaluated into a temp before the surplus
+        // arguments run.
+        let head = message
+            .take_if(|message| !matches!(message, IrNode::Str(_) | IrNode::Undefined))
+            .map(|value| {
+                let local = self.fresh();
+                message = Some(IrNode::Local(local));
+                IrNode::Assign {
+                    local,
+                    value: Box::new(value),
+                }
+            });
+        let error = self.lower_error_object(kind, message);
+        IrNode::Seq(head.into_iter().chain(extra).chain([error]).collect())
     }
 
     /// Build the Error instance `new <kind>(message)` / `<kind>(message)`
@@ -1780,7 +1836,7 @@ impl LowerCtx<'_> {
     /// (just `<name>` for an empty or absent message — jsc keeps no runtime
     /// call frames). The argument is evaluated EXACTLY ONCE into a temp; a
     /// string literal or `undefined` resolves both at compile time.
-    fn lower_error_construct(&mut self, kind: ErrorKind, message: Option<IrNode>) -> IrNode {
+    fn lower_error_object(&mut self, kind: ErrorKind, message: Option<IrNode>) -> IrNode {
         let name = kind.name();
         let stack_of = |text: &str| {
             IrNode::Str(if text.is_empty() {
@@ -1941,21 +1997,14 @@ impl LowerCtx<'_> {
             reserve: u32::try_from(fields).unwrap_or(u32::MAX),
         };
 
-        let mut args = Vec::new();
-        for arg in new_expr.args.as_deref().unwrap_or(&[]) {
-            if arg.spread.is_some() {
-                return Err(
-                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
-                );
-            }
-            args.push(self.lower_expr(&arg.expr)?);
-        }
+        let args = self.lower_new_args(new_expr)?;
         let instance_local = self.fresh();
         Ok(IrNode::New {
             instance: Box::new(instance),
             ctor: Box::new(ctor),
             args,
             instance_local,
+            not_callable: CalleeError::not_a_constructor(name),
         })
     }
 }
@@ -2028,6 +2077,44 @@ fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
         },
         MemberProp::PrivateName(_) => None,
     }
+}
+
+/// The source name a not-a-function / not-a-constructor `TypeError` gives a
+/// callee: an identifier, `this`, or a member chain of them with static keys
+/// (`o.m` and `o['m']` both name `o.m`); `None` for anything else.
+fn source_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(id) => Some(id.sym.as_ref().to_owned()),
+        Expr::This(_) => Some("this".to_owned()),
+        Expr::Paren(p) => source_name(&p.expr),
+        Expr::Member(member) => member_source_name(member),
+        _ => None,
+    }
+}
+
+/// [`source_name`] of a member expression `obj.m` / `obj['m']`.
+fn member_source_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
+    Some(format!(
+        "{}.{}",
+        source_name(&member.obj)?,
+        member_method_name(member)?
+    ))
+}
+
+/// `<callee> is not a function` for a call whose callee is `name` (falling
+/// back to `expression` when the callee has no source name).
+fn not_a_function(name: Option<&str>) -> CalleeError {
+    CalleeError::not_a_function(name.unwrap_or(CalleeError::EXPRESSION))
+}
+
+/// `<obj>.<method> is not a function` for a builtin-named method call's
+/// user-method fallback.
+fn method_not_a_function(obj: &Expr, method: &str) -> CalleeError {
+    not_a_function(
+        source_name(obj)
+            .map(|obj| format!("{obj}.{method}"))
+            .as_deref(),
+    )
 }
 
 /// Whether the receiver's type is a statically-known primitive (string / number /

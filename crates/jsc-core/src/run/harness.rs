@@ -12,7 +12,7 @@ use super::host::{
 use super::promise::{self, Host};
 use crate::abi;
 
-use super::{HEAP, Value, decode, format_value};
+use super::{HEAP, Value, decode, format_value, to_js_string};
 
 /// The `print` host-import flags (see [`abi`]): a value plus a trailing
 /// space, or a value plus a newline.
@@ -179,7 +179,7 @@ fn run_with_sink<W: Write + Send + 'static>(
     )?;
     // The `__convert` import backs `String`/`Number`/`parseFloat`.
     // It decodes the argument jsval (reading linear memory for heap-string
-    // operands), reuses `format_value`/`value_to_number` and the parse helpers, and
+    // operands), reuses `to_js_string`/`value_to_number` and the parse helpers, and
     // returns the converted jsval. `String` allocates a fresh heap string in guest
     // memory via the exported heap-pointer global; the rest return an immediate
     // number jsval and never allocate.
@@ -199,14 +199,15 @@ fn run_with_sink<W: Write + Send + 'static>(
             let result = match op {
                 CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
                 // `parseFloat` operates on the argument's string form.
-                CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&format_value(&value))),
+                CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&to_js_string(&value))),
                 CONVERT_OP_TO_STRING => {
                     // A string argument is returned unchanged (no allocation);
-                    // anything else is formatted and allocated as a heap string.
+                    // anything else takes its JS `ToString` text, allocated as
+                    // a heap string.
                     if matches!(value, Value::Str(_)) {
                         return Ok(bits);
                     }
-                    let text = format_value(&value);
+                    let text = to_js_string(&value);
                     match alloc_string(&mut caller, &text) {
                         Some(base) => (HEAP | base).cast_signed(),
                         // Allocation failed: out of memory traps via

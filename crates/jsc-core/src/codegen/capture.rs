@@ -630,6 +630,16 @@ impl CaptureResolver {
             Expr::Object(o) => {
                 for prop in &o.props {
                     if let PropOrSpread::Prop(prop) = prop {
+                        // A computed key (`{[k]: v}`, `{[k]() {..}}`) is
+                        // evaluated in the enclosing frame.
+                        if let Prop::KeyValue(swc_ecma_ast::KeyValueProp { key, .. })
+                        | Prop::Method(swc_ecma_ast::MethodProp { key, .. })
+                        | Prop::Getter(swc_ecma_ast::GetterProp { key, .. })
+                        | Prop::Setter(swc_ecma_ast::SetterProp { key, .. }) = prop.as_ref()
+                            && let PropName::Computed(c) = key
+                        {
+                            self.expr(&c.expr);
+                        }
                         match prop.as_ref() {
                             Prop::KeyValue(kv) => self.expr(&kv.value),
                             // Shorthand `{n}` references the outer binding `n`.

@@ -718,6 +718,7 @@ pub(super) fn emit_date_method_node(
         method_name,
         recv_local,
         fallback_obj_local,
+        not_callable,
     } = node
     else {
         unreachable!("emit_date_method_node is only called with a DateMethod node")
@@ -744,17 +745,16 @@ pub(super) fn emit_date_method_node(
     enter_frame(helpers);
     emit_date_field(*op, recv_local, function, scratch, strings, helpers);
     function.instruction(&Instruction::Else);
-    if helpers.fn_type == 0 {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    } else {
-        let fallback = IrNode::MethodCallUser {
-            obj: Box::new(IrNode::Local(recv_local)),
-            key: Box::new(IrNode::Str(method_name.clone())),
-            args: args.clone(),
-            obj_local: *fallback_obj_local,
-        };
-        emit_method_call_user(&fallback, function, scratch, strings, helpers);
-    }
+    // A program without functions throws on the fallback (see
+    // `emit_method_call_user`).
+    let fallback = IrNode::MethodCallUser {
+        obj: Box::new(IrNode::Local(recv_local)),
+        key: Box::new(IrNode::Str(method_name.clone())),
+        args: args.clone(),
+        obj_local: *fallback_obj_local,
+        not_callable: not_callable.clone(),
+    };
+    emit_method_call_user(&fallback, function, scratch, strings, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
@@ -1206,6 +1206,7 @@ pub(super) fn emit_map_method_node(
         method_name,
         recv_local,
         fallback_obj_local,
+        not_callable,
     } = node
     else {
         unreachable!("emit_map_method_node is only called with a MapMethod node")
@@ -1237,21 +1238,17 @@ pub(super) fn emit_map_method_node(
     // MAP/SET op path: `handle` is the wrapped receiver base.
     emit_map_op(*op, recv_local, args, function, scratch, strings, helpers);
     function.instruction(&Instruction::Else);
-    if helpers.fn_type == 0 {
-        // No funcref table: an object method call is impossible, so the fallback is
-        // dead code — emit a well-typed `undefined` to keep the module valid.
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    } else {
-        // Fallback: an ordinary user method call `recv.<name>(args)` binding
-        // `this = recv`, reusing the method-call machinery.
-        let fallback = IrNode::MethodCallUser {
-            obj: Box::new(IrNode::Local(recv_local)),
-            key: Box::new(IrNode::Str(method_name.clone())),
-            args: args.clone(),
-            obj_local: *fallback_obj_local,
-        };
-        emit_method_call_user(&fallback, function, scratch, strings, helpers);
-    }
+    // Fallback: an ordinary user method call `recv.<name>(args)` binding
+    // `this = recv`, reusing the method-call machinery (which throws in a
+    // program without functions).
+    let fallback = IrNode::MethodCallUser {
+        obj: Box::new(IrNode::Local(recv_local)),
+        key: Box::new(IrNode::Str(method_name.clone())),
+        args: args.clone(),
+        obj_local: *fallback_obj_local,
+        not_callable: not_callable.clone(),
+    };
+    emit_method_call_user(&fallback, function, scratch, strings, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
@@ -1278,6 +1275,7 @@ pub(super) fn emit_receiver_method_node(
         args,
         recv_local,
         fallback_obj_local,
+        not_callable,
     } = node
     else {
         unreachable!("emit_receiver_method_node is only called with a ReceiverMethod node")
@@ -1352,6 +1350,7 @@ pub(super) fn emit_receiver_method_node(
         key: Box::new(IrNode::Str(op.name().to_owned())),
         args: args.clone(),
         obj_local: *fallback_obj_local,
+        not_callable: not_callable.clone(),
     };
     emit_method_call_user(&fallback, function, scratch, strings, helpers);
     leave_frame(helpers);

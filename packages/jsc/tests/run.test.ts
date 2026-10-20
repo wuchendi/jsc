@@ -307,3 +307,28 @@ it('renders functions, classes, instances, and accessors like the Rust host', as
   ]
   for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
 })
+
+it('converts values with JS ToString like the Rust host', async () => {
+  const cases: [string, string][] = [
+    ['console.log(String([1, 2]))', '1,2\n'],
+    ["console.log([1, [2, 3]].join('-'))", '1-2,3\n'],
+    ["console.log('' + [1, 'a', null, undefined])", '1,a,,\n'],
+    [
+      'console.log(String({}), `${{ a: 1 }}`)',
+      '[object Object] [object Object]\n',
+    ],
+    [
+      "console.log(String(new TypeError('x')), String(new Error()), '' + new RangeError('r'))",
+      'TypeError: x Error RangeError: r\n',
+    ],
+    [
+      "let a = [1, 0]; a[1] = a; console.log(String(a), a.join('-'))",
+      '1, 1-\n',
+    ],
+    [
+      "console.log('x'.padStart(4, [1, 2]), 'a1,2b'.split([1, 2]))",
+      '1,2x [ a, b ]\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})
