@@ -589,3 +589,28 @@ fn closure_over_async_local_runs_as_reaction() {
         "y 1\n",
     );
 }
+
+/// An `await` nested in an expression keeps JS evaluation order: the operands
+/// before it run synchronously, the rest after the microtask resumes the body.
+#[test]
+fn nested_await_preserves_evaluation_order() {
+    assert_output(
+        "let log = \"\";
+         function t(s, v){ log = log + s; return v; }
+         async function f(){ let r = t(\"a\", 1) + (await t(\"b\", 2)) + t(\"c\", 3); console.log(r, log); }
+         f(); log = log + \"|\";",
+        "6 ab|c\n",
+    );
+}
+
+/// A store after a nested `await` targets the receiver evaluated before it.
+#[test]
+fn nested_await_store_targets_the_receiver_captured_before_it() {
+    assert_output(
+        "let box = {o: {x: 0}};
+         let first = box.o;
+         async function f(){ box.o.x = await 5; console.log(first.x, box.o.x); }
+         f(); box.o = {x: 0};",
+        "5 0\n",
+    );
+}
