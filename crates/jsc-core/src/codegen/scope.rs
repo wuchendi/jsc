@@ -17,6 +17,8 @@ impl Frame {
             next_label: 0,
             allows_this: false,
             this_local: None,
+            arrow: false,
+            new_target_local: None,
         }
     }
 }
@@ -220,6 +222,34 @@ impl<'a> LowerCtx<'a> {
         Some(slot)
     }
 
+    /// Resolve `new.target` (design 4.5): the nearest non-arrow function's
+    /// prologue snapshot, read directly in that function and captured BY VALUE
+    /// (it is immutable) through each nested arrow's environment. `undefined` in
+    /// a generator/async body (never constructed); `None` at top level.
+    pub(super) fn resolve_new_target(&mut self) -> Option<IrNode> {
+        let fi = self.frames.iter().rposition(|frame| !frame.arrow)?;
+        if fi == 0 && self.main_ctx {
+            return None;
+        }
+        if self.frames[fi].env_backed {
+            return Some(IrNode::Undefined);
+        }
+        let local = if let Some(local) = self.frames[fi].new_target_local {
+            local
+        } else {
+            let frame = &mut self.frames[fi];
+            let local = frame.next;
+            frame.next += 1;
+            frame.new_target_local = Some(local);
+            frame.by_id.insert(new_target_id(fi), local);
+            local
+        };
+        if fi == self.top() {
+            return Some(IrNode::Local(local));
+        }
+        Some(IrNode::EnvLoad(self.route_env(fi, new_target_id(fi))))
+    }
+
     /// Whether the local `idx` in the current frame is a boxed cell.
     pub(super) fn is_cell(&self, idx: u32) -> bool {
         self.frames.last().is_some_and(|f| f.cells.contains(&idx))
@@ -407,4 +437,11 @@ impl<'a> LowerCtx<'a> {
         };
         IrNode::EnvLoad(slot)
     }
+}
+
+/// The synthetic binding id of the `new.target` snapshot of the function at
+/// frame depth `frame`: above every source offset (a [`binding_id`]), unique
+/// among the frames enclosing a capture.
+fn new_target_id(frame: usize) -> u32 {
+    0x8000_0000 | u32::try_from(frame).unwrap_or(0)
 }
