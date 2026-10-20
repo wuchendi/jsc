@@ -21,12 +21,10 @@ export const TRUE = 0x7ff9_0000_0000_0001n
 export const NULL = 0x7ffa_0000_0000_0000n
 /** NaN-boxed `undefined` (tag `0b011`). */
 export const UNDEFINED = 0x7ffb_0000_0000_0000n
-/** `typeof`-result type-string immediate header (tag `0b100`); low bits index the table. */
-export const TYPEOF = 0x7ffc_0000_0000_0000n
 /** NaN-boxed heap-pointer header (tag `0b101`): `HEAP | (ptr as u32)`. */
 export const HEAP = 0x7ffd_0000_0000_0000n
 
-/** Bytes of every heap block's leading header: the TYPE BYTE plus 3 padding bytes. */
+/** Bytes of every heap block's leading header: the TYPE BYTE plus the zero `gc`/`flags`/`class` bytes. */
 export const HEADER_SIZE = 4
 
 /** TYPE BYTE of a heap string block: `[type=0][pad×3][len:u32][utf8]`. */
@@ -56,8 +54,18 @@ export const DATE_MS_OFFSET = HEADER_SIZE + 4
 
 /** Export name of the module's linear memory. */
 export const MEMORY_EXPORT_NAME = 'memory'
-/** Export name of the bump-allocator heap-pointer global (host allocation). */
+/** Export name of the bump-allocator heap-pointer global (read for the OOM sentinel). */
 export const HEAP_PTR_EXPORT_NAME = '__heap_ptr'
+/** The linear-memory cap in 64 KiB wasm pages (512 MiB). */
+export const MEMORY_MAX_PAGES = 8192
+/** The sticky out-of-memory sentinel the guest stores in `__heap_ptr` (`i32`). */
+export const HEAP_PTR_OOM = -1
+/** Export name of the `__new_string(len) -> base` guest string constructor. */
+export const NEW_STRING_EXPORT_NAME = '__new_string'
+/** Export name of the `__new_array(len) -> base` guest array constructor. */
+export const NEW_ARRAY_EXPORT_NAME = '__new_array'
+/** Export name of the `__new_promise() -> base` guest pending-promise constructor. */
+export const NEW_PROMISE_EXPORT_NAME = '__new_promise'
 /** Export name of the pending-exception flag global (`i32`). */
 export const EXC_PENDING_EXPORT_NAME = '__exc_pending'
 /** Export name of the in-flight exception value global (`i64`). */
@@ -133,17 +141,7 @@ export const PROMISE_OP_SETTLE_REJECT = 6
 /** `__promise` op: spawn an `async function` body from generator handle `a`. */
 export const PROMISE_OP_ASYNC_SPAWN = 7
 
-/** The `typeof` result strings, indexed by a boxed type-string immediate. */
-export const TYPEOF_STRINGS = [
-  'number',
-  'boolean',
-  'undefined',
-  'object',
-  'string',
-  'function',
-] as const
-
 /** 64-bit unsigned mask, for normalizing signed `bigint`s that cross the wasm boundary. */
 export const U64_MASK = 0xffff_ffff_ffff_ffffn
-/** 32-bit unsigned mask, for extracting the low 32 bits (heap offset / typeof index). */
+/** 32-bit unsigned mask, for extracting the low 32 bits (heap offset). */
 export const U32_MASK = 0xffff_ffffn

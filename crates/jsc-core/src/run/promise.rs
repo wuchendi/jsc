@@ -22,7 +22,6 @@ use wasmtime::{AsContextMut, Caller, Func, Global, Instance, Memory, Store, Stor
 
 use crate::abi;
 
-use super::host::heap_reserve;
 use super::{
     HEADER_SIZE, HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED, TYPE_FUNCTION,
     TYPE_PROMISE,
@@ -30,9 +29,6 @@ use super::{
 
 /// The NaN-boxed `undefined` jsval bits.
 const UNDEFINED: u64 = abi::UNDEFINED;
-
-/// The `[type][pad×3][state:i32][value:i64]` promise block size in bytes.
-const PROMISE_BLOCK_SIZE: usize = HEADER_SIZE + 4 + 8;
 
 /// The store data threaded through `wasmtime`: the `console.log` output sink plus
 /// the promise engine. Split so the `print` import writes to `sink` while the
@@ -118,7 +114,9 @@ impl std::fmt::Debug for PromiseEngine {
 #[derive(Clone, Copy)]
 struct Handles {
     memory: Memory,
-    heap_ptr: Global,
+    /// The `__new_promise() -> base` guest constructor every promise block is
+    /// allocated through.
+    new_promise: Func,
     exc_pending: Global,
     exc_value: Global,
     /// The `__invoke1` callback trampoline. `None` when the program declares no
@@ -135,9 +133,9 @@ impl Handles {
     fn from_caller<W: 'static>(caller: &mut Caller<'_, Host<W>>) -> Option<Self> {
         Some(Self {
             memory: caller.get_export("memory")?.into_memory()?,
-            heap_ptr: caller
-                .get_export(abi::HEAP_PTR_EXPORT_NAME)?
-                .into_global()?,
+            new_promise: caller
+                .get_export(abi::NEW_PROMISE_EXPORT_NAME)?
+                .into_func()?,
             exc_pending: caller
                 .get_export(abi::EXC_PENDING_EXPORT_NAME)?
                 .into_global()?,
@@ -158,7 +156,7 @@ impl Handles {
     fn from_instance<W: 'static>(store: &mut Store<Host<W>>, instance: &Instance) -> Option<Self> {
         Some(Self {
             memory: instance.get_memory(&mut *store, "memory")?,
-            heap_ptr: instance.get_global(&mut *store, abi::HEAP_PTR_EXPORT_NAME)?,
+            new_promise: instance.get_func(&mut *store, abi::NEW_PROMISE_EXPORT_NAME)?,
             exc_pending: instance.get_global(&mut *store, abi::EXC_PENDING_EXPORT_NAME)?,
             exc_value: instance.get_global(&mut *store, abi::EXC_VALUE_EXPORT_NAME)?,
             invoke1: instance.get_func(&mut *store, abi::INVOKE_EXPORT_NAME),
@@ -662,27 +660,25 @@ fn invoke1<W: Write + Send + 'static>(
     (result, false)
 }
 
-/// Bump-allocate a fresh `[type][pad×3][state:i32][value:i64]` promise block in
-/// guest memory and return its heap jsval, or `None` on a failed allocation.
+/// Allocate a fresh promise block through the guest `__new_promise` export,
+/// settle it to `state`/`value` unless pending, and return its heap jsval, or
+/// `None` on a failed allocation (an out-of-memory trap leaves the sentinel for
+/// the run stage to report).
 fn alloc_promise<W: Write + Send + 'static>(
     mut ctx: StoreContextMut<'_, Host<W>>,
     handles: &Handles,
     state: i32,
     value: u64,
 ) -> Option<u64> {
-    let mut block = Vec::with_capacity(PROMISE_BLOCK_SIZE);
-    block.push(TYPE_PROMISE);
-    block.resize(HEADER_SIZE, 0);
-    block.extend_from_slice(&state.to_le_bytes());
-    block.extend_from_slice(&value.to_le_bytes());
-    let base = heap_alloc(ctx.as_context_mut(), handles, &block)?;
-    if state == PROMISE_REJECTED {
-        ctx.data_mut()
-            .engine
-            .rejected
-            .insert(u32::try_from(base).ok()?);
+    let new_promise = handles.new_promise.typed::<(), i32>(&ctx).ok()?;
+    let base = u32::try_from(new_promise.call(&mut ctx, ()).ok()?).ok()?;
+    if state != PROMISE_PENDING {
+        write_settlement(ctx.as_context_mut(), handles, base, state, value);
     }
-    Some(HEAP | base)
+    if state == PROMISE_REJECTED {
+        ctx.data_mut().engine.rejected.insert(base);
+    }
+    Some(HEAP | u64::from(base))
 }
 
 /// Write a promise block's settlement (`state` + `value`) into guest memory.
@@ -699,25 +695,6 @@ fn write_settlement<W: Write + Send + 'static>(
     let _ = handles
         .memory
         .write(&mut ctx, base as usize + HEADER_SIZE, &buf);
-}
-
-/// Bump-allocate `block` in guest memory via the exported `__heap_ptr` global
-/// (mirroring the guest `__alloc`), growing linear memory via [`heap_reserve`].
-/// Returns the block's base offset, or `None` when a read/write/grow fails (a
-/// failed grow leaves the out-of-memory sentinel for the run stage to report).
-fn heap_alloc<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
-    handles: &Handles,
-    block: &[u8],
-) -> Option<u64> {
-    let base = heap_reserve(&mut ctx, handles.heap_ptr, handles.memory, block.len())?;
-    let end = base + block.len();
-    handles.memory.write(&mut ctx, base, block).ok()?;
-    handles
-        .heap_ptr
-        .set(&mut ctx, Val::I32(i32::try_from(end).ok()?))
-        .ok()?;
-    Some(base as u64)
 }
 
 /// The base offset (low 32 bits) of a heap jsval.
