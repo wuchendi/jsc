@@ -271,3 +271,92 @@ fn core_language_regression() {
         "stderr should explain the const violation, got: {stderr}"
     );
 }
+
+/// What a nested-`yield`/`await` shape does today.
+enum Nested {
+    /// Rejected at compile time (exit 2) — never a panic.
+    CompileError,
+    /// Compiles and runs, printing this `console.log` output.
+    Prints(&'static str),
+}
+
+/// A `yield`/`await` nested inside an expression shape either compiles to a
+/// clean compile error or runs correctly — it never panics the compiler. Each
+/// body uses `@` for the suspend keyword with operand `7`, and the driver sends
+/// `7` back, so a supported shape observes `7` at the suspend point in both the
+/// `function*` and the `async function` variant.
+#[test]
+fn nested_yield_and_await_never_panic() {
+    use Nested::{CompileError, Prints};
+    let cases: &[(&str, Nested)] = &[
+        (
+            "let o = {x:0}; o.x = (@ 7) ? 2 : 3; console.log(o.x);",
+            CompileError,
+        ),
+        (
+            "let o = {x:0}; let k = \"x\"; o[k] = @ 7; console.log(o.x);",
+            CompileError,
+        ),
+        (
+            "let a = [1,2]; let i = 1; a[i] += @ 7; console.log(a[1]);",
+            CompileError,
+        ),
+        (
+            "let o = {x:{y:0}}; o.x.y = @ 7; console.log(o.x.y);",
+            CompileError,
+        ),
+        (
+            "let o = {f: function(v){ return v + 1; }}; console.log(o.f(@ 7));",
+            CompileError,
+        ),
+        ("let p = {v: @ 7}; console.log(p.v);", CompileError),
+        ("let a = [@ 7, 1]; console.log(a[0]);", CompileError),
+        ("console.log(`v=${@ 7}`);", CompileError),
+        (
+            "let c = true; let r = c ? (@ 7) : 0; console.log(r);",
+            CompileError,
+        ),
+        ("let r = true && (@ 7); console.log(r);", CompileError),
+        ("let r = false || (@ 7); console.log(r);", CompileError),
+        ("let r = null ?? (@ 7); console.log(r);", CompileError),
+        // Already-supported statement shapes keep working.
+        ("let r = 0; r = @ 7; console.log(r);", Prints("7\n")),
+        ("@ 7; console.log(1);", Prints("1\n")),
+        (
+            "let r = 0; if (true) { r = @ 7; } console.log(r);",
+            Prints("7\n"),
+        ),
+    ];
+    for (body, expected) in cases {
+        let generator = format!(
+            "function* g(){{ {} }} let it = g(); it.next(); it.next(7); it.next(7);",
+            body.replace('@', "yield")
+        );
+        let async_fn = format!(
+            "async function f(){{ {} }} f();",
+            body.replace('@', "await")
+        );
+        for src in [generator, async_fn] {
+            let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+                .args(["-e", &src])
+                .output()
+                .expect("failed to spawn jsc binary");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            match expected {
+                CompileError => assert!(
+                    output.status.code() == Some(2),
+                    "`{src}` should be a compile error (exit 2), got {:?}: {stderr}",
+                    output.status
+                ),
+                Prints(out) => {
+                    assert!(
+                        output.status.success(),
+                        "`{src}` should run, got {:?}: {stderr}",
+                        output.status
+                    );
+                    assert_eq!(String::from_utf8_lossy(&output.stdout), *out, "for `{src}`");
+                }
+            }
+        }
+    }
+}
