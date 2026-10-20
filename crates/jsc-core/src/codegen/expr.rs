@@ -235,6 +235,15 @@ impl LowerCtx<'_> {
             // `new.target`: the enclosing non-arrow function's snapshot; outside
             // any function it is a SyntaxError.
             Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::NewTarget => {
+                // An escaped spelling (`new.t\u0061rget`) is longer than the
+                // 10-byte keyword form and is a SyntaxError.
+                if meta.span.hi.0 - meta.span.lo.0 != 10 {
+                    return Err(CompileError::spanned(
+                        meta.span,
+                        "keywords in `new.target` cannot contain escapes",
+                    )
+                    .into());
+                }
                 self.resolve_new_target().ok_or_else(|| {
                     CompileError::spanned(meta.span, "`new.target` is only valid inside a function")
                         .into()

@@ -100,6 +100,12 @@ fn new_target_at_top_level_is_compile_error() {
         .output()
         .expect("failed to spawn jsc binary");
     assert_eq!(output.status.code(), Some(2));
+    // An escaped keyword (`new.t\u0061rget`) is a `SyntaxError` too.
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "function f(){ new.t\\u0061rget }"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert_eq!(output.status.code(), Some(2));
 }
 
 /// A class constructor called without `new` throws; class identity is by
