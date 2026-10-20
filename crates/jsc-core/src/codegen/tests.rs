@@ -1,6 +1,6 @@
 use super::lower;
 use crate::frontend::{Dialect, parse};
-use crate::ir::{BinOp, IrNode, IrStmt, ObjectBuiltinOp, OpSetKind, PropKey};
+use crate::ir::{BinOp, ConvertOp, ErrorKind, IrNode, IrStmt, ObjectBuiltinOp, OpSetKind, PropKey};
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
     lower(&parse(src, Dialect::Js)?)
@@ -143,6 +143,7 @@ fn lowers_object_literal() {
                 (PropKey::Static("b".to_owned()), IrNode::Num(2.0)),
             ],
             proto: None,
+            class: crate::abi::CLASS_ORDINARY,
             reserve: 0,
         }
     );
@@ -166,53 +167,78 @@ fn lowers_computed_and_numeric_literal_keys() {
 
 #[test]
 fn lowers_error_constructor_to_object() {
-    // `new TypeError("bad")` lowers to a branded error object: `name`, `message`,
-    // the derived `stack`, and the hidden `@@errorkind` marker. The message is
-    // teed into a fresh temp (evaluated once) and reused by `stack`.
+    // `new TypeError("bad")` lowers to a class-ERROR object linked to the
+    // static `%TypeError.prototype%`, owning non-enumerable `message` and
+    // `stack` (a string literal resolves both at compile time).
     let program = lower_src("new TypeError(\"bad\")").expect("should lower");
-    let IrStmt::Expr(IrNode::Object { entries, .. }) = &program.stmts[0] else {
-        unreachable!("expected an object literal");
-    };
-    let keys: Vec<&PropKey> = entries.iter().map(|(key, _)| key).collect();
     assert_eq!(
-        keys,
-        [
-            &PropKey::Static("name".to_owned()),
-            &PropKey::Static("message".to_owned()),
-            &PropKey::Static("stack".to_owned()),
-            &PropKey::Hidden(crate::abi::ERROR_KIND_KEY.to_owned()),
-        ]
-    );
-    assert_eq!(entries[0].1, IrNode::Str("TypeError".to_owned()));
-    assert_eq!(entries[3].1, IrNode::Num(crate::abi::ERROR_KIND_TYPE));
-    let IrNode::Assign { local, value } = &entries[1].1 else {
-        unreachable!("message should tee into a temp");
-    };
-    assert_eq!(**value, IrNode::Str("bad".to_owned()));
-    assert_eq!(
-        entries[2].1,
-        IrNode::Binary {
-            op: BinOp::Add,
-            lhs: Box::new(IrNode::Str("TypeError: ".to_owned())),
-            rhs: Box::new(IrNode::Local(*local)),
-        }
+        program.stmts[0],
+        IrStmt::Expr(IrNode::Object {
+            entries: vec![
+                (
+                    PropKey::Hidden("message".to_owned()),
+                    IrNode::Str("bad".to_owned())
+                ),
+                (
+                    PropKey::Hidden("stack".to_owned()),
+                    IrNode::Str("TypeError: bad".to_owned())
+                ),
+            ],
+            proto: Some(Box::new(IrNode::ErrorProto(ErrorKind::TypeError))),
+            class: crate::abi::CLASS_ERROR,
+            reserve: 0,
+        })
     );
 }
 
 #[test]
-fn lowers_error_no_arg_to_empty_message() {
-    // `new Error()` defaults `message` to "" and `stack` to just the name (no
-    // trailing colon), still carrying the hidden `@@errorkind` marker.
-    let program = lower_src("new Error()").expect("should lower");
+fn lowers_error_dynamic_message_once() {
+    // A non-literal message is evaluated once into a temp: `undefined` builds
+    // an error without an own `message`, anything else its `ToString`.
+    let program = lower_src("let m = 1; new Error(m)").expect("should lower");
+    let IrStmt::Expr(IrNode::Ternary {
+        cond,
+        then_branch,
+        else_branch,
+    }) = &program.stmts[1]
+    else {
+        unreachable!("expected the undefined-message test");
+    };
+    assert!(matches!(&**cond, IrNode::Binary { op: BinOp::Eq, lhs, rhs }
+        if matches!(&**lhs, IrNode::Assign { .. }) && **rhs == IrNode::Undefined));
     assert_eq!(
-        program.stmts[0],
-        IrStmt::Expr(IrNode::error_object(
-            IrNode::Str("Error".to_owned()),
-            IrNode::Str(String::new()),
-            IrNode::Str("Error".to_owned()),
-            crate::abi::ERROR_KIND_ERROR,
-        ))
+        **then_branch,
+        IrNode::error_object(
+            ErrorKind::Error,
+            None,
+            None,
+            IrNode::Str("Error".to_owned())
+        )
     );
+    let IrNode::Object { entries, .. } = &**else_branch else {
+        unreachable!("expected the error object");
+    };
+    assert!(matches!(&entries[0].1, IrNode::Assign { value, .. }
+        if matches!(&**value, IrNode::ConvertCall { op: ConvertOp::ToString, .. })));
+}
+
+#[test]
+fn lowers_error_no_arg_to_inherited_message() {
+    // `new Error()` and `Error()` own no `message` (the prototype's `""` is
+    // inherited) and a bare-name `stack`.
+    for src in ["new Error()", "Error()", "new Error(undefined)"] {
+        let program = lower_src(src).expect("should lower");
+        assert_eq!(
+            program.stmts[0],
+            IrStmt::Expr(IrNode::error_object(
+                ErrorKind::Error,
+                None,
+                None,
+                IrNode::Str("Error".to_owned()),
+            )),
+            "for `{src}`"
+        );
+    }
 }
 
 #[test]

@@ -751,6 +751,11 @@ impl LowerCtx<'_> {
                 func: sig.index,
                 args,
             })
+        } else if let Some(kind) = ErrorKind::from_name(name) {
+            // `Error(m)` without `new` constructs too (design 4.7); like
+            // `new Error(m)`, only the first argument is used.
+            let message = args.into_iter().next();
+            Ok(self.lower_error_construct(kind, message))
         } else if let Some(op) = convert_builtin_op(name) {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
@@ -1607,6 +1612,7 @@ impl LowerCtx<'_> {
         Ok(IrNode::Object {
             entries,
             proto: None,
+            class: crate::abi::CLASS_ORDINARY,
             reserve: 0,
         })
     }
@@ -1659,7 +1665,7 @@ impl LowerCtx<'_> {
     /// Resolve the right-hand side of an `instanceof` to an [`InstanceOfKind`].
     /// A user class is matched FIRST (so a `class Error {}` shadows the builtin)
     /// and lowers to a `proto`-chain walk against `C.prototype`; an UNSHADOWED `Error`/
-    /// `TypeError`/`RangeError` identifier lowers to a hidden-brand check.
+    /// `TypeError`/`RangeError` identifier walks for its static prototype.
     /// Anything else — a non-identifier, a shadowed error name, or an unrelated
     /// binding — is a clean compile error.
     fn instanceof_kind(&mut self, right: &Expr) -> anyhow::Result<InstanceOfKind> {
@@ -1679,13 +1685,13 @@ impl LowerCtx<'_> {
         if self.shared.classes.borrow().contains_key(name) {
             // User class: walk the receiver's `proto` chain for `C.prototype`.
             let class_proto = self.class_prototype_read(name, id.span)?;
-            return Ok(InstanceOfKind::Class(Box::new(class_proto)));
+            return Ok(InstanceOfKind::Proto(Box::new(class_proto)));
         }
         if self.resolve(name).is_none() {
+            if let Some(kind) = ErrorKind::from_name(name) {
+                return Ok(InstanceOfKind::Proto(Box::new(IrNode::ErrorProto(kind))));
+            }
             match name {
-                "Error" => return Ok(InstanceOfKind::Error),
-                "TypeError" => return Ok(InstanceOfKind::TypeError),
-                "RangeError" => return Ok(InstanceOfKind::RangeError),
                 // The runtime-TYPE-BYTE builtins: `Array`/`Object`/`Function`/
                 // `Date` are not real bindings, so a user `let Array = ..` shadows
                 // them (the `resolve` guard above) and falls through to the error.
@@ -1743,13 +1749,13 @@ impl LowerCtx<'_> {
         if name == "Date" && self.resolve("Date").is_none() {
             return self.lower_new_date(callee.span, new_expr);
         }
-        if !matches!(name, "Error" | "TypeError" | "RangeError") {
+        let Some(kind) = ErrorKind::from_name(name) else {
             return Err(CompileError::spanned(
                 callee.span(),
                 format!("unsupported constructor: {name}"),
             )
             .into());
-        }
+        };
         let args = new_expr.args.as_deref().unwrap_or(&[]);
         // `message` is arg0 (spread rejected), or absent when no argument is given.
         let message = match args.first() {
@@ -1765,42 +1771,75 @@ impl LowerCtx<'_> {
             }
             None => None,
         };
-        // The hidden identity marker (`@@errorkind`): a number jsval keyed by a
-        // reserved `@@`-prefixed key, so it stays invisible to `for-in` /
-        // `Object.keys` / `JSON.stringify` yet lets `instanceof` and the value
-        // renderer recognize the error kind. The `matches!` guard above proves
-        // `name` is one of the three, so the `_` arm is `Error`.
-        let kind = match name {
-            "TypeError" => crate::abi::ERROR_KIND_TYPE,
-            "RangeError" => crate::abi::ERROR_KIND_RANGE,
-            _ => crate::abi::ERROR_KIND_ERROR,
+        Ok(self.lower_error_construct(kind, message))
+    }
+
+    /// Build the Error instance `new <kind>(message)` / `<kind>(message)`
+    /// constructs (design 4.7): an own `message` = `ToString(message)` only when
+    /// the argument is not `undefined`, and `stack` = `"<name>: <message>"`
+    /// (just `<name>` for an empty or absent message — jsc keeps no runtime
+    /// call frames). The argument is evaluated EXACTLY ONCE into a temp; a
+    /// string literal or `undefined` resolves both at compile time.
+    fn lower_error_construct(&mut self, kind: ErrorKind, message: Option<IrNode>) -> IrNode {
+        let name = kind.name();
+        let stack_of = |text: &str| {
+            IrNode::Str(if text.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name}: {text}")
+            })
         };
-        // `stack` is the single-line `"<name>: <message>"` (just `<name>` when no
-        // message was given — jsc keeps no runtime call frames). The message
-        // sub-expression is teed into a fresh temp so it is evaluated EXACTLY
-        // ONCE: a side-effecting `new Error(f())` must not run `f` twice.
-        let (message_value, stack) = match message {
-            Some(message) => {
-                let msg_local = self.fresh();
-                let message_value = IrNode::Assign {
-                    local: msg_local,
-                    value: Box::new(message),
-                };
-                let stack = IrNode::Binary {
-                    op: BinOp::Add,
-                    lhs: Box::new(IrNode::Str(format!("{name}: "))),
-                    rhs: Box::new(IrNode::Local(msg_local)),
-                };
-                (message_value, stack)
+        match message {
+            None | Some(IrNode::Undefined) => {
+                IrNode::error_object(kind, None, None, IrNode::Str(name.to_owned()))
             }
-            None => (IrNode::Str(String::new()), IrNode::Str(name.to_owned())),
-        };
-        Ok(IrNode::error_object(
-            IrNode::Str(name.to_owned()),
-            message_value,
-            stack,
-            kind,
-        ))
+            Some(IrNode::Str(text)) => {
+                let stack = stack_of(&text);
+                IrNode::error_object(kind, None, Some(IrNode::Str(text)), stack)
+            }
+            Some(message) => {
+                let arg = self.fresh();
+                let msg = self.fresh();
+                let text = IrNode::Assign {
+                    local: msg,
+                    value: Box::new(IrNode::ConvertCall {
+                        op: ConvertOp::ToString,
+                        arg: Box::new(IrNode::Local(arg)),
+                        radix: None,
+                    }),
+                };
+                let stack = IrNode::Ternary {
+                    cond: Box::new(IrNode::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(IrNode::Local(msg)),
+                        rhs: Box::new(IrNode::Str(String::new())),
+                    }),
+                    then_branch: Box::new(IrNode::Str(name.to_owned())),
+                    else_branch: Box::new(IrNode::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(IrNode::Str(format!("{name}: "))),
+                        rhs: Box::new(IrNode::Local(msg)),
+                    }),
+                };
+                IrNode::Ternary {
+                    cond: Box::new(IrNode::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(IrNode::Assign {
+                            local: arg,
+                            value: Box::new(message),
+                        }),
+                        rhs: Box::new(IrNode::Undefined),
+                    }),
+                    then_branch: Box::new(IrNode::error_object(
+                        kind,
+                        None,
+                        None,
+                        IrNode::Str(name.to_owned()),
+                    )),
+                    else_branch: Box::new(IrNode::error_object(kind, None, Some(text), stack)),
+                }
+            }
+        }
     }
 
     /// Lower `new Date()` / `new Date(ms)` into an [`IrNode::DateNew`].
@@ -1898,6 +1937,7 @@ impl LowerCtx<'_> {
         let instance = IrNode::Object {
             entries: Vec::new(),
             proto: Some(Box::new(proto)),
+            class: crate::abi::CLASS_ORDINARY,
             reserve: u32::try_from(fields).unwrap_or(u32::MAX),
         };
 

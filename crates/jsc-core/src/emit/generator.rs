@@ -154,7 +154,7 @@ pub(super) fn emit_gen_resume(
         return;
     }
 
-    // 2. A non-generator receiver throws a branded `TypeError`.
+    // 2. A non-generator receiver throws a `TypeError`.
     emit_is_generator(function, handle_slot);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -206,7 +206,7 @@ pub(super) fn emit_gen_resume(
     emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
 }
 
-/// Emit the branded-`TypeError` throw shared by the two non-generator-receiver
+/// Emit the `TypeError` throw shared by the two non-generator-receiver
 /// paths of [`emit_gen_resume`]: stash the error in `$exc_value`, set the pending
 /// flag, clear any routed completion, and unwind to the nearest handler.
 fn emit_throw_type_error(
@@ -254,7 +254,16 @@ fn emit_result_object(
         ),
         (PropKey::Static("done".to_owned()), IrNode::Local(scratch)),
     ];
-    emit_object_node(&entries, None, 0, function, scratch, strings, helpers);
+    emit_object_node(
+        &entries,
+        None,
+        abi::CLASS_ORDINARY,
+        0,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
 }
 
 /// Emit a generator STATE MACHINE function. Its wasm parameters are the

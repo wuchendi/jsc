@@ -612,6 +612,7 @@ impl LowerCtx<'_> {
             IrNode::Object {
                 entries: proto_entries,
                 proto: proto_link,
+                class: crate::abi::CLASS_ORDINARY,
                 reserve: 0,
             },
         )];

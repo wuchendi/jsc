@@ -104,6 +104,9 @@ pub(super) fn emit_node(
                 helpers,
             );
         }
+        IrNode::ErrorProto(kind) => {
+            function.instruction(&Instruction::I64Const(error_proto_bits(*kind, helpers)));
+        }
         IrNode::DeclFunc(table_index) => {
             let base = decl_func_base(*table_index, helpers);
             function.instruction(&Instruction::I64Const(
@@ -257,11 +260,13 @@ pub(super) fn emit_node(
         IrNode::Object {
             entries,
             proto,
+            class,
             reserve,
         } => {
             emit_object_node(
                 entries,
                 proto.as_deref(),
+                *class,
                 *reserve,
                 function,
                 scratch,
@@ -618,7 +623,7 @@ pub(super) fn emit_method_call_user(
 /// snapshotted `this`) rather than a member receiver, so a parent constructor's
 /// `this.<field> = ..` mutates the instance the subclass is building. `callee` is
 /// a direct function value (the parent constructor or a parent-prototype method);
-/// the same not-a-function runtime guard throws a branded `TypeError` if `super.m`
+/// the same not-a-function runtime guard throws a `TypeError` if `super.m`
 /// resolves to a non-function (e.g. a missing method).
 pub(super) fn emit_this_call(
     node: &IrNode,
@@ -647,7 +652,7 @@ pub(super) fn emit_this_call(
     function.instruction(&Instruction::LocalSet(callee_val));
 
     // Runtime guard: the callee MUST be a function value — a `super.m` that
-    // resolves to `undefined` (missing method) throws a branded TypeError instead
+    // resolves to `undefined` (missing method) throws a TypeError instead
     // of dispatching a bogus funcref index. Identical to the method-call guard.
     emit_callable_guard(function, callee_val, scratch, strings, helpers);
 
@@ -1252,7 +1257,7 @@ pub(super) fn emit_call_indirect(
     // Evaluate the callee once; stash its block base.
     emit_node(callee, function, scratch, strings, helpers);
     // A program that declares no function has no funcref table, so the callee
-    // can never be a function value: throw the branded not-a-function TypeError
+    // can never be a function value: throw the not-a-function TypeError
     // instead of emitting an invalid `call_indirect`. The transfer leaves the
     // stack polymorphic, so the discarded operands need no cleanup.
     if !helpers.has_funcs {
@@ -1296,7 +1301,7 @@ pub(super) fn emit_call_indirect(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Throw the branded not-a-function `TypeError` (see [`internal_type_error`]) and
+/// Throw the not-a-function `TypeError` (see [`internal_type_error`]) and
 /// unwind to the nearest handler. Used where a program with no funcref table
 /// would otherwise need a `call_indirect`; the transfer leaves the stack
 /// polymorphic, so any discarded operands need no cleanup.
@@ -1316,7 +1321,7 @@ pub(super) fn emit_throw_not_a_function(
 }
 
 /// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in
-/// `local` is a heap FUNCTION value, throw the branded not-a-function `TypeError`
+/// `local` is a heap FUNCTION value, throw the not-a-function `TypeError`
 /// (see [`emit_throw_not_a_function`]) and unwind. Stack-neutral on the
 /// not-thrown path. The throw path builds the error object in the low scratch
 /// slots, so `local` may itself be a scratch slot the caller re-reads afterwards

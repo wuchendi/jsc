@@ -19,7 +19,7 @@
 //! # Errors
 //!
 //! Malformed (or unsupported — a `\u` escape) input calls `__json_throw`, which
-//! stashes a branded `Error` in `$exc_value`, sets `$exc_pending`, and unwinds via
+//! stashes an `Error` in `$exc_value`, sets `$exc_pending`, and unwinds via
 //! the exception-unwinding mechanism. Each helper checks `$exc_pending` after a recursive call and
 //! propagates; the emit-context [`emit_json_parse_node`] issues the final
 //! post-call `emit_propagate_if_pending` so a `try`/`catch` around `JSON.parse`
@@ -192,7 +192,7 @@ pub(super) fn emit_json_ws() -> Function {
     function
 }
 
-/// `__json_throw() -> i64`: stash a branded `SyntaxError` in `$exc_value`, set the
+/// `__json_throw() -> i64`: stash a `SyntaxError` in `$exc_value`, set the
 /// pending flag + clear any routed completion, and return a dummy `undefined`.
 pub(super) fn emit_json_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     // The full `emit_main` scratch-local layout (starting at local 0, since this

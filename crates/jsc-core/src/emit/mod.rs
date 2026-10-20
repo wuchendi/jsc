@@ -34,9 +34,9 @@ use wasm_encoder::{
 
 use crate::abi;
 use crate::ir::{
-    ArrayHofOp, BinOp, ConvertOp, DateOp, FnKind, InstanceOfKind, IrCase, IrFunction, IrNode,
-    IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey,
-    ReceiverOp, SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, ConvertOp, DateOp, ErrorKind, FnKind, InstanceOfKind, IrCase, IrFunction,
+    IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind,
+    PropKey, ReceiverOp, SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -388,7 +388,7 @@ const TRUE_BITS: i64 = abi::TRUE.cast_signed();
 /// whose member reads `undefined` (or a non-function) can only be caught at
 /// runtime, so instead of dispatching that value as a bogus funcref index
 /// (undefined behaviour — a wrong result or a cryptic wasm trap) the guard
-/// raises a clean exception — a real branded `TypeError` object, so
+/// raises a clean exception — a real `TypeError` object, so
 /// `catch (e) { e instanceof TypeError }` holds — surfaced when uncaught as
 /// `Uncaught TypeError: called value is not a function`. This is the
 /// error's `.message` (no `TypeError:` prefix); the prefixed first line lives in
@@ -401,33 +401,42 @@ const NOT_A_FUNCTION_MSG: &str = "called value is not a function";
 const NOT_A_FUNCTION_STACK: &str = "TypeError: called value is not a function";
 
 /// The static strings the internal-`TypeError` object (see [`internal_type_error`])
-/// embeds — its keys, kind marker key, `name`, `.message`, and `.stack`. They
-/// must be interned wherever the runtime callee guard can fire so their `[len][utf8]` blobs
-/// exist in the data segment; [`collect_node`] seeds them at each guarded call.
-const INTERNAL_TYPE_ERROR_STRS: [&str; 7] = [
-    "name",
-    "message",
-    "stack",
-    abi::ERROR_KIND_KEY,
-    "TypeError",
-    NOT_A_FUNCTION_MSG,
-    NOT_A_FUNCTION_STACK,
-];
+/// embeds — its `.message` and `.stack`. They must be interned wherever the
+/// runtime callee guard can fire so their `[len][utf8]` blobs exist in the data
+/// segment; [`collect_node`] seeds them (with [`ERROR_STRS`]) at each guarded
+/// call.
+const INTERNAL_TYPE_ERROR_STRS: [&str; 2] = [NOT_A_FUNCTION_MSG, NOT_A_FUNCTION_STACK];
 
-/// Build the branded `TypeError` object the runtime callee guard throws: a plain
-/// object carrying `name`/`message`/`stack` plus the hidden `@@errorkind` marker,
-/// identical in shape to `new TypeError("called value is not a function")` so it
-/// is `instanceof TypeError`/`Error`, reads its `.name`/`.message`/`.stack`, and
-/// renders as `TypeError: called value is not a function`. Emitted at the guard
+/// Build the `TypeError` the runtime callee guard throws, identical in shape
+/// to `new TypeError("called value is not a function")`. Emitted at the guard
 /// site via [`emit_node`]; its strings are seeded by [`INTERNAL_TYPE_ERROR_STRS`].
 fn internal_type_error() -> IrNode {
     IrNode::error_object(
-        IrNode::Str("TypeError".to_owned()),
-        IrNode::Str(NOT_A_FUNCTION_MSG.to_owned()),
+        ErrorKind::TypeError,
+        None,
+        Some(IrNode::Str(NOT_A_FUNCTION_MSG.to_owned())),
         IrNode::Str(NOT_A_FUNCTION_STACK.to_owned()),
-        abi::ERROR_KIND_TYPE,
     )
 }
+
+/// The static strings every error needs: the own keys of an Error instance and
+/// the keys and values of the static error prototypes (see
+/// [`emit_error_protos`]). Seeded by [`collect_node`] wherever an error can be
+/// created or observed; the prototypes are emitted iff all are interned.
+const ERROR_STRS: [&str; 7] = [
+    "name",
+    "message",
+    "stack",
+    "",
+    "Error",
+    "TypeError",
+    "RangeError",
+];
+
+/// The byte size of one static error prototype block: the object-family
+/// prefix, then its `TYPE_PROPS` table holding `name` and `message`.
+const ERROR_PROTO_SIZE: i32 =
+    (abi::OBJ_PREFIX_SIZE + abi::PROPS_HEADER_SIZE + 2 * abi::PROP_ENTRY_SIZE).cast_signed();
 
 /// The message fragments `__nullish_throw` splices into the V8-style text of the
 /// `TypeError` raised by a member read/write on a `null`/`undefined` receiver:
@@ -462,17 +471,12 @@ const FN_KEYS: [&str; 6] = [
     "",
 ];
 
-/// The static strings `__nullish_throw` needs — the error object's keys, kind
-/// marker key and `name`, the receiver words, and the message fragments. Seeded
-/// by [`collect_node`] at every guarded member read/write/method-call site so
-/// their `[len][utf8]` blobs exist when the guard throws.
-const NULLISH_ERROR_STRS: [&str; 14] = [
+/// The static strings `__nullish_throw` needs — the receiver words and the
+/// message fragments. Seeded (with [`ERROR_STRS`]) by [`collect_node`] at every
+/// guarded member read/write/method-call site so their `[len][utf8]` blobs
+/// exist when the guard throws.
+const NULLISH_ERROR_STRS: [&str; 9] = [
     INDEX_LENGTH_KEY,
-    "name",
-    "message",
-    "stack",
-    abi::ERROR_KIND_KEY,
-    "TypeError",
     "null",
     "undefined",
     NULLISH_READ_PREFIX,
@@ -541,16 +545,11 @@ const PROP_THROW_GETTER_ONLY: i32 = 5;
 /// `__prop_throw`'s `mode` argument: deleting a non-configurable property.
 const PROP_THROW_DELETE: i32 = 6;
 
-/// The static strings `__prop_throw` needs — the error object's keys, kind
-/// marker key and `name`, and the message fragments (plus every
-/// [`PROP_KEYED_MSGS`] fragment). Seeded by [`collect_node`] at every member
-/// store and `delete` site so their `[len][utf8]` blobs exist when it throws.
-const PROP_ERROR_STRS: [&str; 14] = [
-    "name",
-    "message",
-    "stack",
-    abi::ERROR_KIND_KEY,
-    "TypeError",
+/// The static strings `__prop_throw` needs — the message fragments (plus every
+/// [`PROP_KEYED_MSGS`] fragment). Seeded (with [`ERROR_STRS`]) by
+/// [`collect_node`] at every member store and `delete` site so their
+/// `[len][utf8]` blobs exist when it throws.
+const PROP_ERROR_STRS: [&str; 9] = [
     ARRAY_GROW_MSG,
     TYPE_ERROR_STACK_PREFIX,
     PRIM_CREATE_PREFIX,
@@ -563,9 +562,9 @@ const PROP_ERROR_STRS: [&str; 14] = [
 ];
 
 /// The `JSON.parse` syntax-error `.name`, `.message`, and `.stack` text. jsc has
-/// no `SyntaxError` error KIND, so the thrown object is branded as a base `Error`
-/// (`e instanceof Error` holds) while its `.name` reads `SyntaxError` and it
-/// renders as `SyntaxError: …`. A single generic message covers every malformed /
+/// no `%SyntaxError.prototype%` yet, so the thrown object is an `Error` (`e
+/// instanceof Error` holds) with an own `.name` of `SyntaxError`, rendering as
+/// `SyntaxError: …`. A single generic message covers every malformed /
 /// unsupported-input case (a `\u` escape is out of v1 scope; see `json_parse`).
 const JSON_ERROR_NAME: &str = "SyntaxError";
 /// See [`JSON_ERROR_NAME`].
@@ -573,29 +572,21 @@ const JSON_ERROR_MSG: &str = "JSON.parse: invalid or unsupported JSON input";
 /// See [`JSON_ERROR_NAME`].
 const JSON_ERROR_STACK: &str = "SyntaxError: JSON.parse: invalid or unsupported JSON input";
 
-/// The static strings the `JSON.parse` syntax-error object embeds, interned by
-/// [`collect_node`] wherever a `JsonParse` node exists so their `[len][utf8]`
-/// blobs are in the data segment when `__json_throw` builds the object.
-const JSON_PARSE_ERROR_STRS: [&str; 7] = [
-    "name",
-    "message",
-    "stack",
-    abi::ERROR_KIND_KEY,
-    JSON_ERROR_NAME,
-    JSON_ERROR_MSG,
-    JSON_ERROR_STACK,
-];
+/// The static strings the `JSON.parse` syntax-error object embeds, interned
+/// (with [`ERROR_STRS`]) by [`collect_node`] wherever a `JsonParse` node exists
+/// so their `[len][utf8]` blobs are in the data segment when `__json_throw`
+/// builds the object.
+const JSON_PARSE_ERROR_STRS: [&str; 3] = [JSON_ERROR_NAME, JSON_ERROR_MSG, JSON_ERROR_STACK];
 
-/// Build the branded syntax-error object `__json_throw` raises on malformed JSON:
-/// a plain object with `name`/`message`/`stack` plus the hidden `@@errorkind`
-/// marker (a base `Error`), identical in shape to [`internal_type_error`]. Emitted
-/// via [`emit_node`]; its strings are seeded by [`JSON_PARSE_ERROR_STRS`].
+/// Build the syntax-error object `__json_throw` raises on malformed JSON, the
+/// same shape as [`internal_type_error`]. Emitted via [`emit_node`]; its
+/// strings are seeded by [`JSON_PARSE_ERROR_STRS`].
 fn json_syntax_error() -> IrNode {
     IrNode::error_object(
-        IrNode::Str(JSON_ERROR_NAME.to_owned()),
-        IrNode::Str(JSON_ERROR_MSG.to_owned()),
+        ErrorKind::Error,
+        Some(JSON_ERROR_NAME),
+        Some(IrNode::Str(JSON_ERROR_MSG.to_owned())),
         IrNode::Str(JSON_ERROR_STACK.to_owned()),
-        abi::ERROR_KIND_ERROR,
     )
 }
 
@@ -905,7 +896,7 @@ struct Helpers<'a> {
     str_to_array: u32,
     /// The in-wasm `JSON.parse` recursive-descent helpers (backing
     /// [`crate::ir::IrNode::JsonParse`]). `__json_ws` skips whitespace;
-    /// `__json_throw` raises a branded syntax error; `__json_string`/`__json_number`
+    /// `__json_throw` raises a syntax error; `__json_string`/`__json_number`
     /// parse the scalar tokens; `__json_value` dispatches on the current byte;
     /// `__json_array`/`__json_object` parse the composites (an object defines
     /// each member through `__define`); and
@@ -942,6 +933,21 @@ struct Helpers<'a> {
     fn_info: i32,
 }
 
+/// The heap-pointer jsval of `kind`'s static prototype block (see
+/// [`emit_error_protos`]). The prototypes directly follow the function data
+/// ([`FnLayout::errors`]); every site referencing one seeds [`ERROR_STRS`],
+/// so they are present.
+fn error_proto_bits(kind: ErrorKind, helpers: Helpers<'_>) -> i64 {
+    let base = if helpers.has_funcs {
+        decl_func_base(helpers.settle_resolve_slot, helpers)
+    } else {
+        helpers.fn_info
+    };
+    let index = ErrorKind::ALL.iter().position(|k| *k == kind).unwrap_or(0);
+    let addr = base + ERROR_PROTO_SIZE * i32::try_from(index).unwrap_or(0);
+    HEAP_BITS | i64::from(addr)
+}
+
 /// The address of the static function block of top-level declaration
 /// `table_index`: the blocks follow the `__fn_info` table's entries for the
 /// user functions and the two settlers (`settle_resolve_slot` is the user
@@ -964,6 +970,9 @@ struct FnLayout {
     info: i32,
     /// Base address of the static function blocks.
     blocks: i32,
+    /// Base address of the static error prototypes, [`ERROR_PROTO_SIZE`] bytes
+    /// each in [`ErrorKind::ALL`] order, or `0` when absent.
+    errors: i32,
 }
 
 mod array;
@@ -1027,11 +1036,22 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     let n = program.functions.len();
     let fn_count = i32::try_from(n).unwrap_or(i32::MAX);
     let info_count = if n > 0 { fn_count + 2 } else { 0 };
+    // The static error prototypes follow the function blocks, only when every
+    // string they and the errors need is interned (seeded wherever an error
+    // can be created or observed).
+    let blocks = strings_end + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_count;
+    let blocks_end = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
+    let has_errors = ERROR_STRS.iter().all(|s| offsets.contains_key(*s));
     let layout = FnLayout {
         info: strings_end,
-        blocks: strings_end + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_count,
+        blocks,
+        errors: if has_errors { blocks_end } else { 0 },
     };
-    let intern_base = layout.blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
+    let intern_base = if has_errors {
+        blocks_end + ERROR_PROTO_SIZE * i32::try_from(ErrorKind::ALL.len()).unwrap_or(0)
+    } else {
+        blocks_end
+    };
     let intern = intern_table(&offsets, intern_base);
     let heap_ptr_init = intern_base + 4 * intern.cap;
 

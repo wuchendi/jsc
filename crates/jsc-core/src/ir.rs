@@ -245,7 +245,7 @@ pub enum PropKey {
     Static(String),
     /// A compile-time string key of a NON-enumerable (writable, configurable)
     /// property: class prototype methods/accessors, `constructor`, static
-    /// methods, and the reserved `@@errorkind` brand.
+    /// methods, and an error's own `message` / `stack`.
     Hidden(String),
     /// A compile-time string key of a non-writable, non-enumerable,
     /// non-configurable data property: a class's `prototype`.
@@ -256,12 +256,11 @@ pub enum PropKey {
 }
 
 /// What the right-hand side of an `instanceof` names (E-series). Recognized
-/// syntactically at codegen from a bare identifier: a **user class** (the
-/// receiver's `proto` chain is walked for the class's shared prototype)
-/// takes precedence, so `class Error {}` shadows the builtin; otherwise the three
-/// builtin error constructors match the receiver's hidden brand (`Error` matches
-/// any branded error; `TypeError`/`RangeError` match only their own kind, both
-/// still `instanceof Error`). Any other right-hand side is rejected at lowering.
+/// syntactically at codegen from a bare identifier: a **user class** takes
+/// precedence, so `class Error {}` shadows the builtin; it and the three
+/// builtin error constructors walk the receiver's `proto` chain for their
+/// prototype ([`InstanceOfKind::Proto`]). Any other right-hand side is
+/// rejected at lowering.
 ///
 /// The builtin constructors `Array`/`Object`/`Function`/`Date` match by the
 /// receiver's runtime TYPE BYTE rather than a prototype hop: `Array` /
@@ -271,12 +270,6 @@ pub enum PropKey {
 /// Object`, while a string/number/boolean/null/undefined is not).
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceOfKind {
-    /// `instanceof Error` — matches any branded error (marker present).
-    Error,
-    /// `instanceof TypeError` — brand `=== ERROR_KIND_TYPE`.
-    TypeError,
-    /// `instanceof RangeError` — brand `=== ERROR_KIND_RANGE`.
-    RangeError,
     /// `instanceof Array` — the receiver is a heap `TYPE_ARRAY` block.
     Array,
     /// `instanceof Function` — the receiver is a heap `TYPE_FUNCTION` value.
@@ -286,12 +279,43 @@ pub enum InstanceOfKind {
     /// `instanceof Object` — the receiver is any heap pointer that is not a
     /// primitive string.
     Object,
-    /// `instanceof C` for a user class `C`: some object on the receiver's
-    /// `proto` chain must be the SAME object as `Get(C, "prototype")`. The walk
-    /// starts at the receiver's `proto` slot and follows each prototype object's
-    /// own `proto` (linked by `extends`) until a match or `null`. Carries the
-    /// expression that reads the class's prototype (`C.prototype`).
-    Class(Box<IrNode>),
+    /// `instanceof C` for a user class `C` or a builtin error constructor: some
+    /// object on the receiver's `proto` chain must be the SAME object as the
+    /// prototype the carried expression yields (`C.prototype`, or the static
+    /// [`IrNode::ErrorProto`]). The walk starts at the receiver's `proto` slot
+    /// and follows each prototype's own `proto` until a match or `null`.
+    Proto(Box<IrNode>),
+}
+
+/// A builtin error kind with a static prototype object in the data segment
+/// (`%Error.prototype%`, `%TypeError.prototype%`, `%RangeError.prototype%`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// `Error`.
+    Error,
+    /// `TypeError` (its prototype inherits from `%Error.prototype%`).
+    TypeError,
+    /// `RangeError` (its prototype inherits from `%Error.prototype%`).
+    RangeError,
+}
+
+impl ErrorKind {
+    /// Every kind, in static-prototype layout order.
+    pub(crate) const ALL: [ErrorKind; 3] = [Self::Error, Self::TypeError, Self::RangeError];
+
+    /// The kind named by the constructor identifier `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// The constructor name, which is also the prototype's `name` value.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Error => "Error",
+            Self::TypeError => "TypeError",
+            Self::RangeError => "RangeError",
+        }
+    }
 }
 
 /// A `Map`/`Set` instance method. Recognized syntactically from a
@@ -480,6 +504,9 @@ pub enum IrNode {
         /// header `flags` the object is created with.
         kind: FnKind,
     },
+    /// The static prototype object of a builtin error kind (a heap-pointer
+    /// jsval to a data-segment block, a compile-time constant).
+    ErrorProto(ErrorKind),
     /// The function object of a top-level function declaration (funcref-table
     /// index `.0`). A top-level declaration never captures, so its one object
     /// is a static block in the data segment: every reference yields the same
@@ -612,12 +639,17 @@ pub enum IrNode {
     /// entry's key and value are evaluated left-to-right and defined as an own
     /// property (a later duplicate key overwrites the earlier slot in place). An
     /// [`IrNode::MakeAccessor`] value defines an accessor property. `proto` is
-    /// the `proto` slot jsval (`null` when absent).
+    /// the `proto` slot jsval (`null` when absent), `class` its header `class`
+    /// byte.
     Object {
         /// The entries, in source order.
         entries: Vec<(PropKey, IrNode)>,
-        /// The prototype link (a class instance's or derived prototype's parent).
+        /// The prototype link (a class instance's or derived prototype's
+        /// parent, an error's kind prototype).
         proto: Option<Box<IrNode>>,
+        /// The `class` byte ([`crate::abi::CLASS_ORDINARY`] or
+        /// [`crate::abi::CLASS_ERROR`]).
+        class: u8,
         /// Extra table capacity to reserve beyond the entries (a class
         /// instance's field-scan count).
         reserve: u32,
@@ -653,7 +685,7 @@ pub enum IrNode {
     StrLen(Box<IrNode>),
     /// The nullish-receiver guard of a builtin member access (`recv.length`,
     /// `recv.push(..)`, `recv.get(..)`, ...): yields `value` unchanged, but throws
-    /// the branded `TypeError` `Cannot read properties of <null|undefined>
+    /// the `TypeError` `Cannot read properties of <null|undefined>
     /// (reading '<key>')` when it is `null`/`undefined`. Wrapped around the
     /// receiver by codegen; elided at emit for a statically non-nullish value.
     NullishCheck {
@@ -968,11 +1000,7 @@ pub enum IrNode {
     /// jsval. `value` is evaluated once and — via a runtime OBJECT type-byte
     /// guard — a non-heap or non-object operand (number, string, array, `Map`,
     /// …) yields `false` without trapping. For an object, `kind` selects the
-    /// test: a user class walks the receiver's `proto` chain for the class's
-    /// prototype; a builtin error checks the hidden [`crate::abi::ERROR_KIND_KEY`]
-    /// brand. The right-hand side is restricted at lowering to a user class or
-    /// one of the three builtin error constructors (no general prototype-chain
-    /// `instanceof`).
+    /// test (see [`InstanceOfKind`]).
     InstanceOf {
         /// The left operand (any value).
         value: Box<IrNode>,
@@ -1007,7 +1035,7 @@ pub enum IrNode {
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
     /// guest value tree — including OBJECTS with runtime-unknown keys, each
     /// member interned and defined through `__define`. Malformed
-    /// input throws a branded `Error` (`.name` `SyntaxError`). The optional reviver
+    /// input throws an `Error` (`.name` `SyntaxError`). The optional reviver
     /// argument is unsupported and rejected at codegen.
     JsonParse {
         /// The single text argument, evaluated once and parsed.
@@ -1405,21 +1433,30 @@ pub struct IrProgram {
 }
 
 impl IrNode {
-    /// A branded error object `{ name, message, stack }` plus the non-enumerable
-    /// [`crate::abi::ERROR_KIND_KEY`] brand `kind` — the shape every builtin and
+    /// An Error instance (design 4.7): a `TYPE_OBJECT` of class
+    /// [`crate::abi::CLASS_ERROR`] whose `proto` is `kind`'s static prototype,
+    /// with the non-enumerable own properties `name` (only to override the
+    /// inherited one, for kinds without a prototype of their own), `message`
+    /// (when one was given), and `stack` — the shape every builtin and
     /// engine-raised error shares.
-    pub(crate) fn error_object(name: IrNode, message: IrNode, stack: IrNode, kind: f64) -> Self {
+    pub(crate) fn error_object(
+        kind: ErrorKind,
+        name: Option<&str>,
+        message: Option<IrNode>,
+        stack: IrNode,
+    ) -> Self {
+        let name = name.map(|name| {
+            (
+                PropKey::Hidden("name".to_owned()),
+                IrNode::Str(name.to_owned()),
+            )
+        });
+        let message = message.map(|message| (PropKey::Hidden("message".to_owned()), message));
+        let stack = (PropKey::Hidden("stack".to_owned()), stack);
         Self::Object {
-            entries: vec![
-                (PropKey::Static("name".to_owned()), name),
-                (PropKey::Static("message".to_owned()), message),
-                (PropKey::Static("stack".to_owned()), stack),
-                (
-                    PropKey::Hidden(crate::abi::ERROR_KIND_KEY.to_owned()),
-                    IrNode::Num(kind),
-                ),
-            ],
-            proto: None,
+            entries: name.into_iter().chain(message).chain([stack]).collect(),
+            proto: Some(Box::new(IrNode::ErrorProto(kind))),
+            class: crate::abi::CLASS_ERROR,
             reserve: 0,
         }
     }
@@ -1445,6 +1482,7 @@ impl IrNode {
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
             | IrNode::DeclFunc(_)
+            | IrNode::ErrorProto(_)
             | IrNode::DateNow => false,
             IrNode::Assign { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -1582,6 +1620,7 @@ impl IrNode {
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
             | IrNode::DeclFunc(_)
+            | IrNode::ErrorProto(_)
             | IrNode::DateNow => Vec::new(),
             IrNode::Assign { value: inner, .. }
             | IrNode::CellNew(inner)

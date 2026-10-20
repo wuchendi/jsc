@@ -2,10 +2,10 @@
 use super::*;
 
 /// Emit an object literal ([`IrNode::Object`]), leaving the object jsval on the
-/// stack. One `__alloc` reserves the 16-byte `TYPE_OBJECT` prefix and, right
-/// after it, a `TYPE_PROPS` table of `cap = max(entries, reserve)` entries
-/// (`{}` with no reserve gets `props = 0` and no table). `proto` (or `null`) is
-/// written into the `proto` slot.
+/// stack. One `__alloc` reserves the 16-byte `TYPE_OBJECT` prefix (with its
+/// `class` byte) and, right after it, a `TYPE_PROPS` table of `cap =
+/// max(entries, reserve)` entries (`{}` with no reserve gets `props = 0` and no
+/// table). `proto` (or `null`) is written into the `proto` slot.
 ///
 /// When every key is a distinct compile-time string, each entry is laid down
 /// directly — the interned key constant with its attributes as one `i64`, then
@@ -15,10 +15,11 @@ use super::*;
 /// interns a computed key and overwrites a duplicate in place. Mirrors
 /// [`emit_array_node`]'s alloc→write→rebox shape, keeping `dst` on the operand
 /// stack so nested objects/arrays in the key and value expressions compose.
-#[allow(clippy::too_many_lines)] // one straight-line literal layout
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one straight-line literal layout
 pub(super) fn emit_object_node(
     entries: &[(PropKey, IrNode)],
     proto: Option<&IrNode>,
+    class: u8,
     reserve: u32,
     function: &mut Function,
     scratch: u32,
@@ -59,8 +60,9 @@ pub(super) fn emit_object_node(
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
+    let header = i64::from(TYPE_OBJECT) | i64::from(class) << 24;
     if cap == 0 {
-        function.instruction(&Instruction::I64Const(i64::from(TYPE_OBJECT)));
+        function.instruction(&Instruction::I64Const(header));
     } else {
         function.instruction(&Instruction::LocalGet(dst));
         function.instruction(&Instruction::I32Const(table));
@@ -68,7 +70,7 @@ pub(super) fn emit_object_node(
         function.instruction(&Instruction::I64ExtendI32U);
         function.instruction(&Instruction::I64Const(32));
         function.instruction(&Instruction::I64Shl);
-        function.instruction(&Instruction::I64Const(i64::from(TYPE_OBJECT)));
+        function.instruction(&Instruction::I64Const(header));
         function.instruction(&Instruction::I64Or);
     }
     function.instruction(&Instruction::I64Store(mem(0)));
@@ -341,10 +343,9 @@ pub(super) fn emit_object_has_node(
 /// high scratch slot and gated by [`emit_is_object`]: only a heap OBJECT can be
 /// an instance, so a non-heap or non-object operand (number, `null`, array,
 /// `Map`, …) yields `false` without ever reading a bogus type byte. For an
-/// object the per-`kind` test runs: a **user class** walks the receiver's
-/// `proto` chain for the class's prototype pointer; a **builtin error** reads
-/// the non-enumerable `@@errorkind` brand (`__get`) and matches its presence
-/// (`Error`) or exact kind (`TypeError`/`RangeError`).
+/// object a **user class** or **builtin error** walks the receiver's `proto`
+/// chain for the prototype pointer (`C.prototype` or the static error
+/// prototype).
 #[allow(clippy::too_many_lines)] // straight-line per-kind emit, not branching depth
 pub(super) fn emit_instanceof_node(
     value: &IrNode,
@@ -373,16 +374,13 @@ pub(super) fn emit_instanceof_node(
         InstanceOfKind::Object => {
             return emit_type_byte_instanceof(function, v, TYPE_STRING, true);
         }
-        InstanceOfKind::Class(_)
-        | InstanceOfKind::Error
-        | InstanceOfKind::TypeError
-        | InstanceOfKind::RangeError => {}
+        InstanceOfKind::Proto(_) => {}
     }
 
     emit_is_object(function, v);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     match kind {
-        InstanceOfKind::Class(class_proto) => {
+        InstanceOfKind::Proto(class_proto) => {
             // Walk the receiver's `proto` chain for pointer identity with the
             // class's shared prototype: `true` iff some link is the SAME block (a
             // single hop under no-`extends`, more under `extends`). The base
@@ -430,44 +428,12 @@ pub(super) fn emit_instanceof_node(
             function.instruction(&Instruction::I32Const(0)); // unreachable fall-through
             function.instruction(&Instruction::End); // block -> i32 on the stack
         }
-        error_kind => {
-            // marker = __get(v, "@@errorkind"); absent -> undefined.
-            function.instruction(&Instruction::LocalGet(v));
-            function.instruction(&Instruction::I32Const(static_key(
-                strings,
-                crate::abi::ERROR_KIND_KEY,
-            )));
-            function.instruction(&Instruction::Call(helpers.get));
-            match error_kind {
-                // `instanceof Error`: any branded error (marker present).
-                InstanceOfKind::Error => {
-                    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-                    function.instruction(&Instruction::I64Ne);
-                }
-                // Exact kind: the marker strictly equals the kind's number jsval.
-                InstanceOfKind::TypeError => {
-                    function.instruction(&Instruction::I64Const(
-                        crate::abi::ERROR_KIND_TYPE.to_bits().cast_signed(),
-                    ));
-                    function.instruction(&Instruction::I64Eq);
-                }
-                InstanceOfKind::RangeError => {
-                    function.instruction(&Instruction::I64Const(
-                        crate::abi::ERROR_KIND_RANGE.to_bits().cast_signed(),
-                    ));
-                    function.instruction(&Instruction::I64Eq);
-                }
-                // Unreachable: `Class` is handled by the outer arm above, and the
-                // runtime-TYPE-BYTE kinds return before this `is_object` gate.
-                InstanceOfKind::Class(_)
-                | InstanceOfKind::Array
-                | InstanceOfKind::Function
-                | InstanceOfKind::Date
-                | InstanceOfKind::Object => {
-                    function.instruction(&Instruction::Drop);
-                    function.instruction(&Instruction::I32Const(0));
-                }
-            }
+        // Unreachable: the runtime-TYPE-BYTE kinds return before this gate.
+        InstanceOfKind::Array
+        | InstanceOfKind::Function
+        | InstanceOfKind::Date
+        | InstanceOfKind::Object => {
+            function.instruction(&Instruction::I32Const(0));
         }
     }
     // Box the i32 `1`/`0` into a TRUE/FALSE jsval (`FALSE_BITS | bit`).
@@ -2148,7 +2114,7 @@ pub(super) fn emit_nullish_guard(
     function.instruction(&Instruction::End);
 }
 
-/// `__nullish_throw(recv: i64, key: i64, set: i32)`: build the branded
+/// `__nullish_throw(recv: i64, key: i64, set: i32)`: build the
 /// `TypeError` for a member read (`set == 0`) or write (`set == 1`) on a
 /// `null`/`undefined` `recv`, stash it in `$exc_value`, set the pending flag and
 /// clear any routed completion. The message is spliced from the
@@ -2219,7 +2185,7 @@ fn type_error_helper_locals() -> Vec<(u32, ValType)> {
     ]
 }
 
-/// Raise a branded `TypeError` whose message string jsval is in local `msg`:
+/// Raise a `TypeError` whose message string jsval is in local `msg`:
 /// build `stack = "TypeError: " + msg` into `msg + 1`, the error object, stash it
 /// in `$exc_value`, set the pending flag and clear any routed completion.
 fn emit_raise_type_error(
@@ -2242,10 +2208,10 @@ fn emit_raise_type_error(
     function.instruction(&Instruction::LocalSet(stack));
 
     let error = IrNode::error_object(
-        IrNode::Str("TypeError".to_owned()),
-        IrNode::Local(msg),
+        ErrorKind::TypeError,
+        None,
+        Some(IrNode::Local(msg)),
         IrNode::Local(stack),
-        abi::ERROR_KIND_TYPE,
     );
     emit_node(&error, function, scratch, strings, helpers);
     function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
@@ -2255,7 +2221,7 @@ fn emit_raise_type_error(
     function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
 }
 
-/// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the branded
+/// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the
 /// `TypeError` for a property store or delete the receiver cannot take, stash
 /// it in `$exc_value`, set the pending flag and clear any routed completion.
 /// [`PROP_THROW_GROW`] is an array index store at/past the length — `Cannot

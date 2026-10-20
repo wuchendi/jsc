@@ -341,13 +341,67 @@ fn error_stack_readable_after_catch() {
     );
 }
 
-/// The hidden `@@errorkind` marker is invisible to `Object.keys` — an error's
-/// own enumerable keys are exactly `name`, `message`, `stack`.
+/// An error's own `message` and `stack` are non-enumerable and `name` is
+/// inherited from its kind's prototype, so it has no enumerable own keys.
 #[test]
-fn error_kind_marker_hidden_from_keys() {
-    assert_str(
-        "Object.keys(new Error(\"x\")).join(\",\")",
-        "name,message,stack",
+fn error_has_no_enumerable_own_keys() {
+    assert_str("Object.keys(new Error(\"x\")).join(\",\")", "");
+    assert_str("JSON.stringify(new TypeError(\"x\"))", "{}");
+    assert_output(
+        "let e = new TypeError('bad'); console.log(e instanceof TypeError, e instanceof Error, e instanceof RangeError, e.name, e.message, Object.keys(e).length)",
+        "true true false TypeError bad 0\n",
+    );
+}
+
+/// An engine-raised error is a real `TypeError` instance.
+#[test]
+fn engine_error_is_type_error_instance() {
+    assert_output(
+        "try { null.x } catch (e) { console.log(e instanceof TypeError, e.name, Object.keys(e).length) }",
+        "true TypeError 0\n",
+    );
+}
+
+/// `new Error()` has the inherited empty `message` and a bare-name `stack`.
+#[test]
+fn error_without_message_inherits_empty_message() {
+    assert_output(
+        "let e = new Error(); console.log(e.message === '', e.stack)",
+        "true Error\n",
+    );
+    // An explicit `undefined` message creates no own `message` either.
+    assert_output(
+        "let e = new RangeError(undefined); console.log(e.message === '', e.stack)",
+        "true RangeError\n",
+    );
+}
+
+/// The message argument is converted with `ToString`.
+#[test]
+fn error_message_is_converted_to_string() {
+    assert_output(
+        "let e = new Error(42); console.log(typeof e.message, e.message, e.stack)",
+        "string 42 Error: 42\n",
+    );
+}
+
+/// Assigning `name` creates an own property on the error, leaving the shared
+/// prototype (and so every other error of the kind) unchanged.
+#[test]
+fn error_name_assignment_is_own() {
+    assert_output(
+        "let a = new TypeError('a'); let b = new TypeError('b'); a.name = 'X'; console.log(a.name, b.name, Object.keys(a).join(), a)",
+        "X TypeError name X: a\n",
+    );
+}
+
+/// The kind prototypes are shared static objects: mutating one is visible
+/// through every error of that kind (and subkinds for `Error`).
+#[test]
+fn error_prototypes_are_shared() {
+    assert_output(
+        "let a = new Error('a'); let p = a; try { null.x } catch (e) { p = e } console.log(p instanceof TypeError, a instanceof TypeError, new RangeError('r') instanceof RangeError)",
+        "true false true\n",
     );
 }
 
@@ -383,8 +437,8 @@ fn instanceof_non_object_is_false() {
     assert_bool("[1, 2] instanceof Error", false);
 }
 
-/// A plain object that merely LOOKS like an error (same visible keys) lacks the
-/// hidden `@@errorkind` marker, so it is not `instanceof Error`.
+/// A plain object that merely LOOKS like an error (same visible keys) does not
+/// inherit from `%Error.prototype%`, so it is not `instanceof Error`.
 #[test]
 fn instanceof_plain_object_is_false() {
     assert_bool("({}) instanceof Error", false);

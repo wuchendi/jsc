@@ -263,6 +263,32 @@ it('renders dictionary objects like the Rust host', async () => {
   for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
 })
 
+it('renders errors by their class byte like the Rust host', async () => {
+  const cases: [string, string][] = [
+    [
+      "let e = new TypeError('bad'); console.log(e instanceof TypeError, e instanceof Error, e instanceof RangeError, e.name, e.message, Object.keys(e).length)",
+      'true true false TypeError bad 0\n',
+    ],
+    [
+      "console.log(new RangeError('r'), [new Error()])",
+      'RangeError: r [ Error ]\n',
+    ],
+    [
+      "let e = new Error('m'); e.name = 'X'; console.log(e, { e })",
+      'X: m { e: X: m }\n',
+    ],
+    [
+      'try { null.x } catch (e) { console.log(e) }',
+      "TypeError: Cannot read properties of null (reading 'x')\n",
+    ],
+    [
+      "console.log({ name: 'Error', message: 'x' })",
+      '{ name: Error, message: x }\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})
+
 it('renders functions, classes, instances, and accessors like the Rust host', async () => {
   const cases: [string, string][] = [
     [
