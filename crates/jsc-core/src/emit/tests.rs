@@ -883,11 +883,26 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let mem = memory.data(&store);
     let arr = usize::try_from(arr).expect("base");
     assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
-    assert_eq!(&mem[arr + 4..arr + 8], &2u32.to_le_bytes());
+    assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
+    assert_eq!(
+        &mem[arr + 8..arr + 16],
+        &crate::abi::NULL.to_le_bytes(),
+        "proto"
+    );
+    assert_eq!(&mem[arr + 16..arr + 20], &2u32.to_le_bytes(), "len");
+    let elems = u32::from_le_bytes(mem[arr + 20..arr + 24].try_into().expect("elems"));
+    let elems = usize::try_from(elems).expect("elems");
+    assert_eq!(elems % 8, 0);
+    assert_eq!(&mem[elems..elems + 4], &[crate::abi::TYPE_ELEMS, 0, 0, 0]);
+    assert_eq!(&mem[elems + 4..elems + 8], &2u32.to_le_bytes(), "cap");
     for i in 0..2 {
-        let at = arr + 8 + 8 * i;
+        let at = elems + 8 + 8 * i;
         assert_eq!(&mem[at..at + 8], &crate::abi::UNDEFINED.to_le_bytes());
     }
+    let empty = new_array.call(&mut store, 0).expect("empty array");
+    let mem = memory.data(&store);
+    let empty = usize::try_from(empty).expect("base");
+    assert_eq!(&mem[empty + 16..empty + 24], &[0; 8], "len 0, no store");
 
     let new_promise = instance
         .get_typed_func::<(), i32>(&mut store, crate::abi::NEW_PROMISE_EXPORT_NAME)
@@ -911,13 +926,15 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one straight-line layout walk per kind
 fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     use crate::abi::{
-        DATE_MS_OFFSET, FUNC_ENV_OFFSET, FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_LAZY, FUNC_INDEX_OFFSET,
-        GEN_DONE_OFFSET, GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET,
-        NULL, OBJ_PROPS_OFFSET, OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET,
-        PROMISE_VALUE_OFFSET, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
-        TYPE_PROMISE, TYPE_SET, UNDEFINED,
+        ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, DATE_MS_OFFSET, ELEMS_CAP_OFFSET, ELEMS_DATA_OFFSET,
+        FUNC_ENV_OFFSET, FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_LAZY, FUNC_INDEX_OFFSET, GEN_DONE_OFFSET,
+        GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, NULL,
+        OBJ_PROPS_OFFSET, OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET,
+        PROMISE_VALUE_OFFSET, TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR,
+        TYPE_MAP, TYPE_PROMISE, TYPE_SET, UNDEFINED,
     };
     let u32_at = |mem: &[u8], at: u32| {
         let at = at as usize;
@@ -975,7 +992,38 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let entries = u64_at(&mem, handle + MAP_ENTRIES_OFFSET);
         let arr = u32::try_from(entries & 0xFFFF_FFFF).expect("entries");
         assert_eq!(mem[arr as usize], TYPE_ARRAY, "{src}: entries backing");
+        assert_eq!(
+            u32_at(&mem, arr + ARRAY_LEN_OFFSET),
+            2 * size,
+            "{src}: pairs"
+        );
     }
+
+    // An array literal owns a `cap = len` store; pushes grow it by doubling
+    // from 4, and the handle never moves.
+    let (lit, mem) = heap("[1, 2, 3]", TYPE_ARRAY, 0);
+    assert_eq!(u32_at(&mem, lit + ARRAY_LEN_OFFSET), 3, "literal len");
+    let store = u32_at(&mem, lit + ARRAY_ELEMS_OFFSET);
+    assert_eq!(mem[store as usize], TYPE_ELEMS, "literal store");
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 3, "literal cap");
+    assert_eq!(
+        u64_at(&mem, store + ELEMS_DATA_OFFSET + 16),
+        3.0_f64.to_bits()
+    );
+    let (grown, mem) = heap(
+        "let a = []; let b = a; for (let i = 0; i < 5; i++) a.push(i); b",
+        TYPE_ARRAY,
+        0,
+    );
+    assert_eq!(u32_at(&mem, grown + ARRAY_LEN_OFFSET), 5, "grown len");
+    let store = u32_at(&mem, grown + ARRAY_ELEMS_OFFSET);
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 8, "0 -> 4 -> 8");
+    assert_eq!(
+        u64_at(&mem, store + ELEMS_DATA_OFFSET + 32),
+        4.0_f64.to_bits()
+    );
+    let (empty, mem) = heap("[]", TYPE_ARRAY, 0);
+    assert_eq!(u32_at(&mem, empty + ARRAY_ELEMS_OFFSET), 0, "no store");
 
     let (promise, mem) = heap("Promise.resolve(7)", TYPE_PROMISE, 0);
     assert_eq!(

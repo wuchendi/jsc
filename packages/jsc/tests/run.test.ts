@@ -56,6 +56,15 @@ it('dispatches the string methods through the shim', async () => {
   expect((await run("'a,b,c'.split(',').length")).result).toBe('3')
 })
 
+it('reads and builds array handles through the shim', async () => {
+  const src =
+    'let a = [1, [2, 3], {x: [4]}]; let b = a; for (let i = 0; i < 9; i++) a.push(i); ' +
+    "console.log(b.length, b[1], b[11], 'x,y'.split(','), a.slice(1, 3), a.indexOf(8), a.includes(5))"
+  expect((await run(src)).stdout).toBe(
+    '12 [ 2, 3 ] 8 [ x, y ] [ [ 2, 3 ], { x: [ 4 ] } ] 11 true\n',
+  )
+})
+
 it('parses parseInt with a radix through the shim', async () => {
   expect((await run("parseInt('ff', 16)")).result).toBe('255')
   expect((await run("parseInt('0xff')")).result).toBe('255')

@@ -278,9 +278,19 @@ const ABI_TRAILING_PARAMS: u32 = abi::ABI_TRAILING_PARAMS;
 /// after the [`HEADER_SIZE`] header). Maps to `typeof` "string".
 const TYPE_STRING: i32 = abi::TYPE_STRING as i32;
 
-/// Type byte for a heap array block: `[type=1][pad×3][len:u32][elem:i64 × len]`
-/// (payload after the [`HEADER_SIZE`] header). Maps to `typeof` "object".
+/// Type byte, field offsets, and size of an array handle (`length` and the
+/// base of its element store). Maps to `typeof` "object". See
+/// [`abi::TYPE_ARRAY`] for the full layout.
 const TYPE_ARRAY: i32 = abi::TYPE_ARRAY as i32;
+const ARRAY_LEN_OFFSET: u64 = abi::ARRAY_LEN_OFFSET as u64;
+const ARRAY_ELEMS_OFFSET: u64 = abi::ARRAY_ELEMS_OFFSET as u64;
+const ARRAY_BLOCK_SIZE: i32 = abi::ARRAY_BLOCK_SIZE.cast_signed();
+
+/// Type byte and field offsets of an array element store (internal): `cap`,
+/// then element `i` at `ELEMS_DATA_OFFSET + 8 * i`. See [`abi::TYPE_ELEMS`].
+const TYPE_ELEMS: i32 = abi::TYPE_ELEMS as i32;
+const ELEMS_CAP_OFFSET: u64 = abi::ELEMS_CAP_OFFSET as u64;
+const ELEMS_DATA_OFFSET: u64 = abi::ELEMS_DATA_OFFSET as u64;
 
 /// Type byte for a heap object block:
 /// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]` (payload after the
@@ -836,14 +846,14 @@ struct Helpers<'a> {
     for_in_keys: u32,
     /// `__rest(src, excl) -> object`: the object-rest copy.
     rest: u32,
-    /// `__array_push(base, value) -> new_base`: bump-allocate a new array
-    /// block of `len + 1` element capacity, copy the header + existing elements,
-    /// append `value`, bump the u32 length header, and return the new block base.
+    /// `__array_push(base, value) -> base`: append `value` to the array handle
+    /// in place (amortized growth through [`Self::array_reserve`]) and return
+    /// the same handle base.
     array_push: u32,
-    /// `__array_concat(dst, src) -> new_base`: bump-allocate a new array
-    /// block holding every element of `dst` followed by every element of `src`,
-    /// and return the new block base. Used to append a spread source's elements
-    /// when building a spread array literal or spread call argument list.
+    /// `__array_concat(dst, src) -> dst`: append every element of array `src`
+    /// to array `dst` in place and return `dst`. Used to append a spread
+    /// source's elements when building a spread array literal or spread call
+    /// argument list.
     array_concat: u32,
     /// `__json_escape(str_ptr) -> str_base`: bump-allocate a fresh heap
     /// string that is the JSON-quoted + escaped form of the source string (leading
@@ -923,6 +933,22 @@ struct Helpers<'a> {
     /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
     /// is the helper right after `__define` (`define + 1`).
     fn_info: i32,
+}
+
+impl Helpers<'_> {
+    /// `__new_array(len) -> i32`: the exported array constructor, right after
+    /// `__new_string`.
+    fn new_array(self) -> u32 {
+        self.new_string + 1
+    }
+
+    /// `__array_reserve(base, need)`: grow the array handle's element store to
+    /// hold at least `need` elements (`cap' = max(need, 4, 2 * cap)`), copying
+    /// the `len` live slots and repointing `elems`; the handle never moves. It
+    /// is the helper right before `__array_push`.
+    fn array_reserve(self) -> u32 {
+        self.array_push - 1
+    }
 }
 
 /// The heap-pointer jsval of `kind`'s static prototype block (see
@@ -1257,8 +1283,9 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_own_keys(helpers));
     code.function(&emit_for_in_keys(helpers));
     code.function(&emit_rest(helpers));
-    code.function(&emit_array_push(helpers.alloc));
-    code.function(&emit_array_concat(helpers.alloc));
+    code.function(&emit_array_reserve(helpers.alloc));
+    code.function(&emit_array_push(helpers.array_reserve()));
+    code.function(&emit_array_concat(helpers.array_reserve()));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.json_str,
@@ -1277,14 +1304,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
     // Map/Set helpers.
     code.function(&emit_loose_eq(helpers.str_eq, helpers.convert));
-    code.function(&emit_str_to_array(helpers.alloc, helpers.str_index));
+    code.function(&emit_str_to_array(helpers.new_array(), helpers.str_index));
     // The in-wasm `JSON.parse` family, in the order their indices were assigned.
     code.function(&emit_json_ws());
     code.function(&emit_json_throw(&offsets, helpers));
     code.function(&emit_json_string(helpers.alloc, helpers));
     code.function(&emit_json_number(helpers.alloc, helpers.convert, helpers));
     code.function(&emit_json_value(helpers));
-    code.function(&emit_json_array(helpers.alloc, helpers));
+    code.function(&emit_json_array(helpers));
     code.function(&emit_json_object(helpers.alloc, helpers));
     code.function(&emit_json_parse(helpers));
     // `__gen_to_array` — the generator-spread drain — precedes the
