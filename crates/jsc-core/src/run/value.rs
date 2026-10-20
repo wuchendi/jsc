@@ -64,6 +64,29 @@ pub enum Value {
     /// (`1970-01-01T00:00:00.000Z`), or `Invalid Date` when the timestamp is not
     /// finite — matching Node's `console.log` of a `Date`.
     Date(f64),
+    /// A back-reference to a container still being decoded on the current path
+    /// (a cycle). Carries the cycle target's 1-based reference number and
+    /// renders Node-console style as `[Circular *N]`.
+    Circular(usize),
+    /// A container that some [`Value::Circular`] inside it points back to:
+    /// the reference number and the decoded container. Renders as
+    /// `<ref *N> ` followed by the container.
+    Ref(usize, Box<Value>),
+}
+
+/// Cycle-guard state for one [`decode`] call: the heap blocks on the current
+/// recursion path and the cycle targets numbered so far (in discovery order,
+/// matching Node's `*1`, `*2`, ... numbering).
+struct Guard {
+    path: Vec<usize>,
+    refs: Vec<usize>,
+}
+
+impl Guard {
+    /// The reference number of cycle target `ptr`, if one was assigned.
+    fn ref_of(&self, ptr: usize) -> Option<usize> {
+        self.refs.iter().position(|&p| p == ptr).map(|i| i + 1)
+    }
 }
 
 /// Decode raw jsval `bits` into a [`Value`] per the NaN-box layout.
@@ -74,6 +97,18 @@ pub enum Value {
 /// [`run`]: super::run
 #[must_use]
 pub fn decode(bits: u64, memory: &[u8]) -> Value {
+    decode_in(
+        bits,
+        memory,
+        &mut Guard {
+            path: Vec::new(),
+            refs: Vec::new(),
+        },
+    )
+}
+
+/// [`decode`] under the cycle guard `guard`.
+fn decode_in(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
     // Any value without the full QNAN mask set is an ordinary number (this also
     // covers infinities, whose exponent is all ones but quiet bit is clear).
     if bits & QNAN != QNAN {
@@ -85,7 +120,7 @@ pub fn decode(bits: u64, memory: &[u8]) -> Value {
         0b010 => Value::Null,
         0b011 => Value::Undefined,
         // Single heap tag: read the block's TYPE BYTE to pick the arm.
-        0b101 => decode_heap(bits, memory),
+        0b101 => decode_heap(bits, memory, guard),
         // Tags 0b100, 0b110 and 0b111 (unused), and 0b000
         // (the canonical number NaN). Any such pattern decodes as a NaN number,
         // keeping decode total without a panic.
@@ -98,16 +133,38 @@ pub fn decode(bits: u64, memory: &[u8]) -> Value {
 /// the string / array / object / function decoder. A function block
 /// decodes to [`Value::Function`]; an unknown or out-of-range type byte decodes
 /// as `undefined`, keeping decode total.
-fn decode_heap(bits: u64, memory: &[u8]) -> Value {
+///
+/// Containers (array / object / promise) are cycle-guarded: a block already on
+/// the recursion path decodes as [`Value::Circular`], and the block it points
+/// back to is wrapped in [`Value::Ref`] once decoded.
+fn decode_heap(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
     let ptr = (bits & 0xFFFF_FFFF) as usize;
-    match memory.get(ptr).copied() {
+    let ty = memory.get(ptr).copied();
+    if matches!(ty, Some(TYPE_ARRAY | TYPE_OBJECT | TYPE_PROMISE)) {
+        if guard.path.contains(&ptr) {
+            let id = guard.ref_of(ptr).unwrap_or_else(|| {
+                guard.refs.push(ptr);
+                guard.refs.len()
+            });
+            return Value::Circular(id);
+        }
+        guard.path.push(ptr);
+        let value = match ty {
+            Some(TYPE_ARRAY) => decode_array(ptr, memory, guard),
+            Some(TYPE_OBJECT) => decode_object(ptr, memory, guard),
+            _ => decode_promise(ptr, memory, guard),
+        };
+        guard.path.pop();
+        return match guard.ref_of(ptr) {
+            Some(id) => Value::Ref(id, Box::new(value)),
+            None => value,
+        };
+    }
+    match ty {
         Some(TYPE_STRING) => decode_string(ptr, memory),
-        Some(TYPE_ARRAY) => decode_array(ptr, memory),
-        Some(TYPE_OBJECT) => decode_object(ptr, memory),
         Some(TYPE_FUNCTION) => Value::Function,
         Some(TYPE_MAP) => Value::Map(decode_size(ptr, memory)),
         Some(TYPE_SET) => Value::Set(decode_size(ptr, memory)),
-        Some(TYPE_PROMISE) => decode_promise(ptr, memory),
         Some(TYPE_GENERATOR) => Value::Generator,
         Some(TYPE_DATE) => decode_date(ptr, memory),
         _ => Value::Undefined,
@@ -130,7 +187,7 @@ fn decode_date(ptr: usize, memory: &[u8]) -> Value {
 /// the i32 `state` at `ptr + HEADER_SIZE` and the i64 settled `value` at
 /// `ptr + HEADER_SIZE + 4` (decoded recursively). Defensive: a truncated block
 /// reads as pending with an `undefined` value.
-fn decode_promise(ptr: usize, memory: &[u8]) -> Value {
+fn decode_promise(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     let state_at = ptr + HEADER_SIZE;
     let state = memory
         .get(state_at..state_at + 4)
@@ -139,7 +196,11 @@ fn decode_promise(ptr: usize, memory: &[u8]) -> Value {
     let value = memory
         .get(val_at..val_at + 8)
         .map_or(Value::Undefined, |b| {
-            decode(u64::from_le_bytes(b.try_into().unwrap_or([0; 8])), memory)
+            decode_in(
+                u64::from_le_bytes(b.try_into().unwrap_or([0; 8])),
+                memory,
+                guard,
+            )
         });
     Value::Promise {
         state,
@@ -182,7 +243,7 @@ fn decode_string(ptr: usize, memory: &[u8]) -> Value {
 ///
 /// Defensive: an out-of-range header yields an empty array and a truncated
 /// element run stops early, so a malformed pointer never panics.
-fn decode_array(ptr: usize, memory: &[u8]) -> Value {
+fn decode_array(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     let len_at = ptr + HEADER_SIZE;
     let Some(len_bytes) = memory.get(len_at..len_at + 4) else {
         return Value::Array(Vec::new());
@@ -195,7 +256,7 @@ fn decode_array(ptr: usize, memory: &[u8]) -> Value {
             break;
         };
         let elem_bits = u64::from_le_bytes(elem_bytes.try_into().unwrap_or([0; 8]));
-        elems.push(decode(elem_bits, memory));
+        elems.push(decode_in(elem_bits, memory, guard));
     }
     Value::Array(elems)
 }
@@ -208,7 +269,7 @@ fn decode_array(ptr: usize, memory: &[u8]) -> Value {
 ///
 /// Defensive: an out-of-range header yields an empty object and a truncated entry
 /// run stops early, so a malformed pointer never panics.
-fn decode_object(ptr: usize, memory: &[u8]) -> Value {
+fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     let n_at = ptr + HEADER_SIZE;
     let Some(n_bytes) = memory.get(n_at..n_at + 4) else {
         return Value::Object(Vec::new());
@@ -230,7 +291,7 @@ fn decode_object(ptr: usize, memory: &[u8]) -> Value {
             _ => String::new(),
         };
         let val_bits = u64::from_le_bytes(val_bytes.try_into().unwrap_or([0; 8]));
-        entries.push((key, decode(val_bits, memory)));
+        entries.push((key, decode_in(val_bits, memory, guard)));
     }
     Value::Object(entries)
 }
@@ -377,6 +438,9 @@ pub fn format_value(value: &Value) -> String {
         Value::Generator => "Object [Generator]".to_owned(),
         // A Date renders as its ISO 8601 UTC string.
         Value::Date(ms) => format_date_iso(*ms),
+        // Cycle markers render Node-console style.
+        Value::Circular(id) => format!("[Circular *{id}]"),
+        Value::Ref(id, value) => format!("<ref *{id}> {}", format_value(value)),
     }
 }
 

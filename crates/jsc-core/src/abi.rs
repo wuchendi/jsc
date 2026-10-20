@@ -33,10 +33,13 @@
 //! ## Heap-block layout
 //!
 //! Every heap block opens with a [`HEADER_SIZE`]-byte header: a `TYPE_*` byte at
-//! offset 0 (see [`TYPE_STRING`] … [`TYPE_CELL`]) plus 3 padding bytes, so the
-//! per-type payload begins 4-byte aligned at [`HEADER_SIZE`]. The single [`HEAP`]
-//! tag boxes strings, arrays, objects, and functions alike; the concrete kind is
-//! the TYPE BYTE, not the NaN-box tag.
+//! offset 0 (see [`TYPE_STRING`] … [`TYPE_CELL`]) followed by the reserved
+//! [`HEADER_GC_OFFSET`], [`HEADER_FLAGS_OFFSET`], and [`HEADER_CLASS_OFFSET`]
+//! bytes (always written 0), so the per-type payload begins at [`HEADER_SIZE`].
+//! Every block base is [`BLOCK_ALIGN`]-aligned: `__alloc` rounds each request up
+//! and static data blobs are padded to it. The single [`HEAP`] tag boxes
+//! strings, arrays, objects, and functions alike; the concrete kind is the TYPE
+//! BYTE, not the NaN-box tag.
 
 /// The quiet-NaN mask (exponent all ones + quiet bit): a value is a boxed
 /// immediate (or the canonical number NaN) iff `bits & QNAN == QNAN`.
@@ -76,8 +79,29 @@ pub(crate) const TYPEOF_STRINGS: [&str; 6] = [
 pub(crate) const HEAP: u64 = 0x7FFD_0000_0000_0000;
 
 /// The size in bytes of every heap block's leading header: the TYPE BYTE
-/// at offset 0 plus 3 padding bytes. The per-type payload begins here.
+/// at offset 0 plus the `gc`/`flags`/`class` bytes. The per-type payload begins
+/// here.
 pub(crate) const HEADER_SIZE: u32 = 4;
+
+/// Header byte 1: the `gc` byte (phase 4: bit 0 = mark). Reserved; every block
+/// is created with it 0.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const HEADER_GC_OFFSET: u32 = 1;
+
+/// Header byte 2: the per-kind `flags` byte. Reserved; every block is created
+/// with it 0.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
+
+/// Header byte 3: the `TYPE_OBJECT` sub-`class` byte. Reserved; every block is
+/// created with it 0.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const HEADER_CLASS_OFFSET: u32 = 3;
+
+/// The alignment in bytes of every heap block base: `__alloc` rounds every
+/// request up to a multiple of it, and static data blobs are padded to it, so
+/// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
+pub(crate) const BLOCK_ALIGN: u32 = 8;
 
 /// The number of trailing (non-positional) parameters every user function carries
 /// under the uniform ABI, appended after the `K = max_arity` positional argument
@@ -362,12 +386,34 @@ pub(crate) const INVOKE_EXPORT_NAME: &str = "__invoke1";
 /// exception via `__exc_pending`) for the host to read.
 pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
 
+/// The name under which the module exports the `__alloc(size: i32) -> base: i32`
+/// bump allocator. It rounds `size` up to [`BLOCK_ALIGN`], zeroes the block's
+/// [`HEADER_SIZE`] header bytes, and returns the 8-aligned base; on exhaustion it
+/// stores [`HEAP_PTR_OOM`] and traps.
+pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
+
+/// The name under which the module exports the `__new_string(len: i32) -> base:
+/// i32` constructor: a [`TYPE_STRING`] block with `len` set and a `len`-byte
+/// payload for the caller to fill. The hosts allocate every string through it.
+pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
+
+/// The name under which the module exports the `__new_array(len: i32) -> base:
+/// i32` constructor: a [`TYPE_ARRAY`] block with `len` set and every element
+/// `undefined`. The hosts allocate every array through it.
+pub(crate) const NEW_ARRAY_EXPORT_NAME: &str = "__new_array";
+
+/// The name under which the module exports the `__new_promise() -> base: i32`
+/// constructor: a pending [`TYPE_PROMISE`] block (value `undefined`). The hosts
+/// allocate every promise through it.
+pub(crate) const NEW_PROMISE_EXPORT_NAME: &str = "__new_promise";
+
 /// The name under which the module exports its linear memory; [`crate::run`]
 /// reads it back to resolve heap pointers.
 pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";
 
 /// The name under which the bump-allocator heap-pointer global is exported so
-/// the host `__convert`/`__method` imports can allocate in guest memory.
+/// the run stage can detect the [`HEAP_PTR_OOM`] sentinel (hosts only read it;
+/// they allocate through the constructor exports).
 pub(crate) const HEAP_PTR_EXPORT_NAME: &str = "__heap_ptr";
 
 /// The linear-memory cap in 64 KiB wasm pages (512 MiB), declared as the
@@ -461,3 +507,7 @@ pub(crate) const METHOD_OP_SUBSTRING: i32 = 15;
 
 /// `__method` op flag: `split` (string, yields an array).
 pub(crate) const METHOD_OP_SPLIT: i32 = 16;
+
+#[cfg(test)]
+#[path = "abi_drift_tests.rs"]
+mod drift_tests;

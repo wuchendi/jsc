@@ -1,0 +1,11 @@
+program	user_ops	call_indirect	prop_calls	host_calls	fuel	reason
+array_hofs	1264	4	0	16	24133	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+class_methods	8936	29	29	95	78518	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+console_log	385	0	0	10	1458	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+fib	379	0	0	5	3644802	
+for_in	1103	0	1	19	12900	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+json	1311	0	4	23	16577	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+map_set	1995	0	2	29	37938	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+math	3330	0	0	37	52570	
+object_reads	1986	0	5	34	22546	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+string_methods	938	0	0	30	12745	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors

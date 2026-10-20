@@ -4,11 +4,10 @@
 
 use std::io::Write;
 
-use wasmtime::{Caller, Engine, Linker, Module, Store};
+use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 
 use super::host::{
-    heap_exhausted, host_alloc_string, method_dispatch, parse_float_str, parse_int_str,
-    value_to_number,
+    alloc_string, heap_exhausted, method_dispatch, parse_float_str, parse_int_str, value_to_number,
 };
 use super::promise::{self, Host};
 use crate::abi;
@@ -79,7 +78,7 @@ fn oom_guard<W>(caller: &mut Caller<'_, W>, bits: i64) -> wasmtime::Result<i64> 
 pub fn run(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>)> {
     // Default sink: `console.log` output streams to the process's real stdout
     // during execution.
-    let (bits, memory, _out) = run_with_sink(wasm, std::io::stdout())?;
+    let (bits, memory, _out, _fuel) = run_with_sink(wasm, std::io::stdout(), None)?;
     Ok((bits, memory))
 }
 
@@ -94,8 +93,29 @@ pub fn run(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>)> {
 ///
 /// Returns an error under the same conditions as [`run`].
 pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
-    let (bits, memory, out) = run_with_sink(wasm, Vec::<u8>::new())?;
+    let (bits, memory, out, _fuel) = run_with_sink(wasm, Vec::<u8>::new(), None)?;
     Ok((bits, memory, String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// The fuel budget of [`run_metered`]: far above any measured program, so it
+/// never runs out in practice.
+const FUEL_BUDGET: u64 = 1 << 40;
+
+/// Like [`run_capturing`], but on an engine with wasmtime fuel metering on:
+/// returns the captured `console.log` output and the fuel consumed (executed
+/// wasm instructions, `main` plus the microtask drain).
+///
+/// For measurement only (the opcount snapshot gate in
+/// `crates/jsc-core/tests/opcount.rs`); the CLI and [`run`] keep the default
+/// unmetered engine.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`run`], or if the run
+/// exhausts the (very large) fuel budget.
+pub fn run_metered(wasm: &[u8]) -> anyhow::Result<(String, u64)> {
+    let (_bits, _memory, out, fuel) = run_with_sink(wasm, Vec::<u8>::new(), Some(FUEL_BUDGET))?;
+    Ok((String::from_utf8_lossy(&out).into_owned(), fuel))
 }
 
 /// Instantiate `wasm` with a `wasmtime::Linker` that supplies the host `print`
@@ -107,6 +127,10 @@ pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
 /// program value. `out` is any [`Write`] sink (real stdout, or an in-memory
 /// buffer for capture); it is threaded through the [`Store`] and handed back so
 /// captured output can be recovered.
+///
+/// With `fuel: Some(budget)` the engine meters fuel and the fourth result is the
+/// fuel consumed; with `None` it is the default unmetered engine and the fourth
+/// result is `0`.
 // One straight-line harness: engine setup, the seven host imports (print,
 // __convert, __method, __promise, __then, __now, __parse_int), the call, and the after-`main`
 // microtask drain — length reflects the import roster, not branching.
@@ -114,10 +138,17 @@ pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
 fn run_with_sink<W: Write + Send + 'static>(
     wasm: &[u8],
     out: W,
-) -> anyhow::Result<(u64, Vec<u8>, W)> {
-    let engine = Engine::default();
+    fuel: Option<u64>,
+) -> anyhow::Result<(u64, Vec<u8>, W, u64)> {
+    let engine = match fuel {
+        Some(_) => Engine::new(Config::new().consume_fuel(true))?,
+        None => Engine::default(),
+    };
     let module = Module::new(&engine, wasm)?;
     let mut store = Store::new(&engine, Host::new(out));
+    if let Some(budget) = fuel {
+        store.set_fuel(budget)?;
+    }
     let mut linker = Linker::new(&engine);
     linker.func_wrap(
         "env",
@@ -176,7 +207,7 @@ fn run_with_sink<W: Write + Send + 'static>(
                         return Ok(bits);
                     }
                     let text = format_value(&value);
-                    match host_alloc_string(&mut caller, &text) {
+                    match alloc_string(&mut caller, &text) {
                         Some(base) => (HEAP | base).cast_signed(),
                         // Allocation failed: out of memory traps via
                         // `oom_guard`; a missing export yields `undefined`.
@@ -324,7 +355,16 @@ fn run_with_sink<W: Write + Send + 'static>(
         let rendered = format_value(&decode(value_bits, &memory));
         return Err(anyhow::anyhow!("Uncaught (in promise) {rendered}"));
     }
-    Ok((result.cast_unsigned(), memory, store.into_data().sink))
+    let consumed = match fuel {
+        Some(budget) => budget.saturating_sub(store.get_fuel()?),
+        None => 0,
+    };
+    Ok((
+        result.cast_unsigned(),
+        memory,
+        store.into_data().sink,
+        consumed,
+    ))
 }
 
 /// Compile JavaScript `src` all the way to a value: parse, lower, emit, run.
