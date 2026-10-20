@@ -31,9 +31,9 @@ use swc_ecma_ast::{
 };
 
 use crate::ir::{
-    ArrayHofOp, BinOp, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, InstanceOfKind, IrCase,
-    IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp,
-    OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, InstanceOfKind,
+    IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp,
+    ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].

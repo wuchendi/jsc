@@ -454,7 +454,7 @@ fn nullish_promise_method_receiver_throws_a_type_error() {
 fn then_on_a_primitive_throws_a_type_error() {
     assert_uncaught(
         "let x = 5; x.then();",
-        "TypeError: called value is not a function",
+        "TypeError: x.then is not a function",
     );
 }
 

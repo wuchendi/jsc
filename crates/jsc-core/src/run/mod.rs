@@ -59,7 +59,7 @@ mod value;
 mod tests;
 
 pub use harness::{compile_and_run, compile_and_run_capturing, run, run_capturing, run_metered};
-pub use value::{Value, decode, format_number, format_value};
+pub use value::{Value, decode, format_number, format_value, to_js_string};
 
 use crate::abi;
 

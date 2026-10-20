@@ -1,6 +1,8 @@
 use super::lower;
 use crate::frontend::{Dialect, parse};
-use crate::ir::{BinOp, ConvertOp, ErrorKind, IrNode, IrStmt, ObjectBuiltinOp, OpSetKind, PropKey};
+use crate::ir::{
+    BinOp, CalleeError, ConvertOp, ErrorKind, IrNode, IrStmt, ObjectBuiltinOp, OpSetKind, PropKey,
+};
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
     lower(&parse(src, Dialect::Js)?)
@@ -646,7 +648,41 @@ fn lowers_call_through_variable_to_call_indirect() {
         IrNode::CallIndirect {
             callee: Box::new(IrNode::Local(0)),
             args: vec![IrNode::Num(40.0), IrNode::Num(2.0)],
+            not_callable: CalleeError::not_a_function("f"),
         }
+    );
+}
+
+#[test]
+fn names_the_callee_of_a_guarded_call() {
+    // A member callee is named `o.m` (dot or string key); any other callee is
+    // `expression`.
+    let not_callable = |src: &str| {
+        let program = lower_src(src).expect("lower");
+        match program.stmts.last() {
+            Some(IrStmt::Expr(
+                IrNode::MethodCallUser { not_callable, .. }
+                | IrNode::CallIndirect { not_callable, .. },
+            )) => not_callable.message.clone(),
+            other => unreachable!("expected a guarded call, got {other:?}"),
+        }
+    };
+    assert_eq!(not_callable("let o = {}; o.m()"), "o.m is not a function");
+    assert_eq!(
+        not_callable("let o = {}; o['m']()"),
+        "o.m is not a function"
+    );
+    assert_eq!(
+        not_callable("let o = {}; o.a.b()"),
+        "o.a.b is not a function"
+    );
+    assert_eq!(
+        not_callable("let o = {}; let k = 'm'; o[k]()"),
+        "expression is not a function"
+    );
+    assert_eq!(
+        not_callable("let a = [{}]; a[0]()"),
+        "expression is not a function"
     );
 }
 
@@ -674,6 +710,7 @@ fn passing_a_function_argument_lowers_to_decl_func() {
         vec![IrStmt::Return(Some(IrNode::CallIndirect {
             callee: Box::new(IrNode::Local(0)),
             args: vec![IrNode::Local(1)],
+            not_callable: CalleeError::not_a_function("f"),
         }))]
     );
 }

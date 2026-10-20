@@ -34,9 +34,9 @@ use wasm_encoder::{
 
 use crate::abi;
 use crate::ir::{
-    ArrayHofOp, BinOp, ConvertOp, DateOp, ErrorKind, FnKind, InstanceOfKind, IrCase, IrFunction,
-    IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind,
-    PropKey, ReceiverOp, SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind, InstanceOfKind, IrCase,
+    IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp,
+    OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -380,42 +380,34 @@ const FALSE_BITS: i64 = abi::FALSE.cast_signed();
 /// The NaN-boxed `true` jsval (see [`abi::TRUE`]).
 const TRUE_BITS: i64 = abi::TRUE.cast_signed();
 
-/// The message thrown by the runtime callee-is-a-function guard in
-/// [`emit_method_call_user`] when a method call's resolved member is NOT a
-/// function value. This is the dynamic-shape complement of the compile-time
-/// unknown-method diagnostics (static-primitive and static-object-shape receivers):
-/// a `new`-instance, reassigned binding, computed key, or call-result receiver
-/// whose member reads `undefined` (or a non-function) can only be caught at
-/// runtime, so instead of dispatching that value as a bogus funcref index
-/// (undefined behaviour — a wrong result or a cryptic wasm trap) the guard
-/// raises a clean exception — a real `TypeError` object, so
-/// `catch (e) { e instanceof TypeError }` holds — surfaced when uncaught as
-/// `Uncaught TypeError: called value is not a function`. This is the
-/// error's `.message` (no `TypeError:` prefix); the prefixed first line lives in
-/// [`NOT_A_FUNCTION_STACK`]. The object's static strings are interned into the
-/// data segment by [`collect_node`] at every method-call site.
-const NOT_A_FUNCTION_MSG: &str = "called value is not a function";
+/// The `.message` and `.stack` of the `TypeError` a guarded call site throws
+/// when its callee is not callable: a [`CalleeError`]'s texts, or
+/// [`EXPRESSION_NOT_A_FUNCTION`]. Both strings are interned by
+/// [`collect_node`] at the site.
+type CalleeErrorText<'a> = [&'a str; 2];
 
-/// The internal `TypeError`'s single-line `.stack` (its `name: message` first
-/// line); see [`NOT_A_FUNCTION_MSG`] and [`internal_type_error`].
-const NOT_A_FUNCTION_STACK: &str = "TypeError: called value is not a function";
+/// The [`CalleeErrorText`] of an IR [`CalleeError`].
+fn callee_error_text(error: &CalleeError) -> CalleeErrorText<'_> {
+    [&error.message, &error.stack]
+}
 
-/// The static strings the internal-`TypeError` object (see [`internal_type_error`])
-/// embeds — its `.message` and `.stack`. They must be interned wherever the
-/// runtime callee guard can fire so their `[len][utf8]` blobs exist in the data
-/// segment; [`collect_node`] seeds them (with [`ERROR_STRS`]) at each guarded
-/// call.
-const INTERNAL_TYPE_ERROR_STRS: [&str; 2] = [NOT_A_FUNCTION_MSG, NOT_A_FUNCTION_STACK];
+/// The not-a-function `TypeError` text of a guarded call whose callee has no
+/// source name (an array callback, a promise executor, a `super` call, a
+/// generator resume).
+const EXPRESSION_NOT_A_FUNCTION: CalleeErrorText<'static> = [
+    "expression is not a function",
+    "TypeError: expression is not a function",
+];
 
-/// Build the `TypeError` the runtime callee guard throws, identical in shape
-/// to `new TypeError("called value is not a function")`. Emitted at the guard
-/// site via [`emit_node`]; its strings are seeded by [`INTERNAL_TYPE_ERROR_STRS`].
-fn internal_type_error() -> IrNode {
+/// The `TypeError` a guarded call site throws (shape of `new TypeError(m)`,
+/// see [`IrNode::error_object`]). Emitted on the throw path via [`emit_node`];
+/// its strings are seeded with [`ERROR_STRS`] by [`collect_node`].
+fn callee_type_error([message, stack]: CalleeErrorText<'_>) -> IrNode {
     IrNode::error_object(
         ErrorKind::TypeError,
         None,
-        Some(IrNode::Str(NOT_A_FUNCTION_MSG.to_owned())),
-        IrNode::Str(NOT_A_FUNCTION_STACK.to_owned()),
+        Some(IrNode::Str(message.to_owned())),
+        IrNode::Str(stack.to_owned()),
     )
 }
 
@@ -579,7 +571,7 @@ const JSON_ERROR_STACK: &str = "SyntaxError: JSON.parse: invalid or unsupported 
 const JSON_PARSE_ERROR_STRS: [&str; 3] = [JSON_ERROR_NAME, JSON_ERROR_MSG, JSON_ERROR_STACK];
 
 /// Build the syntax-error object `__json_throw` raises on malformed JSON, the
-/// same shape as [`internal_type_error`]. Emitted via [`emit_node`]; its
+/// same shape as [`callee_type_error`]. Emitted via [`emit_node`]; its
 /// strings are seeded by [`JSON_PARSE_ERROR_STRS`].
 fn json_syntax_error() -> IrNode {
     IrNode::error_object(

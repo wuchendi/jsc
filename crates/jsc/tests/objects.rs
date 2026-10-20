@@ -100,7 +100,7 @@ fn absent_method_call_is_a_runtime_type_error() {
     assert_eq!(output.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("Uncaught TypeError: called value is not a function")
+            .contains("Uncaught TypeError: o.foo is not a function")
     );
     assert_eq!(jsc(&["-p", "let o = {}; o.f = () => 1; o.f()"]), "1");
 }

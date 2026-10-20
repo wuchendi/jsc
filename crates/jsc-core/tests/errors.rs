@@ -1081,62 +1081,88 @@ fn no_throw_programs_unaffected() {
 
 // --- IsCallable check before an indirect call (DF4) ---------------------------
 
-/// The branded `TypeError` every non-callable callee raises.
-const NOT_A_FUNCTION: &str = "TypeError: called value is not a function";
+/// The not-a-function `TypeError` of a callee with no source name.
+const EXPR_NOT_A_FUNCTION: &str = "TypeError: expression is not a function";
 
 /// A plain indirect call on a non-function value throws instead of dispatching
-/// the value's low bits as a funcref index (which used to run function 0).
+/// the value's low bits as a funcref index (which used to run function 0); the
+/// message names the callee.
 #[test]
 fn indirect_call_on_non_function_throws() {
     assert_uncaught(
         "function a(){ return \"A\" } let x = {}; x()",
-        NOT_A_FUNCTION,
+        "TypeError: x is not a function",
     );
-    assert_uncaught("function a(){ return 1 } let x = 5; x()", NOT_A_FUNCTION);
+    assert_uncaught(
+        "function a(){ return 1 } let x = 5; x()",
+        "TypeError: x is not a function",
+    );
     assert_uncaught(
         "function a(){ return 1 } let x = undefined; x()",
-        NOT_A_FUNCTION,
+        "TypeError: x is not a function",
     );
     // An array element and a call result have no source name.
     assert_uncaught(
         "function a(){ return 1 } let arr = [{}]; arr[0]()",
-        NOT_A_FUNCTION,
+        EXPR_NOT_A_FUNCTION,
     );
-    assert_uncaught("function a(){ return {} } a()()", NOT_A_FUNCTION);
+    assert_uncaught("function a(){ return {} } a()()", EXPR_NOT_A_FUNCTION);
     // A spread call through a non-function value.
     assert_uncaught(
         "function a(){ return 1 } let x = {}; x(...[1])",
-        NOT_A_FUNCTION,
+        "TypeError: x is not a function",
     );
 }
 
-/// A member callee that resolves to a non-function throws.
+/// A member callee that resolves to a non-function throws, named `o.m`
+/// whether written with a dot or a string key.
 #[test]
 fn member_call_on_non_function_throws() {
-    assert_uncaught("let o = {f: {}}; o.f()", NOT_A_FUNCTION);
+    assert_uncaught("let o = {f: {}}; o.f()", "TypeError: o.f is not a function");
     assert_uncaught(
-        "function a(){ return 1 } let o = {f: {}}; o.f()",
-        NOT_A_FUNCTION,
+        "function a(){ return 1 } let o = {f: {}}; o['f']()",
+        "TypeError: o.f is not a function",
     );
+    assert_uncaught(
+        "let o = {p: {}}; o.p.q()",
+        "TypeError: o.p.q is not a function",
+    );
+    assert_uncaught("let x = {}; x()", "TypeError: x is not a function");
+    assert_uncaught("let o = {}; o.m()", "TypeError: o.m is not a function");
 }
 
 /// An array higher-order method rejects a non-function callback before it
 /// iterates — even over an empty array, matching Node.
 #[test]
 fn hof_callback_non_function_throws() {
-    assert_uncaught("function a(){ return 1 } [1].map({})", NOT_A_FUNCTION);
-    assert_uncaught("function a(){ return 1 } [].map({})", NOT_A_FUNCTION);
-    assert_uncaught("function a(){ return 1 } [1].filter(5)", NOT_A_FUNCTION);
-    assert_uncaught("function a(){ return 1 } [1].forEach(5)", NOT_A_FUNCTION);
-    assert_uncaught("function a(){ return 1 } [1].reduce({}, 0)", NOT_A_FUNCTION);
+    assert_uncaught("function a(){ return 1 } [1].map({})", EXPR_NOT_A_FUNCTION);
+    assert_uncaught("function a(){ return 1 } [].map({})", EXPR_NOT_A_FUNCTION);
+    assert_uncaught(
+        "function a(){ return 1 } [1].filter(5)",
+        EXPR_NOT_A_FUNCTION,
+    );
+    assert_uncaught(
+        "function a(){ return 1 } [1].forEach(5)",
+        EXPR_NOT_A_FUNCTION,
+    );
+    assert_uncaught(
+        "function a(){ return 1 } [1].reduce({}, 0)",
+        EXPR_NOT_A_FUNCTION,
+    );
 }
 
 /// `new Promise(executor)` with a non-function executor throws synchronously,
 /// and `new` on a class binding reassigned to a non-class throws.
 #[test]
 fn promise_executor_and_new_non_function_throw() {
-    assert_uncaught("function a(){ return 1 } new Promise(5)", NOT_A_FUNCTION);
-    assert_uncaught("class A {}\nA = {}\nnew A()", NOT_A_FUNCTION);
+    assert_uncaught(
+        "function a(){ return 1 } new Promise(5)",
+        EXPR_NOT_A_FUNCTION,
+    );
+    assert_uncaught(
+        "class A {}\nA = {}\nnew A()",
+        "TypeError: A is not a constructor",
+    );
 }
 
 /// A non-callable `.then` reaction is a passthrough (the host engine skips it),
@@ -1154,9 +1180,10 @@ fn promise_non_function_reaction_passes_through() {
 fn non_function_call_is_catchable() {
     assert_output(
         "function a(){ return 1 } let x = {}; \
-         try { x() } catch (e) { console.log(e instanceof TypeError, e.message) } \
+         try { x() } catch (e) { console.log(e instanceof TypeError, e.message, e.stack) } \
          try { [1].map(5) } catch (e) { console.log(e instanceof TypeError, e.message) }",
-        "true called value is not a function\ntrue called value is not a function\n",
+        "true x is not a function TypeError: x is not a function\n\
+         true expression is not a function\n",
     );
 }
 
@@ -1172,16 +1199,17 @@ fn callable_values_still_dispatch() {
 
 /// A program that declares no function has no funcref table, so every
 /// non-callable call site must throw directly instead of emitting an (invalid)
-/// `call_indirect`. (`new` needs no such path: a class always synthesizes a
-/// constructor function.)
+/// `call_indirect` — with the same per-site messages.
 #[test]
 fn non_function_call_without_functions_throws() {
-    assert_uncaught("[1].map(5)", NOT_A_FUNCTION);
-    assert_uncaught("[1].filter(5)", NOT_A_FUNCTION);
-    assert_uncaught("[1].forEach(5)", NOT_A_FUNCTION);
-    assert_uncaught("[1].reduce({}, 0)", NOT_A_FUNCTION);
-    assert_uncaught("new Promise(5)", NOT_A_FUNCTION);
-    assert_uncaught("let x = {}; x(...[1])", NOT_A_FUNCTION);
+    assert_uncaught("[1].map(5)", EXPR_NOT_A_FUNCTION);
+    assert_uncaught("[1].filter(5)", EXPR_NOT_A_FUNCTION);
+    assert_uncaught("[1].forEach(5)", EXPR_NOT_A_FUNCTION);
+    assert_uncaught("[1].reduce({}, 0)", EXPR_NOT_A_FUNCTION);
+    assert_uncaught("new Promise(5)", EXPR_NOT_A_FUNCTION);
+    assert_uncaught("let x = {}; x(...[1])", "TypeError: x is not a function");
+    assert_uncaught("let x = 1; x()", "TypeError: x is not a function");
+    assert_uncaught("let o = {}; o.m()", "TypeError: o.m is not a function");
 }
 
 /// The function-free not-a-function `TypeError` is catchable.
@@ -1192,7 +1220,51 @@ fn non_function_call_without_functions_is_catchable() {
          try { new Promise(5) } catch (e) { console.log(e.message) } \
          let x = {}; \
          try { x(...[1]) } catch (e) { console.log(e.message) }",
-        "true called value is not a function\ncalled value is not a function\n\
-         called value is not a function\n",
+        "true expression is not a function\nexpression is not a function\n\
+         x is not a function\n",
+    );
+}
+
+/// `new` on a value that is not a class or supported builtin compiles and
+/// throws `<name> is not a constructor` at run time, after evaluating the
+/// target and the arguments. Plain `function` declarations take the same
+/// path until construct lands (S3).
+#[test]
+fn new_on_non_constructor_throws() {
+    assert_uncaught("let x = 5; new x()", "TypeError: x is not a constructor");
+    assert_uncaught("let o = {}; new o()", "TypeError: o is not a constructor");
+    assert_uncaught(
+        "function g(p) { return new p() } g(1)",
+        "TypeError: p is not a constructor",
+    );
+    assert_uncaught(
+        "function F() {} new F()",
+        "TypeError: F is not a constructor",
+    );
+    assert_uncaught(
+        "let o = {}; new o.C()",
+        "TypeError: o.C is not a constructor",
+    );
+    assert_output(
+        "let i = 0; let o = {}; \
+         try { new o(i++, i++) } catch (e) { console.log(e instanceof TypeError, e.message, i) }",
+        "true o is not a constructor 2\n",
+    );
+}
+
+/// `Error(a, b)` / `new Error(a, b)` evaluate (and discard) the arguments past
+/// the first, left to right, after the message.
+#[test]
+fn error_constructors_evaluate_surplus_arguments() {
+    assert_output(
+        "let i = 0; let e1 = Error(i++, i++); let e2 = new TypeError('m', i++); \
+         let e3 = new RangeError(String(i), i++, i++); \
+         console.log(i, e1.message, e2.message, e3.message)",
+        "5 0 m 3\n",
+    );
+    assert_output(
+        "let log = ''; let f = (v) => { log = log + v; return v }; \
+         let e = new Error(f('a'), f('b'), f('c')); console.log(log, e.message)",
+        "abc a\n",
     );
 }

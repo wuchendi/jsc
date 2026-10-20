@@ -4,7 +4,7 @@
 #![cfg(feature = "native-run")]
 
 use super::emit;
-use crate::ir::{BinOp, IrCase, IrFunction, IrNode, IrProgram, IrStmt, PropKey};
+use crate::ir::{BinOp, CalleeError, IrCase, IrFunction, IrNode, IrProgram, IrStmt, PropKey};
 
 /// Wrap a single expression into a one-statement program.
 fn expr_program(node: IrNode) -> IrProgram {
@@ -702,6 +702,7 @@ fn emits_valid_module_with_function_value_and_indirect_call() {
             IrStmt::Expr(IrNode::CallIndirect {
                 callee: Box::new(IrNode::Local(0)),
                 args: vec![IrNode::Num(42.0)],
+                not_callable: CalleeError::not_a_function("f"),
             }),
         ],
         functions: vec![IrFunction {

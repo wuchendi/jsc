@@ -682,6 +682,47 @@ pub fn format_value(value: &Value) -> String {
     }
 }
 
+/// The JS `ToString` text of a decoded [`Value`] (what `String(v)`, `'' + v`
+/// and `join` produce), as opposed to [`format_value`]'s console rendering:
+/// an array joins its elements' `ToString` with `,` (`null`/`undefined`
+/// elements and cycle back-references are empty, as in V8), a plain object or
+/// class instance is `[object Object]`, an error is `Error.prototype.toString`
+/// (`Name: message`, or whichever half is non-empty), and Map/Set/promise/
+/// generator use their `Object.prototype.toString` tags. Functions (no source
+/// text is kept) and Dates keep their console rendering.
+#[must_use]
+pub fn to_js_string(value: &Value) -> String {
+    match value {
+        Value::Array(elems) => elems
+            .iter()
+            .map(|elem| match elem {
+                Value::Null | Value::Undefined => String::new(),
+                other => to_js_string(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) | Value::Instance { .. } => "[object Object]".to_owned(),
+        Value::Error { name, message } => match (name.is_empty(), message.is_empty()) {
+            (_, true) => name.clone(),
+            (true, false) => message.clone(),
+            (false, false) => format!("{name}: {message}"),
+        },
+        Value::Map(_) => "[object Map]".to_owned(),
+        Value::Set(_) => "[object Set]".to_owned(),
+        Value::Promise { .. } => "[object Promise]".to_owned(),
+        Value::Generator => "[object Generator]".to_owned(),
+        Value::Accessor { .. } | Value::Circular(_) => String::new(),
+        Value::Ref(_, inner) => to_js_string(inner),
+        Value::Number(_)
+        | Value::Bool(_)
+        | Value::Null
+        | Value::Undefined
+        | Value::Str(_)
+        | Value::Function { .. }
+        | Value::Date(_) => format_value(value),
+    }
+}
+
 /// Render own properties Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
 fn format_entries(entries: &[(String, Value)]) -> String {
     if entries.is_empty() {

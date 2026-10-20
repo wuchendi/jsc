@@ -100,13 +100,10 @@ fn primitive_unknown_reads_are_undefined() {
 #[test]
 fn primitive_unknown_method_call_throws() {
     for (decl, _, _) in PRIMITIVES {
-        assert_type_error(
-            &format!("{decl} v.foo();"),
-            "called value is not a function",
-        );
+        assert_type_error(&format!("{decl} v.foo();"), "v.foo is not a function");
         assert_type_error(
             &format!("{decl} let k=\"foo\"; v[k]();"),
-            "called value is not a function",
+            "expression is not a function",
         );
     }
 }

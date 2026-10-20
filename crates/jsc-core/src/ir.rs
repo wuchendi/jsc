@@ -318,6 +318,39 @@ impl ErrorKind {
     }
 }
 
+/// The `TypeError` a call or `new` site throws when its callee is not callable
+/// (or not a constructor), named by codegen after the callee's source text:
+/// `x` for an identifier, `o.m` for a member with a static key, `expression`
+/// otherwise. Carries the error's `.message` and its single-line `.stack`;
+/// both are static strings interned wherever the site can throw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalleeError {
+    /// The error's `.message`, e.g. `x is not a function`.
+    pub message: String,
+    /// The error's `.stack` first line, `TypeError: <message>`.
+    pub stack: String,
+}
+
+impl CalleeError {
+    /// The source name of a callee with no nameable source text.
+    pub(crate) const EXPRESSION: &'static str = "expression";
+
+    /// `<name> is not a function`.
+    pub(crate) fn not_a_function(name: &str) -> Self {
+        Self::with_message(format!("{name} is not a function"))
+    }
+
+    /// `<name> is not a constructor`.
+    pub(crate) fn not_a_constructor(name: &str) -> Self {
+        Self::with_message(format!("{name} is not a constructor"))
+    }
+
+    fn with_message(message: String) -> Self {
+        let stack = format!("TypeError: {message}");
+        Self { message, stack }
+    }
+}
+
 /// A `Map`/`Set` instance method. Recognized syntactically from a
 /// `<expr>.<name>(args)` member callee at codegen; because these names
 /// (`set`/`get`/`has`/`add`/`delete`) can ALSO be ordinary object/class methods
@@ -422,8 +455,9 @@ pub enum SpreadCallee {
     /// A direct call to a known function declaration — its codegen function
     /// index (the same value carried by [`IrNode::Call`]'s `func`).
     Direct(u32),
-    /// An indirect call through a computed function value.
-    Indirect(Box<IrNode>),
+    /// An indirect call through a computed function value, with the
+    /// `TypeError` it throws when that value is not callable.
+    Indirect(Box<IrNode>, CalleeError),
     /// A `super(...args)` call: the parent constructor value, invoked with
     /// `this` kept as the enclosing constructor's snapshot in `this_local`
     /// (like [`IrNode::ThisCall`]).
@@ -595,6 +629,9 @@ pub enum IrNode {
         callee: Box<IrNode>,
         /// The argument expressions, in source order.
         args: Vec<IrNode>,
+        /// The `TypeError` thrown when the callee is not callable, named after
+        /// the callee's source text.
+        not_callable: CalleeError,
     },
     /// The unary `typeof` operator applied to a sub-expression. It yields a
     /// boxed type-string immediate (tag `0b100`) naming the operand's runtime
@@ -678,10 +715,11 @@ pub enum IrNode {
         /// The excluded keys — an [`IrNode::Array`] of [`IrNode::Str`] names.
         exclude: Box<IrNode>,
     },
-    /// The `.length` member of a string or array: reads the u32 `len` header at
-    /// the operand's block base `+ HEADER_SIZE` and produces it as a number jsval.
-    /// The operand is assumed to be a string or array pointer (both
-    /// carry the same u32 header at that offset).
+    /// The `.length` member, dispatched on the receiver kind (DF2): a string or
+    /// array reads its u32 `len` header at the block base `+ HEADER_SIZE` as a
+    /// number jsval; any other heap value reads its `length` property through
+    /// `__get`; a primitive yields `undefined`. Codegen wraps the receiver in a
+    /// [`IrNode::NullishCheck`].
     StrLen(Box<IrNode>),
     /// The nullish-receiver guard of a builtin member access (`recv.length`,
     /// `recv.push(..)`, `recv.get(..)`, ...): yields `value` unchanged, but throws
@@ -933,6 +971,9 @@ pub enum IrNode {
         /// Fresh temp local holding the evaluated receiver across argument
         /// evaluation and the `__this` set.
         obj_local: u32,
+        /// The `TypeError` thrown when the member is not callable (`o.m is not
+        /// a function`).
+        not_callable: CalleeError,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
@@ -976,7 +1017,16 @@ pub enum IrNode {
         args: Vec<IrNode>,
         /// Fresh temp local holding the instance across the constructor call.
         instance_local: u32,
+        /// The `TypeError` thrown when the class binding no longer holds a
+        /// function (`A is not a constructor`).
+        not_callable: CalleeError,
     },
+    /// Evaluate each expression left to right, discarding every value but the
+    /// last, which is the node's value. Built by codegen (never empty) for
+    /// operands evaluated only for their side effects: surplus `Error(..)`
+    /// arguments, and the target and arguments of a `new` that then throws
+    /// `is not a constructor`.
+    Seq(Vec<IrNode>),
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
     /// `__own_keys` (`__for_in_keys`), which builds a fresh array in own-key
@@ -1074,6 +1124,9 @@ pub enum IrNode {
         recv_local: u32,
         /// Fresh temp local for the fallback user method call's own receiver stash.
         fallback_obj_local: u32,
+        /// The `TypeError` the user-method fallback throws when the member is
+        /// not callable.
+        not_callable: CalleeError,
     },
     /// A promise / generator instance method call `recv.<op>(args)`. Like
     /// [`IrNode::MapMethod`], `recv` is evaluated ONCE into `recv_local`, then a
@@ -1095,6 +1148,9 @@ pub enum IrNode {
         recv_local: u32,
         /// Fresh temp local for the fallback user method call's own receiver stash.
         fallback_obj_local: u32,
+        /// The `TypeError` the user-method fallback throws when the member is
+        /// not callable.
+        not_callable: CalleeError,
     },
     /// `Promise.resolve(v)`: build a promise already fulfilled with `v`
     /// (or return `v` unchanged when it is itself a promise). Lowers to the host
@@ -1195,6 +1251,9 @@ pub enum IrNode {
         recv_local: u32,
         /// Fresh temp local for the fallback user method call's own receiver stash.
         fallback_obj_local: u32,
+        /// The `TypeError` the user-method fallback throws when the member is
+        /// not callable.
+        not_callable: CalleeError,
     },
 }
 
@@ -1560,9 +1619,12 @@ impl IrNode {
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }
             | IrNode::Array(args)
+            | IrNode::Seq(args)
             | IrNode::ConsoleLog { args }
             | IrNode::MathCall { args, .. } => args.iter().any(f),
-            IrNode::CallIndirect { callee: recv, args }
+            IrNode::CallIndirect {
+                callee: recv, args, ..
+            }
             | IrNode::MethodCall { recv, args, .. }
             | IrNode::ThisCall {
                 callee: recv, args, ..
@@ -1593,7 +1655,7 @@ impl IrNode {
                 SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
             }),
             IrNode::CallSpread { target, args } => {
-                matches!(target, SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } if f(callee))
+                matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } if f(callee))
                     || f(args)
             }
         }
@@ -1702,9 +1764,12 @@ impl IrNode {
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }
             | IrNode::Array(args)
+            | IrNode::Seq(args)
             | IrNode::ConsoleLog { args }
             | IrNode::MathCall { args, .. } => args.iter_mut().collect(),
-            IrNode::CallIndirect { callee: recv, args }
+            IrNode::CallIndirect {
+                callee: recv, args, ..
+            }
             | IrNode::MethodCall { recv, args, .. }
             | IrNode::ThisCall {
                 callee: recv, args, ..
@@ -1755,7 +1820,9 @@ impl IrNode {
                 .collect(),
             IrNode::CallSpread { target, args } => {
                 let mut out = Vec::new();
-                if let SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } = target {
+                if let SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } =
+                    target
+                {
                     out.push(&mut **callee);
                 }
                 out.push(&mut **args);

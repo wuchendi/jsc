@@ -153,10 +153,7 @@ fn functions_take_properties() {
 /// An absent method is a runtime `TypeError`; an added one is callable.
 #[test]
 fn absent_methods_fail_at_run_time() {
-    assert_uncaught(
-        "let o = {}; o.foo()",
-        "TypeError: called value is not a function",
-    );
+    assert_uncaught("let o = {}; o.foo()", "TypeError: o.foo is not a function");
     assert_output("let o = {}; o.f = () => 1; console.log(o.f())", "1\n");
 }
 
@@ -176,5 +173,25 @@ fn json_parse_builds_dictionary_objects() {
     assert_output(
         "let o = JSON.parse('{\"b\": 1, \"a\": {\"c\": 2}, \"b\": 3}'); o.d = 4; console.log(o, o.a.c)",
         "{ b: 3, a: { c: 2 }, d: 4 } 2\n",
+    );
+}
+
+/// DF2: `.length` dispatches on the receiver kind — strings and arrays read
+/// their length header, functions their materialized `length`, objects their
+/// own or inherited `length` property, and primitives without one `undefined`.
+#[test]
+fn length_dispatches_on_receiver_kind() {
+    assert_output(
+        "console.log((5).length, ({}).length, ({length: 3}).length, 'abc'.length, [1,2].length, (function(a,b){}).length)",
+        "undefined undefined 3 3 2 2\n",
+    );
+    assert_output(
+        "class A { get length() { return 7 } } let f = (a, b, c) => 0; \
+         console.log(new A().length, f.length, true.length, Object.keys([]).length)",
+        "7 3 undefined 0\n",
+    );
+    assert_uncaught(
+        "let n = null; n.length",
+        "TypeError: Cannot read properties of null (reading 'length')",
     );
 }

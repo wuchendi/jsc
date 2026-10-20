@@ -702,8 +702,19 @@ pub(super) fn collect_node<'a>(
         // An indirect call and a `super(..)`/`super.m(..)` `ThisCall` both intern
         // their callee expression and every argument, plus the not-a-function
         // TypeError strings (a function-less program's indirect call throws it).
-        IrNode::CallIndirect { callee, args } | IrNode::ThisCall { callee, args, .. } => {
-            seed_type_error_strs(order, seen);
+        IrNode::CallIndirect {
+            callee,
+            args,
+            not_callable,
+        } => {
+            seed_callee_error(callee_error_text(not_callable), order, seen);
+            collect_node(callee, order, seen);
+            for arg in args {
+                collect_node(arg, order, seen);
+            }
+        }
+        IrNode::ThisCall { callee, args, .. } => {
+            seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
             collect_node(callee, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
@@ -751,7 +762,7 @@ pub(super) fn collect_node<'a>(
             collect_node(cell, order, seen);
             collect_node(value, order, seen);
         }
-        IrNode::Array(elems) => {
+        IrNode::Array(elems) | IrNode::Seq(elems) => {
             for elem in elems {
                 collect_node(elem, order, seen);
             }
@@ -762,11 +773,20 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::CallSpread { target, args } => {
-            if let SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } = target {
-                if !is_static_function(callee) {
-                    seed_type_error_strs(order, seen);
+            match target {
+                SpreadCallee::Indirect(callee, not_callable) => {
+                    if !is_static_function(callee) {
+                        seed_callee_error(callee_error_text(not_callable), order, seen);
+                    }
+                    collect_node(callee, order, seen);
                 }
-                collect_node(callee, order, seen);
+                SpreadCallee::This { callee, .. } => {
+                    if !is_static_function(callee) {
+                        seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
+                    }
+                    collect_node(callee, order, seen);
+                }
+                SpreadCallee::Direct(_) => {}
             }
             collect_node(args, order, seen);
         }
@@ -789,7 +809,7 @@ pub(super) fn collect_node<'a>(
             ..
         } => {
             if !is_static_function(callback) {
-                seed_type_error_strs(order, seen);
+                seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
             }
             collect_node(array, order, seen);
             collect_node(callback, order, seen);
@@ -803,10 +823,16 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
-        IrNode::MethodCallUser { obj, key, args, .. } => {
+        IrNode::MethodCallUser {
+            obj,
+            key,
+            args,
+            not_callable,
+            ..
+        } => {
             // Seed the runtime callee-is-a-function guard's TypeError
             // strings so their data-segment blobs exist when the guard throws.
-            seed_type_error_strs(order, seen);
+            seed_callee_error(callee_error_text(not_callable), order, seen);
             seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(key, order, seen);
@@ -818,9 +844,10 @@ pub(super) fn collect_node<'a>(
             instance,
             ctor,
             args,
+            not_callable,
             ..
         } => {
-            seed_type_error_strs(order, seen);
+            seed_callee_error(callee_error_text(not_callable), order, seen);
             collect_node(instance, order, seen);
             collect_node(ctor, order, seen);
             for arg in args {
@@ -912,6 +939,7 @@ pub(super) fn collect_node<'a>(
             recv,
             args,
             method_name,
+            not_callable,
             ..
         } => {
             if seen.insert(method_name.as_str()) {
@@ -919,7 +947,7 @@ pub(super) fn collect_node<'a>(
             }
             // The unknown-collection-method fallback lowers to a user method call,
             // which the runtime callee guard protects — seed its TypeError strings too.
-            seed_type_error_strs(order, seen);
+            seed_callee_error(callee_error_text(not_callable), order, seen);
             collect_node(recv, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
@@ -929,7 +957,13 @@ pub(super) fn collect_node<'a>(
         // fallback key) into the string table; the generator path builds a
         // `{ value, done }` result, and the guarded fallback throws a nullish /
         // not-a-function TypeError — seed all of those strings too.
-        IrNode::ReceiverMethod { op, recv, args, .. } => {
+        IrNode::ReceiverMethod {
+            op,
+            recv,
+            args,
+            not_callable,
+            ..
+        } => {
             let keys: &[&'static str] = if matches!(op, ReceiverOp::Next) {
                 &["value", "done"]
             } else {
@@ -941,7 +975,7 @@ pub(super) fn collect_node<'a>(
                     order.push(s);
                 }
             }
-            seed_type_error_strs(order, seen);
+            seed_callee_error(callee_error_text(not_callable), order, seen);
             seed_nullish_strs(order, seen);
             collect_node(recv, order, seen);
             for arg in args {
@@ -953,6 +987,7 @@ pub(super) fn collect_node<'a>(
             recv,
             args,
             method_name,
+            not_callable,
             ..
         } => {
             if seen.insert(method_name.as_str()) {
@@ -960,7 +995,7 @@ pub(super) fn collect_node<'a>(
             }
             // The non-Date fallback lowers to a guarded user method call — seed
             // its TypeError strings too.
-            seed_type_error_strs(order, seen);
+            seed_callee_error(callee_error_text(not_callable), order, seen);
             // `toISOString()` returns the interned `"Invalid Date"` literal for a
             // non-finite timestamp, so its `[len][utf8]` blob must exist.
             if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
@@ -995,7 +1030,7 @@ pub(super) fn collect_node<'a>(
         // (the settler functions are runtime-emitted, no literals).
         IrNode::PromiseCtor { executor, .. } => {
             if !is_static_function(executor) {
-                seed_type_error_strs(order, seen);
+                seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
             }
             collect_node(executor, order, seen);
         }
@@ -1017,7 +1052,7 @@ pub(super) fn collect_node<'a>(
                     order.push(key);
                 }
             }
-            seed_type_error_strs(order, seen);
+            seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
             collect_node(handle, order, seen);
             collect_node(sent, order, seen);
         }
@@ -1073,12 +1108,20 @@ fn seed_nullish_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) 
     seed_strs(&NULLISH_ERROR_STRS, order, seen);
 }
 
-/// Seed the not-a-function guard's [`INTERNAL_TYPE_ERROR_STRS`] (and
-/// [`ERROR_STRS`]) so the `TypeError` it throws finds their `[len][utf8]`
-/// blobs in the data segment; see [`collect_node`].
-fn seed_type_error_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+/// Seed a not-callable guard's [`CalleeErrorText`] (and [`ERROR_STRS`]) so
+/// the `TypeError` it throws finds their `[len][utf8]` blobs in the data
+/// segment; see [`collect_node`].
+fn seed_callee_error<'a>(
+    text: CalleeErrorText<'a>,
+    order: &mut Vec<&'a str>,
+    seen: &mut HashSet<&'a str>,
+) {
     seed_strs(&ERROR_STRS, order, seen);
-    seed_strs(&INTERNAL_TYPE_ERROR_STRS, order, seen);
+    for s in text {
+        if seen.insert(s) {
+            order.push(s);
+        }
+    }
 }
 
 /// Seed the member-store guard's [`PROP_ERROR_STRS`] (and [`ERROR_STRS`]) so

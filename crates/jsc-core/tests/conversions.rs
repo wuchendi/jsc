@@ -161,3 +161,29 @@ fn conversions_through_console_log() {
         "42 8 true\n",
     );
 }
+
+/// `String(v)`, `'' + v`, template literals, and `join` use JS `ToString`
+/// text (not the console rendering): arrays join their elements, plain objects
+/// are `[object Object]`, errors use `Error.prototype.toString`, and a cyclic
+/// array joins its self-reference as the empty string.
+#[test]
+fn to_string_uses_js_text() {
+    assert_output(
+        "console.log(String([1, 2])); console.log([1, [2, 3]].join('-')); \
+         console.log('' + [1, 'a', null, undefined]); console.log(String({}), `${{ a: 1 }}`)",
+        "1,2\n1-2,3\n1,a,,\n[object Object] [object Object]\n",
+    );
+    assert_output(
+        "console.log(String(new TypeError('x')), String(new Error()), '' + new RangeError('r'))",
+        "TypeError: x Error RangeError: r\n",
+    );
+    assert_output(
+        "let e = new Error('m'); e.name = ''; console.log(String(e)); \
+         let a = [1, 0]; a[1] = a; console.log(String(a), a.join('-'))",
+        "m\n1, 1-\n",
+    );
+    assert_output(
+        "console.log('x'.padStart(4, [1, 2]), 'a1,2b'.split([1, 2]), parseFloat([2.5]))",
+        "1,2x [ a, b ] 2.5\n",
+    );
+}

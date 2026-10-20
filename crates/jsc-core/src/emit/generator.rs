@@ -149,7 +149,13 @@ pub(super) fn emit_gen_resume(
     // Throw the `TypeError` UNCONDITIONALLY (skipping the invalid indirect call)
     // and leave `undefined` as the fall-through result of this expression.
     if !helpers.has_funcs {
-        emit_throw_type_error(function, scratch, strings, helpers);
+        emit_throw_not_a_function(
+            function,
+            EXPRESSION_NOT_A_FUNCTION,
+            scratch,
+            strings,
+            helpers,
+        );
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         return;
     }
@@ -159,7 +165,13 @@ pub(super) fn emit_gen_resume(
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    emit_throw_type_error(function, scratch, strings, helpers);
+    emit_throw_not_a_function(
+        function,
+        EXPRESSION_NOT_A_FUNCTION,
+        scratch,
+        strings,
+        helpers,
+    );
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 
@@ -204,24 +216,6 @@ pub(super) fn emit_gen_resume(
     // 4. Build the `{ value, done }` result object from the SM's value and the
     // handle's `done` flag.
     emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
-}
-
-/// Emit the `TypeError` throw shared by the two non-generator-receiver
-/// paths of [`emit_gen_resume`]: stash the error in `$exc_value`, set the pending
-/// flag, clear any routed completion, and unwind to the nearest handler.
-fn emit_throw_type_error(
-    function: &mut Function,
-    scratch: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    emit_node(&internal_type_error(), function, scratch, strings, helpers);
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
-    emit_throw_return(function, helpers);
 }
 
 /// Emit the `{ value, done }` iterator result object, leaving its jsval on the
