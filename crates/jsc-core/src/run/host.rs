@@ -7,6 +7,7 @@ use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
+use super::value::{array_elements, array_layout, join_elements};
 use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
@@ -81,19 +82,22 @@ pub(super) fn alloc_string<W: Send + 'static>(
     Some(base as u64)
 }
 
-/// Allocate a heap ARRAY block holding the jsval bits `elems` through the guest
-/// `__new_array` export and return its base offset, or `None` if the export is
-/// missing or the allocation/write fails. The guest writes the header; the host
-/// only fills the elements.
+/// Allocate a heap ARRAY holding the jsval bits `elems` through the guest
+/// `__new_array` export and return its handle base offset, or `None` if the
+/// export is missing or the allocation/write fails. The guest builds the handle
+/// and its element store; the host only fills the elements.
 fn alloc_array<W: Send + 'static>(caller: &mut Caller<'_, W>, elems: &[u64]) -> Option<u64> {
     let len = elems.len().min(MEMORY_MAX_BYTES / 8);
     let base = guest_new(caller, abi::NEW_ARRAY_EXPORT_NAME, len)?;
     let mem = caller
         .get_export(abi::MEMORY_EXPORT_NAME)
         .and_then(wasmtime::Extern::into_memory)?;
-    let bytes: Vec<u8> = elems.iter().flat_map(|bits| bits.to_le_bytes()).collect();
-    mem.write(&mut *caller, base + HEADER_SIZE + 4, &bytes)
-        .ok()?;
+    let (_, data) = array_layout(mem.data(&*caller), base)?;
+    let bytes: Vec<u8> = elems[..len]
+        .iter()
+        .flat_map(|bits| bits.to_le_bytes())
+        .collect();
+    mem.write(&mut *caller, data, &bytes).ok()?;
     Some(base as u64)
 }
 
@@ -225,18 +229,11 @@ fn heap_ptr(bits: u64) -> Option<usize> {
     }
 }
 
-/// The u32 `len` header of an array/string block at `ptr + HEADER_SIZE`.
+/// The u32 `len` header of a string block at `ptr + HEADER_SIZE`.
 fn block_len(mem: &[u8], ptr: usize) -> Option<usize> {
     let at = ptr.checked_add(HEADER_SIZE)?;
     let bytes = mem.get(at..at + 4)?;
     usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()
-}
-
-/// The raw jsval bits of array element `i` at `ptr + HEADER_SIZE + 4 + 8*i`.
-fn array_elem_bits(mem: &[u8], ptr: usize, i: usize) -> Option<u64> {
-    let start = ptr.checked_add(HEADER_SIZE + 4 + 8 * i)?;
-    let bytes = mem.get(start..start + 8)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// The UTF-8 payload bytes of a heap STRING block (`[len:u32][utf8]` at
@@ -282,32 +279,27 @@ fn strict_eq_bits(a: u64, b: u64, mem: &[u8]) -> bool {
 }
 
 /// `array.indexOf(x)`: the number bits of the first index whose element `=== x`,
-/// or `-1` when absent.
+/// or `-1` when absent. A hole is no element, so it never matches.
 fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
-    let len = block_len(mem, ptr).unwrap_or(0);
-    for i in 0..len {
-        if let Some(elem) = array_elem_bits(mem, ptr, i)
-            && strict_eq_bits(elem, needle, mem)
-        {
-            return index_bits(i);
-        }
-    }
-    not_found_bits()
+    let (_, present) = array_elements(mem, ptr).unwrap_or_default();
+    present
+        .into_iter()
+        .find(|&(_, elem)| strict_eq_bits(elem, needle, mem))
+        .map_or_else(not_found_bits, |(i, _)| index_bits(i))
 }
 
 /// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
-/// except that `NaN` matches `NaN`.
+/// except that `NaN` matches `NaN`; a hole reads as `undefined`.
 fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
-    let len = block_len(mem, ptr).unwrap_or(0);
-    (0..len).any(|i| {
-        array_elem_bits(mem, ptr, i).is_some_and(|elem| {
+    let (len, present) = array_elements(mem, ptr).unwrap_or_default();
+    (needle == abi::UNDEFINED && present.len() < len)
+        || present.into_iter().any(|(_, elem)| {
             strict_eq_bits(elem, needle, mem)
                 || matches!(
                     (decode(elem, mem), decode(needle, mem)),
                     (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
                 )
         })
-    })
 }
 
 /// `string.indexOf(sub)`: the number bits of the first BYTE index where `sub`
@@ -330,8 +322,8 @@ fn string_index_of(mem: &[u8], ptr: usize, sub: u64) -> u64 {
 }
 
 /// `array.join(sep)`: build a heap string of `ToString(element)` for each element
-/// joined by `sep` (`","` when `sep` is `undefined`); `null`/`undefined` elements
-/// and cycle back-references render as `""` (JS join semantics). The receiver
+/// joined by `sep` (`","` when `sep` is `undefined`); `null`/`undefined` elements,
+/// holes, and cycle back-references render as `""` (JS join semantics). The receiver
 /// is decoded as a whole so a self-reference is caught by the decoder's cycle
 /// guard. Returns the result's heap jsval bits.
 fn array_join<W: Send + 'static>(
@@ -345,21 +337,14 @@ fn array_join<W: Send + 'static>(
         other => to_js_string(&other),
     };
     let elems = match decode(HEAP | u64::try_from(ptr).ok()?, mem) {
-        Value::Array(elems) => elems,
+        Value::Array(elems, _) => elems,
         Value::Ref(_, inner) => match *inner {
-            Value::Array(elems) => elems,
+            Value::Array(elems, _) => elems,
             _ => return None,
         },
         _ => return None,
     };
-    let pieces: Vec<String> = elems
-        .iter()
-        .map(|elem| match elem {
-            Value::Null | Value::Undefined => String::new(),
-            other => to_js_string(other),
-        })
-        .collect();
-    alloc_string(caller, &pieces.join(&sep)).map(|base| HEAP | base)
+    alloc_string(caller, &join_elements(&elems, &sep)).map(|base| HEAP | base)
 }
 
 /// Resolve one JS slice endpoint against a sequence `len`: `undefined` uses
@@ -384,7 +369,7 @@ fn slice_index(bits: u64, mem: &[u8], default: usize, len: usize) -> usize {
 
 /// `array.slice(a, b)`: a NEW heap array of elements `[a, b)` (JS negative/clamp
 /// semantics; `b` omitted => to end). Element jsval bits are copied verbatim, so
-/// heap-reference elements stay shared. Returns the result's heap jsval bits.
+/// heap-reference elements stay shared and holes stay holes. Returns the result's heap jsval bits.
 fn array_slice<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     mem: &[u8],
@@ -392,12 +377,15 @@ fn array_slice<W: Send + 'static>(
     a: i64,
     b: i64,
 ) -> Option<u64> {
-    let len = block_len(mem, ptr)?;
+    let (len, present) = array_elements(mem, ptr)?;
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
-    let elems = (start..end)
-        .map(|i| array_elem_bits(mem, ptr, i))
-        .collect::<Option<Vec<u64>>>()?;
+    let mut elems = vec![abi::HOLE; end - start];
+    for (i, bits) in present {
+        if (start..end).contains(&i) {
+            elems[i - start] = bits;
+        }
+    }
     alloc_array(caller, &elems).map(|base| HEAP | base)
 }
 

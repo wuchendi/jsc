@@ -414,6 +414,7 @@ impl LowerCtx<'_> {
                 then_body: vec![IrStmt::Expr(IrNode::ArrayPush {
                     local: tmp,
                     value: Box::new(IrNode::Local(j)),
+                    not_array: None,
                 })],
                 else_body: Vec::new(),
             });
@@ -423,6 +424,7 @@ impl LowerCtx<'_> {
         let overflow = self.overflow_loop(n, k, spread, |_, value| IrNode::ArrayPush {
             local: tmp,
             value: Box::new(value),
+            not_array: None,
         });
         body.push(overflow);
         let rest_local = self.declare(rest_ident.id.sym.as_ref(), true, binding_id(rest_ident));

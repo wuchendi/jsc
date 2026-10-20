@@ -884,6 +884,7 @@ impl LowerCtx<'_> {
                 obj: Box::new(IrNode::Local(temp)),
                 index: Box::new(IrNode::Local(idx)),
             }),
+            not_array: None,
         })];
         let update = vec![IrStmt::Expr(IrNode::Assign {
             local: idx,
@@ -1126,10 +1127,8 @@ impl LowerCtx<'_> {
                         out.push(IrStmt::Decl { local: key, init });
                         IrNode::Local(key)
                     }
-                    MemberProp::Ident(id) if id.sym.as_ref() != "length" => {
-                        IrNode::Str(id.sym.as_ref().to_owned())
-                    }
-                    _ => {
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                    MemberProp::PrivateName(_) => {
                         return Err(CompileError::spanned(
                             m.span(),
                             "unsupported assignment target",

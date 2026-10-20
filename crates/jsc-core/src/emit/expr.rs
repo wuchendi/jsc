@@ -45,6 +45,9 @@ pub(super) fn emit_node(
         IrNode::Undefined => {
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
+        IrNode::ArrayHole => {
+            function.instruction(&Instruction::I64Const(HOLE_BITS));
+        }
         IrNode::Local(index) => {
             function.instruction(&Instruction::LocalGet(*index));
         }
@@ -256,17 +259,23 @@ pub(super) fn emit_node(
         IrNode::MathSpread { op, args } => {
             emit_math_spread(*op, args, function, scratch, strings, helpers);
         }
-        // The receiver binding is guarded before the argument runs (the member
-        // read precedes argument evaluation).
-        IrNode::ArrayPush { local, value } => {
-            let key = IrNode::Str("push".to_owned());
-            emit_nullish_guard(function, *local, &key, false, scratch, strings, helpers);
-            emit_array_push_node(*local, value, function, scratch, strings, helpers);
+        IrNode::ArrayPush {
+            local,
+            value,
+            not_array,
+        } => {
+            emit_array_push_node(
+                *local,
+                value,
+                not_array.as_ref(),
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
         }
-        IrNode::ArrayPop { local } => {
-            let key = IrNode::Str("pop".to_owned());
-            emit_nullish_guard(function, *local, &key, false, scratch, strings, helpers);
-            emit_array_pop_node(*local, function, scratch);
+        IrNode::ArrayPop { local, not_array } => {
+            emit_array_pop_node(*local, not_array, function, scratch, strings, helpers);
         }
         IrNode::ArrayHof {
             op,
@@ -1250,8 +1259,8 @@ pub(super) fn emit_cell_new(
 }
 
 /// Emit `<recv>.length`: for a string or array operand (low 32 bits are the
-/// block base) read the u32 `len` header at `base + HEADER_SIZE` and rebox it
-/// as a number jsval; any other heap operand reads its `length` property
+/// block base) read its u32 length (a string's at `base + HEADER_SIZE`, an
+/// array's at `base + ARRAY_LEN_OFFSET`) and rebox it as a number jsval; any other heap operand reads its `length` property
 /// through `__get`; a primitive operand yields `undefined` without touching
 /// memory. The operand is stashed in the general i64 scratch slot (`+0`).
 pub(super) fn emit_str_len(
@@ -1267,18 +1276,28 @@ pub(super) fn emit_str_len(
     function.instruction(&Instruction::LocalSet(scratch));
     emit_is_pointer(function, scratch);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // A string or array (kind byte <= TYPE_ARRAY) reads its length header; any
-    // other heap value (a function's `length`, an object's own) is a `__get`.
-    function.instruction(&Instruction::LocalGet(scratch));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I32Load8U(MemArg {
+    // A string or array (kind byte <= TYPE_ARRAY) reads its length; any other
+    // heap value (a function's `length`, an object's own) is a `__get`.
+    let kind = MemArg {
         offset: 0,
         align: 0,
         memory_index: 0,
-    }));
+    };
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(kind));
     function.instruction(&Instruction::I32Const(TYPE_ARRAY));
     function.instruction(&Instruction::I32LeU);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    // kind != TYPE_STRING (so TYPE_ARRAY) ? array length : string length.
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(kind));
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(array_len_slot()));
+    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
@@ -1286,6 +1305,7 @@ pub(super) fn emit_str_len(
         align: 2,
         memory_index: 0,
     }));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
     function.instruction(&Instruction::Else);
@@ -1800,7 +1820,8 @@ pub(super) fn emit_call_spread(
 }
 
 /// Build a spread call's argument array (the `args` [`IrNode::ArraySpread`]) and
-/// stash its block base into `base` and its element count into `len`.
+/// stash its handle base into `base` and its element count into `len`. The
+/// array is fresh, private and dense (spreading reads holes as `undefined`).
 fn emit_spread_args_setup(
     args: &IrNode,
     base: u32,
@@ -1812,19 +1833,15 @@ fn emit_spread_args_setup(
 ) {
     emit_node(args, function, scratch, strings, helpers);
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(base));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::LocalTee(base));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::LocalSet(len));
 }
 
 /// Push the uniform ABI's `K` positional slots from a spread call's argument
-/// array: slot `i` is `array[i]` (the i64 at `base + HEADER_SIZE + 4 + 8*i`)
-/// when `i < len`, else `undefined`. Any element beyond `K` stays in the array,
+/// array (handle base in `base`): slot `i` is `array[i]` (the i64 at
+/// `store + ELEMS_DATA_OFFSET + 8*i`, `store` the handle's element store) when
+/// `i < len`, else `undefined`. Any element beyond `K` stays in the array,
 /// which [`emit_publish_spread_args`] hands to the callee.
 fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: Helpers<'_>) {
     for i in 0..helpers.max_args {
@@ -1834,18 +1851,15 @@ fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: 
         function.instruction(&Instruction::I32GtU);
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         function.instruction(&Instruction::LocalGet(base));
-        function.instruction(&Instruction::I64Load(MemArg {
-            offset: (HEADER_SIZE + 4) as u64 + 8 * u64::from(i),
-            align: 0,
-            memory_index: 0,
-        }));
+        emit_array_elems(function);
+        function.instruction(&Instruction::I64Load(elem_slot(u64::from(i))));
         function.instruction(&Instruction::Else);
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         function.instruction(&Instruction::End);
     }
 }
 
-/// Publish a spread call's argument array (block base in `base`) in
+/// Publish a spread call's argument array (handle base in `base`) in
 /// `$__spread_args` right before the call, after every argument and the callee
 /// were evaluated, so a callee gathering its arguments reads the ones beyond
 /// `K` from it (only when its argument count exceeds `K`). Stack-neutral.

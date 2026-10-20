@@ -65,11 +65,10 @@ fn array_push_decodes_grown_array() {
     let result = compile_and_run("let a=[1,2]; a.push(3); a").expect("pipeline should succeed");
     assert_eq!(
         result,
-        Value::Array(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0),
-        ])
+        Value::Array(
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0),],
+            Vec::new()
+        )
     );
 }
 
@@ -79,7 +78,7 @@ fn array_pop_decodes_shrunk_array() {
     let result = compile_and_run("let a=[10,20,30]; a.pop(); a").expect("pipeline should succeed");
     assert_eq!(
         result,
-        Value::Array(vec![Value::Number(10.0), Value::Number(20.0)])
+        Value::Array(vec![Value::Number(10.0), Value::Number(20.0)], Vec::new())
     );
 }
 
@@ -96,16 +95,6 @@ fn array_push_preserves_string_elements() {
 #[test]
 fn array_pop_then_push_length() {
     assert_number("let a=[1,2,3]; a.pop(); a.push(9); a.length", 3.0);
-}
-
-/// Growing a captured (boxed-cell) array is out of scope: it is a compile error,
-/// not a silent miscompile.
-#[test]
-fn array_push_on_captured_array_errors() {
-    assert!(
-        compile_and_run("let a=[1,2]; let f=()=>a[0]; a.push(3)").is_err(),
-        "push on a captured array should be rejected"
-    );
 }
 
 /// `push`/`pop` arities are validated at compile time.
