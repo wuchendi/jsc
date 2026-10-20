@@ -614,3 +614,44 @@ fn nested_await_store_targets_the_receiver_captured_before_it() {
         "5 0\n",
     );
 }
+
+/// An `await` in a `for-of` body over an array keeps the loop's cursor across
+/// each resume.
+#[test]
+fn await_in_a_for_of_body() {
+    assert_output(
+        "async function f(xs){ let s = 0; for (const x of xs) { s += await x } return s }
+         f([1, 2, 3]).then(v => console.log(v));",
+        "6\n",
+    );
+}
+
+/// An `await` in a `for-in` body walks every key of the snapshot.
+#[test]
+fn await_in_a_for_in_body() {
+    assert_output(
+        "async function f(o){ let out = \"\"; for (const k in o) { out = out + k + (await o[k]); } return out }
+         f({ a: 1, b: 2 }).then(v => console.log(v));",
+        "a1b2\n",
+    );
+}
+
+/// An `await` inside a `switch` case resumes into the selected clause, and
+/// `break` after the resume leaves the switch.
+#[test]
+fn await_in_a_switch_case() {
+    assert_output(
+        "async function f(x){
+           let r = \"\";
+           switch (await x) {
+             case 1: r = r + (await \"one\"); break;
+             case 2: r = r + \"two\";
+             default: r = r + (await \"dflt\");
+           }
+           return r;
+         }
+         f(1).then(v => console.log(v));
+         f(2).then(v => console.log(v));",
+        "one\ntwodflt\n",
+    );
+}

@@ -233,3 +233,22 @@ fn labeled_break_continue_via_eval() {
         "12"
     );
 }
+
+/// A `yield` inside a `for-of` body and inside a `switch` case, end to end.
+#[test]
+fn generator_yield_in_for_of_and_switch_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function* g(xs){ for (const x of xs) { yield x * 2 } } [...g([1,2,3])]"
+        ]),
+        "[ 2, 4, 6 ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function* g(x){ switch (x) { case 1: yield \"a\"; case 2: yield \"b\"; break; default: yield \"c\" } } [...g(1)].join(\"\")"
+        ]),
+        "ab"
+    );
+}
