@@ -98,16 +98,6 @@ fn array_pop_then_push_length() {
     assert_number("let a=[1,2,3]; a.pop(); a.push(9); a.length", 3.0);
 }
 
-/// Growing a captured (boxed-cell) array is out of scope: it is a compile error,
-/// not a silent miscompile.
-#[test]
-fn array_push_on_captured_array_errors() {
-    assert!(
-        compile_and_run("let a=[1,2]; let f=()=>a[0]; a.push(3)").is_err(),
-        "push on a captured array should be rejected"
-    );
-}
-
 /// `push`/`pop` arities are validated at compile time.
 #[test]
 fn array_method_arity_errors() {

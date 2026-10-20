@@ -242,3 +242,87 @@ fn index_computed_rhs_and_index_no_clobber() {
     // Computed index on a READ.
     assert_eq!(jsc(&["-p", "let a=[10,20]; let i=0; a[i+1]"]), "20");
 }
+
+/// `push`/`pop` accept any receiver expression, evaluated exactly once:
+/// captured bindings, module bindings read inside functions, parameters,
+/// member reads, call results, and element reads.
+#[test]
+fn push_pop_on_any_receiver() {
+    let cases: [(&str, &str); 12] = [
+        (
+            "function f(){ let a=[]; const g=()=>a.push(1); g(); g(); return a.length } f()",
+            "2",
+        ),
+        (
+            "const a=[]; function f(){ a.push(1) } f(); f(); a.length",
+            "2",
+        ),
+        (
+            "function add(xs,v){ xs.push(v) } const a=[]; add(a,1); add(a,2); a",
+            "[ 1, 2 ]",
+        ),
+        (
+            "const o={xs:[]}; o.xs.push(1); o.xs.push(2); o.xs",
+            "[ 1, 2 ]",
+        ),
+        (
+            "let n=0; const a=[]; function f(){ n++; return a } f().push(7); f().push(8); n+':'+a",
+            "2:7,8",
+        ),
+        (
+            "const m=[[1],[2]]; let i=1; m[i].push(3); m",
+            "[ [ 1 ], [ 2, 3 ] ]",
+        ),
+        ("let a=[1]; const b=a; (()=>a.push(2))(); b.length", "2"),
+        (
+            "function f(){ let a=[1,2]; const g=()=>a.pop(); return g()+':'+a.length } f()",
+            "2:1",
+        ),
+        (
+            "const a=[1,2]; function f(){ return a.pop() } f()+':'+a.length",
+            "2:1",
+        ),
+        (
+            "function p(xs){ return xs.pop() } const a=[5,6]; p(a)+':'+a",
+            "6:5",
+        ),
+        ("const o={xs:[1,2]}; o.xs.pop()+':'+o.xs.length", "2:1"),
+        (
+            "let n=0; const a=[1,2]; function f(){ n++; return a } f().pop()+':'+n+':'+a",
+            "2:1:1",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(jsc(&["-p", src]), want, "{src}");
+    }
+}
+
+/// A non-array receiver throws `<recv>.push is not a function` (the method is
+/// absent), after the arguments are evaluated; a nullish receiver still throws
+/// the member-read `TypeError` first.
+#[test]
+fn push_pop_on_non_array_receiver_throws() {
+    assert_eq!(
+        caught("const o={}; o.push(1)"),
+        "true|o.push is not a function"
+    );
+    assert_eq!(
+        caught("const o={v:5}; o.v.pop()"),
+        "true|o.v.pop is not a function"
+    );
+    assert_eq!(
+        caught("function f(){ return 1 } f().push(2)"),
+        "true|expression is not a function"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let n=0; const o={}; try { o.push(n++) } catch(e) {} n"
+        ]),
+        "1"
+    );
+    assert_eq!(
+        caught("const o={xs:null}; o.xs.push(1)"),
+        "true|Cannot read properties of null (reading 'push')"
+    );
+}

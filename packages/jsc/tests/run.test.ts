@@ -193,6 +193,10 @@ it('renders cyclic structures Node-console style', async () => {
       '<ref *1> [ 1, [Circular *1] ]\n',
     ],
     [
+      'const a = [1]; a.push(a); console.log(a)',
+      '<ref *1> [ 1, [Circular *1] ]\n',
+    ],
+    [
       'let o = {self: null, x: 1}; o.self = o; console.log(o)',
       '<ref *1> { self: [Circular *1], x: 1 }\n',
     ],

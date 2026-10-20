@@ -335,6 +335,7 @@ impl LowerCtx<'_> {
                 then_body: vec![IrStmt::Expr(IrNode::ArrayPush {
                     local: tmp,
                     value: Box::new(IrNode::Local(j)),
+                    not_array: None,
                 })],
                 else_body: Vec::new(),
             });

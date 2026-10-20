@@ -7,10 +7,14 @@ use jsc_core::run::{compile_and_run, format_value};
 mod common;
 use common::assert_output;
 
-/// An array that contains itself. Built with in-bounds index writes: `push`
-/// reallocates the array today, so `a.push(a)` stores the old block.
+/// An array that contains itself, built by in-bounds index writes or by
+/// `push` (the handle never moves, so the pushed value is the array itself).
 #[test]
 fn self_array() {
+    assert_output(
+        "const a = [1]; a.push(a); console.log(a)",
+        "<ref *1> [ 1, [Circular *1] ]\n",
+    );
     assert_output(
         "let a = [1, 0]; a[1] = a; console.log(a)",
         "<ref *1> [ 1, [Circular *1] ]\n",

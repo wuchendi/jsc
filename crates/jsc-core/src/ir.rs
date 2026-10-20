@@ -796,24 +796,32 @@ pub enum IrNode {
         /// Whether this is a plain compound assignment or a member `++`/`--`.
         kind: OpSetKind,
     },
-    /// `array.push(value)` on a plain-local array binding. Appends `value` to the
-    /// array handle in place (`__array_push`, amortized store growth; the handle
-    /// never moves, so every alias observes it). Yields the new length as a
-    /// number jsval (JS semantics). Only a plain local receiver is supported — a
-    /// captured (boxed-cell) array is rejected at codegen.
+    /// `array.push(value)` on the array handle held in a wasm local. Appends
+    /// `value` to the handle in place (`__array_push`, amortized store growth;
+    /// the handle never moves, so every alias observes it). Yields the new
+    /// length as a number jsval (JS semantics). Codegen evaluates any receiver
+    /// expression into the local and guards it against `null`/`undefined`
+    /// before this node runs.
     ArrayPush {
         /// The wasm local holding the array handle.
         local: u32,
         /// The value appended at the new last slot.
         value: Box<IrNode>,
+        /// The `TypeError` (`<recv>.push is not a function`) thrown, after
+        /// `value` is evaluated, when the local is not a `TYPE_ARRAY` handle;
+        /// `None` for a compiler-built receiver that is always an array.
+        not_array: Option<CalleeError>,
     },
-    /// `array.pop()` on a plain-local array binding. Shrinks the handle in
-    /// place: its u32 length is decremented and the removed last element jsval
-    /// is yielded. An empty array
-    /// yields `undefined`.
+    /// `array.pop()` on the array handle held in a wasm local (receiver
+    /// evaluation and guards as for [`IrNode::ArrayPush`]). Shrinks the handle
+    /// in place: its u32 length is decremented and the removed last element
+    /// jsval is yielded. An empty array yields `undefined`.
     ArrayPop {
         /// The wasm local holding the array whose block is decremented in place.
         local: u32,
+        /// The `TypeError` (`<recv>.pop is not a function`) thrown when the
+        /// local is not a `TYPE_ARRAY` handle.
+        not_array: CalleeError,
     },
     /// An array higher-order method call `array.map/filter/reduce/forEach(...)`.
     /// The `array` receiver is evaluated once into a scratch base (so any array
@@ -1021,8 +1029,9 @@ pub enum IrNode {
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
     /// operands evaluated only for their side effects: surplus `Error(..)`
-    /// arguments, and the target and arguments of a `new` that then throws
-    /// `is not a constructor`.
+    /// arguments, the target and arguments of a `new` that then throws
+    /// `is not a constructor`, and the nullish-guarded receiver of a
+    /// `push`/`pop`.
     Seq(Vec<IrNode>),
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
