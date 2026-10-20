@@ -167,6 +167,16 @@ it('reports a host allocation past the memory cap like the Rust host', async () 
   await expect(run(src)).rejects.toThrow(/^Uncaught RangeError: out of memory$/)
 }, 60_000)
 
+it('reports a guest allocation past the memory cap like the Rust host', async () => {
+  // Same program as `huge_allocation_is_out_of_memory` in
+  // crates/jsc-core/tests/memory.rs: the guest's own `__alloc` for the 64M
+  // element spread fails inside `main` with no host import involved.
+  const src =
+    "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } " +
+    'let a = [...s]; a.length'
+  await expect(run(src)).rejects.toThrow(/^Uncaught RangeError: out of memory$/)
+}, 60_000)
+
 it('renders cyclic structures Node-console style', async () => {
   const cases: [string, string][] = [
     [
