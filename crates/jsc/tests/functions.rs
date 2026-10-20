@@ -207,14 +207,13 @@ fn call_spread_via_eval() {
         jsc(&["-p", "function add(a,b,c){return a+b+c} add(10,...[20,12])"]),
         "42"
     );
-    // A rest-parameter callee collects the spread via the dynamic argc. The
-    // uniform ABI passes K positional slots, so K (widened here by the 4-arg
-    // `sum(1,2,3,4)` call) must cover the spread's runtime length.
+    // A rest-parameter callee collects the whole spread via the dynamic argc,
+    // also the elements beyond the uniform ABI's K positional slots.
     assert_eq!(
         jsc(&[
             "-p",
             "function sum(...xs){let t=0;for(const x of xs)t=t+x;return t} \
-             sum(1,2,3,4); sum(...[1,2,3,4])"
+             sum(...[1,2,3,4])"
         ]),
         "10"
     );

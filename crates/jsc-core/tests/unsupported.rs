@@ -68,20 +68,12 @@ fn rejects_top_level_this() {
 }
 
 #[test]
-fn rejects_class_expressions() {
-    // A single class declaration with a constructor is supported, as are
-    // `extends`/`super` (see the classes suite), but a class
-    // EXPRESSION (`let C = class{}`) remains out of scope.
-    assert_rejected("let C = class {}; new C()");
-    assert_rejected("let C = class { constructor() {} }; new C()");
-    // `extends` requires a NAMED class declared earlier; other superclass forms
-    // stay rejected.
-    assert_rejected("class B extends Missing {} new B()");
-    assert_rejected("let X = 1; class B extends X {} new B()");
-    // Plain instance methods, plain instance fields, and `static`
-    // members are supported (see the classes suite); computed field forms remain
-    // out of scope.
+fn rejects_computed_class_fields() {
+    // Class declarations and expressions, `extends` of any expression, and
+    // plain/static members are supported (see the classes suites); computed
+    // field forms remain out of scope.
     assert_rejected("class A { [k] = 1 } new A()");
+    assert_rejected("let C = class { [k] = 1 }; new C()");
 }
 
 #[test]

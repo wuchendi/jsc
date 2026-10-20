@@ -59,6 +59,13 @@ pub(crate) const NULL: u64 = 0x7FFA_0000_0000_0000;
 /// fallbacks.
 pub(crate) const UNDEFINED: u64 = 0x7FFB_0000_0000_0000;
 
+/// An array hole: an element slot with no element (a literal elision, a
+/// `delete`d index, or a gap left by growth by index). [`UNDEFINED`] with a
+/// nonzero payload, which no JS value produces, so it never escapes to JS: an
+/// element read that loads it yields `undefined`. The same bit pattern marks
+/// a module cell still in its TDZ.
+pub(crate) const HOLE: u64 = UNDEFINED | 1;
+
 /// The `typeof` result strings, in `typeof`-index order. A `typeof` result is a
 /// real interned HEAP STRING (tag `0b100` is retired), so these are the words
 /// `emit_typeof_node` interns and selects between; the decoder reads them back as
@@ -109,6 +116,10 @@ pub(crate) const CLASS_ORDINARY: u8 = 0;
 /// `name`.
 pub(crate) const CLASS_ERROR: u8 = 1;
 
+/// [`TYPE_OBJECT`] `class` byte: an (unmapped) `arguments` object. It owns
+/// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
+pub(crate) const CLASS_ARGUMENTS: u8 = 2;
+
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
@@ -116,8 +127,7 @@ pub(crate) const BLOCK_ALIGN: u32 = 8;
 
 /// Byte offset of the object-family prefix's `props: u32` slot (right after the
 /// header): the base of the block's [`TYPE_PROPS`] own-property table, `0` = no
-/// own named properties. Shared by every object-family kind except
-/// [`TYPE_ARRAY`] (which still carries its pre-prefix layout).
+/// own named properties. Shared by every object-family kind.
 pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
 
 /// Object-family header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the object
@@ -148,9 +158,30 @@ pub(crate) const ABI_TRAILING_PARAMS: u32 = 2;
 /// `[type=0][pad×3][len:u32][utf8]`. Maps to `typeof` "string".
 pub(crate) const TYPE_STRING: u8 = 0;
 
-/// TYPE BYTE of a heap array block:
-/// `[type=1][pad×3][len:u32][elem:i64 × len]`. Maps to `typeof` "object".
+/// TYPE BYTE of an array handle: the object-family prefix, then
+/// `[len:u32 @16][elems:u32 @20]` ([`ARRAY_BLOCK_SIZE`] bytes). `elems` is the
+/// base of the [`TYPE_ELEMS`] store holding the elements (`0` while the
+/// capacity is 0). Growth replaces the store and rewrites `elems`, so the handle
+/// never moves. `props` holds the named properties, and on an
+/// [`ARRAY_FLAG_SPARSE`] array also the elements past the store. Maps to
+/// `typeof` "object".
 pub(crate) const TYPE_ARRAY: u8 = 1;
+
+/// Byte offset (from a [`TYPE_ARRAY`] handle base) of the u32 `length`.
+pub(crate) const ARRAY_LEN_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_ARRAY`] handle base) of the u32 base of its
+/// [`TYPE_ELEMS`] store, `0` when the capacity is 0.
+pub(crate) const ARRAY_ELEMS_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// The byte size of a [`TYPE_ARRAY`] handle.
+pub(crate) const ARRAY_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is sparse. Its store keeps
+/// elements `0..cap` (holes past `length`); every element at or past `cap` is
+/// an array-index key in its `props` table, so `length` may exceed the store.
+/// Set by a store or `length` write past the dense-growth bound; never cleared.
+pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
 
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
@@ -190,6 +221,11 @@ pub(crate) const FUNC_FLAG_CONSTRUCTOR: u8 = 8;
 /// Its `prototype` is installed by the class definition, not materialized.
 pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
 
+/// [`TYPE_FUNCTION`] header `flags` bit: the constructor allocates its own
+/// `this` (a derived class: `super(..)` constructs it), so `new` skips the
+/// allocation.
+pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
@@ -218,11 +254,10 @@ pub(crate) const TYPE_CELL: u8 = 5;
 
 /// TYPE BYTE of a `Map` handle block: the object-family prefix, then
 /// `[size:u32 @16][pad:u32][entries:i64 @24]`. `size` is the logical entry count
-/// (backing `.size`); `entries` is a heap jsval pointing at a GROWABLE array that
-/// stores the `(key, value)` pairs flattened (key at even element slots, value at
-/// the following odd slot). Growth reallocs that backing array and rewrites the
-/// `entries` slot IN PLACE, so the handle jsval never moves. Maps to `typeof`
-/// "object".
+/// (backing `.size`); `entries` is a heap jsval pointing at a [`TYPE_ARRAY`]
+/// that stores the `(key, value)` pairs flattened (key at even element slots,
+/// value at the following odd slot) and grows in place like any array. Maps to
+/// `typeof` "object".
 pub(crate) const TYPE_MAP: u8 = 6;
 
 /// TYPE BYTE of a `Set` handle block: identical layout to [`TYPE_MAP`]. A Set reuses the same flattened
@@ -391,6 +426,20 @@ pub(crate) const PROPS_HAS_INDEX_KEYS: u8 = 1;
 /// [`TYPE_PROPS`] `tflags` bit: some entry lacks [`ATTR_ENUMERABLE`].
 pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
 
+/// TYPE BYTE of an array element store (internal, never a user value), the
+/// block a [`TYPE_ARRAY`] handle's `elems` slot points at:
+/// `[type=13][pad×3][cap:u32 @4]` followed by `cap` element jsvals from
+/// [`ELEMS_DATA_OFFSET`] (`8 + 8 * cap` bytes). Slots at and past the owner's
+/// `length` are unused.
+pub(crate) const TYPE_ELEMS: u8 = 13;
+
+/// Byte offset (from a [`TYPE_ELEMS`] block base) of the u32 `cap`.
+pub(crate) const ELEMS_CAP_OFFSET: u32 = HEADER_SIZE;
+
+/// Byte offset (from a [`TYPE_ELEMS`] block base) of element 0; element `i`
+/// is the jsval at `ELEMS_DATA_OFFSET + 8 * i`.
+pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
+
 /// Property `attrs` bit: a data property's value may be reassigned (ignored
 /// for an accessor).
 pub(crate) const ATTR_WRITABLE: u32 = 1;
@@ -530,7 +579,8 @@ pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
 pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
 
 /// The name under which the module exports the `__new_array(len: i32) -> base:
-/// i32` constructor: a [`TYPE_ARRAY`] block with `len` set and every element
+/// i32` constructor: a [`TYPE_ARRAY`] handle with `len` set and a `cap = len`
+/// [`TYPE_ELEMS`] store (none when `len` is 0) whose every element is
 /// `undefined`. The hosts allocate every array through it.
 pub(crate) const NEW_ARRAY_EXPORT_NAME: &str = "__new_array";
 

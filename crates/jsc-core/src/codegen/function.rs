@@ -192,6 +192,15 @@ impl LowerCtx<'_> {
             }));
         }
 
+        // A base class constructor defines the instance fields first (design
+        // 4.5: right after allocation, before the parameters are bound).
+        if self.frame().ctor == FnKind::Class
+            && let Some(this_local) = self.ensure_this_local()
+            && let Some(fields) = self.lower_field_inits(IrNode::Local(this_local))?
+        {
+            body.push(IrStmt::Expr(fields));
+        }
+
         // Default-parameter guards, IN PARAMETER ORDER (after capture-boxing so a
         // defaulted cell param reads/writes its boxed cell).
         self.lower_default_guards(defaults, &mut body)?;
@@ -225,6 +234,19 @@ impl LowerCtx<'_> {
             self.lower_binding_pattern(pat, IrNode::Local(temp), true, &mut body)?;
         }
 
+        if self.frame().derived()
+            && let BodyKind::Block(stmts) = body_kind
+        {
+            self.frame().supers.top_level = stmts.iter().find_map(super_call_span);
+            if stmts.iter().any(|s| stmt_arrow_super(s, false)) {
+                let (cell, id) = self.hidden_local();
+                self.frame().supers.this_cell = Some(id);
+                body.push(IrStmt::Expr(IrNode::Assign {
+                    local: cell,
+                    value: Box::new(IrNode::CellNew(Box::new(IrNode::Hole))),
+                }));
+            }
+        }
         match body_kind {
             BodyKind::Block(stmts) => self.lower_stmts(stmts, &mut body)?,
             BodyKind::Expr(expr) => {
@@ -233,18 +255,67 @@ impl LowerCtx<'_> {
             }
         }
 
+        // A derived constructor falling off its end returns `this`, which must
+        // have been bound by `super(..)`.
+        let derived = self.frame().derived();
+        if derived {
+            let fi = self.top();
+            let this = self.derived_this(fi);
+            body.push(IrStmt::Return(Some(this)));
+        }
+
         // If the body read `this`, prepend the prologue snapshot as the VERY FIRST
         // statement: `this_slot = __this`, so a nested `this.other()` that
         // re-sets the global cannot disturb this frame's own receiver. A function
         // that never reads `this` needs no snapshot (its slot was never allocated),
-        // leaving its IR unchanged.
+        // leaving its IR unchanged. A derived constructor's `this` starts in the
+        // TDZ instead (the hole), until `super(..)` binds it.
         if let Some(this_local) = self.frame().this_local {
             body.insert(
                 0,
                 IrStmt::Expr(IrNode::Assign {
                     local: this_local,
-                    value: Box::new(IrNode::ThisGlobal),
+                    value: Box::new(if derived {
+                        IrNode::Hole
+                    } else {
+                        IrNode::ThisGlobal
+                    }),
                 }),
+            );
+        }
+        // Likewise `new.target` (referenced here or by a nested arrow): the
+        // `__new_target` global under the construct marker (`argc < 0`), else
+        // `undefined`.
+        if let Some(local) = self.frame().new_target_local {
+            body.insert(
+                0,
+                IrStmt::Expr(IrNode::Assign {
+                    local,
+                    value: Box::new(IrNode::Ternary {
+                        cond: Box::new(IrNode::IsConstructCall(k + 1)),
+                        then_branch: Box::new(IrNode::NewTargetGlobal),
+                        else_branch: Box::new(IrNode::Undefined),
+                    }),
+                }),
+            );
+        }
+
+        // `arguments` (referenced here or by a nested arrow): built from the
+        // incoming slots before any parameter is boxed, defaulted or assigned
+        // (unmapped semantics).
+        if let Some(local) = self.frame().arguments_local {
+            let init = self.lower_arguments_object(local, k);
+            body.splice(0..0, init);
+        }
+        // A function gathering its arguments snapshots `__spread_args` first,
+        // before any call in its prologue or body can overwrite it.
+        if let Some(local) = self.frame().spread_args_local {
+            body.insert(
+                0,
+                IrStmt::Decl {
+                    local,
+                    init: IrNode::SpreadArgsGlobal,
+                },
             );
         }
 
@@ -307,9 +378,12 @@ impl LowerCtx<'_> {
     /// Emit the prologue for a trailing rest parameter: collect
     /// `[arg_p, .., arg_{argc-1}]` into a REAL array bound to the rest name.
     ///
-    /// `argc` (local `k + 1`, a number jsval) is the actual source argument count,
-    /// so each positional slot `j in p..k` is appended only when `j < argc` —
-    /// excluding the `undefined` padding beyond the real arguments. The array is
+    /// `argc` (local `k + 1`, a number jsval) is the actual source argument count
+    /// `n`, or the construct marker `-(n + 1)` (decoded first), so each
+    /// positional slot `j in p..k` is appended only when `j < n` —
+    /// excluding the `undefined` padding beyond the real arguments — and the
+    /// arguments `k..n` of a spread call are appended from the spread argument
+    /// array ([`Self::overflow_loop`]). The array is
     /// built in a plain temp local (`ArrayPush` needs a plain array binding), then
     /// bound to the rest name, boxed into a cell when the binding is captured.
     fn lower_rest_param(
@@ -319,7 +393,12 @@ impl LowerCtx<'_> {
         k: u32,
         body: &mut Vec<IrStmt>,
     ) {
-        let argc = IrNode::Local(k + 1);
+        let n = self.fresh();
+        body.push(IrStmt::Decl {
+            local: n,
+            init: IrNode::ArgCount(k + 1),
+        });
+        let argc = IrNode::Local(n);
         let tmp = self.fresh();
         body.push(IrStmt::Decl {
             local: tmp,
@@ -335,10 +414,19 @@ impl LowerCtx<'_> {
                 then_body: vec![IrStmt::Expr(IrNode::ArrayPush {
                     local: tmp,
                     value: Box::new(IrNode::Local(j)),
+                    not_array: None,
                 })],
                 else_body: Vec::new(),
             });
         }
+        // Arguments beyond the `K` slots come from the spread argument array.
+        let spread = self.spread_args_local();
+        let overflow = self.overflow_loop(n, k, spread, |_, value| IrNode::ArrayPush {
+            local: tmp,
+            value: Box::new(value),
+            not_array: None,
+        });
+        body.push(overflow);
         let rest_local = self.declare(rest_ident.id.sym.as_ref(), true, binding_id(rest_ident));
         let init = if self.is_cell(rest_local) {
             IrNode::CellNew(Box::new(IrNode::Local(tmp)))
@@ -349,6 +437,102 @@ impl LowerCtx<'_> {
             local: rest_local,
             init,
         });
+    }
+
+    /// The prologue building this function's `arguments` object into `local`:
+    /// an ordinary object of class ARGUMENTS (`proto` the `%Object.prototype%`
+    /// placeholder `null`) with a non-enumerable `length` = `n` and the own
+    /// properties `"0".."n-1"` holding every actual argument (slots `0..k`, then
+    /// the spread overflow). Unmapped: the values are copied, never aliased.
+    fn lower_arguments_object(&mut self, local: u32, k: u32) -> Vec<IrStmt> {
+        let n = self.fresh();
+        let mut out = vec![
+            IrStmt::Decl {
+                local: n,
+                init: IrNode::ArgCount(k + 1),
+            },
+            IrStmt::Decl {
+                local,
+                init: IrNode::Object {
+                    entries: vec![(PropKey::Hidden("length".to_owned()), IrNode::Local(n))],
+                    proto: None,
+                    class: crate::abi::CLASS_ARGUMENTS,
+                    reserve: k + 1,
+                },
+            },
+        ];
+        let set = |index: IrNode, value: IrNode| IrNode::IndexSet {
+            obj: Box::new(IrNode::Local(local)),
+            index: Box::new(index),
+            value: Box::new(value),
+        };
+        for j in 0..k {
+            out.push(IrStmt::If {
+                cond: IrNode::Binary {
+                    op: BinOp::Lt,
+                    lhs: Box::new(IrNode::Num(f64::from(j))),
+                    rhs: Box::new(IrNode::Local(n)),
+                },
+                then_body: vec![IrStmt::Expr(set(
+                    IrNode::Num(f64::from(j)),
+                    IrNode::Local(j),
+                ))],
+                else_body: Vec::new(),
+            });
+        }
+        let spread = self.spread_args_local();
+        out.push(self.overflow_loop(n, k, spread, set));
+        out
+    }
+
+    /// `if (k < n) for (let i = k; i < n; i++) store(i, spread[i])`: hand each
+    /// argument beyond the `K` slots — only a spread call passes more than `K`
+    /// — from the spread argument array snapshot in `spread` to `store`. `n` is
+    /// the local holding the decoded argument count.
+    fn overflow_loop(
+        &mut self,
+        n: u32,
+        k: u32,
+        spread: u32,
+        store: impl FnOnce(IrNode, IrNode) -> IrNode,
+    ) -> IrStmt {
+        let i = self.fresh();
+        let index = IrNode::Local(i);
+        let value = IrNode::Index {
+            obj: Box::new(IrNode::Local(spread)),
+            index: Box::new(index.clone()),
+        };
+        IrStmt::If {
+            cond: IrNode::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(IrNode::Num(f64::from(k))),
+                rhs: Box::new(IrNode::Local(n)),
+            },
+            then_body: vec![
+                IrStmt::Decl {
+                    local: i,
+                    init: IrNode::Num(f64::from(k)),
+                },
+                IrStmt::While {
+                    cond: IrNode::Binary {
+                        op: BinOp::Lt,
+                        lhs: Box::new(index.clone()),
+                        rhs: Box::new(IrNode::Local(n)),
+                    },
+                    body: vec![IrStmt::Expr(store(index.clone(), value))],
+                    update: vec![IrStmt::Expr(IrNode::Assign {
+                        local: i,
+                        value: Box::new(IrNode::Binary {
+                            op: BinOp::Add,
+                            lhs: Box::new(index),
+                            rhs: Box::new(IrNode::Num(1.0)),
+                        }),
+                    })],
+                    label: None,
+                },
+            ],
+            else_body: Vec::new(),
+        }
     }
 
     /// Lift a function/arrow to a top-level [`IrFunction`] (registered in the
@@ -362,6 +546,19 @@ impl LowerCtx<'_> {
         body_kind: BodyKind<'_>,
         name: &str,
         kind: FnKind,
+    ) -> anyhow::Result<IrNode> {
+        self.lower_lifted(param_pats, body_kind, name, kind, false)
+    }
+
+    /// [`Self::lower_lifted_function`], for an arrow body when `arrow` is set
+    /// (it reads its enclosing function's `new.target`).
+    fn lower_lifted(
+        &mut self,
+        param_pats: &[&Pat],
+        body_kind: BodyKind<'_>,
+        name: &str,
+        kind: FnKind,
+        arrow: bool,
     ) -> anyhow::Result<IrNode> {
         // Reserve this function's table slot before lowering its body, so any
         // function nested in the body takes a later slot.
@@ -380,6 +577,10 @@ impl LowerCtx<'_> {
         let table_index = self.shared.arrow_base - 1 + u32::try_from(pos).unwrap_or(u32::MAX);
 
         self.push_frame();
+        self.frame().arrow = arrow;
+        if matches!(kind, FnKind::Class | FnKind::DerivedClass) {
+            self.frame().ctor = kind;
+        }
         let built = self.build_function_body(param_pats, body_kind);
         let (mut func, env_layout) = match built {
             Ok(pair) => pair,
@@ -389,6 +590,11 @@ impl LowerCtx<'_> {
             }
         };
         self.pop_frame();
+        // A class constructor called without the construct marker throws
+        // before anything else runs (design 4.5).
+        if matches!(kind, FnKind::Class | FnKind::DerivedClass) {
+            func.body.insert(0, class_call_guard(name, func.params - 1));
+        }
         func.info = fn_info(name, param_pats, kind);
         self.shared.arrows.borrow_mut()[pos] = func;
 
@@ -455,8 +661,9 @@ impl LowerCtx<'_> {
     /// enclosing bindings the body references. An expression body (`=> expr`)
     /// desugars to `return expr`; a block body (`=> { .. }`) lowers its statements
     /// directly. Single-parameter (`x => ..`) and parenthesized zero/multi-parameter
-    /// forms all lower the same way. Arrows carry no `this`/`arguments`, and are
-    /// not constructors. `name` is the inferred `name` (`""` when anonymous).
+    /// forms all lower the same way. Arrows read the enclosing function's
+    /// `new.target`/`arguments`, and are not constructors. `name` is the
+    /// inferred `name` (`""` when anonymous).
     pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr, name: &str) -> anyhow::Result<IrNode> {
         // `async`/generator arrows are out of scope: reject rather than
         // silently compile the body as a plain arrow (wrong result).
@@ -475,6 +682,203 @@ impl LowerCtx<'_> {
             ArrowFunctionBody::FunctionBody(block) => BodyKind::Block(&block.stmts),
             ArrowFunctionBody::Expr(expr) => BodyKind::Expr(expr),
         };
-        self.lower_lifted_function(&param_pats, body_kind, name, FnKind::Plain)
+        self.lower_lifted(&param_pats, body_kind, name, FnKind::Plain, true)
+    }
+}
+
+impl LowerCtx<'_> {
+    /// The derived constructor frame whose `this` the current code reads: the
+    /// current frame, or the one enclosing the current arrows when its `this`
+    /// lives in a cell ([`SuperCalls::this_cell`]).
+    pub(super) fn derived_frame(&self) -> Option<usize> {
+        let fi = self.frames.iter().rposition(|f| !f.arrow)?;
+        let frame = &self.frames[fi];
+        (frame.derived() && (fi == self.top() || frame.supers.this_cell.is_some())).then_some(fi)
+    }
+
+    /// The current value of derived constructor frame `fi`'s `this` (the
+    /// hole before `super(..)`), unchecked.
+    pub(super) fn derived_this_raw(&mut self, fi: usize) -> IrNode {
+        match self.frames[fi].supers.this_cell {
+            Some(id) => IrNode::CellGet(Box::new(self.read_hidden(fi, id))),
+            None => IrNode::Local(self.ensure_this_local().unwrap_or(0)),
+        }
+    }
+
+    /// Read derived constructor frame `fi`'s `this`: TDZ-checked unless a
+    /// top-level `super(..)` already bound it (see [`SuperCalls::top_level`]).
+    pub(super) fn derived_this(&mut self, fi: usize) -> IrNode {
+        let raw = self.derived_this_raw(fi);
+        if fi == self.top() && self.frame().supers.this_bound {
+            return raw;
+        }
+        IrNode::Ternary {
+            cond: Box::new(IrNode::IsHole(Box::new(raw.clone()))),
+            then_branch: Box::new(IrNode::Throw(Box::new(reference_error(DERIVED_THIS_TDZ)))),
+            else_branch: Box::new(raw),
+        }
+    }
+
+    /// Bind derived constructor frame `fi`'s `this` to `value`.
+    pub(super) fn derived_bind_this(&mut self, fi: usize, value: IrNode) -> IrNode {
+        match self.frames[fi].supers.this_cell {
+            Some(id) => IrNode::CellSet {
+                cell: Box::new(self.read_hidden(fi, id)),
+                value: Box::new(value),
+            },
+            None => IrNode::Assign {
+                local: self.ensure_this_local().unwrap_or(0),
+                value: Box::new(value),
+            },
+        }
+    }
+
+    /// Define the current class's instance fields ([`Self::class_fields`]) on
+    /// `this` in source order with `CreateDataProperty` semantics (design 11.2
+    /// q8: `__define`, so an inherited setter is not invoked); `None` when the
+    /// class declares no fields. An uninitialized `f;` defines `undefined`.
+    pub(super) fn lower_field_inits(&mut self, this: IrNode) -> anyhow::Result<Option<IrNode>> {
+        if self.class_fields.is_empty() {
+            return Ok(None);
+        }
+        let fields = std::mem::take(&mut self.class_fields);
+        let mut entries = Vec::with_capacity(fields.len());
+        for p in &fields {
+            let key = super::stmt::prop_key_name(&p.key)?;
+            let value = match &p.value {
+                Some(init) => self.lower_named_expr(init, &key)?,
+                None => IrNode::Undefined,
+            };
+            entries.push((PropKey::Static(key), value));
+        }
+        self.class_fields = fields;
+        let local = self.fresh();
+        Ok(Some(IrNode::DefineProps {
+            obj: Box::new(this),
+            local,
+            entries,
+        }))
+    }
+}
+
+/// The span of the `super(..)` call when `stmt` is the expression statement
+/// `super(..);`.
+fn super_call_span(stmt: &Stmt) -> Option<swc_common::Span> {
+    let Stmt::Expr(expr_stmt) = stmt else {
+        return None;
+    };
+    match strip_parens(&expr_stmt.expr) {
+        Expr::Call(call) if matches!(call.callee, Callee::Super(_)) => Some(call.span),
+        _ => None,
+    }
+}
+
+/// Whether `stmt` contains a `super(..)` call, `this`, or `super.x` inside an
+/// arrow function (`arrow`: already inside one), not descending into non-arrow
+/// functions or classes. Conservative: an arrow `super(..)` in a shape not
+/// walked here stays a compile error.
+fn stmt_arrow_super(stmt: &Stmt, arrow: bool) -> bool {
+    let e = |x: &Expr| expr_arrow_super(x, arrow);
+    let s = |x: &Stmt| stmt_arrow_super(x, arrow);
+    match stmt {
+        Stmt::Expr(x) => e(&x.expr),
+        Stmt::Return(r) => r.arg.as_deref().is_some_and(e),
+        Stmt::Throw(t) => e(&t.arg),
+        Stmt::Block(b) => b.stmts.iter().any(s),
+        Stmt::If(i) => e(&i.test) || s(&i.cons) || i.alt.as_deref().is_some_and(s),
+        Stmt::Decl(Decl::Var(v)) => v.decls.iter().any(|d| d.init.as_deref().is_some_and(e)),
+        Stmt::Try(t) => {
+            t.block.stmts.iter().any(s)
+                || t.handler
+                    .as_ref()
+                    .is_some_and(|h| h.body.stmts.iter().any(s))
+                || t.finalizer.as_ref().is_some_and(|f| f.stmts.iter().any(s))
+        }
+        Stmt::While(w) => e(&w.test) || s(&w.body),
+        Stmt::DoWhile(w) => e(&w.test) || s(&w.body),
+        Stmt::Labeled(l) => s(&l.body),
+        _ => false,
+    }
+}
+
+/// [`stmt_arrow_super`] for an expression.
+fn expr_arrow_super(expr: &Expr, arrow: bool) -> bool {
+    let e = |x: &Expr| expr_arrow_super(x, arrow);
+    match expr {
+        Expr::Call(c) => {
+            (arrow && matches!(c.callee, Callee::Super(_)))
+                || matches!(&c.callee, Callee::Expr(x) if e(x))
+                || c.args.iter().any(|a| e(&a.expr))
+        }
+        Expr::Arrow(a) => match a.body.as_ref() {
+            ArrowFunctionBody::FunctionBody(b) => b.stmts.iter().any(|s| stmt_arrow_super(s, true)),
+            ArrowFunctionBody::Expr(x) => expr_arrow_super(x, true),
+        },
+        // An arrow's `this` / `super.x` is the constructor's (lexical) `this`.
+        Expr::This(_) | Expr::SuperProp(_) => arrow,
+        Expr::Paren(p) => e(&p.expr),
+        Expr::Seq(q) => q.exprs.iter().any(|x| e(x)),
+        Expr::Assign(a) => e(&a.right),
+        Expr::Bin(b) => e(&b.left) || e(&b.right),
+        Expr::Cond(c) => e(&c.test) || e(&c.cons) || e(&c.alt),
+        Expr::Unary(u) => e(&u.arg),
+        Expr::Member(m) => e(&m.obj),
+        Expr::New(n) => e(&n.callee) || n.args.iter().flatten().any(|a| e(&a.expr)),
+        _ => false,
+    }
+}
+
+/// The derived-constructor `this` TDZ message (design 4.5).
+pub(super) const DERIVED_THIS_TDZ: &str = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
+
+/// A `ReferenceError` with `message` (no `%ReferenceError.prototype%` yet, S4:
+/// an `Error` with an own `name`).
+pub(super) fn reference_error(message: &str) -> IrNode {
+    IrNode::error_object(
+        ErrorKind::Error,
+        Some("ReferenceError"),
+        Some(IrNode::Str(message.to_owned())),
+        IrNode::Str(format!("ReferenceError: {message}")),
+    )
+}
+
+/// A `TypeError` with `message`: a string literal, or a side-effect-free read
+/// of a string (evaluated twice, for `message` and `stack`).
+pub(super) fn type_error(message: IrNode) -> IrNode {
+    let stack = match &message {
+        IrNode::Str(text) => IrNode::Str(format!("TypeError: {text}")),
+        _ => IrNode::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(IrNode::Str("TypeError: ".to_owned())),
+            rhs: Box::new(message.clone()),
+        },
+    };
+    IrNode::error_object(ErrorKind::TypeError, None, Some(message), stack)
+}
+
+/// `cond ? undefined : throw error`: a guard throwing `error` unless `cond`.
+pub(super) fn guard(cond: IrNode, error: IrNode) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(cond),
+        then_branch: Box::new(IrNode::Undefined),
+        else_branch: Box::new(IrNode::Throw(Box::new(error))),
+    }
+}
+
+/// `if (argc >= 0) throw TypeError("Class constructor <name> cannot be invoked
+/// without 'new'")`, the class constructor prologue rejecting a plain call
+/// (`argc` is the local `argc`).
+fn class_call_guard(name: &str, argc: u32) -> IrStmt {
+    let message = format!("Class constructor {name} cannot be invoked without 'new'");
+    let stack = format!("TypeError: {message}");
+    IrStmt::If {
+        cond: IrNode::IsConstructCall(argc),
+        then_body: Vec::new(),
+        else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(IrNode::error_object(
+            ErrorKind::TypeError,
+            None,
+            Some(IrNode::Str(message)),
+            IrNode::Str(stack),
+        ))))],
     }
 }

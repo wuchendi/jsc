@@ -17,6 +17,12 @@ impl Frame {
             next_label: 0,
             allows_this: false,
             this_local: None,
+            arrow: false,
+            new_target_local: None,
+            ctor: FnKind::Plain,
+            supers: SuperCalls::default(),
+            arguments_local: None,
+            spread_args_local: None,
         }
     }
 }
@@ -31,12 +37,13 @@ impl<'a> LowerCtx<'a> {
             main_ctx: false,
             async_body: false,
             current_super: None,
-            static_init_class: None,
+            class_fields: Vec::new(),
+            static_init: None,
         }
     }
 
     /// The index of the innermost (current) function frame.
-    fn top(&self) -> usize {
+    pub(super) fn top(&self) -> usize {
         self.frames.len() - 1
     }
 
@@ -218,6 +225,110 @@ impl<'a> LowerCtx<'a> {
         let slot = self.fresh();
         self.frame().this_local = Some(slot);
         Some(slot)
+    }
+
+    /// Resolve `new.target` (design 4.5): the nearest non-arrow function's
+    /// prologue snapshot, read directly in that function and captured BY VALUE
+    /// (it is immutable) through each nested arrow's environment. `undefined` in
+    /// a generator/async body (never constructed); `None` at top level.
+    pub(super) fn resolve_new_target(&mut self) -> Option<IrNode> {
+        let fi = self.frames.iter().rposition(|frame| !frame.arrow)?;
+        if fi == 0 && self.main_ctx {
+            return None;
+        }
+        if self.frames[fi].env_backed {
+            return Some(IrNode::Undefined);
+        }
+        let local = if let Some(local) = self.frames[fi].new_target_local {
+            local
+        } else {
+            let frame = &mut self.frames[fi];
+            let local = frame.next;
+            frame.next += 1;
+            frame.new_target_local = Some(local);
+            frame.by_id.insert(new_target_id(fi), local);
+            local
+        };
+        if fi == self.top() {
+            return Some(IrNode::Local(local));
+        }
+        Some(IrNode::EnvLoad(self.route_env(fi, new_target_id(fi))))
+    }
+
+    /// Allocate a hidden local in the current frame for a value captured BY
+    /// VALUE into nested functions (like the `new.target` snapshot): the parent
+    /// constructor and prototype of a class, or the class value itself. Returns
+    /// the local and its synthetic binding id, read with [`Self::read_hidden`].
+    /// The local must be assigned before any closure reading it is created.
+    pub(super) fn hidden_local(&mut self) -> (u32, u32) {
+        let n = self.shared.hidden_ids.get();
+        self.shared.hidden_ids.set(n + 1);
+        let id = 0xC000_0000 | n;
+        let local = self.fresh();
+        self.frame().by_id.insert(id, local);
+        (local, id)
+    }
+
+    /// Read the hidden binding `id` declared in frame `frame` (see
+    /// [`Self::hidden_local`]): its local there, else through the environment.
+    pub(super) fn read_hidden(&mut self, frame: usize, id: u32) -> IrNode {
+        if frame == self.top() {
+            return self.frames[frame]
+                .by_id
+                .get(&id)
+                .map_or(IrNode::Undefined, |&local| IrNode::Local(local));
+        }
+        IrNode::EnvLoad(self.route_env(frame, id))
+    }
+
+    /// Whether every frame above `frame` is an arrow (so `this` there is the
+    /// one of `frame`).
+    pub(super) fn only_arrows_above(&self, frame: usize) -> bool {
+        self.frames[frame + 1..].iter().all(|f| f.arrow)
+    }
+
+    /// Resolve `arguments`: the nearest non-arrow function's `arguments`
+    /// object, built in its prologue (allocated on first reference) and captured
+    /// BY VALUE through each nested arrow's environment (the binding is never
+    /// reassigned). `Err` with the diagnostic at top level and in a
+    /// generator/async body.
+    pub(super) fn resolve_arguments(&mut self) -> Result<IrNode, &'static str> {
+        let fi = self
+            .frames
+            .iter()
+            .rposition(|frame| !frame.arrow)
+            .unwrap_or(0);
+        if fi == 0 && self.main_ctx {
+            return Err("`arguments` is only valid inside a function");
+        }
+        if self.frames[fi].env_backed {
+            return Err("`arguments` in a generator or async function is unsupported");
+        }
+        let local = if let Some(local) = self.frames[fi].arguments_local {
+            local
+        } else {
+            let frame = &mut self.frames[fi];
+            let local = frame.next;
+            frame.next += 1;
+            frame.arguments_local = Some(local);
+            frame.by_id.insert(arguments_id(fi), local);
+            local
+        };
+        if fi == self.top() {
+            return Ok(IrNode::Local(local));
+        }
+        Ok(IrNode::EnvLoad(self.route_env(fi, arguments_id(fi))))
+    }
+
+    /// The current frame's snapshot of the `__spread_args` global, allocated
+    /// on first use (the prologue snapshot is added by `build_function_body`).
+    pub(super) fn spread_args_local(&mut self) -> u32 {
+        if let Some(local) = self.frame().spread_args_local {
+            return local;
+        }
+        let local = self.fresh();
+        self.frame().spread_args_local = Some(local);
+        local
     }
 
     /// Whether the local `idx` in the current frame is a boxed cell.
@@ -407,4 +518,17 @@ impl<'a> LowerCtx<'a> {
         };
         IrNode::EnvLoad(slot)
     }
+}
+
+/// The synthetic binding id of the `new.target` snapshot of the function at
+/// frame depth `frame`: above every source offset (a [`binding_id`]), unique
+/// among the frames enclosing a capture.
+fn new_target_id(frame: usize) -> u32 {
+    0x8000_0000 | u32::try_from(frame).unwrap_or(0)
+}
+
+/// The synthetic binding id of the `arguments` object of the function at frame
+/// depth `frame`, distinct from every [`new_target_id`].
+fn arguments_id(frame: usize) -> u32 {
+    0xC000_0000 | u32::try_from(frame).unwrap_or(0)
 }

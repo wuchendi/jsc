@@ -339,13 +339,14 @@ pub(super) fn emit_object_has_node(
 }
 
 /// Emit an `x instanceof RHS` identity test, leaving a `true`/`false`
-/// jsval on the stack. The operand `value` is evaluated once into a dedicated
-/// high scratch slot and gated by [`emit_is_object`]: only a heap OBJECT can be
-/// an instance, so a non-heap or non-object operand (number, `null`, array,
-/// `Map`, …) yields `false` without ever reading a bogus type byte. For an
-/// object a **user class** or **builtin error** walks the receiver's `proto`
-/// chain for the prototype pointer (`C.prototype` or the static error
-/// prototype).
+/// jsval on the stack. The operand `value` is evaluated first, then the
+/// right-hand side. The runtime-TYPE-BYTE builtins test the operand's heap kind;
+/// the prototype kinds gate the operand with [`emit_is_proto_carrier`] (a value
+/// without a `proto` slot is never an instance) and walk its `proto` chain for
+/// the target prototype: the static error prototype ([`InstanceOfKind::Proto`])
+/// or, for [`InstanceOfKind::Ctor`] (`OrdinaryHasInstance`), `Get(C,
+/// "prototype")` of the callable-guarded right-hand side `C`, which must be an
+/// object.
 #[allow(clippy::too_many_lines)] // straight-line per-kind emit, not branching depth
 pub(super) fn emit_instanceof_node(
     value: &IrNode,
@@ -355,94 +356,153 @@ pub(super) fn emit_instanceof_node(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    // Evaluate the operand once and stash it in a dedicated high slot (the child
-    // emit reuses the low scratch slots, matching `emit_index_node`).
-    let v = scratch + 17;
     emit_node(value, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(v));
-
-    // The runtime-TYPE-BYTE builtins test the receiver's heap kind directly
-    // (independent of the byte-2 object gate the class/error kinds share):
+    // The runtime-TYPE-BYTE builtins test the receiver's heap kind directly:
     // `Array`/`Function`/`Date` match their own byte; `Object` matches ANY heap
-    // pointer whose byte is not `TYPE_STRING` (a primitive string is not an object).
-    match kind {
-        InstanceOfKind::Array => return emit_type_byte_instanceof(function, v, TYPE_ARRAY, false),
-        InstanceOfKind::Function => {
-            return emit_type_byte_instanceof(function, v, TYPE_FUNCTION, false);
-        }
-        InstanceOfKind::Date => return emit_type_byte_instanceof(function, v, TYPE_DATE, false),
-        InstanceOfKind::Object => {
-            return emit_type_byte_instanceof(function, v, TYPE_STRING, true);
-        }
-        InstanceOfKind::Proto(_) => {}
-    }
-
-    emit_is_object(function, v);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    match kind {
-        InstanceOfKind::Proto(class_proto) => {
-            // Walk the receiver's `proto` chain for pointer identity with the
-            // class's shared prototype: `true` iff some link is the SAME block (a
-            // single hop under no-`extends`, more under `extends`). The base
-            // prototype's `proto` is `null`, ending the walk. `cur`/`tgt` are
-            // dedicated high slots (`+19`/`+20`).
-            let cur = scratch + 19;
-            let tgt = scratch + 20;
-            let proto_slot = MemArg {
-                offset: OBJ_PROTO_OFFSET,
-                align: 3,
-                memory_index: 0,
-            };
-            // cur = recv.proto (read while `v` is intact).
-            function.instruction(&Instruction::LocalGet(v));
-            function.instruction(&Instruction::I32WrapI64);
-            function.instruction(&Instruction::I64Load(proto_slot));
-            function.instruction(&Instruction::LocalSet(cur));
-            // tgt = <class>.prototype (its emit may reuse `+17`/`+18`; `v` is
-            // already consumed).
-            emit_node(class_proto, function, scratch, strings, helpers);
-            function.instruction(&Instruction::LocalSet(tgt));
-            // Loop: 1 iff `cur` reaches `tgt`, 0 iff the chain runs out (non-object).
-            function.instruction(&Instruction::Block(BlockType::Result(ValType::I32)));
-            function.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_is_object(function, cur);
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::If(BlockType::Empty));
-            function.instruction(&Instruction::I32Const(0));
-            function.instruction(&Instruction::Br(2)); // -> block result: not an instance
-            function.instruction(&Instruction::End);
-            function.instruction(&Instruction::LocalGet(cur));
-            function.instruction(&Instruction::LocalGet(tgt));
-            function.instruction(&Instruction::I64Eq);
-            function.instruction(&Instruction::If(BlockType::Empty));
-            function.instruction(&Instruction::I32Const(1));
-            function.instruction(&Instruction::Br(2)); // -> block result: match
-            function.instruction(&Instruction::End);
-            // cur = cur.proto — the next link up the chain.
-            function.instruction(&Instruction::LocalGet(cur));
-            function.instruction(&Instruction::I32WrapI64);
-            function.instruction(&Instruction::I64Load(proto_slot));
-            function.instruction(&Instruction::LocalSet(cur));
-            function.instruction(&Instruction::Br(0)); // continue the loop
-            function.instruction(&Instruction::End); // loop
-            function.instruction(&Instruction::I32Const(0)); // unreachable fall-through
-            function.instruction(&Instruction::End); // block -> i32 on the stack
-        }
-        // Unreachable: the runtime-TYPE-BYTE kinds return before this gate.
+    // pointer whose byte is not `TYPE_STRING` (a primitive string is not an
+    // object). The operand is stashed in a dedicated high slot.
+    let v = scratch + 17;
+    let (rhs, ctor) = match kind {
         InstanceOfKind::Array
         | InstanceOfKind::Function
         | InstanceOfKind::Date
         | InstanceOfKind::Object => {
-            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::LocalSet(v));
+            let (type_byte, negate) = match kind {
+                InstanceOfKind::Array => (TYPE_ARRAY, false),
+                InstanceOfKind::Function => (TYPE_FUNCTION, false),
+                InstanceOfKind::Date => (TYPE_DATE, false),
+                _ => (TYPE_STRING, true),
+            };
+            return emit_type_byte_instanceof(function, v, type_byte, negate);
         }
+        InstanceOfKind::Proto(proto) => (proto, false),
+        InstanceOfKind::Ctor(ctor) => (ctor, true),
+    };
+
+    // `cur` walks the receiver's `proto` chain; `tgt` holds the right-hand side
+    // and then the target prototype. Both are dedicated high slots (`+19`/`+20`)
+    // the `prototype` read below (`+17`/`+18`) does not touch. The operand rides
+    // the operand stack while the right-hand side evaluates.
+    let cur = scratch + 19;
+    let tgt = scratch + 20;
+    emit_node(rhs, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(tgt));
+    function.instruction(&Instruction::LocalSet(cur));
+    if ctor {
+        // `IsCallable(C)`, checked before the receiver (a primitive operand still
+        // throws for a non-callable right-hand side).
+        emit_callable_guard(
+            function,
+            INSTANCEOF_NOT_CALLABLE,
+            tgt,
+            scratch,
+            strings,
+            helpers,
+        );
     }
+
+    emit_is_proto_carrier(function, cur);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    if ctor {
+        // P = Get(C, "prototype"); a non-object P throws.
+        emit_get_call(
+            function,
+            tgt,
+            &IrNode::Str("prototype".to_owned()),
+            scratch + 18,
+            strings,
+            helpers,
+        );
+        if helpers.has_accessors {
+            emit_propagate_if_pending(function, helpers);
+        }
+        function.instruction(&Instruction::LocalSet(tgt));
+        emit_is_pointer(function, tgt);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        emit_load_type_byte(function, tgt);
+        function.instruction(&Instruction::I32Const(TYPE_STRING));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        emit_throw_not_a_function(
+            function,
+            INSTANCEOF_NON_OBJECT_PROTOTYPE,
+            scratch,
+            strings,
+            helpers,
+        );
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
+    // Walk the receiver's `proto` chain for pointer identity with the target
+    // prototype: `true` iff some link is the SAME block. A chain ends at `null`.
+    let proto_slot = MemArg {
+        offset: OBJ_PROTO_OFFSET,
+        align: 3,
+        memory_index: 0,
+    };
+    // cur = recv.proto.
+    function.instruction(&Instruction::LocalGet(cur));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(proto_slot));
+    function.instruction(&Instruction::LocalSet(cur));
+    // Loop: 1 iff `cur` reaches `tgt`, 0 iff the chain runs out.
+    function.instruction(&Instruction::Block(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_is_proto_carrier(function, cur);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::Br(2)); // -> block result: not an instance
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(cur));
+    function.instruction(&Instruction::LocalGet(tgt));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::Br(2)); // -> block result: match
+    function.instruction(&Instruction::End);
+    // cur = cur.proto — the next link up the chain.
+    function.instruction(&Instruction::LocalGet(cur));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(proto_slot));
+    function.instruction(&Instruction::LocalSet(cur));
+    function.instruction(&Instruction::Br(0)); // continue the loop
+    function.instruction(&Instruction::End); // loop
+    function.instruction(&Instruction::I32Const(0)); // unreachable fall-through
+    function.instruction(&Instruction::End); // block -> i32 on the stack
     // Box the i32 `1`/`0` into a TRUE/FALSE jsval (`FALSE_BITS | bit`).
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::I64Or);
+    leave_frame(helpers);
     function.instruction(&Instruction::Else);
-    // A non-object operand is never an instance.
+    // A receiver without a `proto` slot is never an instance.
     function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::End);
+}
+
+/// Push `1` if the jsval in `local` is a heap block carrying a `proto` slot
+/// (any object-family kind: not a string or an array), else `0`. The type-byte
+/// reads are gated behind [`emit_is_pointer`].
+fn emit_is_proto_carrier(function: &mut Function, local: u32) {
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_STRING));
+    function.instruction(&Instruction::I32Ne);
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
 }
 
@@ -528,11 +588,10 @@ pub(super) fn emit_json_stringify_node(
 }
 
 /// Emit a `new Map()` / `new Set()` construction, leaving the fresh handle
-/// jsval on the stack. Two blocks are bump-allocated: an empty growable backing
-/// array (`TYPE_ARRAY`, len 0) and the handle itself (`TYPE_MAP`/`TYPE_SET`), whose
-/// `size` header starts at 0 and whose `entries` slot holds the backing array's
-/// heap jsval. The handle jsval never moves afterward — growth reallocs the backing
-/// and rewrites the `entries` slot in place.
+/// jsval on the stack. Two blocks are allocated: an empty backing array
+/// (`__new_array(0)`, grown in place) and the handle itself
+/// (`TYPE_MAP`/`TYPE_SET`), whose `size` header starts at 0 and whose `entries`
+/// slot holds the backing array's heap jsval.
 pub(super) fn emit_map_new_node(
     set: bool,
     function: &mut Function,
@@ -541,16 +600,6 @@ pub(super) fn emit_map_new_node(
 ) {
     let dst = scratch + 3;
     let earr = scratch + 7;
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
     let size_slot = MemArg {
         offset: MAP_SIZE_OFFSET,
         align: 2,
@@ -562,16 +611,10 @@ pub(super) fn emit_map_new_node(
         memory_index: 0,
     };
 
-    // Empty backing array: __alloc(HEADER_SIZE + 4); TYPE_ARRAY byte; len = 0.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::Call(helpers.alloc));
-    function.instruction(&Instruction::LocalSet(earr));
-    function.instruction(&Instruction::LocalGet(earr));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(type_byte));
-    function.instruction(&Instruction::LocalGet(earr));
+    // Empty backing array: __new_array(0).
     function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::Call(helpers.new_array()));
+    function.instruction(&Instruction::LocalSet(earr));
 
     // Handle: __alloc(MAP_BLOCK_SIZE); object prefix; size = 0;
     // entries = rebox(earr).
@@ -1440,11 +1483,12 @@ pub(super) fn emit_object_rest_node(
 
 /// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for the
 /// heap array/string in `s0` (`0 <= idx < len`, `trunc(idx) == idx`), else `0`.
-/// The length is the u32 header at `+HEADER_SIZE`, shared by arrays and strings.
+/// The length is the u32 at `+len_offset` ([`ARRAY_LEN_OFFSET`] for an array,
+/// [`HEADER_SIZE`] for a string).
 /// The compares run on `f64`, where every non-number jsval (a boxed tag) and the
 /// canonical NaN read as NaN and so fail all three — a string key or `NaN`
 /// is never mistaken for index `0`.
-fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
+fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32, len_offset: u64) {
     let key_f64 = |function: &mut Function| {
         function.instruction(&Instruction::LocalGet(s1));
         function.instruction(&Instruction::F64ReinterpretI64);
@@ -1458,7 +1502,7 @@ fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: len_offset,
         align: 2,
         memory_index: 0,
     }));
@@ -1470,6 +1514,29 @@ fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
     function.instruction(&Instruction::F64Trunc);
     key_f64(function);
     function.instruction(&Instruction::F64Eq);
+    function.instruction(&Instruction::I32And);
+}
+
+/// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for
+/// the heap array in `s0` ([`emit_index_in_bounds`]) and the array is not
+/// `SPARSE` (whose elements past its store are not in it), else `0`.
+fn emit_dense_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
+    emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
+    emit_sparse_test(function, s0);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::I32And);
+}
+
+/// Push i32 nonzero when the heap array jsval in `s0` is `SPARSE`, else `0`.
+fn emit_sparse_test(function: &mut Function, s0: u32) {
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(ARRAY_SPARSE));
     function.instruction(&Instruction::I32And);
 }
 
@@ -1521,11 +1588,6 @@ fn emit_index_string_key(
     function.instruction(&Instruction::End);
 }
 
-/// Push the length header of the array/string in `s0` as a number jsval.
-fn emit_len_boxed(function: &mut Function, s0: u32) {
-    emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
-}
-
 /// Push the u32 field at byte `offset` of the block whose jsval is in `s0`,
 /// reboxed as a number jsval.
 fn emit_u32_field_boxed(function: &mut Function, s0: u32, offset: u64) {
@@ -1563,11 +1625,13 @@ fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Help
 /// without touching memory. A static string key goes straight to `__get` with
 /// its interned key constant (`__get` resolves a string's or array's
 /// `length`/index keys itself); the one exception is `.size`, which a
-/// `Map`/`Set` handle answers from its header. A computed key on an array or
-/// string keeps the element path: `"length"`, a canonical numeric index
-/// (number or numeric string), or `undefined`. Any other computed read
+/// `Map`/`Set` handle answers from its header. A computed in-range integer
+/// key on an array loads the element (a hole reads `undefined`); a computed
+/// key on a string keeps the string path: `"length"`, a canonical numeric
+/// index (number or numeric string), or `undefined`. Any other computed read
 /// converts the key with `ToPropertyKey` (a lookup, so a never-interned key
-/// reads `undefined`) and calls `__get`.
+/// reads `undefined`) and calls `__get` (which routes an array's canonical
+/// index strings to its elements and its other keys to its own table).
 ///
 /// Both operands are evaluated on the operand stack before being stashed in
 /// the DEDICATED HIGH scratch slots `+17`/`+18`, so a computed index that is
@@ -1657,9 +1721,9 @@ fn emit_get_call(
 }
 
 /// Emit the computed-key half of [`emit_index_node`] for the heap receiver in
-/// `s0` and the key jsval in `s1`: an array loads the in-range element (or
-/// reads `length`), a string builds the in-range one-char string (or reads
-/// `length`), and any other receiver goes through `__get`.
+/// `s0` and the key jsval in `s1`: an array loads the element of an in-range
+/// integer key, a string builds the in-range one-char string (or reads
+/// `length`), and any other key or receiver goes through `__get`.
 fn emit_index_dynamic(
     function: &mut Function,
     scratch: u32,
@@ -1672,32 +1736,36 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::I32Const(TYPE_ARRAY));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // ARRAY: `"length"` reads the header; otherwise an out-of-bounds or
-    // non-index key yields `undefined`, and an in-range index loads the i64
-    // element jsval at ptr + HEADER_SIZE + 4 + 8*i. The loaded value is already a
-    // boxed jsval, so it is returned as-is.
-    emit_index_string_key(function, s1, scratch, strings, helpers);
+    // ARRAY: an in-range integer key loads the i64 element jsval at
+    // elems + 8 + 8*i (`__sparse_get` on a SPARSE array; stashed in `s1`, the
+    // key being dead) and reads a hole as `undefined`; any other key goes
+    // through `__get`.
+    emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    emit_len_boxed(function, s0);
-    function.instruction(&Instruction::Else);
-    emit_index_in_bounds(function, s0, s1);
+    emit_sparse_test(function, s0);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::I32TruncSatF64U);
+    function.instruction(&Instruction::Call(helpers.sparse_get()));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::I32WrapI64);
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::I32TruncSatF64U);
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalSet(s1));
+    emit_elem_read(function, s1);
+    function.instruction(&Instruction::Else);
+    emit_get_dynamic(function, s0, s1, helpers);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     emit_load_type_byte(function, s0);
@@ -1710,9 +1778,9 @@ fn emit_index_dynamic(
     // `__str_index` (reboxed as a heap jsval).
     emit_index_string_key(function, s1, scratch, strings, helpers);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    emit_len_boxed(function, s0);
+    emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
     function.instruction(&Instruction::Else);
-    emit_index_in_bounds(function, s0, s1);
+    emit_index_in_bounds(function, s0, s1, HEADER_SIZE as u64);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     emit_str_index_boxed(function, s0, s1, helpers);
     function.instruction(&Instruction::Else);
@@ -1721,13 +1789,19 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     // Every other heap receiver: the generic property read.
+    emit_get_dynamic(function, s0, s1, helpers);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+}
+
+/// Push `__get(s0, ToPropertyKey(s1))` for the receiver in `s0` and the key
+/// jsval in `s1` (a lookup: a never-interned key reads `undefined`).
+fn emit_get_dynamic(function: &mut Function, s0: u32, s1: u32, helpers: Helpers<'_>) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::Call(helpers.to_key));
     function.instruction(&Instruction::Call(helpers.get));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
 }
 
 /// Emit a member assignment `obj[index] = value`, leaving `value` on the
@@ -1735,12 +1809,14 @@ fn emit_index_dynamic(
 ///
 /// A primitive receiver (number/boolean, or a heap string) throws the
 /// strict-mode create-property `TypeError` before any heap access. An array
-/// keeps its element store (an in-range integer index; a store at/past the
-/// length or a named key throws until S2). Every other receiver goes through
-/// `__set` (`OrdinarySet`: an accessor's setter, a read-only or non-extensible
+/// stores an in-range integer index inline and hands any other key to
+/// `__array_set` (growth by index, canonical index strings, `length`, named
+/// properties). Every other receiver — and any receiver under a static key
+/// that is neither an array index nor `length` — goes through `__set`
+/// (`OrdinarySet`: an accessor's setter, a read-only or non-extensible
 /// `TypeError`, else an own data property, added when absent) with the key
-/// converted by `ToPropertyKey` and interned; `__set` may leave an exception
-/// pending, so it is followed by the pending-exception check.
+/// converted by `ToPropertyKey` and interned. Both helpers may leave an
+/// exception pending, so they are followed by the pending-exception check.
 ///
 /// `obj`, `index`, and `value` are each evaluated once (left-to-right) on the
 /// operand stack, then stashed into the DEDICATED HIGH scratch slots
@@ -1800,6 +1876,16 @@ pub(super) fn emit_index_set_node(
         function.instruction(&Instruction::End);
     }
 
+    // A static named key (not an array index, not `length`) is an ordinary
+    // property on every receiver, arrays included.
+    if let IrNode::Str(name) = index
+        && name != INDEX_LENGTH_KEY
+        && !is_array_index(name)
+    {
+        emit_set_call(function, s0, index, s1, sval, strings, helpers);
+        function.instruction(&Instruction::LocalGet(sval));
+        return;
+    }
     // `obj` is a heap pointer here (the guard above threw otherwise), so reading
     // its type byte is safe. Both arms can unwind, so the dispatch `if` is
     // tracked as a control frame.
@@ -1810,11 +1896,7 @@ pub(super) fn emit_index_set_node(
     enter_frame(helpers);
     emit_index_set_array(function, s0, s1, sval, helpers);
     function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::LocalGet(s0));
-    emit_prop_key(function, index, s1, true, strings, helpers);
-    function.instruction(&Instruction::LocalGet(sval));
-    function.instruction(&Instruction::Call(helpers.set));
-    emit_propagate_if_pending(function, helpers);
+    emit_set_call(function, s0, index, s1, sval, strings, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 
@@ -1822,13 +1904,31 @@ pub(super) fn emit_index_set_node(
     function.instruction(&Instruction::LocalGet(sval));
 }
 
-/// Emit the array arm of [`emit_index_set_node`] for the array in `s0`. A number
-/// key `k` that is a non-negative integer (`k >= 0` and `k - trunc(k) == 0`,
-/// false for `NaN`/`±Infinity`) stores the element at `ptr + HEADER_SIZE + 4 +
-/// 8*k` when `k < length`, else raises the grow `TypeError`. Any other key
-/// raises the named-array-property `TypeError` naming `String(key)` (S2 owns
-/// array properties). The key reinterpretation is pure, so a non-number key
-/// reads no memory. The caller tracks the enclosing dispatch frame.
+/// Emit `__set(s0, ToPropertyKey(index), sval)` (the key interned) followed
+/// by the pending-exception check.
+fn emit_set_call(
+    function: &mut Function,
+    s0: u32,
+    index: &IrNode,
+    s1: u32,
+    sval: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    function.instruction(&Instruction::LocalGet(s0));
+    emit_prop_key(function, index, s1, true, strings, helpers);
+    function.instruction(&Instruction::LocalGet(sval));
+    function.instruction(&Instruction::Call(helpers.set));
+    emit_propagate_if_pending(function, helpers);
+}
+
+/// Emit the array arm of [`emit_index_set_node`] for the array in `s0`: an
+/// integer key `0 <= k < length` of a dense array stores the element at
+/// `elems + 8 + 8*k` inline (the compares run on `f64`, so a non-number key
+/// fails them without reading memory); any other key (or a `SPARSE` array)
+/// goes to `__array_set` (growth by index, sparse elements, canonical index
+/// strings, `length`, named properties), followed by the pending-exception
+/// check. The caller tracks the enclosing dispatch frame.
 fn emit_index_set_array(
     function: &mut Function,
     s0: u32,
@@ -1836,60 +1936,28 @@ fn emit_index_set_array(
     sval: u32,
     helpers: Helpers<'_>,
 ) {
-    let key_f64 = |function: &mut Function| {
-        function.instruction(&Instruction::LocalGet(s1));
-        function.instruction(&Instruction::F64ReinterpretI64);
-    };
-    // is_number(key) && key >= 0 && key - trunc(key) == 0
-    emit_is_number(function, s1);
-    key_f64(function);
-    function.instruction(&Instruction::F64Const(0.0.into()));
-    function.instruction(&Instruction::F64Ge);
-    function.instruction(&Instruction::I32And);
-    key_f64(function);
-    key_f64(function);
-    function.instruction(&Instruction::F64Trunc);
-    function.instruction(&Instruction::F64Sub);
-    function.instruction(&Instruction::F64Const(0.0.into()));
-    function.instruction(&Instruction::F64Eq);
-    function.instruction(&Instruction::I32And);
+    emit_dense_index_in_bounds(function, s0, s1);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    // key < length (the u32 header at `ptr + HEADER_SIZE`).
-    key_f64(function);
+    // In bounds: store the element jsval at elems + 8 + 8*i. Mirrors
+    // `emit_index_node`'s array arm.
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::F64ConvertI32U);
-    function.instruction(&Instruction::F64Lt);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    enter_frame(helpers);
-    // In bounds: store the element jsval at ptr + HEADER_SIZE + 4 + 8*i (the
-    // header offset folded into the store's MemArg). Mirrors `emit_index_node`'s
-    // array arm.
-    function.instruction(&Instruction::LocalGet(s0));
-    function.instruction(&Instruction::I32WrapI64);
-    key_f64(function);
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::I32TruncSatF64U);
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(sval));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Store(elem_slot(0)));
     function.instruction(&Instruction::Else);
-    emit_prop_throw_call(function, s0, s1, PROP_THROW_GROW, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::Else);
-    emit_prop_throw_call(function, s0, s1, PROP_THROW_ARRAY_KEY, helpers);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::LocalGet(sval));
+    function.instruction(&Instruction::Call(helpers.array_set()));
+    emit_propagate_if_pending(function, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
@@ -1897,7 +1965,7 @@ fn emit_index_set_array(
 /// Call `__prop_throw(recv, key, mode)` on the receiver/key stashed in locals
 /// `recv`/`key` and unwind like `throw`. The caller tracks every enclosing
 /// control frame.
-fn emit_prop_throw_call(
+pub(super) fn emit_prop_throw_call(
     function: &mut Function,
     recv: u32,
     key: u32,
@@ -2029,7 +2097,7 @@ fn never_primitive(node: &IrNode) -> bool {
         IrNode::Object { .. }
             | IrNode::Array(_)
             | IrNode::ArraySpread(_)
-            | IrNode::New { .. }
+            | IrNode::Construct { .. }
             | IrNode::MapNew { .. }
             | IrNode::DateNew { .. }
             | IrNode::FuncValue { .. }
@@ -2050,7 +2118,7 @@ fn never_nullish(node: &IrNode) -> bool {
             | IrNode::Object { .. }
             | IrNode::Array(_)
             | IrNode::ArraySpread(_)
-            | IrNode::New { .. }
+            | IrNode::Construct { .. }
             | IrNode::MapNew { .. }
             | IrNode::DateNew { .. }
             | IrNode::FuncValue { .. }
@@ -2169,7 +2237,7 @@ pub(super) fn emit_nullish_throw(strings: &HashMap<String, i32>, helpers: Helper
 /// `emit_main` scratch layout (so `emit_node` can build the error object as it
 /// would in `main`), then the message and stack string jsvals at `scratch + 24`
 /// and `scratch + 25`.
-fn type_error_helper_locals() -> Vec<(u32, ValType)> {
+pub(super) fn type_error_helper_locals() -> Vec<(u32, ValType)> {
     vec![
         (3, ValType::I64),
         (1, ValType::I32),
@@ -2223,8 +2291,7 @@ fn emit_raise_type_error(
 /// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the
 /// `TypeError` for a property store or delete the receiver cannot take, stash
 /// it in `$exc_value`, set the pending flag and clear any routed completion.
-/// [`PROP_THROW_GROW`] is an array index store at/past the length — `Cannot
-/// grow array by index assignment yet`; [`PROP_THROW_PRIMITIVE`] is a store on
+/// [`PROP_THROW_PRIMITIVE`] is a store on
 /// a primitive `recv` — `Cannot create property '<String(key)>' on
 /// <number|string|boolean> '<String(recv)>'`; every other mode wraps
 /// `String(key)` in its [`PROP_KEYED_MSGS`] fragments.
@@ -2244,12 +2311,6 @@ pub(super) fn emit_prop_throw(strings: &HashMap<String, i32>, helpers: Helpers<'
         function.instruction(&Instruction::I32WrapI64);
     };
 
-    function.instruction(&Instruction::LocalGet(mode));
-    function.instruction(&Instruction::I32Const(PROP_THROW_GROW));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::I32Const(at(ARRAY_GROW_MSG)));
-    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(mode));
     function.instruction(&Instruction::I32Const(PROP_THROW_PRIMITIVE));
     function.instruction(&Instruction::I32Eq);
@@ -2295,7 +2356,6 @@ pub(super) fn emit_prop_throw(strings: &HashMap<String, i32>, helpers: Helpers<'
     concat(&mut function);
     pick(&mut function, |entry| entry.2);
     concat(&mut function);
-    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));

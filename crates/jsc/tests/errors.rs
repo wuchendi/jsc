@@ -340,12 +340,14 @@ fn uncaught_throw_exits_one() {
 }
 
 /// An UNCAUGHT `TypeError` from a property write fails the process: exit 1
-/// with the message on stderr (a named property store on an array still
-/// throws).
+/// with the message on stderr (a store on a primitive throws).
 #[test]
 fn uncaught_property_write_error_exits_one() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", "let a = [1]; a.x = 1; console.log(\"unreachable\")"])
+        .args([
+            "-e",
+            "let s = \"x\"; s.foo = 1; console.log(\"unreachable\")",
+        ])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(
@@ -354,7 +356,7 @@ fn uncaught_property_write_error_exits_one() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Uncaught TypeError: Cannot set named property 'x' on an array yet"),
+        stderr.contains("Uncaught TypeError: Cannot create property 'foo' on string 'x'"),
         "stderr should report the TypeError, got: {stderr}"
     );
     assert!(
@@ -363,15 +365,15 @@ fn uncaught_property_write_error_exits_one() {
     );
 }
 
-/// A property-write `TypeError` (a named store on an array) unwinds through
+/// A property-write `TypeError` (a store on a primitive) unwinds through
 /// `finally` and nested function frames to the nearest handler.
 #[test]
 fn property_write_error_unwinds_through_finally_and_calls() {
     assert_eq!(
         jsc(&[
             "-p",
-            "let log=\"\"; function f(o){ try { o.x = 1; log+=\"no\" } finally { log+=\"f\" } } \
-             try { f([1]) } catch(e) { log+=\"|\"+e.name } log"
+            "let log=\"\"; function f(o){ try { o[\"foo\"] = 1; log+=\"no\" } finally { log+=\"f\" } } \
+             try { f(\"x\") } catch(e) { log+=\"|\"+e.name } log"
         ]),
         "f|TypeError"
     );
@@ -403,19 +405,15 @@ fn unsupported_object_methods_error() {
 }
 
 /// Out-of-scope class forms are rejected at compile time with a
-/// non-zero exit and an explanatory, spanned message. A class with a constructor,
-/// plain instance methods, and `static` members is supported (see the classes
-/// suite); inheritance, decorators, and every out-of-scope method/field form
-/// (getter, setter, private, computed, async, generator) stay out of scope.
+/// non-zero exit and an explanatory, spanned message. Constructors, methods,
+/// accessors (instance and static), fields, `extends`, and class expressions
+/// are supported (see the classes suites); computed, private, async, and
+/// generator members stay out of scope.
 #[test]
 fn unsupported_class_forms_error() {
     let cases = [
-        ("class A extends B {} 1", "extends"),
         ("class A{ [k] = 1 } 1", "computed"),
-        // Instance accessors are supported; a STATIC getter/setter is not.
-        ("class A{ static get v(){return 1} } 1", "getter"),
-        ("class A{ static set v(x){} } 1", "setter"),
-        // A computed instance accessor is still rejected.
+        // A computed accessor is still rejected.
         ("class A{ get [k](){return 1} } 1", "computed"),
         ("class A{ #p = 1 } 1", "private"),
         ("class A{ [k](){} } 1", "computed"),

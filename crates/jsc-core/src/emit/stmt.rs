@@ -589,6 +589,10 @@ pub(super) fn emit_cond(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    if let IrNode::IsConstructCall(argc) = cond {
+        emit_is_construct_call(function, *argc);
+        return;
+    }
     emit_node(cond, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
 

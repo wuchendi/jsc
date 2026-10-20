@@ -485,7 +485,7 @@ fn emit_segment_term(
 
 /// Emit the `__gen_to_array(gen) -> array` helper: drive the generator
 /// to exhaustion via `call_indirect`, collecting each yielded value into a fresh
-/// growable array (the generator's `return` value is NOT included, matching the
+/// array (the generator's `return` value is NOT included, matching the
 /// iterator protocol). Backs `[...gen]` / `f(...gen)` spread.
 ///
 /// When the program declares no functions there is no funcref table, so no
@@ -504,25 +504,10 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
         return function;
     }
 
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    // arr = a fresh empty array: __alloc(HEADER_SIZE + 4), TYPE_ARRAY byte, len 0.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::Call(helpers.alloc));
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(type_byte));
-    function.instruction(&Instruction::LocalGet(arr));
+    // arr = a fresh empty array, grown in place by `__array_push`.
     function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::Call(helpers.new_array()));
+    function.instruction(&Instruction::LocalSet(arr));
 
     let k = helpers.max_args as usize;
     function.instruction(&Instruction::Block(BlockType::Empty)); // $exit (depth 1)
@@ -566,11 +551,11 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
         memory_index: 0,
     }));
     function.instruction(&Instruction::BrIf(1)); // -> $exit
-    // arr = __array_push(arr, val).
+    // __array_push(arr, val).
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(val));
     function.instruction(&Instruction::Call(helpers.array_push));
-    function.instruction(&Instruction::LocalSet(arr));
+    function.instruction(&Instruction::Drop);
     function.instruction(&Instruction::Br(0)); // -> $L
     function.instruction(&Instruction::End); // $L
     function.instruction(&Instruction::End); // $exit

@@ -36,15 +36,18 @@
 //! # Heap block header
 //!
 //! Every heap block begins with a `HEADER_SIZE`-byte header: byte `0` is the TYPE
-//! BYTE (0 string, 1 array, 2 object, 3 function), bytes `1..4` are padding, and
-//! the per-type payload begins at offset
-//! `HEADER_SIZE`:
+//! BYTE (0 string, 1 array, 2 object, 3 function, ...), bytes `1..4` are the
+//! reserved `gc`/`flags`/`class` bytes. A string's payload begins at
+//! `HEADER_SIZE`; every object-family kind (array, object, function, ...) opens
+//! with the `props`/`proto` prefix, its payload at `OBJ_PREFIX_SIZE`:
 //!
 //! ```text
-//! type 0 string : [type][pad×3][len:u32 LE][utf8]
-//! type 1 array  : [type][pad×3][len:u32 LE][elem:i64 × len]
-//! type 2 object : [type][pad×3][n:u32 LE][(key_ptr:i64, val:i64) × n]
+//! type 0  string : [type][flags…][len:u32 LE][utf8]
+//! type 1  array  : [type][…][props:u32][proto:i64][len:u32][elems:u32]
+//! type 13 elems  : [type][…][cap:u32][elem:i64 × cap]
 //! ```
+//!
+//! See [`abi`] for every kind's layout.
 //!
 //! The immediate types (number/boolean/null/undefined/typeof-string) need no
 //! memory. A heap pointer resolves against the module's exported `"memory"`;
@@ -95,6 +98,11 @@ const MAP_SIZE_OFFSET: usize = abi::MAP_SIZE_OFFSET as usize;
 const PROMISE_STATE_OFFSET: usize = abi::PROMISE_STATE_OFFSET as usize;
 const PROMISE_VALUE_OFFSET: usize = abi::PROMISE_VALUE_OFFSET as usize;
 const GEN_DONE_OFFSET: usize = abi::GEN_DONE_OFFSET as usize;
+
+/// Array handle and element store offsets; see [`abi::TYPE_ARRAY`].
+const ARRAY_LEN_OFFSET: usize = abi::ARRAY_LEN_OFFSET as usize;
+const ARRAY_ELEMS_OFFSET: usize = abi::ARRAY_ELEMS_OFFSET as usize;
+const ELEMS_DATA_OFFSET: usize = abi::ELEMS_DATA_OFFSET as usize;
 
 /// Promise `state` header values; see [`abi`].
 const PROMISE_PENDING: i32 = abi::PROMISE_PENDING;
