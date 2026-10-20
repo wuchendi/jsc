@@ -461,3 +461,7 @@ pub(crate) const METHOD_OP_SUBSTRING: i32 = 15;
 
 /// `__method` op flag: `split` (string, yields an array).
 pub(crate) const METHOD_OP_SPLIT: i32 = 16;
+
+#[cfg(test)]
+#[path = "abi_drift_tests.rs"]
+mod drift_tests;
