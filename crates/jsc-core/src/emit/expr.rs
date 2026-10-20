@@ -1135,6 +1135,15 @@ pub(super) fn emit_promise_ctor(
 ) {
     let exec_base = scratch + 7;
 
+    // No funcref table (a function-less program): the executor can never be a
+    // function value, so throw instead of emitting an invalid `call_indirect`.
+    // Allocating P first is unobservable, so it is skipped.
+    if !helpers.has_funcs {
+        emit_node(executor, function, scratch, strings, helpers);
+        emit_throw_not_a_function(function, scratch, strings, helpers);
+        return;
+    }
+
     // P = __promise(NEW, undefined, undefined); stash it in p_local.
     function.instruction(&Instruction::I32Const(PROMISE_OP_NEW));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -1332,7 +1341,7 @@ pub(super) fn emit_call_indirect(
 /// unwind to the nearest handler. Used where a program with no funcref table
 /// would otherwise need a `call_indirect`; the transfer leaves the stack
 /// polymorphic, so any discarded operands need no cleanup.
-fn emit_throw_not_a_function(
+pub(super) fn emit_throw_not_a_function(
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -1416,6 +1425,12 @@ pub(super) fn emit_call_spread(
             // The callee is evaluated first (JS order) and its base stashed, then
             // the argument array is built and read.
             emit_node(callee, function, scratch, strings, helpers);
+            // No funcref table (a function-less program): the callee can never
+            // be a function value, so throw instead of an invalid `call_indirect`.
+            if !helpers.has_funcs {
+                emit_throw_not_a_function(function, scratch, strings, helpers);
+                return;
+            }
             // IsCallable (DF4), checked while the full callee jsval is at hand.
             if !is_static_function(callee) {
                 function.instruction(&Instruction::LocalSet(scratch));

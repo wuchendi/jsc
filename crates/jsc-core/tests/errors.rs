@@ -1115,3 +1115,30 @@ fn callable_values_still_dispatch() {
     assert_number("let f = (a, b) => a + b; f(...[40, 2])", 42.0);
     assert_number("class A { constructor() { this.v = 42 } } new A().v", 42.0);
 }
+
+/// A program that declares no function has no funcref table, so every
+/// non-callable call site must throw directly instead of emitting an (invalid)
+/// `call_indirect`. (`new` needs no such path: a class always synthesizes a
+/// constructor function.)
+#[test]
+fn non_function_call_without_functions_throws() {
+    assert_uncaught("[1].map(5)", NOT_A_FUNCTION);
+    assert_uncaught("[1].filter(5)", NOT_A_FUNCTION);
+    assert_uncaught("[1].forEach(5)", NOT_A_FUNCTION);
+    assert_uncaught("[1].reduce({}, 0)", NOT_A_FUNCTION);
+    assert_uncaught("new Promise(5)", NOT_A_FUNCTION);
+    assert_uncaught("let x = {}; x(...[1])", NOT_A_FUNCTION);
+}
+
+/// The function-free not-a-function `TypeError` is catchable.
+#[test]
+fn non_function_call_without_functions_is_catchable() {
+    assert_output(
+        "try { [1].map(5) } catch (e) { console.log(e instanceof TypeError, e.message) } \
+         try { new Promise(5) } catch (e) { console.log(e.message) } \
+         let x = {}; \
+         try { x(...[1]) } catch (e) { console.log(e.message) }",
+        "true called value is not a function\ncalled value is not a function\n\
+         called value is not a function\n",
+    );
+}

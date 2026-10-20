@@ -941,30 +941,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // Collect every distinct string literal and assign each a compile-time byte
     // offset in linear memory. `heap_ptr_init` is the first free offset after all
     // literal blobs — where the bump allocator begins.
-    let (mut offsets, mut heap_ptr_init) = collect_strings(program);
+    let (offsets, heap_ptr_init) = collect_strings(program);
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
     let n = program.functions.len();
     let has_funcs = n > 0;
-    // Every indirect call through a user value (plain, spread, HOF callback,
-    // `new`, promise executor) is preceded by an IsCallable check whose throw path
-    // builds the not-a-function TypeError (DF4). Intern its strings whenever a
-    // funcref table exists, so each such site finds them regardless of node kind.
-    if has_funcs {
-        for text in INTERNAL_TYPE_ERROR_STRS {
-            if !offsets.contains_key(text) {
-                offsets.insert(text.to_owned(), heap_ptr_init);
-                // Same `[type][pad×3][len:u32][utf8]` blob layout, padded to 8, as
-                // `collect_strings`.
-                let blob_len = HEADER_SIZE + 4 + i32::try_from(text.len()).unwrap_or(i32::MAX);
-                heap_ptr_init = heap_ptr_init
-                    .saturating_add(blob_len)
-                    .saturating_add(BLOCK_ALIGN - 1)
-                    & -BLOCK_ALIGN;
-            }
-        }
-    }
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
