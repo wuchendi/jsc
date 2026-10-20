@@ -1957,7 +1957,7 @@ fn emit_index_set_array(
 /// Call `__prop_throw(recv, key, mode)` on the receiver/key stashed in locals
 /// `recv`/`key` and unwind like `throw`. The caller tracks every enclosing
 /// control frame.
-fn emit_prop_throw_call(
+pub(super) fn emit_prop_throw_call(
     function: &mut Function,
     recv: u32,
     key: u32,

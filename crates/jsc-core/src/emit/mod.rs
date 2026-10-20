@@ -508,7 +508,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 5] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 7] = [
     (
         PROP_THROW_ARRAY_KEY,
         "Cannot set named property '",
@@ -530,6 +530,16 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 5] = [
         " of object which has only a getter",
     ),
     (PROP_THROW_DELETE, "Cannot delete property '", "' of object"),
+    (
+        PROP_THROW_EXTENDS,
+        "Class extends value ",
+        " is not a constructor or null",
+    ),
+    (
+        PROP_THROW_EXTENDS_PROTO,
+        "Class extends value does not have valid prototype property ",
+        "",
+    ),
 ];
 /// The `TypeError` message `__prop_throw` raises for an array index store at or
 /// past the current length.
@@ -563,6 +573,12 @@ const PROP_THROW_NOT_EXTENSIBLE: i32 = 4;
 const PROP_THROW_GETTER_ONLY: i32 = 5;
 /// `__prop_throw`'s `mode` argument: deleting a non-configurable property.
 const PROP_THROW_DELETE: i32 = 6;
+/// `__prop_throw`'s `mode` argument: a class `extends` value (the `key`) that
+/// is neither a constructor nor `null`.
+const PROP_THROW_EXTENDS: i32 = 7;
+/// `__prop_throw`'s `mode` argument: a class parent whose `prototype` (the
+/// `key`) is neither an object nor `null`.
+const PROP_THROW_EXTENDS_PROTO: i32 = 8;
 
 /// The static strings `__prop_throw` needs — the message fragments (plus every
 /// [`PROP_KEYED_MSGS`] fragment). Seeded (with [`ERROR_STRS`]) by

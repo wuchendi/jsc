@@ -543,13 +543,16 @@ fn emit_fn_data(
 }
 
 /// The header `flags` a fresh function object of `kind` is created with:
-/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR`) per its kind.
+/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR` / `SELF_ALLOC`) per its kind.
 pub(super) fn fn_flags(kind: FnKind) -> u8 {
     abi::FUNC_FLAG_LAZY
         | match kind {
             FnKind::Plain => 0,
             FnKind::Constructor => abi::FUNC_FLAG_CONSTRUCTOR,
             FnKind::Class => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR,
+            FnKind::DerivedClass => {
+                abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR | abi::FUNC_FLAG_SELF_ALLOC
+            }
         }
 }
 
@@ -754,6 +757,7 @@ pub(super) fn collect_node<'a>(
         IrNode::StrLen(operand)
         | IrNode::Not(operand)
         | IrNode::IsHole(operand)
+        | IrNode::IsObject(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
@@ -781,6 +785,14 @@ pub(super) fn collect_node<'a>(
         IrNode::CellSet { cell, value } => {
             collect_node(cell, order, seen);
             collect_node(value, order, seen);
+        }
+        IrNode::ClassHeritage { value, .. } => {
+            seed_prop_strs(order, seen);
+            collect_node(value, order, seen);
+        }
+        IrNode::SetProto { obj, proto } => {
+            collect_node(obj, order, seen);
+            collect_node(proto, order, seen);
         }
         IrNode::Array(elems) | IrNode::Seq(elems) => {
             for elem in elems {
@@ -873,6 +885,7 @@ pub(super) fn collect_node<'a>(
             args,
             spread,
             not_constructor,
+            new_target,
             ..
         } => {
             seed_callee_error(callee_error_text(not_constructor), order, seen);
@@ -882,6 +895,9 @@ pub(super) fn collect_node<'a>(
             }
             if let Some(spread) = spread {
                 collect_node(spread, order, seen);
+            }
+            if let Some(new_target) = new_target {
+                collect_node(new_target, order, seen);
             }
         }
         IrNode::ObjectRest { source, exclude } => {
@@ -1123,6 +1139,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::NewTargetGlobal
         | IrNode::IsConstructCall(_)
         | IrNode::ArgCount(_)
+        | IrNode::Hole
         | IrNode::SpreadArgsGlobal
         | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.

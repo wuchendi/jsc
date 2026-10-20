@@ -596,6 +596,32 @@ pub enum IrNode {
     /// its binding's declaration runs, as a boolean jsval. Guards accesses to a
     /// module binding from a function body, which may run before the declaration.
     IsHole(Box<IrNode>),
+    /// The TDZ hole itself: a derived constructor's `this` before `super(..)`.
+    Hole,
+    /// Whether the value is an object (a heap value other than a string), as a
+    /// boolean jsval.
+    IsObject(Box<IrNode>),
+    /// A class heritage `extends value` (design 4.5): evaluate `value` into
+    /// `parent`; unless it is `null` it must be a constructor, and `proto` gets
+    /// `Get(parent, "prototype")`, which must be an object or `null` (`proto` is
+    /// `null` for a `null` parent); either failure throws a `TypeError` naming
+    /// the value. Yields `undefined`.
+    ClassHeritage {
+        /// The `extends` expression.
+        value: Box<IrNode>,
+        /// Local receiving the parent constructor (or `null`).
+        parent: u32,
+        /// Local receiving the parent's `prototype` (or `null`).
+        proto: u32,
+    },
+    /// Store `proto` into the `proto` slot of the object-family value `obj` and
+    /// yield `obj`. `obj` is read twice, so it must be side-effect free.
+    SetProto {
+        /// The object whose prototype is set.
+        obj: Box<IrNode>,
+        /// The new prototype (an object or `null`).
+        proto: Box<IrNode>,
+    },
     /// A `yield expr` expression. Produced by lowering a generator
     /// body; the generator segmentation pass CONSUMES every `Yield`, turning it
     /// into a state-machine suspend point, so a `Yield` that survives to the
@@ -1045,6 +1071,9 @@ pub enum IrNode {
         reserve: u32,
         /// The `TypeError` thrown when `callee` is not a constructor.
         not_constructor: CalleeError,
+        /// `super(..)` (`__construct_with`): the `new.target` to construct
+        /// with (a side-effect-free read) instead of `callee`.
+        new_target: Option<Box<IrNode>>,
     },
     /// Read the `__new_target` wasm global. Emitted ONLY in the prologue of a
     /// function that references `new.target`, guarded by the construct marker.
@@ -1465,6 +1494,9 @@ pub enum FnKind {
     Constructor,
     /// A class constructor: its `prototype` is defined by the class.
     Class,
+    /// A derived class constructor (`class B extends P`): also `SELF_ALLOC`,
+    /// so `new` leaves the allocation to `super(..)`.
+    DerivedClass,
 }
 
 /// One basic block of a generator state machine: a run of
@@ -1579,6 +1611,7 @@ impl IrNode {
             | IrNode::NewTargetGlobal
             | IrNode::IsConstructCall(_)
             | IrNode::ArgCount(_)
+            | IrNode::Hole
             | IrNode::SpreadArgsGlobal
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
@@ -1590,6 +1623,8 @@ impl IrNode {
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
+            | IrNode::IsObject(inner)
+            | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::TypeOf(inner)
@@ -1689,8 +1724,15 @@ impl IrNode {
                 callee,
                 args,
                 spread,
+                new_target,
                 ..
-            } => f(callee) || args.iter().any(&mut f) || spread.as_deref().is_some_and(f),
+            } => {
+                f(callee)
+                    || args.iter().any(&mut f)
+                    || spread.as_deref().is_some_and(&mut f)
+                    || new_target.as_deref().is_some_and(f)
+            }
+            IrNode::SetProto { obj, proto } => f(obj) || f(proto),
             IrNode::Object { entries, proto, .. } => {
                 proto.as_deref().is_some_and(&mut f)
                     || entries.iter().any(|(key, value)| {
@@ -1733,6 +1775,7 @@ impl IrNode {
             | IrNode::NewTargetGlobal
             | IrNode::IsConstructCall(_)
             | IrNode::ArgCount(_)
+            | IrNode::Hole
             | IrNode::SpreadArgsGlobal
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
@@ -1744,6 +1787,8 @@ impl IrNode {
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
+            | IrNode::IsObject(inner)
+            | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::TypeOf(inner)
@@ -1851,11 +1896,14 @@ impl IrNode {
                 callee,
                 args,
                 spread,
+                new_target,
                 ..
             } => std::iter::once(&mut **callee)
                 .chain(args.iter_mut())
                 .chain(spread.as_deref_mut())
+                .chain(new_target.as_deref_mut())
                 .collect(),
+            IrNode::SetProto { obj, proto } => vec![&mut **obj, &mut **proto],
             IrNode::Object { entries, proto, .. } => {
                 let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
                 for (key, value) in entries {

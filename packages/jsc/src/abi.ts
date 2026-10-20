@@ -112,6 +112,8 @@ export const OBJ_PROTO_OFFSET = 8
 export const FUNC_INDEX_OFFSET = OBJ_PREFIX_SIZE
 /** {@link TYPE_FUNCTION} `flags` bit: the function is a class constructor. */
 export const FUNC_FLAG_CLASS_CTOR = 16
+/** {@link TYPE_FUNCTION} `flags` bit: the constructor allocates its own `this` (a derived class). */
+export const FUNC_FLAG_SELF_ALLOC = 32
 /** Address of the `u32` base of the `__fn_info` table (`[name key:u32][length:u32]` per function). */
 export const FN_INFO_ADDR = 4
 /** Byte size of one `__fn_info` entry. */
