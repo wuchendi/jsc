@@ -232,6 +232,14 @@ impl LowerCtx<'_> {
                     }
                 }
             }
+            // `new.target`: the enclosing non-arrow function's snapshot; outside
+            // any function it is a SyntaxError.
+            Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::NewTarget => {
+                self.resolve_new_target().ok_or_else(|| {
+                    CompileError::spanned(meta.span, "`new.target` is only valid inside a function")
+                        .into()
+                })
+            }
             other => Err(CompileError::spanned(other.span(), unsupported_expr_msg(other)).into()),
         }
     }
@@ -491,6 +499,7 @@ impl LowerCtx<'_> {
             callee: Box::new(callee),
             args,
             this_local,
+            construct: true,
         })
     }
 
@@ -531,6 +540,7 @@ impl LowerCtx<'_> {
             callee: Box::new(callee),
             args,
             this_local,
+            construct: false,
         })
     }
 
@@ -1717,90 +1727,99 @@ impl LowerCtx<'_> {
     }
 
     fn lower_new(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
-        let Expr::Ident(callee) = new_expr.callee.as_ref() else {
-            let target = self.lower_expr(&new_expr.callee)?;
-            let args = self.lower_new_args(new_expr)?;
-            return Ok(Self::not_a_constructor(
-                target,
-                args,
-                source_name(&new_expr.callee).as_deref(),
-            ));
-        };
-        let name = callee.sym.as_ref();
-        // A `new A(args)` on a user class declared earlier takes the class
-        // instantiation path; the builtin Error constructors fall through below.
-        if self.shared.classes.borrow().contains_key(name) {
-            return self.lower_new_class(name, callee.span, new_expr);
-        }
-        // `new Map()` / `new Set()`: a fresh empty collection handle. Like the
-        // other builtins, `Map`/`Set` are not real bindings, so a user `let Map = ..`
-        // shadows them. Only the empty constructor is in scope — arguments (e.g.
-        // `new Map([[k, v]])`) are rejected.
-        if matches!(name, "Map" | "Set") && self.resolve(name).is_none() {
-            let args = new_expr.args.as_deref().unwrap_or(&[]);
-            if !args.is_empty() {
-                return Err(CompileError::spanned(
-                    callee.span(),
-                    format!(
-                        "new {name}(..) with constructor arguments is unsupported (only the empty \
-                         `new {name}()` is supported)"
-                    ),
-                )
-                .into());
+        // The builtin constructors keep their dedicated paths while unshadowed:
+        // they are not real bindings, so a user `let Map = ..` or `function
+        // Error(){}` constructs through the general path below.
+        if let Expr::Ident(callee) = new_expr.callee.as_ref()
+            && self.resolve(callee.sym.as_ref()).is_none()
+            && !self.shared.funcs.contains_key(callee.sym.as_ref())
+        {
+            let name = callee.sym.as_ref();
+            // `new Map()` / `new Set()`: a fresh empty collection handle. Only
+            // the empty constructor is in scope — arguments (e.g.
+            // `new Map([[k, v]])`) are rejected.
+            if matches!(name, "Map" | "Set") {
+                let args = new_expr.args.as_deref().unwrap_or(&[]);
+                if !args.is_empty() {
+                    return Err(CompileError::spanned(
+                        callee.span(),
+                        format!(
+                            "new {name}(..) with constructor arguments is unsupported (only the \
+                             empty `new {name}()` is supported)"
+                        ),
+                    )
+                    .into());
+                }
+                return Ok(IrNode::MapNew { set: name == "Set" });
             }
-            return Ok(IrNode::MapNew { set: name == "Set" });
+            // `new Promise(executor)`: the executor form of the Promise constructor.
+            if name == "Promise" {
+                return self.lower_new_promise(callee.span, new_expr);
+            }
+            // `new Date()` / `new Date(ms)`.
+            if name == "Date" {
+                return self.lower_new_date(callee.span, new_expr);
+            }
+            if let Some(kind) = ErrorKind::from_name(name) {
+                let mut args = Vec::new();
+                for arg in new_expr.args.as_deref().unwrap_or(&[]) {
+                    if arg.spread.is_some() {
+                        return Err(CompileError::spanned(
+                            arg.span(),
+                            "spread arguments are unsupported",
+                        )
+                        .into());
+                    }
+                    args.push(self.lower_expr(&arg.expr)?);
+                }
+                return Ok(self.lower_error_construct(kind, args));
+            }
         }
-        // `new Promise(executor)`: the executor form of the Promise
-        // constructor. Like `Map`/`Set`, `Promise` is not a real binding, so a
-        // user `let Promise = ..` shadows it.
-        if name == "Promise" && self.resolve("Promise").is_none() {
-            return self.lower_new_promise(callee.span, new_expr);
-        }
-        // `new Date()` / `new Date(ms)`. Like the other builtins, `Date`
-        // is not a real binding, so a user `let Date = ..` shadows it.
-        if name == "Date" && self.resolve("Date").is_none() {
-            return self.lower_new_date(callee.span, new_expr);
-        }
-        let args = self.lower_new_args(new_expr)?;
-        let Some(kind) = ErrorKind::from_name(name) else {
-            let target = self.lower_ident(name, callee.span)?;
-            return Ok(Self::not_a_constructor(target, args, Some(name)));
-        };
-        Ok(self.lower_error_construct(kind, args))
+        self.lower_construct(new_expr)
     }
 
-    /// Lower the arguments of `new X(args)` (spread rejected).
-    fn lower_new_args(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<Vec<IrNode>> {
-        let mut args = Vec::new();
-        for arg in new_expr.args.as_deref().unwrap_or(&[]) {
-            if arg.spread.is_some() {
-                return Err(
-                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
-                );
+    /// Lower `new X(args)` for any constructor expression `X` into an
+    /// [`IrNode::Construct`] (design 4.5). Class identity is by binding: `X` is
+    /// evaluated like any expression. When `X` names a recorded class, `this`'s
+    /// property table is pre-sized for the fields its constructor chain assigns
+    /// (capacity only; a rebound name just over-reserves).
+    fn lower_construct(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
+        let callee = self.lower_expr(&new_expr.callee)?;
+        let reserve = match new_expr.callee.as_ref() {
+            Expr::Ident(id) => self
+                .shared
+                .classes
+                .borrow()
+                .get(id.sym.as_ref())
+                .map_or(0, |info| info.fields.len()),
+            _ => 0,
+        };
+        let args = new_expr.args.as_deref().unwrap_or(&[]);
+        let mut lowered = Vec::with_capacity(args.len());
+        let mut parts = Vec::new();
+        let has_spread = args.iter().any(|arg| arg.spread.is_some());
+        for arg in args {
+            let value = self.lower_expr(&arg.expr)?;
+            if !has_spread {
+                lowered.push(value);
+            } else if arg.spread.is_some() {
+                parts.push(SpreadElem::Spread(value));
+            } else {
+                parts.push(SpreadElem::Item(value));
             }
-            args.push(self.lower_expr(&arg.expr)?);
         }
-        Ok(args)
-    }
-
-    /// `new target(args)` on a value that is not a recorded class or supported
-    /// builtin: evaluate the target and the arguments, then throw
-    /// `<name> is not a constructor`. Plain `function` declarations land here
-    /// too until construct is implemented (S3).
-    fn not_a_constructor(target: IrNode, args: Vec<IrNode>, name: Option<&str>) -> IrNode {
-        let error = CalleeError::not_a_constructor(name.unwrap_or(CalleeError::EXPRESSION));
-        let thrown = IrNode::Throw(Box::new(IrNode::error_object(
-            ErrorKind::TypeError,
-            None,
-            Some(IrNode::Str(error.message)),
-            IrNode::Str(error.stack),
-        )));
-        IrNode::Seq(
-            std::iter::once(target)
-                .chain(args)
-                .chain([thrown])
-                .collect(),
-        )
+        let name = source_name(&new_expr.callee);
+        Ok(IrNode::Construct {
+            callee: Box::new(callee),
+            args: lowered,
+            spread: has_spread.then(|| Box::new(IrNode::ArraySpread(parts))),
+            callee_local: self.fresh(),
+            this_local: self.fresh(),
+            reserve: u32::try_from(reserve).unwrap_or(u32::MAX),
+            not_constructor: CalleeError::not_a_constructor(
+                name.as_deref().unwrap_or(CalleeError::EXPRESSION),
+            ),
+        })
     }
 
     /// Build the Error instance `<kind>(args)` / `new <kind>(args)` constructs:
@@ -1968,43 +1987,6 @@ impl LowerCtx<'_> {
         Ok(IrNode::PromiseCtor {
             executor: Box::new(executor),
             p_local,
-        })
-    }
-
-    /// Lower `new A(args)` on a user class `A` into an [`IrNode::New`]. The
-    /// class binding `A` is read (a side-effect-free local/cell read): its value
-    /// is the constructor, and the fresh instance is an empty object whose
-    /// `proto` is `A.prototype` and whose property table is pre-sized for the
-    /// fields the constructor chain assigns. Spread arguments are rejected.
-    fn lower_new_class(
-        &mut self,
-        name: &str,
-        span: Span,
-        new_expr: &swc_ecma_ast::NewExpr,
-    ) -> anyhow::Result<IrNode> {
-        let fields = {
-            let classes = self.shared.classes.borrow();
-            classes.get(name).map_or(0, |info| info.fields.len())
-        };
-        // Read the class binding twice (both are pure local/cell reads): once for
-        // the prototype the instance links to, once as the constructor.
-        let proto = self.class_prototype_read(name, span)?;
-        let ctor = self.lower_ident(name, span)?;
-        let instance = IrNode::Object {
-            entries: Vec::new(),
-            proto: Some(Box::new(proto)),
-            class: crate::abi::CLASS_ORDINARY,
-            reserve: u32::try_from(fields).unwrap_or(u32::MAX),
-        };
-
-        let args = self.lower_new_args(new_expr)?;
-        let instance_local = self.fresh();
-        Ok(IrNode::New {
-            instance: Box::new(instance),
-            ctor: Box::new(ctor),
-            args,
-            instance_local,
-            not_callable: CalleeError::not_a_constructor(name),
         })
     }
 }

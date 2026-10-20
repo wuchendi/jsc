@@ -460,7 +460,7 @@ pub enum SpreadCallee {
     Indirect(Box<IrNode>, CalleeError),
     /// A `super(...args)` call: the parent constructor value, invoked with
     /// `this` kept as the enclosing constructor's snapshot in `this_local`
-    /// (like [`IrNode::ThisCall`]).
+    /// (like [`IrNode::ThisCall`]) and the construct marker as `argc`.
     This {
         /// The parent constructor function value.
         callee: Box<IrNode>,
@@ -998,34 +998,49 @@ pub enum IrNode {
         /// The enclosing method/constructor's `this` snapshot local, rebound as
         /// `__this` for the call.
         this_local: u32,
+        /// `super(..)`: pass the construct marker (`argc = -(n + 1)`), so the
+        /// parent class constructor accepts the call.
+        construct: bool,
     },
-    /// A class instantiation `new A(args)`. Allocates the fresh `instance`
-    /// object (linked to the class prototype, its property table pre-sized for
-    /// the fields the constructor assigns), binds `this = instance`, runs the constructor
-    /// function value `ctor` with `args` under the uniform ABI, DISCARDS the
-    /// constructor's return value, and evaluates to the instance. The instance is
-    /// stashed in `instance_local` so it survives the constructor call and is
-    /// yielded afterward — mirroring [`IrNode::MethodCallUser`]'s `this`-binding
-    /// call shape but yielding the receiver rather than the call result.
-    New {
-        /// The fresh instance allocation: an entry-less [`IrNode::Object`] whose
-        /// `proto` is the class prototype and whose `reserve` is the field count.
-        instance: Box<IrNode>,
-        /// The constructor function value to run (the class binding's value).
-        ctor: Box<IrNode>,
-        /// The constructor argument expressions, in source order.
+    /// `new callee(args)` (design 4.5): evaluate `callee` into `callee_local` and
+    /// the arguments, then `IsConstructor(callee)` (a function with
+    /// `FUNC_FLAG_CONSTRUCTOR`, else throw `not_constructor`); allocate `this` = a
+    /// fresh ordinary object (in `this_local`) whose `proto` is
+    /// `Get(callee, "prototype")` when that is an object, else
+    /// `%Object.prototype%`; set `__this = this`, `__new_target = callee`, and call
+    /// `callee` with the construct marker `argc = -(n + 1)`. The result is the
+    /// return value when it is an object, else `this`.
+    Construct {
+        /// The constructor expression.
+        callee: Box<IrNode>,
+        /// The argument expressions, in source order (empty with `spread`).
         args: Vec<IrNode>,
-        /// Fresh temp local holding the instance across the constructor call.
-        instance_local: u32,
-        /// The `TypeError` thrown when the class binding no longer holds a
-        /// function (`A is not a constructor`).
-        not_callable: CalleeError,
+        /// The argument array ([`IrNode::ArraySpread`]) when any argument is a
+        /// spread; its length is the dynamic argument count.
+        spread: Option<Box<IrNode>>,
+        /// Fresh temp local holding the callee across the arguments (and then
+        /// the call's return value).
+        callee_local: u32,
+        /// Fresh temp local holding the allocated `this` across the call.
+        this_local: u32,
+        /// Property-table capacity pre-reserved on `this` (an optimisation only).
+        reserve: u32,
+        /// The `TypeError` thrown when `callee` is not a constructor.
+        not_constructor: CalleeError,
     },
+    /// Read the `__new_target` wasm global. Emitted ONLY in the prologue of a
+    /// function that references `new.target`, guarded by the construct marker.
+    NewTargetGlobal,
+    /// Whether the `argc` local carries the construct marker `-(n + 1)` (its
+    /// number is negative), as a boolean.
+    IsConstructCall(u32),
+    /// The source argument count `n` held by the `argc` local, decoding the
+    /// construct marker `-(n + 1)`, as a number.
+    ArgCount(u32),
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
     /// operands evaluated only for their side effects: surplus `Error(..)`
-    /// arguments, and the target and arguments of a `new` that then throws
-    /// `is not a constructor`.
+    /// arguments.
     Seq(Vec<IrNode>),
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
@@ -1537,6 +1552,9 @@ impl IrNode {
             | IrNode::SentValue
             | IrNode::ExcValue
             | IrNode::ThisGlobal
+            | IrNode::NewTargetGlobal
+            | IrNode::IsConstructCall(_)
+            | IrNode::ArgCount(_)
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
@@ -1633,12 +1651,12 @@ impl IrNode {
             | IrNode::ReceiverMethod { recv, args, .. }
             | IrNode::DateMethod { recv, args, .. } => f(recv) || args.iter().any(f),
             IrNode::MethodCallUser { obj, key, args, .. } => f(obj) || f(key) || args.iter().any(f),
-            IrNode::New {
-                instance,
-                ctor,
+            IrNode::Construct {
+                callee,
                 args,
+                spread,
                 ..
-            } => f(instance) || f(ctor) || args.iter().any(f),
+            } => f(callee) || args.iter().any(&mut f) || spread.as_deref().is_some_and(f),
             IrNode::Object { entries, proto, .. } => {
                 proto.as_deref().is_some_and(&mut f)
                     || entries.iter().any(|(key, value)| {
@@ -1678,6 +1696,9 @@ impl IrNode {
             | IrNode::SentValue
             | IrNode::ExcValue
             | IrNode::ThisGlobal
+            | IrNode::NewTargetGlobal
+            | IrNode::IsConstructCall(_)
+            | IrNode::ArgCount(_)
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
@@ -1783,14 +1804,14 @@ impl IrNode {
                 .into_iter()
                 .chain(args.iter_mut())
                 .collect(),
-            IrNode::New {
-                instance,
-                ctor,
+            IrNode::Construct {
+                callee,
                 args,
+                spread,
                 ..
-            } => [&mut **instance, &mut **ctor]
-                .into_iter()
+            } => std::iter::once(&mut **callee)
                 .chain(args.iter_mut())
+                .chain(spread.as_deref_mut())
                 .collect(),
             IrNode::Object { entries, proto, .. } => {
                 let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();

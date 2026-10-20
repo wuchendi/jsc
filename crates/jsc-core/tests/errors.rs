@@ -1225,10 +1225,9 @@ fn non_function_call_without_functions_is_catchable() {
     );
 }
 
-/// `new` on a value that is not a class or supported builtin compiles and
-/// throws `<name> is not a constructor` at run time, after evaluating the
-/// target and the arguments. Plain `function` declarations take the same
-/// path until construct lands (S3).
+/// `new` on a value that is not a constructor compiles and throws
+/// `<name> is not a constructor` at run time, after evaluating the target and
+/// the arguments.
 #[test]
 fn new_on_non_constructor_throws() {
     assert_uncaught("let x = 5; new x()", "TypeError: x is not a constructor");
@@ -1238,8 +1237,8 @@ fn new_on_non_constructor_throws() {
         "TypeError: p is not a constructor",
     );
     assert_uncaught(
-        "function F() {} new F()",
-        "TypeError: F is not a constructor",
+        "function g() {} let f = () => 1; new f()",
+        "TypeError: f is not a constructor",
     );
     assert_uncaught(
         "let o = {}; new o.C()",
