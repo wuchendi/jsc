@@ -555,26 +555,7 @@ pub(super) fn emit_method_call_user(
     // any non-function). Dispatching that as a funcref index is undefined
     // behaviour; instead throw a clean `TypeError` and unwind to the nearest
     // handler (or the program boundary), exactly like `throw`.
-    emit_is_function(function, callee_val);
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // The `if` opens a control frame around the throw transfer; count it so the
-    // handler-relative `br` uses the right nesting depth.
-    enter_frame(helpers);
-    // Throw a real branded TypeError object (not a bare string): build it inline
-    // and stash it in `$exc_value`. This branch only runs on the throw path, so
-    // clobbering the low scratch slots (which held the callee) is harmless — the
-    // not-thrown path below never re-enters here.
-    emit_node(&internal_type_error(), function, scratch, strings, helpers);
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
-    // A throw replaces any pending return/break/continue a `finally` was routing.
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
-    emit_throw_return(function, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
+    emit_callable_guard(function, callee_val, scratch, strings, helpers);
 
     // Not-thrown path: proceed with the callee's block base (its wrapped pointer).
     function.instruction(&Instruction::LocalGet(callee_val));
@@ -727,19 +708,7 @@ pub(super) fn emit_this_call(
     // Runtime guard: the callee MUST be a function value — a `super.m` that
     // resolves to `undefined` (missing method) throws a branded TypeError instead
     // of dispatching a bogus funcref index. Identical to the method-call guard.
-    emit_is_function(function, callee_val);
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    enter_frame(helpers);
-    emit_node(&internal_type_error(), function, scratch, strings, helpers);
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
-    emit_throw_return(function, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
+    emit_callable_guard(function, callee_val, scratch, strings, helpers);
 
     // Not-thrown path: proceed with the callee's block base (its wrapped pointer).
     function.instruction(&Instruction::LocalGet(callee_val));
@@ -809,8 +778,13 @@ pub(super) fn emit_new(
     // K padded argument slots (deepest on the stack).
     emit_call_args(args, function, scratch, strings, helpers);
 
-    // Evaluate the constructor function value and stash its block base.
+    // Evaluate the constructor function value and stash its block base. A class
+    // binding reassigned to a non-class reads a non-function constructor entry,
+    // which must throw rather than dispatch (DF4).
     emit_node(ctor, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(scratch));
+    emit_callable_guard(function, scratch, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
 
@@ -1196,8 +1170,14 @@ pub(super) fn emit_promise_ctor(
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
 
-    // Evaluate the executor once, stash its block base, and call it env-last.
+    // Evaluate the executor once, stash its block base, and call it env-last. A
+    // non-function executor throws synchronously (DF4).
     emit_node(executor, function, scratch, strings, helpers);
+    if !is_static_function(executor) {
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_callable_guard(function, scratch, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+    }
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(exec_base));
     emit_reset_this(function);
@@ -1311,6 +1291,14 @@ pub(super) fn emit_call_indirect(
         emit_throw_not_a_function(function, scratch, strings, helpers);
         return;
     }
+    // IsCallable (DF4): a non-function callee throws instead of dispatching its
+    // low bits as a funcref index. The general i64 scratch slot (+0) is free:
+    // every argument is already on the stack.
+    if !is_static_function(callee) {
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_callable_guard(function, scratch, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+    }
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
     // A plain indirect call binds `this = undefined` — method calls take the
@@ -1359,6 +1347,36 @@ fn emit_throw_not_a_function(
     emit_throw_return(function, helpers);
 }
 
+/// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in
+/// `local` is a heap FUNCTION value, throw the branded not-a-function `TypeError`
+/// (see [`emit_throw_not_a_function`]) and unwind. Stack-neutral on the
+/// not-thrown path. The throw path builds the error object in the low scratch
+/// slots, so `local` may itself be a scratch slot the caller re-reads afterwards
+/// — that read only runs when nothing was thrown.
+pub(super) fn emit_callable_guard(
+    function: &mut Function,
+    local: u32,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_is_function(function, local);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // The `if` opens a control frame around the throw transfer; count it so the
+    // handler-relative `br` uses the right nesting depth.
+    enter_frame(helpers);
+    emit_throw_not_a_function(function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// Whether `callee` is a function literal, so its value is statically a
+/// function and an indirect call through it needs no `IsCallable` check.
+pub(super) fn is_static_function(callee: &IrNode) -> bool {
+    matches!(callee, IrNode::FuncValue { .. })
+}
+
 /// Emit a call whose argument list contains a spread `f(...a)`, leaving
 /// the callee's boxed jsval result on the stack. The `args` node (an
 /// [`IrNode::ArraySpread`]) is materialized into a heap array; its elements are
@@ -1398,6 +1416,12 @@ pub(super) fn emit_call_spread(
             // The callee is evaluated first (JS order) and its base stashed, then
             // the argument array is built and read.
             emit_node(callee, function, scratch, strings, helpers);
+            // IsCallable (DF4), checked while the full callee jsval is at hand.
+            if !is_static_function(callee) {
+                function.instruction(&Instruction::LocalSet(scratch));
+                emit_callable_guard(function, scratch, scratch, strings, helpers);
+                function.instruction(&Instruction::LocalGet(scratch));
+            }
             function.instruction(&Instruction::I32WrapI64);
             function.instruction(&Instruction::LocalSet(cb));
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
