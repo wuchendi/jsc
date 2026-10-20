@@ -3,7 +3,9 @@
 
 use jsc_core::run::compile_and_run_capturing;
 mod common;
-use common::{assert_bool, assert_number, assert_rejected, assert_str, assert_uncaught};
+use common::{
+    assert_bool, assert_number, assert_output, assert_rejected, assert_str, assert_uncaught,
+};
 
 // --- uncaught throw ---------------------------------------------------------
 
@@ -1021,4 +1023,95 @@ fn no_throw_programs_unaffected() {
     );
     assert_number("let adder = (a) => (b) => a + b; adder(40)(2)", 42.0);
     assert_number("[1, 2, 3].reduce((a, b) => a + b, 0)", 6.0);
+}
+
+// --- IsCallable check before an indirect call (DF4) ---------------------------
+
+/// The branded `TypeError` every non-callable callee raises.
+const NOT_A_FUNCTION: &str = "TypeError: called value is not a function";
+
+/// A plain indirect call on a non-function value throws instead of dispatching
+/// the value's low bits as a funcref index (which used to run function 0).
+#[test]
+fn indirect_call_on_non_function_throws() {
+    assert_uncaught(
+        "function a(){ return \"A\" } let x = {}; x()",
+        NOT_A_FUNCTION,
+    );
+    assert_uncaught("function a(){ return 1 } let x = 5; x()", NOT_A_FUNCTION);
+    assert_uncaught(
+        "function a(){ return 1 } let x = undefined; x()",
+        NOT_A_FUNCTION,
+    );
+    // An array element and a call result have no source name.
+    assert_uncaught(
+        "function a(){ return 1 } let arr = [{}]; arr[0]()",
+        NOT_A_FUNCTION,
+    );
+    assert_uncaught("function a(){ return {} } a()()", NOT_A_FUNCTION);
+    // A spread call through a non-function value.
+    assert_uncaught(
+        "function a(){ return 1 } let x = {}; x(...[1])",
+        NOT_A_FUNCTION,
+    );
+}
+
+/// A member callee that resolves to a non-function throws.
+#[test]
+fn member_call_on_non_function_throws() {
+    assert_uncaught("let o = {f: {}}; o.f()", NOT_A_FUNCTION);
+    assert_uncaught(
+        "function a(){ return 1 } let o = {f: {}}; o.f()",
+        NOT_A_FUNCTION,
+    );
+}
+
+/// An array higher-order method rejects a non-function callback before it
+/// iterates — even over an empty array, matching Node.
+#[test]
+fn hof_callback_non_function_throws() {
+    assert_uncaught("function a(){ return 1 } [1].map({})", NOT_A_FUNCTION);
+    assert_uncaught("function a(){ return 1 } [].map({})", NOT_A_FUNCTION);
+    assert_uncaught("function a(){ return 1 } [1].filter(5)", NOT_A_FUNCTION);
+    assert_uncaught("function a(){ return 1 } [1].forEach(5)", NOT_A_FUNCTION);
+    assert_uncaught("function a(){ return 1 } [1].reduce({}, 0)", NOT_A_FUNCTION);
+}
+
+/// `new Promise(executor)` with a non-function executor throws synchronously,
+/// and `new` on a class binding reassigned to a non-class throws.
+#[test]
+fn promise_executor_and_new_non_function_throw() {
+    assert_uncaught("function a(){ return 1 } new Promise(5)", NOT_A_FUNCTION);
+    assert_uncaught("class A {}\nA = {}\nnew A()", NOT_A_FUNCTION);
+}
+
+/// A non-callable `.then` reaction is a passthrough (the host engine skips it),
+/// not a `TypeError`.
+#[test]
+fn promise_non_function_reaction_passes_through() {
+    assert_output(
+        "function a(){ return 1 } Promise.resolve(7).then({}).then(v => console.log(v))",
+        "7\n",
+    );
+}
+
+/// The not-a-function `TypeError` is a real, catchable `TypeError`.
+#[test]
+fn non_function_call_is_catchable() {
+    assert_output(
+        "function a(){ return 1 } let x = {}; \
+         try { x() } catch (e) { console.log(e instanceof TypeError, e.message) } \
+         try { [1].map(5) } catch (e) { console.log(e instanceof TypeError, e.message) }",
+        "true called value is not a function\ntrue called value is not a function\n",
+    );
+}
+
+/// Valid indirect calls, method calls, HOF callbacks and constructors still run.
+#[test]
+fn callable_values_still_dispatch() {
+    assert_number("let f = (a, b) => a + b; f(40, 2)", 42.0);
+    assert_number("let o = { f() { return 42 } }; o.f()", 42.0);
+    assert_number("[1, 2, 3].map(x => x * 2).reduce((a, b) => a + b, 0)", 12.0);
+    assert_number("let f = (a, b) => a + b; f(...[40, 2])", 42.0);
+    assert_number("class A { constructor() { this.v = 42 } } new A().v", 42.0);
 }

@@ -2,10 +2,15 @@
 use super::*;
 
 /// Emit the `__alloc(size: i32) -> i32` bump allocator: return the current
-/// `__heap_ptr`, then advance it by `size`, growing linear memory on demand.
+/// `__heap_ptr`, then advance it by `size` rounded up to [`BLOCK_ALIGN`] (so
+/// every block base stays 8-aligned), growing linear memory on demand, and write
+/// the block's [`HEADER_SIZE`] header bytes 0 (the type byte the caller then
+/// stores, plus the reserved `gc`/`flags`/`class` bytes). Every caller requests
+/// at least a header, so `size > 0`.
 ///
-/// The end offset is computed in `i64` (both operands zero-extended), so it can
-/// never wrap; the fast path is one compare against `memory.size * 64 KiB`. On
+/// The end offset is computed in `i64` (both operands zero-extended), so neither
+/// the rounding nor the add can wrap; the fast path is one compare against
+/// `memory.size * 64 KiB`. On
 /// overflow the cold path grows by `max(needed, current)` pages (at least
 /// doubling), falling back to exactly the needed pages. When even that fails
 /// (the module's memory `maximum` is reached) it stores the sticky
@@ -20,12 +25,16 @@ pub(super) fn emit_alloc() -> Function {
         (1, ValType::I32),
     ]);
     let (size, old, end, need) = (0, 1, 2, 3);
-    // old = __heap_ptr; end = u64(old) + u64(size).
+    // old = __heap_ptr; end = u64(old) + ((u64(size) + 7) & !7).
     function.instruction(&Instruction::GlobalGet(HEAP_PTR_GLOBAL));
     function.instruction(&Instruction::LocalTee(old));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::LocalGet(size));
     function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(i64::from(BLOCK_ALIGN - 1)));
+    function.instruction(&Instruction::I64Add);
+    function.instruction(&Instruction::I64Const(-i64::from(BLOCK_ALIGN)));
+    function.instruction(&Instruction::I64And);
     function.instruction(&Instruction::I64Add);
     function.instruction(&Instruction::LocalTee(end));
     // if end > memory.size << 16: grow.
@@ -69,11 +78,131 @@ pub(super) fn emit_alloc() -> Function {
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    // __heap_ptr = end; return old.
+    // __heap_ptr = end; zero the header at old; return old.
     function.instruction(&Instruction::LocalGet(end));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::GlobalSet(HEAP_PTR_GLOBAL));
     function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// Emit `__alloc(size)` for a block of kind `type_byte`, store the type byte,
+/// and leave the base in local `base`.
+fn emit_new_block(function: &mut Function, alloc: u32, base: u32, type_byte: i32) {
+    function.instruction(&Instruction::Call(alloc));
+    function.instruction(&Instruction::LocalTee(base));
+    function.instruction(&Instruction::I32Const(type_byte));
+    function.instruction(&Instruction::I32Store8(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+}
+
+/// Emit the exported `__new_string(len: i32) -> i32` constructor: a
+/// [`TYPE_STRING`] block `[0][0×3][len:u32][len bytes]` whose payload the host
+/// fills. Local 0 is `len`; local 1 the base.
+pub(super) fn emit_new_string(alloc: u32) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
+    let (len, base) = (0, 1);
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Add);
+    emit_new_block(&mut function, alloc, base, TYPE_STRING);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: HEADER_SIZE as u64,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// Emit the exported `__new_array(len: i32) -> i32` constructor: a
+/// [`TYPE_ARRAY`] block `[1][0×3][len:u32][elem:i64 × len]` with every element
+/// `undefined`. Local 0 is `len`; local 1 the base; local 2 the element cursor.
+pub(super) fn emit_new_array(alloc: u32) -> Function {
+    let mut function = Function::new(vec![(2, ValType::I32)]);
+    let (len, base, at) = (0, 1, 2);
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Add);
+    emit_new_block(&mut function, alloc, base, TYPE_ARRAY);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: HEADER_SIZE as u64,
+        align: 2,
+        memory_index: 0,
+    }));
+    // for (at = base; at < base + 8 * len; at += 8) *(at + 8) = undefined.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalSet(at));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Store(MemArg {
+        offset: (HEADER_SIZE + 4) as u64,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I32Const(8));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(at));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// Emit the exported `__new_promise() -> i32` constructor: a pending
+/// [`abi::TYPE_PROMISE`] block `[8][0×3][state:i32][value:i64]` with `state =
+/// PENDING` and `value = undefined`. Local 0 is the base.
+pub(super) fn emit_new_promise(alloc: u32) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
+    let base = 0;
+    function.instruction(&Instruction::I32Const(HEADER_SIZE + 12));
+    emit_new_block(&mut function, alloc, base, i32::from(abi::TYPE_PROMISE));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Const(abi::PROMISE_PENDING));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: HEADER_SIZE as u64,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Store(MemArg {
+        offset: (HEADER_SIZE + 4) as u64,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::End);
     function
 }
