@@ -109,6 +109,10 @@ pub(crate) const CLASS_ORDINARY: u8 = 0;
 /// `name`.
 pub(crate) const CLASS_ERROR: u8 = 1;
 
+/// [`TYPE_OBJECT`] `class` byte: an (unmapped) `arguments` object. It owns
+/// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
+pub(crate) const CLASS_ARGUMENTS: u8 = 2;
+
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
@@ -189,6 +193,11 @@ pub(crate) const FUNC_FLAG_CONSTRUCTOR: u8 = 8;
 /// [`TYPE_FUNCTION`] header `flags` bit: the function is a class constructor.
 /// Its `prototype` is installed by the class definition, not materialized.
 pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the constructor allocates its own
+/// `this` (a derived class: `super(..)` constructs it), so `new` skips the
+/// allocation.
+pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
 
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
