@@ -1066,22 +1066,6 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// The complete own-key set of a method-call receiver whose object shape is
-    /// statically known: a direct object literal, or an identifier bound to a
-    /// `let`/`const` object literal that is never reassigned (recorded in
-    /// [`Shared::object_shapes`]). `None` when the shape is not statically known,
-    /// so the caller falls back to runtime dispatch.
-    fn receiver_object_shape(&self, recv: &Expr) -> Option<Vec<String>> {
-        match strip_parens(recv) {
-            literal @ Expr::Object(_) => object_literal_keys(literal),
-            Expr::Ident(ident) => {
-                let id = self.binding_id_of(ident.sym.as_ref())?;
-                self.shared.object_shapes.get(&id).cloned()
-            }
-            _ => None,
-        }
-    }
-
     /// Lower a user method call `obj.m(args)` / `obj[k](args)` into an
     /// [`IrNode::MethodCallUser`] binding `this = obj`. The receiver is
     /// evaluated once into a fresh temp; the callee is the function value at the
@@ -1102,18 +1086,6 @@ impl LowerCtx<'_> {
         // provably unknown — reject it with a span diagnostic instead of emitting
         // a `call_indirect` the wasm validator (or runtime) would reject.
         if static_primitive_receiver(&member.obj) {
-            return Err(unknown_method_error(member.span(), name.as_deref()));
-        }
-        // Static-shape guard: when the receiver's complete own-key set is known
-        // (a direct object literal, or a `let`/`const` binding initialized with
-        // one and never reassigned) and the statically-known method name is not
-        // among those keys, the call is provably unknown — the object model has no
-        // dynamic key growth, so `obj.<name>` reads `undefined` and dispatches it
-        // as a bogus funcref index. Reject it with a span diagnostic instead.
-        if let Some(method) = name.as_deref()
-            && let Some(keys) = self.receiver_object_shape(&member.obj)
-            && !keys.iter().any(|k| k == method)
-        {
             return Err(unknown_method_error(member.span(), name.as_deref()));
         }
         let key = match &member.prop {
@@ -1482,13 +1454,14 @@ impl LowerCtx<'_> {
         Ok(IrNode::Array(elems))
     }
 
-    /// Lower an object literal `{a: e0, "b": e1, m(){..}, n, ..}` into an
-    /// [`IrNode::Object`], evaluating each value expression left-to-right. Key-value
-    /// entries, shorthand properties (`{n}` ≡ `{n: n}`), and method/shorthand-method
-    /// properties (`{m(){..}}` ≡ `{m: function(){..}}`, a first-class function value
-    /// carrying `this`) are in scope with a static identifier or string key.
-    /// Computed keys, spread, and getter/setter/computed/async/generator methods are
-    /// rejected with spans.
+    /// Lower an object literal `{a: e0, "b": e1, [k]: e2, 1: e3, m(){..}, n, ..}`
+    /// into an [`IrNode::Object`], evaluating each key and value left-to-right.
+    /// Key-value entries, shorthand properties (`{n}` ≡ `{n: n}`), and
+    /// method/shorthand-method properties (`{m(){..}}` ≡ `{m: function(){..}}`, a
+    /// first-class function value carrying `this`) are in scope; identifier and
+    /// string keys are static, computed and numeric keys are converted at run
+    /// time. Spread, getters/setters, and async/generator methods are rejected
+    /// with spans.
     ///
     /// # Errors
     ///
@@ -1509,12 +1482,12 @@ impl LowerCtx<'_> {
             };
             match prop.as_ref() {
                 Prop::KeyValue(kv) => {
-                    let key = prop_name_key(&kv.key)?;
+                    let key = self.lower_prop_key(&kv.key)?;
                     entries.push((key, self.lower_expr(&kv.value)?));
                 }
                 // Shorthand `{n}` ≡ `{n: n}`: the value is the identifier read.
                 Prop::Shorthand(ident) => {
-                    let key = ident.sym.as_ref().to_owned();
+                    let key = PropKey::Static(ident.sym.as_ref().to_owned());
                     let value = self.lower_ident(ident.sym.as_ref(), ident.span)?;
                     entries.push((key, value));
                 }
@@ -1522,7 +1495,7 @@ impl LowerCtx<'_> {
                 // function value (like an arrow) that carries `this`.
                 Prop::Method(method) => {
                     reject_unsupported_function(&method.function)?;
-                    let key = prop_name_key(&method.key)?;
+                    let key = self.lower_prop_key(&method.key)?;
                     let block = method
                         .function
                         .body
@@ -1548,7 +1521,28 @@ impl LowerCtx<'_> {
                 }
             }
         }
-        Ok(IrNode::Object(entries))
+        Ok(IrNode::Object {
+            entries,
+            proto: None,
+            reserve: 0,
+        })
+    }
+
+    /// Lower an object-literal property name: an identifier or string key is
+    /// static; a numeric or computed key is evaluated (in source order) and
+    /// converted with `ToPropertyKey` at run time.
+    fn lower_prop_key(&mut self, name: &PropName) -> anyhow::Result<PropKey> {
+        match name {
+            PropName::Ident(id) => Ok(PropKey::Static(id.sym.as_ref().to_owned())),
+            PropName::Str(s) => Ok(PropKey::Static(s.value.to_string_lossy().into_owned())),
+            PropName::Num(n) => Ok(PropKey::Computed(IrNode::Num(n.value))),
+            PropName::Computed(c) => Ok(PropKey::Computed(self.lower_expr(&c.expr)?)),
+            PropName::BigInt(_) => Err(CompileError::spanned(
+                name.span(),
+                "unsupported object key: BigInt keys are not supported",
+            )
+            .into()),
+        }
     }
 
     /// Lower a `new <Id>(args)` expression for the three built-in error
@@ -1723,12 +1717,12 @@ impl LowerCtx<'_> {
             }
             None => (IrNode::Str(String::new()), IrNode::Str(name.to_owned())),
         };
-        Ok(IrNode::Object(vec![
-            ("name".to_owned(), IrNode::Str(name.to_owned())),
-            ("message".to_owned(), message_value),
-            ("stack".to_owned(), stack),
-            (crate::abi::ERROR_KIND_KEY.to_owned(), IrNode::Num(kind)),
-        ]))
+        Ok(IrNode::error_object(
+            IrNode::Str(name.to_owned()),
+            message_value,
+            stack,
+            kind,
+        ))
     }
 
     /// Lower `new Date()` / `new Date(ms)` into an [`IrNode::DateNew`].
@@ -1806,10 +1800,10 @@ impl LowerCtx<'_> {
 
     /// Lower `new A(args)` on a user class `A` into an [`IrNode::New`]. The
     /// class binding `A` is read (a side-effect-free local/cell read) to reach its
-    /// reserved constructor and prototype entries; the fresh instance is an object
-    /// pre-slotted with the reserved prototype link (pointing at the class's shared
-    /// prototype) and one `undefined` slot per field the constructor assigns, since
-    /// the object model has no dynamic key growth. Spread arguments are rejected.
+    /// reserved constructor and prototype entries; the fresh instance is an empty
+    /// object whose `proto` is the class's shared prototype and whose property
+    /// table is pre-sized for the fields the constructor chain assigns. Spread
+    /// arguments are rejected.
     fn lower_new_class(
         &mut self,
         name: &str,
@@ -1818,10 +1812,7 @@ impl LowerCtx<'_> {
     ) -> anyhow::Result<IrNode> {
         let fields = {
             let classes = self.shared.classes.borrow();
-            classes
-                .get(name)
-                .map(|info| info.fields.clone())
-                .unwrap_or_default()
+            classes.get(name).map_or(0, |info| info.fields.len())
         };
         // Read the class binding twice (both are pure local/cell reads): once for
         // the shared prototype the instance links to, once for the constructor.
@@ -1834,12 +1825,11 @@ impl LowerCtx<'_> {
             obj: Box::new(class_read),
             index: Box::new(IrNode::Str(crate::abi::CLASS_CONSTRUCTOR_KEY.to_owned())),
         };
-        // The fresh instance: the prototype link first, then a slot per field.
-        let mut entries = vec![(crate::abi::CLASS_PROTOTYPE_KEY.to_owned(), proto)];
-        for field in fields {
-            entries.push((field, IrNode::Undefined));
-        }
-        let instance = IrNode::Object(entries);
+        let instance = IrNode::Object {
+            entries: Vec::new(),
+            proto: Some(Box::new(proto)),
+            reserve: u32::try_from(fields).unwrap_or(u32::MAX),
+        };
 
         let mut args = Vec::new();
         for arg in new_expr.args.as_deref().unwrap_or(&[]) {
@@ -1904,22 +1894,6 @@ fn collect_chain_links<'a>(chain: &'a OptChainExpr, links: &mut Vec<ChainLink<'a
     };
     links.push(link);
     root
-}
-
-/// The static string key of an object property name: an identifier or
-/// string-literal [`PropName`]. Computed (`[k]`) and numeric keys are rejected
-/// with a span — the object model interns compile-time string keys only.
-fn prop_name_key(name: &PropName) -> anyhow::Result<String> {
-    match name {
-        PropName::Ident(id) => Ok(id.sym.as_ref().to_owned()),
-        PropName::Str(s) => Ok(s.value.to_string_lossy().into_owned()),
-        _ => Err(CompileError::spanned(
-            name.span(),
-            "unsupported object key: only identifier and string keys are supported \
-             (computed and numeric keys are not)",
-        )
-        .into()),
-    }
 }
 
 /// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a

@@ -2,9 +2,9 @@
 //! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
 
 use super::{
-    DATE_MS_OFFSET, ERROR_KIND_KEY, HEADER_SIZE, PROMISE_FULFILLED, PROMISE_REJECTED, QNAN,
-    TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE,
-    TYPE_SET, TYPE_STRING,
+    DATE_MS_OFFSET, ERROR_KIND_KEY, HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED,
+    PROMISE_REJECTED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE,
+    TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -28,10 +28,29 @@ pub enum Value {
     /// A heap array, read from linear memory via an array-pointer jsval.
     /// Elements are decoded recursively, so arrays nest.
     Array(Vec<Value>),
-    /// A heap object, read from linear memory via an object-pointer jsval.
-    /// Entries preserve insertion order; keys are heap strings and values are
-    /// decoded recursively, so objects nest.
+    /// A heap object, read from linear memory via an object-pointer jsval: its
+    /// own enumerable properties in own-key order (integer keys ascending,
+    /// then the other keys in insertion order), values decoded recursively, so
+    /// objects nest.
     Object(Vec<(String, Value)>),
+    /// A branded Error object (one carrying the non-enumerable
+    /// `@@errorkind` brand): its `name` and `message` strings. Renders as its
+    /// single-line stack `"<name>: <message>"`.
+    Error {
+        /// The `name` property (`"Error"` when absent or not a string).
+        name: String,
+        /// The `message` property (empty when absent or not a string).
+        message: String,
+    },
+    /// An accessor property's value as rendered inside an object: which
+    /// halves (getter / setter) it has. Renders as `[Getter]`, `[Setter]`, or
+    /// `[Getter/Setter]`.
+    Accessor {
+        /// Whether the property has a getter.
+        getter: bool,
+        /// Whether the property has a setter.
+        setter: bool,
+    },
     /// A first-class function value, read from linear memory via a
     /// function-pointer jsval (type byte `3`). The backing block holds a
     /// funcref-table index and an environment slot; a returned bare function
@@ -184,15 +203,15 @@ fn decode_date(ptr: usize, memory: &[u8]) -> Value {
 }
 
 /// Resolve a heap promise block at base `ptr` into a [`Value::Promise`]:
-/// the i32 `state` at `ptr + HEADER_SIZE` and the i64 settled `value` at
-/// `ptr + HEADER_SIZE + 4` (decoded recursively). Defensive: a truncated block
+/// the i32 `state` at `ptr + PROMISE_STATE_OFFSET` and the i64 settled `value`
+/// at `ptr + PROMISE_VALUE_OFFSET` (decoded recursively). Defensive: a truncated block
 /// reads as pending with an `undefined` value.
 fn decode_promise(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
-    let state_at = ptr + HEADER_SIZE;
+    let state_at = ptr + PROMISE_STATE_OFFSET;
     let state = memory
         .get(state_at..state_at + 4)
         .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap_or([0; 4])));
-    let val_at = state_at + 4;
+    let val_at = ptr + PROMISE_VALUE_OFFSET;
     let value = memory
         .get(val_at..val_at + 8)
         .map_or(Value::Undefined, |b| {
@@ -208,11 +227,11 @@ fn decode_promise(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     }
 }
 
-/// Read the u32 `size` header of a Map/Set handle block at base `ptr` (at
-/// `ptr + HEADER_SIZE`), the logical entry count. Defensive: an out-of-range
+/// Read the u32 `size` field of a Map/Set handle block at base `ptr` (at
+/// `ptr + MAP_SIZE_OFFSET`), the logical entry count. Defensive: an out-of-range
 /// header yields `0`, so a malformed pointer never panics.
 fn decode_size(ptr: usize, memory: &[u8]) -> usize {
-    let at = ptr + HEADER_SIZE;
+    let at = ptr + MAP_SIZE_OFFSET;
     memory.get(at..at + 4).map_or(0, |b| {
         u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
     })
@@ -261,37 +280,101 @@ fn decode_array(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     Value::Array(elems)
 }
 
-/// Resolve a heap object block at base `ptr` into a [`Value::Object`] by reading
-/// the u32 `n` header at `ptr + HEADER_SIZE`, then decoding `n` consecutive 16-byte
-/// entries at `ptr + HEADER_SIZE + 4 + 16*k`: the key jsval (a heap-string pointer)
-/// at offset `+0` and the value jsval at offset `+8` (each recursively). Nested
-/// objects, arrays, and strings resolve through the same `memory`.
+/// Read the little-endian u32 at `at`, or `None` when out of range.
+fn read_u32(memory: &[u8], at: usize) -> Option<u32> {
+    let bytes = memory.get(at..at + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Read the little-endian u64 at `at`, or `None` when out of range.
+fn read_u64(memory: &[u8], at: usize) -> Option<u64> {
+    let bytes = memory.get(at..at + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Resolve a heap object block at base `ptr` by walking its `TYPE_PROPS` table
+/// (at the `props` slot): tombstones and non-enumerable entries are skipped,
+/// integer keys (strings flagged `ARRAY_INDEX`) come first in ascending order
+/// when the table has `HAS_INDEX_KEYS`, then the other keys in slot order. An
+/// accessor property decodes as [`Value::Accessor`]; an object carrying the
+/// non-enumerable `@@errorkind` brand decodes as [`Value::Error`].
 ///
-/// Defensive: an out-of-range header yields an empty object and a truncated entry
-/// run stops early, so a malformed pointer never panics.
+/// Defensive: a truncated table stops early, so a malformed pointer never
+/// panics.
 fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
-    let n_at = ptr + HEADER_SIZE;
-    let Some(n_bytes) = memory.get(n_at..n_at + 4) else {
+    use crate::abi;
+    let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize).unwrap_or(0) as usize;
+    if props == 0 {
         return Value::Object(Vec::new());
-    };
-    let n = u32::from_le_bytes(n_bytes.try_into().unwrap_or([0; 4])) as usize;
-    let mut entries = Vec::with_capacity(n);
-    for k in 0..n {
-        let key_start = n_at + 4 + 16 * k;
-        let Some(key_bytes) = memory.get(key_start..key_start + 8) else {
+    }
+    let count = read_u32(memory, props + abi::PROPS_COUNT_OFFSET as usize).unwrap_or(0) as usize;
+    let tflags = memory
+        .get(props + abi::PROPS_TFLAGS_OFFSET as usize)
+        .copied()
+        .unwrap_or(0);
+    let mut is_error = false;
+    // (index value for an integer key, key text, attrs, value bits)
+    let mut keyed: Vec<(Option<u32>, String, u32, u64)> = Vec::with_capacity(count);
+    for k in 0..count {
+        let entry = props + abi::PROPS_HEADER_SIZE as usize + abi::PROP_ENTRY_SIZE as usize * k;
+        let (Some(key), Some(attrs), Some(bits)) = (
+            read_u32(memory, entry + abi::PROP_KEY_OFFSET as usize),
+            read_u32(memory, entry + abi::PROP_ATTRS_OFFSET as usize),
+            read_u64(memory, entry + abi::PROP_VALUE_OFFSET as usize),
+        ) else {
             break;
         };
-        let Some(val_bytes) = memory.get(key_start + 8..key_start + 16) else {
-            break;
+        if key == 0 {
+            continue;
+        }
+        let Value::Str(text) = decode_string(key as usize, memory) else {
+            continue;
         };
-        let key_bits = u64::from_le_bytes(key_bytes.try_into().unwrap_or([0; 8]));
-        // The key jsval is a heap-string pointer; decode it and take its text.
-        let key = match decode(key_bits, memory) {
-            Value::Str(s) => s,
-            _ => String::new(),
+        if text == ERROR_KIND_KEY {
+            is_error = true;
+        }
+        if attrs & abi::ATTR_ENUMERABLE == 0 {
+            continue;
+        }
+        let flags = memory
+            .get(key as usize + abi::HEADER_FLAGS_OFFSET as usize)
+            .copied()
+            .unwrap_or(0);
+        let index = (tflags & abi::PROPS_HAS_INDEX_KEYS != 0
+            && flags & abi::STR_FLAG_ARRAY_INDEX != 0)
+            .then(|| text.parse::<u32>().ok())
+            .flatten();
+        keyed.push((index, text, attrs, bits));
+    }
+    // A stable sort keeps the non-index keys in slot order after the indices.
+    keyed.sort_by_key(|(index, ..)| index.map_or((1, 0), |i| (0, i)));
+    let mut entries = Vec::with_capacity(keyed.len());
+    for (_, key, attrs, bits) in keyed {
+        let value = if attrs & abi::ATTR_ACCESSOR != 0 {
+            let pair = (bits & 0xFFFF_FFFF) as usize;
+            let half = |offset: u32| {
+                read_u64(memory, pair + offset as usize).is_some_and(|b| b != abi::UNDEFINED)
+            };
+            Value::Accessor {
+                getter: half(abi::ACCESSOR_GET_OFFSET),
+                setter: half(abi::ACCESSOR_SET_OFFSET),
+            }
+        } else {
+            decode_in(bits, memory, guard)
         };
-        let val_bits = u64::from_le_bytes(val_bytes.try_into().unwrap_or([0; 8]));
-        entries.push((key, decode_in(val_bits, memory, guard)));
+        entries.push((key, value));
+    }
+    if is_error {
+        let field = |name: &str| {
+            entries.iter().find_map(|(key, value)| match value {
+                Value::Str(s) if key == name => Some(s.clone()),
+                _ => None,
+            })
+        };
+        return Value::Error {
+            name: field("name").unwrap_or_else(|| "Error".to_owned()),
+            message: field("message").unwrap_or_default(),
+        };
     }
     Value::Object(entries)
 }
@@ -399,10 +482,6 @@ pub fn format_value(value: &Value) -> String {
                 format!("[ {inner} ]")
             }
         }
-        // A branded Error object renders as its single-line stack
-        // (`"<name>: <message>"`), the way a JS console prints an error's first
-        // line, rather than as a plain `{ ... }` object.
-        Value::Object(entries) if is_error_object(entries) => render_error(entries),
         // An object renders Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
         Value::Object(entries) => {
             if entries.is_empty() {
@@ -416,6 +495,21 @@ pub fn format_value(value: &Value) -> String {
                 format!("{{ {inner} }}")
             }
         }
+        // A branded Error object renders as its single-line stack
+        // (`"<name>: <message>"`, or just the name without a message), the way
+        // a JS console prints an error's first line.
+        Value::Error { name, message } => {
+            if message.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}: {message}")
+            }
+        }
+        Value::Accessor { getter, setter } => match (getter, setter) {
+            (true, true) => "[Getter/Setter]".to_owned(),
+            (false, true) => "[Setter]".to_owned(),
+            _ => "[Getter]".to_owned(),
+        },
         // A function value renders Node-console style. jsc does not track a
         // function's source name through the value, so every function prints
         // anonymously.
@@ -479,31 +573,6 @@ fn format_date_iso(ms: f64) -> String {
     let year = if month <= 2 { year + 1 } else { year };
 
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
-}
-
-/// Whether the decoded object `entries` describe a branded Error object — i.e.
-/// they carry the hidden [`ERROR_KIND_KEY`] identity marker that
-/// `new Error`/`new TypeError`/`new RangeError` attach.
-fn is_error_object(entries: &[(String, Value)]) -> bool {
-    entries.iter().any(|(key, _)| key == ERROR_KIND_KEY)
-}
-
-/// Render a branded Error object as its single-line stack: `"<name>: <message>"`,
-/// or just `"<name>"` when the message is empty. Missing/non-string `name` falls
-/// back to `"Error"`, matching how a JS console prints an error's first line.
-/// Assumes [`is_error_object`] already held.
-fn render_error(entries: &[(String, Value)]) -> String {
-    let field = |name: &str| {
-        entries.iter().find_map(|(key, value)| match value {
-            Value::Str(s) if key == name => Some(s.as_str()),
-            _ => None,
-        })
-    };
-    let name = field("name").unwrap_or("Error");
-    match field("message") {
-        Some(message) if !message.is_empty() => format!("{name}: {message}"),
-        _ => name.to_owned(),
-    }
 }
 
 #[cfg(test)]

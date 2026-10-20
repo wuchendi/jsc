@@ -135,30 +135,31 @@ fn rejects_unknown_array_method() {
 }
 
 #[test]
-fn rejects_unknown_object_method() {
-    // The receiver's own-key set is statically known and lacks the method,
-    // so `o.foo()` is provably an unknown method.
-    assert_unknown_method("let o = {}; o.foo()", "foo");
-    assert_unknown_method("let o = { a: 1 }; o.bar()", "bar");
-    assert_unknown_method("let o = {}; o[\"baz\"]()", "baz");
+fn unknown_object_method_throws_at_runtime() {
+    // Objects are dynamic: a method absent from the receiver reads `undefined`,
+    // so calling it is an uncaught `TypeError` at run time, not a compile error.
+    const MSG: &str = "TypeError: called value is not a function";
+    assert_uncaught("let o = {}; o.foo()", MSG);
+    assert_uncaught("let o = { a: 1 }; o.bar()", MSG);
+    assert_uncaught("let o = {}; o[\"baz\"]()", MSG);
+    assert_uncaught("let o = { f() { return 1 } }; o.bar()", MSG);
+    assert_uncaught("({ f() { return 1 } }).bar()", MSG);
 }
 
 #[test]
-fn rejects_unknown_method_on_static_object_shape() {
-    // Static-shape guard: even when the program defines functions (so a funcref
-    // table DOES exist) and the receiver object literally CARRIES methods, a method
-    // name absent from the receiver's statically-known own-key set is provably
-    // unknown — the object model has no dynamic key growth — so instead of reading
-    // `undefined` and dispatching it as a bogus funcref index (a wrong value), it is
-    // a clean span diagnostic.
-    assert_unknown_method("let o = { f() { return 1 } }; o.bar()", "bar");
-    assert_unknown_method("const o = { f() { return 1 } }; o.bar()", "bar");
-    // A direct object-literal receiver is checked in place.
-    assert_unknown_method("({ f() { return 1 } }).bar()", "bar");
-    // The static string-key computed form resolves the same known shape.
-    assert_unknown_method("let o = { f() { return 1 } }; o[\"bar\"]()", "bar");
-    // A parenthesized literal initializer is still a known shape.
-    assert_unknown_method("let o = ({ a: 1, g() { return 2 } }); o.h()", "h");
+fn method_added_after_literal_is_callable() {
+    use jsc_core::run::{Value, compile_and_run};
+    // A method added to an object after its literal is an ordinary property, so
+    // calling it works (dot and computed forms, arrow and method values).
+    assert_eq!(
+        compile_and_run("let o = {}; o.f = () => 1; o.f()").expect("added method must run"),
+        Value::Number(1.0),
+    );
+    assert_eq!(
+        compile_and_run("const o = { a: 2 }; o[\"g\"] = function () { return this.a }; o.g()")
+            .expect("added method must run"),
+        Value::Number(2.0),
+    );
 }
 
 #[test]

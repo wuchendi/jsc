@@ -19,13 +19,12 @@ use wasmparser::{Operator, Parser, Payload};
 
 const HEADER: &str = "program\tuser_ops\tcall_indirect\tprop_calls\thost_calls\tfuel\treason";
 
-/// Offset of `__obj_get` past the first helper (`__alloc`), and of the other
-/// property-access helpers past `__obj_get`, in the emitter's helper layout
+/// Offsets of the property-access helpers `__get`/`__set`/`__has`/`__delete`
+/// past the first helper (`__alloc`) in the emitter's helper layout
 /// (`emit/sections.rs`): `__alloc`, `__concat`, `__str_eq`, `__str_cmp`,
-/// `__str_index`, `__obj_get`, `__obj_set`, ..., `__obj_has` (+8),
-/// `__obj_delete` (+9).
-const OBJ_GET_PAST_ALLOC: u32 = 5;
-const PROP_HELPERS_PAST_OBJ_GET: [u32; 4] = [0, 1, 8, 9];
+/// `__str_index`, the six interning helpers, `__to_key`, `__prop_find`,
+/// `__define`, then `__get` (+14), `__set`, `__has`, `__delete` (+17).
+const PROP_HELPERS_PAST_ALLOC: [u32; 4] = [14, 15, 16, 17];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -58,7 +57,7 @@ fn corpus_dir() -> PathBuf {
 /// (`n` = `IrProgram::functions.len()`), then the runtime helpers. "User code"
 /// is code-section bodies `0..=n` (`main` + user functions); a `call` target
 /// below `imports` is a host call; `prop_calls` counts calls to the
-/// property-access helpers `__obj_get`/`__obj_set`/`__obj_has`/`__obj_delete`.
+/// property-access helpers `__get`/`__set`/`__has`/`__delete`.
 fn measure(src: &str) -> Row {
     let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js).expect("parse");
     let ir = jsc_core::codegen::lower(&program).expect("lower");
@@ -83,7 +82,6 @@ fn measure(src: &str) -> Row {
             Payload::CodeSectionEntry(func) => {
                 if body < user_bodies {
                     let alloc = imports + u32::try_from(user_bodies).expect("index fits u32");
-                    let obj_get = alloc + OBJ_GET_PAST_ALLOC;
                     let mut ops = func.get_operators_reader().expect("operators");
                     while !ops.eof() {
                         let op = ops.read().expect("operator");
@@ -94,9 +92,9 @@ fn measure(src: &str) -> Row {
                                 row.host_calls += 1;
                             }
                             Operator::Call { function_index }
-                                if PROP_HELPERS_PAST_OBJ_GET
+                                if PROP_HELPERS_PAST_ALLOC
                                     .iter()
-                                    .any(|d| obj_get + d == function_index) =>
+                                    .any(|d| alloc + d == function_index) =>
                             {
                                 row.prop_calls += 1;
                             }

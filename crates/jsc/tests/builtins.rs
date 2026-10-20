@@ -221,3 +221,25 @@ fn date_shadowing_and_arity() {
         "7",
     );
 }
+
+/// Object-family values render through their payload offsets (Map/Set `size`,
+/// Date `ms`, Promise `state`/`value`, generator and function blocks). The
+/// browser shim asserts the same text in `packages/jsc/tests/run.test.ts`.
+#[test]
+fn object_family_values_render_through_payload_offsets() {
+    let src = "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.delete(2); \
+               const s = new Set(); s.add(1); s.add(2); \
+               function* gen() { yield 1 } function f(x) { return x } \
+               console.log(m, s, m.size, s.size, m.get(1), new Date(5), f, gen(), \
+               Promise.resolve(4), Promise.reject(1).catch(() => 0)); \
+               [m, s, new Date(0), Promise.resolve(f)]";
+    assert_eq!(
+        jsc_raw_stdout(&["-e", src]),
+        "Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function (anonymous)] \
+         Object [Generator] Promise { 4 } Promise { <pending> }\n"
+    );
+    assert_eq!(
+        jsc(&["-p", src]).lines().last(),
+        Some("[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function (anonymous)] } ]")
+    );
+}

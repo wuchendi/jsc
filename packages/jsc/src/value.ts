@@ -6,19 +6,42 @@
  */
 
 import {
+  ACCESSOR_GET_OFFSET,
+  ACCESSOR_SET_OFFSET,
+  ATTR_ACCESSOR,
+  ATTR_ENUMERABLE,
   DATE_MS_OFFSET,
+  ERROR_KIND_KEY,
+  HEADER_FLAGS_OFFSET,
   HEADER_SIZE,
+  MAP_SIZE_OFFSET,
+  OBJ_PROPS_OFFSET,
   PROMISE_FULFILLED,
   PROMISE_REJECTED,
+  PROMISE_STATE_OFFSET,
+  PROMISE_VALUE_OFFSET,
+  PROP_ATTRS_OFFSET,
+  PROP_ENTRY_SIZE,
+  PROP_KEY_OFFSET,
+  PROP_VALUE_OFFSET,
+  PROPS_COUNT_OFFSET,
+  PROPS_HAS_INDEX_KEYS,
+  PROPS_HEADER_SIZE,
+  PROPS_TFLAGS_OFFSET,
   QNAN,
+  STR_FLAG_ARRAY_INDEX,
   TYPE_ARRAY,
   TYPE_DATE,
   TYPE_FUNCTION,
+  TYPE_GENERATOR,
+  TYPE_MAP,
   TYPE_OBJECT,
   TYPE_PROMISE,
+  TYPE_SET,
   TYPE_STRING,
   U32_MASK,
   U64_MASK,
+  UNDEFINED,
 } from './abi.js'
 
 /** A decoded jsval — the in-scope runtime value types (mirrors `value.rs::Value`). */
@@ -30,8 +53,13 @@ export type Value =
   | { kind: 'string'; value: string }
   | { kind: 'array'; items: Value[] }
   | { kind: 'object'; entries: [string, Value][] }
+  | { kind: 'error'; name: string; message: string }
+  | { kind: 'accessor'; getter: boolean; setter: boolean }
   | { kind: 'function' }
+  | { kind: 'map'; size: number }
+  | { kind: 'set'; size: number }
   | { kind: 'promise'; state: number; value: Value }
+  | { kind: 'generator' }
   | { kind: 'date'; ms: number }
   | { kind: 'circular'; id: number }
   | { kind: 'ref'; id: number; value: Value }
@@ -153,6 +181,12 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
       return decodeString(ptr, mem)
     case TYPE_FUNCTION:
       return { kind: 'function' }
+    case TYPE_MAP:
+      return { kind: 'map', size: decodeSize(ptr, mem) }
+    case TYPE_SET:
+      return { kind: 'set', size: decodeSize(ptr, mem) }
+    case TYPE_GENERATOR:
+      return { kind: 'generator' }
     case TYPE_DATE:
       return decodeDate(ptr, mem)
     default:
@@ -162,18 +196,27 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
 
 /**
  * Resolve a heap promise block at `ptr` (mirrors `value.rs::decode_promise`):
- * the `i32` state at `ptr + HEADER_SIZE` and the settled `i64` value after it. A
- * truncated block reads as pending with an `undefined` value.
+ * the `i32` state at `ptr + PROMISE_STATE_OFFSET` and the settled `i64` value at
+ * `ptr + PROMISE_VALUE_OFFSET`. A truncated block reads as pending with an
+ * `undefined` value.
  */
 function decodePromise(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const state = readU32(mem, ptr + HEADER_SIZE)
-  const bits = readU64(mem, ptr + HEADER_SIZE + 4)
+  const state = readU32(mem, ptr + PROMISE_STATE_OFFSET)
+  const bits = readU64(mem, ptr + PROMISE_VALUE_OFFSET)
   return {
     kind: 'promise',
     state: state === undefined ? 0 : state | 0,
     value:
       bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard),
   }
+}
+
+/**
+ * The `u32` logical entry count of a Map/Set handle block at `ptr` (mirrors
+ * `value.rs::decode_size`); a truncated block reads as `0`.
+ */
+function decodeSize(ptr: number, mem: Uint8Array): number {
+  return readU32(mem, ptr + MAP_SIZE_OFFSET) ?? 0
 }
 
 /**
@@ -210,19 +253,80 @@ function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
   return { kind: 'array', items }
 }
 
-/** Resolve a heap object block at `ptr`: `n` × `(key_ptr:i64, val:i64)` entries. */
+/**
+ * Resolve a heap object block at `ptr` by walking its property table (mirrors
+ * `value.rs::decode_object`): tombstones and non-enumerable entries are
+ * skipped, integer keys come first in ascending order when the table has
+ * `HAS_INDEX_KEYS`, then the other keys in slot order. An accessor property
+ * decodes as `accessor`; an object carrying the non-enumerable `@@errorkind`
+ * brand decodes as `error`.
+ */
 function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const n = readU32(mem, ptr + HEADER_SIZE)
-  if (n === undefined) return { kind: 'object', entries: [] }
+  const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
+  if (props === 0) return { kind: 'object', entries: [] }
+  const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
+  const tflags = mem[props + PROPS_TFLAGS_OFFSET] ?? 0
+  let isError = false
+  const keyed: [number | undefined, string, number, bigint][] = []
+  for (let k = 0; k < count; k++) {
+    const entry = props + PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k
+    const key = readU32(mem, entry + PROP_KEY_OFFSET)
+    const attrs = readU32(mem, entry + PROP_ATTRS_OFFSET)
+    const bits = readU64(mem, entry + PROP_VALUE_OFFSET)
+    if (key === undefined || attrs === undefined || bits === undefined) break
+    if (key === 0) continue
+    const decodedKey = decodeString(key, mem)
+    const text = decodedKey.kind === 'string' ? decodedKey.value : ''
+    if (text === ERROR_KIND_KEY) isError = true
+    if ((attrs & ATTR_ENUMERABLE) === 0) continue
+    const flags = mem[key + HEADER_FLAGS_OFFSET] ?? 0
+    const index =
+      (tflags & PROPS_HAS_INDEX_KEYS) !== 0 &&
+      (flags & STR_FLAG_ARRAY_INDEX) !== 0
+        ? Number(text)
+        : undefined
+    keyed.push([index, text, attrs, bits])
+  }
+  // A stable sort keeps the non-index keys in slot order after the indices.
+  keyed.sort((a, b) =>
+    a[0] === undefined
+      ? b[0] === undefined
+        ? 0
+        : 1
+      : b[0] === undefined
+        ? -1
+        : a[0] - b[0],
+  )
   const entries: [string, Value][] = []
-  for (let k = 0; k < n; k++) {
-    const keyStart = ptr + HEADER_SIZE + 4 + 16 * k
-    const keyBits = readU64(mem, keyStart)
-    const valBits = readU64(mem, keyStart + 8)
-    if (keyBits === undefined || valBits === undefined) break
-    const decodedKey = decode(keyBits, mem)
-    const key = decodedKey.kind === 'string' ? decodedKey.value : ''
-    entries.push([key, decodeIn(valBits, mem, guard)])
+  for (const [, key, attrs, bits] of keyed) {
+    if ((attrs & ATTR_ACCESSOR) !== 0) {
+      const pair = Number(bits & U32_MASK)
+      const half = (offset: number) => {
+        const b = readU64(mem, pair + offset)
+        return b !== undefined && b !== UNDEFINED
+      }
+      entries.push([
+        key,
+        {
+          kind: 'accessor',
+          getter: half(ACCESSOR_GET_OFFSET),
+          setter: half(ACCESSOR_SET_OFFSET),
+        },
+      ])
+    } else {
+      entries.push([key, decodeIn(bits, mem, guard)])
+    }
+  }
+  if (isError) {
+    const field = (name: string) => {
+      const found = entries.find(([k, v]) => k === name && v.kind === 'string')
+      return found && found[1].kind === 'string' ? found[1].value : undefined
+    }
+    return {
+      kind: 'error',
+      name: field('name') ?? 'Error',
+      message: field('message') ?? '',
+    }
   }
   return { kind: 'object', entries }
 }
@@ -259,8 +363,25 @@ export function formatValue(value: Value): string {
       return value.entries.length === 0
         ? '{}'
         : `{ ${value.entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(', ')} }`
+    // A branded Error renders as its single-line stack.
+    case 'error':
+      return value.message === ''
+        ? value.name
+        : `${value.name}: ${value.message}`
+    case 'accessor':
+      return value.getter && value.setter
+        ? '[Getter/Setter]'
+        : value.setter
+          ? '[Setter]'
+          : '[Getter]'
     case 'function':
       return '[Function (anonymous)]'
+    case 'map':
+      return `Map(${value.size})`
+    case 'set':
+      return `Set(${value.size})`
+    case 'generator':
+      return 'Object [Generator]'
     case 'promise':
       if (value.state === PROMISE_FULFILLED)
         return `Promise { ${formatValue(value.value)} }`
