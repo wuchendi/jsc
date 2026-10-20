@@ -171,23 +171,6 @@ pub(super) fn emit_is_string(function: &mut Function, local: u32) {
     function.instruction(&Instruction::End);
 }
 
-/// Push `1` if the jsval in `local` is a heap OBJECT (type byte `2`), else `0`.
-/// Like [`emit_is_string`], this is `is_pointer(local) & (type_byte ==
-/// TYPE_OBJECT)`, with the type-byte read gated behind an `if` on
-/// [`emit_is_pointer`] so it never runs for a non-pointer (whose wrapped low
-/// bits would be a bogus offset). Used by the `instanceof` error-identity test,
-/// whose operand may be any value (a non-object is simply not an instance).
-pub(super) fn emit_is_object(function: &mut Function, local: u32) {
-    emit_is_pointer(function, local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_OBJECT));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-}
-
 /// Push `1` if the jsval in `local` is a heap FUNCTION value, else `0`.
 /// Like [`emit_is_string`], this is `is_pointer(local) & (type_byte ==
 /// TYPE_FUNCTION)`, with the type-byte read gated behind an `if` on

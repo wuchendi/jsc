@@ -255,12 +255,12 @@ pub enum PropKey {
     Computed(IrNode),
 }
 
-/// What the right-hand side of an `instanceof` names (E-series). Recognized
-/// syntactically at codegen from a bare identifier: a **user class** takes
-/// precedence, so `class Error {}` shadows the builtin; it and the three
-/// builtin error constructors walk the receiver's `proto` chain for their
-/// prototype ([`InstanceOfKind::Proto`]). Any other right-hand side is
-/// rejected at lowering.
+/// What the right-hand side of an `instanceof` is (design 4.6). Any expression
+/// is accepted: the general case is [`InstanceOfKind::Ctor`]
+/// (`OrdinaryHasInstance`). The builtin names that are not yet runtime values
+/// are recognized syntactically at codegen when no binding shadows them: the
+/// three builtin error constructors walk the receiver's `proto` chain for their
+/// static prototype ([`InstanceOfKind::Proto`]).
 ///
 /// The builtin constructors `Array`/`Object`/`Function`/`Date` match by the
 /// receiver's runtime TYPE BYTE rather than a prototype hop: `Array` /
@@ -279,12 +279,18 @@ pub enum InstanceOfKind {
     /// `instanceof Object` — the receiver is any heap pointer that is not a
     /// primitive string.
     Object,
-    /// `instanceof C` for a user class `C` or a builtin error constructor: some
-    /// object on the receiver's `proto` chain must be the SAME object as the
-    /// prototype the carried expression yields (`C.prototype`, or the static
-    /// [`IrNode::ErrorProto`]). The walk starts at the receiver's `proto` slot
-    /// and follows each prototype's own `proto` until a match or `null`.
+    /// `instanceof E` for an unshadowed builtin error constructor: some object
+    /// on the receiver's `proto` chain must be the SAME object as the static
+    /// prototype the carried [`IrNode::ErrorProto`] yields. The walk starts at
+    /// the receiver's `proto` slot and follows each prototype's own `proto`
+    /// until a match or `null`.
     Proto(Box<IrNode>),
+    /// `instanceof C` for any other right-hand side expression:
+    /// `OrdinaryHasInstance(C, x)`. A non-callable `C` throws a `TypeError`; a
+    /// non-object receiver is `false`; otherwise `Get(C, "prototype")` (a
+    /// non-object one throws a `TypeError`) is searched for on the receiver's
+    /// `proto` chain like [`InstanceOfKind::Proto`].
+    Ctor(Box<IrNode>),
 }
 
 /// A builtin error kind with a static prototype object in the data segment
@@ -1556,7 +1562,6 @@ impl IrNode {
             | IrNode::Not(inner)
             | IrNode::Throw(inner)
             | IrNode::ObjectBuiltin { arg: inner, .. }
-            | IrNode::InstanceOf { value: inner, .. }
             | IrNode::JsonStringify { arg: inner }
             | IrNode::JsonParse { arg: inner }
             | IrNode::PromiseResolve(inner)
@@ -1568,6 +1573,16 @@ impl IrNode {
             | IrNode::AsyncSpawn(inner)
             | IrNode::DateGetTime { recv: inner }
             | IrNode::MathSpread { args: inner, .. } => f(inner),
+            IrNode::InstanceOf { value, kind } => {
+                f(value)
+                    || match kind {
+                        InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => f(rhs),
+                        InstanceOfKind::Array
+                        | InstanceOfKind::Function
+                        | InstanceOfKind::Date
+                        | InstanceOfKind::Object => false,
+                    }
+            }
             IrNode::Binary { lhs: a, rhs: b, .. }
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }
@@ -1697,7 +1712,6 @@ impl IrNode {
             | IrNode::Not(inner)
             | IrNode::Throw(inner)
             | IrNode::ObjectBuiltin { arg: inner, .. }
-            | IrNode::InstanceOf { value: inner, .. }
             | IrNode::JsonStringify { arg: inner }
             | IrNode::JsonParse { arg: inner }
             | IrNode::PromiseResolve(inner)
@@ -1709,6 +1723,15 @@ impl IrNode {
             | IrNode::AsyncSpawn(inner)
             | IrNode::DateGetTime { recv: inner }
             | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
+            IrNode::InstanceOf { value, kind } => match kind {
+                InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => {
+                    vec![&mut **value, &mut **rhs]
+                }
+                InstanceOfKind::Array
+                | InstanceOfKind::Function
+                | InstanceOfKind::Date
+                | InstanceOfKind::Object => vec![&mut **value],
+            },
             IrNode::Binary { lhs: a, rhs: b, .. }
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }

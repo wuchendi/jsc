@@ -684,6 +684,18 @@ pub(super) fn emit_this_call(
     emit_node(callee, function, scratch, strings, helpers);
     let callee_val = scratch;
     function.instruction(&Instruction::LocalSet(callee_val));
+    // No funcref table (a function-less program, e.g. an optional call
+    // `o.m?.()` on a literal): the callee can never be a function value.
+    if !helpers.has_funcs {
+        emit_throw_not_a_function(
+            function,
+            EXPRESSION_NOT_A_FUNCTION,
+            scratch,
+            strings,
+            helpers,
+        );
+        return;
+    }
 
     // Runtime guard: the callee MUST be a function value — a `super.m` that
     // resolves to `undefined` (missing method) throws a TypeError instead

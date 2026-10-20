@@ -497,18 +497,19 @@ fn instanceof_user_class_non_object_is_false() {
     assert_bool("class C {} ({}) instanceof C", false);
 }
 
-/// `instanceof` with a right-hand side that is neither a user class nor an
-/// (unshadowed) builtin (`Error`/`TypeError`/`RangeError`/`Array`/`Object`/
-/// `Function`/`Date`) is rejected at compile time — jsc models no general
-/// prototype-chain `instanceof`. A user binding that SHADOWS a builtin name also
-/// falls through to the same rejection.
+/// `instanceof` accepts any right-hand side (`OrdinaryHasInstance`): a
+/// non-callable one throws a `TypeError` at run time, and a user binding that
+/// SHADOWS a builtin name is matched as an ordinary value.
 #[test]
-fn instanceof_unsupported_rhs_rejected() {
-    assert_rejected("({}) instanceof 5");
-    assert_rejected("let C = 1; ({}) instanceof C");
-    assert_rejected("let Error = 1; ({}) instanceof Error");
-    assert_rejected("let Array = 1; [] instanceof Array");
-    assert_rejected("let Object = 1; ({}) instanceof Object");
+fn instanceof_any_rhs() {
+    let not_callable = "TypeError: Right-hand side of 'instanceof' is not callable";
+    assert_uncaught("({}) instanceof 5", not_callable);
+    assert_uncaught("let C = 1; ({}) instanceof C", not_callable);
+    assert_uncaught("let Error = 1; ({}) instanceof Error", not_callable);
+    assert_uncaught("let Array = 1; [] instanceof Array", not_callable);
+    assert_uncaught("let Object = 1; ({}) instanceof Object", not_callable);
+    assert_bool("class C {} let K = C; new C() instanceof K", true);
+    assert_bool("class X {} let Object = X; ({}) instanceof Object", false);
 }
 
 /// The `Date` builtin accepts only the timestamp constructor forms and a
