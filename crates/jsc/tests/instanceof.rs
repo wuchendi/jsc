@@ -167,3 +167,31 @@ fn optional_bare_call_this_undefined() {
         "true true"
     );
 }
+
+/// A plain `function` constructor (S3 construct) links its instances to
+/// `F.prototype`, so `instanceof F` holds; an object returned by the
+/// constructor replaces `this` and is not an instance.
+#[test]
+fn instanceof_plain_function_constructor() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function F(){ this.v = 1 } function G(){ return {} } \
+             console.log(new F() instanceof F, new G() instanceof G, ({}) instanceof F)"
+        ]),
+        "true false false"
+    );
+}
+
+/// Construct and optional-call `this` together.
+#[test]
+fn construct_with_optional_call_this() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function F(){ this.v = 1 } let f = new F(); \
+             console.log(f instanceof F, ({m(){ return this }})?.m() !== undefined)"
+        ]),
+        "true true"
+    );
+}

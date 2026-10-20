@@ -390,8 +390,9 @@ struct Frame {
     /// `breakable` that excludes `switch`). A `continue` is legal only when this
     /// is nonzero — it targets a loop, never a bare `switch`.
     loopable: u32,
-    /// Binding id → local for the boxed cells declared in this frame; used to
-    /// source a captured cell when building an inner function's environment.
+    /// Binding id → local for the boxed cells declared in this frame (and its
+    /// by-value `new.target` snapshot); used to source a captured binding when
+    /// building an inner function's environment.
     by_id: HashMap<u32, u32>,
     /// When set, EVERY binding declared in this frame is a boxed cell reached
     /// through the frame's own environment (an `EnvLoad`), not a wasm local — the
@@ -422,6 +423,13 @@ struct Frame {
     /// and for a function that never reads `this`). An `Expr::This` in this frame
     /// reads this local.
     this_local: Option<u32>,
+    /// Whether this frame is an arrow body, which has no `new.target` of its
+    /// own: it reads the enclosing function's.
+    arrow: bool,
+    /// The wasm local this (non-arrow) function snapshots `new.target` into at
+    /// entry, allocated on the first `new.target` reference in it or in a nested
+    /// arrow (`None` until then).
+    new_target_local: Option<u32>,
 }
 
 /// Lowering context: a stack of function frames. Each frame maps

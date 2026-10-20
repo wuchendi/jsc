@@ -2089,7 +2089,7 @@ fn never_primitive(node: &IrNode) -> bool {
         IrNode::Object { .. }
             | IrNode::Array(_)
             | IrNode::ArraySpread(_)
-            | IrNode::New { .. }
+            | IrNode::Construct { .. }
             | IrNode::MapNew { .. }
             | IrNode::DateNew { .. }
             | IrNode::FuncValue { .. }
@@ -2110,7 +2110,7 @@ fn never_nullish(node: &IrNode) -> bool {
             | IrNode::Object { .. }
             | IrNode::Array(_)
             | IrNode::ArraySpread(_)
-            | IrNode::New { .. }
+            | IrNode::Construct { .. }
             | IrNode::MapNew { .. }
             | IrNode::DateNew { .. }
             | IrNode::FuncValue { .. }

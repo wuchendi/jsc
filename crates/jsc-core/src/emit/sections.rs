@@ -390,6 +390,16 @@ pub(super) fn build_globals(
         let (ty, init) = mut_i32(init);
         globals.global(ty, &init);
     }
+    // The `new.target` carrier ($__new_target, i64, index NEW_TARGET_GLOBAL),
+    // `undefined` until a `new` sets it. Internal, not exported.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I64,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i64_const(UNDEFINED_BITS),
+    );
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..module_cells {
@@ -840,18 +850,20 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
-        IrNode::New {
-            instance,
-            ctor,
+        IrNode::Construct {
+            callee,
             args,
-            not_callable,
+            spread,
+            not_constructor,
             ..
         } => {
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            collect_node(instance, order, seen);
-            collect_node(ctor, order, seen);
+            seed_callee_error(callee_error_text(not_constructor), order, seen);
+            collect_node(callee, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
+            }
+            if let Some(spread) = spread {
+                collect_node(spread, order, seen);
             }
         }
         IrNode::ObjectRest { source, exclude } => {
@@ -1090,6 +1102,9 @@ pub(super) fn collect_node<'a>(
         | IrNode::SentValue
         | IrNode::ExcValue
         | IrNode::ThisGlobal
+        | IrNode::NewTargetGlobal
+        | IrNode::IsConstructCall(_)
+        | IrNode::ArgCount(_)
         | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.
         | IrNode::MapNew { .. }
