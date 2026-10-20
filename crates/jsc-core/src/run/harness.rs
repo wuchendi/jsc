@@ -7,8 +7,7 @@ use std::io::Write;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 
 use super::host::{
-    heap_exhausted, host_alloc_string, method_dispatch, parse_float_str, parse_int_str,
-    value_to_number,
+    alloc_string, heap_exhausted, method_dispatch, parse_float_str, parse_int_str, value_to_number,
 };
 use super::promise::{self, Host};
 use crate::abi;
@@ -208,7 +207,7 @@ fn run_with_sink<W: Write + Send + 'static>(
                         return Ok(bits);
                     }
                     let text = format_value(&value);
-                    match host_alloc_string(&mut caller, &text) {
+                    match alloc_string(&mut caller, &text) {
                         Some(base) => (HEAP | base).cast_signed(),
                         // Allocation failed: out of memory traps via
                         // `oom_guard`; a missing export yields `undefined`.

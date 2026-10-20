@@ -1,9 +1,9 @@
-//! Host-import handlers backing the `__convert`/`__method` env imports and the
-//! bump-allocator they share. Everything here runs host-side against a
-//! `wasmtime::Caller`, decoding the guest's linear memory and (for the methods
-//! that build a fresh value) allocating a new heap block back into it.
+//! Host-import handlers backing the `__convert`/`__method` env imports. Everything
+//! here runs host-side against a `wasmtime::Caller`, decoding the guest's linear
+//! memory and (for the methods that build a fresh value) allocating a new heap
+//! block through the guest's exported constructors.
 
-use wasmtime::{AsContextMut, Caller, Global, Memory, Val};
+use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
@@ -34,97 +34,67 @@ const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
 const TRUE_BITS: u64 = abi::TRUE;
 const FALSE_BITS: u64 = abi::FALSE;
 
-/// The name under which `crate::emit` exports the bump-allocator heap pointer
-/// global (see [`abi::HEAP_PTR_EXPORT_NAME`]) so the `__convert` import can
-/// bump-allocate a heap string.
-const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
-
 /// The out-of-memory heap-pointer sentinel; see [`abi::HEAP_PTR_OOM`].
 const HEAP_PTR_OOM: i32 = abi::HEAP_PTR_OOM;
 
-/// The size in bytes of one wasm page.
-const PAGE_SIZE: usize = 0x1_0000;
+/// The linear-memory cap in bytes. A constructor request at or past it can
+/// only run out of memory, so lengths are clamped to it before the call (which
+/// keeps the guest's `i32` size arithmetic from wrapping).
+// 512 MiB fits `usize` on every supported target.
+#[allow(clippy::cast_possible_truncation)]
+const MEMORY_MAX_BYTES: usize = abi::MEMORY_MAX_PAGES as usize * 0x1_0000;
 
-/// Bump-allocate a heap STRING block holding `text` in the caller's guest memory
-/// and return its base offset, or `None` if the required exports are
-/// missing or the write fails.
-///
-/// The block is laid out exactly like a runtime-allocated string —
-/// `[type=0][pad×3][len:u32 LE][utf8]` — so [`decode`] resolves it identically to a
-/// literal or concatenation. It reads the exported `__heap_ptr` global as the free
-/// offset, grows linear memory if the block would overflow it, writes the bytes,
-/// and advances the global past them (mirroring the guest `__alloc`).
-pub(super) fn host_alloc_string<W: Send + 'static>(
+/// Call the guest constructor export `name(len) -> base` (`__new_string` /
+/// `__new_array`) and return the new block's base offset, or `None` when the
+/// export is missing or the call traps — an out-of-memory trap leaves the
+/// [`abi::HEAP_PTR_OOM`] sentinel for the run stage to report.
+fn guest_new<W: Send + 'static>(
+    caller: &mut Caller<'_, W>,
+    name: &str,
+    len: usize,
+) -> Option<usize> {
+    let ctor = caller
+        .get_export(name)
+        .and_then(wasmtime::Extern::into_func)?
+        .typed::<i32, i32>(&*caller)
+        .ok()?;
+    let len = i32::try_from(len).ok()?;
+    let base = ctor.call(&mut *caller, len).ok()?;
+    usize::try_from(base).ok()
+}
+
+/// Allocate a heap STRING block holding `text` through the guest
+/// `__new_string` export and return its base offset, or `None` if the export is
+/// missing or the allocation/write fails. The guest writes the header; the host
+/// only fills the UTF-8 payload.
+pub(super) fn alloc_string<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     text: &str,
 ) -> Option<u64> {
-    // Build the [type=STRING][pad×3][len:u32][utf8] block, then bump-allocate it.
-    let mut block = Vec::with_capacity(HEADER_SIZE + 4 + text.len());
-    block.push(TYPE_STRING);
-    block.resize(HEADER_SIZE, 0);
-    let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
-    block.extend_from_slice(&len.to_le_bytes());
-    block.extend_from_slice(text.as_bytes());
-    host_alloc(caller, &block)
-}
-
-/// Bump-allocate a pre-built heap `block` (its leading TYPE BYTE, header, and
-/// payload already laid out exactly like a guest-allocated block) in the caller's
-/// guest memory and return its base offset, or `None` when the required exports
-/// are missing or the write fails.
-///
-/// It reads the exported `__heap_ptr` global as the free offset, grows linear
-/// memory if the block would overflow it, writes the bytes, and advances the
-/// global past them — mirroring the guest `__alloc` so [`decode`] resolves the
-/// result identically to a runtime-allocated value.
-fn host_alloc<W: Send + 'static>(caller: &mut Caller<'_, W>, block: &[u8]) -> Option<u64> {
-    let global = caller
-        .get_export(HEAP_PTR_EXPORT_NAME)
-        .and_then(wasmtime::Extern::into_global)?;
+    let len = text.len().min(MEMORY_MAX_BYTES);
+    let base = guest_new(caller, abi::NEW_STRING_EXPORT_NAME, len)?;
     let mem = caller
-        .get_export("memory")
+        .get_export(abi::MEMORY_EXPORT_NAME)
         .and_then(wasmtime::Extern::into_memory)?;
-    let base = heap_reserve(&mut *caller, global, mem, block.len())?;
-    let end = base + block.len();
-    mem.write(&mut *caller, base, block).ok()?;
-    global
-        .set(&mut *caller, Val::I32(i32::try_from(end).ok()?))
+    mem.write(&mut *caller, base + HEADER_SIZE + 4, text.as_bytes())
         .ok()?;
     Some(base as u64)
 }
 
-/// Ensure `len` bytes starting at the current `__heap_ptr` fit in linear memory,
-/// growing it with the guest `__alloc` policy (by `max(needed, current)` pages,
-/// falling back to exactly the needed pages), and return the start offset.
-///
-/// When memory cannot grow (the module's `maximum` is reached) or the pointer
-/// already holds the sticky [`abi::HEAP_PTR_OOM`] sentinel, the sentinel is
-/// (re)stored and `None` is returned; the run stage reports it as
-/// `Uncaught RangeError: out of memory`.
-pub(super) fn heap_reserve(
-    mut store: impl AsContextMut,
-    global: Global,
-    mem: Memory,
-    len: usize,
-) -> Option<usize> {
-    // The sentinel (and any other negative pointer) fails the conversion.
-    let ptr = global.get(&mut store).i32()?;
-    let reserved = usize::try_from(ptr).ok().and_then(|base| {
-        let end = base.checked_add(len)?;
-        let cur = mem.data_size(&store);
-        if end > cur {
-            let cur_pages = (cur / PAGE_SIZE) as u64;
-            let need = (end - cur).div_ceil(PAGE_SIZE) as u64;
-            if mem.grow(&mut store, need.max(cur_pages)).is_err() {
-                mem.grow(&mut store, need).ok()?;
-            }
-        }
-        Some(base)
-    });
-    if reserved.is_none() {
-        let _ = global.set(&mut store, Val::I32(HEAP_PTR_OOM));
-    }
-    reserved
+/// Allocate a heap ARRAY block holding the jsval bits `elems` through the guest
+/// `__new_array` export and return its base offset, or `None` if the export is
+/// missing or the allocation/write fails. The guest writes the header; the host
+/// only fills the elements.
+fn alloc_array<W: Send + 'static>(caller: &mut Caller<'_, W>, elems: &[u64]) -> Option<u64> {
+    let len = elems.len().min(MEMORY_MAX_BYTES / 8);
+    let base = guest_new(caller, abi::NEW_ARRAY_EXPORT_NAME, len)?;
+    let mem = caller
+        .get_export(abi::MEMORY_EXPORT_NAME)
+        .and_then(wasmtime::Extern::into_memory)?;
+    let bytes: Vec<u8> = elems.iter().flat_map(|bits| bits.to_le_bytes()).collect();
+    mem.write(&mut *caller, base + HEADER_SIZE + 4, &bytes)
+        .ok()?;
+    Some(base as u64)
 }
 
 /// Whether the heap-pointer global holds the out-of-memory sentinel: some guest
@@ -150,8 +120,8 @@ pub(super) fn method_dispatch<W: Send + 'static>(
     arg1: i64,
 ) -> Option<u64> {
     // Snapshot memory once so every decode/raw read below is a plain slice lookup;
-    // any allocation happens afterwards through `host_alloc` (which re-borrows the
-    // memory mutably).
+    // any allocation happens afterwards through the guest constructors (which
+    // re-borrow the memory mutably).
     let mem: Vec<u8> = match caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)
@@ -200,7 +170,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                     })
                     .collect();
                 let text = String::from_utf8_lossy(&mapped);
-                host_alloc_string(caller, &text).map(|base| HEAP | base)
+                alloc_string(caller, &text).map(|base| HEAP | base)
             }
             _ => None,
         },
@@ -213,7 +183,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                     Some(u) => String::from_utf8_lossy(&bytes[u..=u]).into_owned(),
                     None => String::new(),
                 };
-                host_alloc_string(caller, &text).map(|base| HEAP | base)
+                alloc_string(caller, &text).map(|base| HEAP | base)
             }
             _ => None,
         },
@@ -382,7 +352,7 @@ fn array_join<W: Send + 'static>(
             },
         )
         .collect();
-    host_alloc_string(caller, &pieces.join(&sep)).map(|base| HEAP | base)
+    alloc_string(caller, &pieces.join(&sep)).map(|base| HEAP | base)
 }
 
 /// Resolve one JS slice endpoint against a sequence `len`: `undefined` uses
@@ -418,16 +388,10 @@ fn array_slice<W: Send + 'static>(
     let len = block_len(mem, ptr)?;
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
-    let count = end - start;
-    // Build the [type=ARRAY][pad×3][len:u32][elem:i64 × count] block.
-    let mut block = Vec::with_capacity(HEADER_SIZE + 4 + 8 * count);
-    block.push(TYPE_ARRAY);
-    block.resize(HEADER_SIZE, 0);
-    block.extend_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
-    for i in start..end {
-        block.extend_from_slice(&array_elem_bits(mem, ptr, i)?.to_le_bytes());
-    }
-    host_alloc(caller, &block).map(|base| HEAP | base)
+    let elems = (start..end)
+        .map(|i| array_elem_bits(mem, ptr, i))
+        .collect::<Option<Vec<u64>>>()?;
+    alloc_array(caller, &elems).map(|base| HEAP | base)
 }
 
 /// `string.slice(a, b)`: a NEW substring `[a, b)` by BYTE index (JS negative/clamp
@@ -444,7 +408,7 @@ fn string_slice<W: Send + 'static>(
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
     let text = String::from_utf8_lossy(&bytes[start..end]);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// `string.trim()` / `trimStart()` / `trimEnd()`: a NEW heap string with leading
@@ -460,7 +424,7 @@ fn string_trim<W: Send + 'static>(
     let trim_start = op != METHOD_OP_TRIM_END;
     let trim_end = op != METHOD_OP_TRIM_START;
     let text = String::from_utf8_lossy(trim_bytes(&bytes, trim_start, trim_end));
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// `string.repeat(n)`: a NEW heap string of the receiver repeated `n` times. A
@@ -481,7 +445,7 @@ fn string_repeat<W: Send + 'static>(
         out.extend_from_slice(&bytes);
     }
     let text = String::from_utf8_lossy(&out);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// `string.startsWith(sub)` / `endsWith(sub)`: a boolean prefix/suffix test (`sub`
@@ -516,7 +480,7 @@ fn string_pad<W: Send + 'static>(
         other => format_value(&other),
     };
     let text = pad_bytes(&bytes, target, pad.as_bytes(), op == METHOD_OP_PAD_START);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// `string.substring(a, b)`: a NEW substring `[a, b)` by BYTE index (endpoints
@@ -535,7 +499,7 @@ fn string_substring<W: Send + 'static>(
     let b = substring_index(arg1.cast_unsigned(), mem, len, len);
     let (lo, hi) = (a.min(b), a.max(b));
     let text = String::from_utf8_lossy(&bytes[lo..hi]);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// The NaN-boxed jsval bits of a boolean (`abi::TRUE` / `abi::FALSE`).
@@ -637,20 +601,13 @@ fn string_split<W: Send + 'static>(
     };
     // Allocate each piece as a heap string first (each is an owned byte vec,
     // independent of guest memory), collecting their jsval bits, then build the
-    // backing array block from them.
+    // backing array from them.
     let mut elems = Vec::with_capacity(pieces.len());
     for piece in &pieces {
         let text = String::from_utf8_lossy(piece);
-        elems.push(HEAP | host_alloc_string(caller, &text)?);
+        elems.push(HEAP | alloc_string(caller, &text)?);
     }
-    let mut block = Vec::with_capacity(HEADER_SIZE + 4 + 8 * elems.len());
-    block.push(TYPE_ARRAY);
-    block.resize(HEADER_SIZE, 0);
-    block.extend_from_slice(&u32::try_from(elems.len()).unwrap_or(u32::MAX).to_le_bytes());
-    for bits in elems {
-        block.extend_from_slice(&bits.to_le_bytes());
-    }
-    host_alloc(caller, &block).map(|base| HEAP | base)
+    alloc_array(caller, &elems).map(|base| HEAP | base)
 }
 
 /// Split `hay` on each non-overlapping occurrence of the non-empty `sep`, keeping
