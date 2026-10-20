@@ -159,7 +159,10 @@ it('rejects run() on an unhandled top-level await rejection', async () => {
 
 it('renders cyclic structures Node-console style', async () => {
   const cases: [string, string][] = [
-    ['let a = [1, 0]; a[1] = a; console.log(a)', '<ref *1> [ 1, [Circular *1] ]\n'],
+    [
+      'let a = [1, 0]; a[1] = a; console.log(a)',
+      '<ref *1> [ 1, [Circular *1] ]\n',
+    ],
     [
       'let o = {self: null, x: 1}; o.self = o; console.log(o)',
       '<ref *1> { self: [Circular *1], x: 1 }\n',
