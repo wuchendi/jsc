@@ -247,6 +247,22 @@ impl LowerCtx<'_> {
                 }),
             );
         }
+        // Likewise `new.target` (referenced here or by a nested arrow): the
+        // `__new_target` global under the construct marker (`argc < 0`), else
+        // `undefined`.
+        if let Some(local) = self.frame().new_target_local {
+            body.insert(
+                0,
+                IrStmt::Expr(IrNode::Assign {
+                    local,
+                    value: Box::new(IrNode::Ternary {
+                        cond: Box::new(IrNode::IsConstructCall(k + 1)),
+                        then_branch: Box::new(IrNode::NewTargetGlobal),
+                        else_branch: Box::new(IrNode::Undefined),
+                    }),
+                }),
+            );
+        }
 
         let locals = self.frame().next;
         let env_layout = self.frame().env.clone();
@@ -307,8 +323,9 @@ impl LowerCtx<'_> {
     /// Emit the prologue for a trailing rest parameter: collect
     /// `[arg_p, .., arg_{argc-1}]` into a REAL array bound to the rest name.
     ///
-    /// `argc` (local `k + 1`, a number jsval) is the actual source argument count,
-    /// so each positional slot `j in p..k` is appended only when `j < argc` —
+    /// `argc` (local `k + 1`, a number jsval) is the actual source argument count
+    /// `n`, or the construct marker `-(n + 1)` (decoded first), so each
+    /// positional slot `j in p..k` is appended only when `j < n` —
     /// excluding the `undefined` padding beyond the real arguments. The array is
     /// built in a plain temp local (`ArrayPush` needs a plain array binding), then
     /// bound to the rest name, boxed into a cell when the binding is captured.
@@ -319,7 +336,12 @@ impl LowerCtx<'_> {
         k: u32,
         body: &mut Vec<IrStmt>,
     ) {
-        let argc = IrNode::Local(k + 1);
+        let n = self.fresh();
+        body.push(IrStmt::Decl {
+            local: n,
+            init: IrNode::ArgCount(k + 1),
+        });
+        let argc = IrNode::Local(n);
         let tmp = self.fresh();
         body.push(IrStmt::Decl {
             local: tmp,
@@ -363,6 +385,19 @@ impl LowerCtx<'_> {
         name: &str,
         kind: FnKind,
     ) -> anyhow::Result<IrNode> {
+        self.lower_lifted(param_pats, body_kind, name, kind, false)
+    }
+
+    /// [`Self::lower_lifted_function`], for an arrow body when `arrow` is set
+    /// (it reads its enclosing function's `new.target`).
+    fn lower_lifted(
+        &mut self,
+        param_pats: &[&Pat],
+        body_kind: BodyKind<'_>,
+        name: &str,
+        kind: FnKind,
+        arrow: bool,
+    ) -> anyhow::Result<IrNode> {
         // Reserve this function's table slot before lowering its body, so any
         // function nested in the body takes a later slot.
         let pos = {
@@ -380,6 +415,7 @@ impl LowerCtx<'_> {
         let table_index = self.shared.arrow_base - 1 + u32::try_from(pos).unwrap_or(u32::MAX);
 
         self.push_frame();
+        self.frame().arrow = arrow;
         let built = self.build_function_body(param_pats, body_kind);
         let (mut func, env_layout) = match built {
             Ok(pair) => pair,
@@ -389,6 +425,11 @@ impl LowerCtx<'_> {
             }
         };
         self.pop_frame();
+        // A class constructor called without the construct marker throws
+        // before anything else runs (design 4.5).
+        if kind == FnKind::Class {
+            func.body.insert(0, class_call_guard(name, func.params - 1));
+        }
         func.info = fn_info(name, param_pats, kind);
         self.shared.arrows.borrow_mut()[pos] = func;
 
@@ -475,6 +516,24 @@ impl LowerCtx<'_> {
             ArrowFunctionBody::FunctionBody(block) => BodyKind::Block(&block.stmts),
             ArrowFunctionBody::Expr(expr) => BodyKind::Expr(expr),
         };
-        self.lower_lifted_function(&param_pats, body_kind, name, FnKind::Plain)
+        self.lower_lifted(&param_pats, body_kind, name, FnKind::Plain, true)
+    }
+}
+
+/// `if (argc >= 0) throw TypeError("Class constructor <name> cannot be invoked
+/// without 'new'")`, the class constructor prologue rejecting a plain call
+/// (`argc` is the local `argc`).
+fn class_call_guard(name: &str, argc: u32) -> IrStmt {
+    let message = format!("Class constructor {name} cannot be invoked without 'new'");
+    let stack = format!("TypeError: {message}");
+    IrStmt::If {
+        cond: IrNode::IsConstructCall(argc),
+        then_body: Vec::new(),
+        else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(IrNode::error_object(
+            ErrorKind::TypeError,
+            None,
+            Some(IrNode::Str(message)),
+            IrNode::Str(stack),
+        ))))],
     }
 }

@@ -184,9 +184,9 @@ fn scan_expr_arity(expr: &Expr) -> usize {
         // `new A(args)` invokes the constructor through the uniform ABI, so
         // `K` must cover the argument count (like a plain call) and any arrow arg.
         Expr::New(n) => {
-            let mut m = 0;
+            let mut m = scan_expr_arity(&n.callee);
             if let Some(args) = &n.args {
-                m = args.len();
+                m = m.max(args.len());
                 for arg in args {
                     m = m.max(scan_expr_arity(&arg.expr));
                 }

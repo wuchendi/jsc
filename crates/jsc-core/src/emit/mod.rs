@@ -228,10 +228,16 @@ const INTERN_CAP_GLOBAL: u32 = 10;
 /// See [`INTERN_BASE_GLOBAL`].
 const INTERN_COUNT_GLOBAL: u32 = 11;
 
+/// The wasm global index of the `new.target` carrier (`$__new_target`, i64,
+/// init `undefined`): `new X()` sets it to `X` just before calling `X` with the
+/// construct marker; a function referencing `new.target` snapshots it in its
+/// prologue when the marker is present. Internal.
+const NEW_TARGET_GLOBAL: u32 = 12;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the intern-table globals and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 12;
+/// the `new.target` global and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 13;
 
 /// The TDZ hole a module cell holds until its binding is initialized
 /// (`IrNode::IsHole`): an `undefined`-tagged NaN box with a nonzero payload, which
@@ -397,6 +403,20 @@ fn callee_error_text(error: &CalleeError) -> CalleeErrorText<'_> {
 const EXPRESSION_NOT_A_FUNCTION: CalleeErrorText<'static> = [
     "expression is not a function",
     "TypeError: expression is not a function",
+];
+
+/// The `TypeError` text of an `instanceof` whose right-hand side is not
+/// callable.
+const INSTANCEOF_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Right-hand side of 'instanceof' is not callable",
+    "TypeError: Right-hand side of 'instanceof' is not callable",
+];
+
+/// The `TypeError` text of an `instanceof` whose right-hand side's
+/// `prototype` is not an object.
+const INSTANCEOF_NON_OBJECT_PROTOTYPE: CalleeErrorText<'static> = [
+    "Function has non-object prototype in instanceof check",
+    "TypeError: Function has non-object prototype in instanceof check",
 ];
 
 /// The `TypeError` a guarded call site throws (shape of `new TypeError(m)`,
