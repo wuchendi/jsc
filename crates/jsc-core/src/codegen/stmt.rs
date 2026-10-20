@@ -914,6 +914,7 @@ impl LowerCtx<'_> {
                 obj: Box::new(IrNode::Local(temp)),
                 index: Box::new(IrNode::Local(idx)),
             }),
+            not_array: None,
         })];
         let update = vec![IrStmt::Expr(IrNode::Assign {
             local: idx,

@@ -2,9 +2,10 @@
 //! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
 
 use super::{
-    CLASS_ERROR, DATE_MS_OFFSET, HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED,
-    PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION,
-    TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
+    ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
+    HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
+    TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -25,9 +26,14 @@ pub enum Value {
     /// `typeof` result is an ordinary heap string too (there is no immediate
     /// encoding), so it decodes here.
     Str(String),
-    /// A heap array, read from linear memory via an array-pointer jsval.
-    /// Elements are decoded recursively, so arrays nest.
-    Array(Vec<Value>),
+    /// A heap array, read from linear memory via an array-pointer jsval: its
+    /// elements (a hole is [`Value::Hole`]), decoded recursively so arrays
+    /// nest, then its own enumerable named properties as in [`Value::Object`].
+    /// Renders Node-style as `[ 1, <1 empty item>, 3, foo: 1 ]`.
+    Array(Vec<Value>, Vec<(String, Value)>),
+    /// An array hole (an element slot with no element), only ever an element
+    /// of a [`Value::Array`]. Runs of holes render as `<N empty items>`.
+    Hole,
     /// A heap object, read from linear memory via an object-pointer jsval: its
     /// own enumerable properties in own-key order (integer keys ascending,
     /// then the other keys in insertion order), values decoded recursively, so
@@ -277,29 +283,39 @@ fn decode_string(ptr: usize, memory: &[u8]) -> Value {
     Value::Str(String::from_utf8_lossy(str_bytes).into_owned())
 }
 
-/// Resolve a heap array block at base `ptr` into a [`Value::Array`] by reading the
-/// u32 `len` header at `ptr + HEADER_SIZE`, then decoding `len` consecutive i64
-/// element jsvals at `ptr + HEADER_SIZE + 4 + 8*k` (each recursively). Nested
-/// arrays and strings resolve through the same `memory`.
+/// The length of the array handle at base `ptr` and the address of its element
+/// 0 (element `k` is the jsval at `data + 8*k` of its element store), or `None`
+/// when the handle is truncated.
+pub(super) fn array_layout(memory: &[u8], ptr: usize) -> Option<(usize, usize)> {
+    let len = read_u32(memory, ptr + ARRAY_LEN_OFFSET)? as usize;
+    let elems = read_u32(memory, ptr + ARRAY_ELEMS_OFFSET)? as usize;
+    Some((len, elems + ELEMS_DATA_OFFSET))
+}
+
+/// Resolve a heap array handle at base `ptr` into a [`Value::Array`] by
+/// decoding its `len` element jsvals from its element store (each
+/// recursively; a hole is [`Value::Hole`]) and its own named properties
+/// ([`decode_props`]). Nested arrays and strings resolve through the same
+/// `memory`.
 ///
-/// Defensive: an out-of-range header yields an empty array and a truncated
-/// element run stops early, so a malformed pointer never panics.
+/// Defensive: a truncated handle yields an empty array and a truncated element
+/// run stops early, so a malformed pointer never panics.
 fn decode_array(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
-    let len_at = ptr + HEADER_SIZE;
-    let Some(len_bytes) = memory.get(len_at..len_at + 4) else {
-        return Value::Array(Vec::new());
+    let Some((len, data)) = array_layout(memory, ptr) else {
+        return Value::Array(Vec::new(), Vec::new());
     };
-    let len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
     let mut elems = Vec::with_capacity(len);
     for k in 0..len {
-        let start = len_at + 4 + 8 * k;
-        let Some(elem_bytes) = memory.get(start..start + 8) else {
+        let Some(elem_bits) = read_u64(memory, data + 8 * k) else {
             break;
         };
-        let elem_bits = u64::from_le_bytes(elem_bytes.try_into().unwrap_or([0; 8]));
-        elems.push(decode_in(elem_bits, memory, guard));
+        elems.push(if elem_bits == crate::abi::HOLE {
+            Value::Hole
+        } else {
+            decode_in(elem_bits, memory, guard)
+        });
     }
-    Value::Array(elems)
+    Value::Array(elems, decode_props(ptr, memory, guard))
 }
 
 /// Read the little-endian u32 at `at`, or `None` when out of range.
@@ -597,21 +613,41 @@ pub fn format_value(value: &Value) -> String {
         Value::Number(n) => format_number(*n),
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_owned(),
-        Value::Undefined => "undefined".to_owned(),
+        // A hole outside an array (never produced) reads as `undefined`.
+        Value::Undefined | Value::Hole => "undefined".to_owned(),
         // A string renders as its raw text, with no surrounding quotes (a `typeof`
         // result is an ordinary string, so `console.log(typeof x)` prints the word).
         Value::Str(s) => s.clone(),
-        // An array renders Node-console style: `[ 1, 2, 3 ]`, `[]` when empty.
-        Value::Array(elems) => {
-            if elems.is_empty() {
+        // An array renders Node-console style: `[ 1, 2, 3 ]`, `[]` when empty,
+        // a run of holes as `<N empty items>`, named properties last.
+        Value::Array(elems, props) => {
+            let mut parts = Vec::new();
+            let mut holes = 0;
+            let flush = |parts: &mut Vec<String>, holes: &mut usize| {
+                if *holes > 0 {
+                    let s = if *holes == 1 { "" } else { "s" };
+                    parts.push(format!("<{holes} empty item{s}>"));
+                    *holes = 0;
+                }
+            };
+            for elem in elems {
+                if *elem == Value::Hole {
+                    holes += 1;
+                } else {
+                    flush(&mut parts, &mut holes);
+                    parts.push(format_value(elem));
+                }
+            }
+            flush(&mut parts, &mut holes);
+            parts.extend(
+                props
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {}", format_value(value))),
+            );
+            if parts.is_empty() {
                 "[]".to_owned()
             } else {
-                let inner = elems
-                    .iter()
-                    .map(format_value)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("[ {inner} ]")
+                format!("[ {} ]", parts.join(", "))
             }
         }
         // An object renders Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
@@ -685,7 +721,7 @@ pub fn format_value(value: &Value) -> String {
 /// The JS `ToString` text of a decoded [`Value`] (what `String(v)`, `'' + v`
 /// and `join` produce), as opposed to [`format_value`]'s console rendering:
 /// an array joins its elements' `ToString` with `,` (`null`/`undefined`
-/// elements and cycle back-references are empty, as in V8), a plain object or
+/// elements, holes, and cycle back-references are empty, as in V8), a plain object or
 /// class instance is `[object Object]`, an error is `Error.prototype.toString`
 /// (`Name: message`, or whichever half is non-empty), and Map/Set/promise/
 /// generator use their `Object.prototype.toString` tags. Functions (no source
@@ -693,10 +729,10 @@ pub fn format_value(value: &Value) -> String {
 #[must_use]
 pub fn to_js_string(value: &Value) -> String {
     match value {
-        Value::Array(elems) => elems
+        Value::Array(elems, _) => elems
             .iter()
             .map(|elem| match elem {
-                Value::Null | Value::Undefined => String::new(),
+                Value::Null | Value::Undefined | Value::Hole => String::new(),
                 other => to_js_string(other),
             })
             .collect::<Vec<_>>()
@@ -711,7 +747,7 @@ pub fn to_js_string(value: &Value) -> String {
         Value::Set(_) => "[object Set]".to_owned(),
         Value::Promise { .. } => "[object Promise]".to_owned(),
         Value::Generator => "[object Generator]".to_owned(),
-        Value::Accessor { .. } | Value::Circular(_) => String::new(),
+        Value::Accessor { .. } | Value::Circular(_) | Value::Hole => String::new(),
         Value::Ref(_, inner) => to_js_string(inner),
         Value::Number(_)
         | Value::Bool(_)

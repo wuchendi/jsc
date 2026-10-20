@@ -23,6 +23,7 @@ import {
   HEAP,
   HEAP_PTR_EXPORT_NAME,
   HEAP_PTR_OOM,
+  HOLE,
   INVOKE_EXPORT_NAME,
   MEMORY_EXPORT_NAME,
   MEMORY_MAX_PAGES,
@@ -72,6 +73,7 @@ import {
   UNDEFINED,
 } from './abi.js'
 import {
+  arrayLayout,
   asU64,
   decode,
   f64ToBits,
@@ -218,8 +220,9 @@ export function createShim(): Shim {
   }
 
   /**
-   * Allocate a heap ARRAY block holding the jsval bits `elems` through
-   * `__new_array`, filling only the elements (mirrors `host.rs::alloc_array`).
+   * Allocate a heap ARRAY holding the jsval bits `elems` through
+   * `__new_array` (which builds the handle and its element store), filling
+   * only the elements (mirrors `host.rs::alloc_array`).
    */
   function allocArray(elems: bigint[]): bigint | null {
     const base = guestNew(
@@ -228,7 +231,9 @@ export function createShim(): Shim {
     )
     const mem = memory()
     if (base === null || !mem) return null
-    const at = base + HEADER_SIZE + 4
+    const layout = arrayLayout(memView(), base)
+    if (layout === undefined) return null
+    const at = layout[1]
     if (at + 8 * elems.length > mem.buffer.byteLength) return null
     const dv = new DataView(mem.buffer)
     elems.forEach((bits, i) => {
@@ -254,7 +259,7 @@ export function createShim(): Shim {
     a: bigint,
     b: bigint,
   ): bigint | null {
-    const len = blockLen(mem, ptr)
+    const len = arrayLen(mem, ptr)
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
     const elems: bigint[] = []
@@ -408,9 +413,8 @@ export function createShim(): Shim {
           return stringIndexOf(mem, ptr, arg0)
         return null
       case METHOD_OP_INCLUDES:
-        if (ptr !== null && typeByte === TYPE_ARRAY) {
-          return arrayIndexOf(mem, ptr, arg0) === f64ToBits(-1) ? FALSE : TRUE
-        }
+        if (ptr !== null && typeByte === TYPE_ARRAY)
+          return arrayIncludes(mem, ptr, arg0) ? TRUE : FALSE
         // `str.includes(sub)` — substring containment (an empty `sub` => true).
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
@@ -889,7 +893,7 @@ function readGenDone(mem: Uint8Array, gen: bigint): boolean {
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true) !== 0
 }
 
-/** The `u32` `len` header of an array/string block at `ptr + HEADER_SIZE`. */
+/** The `u32` `len` header of a string block at `ptr + HEADER_SIZE`. */
 function blockLen(mem: Uint8Array, ptr: number): number {
   const at = ptr + HEADER_SIZE
   if (at + 4 > mem.length) return 0
@@ -902,9 +906,16 @@ function blockLen(mem: Uint8Array, ptr: number): number {
   )
 }
 
-/** The raw jsval bits of array element `i`, or `null` when out of range. */
+/** The length of the array handle at `ptr` (`0` when truncated). */
+function arrayLen(mem: Uint8Array, ptr: number): number {
+  return arrayLayout(mem, ptr)?.[0] ?? 0
+}
+
+/** The raw jsval bits of element `i` of the array handle at `ptr`, or `null` when out of range. */
 function arrayElemBits(mem: Uint8Array, ptr: number, i: number): bigint | null {
-  const start = ptr + HEADER_SIZE + 4 + 8 * i
+  const layout = arrayLayout(mem, ptr)
+  if (layout === undefined) return null
+  const start = layout[1] + 8 * i
   if (start + 8 > mem.length) return null
   let value = 0n
   for (let k = 7; k >= 0; k--) value = (value << 8n) | BigInt(mem[start + k]!)
@@ -950,9 +961,34 @@ function strictEqBits(a: bigint, b: bigint, mem: Uint8Array): boolean {
   return a === b
 }
 
-/** `array.indexOf(x)`: first index whose element `=== x`, or `-1`. */
+/**
+ * `array.includes(x)` (mirrors `host.rs::array_includes`): some element is
+ * `SameValueZero` to `x` — `===`, except that `NaN` matches `NaN`; a hole
+ * reads as `undefined`.
+ */
+function arrayIncludes(mem: Uint8Array, ptr: number, needle: bigint): boolean {
+  const len = arrayLen(mem, ptr)
+  const n = decode(needle, mem)
+  for (let i = 0; i < len; i++) {
+    let elem = arrayElemBits(mem, ptr, i)
+    if (elem === null) continue
+    if (elem === HOLE) elem = UNDEFINED
+    if (strictEqBits(elem, needle, mem)) return true
+    const e = decode(elem, mem)
+    if (
+      e.kind === 'number' &&
+      n.kind === 'number' &&
+      Number.isNaN(e.value) &&
+      Number.isNaN(n.value)
+    )
+      return true
+  }
+  return false
+}
+
+/** `array.indexOf(x)`: first index whose element `=== x`, or `-1` (a hole never matches). */
 function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
-  const len = blockLen(mem, ptr)
+  const len = arrayLen(mem, ptr)
   for (let i = 0; i < len; i++) {
     const elem = arrayElemBits(mem, ptr, i)
     if (elem !== null && strictEqBits(elem, needle, mem)) return indexBits(i)
@@ -983,7 +1019,7 @@ function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
 
 /**
  * The joined text of `array.join(sep)` (`","` when `sep` is `undefined`);
- * nullish elements and cycle back-references stringify to `""`. The receiver
+ * nullish elements, holes, and cycle back-references stringify to `""`. The receiver
  * is decoded as a whole so the decoder's cycle guard catches self-references.
  * Mirrors the pure part of `host.rs::array_join` (allocation is done by the
  * caller).
@@ -996,7 +1032,9 @@ function arrayJoinText(mem: Uint8Array, ptr: number, sepBits: bigint): string {
   if (recv.kind !== 'array') return ''
   return recv.items
     .map((v) =>
-      v.kind === 'null' || v.kind === 'undefined' ? '' : toJsString(v),
+      v.kind === 'null' || v.kind === 'undefined' || v.kind === 'hole'
+        ? ''
+        : toJsString(v),
     )
     .join(sep)
 }

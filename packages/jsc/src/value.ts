@@ -8,10 +8,13 @@
 import {
   ACCESSOR_GET_OFFSET,
   ACCESSOR_SET_OFFSET,
+  ARRAY_ELEMS_OFFSET,
+  ARRAY_LEN_OFFSET,
   ATTR_ACCESSOR,
   ATTR_ENUMERABLE,
   CLASS_ERROR,
   DATE_MS_OFFSET,
+  ELEMS_DATA_OFFSET,
   FN_INFO_ADDR,
   FN_INFO_ENTRY_SIZE,
   FN_INFO_NAME_OFFSET,
@@ -21,6 +24,7 @@ import {
   HEADER_FLAGS_OFFSET,
   HEADER_SIZE,
   HEAP,
+  HOLE,
   MAP_SIZE_OFFSET,
   OBJ_PROPS_OFFSET,
   OBJ_PROTO_OFFSET,
@@ -59,7 +63,8 @@ export type Value =
   | { kind: 'null' }
   | { kind: 'undefined' }
   | { kind: 'string'; value: string }
-  | { kind: 'array'; items: Value[] }
+  | { kind: 'array'; items: Value[]; props: [string, Value][] }
+  | { kind: 'hole' }
   | { kind: 'object'; entries: [string, Value][] }
   | { kind: 'instance'; className: string; entries: [string, Value][] }
   | { kind: 'error'; name: string; message: string }
@@ -260,17 +265,37 @@ function decodeString(ptr: number, mem: Uint8Array): Value {
   }
 }
 
-/** Resolve a heap array block at `ptr`, decoding each `i64` element recursively. */
+/**
+ * The length of the array handle at `ptr` and the address of its element 0
+ * (element `k` is at `data + 8 * k` of its element store), or `undefined`
+ * when the handle is truncated (mirrors `value.rs::array_layout`).
+ */
+export function arrayLayout(
+  mem: Uint8Array,
+  ptr: number,
+): [len: number, data: number] | undefined {
+  const len = readU32(mem, ptr + ARRAY_LEN_OFFSET)
+  const elems = readU32(mem, ptr + ARRAY_ELEMS_OFFSET)
+  if (len === undefined || elems === undefined) return undefined
+  return [len, elems + ELEMS_DATA_OFFSET]
+}
+
+/**
+ * Resolve a heap array handle at `ptr`, decoding each `i64` element
+ * recursively (a hole is `hole`), then its own named properties (mirrors
+ * `value.rs::decode_array`).
+ */
 function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const len = readU32(mem, ptr + HEADER_SIZE)
-  if (len === undefined) return { kind: 'array', items: [] }
+  const layout = arrayLayout(mem, ptr)
+  if (layout === undefined) return { kind: 'array', items: [], props: [] }
+  const [len, data] = layout
   const items: Value[] = []
   for (let k = 0; k < len; k++) {
-    const elem = readU64(mem, ptr + HEADER_SIZE + 4 + 8 * k)
+    const elem = readU64(mem, data + 8 * k)
     if (elem === undefined) break
-    items.push(decodeIn(elem, mem, guard))
+    items.push(elem === HOLE ? { kind: 'hole' } : decodeIn(elem, mem, guard))
   }
-  return { kind: 'array', items }
+  return { kind: 'array', items, props: decodeProps(ptr, mem, guard) }
 }
 
 /**
@@ -503,9 +528,10 @@ export function formatValue(value: Value): string {
     case 'string':
       return value.value
     case 'array':
-      return value.items.length === 0
-        ? '[]'
-        : `[ ${value.items.map(formatValue).join(', ')} ]`
+      return formatArray(value.items, value.props)
+    // A hole outside an array (never produced) reads as `undefined`.
+    case 'hole':
+      return 'undefined'
     case 'object':
       return formatEntries(value.entries)
     // A class instance is prefixed with its constructor's name.
@@ -566,7 +592,9 @@ export function toJsString(value: Value): string {
     case 'array':
       return value.items
         .map((v) =>
-          v.kind === 'null' || v.kind === 'undefined' ? '' : toJsString(v),
+          v.kind === 'null' || v.kind === 'undefined' || v.kind === 'hole'
+            ? ''
+            : toJsString(v),
         )
         .join(',')
     case 'object':
@@ -586,12 +614,38 @@ export function toJsString(value: Value): string {
       return '[object Generator]'
     case 'accessor':
     case 'circular':
+    case 'hole':
       return ''
     case 'ref':
       return toJsString(value.value)
     default:
       return formatValue(value)
   }
+}
+
+/**
+ * Render an array Node-console style: `[ 1, 2 ]`, `[]` when empty, a run of
+ * holes as `<N empty items>`, named properties last (mirrors the
+ * `value.rs::format_value` array arm).
+ */
+function formatArray(items: Value[], props: [string, Value][]): string {
+  const parts: string[] = []
+  let holes = 0
+  const flush = () => {
+    if (holes > 0) parts.push(`<${holes} empty item${holes === 1 ? '' : 's'}>`)
+    holes = 0
+  }
+  for (const item of items) {
+    if (item.kind === 'hole') {
+      holes++
+    } else {
+      flush()
+      parts.push(formatValue(item))
+    }
+  }
+  flush()
+  for (const [k, v] of props) parts.push(`${k}: ${formatValue(v)}`)
+  return parts.length === 0 ? '[]' : `[ ${parts.join(', ')} ]`
 }
 
 /** Render own properties Node-console style: `{ a: 1 }`, `{}` when empty. */

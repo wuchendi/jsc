@@ -233,10 +233,13 @@ const INTERN_COUNT_GLOBAL: u32 = 11;
 /// the intern-table globals and set in `main`'s prologue).
 const MODULE_CELL_GLOBAL_BASE: u32 = 12;
 
+/// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
+/// missing element. Every element read maps it to `undefined`.
+const HOLE_BITS: i64 = abi::HOLE.cast_signed();
+
 /// The TDZ hole a module cell holds until its binding is initialized
-/// (`IrNode::IsHole`): an `undefined`-tagged NaN box with a nonzero payload, which
-/// no JS value ever produces.
-const TDZ_HOLE_BITS: i64 = abi::UNDEFINED.cast_signed() | 1;
+/// (`IrNode::IsHole`): the [`HOLE_BITS`] pattern, which no JS value produces.
+const TDZ_HOLE_BITS: i64 = HOLE_BITS;
 
 /// [`CF_KIND_GLOBAL`] value for a pending `return` (payload in
 /// [`CF_VALUE_GLOBAL`]).
@@ -278,9 +281,19 @@ const ABI_TRAILING_PARAMS: u32 = abi::ABI_TRAILING_PARAMS;
 /// after the [`HEADER_SIZE`] header). Maps to `typeof` "string".
 const TYPE_STRING: i32 = abi::TYPE_STRING as i32;
 
-/// Type byte for a heap array block: `[type=1][pad×3][len:u32][elem:i64 × len]`
-/// (payload after the [`HEADER_SIZE`] header). Maps to `typeof` "object".
+/// Type byte, field offsets, and size of an array handle (`length` and the
+/// base of its element store). Maps to `typeof` "object". See
+/// [`abi::TYPE_ARRAY`] for the full layout.
 const TYPE_ARRAY: i32 = abi::TYPE_ARRAY as i32;
+const ARRAY_LEN_OFFSET: u64 = abi::ARRAY_LEN_OFFSET as u64;
+const ARRAY_ELEMS_OFFSET: u64 = abi::ARRAY_ELEMS_OFFSET as u64;
+const ARRAY_BLOCK_SIZE: i32 = abi::ARRAY_BLOCK_SIZE.cast_signed();
+
+/// Type byte and field offsets of an array element store (internal): `cap`,
+/// then element `i` at `ELEMS_DATA_OFFSET + 8 * i`. See [`abi::TYPE_ELEMS`].
+const TYPE_ELEMS: i32 = abi::TYPE_ELEMS as i32;
+const ELEMS_CAP_OFFSET: u64 = abi::ELEMS_CAP_OFFSET as u64;
+const ELEMS_DATA_OFFSET: u64 = abi::ELEMS_DATA_OFFSET as u64;
 
 /// Type byte for a heap object block:
 /// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]` (payload after the
@@ -483,9 +496,9 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 /// for each keyed `TypeError` mode, indexed by mode.
 const PROP_KEYED_MSGS: [(i32, &str, &str); 5] = [
     (
-        PROP_THROW_ARRAY_KEY,
-        "Cannot set named property '",
-        "' on an array yet",
+        PROP_THROW_ARRAY_LENGTH,
+        "Cannot set array property '",
+        "' yet",
     ),
     (
         PROP_THROW_READ_ONLY,
@@ -504,9 +517,9 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 5] = [
     ),
     (PROP_THROW_DELETE, "Cannot delete property '", "' of object"),
 ];
-/// The `TypeError` message `__prop_throw` raises for an array index store at or
-/// past the current length.
-const ARRAY_GROW_MSG: &str = "Cannot grow array by index assignment yet";
+/// The `TypeError` message `__prop_throw` raises for an array index store
+/// beyond the dense-growth bound (sparse arrays are not supported yet).
+const ARRAY_GROW_MSG: &str = "Cannot grow array sparsely by index assignment yet";
 
 /// The message fragments `__prop_throw` splices into the strict-mode
 /// `TypeError` raised by a member store on a primitive receiver:
@@ -519,10 +532,11 @@ const PRIM_CREATE_QUOTE: &str = " '";
 /// See [`PRIM_CREATE_PREFIX`].
 const PRIM_CREATE_SUFFIX: &str = "'";
 
-/// `__prop_throw`'s `mode` argument: a named (non-index) property store on an
-/// array (S2 owns array properties).
-const PROP_THROW_ARRAY_KEY: i32 = 0;
-/// `__prop_throw`'s `mode` argument: an array index store at/past the length.
+/// `__prop_throw`'s `mode` argument: a `length` store on an array (`length`
+/// writes are not supported yet).
+const PROP_THROW_ARRAY_LENGTH: i32 = 0;
+/// `__prop_throw`'s `mode` argument: an array index store beyond the
+/// dense-growth bound.
 const PROP_THROW_GROW: i32 = 1;
 /// `__prop_throw`'s `mode` argument: any store on a primitive receiver.
 const PROP_THROW_PRIMITIVE: i32 = 2;
@@ -751,11 +765,10 @@ struct Helpers<'a> {
     /// [`object::emit_nullish_guard`]).
     nullish_throw: u32,
     /// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the `TypeError` for
-    /// a member store the receiver cannot take — an absent property
-    /// ([`PROP_THROW_ADD`], message names `String(key)`), an array index at/past
-    /// the length ([`PROP_THROW_GROW`]), or any store on a primitive `recv`
-    /// ([`PROP_THROW_PRIMITIVE`]) — and leave it in flight (`$exc_pending` set).
-    /// The out-of-line half of [`object::emit_index_set_node`]'s miss paths.
+    /// a member store or delete the receiver cannot take — an array index
+    /// beyond the dense-growth bound ([`PROP_THROW_GROW`]), any store on a
+    /// primitive `recv` ([`PROP_THROW_PRIMITIVE`]), or a keyed mode of
+    /// [`PROP_KEYED_MSGS`] — and leave it in flight (`$exc_pending` set).
     prop_throw: u32,
     /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
     /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).
@@ -836,14 +849,14 @@ struct Helpers<'a> {
     for_in_keys: u32,
     /// `__rest(src, excl) -> object`: the object-rest copy.
     rest: u32,
-    /// `__array_push(base, value) -> new_base`: bump-allocate a new array
-    /// block of `len + 1` element capacity, copy the header + existing elements,
-    /// append `value`, bump the u32 length header, and return the new block base.
+    /// `__array_push(base, value) -> base`: append `value` to the array handle
+    /// in place (amortized growth through [`Self::array_reserve`]) and return
+    /// the same handle base.
     array_push: u32,
-    /// `__array_concat(dst, src) -> new_base`: bump-allocate a new array
-    /// block holding every element of `dst` followed by every element of `src`,
-    /// and return the new block base. Used to append a spread source's elements
-    /// when building a spread array literal or spread call argument list.
+    /// `__array_concat(dst, src) -> dst`: append every element of array `src`
+    /// to array `dst` in place and return `dst`. Used to append a spread
+    /// source's elements when building a spread array literal or spread call
+    /// argument list.
     array_concat: u32,
     /// `__json_escape(str_ptr) -> str_base`: bump-allocate a fresh heap
     /// string that is the JSON-quoted + escaped form of the source string (leading
@@ -923,6 +936,30 @@ struct Helpers<'a> {
     /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
     /// is the helper right after `__define` (`define + 1`).
     fn_info: i32,
+}
+
+impl Helpers<'_> {
+    /// `__new_array(len) -> i32`: the exported array constructor, right after
+    /// `__new_string`.
+    fn new_array(self) -> u32 {
+        self.new_string + 1
+    }
+
+    /// `__array_reserve(base, need)`: grow the array handle's element store to
+    /// hold at least `need` elements (`cap' = max(need, 4, 2 * cap)`), copying
+    /// the `len` live slots and repointing `elems`; the handle never moves. It
+    /// is the helper right before `__array_push`.
+    fn array_reserve(self) -> u32 {
+        self.array_push - 1
+    }
+
+    /// `__array_set(recv, key, v)`: the slow path of a member store on an
+    /// array — growth by index, DF9 key routing, named properties (see
+    /// [`props::emit_array_set`]); may leave an exception pending. It is the
+    /// helper right after `__array_concat`.
+    fn array_set(self) -> u32 {
+        self.array_concat + 1
+    }
 }
 
 /// The heap-pointer jsval of `kind`'s static prototype block (see
@@ -1253,12 +1290,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_get(&offsets, helpers));
     code.function(&emit_set(helpers));
     code.function(&emit_has(&offsets, helpers));
-    code.function(&emit_delete(helpers));
+    code.function(&emit_delete(&offsets, helpers));
     code.function(&emit_own_keys(helpers));
     code.function(&emit_for_in_keys(helpers));
     code.function(&emit_rest(helpers));
-    code.function(&emit_array_push(helpers.alloc));
-    code.function(&emit_array_concat(helpers.alloc));
+    code.function(&emit_array_reserve(helpers.alloc));
+    code.function(&emit_array_push(helpers.array_reserve()));
+    code.function(&emit_array_concat(helpers.array_reserve()));
+    code.function(&emit_array_set(&offsets, helpers));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.json_str,
@@ -1277,14 +1316,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
     // Map/Set helpers.
     code.function(&emit_loose_eq(helpers.str_eq, helpers.convert));
-    code.function(&emit_str_to_array(helpers.alloc, helpers.str_index));
+    code.function(&emit_str_to_array(helpers.new_array(), helpers.str_index));
     // The in-wasm `JSON.parse` family, in the order their indices were assigned.
     code.function(&emit_json_ws());
     code.function(&emit_json_throw(&offsets, helpers));
     code.function(&emit_json_string(helpers.alloc, helpers));
     code.function(&emit_json_number(helpers.alloc, helpers.convert, helpers));
     code.function(&emit_json_value(helpers));
-    code.function(&emit_json_array(helpers.alloc, helpers));
+    code.function(&emit_json_array(helpers));
     code.function(&emit_json_object(helpers.alloc, helpers));
     code.function(&emit_json_parse(helpers));
     // `__gen_to_array` — the generator-spread drain — precedes the

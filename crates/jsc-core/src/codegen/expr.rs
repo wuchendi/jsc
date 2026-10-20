@@ -594,10 +594,9 @@ impl LowerCtx<'_> {
         {
             return lower_math_call(name, args, callee_expr.span());
         }
-        // `array.push(x)` / `array.pop()` are growing array methods,
-        // dispatched syntactically by method name (kept distinct from `x[i]`
-        // element indexing). The receiver must be a simple bound array variable so
-        // `push` can rebind it to the reallocated block.
+        // `recv.push(x)` / `recv.pop()` are growing array methods, dispatched
+        // syntactically by method name (kept distinct from `x[i]` element
+        // indexing). The receiver is any expression, evaluated once.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
             && matches!(id.sym.as_ref(), "push" | "pop")
@@ -606,8 +605,8 @@ impl LowerCtx<'_> {
         }
         // `array.map/filter/reduce/forEach(callback[, init])` are higher-order array
         // methods, dispatched syntactically by method name (kept distinct
-        // from `x[i]` element indexing). Unlike push/pop the receiver is any array
-        // expression (a literal or a binding); it is evaluated once and not rebound.
+        // from `x[i]` element indexing). The receiver is any array expression (a
+        // literal or a binding), evaluated once.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
             && matches!(id.sym.as_ref(), "map" | "filter" | "reduce" | "forEach")
@@ -897,42 +896,22 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a growing array method call `array.push(x)` / `array.pop()`.
-    /// The receiver must be a simple identifier bound to a **plain local** array so
-    /// `push` can rebind it (`local.set`) to the reallocated block. A temp /
-    /// expression receiver, or a captured (boxed-cell) array, is rejected —
-    /// captured arrays do not round-trip through the runtime index/length path,
-    /// so growing one is out of scope. Arities are validated here (`push` takes
-    /// one argument, `pop` none).
+    /// Lower a growing array method call `recv.push(x)` / `recv.pop()`. The
+    /// receiver is any expression, evaluated exactly once: a plain local is
+    /// read in place, anything else (a captured or module binding, a member,
+    /// a call result) is stashed in a fresh temp. The receiver is guarded
+    /// against `null`/`undefined` (the member read), then an array receiver
+    /// grows/shrinks in place; any other receiver has no such method, so the
+    /// call throws `<recv>.<method> is not a function` once its argument is
+    /// evaluated. Arities are validated here (`push` takes one argument, `pop`
+    /// none).
     fn lower_array_method(
         &mut self,
         method: &str,
         obj: &Expr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let Expr::Ident(obj_id) = obj else {
-            return Err(CompileError::spanned(
-                obj.span(),
-                format!("array.{method} requires a bound array variable receiver"),
-            )
-            .into());
-        };
-        let name = obj_id.sym.as_ref();
-        let Some(resolved) = self.resolve(name) else {
-            return Err(CompileError::spanned(
-                obj_id.span(),
-                format!("array.{method} on undeclared variable: {name}"),
-            )
-            .into());
-        };
-        let AccessKind::Plain(local) = resolved.kind else {
-            return Err(CompileError::spanned(
-                obj_id.span(),
-                format!("array.{method} on a captured array is unsupported"),
-            )
-            .into());
-        };
-        match method {
+        let value = match method {
             "push" => {
                 let [value] = <[IrNode; 1]>::try_from(args).map_err(|args| {
                     CompileError::spanned(
@@ -940,10 +919,7 @@ impl LowerCtx<'_> {
                         format!("push expects 1 argument, got {}", args.len()),
                     )
                 })?;
-                Ok(IrNode::ArrayPush {
-                    local,
-                    value: Box::new(value),
-                })
+                Some(value)
             }
             "pop" => {
                 if !args.is_empty() {
@@ -953,10 +929,37 @@ impl LowerCtx<'_> {
                     )
                     .into());
                 }
-                Ok(IrNode::ArrayPop { local })
+                None
             }
             _ => unreachable!("caller restricts the method to push/pop"),
-        }
+        };
+        let plain = match obj {
+            Expr::Ident(id) => self.resolve(id.sym.as_ref()).and_then(|r| match r.kind {
+                AccessKind::Plain(local) => Some(local),
+                AccessKind::Cell(_) => None,
+            }),
+            _ => None,
+        };
+        let (local, recv) = if let Some(local) = plain {
+            (local, IrNode::Local(local))
+        } else {
+            let tmp = self.fresh();
+            let recv = IrNode::Assign {
+                local: tmp,
+                value: Box::new(self.lower_expr(obj)?),
+            };
+            (tmp, recv)
+        };
+        let not_array = method_not_a_function(obj, method);
+        let grow = match value {
+            Some(value) => IrNode::ArrayPush {
+                local,
+                value: Box::new(value),
+                not_array: Some(not_array),
+            },
+            None => IrNode::ArrayPop { local, not_array },
+        };
+        Ok(IrNode::Seq(vec![nullish_check(recv, method), grow]))
     }
 
     /// Lower a higher-order array method call `array.map/filter/reduce/forEach(...)`.
@@ -1164,14 +1167,6 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower an array literal `[e0, e1, ..]` into an [`IrNode::Array`], evaluating
-    /// each element left-to-right. Holes (elisions) and spread elements are out of
-    /// scope (later stages).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on an array hole or a spread element, or if any element
-    /// expression is outside the supported subset.
     /// Lower an assignment `target = value`. An identifier target is a local
     /// assign; a computed-member target `obj[i] = v` is an in-place array element
     /// store. A static-member target `obj.a = v` is object territory,
@@ -1472,6 +1467,15 @@ impl LowerCtx<'_> {
         })
     }
 
+    /// Lower an array literal `[e0, e1, ..]` into an [`IrNode::Array`], evaluating
+    /// each element left-to-right; an elision (`[1, , 3]`) is an
+    /// [`IrNode::ArrayHole`] (the parser drops a single trailing comma, so
+    /// `[1,]` has one element). A literal with a spread element lowers to the
+    /// runtime-built [`IrNode::ArraySpread`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any element expression is outside the supported subset.
     fn lower_array(&mut self, arr: &ArrayLit) -> anyhow::Result<IrNode> {
         // A spread element `[...a, b]` makes the array's length only known
         // at runtime, so it lowers to the runtime-built `ArraySpread`; a plain
@@ -1483,32 +1487,22 @@ impl LowerCtx<'_> {
         {
             let mut parts = Vec::with_capacity(arr.elems.len());
             for elem in &arr.elems {
-                let Some(elem) = elem else {
-                    return Err(CompileError::spanned(
-                        arr.span(),
-                        "array holes (elisions) are unsupported",
-                    )
-                    .into());
-                };
-                let lowered = self.lower_expr(&elem.expr)?;
-                parts.push(if elem.spread.is_some() {
-                    SpreadElem::Spread(lowered)
-                } else {
-                    SpreadElem::Item(lowered)
+                parts.push(match elem {
+                    None => SpreadElem::Item(IrNode::ArrayHole),
+                    Some(elem) if elem.spread.is_some() => {
+                        SpreadElem::Spread(self.lower_expr(&elem.expr)?)
+                    }
+                    Some(elem) => SpreadElem::Item(self.lower_expr(&elem.expr)?),
                 });
             }
             return Ok(IrNode::ArraySpread(parts));
         }
         let mut elems = Vec::with_capacity(arr.elems.len());
         for elem in &arr.elems {
-            let Some(elem) = elem else {
-                return Err(CompileError::spanned(
-                    arr.span(),
-                    "array holes (elisions) are unsupported",
-                )
-                .into());
-            };
-            elems.push(self.lower_expr(&elem.expr)?);
+            elems.push(match elem {
+                None => IrNode::ArrayHole,
+                Some(elem) => self.lower_expr(&elem.expr)?,
+            });
         }
         Ok(IrNode::Array(elems))
     }
