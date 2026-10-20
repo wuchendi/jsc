@@ -156,3 +156,37 @@ it('rejects run() on an unhandled top-level await rejection', async () => {
     /^Uncaught boom$/,
   )
 })
+
+it('renders cyclic structures Node-console style', async () => {
+  const cases: [string, string][] = [
+    ['let a = [1, 0]; a[1] = a; console.log(a)', '<ref *1> [ 1, [Circular *1] ]\n'],
+    [
+      'let o = {self: null, x: 1}; o.self = o; console.log(o)',
+      '<ref *1> { self: [Circular *1], x: 1 }\n',
+    ],
+    [
+      'let o = {x: [0]}; o.x[0] = o; console.log(o)',
+      '<ref *1> { x: [ [Circular *1] ] }\n',
+    ],
+    [
+      'let a = {b: null}; let b = {a: a}; a.b = b; console.log(a)',
+      '<ref *1> { b: { a: [Circular *1] } }\n',
+    ],
+    [
+      'let a = [1, 0, 0]; let b = [2, 0]; a[1] = b; b[1] = b; a[2] = a; console.log(a)',
+      '<ref *2> [ 1, <ref *1> [ 2, [Circular *1] ], [Circular *2] ]\n',
+    ],
+    [
+      'let a = [1, 0]; let b = [2, a, 0]; a[1] = b; b[2] = b; console.log(a)',
+      '<ref *1> [ 1, <ref *2> [ 2, [Circular *1], [Circular *2] ] ]\n',
+    ],
+    [
+      'let s = {v: 1}; let o = {p: s, q: s}; console.log(o)',
+      '{ p: { v: 1 }, q: { v: 1 } }\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+  expect((await run('let a = [1, 0]; a[1] = a; a')).result).toBe(
+    '<ref *1> [ 1, [Circular *1] ]',
+  )
+})
