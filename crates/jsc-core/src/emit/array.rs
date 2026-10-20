@@ -187,12 +187,15 @@ pub(super) fn emit_array_spread(
 }
 
 /// Emit `array.push(value)`, leaving the new length (a number jsval) on
-/// the stack. `__array_push` appends `value` to the handle read from `local` in
-/// place (the handle never moves, so every alias observes the growth) and
-/// returns the handle, whose `length` is then read back.
+/// the stack. Once `value` is evaluated, a non-array `local` throws
+/// `not_array` (when given); otherwise `__array_push` appends `value` to the
+/// handle read from `local` in place (the handle never moves, so every alias
+/// observes the growth) and returns the handle, whose `length` is then read
+/// back.
 pub(super) fn emit_array_push_node(
     local: u32,
     value: &IrNode,
+    not_array: Option<&CalleeError>,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -201,6 +204,9 @@ pub(super) fn emit_array_push_node(
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I32WrapI64);
     emit_node(value, function, scratch, strings, helpers);
+    if let Some(not_array) = not_array {
+        emit_array_guard(function, local, not_array, scratch, strings, helpers);
+    }
     function.instruction(&Instruction::Call(helpers.array_push));
     function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::F64ConvertI32U);
@@ -208,13 +214,22 @@ pub(super) fn emit_array_push_node(
 }
 
 /// Emit `array.pop()`, leaving the removed last element (or `undefined`
-/// for an empty array) on the stack. The handle read from `local` is shrunk IN
-/// PLACE — its `length` drops by one and the element at the old last slot of
-/// its store is yielded.
-pub(super) fn emit_array_pop_node(local: u32, function: &mut Function, scratch: u32) {
+/// for an empty array) on the stack. A non-array `local` throws `not_array`;
+/// otherwise the handle read from `local` is shrunk IN PLACE — its `length`
+/// drops by one and the element at the old last slot of its store is yielded.
+pub(super) fn emit_array_pop_node(
+    local: u32,
+    not_array: &CalleeError,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
     // Two transient i32 scratch locals: the handle base and the new length.
     let base = scratch + 3;
     let new_len = scratch + 7;
+
+    emit_array_guard(function, local, not_array, scratch, strings, helpers);
 
     // base = wrap(array_handle).
     function.instruction(&Instruction::LocalGet(local));
@@ -244,6 +259,40 @@ pub(super) fn emit_array_pop_node(local: u32, function: &mut Function, scratch: 
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::End);
+}
+
+/// Unless the jsval in `local` is a `TYPE_ARRAY` handle, throw the
+/// not-a-function `TypeError` `not_array` (the receiver has no `push`/`pop`)
+/// and unwind. Stack-neutral on the not-thrown path.
+fn emit_array_guard(
+    function: &mut Function,
+    local: u32,
+    not_array: &CalleeError,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // The `if` opens a control frame around the throw transfer.
+    enter_frame(helpers);
+    emit_throw_not_a_function(
+        function,
+        callee_error_text(not_array),
+        scratch,
+        strings,
+        helpers,
+    );
+    leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
 

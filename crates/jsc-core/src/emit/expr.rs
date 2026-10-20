@@ -231,17 +231,23 @@ pub(super) fn emit_node(
         IrNode::MathSpread { op, args } => {
             emit_math_spread(*op, args, function, scratch, strings, helpers);
         }
-        // The receiver binding is guarded before the argument runs (the member
-        // read precedes argument evaluation).
-        IrNode::ArrayPush { local, value } => {
-            let key = IrNode::Str("push".to_owned());
-            emit_nullish_guard(function, *local, &key, false, scratch, strings, helpers);
-            emit_array_push_node(*local, value, function, scratch, strings, helpers);
+        IrNode::ArrayPush {
+            local,
+            value,
+            not_array,
+        } => {
+            emit_array_push_node(
+                *local,
+                value,
+                not_array.as_ref(),
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
         }
-        IrNode::ArrayPop { local } => {
-            let key = IrNode::Str("pop".to_owned());
-            emit_nullish_guard(function, *local, &key, false, scratch, strings, helpers);
-            emit_array_pop_node(*local, function, scratch);
+        IrNode::ArrayPop { local, not_array } => {
+            emit_array_pop_node(*local, not_array, function, scratch, strings, helpers);
         }
         IrNode::ArrayHof {
             op,
@@ -974,8 +980,10 @@ pub(super) fn emit_cell_new(
         align: 0,
         memory_index: 0,
     }));
-    // Value at dst + HEADER_SIZE (evaluate after `dst` is set; `value` may itself
-    // allocate, but it is fully evaluated before this store consumes `dst`).
+    // The cell base goes on the stack twice (the result, then the store
+    // address) before `value` runs: `value` may build a literal that clobbers
+    // the transient `dst` scratch local.
+    function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(dst));
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::I64Store(MemArg {
@@ -983,8 +991,7 @@ pub(super) fn emit_cell_new(
         align: 3,
         memory_index: 0,
     }));
-    // Rebox dst as a heap jsval.
-    function.instruction(&Instruction::LocalGet(dst));
+    // Rebox the cell base as a heap jsval.
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
