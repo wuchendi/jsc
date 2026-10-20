@@ -44,7 +44,7 @@ pub(super) fn emit_object_node(
         };
     let mut static_keys: Vec<&str> = Vec::with_capacity(entries.len());
     for (key, _) in entries {
-        if let PropKey::Static(k) | PropKey::Hidden(k) = key {
+        if let PropKey::Static(k) | PropKey::Hidden(k) | PropKey::Fixed(k) = key {
             static_keys.push(k);
         }
     }
@@ -88,25 +88,13 @@ pub(super) fn emit_object_node(
     }
 
     // Table header: [kind=12][pad][tflags][pad][count] then [cap][live].
-    let attrs_of = |key: &PropKey, value: &IrNode| -> u32 {
-        let enumerable = if matches!(key, PropKey::Hidden(_)) {
-            0
-        } else {
-            abi::ATTR_ENUMERABLE
-        };
-        if matches!(value, IrNode::MakeAccessor { .. }) {
-            abi::ATTR_ACCESSOR | abi::ATTR_CONFIGURABLE | enumerable
-        } else {
-            abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE | enumerable
-        }
-    };
     let (count, tflags) = if direct {
         let mut tflags = 0u8;
         for (key, value) in entries {
             if attrs_of(key, value) & abi::ATTR_ENUMERABLE == 0 {
                 tflags |= abi::PROPS_HAS_NON_ENUM;
             }
-            if let PropKey::Static(k) | PropKey::Hidden(k) = key
+            if let PropKey::Static(k) | PropKey::Hidden(k) | PropKey::Fixed(k) = key
                 && is_array_index(k)
             {
                 tflags |= abi::PROPS_HAS_INDEX_KEYS;
@@ -134,7 +122,7 @@ pub(super) fn emit_object_node(
     for (k, (key, value)) in entries.iter().enumerate() {
         let attrs = attrs_of(key, value);
         if direct {
-            let (PropKey::Static(name) | PropKey::Hidden(name)) = key else {
+            let (PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name)) = key else {
                 continue;
             };
             let entry = u64::from(abi::OBJ_PREFIX_SIZE) + 16 + 16 * k as u64;
@@ -151,22 +139,77 @@ pub(super) fn emit_object_node(
             // __define(dst, `ToPropertyKey`(key), value, attrs), keeping dst below.
             function.instruction(&Instruction::LocalTee(dst));
             function.instruction(&Instruction::LocalGet(dst));
-            match key {
-                PropKey::Static(name) | PropKey::Hidden(name) => {
-                    function.instruction(&Instruction::I32Const(static_key(strings, name)));
-                }
-                PropKey::Computed(expr) => {
-                    emit_node(expr, function, scratch, strings, helpers);
-                    function.instruction(&Instruction::I32Const(1));
-                    function.instruction(&Instruction::Call(helpers.to_key));
-                }
-            }
-            emit_node(value, function, scratch, strings, helpers);
-            function.instruction(&Instruction::I32Const(attrs.cast_signed()));
-            function.instruction(&Instruction::Call(helpers.define));
+            emit_define_entry(key, value, function, scratch, strings, helpers);
         }
     }
     emit_object_rebox(function);
+}
+
+/// The `attrs` an entry `(key, value)` is defined with: an accessor value is
+/// an `ACCESSOR` property, a [`PropKey::Fixed`] key is non-writable,
+/// non-enumerable, and non-configurable, a [`PropKey::Hidden`] key is
+/// non-enumerable, and everything else is writable and configurable.
+fn attrs_of(key: &PropKey, value: &IrNode) -> u32 {
+    let enumerable = if matches!(key, PropKey::Hidden(_) | PropKey::Fixed(_)) {
+        0
+    } else {
+        abi::ATTR_ENUMERABLE
+    };
+    if matches!(key, PropKey::Fixed(_)) {
+        0
+    } else if matches!(value, IrNode::MakeAccessor { .. }) {
+        abi::ATTR_ACCESSOR | abi::ATTR_CONFIGURABLE | enumerable
+    } else {
+        abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE | enumerable
+    }
+}
+
+/// With the target block base already on the stack, push the entry's interned
+/// key (a constant, or `ToPropertyKey` of a computed key), its value, and its
+/// [`attrs_of`], and call `__define`.
+fn emit_define_entry(
+    key: &PropKey,
+    value: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match key {
+        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => {
+            function.instruction(&Instruction::I32Const(static_key(strings, name)));
+        }
+        PropKey::Computed(expr) => {
+            emit_node(expr, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::Call(helpers.to_key));
+        }
+    }
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::I32Const(attrs_of(key, value).cast_signed()));
+    function.instruction(&Instruction::Call(helpers.define));
+}
+
+/// Emit an [`IrNode::DefineProps`]: evaluate `obj` into `local`, define each
+/// entry on it in order (entry values may read `local`), and leave `obj` on
+/// the stack.
+pub(super) fn emit_define_props_node(
+    obj: &IrNode,
+    local: u32,
+    entries: &[(PropKey, IrNode)],
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(obj, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(local));
+    for (key, value) in entries {
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::I32WrapI64);
+        emit_define_entry(key, value, function, scratch, strings, helpers);
+    }
+    function.instruction(&Instruction::LocalGet(local));
 }
 
 /// Rebox the object block base still on the stack as a heap jsval.
@@ -185,9 +228,9 @@ fn emit_object_rebox(function: &mut Function) {
 /// Mirrors [`emit_object_node`]'s alloc→write→rebox discipline: `dst` rides the
 /// operand stack and is re-`tee`d before each write, so building the getter/setter
 /// closure values (which reuse the `+3` allocation scratch for their OWN blocks)
-/// cannot corrupt the accessor block base. A `MakeAccessor` only ever appears as a
-/// value inside the class prototype object, so the two closure builds are the only
-/// nested emits and this stack discipline suffices.
+/// cannot corrupt the accessor block base. A `MakeAccessor` only ever appears as an
+/// object-literal or class-prototype entry value, so the two closure builds are
+/// the only nested emits and this stack discipline suffices.
 pub(super) fn emit_make_accessor_node(
     getter: &IrNode,
     setter: &IrNode,
@@ -357,7 +400,7 @@ pub(super) fn emit_instanceof_node(
             function.instruction(&Instruction::I32WrapI64);
             function.instruction(&Instruction::I64Load(proto_slot));
             function.instruction(&Instruction::LocalSet(cur));
-            // tgt = <class>["@@prototype"] (its emit may reuse `+17`/`+18`; `v` is
+            // tgt = <class>.prototype (its emit may reuse `+17`/`+18`; `v` is
             // already consumed).
             emit_node(class_proto, function, scratch, strings, helpers);
             function.instruction(&Instruction::LocalSet(tgt));
@@ -2025,6 +2068,7 @@ fn never_primitive(node: &IrNode) -> bool {
             | IrNode::MapNew { .. }
             | IrNode::DateNew { .. }
             | IrNode::FuncValue { .. }
+            | IrNode::DeclFunc(_)
     )
 }
 
@@ -2045,6 +2089,7 @@ fn never_nullish(node: &IrNode) -> bool {
             | IrNode::MapNew { .. }
             | IrNode::DateNew { .. }
             | IrNode::FuncValue { .. }
+            | IrNode::DeclFunc(_)
     )
 }
 

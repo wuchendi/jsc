@@ -18,7 +18,7 @@ fn reserved_keys_do_not_leak() {
     assert_output(
         "class A { constructor(){ this.x = 1 } } let a = new A(); let {...r} = a; \
          console.log(Object.keys(a), r, JSON.stringify(a), a)",
-        "[ x ] { x: 1 } {\"x\":1} { x: 1 }\n",
+        "[ x ] { x: 1 } {\"x\":1} A { x: 1 }\n",
     );
     assert_output(
         "let e = new RangeError('r'); console.log(Object.keys(e).length, JSON.stringify(Object.values(new Error())))",

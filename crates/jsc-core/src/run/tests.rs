@@ -985,11 +985,21 @@ fn typeof_function_value_is_function() {
 
 #[test]
 fn bare_function_value_decodes_and_formats() {
-    // A returned bare function value decodes to `Value::Function` without a
-    // panic and renders Node-console style.
+    // A returned bare function value decodes to `Value::Function` with its
+    // `__fn_info` name and renders Node-console style.
     let value = compile_and_run("function id(x){return x} let g=id; g").expect("pipeline");
-    assert_eq!(value, Value::Function);
-    assert_eq!(format_value(&value), "[Function (anonymous)]");
+    assert_eq!(
+        value,
+        Value::Function {
+            name: "id".to_owned(),
+            class: false,
+            extends: None,
+            props: Vec::new(),
+        }
+    );
+    assert_eq!(format_value(&value), "[Function: id]");
+    let arrow = compile_and_run("let g = [() => 1]; g[0]").expect("pipeline");
+    assert_eq!(format_value(&arrow), "[Function (anonymous)]");
 }
 
 #[test]
@@ -1149,7 +1159,8 @@ fn non_capturing_function_is_unaffected() {
 #[test]
 fn function_value_decode_reads_type_byte() {
     // A hand-built function block at base offset 8: [type=3][pad×3][props=0]
-    // [proto=null][func_idx:u32=0][reserved:u32][env:i64=undefined].
+    // [proto=null][func_idx:u32=0][reserved:u32][env:i64=undefined], with no
+    // `__fn_info` table (its address word is 0) and so no name.
     let mut memory = vec![0u8; 8];
     memory.extend_from_slice(&[TYPE_FUNCTION, 0, 0, 0]);
     memory.extend_from_slice(&0u32.to_le_bytes());
@@ -1158,7 +1169,10 @@ fn function_value_decode_reads_type_byte() {
     memory.extend_from_slice(&0u32.to_le_bytes());
     memory.extend_from_slice(&0x7FFB_0000_0000_0000_u64.to_le_bytes());
     let bits = 0x7FFD_0000_0000_0000_u64 | 0x8;
-    assert_eq!(decode(bits, &memory), Value::Function);
+    assert_eq!(
+        format_value(&decode(bits, &memory)),
+        "[Function (anonymous)]"
+    );
 }
 
 // The type byte, not the (single) NaN-box tag, distinguishes a

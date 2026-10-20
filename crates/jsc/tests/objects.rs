@@ -291,10 +291,10 @@ fn object_keys_values_entries_via_eval() {
     assert_eq!(jsc(&["-p", "Object.entries({a:1})[0][1]"]), "1");
 }
 
-/// The enumerators skip the reserved hidden `@@`-prefixed keys, so a class
-/// instance (which carries a `@@prototype` link) enumerates only its own fields.
+/// A class instance's prototype link is not an own property, so the
+/// enumerators list only its own fields.
 #[test]
-fn object_keys_skip_reserved_keys() {
+fn object_keys_list_only_own_fields() {
     assert_eq!(
         jsc(&[
             "-p",
@@ -598,4 +598,41 @@ fn primitive_receiver_via_eval() {
     assert_eq!(jsc(&["-p", "\"abc\".foo"]), "undefined");
     assert_eq!(jsc(&["-p", "\"abc\"[1]"]), "b");
     assert_eq!(jsc(&["-p", "\"abc\".length"]), "3");
+}
+
+/// Object-literal getters and setters are accessor properties: reads call the
+/// getter and writes the setter with `this` = the receiver, and a getter-only
+/// property rejects writes.
+#[test]
+fn object_literal_accessors() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { get x(){ return 1 }, set x(v){ this.y = v } }; o.x = 5; console.log(o.x, o.y, o)"
+        ]),
+        "1 5 { x: [Getter/Setter], y: 5 }"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { get x(){ return 1 } }; try { o.x = 2 } catch (e) { console.log(e instanceof TypeError) }"
+        ]),
+        "true"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { n: 2, get d(){ return this.n * 2 } }; console.log(o.d, o)"
+        ]),
+        "4 { n: 2, d: [Getter] }"
+    );
+    // Accessor bodies capture top-level bindings like any function.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let c = 0; const o = { get a(){ c++; return c }, set b(v){ c = v } }; \
+             o.a; o.b = 9; console.log(o.a, c)"
+        ]),
+        "10 10"
+    );
 }

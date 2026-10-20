@@ -33,6 +33,16 @@ pub enum Value {
     /// then the other keys in insertion order), values decoded recursively, so
     /// objects nest.
     Object(Vec<(String, Value)>),
+    /// A heap object whose `constructor` (found by a data-property chain lookup)
+    /// is a function named other than `Object`, e.g. a class instance: the
+    /// constructor's name and the own enumerable properties. Renders Node-style
+    /// as `A { x: 1 }`.
+    Instance {
+        /// The constructor's name.
+        class: String,
+        /// The own enumerable properties, as in [`Value::Object`].
+        entries: Vec<(String, Value)>,
+    },
     /// A branded Error object (one carrying the non-enumerable
     /// `@@errorkind` brand): its `name` and `message` strings. Renders as its
     /// single-line stack `"<name>: <message>"`.
@@ -51,12 +61,21 @@ pub enum Value {
         /// Whether the property has a setter.
         setter: bool,
     },
-    /// A first-class function value, read from linear memory via a
-    /// function-pointer jsval (type byte `3`). The backing block holds a
-    /// funcref-table index and an environment slot; a returned bare function
-    /// value only needs to decode without panicking (it renders as
-    /// `[Function (anonymous)]`).
-    Function,
+    /// A function object (type byte `3`): its name from the `__fn_info`
+    /// table, its class-ness, and its own enumerable properties. Renders
+    /// Node-style as `[Function: f]` / `[Function (anonymous)]` /
+    /// `[class A]` / `[class B extends A]`, followed by ` { k: v }` when it has
+    /// enumerable properties.
+    Function {
+        /// The function's name (`""` when anonymous).
+        name: String,
+        /// Whether the function is a class constructor.
+        class: bool,
+        /// A derived class's parent class name (via `prototype.[[Prototype]].constructor`).
+        extends: Option<String>,
+        /// The own enumerable properties, as in [`Value::Object`].
+        props: Vec<(String, Value)>,
+    },
     /// A `Map` handle (type byte `6`). Only its logical entry count (`size`)
     /// is decoded — the backing entries are not walked — so it renders as `Map(N)`.
     Map(usize),
@@ -159,7 +178,10 @@ fn decode_in(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
 fn decode_heap(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
     let ptr = (bits & 0xFFFF_FFFF) as usize;
     let ty = memory.get(ptr).copied();
-    if matches!(ty, Some(TYPE_ARRAY | TYPE_OBJECT | TYPE_PROMISE)) {
+    if matches!(
+        ty,
+        Some(TYPE_ARRAY | TYPE_OBJECT | TYPE_PROMISE | TYPE_FUNCTION)
+    ) {
         if guard.path.contains(&ptr) {
             let id = guard.ref_of(ptr).unwrap_or_else(|| {
                 guard.refs.push(ptr);
@@ -171,6 +193,7 @@ fn decode_heap(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
         let value = match ty {
             Some(TYPE_ARRAY) => decode_array(ptr, memory, guard),
             Some(TYPE_OBJECT) => decode_object(ptr, memory, guard),
+            Some(TYPE_FUNCTION) => decode_function(ptr, memory, guard),
             _ => decode_promise(ptr, memory, guard),
         };
         guard.path.pop();
@@ -181,7 +204,6 @@ fn decode_heap(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
     }
     match ty {
         Some(TYPE_STRING) => decode_string(ptr, memory),
-        Some(TYPE_FUNCTION) => Value::Function,
         Some(TYPE_MAP) => Value::Map(decode_size(ptr, memory)),
         Some(TYPE_SET) => Value::Set(decode_size(ptr, memory)),
         Some(TYPE_GENERATOR) => Value::Generator,
@@ -292,20 +314,21 @@ fn read_u64(memory: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
-/// Resolve a heap object block at base `ptr` by walking its `TYPE_PROPS` table
-/// (at the `props` slot): tombstones and non-enumerable entries are skipped,
-/// integer keys (strings flagged `ARRAY_INDEX`) come first in ascending order
-/// when the table has `HAS_INDEX_KEYS`, then the other keys in slot order. An
-/// accessor property decodes as [`Value::Accessor`]; an object carrying the
-/// non-enumerable `@@errorkind` brand decodes as [`Value::Error`].
+/// Decode the own enumerable properties of the object-family block at base
+/// `ptr` by walking its `TYPE_PROPS` table (at the `props` slot): tombstones
+/// and non-enumerable entries are skipped, integer keys (strings flagged
+/// `ARRAY_INDEX`) come first in ascending order when the table has
+/// `HAS_INDEX_KEYS`, then the other keys in slot order. An accessor property
+/// decodes as [`Value::Accessor`]. Also reports whether the table carries the
+/// non-enumerable `@@errorkind` brand.
 ///
 /// Defensive: a truncated table stops early, so a malformed pointer never
 /// panics.
-fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> (Vec<(String, Value)>, bool) {
     use crate::abi;
     let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize).unwrap_or(0) as usize;
     if props == 0 {
-        return Value::Object(Vec::new());
+        return (Vec::new(), false);
     }
     let count = read_u32(memory, props + abi::PROPS_COUNT_OFFSET as usize).unwrap_or(0) as usize;
     let tflags = memory
@@ -364,6 +387,17 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
         };
         entries.push((key, value));
     }
+    (entries, is_error)
+}
+
+/// Resolve a heap object block at base `ptr` from its own enumerable
+/// properties ([`decode_props`]). An object carrying the non-enumerable
+/// `@@errorkind` brand decodes as [`Value::Error`]; an object with a
+/// prototype whose `constructor` names a function other than `Object`
+/// decodes as [`Value::Instance`].
+fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+    use crate::abi;
+    let (entries, is_error) = decode_props(ptr, memory, guard);
     if is_error {
         let field = |name: &str| {
             entries.iter().find_map(|(key, value)| match value {
@@ -376,7 +410,110 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
             message: field("message").unwrap_or_default(),
         };
     }
-    Value::Object(entries)
+    let has_proto = read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize)
+        .is_some_and(|bits| heap_object(bits, memory).is_some());
+    let class = has_proto
+        .then(|| lookup_data(ptr, "constructor", memory))
+        .flatten()
+        .and_then(|bits| function_name(bits, memory))
+        .filter(|name| !name.is_empty() && name != "Object");
+    match class {
+        Some(class) => Value::Instance { class, entries },
+        None => Value::Object(entries),
+    }
+}
+
+/// Resolve a function block at base `ptr` (see [`Value::Function`]).
+fn decode_function(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+    use crate::abi;
+    let flags = memory
+        .get(ptr + abi::HEADER_FLAGS_OFFSET as usize)
+        .copied()
+        .unwrap_or(0);
+    let class = flags & abi::FUNC_FLAG_CLASS_CTOR != 0;
+    let extends = class
+        .then(|| own_data(ptr, "prototype", memory))
+        .flatten()
+        .and_then(|proto| heap_object(proto, memory))
+        .and_then(|proto| read_u64(memory, proto + abi::OBJ_PROTO_OFFSET as usize))
+        .and_then(|parent| heap_object(parent, memory))
+        .and_then(|parent| lookup_data(parent, "constructor", memory))
+        .and_then(|ctor| function_name(ctor, memory));
+    Value::Function {
+        name: function_name(abi::HEAP | ptr as u64, memory).unwrap_or_default(),
+        class,
+        extends,
+        props: decode_props(ptr, memory, guard).0,
+    }
+}
+
+/// The block base of `bits` when it is a heap pointer to an object-family
+/// block that carries a `props` slot (not a string or array).
+fn heap_object(bits: u64, memory: &[u8]) -> Option<usize> {
+    if bits & QNAN != QNAN || (bits >> 48) & 0b111 != 0b101 {
+        return None;
+    }
+    let ptr = (bits & 0xFFFF_FFFF) as usize;
+    let ty = *memory.get(ptr)?;
+    (ty != TYPE_STRING && ty != TYPE_ARRAY).then_some(ptr)
+}
+
+/// The value bits of the own DATA property `key` of the object-family block
+/// at `ptr` (a read-only lookup by key bytes; accessors are skipped).
+fn own_data(ptr: usize, key: &str, memory: &[u8]) -> Option<u64> {
+    use crate::abi;
+    let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize)? as usize;
+    if props == 0 {
+        return None;
+    }
+    let count = read_u32(memory, props + abi::PROPS_COUNT_OFFSET as usize)? as usize;
+    (0..count).find_map(|k| {
+        let entry = props + abi::PROPS_HEADER_SIZE as usize + abi::PROP_ENTRY_SIZE as usize * k;
+        let key_ptr = read_u32(memory, entry + abi::PROP_KEY_OFFSET as usize)?;
+        let attrs = read_u32(memory, entry + abi::PROP_ATTRS_OFFSET as usize)?;
+        let matches = key_ptr != 0
+            && attrs & abi::ATTR_ACCESSOR == 0
+            && matches!(decode_string(key_ptr as usize, memory), Value::Str(text) if text == key);
+        matches
+            .then(|| read_u64(memory, entry + abi::PROP_VALUE_OFFSET as usize))
+            .flatten()
+    })
+}
+
+/// The value bits of the data property `key` found on the object at `ptr` or
+/// the nearest object on its `proto` chain (a read-only lookup: no getter
+/// runs; a bounded walk, so a malformed chain cannot loop forever).
+fn lookup_data(ptr: usize, key: &str, memory: &[u8]) -> Option<u64> {
+    use crate::abi;
+    let mut cur = ptr;
+    for _ in 0..1024 {
+        if let Some(bits) = own_data(cur, key, memory) {
+            return Some(bits);
+        }
+        let proto = read_u64(memory, cur + abi::OBJ_PROTO_OFFSET as usize)?;
+        cur = heap_object(proto, memory)?;
+    }
+    None
+}
+
+/// The `__fn_info` name of the function `bits`, or `None` when `bits` is not
+/// a function.
+fn function_name(bits: u64, memory: &[u8]) -> Option<String> {
+    use crate::abi;
+    let ptr = heap_object(bits, memory)?;
+    if memory.get(ptr) != Some(&TYPE_FUNCTION) {
+        return None;
+    }
+    let info = read_u32(memory, abi::FN_INFO_ADDR as usize)? as usize;
+    let index = read_u32(memory, ptr + abi::FUNC_INDEX_OFFSET as usize)? as usize;
+    let key = read_u32(
+        memory,
+        info + abi::FN_INFO_ENTRY_SIZE as usize * index + abi::FN_INFO_NAME_OFFSET as usize,
+    )?;
+    match decode_string(key as usize, memory) {
+        Value::Str(name) => Some(name),
+        _ => None,
+    }
 }
 
 /// Render an `f64` the way JavaScript prints a number.
@@ -483,18 +620,9 @@ pub fn format_value(value: &Value) -> String {
             }
         }
         // An object renders Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
-        Value::Object(entries) => {
-            if entries.is_empty() {
-                "{}".to_owned()
-            } else {
-                let inner = entries
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {}", format_value(value)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{ {inner} }}")
-            }
-        }
+        Value::Object(entries) => format_entries(entries),
+        // A class instance is prefixed with its constructor's name.
+        Value::Instance { class, entries } => format!("{class} {}", format_entries(entries)),
         // A branded Error object renders as its single-line stack
         // (`"<name>: <message>"`, or just the name without a message), the way
         // a JS console prints an error's first line.
@@ -510,10 +638,31 @@ pub fn format_value(value: &Value) -> String {
             (false, true) => "[Setter]".to_owned(),
             _ => "[Getter]".to_owned(),
         },
-        // A function value renders Node-console style. jsc does not track a
-        // function's source name through the value, so every function prints
-        // anonymously.
-        Value::Function => "[Function (anonymous)]".to_owned(),
+        // A function renders Node-console style by name and class-ness, then
+        // its enumerable properties.
+        Value::Function {
+            name,
+            class,
+            extends,
+            props,
+        } => {
+            let head = match (class, name.is_empty()) {
+                (true, _) => {
+                    let name = if name.is_empty() { "(anonymous)" } else { name };
+                    match extends {
+                        Some(parent) => format!("[class {name} extends {parent}]"),
+                        None => format!("[class {name}]"),
+                    }
+                }
+                (false, true) => "[Function (anonymous)]".to_owned(),
+                (false, false) => format!("[Function: {name}]"),
+            };
+            if props.is_empty() {
+                head
+            } else {
+                format!("{head} {}", format_entries(props))
+            }
+        }
         // A Map/Set renders with its entry count (the backing entries are not
         // decoded), e.g. `Map(2)` / `Set(0)`.
         Value::Map(size) => format!("Map({size})"),
@@ -535,6 +684,20 @@ pub fn format_value(value: &Value) -> String {
         // Cycle markers render Node-console style.
         Value::Circular(id) => format!("[Circular *{id}]"),
         Value::Ref(id, value) => format!("<ref *{id}> {}", format_value(value)),
+    }
+}
+
+/// Render own properties Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
+fn format_entries(entries: &[(String, Value)]) -> String {
+    if entries.is_empty() {
+        "{}".to_owned()
+    } else {
+        let inner = entries
+            .iter()
+            .map(|(key, value)| format!("{key}: {}", format_value(value)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ {inner} }}")
     }
 }
 

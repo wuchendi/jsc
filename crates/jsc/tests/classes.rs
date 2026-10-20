@@ -836,3 +836,68 @@ fn class_instance_property_writes() {
         "1"
     );
 }
+
+/// A class value is its constructor function: `typeof` is `function`, the
+/// non-writable `prototype` links back through a non-enumerable `constructor`,
+/// statics are own properties, and prototype methods are non-enumerable.
+#[test]
+fn class_value_is_constructor_function() {
+    let class_a = "class A { constructor(){ this.x = 1 } m(){} static s(){ return 2 } }";
+    let run = |body: &str| jsc(&["-e", &format!("{class_a} {body}")]);
+    assert_eq!(run("console.log(typeof A)"), "function");
+    assert_eq!(run("console.log(A.prototype.constructor === A)"), "true");
+    assert_eq!(run("console.log(A.s())"), "2");
+    assert_eq!(run("console.log(Object.keys(A.prototype))"), "[]");
+    assert_eq!(run("console.log(Object.keys(A))"), "[]");
+    assert_eq!(
+        run("try { A.prototype = {} } catch (e) { console.log(e instanceof TypeError) }"),
+        "true"
+    );
+    assert_eq!(run("console.log(new A())"), "A { x: 1 }");
+    assert_eq!(run("console.log(A)"), "[class A]");
+    assert_eq!(run("console.log(A.name, A.length)"), "A 0");
+    assert_eq!(run("console.log(A.s.name, A.prototype.m.name)"), "s m");
+    // A static field is an enumerable own data property of the class.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class B { static f = 1; static g = B.f + 1 } console.log(Object.keys(B), B.g)"
+        ]),
+        "[ f, g ] 2"
+    );
+}
+
+/// A derived class links its prototype to the parent's, so instances are
+/// `instanceof` both; a derived class without a constructor forwards its
+/// arguments to the parent's and still runs its own field initializers.
+#[test]
+fn derived_class_prototype_chain() {
+    let classes = "class A { constructor(v){ this.v = v } get() { return this.v } } \
+                   class B extends A {}";
+    let run = |body: &str| jsc(&["-e", &format!("{classes} {body}")]);
+    assert_eq!(
+        run("let b = new B(3); console.log(b instanceof A, b instanceof B, b.get())"),
+        "true true 3"
+    );
+    assert_eq!(run("console.log(new A(1) instanceof B)"), "false");
+    assert_eq!(run("console.log(B === A, B.name)"), "false B");
+    assert_eq!(run("console.log(B)"), "[class B extends A]");
+    assert_eq!(run("console.log(new B(2))"), "B { v: 2 }");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class A { constructor(a, b){ this.s = a + b } } \
+             class B extends A { f = 9 } let b = new B(1, 2); console.log(b.s, b.f)"
+        ]),
+        "3 9"
+    );
+    // `super(...args)` spreads into the parent constructor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class A { constructor(a, b){ this.s = a + b } } \
+             class B extends A { constructor(...xs){ super(...xs) } } console.log(new B(4, 5).s)"
+        ]),
+        "9"
+    );
+}

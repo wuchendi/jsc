@@ -33,7 +33,7 @@ export const TYPE_STRING = 0
 export const TYPE_ARRAY = 1
 /** TYPE BYTE of an ordinary object block: the object-family prefix; properties live in its `props` table. */
 export const TYPE_OBJECT = 2
-/** TYPE BYTE of a first-class function value. Renders as `[Function (anonymous)]`. */
+/** TYPE BYTE of a function object (prefix, then `func_idx:u32`, reserved `u32`, `env:i64`). */
 export const TYPE_FUNCTION = 3
 /** TYPE BYTE of a `Map` handle block (prefix, then `size:u32`, `entries:i64`). */
 export const TYPE_MAP = 6
@@ -46,7 +46,7 @@ export const TYPE_GENERATOR = 9
 /** TYPE BYTE of a `Date` block (prefix, then `ms:f64`). */
 export const TYPE_DATE = 10
 
-/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`). */
+/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
 export const HEADER_FLAGS_OFFSET = 2
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
@@ -102,6 +102,18 @@ export const PROMISE_BLOCK_SIZE = OBJ_PREFIX_SIZE + 16
 export const GEN_DONE_OFFSET = OBJ_PREFIX_SIZE + 8
 /** Byte offset (from a {@link TYPE_DATE} block base) of the `ms` timestamp (`f64`). */
 export const DATE_MS_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset of the object-family prefix's `proto:i64` jsval slot. */
+export const OBJ_PROTO_OFFSET = 8
+/** Byte offset (from a {@link TYPE_FUNCTION} block base) of the funcref-table index (`u32`). */
+export const FUNC_INDEX_OFFSET = OBJ_PREFIX_SIZE
+/** {@link TYPE_FUNCTION} `flags` bit: the function is a class constructor. */
+export const FUNC_FLAG_CLASS_CTOR = 16
+/** Address of the `u32` base of the `__fn_info` table (`[name key:u32][length:u32]` per function). */
+export const FN_INFO_ADDR = 4
+/** Byte size of one `__fn_info` entry. */
+export const FN_INFO_ENTRY_SIZE = 8
+/** Byte offset (within a `__fn_info` entry) of the interned `name` key (`u32`). */
+export const FN_INFO_NAME_OFFSET = 0
 
 /** Export name of the module's linear memory. */
 export const MEMORY_EXPORT_NAME = 'memory'

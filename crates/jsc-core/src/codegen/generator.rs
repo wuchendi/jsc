@@ -79,6 +79,7 @@ impl LowerCtx<'_> {
                 locals: 0,
                 body: Vec::new(),
                 machine: None,
+                info: FnInfo::default(),
             });
             pos
         };
@@ -110,6 +111,7 @@ impl LowerCtx<'_> {
             locals: sm_locals,
             body: Vec::new(),
             machine: Some(segments),
+            info: FnInfo::default(),
         };
 
         // The constructor: `return MakeGenerator(...)`, reading each parameter from
@@ -133,6 +135,7 @@ impl LowerCtx<'_> {
             locals: uniform_params,
             body: ctor_body,
             machine: None,
+            info: FnInfo::default(),
         })
     }
 

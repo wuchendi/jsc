@@ -90,7 +90,8 @@ pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
 /// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
 /// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
-/// [`OBJ_FLAG_NOT_EXTENSIBLE`].
+/// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
+/// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`].
 pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
 
 /// Header byte 3: the `TYPE_OBJECT` sub-`class` byte. Reserved; every block is
@@ -162,6 +163,39 @@ pub(crate) const FUNC_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
 /// The byte size of a [`TYPE_FUNCTION`] block.
 pub(crate) const FUNC_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: `length`, `name`, and (for a
+/// [`FUNC_FLAG_CONSTRUCTOR`]) `prototype` are not yet defined. The first
+/// property operation on the function calls `__fn_materialize`, which defines
+/// them from the function's [`FN_INFO_ENTRY_SIZE`]-byte info entry and clears
+/// the bit.
+pub(crate) const FUNC_FLAG_LAZY: u8 = 4;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the function is a constructor (a
+/// `function` declaration/expression or a class), so materialization gives it
+/// a `prototype` object.
+pub(crate) const FUNC_FLAG_CONSTRUCTOR: u8 = 8;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the function is a class constructor.
+/// Its `prototype` is installed by the class definition, not materialized.
+pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
+
+/// Linear-memory address of the u32 holding the base of the static function
+/// info table (inside the null guard below the first static string): entry
+/// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
+/// func_idx`, holding the function's interned `name` key at
+/// [`FN_INFO_NAME_OFFSET`] and its `length` at [`FN_INFO_LENGTH_OFFSET`]
+/// (`__fn_info`). `__fn_materialize` and the host renderers read it.
+pub(crate) const FN_INFO_ADDR: u32 = 4;
+
+/// The byte size of one function info entry (see [`FN_INFO_ADDR`]).
+pub(crate) const FN_INFO_ENTRY_SIZE: u32 = 8;
+
+/// Byte offset (within a function info entry) of the u32 interned `name` key.
+pub(crate) const FN_INFO_NAME_OFFSET: u32 = 0;
+
+/// Byte offset (within a function info entry) of the u32 `length`.
+pub(crate) const FN_INFO_LENGTH_OFFSET: u32 = 4;
 
 /// TYPE BYTE of a closure **environment** block (internal):
 /// `[type=4][pad×3][count:u32][cell_ptr:i64 × count]`. Never a user value.
@@ -276,9 +310,9 @@ pub(crate) const DATE_MS_OFFSET: u32 = OBJ_PREFIX_SIZE;
 /// The byte size of a [`TYPE_DATE`] block.
 pub(crate) const DATE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 
-/// TYPE BYTE of an **accessor** block (P2b instance getters/setters):
-/// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds a class instance
-/// accessor property's getter and setter FUNCTION VALUES (the `undefined` bits
+/// TYPE BYTE of an **accessor** block (class and object-literal getters/setters):
+/// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds an accessor
+/// property's getter and setter FUNCTION VALUES (the `undefined` bits
 /// when a half is absent). It is the value of an [`ATTR_ACCESSOR`] property
 /// table entry, so `__get` invokes the getter with `this = receiver` and
 /// `__set` the setter. Never a program-visible value; the host decoders render
@@ -374,13 +408,6 @@ pub(crate) const STR_FLAG_INTERNED: u8 = 1;
 /// intern time.
 pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
-/// A compile-time-only interned SENTINEL key present in the string table iff the
-/// program lowers at least one instance accessor ([`crate::ir::IrNode::MakeAccessor`]).
-/// The emitter gates the getter/setter invocation inside `__get` / `__set` (and
-/// the post-access exception check) on its presence. It is never read at
-/// runtime (the `@@` prefix keeps it off any JS-visible surface).
-pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
-
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
 /// value `undefined`). A method call `obj.m(args)` sets it to the receiver
 /// immediately before the `call_indirect`; every function/arrow prologue
@@ -389,20 +416,6 @@ pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
 /// completion-routing globals (indices `0..=4`), so it is index `5`. Internal —
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
-
-/// Reserved hidden property key naming a class's shared PROTOTYPE object: the
-/// class value stores its prototype under this non-enumerable key, and `new`
-/// reads it to fill each instance's `proto` slot (a derived prototype's
-/// `proto` is the parent's). The `@@` prefix cannot begin a JS identifier, so
-/// ordinary `obj.name` source access never collides with it.
-pub(crate) const CLASS_PROTOTYPE_KEY: &str = "@@prototype";
-
-/// Reserved hidden property key naming a class's CONSTRUCTOR function value.
-/// The class binding stores its lowered constructor — an ordinary
-/// uniform-ABI function value — under this key; `new A(args)` reads it back and
-/// runs it with `this` bound to the fresh instance. Same interning/`@@`-prefix
-/// rationale as [`CLASS_PROTOTYPE_KEY`].
-pub(crate) const CLASS_CONSTRUCTOR_KEY: &str = "@@constructor";
 
 /// Reserved hidden property key marking a builtin **Error** object's kind
 /// (E-series). `new Error`/`new TypeError`/`new RangeError` store one of

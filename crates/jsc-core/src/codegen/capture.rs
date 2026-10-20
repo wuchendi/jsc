@@ -460,6 +460,19 @@ impl CaptureResolver {
                 _ => {}
             }
         }
+        // A derived class without a constructor gets the default one, whose
+        // `super(...args)` references the superclass from its own frame.
+        if let Some(sup) = &super_name
+            && !c
+                .class
+                .body
+                .iter()
+                .any(|m| matches!(m, ClassMember::Constructor(_)))
+        {
+            self.enter_function();
+            self.reference(sup);
+            self.exit_function();
+        }
     }
 
     /// Analyze a `for-of` / `for-in` loop, mirroring [`LowerCtx::lower_for_of`] /
@@ -628,7 +641,16 @@ impl CaptureResolver {
                                 &method.function.params,
                                 method.function.body.as_ref().map(|b| &b.stmts),
                             ),
-                            _ => {}
+                            // A getter/setter body is a function frame too.
+                            Prop::Getter(getter) => self.function(
+                                &getter.function.params,
+                                getter.function.body.as_ref().map(|b| &b.stmts),
+                            ),
+                            Prop::Setter(setter) => self.function(
+                                &setter.function.params,
+                                setter.function.body.as_ref().map(|b| &b.stmts),
+                            ),
+                            Prop::Assign(_) => {}
                         }
                     }
                 }

@@ -235,11 +235,11 @@ fn object_family_values_render_through_payload_offsets() {
                [m, s, new Date(0), Promise.resolve(f)]";
     assert_eq!(
         jsc_raw_stdout(&["-e", src]),
-        "Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function (anonymous)] \
+        "Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function: f] \
          Object [Generator] Promise { 4 } Promise { <pending> }\n"
     );
     assert_eq!(
         jsc(&["-p", src]).lines().last(),
-        Some("[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function (anonymous)] } ]")
+        Some("[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function: f] } ]")
     );
 }

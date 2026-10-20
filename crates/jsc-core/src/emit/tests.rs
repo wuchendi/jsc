@@ -672,6 +672,7 @@ fn emits_valid_module_with_function_and_call() {
                 rhs: Box::new(IrNode::Local(1)),
             }))],
             machine: None,
+            info: crate::ir::FnInfo::default(),
         }],
     };
     validate(&emit(&program));
@@ -693,6 +694,7 @@ fn emits_valid_module_with_function_value_and_indirect_call() {
                 init: IrNode::FuncValue {
                     table_index: 0,
                     captures: vec![],
+                    kind: crate::ir::FnKind::Plain,
                 },
             },
             IrStmt::Expr(IrNode::CallIndirect {
@@ -705,6 +707,7 @@ fn emits_valid_module_with_function_value_and_indirect_call() {
             locals: 3,
             body: vec![IrStmt::Return(Some(IrNode::Local(0)))],
             machine: None,
+            info: crate::ir::FnInfo::default(),
         }],
     };
     let bytes = emit(&program);
@@ -783,7 +786,8 @@ fn static_string_blobs_are_8_aligned() {
 fn every_block_is_8_aligned_with_zero_header_bytes() {
     // Guest-allocated (concat, array, object, function, Map, Date, generator)
     // and host-allocated (String(n), string/array methods, promises) blocks
-    // all start 8-aligned with header bytes 1..3 (`gc`, `flags`, `class`) zero.
+    // all start 8-aligned with header bytes 1..3 (`gc`, `flags`, `class`) zero,
+    // except a fresh arrow's `flags`, which is `LAZY`.
     for src in [
         "'x' + 1",
         "let n = 3; [1, n]",
@@ -813,9 +817,14 @@ fn every_block_is_8_aligned_with_zero_header_bytes() {
             ("flags", crate::abi::HEADER_FLAGS_OFFSET),
             ("class", crate::abi::HEADER_CLASS_OFFSET),
         ] {
+            let want = if name == "flags" && memory[base] == crate::abi::TYPE_FUNCTION {
+                crate::abi::FUNC_FLAG_LAZY
+            } else {
+                0
+            };
             assert_eq!(
                 memory[base + offset as usize],
-                0,
+                want,
                 "{src}: header {name} byte"
             );
         }
@@ -901,11 +910,11 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
 #[test]
 fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     use crate::abi::{
-        DATE_MS_OFFSET, FUNC_ENV_OFFSET, FUNC_INDEX_OFFSET, GEN_DONE_OFFSET, GEN_ENV_OFFSET,
-        GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, NULL, OBJ_PROPS_OFFSET,
-        OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET,
-        TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_PROMISE, TYPE_SET,
-        UNDEFINED,
+        DATE_MS_OFFSET, FUNC_ENV_OFFSET, FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_LAZY, FUNC_INDEX_OFFSET,
+        GEN_DONE_OFFSET, GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET,
+        NULL, OBJ_PROPS_OFFSET, OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET,
+        PROMISE_VALUE_OFFSET, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
+        TYPE_PROMISE, TYPE_SET, UNDEFINED,
     };
     let u32_at = |mem: &[u8], at: u32| {
         let at = at as usize;
@@ -915,7 +924,7 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let at = at as usize;
         u64::from_le_bytes(mem[at..at + 8].try_into().expect("u64"))
     };
-    let heap = |src: &str, kind: u8| {
+    let heap = |src: &str, kind: u8, flags: u8| {
         let bytes = emit_js(src);
         validate(&bytes);
         let (bits, memory) = crate::run::run(&bytes).expect("module should run");
@@ -923,7 +932,7 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let base = u32::try_from(bits & 0xFFFF_FFFF).expect("base");
         assert_eq!(base % 8, 0, "{src}: 8-aligned");
         let at = base as usize;
-        assert_eq!(&memory[at..at + 4], &[kind, 0, 0, 0], "{src}: header");
+        assert_eq!(&memory[at..at + 4], &[kind, 0, flags, 0], "{src}: header");
         assert_eq!(u32_at(&memory, base + OBJ_PROPS_OFFSET), 0, "{src}: props");
         assert_eq!(
             u64_at(&memory, base + OBJ_PROTO_OFFSET),
@@ -933,12 +942,20 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         (base, memory)
     };
 
-    let (func, mem) = heap("function f(x) { return x } f", TYPE_FUNCTION);
+    let (func, mem) = heap(
+        "function f(x) { return x } f",
+        TYPE_FUNCTION,
+        FUNC_FLAG_LAZY | FUNC_FLAG_CONSTRUCTOR,
+    );
     assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET), 0, "func_idx");
     assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET + 4), 0, "reserved");
     assert_eq!(u64_at(&mem, func + FUNC_ENV_OFFSET), UNDEFINED, "env");
 
-    let (closure, mem) = heap("let n = 1; let g = () => n; g", TYPE_FUNCTION);
+    let (closure, mem) = heap(
+        "let n = 1; let g = () => n; g",
+        TYPE_FUNCTION,
+        FUNC_FLAG_LAZY,
+    );
     let env = u64_at(&mem, closure + FUNC_ENV_OFFSET);
     assert_eq!((env >> 48) & 0b111, 0b101, "closure env is a heap block");
 
@@ -950,14 +967,14 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         ),
         ("let s = new Set(); s.add(1); s", TYPE_SET, 1),
     ] {
-        let (handle, mem) = heap(src, kind);
+        let (handle, mem) = heap(src, kind, 0);
         assert_eq!(u32_at(&mem, handle + MAP_SIZE_OFFSET), size, "{src}: size");
         let entries = u64_at(&mem, handle + MAP_ENTRIES_OFFSET);
         let arr = u32::try_from(entries & 0xFFFF_FFFF).expect("entries");
         assert_eq!(mem[arr as usize], TYPE_ARRAY, "{src}: entries backing");
     }
 
-    let (promise, mem) = heap("Promise.resolve(7)", TYPE_PROMISE);
+    let (promise, mem) = heap("Promise.resolve(7)", TYPE_PROMISE, 0);
     assert_eq!(
         u32_at(&mem, promise + PROMISE_STATE_OFFSET).cast_signed(),
         PROMISE_FULFILLED
@@ -970,6 +987,7 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     let (generator, mem) = heap(
         "function* gen() { yield 1 } let it = gen(); it.next(); it",
         TYPE_GENERATOR,
+        0,
     );
     assert_eq!(
         u32_at(&mem, generator + GEN_STATE_OFFSET),
@@ -980,6 +998,6 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     let frame = u64_at(&mem, generator + GEN_ENV_OFFSET);
     assert_eq!((frame >> 48) & 0b111, 0b101, "frame is a heap block");
 
-    let (date, mem) = heap("new Date(1234.5)", TYPE_DATE);
+    let (date, mem) = heap("new Date(1234.5)", TYPE_DATE, 0);
     assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234.5_f64.to_bits());
 }

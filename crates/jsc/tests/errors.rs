@@ -377,13 +377,11 @@ fn property_write_error_unwinds_through_finally_and_calls() {
     );
 }
 
-/// Out-of-scope object method forms (getter/setter, async/generator methods) are rejected at compile time with exit code 2 and
+/// Out-of-scope object method forms (async/generator methods) are rejected at compile time with exit code 2 and
 /// an explanatory message.
 #[test]
 fn unsupported_object_methods_error() {
     let cases = [
-        ("let o={get x(){return 1}}; o.x", "getter"),
-        ("let o={set x(v){}}; 1", "setter"),
         ("let o={async m(){return 1}}; 1", "async"),
         ("let o={*m(){return 1}}; 1", "generator"),
     ];

@@ -8,13 +8,10 @@
 //!
 //! For `negative: { phase: runtime }` tests the expected constructor name is
 //! matched against the token after `Uncaught ` on stderr. jsc prints builtin
-//! errors as `Uncaught TypeError: msg`, so builtin names match. An uncaught
-//! user class instance prints as an object literal
-//! (`Uncaught { @@prototype: ..., message: x }`) without its class
-//! name, so runtime-negative tests expecting `Test262Error` cannot match and
-//! count as failures until jsc names class instances. Harness assertion
-//! failures throw `new Error("Test262Error: ...")` and therefore report the
-//! name `Error`.
+//! errors as `Uncaught TypeError: msg`, so builtin names match, and an
+//! uncaught user class instance Node-style with its class name
+//! (`Uncaught Test262Error { message: x }`). Harness assertion failures throw
+//! `new Error("Test262Error: ...")` and therefore report the name `Error`.
 
 use crate::frontmatter::Negative;
 
@@ -191,11 +188,11 @@ mod tests {
     #[test]
     fn observed_jsc_stderr() {
         let t262 = neg("runtime", "Test262Error");
-        let class_instance = "Uncaught { @@prototype: {}, message: top }\n";
-        assert_eq!(uncaught_name(class_instance), Some("{"));
+        let class_instance = "Uncaught Test262Error { message: top }\n";
+        assert_eq!(uncaught_name(class_instance), Some("Test262Error"));
         assert_eq!(
             classify(Status::Exited(1), class_instance, Some(&t262)),
-            Outcome::Fail
+            Outcome::Pass
         );
         let harness = "Uncaught Error: Test262Error: Expected SameValue\n";
         assert_eq!(uncaught_name(harness), Some("Error"));

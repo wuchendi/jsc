@@ -224,11 +224,11 @@ it('renders object-family values like the Rust host', async () => {
       '[m, s, new Date(0), Promise.resolve(f)]',
   )
   expect(stdout).toBe(
-    'Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function (anonymous)] ' +
+    'Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function: f] ' +
       'Object [Generator] Promise { 4 } Promise { <pending> }\n',
   )
   expect(result).toBe(
-    '[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function (anonymous)] } ]',
+    '[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function: f] } ]',
   )
 })
 
@@ -236,7 +236,7 @@ it('renders dictionary objects like the Rust host', async () => {
   const cases: [string, string][] = [
     [
       'class A { constructor(){ this.x = 1 } m(){} } let a = new A(); for (const k in a) console.log(k); console.log(Object.keys(a), JSON.stringify(a), a)',
-      'x\n[ x ] {"x":1} { x: 1 }\n',
+      'x\n[ x ] {"x":1} A { x: 1 }\n',
     ],
     ['let n = 5; console.log(n.x, true.y)', 'undefined undefined\n'],
     [
@@ -259,6 +259,25 @@ it('renders dictionary objects like the Rust host', async () => {
       "console.log(new TypeError('boom'), [new Error()], Object.keys({'@x': 1}))",
       'TypeError: boom [ Error ] [ @x ]\n',
     ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})
+
+it('renders functions, classes, instances, and accessors like the Rust host', async () => {
+  const cases: [string, string][] = [
+    [
+      'class A { constructor(){ this.x = 1 } } class B extends A {} console.log(A, B, new A(), new B())',
+      '[class A] [class B extends A] A { x: 1 } B { x: 1 }\n',
+    ],
+    [
+      'function f(){} f.x = 1; let g = () => 0; console.log(f, g, () => 0)',
+      '[Function: f] { x: 1 } [Function: g] [Function (anonymous)]\n',
+    ],
+    [
+      'let o = { get x(){ return 1 }, set x(v){ this.y = v } }; o.x = 5; console.log(o.x, o.y, o)',
+      '1 5 { x: [Getter/Setter], y: 5 }\n',
+    ],
+    ['class E {} console.log(new E(), E.prototype)', 'E {} {}\n'],
   ]
   for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
 })

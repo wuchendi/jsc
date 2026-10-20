@@ -92,8 +92,30 @@ pub(super) fn emit_node(
         IrNode::FuncValue {
             table_index,
             captures,
+            kind,
         } => {
-            emit_func_value(*table_index, captures, function, scratch, strings, helpers);
+            emit_func_value(
+                *table_index,
+                captures,
+                *kind,
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
+        }
+        IrNode::DeclFunc(table_index) => {
+            let base = decl_func_base(*table_index, helpers);
+            function.instruction(&Instruction::I64Const(
+                HEAP_BITS | i64::from(base.cast_unsigned()),
+            ));
+        }
+        IrNode::DefineProps {
+            obj,
+            local,
+            entries,
+        } => {
+            emit_define_props_node(obj, *local, entries, function, scratch, strings, helpers);
         }
         IrNode::CallIndirect { callee, args } => {
             emit_call_indirect(callee, args, function, scratch, strings, helpers);
@@ -754,8 +776,9 @@ pub(super) fn emit_argc(count: usize, function: &mut Function) {
 /// Emit a first-class function value `IrNode::FuncValue`, leaving its jsval
 /// (single heap tag `0b101`, type byte `TYPE_FUNCTION`) on the stack.
 /// `__alloc(FUNC_BLOCK_SIZE)` reserves the block, then the object-family prefix
-/// (`null` prototype), the funcref-table index (at [`FUNC_INDEX_OFFSET`]), and the
-/// environment slot (at [`FUNC_ENV_OFFSET`]) are written.
+/// (header `flags` `LAZY` plus the function's constructor kind, no properties,
+/// `null` prototype), the funcref-table index (at [`FUNC_INDEX_OFFSET`]), and
+/// the environment slot (at [`FUNC_ENV_OFFSET`]) are written.
 ///
 /// For a non-capturing function `captures` is empty and the env slot is
 /// `undefined`. For a **closure** the environment block is built first (via
@@ -765,6 +788,7 @@ pub(super) fn emit_argc(count: usize, function: &mut Function) {
 pub(super) fn emit_func_value(
     table_index: u32,
     captures: &[IrNode],
+    kind: FnKind,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -797,8 +821,9 @@ pub(super) fn emit_func_value(
     function.instruction(&Instruction::Call(helpers.alloc));
 
     // Write the TYPE_FUNCTION prefix at dst, keeping dst on the stack.
+    let flags = fn_flags(kind);
     function.instruction(&Instruction::LocalTee(dst));
-    emit_object_prefix(function, dst, TYPE_FUNCTION);
+    emit_object_prefix(function, dst, TYPE_FUNCTION | i32::from(flags) << 16);
 
     // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
@@ -911,11 +936,11 @@ pub(super) fn emit_cell_new(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit `<string>.length` / `<array>.length`: for a heap-pointer operand (low
-/// 32 bits are the block base) read the u32 `len` header at
-/// `base + HEADER_SIZE` and rebox it as a number jsval; a primitive operand
-/// yields `undefined` without touching memory. The operand is stashed in the
-/// general i64 scratch slot (`+0`).
+/// Emit `<recv>.length`: for a string or array operand (low 32 bits are the
+/// block base) read the u32 `len` header at `base + HEADER_SIZE` and rebox it
+/// as a number jsval; any other heap operand reads its `length` property
+/// through `__get`; a primitive operand yields `undefined` without touching
+/// memory. The operand is stashed in the general i64 scratch slot (`+0`).
 pub(super) fn emit_str_len(
     operand: &IrNode,
     function: &mut Function,
@@ -929,6 +954,18 @@ pub(super) fn emit_str_len(
     function.instruction(&Instruction::LocalSet(scratch));
     emit_is_pointer(function, scratch);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    // A string or array (kind byte <= TYPE_ARRAY) reads its length header; any
+    // other heap value (a function's `length`, an object's own) is a `__get`.
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
+    function.instruction(&Instruction::I32LeU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
@@ -938,6 +975,17 @@ pub(super) fn emit_str_len(
     }));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::I32Const(static_key(
+        strings,
+        INDEX_LENGTH_KEY,
+    )));
+    function.instruction(&Instruction::Call(helpers.get));
+    if helpers.has_accessors {
+        emit_propagate_if_pending(function, helpers);
+    }
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
@@ -1158,9 +1206,14 @@ fn emit_settler_value(
     // dst = __alloc(FUNC_BLOCK_SIZE); leave dst (i32) on the stack.
     function.instruction(&Instruction::I32Const(FUNC_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
-    // Write the TYPE_FUNCTION prefix at dst, keeping dst on the stack.
+    // Write the TYPE_FUNCTION prefix at dst (a lazy anonymous non-constructor,
+    // its info entry right after the user functions'), keeping dst on the stack.
     function.instruction(&Instruction::LocalTee(dst));
-    emit_object_prefix(function, dst, TYPE_FUNCTION);
+    emit_object_prefix(
+        function,
+        dst,
+        TYPE_FUNCTION | i32::from(abi::FUNC_FLAG_LAZY) << 16,
+    );
     // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
@@ -1289,7 +1342,7 @@ pub(super) fn emit_callable_guard(
 /// Whether `callee` is a function literal, so its value is statically a
 /// function and an indirect call through it needs no `IsCallable` check.
 pub(super) fn is_static_function(callee: &IrNode) -> bool {
-    matches!(callee, IrNode::FuncValue { .. })
+    matches!(callee, IrNode::FuncValue { .. } | IrNode::DeclFunc(_))
 }
 
 /// Emit a call whose argument list contains a spread `f(...a)`, leaving
@@ -1326,7 +1379,7 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             emit_propagate_if_pending(function, helpers);
         }
-        SpreadCallee::Indirect(callee) => {
+        SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } => {
             let cb = scratch + 7;
             // The callee is evaluated first (JS order) and its base stashed, then
             // the argument array is built and read.
@@ -1347,8 +1400,14 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::LocalSet(cb));
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             emit_spread_arg_slots(base, len, function, helpers);
-            // A plain indirect call binds `this = undefined`.
-            emit_reset_this(function);
+            // A plain indirect call binds `this = undefined`; `super(...)`
+            // keeps the enclosing constructor's `this`.
+            if let SpreadCallee::This { this_local, .. } = target {
+                function.instruction(&Instruction::LocalGet(*this_local));
+                function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+            } else {
+                emit_reset_this(function);
+            }
             // Trailing env argument: the callee's own environment (FUNC_ENV_OFFSET).
             function.instruction(&Instruction::LocalGet(cb));
             function.instruction(&Instruction::I64Load(MemArg {
