@@ -213,3 +213,122 @@ it('renders cyclic structures Node-console style', async () => {
     '<ref *1> [ 1, [Circular *1] ]',
   )
 })
+
+it('renders object-family values like the Rust host', async () => {
+  const { stdout, result } = await run(
+    "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.delete(2); " +
+      'const s = new Set(); s.add(1); s.add(2); ' +
+      'function* gen() { yield 1 } function f(x) { return x } ' +
+      'console.log(m, s, m.size, s.size, m.get(1), new Date(5), f, gen(), ' +
+      'Promise.resolve(4), Promise.reject(1).catch(() => 0)); ' +
+      '[m, s, new Date(0), Promise.resolve(f)]',
+  )
+  expect(stdout).toBe(
+    'Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function: f] ' +
+      'Object [Generator] Promise { 4 } Promise { <pending> }\n',
+  )
+  expect(result).toBe(
+    '[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function: f] } ]',
+  )
+})
+
+it('renders dictionary objects like the Rust host', async () => {
+  const cases: [string, string][] = [
+    [
+      'class A { constructor(){ this.x = 1 } m(){} } let a = new A(); for (const k in a) console.log(k); console.log(Object.keys(a), JSON.stringify(a), a)',
+      'x\n[ x ] {"x":1} A { x: 1 }\n',
+    ],
+    ['let n = 5; console.log(n.x, true.y)', 'undefined undefined\n'],
+    [
+      "class A { m(){} } console.log('m' in new A(), Object.keys({b:1, 2:1, a:1, 1:1}))",
+      'true [ 1, 2, b, a ]\n',
+    ],
+    [
+      'let o = {}; o.x = 1; o.y = 2; delete o.x; o.z = 3; console.log(o)',
+      '{ y: 2, z: 3 }\n',
+    ],
+    [
+      "let k = 'a' + 'b'; let o = { ab: 1 }; o[1] = 2; console.log(o[k], k in o, o['1'], o)",
+      '1 true 2 { 1: 2, ab: 1 }\n',
+    ],
+    [
+      "let k = 'c'; let o = {[k]: 1, 2.5: 'b', 1: 'a'}; console.log(Object.entries(o), o)",
+      '[ [ 1, a ], [ c, 1 ], [ 2.5, b ] ] { 1: a, c: 1, 2.5: b }\n',
+    ],
+    [
+      "console.log(new TypeError('boom'), [new Error()], Object.keys({'@x': 1}))",
+      'TypeError: boom [ Error ] [ @x ]\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})
+
+it('renders errors by their class byte like the Rust host', async () => {
+  const cases: [string, string][] = [
+    [
+      "let e = new TypeError('bad'); console.log(e instanceof TypeError, e instanceof Error, e instanceof RangeError, e.name, e.message, Object.keys(e).length)",
+      'true true false TypeError bad 0\n',
+    ],
+    [
+      "console.log(new RangeError('r'), [new Error()])",
+      'RangeError: r [ Error ]\n',
+    ],
+    [
+      "let e = new Error('m'); e.name = 'X'; console.log(e, { e })",
+      'X: m { e: X: m }\n',
+    ],
+    [
+      'try { null.x } catch (e) { console.log(e) }',
+      "TypeError: Cannot read properties of null (reading 'x')\n",
+    ],
+    [
+      "console.log({ name: 'Error', message: 'x' })",
+      '{ name: Error, message: x }\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})
+
+it('renders functions, classes, instances, and accessors like the Rust host', async () => {
+  const cases: [string, string][] = [
+    [
+      'class A { constructor(){ this.x = 1 } } class B extends A {} console.log(A, B, new A(), new B())',
+      '[class A] [class B extends A] A { x: 1 } B { x: 1 }\n',
+    ],
+    [
+      'function f(){} f.x = 1; let g = () => 0; console.log(f, g, () => 0)',
+      '[Function: f] { x: 1 } [Function: g] [Function (anonymous)]\n',
+    ],
+    [
+      'let o = { get x(){ return 1 }, set x(v){ this.y = v } }; o.x = 5; console.log(o.x, o.y, o)',
+      '1 5 { x: [Getter/Setter], y: 5 }\n',
+    ],
+    ['class E {} console.log(new E(), E.prototype)', 'E {} {}\n'],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})
+
+it('converts values with JS ToString like the Rust host', async () => {
+  const cases: [string, string][] = [
+    ['console.log(String([1, 2]))', '1,2\n'],
+    ["console.log([1, [2, 3]].join('-'))", '1-2,3\n'],
+    ["console.log('' + [1, 'a', null, undefined])", '1,a,,\n'],
+    [
+      'console.log(String({}), `${{ a: 1 }}`)',
+      '[object Object] [object Object]\n',
+    ],
+    [
+      "console.log(String(new TypeError('x')), String(new Error()), '' + new RangeError('r'))",
+      'TypeError: x Error RangeError: r\n',
+    ],
+    [
+      "let a = [1, 0]; a[1] = a; console.log(String(a), a.join('-'))",
+      '1, 1-\n',
+    ],
+    [
+      "console.log('x'.padStart(4, [1, 2]), 'a1,2b'.split([1, 2]))",
+      '1,2x [ a, b ]\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})

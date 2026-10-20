@@ -306,7 +306,7 @@ pub(super) fn emit_hof_invoke(
     emit_reset_this(function);
     function.instruction(&Instruction::LocalGet(cb));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
@@ -315,7 +315,7 @@ pub(super) fn emit_hof_invoke(
     emit_argc(real_args as usize, function);
     function.instruction(&Instruction::LocalGet(cb));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -381,14 +381,27 @@ pub(super) fn emit_array_hof(
     // No funcref table (a function-less program): the callback can never be a
     // function value, so throw instead of emitting an invalid `call_indirect`.
     if !helpers.has_funcs {
-        emit_throw_not_a_function(function, scratch, strings, helpers);
+        emit_throw_not_a_function(
+            function,
+            EXPRESSION_NOT_A_FUNCTION,
+            scratch,
+            strings,
+            helpers,
+        );
         return;
     }
     // IsCallable (DF4): a non-function callback throws before any iteration
     // (even over an empty array); a function literal needs no check.
     if !is_static_function(callback) {
         function.instruction(&Instruction::LocalSet(scratch));
-        emit_callable_guard(function, scratch, scratch, strings, helpers);
+        emit_callable_guard(
+            function,
+            EXPRESSION_NOT_A_FUNCTION,
+            scratch,
+            scratch,
+            strings,
+            helpers,
+        );
         function.instruction(&Instruction::LocalGet(scratch));
     }
     function.instruction(&Instruction::I32WrapI64);

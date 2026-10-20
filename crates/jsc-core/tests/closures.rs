@@ -135,3 +135,18 @@ fn module_bindings_reachable_from_nested_shapes() {
         "3",
     );
 }
+
+/// A computed object-literal key inside a function that references an outer
+/// binding is captured like any other reference.
+#[test]
+fn computed_object_key_captures_outer_binding() {
+    assert_output(
+        "let k = 'a'; function f() { return {[k]: 1} } console.log(f())",
+        "{ a: 1 }\n",
+    );
+    assert_output(
+        "function outer() { let k = 'm'; return () => ({ [k]() { return 2 }, get [k + 'g']() { return 3 } }) } \
+         let o = outer()(); console.log(o.m(), o.mg)",
+        "2 3\n",
+    );
+}

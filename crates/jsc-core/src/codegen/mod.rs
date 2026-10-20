@@ -31,9 +31,9 @@ use swc_ecma_ast::{
 };
 
 use crate::ir::{
-    ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, ReceiverOp,
-    SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, InstanceOfKind,
+    IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp,
+    ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
@@ -152,7 +152,6 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             .map(|(name, slot)| (name.clone(), slot))
             .collect(),
         module_mutable: analysis.module_mutable,
-        object_shapes: analysis.object_shapes,
         completion: Cell::new(None),
     };
 
@@ -240,7 +239,7 @@ struct Shared<'a> {
     captured: std::collections::HashSet<u32>,
     /// Class declarations lowered so far, keyed by name. A `class A`
     /// declaration records its instance shape here as it is lowered; a later
-    /// `new A(args)` reads the shape back to pre-slot the fresh instance. Classes
+    /// `new A(args)` reads the shape back to pre-size the fresh instance. Classes
     /// are not hoisted (TDZ), so a `new` always follows its declaration in source
     /// order, matching this build-then-read ordering. Interior mutability lets the
     /// immutable-borrow lowering walk register new classes.
@@ -252,13 +251,6 @@ struct Shared<'a> {
     module_slots: HashMap<String, u32>,
     /// Mutability of each module binding (see [`CaptureAnalysis::module_mutable`]).
     module_mutable: HashMap<String, bool>,
-    /// The provably-fixed object shape of each qualifying binding (see
-    /// [`CaptureAnalysis::object_shapes`]): [`binding_id`] mapped to the own keys
-    /// of the object literal it holds. A user method call whose receiver resolves
-    /// to one of these bindings — or is itself a direct object literal — and whose
-    /// statically-known name is absent from the shape is rejected as an unknown
-    /// method, closing the wrong-value dispatch this static-shape guard targets.
-    object_shapes: HashMap<u32, Vec<String>>,
     /// The `main` local tracking the completion value (for `-p`) of the
     /// top-level `try` statement being lowered, or `None` outside one. While set,
     /// every expression statement in `main`'s own frame stores its value here
@@ -269,14 +261,13 @@ struct Shared<'a> {
 
 /// The lowered shape of a `class` declaration: the instance field names the
 /// constructor assigns via `this.<field> = ..`, in first-seen order. `new A(args)`
-/// pre-allocates the instance object with one slot per field (initialized to
-/// `undefined`), because the object model has no dynamic key growth — a fresh
-/// empty object could not gain a `this.v` property at runtime.
+/// sizes the instance's property table for them up front (design 3.2), so the
+/// constructor's adds do not regrow it.
 struct ClassInfo {
     /// Distinct instance field names, in first-assignment order. For a derived
     /// class (E-series `extends`) this already includes the inherited fields
     /// (the parent's flattened list, then this class's own), so `new C()`
-    /// pre-slots every field a constructor up the chain may assign.
+    /// reserves room for every field a constructor up the chain may assign.
     fields: Vec<String>,
 }
 
@@ -304,22 +295,6 @@ struct CaptureResolver {
     /// (`false` for `const`). Collected before the walk so a forward reference
     /// from a closure resolves to a module binding.
     top_bindings: HashMap<String, bool>,
-    /// Names that are the target of an assignment (`x = ..`, `x op= ..`, `++x`,
-    /// `x--`, or a destructuring assignment) ANYWHERE in the program. A
-    /// name-based over-approximation used to disqualify object-shape candidates:
-    /// a binding whose name is ever reassigned cannot be trusted to keep its
-    /// declared literal shape, so it is excluded (see [`object_shapes`]).
-    ///
-    /// [`object_shapes`]: CaptureAnalysis::object_shapes
-    assigned: std::collections::HashSet<String>,
-    /// Provisional object-shape entries `(binding_id, name, own keys)`: every
-    /// `let`/`const` binding initialized directly with an object literal whose
-    /// keys are all statically known. Finalized in [`analyze_captures`] by
-    /// dropping any whose name appears in [`assigned`], leaving the bindings
-    /// whose literal shape is provably fixed.
-    ///
-    /// [`assigned`]: CaptureResolver::assigned
-    shape_candidates: Vec<(u32, String, Vec<String>)>,
 }
 
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
@@ -343,15 +318,6 @@ struct CaptureAnalysis {
     ///
     /// [`module_names`]: CaptureAnalysis::module_names
     module_mutable: HashMap<String, bool>,
-    /// The provably-fixed object shape of each qualifying binding: its
-    /// [`binding_id`] mapped to the own keys of the object literal it is
-    /// initialized with. A binding qualifies when it is a `let`/`const`
-    /// initialized directly with an all-static-key object literal AND its name
-    /// is never reassigned. A method call on such a receiver whose name is not
-    /// among these keys is provably unknown (the object model has no dynamic key
-    /// growth), so lowering rejects it with a span diagnostic instead of emitting
-    /// a bogus runtime dispatch.
-    object_shapes: HashMap<u32, Vec<String>>,
 }
 
 /// The body shape passed to [`CaptureResolver::arrow_or_fn`].

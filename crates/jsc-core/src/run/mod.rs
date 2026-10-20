@@ -59,7 +59,7 @@ mod value;
 mod tests;
 
 pub use harness::{compile_and_run, compile_and_run_capturing, run, run_capturing, run_metered};
-pub use value::{Value, decode, format_number, format_value};
+pub use value::{Value, decode, format_number, format_value, to_js_string};
 
 use crate::abi;
 
@@ -88,15 +88,20 @@ const TYPE_PROMISE: u8 = abi::TYPE_PROMISE;
 const TYPE_GENERATOR: u8 = abi::TYPE_GENERATOR;
 const TYPE_DATE: u8 = abi::TYPE_DATE;
 
-/// Byte offset of a `Date` block's f64 `ms` payload; see [`abi`].
+/// Object-family payload offsets (`Date` ms, Map/Set size, Promise
+/// state/value, Generator done); see [`abi`].
 const DATE_MS_OFFSET: usize = abi::DATE_MS_OFFSET as usize;
+const MAP_SIZE_OFFSET: usize = abi::MAP_SIZE_OFFSET as usize;
+const PROMISE_STATE_OFFSET: usize = abi::PROMISE_STATE_OFFSET as usize;
+const PROMISE_VALUE_OFFSET: usize = abi::PROMISE_VALUE_OFFSET as usize;
+const GEN_DONE_OFFSET: usize = abi::GEN_DONE_OFFSET as usize;
 
 /// Promise `state` header values; see [`abi`].
 const PROMISE_PENDING: i32 = abi::PROMISE_PENDING;
 const PROMISE_FULFILLED: i32 = abi::PROMISE_FULFILLED;
 const PROMISE_REJECTED: i32 = abi::PROMISE_REJECTED;
 
-/// Reserved hidden key marking a branded Error object's kind; see
-/// [`abi::ERROR_KIND_KEY`]. The renderer uses its presence to print an error as
-/// its single-line stack rather than a plain `{ ... }` object.
-const ERROR_KIND_KEY: &str = abi::ERROR_KIND_KEY;
+/// The `TYPE_OBJECT` `class` byte of an Error instance; see
+/// [`abi::CLASS_ERROR`]. The renderer prints such an object as its
+/// single-line stack rather than a plain `{ ... }` object.
+const CLASS_ERROR: u8 = abi::CLASS_ERROR;

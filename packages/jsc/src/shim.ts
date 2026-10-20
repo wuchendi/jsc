@@ -48,6 +48,7 @@ import {
   NEW_STRING_EXPORT_NAME,
   PRINT_FLAG_END,
   PRINT_FLAG_SEP,
+  PROMISE_BLOCK_SIZE,
   PROMISE_FULFILLED,
   PROMISE_OP_ASYNC_SPAWN,
   PROMISE_OP_AWAIT,
@@ -59,6 +60,8 @@ import {
   PROMISE_OP_SETTLE_REJECT,
   PROMISE_PENDING,
   PROMISE_REJECTED,
+  PROMISE_STATE_OFFSET,
+  PROMISE_VALUE_OFFSET,
   QNAN,
   TRUE,
   TYPE_ARRAY,
@@ -75,6 +78,7 @@ import {
   formatValue,
   parseFloatStr,
   parseIntStr,
+  toJsString,
   valueToNumber,
 } from './value.js'
 
@@ -123,9 +127,6 @@ interface Job {
   finally: boolean
   asyncGen: bigint | null
 }
-
-/** The `[type][pad×3][state:i32][value:i64]` promise block size in bytes. */
-const PROMISE_BLOCK_SIZE = HEADER_SIZE + 4 + 8
 
 /** The linear-memory cap in bytes; constructor lengths are clamped to it (mirrors `host.rs`). */
 const MEMORY_MAX_BYTES = MEMORY_MAX_PAGES * 0x1_0000
@@ -325,7 +326,7 @@ export function createShim(): Shim {
     const pad =
       padValue.kind === 'undefined'
         ? utf8Encode.encode(' ')
-        : utf8Encode.encode(formatValue(padValue))
+        : utf8Encode.encode(toJsString(padValue))
     const base = allocString(
       padBytes(bytes, target, pad, op === METHOD_OP_PAD_START),
     )
@@ -364,7 +365,7 @@ export function createShim(): Shim {
       // An omitted separator yields a single-element array of the whole string.
       pieces = [bytes]
     } else {
-      const sep = utf8Encode.encode(formatValue(sepValue))
+      const sep = utf8Encode.encode(toJsString(sepValue))
       pieces =
         sep.length === 0
           ? // An empty separator splits into one element per byte.
@@ -522,8 +523,8 @@ export function createShim(): Shim {
     const mem = memory()
     if (!mem || base + PROMISE_BLOCK_SIZE > mem.buffer.byteLength) return
     const dv = new DataView(mem.buffer)
-    dv.setInt32(base + HEADER_SIZE, state, true)
-    dv.setBigUint64(base + HEADER_SIZE + 4, value, true)
+    dv.setInt32(base + PROMISE_STATE_OFFSET, state, true)
+    dv.setBigUint64(base + PROMISE_VALUE_OFFSET, value, true)
   }
 
   /**
@@ -771,11 +772,11 @@ export function createShim(): Shim {
       case CONVERT_OP_TO_NUMBER:
         return f64ToBits(valueToNumber(value))
       case CONVERT_OP_PARSE_FLOAT:
-        return f64ToBits(parseFloatStr(formatValue(value)))
+        return f64ToBits(parseFloatStr(toJsString(value)))
       case CONVERT_OP_TO_STRING: {
         // A string argument is returned unchanged (no allocation).
         if (value.kind === 'string') return u
-        const base = allocString(formatValue(value))
+        const base = allocString(toJsString(value))
         return base === null ? UNDEFINED : HEAP | base
       }
       default:
@@ -867,14 +868,14 @@ function asFunction(mem: Uint8Array, bits: bigint): boolean {
 
 /** A promise block's `i32` state; a truncated block reads as pending. */
 function readState(mem: Uint8Array, base: number): number {
-  const at = base + HEADER_SIZE
+  const at = base + PROMISE_STATE_OFFSET
   if (at + 4 > mem.length) return PROMISE_PENDING
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true)
 }
 
 /** A promise block's settled value bits; a truncated block reads as `undefined`. */
 function readValue(mem: Uint8Array, base: number): bigint {
-  const at = base + HEADER_SIZE + 4
+  const at = base + PROMISE_VALUE_OFFSET
   if (at + 8 > mem.length) return UNDEFINED
   return new DataView(mem.buffer, mem.byteOffset).getBigUint64(at, true)
 }
@@ -982,24 +983,22 @@ function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
 
 /**
  * The joined text of `array.join(sep)` (`","` when `sep` is `undefined`);
- * `null`/`undefined` elements stringify to `""`. Mirrors the pure part of
- * `host.rs::array_join` (allocation is done by the caller).
+ * nullish elements and cycle back-references stringify to `""`. The receiver
+ * is decoded as a whole so the decoder's cycle guard catches self-references.
+ * Mirrors the pure part of `host.rs::array_join` (allocation is done by the
+ * caller).
  */
 function arrayJoinText(mem: Uint8Array, ptr: number, sepBits: bigint): string {
   const sepValue = decode(sepBits, mem)
-  const sep = sepValue.kind === 'undefined' ? ',' : formatValue(sepValue)
-  const len = blockLen(mem, ptr)
-  const pieces: string[] = []
-  for (let i = 0; i < len; i++) {
-    const elem = arrayElemBits(mem, ptr, i)
-    const v = elem === null ? null : decode(elem, mem)
-    pieces.push(
-      v === null || v.kind === 'null' || v.kind === 'undefined'
-        ? ''
-        : formatValue(v),
+  const sep = sepValue.kind === 'undefined' ? ',' : toJsString(sepValue)
+  let recv = decode(HEAP | BigInt(ptr), mem)
+  if (recv.kind === 'ref') recv = recv.value
+  if (recv.kind !== 'array') return ''
+  return recv.items
+    .map((v) =>
+      v.kind === 'null' || v.kind === 'undefined' ? '' : toJsString(v),
     )
-  }
-  return pieces.join(sep)
+    .join(sep)
 }
 
 /**
@@ -1028,10 +1027,10 @@ function isAsciiWhitespace(b: number): boolean {
 /**
  * Coerce a method argument's raw bits to its JS string form as bytes (mirrors
  * `host.rs::arg_bytes`): a string yields its payload, everything else its
- * `formatValue` rendering.
+ * JS `ToString` text.
  */
 function argBytes(bits: bigint, mem: Uint8Array): Uint8Array {
-  return utf8Encode.encode(formatValue(decode(bits, mem)))
+  return utf8Encode.encode(toJsString(decode(bits, mem)))
 }
 
 /** Whether `hay` contains the contiguous `needle` (empty => true; mirrors `byte_contains`). */

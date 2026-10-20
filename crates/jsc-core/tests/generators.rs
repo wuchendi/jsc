@@ -652,7 +652,7 @@ fn a_non_generator_next_throws_a_type_error() {
     // A `.next()` receiver that is not a generator throws a branded TypeError.
     assert_uncaught(
         "function* g(){ yield 1 } let o = {}; o.next();",
-        "TypeError: called value is not a function",
+        "TypeError: o.next is not a function",
     );
 }
 

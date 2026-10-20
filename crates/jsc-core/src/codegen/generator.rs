@@ -79,6 +79,7 @@ impl LowerCtx<'_> {
                 locals: 0,
                 body: Vec::new(),
                 machine: None,
+                info: FnInfo::default(),
             });
             pos
         };
@@ -110,6 +111,7 @@ impl LowerCtx<'_> {
             locals: sm_locals,
             body: Vec::new(),
             machine: Some(segments),
+            info: FnInfo::default(),
         };
 
         // The constructor: `return MakeGenerator(...)`, reading each parameter from
@@ -133,6 +135,7 @@ impl LowerCtx<'_> {
             locals: uniform_params,
             body: ctor_body,
             machine: None,
+            info: FnInfo::default(),
         })
     }
 
@@ -172,19 +175,19 @@ impl LowerCtx<'_> {
         let iter_val = self.lower_expr(arg)?;
         // Synthetic generator-local temporaries. Their ids are irrelevant to a
         // generator frame (no enclosing closure references them), so any distinct
-        // values work; the `@@`-prefixed names cannot collide with a user binding.
+        // values work; the `%`-prefixed names cannot collide with a user binding.
         let base = yield_expr.span.lo.0;
-        let source = self.delegate_temp(&format!("@@ys_it_{base}"), base, iter_val, out);
+        let source = self.delegate_temp(&format!("%ys_it_{base}"), base, iter_val, out);
         let mut gen_body = Vec::new();
         let step = self.delegate_temp(
-            &format!("@@ys_r_{base}"),
+            &format!("%ys_r_{base}"),
             base.wrapping_add(1),
             IrNode::Undefined,
             &mut gen_body,
         );
         let mut index_body = Vec::new();
         let cursor = self.delegate_temp(
-            &format!("@@ys_i_{base}"),
+            &format!("%ys_i_{base}"),
             base.wrapping_add(2),
             IrNode::Num(0.0),
             &mut index_body,
@@ -893,16 +896,10 @@ fn node_contains_yield(node: &IrNode) -> bool {
 /// The `TypeError` a `yield*` over a non-iterable operand throws.
 fn not_iterable_error() -> IrNode {
     let message = "yield* operand is not iterable";
-    IrNode::Object(vec![
-        ("name".to_owned(), IrNode::Str("TypeError".to_owned())),
-        ("message".to_owned(), IrNode::Str(message.to_owned())),
-        (
-            "stack".to_owned(),
-            IrNode::Str(format!("TypeError: {message}")),
-        ),
-        (
-            crate::abi::ERROR_KIND_KEY.to_owned(),
-            IrNode::Num(crate::abi::ERROR_KIND_TYPE),
-        ),
-    ])
+    IrNode::error_object(
+        ErrorKind::TypeError,
+        None,
+        Some(IrNode::Str(message.to_owned())),
+        IrNode::Str(format!("TypeError: {message}")),
+    )
 }
