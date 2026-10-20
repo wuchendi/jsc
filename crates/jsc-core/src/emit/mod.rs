@@ -228,10 +228,23 @@ const INTERN_CAP_GLOBAL: u32 = 10;
 /// See [`INTERN_BASE_GLOBAL`].
 const INTERN_COUNT_GLOBAL: u32 = 11;
 
+/// The wasm global index of the `new.target` carrier (`$__new_target`, i64,
+/// init `undefined`): `new X()` sets it to `X` just before calling `X` with the
+/// construct marker; a function referencing `new.target` snapshots it in its
+/// prologue when the marker is present. Internal.
+const NEW_TARGET_GLOBAL: u32 = 12;
+
+/// The wasm global index of the spread-argument carrier (`$__spread_args`,
+/// i64, init `undefined`): every spread call / construct sets it to its
+/// argument array just before the call, so a callee gathering its arguments (a
+/// rest parameter or `arguments`) reads the ones beyond the `K` positional
+/// slots from it. Plain calls never touch it. Internal.
+const SPREAD_ARGS_GLOBAL: u32 = 13;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the intern-table globals and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 12;
+/// the spread-argument global and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 14;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -414,6 +427,20 @@ const EXPRESSION_NOT_A_FUNCTION: CalleeErrorText<'static> = [
     "TypeError: expression is not a function",
 ];
 
+/// The `TypeError` text of an `instanceof` whose right-hand side is not
+/// callable.
+const INSTANCEOF_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Right-hand side of 'instanceof' is not callable",
+    "TypeError: Right-hand side of 'instanceof' is not callable",
+];
+
+/// The `TypeError` text of an `instanceof` whose right-hand side's
+/// `prototype` is not an object.
+const INSTANCEOF_NON_OBJECT_PROTOTYPE: CalleeErrorText<'static> = [
+    "Function has non-object prototype in instanceof check",
+    "TypeError: Function has non-object prototype in instanceof check",
+];
+
 /// The `TypeError` a guarded call site throws (shape of `new TypeError(m)`,
 /// see [`IrNode::error_object`]). Emitted on the throw path via [`emit_node`];
 /// its strings are seeded with [`ERROR_STRS`] by [`collect_node`].
@@ -496,7 +523,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 4] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 6] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -513,6 +540,16 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 4] = [
         " of object which has only a getter",
     ),
     (PROP_THROW_DELETE, "Cannot delete property '", "' of object"),
+    (
+        PROP_THROW_EXTENDS,
+        "Class extends value ",
+        " is not a constructor or null",
+    ),
+    (
+        PROP_THROW_EXTENDS_PROTO,
+        "Class extends value does not have valid prototype property ",
+        "",
+    ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
 /// for a `length` write whose value is not a valid array length.
@@ -543,6 +580,12 @@ const PROP_THROW_NOT_EXTENSIBLE: i32 = 4;
 const PROP_THROW_GETTER_ONLY: i32 = 5;
 /// `__prop_throw`'s `mode` argument: deleting a non-configurable property.
 const PROP_THROW_DELETE: i32 = 6;
+/// `__prop_throw`'s `mode` argument: a class `extends` value (the `key`) that
+/// is neither a constructor nor `null`.
+const PROP_THROW_EXTENDS: i32 = 7;
+/// `__prop_throw`'s `mode` argument: a class parent whose `prototype` (the
+/// `key`) is neither an object nor `null`.
+const PROP_THROW_EXTENDS_PROTO: i32 = 8;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded (with

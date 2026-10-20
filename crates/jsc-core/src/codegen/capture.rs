@@ -400,22 +400,27 @@ impl CaptureResolver {
     }
 
     /// Analyze a class declaration: bind the class name in the enclosing
-    /// scope FIRST, so a `new C()` inside the constructor or a method body resolves
-    /// to it and is marked captured across the function boundary. Each
-    /// constructor and instance-method body is then a fresh function frame (like a
-    /// nested fn declaration), so a binding it references from an enclosing scope
-    /// (including the class name) is captured.
+    /// scope, then analyze the class (see [`Self::class`]) with its inner name
+    /// binding.
     fn class_decl(&mut self, c: &ClassDecl) {
         self.declare(c.ident.sym.as_ref(), c.ident.span.lo.0);
-        // A derived class's constructor/methods implicitly reference the superclass
-        // binding through `super` (E-series): mark it referenced inside each body
-        // frame so a captured parent is boxed into a cell the lifted body can read,
-        // exactly like a `new Parent()` reference would.
-        let super_name = c.class.super_class.as_ref().and_then(|e| match e.as_ref() {
-            Expr::Ident(id) => Some(id.sym.as_ref().to_owned()),
-            _ => None,
-        });
-        for member in &c.class.body {
+        self.class(&c.class, Some(c.ident.sym.as_ref()));
+    }
+
+    /// Analyze a class, mirroring [`LowerCtx::lower_class`]: a class scope
+    /// binding the inner `name` (if any), the `extends` expression, then each
+    /// constructor, method, and field initializer as a fresh function frame, so
+    /// a binding referenced there from an enclosing scope (including the inner
+    /// name) is captured.
+    fn class(&mut self, class: &swc_ecma_ast::Class, name: Option<&str>) {
+        self.push_scope();
+        if let Some(name) = name {
+            self.declare(name, class.span.lo.0);
+        }
+        if let Some(super_class) = &class.super_class {
+            self.expr(super_class);
+        }
+        for member in &class.body {
             match member {
                 ClassMember::Constructor(ctor) => {
                     self.enter_function();
@@ -424,32 +429,17 @@ impl CaptureResolver {
                             self.declare_param(&p.pat);
                         }
                     }
-                    if let Some(sup) = &super_name {
-                        self.reference(sup);
-                    }
                     if let Some(body) = &ctor.body {
                         self.stmts(&body.stmts);
                     }
                     self.exit_function();
                 }
-                // A method body is a fresh function frame, mirroring the
-                // constructor. Inlined (rather than the `function` helper) so a
-                // derived class can reference its superclass inside the frame.
                 ClassMember::Method(m) => {
-                    self.enter_function();
-                    for param in &m.function.params {
-                        self.declare_param(&param.pat);
-                    }
-                    if let Some(sup) = &super_name {
-                        self.reference(sup);
-                    }
-                    if let Some(body) = &m.function.body {
-                        self.stmts(&body.stmts);
-                    }
-                    self.exit_function();
+                    self.function(
+                        &m.function.params,
+                        m.function.body.as_ref().map(|b| &b.stmts),
+                    );
                 }
-                // A field initializer runs in its own `this`-binding scope, so a
-                // binding it references from an enclosing scope is captured.
                 ClassMember::ClassProp(p) => {
                     if let Some(value) = &p.value {
                         self.enter_function();
@@ -460,19 +450,7 @@ impl CaptureResolver {
                 _ => {}
             }
         }
-        // A derived class without a constructor gets the default one, whose
-        // `super(...args)` references the superclass from its own frame.
-        if let Some(sup) = &super_name
-            && !c
-                .class
-                .body
-                .iter()
-                .any(|m| matches!(m, ClassMember::Constructor(_)))
-        {
-            self.enter_function();
-            self.reference(sup);
-            self.exit_function();
-        }
+        self.pop_scope();
     }
 
     /// Analyze a `for-of` / `for-in` loop, mirroring [`LowerCtx::lower_for_of`] /
@@ -550,6 +528,12 @@ impl CaptureResolver {
                     &f.function.params,
                     f.function.body.as_ref().map(|b| &b.stmts),
                 );
+            }
+            Expr::Class(c) => self.class(&c.class, c.ident.as_ref().map(|id| id.sym.as_ref())),
+            Expr::SuperProp(sp) => {
+                if let swc_ecma_ast::SuperProp::Computed(c) = &sp.prop {
+                    self.expr(&c.expr);
+                }
             }
             Expr::Assign(a) => {
                 if let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &a.left {

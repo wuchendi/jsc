@@ -127,11 +127,7 @@ impl LowerCtx<'_> {
                 key: Box::new(self.lower_expr(&b.left)?),
                 obj: Box::new(self.lower_expr(&b.right)?),
             }),
-            // `x instanceof RHS` (E-series). The right-hand side must be a bare
-            // identifier naming EITHER a user class (checked first, so a
-            // `class Error {}` shadows the builtin) OR one of the three builtin
-            // error constructors (only when unshadowed); anything else is a clean
-            // compile error (jsc models no general prototype-chain `instanceof`).
+            // `x instanceof RHS` (design 4.6): any right-hand side expression.
             Expr::Bin(b) if matches!(b.op, BinaryOp::InstanceOf) => {
                 self.lower_instanceof(&b.left, &b.right)
             }
@@ -219,11 +215,16 @@ impl LowerCtx<'_> {
             // `this` reads the current function's snapshotted `this` slot,
             // allocated on first use; outside any function (the top-level `main`
             // frame) there is no `this` binding, so it stays unsupported. Inside a
-            // deferred `static` field initializer (P2b) `this` is the class itself,
-            // so it resolves to the class binding.
+            // `static` field initializer `this` is the class itself; inside a
+            // derived constructor it is in the TDZ until `super(..)`.
             Expr::This(this_expr) => {
-                if let Some(class) = self.static_init_class.clone() {
-                    return self.lower_ident(&class, this_expr.span);
+                if let Some((frame, id)) = self.static_init
+                    && self.only_arrows_above(frame)
+                {
+                    return Ok(self.read_hidden(frame, id));
+                }
+                if let Some(fi) = self.derived_frame() {
+                    return Ok(self.derived_this(fi));
                 }
                 match self.ensure_this_local() {
                     Some(local) => Ok(IrNode::Local(local)),
@@ -231,6 +232,33 @@ impl LowerCtx<'_> {
                         Err(CompileError::spanned(this_expr.span, "`this` is not supported").into())
                     }
                 }
+            }
+            Expr::SuperProp(super_prop) => {
+                let read = self.lower_super_prop(super_prop)?;
+                Ok(read)
+            }
+            // A class expression; an anonymous one has the empty name here
+            // (`lower_named_expr` names it after its binding).
+            Expr::Class(class_expr) => match &class_expr.ident {
+                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true),
+                None => self.lower_class(&class_expr.class, "", false),
+            },
+            // `new.target`: the enclosing non-arrow function's snapshot; outside
+            // any function it is a SyntaxError.
+            Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::NewTarget => {
+                // An escaped spelling (`new.t\u0061rget`) is longer than the
+                // 10-byte keyword form and is a SyntaxError.
+                if meta.span.hi.0 - meta.span.lo.0 != 10 {
+                    return Err(CompileError::spanned(
+                        meta.span,
+                        "keywords in `new.target` cannot contain escapes",
+                    )
+                    .into());
+                }
+                self.resolve_new_target().ok_or_else(|| {
+                    CompileError::spanned(meta.span, "`new.target` is only valid inside a function")
+                        .into()
+                })
             }
             other => Err(CompileError::spanned(other.span(), unsupported_expr_msg(other)).into()),
         }
@@ -282,6 +310,20 @@ impl LowerCtx<'_> {
     fn lower_opt_chain(&mut self, chain: &OptChainExpr) -> anyhow::Result<IrNode> {
         let mut links = Vec::new();
         let root = collect_chain_links(chain, &mut links);
+        // `o.m?.(..)`: the callee `o.m` is a plain member expression; split it
+        // into its base and a member link so the call binds `this = o`.
+        if let (Expr::Member(member), Some(ChainLink::Call { .. })) = (root, links.first()) {
+            links.insert(
+                0,
+                ChainLink::Member {
+                    prop: &member.prop,
+                    optional: false,
+                    span: member.span,
+                },
+            );
+            let base = self.lower_expr(&member.obj)?;
+            return self.build_chain(base, &links);
+        }
         let base = self.lower_expr(root)?;
         self.build_chain(base, &links)
     }
@@ -300,35 +342,83 @@ impl LowerCtx<'_> {
             // Evaluate the base once into `temp`, then continue the tail through a
             // read of `temp` so the base's side effects run exactly once.
             let temp = self.fresh();
-            let applied = self.apply_link(IrNode::Local(temp), link)?;
-            let tail = self.build_chain(applied, rest)?;
-            // nullish(temp) ≡ `temp === null || temp === undefined`; the base is
-            // teed into `temp` while computing the first comparison.
-            let is_nullish = IrNode::Logical {
-                op: LogicalOp::Or,
-                lhs: Box::new(IrNode::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(IrNode::Assign {
-                        local: temp,
-                        value: Box::new(value),
-                    }),
-                    rhs: Box::new(IrNode::Null),
-                }),
-                rhs: Box::new(IrNode::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(IrNode::Local(temp)),
-                    rhs: Box::new(IrNode::Undefined),
-                }),
-            };
-            Ok(IrNode::Ternary {
-                cond: Box::new(is_nullish),
-                then_branch: Box::new(IrNode::Undefined),
-                else_branch: Box::new(tail),
-            })
+            let tail = self.build_link(IrNode::Local(temp), link, rest)?;
+            Ok(nullish_short_circuit(temp, value, tail))
         } else {
-            let applied = self.apply_link(value, link)?;
-            self.build_chain(applied, rest)
+            self.build_link(value, link, rest)
         }
+    }
+
+    /// Apply `link` to `obj` and fold the remaining `rest` of the chain. A member
+    /// link directly followed by a call link is a method call binding `this =
+    /// obj` (like `obj.m(..)`); an optional call `obj.m?.(..)` evaluates
+    /// `obj.m` once and short-circuits the rest of the chain when it is nullish.
+    fn build_link(
+        &mut self,
+        obj: IrNode,
+        link: &ChainLink<'_>,
+        rest: &[ChainLink<'_>],
+    ) -> anyhow::Result<IrNode> {
+        let (
+            ChainLink::Member { prop, span, .. },
+            Some((ChainLink::Call { args, optional }, after)),
+        ) = (link, rest.split_first())
+        else {
+            let applied = self.apply_link(obj, link)?;
+            return self.build_chain(applied, rest);
+        };
+        let args = self.lower_chain_args(args)?;
+        if *optional {
+            let this_local = self.fresh();
+            let method = self.apply_link(
+                IrNode::Assign {
+                    local: this_local,
+                    value: Box::new(obj),
+                },
+                link,
+            )?;
+            let callee = self.fresh();
+            let call = IrNode::ThisCall {
+                callee: Box::new(IrNode::Local(callee)),
+                args,
+                this_local,
+                construct: false,
+            };
+            let tail = self.build_chain(call, after)?;
+            return Ok(nullish_short_circuit(callee, method, tail));
+        }
+        let key = match prop {
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
+            MemberProp::PrivateName(_) => {
+                return Err(
+                    CompileError::spanned(*span, "private fields are not supported").into(),
+                );
+            }
+        };
+        let obj_local = self.fresh();
+        let call = IrNode::MethodCallUser {
+            obj: Box::new(obj),
+            key: Box::new(key),
+            args,
+            obj_local,
+            not_callable: not_a_function(None),
+        };
+        self.build_chain(call, after)
+    }
+
+    /// Lower the arguments of an optional-chain call link (spread is unsupported).
+    fn lower_chain_args(&mut self, args: &[ExprOrSpread]) -> anyhow::Result<Vec<IrNode>> {
+        let mut lowered = Vec::with_capacity(args.len());
+        for arg in args {
+            if arg.spread.is_some() {
+                return Err(
+                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
+                );
+            }
+            lowered.push(self.lower_expr(&arg.expr)?);
+        }
+        Ok(lowered)
     }
 
     /// Apply a single chain link to the running `obj` value: a member/index read
@@ -352,24 +442,11 @@ impl LowerCtx<'_> {
                     Err(CompileError::spanned(*span, "private fields are not supported").into())
                 }
             },
-            ChainLink::Call { args, .. } => {
-                let mut lowered = Vec::with_capacity(args.len());
-                for arg in *args {
-                    if arg.spread.is_some() {
-                        return Err(CompileError::spanned(
-                            arg.span(),
-                            "spread arguments are unsupported",
-                        )
-                        .into());
-                    }
-                    lowered.push(self.lower_expr(&arg.expr)?);
-                }
-                Ok(IrNode::CallIndirect {
-                    callee: Box::new(obj),
-                    args: lowered,
-                    not_callable: not_a_function(None),
-                })
-            }
+            ChainLink::Call { args, .. } => Ok(IrNode::CallIndirect {
+                callee: Box::new(obj),
+                args: self.lower_chain_args(args)?,
+                not_callable: not_a_function(None),
+            }),
         }
     }
 
@@ -391,6 +468,9 @@ impl LowerCtx<'_> {
                 "undefined" => Ok(IrNode::Undefined),
                 "NaN" => Ok(IrNode::Num(f64::NAN)),
                 "Infinity" => Ok(IrNode::Num(f64::INFINITY)),
+                "arguments" => self
+                    .resolve_arguments()
+                    .map_err(|msg| CompileError::spanned(span, msg).into()),
                 _ => {
                     Err(CompileError::spanned(span, format!("undeclared variable: {name}")).into())
                 }
@@ -405,6 +485,9 @@ impl LowerCtx<'_> {
         match expr {
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
             Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
+            Expr::Class(class_expr) if class_expr.ident.is_none() => {
+                self.lower_class(&class_expr.class, name, false)
+            }
             _ => self.lower_expr(expr),
         }
     }
@@ -433,110 +516,145 @@ impl LowerCtx<'_> {
         )
     }
 
-    /// Read `Parent.prototype` for the class bound to `class_name`: the target of
-    /// a derived prototype's `proto` link and of `super.m(..)`.
-    pub(super) fn class_prototype_read(
-        &mut self,
-        class_name: &str,
-        span: Span,
-    ) -> anyhow::Result<IrNode> {
-        Ok(IrNode::Index {
-            obj: Box::new(self.lower_ident(class_name, span)?),
-            index: Box::new(IrNode::Str("prototype".to_owned())),
-        })
-    }
-
-    /// Lower `super(args)` (E-series): a call to the parent constructor that keeps
-    /// the CURRENT `this` (an [`IrNode::ThisCall`]), so the parent constructor's
-    /// `this.<field> = ..` mutates the same instance the subclass is building.
+    /// Lower `super(args)` inside a derived class constructor (design 4.5):
+    /// `__construct_with(parent, args, new.target)` — the parent allocates
+    /// `this` with `proto = new.target.prototype` (or returns its own object) —
+    /// then bind the result as `this` (a `ReferenceError` when already bound)
+    /// and run the class's instance fields on it. Yields `this`.
     fn lower_super_ctor_call(
         &mut self,
         call: &swc_ecma_ast::CallExpr,
         span: Span,
     ) -> anyhow::Result<IrNode> {
-        let Some(parent) = self.current_super.clone() else {
+        let fi = self.derived_frame();
+        let scope = self
+            .current_super
+            .filter(|_| fi.is_some())
+            .and_then(|scope| scope.parent.map(|parent| (scope, parent)));
+        let (Some(fi), Some((scope, parent))) = (fi, scope) else {
             return Err(CompileError::spanned(
                 span,
                 "`super(..)` is only valid inside a derived class constructor",
             )
             .into());
         };
-        let Some(this_local) = self.ensure_this_local() else {
-            return Err(CompileError::spanned(span, "`super` is not available here").into());
-        };
-        let callee = self.lower_ident(&parent, span)?;
-        if call.args.iter().any(|arg| arg.spread.is_some()) {
-            let parts = call
-                .args
-                .iter()
-                .map(|arg| {
-                    let value = self.lower_expr(&arg.expr)?;
-                    Ok(if arg.spread.is_some() {
-                        SpreadElem::Spread(value)
-                    } else {
-                        SpreadElem::Item(value)
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            return Ok(IrNode::CallSpread {
-                target: SpreadCallee::This {
-                    callee: Box::new(callee),
-                    this_local,
-                },
-                args: Box::new(IrNode::ArraySpread(parts)),
-            });
-        }
-        let args = self.lower_super_args(call)?;
-        Ok(IrNode::ThisCall {
+        let new_target = self.resolve_new_target().unwrap_or(IrNode::Undefined);
+        let callee = self.read_hidden(scope.frame, parent);
+        let (args, spread) = self.lower_construct_args(&call.args)?;
+        let result = self.fresh();
+        let construct = IrNode::Construct {
             callee: Box::new(callee),
             args,
-            this_local,
+            spread,
+            callee_local: self.fresh(),
+            this_local: self.fresh(),
+            reserve: scope.reserve,
+            not_constructor: CalleeError::not_a_constructor("Super constructor"),
+            new_target: Some(Box::new(new_target)),
+        };
+        // The body's top-level `super(..)` statement, when no other call was
+        // lowered before it, is the first to run: `this` cannot be bound yet,
+        // and is definitely bound from here on.
+        let top = fi == self.top();
+        let supers = &mut self.frames[fi].supers;
+        let top_level = top && supers.top_level == Some(call.span);
+        let first = supers.lowered == 0 && top_level;
+        supers.lowered += 1;
+        let mut seq = vec![IrNode::Assign {
+            local: result,
+            value: Box::new(construct),
+        }];
+        if !first {
+            let raw = self.derived_this_raw(fi);
+            seq.push(guard(
+                IrNode::IsHole(Box::new(raw)),
+                reference_error("Super constructor may only be called once"),
+            ));
+        }
+        seq.push(self.derived_bind_this(fi, IrNode::Local(result)));
+        self.frames[fi].supers.this_bound |= top_level;
+        if let Some(fields) = self.lower_field_inits(IrNode::Local(result))? {
+            seq.push(fields);
+        }
+        seq.push(IrNode::Local(result));
+        Ok(IrNode::Seq(seq))
+    }
+
+    /// The object `super.x` looks `x` up on: the home object's prototype — the
+    /// parent's `prototype` for instance members, the parent itself for static
+    /// ones — or `None` in a base class (whose home prototype is the not yet
+    /// modelled `%Object.prototype%` / `%Function.prototype%`).
+    fn super_home(&mut self, span: Span) -> anyhow::Result<Option<IrNode>> {
+        let Some(scope) = self.current_super else {
+            return Err(CompileError::spanned(span, "`super` is only valid inside a class").into());
+        };
+        let id = if scope.is_static {
+            scope.parent
+        } else {
+            scope.proto_parent
+        };
+        Ok(id.map(|id| self.read_hidden(scope.frame, id)))
+    }
+
+    /// Lower the key of `super.x` / `super[k]`.
+    fn lower_super_key(&mut self, super_prop: &SuperPropExpr) -> anyhow::Result<IrNode> {
+        Ok(match &super_prop.prop {
+            SuperProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            SuperProp::Computed(c) => self.lower_expr(&c.expr)?,
         })
     }
 
-    /// Lower `super.m(args)` (E-series): a call to the parent prototype's method `m`
-    /// with the CURRENT `this`. `m` is resolved through `Parent.prototype`, so
-    /// it walks up the parent's own chain (an [`IrNode::ThisCall`]).
+    /// Prefix `node` with the read of `this` a `super.x` reference makes first
+    /// (TDZ-checked in a derived constructor); returns the local holding it.
+    fn super_this(&mut self, node: IrNode, span: Span) -> anyhow::Result<(IrNode, u32)> {
+        if let Some(fi) = self.derived_frame() {
+            let this = self.derived_this(fi);
+            let local = self.fresh();
+            let read = IrNode::Assign {
+                local,
+                value: Box::new(this),
+            };
+            return Ok((IrNode::Seq(vec![read, node]), local));
+        }
+        let Some(this_local) = self.ensure_this_local() else {
+            return Err(CompileError::spanned(span, "`super` is not available here").into());
+        };
+        Ok((node, this_local))
+    }
+
+    /// Lower a `super.x` / `super[k]` read through the home object (see
+    /// [`Self::super_home`]).
+    fn lower_super_prop(&mut self, super_prop: &SuperPropExpr) -> anyhow::Result<IrNode> {
+        let home = self.super_home(super_prop.span)?;
+        let key = self.lower_super_key(super_prop)?;
+        let read = match home {
+            Some(home) => IrNode::Index {
+                obj: Box::new(home),
+                index: Box::new(key),
+            },
+            None => IrNode::Seq(vec![key, IrNode::Undefined]),
+        };
+        Ok(self.super_this(read, super_prop.span)?.0)
+    }
+
+    /// Lower `super.m(args)`: the method found through the home object (see
+    /// [`Self::super_home`]), called with the CURRENT `this` (an
+    /// [`IrNode::ThisCall`]).
     fn lower_super_method_call(
         &mut self,
         call: &swc_ecma_ast::CallExpr,
         super_prop: &SuperPropExpr,
     ) -> anyhow::Result<IrNode> {
-        let Some(parent) = self.current_super.clone() else {
-            return Err(CompileError::spanned(
-                super_prop.span,
-                "`super.<m>` is only valid inside a derived class method",
-            )
-            .into());
+        let home = self.super_home(super_prop.span)?;
+        let key = self.lower_super_key(super_prop)?;
+        let method = match home {
+            Some(home) => IrNode::Index {
+                obj: Box::new(home),
+                index: Box::new(key),
+            },
+            None => IrNode::Seq(vec![key, IrNode::Undefined]),
         };
-        let Some(this_local) = self.ensure_this_local() else {
-            return Err(
-                CompileError::spanned(super_prop.span, "`super` is not available here").into(),
-            );
-        };
-        let SuperProp::Ident(id) = &super_prop.prop else {
-            return Err(CompileError::spanned(
-                super_prop.span,
-                "computed `super[..]` is unsupported",
-            )
-            .into());
-        };
-        let args = self.lower_super_args(call)?;
-        let parent_proto = self.class_prototype_read(&parent, super_prop.span)?;
-        let callee = IrNode::Index {
-            obj: Box::new(parent_proto),
-            index: Box::new(IrNode::Str(id.sym.as_ref().to_owned())),
-        };
-        Ok(IrNode::ThisCall {
-            callee: Box::new(callee),
-            args,
-            this_local,
-        })
-    }
-
-    /// Lower the argument list of a `super(..)` / `super.m(..)` call (spread is out
-    /// of scope, matching the other class constructor/method call paths).
-    fn lower_super_args(&mut self, call: &swc_ecma_ast::CallExpr) -> anyhow::Result<Vec<IrNode>> {
+        let (callee, this_local) = self.super_this(method, super_prop.span)?;
         let mut args = Vec::with_capacity(call.args.len());
         for arg in &call.args {
             if arg.spread.is_some() {
@@ -546,7 +664,12 @@ impl LowerCtx<'_> {
             }
             args.push(self.lower_expr(&arg.expr)?);
         }
-        Ok(args)
+        Ok(IrNode::ThisCall {
+            callee: Box::new(callee),
+            args,
+            this_local,
+            construct: false,
+        })
     }
 
     /// Lower a call expression `callee(args)`. A call to a bare **function name**
@@ -846,15 +969,19 @@ impl LowerCtx<'_> {
         }
 
         let Expr::Ident(ident) = callee_expr else {
-            // The member-callee built-ins (`console.log`, array/string methods)
-            // do not accept a spread; a genuine computed callee is an indirect
-            // spread call through the funcref table.
-            if let Expr::Member(_) = callee_expr {
-                return Err(CompileError::spanned(
-                    call.span(),
-                    "spread arguments are unsupported for this call target",
-                )
-                .into());
+            // A member callee `obj.m(...xs)` is a method call binding `this =
+            // obj`: the receiver is stored into a temp, then the method read from
+            // it. Any other computed callee is an indirect spread call through the
+            // funcref table.
+            if let Expr::Member(member) = callee_expr {
+                if spread_rejecting_member(callee_expr, member) {
+                    return Err(CompileError::spanned(
+                        call.span(),
+                        "spread arguments are unsupported for this builtin method",
+                    )
+                    .into());
+                }
+                return self.lower_spread_method_call(member, args);
             }
             return Ok(IrNode::CallSpread {
                 target: SpreadCallee::Indirect(
@@ -894,6 +1021,47 @@ impl LowerCtx<'_> {
                     .into(),
             )
         }
+    }
+
+    /// Lower a spread method call `obj.m(...args)` / `obj[k](...args)` (the
+    /// argument array already built into `args`): JS order evaluates the
+    /// receiver, then the member, then the arguments, and binds `this = obj`.
+    fn lower_spread_method_call(
+        &mut self,
+        member: &swc_ecma_ast::MemberExpr,
+        args: Box<IrNode>,
+    ) -> anyhow::Result<IrNode> {
+        let key = match &member.prop {
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
+            MemberProp::PrivateName(_) => {
+                return Err(CompileError::spanned(
+                    member.span(),
+                    "private fields are not supported",
+                )
+                .into());
+            }
+        };
+        let obj = self.lower_expr(&member.obj)?;
+        let this_local = self.fresh();
+        let callee = IrNode::Seq(vec![
+            IrNode::Assign {
+                local: this_local,
+                value: Box::new(obj),
+            },
+            IrNode::Index {
+                obj: Box::new(IrNode::Local(this_local)),
+                index: Box::new(key),
+            },
+        ]);
+        Ok(IrNode::CallSpread {
+            target: SpreadCallee::Method {
+                callee: Box::new(callee),
+                this_local,
+                not_callable: not_a_function(member_source_name(member).as_deref()),
+            },
+            args,
+        })
     }
 
     /// Lower a growing array method call `recv.push(x)` / `recv.pop()`. The
@@ -1653,144 +1821,147 @@ impl LowerCtx<'_> {
     ///
     /// Returns an error for any callee other than the three error identifiers,
     /// for spread arguments, or if the message expression is unsupported.
-    /// Lower `left instanceof right` (E-series) into an [`IrNode::InstanceOf`].
+    /// Lower `left instanceof right` (design 4.6) into an [`IrNode::InstanceOf`].
     /// See [`Self::instanceof_kind`] for the right-hand-side dispatch.
     fn lower_instanceof(&mut self, left: &Expr, right: &Expr) -> anyhow::Result<IrNode> {
-        let kind = self.instanceof_kind(right)?;
+        let value = self.lower_expr(left)?;
         Ok(IrNode::InstanceOf {
-            value: Box::new(self.lower_expr(left)?),
-            kind,
+            value: Box::new(value),
+            kind: self.instanceof_kind(right)?,
         })
     }
 
     /// Resolve the right-hand side of an `instanceof` to an [`InstanceOfKind`].
-    /// A user class is matched FIRST (so a `class Error {}` shadows the builtin)
-    /// and lowers to a `proto`-chain walk against `C.prototype`; an UNSHADOWED `Error`/
-    /// `TypeError`/`RangeError` identifier walks for its static prototype.
-    /// Anything else — a non-identifier, a shadowed error name, or an unrelated
-    /// binding — is a clean compile error.
+    /// An UNSHADOWED `Error`/`TypeError`/`RangeError`/`Array`/`Function`/`Date`/
+    /// `Object` identifier (not yet a runtime value) takes its builtin test; any
+    /// other expression — including a binding that shadows one of those names —
+    /// is `OrdinaryHasInstance` on its value.
     fn instanceof_kind(&mut self, right: &Expr) -> anyhow::Result<InstanceOfKind> {
-        let unsupported = |span: Span| -> anyhow::Error {
-            CompileError::spanned(
-                span,
-                "instanceof requires a user class or one of \
-                 Error/TypeError/RangeError/Array/Object/Function/Date \
-                 on the right-hand side",
-            )
-            .into()
-        };
-        let Expr::Ident(id) = right else {
-            return Err(unsupported(right.span()));
-        };
-        let name = id.sym.as_ref();
-        if self.shared.classes.borrow().contains_key(name) {
-            // User class: walk the receiver's `proto` chain for `C.prototype`.
-            let class_proto = self.class_prototype_read(name, id.span)?;
-            return Ok(InstanceOfKind::Proto(Box::new(class_proto)));
-        }
-        if self.resolve(name).is_none() {
-            if let Some(kind) = ErrorKind::from_name(name) {
-                return Ok(InstanceOfKind::Proto(Box::new(IrNode::ErrorProto(kind))));
-            }
-            match name {
-                // The runtime-TYPE-BYTE builtins: `Array`/`Object`/`Function`/
-                // `Date` are not real bindings, so a user `let Array = ..` shadows
-                // them (the `resolve` guard above) and falls through to the error.
-                "Array" => return Ok(InstanceOfKind::Array),
-                "Function" => return Ok(InstanceOfKind::Function),
-                "Date" => return Ok(InstanceOfKind::Date),
-                "Object" => return Ok(InstanceOfKind::Object),
-                _ => {}
+        if let Expr::Ident(id) = right {
+            let name = id.sym.as_ref();
+            if self.resolve(name).is_none() {
+                if let Some(kind) = ErrorKind::from_name(name) {
+                    return Ok(InstanceOfKind::Proto(Box::new(IrNode::ErrorProto(kind))));
+                }
+                match name {
+                    "Array" => return Ok(InstanceOfKind::Array),
+                    "Function" => return Ok(InstanceOfKind::Function),
+                    "Date" => return Ok(InstanceOfKind::Date),
+                    "Object" => return Ok(InstanceOfKind::Object),
+                    _ => {}
+                }
             }
         }
-        Err(unsupported(id.span))
+        Ok(InstanceOfKind::Ctor(Box::new(self.lower_expr(right)?)))
     }
 
     fn lower_new(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
-        let Expr::Ident(callee) = new_expr.callee.as_ref() else {
-            let target = self.lower_expr(&new_expr.callee)?;
-            let args = self.lower_new_args(new_expr)?;
-            return Ok(Self::not_a_constructor(
-                target,
-                args,
-                source_name(&new_expr.callee).as_deref(),
-            ));
-        };
-        let name = callee.sym.as_ref();
-        // A `new A(args)` on a user class declared earlier takes the class
-        // instantiation path; the builtin Error constructors fall through below.
-        if self.shared.classes.borrow().contains_key(name) {
-            return self.lower_new_class(name, callee.span, new_expr);
-        }
-        // `new Map()` / `new Set()`: a fresh empty collection handle. Like the
-        // other builtins, `Map`/`Set` are not real bindings, so a user `let Map = ..`
-        // shadows them. Only the empty constructor is in scope — arguments (e.g.
-        // `new Map([[k, v]])`) are rejected.
-        if matches!(name, "Map" | "Set") && self.resolve(name).is_none() {
-            let args = new_expr.args.as_deref().unwrap_or(&[]);
-            if !args.is_empty() {
-                return Err(CompileError::spanned(
-                    callee.span(),
-                    format!(
-                        "new {name}(..) with constructor arguments is unsupported (only the empty \
-                         `new {name}()` is supported)"
-                    ),
-                )
-                .into());
+        // The builtin constructors keep their dedicated paths while unshadowed:
+        // they are not real bindings, so a user `let Map = ..` or `function
+        // Error(){}` constructs through the general path below.
+        if let Expr::Ident(callee) = new_expr.callee.as_ref()
+            && self.resolve(callee.sym.as_ref()).is_none()
+            && !self.shared.funcs.contains_key(callee.sym.as_ref())
+        {
+            let name = callee.sym.as_ref();
+            // `new Map()` / `new Set()`: a fresh empty collection handle. Only
+            // the empty constructor is in scope — arguments (e.g.
+            // `new Map([[k, v]])`) are rejected.
+            if matches!(name, "Map" | "Set") {
+                let args = new_expr.args.as_deref().unwrap_or(&[]);
+                if !args.is_empty() {
+                    return Err(CompileError::spanned(
+                        callee.span(),
+                        format!(
+                            "new {name}(..) with constructor arguments is unsupported (only the \
+                             empty `new {name}()` is supported)"
+                        ),
+                    )
+                    .into());
+                }
+                return Ok(IrNode::MapNew { set: name == "Set" });
             }
-            return Ok(IrNode::MapNew { set: name == "Set" });
+            // `new Promise(executor)`: the executor form of the Promise constructor.
+            if name == "Promise" {
+                return self.lower_new_promise(callee.span, new_expr);
+            }
+            // `new Date()` / `new Date(ms)`.
+            if name == "Date" {
+                return self.lower_new_date(callee.span, new_expr);
+            }
+            if let Some(kind) = ErrorKind::from_name(name) {
+                let mut args = Vec::new();
+                for arg in new_expr.args.as_deref().unwrap_or(&[]) {
+                    if arg.spread.is_some() {
+                        return Err(CompileError::spanned(
+                            arg.span(),
+                            "spread arguments are unsupported",
+                        )
+                        .into());
+                    }
+                    args.push(self.lower_expr(&arg.expr)?);
+                }
+                return Ok(self.lower_error_construct(kind, args));
+            }
         }
-        // `new Promise(executor)`: the executor form of the Promise
-        // constructor. Like `Map`/`Set`, `Promise` is not a real binding, so a
-        // user `let Promise = ..` shadows it.
-        if name == "Promise" && self.resolve("Promise").is_none() {
-            return self.lower_new_promise(callee.span, new_expr);
-        }
-        // `new Date()` / `new Date(ms)`. Like the other builtins, `Date`
-        // is not a real binding, so a user `let Date = ..` shadows it.
-        if name == "Date" && self.resolve("Date").is_none() {
-            return self.lower_new_date(callee.span, new_expr);
-        }
-        let args = self.lower_new_args(new_expr)?;
-        let Some(kind) = ErrorKind::from_name(name) else {
-            let target = self.lower_ident(name, callee.span)?;
-            return Ok(Self::not_a_constructor(target, args, Some(name)));
-        };
-        Ok(self.lower_error_construct(kind, args))
+        self.lower_construct(new_expr)
     }
 
-    /// Lower the arguments of `new X(args)` (spread rejected).
-    fn lower_new_args(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<Vec<IrNode>> {
-        let mut args = Vec::new();
-        for arg in new_expr.args.as_deref().unwrap_or(&[]) {
-            if arg.spread.is_some() {
-                return Err(
-                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
-                );
-            }
-            args.push(self.lower_expr(&arg.expr)?);
-        }
-        Ok(args)
+    /// Lower `new X(args)` for any constructor expression `X` into an
+    /// [`IrNode::Construct`] (design 4.5). Class identity is by binding: `X` is
+    /// evaluated like any expression. When `X` names a recorded class, `this`'s
+    /// property table is pre-sized for the fields its constructor chain assigns
+    /// (capacity only; a rebound name just over-reserves).
+    fn lower_construct(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
+        let callee = self.lower_expr(&new_expr.callee)?;
+        let reserve = match new_expr.callee.as_ref() {
+            Expr::Ident(id) => self
+                .shared
+                .classes
+                .borrow()
+                .get(id.sym.as_ref())
+                .map_or(0, |info| info.fields.len()),
+            _ => 0,
+        };
+        let (args, spread) = self.lower_construct_args(new_expr.args.as_deref().unwrap_or(&[]))?;
+        let name = source_name(&new_expr.callee);
+        Ok(IrNode::Construct {
+            callee: Box::new(callee),
+            args,
+            spread,
+            callee_local: self.fresh(),
+            this_local: self.fresh(),
+            reserve: u32::try_from(reserve).unwrap_or(u32::MAX),
+            not_constructor: CalleeError::not_a_constructor(
+                name.as_deref().unwrap_or(CalleeError::EXPRESSION),
+            ),
+            new_target: None,
+        })
     }
 
-    /// `new target(args)` on a value that is not a recorded class or supported
-    /// builtin: evaluate the target and the arguments, then throw
-    /// `<name> is not a constructor`. Plain `function` declarations land here
-    /// too until construct is implemented (S3).
-    fn not_a_constructor(target: IrNode, args: Vec<IrNode>, name: Option<&str>) -> IrNode {
-        let error = CalleeError::not_a_constructor(name.unwrap_or(CalleeError::EXPRESSION));
-        let thrown = IrNode::Throw(Box::new(IrNode::error_object(
-            ErrorKind::TypeError,
-            None,
-            Some(IrNode::Str(error.message)),
-            IrNode::Str(error.stack),
-        )));
-        IrNode::Seq(
-            std::iter::once(target)
-                .chain(args)
-                .chain([thrown])
-                .collect(),
-        )
+    /// Lower the arguments of a `new` / `super(..)` call: the argument list,
+    /// or, when any argument is a spread, the argument array.
+    fn lower_construct_args(
+        &mut self,
+        args: &[ExprOrSpread],
+    ) -> anyhow::Result<(Vec<IrNode>, Option<Box<IrNode>>)> {
+        let mut lowered = Vec::with_capacity(args.len());
+        let mut parts = Vec::new();
+        let has_spread = args.iter().any(|arg| arg.spread.is_some());
+        for arg in args {
+            let value = self.lower_expr(&arg.expr)?;
+            if !has_spread {
+                lowered.push(value);
+            } else if arg.spread.is_some() {
+                parts.push(SpreadElem::Spread(value));
+            } else {
+                parts.push(SpreadElem::Item(value));
+            }
+        }
+        Ok((
+            lowered,
+            has_spread.then(|| Box::new(IrNode::ArraySpread(parts))),
+        ))
     }
 
     /// Build the Error instance `<kind>(args)` / `new <kind>(args)` constructs:
@@ -1960,43 +2131,6 @@ impl LowerCtx<'_> {
             p_local,
         })
     }
-
-    /// Lower `new A(args)` on a user class `A` into an [`IrNode::New`]. The
-    /// class binding `A` is read (a side-effect-free local/cell read): its value
-    /// is the constructor, and the fresh instance is an empty object whose
-    /// `proto` is `A.prototype` and whose property table is pre-sized for the
-    /// fields the constructor chain assigns. Spread arguments are rejected.
-    fn lower_new_class(
-        &mut self,
-        name: &str,
-        span: Span,
-        new_expr: &swc_ecma_ast::NewExpr,
-    ) -> anyhow::Result<IrNode> {
-        let fields = {
-            let classes = self.shared.classes.borrow();
-            classes.get(name).map_or(0, |info| info.fields.len())
-        };
-        // Read the class binding twice (both are pure local/cell reads): once for
-        // the prototype the instance links to, once as the constructor.
-        let proto = self.class_prototype_read(name, span)?;
-        let ctor = self.lower_ident(name, span)?;
-        let instance = IrNode::Object {
-            entries: Vec::new(),
-            proto: Some(Box::new(proto)),
-            class: crate::abi::CLASS_ORDINARY,
-            reserve: u32::try_from(fields).unwrap_or(u32::MAX),
-        };
-
-        let args = self.lower_new_args(new_expr)?;
-        let instance_local = self.fresh();
-        Ok(IrNode::New {
-            instance: Box::new(instance),
-            ctor: Box::new(ctor),
-            args,
-            instance_local,
-            not_callable: CalleeError::not_a_constructor(name),
-        })
-    }
 }
 
 /// One link of a flattened optional chain (see [`LowerCtx::lower_opt_chain`]),
@@ -2043,6 +2177,34 @@ fn collect_chain_links<'a>(chain: &'a OptChainExpr, links: &mut Vec<ChainLink<'a
     };
     links.push(link);
     root
+}
+
+/// `value` is evaluated once into `temp`; when it is `null`/`undefined` the
+/// whole expression is `undefined`, otherwise `tail` (which reads `temp`).
+fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
+    // nullish(temp) ≡ `temp === null || temp === undefined`; the value is teed
+    // into `temp` while computing the first comparison.
+    let is_nullish = IrNode::Logical {
+        op: LogicalOp::Or,
+        lhs: Box::new(IrNode::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(IrNode::Assign {
+                local: temp,
+                value: Box::new(value),
+            }),
+            rhs: Box::new(IrNode::Null),
+        }),
+        rhs: Box::new(IrNode::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(IrNode::Local(temp)),
+            rhs: Box::new(IrNode::Undefined),
+        }),
+    };
+    IrNode::Ternary {
+        cond: Box::new(is_nullish),
+        then_branch: Box::new(IrNode::Undefined),
+        else_branch: Box::new(tail),
+    }
 }
 
 /// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a
@@ -2127,7 +2289,6 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
         Expr::Yield(_) => "yield expressions are not supported",
-        Expr::Class(_) => "class expressions are not supported",
         Expr::Seq(_) => "comma (sequence) expressions are not supported",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
@@ -2139,6 +2300,22 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
 /// promise / generator instance method. Recognized purely syntactically from a
 /// `<expr>.<name>(..)` member callee; the lowered node dispatches on the
 /// receiver's runtime TYPE BYTE and falls back to a user method call.
+/// Whether a spread call through the member callee `callee` (= `member`) hits
+/// a builtin dispatched by name with no user-method fallback (`console.log`,
+/// the `Object`/`JSON`/`Promise` statics, the array/string methods,
+/// `getTime`), which take no spread.
+fn spread_rejecting_member(callee: &Expr, member: &swc_ecma_ast::MemberExpr) -> bool {
+    is_console_log(callee)
+        || object_method_name(callee).is_some()
+        || json_method_name(callee).is_some()
+        || promise_static_method_name(callee).is_some()
+        || matches!(&member.prop, MemberProp::Ident(id) if {
+            let name = id.sym.as_ref();
+            matches!(name, "push" | "pop" | "map" | "filter" | "reduce" | "forEach" | "getTime")
+                || non_callback_method_op(name).is_some()
+        })
+}
+
 fn receiver_method_op(name: &str) -> Option<ReceiverOp> {
     Some(match name {
         "then" => ReceiverOp::Then,

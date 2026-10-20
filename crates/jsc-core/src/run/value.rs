@@ -50,6 +50,10 @@ pub enum Value {
         /// The own enumerable properties, as in [`Value::Object`].
         entries: Vec<(String, Value)>,
     },
+    /// An `arguments` object (a `TYPE_OBJECT` of class `ARGUMENTS`): its own
+    /// enumerable properties, as in [`Value::Object`]. Renders Node-style as
+    /// `[Arguments] { '0': 1 }`.
+    Arguments(Vec<(String, Value)>),
     /// An Error instance (a `TYPE_OBJECT` of class `ERROR`): its `name` and
     /// `message` strings, found by a data-property chain lookup. Renders as its
     /// single-line stack `"<name>: <message>"`.
@@ -479,6 +483,9 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
         };
     }
     let entries = decode_props(ptr, memory, guard);
+    if memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize) == Some(&abi::CLASS_ARGUMENTS) {
+        return Value::Arguments(entries);
+    }
     let has_proto = read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize)
         .is_some_and(|bits| heap_object(bits, memory).is_some());
     let class = has_proto
@@ -712,6 +719,14 @@ pub fn format_value(value: &Value) -> String {
         Value::Object(entries) => format_entries(entries),
         // A class instance is prefixed with its constructor's name.
         Value::Instance { class, entries } => format!("{class} {}", format_entries(entries)),
+        // An `arguments` object quotes its (index) keys, as Node does.
+        Value::Arguments(entries) => {
+            let quoted: Vec<(String, Value)> = entries
+                .iter()
+                .map(|(key, value)| (quote_key(key), value.clone()))
+                .collect();
+            format!("[Arguments] {}", format_entries(&quoted))
+        }
         // An Error instance renders as its single-line stack
         // (`"<name>: <message>"`, or just the name without a message), the way
         // a JS console prints an error's first line.
@@ -817,6 +832,7 @@ pub fn to_js_string(value: &Value) -> String {
     match value {
         Value::Array(elems, _) => join_elements(elems, ","),
         Value::Object(_) | Value::Instance { .. } => "[object Object]".to_owned(),
+        Value::Arguments(_) => "[object Arguments]".to_owned(),
         Value::Error { name, message } => match (name.is_empty(), message.is_empty()) {
             (_, true) => name.clone(),
             (true, false) => message.clone(),
@@ -835,6 +851,20 @@ pub fn to_js_string(value: &Value) -> String {
         | Value::Str(_)
         | Value::Function { .. }
         | Value::Date(_) => format_value(value),
+    }
+}
+
+/// A property key as Node's console prints it: an identifier-like key bare,
+/// anything else (an index key) single-quoted.
+fn quote_key(key: &str) -> String {
+    let identifier = key.chars().next().is_some_and(|c| !c.is_ascii_digit())
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    if identifier {
+        key.to_owned()
+    } else {
+        format!("'{key}'")
     }
 }
 
