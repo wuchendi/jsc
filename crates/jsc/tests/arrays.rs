@@ -299,7 +299,7 @@ fn push_pop_on_any_receiver() {
 
 /// A non-array receiver throws `<recv>.push is not a function` (the method is
 /// absent), after the arguments are evaluated; a nullish receiver still throws
-/// the member-read TypeError first.
+/// the member-read `TypeError` first.
 #[test]
 fn push_pop_on_non_array_receiver_throws() {
     assert_eq!(

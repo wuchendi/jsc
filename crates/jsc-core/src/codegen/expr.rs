@@ -936,20 +936,19 @@ impl LowerCtx<'_> {
         let plain = match obj {
             Expr::Ident(id) => self.resolve(id.sym.as_ref()).and_then(|r| match r.kind {
                 AccessKind::Plain(local) => Some(local),
-                _ => None,
+                AccessKind::Cell(_) => None,
             }),
             _ => None,
         };
-        let (local, recv) = match plain {
-            Some(local) => (local, IrNode::Local(local)),
-            None => {
-                let tmp = self.fresh();
-                let recv = IrNode::Assign {
-                    local: tmp,
-                    value: Box::new(self.lower_expr(obj)?),
-                };
-                (tmp, recv)
-            }
+        let (local, recv) = if let Some(local) = plain {
+            (local, IrNode::Local(local))
+        } else {
+            let tmp = self.fresh();
+            let recv = IrNode::Assign {
+                local: tmp,
+                value: Box::new(self.lower_expr(obj)?),
+            };
+            (tmp, recv)
         };
         let not_array = method_not_a_function(obj, method);
         let grow = match value {
