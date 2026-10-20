@@ -367,6 +367,7 @@ impl LowerCtx<'_> {
                 callee: Box::new(IrNode::Local(callee)),
                 args,
                 this_local,
+                construct: false,
             };
             let tail = self.build_chain(call, after)?;
             return Ok(nullish_short_circuit(callee, method, tail));
