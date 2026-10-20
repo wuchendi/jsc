@@ -2409,6 +2409,8 @@ language/expressions/in/private-field-invalid-rhs.js
 language/expressions/in/private-field-rhs-yield-absent.js
 language/expressions/in/rhs-yield-absent-strict.js
 language/expressions/in/rhs-yield-present.js
+language/expressions/instanceof/S11.8.6_A5_T1.js
+language/expressions/instanceof/S11.8.6_A5_T2.js
 language/expressions/less-than-or-equal/S11.8.3_A2.4_T1.js
 language/expressions/less-than-or-equal/S11.8.3_A2.4_T2.js
 language/expressions/less-than-or-equal/S11.8.3_A3.1_T1.3.js
