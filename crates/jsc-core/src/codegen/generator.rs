@@ -603,7 +603,7 @@ impl CfgBuilder<'_> {
             IrNode::Local(local)
             | IrNode::IncDec { local, .. }
             | IrNode::ArrayPush { local, .. }
-            | IrNode::ArrayPop { local } => Some(*local),
+            | IrNode::ArrayPop { local, .. } => Some(*local),
             _ => None,
         };
         if let Some(local) = read

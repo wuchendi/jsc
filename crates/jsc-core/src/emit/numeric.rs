@@ -163,26 +163,24 @@ pub(super) fn emit_math_spread(
     helpers: Helpers<'_>,
 ) {
     // Reuse the array higher-order loop's scratch slots (idle here): the array
-    // base, its length, the loop index, and the i64 accumulator. The `args` build
-    // finishes using these before the fold seeds them.
+    // element store, its length, the loop index, and the i64 accumulator. The
+    // `args` build finishes using these before the fold seeds them.
     let base = scratch + 8;
     let len = scratch + 9;
     let idx = scratch + 10;
     let acc = scratch + 13;
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
     let is_min = matches!(op, MathOp::Min);
 
-    // Materialize the argument array; base -> `base`, length -> `len`, idx = 0.
+    // Materialize the (fresh, private) argument array; its length -> `len`, its
+    // element store -> `base`, idx = 0.
     emit_node(args, function, scratch, strings, helpers);
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(base));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::LocalTee(base));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::LocalSet(len));
+    function.instruction(&Instruction::LocalGet(base));
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalSet(base));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(idx));
 
@@ -211,11 +209,7 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::F64ReinterpretI64);
     if is_min {
         function.instruction(&Instruction::F64Min);

@@ -2,9 +2,10 @@
 //! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
 
 use super::{
-    CLASS_ERROR, DATE_MS_OFFSET, HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED,
-    PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION,
-    TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
+    ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
+    HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
+    TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -277,26 +278,30 @@ fn decode_string(ptr: usize, memory: &[u8]) -> Value {
     Value::Str(String::from_utf8_lossy(str_bytes).into_owned())
 }
 
-/// Resolve a heap array block at base `ptr` into a [`Value::Array`] by reading the
-/// u32 `len` header at `ptr + HEADER_SIZE`, then decoding `len` consecutive i64
-/// element jsvals at `ptr + HEADER_SIZE + 4 + 8*k` (each recursively). Nested
-/// arrays and strings resolve through the same `memory`.
+/// The length of the array handle at base `ptr` and the address of its element
+/// 0 (element `k` is the jsval at `data + 8*k` of its element store), or `None`
+/// when the handle is truncated.
+pub(super) fn array_layout(memory: &[u8], ptr: usize) -> Option<(usize, usize)> {
+    let len = read_u32(memory, ptr + ARRAY_LEN_OFFSET)? as usize;
+    let elems = read_u32(memory, ptr + ARRAY_ELEMS_OFFSET)? as usize;
+    Some((len, elems + ELEMS_DATA_OFFSET))
+}
+
+/// Resolve a heap array handle at base `ptr` into a [`Value::Array`] by
+/// decoding its `len` element jsvals from its element store (each
+/// recursively). Nested arrays and strings resolve through the same `memory`.
 ///
-/// Defensive: an out-of-range header yields an empty array and a truncated
-/// element run stops early, so a malformed pointer never panics.
+/// Defensive: a truncated handle yields an empty array and a truncated element
+/// run stops early, so a malformed pointer never panics.
 fn decode_array(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
-    let len_at = ptr + HEADER_SIZE;
-    let Some(len_bytes) = memory.get(len_at..len_at + 4) else {
+    let Some((len, data)) = array_layout(memory, ptr) else {
         return Value::Array(Vec::new());
     };
-    let len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
     let mut elems = Vec::with_capacity(len);
     for k in 0..len {
-        let start = len_at + 4 + 8 * k;
-        let Some(elem_bytes) = memory.get(start..start + 8) else {
+        let Some(elem_bits) = read_u64(memory, data + 8 * k) else {
             break;
         };
-        let elem_bits = u64::from_le_bytes(elem_bytes.try_into().unwrap_or([0; 8]));
         elems.push(decode_in(elem_bits, memory, guard));
     }
     Value::Array(elems)

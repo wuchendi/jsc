@@ -8,10 +8,13 @@
 import {
   ACCESSOR_GET_OFFSET,
   ACCESSOR_SET_OFFSET,
+  ARRAY_ELEMS_OFFSET,
+  ARRAY_LEN_OFFSET,
   ATTR_ACCESSOR,
   ATTR_ENUMERABLE,
   CLASS_ERROR,
   DATE_MS_OFFSET,
+  ELEMS_DATA_OFFSET,
   FN_INFO_ADDR,
   FN_INFO_ENTRY_SIZE,
   FN_INFO_NAME_OFFSET,
@@ -260,13 +263,29 @@ function decodeString(ptr: number, mem: Uint8Array): Value {
   }
 }
 
-/** Resolve a heap array block at `ptr`, decoding each `i64` element recursively. */
+/**
+ * The length of the array handle at `ptr` and the address of its element 0
+ * (element `k` is at `data + 8 * k` of its element store), or `undefined`
+ * when the handle is truncated (mirrors `value.rs::array_layout`).
+ */
+export function arrayLayout(
+  mem: Uint8Array,
+  ptr: number,
+): [len: number, data: number] | undefined {
+  const len = readU32(mem, ptr + ARRAY_LEN_OFFSET)
+  const elems = readU32(mem, ptr + ARRAY_ELEMS_OFFSET)
+  if (len === undefined || elems === undefined) return undefined
+  return [len, elems + ELEMS_DATA_OFFSET]
+}
+
+/** Resolve a heap array handle at `ptr`, decoding each `i64` element recursively. */
 function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const len = readU32(mem, ptr + HEADER_SIZE)
-  if (len === undefined) return { kind: 'array', items: [] }
+  const layout = arrayLayout(mem, ptr)
+  if (layout === undefined) return { kind: 'array', items: [] }
+  const [len, data] = layout
   const items: Value[] = []
   for (let k = 0; k < len; k++) {
-    const elem = readU64(mem, ptr + HEADER_SIZE + 4 + 8 * k)
+    const elem = readU64(mem, data + 8 * k)
     if (elem === undefined) break
     items.push(decodeIn(elem, mem, guard))
   }

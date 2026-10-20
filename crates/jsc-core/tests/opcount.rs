@@ -221,3 +221,18 @@ fn opcount_snapshot() {
          changed rows if intended):\n{report}"
     );
 }
+
+/// `n` pushes onto one array cost amortized O(1) each: the fuel of 1e5 pushes
+/// stays well under 2.5x the fuel of 5e4 (a per-push copy would be ~4x).
+#[test]
+fn push_fuel_is_linear() {
+    let pushes = |n: u32| {
+        format!("const a = []; for (let i = 0; i < {n}; i++) a.push(i); console.log(a.length)")
+    };
+    let half = measure(&pushes(50_000)).fuel;
+    let full = measure(&pushes(100_000)).fuel;
+    assert!(
+        full * 2 < half * 5,
+        "push fuel is not linear: fuel(5e4) = {half}, fuel(1e5) = {full}"
+    );
+}

@@ -101,7 +101,11 @@ pub(super) fn build_type_and_function_sections<'a>(
         own_keys: index(),
         for_in_keys: index(),
         rest: index(),
-        array_push: index(),
+        // `__array_reserve` takes the index right before `__array_push`.
+        array_push: {
+            index();
+            index()
+        },
         array_concat: index(),
         json_escape: index(),
         json_str: index(),
@@ -273,9 +277,11 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I64], &[I64]),
         // `__rest(src, excl) -> object`.
         (&[I64, I64], &[I64]),
-        // `__array_push(base, value) -> new_base`.
+        // `__array_reserve(base, need)`.
+        (&[I32, I32], &[]),
+        // `__array_push(base, value) -> base`.
         (&[I32, I64], &[I32]),
-        // `__array_concat(dst, src) -> new_base`.
+        // `__array_concat(dst, src) -> dst`.
         (&[I32, I32], &[I32]),
         // `__json_escape(str) -> str` and `__json_str(v) -> str`.
         (&[I32], &[I32]),
@@ -680,12 +686,12 @@ pub(super) fn collect_node<'a>(
             }
             collect_node(value, order, seen);
         }
-        // `ArrayPush` carries only its pushed value plus the receiver guard's
-        // strings (its local read/rebind has no string literals).
-        IrNode::ArrayPush { value, .. } => {
-            seed_nullish_strs(order, seen);
-            if seen.insert("push") {
-                order.push("push");
+        // `ArrayPush` carries its pushed value plus the not-an-array error.
+        IrNode::ArrayPush {
+            value, not_array, ..
+        } => {
+            if let Some(not_array) = not_array {
+                seed_callee_error(callee_error_text(not_array), order, seen);
             }
             collect_node(value, order, seen);
         }
@@ -1064,12 +1070,9 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::DateGetTime { recv } => collect_node(recv, order, seen),
-        // `pop` only needs its receiver guard's strings.
-        IrNode::ArrayPop { .. } => {
-            seed_nullish_strs(order, seen);
-            if seen.insert("pop") {
-                order.push("pop");
-            }
+        // `pop` only needs its not-an-array error.
+        IrNode::ArrayPop { not_array, .. } => {
+            seed_callee_error(callee_error_text(not_array), order, seen);
         }
         // A static error prototype must be laid out.
         IrNode::ErrorProto(_) => seed_strs(&ERROR_STRS, order, seen),

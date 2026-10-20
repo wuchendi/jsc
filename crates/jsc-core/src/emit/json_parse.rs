@@ -97,19 +97,6 @@ fn propagate_if_pending(function: &mut Function) {
     function.instruction(&Instruction::End);
 }
 
-/// Allocate a fresh empty `TYPE_ARRAY` block into i32 `local` (base offset).
-fn init_empty_array(function: &mut Function, alloc_index: u32, local: u32) {
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(local));
-    function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(byte_mem()));
-    function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(len_header()));
-}
-
 /// Push the boxed heap jsval of the i32 block base in `local`.
 fn box_local(function: &mut Function, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
@@ -511,7 +498,7 @@ pub(super) fn emit_json_value(helpers: Helpers<'_>) -> Function {
 
 /// `__json_array() -> i64`: parse a JSON array (cursor at `[`) into a fresh heap
 /// array, growing it element by element via `__array_push`.
-pub(super) fn emit_json_array(alloc_index: u32, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_json_array(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![
         (1, ValType::I32),
         (1, ValType::I64),
@@ -520,7 +507,9 @@ pub(super) fn emit_json_array(alloc_index: u32, helpers: Helpers<'_>) -> Functio
     let (arr, elem, c) = (0, 1, 2);
 
     advance(&mut function); // consume '['
-    init_empty_array(&mut function, alloc_index, arr);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::Call(helpers.new_array()));
+    function.instruction(&Instruction::LocalSet(arr));
     function.instruction(&Instruction::Call(helpers.json_ws));
     // Empty array: if next is ']', consume it and return the empty array.
     at_end(&mut function);
@@ -542,11 +531,11 @@ pub(super) fn emit_json_array(alloc_index: u32, helpers: Helpers<'_>) -> Functio
     function.instruction(&Instruction::Call(helpers.json_value));
     function.instruction(&Instruction::LocalSet(elem));
     propagate_if_pending(&mut function);
-    // arr = __array_push(arr, element).
+    // __array_push(arr, element).
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(elem));
     function.instruction(&Instruction::Call(helpers.array_push));
-    function.instruction(&Instruction::LocalSet(arr));
+    function.instruction(&Instruction::Drop);
     function.instruction(&Instruction::Call(helpers.json_ws));
     // if at_end: unterminated -> throw.
     at_end(&mut function);
