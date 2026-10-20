@@ -7,6 +7,7 @@ use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
+use super::value::array_layout;
 use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
@@ -81,19 +82,22 @@ pub(super) fn alloc_string<W: Send + 'static>(
     Some(base as u64)
 }
 
-/// Allocate a heap ARRAY block holding the jsval bits `elems` through the guest
-/// `__new_array` export and return its base offset, or `None` if the export is
-/// missing or the allocation/write fails. The guest writes the header; the host
-/// only fills the elements.
+/// Allocate a heap ARRAY holding the jsval bits `elems` through the guest
+/// `__new_array` export and return its handle base offset, or `None` if the
+/// export is missing or the allocation/write fails. The guest builds the handle
+/// and its element store; the host only fills the elements.
 fn alloc_array<W: Send + 'static>(caller: &mut Caller<'_, W>, elems: &[u64]) -> Option<u64> {
     let len = elems.len().min(MEMORY_MAX_BYTES / 8);
     let base = guest_new(caller, abi::NEW_ARRAY_EXPORT_NAME, len)?;
     let mem = caller
         .get_export(abi::MEMORY_EXPORT_NAME)
         .and_then(wasmtime::Extern::into_memory)?;
-    let bytes: Vec<u8> = elems.iter().flat_map(|bits| bits.to_le_bytes()).collect();
-    mem.write(&mut *caller, base + HEADER_SIZE + 4, &bytes)
-        .ok()?;
+    let (_, data) = array_layout(mem.data(&*caller), base)?;
+    let bytes: Vec<u8> = elems[..len]
+        .iter()
+        .flat_map(|bits| bits.to_le_bytes())
+        .collect();
+    mem.write(&mut *caller, data, &bytes).ok()?;
     Some(base as u64)
 }
 
@@ -225,16 +229,22 @@ fn heap_ptr(bits: u64) -> Option<usize> {
     }
 }
 
-/// The u32 `len` header of an array/string block at `ptr + HEADER_SIZE`.
+/// The u32 `len` header of a string block at `ptr + HEADER_SIZE`.
 fn block_len(mem: &[u8], ptr: usize) -> Option<usize> {
     let at = ptr.checked_add(HEADER_SIZE)?;
     let bytes = mem.get(at..at + 4)?;
     usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()
 }
 
-/// The raw jsval bits of array element `i` at `ptr + HEADER_SIZE + 4 + 8*i`.
+/// The length of the array handle at `ptr`.
+fn array_len(mem: &[u8], ptr: usize) -> Option<usize> {
+    array_layout(mem, ptr).map(|(len, _)| len)
+}
+
+/// The raw jsval bits of element `i` of the array handle at `ptr`.
 fn array_elem_bits(mem: &[u8], ptr: usize, i: usize) -> Option<u64> {
-    let start = ptr.checked_add(HEADER_SIZE + 4 + 8 * i)?;
+    let (_, data) = array_layout(mem, ptr)?;
+    let start = data.checked_add(8 * i)?;
     let bytes = mem.get(start..start + 8)?;
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
@@ -284,7 +294,7 @@ fn strict_eq_bits(a: u64, b: u64, mem: &[u8]) -> bool {
 /// `array.indexOf(x)`: the number bits of the first index whose element `=== x`,
 /// or `-1` when absent.
 fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
-    let len = block_len(mem, ptr).unwrap_or(0);
+    let len = array_len(mem, ptr).unwrap_or(0);
     for i in 0..len {
         if let Some(elem) = array_elem_bits(mem, ptr, i)
             && strict_eq_bits(elem, needle, mem)
@@ -298,7 +308,7 @@ fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
 /// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
 /// except that `NaN` matches `NaN`.
 fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
-    let len = block_len(mem, ptr).unwrap_or(0);
+    let len = array_len(mem, ptr).unwrap_or(0);
     (0..len).any(|i| {
         array_elem_bits(mem, ptr, i).is_some_and(|elem| {
             strict_eq_bits(elem, needle, mem)
@@ -392,7 +402,7 @@ fn array_slice<W: Send + 'static>(
     a: i64,
     b: i64,
 ) -> Option<u64> {
-    let len = block_len(mem, ptr)?;
+    let len = array_len(mem, ptr)?;
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
     let elems = (start..end)

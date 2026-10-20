@@ -72,10 +72,8 @@ const FUNC_CLASS_CTOR: i32 = abi::FUNC_FLAG_CLASS_CTOR as i32;
 /// [`LAZY_FN_MASK`]: kind byte `TYPE_FUNCTION`, `flags` bit `LAZY`.
 const LAZY_FN_WORD: i32 = TYPE_FUNCTION | FUNC_LAZY << 16;
 const LAZY_FN_MASK: i32 = 0xFF | FUNC_LAZY << 16;
-/// Byte offset of a string's (or array's) u32 length, and of its payload.
+/// Byte offset of a string's u32 length, and of its payload.
 const LEN: u64 = HEADER_SIZE as u64;
-const PAYLOAD: u64 = (HEADER_SIZE + 4) as u64;
-/// [`PAYLOAD`] as an `i32` address addend.
 const PAYLOAD_I32: i32 = HEADER_SIZE + 4;
 
 /// The 32-bit FNV-1a offset basis and prime the intern table hashes with.
@@ -215,7 +213,7 @@ pub(super) fn emit_key_lookup(
 }
 
 /// Push `1` when the i32 kind byte in `local` is a string or an array (the two
-/// kinds with exotic own keys and no `props` slot), else `0`.
+/// kinds with exotic own keys; an array's `props` table stays empty), else `0`.
 fn emit_is_string_or_array_kind(function: &mut Function, local: u32) {
     wasm!(function;
         LocalGet(local), I32Const(TYPE_STRING), I32Eq,
@@ -229,10 +227,25 @@ fn emit_box_heap(function: &mut Function) {
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
 }
 
-/// Push the address of element `i` (i32 local) of the array whose base is in
-/// i32 local `arr`.
+/// Push the address of element `i` (i32 local) of the array whose handle base
+/// is in i32 local `arr`, less [`ELEMS_DATA_OFFSET`] (the load/store `MemArg`
+/// adds it).
 fn emit_elem_addr(function: &mut Function, arr: u32, i: u32) {
-    wasm!(function; LocalGet(arr), LocalGet(i), I32Const(3), I32Shl, I32Add);
+    wasm!(function;
+        LocalGet(arr), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalGet(i), I32Const(3), I32Shl, I32Add,
+    );
+}
+
+/// Push the u32 length of the string or array whose base is in i32 local `o`.
+fn emit_exotic_len(function: &mut Function, o: u32) {
+    wasm!(function;
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_STRING), I32Eq,
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(o), I32Load(m32(LEN)),
+        Else,
+        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)),
+        End,
+    );
 }
 
 /// Invoke the accessor function value in i64 local `callee` with `this` = the
@@ -660,12 +673,19 @@ fn emit_exotic_get(
     wasm!(function;
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
         If(BlockType::Result(ValType::I64)),
-        LocalGet(o), I32Load(m32(LEN)), F64ConvertI32U, I64ReinterpretF64,
+    );
+    emit_exotic_len(function, o);
+    wasm!(function;
+        F64ConvertI32U, I64ReinterpretF64,
         Else,
         LocalGet(key), Call(helpers.index_value),
         I32Const(-1),
         LocalGet(key), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And, Select,
-        LocalTee(i), LocalGet(o), I32Load(m32(LEN)), I32LtU,
+        LocalTee(i),
+    );
+    emit_exotic_len(function, o);
+    wasm!(function;
+        I32LtU,
         If(BlockType::Result(ValType::I64)),
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Result(ValType::I64)),
@@ -675,7 +695,7 @@ fn emit_exotic_get(
     wasm!(function; Else);
     emit_elem_addr(function, o, i);
     wasm!(function;
-        I64Load(m64(PAYLOAD)),
+        I64Load(m64(ELEMS_DATA_OFFSET)),
         End,
         Else, I64Const(UNDEFINED_BITS), End,
         End,
@@ -820,7 +840,10 @@ pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
         LocalGet(key), Call(helpers.index_value),
         I32Const(-1),
         LocalGet(key), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And, Select,
-        LocalGet(o), I32Load(m32(LEN)), I32LtU,
+    );
+    emit_exotic_len(&mut f, o);
+    wasm!(f;
+        I32LtU,
         I32Or, Return,
         End,
         Loop(BlockType::Empty),
@@ -929,7 +952,10 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         If(BlockType::Empty),
         // Indices 0..len as decimal strings.
-        LocalGet(o), I32Load(m32(LEN)), LocalTee(j), Call(new_array), LocalSet(out),
+    );
+    emit_exotic_len(&mut f, o);
+    wasm!(f;
+        LocalTee(j), Call(new_array), LocalSet(out),
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(j), I32GeU, BrIf(1),
@@ -938,7 +964,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f; LocalGet(i), Call(helpers.index_string));
     emit_box_heap(&mut f);
     wasm!(f;
-        I64Store(m64(PAYLOAD)),
+        I64Store(m64(ELEMS_DATA_OFFSET)),
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
@@ -971,13 +997,14 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         LocalGet(i), I32Eqz, BrIf(1),
     );
     // if index_value(out[i - 1]) <= n: break; else out[i] = out[i - 1].
-    wasm!(f; LocalGet(out), LocalGet(i), I32Const(1), I32Sub, I32Const(3), I32Shl, I32Add,
-        I64Load(m64(PAYLOAD)), LocalTee(kv), I32WrapI64, Call(helpers.index_value),
+    wasm!(f; LocalGet(out), I32Load(m32(ARRAY_ELEMS_OFFSET)),
+        LocalGet(i), I32Const(1), I32Sub, I32Const(3), I32Shl, I32Add,
+        I64Load(m64(ELEMS_DATA_OFFSET)), LocalTee(kv), I32WrapI64, Call(helpers.index_value),
         LocalGet(n), I32LeU, BrIf(1),
     );
     emit_elem_addr(&mut f, out, i);
     wasm!(f;
-        LocalGet(kv), I64Store(m64(PAYLOAD)),
+        LocalGet(kv), I64Store(m64(ELEMS_DATA_OFFSET)),
         LocalGet(i), I32Const(1), I32Sub, LocalSet(i),
         Br(0),
         End, End,
@@ -986,7 +1013,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f; LocalGet(k));
     emit_box_heap(&mut f);
     wasm!(f;
-        I64Store(m64(PAYLOAD)),
+        I64Store(m64(ELEMS_DATA_OFFSET)),
         LocalGet(j), I32Const(1), I32Add, LocalSet(j),
         End,
     );
@@ -1004,13 +1031,13 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f; LocalGet(k));
     emit_box_heap(&mut f);
     wasm!(f;
-        I64Store(m64(PAYLOAD)),
+        I64Store(m64(ELEMS_DATA_OFFSET)),
         LocalGet(j), I32Const(1), I32Add, LocalSet(j),
         End,
     );
     entry_loop_tail(&mut f);
     wasm!(f;
-        LocalGet(out), LocalGet(j), I32Store(m32(LEN)),
+        LocalGet(out), LocalGet(j), I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
         // Values / entries: map each key in place.
         LocalGet(mode), I32Const(OWN_VALUES), I32Eq,
@@ -1021,7 +1048,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         LocalGet(i), LocalGet(j), I32GeU, BrIf(1),
     );
     emit_elem_addr(&mut f, out, i);
-    wasm!(f; I64Load(m64(PAYLOAD)), LocalSet(kv));
+    wasm!(f; I64Load(m64(ELEMS_DATA_OFFSET)), LocalSet(kv));
     emit_is_string_or_array_kind(&mut f, t);
     wasm!(f;
         If(BlockType::Result(ValType::I64)),
@@ -1033,7 +1060,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f; Else);
     emit_elem_addr(&mut f, o, i);
     wasm!(f;
-        I64Load(m64(PAYLOAD)),
+        I64Load(m64(ELEMS_DATA_OFFSET)),
         End,
         Else,
         LocalGet(obj), LocalGet(kv), I32WrapI64, Call(helpers.get),
@@ -1041,15 +1068,17 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         LocalSet(val),
         LocalGet(mode), I32Const(OWN_ENTRIES), I32Eq,
         If(BlockType::Empty),
-        I32Const(2), Call(new_array), LocalTee(x), LocalGet(kv), I64Store(m64(PAYLOAD)),
-        LocalGet(x), LocalGet(val), I64Store(m64(PAYLOAD + 8)),
+        I32Const(2), Call(new_array), LocalTee(x),
+        I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalGet(kv), I64Store(m64(ELEMS_DATA_OFFSET)),
+        LocalGet(x), I32Load(m32(ARRAY_ELEMS_OFFSET)),
+        LocalGet(val), I64Store(m64(ELEMS_DATA_OFFSET + 8)),
         LocalGet(x),
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalSet(val), End);
     emit_elem_addr(&mut f, out, i);
     wasm!(f;
-        LocalGet(val), I64Store(m64(PAYLOAD)),
+        LocalGet(val), I64Store(m64(ELEMS_DATA_OFFSET)),
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
@@ -1065,14 +1094,14 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
 /// whose base is in i32 local `arr`, else `0` (`i`/`n` are i32 scratch).
 fn emit_array_contains(function: &mut Function, arr: u32, needle: u32, i: u32, n: u32) {
     wasm!(function;
-        LocalGet(arr), I32Load(m32(LEN)), LocalSet(n),
+        LocalGet(arr), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), LocalSet(i),
         Block(BlockType::Result(ValType::I32)), Loop(BlockType::Empty),
         I32Const(0), LocalGet(i), LocalGet(n), I32GeU, BrIf(1), Drop,
     );
     emit_elem_addr(function, arr, i);
     wasm!(function;
-        I64Load(m64(PAYLOAD)), LocalGet(needle), I64Eq,
+        I64Load(m64(ELEMS_DATA_OFFSET)), LocalGet(needle), I64Eq,
         If(BlockType::Empty), I32Const(1), Br(2), End,
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
@@ -1120,30 +1149,22 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         I32Eqz, BrIf(1),
         LocalGet(cur), I32Const(OWN_ALL), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
-        I32Load(m32(LEN)), LocalSet(n),
+        I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
     );
     emit_elem_addr(&mut f, ks, i);
-    wasm!(f; I64Load(m64(PAYLOAD)), LocalSet(k), LocalGet(seen), I32WrapI64, LocalSet(o));
+    wasm!(f; I64Load(m64(ELEMS_DATA_OFFSET)), LocalSet(k), LocalGet(seen), I32WrapI64, LocalSet(o));
     emit_array_contains(&mut f, o, k, j, m);
     wasm!(f;
         I32Eqz,
         If(BlockType::Empty),
-        LocalGet(o), LocalGet(k), Call(helpers.array_push),
-    );
-    emit_box_heap(&mut f);
-    wasm!(f;
-        LocalSet(seen),
+        LocalGet(o), LocalGet(k), Call(helpers.array_push), Drop,
         LocalGet(cur), I32WrapI64, LocalGet(k), I32WrapI64, Call(helpers.prop_find),
         I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And,
         If(BlockType::Empty),
-        LocalGet(out), I32WrapI64, LocalGet(k), Call(helpers.array_push),
-    );
-    emit_box_heap(&mut f);
-    wasm!(f;
-        LocalSet(out),
+        LocalGet(out), I32WrapI64, LocalGet(k), Call(helpers.array_push), Drop,
         End,
         End,
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
@@ -1176,7 +1197,7 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
     emit_object_prefix(&mut f, dst, TYPE_OBJECT);
     wasm!(f;
         LocalGet(src), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
-        I32Load(m32(LEN)), LocalSet(n),
+        I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         LocalGet(excl), I32WrapI64, LocalSet(x),
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -1184,7 +1205,7 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
     );
     emit_elem_addr(&mut f, ks, i);
     wasm!(f;
-        I64Load(m64(PAYLOAD)), I32Const(1), Call(helpers.to_key), LocalTee(j),
+        I64Load(m64(ELEMS_DATA_OFFSET)), I32Const(1), Call(helpers.to_key), LocalTee(j),
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalSet(k));

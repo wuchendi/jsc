@@ -129,32 +129,68 @@ pub(super) fn emit_new_string(alloc: u32) -> Function {
     function
 }
 
-/// Emit the exported `__new_array(len: i32) -> i32` constructor: a
-/// [`TYPE_ARRAY`] block `[1][0×3][len:u32][elem:i64 × len]` with every element
-/// `undefined`. Local 0 is `len`; local 1 the base; local 2 the element cursor.
-pub(super) fn emit_new_array(alloc: u32) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
-    let (len, base, at) = (0, 1, 2);
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(3));
-    function.instruction(&Instruction::I32Shl);
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::I32Add);
-    emit_new_block(&mut function, alloc, base, TYPE_ARRAY);
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
+/// A 4-byte-aligned `u32` [`MemArg`] at `offset`.
+fn mem32(offset: u64) -> MemArg {
+    MemArg {
+        offset,
         align: 2,
         memory_index: 0,
-    }));
-    // for (at = base; at < base + 8 * len; at += 8) *(at + 8) = undefined.
+    }
+}
+
+/// An 8-byte-aligned `i64` [`MemArg`] at `offset`.
+fn mem64(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+/// Emit `store = __alloc(8 + 8 * cap)` as a [`TYPE_ELEMS`] block with its
+/// `cap` written, leaving the base in local `store`.
+fn emit_new_elems(function: &mut Function, alloc: u32, cap: u32, store: u32) {
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
+    function.instruction(&Instruction::I32Add);
+    emit_new_block(function, alloc, store, TYPE_ELEMS);
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::I32Store(mem32(ELEMS_CAP_OFFSET)));
+}
+
+/// Emit the exported `__new_array(len: i32) -> i32` constructor: a
+/// [`TYPE_ARRAY`] handle with `len` set and, when `len > 0`, a `cap = len`
+/// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
+/// locals 1/2/3 the handle base, the store base, and the element cursor.
+pub(super) fn emit_new_array(alloc: u32) -> Function {
+    let mut function = Function::new(vec![(3, ValType::I32)]);
+    let (len, base, store, at) = (0, 1, 2, 3);
+    function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
+    function.instruction(&Instruction::Call(alloc));
+    function.instruction(&Instruction::LocalSet(base));
+    emit_object_prefix(&mut function, base, TYPE_ARRAY);
     function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    emit_new_elems(&mut function, alloc, len, store);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
+    // for (at = store; at < store + 8 * len; at += 8) *(at + 8) = undefined.
+    function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::LocalSet(at));
     function.instruction(&Instruction::Block(BlockType::Empty));
     function.instruction(&Instruction::Loop(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(at));
-    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(3));
     function.instruction(&Instruction::I32Shl);
@@ -163,16 +199,13 @@ pub(super) fn emit_new_array(alloc: u32) -> Function {
     function.instruction(&Instruction::BrIf(1));
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 3,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(at));
     function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalGet(base));
@@ -622,164 +655,171 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the `__array_push(base: i32, value: i64) -> i32` array grower.
+/// Emit the `__array_reserve(base: i32, need: i32)` store grower.
 ///
-/// The bump allocator has no free list, so growing a fixed-size array block means
-/// allocating a fresh, larger block and abandoning the old one. It reads the u32
-/// `len` header at `base + HEADER_SIZE`, bump-allocates `HEADER_SIZE + 4 + 8*(len +
-/// 1)` bytes via `__alloc` (at `alloc_index`), `memory.copy`s the entire old block
-/// prefix (`TYPE_ARRAY` byte + `len` header + `len` element slots) into it, appends
-/// `value` at the new last slot (`dst + HEADER_SIZE + 4 + 8*len`), bumps the length
-/// header to `len + 1`, and returns the new block base. The two params occupy
-/// locals 0/1; two extra `i32` locals hold `len` and `dst`.
-pub(super) fn emit_array_push(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
-    let (base, value, len, dst) = (0, 1, 2, 3);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let payload = (HEADER_SIZE + 4) as u64;
+/// When the array handle's capacity (the `cap` of its [`TYPE_ELEMS`] store, `0`
+/// with no store) is below `need`, it allocates a fresh store of
+/// `cap' = max(need, 4, 2 * cap)` slots, `memory.copy`s the `len` live slots
+/// into it, and repoints the handle's `elems`; the handle never moves. Locals
+/// 0/1 are the params; extra `i32` locals hold the old store, `cap`, and the
+/// new store.
+pub(super) fn emit_array_reserve(alloc_index: u32) -> Function {
+    let mut function = Function::new(vec![(3, ValType::I32)]);
+    let (base, need, old, cap, store) = (0, 1, 2, 3, 4);
 
-    // len = load u32 header at base + HEADER_SIZE.
+    // old = base.elems; cap = old ? old.cap : 0.
     function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(len));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalTee(old));
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Load(mem32(ELEMS_CAP_OFFSET)));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalTee(cap));
+    // if cap >= need: nothing to do.
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
 
-    // dst = __alloc(HEADER_SIZE + 4 + 8*(len + 1)); leave dst in its local.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(len));
+    // cap = max(4, 2 * cap); cap = max(cap, need).
+    function.instruction(&Instruction::LocalGet(cap));
     function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::LocalTee(cap));
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::I32GtU);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::LocalTee(cap));
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::I32GtU);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::LocalSet(cap));
+    emit_new_elems(&mut function, alloc_index, cap, store);
 
-    // memory.copy(dst, base, HEADER_SIZE + 4 + 8*len): the type byte, the u32 len
-    // header, and every existing element slot.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
+    // if old: memory.copy(store + 8, old + 8, 8 * len).
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::MemoryCopy {
         src_mem: 0,
         dst_mem: 0,
     });
+    function.instruction(&Instruction::End);
 
-    // Append value at dst + HEADER_SIZE + 4 + 8*len.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(value));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload,
-        align: 0,
-        memory_index: 0,
-    }));
-
-    // Bump the u32 len header to len + 1.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(header));
-
-    // Return the new block base.
-    function.instruction(&Instruction::LocalGet(dst));
+    // base.elems = store.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::End);
     function
 }
 
-/// Emit the `__array_concat(dst: i32, src: i32) -> i32` array joiner.
-///
-/// Like [`emit_array_push`], the bump allocator has no free list, so appending
-/// one array's elements to another means allocating a fresh block. It reads the
-/// u32 `len` headers of both source blocks, bump-allocates `HEADER_SIZE + 4 +
-/// 8*(dlen + slen)` bytes via `__alloc` (at `alloc_index`), `memory.copy`s the
-/// `dst` prefix (`TYPE_ARRAY` byte + `dlen` header + `dlen` element slots) into
-/// it, `memory.copy`s `src`'s `slen` element slots right after them, writes the
-/// combined length header, and returns the new block base. The two params occupy
-/// locals 0/1; three extra `i32` locals hold `dlen`, `slen`, and `nb`.
-pub(super) fn emit_array_concat(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(3, ValType::I32)]);
-    let (dst, src, dlen, slen, nb) = (0, 1, 2, 3, 4);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let prefix = HEADER_SIZE + 4;
+/// Emit the `__array_push(base: i32, value: i64) -> i32` in-place appender:
+/// `__array_reserve(base, len + 1)`, store `value` at slot `len` of the
+/// element store, bump `len`, and return the (unchanged) handle base. The two
+/// params occupy locals 0/1; an extra `i32` local holds `len`.
+pub(super) fn emit_array_push(reserve_index: u32) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
+    let (base, value, len) = (0, 1, 2);
 
-    // dlen = load u32 header at dst + HEADER_SIZE; slen = same for src.
+    // len = base.len; __array_reserve(base, len + 1).
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalTee(len));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::Call(reserve_index));
+
+    // base.elems[len] = value.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
+
+    // base.len = len + 1; return base.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// Emit the `__array_concat(dst: i32, src: i32) -> i32` in-place joiner:
+/// `__array_reserve(dst, dlen + slen)`, `memory.copy` `src`'s `slen` element
+/// slots right after `dst`'s, write the combined length, and return `dst`.
+/// The two params occupy locals 0/1; two extra `i32` locals hold `dlen` and
+/// `slen`.
+pub(super) fn emit_array_concat(reserve_index: u32) -> Function {
+    let mut function = Function::new(vec![(2, ValType::I32)]);
+    let (dst, src, dlen, slen) = (0, 1, 2, 3);
+
+    // dlen = dst.len; slen = src.len; an empty `src` leaves `dst` as is.
     function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(dlen));
     function.instruction(&Instruction::LocalGet(src));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(slen));
-
-    // nb = __alloc(HEADER_SIZE + 4 + 8*(dlen + slen)); leave nb in its local.
-    function.instruction(&Instruction::I32Const(prefix));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalTee(slen));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // __array_reserve(dst, dlen + slen).
+    function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(dlen));
     function.instruction(&Instruction::LocalGet(slen));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(nb));
-
-    // memory.copy(nb, dst, HEADER_SIZE + 4 + 8*dlen): the type byte, the u32 len
-    // header, and every `dst` element slot.
-    function.instruction(&Instruction::LocalGet(nb));
+    function.instruction(&Instruction::Call(reserve_index));
+    // memory.copy(dst.elems + 8 + 8 * dlen, src.elems + 8, 8 * slen).
     function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(prefix));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalGet(dlen));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-
-    // memory.copy(nb + HEADER_SIZE + 4 + 8*dlen, src + HEADER_SIZE + 4, 8*slen):
-    // append `src`'s element slots right after `dst`'s.
-    function.instruction(&Instruction::LocalGet(nb));
-    function.instruction(&Instruction::I32Const(prefix));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(dlen));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(src));
-    function.instruction(&Instruction::I32Const(prefix));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(slen));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::MemoryCopy {
         src_mem: 0,
         dst_mem: 0,
     });
-
-    // Write the combined u32 len header (dlen + slen) at nb + HEADER_SIZE.
-    function.instruction(&Instruction::LocalGet(nb));
+    // dst.len = dlen + slen.
+    function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(dlen));
     function.instruction(&Instruction::LocalGet(slen));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(header));
-
-    // Return the new block base.
-    function.instruction(&Instruction::LocalGet(nb));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::End);
     function
 }
@@ -1021,16 +1061,7 @@ pub(super) fn emit_json_str(
     let v = 0;
     let (ptr, tb, n, k, first, acc) = (1, 2, 3, 4, 5, 6);
     let (elem, key, val) = (7, 8, 9);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let elem_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 3,
-        memory_index: 0,
-    };
+    let elem_slot = mem64(ELEMS_DATA_OFFSET);
 
     // Emit `acc = concat(acc, <piece already on stack>)` — the piece expression
     // must already be pushed by the caller right before invoking this.
@@ -1067,7 +1098,7 @@ pub(super) fn emit_json_str(
     function.instruction(&Instruction::I32Const(tokens.lbrack));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(n));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::LocalSet(first));
@@ -1078,8 +1109,10 @@ pub(super) fn emit_json_str(
     function.instruction(&Instruction::LocalGet(n));
     function.instruction(&Instruction::I32LtU);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // elem = load_i64(ptr + 8*k + elem_slot).
+    // elem = load_i64(ptr.elems + 8*k + elem_slot) (the store is reloaded: a
+    // nested getter may grow the array).
     function.instruction(&Instruction::LocalGet(ptr));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalGet(k));
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
@@ -1136,7 +1169,7 @@ pub(super) fn emit_json_str(
     function.instruction(&Instruction::Call(own_keys_index));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalTee(ptr));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(n));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::LocalSet(first));
@@ -1149,6 +1182,7 @@ pub(super) fn emit_json_str(
     function.instruction(&Instruction::If(BlockType::Empty));
     // key = keys[k]; val = __get(v, key).
     function.instruction(&Instruction::LocalGet(ptr));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalGet(k));
     function.instruction(&Instruction::I32Const(3));
     function.instruction(&Instruction::I32Shl);
@@ -1435,41 +1469,21 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
 /// `s` is a heap-string jsval; the returned jsval is a boxed heap array. Fixes
 /// the pre-existing garbage-value bug where `[...str]` fell through to
 /// `__array_concat` (which reinterpreted the string's UTF-8 bytes as jsvals).
-pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Function {
-    let mut function = Function::new(vec![(4, ValType::I32)]);
-    let (s, ptr, len, arr, i) = (0, 1, 2, 3, 4);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
+pub(super) fn emit_str_to_array(new_array_index: u32, str_index_index: u32) -> Function {
+    let mut function = Function::new(vec![(5, ValType::I32)]);
+    let (s, ptr, len, arr, i, store) = (0, 1, 2, 3, 4, 5);
 
     // ptr = wrap(s); len = load_u32(ptr + HEADER_SIZE) (the string's byte length).
     function.instruction(&Instruction::LocalGet(s));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(ptr));
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(len));
-
-    // arr = __alloc(HEADER_SIZE + 4 + 8*len); write TYPE_ARRAY + u32 len header.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::LocalTee(ptr));
+    function.instruction(&Instruction::I32Load(mem32(HEADER_SIZE as u64)));
+    function.instruction(&Instruction::LocalTee(len));
+    // arr = __new_array(len); store = arr.elems.
+    function.instruction(&Instruction::Call(new_array_index));
+    function.instruction(&Instruction::LocalTee(arr));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalSet(store));
 
     // Fill element k = box(__str_index(ptr, k)) for k in 0..len; `i` starts at 0.
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -1478,11 +1492,11 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
-    // address = arr + 8*i (element slot at MemArg offset HEADER_SIZE + 4).
-    function.instruction(&Instruction::LocalGet(arr));
+    // address = store + 8*i (element slot at MemArg offset ELEMS_DATA_OFFSET).
+    function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::I32Add);
     // value = HEAP_BITS | extend_u(__str_index(ptr, i)).
     function.instruction(&Instruction::LocalGet(ptr));
@@ -1491,11 +1505,7 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
     function.instruction(&Instruction::LocalGet(i));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
@@ -1504,12 +1514,11 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 
-    // Rebox the array block base as a heap jsval.
+    // Rebox the array handle base as a heap jsval.
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
-    // Close the function body.
     function.instruction(&Instruction::End);
     function
 }
@@ -1517,20 +1526,16 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
 /// Emit the `__map_find(handle: i32, key: i64) -> i32` Map/Set lookup.
 ///
 /// `handle` is the base of a `TYPE_MAP`/`TYPE_SET` block; its `entries` slot (at
-/// [`MAP_ENTRIES_OFFSET`]) holds the backing array jsval. Reads the array's u32 `len`
-/// header, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
+/// [`MAP_ENTRIES_OFFSET`]) holds the backing array jsval. Reads the array's
+/// `len` and element store, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
 /// returning the byte ADDRESS of the first slot whose value is `__same_value_zero` (at
 /// `svz_index`) to `key`, or `-1` on a miss. The value slot sits 8 bytes past the
 /// returned address. Params occupy locals 0/1; four extra `i32` locals hold the
-/// backing base, its length, the loop index, and the current slot address.
+/// backing element store, its length, the loop index, and the current slot
+/// address.
 pub(super) fn emit_map_find(svz_index: u32) -> Function {
     let mut function = Function::new(vec![(4, ValType::I32)]);
-    let (handle, key, arr, len, i, slot) = (0, 1, 2, 3, 4, 5);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
+    let (handle, key, store, len, i, slot) = (0, 1, 2, 3, 4, 5);
     let entries_slot = MemArg {
         offset: MAP_ENTRIES_OFFSET,
         align: 3,
@@ -1542,14 +1547,16 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
         memory_index: 0,
     };
 
-    // arr = wrap(load_i64(handle + entries_slot)); len = load_u32(arr + HEADER_SIZE).
+    // arr = wrap(load_i64(handle + entries_slot)); len = arr.len; store = arr.elems.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::I64Load(entries_slot));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::LocalTee(store));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(len));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalSet(store));
 
     // Scan even key slots; `i` starts at 0 (the fresh local's default).
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -1559,13 +1566,13 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
-    // slot = arr + HEADER_SIZE + 4 + 8*i.
-    function.instruction(&Instruction::LocalGet(arr));
+    // slot = store + ELEMS_DATA_OFFSET + 8*i.
+    function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::LocalGet(i));
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(slot));
     // if __same_value_zero(load_i64(slot), key) { return slot }.
@@ -1595,11 +1602,10 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
 /// Emit the `__map_set(handle: i32, key: i64, val: i64)` Map/Set insert-or-update.
 /// Looks the key up with `__map_find` (at `map_find_index`): on a hit it
 /// overwrites the value slot (8 bytes past the found key slot); on a miss it appends
-/// `key` then `val` to the growable backing via `__array_push` (at
-/// `array_push_index`) — reboxing and REWRITING the handle's `entries` slot in place
-/// since the backing base moves on growth — and bumps the u32 `size` header by one.
-/// `set.add` reuses this with `val = undefined`. Params occupy locals 0/1/2; two
-/// extra `i32` locals hold the found address and the backing base.
+/// `key` then `val` to the backing array in place via `__array_push` (at
+/// `array_push_index`) and bumps the u32 `size` header by one. `set.add` reuses
+/// this with `val = undefined`. Params occupy locals 0/1/2; two extra `i32`
+/// locals hold the found address and the backing array base.
 pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Function {
     let mut function = Function::new(vec![(2, ValType::I32)]);
     let (handle, key, val, addr, arr) = (0, 1, 2, 3, 4);
@@ -1641,22 +1647,13 @@ pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Functi
     function.instruction(&Instruction::I64Load(entries_slot));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(arr));
-    // arr = __array_push(arr, key); arr = __array_push(arr, val).
+    // __array_push(arr, key); __array_push(arr, val).
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(key));
     function.instruction(&Instruction::Call(array_push_index));
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(val));
     function.instruction(&Instruction::Call(array_push_index));
-    function.instruction(&Instruction::LocalSet(arr));
-    // Rewrite the handle's entries slot with the reboxed (grown) backing base.
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::I64Store(entries_slot));
+    function.instruction(&Instruction::Drop);
     // size += 1.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::LocalGet(handle));
@@ -1715,17 +1712,12 @@ pub(super) fn emit_map_has(map_find_index: u32) -> Function {
 /// Looks the key up with `__map_find` (at `map_find_index`); on a miss returns `0`.
 /// On a hit it COMPACTS the two-slot `(key, value)` entry out of the backing array —
 /// `memory.copy` shifts every trailing pair down one entry (16 bytes) — decrements
-/// the backing's u32 `len` header by 2 and the handle's u32 `size` header by 1, and
+/// the backing's u32 `len` by 2 and the handle's u32 `size` header by 1, and
 /// returns `1`. Params occupy locals 0/1; four extra `i32` locals hold the found
 /// address, the backing base, its length, and the shift byte count.
 pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
     let mut function = Function::new(vec![(4, ValType::I32)]);
     let (handle, key, addr, arr, len, count) = (0, 1, 2, 3, 4, 5);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
     let entries_slot = MemArg {
         offset: MAP_ENTRIES_OFFSET,
         align: 3,
@@ -1749,18 +1741,20 @@ pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
 
-    // arr = wrap(load_i64(handle + entries_slot)); len = load_u32(arr + HEADER_SIZE).
+    // arr = wrap(load_i64(handle + entries_slot)); len = arr.len.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::I64Load(entries_slot));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(arr));
     function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(len));
 
-    // count = (arr + HEADER_SIZE + 4 + 8*len) - (addr + 16): trailing bytes to move.
+    // count = (arr.elems + ELEMS_DATA_OFFSET + 8*len) - (addr + 16): trailing
+    // bytes to move.
     function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(8));
@@ -1788,7 +1782,7 @@ pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(2));
     function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
     // size -= 1.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::LocalGet(handle));
