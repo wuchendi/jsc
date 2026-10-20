@@ -461,9 +461,14 @@ pub(super) fn emit_map_new_node(
         align: 2,
         memory_index: 0,
     };
+    let size_slot = MemArg {
+        offset: MAP_SIZE_OFFSET,
+        align: 2,
+        memory_index: 0,
+    };
     let entries_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+        offset: MAP_ENTRIES_OFFSET,
+        align: 3,
         memory_index: 0,
     };
 
@@ -478,20 +483,15 @@ pub(super) fn emit_map_new_node(
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Store(header));
 
-    // Handle: __alloc(MAP_BLOCK_SIZE); type byte; size = 0; entries = rebox(earr).
+    // Handle: __alloc(MAP_BLOCK_SIZE); object prefix; size = 0;
+    // entries = rebox(earr).
     function.instruction(&Instruction::I32Const(MAP_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(if set {
-        TYPE_SET
-    } else {
-        TYPE_MAP
-    }));
-    function.instruction(&Instruction::I32Store8(type_byte));
+    emit_object_prefix(function, dst, if set { TYPE_SET } else { TYPE_MAP });
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::I32Store(size_slot));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(earr));
     function.instruction(&Instruction::I64ExtendI32U);
@@ -517,7 +517,7 @@ fn date_ms_slot() -> MemArg {
 
 /// Emit `new Date()` / `new Date(ms)`, leaving the fresh `TYPE_DATE`
 /// handle jsval on the stack. A [`DATE_BLOCK_SIZE`] block is bump-allocated; its
-/// type byte is written and its f64 payload set to the millisecond timestamp —
+/// object-family prefix is written and its f64 payload set to the millisecond timestamp —
 /// either `ms` (a number jsval, whose raw i64 IS the f64 bit pattern, reinterpreted
 /// here) or, when `ms` is `None`, the host wall clock (`__now`, already an f64).
 pub(super) fn emit_date_new_node(
@@ -528,19 +528,12 @@ pub(super) fn emit_date_new_node(
     helpers: Helpers<'_>,
 ) {
     let dst = scratch + 3;
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
 
-    // dst = __alloc(DATE_BLOCK_SIZE); write the TYPE_DATE byte.
+    // dst = __alloc(DATE_BLOCK_SIZE); write the TYPE_DATE object prefix.
     function.instruction(&Instruction::I32Const(DATE_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_DATE));
-    function.instruction(&Instruction::I32Store8(type_byte));
+    emit_object_prefix(function, dst, TYPE_DATE);
 
     // ms slot = f64 timestamp. Push the store address, then the f64 value.
     function.instruction(&Instruction::LocalGet(dst));
@@ -1449,10 +1442,16 @@ fn emit_index_string_key(
 
 /// Push the length header of the array/string in `s0` as a number jsval.
 fn emit_len_boxed(function: &mut Function, s0: u32) {
+    emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
+}
+
+/// Push the u32 field at byte `offset` of the block whose jsval is in `s0`,
+/// reboxed as a number jsval.
+fn emit_u32_field_boxed(function: &mut Function, s0: u32, offset: u64) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset,
         align: 2,
         memory_index: 0,
     }));
@@ -1544,8 +1543,8 @@ pub(super) fn emit_index_node(
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // size = u32 at s0 + HEADER_SIZE, reboxed as a number jsval.
-    emit_len_boxed(function, s0);
+    // size = u32 at s0 + MAP_SIZE_OFFSET, reboxed as a number jsval.
+    emit_u32_field_boxed(function, s0, MAP_SIZE_OFFSET);
     function.instruction(&Instruction::Else);
 
     // Runtime type-byte dispatch (if/else chain so only the matching path runs):
@@ -1981,14 +1980,14 @@ fn emit_index_set_object_accessor(
     function.instruction(&Instruction::LocalSet(base));
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     emit_argc(1, function);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));

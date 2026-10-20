@@ -18,6 +18,10 @@ use super::{
     PROMISE_PENDING, PROMISE_REJECTED, QNAN, TRUE, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION,
     TYPE_OBJECT, TYPE_PROMISE, TYPE_STRING, UNDEFINED,
 };
+use super::{
+    MAP_SIZE_OFFSET, OBJ_PREFIX_SIZE, PROMISE_BLOCK_SIZE, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, TYPE_GENERATOR, TYPE_MAP, TYPE_SET,
+};
 
 /// A parsed `export const` value.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,11 +53,19 @@ fn expected() -> Vec<(&'static str, Val)> {
         ("TYPE_ARRAY", int(TYPE_ARRAY)),
         ("TYPE_OBJECT", int(TYPE_OBJECT)),
         ("TYPE_FUNCTION", int(TYPE_FUNCTION)),
+        ("TYPE_MAP", int(TYPE_MAP)),
+        ("TYPE_SET", int(TYPE_SET)),
         ("TYPE_PROMISE", int(TYPE_PROMISE)),
+        ("TYPE_GENERATOR", int(TYPE_GENERATOR)),
         ("TYPE_DATE", int(TYPE_DATE)),
+        ("OBJ_PREFIX_SIZE", int(OBJ_PREFIX_SIZE)),
         ("PROMISE_PENDING", int(PROMISE_PENDING)),
         ("PROMISE_FULFILLED", int(PROMISE_FULFILLED)),
         ("PROMISE_REJECTED", int(PROMISE_REJECTED)),
+        ("MAP_SIZE_OFFSET", int(MAP_SIZE_OFFSET)),
+        ("PROMISE_STATE_OFFSET", int(PROMISE_STATE_OFFSET)),
+        ("PROMISE_VALUE_OFFSET", int(PROMISE_VALUE_OFFSET)),
+        ("PROMISE_BLOCK_SIZE", int(PROMISE_BLOCK_SIZE)),
         ("GEN_DONE_OFFSET", int(GEN_DONE_OFFSET)),
         ("DATE_MS_OFFSET", int(DATE_MS_OFFSET)),
         ("MEMORY_EXPORT_NAME", s(MEMORY_EXPORT_NAME)),
@@ -211,4 +223,67 @@ fn abi_ts_matches_rust_abi() {
         "abi.ts drifted from abi.rs:\n{}",
         errors.join("\n")
     );
+}
+
+/// Pins the object-family prefix and per-kind payload layouts to
+/// `design/object-model.md` table 2.2.
+#[test]
+fn object_family_layout_matches_design() {
+    use super::{
+        DATE_BLOCK_SIZE, FUNC_BLOCK_SIZE, FUNC_ENV_OFFSET, FUNC_INDEX_OFFSET, GEN_BLOCK_SIZE,
+        GEN_ENV_OFFSET, GEN_SM_IDX_OFFSET, GEN_STATE_OFFSET, MAP_BLOCK_SIZE, MAP_ENTRIES_OFFSET,
+        OBJ_PROPS_OFFSET, OBJ_PROTO_OFFSET,
+    };
+    let actual = [
+        ("OBJ_PROPS_OFFSET", OBJ_PROPS_OFFSET),
+        ("OBJ_PROTO_OFFSET", OBJ_PROTO_OFFSET),
+        ("OBJ_PREFIX_SIZE", OBJ_PREFIX_SIZE),
+        ("FUNC_INDEX_OFFSET", FUNC_INDEX_OFFSET),
+        ("FUNC_ENV_OFFSET", FUNC_ENV_OFFSET),
+        ("FUNC_BLOCK_SIZE", FUNC_BLOCK_SIZE),
+        ("MAP_SIZE_OFFSET", MAP_SIZE_OFFSET),
+        ("MAP_ENTRIES_OFFSET", MAP_ENTRIES_OFFSET),
+        ("MAP_BLOCK_SIZE", MAP_BLOCK_SIZE),
+        ("PROMISE_STATE_OFFSET", PROMISE_STATE_OFFSET),
+        ("PROMISE_VALUE_OFFSET", PROMISE_VALUE_OFFSET),
+        ("PROMISE_BLOCK_SIZE", PROMISE_BLOCK_SIZE),
+        ("GEN_SM_IDX_OFFSET", GEN_SM_IDX_OFFSET),
+        ("GEN_STATE_OFFSET", GEN_STATE_OFFSET),
+        ("GEN_DONE_OFFSET", GEN_DONE_OFFSET),
+        ("GEN_ENV_OFFSET", GEN_ENV_OFFSET),
+        ("GEN_BLOCK_SIZE", GEN_BLOCK_SIZE),
+        ("DATE_MS_OFFSET", DATE_MS_OFFSET),
+        ("DATE_BLOCK_SIZE", DATE_BLOCK_SIZE),
+    ];
+    let design = [
+        4, 8, 16, // prefix
+        16, 24, 32, // function
+        16, 24, 32, // map / set
+        16, 24, 32, // promise
+        16, 20, 24, 32, 40, // generator
+        16, 24, // date
+    ];
+    for ((name, got), want) in actual.iter().zip(design) {
+        assert_eq!(*got, want, "{name}");
+    }
+    // Every i64/f64 slot is 8-byte aligned; every block size is a BLOCK_ALIGN multiple.
+    for slot in [
+        OBJ_PROTO_OFFSET,
+        FUNC_ENV_OFFSET,
+        MAP_ENTRIES_OFFSET,
+        PROMISE_VALUE_OFFSET,
+        GEN_ENV_OFFSET,
+        DATE_MS_OFFSET,
+    ] {
+        assert_eq!(slot % 8, 0);
+    }
+    for size in [
+        FUNC_BLOCK_SIZE,
+        MAP_BLOCK_SIZE,
+        PROMISE_BLOCK_SIZE,
+        GEN_BLOCK_SIZE,
+        DATE_BLOCK_SIZE,
+    ] {
+        assert_eq!(size % super::BLOCK_ALIGN, 0);
+    }
 }

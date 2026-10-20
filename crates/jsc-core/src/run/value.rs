@@ -2,9 +2,9 @@
 //! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
 
 use super::{
-    DATE_MS_OFFSET, ERROR_KIND_KEY, HEADER_SIZE, PROMISE_FULFILLED, PROMISE_REJECTED, QNAN,
-    TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE,
-    TYPE_SET, TYPE_STRING,
+    DATE_MS_OFFSET, ERROR_KIND_KEY, HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED,
+    PROMISE_REJECTED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE,
+    TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -184,15 +184,15 @@ fn decode_date(ptr: usize, memory: &[u8]) -> Value {
 }
 
 /// Resolve a heap promise block at base `ptr` into a [`Value::Promise`]:
-/// the i32 `state` at `ptr + HEADER_SIZE` and the i64 settled `value` at
-/// `ptr + HEADER_SIZE + 4` (decoded recursively). Defensive: a truncated block
+/// the i32 `state` at `ptr + PROMISE_STATE_OFFSET` and the i64 settled `value`
+/// at `ptr + PROMISE_VALUE_OFFSET` (decoded recursively). Defensive: a truncated block
 /// reads as pending with an `undefined` value.
 fn decode_promise(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
-    let state_at = ptr + HEADER_SIZE;
+    let state_at = ptr + PROMISE_STATE_OFFSET;
     let state = memory
         .get(state_at..state_at + 4)
         .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap_or([0; 4])));
-    let val_at = state_at + 4;
+    let val_at = ptr + PROMISE_VALUE_OFFSET;
     let value = memory
         .get(val_at..val_at + 8)
         .map_or(Value::Undefined, |b| {
@@ -208,11 +208,11 @@ fn decode_promise(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     }
 }
 
-/// Read the u32 `size` header of a Map/Set handle block at base `ptr` (at
-/// `ptr + HEADER_SIZE`), the logical entry count. Defensive: an out-of-range
+/// Read the u32 `size` field of a Map/Set handle block at base `ptr` (at
+/// `ptr + MAP_SIZE_OFFSET`), the logical entry count. Defensive: an out-of-range
 /// header yields `0`, so a malformed pointer never panics.
 fn decode_size(ptr: usize, memory: &[u8]) -> usize {
-    let at = ptr + HEADER_SIZE;
+    let at = ptr + MAP_SIZE_OFFSET;
     memory.get(at..at + 4).map_or(0, |b| {
         u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
     })
