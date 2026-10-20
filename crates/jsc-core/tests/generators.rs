@@ -3,8 +3,8 @@
 //! Covers the user-approved v1 cut: `function*` declarations with `yield` in
 //! statement / `x = yield` / `return yield` positions, `.next(v)` returning
 //! `{ value, done }`, a persistent frame that survives across suspends, and the
-//! diagnostics for the out-of-scope forms (CUT A: yield in try/catch/finally; a
-//! non-generator `.next()` receiver). A `yield` nested in an expression is
+//! diagnostics for the out-of-scope forms (a non-generator `.next()` receiver).
+//! A `yield` may sit in a `try`, `catch` or `finally` clause. A `yield` nested in an expression is
 //! linearized with JS evaluation order; a `yield` inside `for-of`/`for-in`/
 //! `switch` crosses the loop/switch temporaries through frame cells.
 
@@ -515,31 +515,161 @@ fn a_switch_with_break_but_no_yield_inside_a_generator() {
     );
 }
 
+// --- yield/await inside try/catch/finally ------------------------------------
+
+#[test]
+fn yield_in_try_completes_normally() {
+    assert_output(
+        "function* g(){ try { yield 1; yield 2; } catch (e) { yield 99; } yield 3; }
+         console.log([...g()].join());",
+        "1,2,3\n",
+    );
+}
+
+#[test]
+fn a_throw_after_resume_is_caught_by_the_catch() {
+    assert_output(
+        "function* g(){ try { yield 1; throw new Error(\"x\") } catch (e) { yield e.message } }
+         console.log(JSON.stringify([...g()]));",
+        "[1,\"x\"]\n",
+    );
+}
+
+#[test]
+fn yield_inside_catch() {
+    assert_output(
+        "function* g(){ try { throw 5; } catch (e) { yield e; yield e + 1; } yield 0; }
+         console.log([...g()].join());",
+        "5,6,0\n",
+    );
+}
+
+#[test]
+fn yield_inside_finally_on_normal_completion() {
+    assert_output(
+        "function* g(){ try { yield 1; } finally { yield 2; console.log(\"fin\"); } yield 3; }
+         console.log([...g()].join());",
+        "fin\n1,2,3\n",
+    );
+}
+
+#[test]
+fn finally_runs_on_throw_then_rethrows_to_an_outer_try() {
+    assert_output(
+        "function* g(){
+           try { try { yield 1; throw new Error(\"boom\"); } finally { yield 2; } }
+           catch (e) { yield e.message; }
+         }
+         console.log([...g()].join());",
+        "1,2,boom\n",
+    );
+}
+
+#[test]
+fn finally_rethrow_escapes_the_generator_uncaught() {
+    assert_uncaught(
+        "function* g(){ try { yield 1; throw new Error(\"out\"); } finally { console.log(\"fin\"); } }
+         let it = g(); it.next(); it.next();",
+        "Error: out",
+    );
+}
+
+#[test]
+fn a_throw_out_of_the_generator_completes_it() {
+    assert_output(
+        "function* g(){ yield 1; throw new Error(\"x\"); yield 2; }
+         let it = g(); it.next();
+         try { it.next(); } catch (e) { console.log(e.message); }
+         let r = it.next(); console.log(r.value, r.done);",
+        "x\nundefined true\n",
+    );
+}
+
+#[test]
+fn return_inside_try_runs_finally_and_keeps_the_value() {
+    assert_output(
+        "function* g(){ try { yield 1; return 7; } finally { yield 2; console.log(\"fin\"); } }
+         let it = g();
+         let a = it.next(); console.log(a.value, a.done);
+         let b = it.next(); console.log(b.value, b.done);
+         let c = it.next(); console.log(c.value, c.done);
+         let d = it.next(); console.log(d.value, d.done);",
+        "1 false\n2 false\nfin\n7 true\nundefined true\n",
+    );
+}
+
+#[test]
+fn break_and_continue_out_of_a_try_in_a_loop_run_finally() {
+    assert_output(
+        "function* g(){
+           for (let i = 0; i < 5; i++) {
+             try {
+               if (i === 1) continue;
+               if (i === 3) break;
+               yield i;
+             } finally { yield \"f\" + i; }
+           }
+           yield \"end\";
+         }
+         console.log([...g()].join());",
+        "0,f0,f1,2,f2,f3,end\n",
+    );
+}
+
+#[test]
+fn nested_try_finally_runs_inner_then_outer() {
+    assert_output(
+        "function* g(){
+           try {
+             try { yield 1; return 9; } finally { yield \"inner\"; }
+           } finally { yield \"outer\"; }
+         }
+         let it = g(); let out = [];
+         for (let r = it.next(); ; r = it.next()) { out.push(r.value); if (r.done) break; }
+         console.log(out.join());",
+        "1,inner,outer,9\n",
+    );
+}
+
+#[test]
+fn a_callee_exception_after_resume_lands_in_the_right_handler() {
+    assert_output(
+        "function boom(){ throw new Error(\"callee\"); }
+         function* g(){
+           try {
+             try { yield 1; } catch (e) { yield \"wrong\"; }
+             yield 2;
+             boom();
+           } catch (e) { yield e.message; }
+         }
+         console.log([...g()].join());",
+        "1,2,callee\n",
+    );
+}
+
+#[test]
+fn an_exception_from_an_inner_generator_is_caught_across_resumes() {
+    assert_output(
+        "function* inner(){ yield 1; throw new Error(\"inner\"); }
+         function* outer(){
+           let it = inner();
+           try { yield it.next().value; yield it.next().value; } catch (e) { yield e.message; }
+         }
+         console.log([...outer()].join());",
+        "1,inner\n",
+    );
+}
+
+#[test]
+fn async_await_in_try_then_catch_resolves() {
+    assert_output(
+        "async function f(){ try { await 1; throw new Error(\"e\") } catch (x) { return x.message } }
+         f().then(v => console.log(v));",
+        "e\n",
+    );
+}
+
 // --- Diagnostics: the still-out-of-scope forms ------------------------------
-
-#[test]
-fn cut_a_rejects_yield_inside_try() {
-    // Exception-handler state across a suspend is out of scope.
-    assert_rejected("function* g(){ try { yield 1; } catch (e) {} }");
-    assert_rejected("function* g(){ try { doThing(); } finally { yield 1; } }");
-}
-
-#[test]
-fn unsupported_yield_positions_name_the_construct() {
-    let cases = [(
-        "function* g(){ try { yield 1; } catch (e) {} }",
-        "a `yield` inside try/catch/finally is not supported",
-    )];
-    for (src, expected) in cases {
-        let msg = jsc_core::run::compile_and_run(src)
-            .err()
-            .map(|err| err.to_string())
-            .unwrap_or_default();
-        assert_eq!(msg, expected, "diagnostic for `{src}`");
-    }
-}
-
-// --- A `yield` nested in an expression -----------------------------------
 
 #[test]
 fn a_nested_yield_preserves_evaluation_order() {

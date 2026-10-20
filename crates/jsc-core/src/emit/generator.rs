@@ -10,6 +10,12 @@
 //! state and re-dispatch. `gen.next(v)` ([`emit_gen_resume`]) drives it
 //! through `call_indirect`, resuming at `state` and reaching the frame's cells
 //! through the ordinary closure `EnvLoad` path.
+//!
+//! A block with an exception handler (a `try` crossing a suspend) is wrapped in a
+//! wasm landing pad registered on the [`Unwind`] handler stack: a throw inside it
+//! stores `gen.state = handler` and re-dispatches with the exception pending. The
+//! whole dispatch sits in an outermost landing pad, so an exception no block
+//! catches marks the generator done before it leaves the state machine.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -266,7 +272,10 @@ fn emit_result_object(
 /// segment. Each segment runs its straight-line statements and ends by either
 /// storing the next state and returning the yielded value (`done` stays `0`), or
 /// setting `done = 1` and returning the final value. Re-entry after completion
-/// hits the out-of-range default and returns `undefined`.
+/// hits the out-of-range default and returns `undefined`. A segment with a
+/// handler runs inside a landing pad that re-dispatches to the handler block on a
+/// throw; an uncaught throw lands in the outermost pad, which completes the
+/// generator and returns with the exception still pending.
 pub(super) fn emit_generator_sm(
     func: &IrFunction,
     strings: &HashMap<String, i32>,
@@ -296,6 +305,10 @@ pub(super) fn emit_generator_sm(
     // The generator handle is local 1 (a1); read/write `state`/`done` through it.
     let gen_local = 1;
 
+    // The outermost landing pad: the active handler wherever no `try` is, so an
+    // uncaught throw completes the generator (below) instead of returning with
+    // `state` unchanged.
+    open_landing_pad(&mut function, helpers);
     // A `loop` wraps the whole dispatch so a `Jump`/`Branch` terminator can store
     // the next block index and `br` back to re-dispatch (CFG flattening). Inside
     // it, one `block` per basic block plus a trailing out-of-range default, then a
@@ -304,6 +317,7 @@ pub(super) fn emit_generator_sm(
     // / a `return`) or by re-dispatching (`Jump`/`Branch`).
     function.instruction(&Instruction::Loop(BlockType::Empty));
     enter_frame(helpers);
+    let loop_depth = helpers.unwind.borrow().depth;
     for _ in 0..=n {
         function.instruction(&Instruction::Block(BlockType::Empty));
         enter_frame(helpers);
@@ -322,6 +336,16 @@ pub(super) fn emit_generator_sm(
         // Close this block's dispatch frame; its code follows the `End`.
         function.instruction(&Instruction::End);
         leave_frame(helpers);
+        // A guarded block runs inside its landing pad, the innermost handler.
+        if segment.handler.is_some() {
+            open_landing_pad(&mut function, helpers);
+        }
+        // A handler block is entered with the exception pending: clear it (the
+        // thrown value stays in `$exc_value` for the block to read).
+        if segment.catches {
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
+        }
         emit_stmts(
             &segment.stmts,
             &mut function,
@@ -331,9 +355,8 @@ pub(super) fn emit_generator_sm(
             None,
             None,
         );
-        // The `loop` sits at depth 1 (reset = 0, the loop is the first frame), so a
-        // re-dispatch `br` targets `unwind.depth - 1` from wherever we are now.
-        let loop_rel = helpers.unwind.borrow().depth - 1;
+        // A re-dispatch `br` targets the `loop` from wherever we are now.
+        let loop_rel = helpers.unwind.borrow().depth - loop_depth;
         emit_segment_term(
             &segment.term,
             gen_local,
@@ -344,6 +367,18 @@ pub(super) fn emit_generator_sm(
             strings,
             helpers,
         );
+        // The landing: reached only by a throw's `br`; enter the handler block.
+        if let Some(handler) = segment.handler {
+            close_landing_pad(&mut function, helpers);
+            store_gen_i32(
+                &mut function,
+                gen_local,
+                GEN_STATE_OFFSET,
+                handler.cast_signed(),
+            );
+            let loop_rel = helpers.unwind.borrow().depth - loop_depth;
+            function.instruction(&Instruction::Br(loop_rel));
+        }
     }
 
     // Close the default block: a resume with an out-of-range state (a completed
@@ -353,9 +388,15 @@ pub(super) fn emit_generator_sm(
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::Return);
     // Close the dispatch loop. Every path above `return`s or re-dispatches, so the
-    // fall-through here is unreachable; emit a dummy result to satisfy validation.
+    // fall-through here is unreachable.
     function.instruction(&Instruction::End);
     leave_frame(helpers);
+    function.instruction(&Instruction::Unreachable);
+    // Close the outermost landing pad: an uncaught throw completes the generator
+    // (`done = 1`, out-of-range state) and returns with the exception pending.
+    close_landing_pad(&mut function, helpers);
+    store_gen_i32(&mut function, gen_local, GEN_DONE_OFFSET, 1);
+    store_gen_i32(&mut function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
     function
@@ -377,21 +418,23 @@ fn emit_segment_term(
 ) {
     match term {
         GenTerm::Yield { value, resume } => {
-            // state = resume; return the yielded value (done stays 0).
-            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, resume.cast_signed());
+            // Evaluate the yielded value (it may throw), then state = resume and
+            // return it (done stays 0).
             emit_node(value, function, scratch, strings, helpers);
+            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, resume.cast_signed());
             function.instruction(&Instruction::Return);
         }
         GenTerm::Return(value) => {
-            // done = 1; state = n (out of range) so re-entry yields undefined.
-            store_gen_i32(function, gen_local, GEN_DONE_OFFSET, 1);
-            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
+            // Evaluate the value (it may throw), then done = 1; state = n (out of
+            // range) so re-entry yields undefined.
             match value {
                 Some(value) => emit_node(value, function, scratch, strings, helpers),
                 None => {
                     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
                 }
             }
+            store_gen_i32(function, gen_local, GEN_DONE_OFFSET, 1);
+            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
             function.instruction(&Instruction::Return);
         }
         GenTerm::Jump(target) => {
@@ -585,6 +628,24 @@ pub(super) fn emit_async_step(helpers: Helpers<'_>) -> Function {
     // The SM's value is on the stack; the host reads `done`/`__exc_pending`.
     function.instruction(&Instruction::End);
     function
+}
+
+/// Open a `block` and register it as the innermost exception handler: a throw
+/// inside `br`s to just past its `End` (the landing code).
+fn open_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    let mut unwind = helpers.unwind.borrow_mut();
+    unwind.depth += 1;
+    let depth = unwind.depth;
+    unwind.handlers.push(depth);
+}
+
+/// Close a block opened with [`open_landing_pad`], unregistering its handler.
+fn close_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
+    let mut unwind = helpers.unwind.borrow_mut();
+    unwind.handlers.pop();
+    unwind.depth -= 1;
+    function.instruction(&Instruction::End);
 }
 
 /// Store the i32 constant `value` into the generator handle field at `offset`
