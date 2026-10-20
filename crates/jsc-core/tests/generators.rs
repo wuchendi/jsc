@@ -4,8 +4,8 @@
 //! statement / `x = yield` / `return yield` positions, `.next(v)` returning
 //! `{ value, done }`, a persistent frame that survives across suspends, and the
 //! diagnostics for the out-of-scope forms (CUT A: yield in try/catch/finally;
-//! CUT B: yield inside control flow; nested-expression yield; `yield*`; a
-//! non-generator `.next()` receiver).
+//! yield inside a `switch`; a non-generator `.next()` receiver). A `yield` nested
+//! in an expression is linearized with JS evaluation order.
 
 mod common;
 
@@ -352,29 +352,20 @@ fn cut_a_rejects_yield_inside_try() {
 }
 
 #[test]
-fn rejects_yield_inside_switch_or_in_a_condition() {
+fn rejects_yield_inside_switch() {
     assert_rejected("function* g(){ switch (1) { case 1: yield 1; } }");
-    assert_rejected("function* g(){ let i = 0; while (yield i) { i++; } }");
 }
 
 #[test]
 fn unsupported_yield_positions_name_the_construct() {
     let cases = [
         (
-            "function* g(){ if (yield 1) {} }",
-            "a `yield` in an `if` condition is not supported",
-        ),
-        (
-            "function* g(){ let i = 0; while (yield i) { i++; } }",
-            "a `yield` in a loop condition or update is not supported",
-        ),
-        (
             "function* g(){ switch (1) { case 1: yield 1; } }",
             "a `yield` inside a `switch` is not supported",
         ),
         (
-            "function* g(){ yield (yield 1); }",
-            "a `yield` operand may not itself contain a `yield`",
+            "function* g(){ try { yield 1; } catch (e) {} }",
+            "a `yield` inside try/catch/finally is not supported",
         ),
     ];
     for (src, expected) in cases {
@@ -386,11 +377,111 @@ fn unsupported_yield_positions_name_the_construct() {
     }
 }
 
+// --- A `yield` nested in an expression -----------------------------------
+
 #[test]
-fn rejects_a_yield_nested_in_a_larger_expression() {
-    assert_rejected("function* g(){ let x = (yield 1) + 2; }");
-    assert_rejected("function* g(){ foo(yield 1); }");
-    assert_rejected("function* g(){ yield (yield 1); }");
+fn a_nested_yield_preserves_evaluation_order() {
+    // `t("a")` runs before the suspend, `t("c")` after it; the driver's `|` lands
+    // in between.
+    assert_output(
+        "let log = \"\";
+         function t(s, v){ log = log + s; return v; }
+         function* g(){ let r = t(\"a\", 1) + (yield t(\"b\", 2)) + t(\"c\", 3); log = log + \"d\"; return r; }
+         let it = g();
+         let a = it.next(); log = log + \"|\";
+         let b = it.next(10);
+         console.log(a.value, b.value, b.done, log);",
+        "2 14 true ab|cd\n",
+    );
+}
+
+#[test]
+fn a_nested_yield_call_evaluates_arguments_in_order() {
+    assert_output(
+        "let log = \"\";
+         function t(s, v){ log = log + s; return v; }
+         let o = {f: function(a, b, c){ return a * 100 + b * 10 + c; }};
+         function* g(){ return o.f(t(\"a\", 1), yield 2, t(\"c\", 3)); }
+         let it = g();
+         let a = it.next(); log = log + \"|\";
+         let b = it.next(5);
+         console.log(a.value, b.value, log);",
+        "2 153 a|c\n",
+    );
+}
+
+#[test]
+fn a_store_after_a_suspend_targets_the_receiver_captured_before_it() {
+    // The receiver and the computed key are evaluated before the `yield`; the
+    // driver rebinds both during the suspend, which must not redirect the store.
+    assert_output(
+        "let box = {o: {x: 0}};
+         let first = box.o;
+         let key = \"x\";
+         function* g(){ box.o[key] = yield 1; }
+         let it = g(); it.next();
+         box.o = {x: 0}; key = \"y\";
+         it.next(5);
+         console.log(first.x, box.o.x);",
+        "5 0\n",
+    );
+}
+
+#[test]
+fn a_compound_member_update_reads_the_old_value_before_the_suspend() {
+    assert_output(
+        "let a = [1];
+         function* g(){ a[0] += yield 1; }
+         let it = g(); it.next();
+         a[0] = 100;
+         it.next(5);
+         console.log(a[0]);",
+        "6\n",
+    );
+}
+
+#[test]
+fn a_short_circuited_yield_does_not_suspend() {
+    assert_output(
+        "function* g(){ let r = 1 || (yield 9); yield r; let s = null ?? (yield 8); yield s; }
+         let it = g();
+         let a = it.next(); console.log(a.value, a.done);
+         let b = it.next(); console.log(b.value, b.done);
+         let c = it.next(3); console.log(c.value, c.done);",
+        "1 false\n8 false\n3 false\n",
+    );
+}
+
+#[test]
+fn a_conditional_yields_only_on_the_taken_branch() {
+    assert_output(
+        "function* g(c){ return c ? (yield 1) : (yield 2); }
+         let it = g(false);
+         let a = it.next(); console.log(a.value, a.done);
+         let b = it.next(5); console.log(b.value, b.done);",
+        "2 false\n5 true\n",
+    );
+}
+
+#[test]
+fn a_yield_of_a_yield_resumes_twice() {
+    assert_output(
+        "function* g(){ let r = yield (yield 1); return r; }
+         let it = g();
+         console.log(it.next().value, it.next(2).value, it.next(3).value);",
+        "1 2 3\n",
+    );
+}
+
+#[test]
+fn a_yield_in_a_loop_or_if_condition() {
+    assert_output(
+        "function* g(){ let i = 0; while (yield i) { i++; } if (yield 9) { return 1; } return 2; }
+         let it = g();
+         console.log(it.next().value, it.next(true).value, it.next(true).value);
+         console.log(it.next(false).value, it.next(0).value);",
+        "0 1 2\n9 2\n",
+    );
 }
 
 #[test]

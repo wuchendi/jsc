@@ -15,9 +15,19 @@
 //! `yield* inner` (delegation) desugars to a driving `while` loop over
 //! `inner.next()` (see [`LowerCtx::lower_yield_delegate`]), reusing the CFG.
 //!
+//! A `yield` (or, in an `async function`, an `await`) nested anywhere inside an
+//! expression is LINEARIZED by the CFG builder ([`CfgBuilder::linearize`]): the
+//! expression's sub-expressions are evaluated left-to-right, every value computed
+//! before a suspend and needed after it is spilled to a fresh frame cell (raw wasm
+//! locals do not survive a suspend), and `?:`/`&&`/`||`/`??` with a `yield` in a
+//! lazily evaluated operand become CFG branches into a result cell, so the operand
+//! only suspends when it actually runs. This covers `yield` in `if`/loop
+//! conditions and `yield yield x` too.
+//!
 //! Still rejected (deferred): a `yield` inside `try`/`catch`/`finally` (handler
-//! state across a suspend), inside a `switch`, in a loop/if CONDITION, or nested
-//! in a larger expression; generator expressions/arrows/methods; and non-simple parameters.
+//! state across a suspend) or inside a `switch`; a `yield` whose continuation would
+//! read a compiler temporary set before the suspend; generator
+//! expressions/arrows/methods; and non-simple parameters.
 //!
 //! A closure nested in the body captures the frame's env cells by reference
 //! (see [`LowerCtx::capture_source`]), so it shares them with the body across
@@ -25,6 +35,8 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+
+use std::collections::HashSet;
 
 use swc_common::Spanned;
 
@@ -78,7 +90,7 @@ impl LowerCtx<'_> {
         // The frame's env size (`total`) and local count are read before popping.
         self.push_frame();
         let lowered = self.lower_generator_body(function, block, uniform_params);
-        let (body, nparams, total, sm_locals) = match lowered {
+        let (body, nparams, mut total, sm_locals) = match lowered {
             Ok((body, nparams)) => {
                 let total = u32::try_from(self.env_len()).unwrap_or(u32::MAX);
                 let sm_locals = self.frame().next;
@@ -91,7 +103,8 @@ impl LowerCtx<'_> {
         };
         self.pop_frame();
 
-        let segments = build_segments(&body, fn_decl)?;
+        // Spill cells for values live across a nested suspend extend the frame.
+        let segments = build_segments(&body, fn_decl, &mut total)?;
         self.shared.arrows.borrow_mut()[sm_pos] = IrFunction {
             params: uniform_params,
             locals: sm_locals,
@@ -314,16 +327,26 @@ impl LowerCtx<'_> {
 /// (which desugar to [`IrStmt::If`]/[`IrStmt::While`]) crossing a `yield` are
 /// flattened into blocks linked by `Jump`/`Branch`/`Yield` terminators, so
 /// control can suspend anywhere. `break`/`continue`/`return` become jumps to the
-/// relevant block. Only `yield`/`try` crossing a suspend and a few corner forms
-/// are still rejected (see [`CfgBuilder::lower_stmt`]).
-fn build_segments(stmts: &[IrStmt], fn_decl: &FnDecl) -> anyhow::Result<Vec<GenSegment>> {
+/// relevant block. A `yield` nested in an expression is linearized (see
+/// [`CfgBuilder::linearize`]); each spill cell it needs is a new frame slot, so
+/// `total` (the frame cell count) grows accordingly. Only `yield`/`try` crossing a
+/// suspend and a few corner forms are still rejected (see [`CfgBuilder::lower_stmt`]).
+fn build_segments(
+    stmts: &[IrStmt],
+    fn_decl: &FnDecl,
+    total: &mut u32,
+) -> anyhow::Result<Vec<GenSegment>> {
     let mut cfg = CfgBuilder {
         fn_decl,
         blocks: vec![PendingBlock::default()],
         cur: 0,
         loops: Vec::new(),
+        next_slot: *total,
+        suspended: false,
+        live: HashSet::new(),
     };
     cfg.lower_stmts(stmts)?;
+    *total = cfg.next_slot;
     // Fall off the end: `return undefined` (sets `done`).
     if cfg.blocks[cfg.cur].term.is_none() {
         cfg.blocks[cfg.cur].term = Some(GenTerm::Return(None));
@@ -363,6 +386,13 @@ struct CfgBuilder<'a> {
     /// The block currently being filled.
     cur: usize,
     loops: Vec<LoopCtx>,
+    /// The next free frame cell slot, for spill cells.
+    next_slot: u32,
+    /// Whether the statement being linearized has already suspended.
+    suspended: bool,
+    /// Raw wasm locals written since the statement's last suspend — the only ones
+    /// a continuation may still read (see [`CfgBuilder::track`]).
+    live: HashSet<u32>,
 }
 
 impl CfgBuilder<'_> {
@@ -408,54 +438,35 @@ impl CfgBuilder<'_> {
             return Ok(());
         }
         match stmt {
-            // `yield e;` — suspend, discard the sent value.
-            IrStmt::Expr(IrNode::Yield(value)) => {
-                reject_nested_yield(value, self.fn_decl)?;
-                let resume = self.new_block();
-                self.terminate(GenTerm::Yield {
-                    value: (**value).clone(),
-                    resume,
-                });
-                self.cur = resume as usize;
+            // An expression statement / declaration / `return` with a suspend
+            // somewhere inside: linearize it around each suspend point.
+            IrStmt::Expr(node) => {
+                self.begin_statement();
+                let value = self.linearize(node.clone())?;
+                if !matches!(value, IrNode::SentValue) {
+                    self.push(IrStmt::Expr(value))?;
+                }
             }
-            // `x = yield e` — suspend, then bind the sent value into the cell.
-            IrStmt::Expr(IrNode::CellSet { cell, value })
-                if matches!(value.as_ref(), IrNode::Yield(_)) =>
-            {
-                let IrNode::Yield(inner) = value.as_ref() else {
-                    unreachable!("guarded by the match arm")
-                };
-                reject_nested_yield(inner, self.fn_decl)?;
-                let resume = self.new_block();
-                self.terminate(GenTerm::Yield {
-                    value: (**inner).clone(),
-                    resume,
-                });
-                self.cur = resume as usize;
-                self.blocks[self.cur]
-                    .stmts
-                    .push(IrStmt::Expr(IrNode::CellSet {
-                        cell: cell.clone(),
-                        value: Box::new(IrNode::SentValue),
-                    }));
-            }
-            // `return yield e` — suspend, then the resume returns the sent value.
-            IrStmt::Return(Some(IrNode::Yield(value))) => {
-                reject_nested_yield(value, self.fn_decl)?;
-                let resume = self.new_block();
-                self.terminate(GenTerm::Yield {
-                    value: (**value).clone(),
-                    resume,
-                });
-                self.cur = resume as usize;
-                self.terminate(GenTerm::Return(Some(IrNode::SentValue)));
+            IrStmt::Decl { local, init } => {
+                self.begin_statement();
+                let init = self.linearize(init.clone())?;
+                self.push(IrStmt::Decl {
+                    local: *local,
+                    init,
+                })?;
             }
             // `return e` / `return;` — end the generator (`Return` sets `done`).
             IrStmt::Return(value) => {
-                if let Some(node) = value {
-                    reject_nested_yield(node, self.fn_decl)?;
-                }
-                self.terminate(GenTerm::Return(value.clone()));
+                self.begin_statement();
+                let value = match value {
+                    Some(node) => {
+                        let node = self.linearize(node.clone())?;
+                        self.track(&node)?;
+                        Some(node)
+                    }
+                    None => None,
+                };
+                self.terminate(GenTerm::Return(value));
             }
             // `if (cond) then else` crossing a yield — flatten to a `Branch`.
             IrStmt::If {
@@ -463,14 +474,14 @@ impl CfgBuilder<'_> {
                 then_body,
                 else_body,
             } => {
-                if node_contains_yield(cond) {
-                    return Err(self.unsupported("a `yield` in an `if` condition is not supported"));
-                }
+                self.begin_statement();
+                let cond = self.linearize(cond.clone())?;
+                self.track(&cond)?;
                 let then_b = self.new_block();
                 let else_b = self.new_block();
                 let join = self.new_block();
                 self.terminate(GenTerm::Branch {
-                    cond: cond.clone(),
+                    cond,
                     then_block: then_b,
                     else_block: else_b,
                 });
@@ -489,17 +500,14 @@ impl CfgBuilder<'_> {
                 update,
                 label,
             } => {
-                if node_contains_yield(cond) || update.iter().any(stmt_contains_yield) {
-                    return Err(self
-                        .unsupported("a `yield` in a loop condition or update is not supported"));
-                }
                 // In a generator every source variable is an env cell (never a raw
                 // `Local`); a raw `Local` in a flattened loop's condition is a
                 // NON-PERSISTING temporary — the tell-tale of a `for-of`/`for-in`
                 // (its hidden index/length locals). Those do not survive a suspend,
                 // so such a loop crossing a `yield` would silently mis-iterate.
-                let crosses_yield =
-                    body.iter().any(stmt_contains_yield) || update.iter().any(stmt_contains_yield);
+                let crosses_yield = node_contains_yield(cond)
+                    || body.iter().any(stmt_contains_yield)
+                    || update.iter().any(stmt_contains_yield);
                 if crosses_yield && node_reads_raw_local(cond) {
                     return Err(self.unsupported(
                         "a `for-of`/`for-in` loop with a `yield` in its body is not supported \
@@ -517,8 +525,11 @@ impl CfgBuilder<'_> {
                 };
                 self.terminate(GenTerm::Jump(head));
                 self.cur = head as usize;
+                self.begin_statement();
+                let test = self.linearize(cond.clone())?;
+                self.track(&test)?;
                 self.terminate(GenTerm::Branch {
-                    cond: cond.clone(),
+                    cond: test,
                     then_block: body_b,
                     else_block: exit,
                 });
@@ -555,16 +566,247 @@ impl CfgBuilder<'_> {
             IrStmt::Switch { .. } => {
                 return Err(self.unsupported("a `yield` inside a `switch` is not supported"));
             }
-            // A `yield` nested inside a larger expression (a call argument, an
-            // operand, …) — the segmentation only splits at statement granularity.
-            _ => {
-                return Err(self.unsupported(
-                    "a `yield` in this position is not supported: use `yield e;`, \
-                     `x = yield e;`, or `return yield e;`",
-                ));
-            }
         }
         Ok(())
+    }
+
+    /// Start linearizing a new statement: nothing has suspended yet, so every
+    /// raw local is still readable.
+    fn begin_statement(&mut self) {
+        self.suspended = false;
+        self.live.clear();
+    }
+
+    /// Append `stmt` to the current block (after [`Self::track`]ing its nodes).
+    fn push(&mut self, stmt: IrStmt) -> anyhow::Result<()> {
+        let mut result = Ok(());
+        stmt.any_node(|node| {
+            result = self.track(node);
+            result.is_err()
+        });
+        result?;
+        self.blocks[self.cur].stmts.push(stmt);
+        Ok(())
+    }
+
+    /// Record the raw wasm locals `node` writes and reject a read of one that a
+    /// suspend earlier in the statement has invalidated: raw locals do not
+    /// survive a suspend, so a continuation may only read a local it set itself.
+    fn track(&mut self, node: &IrNode) -> anyhow::Result<()> {
+        if let IrNode::Assign { local, .. } = node {
+            self.live.insert(*local);
+        }
+        let read = match node {
+            IrNode::Local(local)
+            | IrNode::IncDec { local, .. }
+            | IrNode::ArrayPush { local, .. }
+            | IrNode::ArrayPop { local } => Some(*local),
+            _ => None,
+        };
+        if let Some(local) = read
+            && self.suspended
+            && !self.live.contains(&local)
+        {
+            return Err(self.unsupported(
+                "a `yield` here would lose a compiler temporary across the suspend; \
+                 move the `yield` into its own statement",
+            ));
+        }
+        let mut result = Ok(());
+        node.any_child(|child| {
+            result = self.track(child);
+            result.is_err()
+        });
+        result
+    }
+
+    /// Suspend with `value`: end the current block with a `Yield` and continue in
+    /// the resume block, where the sent value is [`IrNode::SentValue`].
+    fn suspend(&mut self, value: IrNode) -> anyhow::Result<()> {
+        self.track(&value)?;
+        let resume = self.new_block();
+        self.terminate(GenTerm::Yield { value, resume });
+        self.cur = resume as usize;
+        self.suspended = true;
+        self.live.clear();
+        Ok(())
+    }
+
+    /// A fresh frame cell slot (an env cell the constructor pre-creates), which —
+    /// unlike a raw wasm local — survives a suspend.
+    fn fresh_slot(&mut self) -> u32 {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        slot
+    }
+
+    /// Evaluate `value` now into a fresh frame cell and return the read of that
+    /// cell, so the value outlives a later suspend. A constant or a cell pointer
+    /// is returned as is.
+    fn spill(&mut self, value: IrNode) -> anyhow::Result<IrNode> {
+        if matches!(
+            value,
+            IrNode::Num(_)
+                | IrNode::Str(_)
+                | IrNode::Bool(_)
+                | IrNode::Null
+                | IrNode::Undefined
+                | IrNode::EnvLoad(_)
+                | IrNode::ModuleCell(_)
+        ) {
+            return Ok(value);
+        }
+        let slot = self.fresh_slot();
+        self.push(IrStmt::Expr(slot_set(slot, value)))?;
+        Ok(slot_get(slot))
+    }
+
+    /// Linearize `node` into the current block: emit every suspend it contains
+    /// (splitting blocks), and return the yield-free expression computing its
+    /// value in the block where control ends up. Sub-expressions run
+    /// left-to-right; each one evaluated before the LAST child containing a
+    /// suspend is spilled to a frame cell. A lazily evaluated operand of
+    /// `?:`/`&&`/`||`/`??` that contains a suspend becomes a CFG branch, so it
+    /// only suspends when it runs.
+    fn linearize(&mut self, node: IrNode) -> anyhow::Result<IrNode> {
+        if !node_contains_yield(&node) {
+            return Ok(node);
+        }
+        match node {
+            IrNode::Yield(value) => {
+                let value = self.linearize(*value)?;
+                self.suspend(value)?;
+                Ok(IrNode::SentValue)
+            }
+            IrNode::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } if node_contains_yield(&then_branch) || node_contains_yield(&else_branch) => {
+                self.linearize_ternary(*cond, *then_branch, *else_branch)
+            }
+            IrNode::Logical { op, lhs, rhs } if node_contains_yield(&rhs) => {
+                self.linearize_logical(op, *lhs, *rhs)
+            }
+            // `obj[key] op= rhs` reads the current member value BEFORE evaluating
+            // `rhs`, so with a suspend in `rhs` the read is spilled up front and the
+            // update becomes a plain store.
+            IrNode::IndexOpSet {
+                obj,
+                index,
+                op,
+                rhs,
+                kind: OpSetKind::Compound,
+                ..
+            } if node_contains_yield(&rhs) => {
+                let obj = self.linearize(*obj)?;
+                let obj = self.spill(obj)?;
+                let index = self.linearize(*index)?;
+                let index = self.spill(index)?;
+                let current = self.spill(IrNode::Index {
+                    obj: Box::new(obj.clone()),
+                    index: Box::new(index.clone()),
+                })?;
+                let rhs = self.linearize(*rhs)?;
+                Ok(IrNode::IndexSet {
+                    obj: Box::new(obj),
+                    index: Box::new(index),
+                    value: Box::new(IrNode::Binary {
+                        op,
+                        lhs: Box::new(current),
+                        rhs: Box::new(rhs),
+                    }),
+                })
+            }
+            mut node => {
+                let mut children = node.children_mut();
+                let last = children
+                    .iter()
+                    .rposition(|child| node_contains_yield(child))
+                    .unwrap_or(0);
+                for (i, child) in children.iter_mut().enumerate().take(last + 1) {
+                    let value = self.linearize(std::mem::replace(*child, IrNode::Undefined))?;
+                    **child = if i < last { self.spill(value)? } else { value };
+                }
+                drop(children);
+                Ok(node)
+            }
+        }
+    }
+
+    /// Linearize `cond ? then_branch : else_branch` with a suspend in a branch:
+    /// branch on `cond` and evaluate only the taken branch into a result cell.
+    fn linearize_ternary(
+        &mut self,
+        cond: IrNode,
+        then_branch: IrNode,
+        else_branch: IrNode,
+    ) -> anyhow::Result<IrNode> {
+        let cond = self.linearize(cond)?;
+        self.track(&cond)?;
+        let result = self.fresh_slot();
+        let then_b = self.new_block();
+        let else_b = self.new_block();
+        let join = self.new_block();
+        self.terminate(GenTerm::Branch {
+            cond,
+            then_block: then_b,
+            else_block: else_b,
+        });
+        for (block, branch) in [(then_b, then_branch), (else_b, else_branch)] {
+            self.cur = block as usize;
+            let value = self.linearize(branch)?;
+            self.push(IrStmt::Expr(slot_set(result, value)))?;
+            self.terminate(GenTerm::Jump(join));
+        }
+        self.cur = join as usize;
+        Ok(slot_get(result))
+    }
+
+    /// Linearize `lhs op rhs` with a suspend in `rhs`: store `lhs` into a result
+    /// cell and branch to evaluate `rhs` (overwriting it) only when not
+    /// short-circuited.
+    fn linearize_logical(
+        &mut self,
+        op: LogicalOp,
+        lhs: IrNode,
+        rhs: IrNode,
+    ) -> anyhow::Result<IrNode> {
+        let lhs = self.linearize(lhs)?;
+        let result = self.fresh_slot();
+        self.push(IrStmt::Expr(slot_set(result, lhs)))?;
+        let rhs_b = self.new_block();
+        let join = self.new_block();
+        // The rhs runs when `&&`'s lhs is truthy, `||`'s is falsy, or
+        // `??`'s is nullish.
+        let (cond, then_block, else_block) = match op {
+            LogicalOp::And => (slot_get(result), rhs_b, join),
+            LogicalOp::Or => (slot_get(result), join, rhs_b),
+            LogicalOp::Nullish => {
+                let is = |value| IrNode::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(slot_get(result)),
+                    rhs: Box::new(value),
+                };
+                let nullish = IrNode::Logical {
+                    op: LogicalOp::Or,
+                    lhs: Box::new(is(IrNode::Null)),
+                    rhs: Box::new(is(IrNode::Undefined)),
+                };
+                (nullish, rhs_b, join)
+            }
+        };
+        self.terminate(GenTerm::Branch {
+            cond,
+            then_block,
+            else_block,
+        });
+        self.cur = rhs_b as usize;
+        let value = self.linearize(rhs)?;
+        self.push(IrStmt::Expr(slot_set(result, value)))?;
+        self.terminate(GenTerm::Jump(join));
+        self.cur = join as usize;
+        Ok(slot_get(result))
     }
 
     /// Resolve a `break`/`continue` target block: the innermost loop for an
@@ -617,17 +859,17 @@ fn stmt_contains_break_or_continue(stmt: &IrStmt) -> bool {
         || stmt.any_stmt(stmt_contains_break_or_continue)
 }
 
-/// Reject a `yield` whose operand itself contains a `yield` (`yield yield x`),
-/// which the single-suspend segmentation cannot model.
-fn reject_nested_yield(value: &IrNode, fn_decl: &FnDecl) -> anyhow::Result<()> {
-    if node_contains_yield(value) {
-        return Err(CompileError::spanned(
-            fn_decl.function.span(),
-            "a `yield` operand may not itself contain a `yield`",
-        )
-        .into());
+/// Write `value` into frame cell `slot` (a spill cell).
+fn slot_set(slot: u32, value: IrNode) -> IrNode {
+    IrNode::CellSet {
+        cell: Box::new(IrNode::EnvLoad(slot)),
+        value: Box::new(value),
     }
-    Ok(())
+}
+
+/// Read frame cell `slot` (a spill cell).
+fn slot_get(slot: u32) -> IrNode {
+    IrNode::CellGet(Box::new(IrNode::EnvLoad(slot)))
 }
 
 /// Whether a statement contains a `yield` anywhere (recursively).

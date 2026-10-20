@@ -1484,6 +1484,151 @@ impl IrNode {
             }
         }
     }
+
+    /// Mutable references to every DIRECT child expression, in JS evaluation
+    /// order (the order [`Self::any_child`] visits them). Exhaustive over every
+    /// variant, like [`Self::any_child`].
+    #[allow(clippy::too_many_lines)]
+    pub fn children_mut(&mut self) -> Vec<&mut IrNode> {
+        match self {
+            IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::Local(_)
+            | IrNode::EnvLoad(_)
+            | IrNode::ModuleCell(_)
+            | IrNode::SentValue
+            | IrNode::ExcValue
+            | IrNode::ThisGlobal
+            | IrNode::ArrayPop { .. }
+            | IrNode::IncDec { .. }
+            | IrNode::MapNew { .. }
+            | IrNode::DateNow => Vec::new(),
+            IrNode::Assign { value: inner, .. }
+            | IrNode::CellNew(inner)
+            | IrNode::CellGet(inner)
+            | IrNode::IsHole(inner)
+            | IrNode::Yield(inner)
+            | IrNode::IsGenerator(inner)
+            | IrNode::TypeOf(inner)
+            | IrNode::StrLen(inner)
+            | IrNode::NullishCheck { value: inner, .. }
+            | IrNode::ArrayPush { value: inner, .. }
+            | IrNode::Not(inner)
+            | IrNode::Throw(inner)
+            | IrNode::ObjectBuiltin { arg: inner, .. }
+            | IrNode::InstanceOf { value: inner, .. }
+            | IrNode::JsonStringify { arg: inner }
+            | IrNode::JsonParse { arg: inner }
+            | IrNode::PromiseResolve(inner)
+            | IrNode::PromiseReject(inner)
+            | IrNode::Await(inner)
+            | IrNode::PromiseCtor {
+                executor: inner, ..
+            }
+            | IrNode::AsyncSpawn(inner)
+            | IrNode::DateGetTime { recv: inner }
+            | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
+            IrNode::Binary { lhs: a, rhs: b, .. }
+            | IrNode::Logical { lhs: a, rhs: b, .. }
+            | IrNode::CellSet { cell: a, value: b }
+            | IrNode::GenResume { handle: a, sent: b }
+            | IrNode::ObjectRest {
+                source: a,
+                exclude: b,
+            }
+            | IrNode::Index { obj: a, index: b }
+            | IrNode::MakeAccessor {
+                getter: a,
+                setter: b,
+            }
+            | IrNode::ArrayHof {
+                array: a,
+                callback: b,
+                init: None,
+                ..
+            }
+            | IrNode::ObjectKey { obj: a, index: b }
+            | IrNode::ObjectHas { key: a, obj: b }
+            | IrNode::ObjectDelete { obj: a, key: b }
+            | IrNode::PromiseFinally {
+                promise: a,
+                on_finally: b,
+            } => vec![&mut **a, &mut **b],
+            IrNode::IndexOpSet {
+                obj, index, rhs, ..
+            } => vec![&mut **obj, &mut **index, &mut **rhs],
+            IrNode::IndexSet { obj, index, value } => vec![&mut **obj, &mut **index, &mut **value],
+            IrNode::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => vec![&mut **cond, &mut **then_branch, &mut **else_branch],
+            IrNode::PromiseThen {
+                promise,
+                on_fulfilled,
+                on_rejected,
+            } => vec![&mut **promise, &mut **on_fulfilled, &mut **on_rejected],
+            IrNode::ArrayHof {
+                array,
+                callback,
+                init: Some(init),
+                ..
+            } => vec![&mut **array, &mut **callback, &mut **init],
+            IrNode::ConvertCall { arg, radix, .. } => {
+                let mut out = vec![&mut **arg];
+                out.extend(radix.as_deref_mut());
+                out
+            }
+            IrNode::DateNew { ms } => ms.as_deref_mut().into_iter().collect(),
+            IrNode::Call { args, .. }
+            | IrNode::FuncValue { captures: args, .. }
+            | IrNode::MakeGenerator { slots: args, .. }
+            | IrNode::Array(args)
+            | IrNode::ConsoleLog { args }
+            | IrNode::MathCall { args, .. } => args.iter_mut().collect(),
+            IrNode::CallIndirect { callee: recv, args }
+            | IrNode::MethodCall { recv, args, .. }
+            | IrNode::ThisCall {
+                callee: recv, args, ..
+            }
+            | IrNode::MapMethod { recv, args, .. }
+            | IrNode::ReceiverMethod { recv, args, .. }
+            | IrNode::DateMethod { recv, args, .. } => std::iter::once(&mut **recv)
+                .chain(args.iter_mut())
+                .collect(),
+            IrNode::MethodCallUser { obj, key, args, .. } => [&mut **obj, &mut **key]
+                .into_iter()
+                .chain(args.iter_mut())
+                .collect(),
+            IrNode::New {
+                instance,
+                ctor,
+                args,
+                ..
+            } => [&mut **instance, &mut **ctor]
+                .into_iter()
+                .chain(args.iter_mut())
+                .collect(),
+            IrNode::Object(entries) => entries.iter_mut().map(|(_, value)| value).collect(),
+            IrNode::ArraySpread(elems) => elems
+                .iter_mut()
+                .map(|elem| match elem {
+                    SpreadElem::Item(value) | SpreadElem::Spread(value) => value,
+                })
+                .collect(),
+            IrNode::CallSpread { target, args } => {
+                let mut out = Vec::new();
+                if let SpreadCallee::Indirect(callee) = target {
+                    out.push(&mut **callee);
+                }
+                out.push(&mut **args);
+                out
+            }
+        }
+    }
 }
 
 impl IrStmt {
