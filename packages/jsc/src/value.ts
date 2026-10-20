@@ -10,13 +10,14 @@ import {
   ACCESSOR_SET_OFFSET,
   ATTR_ACCESSOR,
   ATTR_ENUMERABLE,
+  CLASS_ERROR,
   DATE_MS_OFFSET,
-  ERROR_KIND_KEY,
   FN_INFO_ADDR,
   FN_INFO_ENTRY_SIZE,
   FN_INFO_NAME_OFFSET,
   FUNC_FLAG_CLASS_CTOR,
   FUNC_INDEX_OFFSET,
+  HEADER_CLASS_OFFSET,
   HEADER_FLAGS_OFFSET,
   HEADER_SIZE,
   HEAP,
@@ -277,19 +278,17 @@ function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
  * walking its property table (mirrors `value.rs::decode_props`): tombstones
  * and non-enumerable entries are skipped, integer keys come first in
  * ascending order when the table has `HAS_INDEX_KEYS`, then the other keys in
- * slot order. An accessor property decodes as `accessor`. Also reports
- * whether the table carries the non-enumerable `@@errorkind` brand.
+ * slot order. An accessor property decodes as `accessor`.
  */
 function decodeProps(
   ptr: number,
   mem: Uint8Array,
   guard: Guard,
-): [[string, Value][], boolean] {
+): [string, Value][] {
   const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
-  if (props === 0) return [[], false]
+  if (props === 0) return []
   const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
   const tflags = mem[props + PROPS_TFLAGS_OFFSET] ?? 0
-  let isError = false
   const keyed: [number | undefined, string, number, bigint][] = []
   for (let k = 0; k < count; k++) {
     const entry = props + PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k
@@ -299,7 +298,6 @@ function decodeProps(
     if (key === undefined || attrs === undefined || bits === undefined) break
     if (key === 0) continue
     const text = stringAt(key, mem)
-    if (text === ERROR_KIND_KEY) isError = true
     if ((attrs & ATTR_ENUMERABLE) === 0) continue
     const flags = mem[key + HEADER_FLAGS_OFFSET] ?? 0
     const index =
@@ -339,21 +337,22 @@ function decodeProps(
       entries.push([key, decodeIn(bits, mem, guard)])
     }
   }
-  return [entries, isError]
+  return entries
 }
 
 /**
  * Resolve a heap object block at `ptr` from its own enumerable properties
- * (mirrors `value.rs::decode_object`): an object carrying the `@@errorkind`
- * brand decodes as `error`; an object with a prototype whose `constructor`
- * names a function other than `Object` decodes as `instance`.
+ * (mirrors `value.rs::decode_object`): an object of class `ERROR` decodes as
+ * `error` with its (possibly inherited) `name` and `message`; an object with
+ * a prototype whose `constructor` names a function other than `Object`
+ * decodes as `instance`.
  */
 function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const [entries, isError] = decodeProps(ptr, mem, guard)
-  if (isError) {
+  if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ERROR) {
     const field = (name: string) => {
-      const found = entries.find(([k, v]) => k === name && v.kind === 'string')
-      return found && found[1].kind === 'string' ? found[1].value : undefined
+      const bits = lookupData(ptr, name, mem)
+      const value = bits === undefined ? undefined : decodeIn(bits, mem, guard)
+      return value?.kind === 'string' ? value.value : undefined
     }
     return {
       kind: 'error',
@@ -361,6 +360,7 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
       message: field('message') ?? '',
     }
   }
+  const entries = decodeProps(ptr, mem, guard)
   const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
   if (proto !== undefined && heapObject(proto, mem) !== undefined) {
     const ctor = lookupData(ptr, 'constructor', mem)
@@ -395,7 +395,7 @@ function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
     name: functionName(HEAP | BigInt(ptr), mem) ?? '',
     isClass,
     extends: parent,
-    props: decodeProps(ptr, mem, guard)[0],
+    props: decodeProps(ptr, mem, guard),
   }
 }
 

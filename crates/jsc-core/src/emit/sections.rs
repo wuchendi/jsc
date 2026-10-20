@@ -441,7 +441,45 @@ pub(super) fn emit_data_section(
     if !functions.is_empty() {
         emit_fn_data(&mut data, offsets, functions, layout);
     }
+    if layout.errors != 0 {
+        emit_error_protos(&mut data, offsets, layout.errors);
+    }
     data
+}
+
+/// Lay out the static error prototypes at `base` (design 4.1/4.2), one
+/// [`ERROR_PROTO_SIZE`]-byte block per [`ErrorKind::ALL`] entry: a
+/// `TYPE_OBJECT` prefix whose `props` points right behind it at a full
+/// two-entry `TYPE_PROPS` table (so a user addition grows it onto the heap)
+/// holding `name: "<Kind>"` and `message: ""`, both writable, non-enumerable,
+/// configurable. `%Error.prototype%` has a `null` prototype (until S4); the
+/// others inherit from it.
+fn emit_error_protos(data: &mut DataSection, offsets: &HashMap<String, i32>, base: i32) {
+    let at = |s: &str| offsets.get(s).copied().unwrap_or(HEAP_BASE);
+    let heap = |addr: i32| abi::HEAP | u64::from(addr.cast_unsigned());
+    let attrs = abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE;
+    let mut blob = Vec::with_capacity(ERROR_PROTO_SIZE as usize * ErrorKind::ALL.len());
+    for (index, kind) in (0i32..).zip(ErrorKind::ALL) {
+        let addr = base + ERROR_PROTO_SIZE * index;
+        let proto = if kind == ErrorKind::Error {
+            abi::NULL
+        } else {
+            heap(base)
+        };
+        blob.extend_from_slice(&[abi::TYPE_OBJECT, 0, 0, abi::CLASS_ORDINARY]);
+        blob.extend_from_slice(&(addr + abi::OBJ_PREFIX_SIZE.cast_signed()).to_le_bytes());
+        blob.extend_from_slice(&proto.to_le_bytes());
+        blob.extend_from_slice(&[abi::TYPE_PROPS, 0, abi::PROPS_HAS_NON_ENUM, 0]);
+        for field in [2u32, 2, 2] {
+            blob.extend_from_slice(&field.to_le_bytes());
+        }
+        for (key, value) in [("name", kind.name()), ("message", "")] {
+            blob.extend_from_slice(&at(key).to_le_bytes());
+            blob.extend_from_slice(&attrs.to_le_bytes());
+            blob.extend_from_slice(&heap(at(value)).to_le_bytes());
+        }
+    }
+    data.active(0, &ConstExpr::i32_const(base), blob);
 }
 
 /// Lay out the function data: the `__fn_info` table base at
@@ -766,7 +804,7 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::MethodCallUser { obj, key, args, .. } => {
-            // Seed the runtime callee-is-a-function guard's branded TypeError
+            // Seed the runtime callee-is-a-function guard's TypeError
             // strings so their data-segment blobs exist when the guard throws.
             seed_type_error_strs(order, seen);
             seed_nullish_strs(order, seen);
@@ -809,16 +847,9 @@ pub(super) fn collect_node<'a>(
         IrNode::InstanceOf { value, kind } => {
             collect_node(value, order, seen);
             match kind {
-                // A user-class test reads `C.prototype`.
-                InstanceOfKind::Class(class_proto) => collect_node(class_proto, order, seen),
-                // An error test reads the hidden `@@errorkind` marker via
-                // `__get`, so its key must be interned even when the program
-                // never constructs an error literally.
-                InstanceOfKind::Error | InstanceOfKind::TypeError | InstanceOfKind::RangeError => {
-                    if seen.insert(crate::abi::ERROR_KIND_KEY) {
-                        order.push(crate::abi::ERROR_KIND_KEY);
-                    }
-                }
+                // A prototype walk reads `C.prototype` (or a static error
+                // prototype).
+                InstanceOfKind::Proto(proto) => collect_node(proto, order, seen),
                 // The runtime-TYPE-BYTE builtins read the receiver's own type byte
                 // only — no interned key or literal to seed.
                 InstanceOfKind::Array
@@ -846,12 +877,9 @@ pub(super) fn collect_node<'a>(
         IrNode::JsonParse { arg } => {
             collect_node(arg, order, seen);
             // Seed the syntax-error object's static strings so `__json_throw` can
-            // build a branded `Error` on malformed input.
-            for s in JSON_PARSE_ERROR_STRS {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
+            // build its `Error` on malformed input.
+            seed_strs(&ERROR_STRS, order, seen);
+            seed_strs(&JSON_PARSE_ERROR_STRS, order, seen);
         }
         IrNode::IndexSet { obj, index, value } => {
             seed_nullish_strs(order, seen);
@@ -908,11 +936,12 @@ pub(super) fn collect_node<'a>(
                 &[]
             };
             let name = [op.name()];
-            for &s in name.iter().chain(keys).chain(&INTERNAL_TYPE_ERROR_STRS) {
+            for &s in name.iter().chain(keys) {
                 if seen.insert(s) {
                     order.push(s);
                 }
             }
+            seed_type_error_strs(order, seen);
             seed_nullish_strs(order, seen);
             collect_node(recv, order, seen);
             for arg in args {
@@ -981,7 +1010,7 @@ pub(super) fn collect_node<'a>(
         }
         // `gen.next(sent)` builds a `{ value, done }` result object, so both keys'
         // `[len][utf8]` blobs must live in the data segment; a non-generator
-        // receiver throws a branded `TypeError`, so seed its strings too.
+        // receiver throws a `TypeError`, so seed its strings too.
         IrNode::GenResume { handle, sent } => {
             for key in ["value", "done"] {
                 if seen.insert(key) {
@@ -1007,6 +1036,8 @@ pub(super) fn collect_node<'a>(
                 order.push("pop");
             }
         }
+        // A static error prototype must be laid out.
+        IrNode::ErrorProto(_) => seed_strs(&ERROR_STRS, order, seen),
         IrNode::Num(_)
         | IrNode::Bool(_)
         | IrNode::Null
@@ -1025,30 +1056,36 @@ pub(super) fn collect_node<'a>(
     }
 }
 
-/// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] so `__nullish_throw`
-/// finds their `[len][utf8]` blobs in the data segment; see [`collect_node`].
-fn seed_nullish_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
-    for s in NULLISH_ERROR_STRS {
+/// Record each of `strs` not yet seen, in order; see [`collect_node`].
+fn seed_strs<'a>(strs: &[&'static str], order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    for &s in strs {
         if seen.insert(s) {
             order.push(s);
         }
     }
 }
 
-/// Seed the not-a-function guard's [`INTERNAL_TYPE_ERROR_STRS`] so the branded
-/// `TypeError` it throws finds their `[len][utf8]` blobs in the data segment;
-/// see [`collect_node`].
-fn seed_type_error_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
-    for s in INTERNAL_TYPE_ERROR_STRS {
-        if seen.insert(s) {
-            order.push(s);
-        }
-    }
-}
-
-/// Seed the member-store guard's [`PROP_ERROR_STRS`] so `__prop_throw` finds
+/// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] (and the
+/// [`ERROR_STRS`] of the `TypeError` it raises) so `__nullish_throw` finds
 /// their `[len][utf8]` blobs in the data segment; see [`collect_node`].
-fn seed_prop_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
+fn seed_nullish_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    seed_strs(&ERROR_STRS, order, seen);
+    seed_strs(&NULLISH_ERROR_STRS, order, seen);
+}
+
+/// Seed the not-a-function guard's [`INTERNAL_TYPE_ERROR_STRS`] (and
+/// [`ERROR_STRS`]) so the `TypeError` it throws finds their `[len][utf8]`
+/// blobs in the data segment; see [`collect_node`].
+fn seed_type_error_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    seed_strs(&ERROR_STRS, order, seen);
+    seed_strs(&INTERNAL_TYPE_ERROR_STRS, order, seen);
+}
+
+/// Seed the member-store guard's [`PROP_ERROR_STRS`] (and [`ERROR_STRS`]) so
+/// `__prop_throw` finds their `[len][utf8]` blobs in the data segment; see
+/// [`collect_node`].
+fn seed_prop_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    seed_strs(&ERROR_STRS, order, seen);
     let keyed = PROP_KEYED_MSGS
         .iter()
         .flat_map(|&(_, prefix, suffix)| [prefix, suffix]);

@@ -44,6 +44,7 @@ fn builds_object_literal() {
     let node = IrNode::Object {
         entries: vec![(PropKey::Static("a".to_owned()), IrNode::Num(1.0))],
         proto: None,
+        class: crate::abi::CLASS_ORDINARY,
         reserve: 0,
     };
     let IrNode::Object { entries, .. } = &node else {

@@ -24,7 +24,7 @@ export const UNDEFINED = 0x7ffb_0000_0000_0000n
 /** NaN-boxed heap-pointer header (tag `0b101`): `HEAP | (ptr as u32)`. */
 export const HEAP = 0x7ffd_0000_0000_0000n
 
-/** Bytes of every heap block's leading header: the TYPE BYTE plus the zero `gc`/`flags`/`class` bytes. */
+/** Bytes of every heap block's leading header: the TYPE BYTE plus the `gc`/`flags`/`class` bytes. */
 export const HEADER_SIZE = 4
 
 /** TYPE BYTE of a heap string block: `[type=0][pad×3][len:u32][utf8]`. */
@@ -48,6 +48,10 @@ export const TYPE_DATE = 10
 
 /** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
 export const HEADER_FLAGS_OFFSET = 2
+/** Header byte 3: the `TYPE_OBJECT` sub-`class` byte. */
+export const HEADER_CLASS_OFFSET = 3
+/** `TYPE_OBJECT` `class` byte of an Error instance (its kind is its prototype). */
+export const CLASS_ERROR = 1
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
 
@@ -80,8 +84,6 @@ export const ATTR_ACCESSOR = 8
 export const ACCESSOR_GET_OFFSET = HEADER_SIZE + 4
 /** Byte offset (from an accessor pair block base) of the setter jsval. */
 export const ACCESSOR_SET_OFFSET = HEADER_SIZE + 12
-/** The non-enumerable property key branding an Error object. */
-export const ERROR_KIND_KEY = '@@errorkind'
 
 /** {@link TYPE_PROMISE} `state`: the promise is unsettled. */
 export const PROMISE_PENDING = 0

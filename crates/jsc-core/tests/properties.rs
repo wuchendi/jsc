@@ -22,7 +22,7 @@ fn reserved_keys_do_not_leak() {
     );
     assert_output(
         "let e = new RangeError('r'); console.log(Object.keys(e).length, JSON.stringify(Object.values(new Error())))",
-        "3 [\"Error\",\"\",\"Error\"]\n",
+        "0 []\n",
     );
     assert_output(
         "console.log(Object.keys({'@x': 1, b: 2}), {'@x': 1})",

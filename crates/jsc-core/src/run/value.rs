@@ -2,9 +2,9 @@
 //! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
 
 use super::{
-    DATE_MS_OFFSET, ERROR_KIND_KEY, HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED,
-    PROMISE_REJECTED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE,
-    TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
+    CLASS_ERROR, DATE_MS_OFFSET, HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED,
+    PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION,
+    TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -43,8 +43,8 @@ pub enum Value {
         /// The own enumerable properties, as in [`Value::Object`].
         entries: Vec<(String, Value)>,
     },
-    /// A branded Error object (one carrying the non-enumerable
-    /// `@@errorkind` brand): its `name` and `message` strings. Renders as its
+    /// An Error instance (a `TYPE_OBJECT` of class `ERROR`): its `name` and
+    /// `message` strings, found by a data-property chain lookup. Renders as its
     /// single-line stack `"<name>: <message>"`.
     Error {
         /// The `name` property (`"Error"` when absent or not a string).
@@ -319,23 +319,21 @@ fn read_u64(memory: &[u8], at: usize) -> Option<u64> {
 /// and non-enumerable entries are skipped, integer keys (strings flagged
 /// `ARRAY_INDEX`) come first in ascending order when the table has
 /// `HAS_INDEX_KEYS`, then the other keys in slot order. An accessor property
-/// decodes as [`Value::Accessor`]. Also reports whether the table carries the
-/// non-enumerable `@@errorkind` brand.
+/// decodes as [`Value::Accessor`].
 ///
 /// Defensive: a truncated table stops early, so a malformed pointer never
 /// panics.
-fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> (Vec<(String, Value)>, bool) {
+fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> Vec<(String, Value)> {
     use crate::abi;
     let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize).unwrap_or(0) as usize;
     if props == 0 {
-        return (Vec::new(), false);
+        return Vec::new();
     }
     let count = read_u32(memory, props + abi::PROPS_COUNT_OFFSET as usize).unwrap_or(0) as usize;
     let tflags = memory
         .get(props + abi::PROPS_TFLAGS_OFFSET as usize)
         .copied()
         .unwrap_or(0);
-    let mut is_error = false;
     // (index value for an integer key, key text, attrs, value bits)
     let mut keyed: Vec<(Option<u32>, String, u32, u64)> = Vec::with_capacity(count);
     for k in 0..count {
@@ -353,9 +351,6 @@ fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> (Vec<(String, V
         let Value::Str(text) = decode_string(key as usize, memory) else {
             continue;
         };
-        if text == ERROR_KIND_KEY {
-            is_error = true;
-        }
         if attrs & abi::ATTR_ENUMERABLE == 0 {
             continue;
         }
@@ -387,29 +382,29 @@ fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> (Vec<(String, V
         };
         entries.push((key, value));
     }
-    (entries, is_error)
+    entries
 }
 
 /// Resolve a heap object block at base `ptr` from its own enumerable
-/// properties ([`decode_props`]). An object carrying the non-enumerable
-/// `@@errorkind` brand decodes as [`Value::Error`]; an object with a
-/// prototype whose `constructor` names a function other than `Object`
-/// decodes as [`Value::Instance`].
+/// properties ([`decode_props`]). An object of class `ERROR` decodes as
+/// [`Value::Error`] with its (possibly inherited) `name` and `message`; an
+/// object with a prototype whose `constructor` names a function other than
+/// `Object` decodes as [`Value::Instance`].
 fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     use crate::abi;
-    let (entries, is_error) = decode_props(ptr, memory, guard);
-    if is_error {
-        let field = |name: &str| {
-            entries.iter().find_map(|(key, value)| match value {
-                Value::Str(s) if key == name => Some(s.clone()),
-                _ => None,
-            })
+    if memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize) == Some(&CLASS_ERROR) {
+        let mut field = |name: &str| match lookup_data(ptr, name, memory)
+            .map(|bits| decode_in(bits, memory, guard))
+        {
+            Some(Value::Str(s)) => Some(s),
+            _ => None,
         };
         return Value::Error {
             name: field("name").unwrap_or_else(|| "Error".to_owned()),
             message: field("message").unwrap_or_default(),
         };
     }
+    let entries = decode_props(ptr, memory, guard);
     let has_proto = read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize)
         .is_some_and(|bits| heap_object(bits, memory).is_some());
     let class = has_proto
@@ -443,7 +438,7 @@ fn decode_function(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
         name: function_name(abi::HEAP | ptr as u64, memory).unwrap_or_default(),
         class,
         extends,
-        props: decode_props(ptr, memory, guard).0,
+        props: decode_props(ptr, memory, guard),
     }
 }
 
@@ -623,7 +618,7 @@ pub fn format_value(value: &Value) -> String {
         Value::Object(entries) => format_entries(entries),
         // A class instance is prefixed with its constructor's name.
         Value::Instance { class, entries } => format!("{class} {}", format_entries(entries)),
-        // A branded Error object renders as its single-line stack
+        // An Error instance renders as its single-line stack
         // (`"<name>: <message>"`, or just the name without a message), the way
         // a JS console prints an error's first line.
         Value::Error { name, message } => {

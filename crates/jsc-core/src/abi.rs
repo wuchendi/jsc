@@ -35,7 +35,7 @@
 //! Every heap block opens with a [`HEADER_SIZE`]-byte header: a `TYPE_*` byte at
 //! offset 0 (see [`TYPE_STRING`] … [`TYPE_CELL`]) followed by the reserved
 //! [`HEADER_GC_OFFSET`], [`HEADER_FLAGS_OFFSET`], and [`HEADER_CLASS_OFFSET`]
-//! bytes (always written 0), so the per-type payload begins at [`HEADER_SIZE`].
+//! bytes, so the per-type payload begins at [`HEADER_SIZE`].
 //! Every block base is [`BLOCK_ALIGN`]-aligned: `__alloc` rounds each request up
 //! and static data blobs are padded to it. The single [`HEAP`] tag boxes
 //! strings, arrays, objects, and functions alike; the concrete kind is the TYPE
@@ -94,10 +94,20 @@ pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 /// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`].
 pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
 
-/// Header byte 3: the `TYPE_OBJECT` sub-`class` byte. Reserved; every block is
-/// created with it 0.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Header byte 3: the `TYPE_OBJECT` sub-`class` byte ([`CLASS_ORDINARY`],
+/// [`CLASS_ERROR`]); `0` for every other kind.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const HEADER_CLASS_OFFSET: u32 = 3;
+
+/// [`TYPE_OBJECT`] `class` byte: an ordinary object.
+pub(crate) const CLASS_ORDINARY: u8 = 0;
+
+/// [`TYPE_OBJECT`] `class` byte: an Error instance (`[[ErrorData]]`). Its kind
+/// is its prototype (`%Error.prototype%`, `%TypeError.prototype%`,
+/// `%RangeError.prototype%`, static data-segment objects); it owns a
+/// non-enumerable `stack` (and `message` when one was given) and inherits
+/// `name`.
+pub(crate) const CLASS_ERROR: u8 = 1;
 
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
@@ -416,26 +426,6 @@ pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 /// completion-routing globals (indices `0..=4`), so it is index `5`. Internal —
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
-
-/// Reserved hidden property key marking a builtin **Error** object's kind
-/// (E-series). `new Error`/`new TypeError`/`new RangeError` store one of
-/// [`ERROR_KIND_ERROR`] / [`ERROR_KIND_TYPE`] / [`ERROR_KIND_RANGE`] under this
-/// key as a NON-ENUMERABLE number property, so it never surfaces in `for-in` /
-/// `Object.keys` / `JSON.stringify` / rendering, yet `__get` reads it back so
-/// `instanceof` and the host decoders can recognize an error and its kind. The stored value is never `undefined`, so
-/// "the object is an error" is testable as "the loaded marker is not
-/// `undefined`", and the concrete kind by strict-equality against the constants
-/// below.
-pub(crate) const ERROR_KIND_KEY: &str = "@@errorkind";
-
-/// [`ERROR_KIND_KEY`] value identifying a base `Error`.
-pub(crate) const ERROR_KIND_ERROR: f64 = 0.0;
-
-/// [`ERROR_KIND_KEY`] value identifying a `TypeError` (which is also an `Error`).
-pub(crate) const ERROR_KIND_TYPE: f64 = 1.0;
-
-/// [`ERROR_KIND_KEY`] value identifying a `RangeError` (which is also an `Error`).
-pub(crate) const ERROR_KIND_RANGE: f64 = 2.0;
 
 /// The module name of every host env import (`print`/`__convert`/`__method`).
 pub(crate) const IMPORT_MODULE: &str = "env";

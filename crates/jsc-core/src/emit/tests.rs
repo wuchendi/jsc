@@ -298,6 +298,7 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
                 init: IrNode::Object {
                     entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
                     proto: None,
+                    class: crate::abi::CLASS_ORDINARY,
                     reserve: 0,
                 },
             },
@@ -335,6 +336,7 @@ fn object_property_assignment_via_indexset_ir_missing_key_adds() {
                 init: IrNode::Object {
                     entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
                     proto: None,
+                    class: crate::abi::CLASS_ORDINARY,
                     reserve: 0,
                 },
             },

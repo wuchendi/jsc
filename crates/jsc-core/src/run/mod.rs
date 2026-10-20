@@ -101,7 +101,7 @@ const PROMISE_PENDING: i32 = abi::PROMISE_PENDING;
 const PROMISE_FULFILLED: i32 = abi::PROMISE_FULFILLED;
 const PROMISE_REJECTED: i32 = abi::PROMISE_REJECTED;
 
-/// Reserved hidden key marking a branded Error object's kind; see
-/// [`abi::ERROR_KIND_KEY`]. The renderer uses its presence to print an error as
-/// its single-line stack rather than a plain `{ ... }` object.
-const ERROR_KIND_KEY: &str = abi::ERROR_KIND_KEY;
+/// The `TYPE_OBJECT` `class` byte of an Error instance; see
+/// [`abi::CLASS_ERROR`]. The renderer prints such an object as its
+/// single-line stack rather than a plain `{ ... }` object.
+const CLASS_ERROR: u8 = abi::CLASS_ERROR;
