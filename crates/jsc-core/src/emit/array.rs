@@ -306,7 +306,7 @@ pub(super) fn emit_hof_invoke(
     emit_reset_this(function);
     function.instruction(&Instruction::LocalGet(cb));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
@@ -315,7 +315,7 @@ pub(super) fn emit_hof_invoke(
     emit_argc(real_args as usize, function);
     function.instruction(&Instruction::LocalGet(cb));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));

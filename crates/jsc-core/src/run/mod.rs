@@ -88,8 +88,13 @@ const TYPE_PROMISE: u8 = abi::TYPE_PROMISE;
 const TYPE_GENERATOR: u8 = abi::TYPE_GENERATOR;
 const TYPE_DATE: u8 = abi::TYPE_DATE;
 
-/// Byte offset of a `Date` block's f64 `ms` payload; see [`abi`].
+/// Object-family payload offsets (`Date` ms, Map/Set size, Promise
+/// state/value, Generator done); see [`abi`].
 const DATE_MS_OFFSET: usize = abi::DATE_MS_OFFSET as usize;
+const MAP_SIZE_OFFSET: usize = abi::MAP_SIZE_OFFSET as usize;
+const PROMISE_STATE_OFFSET: usize = abi::PROMISE_STATE_OFFSET as usize;
+const PROMISE_VALUE_OFFSET: usize = abi::PROMISE_VALUE_OFFSET as usize;
+const GEN_DONE_OFFSET: usize = abi::GEN_DONE_OFFSET as usize;
 
 /// Promise `state` header values; see [`abi`].
 const PROMISE_PENDING: i32 = abi::PROMISE_PENDING;

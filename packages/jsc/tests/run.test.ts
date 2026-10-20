@@ -213,3 +213,21 @@ it('renders cyclic structures Node-console style', async () => {
     '<ref *1> [ 1, [Circular *1] ]',
   )
 })
+
+it('renders object-family values like the Rust host', async () => {
+  const { stdout, result } = await run(
+    "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.delete(2); " +
+      'const s = new Set(); s.add(1); s.add(2); ' +
+      'function* gen() { yield 1 } function f(x) { return x } ' +
+      'console.log(m, s, m.size, s.size, m.get(1), new Date(5), f, gen(), ' +
+      'Promise.resolve(4), Promise.reject(1).catch(() => 0)); ' +
+      '[m, s, new Date(0), Promise.resolve(f)]',
+  )
+  expect(stdout).toBe(
+    'Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function (anonymous)] ' +
+      'Object [Generator] Promise { 4 } Promise { <pending> }\n',
+  )
+  expect(result).toBe(
+    '[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function (anonymous)] } ]',
+  )
+})

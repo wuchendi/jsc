@@ -275,24 +275,27 @@ const TYPE_ARRAY: i32 = abi::TYPE_ARRAY as i32;
 /// [`HEADER_SIZE`] header). Maps to `typeof` "object".
 const TYPE_OBJECT: i32 = abi::TYPE_OBJECT as i32;
 
-/// Type byte for the first-class function value: a block laid out as
-/// `[type=3][pad×3][func_idx:u32][env:i64]` — the funcref-table index and the
-/// closure environment (`undefined` until closures land). Maps to `typeof`
-/// "function".
+/// Byte offset of the object-family prefix's `proto` jsval slot (see
+/// [`abi::OBJ_PROTO_OFFSET`]); every non-`TYPE_OBJECT`/`TYPE_ARRAY`
+/// object-family block is created with it `null`.
+const OBJ_PROTO_OFFSET: u64 = abi::OBJ_PROTO_OFFSET as u64;
+
+/// Type byte, field offsets, and size of a first-class function value block
+/// (the funcref-table index and the closure environment). Maps to `typeof`
+/// "function". See [`abi::TYPE_FUNCTION`] for the full layout.
 const TYPE_FUNCTION: i32 = abi::TYPE_FUNCTION as i32;
+const FUNC_INDEX_OFFSET: u64 = abi::FUNC_INDEX_OFFSET as u64;
+const FUNC_ENV_OFFSET: u64 = abi::FUNC_ENV_OFFSET as u64;
+const FUNC_BLOCK_SIZE: i32 = abi::FUNC_BLOCK_SIZE.cast_signed();
 
-/// The byte size of a function-value heap block: the [`HEADER_SIZE`] header, a
-/// u32 funcref-table index, and an i64 environment slot.
-const FUNC_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8;
-
-/// Type byte and field offsets of a `Generator` handle block. See
+/// Type byte, field offsets, and size of a `Generator` handle block. See
 /// [`abi::TYPE_GENERATOR`] for the full layout.
 const TYPE_GENERATOR: i32 = abi::TYPE_GENERATOR as i32;
 const GEN_SM_IDX_OFFSET: u64 = abi::GEN_SM_IDX_OFFSET as u64;
 const GEN_STATE_OFFSET: u64 = abi::GEN_STATE_OFFSET as u64;
 const GEN_DONE_OFFSET: u64 = abi::GEN_DONE_OFFSET as u64;
 const GEN_ENV_OFFSET: u64 = abi::GEN_ENV_OFFSET as u64;
-const GEN_BLOCK_SIZE: i32 = HEADER_SIZE + 12 + 8;
+const GEN_BLOCK_SIZE: i32 = abi::GEN_BLOCK_SIZE.cast_signed();
 
 /// Type byte for a closure **environment** block (internal): a block laid
 /// out as `[type=4][pad×3][count:u32][cell_ptr:i64 × count]` holding the boxed
@@ -309,9 +312,9 @@ const TYPE_CELL: i32 = abi::TYPE_CELL as i32;
 /// i64 value slot.
 const CELL_BLOCK_SIZE: i32 = HEADER_SIZE + 8;
 
-/// Type byte for a `Map` handle block: `[type=6][pad×3][size:u32][entries:i64]`
-/// — the logical entry count and a heap jsval pointing at the growable backing.
-/// Maps to `typeof` "object". See [`abi::TYPE_MAP`].
+/// Type byte for a `Map` handle block — the logical entry count and a heap jsval
+/// pointing at the growable backing. Maps to `typeof` "object". See
+/// [`abi::TYPE_MAP`].
 const TYPE_MAP: i32 = abi::TYPE_MAP as i32;
 
 /// Type byte for a `Set` handle block: the same layout as [`TYPE_MAP`], with
@@ -319,20 +322,21 @@ const TYPE_MAP: i32 = abi::TYPE_MAP as i32;
 /// [`abi::TYPE_SET`].
 const TYPE_SET: i32 = abi::TYPE_SET as i32;
 
-/// The byte size of a Map/Set handle block: the [`HEADER_SIZE`] header (with the
-/// u32 `size` in its padding-aligned slot at `+HEADER_SIZE`) plus the i64 `entries`
-/// backing-array jsval at `+HEADER_SIZE+4`.
-const MAP_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8;
+/// Field offsets and size of a Map/Set handle block (see [`abi::TYPE_MAP`]).
+const MAP_SIZE_OFFSET: u64 = abi::MAP_SIZE_OFFSET as u64;
+const MAP_ENTRIES_OFFSET: u64 = abi::MAP_ENTRIES_OFFSET as u64;
+const MAP_BLOCK_SIZE: i32 = abi::MAP_BLOCK_SIZE.cast_signed();
 
-/// Type byte and payload offset of a `Date` block:
-/// `[type=10][pad×3][pad×4][ms:f64]`. Maps to `typeof` "object". See
-/// [`abi::TYPE_DATE`].
+/// Field offsets and size of a `Promise` block (see [`abi::TYPE_PROMISE`]).
+const PROMISE_STATE_OFFSET: u64 = abi::PROMISE_STATE_OFFSET as u64;
+const PROMISE_VALUE_OFFSET: u64 = abi::PROMISE_VALUE_OFFSET as u64;
+const PROMISE_BLOCK_SIZE: i32 = abi::PROMISE_BLOCK_SIZE.cast_signed();
+
+/// Type byte, payload offset, and size of a `Date` block. Maps to `typeof`
+/// "object". See [`abi::TYPE_DATE`].
 const TYPE_DATE: i32 = abi::TYPE_DATE as i32;
 const DATE_MS_OFFSET: u64 = abi::DATE_MS_OFFSET as u64;
-
-/// The byte size of a `Date` heap block: the [`HEADER_SIZE`] header, 4 padding
-/// bytes for 8-byte alignment, and the 8-byte `ms` timestamp slot.
-const DATE_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8;
+const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 
 /// The TYPE BYTE of an instance-accessor block. See [`abi::TYPE_ACCESSOR`].
 const TYPE_ACCESSOR: i32 = abi::TYPE_ACCESSOR as i32;

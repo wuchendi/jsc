@@ -1140,10 +1140,13 @@ fn non_capturing_function_is_unaffected() {
 
 #[test]
 fn function_value_decode_reads_type_byte() {
-    // A hand-built function block at base offset 8:
-    // [type=3][pad×3][func_idx:u32=0][env:i64=undefined].
+    // A hand-built function block at base offset 8: [type=3][pad×3][props=0]
+    // [proto=null][func_idx:u32=0][reserved:u32][env:i64=undefined].
     let mut memory = vec![0u8; 8];
     memory.extend_from_slice(&[TYPE_FUNCTION, 0, 0, 0]);
+    memory.extend_from_slice(&0u32.to_le_bytes());
+    memory.extend_from_slice(&0x7FFA_0000_0000_0000_u64.to_le_bytes());
+    memory.extend_from_slice(&0u32.to_le_bytes());
     memory.extend_from_slice(&0u32.to_le_bytes());
     memory.extend_from_slice(&0x7FFB_0000_0000_0000_u64.to_le_bytes());
     let bits = 0x7FFD_0000_0000_0000_u64 | 0x8;

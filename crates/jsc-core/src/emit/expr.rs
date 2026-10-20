@@ -566,19 +566,19 @@ pub(super) fn emit_method_call_user(
     function.instruction(&Instruction::LocalGet(obj_local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 
-    // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -642,14 +642,14 @@ pub(super) fn emit_accessor_get(function: &mut Function, scratch: u32, helpers: 
     function.instruction(&Instruction::LocalSet(base));
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     emit_argc(0, function);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -719,19 +719,19 @@ pub(super) fn emit_this_call(
     function.instruction(&Instruction::LocalGet(this_local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 
-    // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -792,19 +792,19 @@ pub(super) fn emit_new(
     function.instruction(&Instruction::LocalGet(instance_local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 
-    // Trailing env argument: the constructor's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the constructor's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -834,9 +834,9 @@ pub(super) fn emit_argc(count: usize, function: &mut Function) {
 
 /// Emit a first-class function value `IrNode::FuncValue`, leaving its jsval
 /// (single heap tag `0b101`, type byte `TYPE_FUNCTION`) on the stack.
-/// `__alloc(FUNC_BLOCK_SIZE)` reserves the block, then the type byte, the
-/// funcref-table index (at `+HEADER_SIZE`), and the environment slot (at
-/// `+HEADER_SIZE+4`) are written.
+/// `__alloc(FUNC_BLOCK_SIZE)` reserves the block, then the object-family prefix
+/// (`null` prototype), the funcref-table index (at [`FUNC_INDEX_OFFSET`]), and the
+/// environment slot (at [`FUNC_ENV_OFFSET`]) are written.
 ///
 /// For a non-capturing function `captures` is empty and the env slot is
 /// `undefined`. For a **closure** the environment block is built first (via
@@ -853,19 +853,14 @@ pub(super) fn emit_func_value(
 ) {
     let dst = scratch + 3;
     let env_tmp = scratch + 6;
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
     let func_idx_slot = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     };
     let env_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+        offset: FUNC_ENV_OFFSET,
+        align: 3,
         memory_index: 0,
     };
 
@@ -882,19 +877,17 @@ pub(super) fn emit_func_value(
     function.instruction(&Instruction::I32Const(FUNC_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
 
-    // Write the TYPE_FUNCTION type byte at dst (offset 0), keeping dst on the stack.
+    // Write the TYPE_FUNCTION prefix at dst, keeping dst on the stack.
     function.instruction(&Instruction::LocalTee(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
-    function.instruction(&Instruction::I32Store8(type_byte));
+    emit_object_prefix(function, dst, TYPE_FUNCTION);
 
-    // Write the u32 funcref-table index at dst + HEADER_SIZE.
+    // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(table_index.cast_signed()));
     function.instruction(&Instruction::I32Store(func_idx_slot));
 
-    // Write the env slot at dst + HEADER_SIZE + 4.
+    // Write the env slot at dst + FUNC_ENV_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(env_tmp));
@@ -1192,14 +1185,14 @@ pub(super) fn emit_promise_ctor(
     emit_reset_this(function);
     function.instruction(&Instruction::LocalGet(exec_base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     emit_argc(2, function);
     function.instruction(&Instruction::LocalGet(exec_base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -1246,31 +1239,25 @@ fn emit_settler_value(
     // dst = __alloc(FUNC_BLOCK_SIZE); leave dst (i32) on the stack.
     function.instruction(&Instruction::I32Const(FUNC_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
-    // Write the TYPE_FUNCTION type byte at dst (offset 0).
+    // Write the TYPE_FUNCTION prefix at dst, keeping dst on the stack.
     function.instruction(&Instruction::LocalTee(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-    // Write the u32 funcref-table index at dst + HEADER_SIZE.
+    emit_object_prefix(function, dst, TYPE_FUNCTION);
+    // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(table_index.cast_signed()));
     function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
-    // Write the bound promise into the env slot at dst + HEADER_SIZE + 4.
+    // Write the bound promise into the env slot at dst + FUNC_ENV_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(p_local));
     function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+        offset: FUNC_ENV_OFFSET,
+        align: 3,
         memory_index: 0,
     }));
     // Rebox the block base (still on the stack) as a heap jsval.
@@ -1313,19 +1300,19 @@ pub(super) fn emit_call_indirect(
     // A plain indirect call binds `this = undefined` — method calls take the
     // dedicated `emit_method_call_user` path instead.
     emit_reset_this(function);
-    // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -1443,18 +1430,18 @@ pub(super) fn emit_call_spread(
             emit_spread_arg_slots(base, len, function, helpers);
             // A plain indirect call binds `this = undefined`.
             emit_reset_this(function);
-            // Trailing env argument: the callee's own environment (+HEADER_SIZE+4).
+            // Trailing env argument: the callee's own environment (FUNC_ENV_OFFSET).
             function.instruction(&Instruction::LocalGet(cb));
             function.instruction(&Instruction::I64Load(MemArg {
-                offset: (HEADER_SIZE + 4) as u64,
+                offset: FUNC_ENV_OFFSET,
                 align: 3,
                 memory_index: 0,
             }));
             emit_spread_argc(len, function);
-            // Funcref-table index (+HEADER_SIZE), on top for call_indirect.
+            // Funcref-table index (FUNC_INDEX_OFFSET), on top for call_indirect.
             function.instruction(&Instruction::LocalGet(cb));
             function.instruction(&Instruction::I32Load(MemArg {
-                offset: HEADER_SIZE as u64,
+                offset: FUNC_INDEX_OFFSET,
                 align: 2,
                 memory_index: 0,
             }));
