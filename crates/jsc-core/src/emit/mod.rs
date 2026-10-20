@@ -106,6 +106,13 @@ const INVOKE_EXPORT_NAME: &str = abi::INVOKE_EXPORT_NAME;
 /// host async engine calls to advance an `async function` body's state machine.
 const ASYNC_STEP_EXPORT_NAME: &str = abi::ASYNC_STEP_EXPORT_NAME;
 
+/// The export names of the bump allocator and the guest constructors the
+/// hosts allocate through (see [`abi`]).
+const ALLOC_EXPORT_NAME: &str = abi::ALLOC_EXPORT_NAME;
+const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
+const NEW_ARRAY_EXPORT_NAME: &str = abi::NEW_ARRAY_EXPORT_NAME;
+const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
+
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
@@ -126,8 +133,7 @@ const METHOD_OP_SUBSTRING: i32 = abi::METHOD_OP_SUBSTRING;
 const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
 
 /// The name under which the bump-allocator heap pointer global is exported so the
-/// host `__convert` import can bump-allocate a heap string in guest memory when
-/// lowering `String(x)`.
+/// run stage can detect the out-of-memory sentinel.
 const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
 
 /// The name under which the pending-exception flag global (`$exc_pending`, i32) is
@@ -235,6 +241,9 @@ const CF_CONTINUE: i32 = 3;
 /// the bump allocator (`__alloc`) then starts at the first free offset *after*
 /// them (see [`emit`]).
 const HEAP_BASE: i32 = 8;
+
+/// The alignment of every heap block base (see [`abi::BLOCK_ALIGN`]).
+const BLOCK_ALIGN: i32 = abi::BLOCK_ALIGN.cast_signed();
 
 /// The NaN-boxed heap-pointer header (see [`abi::HEAP`]): the SINGLE tag for
 /// every heap value. A heap jsval is `HEAP_BITS | (ptr as u32)`, carrying
@@ -745,6 +754,11 @@ struct Helpers<'a> {
     /// table, and `new Promise` — needing an executor function — cannot occur).
     settle_resolve_slot: u32,
     settle_reject_slot: u32,
+    /// `__new_string(len: i32) -> i32`: the exported string constructor. The
+    /// LAST defined functions are it, `__new_array` (`new_string + 1`), and
+    /// `__new_promise` (`new_string + 2`), appended after the settlers so every
+    /// other index stays stable.
+    new_string: u32,
     /// `__alloc(size) -> i32`: bump-allocate `size` bytes, returning the offset.
     /// Called inline by array literals.
     alloc: u32,
@@ -1048,8 +1062,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     let mut exports = ExportSection::new();
     exports.export(EXPORT_NAME, ExportKind::Func, IMPORT_FUNC_COUNT);
     exports.export(MEMORY_EXPORT_NAME, ExportKind::Memory, 0);
-    // The bump-allocator heap pointer global is exported so the host
-    // `__convert` import can bump-allocate a heap string when lowering `String(x)`.
+    // The bump-allocator heap pointer global is exported so the run stage can
+    // detect the out-of-memory sentinel.
     exports.export(HEAP_PTR_EXPORT_NAME, ExportKind::Global, HEAP_PTR_GLOBAL);
     // The exception-unwinding globals are exported so the run stage can
     // detect and render an uncaught exception after `main` returns.
@@ -1066,6 +1080,20 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // The `__async_step` trampoline is exported so the host async engine
     // can drive an `async function` body's state machine one suspend at a time.
     exports.export(ASYNC_STEP_EXPORT_NAME, ExportKind::Func, helpers.async_step);
+    // The allocator and the guest constructors: the hosts allocate every
+    // string/array/promise block through these, never by hand.
+    exports.export(ALLOC_EXPORT_NAME, ExportKind::Func, helpers.alloc);
+    exports.export(NEW_STRING_EXPORT_NAME, ExportKind::Func, helpers.new_string);
+    exports.export(
+        NEW_ARRAY_EXPORT_NAME,
+        ExportKind::Func,
+        helpers.new_string + 1,
+    );
+    exports.export(
+        NEW_PROMISE_EXPORT_NAME,
+        ExportKind::Func,
+        helpers.new_string + 2,
+    );
     module.section(&exports);
 
     // Element section: an active segment filling the funcref table at offset 0
@@ -1173,6 +1201,9 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
         code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers));
     }
+    code.function(&emit_new_string(helpers.alloc));
+    code.function(&emit_new_array(helpers.alloc));
+    code.function(&emit_new_promise(helpers.alloc));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs, if any.

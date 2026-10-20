@@ -103,3 +103,17 @@ fn out_of_memory_inside_try_terminates() {
         "RangeError: out of memory",
     );
 }
+
+/// A program whose guest strings fill ~448 MiB of the 512 MiB cap, so the next
+/// 64 MiB HOST allocation (`s.slice(1)`, built through the guest
+/// `__new_string` export) runs out of memory. Shared verbatim with the shim
+/// parity test in `packages/jsc/tests/run.test.ts`.
+const HOST_OOM: &str = "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } \
+     let t = s + s; let u = t + s; s.slice(1).length";
+
+/// A host-initiated allocation past the cap is the same uncaught
+/// `RangeError: out of memory` as a guest one.
+#[test]
+fn host_initiated_out_of_memory() {
+    assert_uncaught(HOST_OOM, "RangeError: out of memory");
+}

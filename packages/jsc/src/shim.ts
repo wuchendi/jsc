@@ -1,9 +1,11 @@
 /**
  * The JS runtime shim: the `importObject` that backs the emitted module's host
  * env imports (`print` / `__convert` / `__method` / `__promise` / `__then` /
- * `__now` / `__parse_int`) plus the bump-allocator they share. A port of
- * `crates/jsc-core/src/run/harness.rs` (import wiring), `run/host.rs` (handlers +
- * allocator), and `run/promise.rs` (the promise engine + microtask queue). It
+ * `__now` / `__parse_int`). A port of `crates/jsc-core/src/run/harness.rs`
+ * (import wiring + out-of-memory guard), `run/host.rs` (handlers), and
+ * `run/promise.rs` (the promise engine + microtask queue). Every heap block is
+ * allocated through the guest's exported constructors (`__new_string` /
+ * `__new_array` / `__new_promise`), never by hand. It
  * duplicates Rust host semantics against the emitted module's memory (see
  * README, "Host parity").
  */
@@ -20,8 +22,10 @@ import {
   HEADER_SIZE,
   HEAP,
   HEAP_PTR_EXPORT_NAME,
+  HEAP_PTR_OOM,
   INVOKE_EXPORT_NAME,
   MEMORY_EXPORT_NAME,
+  MEMORY_MAX_PAGES,
   METHOD_OP_CHAR_AT,
   METHOD_OP_ENDS_WITH,
   METHOD_OP_INCLUDES,
@@ -39,6 +43,9 @@ import {
   METHOD_OP_TRIM,
   METHOD_OP_TRIM_END,
   METHOD_OP_TRIM_START,
+  NEW_ARRAY_EXPORT_NAME,
+  NEW_PROMISE_EXPORT_NAME,
+  NEW_STRING_EXPORT_NAME,
   PRINT_FLAG_END,
   PRINT_FLAG_SEP,
   PROMISE_FULFILLED,
@@ -77,12 +84,13 @@ export interface Shim {
   imports: WebAssembly.Imports
   /** Everything `console.log` printed, in execution order (mirrors `run_capturing`). */
   stdout: () => string
-  /** Bind the instantiated module so the imports can read/grow its memory. */
+  /** Bind the instantiated module so the imports can read its memory and call its constructors. */
   bindInstance: (instance: WebAssembly.Instance) => void
   /**
    * Drain the microtask queue to empty, then throw
+   * `Error("Uncaught RangeError: out of memory")` if the heap is exhausted, or
    * `Error("Uncaught (in promise) <value>")` for the first rejected promise that
-   * never got a handler (mirrors `promise.rs::drain_after_main`).
+   * never got a handler (mirrors `harness.rs` / `promise.rs::drain_after_main`).
    */
   drainAfterMain: () => void
 }
@@ -117,6 +125,12 @@ interface Job {
 /** The `[type][pad×3][state:i32][value:i64]` promise block size in bytes. */
 const PROMISE_BLOCK_SIZE = HEADER_SIZE + 4 + 8
 
+/** The linear-memory cap in bytes; constructor lengths are clamped to it (mirrors `host.rs`). */
+const MEMORY_MAX_BYTES = MEMORY_MAX_PAGES * 0x1_0000
+
+/** The rendered error for an exhausted heap (mirrors `harness.rs::OUT_OF_MEMORY`). */
+const OUT_OF_MEMORY = 'Uncaught RangeError: out of memory'
+
 const utf8Encode = new TextEncoder()
 const utf8Decoder = new TextDecoder()
 
@@ -143,43 +157,81 @@ export function createShim(): Shim {
     return mem ? new Uint8Array(mem.buffer) : new Uint8Array(0)
   }
 
+  /** An exported global by name, or `undefined` when absent. */
+  function exportGlobal(name: string): WebAssembly.Global | undefined {
+    return instance?.exports[name] as WebAssembly.Global | undefined
+  }
+
+  /** Whether `__heap_ptr` holds the out-of-memory sentinel (mirrors `host.rs::heap_exhausted`). */
+  function heapExhausted(): boolean {
+    const global = exportGlobal(HEAP_PTR_EXPORT_NAME)
+    return global !== undefined && global.value === HEAP_PTR_OOM
+  }
+
   /**
-   * Bump-allocate a pre-built heap `block` in guest memory and return its base
-   * offset, or `null` when the exports are missing or the write fails. Mirrors
-   * `host.rs::host_alloc`: read `__heap_ptr`, grow memory if the block overflows,
-   * write the bytes, and advance the global.
+   * Pass a host import's result through, or throw the out-of-memory error when
+   * the import (or an earlier allocation) left the sentinel in `__heap_ptr`
+   * (mirrors `harness.rs::oom_guard`).
    */
-  function hostAlloc(block: Uint8Array): bigint | null {
-    const mem = memory()
-    const global = instance?.exports[HEAP_PTR_EXPORT_NAME] as
-      | WebAssembly.Global
+  function oomGuard(bits: bigint): bigint {
+    if (heapExhausted()) throw new Error(OUT_OF_MEMORY)
+    return bits
+  }
+
+  /**
+   * Call the guest constructor export `name(...args) -> base` and return the new
+   * block's base offset, or `null` when the export is missing or the call traps
+   * — an out-of-memory trap leaves the sentinel for {@link oomGuard} (mirrors
+   * `host.rs::guest_new`).
+   */
+  function guestNew(name: string, ...args: number[]): number | null {
+    const ctor = instance?.exports[name] as
+      | ((...a: number[]) => number)
       | undefined
-    if (!mem || !global) return null
-    const base = (global.value as number) >>> 0
-    const end = base + block.length
-    const cur = mem.buffer.byteLength
-    if (end > cur) {
-      const pages = Math.ceil((end - cur) / 0x1_0000)
-      try {
-        mem.grow(pages)
-      } catch {
-        return null
-      }
+    if (!ctor) return null
+    try {
+      return ctor(...args) >>> 0
+    } catch {
+      return null
     }
-    new Uint8Array(mem.buffer).set(block, base)
-    global.value = end
+  }
+
+  /**
+   * Allocate a heap STRING block holding `text` through `__new_string`, filling
+   * only the payload (mirrors `host.rs::alloc_string`).
+   */
+  function allocString(text: string): bigint | null {
+    const bytes = utf8Encode.encode(text)
+    const base = guestNew(
+      NEW_STRING_EXPORT_NAME,
+      Math.min(bytes.length, MEMORY_MAX_BYTES),
+    )
+    if (base === null) return null
+    const view = memView()
+    const at = base + HEADER_SIZE + 4
+    if (at + bytes.length > view.length) return null
+    view.set(bytes, at)
     return BigInt(base)
   }
 
-  /** Bump-allocate a heap STRING block holding `text` (mirrors `host.rs::host_alloc_string`). */
-  function hostAllocString(text: string): bigint | null {
-    const bytes = utf8Encode.encode(text)
-    const block = new Uint8Array(HEADER_SIZE + 4 + bytes.length)
-    block[0] = TYPE_STRING
-    // len:u32 LE at HEADER_SIZE, utf8 payload after it.
-    new DataView(block.buffer).setUint32(HEADER_SIZE, bytes.length, true)
-    block.set(bytes, HEADER_SIZE + 4)
-    return hostAlloc(block)
+  /**
+   * Allocate a heap ARRAY block holding the jsval bits `elems` through
+   * `__new_array`, filling only the elements (mirrors `host.rs::alloc_array`).
+   */
+  function allocArray(elems: bigint[]): bigint | null {
+    const base = guestNew(
+      NEW_ARRAY_EXPORT_NAME,
+      Math.min(elems.length, MEMORY_MAX_BYTES / 8),
+    )
+    const mem = memory()
+    if (base === null || !mem) return null
+    const at = base + HEADER_SIZE + 4
+    if (at + 8 * elems.length > mem.buffer.byteLength) return null
+    const dv = new DataView(mem.buffer)
+    elems.forEach((bits, i) => {
+      dv.setBigUint64(at + 8 * i, bits, true)
+    })
+    return BigInt(base)
   }
 
   /** `array.join(sep)` — allocates the joined heap string (mirrors `host.rs::array_join`). */
@@ -188,7 +240,7 @@ export function createShim(): Shim {
     ptr: number,
     sepBits: bigint,
   ): bigint | null {
-    const base = hostAllocString(arrayJoinText(mem, ptr, sepBits))
+    const base = allocString(arrayJoinText(mem, ptr, sepBits))
     return base === null ? null : HEAP | base
   }
 
@@ -202,19 +254,13 @@ export function createShim(): Shim {
     const len = blockLen(mem, ptr)
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
-    const count = end - start
-    const block = new Uint8Array(HEADER_SIZE + 4 + 8 * count)
-    block[0] = TYPE_ARRAY
-    const dv = new DataView(block.buffer)
-    dv.setUint32(HEADER_SIZE, count, true)
-    let off = HEADER_SIZE + 4
+    const elems: bigint[] = []
     for (let i = start; i < end; i++) {
       const elem = arrayElemBits(mem, ptr, i)
       if (elem === null) return null
-      dv.setBigUint64(off, elem, true)
-      off += 8
+      elems.push(elem)
     }
-    const base = hostAlloc(block)
+    const base = allocArray(elems)
     return base === null ? null : HEAP | base
   }
 
@@ -230,7 +276,7 @@ export function createShim(): Shim {
     const len = bytes.length
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
-    const base = hostAllocString(utf8Decode(bytes.subarray(start, end)))
+    const base = allocString(utf8Decode(bytes.subarray(start, end)))
     return base === null ? null : HEAP | base
   }
 
@@ -240,9 +286,7 @@ export function createShim(): Shim {
     if (bytes === null) return null
     const trimStart = op !== METHOD_OP_TRIM_END
     const trimEnd = op !== METHOD_OP_TRIM_START
-    const base = hostAllocString(
-      utf8Decode(trimBytes(bytes, trimStart, trimEnd)),
-    )
+    const base = allocString(utf8Decode(trimBytes(bytes, trimStart, trimEnd)))
     return base === null ? null : HEAP | base
   }
 
@@ -259,7 +303,7 @@ export function createShim(): Shim {
     const n = Math.max(truncToInt(valueToNumber(decode(arg0, mem))), 0)
     const out = new Uint8Array(bytes.length * n)
     for (let i = 0; i < n; i++) out.set(bytes, i * bytes.length)
-    const base = hostAllocString(utf8Decode(out))
+    const base = allocString(utf8Decode(out))
     return base === null ? null : HEAP | base
   }
 
@@ -280,7 +324,7 @@ export function createShim(): Shim {
       padValue.kind === 'undefined'
         ? utf8Encode.encode(' ')
         : utf8Encode.encode(formatValue(padValue))
-    const base = hostAllocString(
+    const base = allocString(
       padBytes(bytes, target, pad, op === METHOD_OP_PAD_START),
     )
     return base === null ? null : HEAP | base
@@ -300,7 +344,7 @@ export function createShim(): Shim {
     const b = substringIndex(arg1, mem, len, len)
     const lo = Math.min(a, b)
     const hi = Math.max(a, b)
-    const base = hostAllocString(utf8Decode(bytes.subarray(lo, hi)))
+    const base = allocString(utf8Decode(bytes.subarray(lo, hi)))
     return base === null ? null : HEAP | base
   }
 
@@ -326,23 +370,14 @@ export function createShim(): Shim {
           : splitOn(bytes, sep)
     }
     // Allocate each piece as a heap string first (the pieces are independent
-    // views/copies), then build the backing array block from their bits.
+    // views/copies), then build the backing array from their bits.
     const elems: bigint[] = []
     for (const piece of pieces) {
-      const base = hostAllocString(utf8Decode(piece))
+      const base = allocString(utf8Decode(piece))
       if (base === null) return null
       elems.push(HEAP | base)
     }
-    const block = new Uint8Array(HEADER_SIZE + 4 + 8 * elems.length)
-    block[0] = TYPE_ARRAY
-    const dv = new DataView(block.buffer)
-    dv.setUint32(HEADER_SIZE, elems.length, true)
-    let off = HEADER_SIZE + 4
-    for (const bits of elems) {
-      dv.setBigUint64(off, bits, true)
-      off += 8
-    }
-    const base = hostAlloc(block)
+    const base = allocArray(elems)
     return base === null ? null : HEAP | base
   }
 
@@ -358,7 +393,7 @@ export function createShim(): Shim {
     arg1: bigint,
   ): bigint | null {
     // Snapshot memory (a copy) so reads below are stable across a later
-    // `hostAlloc` that may grow/detach the buffer — mirrors the Rust snapshot.
+    // guest allocation that may grow/detach the buffer — mirrors the Rust snapshot.
     const mem = memView().slice()
     const ptr = heapPtr(recv)
     const typeByte = ptr === null ? undefined : mem[ptr]
@@ -398,7 +433,7 @@ export function createShim(): Shim {
         const mapped = bytes.map((byte) =>
           op === METHOD_OP_TO_UPPER ? asciiUpper(byte) : asciiLower(byte),
         )
-        const base = hostAllocString(utf8Decode(mapped))
+        const base = allocString(utf8Decode(mapped))
         return base === null ? null : HEAP | base
       }
       case METHOD_OP_CHAR_AT: {
@@ -409,7 +444,7 @@ export function createShim(): Shim {
         // Out-of-range (a negative index) => "".
         const text =
           i >= 0 && i < bytes.length ? utf8Decode(bytes.subarray(i, i + 1)) : ''
-        const base = hostAllocString(text)
+        const base = allocString(text)
         return base === null ? null : HEAP | base
       }
       case METHOD_OP_TRIM:
@@ -458,11 +493,6 @@ export function createShim(): Shim {
   /** Every promise that had a reaction registered (then/catch/finally, await, adoption). */
   const handled = new Set<number>()
 
-  /** An exported global by name, or `undefined` when absent. */
-  function exportGlobal(name: string): WebAssembly.Global | undefined {
-    return instance?.exports[name] as WebAssembly.Global | undefined
-  }
-
   /** An exported `(i64, i64) -> i64` trampoline by name, or `undefined` when absent. */
   function exportTrampoline(
     name: string,
@@ -473,19 +503,16 @@ export function createShim(): Shim {
   }
 
   /**
-   * Bump-allocate a fresh promise block and return its heap jsval, or `null` on
-   * a failed allocation (mirrors `promise.rs::alloc_promise`).
+   * Allocate a fresh promise block through `__new_promise`, settle it to
+   * `state`/`value` unless pending, and return its heap jsval, or `null` on a
+   * failed allocation (mirrors `promise.rs::alloc_promise`).
    */
   function allocPromise(state: number, value: bigint): bigint | null {
-    const block = new Uint8Array(PROMISE_BLOCK_SIZE)
-    block[0] = TYPE_PROMISE
-    const dv = new DataView(block.buffer)
-    dv.setInt32(HEADER_SIZE, state, true)
-    dv.setBigUint64(HEADER_SIZE + 4, value, true)
-    const base = hostAlloc(block)
+    const base = guestNew(NEW_PROMISE_EXPORT_NAME)
     if (base === null) return null
-    if (state === PROMISE_REJECTED) rejected.add(Number(base))
-    return HEAP | base
+    if (state !== PROMISE_PENDING) writeSettlement(base, state, value)
+    if (state === PROMISE_REJECTED) rejected.add(base)
+    return HEAP | BigInt(base)
   }
 
   /** Write a promise block's settlement into guest memory (mirrors `write_settlement`). */
@@ -746,7 +773,7 @@ export function createShim(): Shim {
       case CONVERT_OP_TO_STRING: {
         // A string argument is returned unchanged (no allocation).
         if (value.kind === 'string') return u
-        const base = hostAllocString(formatValue(value))
+        const base = allocString(formatValue(value))
         return base === null ? UNDEFINED : HEAP | base
       }
       default:
@@ -760,17 +787,20 @@ export function createShim(): Shim {
     arg0: bigint,
     arg1: bigint,
   ): bigint =>
-    methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED
+    oomGuard(
+      methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED,
+    )
 
   const imports: WebAssembly.Imports = {
     env: {
       print,
-      __convert: convert,
+      __convert: (bits: bigint, op: number): bigint =>
+        oomGuard(convert(bits, op)),
       __method: method,
       __promise: (op: number, a: bigint, b: bigint): bigint =>
-        promiseDispatch(op, asU64(a), asU64(b)),
+        oomGuard(promiseDispatch(op, asU64(a), asU64(b))),
       __then: (p: bigint, onF: bigint, onR: bigint): bigint =>
-        promiseThen(asU64(p), asU64(onF), asU64(onR)),
+        oomGuard(promiseThen(asU64(p), asU64(onF), asU64(onR))),
       // The host wall clock backing `Date.now()` / `new Date()` (ms since epoch).
       __now: (): number => Date.now(),
       // `parseInt(s, radix)` (an omitted radix arrives as `undefined`).
@@ -792,6 +822,7 @@ export function createShim(): Shim {
     },
     drainAfterMain: () => {
       drain()
+      if (heapExhausted()) throw new Error(OUT_OF_MEMORY)
       const unhandled = [...rejected]
         .filter((base) => !handled.has(base))
         .sort((a, b) => a - b)[0]

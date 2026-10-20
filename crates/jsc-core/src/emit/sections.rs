@@ -146,6 +146,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         } else {
             0
         },
+        // The constructors follow the two settlers (present only with functions).
+        new_string: obj_get_index + 36 + if has_funcs { 2 } else { 0 },
         fn_type: if has_funcs { fn_type } else { 0 },
         max_args,
         has_funcs,
@@ -287,6 +289,15 @@ pub(super) fn build_type_and_function_sections<'a>(
         .ty()
         .function([ValType::I64, ValType::I64], [ValType::I64]);
 
+    // The exported guest constructors, the LAST defined functions:
+    // `__new_string(len: i32) -> i32`, `__new_array(len: i32) -> i32`, and
+    // `__new_promise() -> i32`. Their types follow the import types.
+    types.ty().function([ValType::I32], [ValType::I32]);
+    functions.function(helper_type_base + 48);
+    functions.function(helper_type_base + 48);
+    types.ty().function([], [ValType::I32]);
+    functions.function(helper_type_base + 49);
+
     (
         types,
         functions,
@@ -401,11 +412,12 @@ pub(super) fn emit_data_section(offsets: &HashMap<String, i32>) -> Option<DataSe
 /// Collect every distinct string literal in `program` and assign each a
 /// compile-time byte offset in linear memory.
 ///
-/// Literals are packed contiguously from [`HEAP_BASE`] in first-appearance
-/// order, each occupying `4 + byte_len` bytes (`[len:u32 LE][utf8]`). Identical
-/// literals are deduplicated onto one offset. Returns the offset map plus the
-/// first free offset after all literal data — the bump allocator's start (equal
-/// to [`HEAP_BASE`] when there are no literals).
+/// Literals are placed from [`HEAP_BASE`] in first-appearance order, each
+/// occupying its `[type][pad×3][len:u32 LE][utf8]` block padded up to
+/// [`BLOCK_ALIGN`] so every blob base is 8-aligned. Identical literals are
+/// deduplicated onto one offset. Returns the offset map plus the first free
+/// offset after all literal data — the bump allocator's (8-aligned) start, equal
+/// to [`HEAP_BASE`] when there are no literals.
 pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32) {
     let mut order: Vec<&str> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -440,9 +452,12 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     for text in order {
         offsets.insert(text.to_owned(), next);
         // Each blob is `[type=0][pad×3][len:u32][utf8]` (block header): the block
-        // header, the 4-byte length header, plus the byte length.
+        // header, the 4-byte length header, plus the byte length, padded to 8.
         let blob_len = HEADER_SIZE + 4 + i32::try_from(text.len()).unwrap_or(i32::MAX);
-        next = next.saturating_add(blob_len);
+        next = next
+            .saturating_add(blob_len)
+            .saturating_add(BLOCK_ALIGN - 1)
+            & -BLOCK_ALIGN;
     }
     (offsets, next)
 }
