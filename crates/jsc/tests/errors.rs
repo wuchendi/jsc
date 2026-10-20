@@ -405,19 +405,15 @@ fn unsupported_object_methods_error() {
 }
 
 /// Out-of-scope class forms are rejected at compile time with a
-/// non-zero exit and an explanatory, spanned message. A class with a constructor,
-/// plain instance methods, and `static` members is supported (see the classes
-/// suite); inheritance, decorators, and every out-of-scope method/field form
-/// (getter, setter, private, computed, async, generator) stay out of scope.
+/// non-zero exit and an explanatory, spanned message. Constructors, methods,
+/// accessors (instance and static), fields, `extends`, and class expressions
+/// are supported (see the classes suites); computed, private, async, and
+/// generator members stay out of scope.
 #[test]
 fn unsupported_class_forms_error() {
     let cases = [
-        ("class A extends B {} 1", "extends"),
         ("class A{ [k] = 1 } 1", "computed"),
-        // Instance accessors are supported; a STATIC getter/setter is not.
-        ("class A{ static get v(){return 1} } 1", "getter"),
-        ("class A{ static set v(x){} } 1", "setter"),
-        // A computed instance accessor is still rejected.
+        // A computed accessor is still rejected.
         ("class A{ get [k](){return 1} } 1", "computed"),
         ("class A{ #p = 1 } 1", "private"),
         ("class A{ [k](){} } 1", "computed"),

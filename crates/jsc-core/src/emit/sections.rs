@@ -412,6 +412,26 @@ pub(super) fn build_globals(
         let (ty, init) = mut_i32(init);
         globals.global(ty, &init);
     }
+    // The `new.target` carrier ($__new_target, i64, index NEW_TARGET_GLOBAL),
+    // `undefined` until a `new` sets it. Internal, not exported.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I64,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i64_const(UNDEFINED_BITS),
+    );
+    // The spread-argument carrier ($__spread_args, i64, index
+    // SPREAD_ARGS_GLOBAL), `undefined` until a spread call sets it. Internal.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I64,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i64_const(UNDEFINED_BITS),
+    );
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..module_cells {
@@ -545,13 +565,16 @@ fn emit_fn_data(
 }
 
 /// The header `flags` a fresh function object of `kind` is created with:
-/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR`) per its kind.
+/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR` / `SELF_ALLOC`) per its kind.
 pub(super) fn fn_flags(kind: FnKind) -> u8 {
     abi::FUNC_FLAG_LAZY
         | match kind {
             FnKind::Plain => 0,
             FnKind::Constructor => abi::FUNC_FLAG_CONSTRUCTOR,
             FnKind::Class => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR,
+            FnKind::DerivedClass => {
+                abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR | abi::FUNC_FLAG_SELF_ALLOC
+            }
         }
 }
 
@@ -756,6 +779,7 @@ pub(super) fn collect_node<'a>(
         IrNode::StrLen(operand)
         | IrNode::Not(operand)
         | IrNode::IsHole(operand)
+        | IrNode::IsObject(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
@@ -784,6 +808,14 @@ pub(super) fn collect_node<'a>(
             collect_node(cell, order, seen);
             collect_node(value, order, seen);
         }
+        IrNode::ClassHeritage { value, .. } => {
+            seed_prop_strs(order, seen);
+            collect_node(value, order, seen);
+        }
+        IrNode::SetProto { obj, proto } => {
+            collect_node(obj, order, seen);
+            collect_node(proto, order, seen);
+        }
         IrNode::Array(elems) | IrNode::Seq(elems) => {
             for elem in elems {
                 collect_node(elem, order, seen);
@@ -806,6 +838,14 @@ pub(super) fn collect_node<'a>(
                     if !is_static_function(callee) {
                         seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
                     }
+                    collect_node(callee, order, seen);
+                }
+                SpreadCallee::Method {
+                    callee,
+                    not_callable,
+                    ..
+                } => {
+                    seed_callee_error(callee_error_text(not_callable), order, seen);
                     collect_node(callee, order, seen);
                 }
                 SpreadCallee::Direct(_) => {}
@@ -862,18 +902,24 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
-        IrNode::New {
-            instance,
-            ctor,
+        IrNode::Construct {
+            callee,
             args,
-            not_callable,
+            spread,
+            not_constructor,
+            new_target,
             ..
         } => {
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            collect_node(instance, order, seen);
-            collect_node(ctor, order, seen);
+            seed_callee_error(callee_error_text(not_constructor), order, seen);
+            collect_node(callee, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
+            }
+            if let Some(spread) = spread {
+                collect_node(spread, order, seen);
+            }
+            if let Some(new_target) = new_target {
+                collect_node(new_target, order, seen);
             }
         }
         IrNode::ObjectRest { source, exclude } => {
@@ -896,9 +942,16 @@ pub(super) fn collect_node<'a>(
         IrNode::InstanceOf { value, kind } => {
             collect_node(value, order, seen);
             match kind {
-                // A prototype walk reads `C.prototype` (or a static error
-                // prototype).
+                // A static error prototype walk.
                 InstanceOfKind::Proto(proto) => collect_node(proto, order, seen),
+                // `OrdinaryHasInstance` reads `C.prototype` and may throw either
+                // `TypeError`.
+                InstanceOfKind::Ctor(ctor) => {
+                    collect_node(ctor, order, seen);
+                    seed_strs(&["prototype"], order, seen);
+                    seed_callee_error(INSTANCEOF_NOT_CALLABLE, order, seen);
+                    seed_callee_error(INSTANCEOF_NON_OBJECT_PROTOTYPE, order, seen);
+                }
                 // The runtime-TYPE-BYTE builtins read the receiver's own type byte
                 // only — no interned key or literal to seed.
                 InstanceOfKind::Array
@@ -1103,6 +1156,11 @@ pub(super) fn collect_node<'a>(
         | IrNode::SentValue
         | IrNode::ExcValue
         | IrNode::ThisGlobal
+        | IrNode::NewTargetGlobal
+        | IrNode::IsConstructCall(_)
+        | IrNode::ArgCount(_)
+        | IrNode::Hole
+        | IrNode::SpreadArgsGlobal
         | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.
         | IrNode::MapNew { .. }
