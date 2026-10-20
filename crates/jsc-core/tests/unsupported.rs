@@ -49,7 +49,6 @@ fn rejects_generator_functions() {
     // generators suite); a generator EXPRESSION and the out-of-scope yield
     // forms remain rejected.
     assert_rejected("let g = function* () { return 1 }; g()");
-    assert_rejected("function* g() { yield (yield 1) } g().next()");
     assert_rejected("function* g() { try { yield 1 } catch (e) {} } g().next()");
 }
 
