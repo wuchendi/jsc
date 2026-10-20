@@ -405,6 +405,20 @@ const EXPRESSION_NOT_A_FUNCTION: CalleeErrorText<'static> = [
     "TypeError: expression is not a function",
 ];
 
+/// The `TypeError` text of an `instanceof` whose right-hand side is not
+/// callable.
+const INSTANCEOF_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Right-hand side of 'instanceof' is not callable",
+    "TypeError: Right-hand side of 'instanceof' is not callable",
+];
+
+/// The `TypeError` text of an `instanceof` whose right-hand side's
+/// `prototype` is not an object.
+const INSTANCEOF_NON_OBJECT_PROTOTYPE: CalleeErrorText<'static> = [
+    "Function has non-object prototype in instanceof check",
+    "TypeError: Function has non-object prototype in instanceof check",
+];
+
 /// The `TypeError` a guarded call site throws (shape of `new TypeError(m)`,
 /// see [`IrNode::error_object`]). Emitted on the throw path via [`emit_node`];
 /// its strings are seeded with [`ERROR_STRS`] by [`collect_node`].

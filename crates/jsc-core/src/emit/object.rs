@@ -339,13 +339,14 @@ pub(super) fn emit_object_has_node(
 }
 
 /// Emit an `x instanceof RHS` identity test, leaving a `true`/`false`
-/// jsval on the stack. The operand `value` is evaluated once into a dedicated
-/// high scratch slot and gated by [`emit_is_object`]: only a heap OBJECT can be
-/// an instance, so a non-heap or non-object operand (number, `null`, array,
-/// `Map`, …) yields `false` without ever reading a bogus type byte. For an
-/// object a **user class** or **builtin error** walks the receiver's `proto`
-/// chain for the prototype pointer (`C.prototype` or the static error
-/// prototype).
+/// jsval on the stack. The operand `value` is evaluated first, then the
+/// right-hand side. The runtime-TYPE-BYTE builtins test the operand's heap kind;
+/// the prototype kinds gate the operand with [`emit_is_proto_carrier`] (a value
+/// without a `proto` slot is never an instance) and walk its `proto` chain for
+/// the target prototype: the static error prototype ([`InstanceOfKind::Proto`])
+/// or, for [`InstanceOfKind::Ctor`] (`OrdinaryHasInstance`), `Get(C,
+/// "prototype")` of the callable-guarded right-hand side `C`, which must be an
+/// object.
 #[allow(clippy::too_many_lines)] // straight-line per-kind emit, not branching depth
 pub(super) fn emit_instanceof_node(
     value: &IrNode,
@@ -355,94 +356,153 @@ pub(super) fn emit_instanceof_node(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    // Evaluate the operand once and stash it in a dedicated high slot (the child
-    // emit reuses the low scratch slots, matching `emit_index_node`).
-    let v = scratch + 17;
     emit_node(value, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(v));
-
-    // The runtime-TYPE-BYTE builtins test the receiver's heap kind directly
-    // (independent of the byte-2 object gate the class/error kinds share):
+    // The runtime-TYPE-BYTE builtins test the receiver's heap kind directly:
     // `Array`/`Function`/`Date` match their own byte; `Object` matches ANY heap
-    // pointer whose byte is not `TYPE_STRING` (a primitive string is not an object).
-    match kind {
-        InstanceOfKind::Array => return emit_type_byte_instanceof(function, v, TYPE_ARRAY, false),
-        InstanceOfKind::Function => {
-            return emit_type_byte_instanceof(function, v, TYPE_FUNCTION, false);
-        }
-        InstanceOfKind::Date => return emit_type_byte_instanceof(function, v, TYPE_DATE, false),
-        InstanceOfKind::Object => {
-            return emit_type_byte_instanceof(function, v, TYPE_STRING, true);
-        }
-        InstanceOfKind::Proto(_) => {}
-    }
-
-    emit_is_object(function, v);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    match kind {
-        InstanceOfKind::Proto(class_proto) => {
-            // Walk the receiver's `proto` chain for pointer identity with the
-            // class's shared prototype: `true` iff some link is the SAME block (a
-            // single hop under no-`extends`, more under `extends`). The base
-            // prototype's `proto` is `null`, ending the walk. `cur`/`tgt` are
-            // dedicated high slots (`+19`/`+20`).
-            let cur = scratch + 19;
-            let tgt = scratch + 20;
-            let proto_slot = MemArg {
-                offset: OBJ_PROTO_OFFSET,
-                align: 3,
-                memory_index: 0,
-            };
-            // cur = recv.proto (read while `v` is intact).
-            function.instruction(&Instruction::LocalGet(v));
-            function.instruction(&Instruction::I32WrapI64);
-            function.instruction(&Instruction::I64Load(proto_slot));
-            function.instruction(&Instruction::LocalSet(cur));
-            // tgt = <class>.prototype (its emit may reuse `+17`/`+18`; `v` is
-            // already consumed).
-            emit_node(class_proto, function, scratch, strings, helpers);
-            function.instruction(&Instruction::LocalSet(tgt));
-            // Loop: 1 iff `cur` reaches `tgt`, 0 iff the chain runs out (non-object).
-            function.instruction(&Instruction::Block(BlockType::Result(ValType::I32)));
-            function.instruction(&Instruction::Loop(BlockType::Empty));
-            emit_is_object(function, cur);
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::If(BlockType::Empty));
-            function.instruction(&Instruction::I32Const(0));
-            function.instruction(&Instruction::Br(2)); // -> block result: not an instance
-            function.instruction(&Instruction::End);
-            function.instruction(&Instruction::LocalGet(cur));
-            function.instruction(&Instruction::LocalGet(tgt));
-            function.instruction(&Instruction::I64Eq);
-            function.instruction(&Instruction::If(BlockType::Empty));
-            function.instruction(&Instruction::I32Const(1));
-            function.instruction(&Instruction::Br(2)); // -> block result: match
-            function.instruction(&Instruction::End);
-            // cur = cur.proto — the next link up the chain.
-            function.instruction(&Instruction::LocalGet(cur));
-            function.instruction(&Instruction::I32WrapI64);
-            function.instruction(&Instruction::I64Load(proto_slot));
-            function.instruction(&Instruction::LocalSet(cur));
-            function.instruction(&Instruction::Br(0)); // continue the loop
-            function.instruction(&Instruction::End); // loop
-            function.instruction(&Instruction::I32Const(0)); // unreachable fall-through
-            function.instruction(&Instruction::End); // block -> i32 on the stack
-        }
-        // Unreachable: the runtime-TYPE-BYTE kinds return before this gate.
+    // pointer whose byte is not `TYPE_STRING` (a primitive string is not an
+    // object). The operand is stashed in a dedicated high slot.
+    let v = scratch + 17;
+    let (rhs, ctor) = match kind {
         InstanceOfKind::Array
         | InstanceOfKind::Function
         | InstanceOfKind::Date
         | InstanceOfKind::Object => {
-            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::LocalSet(v));
+            let (type_byte, negate) = match kind {
+                InstanceOfKind::Array => (TYPE_ARRAY, false),
+                InstanceOfKind::Function => (TYPE_FUNCTION, false),
+                InstanceOfKind::Date => (TYPE_DATE, false),
+                _ => (TYPE_STRING, true),
+            };
+            return emit_type_byte_instanceof(function, v, type_byte, negate);
         }
+        InstanceOfKind::Proto(proto) => (proto, false),
+        InstanceOfKind::Ctor(ctor) => (ctor, true),
+    };
+
+    // `cur` walks the receiver's `proto` chain; `tgt` holds the right-hand side
+    // and then the target prototype. Both are dedicated high slots (`+19`/`+20`)
+    // the `prototype` read below (`+17`/`+18`) does not touch. The operand rides
+    // the operand stack while the right-hand side evaluates.
+    let cur = scratch + 19;
+    let tgt = scratch + 20;
+    emit_node(rhs, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(tgt));
+    function.instruction(&Instruction::LocalSet(cur));
+    if ctor {
+        // `IsCallable(C)`, checked before the receiver (a primitive operand still
+        // throws for a non-callable right-hand side).
+        emit_callable_guard(
+            function,
+            INSTANCEOF_NOT_CALLABLE,
+            tgt,
+            scratch,
+            strings,
+            helpers,
+        );
     }
+
+    emit_is_proto_carrier(function, cur);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    if ctor {
+        // P = Get(C, "prototype"); a non-object P throws.
+        emit_get_call(
+            function,
+            tgt,
+            &IrNode::Str("prototype".to_owned()),
+            scratch + 18,
+            strings,
+            helpers,
+        );
+        if helpers.has_accessors {
+            emit_propagate_if_pending(function, helpers);
+        }
+        function.instruction(&Instruction::LocalSet(tgt));
+        emit_is_pointer(function, tgt);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        emit_load_type_byte(function, tgt);
+        function.instruction(&Instruction::I32Const(TYPE_STRING));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        emit_throw_not_a_function(
+            function,
+            INSTANCEOF_NON_OBJECT_PROTOTYPE,
+            scratch,
+            strings,
+            helpers,
+        );
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
+    // Walk the receiver's `proto` chain for pointer identity with the target
+    // prototype: `true` iff some link is the SAME block. A chain ends at `null`.
+    let proto_slot = MemArg {
+        offset: OBJ_PROTO_OFFSET,
+        align: 3,
+        memory_index: 0,
+    };
+    // cur = recv.proto.
+    function.instruction(&Instruction::LocalGet(cur));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(proto_slot));
+    function.instruction(&Instruction::LocalSet(cur));
+    // Loop: 1 iff `cur` reaches `tgt`, 0 iff the chain runs out.
+    function.instruction(&Instruction::Block(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_is_proto_carrier(function, cur);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::Br(2)); // -> block result: not an instance
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(cur));
+    function.instruction(&Instruction::LocalGet(tgt));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::Br(2)); // -> block result: match
+    function.instruction(&Instruction::End);
+    // cur = cur.proto — the next link up the chain.
+    function.instruction(&Instruction::LocalGet(cur));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(proto_slot));
+    function.instruction(&Instruction::LocalSet(cur));
+    function.instruction(&Instruction::Br(0)); // continue the loop
+    function.instruction(&Instruction::End); // loop
+    function.instruction(&Instruction::I32Const(0)); // unreachable fall-through
+    function.instruction(&Instruction::End); // block -> i32 on the stack
     // Box the i32 `1`/`0` into a TRUE/FALSE jsval (`FALSE_BITS | bit`).
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::I64Or);
+    leave_frame(helpers);
     function.instruction(&Instruction::Else);
-    // A non-object operand is never an instance.
+    // A receiver without a `proto` slot is never an instance.
     function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::End);
+}
+
+/// Push `1` if the jsval in `local` is a heap block carrying a `proto` slot
+/// (any object-family kind: not a string or an array), else `0`. The type-byte
+/// reads are gated behind [`emit_is_pointer`].
+fn emit_is_proto_carrier(function: &mut Function, local: u32) {
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_STRING));
+    function.instruction(&Instruction::I32Ne);
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
 }
 

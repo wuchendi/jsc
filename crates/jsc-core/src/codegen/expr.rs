@@ -127,11 +127,7 @@ impl LowerCtx<'_> {
                 key: Box::new(self.lower_expr(&b.left)?),
                 obj: Box::new(self.lower_expr(&b.right)?),
             }),
-            // `x instanceof RHS` (E-series). The right-hand side must be a bare
-            // identifier naming EITHER a user class (checked first, so a
-            // `class Error {}` shadows the builtin) OR one of the three builtin
-            // error constructors (only when unshadowed); anything else is a clean
-            // compile error (jsc models no general prototype-chain `instanceof`).
+            // `x instanceof RHS` (design 4.6): any right-hand side expression.
             Expr::Bin(b) if matches!(b.op, BinaryOp::InstanceOf) => {
                 self.lower_instanceof(&b.left, &b.right)
             }
@@ -299,6 +295,20 @@ impl LowerCtx<'_> {
     fn lower_opt_chain(&mut self, chain: &OptChainExpr) -> anyhow::Result<IrNode> {
         let mut links = Vec::new();
         let root = collect_chain_links(chain, &mut links);
+        // `o.m?.(..)`: the callee `o.m` is a plain member expression; split it
+        // into its base and a member link so the call binds `this = o`.
+        if let (Expr::Member(member), Some(ChainLink::Call { .. })) = (root, links.first()) {
+            links.insert(
+                0,
+                ChainLink::Member {
+                    prop: &member.prop,
+                    optional: false,
+                    span: member.span,
+                },
+            );
+            let base = self.lower_expr(&member.obj)?;
+            return self.build_chain(base, &links);
+        }
         let base = self.lower_expr(root)?;
         self.build_chain(base, &links)
     }
@@ -317,35 +327,82 @@ impl LowerCtx<'_> {
             // Evaluate the base once into `temp`, then continue the tail through a
             // read of `temp` so the base's side effects run exactly once.
             let temp = self.fresh();
-            let applied = self.apply_link(IrNode::Local(temp), link)?;
-            let tail = self.build_chain(applied, rest)?;
-            // nullish(temp) ≡ `temp === null || temp === undefined`; the base is
-            // teed into `temp` while computing the first comparison.
-            let is_nullish = IrNode::Logical {
-                op: LogicalOp::Or,
-                lhs: Box::new(IrNode::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(IrNode::Assign {
-                        local: temp,
-                        value: Box::new(value),
-                    }),
-                    rhs: Box::new(IrNode::Null),
-                }),
-                rhs: Box::new(IrNode::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(IrNode::Local(temp)),
-                    rhs: Box::new(IrNode::Undefined),
-                }),
-            };
-            Ok(IrNode::Ternary {
-                cond: Box::new(is_nullish),
-                then_branch: Box::new(IrNode::Undefined),
-                else_branch: Box::new(tail),
-            })
+            let tail = self.build_link(IrNode::Local(temp), link, rest)?;
+            Ok(nullish_short_circuit(temp, value, tail))
         } else {
-            let applied = self.apply_link(value, link)?;
-            self.build_chain(applied, rest)
+            self.build_link(value, link, rest)
         }
+    }
+
+    /// Apply `link` to `obj` and fold the remaining `rest` of the chain. A member
+    /// link directly followed by a call link is a method call binding `this =
+    /// obj` (like `obj.m(..)`); an optional call `obj.m?.(..)` evaluates
+    /// `obj.m` once and short-circuits the rest of the chain when it is nullish.
+    fn build_link(
+        &mut self,
+        obj: IrNode,
+        link: &ChainLink<'_>,
+        rest: &[ChainLink<'_>],
+    ) -> anyhow::Result<IrNode> {
+        let (
+            ChainLink::Member { prop, span, .. },
+            Some((ChainLink::Call { args, optional }, after)),
+        ) = (link, rest.split_first())
+        else {
+            let applied = self.apply_link(obj, link)?;
+            return self.build_chain(applied, rest);
+        };
+        let args = self.lower_chain_args(args)?;
+        if *optional {
+            let this_local = self.fresh();
+            let method = self.apply_link(
+                IrNode::Assign {
+                    local: this_local,
+                    value: Box::new(obj),
+                },
+                link,
+            )?;
+            let callee = self.fresh();
+            let call = IrNode::ThisCall {
+                callee: Box::new(IrNode::Local(callee)),
+                args,
+                this_local,
+            };
+            let tail = self.build_chain(call, after)?;
+            return Ok(nullish_short_circuit(callee, method, tail));
+        }
+        let key = match prop {
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
+            MemberProp::PrivateName(_) => {
+                return Err(
+                    CompileError::spanned(*span, "private fields are not supported").into(),
+                );
+            }
+        };
+        let obj_local = self.fresh();
+        let call = IrNode::MethodCallUser {
+            obj: Box::new(obj),
+            key: Box::new(key),
+            args,
+            obj_local,
+            not_callable: not_a_function(None),
+        };
+        self.build_chain(call, after)
+    }
+
+    /// Lower the arguments of an optional-chain call link (spread is unsupported).
+    fn lower_chain_args(&mut self, args: &[ExprOrSpread]) -> anyhow::Result<Vec<IrNode>> {
+        let mut lowered = Vec::with_capacity(args.len());
+        for arg in args {
+            if arg.spread.is_some() {
+                return Err(
+                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
+                );
+            }
+            lowered.push(self.lower_expr(&arg.expr)?);
+        }
+        Ok(lowered)
     }
 
     /// Apply a single chain link to the running `obj` value: a member/index read
@@ -369,24 +426,11 @@ impl LowerCtx<'_> {
                     Err(CompileError::spanned(*span, "private fields are not supported").into())
                 }
             },
-            ChainLink::Call { args, .. } => {
-                let mut lowered = Vec::with_capacity(args.len());
-                for arg in *args {
-                    if arg.spread.is_some() {
-                        return Err(CompileError::spanned(
-                            arg.span(),
-                            "spread arguments are unsupported",
-                        )
-                        .into());
-                    }
-                    lowered.push(self.lower_expr(&arg.expr)?);
-                }
-                Ok(IrNode::CallIndirect {
-                    callee: Box::new(obj),
-                    args: lowered,
-                    not_callable: not_a_function(None),
-                })
-            }
+            ChainLink::Call { args, .. } => Ok(IrNode::CallIndirect {
+                callee: Box::new(obj),
+                args: self.lower_chain_args(args)?,
+                not_callable: not_a_function(None),
+            }),
         }
     }
 
@@ -1682,57 +1726,38 @@ impl LowerCtx<'_> {
     ///
     /// Returns an error for any callee other than the three error identifiers,
     /// for spread arguments, or if the message expression is unsupported.
-    /// Lower `left instanceof right` (E-series) into an [`IrNode::InstanceOf`].
+    /// Lower `left instanceof right` (design 4.6) into an [`IrNode::InstanceOf`].
     /// See [`Self::instanceof_kind`] for the right-hand-side dispatch.
     fn lower_instanceof(&mut self, left: &Expr, right: &Expr) -> anyhow::Result<IrNode> {
-        let kind = self.instanceof_kind(right)?;
+        let value = self.lower_expr(left)?;
         Ok(IrNode::InstanceOf {
-            value: Box::new(self.lower_expr(left)?),
-            kind,
+            value: Box::new(value),
+            kind: self.instanceof_kind(right)?,
         })
     }
 
     /// Resolve the right-hand side of an `instanceof` to an [`InstanceOfKind`].
-    /// A user class is matched FIRST (so a `class Error {}` shadows the builtin)
-    /// and lowers to a `proto`-chain walk against `C.prototype`; an UNSHADOWED `Error`/
-    /// `TypeError`/`RangeError` identifier walks for its static prototype.
-    /// Anything else — a non-identifier, a shadowed error name, or an unrelated
-    /// binding — is a clean compile error.
+    /// An UNSHADOWED `Error`/`TypeError`/`RangeError`/`Array`/`Function`/`Date`/
+    /// `Object` identifier (not yet a runtime value) takes its builtin test; any
+    /// other expression — including a binding that shadows one of those names —
+    /// is `OrdinaryHasInstance` on its value.
     fn instanceof_kind(&mut self, right: &Expr) -> anyhow::Result<InstanceOfKind> {
-        let unsupported = |span: Span| -> anyhow::Error {
-            CompileError::spanned(
-                span,
-                "instanceof requires a user class or one of \
-                 Error/TypeError/RangeError/Array/Object/Function/Date \
-                 on the right-hand side",
-            )
-            .into()
-        };
-        let Expr::Ident(id) = right else {
-            return Err(unsupported(right.span()));
-        };
-        let name = id.sym.as_ref();
-        if self.shared.classes.borrow().contains_key(name) {
-            // User class: walk the receiver's `proto` chain for `C.prototype`.
-            let class_proto = self.class_prototype_read(name, id.span)?;
-            return Ok(InstanceOfKind::Proto(Box::new(class_proto)));
-        }
-        if self.resolve(name).is_none() {
-            if let Some(kind) = ErrorKind::from_name(name) {
-                return Ok(InstanceOfKind::Proto(Box::new(IrNode::ErrorProto(kind))));
-            }
-            match name {
-                // The runtime-TYPE-BYTE builtins: `Array`/`Object`/`Function`/
-                // `Date` are not real bindings, so a user `let Array = ..` shadows
-                // them (the `resolve` guard above) and falls through to the error.
-                "Array" => return Ok(InstanceOfKind::Array),
-                "Function" => return Ok(InstanceOfKind::Function),
-                "Date" => return Ok(InstanceOfKind::Date),
-                "Object" => return Ok(InstanceOfKind::Object),
-                _ => {}
+        if let Expr::Ident(id) = right {
+            let name = id.sym.as_ref();
+            if self.resolve(name).is_none() {
+                if let Some(kind) = ErrorKind::from_name(name) {
+                    return Ok(InstanceOfKind::Proto(Box::new(IrNode::ErrorProto(kind))));
+                }
+                match name {
+                    "Array" => return Ok(InstanceOfKind::Array),
+                    "Function" => return Ok(InstanceOfKind::Function),
+                    "Date" => return Ok(InstanceOfKind::Date),
+                    "Object" => return Ok(InstanceOfKind::Object),
+                    _ => {}
+                }
             }
         }
-        Err(unsupported(id.span))
+        Ok(InstanceOfKind::Ctor(Box::new(self.lower_expr(right)?)))
     }
 
     fn lower_new(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
@@ -2044,6 +2069,34 @@ fn collect_chain_links<'a>(chain: &'a OptChainExpr, links: &mut Vec<ChainLink<'a
     };
     links.push(link);
     root
+}
+
+/// `value` is evaluated once into `temp`; when it is `null`/`undefined` the
+/// whole expression is `undefined`, otherwise `tail` (which reads `temp`).
+fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
+    // nullish(temp) ≡ `temp === null || temp === undefined`; the value is teed
+    // into `temp` while computing the first comparison.
+    let is_nullish = IrNode::Logical {
+        op: LogicalOp::Or,
+        lhs: Box::new(IrNode::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(IrNode::Assign {
+                local: temp,
+                value: Box::new(value),
+            }),
+            rhs: Box::new(IrNode::Null),
+        }),
+        rhs: Box::new(IrNode::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(IrNode::Local(temp)),
+            rhs: Box::new(IrNode::Undefined),
+        }),
+    };
+    IrNode::Ternary {
+        cond: Box::new(is_nullish),
+        then_branch: Box::new(IrNode::Undefined),
+        else_branch: Box::new(tail),
+    }
 }
 
 /// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a

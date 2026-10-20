@@ -886,9 +886,16 @@ pub(super) fn collect_node<'a>(
         IrNode::InstanceOf { value, kind } => {
             collect_node(value, order, seen);
             match kind {
-                // A prototype walk reads `C.prototype` (or a static error
-                // prototype).
+                // A static error prototype walk.
                 InstanceOfKind::Proto(proto) => collect_node(proto, order, seen),
+                // `OrdinaryHasInstance` reads `C.prototype` and may throw either
+                // `TypeError`.
+                InstanceOfKind::Ctor(ctor) => {
+                    collect_node(ctor, order, seen);
+                    seed_strs(&["prototype"], order, seen);
+                    seed_callee_error(INSTANCEOF_NOT_CALLABLE, order, seen);
+                    seed_callee_error(INSTANCEOF_NON_OBJECT_PROTOTYPE, order, seen);
+                }
                 // The runtime-TYPE-BYTE builtins read the receiver's own type byte
                 // only — no interned key or literal to seed.
                 InstanceOfKind::Array
