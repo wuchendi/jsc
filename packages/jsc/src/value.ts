@@ -27,7 +27,6 @@ export type Value =
   | { kind: 'bool'; value: boolean }
   | { kind: 'null' }
   | { kind: 'undefined' }
-  | { kind: 'typestr'; value: string }
   | { kind: 'string'; value: string }
   | { kind: 'array'; items: Value[] }
   | { kind: 'object'; entries: [string, Value][] }
@@ -214,8 +213,6 @@ export function formatValue(value: Value): string {
       return 'null'
     case 'undefined':
       return 'undefined'
-    case 'typestr':
-      return value.value
     // A string renders as its raw text, with no surrounding quotes.
     case 'string':
       return value.value
@@ -304,7 +301,6 @@ export function valueToNumber(value: Value): number {
     case 'null':
       return 0
     case 'string':
-    case 'typestr':
       return strToNumber(value.value)
     default:
       return Number.NaN
