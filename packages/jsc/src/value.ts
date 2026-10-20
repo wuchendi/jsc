@@ -34,6 +34,18 @@ export type Value =
   | { kind: 'function' }
   | { kind: 'promise'; state: number; value: Value }
   | { kind: 'date'; ms: number }
+  | { kind: 'circular'; id: number }
+  | { kind: 'ref'; id: number; value: Value }
+
+/**
+ * Cycle-guard state for one {@link decode} call (mirrors `value.rs::Guard`):
+ * the heap blocks on the current recursion path and the cycle targets numbered
+ * so far, in discovery order (Node's `*1`, `*2`, ...).
+ */
+interface Guard {
+  path: number[]
+  refs: number[]
+}
 
 // A single scratch buffer for f64 <-> u64 bit reinterpretation, reused so we do
 // not allocate a DataView per decode.
@@ -86,6 +98,11 @@ const utf8 = new TextDecoder()
  * Mirrors `value.rs::decode`.
  */
 export function decode(bits: bigint, mem: Uint8Array): Value {
+  return decodeIn(bits, mem, { path: [], refs: [] })
+}
+
+/** {@link decode} under the cycle guard `guard` (mirrors `value.rs::decode_in`). */
+function decodeIn(bits: bigint, mem: Uint8Array, guard: Guard): Value {
   const u = asU64(bits)
   // Any value without the full QNAN mask set is an ordinary number (this also
   // covers infinities, whose exponent is all ones but quiet bit is clear).
@@ -99,27 +116,44 @@ export function decode(bits: bigint, mem: Uint8Array): Value {
     case 0b011n:
       return { kind: 'undefined' }
     case 0b101n:
-      return decodeHeap(u, mem)
+      return decodeHeap(u, mem, guard)
     // Tags 0b100/0b110/0b111 are retired and 0b000 is the canonical number NaN.
     default:
       return { kind: 'number', value: bitsToF64(u) }
   }
 }
 
-/** Resolve a heap pointer jsval by reading the block's TYPE BYTE. */
-function decodeHeap(bits: bigint, mem: Uint8Array): Value {
+/**
+ * Resolve a heap pointer jsval by reading the block's TYPE BYTE. Containers
+ * (array / object / promise) are cycle-guarded: a block already on the
+ * recursion path decodes as `circular`, and the block it points back to is
+ * wrapped in `ref` once decoded.
+ */
+function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
   const ptr = Number(bits & U32_MASK)
-  switch (mem[ptr]) {
+  const ty = mem[ptr]
+  if (ty === TYPE_ARRAY || ty === TYPE_OBJECT || ty === TYPE_PROMISE) {
+    if (guard.path.includes(ptr)) {
+      let id = guard.refs.indexOf(ptr) + 1
+      if (id === 0) id = guard.refs.push(ptr)
+      return { kind: 'circular', id }
+    }
+    guard.path.push(ptr)
+    const value =
+      ty === TYPE_ARRAY
+        ? decodeArray(ptr, mem, guard)
+        : ty === TYPE_OBJECT
+          ? decodeObject(ptr, mem, guard)
+          : decodePromise(ptr, mem, guard)
+    guard.path.pop()
+    const id = guard.refs.indexOf(ptr) + 1
+    return id === 0 ? value : { kind: 'ref', id, value }
+  }
+  switch (ty) {
     case TYPE_STRING:
       return decodeString(ptr, mem)
-    case TYPE_ARRAY:
-      return decodeArray(ptr, mem)
-    case TYPE_OBJECT:
-      return decodeObject(ptr, mem)
     case TYPE_FUNCTION:
       return { kind: 'function' }
-    case TYPE_PROMISE:
-      return decodePromise(ptr, mem)
     case TYPE_DATE:
       return decodeDate(ptr, mem)
     default:
@@ -132,13 +166,14 @@ function decodeHeap(bits: bigint, mem: Uint8Array): Value {
  * the `i32` state at `ptr + HEADER_SIZE` and the settled `i64` value after it. A
  * truncated block reads as pending with an `undefined` value.
  */
-function decodePromise(ptr: number, mem: Uint8Array): Value {
+function decodePromise(ptr: number, mem: Uint8Array, guard: Guard): Value {
   const state = readU32(mem, ptr + HEADER_SIZE)
   const bits = readU64(mem, ptr + HEADER_SIZE + 4)
   return {
     kind: 'promise',
     state: state === undefined ? 0 : state | 0,
-    value: bits === undefined ? { kind: 'undefined' } : decode(bits, mem),
+    value:
+      bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard),
   }
 }
 
@@ -164,20 +199,20 @@ function decodeString(ptr: number, mem: Uint8Array): Value {
 }
 
 /** Resolve a heap array block at `ptr`, decoding each `i64` element recursively. */
-function decodeArray(ptr: number, mem: Uint8Array): Value {
+function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
   const len = readU32(mem, ptr + HEADER_SIZE)
   if (len === undefined) return { kind: 'array', items: [] }
   const items: Value[] = []
   for (let k = 0; k < len; k++) {
     const elem = readU64(mem, ptr + HEADER_SIZE + 4 + 8 * k)
     if (elem === undefined) break
-    items.push(decode(elem, mem))
+    items.push(decodeIn(elem, mem, guard))
   }
   return { kind: 'array', items }
 }
 
 /** Resolve a heap object block at `ptr`: `n` × `(key_ptr:i64, val:i64)` entries. */
-function decodeObject(ptr: number, mem: Uint8Array): Value {
+function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
   const n = readU32(mem, ptr + HEADER_SIZE)
   if (n === undefined) return { kind: 'object', entries: [] }
   const entries: [string, Value][] = []
@@ -188,7 +223,7 @@ function decodeObject(ptr: number, mem: Uint8Array): Value {
     if (keyBits === undefined || valBits === undefined) break
     const decodedKey = decode(keyBits, mem)
     const key = decodedKey.kind === 'string' ? decodedKey.value : ''
-    entries.push([key, decode(valBits, mem)])
+    entries.push([key, decodeIn(valBits, mem, guard)])
   }
   return { kind: 'object', entries }
 }
@@ -237,6 +272,11 @@ export function formatValue(value: Value): string {
       return 'Promise { <pending> }'
     case 'date':
       return formatDateIso(value.ms)
+    // Cycle markers render Node-console style.
+    case 'circular':
+      return `[Circular *${value.id}]`
+    case 'ref':
+      return `<ref *${value.id}> ${formatValue(value.value)}`
   }
 }
 
