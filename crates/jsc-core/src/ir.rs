@@ -473,6 +473,17 @@ pub enum SpreadCallee {
         /// The enclosing constructor's `this` snapshot local.
         this_local: u32,
     },
+    /// A method call `obj.m(...args)` / `obj[k](...args)`: `callee` stores the
+    /// receiver into `this_local` and then reads the method from it, so the
+    /// call binds `this` = the receiver (like [`IrNode::MethodCallUser`]).
+    Method {
+        /// The receiver store followed by the member read.
+        callee: Box<IrNode>,
+        /// The local holding the receiver, bound as `this` for the call.
+        this_local: u32,
+        /// The `TypeError` thrown when the member is not callable.
+        not_callable: CalleeError,
+    },
 }
 
 /// A node in the numeric-expression IR tree.
@@ -685,8 +696,9 @@ pub enum IrNode {
     /// The arguments are first materialized into a heap array (the same
     /// build as [`IrNode::ArraySpread`], carried by `args`); the call then
     /// spreads that array's elements into the uniform ABI's fixed `K` positional
-    /// slots (padding with `undefined`, dropping any beyond `K`) and passes the
-    /// array's length as the dynamic `argc`.
+    /// slots (padding with `undefined`) and passes the array's length as the
+    /// dynamic `argc`; the array itself is published in `__spread_args` for a
+    /// callee gathering the arguments beyond `K` ([`IrNode::SpreadArgsGlobal`]).
     CallSpread {
         /// How to reach the callee (direct index or computed value).
         target: SpreadCallee,
@@ -716,8 +728,8 @@ pub enum IrNode {
         /// The prototype link (a class instance's or derived prototype's
         /// parent, an error's kind prototype).
         proto: Option<Box<IrNode>>,
-        /// The `class` byte ([`crate::abi::CLASS_ORDINARY`] or
-        /// [`crate::abi::CLASS_ERROR`]).
+        /// The `class` byte ([`crate::abi::CLASS_ORDINARY`],
+        /// [`crate::abi::CLASS_ERROR`] or [`crate::abi::CLASS_ARGUMENTS`]).
         class: u8,
         /// Extra table capacity to reserve beyond the entries (a class
         /// instance's field-scan count).
@@ -1072,6 +1084,12 @@ pub enum IrNode {
     /// The source argument count `n` held by the `argc` local, decoding the
     /// construct marker `-(n + 1)`, as a number.
     ArgCount(u32),
+    /// Read the `__spread_args` wasm global: the argument array of the most
+    /// recent spread call or construct, which holds the arguments beyond the
+    /// `K` positional slots. Emitted ONLY in the prologue of a function that
+    /// gathers its arguments (a rest parameter or `arguments`), which reads it
+    /// only when its decoded argument count exceeds `K`.
+    SpreadArgsGlobal,
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
     /// operands evaluated only for their side effects: surplus `Error(..)`
@@ -1594,6 +1612,7 @@ impl IrNode {
             | IrNode::IsConstructCall(_)
             | IrNode::ArgCount(_)
             | IrNode::Hole
+            | IrNode::SpreadArgsGlobal
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
@@ -1730,7 +1749,7 @@ impl IrNode {
                 SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
             }),
             IrNode::CallSpread { target, args } => {
-                matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } if f(callee))
+                matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } | SpreadCallee::Method { callee, .. } if f(callee))
                     || f(args)
             }
         }
@@ -1757,6 +1776,7 @@ impl IrNode {
             | IrNode::IsConstructCall(_)
             | IrNode::ArgCount(_)
             | IrNode::Hole
+            | IrNode::SpreadArgsGlobal
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
@@ -1912,8 +1932,9 @@ impl IrNode {
                 .collect(),
             IrNode::CallSpread { target, args } => {
                 let mut out = Vec::new();
-                if let SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } =
-                    target
+                if let SpreadCallee::Indirect(callee, _)
+                | SpreadCallee::This { callee, .. }
+                | SpreadCallee::Method { callee, .. } = target
                 {
                     out.push(&mut **callee);
                 }

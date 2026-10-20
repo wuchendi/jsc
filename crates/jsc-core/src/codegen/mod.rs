@@ -431,6 +431,14 @@ struct Frame {
     /// entry, allocated on the first `new.target` reference in it or in a nested
     /// arrow (`None` until then).
     new_target_local: Option<u32>,
+    /// The wasm local this (non-arrow) function builds its `arguments` object
+    /// into at entry, allocated on the first `arguments` reference in it or in
+    /// a nested arrow (`None` until then).
+    arguments_local: Option<u32>,
+    /// The wasm local this function snapshots the `__spread_args` global into
+    /// at entry, allocated when it gathers its arguments (a rest parameter or
+    /// `arguments`) and so may read the ones beyond `K`.
+    spread_args_local: Option<u32>,
     /// [`FnKind::Class`] for a base class constructor, which initializes the
     /// class's instance fields ([`LowerCtx::class_fields`]) on entry;
     /// [`FnKind::DerivedClass`] for a derived one, whose `this` starts in the

@@ -400,6 +400,16 @@ pub(super) fn build_globals(
         },
         &ConstExpr::i64_const(UNDEFINED_BITS),
     );
+    // The spread-argument carrier ($__spread_args, i64, index
+    // SPREAD_ARGS_GLOBAL), `undefined` until a spread call sets it. Internal.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I64,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i64_const(UNDEFINED_BITS),
+    );
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..module_cells {
@@ -808,6 +818,14 @@ pub(super) fn collect_node<'a>(
                     }
                     collect_node(callee, order, seen);
                 }
+                SpreadCallee::Method {
+                    callee,
+                    not_callable,
+                    ..
+                } => {
+                    seed_callee_error(callee_error_text(not_callable), order, seen);
+                    collect_node(callee, order, seen);
+                }
                 SpreadCallee::Direct(_) => {}
             }
             collect_node(args, order, seen);
@@ -1122,6 +1140,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::IsConstructCall(_)
         | IrNode::ArgCount(_)
         | IrNode::Hole
+        | IrNode::SpreadArgsGlobal
         | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.
         | IrNode::MapNew { .. }

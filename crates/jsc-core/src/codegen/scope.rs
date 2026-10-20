@@ -21,6 +21,8 @@ impl Frame {
             new_target_local: None,
             ctor: FnKind::Plain,
             supers: SuperCalls::default(),
+            arguments_local: None,
+            spread_args_local: None,
         }
     }
 }
@@ -285,6 +287,50 @@ impl<'a> LowerCtx<'a> {
         self.frames[frame + 1..].iter().all(|f| f.arrow)
     }
 
+    /// Resolve `arguments`: the nearest non-arrow function's `arguments`
+    /// object, built in its prologue (allocated on first reference) and captured
+    /// BY VALUE through each nested arrow's environment (the binding is never
+    /// reassigned). `Err` with the diagnostic at top level and in a
+    /// generator/async body.
+    pub(super) fn resolve_arguments(&mut self) -> Result<IrNode, &'static str> {
+        let fi = self
+            .frames
+            .iter()
+            .rposition(|frame| !frame.arrow)
+            .unwrap_or(0);
+        if fi == 0 && self.main_ctx {
+            return Err("`arguments` is only valid inside a function");
+        }
+        if self.frames[fi].env_backed {
+            return Err("`arguments` in a generator or async function is unsupported");
+        }
+        let local = if let Some(local) = self.frames[fi].arguments_local {
+            local
+        } else {
+            let frame = &mut self.frames[fi];
+            let local = frame.next;
+            frame.next += 1;
+            frame.arguments_local = Some(local);
+            frame.by_id.insert(arguments_id(fi), local);
+            local
+        };
+        if fi == self.top() {
+            return Ok(IrNode::Local(local));
+        }
+        Ok(IrNode::EnvLoad(self.route_env(fi, arguments_id(fi))))
+    }
+
+    /// The current frame's snapshot of the `__spread_args` global, allocated
+    /// on first use (the prologue snapshot is added by `build_function_body`).
+    pub(super) fn spread_args_local(&mut self) -> u32 {
+        if let Some(local) = self.frame().spread_args_local {
+            return local;
+        }
+        let local = self.fresh();
+        self.frame().spread_args_local = Some(local);
+        local
+    }
+
     /// Whether the local `idx` in the current frame is a boxed cell.
     pub(super) fn is_cell(&self, idx: u32) -> bool {
         self.frames.last().is_some_and(|f| f.cells.contains(&idx))
@@ -479,4 +525,10 @@ impl<'a> LowerCtx<'a> {
 /// among the frames enclosing a capture.
 fn new_target_id(frame: usize) -> u32 {
     0x8000_0000 | u32::try_from(frame).unwrap_or(0)
+}
+
+/// The synthetic binding id of the `arguments` object of the function at frame
+/// depth `frame`, distinct from every [`new_target_id`].
+fn arguments_id(frame: usize) -> u32 {
+    0xC000_0000 | u32::try_from(frame).unwrap_or(0)
 }
