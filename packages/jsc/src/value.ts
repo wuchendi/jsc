@@ -10,6 +10,7 @@ import {
   ACCESSOR_SET_OFFSET,
   ATTR_ACCESSOR,
   ATTR_ENUMERABLE,
+  CLASS_ARGUMENTS,
   CLASS_ERROR,
   DATE_MS_OFFSET,
   FN_INFO_ADDR,
@@ -62,6 +63,7 @@ export type Value =
   | { kind: 'array'; items: Value[] }
   | { kind: 'object'; entries: [string, Value][] }
   | { kind: 'instance'; className: string; entries: [string, Value][] }
+  | { kind: 'arguments'; entries: [string, Value][] }
   | { kind: 'error'; name: string; message: string }
   | { kind: 'accessor'; getter: boolean; setter: boolean }
   | {
@@ -361,6 +363,8 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
     }
   }
   const entries = decodeProps(ptr, mem, guard)
+  if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ARGUMENTS)
+    return { kind: 'arguments', entries }
   const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
   if (proto !== undefined && heapObject(proto, mem) !== undefined) {
     const ctor = lookupData(ptr, 'constructor', mem)
@@ -511,6 +515,11 @@ export function formatValue(value: Value): string {
     // A class instance is prefixed with its constructor's name.
     case 'instance':
       return `${value.className} ${formatEntries(value.entries)}`
+    // An `arguments` object quotes its (index) keys, as Node does.
+    case 'arguments':
+      return `[Arguments] ${formatEntries(
+        value.entries.map(([k, v]): [string, Value] => [quoteKey(k), v]),
+      )}`
     // A branded Error renders as its single-line stack.
     case 'error':
       return value.message === ''
@@ -572,6 +581,8 @@ export function toJsString(value: Value): string {
     case 'object':
     case 'instance':
       return '[object Object]'
+    case 'arguments':
+      return '[object Arguments]'
     case 'error':
       if (value.message === '') return value.name
       if (value.name === '') return value.message
@@ -592,6 +603,13 @@ export function toJsString(value: Value): string {
     default:
       return formatValue(value)
   }
+}
+
+/** A property key as Node's console prints it: identifier-like bare, else single-quoted. */
+function quoteKey(key: string): string {
+  return /^[\p{L}\p{N}_$]+$/u.test(key) && !/^[0-9]/.test(key)
+    ? key
+    : `'${key}'`
 }
 
 /** Render own properties Node-console style: `{ a: 1 }`, `{}` when empty. */

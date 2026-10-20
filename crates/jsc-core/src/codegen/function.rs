@@ -264,6 +264,25 @@ impl LowerCtx<'_> {
             );
         }
 
+        // `arguments` (referenced here or by a nested arrow): built from the
+        // incoming slots before any parameter is boxed, defaulted or assigned
+        // (unmapped semantics).
+        if let Some(local) = self.frame().arguments_local {
+            let init = self.lower_arguments_object(local, k);
+            body.splice(0..0, init);
+        }
+        // A function gathering its arguments snapshots `__spread_args` first,
+        // before any call in its prologue or body can overwrite it.
+        if let Some(local) = self.frame().spread_args_local {
+            body.insert(
+                0,
+                IrStmt::Decl {
+                    local,
+                    init: IrNode::SpreadArgsGlobal,
+                },
+            );
+        }
+
         let locals = self.frame().next;
         let env_layout = self.frame().env.clone();
         Ok((
@@ -326,7 +345,9 @@ impl LowerCtx<'_> {
     /// `argc` (local `k + 1`, a number jsval) is the actual source argument count
     /// `n`, or the construct marker `-(n + 1)` (decoded first), so each
     /// positional slot `j in p..k` is appended only when `j < n` —
-    /// excluding the `undefined` padding beyond the real arguments. The array is
+    /// excluding the `undefined` padding beyond the real arguments — and the
+    /// arguments `k..n` of a spread call are appended from the spread argument
+    /// array ([`Self::overflow_loop`]). The array is
     /// built in a plain temp local (`ArrayPush` needs a plain array binding), then
     /// bound to the rest name, boxed into a cell when the binding is captured.
     fn lower_rest_param(
@@ -361,6 +382,13 @@ impl LowerCtx<'_> {
                 else_body: Vec::new(),
             });
         }
+        // Arguments beyond the `K` slots come from the spread argument array.
+        let spread = self.spread_args_local();
+        let overflow = self.overflow_loop(n, k, spread, |_, value| IrNode::ArrayPush {
+            local: tmp,
+            value: Box::new(value),
+        });
+        body.push(overflow);
         let rest_local = self.declare(rest_ident.id.sym.as_ref(), true, binding_id(rest_ident));
         let init = if self.is_cell(rest_local) {
             IrNode::CellNew(Box::new(IrNode::Local(tmp)))
@@ -371,6 +399,102 @@ impl LowerCtx<'_> {
             local: rest_local,
             init,
         });
+    }
+
+    /// The prologue building this function's `arguments` object into `local`:
+    /// an ordinary object of class ARGUMENTS (`proto` the `%Object.prototype%`
+    /// placeholder `null`) with a non-enumerable `length` = `n` and the own
+    /// properties `"0".."n-1"` holding every actual argument (slots `0..k`, then
+    /// the spread overflow). Unmapped: the values are copied, never aliased.
+    fn lower_arguments_object(&mut self, local: u32, k: u32) -> Vec<IrStmt> {
+        let n = self.fresh();
+        let mut out = vec![
+            IrStmt::Decl {
+                local: n,
+                init: IrNode::ArgCount(k + 1),
+            },
+            IrStmt::Decl {
+                local,
+                init: IrNode::Object {
+                    entries: vec![(PropKey::Hidden("length".to_owned()), IrNode::Local(n))],
+                    proto: None,
+                    class: crate::abi::CLASS_ARGUMENTS,
+                    reserve: k + 1,
+                },
+            },
+        ];
+        let set = |index: IrNode, value: IrNode| IrNode::IndexSet {
+            obj: Box::new(IrNode::Local(local)),
+            index: Box::new(index),
+            value: Box::new(value),
+        };
+        for j in 0..k {
+            out.push(IrStmt::If {
+                cond: IrNode::Binary {
+                    op: BinOp::Lt,
+                    lhs: Box::new(IrNode::Num(f64::from(j))),
+                    rhs: Box::new(IrNode::Local(n)),
+                },
+                then_body: vec![IrStmt::Expr(set(
+                    IrNode::Num(f64::from(j)),
+                    IrNode::Local(j),
+                ))],
+                else_body: Vec::new(),
+            });
+        }
+        let spread = self.spread_args_local();
+        out.push(self.overflow_loop(n, k, spread, set));
+        out
+    }
+
+    /// `if (k < n) for (let i = k; i < n; i++) store(i, spread[i])`: hand each
+    /// argument beyond the `K` slots — only a spread call passes more than `K`
+    /// — from the spread argument array snapshot in `spread` to `store`. `n` is
+    /// the local holding the decoded argument count.
+    fn overflow_loop(
+        &mut self,
+        n: u32,
+        k: u32,
+        spread: u32,
+        store: impl FnOnce(IrNode, IrNode) -> IrNode,
+    ) -> IrStmt {
+        let i = self.fresh();
+        let index = IrNode::Local(i);
+        let value = IrNode::Index {
+            obj: Box::new(IrNode::Local(spread)),
+            index: Box::new(index.clone()),
+        };
+        IrStmt::If {
+            cond: IrNode::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(IrNode::Num(f64::from(k))),
+                rhs: Box::new(IrNode::Local(n)),
+            },
+            then_body: vec![
+                IrStmt::Decl {
+                    local: i,
+                    init: IrNode::Num(f64::from(k)),
+                },
+                IrStmt::While {
+                    cond: IrNode::Binary {
+                        op: BinOp::Lt,
+                        lhs: Box::new(index.clone()),
+                        rhs: Box::new(IrNode::Local(n)),
+                    },
+                    body: vec![IrStmt::Expr(store(index.clone(), value))],
+                    update: vec![IrStmt::Expr(IrNode::Assign {
+                        local: i,
+                        value: Box::new(IrNode::Binary {
+                            op: BinOp::Add,
+                            lhs: Box::new(index),
+                            rhs: Box::new(IrNode::Num(1.0)),
+                        }),
+                    })],
+                    label: None,
+                },
+            ],
+            else_body: Vec::new(),
+        }
     }
 
     /// Lift a function/arrow to a top-level [`IrFunction`] (registered in the
@@ -496,8 +620,9 @@ impl LowerCtx<'_> {
     /// enclosing bindings the body references. An expression body (`=> expr`)
     /// desugars to `return expr`; a block body (`=> { .. }`) lowers its statements
     /// directly. Single-parameter (`x => ..`) and parenthesized zero/multi-parameter
-    /// forms all lower the same way. Arrows carry no `this`/`arguments`, and are
-    /// not constructors. `name` is the inferred `name` (`""` when anonymous).
+    /// forms all lower the same way. Arrows read the enclosing function's
+    /// `new.target`/`arguments`, and are not constructors. `name` is the
+    /// inferred `name` (`""` when anonymous).
     pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr, name: &str) -> anyhow::Result<IrNode> {
         // `async`/generator arrows are out of scope: reject rather than
         // silently compile the body as a plain arrow (wrong result).

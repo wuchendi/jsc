@@ -234,10 +234,17 @@ const INTERN_COUNT_GLOBAL: u32 = 11;
 /// prologue when the marker is present. Internal.
 const NEW_TARGET_GLOBAL: u32 = 12;
 
+/// The wasm global index of the spread-argument carrier (`$__spread_args`,
+/// i64, init `undefined`): every spread call / construct sets it to its
+/// argument array just before the call, so a callee gathering its arguments (a
+/// rest parameter or `arguments`) reads the ones beyond the `K` positional
+/// slots from it. Plain calls never touch it. Internal.
+const SPREAD_ARGS_GLOBAL: u32 = 13;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the `new.target` global and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 13;
+/// the spread-argument global and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 14;
 
 /// The TDZ hole a module cell holds until its binding is initialized
 /// (`IrNode::IsHole`): an `undefined`-tagged NaN box with a nonzero payload, which
