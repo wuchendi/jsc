@@ -486,6 +486,10 @@ pub enum IrNode {
     Null,
     /// The `undefined` value (the global identifier `undefined`).
     Undefined,
+    /// An elision in an array literal (`[1, , 3]`): the raw [`crate::abi::HOLE`]
+    /// element bits. Only ever an element of [`IrNode::Array`] or an item of
+    /// [`IrNode::ArraySpread`], so it never reaches JS as a value.
+    ArrayHole,
     /// A binary operation applied to two sub-expressions.
     Binary {
         /// The operator to apply.
@@ -641,7 +645,8 @@ pub enum IrNode {
     /// `0b101`, type byte `1`): a `cap = n` `TYPE_ELEMS` store holding each
     /// element jsval at `store + 8 + 8*k`, then the 24-byte array handle (object
     /// prefix, `len = n`, `elems = store`).
-    /// Elements are evaluated left-to-right.
+    /// Elements are evaluated left-to-right; an elision is an
+    /// [`IrNode::ArrayHole`] element.
     Array(Vec<IrNode>),
     /// An array literal containing at least one spread element `[0, ...a, 9]`.
     /// Built at runtime: start from a fresh empty array and, left-to-
@@ -1537,6 +1542,7 @@ impl IrNode {
             | IrNode::Bool(_)
             | IrNode::Null
             | IrNode::Undefined
+            | IrNode::ArrayHole
             | IrNode::Local(_)
             | IrNode::EnvLoad(_)
             | IrNode::ModuleCell(_)
@@ -1678,6 +1684,7 @@ impl IrNode {
             | IrNode::Bool(_)
             | IrNode::Null
             | IrNode::Undefined
+            | IrNode::ArrayHole
             | IrNode::Local(_)
             | IrNode::EnvLoad(_)
             | IrNode::ModuleCell(_)

@@ -308,7 +308,10 @@ fn decode_reads_type_byte_to_pick_the_arm() {
     // type=array: a handle `[42.0]` with its element store right after it.
     let mut mem = vec![0u8; base];
     push_array(&mut mem, &[42.0_f64.to_bits()]);
-    assert_eq!(decode(bits, &mem), Value::Array(vec![Value::Number(42.0)]));
+    assert_eq!(
+        decode(bits, &mem),
+        Value::Array(vec![Value::Number(42.0)], Vec::new())
+    );
     // Flip only the type byte to string: [type=0][pad×3][len=1]['x'] would need
     // a 1-byte payload, so rebuild the block accordingly.
     let mut mem = vec![0u8; base];
@@ -500,16 +503,15 @@ fn array_decodes_and_formats() {
     let value = compile_and_run("[1,2,3]").expect("pipeline should succeed");
     assert_eq!(
         value,
-        Value::Array(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0)
-        ])
+        Value::Array(
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+            Vec::new()
+        )
     );
     assert_eq!(format_value(&value), "[ 1, 2, 3 ]");
 
     let empty = compile_and_run("[]").expect("pipeline should succeed");
-    assert_eq!(empty, Value::Array(Vec::new()));
+    assert_eq!(empty, Value::Array(Vec::new(), Vec::new()));
     assert_eq!(format_value(&empty), "[]");
 }
 
@@ -652,7 +654,7 @@ fn decode_array_reads_elements_from_memory() {
     let bits = 0x7FFD_0000_0000_0000_u64 | 0x8;
     assert_eq!(
         decode(bits, &memory),
-        Value::Array(vec![Value::Number(1.0), Value::Number(2.0)])
+        Value::Array(vec![Value::Number(1.0), Value::Number(2.0)], Vec::new())
     );
 }
 
@@ -950,7 +952,7 @@ fn heap_type_byte_typeof_and_value_roundtrip() {
     );
     assert_eq!(
         compile_and_run("let a = [7, 8]; a").expect("pipeline should succeed"),
-        Value::Array(vec![Value::Number(7.0), Value::Number(8.0)])
+        Value::Array(vec![Value::Number(7.0), Value::Number(8.0)], Vec::new())
     );
     // Object: typeof "object" and the entries round-trip.
     assert_eq!(

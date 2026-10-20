@@ -1167,14 +1167,6 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower an array literal `[e0, e1, ..]` into an [`IrNode::Array`], evaluating
-    /// each element left-to-right. Holes (elisions) and spread elements are out of
-    /// scope (later stages).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on an array hole or a spread element, or if any element
-    /// expression is outside the supported subset.
     /// Lower an assignment `target = value`. An identifier target is a local
     /// assign; a computed-member target `obj[i] = v` is an in-place array element
     /// store. A static-member target `obj.a = v` is object territory,
@@ -1475,6 +1467,15 @@ impl LowerCtx<'_> {
         })
     }
 
+    /// Lower an array literal `[e0, e1, ..]` into an [`IrNode::Array`], evaluating
+    /// each element left-to-right; an elision (`[1, , 3]`) is an
+    /// [`IrNode::ArrayHole`] (the parser drops a single trailing comma, so
+    /// `[1,]` has one element). A literal with a spread element lowers to the
+    /// runtime-built [`IrNode::ArraySpread`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any element expression is outside the supported subset.
     fn lower_array(&mut self, arr: &ArrayLit) -> anyhow::Result<IrNode> {
         // A spread element `[...a, b]` makes the array's length only known
         // at runtime, so it lowers to the runtime-built `ArraySpread`; a plain
@@ -1486,32 +1487,22 @@ impl LowerCtx<'_> {
         {
             let mut parts = Vec::with_capacity(arr.elems.len());
             for elem in &arr.elems {
-                let Some(elem) = elem else {
-                    return Err(CompileError::spanned(
-                        arr.span(),
-                        "array holes (elisions) are unsupported",
-                    )
-                    .into());
-                };
-                let lowered = self.lower_expr(&elem.expr)?;
-                parts.push(if elem.spread.is_some() {
-                    SpreadElem::Spread(lowered)
-                } else {
-                    SpreadElem::Item(lowered)
+                parts.push(match elem {
+                    None => SpreadElem::Item(IrNode::ArrayHole),
+                    Some(elem) if elem.spread.is_some() => {
+                        SpreadElem::Spread(self.lower_expr(&elem.expr)?)
+                    }
+                    Some(elem) => SpreadElem::Item(self.lower_expr(&elem.expr)?),
                 });
             }
             return Ok(IrNode::ArraySpread(parts));
         }
         let mut elems = Vec::with_capacity(arr.elems.len());
         for elem in &arr.elems {
-            let Some(elem) = elem else {
-                return Err(CompileError::spanned(
-                    arr.span(),
-                    "array holes (elisions) are unsupported",
-                )
-                .into());
-            };
-            elems.push(self.lower_expr(&elem.expr)?);
+            elems.push(match elem {
+                None => IrNode::ArrayHole,
+                Some(elem) => self.lower_expr(&elem.expr)?,
+            });
         }
         Ok(IrNode::Array(elems))
     }

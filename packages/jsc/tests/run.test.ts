@@ -29,6 +29,24 @@ it('formats arrays Node-console style', async () => {
   expect((await run('[1,2,3]')).result).toBe('[ 1, 2, 3 ]')
 })
 
+it('formats array holes and named properties Node-console style', async () => {
+  expect((await run('[1,,3]')).result).toBe('[ 1, <1 empty item>, 3 ]')
+  expect((await run('[,,1]')).result).toBe('[ <2 empty items>, 1 ]')
+  expect((await run('[,]')).result).toBe('[ <1 empty item> ]')
+  expect((await run('let a=[1]; a[3]=4; a')).result).toBe(
+    '[ 1, <2 empty items>, 4 ]',
+  )
+  expect((await run('let a=[1,2]; a.foo=1; a')).result).toBe('[ 1, 2, foo: 1 ]')
+  expect((await run('let a=[1,,3]; delete a[0]; a')).result).toBe(
+    '[ <2 empty items>, 3 ]',
+  )
+  expect((await run("[1,,3].join('-')")).result).toBe('1--3')
+  expect((await run('[1,,3].includes(undefined)')).result).toBe('true')
+  expect((await run('[1,,3].indexOf(undefined)')).result).toBe('-1')
+  expect((await run('[1,,3].slice(0)')).result).toBe('[ 1, <1 empty item>, 3 ]')
+  expect((await run('String([1,,3])')).result).toBe('1,,3')
+})
+
 it('formats objects Node-console style', async () => {
   expect((await run('({a:1,b:2})')).result).toBe('{ a: 1, b: 2 }')
 })

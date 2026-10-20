@@ -292,7 +292,7 @@ fn strict_eq_bits(a: u64, b: u64, mem: &[u8]) -> bool {
 }
 
 /// `array.indexOf(x)`: the number bits of the first index whose element `=== x`,
-/// or `-1` when absent.
+/// or `-1` when absent. A hole (whose bits equal no jsval) never matches.
 fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
     let len = array_len(mem, ptr).unwrap_or(0);
     for i in 0..len {
@@ -306,11 +306,16 @@ fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
 }
 
 /// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
-/// except that `NaN` matches `NaN`.
+/// except that `NaN` matches `NaN`; a hole reads as `undefined`.
 fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
     let len = array_len(mem, ptr).unwrap_or(0);
     (0..len).any(|i| {
         array_elem_bits(mem, ptr, i).is_some_and(|elem| {
+            let elem = if elem == abi::HOLE {
+                abi::UNDEFINED
+            } else {
+                elem
+            };
             strict_eq_bits(elem, needle, mem)
                 || matches!(
                     (decode(elem, mem), decode(needle, mem)),
@@ -340,8 +345,8 @@ fn string_index_of(mem: &[u8], ptr: usize, sub: u64) -> u64 {
 }
 
 /// `array.join(sep)`: build a heap string of `ToString(element)` for each element
-/// joined by `sep` (`","` when `sep` is `undefined`); `null`/`undefined` elements
-/// and cycle back-references render as `""` (JS join semantics). The receiver
+/// joined by `sep` (`","` when `sep` is `undefined`); `null`/`undefined` elements,
+/// holes, and cycle back-references render as `""` (JS join semantics). The receiver
 /// is decoded as a whole so a self-reference is caught by the decoder's cycle
 /// guard. Returns the result's heap jsval bits.
 fn array_join<W: Send + 'static>(
@@ -355,9 +360,9 @@ fn array_join<W: Send + 'static>(
         other => to_js_string(&other),
     };
     let elems = match decode(HEAP | u64::try_from(ptr).ok()?, mem) {
-        Value::Array(elems) => elems,
+        Value::Array(elems, _) => elems,
         Value::Ref(_, inner) => match *inner {
-            Value::Array(elems) => elems,
+            Value::Array(elems, _) => elems,
             _ => return None,
         },
         _ => return None,
@@ -365,7 +370,7 @@ fn array_join<W: Send + 'static>(
     let pieces: Vec<String> = elems
         .iter()
         .map(|elem| match elem {
-            Value::Null | Value::Undefined => String::new(),
+            Value::Null | Value::Undefined | Value::Hole => String::new(),
             other => to_js_string(other),
         })
         .collect();
@@ -394,7 +399,7 @@ fn slice_index(bits: u64, mem: &[u8], default: usize, len: usize) -> usize {
 
 /// `array.slice(a, b)`: a NEW heap array of elements `[a, b)` (JS negative/clamp
 /// semantics; `b` omitted => to end). Element jsval bits are copied verbatim, so
-/// heap-reference elements stay shared. Returns the result's heap jsval bits.
+/// heap-reference elements stay shared and holes stay holes. Returns the result's heap jsval bits.
 fn array_slice<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     mem: &[u8],

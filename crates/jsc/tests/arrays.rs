@@ -40,34 +40,204 @@ fn caught(body: &str) -> String {
     jsc(&["-p", &src])
 }
 
-/// Arrays do not grow by index assignment yet: an integer index at or past the
-/// length throws, and any other key (non-number, negative, fractional, NaN) is
-/// a named array property, which throws until arrays get property tables. Nothing is written and
-/// in-bounds stores are unaffected.
+/// `a[i] = v` past the length grows the array densely (within
+/// `max(2 * cap, len + 1024)`), filling the gap with holes; compound and
+/// update forms read `undefined` first. A gap beyond the dense bound throws
+/// until sparse arrays land, leaving the array untouched.
 #[test]
-fn array_out_of_bounds_and_non_index_writes_throw() {
-    let grow = "true|Cannot grow array by index assignment yet";
-    assert_eq!(caught("let a = [1, 2]; a[2] = 3"), grow);
-    assert_eq!(caught("let a = [1, 2]; a[100] = 3"), grow);
-    assert_eq!(caught("let a = []; a[0] = 1"), grow);
-    assert_eq!(caught("let a = [1, 2, 3]; a.pop(); a[2] = 9"), grow);
-    let add = |key: &str| format!("true|Cannot set named property '{key}' on an array yet");
-    assert_eq!(caught("let a = [1]; a.foo = 1"), add("foo"));
-    assert_eq!(caught("let a = [1]; a[\"foo\"] = 1"), add("foo"));
-    assert_eq!(caught("let a = [1]; a[-1] = 1"), add("-1"));
-    assert_eq!(caught("let a = [1, 2]; a[0.5] = 1"), add("0.5"));
-    assert_eq!(caught("let a = [1]; a[NaN] = 1"), add("NaN"));
-    // A rejected write leaves every element and the length untouched.
+fn array_grows_by_index_assignment() {
+    assert_eq!(jsc(&["-p", "let a = []; a[0] = 1; a"]), "[ 1 ]");
+    assert_eq!(jsc(&["-p", "let a = [1, 2]; a[2] = 3; a"]), "[ 1, 2, 3 ]");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1]; a[3] = 4; console.log(a, a.length, a[2])"
+        ]),
+        "[ 1, <2 empty items>, 4 ] 4 undefined"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2, 3]; a.pop(); a[2] = 9; a"]),
+        "[ 1, 2, 9 ]"
+    );
     assert_eq!(
         jsc(&[
             "-p",
-            "let a=[1,2]; try { a[2]=3 } catch(e) {} try { a[-1]=7 } catch(e) {} a"
+            "let a = []; for (let i = 0; i < 100; i++) a[i] = i; a.length + a[99]"
         ]),
+        "199"
+    );
+    assert_eq!(jsc(&["-p", "let a = []; a[1023] = 1; a.length"]), "1024");
+    // A canonical index string grows like the number.
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a[\"2\"] = 5; a"]),
+        "[ 1, <1 empty item>, 5 ]"
+    );
+    // Compound and update forms past the end: `undefined` -> NaN, then grow.
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a[2] += 1; a"]),
+        "[ 1, <1 empty item>, NaN ]"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = []; a[1]++; a"]),
+        "[ <1 empty item>, NaN ]"
+    );
+    // Every alias sees the growth (the handle never moves).
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; let b = a; a[4] = 5; b.length"]),
+        "5"
+    );
+    // Beyond the dense bound: TypeError, nothing written.
+    let sparse = "true|Cannot grow array sparsely by index assignment yet";
+    assert_eq!(caught("let a = []; a[1024] = 1"), sparse);
+    assert_eq!(caught("let a = [1, 2]; a[5000] = 3"), sparse);
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2]; try { a[5000] = 3 } catch (e) {} a"]),
         "[ 1, 2 ]"
     );
-    // In-bounds stores (including via compound/update forms) are unchanged.
+    // In-bounds stores (including compound/update forms) are unchanged.
     assert_eq!(jsc(&["-p", "let a=[1,2]; a[1]+=5; a[0]++; a"]), "[ 2, 7 ]");
     assert_eq!(jsc(&["-p", "let a=[1,2]; let i=1; a[i]=4; a[1]"]), "4");
+}
+
+/// DF9: on an array, number keys that are array indices and canonical index
+/// strings take the element path; every other key is an ordinary property in
+/// the array's own table.
+#[test]
+fn array_key_routing() {
+    assert_eq!(jsc(&["-p", "[7, 8][\"1\"]"]), "8");
+    assert_eq!(jsc(&["-p", "let k = \"1\"; [7, 8][k]"]), "8");
+    assert_eq!(jsc(&["-p", "let k = \"\" + 1; [7, 8][k]"]), "8");
+    assert_eq!(jsc(&["-p", "let a = [5]; a.foo"]), "undefined");
+    assert_eq!(jsc(&["-p", "let a = [5]; a.foo = 1; a.foo"]), "1");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [5]; a.foo = 1; console.log(a[0], a.length, a[\"foo\"])"
+        ]),
+        "5 1 1"
+    );
+    // Non-index keys never alias an element.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1, 2]; a[\"01\"] = 7; a[-1] = 8; a[1.5] = 9; a[NaN] = 10; \
+             console.log(a[\"01\"], a[-1], a[1.5], a[NaN], a[1], a.length)"
+        ]),
+        "7 8 9 10 2 2"
+    );
+    assert_eq!(jsc(&["-p", "let a = [1]; a[\"01\"]"]), "undefined");
+    // Named properties render after the elements, Node style.
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2]; a.foo = 1; a"]),
+        "[ 1, 2, foo: 1 ]"
+    );
+    assert_eq!(jsc(&["-p", "let a = []; a.foo = 1; a"]), "[ foo: 1 ]");
+    // `length` writes are not supported yet.
+    assert_eq!(
+        caught("let a = [1]; a[\"length\"] = 3"),
+        "true|Cannot set array property 'length' yet"
+    );
+}
+
+/// Literal elisions are holes: they count toward `length` (a single trailing
+/// comma does not), render as empty items, and read as `undefined`.
+#[test]
+fn array_elisions_are_holes() {
+    assert_eq!(jsc(&["-p", "[1, , 3]"]), "[ 1, <1 empty item>, 3 ]");
+    assert_eq!(jsc(&["-p", "[,]"]), "[ <1 empty item> ]");
+    assert_eq!(jsc(&["-p", "[, , 1]"]), "[ <2 empty items>, 1 ]");
+    assert_eq!(jsc(&["-p", "[1, , , ]"]), "[ 1, <2 empty items> ]");
+    assert_eq!(jsc(&["-p", "[1,].length"]), "1");
+    assert_eq!(jsc(&["-p", "[,].length"]), "1");
+    assert_eq!(jsc(&["-p", "[1, , 3].length"]), "3");
+    assert_eq!(jsc(&["-p", "[1, , 3][1]"]), "undefined");
+    assert_eq!(jsc(&["-p", "[1, , 3][\"1\"]"]), "undefined");
+    assert_eq!(
+        jsc(&["-p", "let a = [1, , 3]; let i = 1; typeof a[i]"]),
+        "undefined"
+    );
+    assert_eq!(jsc(&["-p", "[...[1], , 2]"]), "[ 1, <1 empty item>, 2 ]");
+    assert_eq!(jsc(&["-p", "let a = [1, , ]; a.pop()"]), "undefined");
+    assert_eq!(jsc(&["-p", "let a = [1, , 3]; a[1] = 2; a"]), "[ 1, 2, 3 ]");
+}
+
+/// Holes are absent properties: `in`, `delete`, `Object.keys`, `for-in`, and the
+/// skipping higher-order methods do not see them; reads through iteration,
+/// `includes`, `join`, spread, and destructuring see `undefined`.
+#[test]
+fn array_holes_are_absent() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1, , 3]; console.log(1 in a, 0 in a, \"2\" in a, 3 in a, \"length\" in a)"
+        ]),
+        "false true true false true"
+    );
+    assert_eq!(jsc(&["-p", "let a = [1]; a.foo = 2; \"foo\" in a"]), "true");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1, 2, 3]; console.log(delete a[1], a, a.length, 1 in a)"
+        ]),
+        "true [ 1, <1 empty item>, 3 ] 3 false"
+    );
+    assert_eq!(jsc(&["-p", "let a = [1]; delete a[5]; a"]), "[ 1 ]");
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a.foo = 2; delete a.foo; a"]),
+        "[ 1 ]"
+    );
+    assert_eq!(jsc(&["-p", "Object.keys([1, , 3]).join()"]), "0,2");
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a.foo = 1; Object.keys(a).join()"]),
+        "0,foo"
+    );
+    assert_eq!(jsc(&["-p", "Object.values([1, , 3])"]), "[ 1, 3 ]");
+    assert_eq!(
+        jsc(&["-p", "Object.entries([1, , 3]).join(';')"]),
+        "0,1;2,3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1, , 3]; a.foo = 1; let s = ''; for (const k in a) s += k + ';'; s"
+        ]),
+        "0;2;foo;"
+    );
+    assert_eq!(
+        jsc(&["-e", "[1, , 3].forEach((x, i) => console.log(x, i))"]),
+        "1 0\n3 2"
+    );
+    assert_eq!(
+        jsc(&["-p", "[1, , 3].map(x => x * 2)"]),
+        "[ 2, <1 empty item>, 6 ]"
+    );
+    assert_eq!(jsc(&["-p", "[1, , 3].filter(x => true)"]), "[ 1, 3 ]");
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let n = 0; let s = [1, , 3].reduce((a, x) => { n++; return a + x }, 0); s + ':' + n"
+        ]),
+        "4:2"
+    );
+    assert_eq!(jsc(&["-p", "[1, , 3].indexOf(undefined)"]), "-1");
+    assert_eq!(jsc(&["-p", "[1, undefined].indexOf(undefined)"]), "1");
+    assert_eq!(jsc(&["-p", "[1, , 3].includes(undefined)"]), "true");
+    assert_eq!(jsc(&["-p", "[1, , 3].join('-')"]), "1--3");
+    assert_eq!(jsc(&["-p", "String([1, , 3])"]), "1,,3");
+    assert_eq!(
+        jsc(&["-p", "[1, , 3].slice(0)"]),
+        "[ 1, <1 empty item>, 3 ]"
+    );
+    assert_eq!(
+        jsc(&["-e", "for (const x of [1, , 3]) console.log(x)"]),
+        "1\nundefined\n3"
+    );
+    assert_eq!(jsc(&["-p", "[...[1, , 3]]"]), "[ 1, undefined, 3 ]");
+    assert_eq!(
+        jsc(&["-p", "let [x, y, z] = [1, , 3]; typeof y + z"]),
+        "undefined3"
+    );
+    assert_eq!(jsc(&["-p", "JSON.stringify([1, , 3])"]), "[1,null,3]");
 }
 
 /// `Array.prototype.push`/`pop` grow and shrink a bound array end-to-end
