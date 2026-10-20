@@ -47,6 +47,46 @@ it('formats array holes and named properties Node-console style', async () => {
   expect((await run('String([1,,3])')).result).toBe('1,,3')
 })
 
+it('writes array length and renders sparse arrays like the host', async () => {
+  expect((await run('let a=[1,2,3]; a.length=0; a')).result).toBe('[]')
+  expect((await run('let a=[1]; a.length=5; a')).result).toBe(
+    '[ 1, <4 empty items> ]',
+  )
+  expect((await run('let a=[1,2,3]; a.length-=1; a.push(9); a')).result).toBe(
+    '[ 1, 2, 9 ]',
+  )
+  expect(
+    (
+      await run(
+        "let r=''; try { [].length = -1 } catch (e) { r = (e instanceof RangeError) + '|' + e.message } r",
+      )
+    ).result,
+  ).toBe('true|Invalid array length')
+  expect((await run('const a=[]; a[1e6]=1; a')).result).toBe(
+    '[ <1000000 empty items>, 1 ]',
+  )
+  expect(
+    (
+      await run(
+        'const a=[]; a[1e6]=1; a.length + "|" + a[1e6] + "|" + Object.keys(a)',
+      )
+    ).result,
+  ).toBe('1000001|1|1000000')
+  expect((await run('let a=[1,2]; a[5000]=3; a.foo=4; a')).result).toBe(
+    '[ 1, 2, <4998 empty items>, 3, foo: 4 ]',
+  )
+  expect(
+    (
+      await run(
+        'let a=[1]; a[3000]=2; a.indexOf(2) + "|" + a.includes(undefined) + "|" + a.join("") + "|" + String(a).length',
+      )
+    ).result,
+  ).toBe('3000|true|12|3002')
+  expect((await run('let a=[1]; a[3000]=2; a.slice(2999)')).result).toBe(
+    '[ <1 empty item>, 2 ]',
+  )
+})
+
 it('formats objects Node-console style', async () => {
   expect((await run('({a:1,b:2})')).result).toBe('{ a: 1, b: 2 }')
 })

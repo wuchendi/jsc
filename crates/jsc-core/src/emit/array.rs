@@ -37,6 +37,41 @@ pub(super) fn emit_elem_read(function: &mut Function, elem: u32) {
     function.instruction(&Instruction::I64Xor);
 }
 
+/// Push i32 nonzero when the array handle whose i32 base is in local `arr` is
+/// `SPARSE` (its header `flags` bit), else `0`.
+pub(super) fn emit_is_sparse(function: &mut Function, arr: u32) {
+    function.instruction(&Instruction::LocalGet(arr));
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(ARRAY_SPARSE));
+    function.instruction(&Instruction::I32And);
+}
+
+/// Push the raw element jsval `idx` (an i32 local below the length) of the
+/// array whose i32 base is in local `arr`, a hole as [`HOLE_BITS`]: the store
+/// slot of a dense array, `__sparse_get` (function index `sparse_get`) of a
+/// `SPARSE` one. The store base is reloaded per access, since a callback may
+/// grow the array (replacing its store).
+pub(super) fn emit_elem_load(function: &mut Function, arr: u32, idx: u32, sparse_get: u32) {
+    emit_is_sparse(function, arr);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(arr));
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::Call(sparse_get));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(arr));
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::I32Const(8));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::End);
+}
+
 /// The [`MemArg`] of an array handle's u32 `length`.
 pub(super) fn array_len_slot() -> MemArg {
     MemArg {
@@ -231,7 +266,9 @@ pub(super) fn emit_array_push_node(
 /// Emit `array.pop()`, leaving the removed last element (or `undefined`
 /// for an empty array or a trailing hole) on the stack. A non-array `local` throws `not_array`;
 /// otherwise the handle read from `local` is shrunk IN PLACE — its `length`
-/// drops by one and the element at the old last slot of its store is yielded.
+/// drops by one and the element at the old last slot of its store is yielded
+/// (a `SPARSE` array reads it through `__sparse_get` and shrinks through
+/// `__array_set_length`, which drops it from the property table).
 pub(super) fn emit_array_pop_node(
     local: u32,
     not_array: &CalleeError,
@@ -240,9 +277,11 @@ pub(super) fn emit_array_pop_node(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    // Two transient i32 scratch locals: the handle base and the new length.
+    // Transient scratch locals: the handle base and the new length (i32), and
+    // a sparse array's removed element (i64).
     let base = scratch + 3;
     let new_len = scratch + 7;
+    let removed = scratch + 4;
 
     emit_array_guard(function, local, not_array, scratch, strings, helpers);
 
@@ -257,6 +296,25 @@ pub(super) fn emit_array_pop_node(
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Else);
+    // A SPARSE array: removed = __sparse_get(base, len - 1), then the `length`
+    // write `len - 1` drops that element; a hole reads `undefined`.
+    emit_is_sparse(function, base);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::LocalTee(new_len));
+    function.instruction(&Instruction::Call(helpers.sparse_get()));
+    function.instruction(&Instruction::LocalSet(removed));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(new_len));
+    function.instruction(&Instruction::F64ConvertI32U);
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::Call(helpers.array_set_length()));
+    emit_elem_read(function, removed);
     function.instruction(&Instruction::Else);
     // new_len = len - 1; write it back into the handle.
     function.instruction(&Instruction::LocalGet(base));
@@ -282,6 +340,7 @@ pub(super) fn emit_array_pop_node(
     function.instruction(&Instruction::I64Eq);
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Xor);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 }
 
@@ -319,18 +378,16 @@ fn emit_array_guard(
     function.instruction(&Instruction::End);
 }
 
-/// Push the element jsval at `arr[idx]` onto the stack. `arr`/`idx` are the
-/// array-handle-base / loop-index i32 scratch locals of an [`emit_array_hof`]
-/// loop; the store base is reloaded per access, since a callback may grow the
-/// array (replacing its store).
-pub(super) fn emit_hof_load_elem(function: &mut Function, arr: u32, idx: u32) {
-    function.instruction(&Instruction::LocalGet(arr));
-    emit_array_elems(function);
-    function.instruction(&Instruction::LocalGet(idx));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(elem_slot(0)));
+/// Push the raw element jsval at `arr[idx]` (a hole as [`HOLE_BITS`]) onto the
+/// stack via [`emit_elem_load`]. `arr`/`idx` are the array-handle-base /
+/// loop-index i32 scratch locals of an [`emit_array_hof`] loop.
+pub(super) fn emit_hof_load_elem(
+    function: &mut Function,
+    arr: u32,
+    idx: u32,
+    helpers: Helpers<'_>,
+) {
+    emit_elem_load(function, arr, idx, helpers.sparse_get());
 }
 
 /// Push the loop index `idx` (an i32 scratch local) as a number jsval — its
@@ -502,7 +559,7 @@ pub(super) fn emit_array_hof(
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
     // Skip a hole: the body runs only for a present element.
-    emit_hof_load_elem(function, arr, idx);
+    emit_hof_load_elem(function, arr, idx, helpers);
     function.instruction(&Instruction::I64Const(HOLE_BITS));
     function.instruction(&Instruction::I64Ne);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -520,21 +577,21 @@ pub(super) fn emit_array_hof(
             function.instruction(&Instruction::I32Const(8));
             function.instruction(&Instruction::I32Mul);
             function.instruction(&Instruction::I32Add);
-            emit_hof_load_elem(function, arr, idx);
+            emit_hof_load_elem(function, arr, idx, helpers);
             emit_hof_index(function, idx);
             emit_hof_invoke(function, helpers, cb, 2);
             function.instruction(&Instruction::I64Store(elem_slot(0)));
         }
         ArrayHofOp::Filter => {
             // if truthy(callback(element, index)) { __array_push(res, element) }.
-            emit_hof_load_elem(function, arr, idx);
+            emit_hof_load_elem(function, arr, idx, helpers);
             emit_hof_index(function, idx);
             emit_hof_invoke(function, helpers, cb, 2);
             function.instruction(&Instruction::LocalSet(acc));
             emit_cond(&IrNode::Local(acc), function, scratch, strings, helpers);
             function.instruction(&Instruction::If(BlockType::Empty));
             function.instruction(&Instruction::LocalGet(res));
-            emit_hof_load_elem(function, arr, idx);
+            emit_hof_load_elem(function, arr, idx, helpers);
             function.instruction(&Instruction::Call(helpers.array_push));
             function.instruction(&Instruction::Drop);
             function.instruction(&Instruction::End);
@@ -542,14 +599,14 @@ pub(super) fn emit_array_hof(
         ArrayHofOp::Reduce => {
             // acc = callback(acc, element, index).
             function.instruction(&Instruction::LocalGet(acc));
-            emit_hof_load_elem(function, arr, idx);
+            emit_hof_load_elem(function, arr, idx, helpers);
             emit_hof_index(function, idx);
             emit_hof_invoke(function, helpers, cb, 3);
             function.instruction(&Instruction::LocalSet(acc));
         }
         ArrayHofOp::ForEach => {
             // callback(element, index) for side effects; discard the result.
-            emit_hof_load_elem(function, arr, idx);
+            emit_hof_load_elem(function, arr, idx, helpers);
             emit_hof_index(function, idx);
             emit_hof_invoke(function, helpers, cb, 2);
             function.instruction(&Instruction::Drop);

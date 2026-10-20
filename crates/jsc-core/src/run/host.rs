@@ -7,7 +7,7 @@ use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
-use super::value::array_layout;
+use super::value::{array_elements, array_layout, join_elements};
 use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
@@ -236,19 +236,6 @@ fn block_len(mem: &[u8], ptr: usize) -> Option<usize> {
     usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()
 }
 
-/// The length of the array handle at `ptr`.
-fn array_len(mem: &[u8], ptr: usize) -> Option<usize> {
-    array_layout(mem, ptr).map(|(len, _)| len)
-}
-
-/// The raw jsval bits of element `i` of the array handle at `ptr`.
-fn array_elem_bits(mem: &[u8], ptr: usize, i: usize) -> Option<u64> {
-    let (_, data) = array_layout(mem, ptr)?;
-    let start = data.checked_add(8 * i)?;
-    let bytes = mem.get(start..start + 8)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
-}
-
 /// The UTF-8 payload bytes of a heap STRING block (`[len:u32][utf8]` at
 /// `ptr + HEADER_SIZE`), or `None` when the block is truncated.
 fn string_bytes(mem: &[u8], ptr: usize) -> Option<Vec<u8>> {
@@ -292,37 +279,27 @@ fn strict_eq_bits(a: u64, b: u64, mem: &[u8]) -> bool {
 }
 
 /// `array.indexOf(x)`: the number bits of the first index whose element `=== x`,
-/// or `-1` when absent. A hole (whose bits equal no jsval) never matches.
+/// or `-1` when absent. A hole is no element, so it never matches.
 fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
-    let len = array_len(mem, ptr).unwrap_or(0);
-    for i in 0..len {
-        if let Some(elem) = array_elem_bits(mem, ptr, i)
-            && strict_eq_bits(elem, needle, mem)
-        {
-            return index_bits(i);
-        }
-    }
-    not_found_bits()
+    let (_, present) = array_elements(mem, ptr).unwrap_or_default();
+    present
+        .into_iter()
+        .find(|&(_, elem)| strict_eq_bits(elem, needle, mem))
+        .map_or_else(not_found_bits, |(i, _)| index_bits(i))
 }
 
 /// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
 /// except that `NaN` matches `NaN`; a hole reads as `undefined`.
 fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
-    let len = array_len(mem, ptr).unwrap_or(0);
-    (0..len).any(|i| {
-        array_elem_bits(mem, ptr, i).is_some_and(|elem| {
-            let elem = if elem == abi::HOLE {
-                abi::UNDEFINED
-            } else {
-                elem
-            };
+    let (len, present) = array_elements(mem, ptr).unwrap_or_default();
+    (needle == abi::UNDEFINED && present.len() < len)
+        || present.into_iter().any(|(_, elem)| {
             strict_eq_bits(elem, needle, mem)
                 || matches!(
                     (decode(elem, mem), decode(needle, mem)),
                     (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
                 )
         })
-    })
 }
 
 /// `string.indexOf(sub)`: the number bits of the first BYTE index where `sub`
@@ -367,14 +344,7 @@ fn array_join<W: Send + 'static>(
         },
         _ => return None,
     };
-    let pieces: Vec<String> = elems
-        .iter()
-        .map(|elem| match elem {
-            Value::Null | Value::Undefined | Value::Hole => String::new(),
-            other => to_js_string(other),
-        })
-        .collect();
-    alloc_string(caller, &pieces.join(&sep)).map(|base| HEAP | base)
+    alloc_string(caller, &join_elements(&elems, &sep)).map(|base| HEAP | base)
 }
 
 /// Resolve one JS slice endpoint against a sequence `len`: `undefined` uses
@@ -407,12 +377,15 @@ fn array_slice<W: Send + 'static>(
     a: i64,
     b: i64,
 ) -> Option<u64> {
-    let len = array_len(mem, ptr)?;
+    let (len, present) = array_elements(mem, ptr)?;
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
-    let elems = (start..end)
-        .map(|i| array_elem_bits(mem, ptr, i))
-        .collect::<Option<Vec<u64>>>()?;
+    let mut elems = vec![abi::HOLE; end - start];
+    for (i, bits) in present {
+        if (start..end).contains(&i) {
+            elems[i - start] = bits;
+        }
+    }
     alloc_array(caller, &elems).map(|base| HEAP | base)
 }
 

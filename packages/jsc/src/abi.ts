@@ -112,6 +112,10 @@ export const OBJ_PROTO_OFFSET = 8
 export const ARRAY_LEN_OFFSET = OBJ_PREFIX_SIZE
 /** Byte offset (from an array handle base) of its element store base (`u32`, `0` when the capacity is 0). */
 export const ARRAY_ELEMS_OFFSET = OBJ_PREFIX_SIZE + 4
+/** Array `flags` bit: sparse — elements at or past the store's `cap` are array-index keys in `props`. */
+export const ARRAY_FLAG_SPARSE = 4
+/** Byte offset (from an element store base) of its capacity (`u32`). */
+export const ELEMS_CAP_OFFSET = 4
 /** Byte offset (from an element store base) of element 0; element `i` is at `+ 8 * i`. */
 export const ELEMS_DATA_OFFSET = 8
 /** Byte offset (from a {@link TYPE_FUNCTION} block base) of the funcref-table index (`u32`). */

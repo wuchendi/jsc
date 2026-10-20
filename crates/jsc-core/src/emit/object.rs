@@ -1457,6 +1457,29 @@ fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32, len_offset: u
     function.instruction(&Instruction::I32And);
 }
 
+/// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for
+/// the heap array in `s0` ([`emit_index_in_bounds`]) and the array is not
+/// `SPARSE` (whose elements past its store are not in it), else `0`.
+fn emit_dense_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
+    emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
+    emit_sparse_test(function, s0);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::I32And);
+}
+
+/// Push i32 nonzero when the heap array jsval in `s0` is `SPARSE`, else `0`.
+fn emit_sparse_test(function: &mut Function, s0: u32) {
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(ARRAY_SPARSE));
+    function.instruction(&Instruction::I32And);
+}
+
 /// Emit the string-key half of an array/string index read `s0[s1]`, leaving an
 /// `i32` on the stack: `1` when `s1` is the string `"length"` (the caller yields
 /// the length header), else `0`. Before returning `0`, a CANONICAL numeric
@@ -1654,10 +1677,20 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     // ARRAY: an in-range integer key loads the i64 element jsval at
-    // elems + 8 + 8*i (stashed in `s1`, the key being dead) and reads a hole as
-    // `undefined`; any other key goes through `__get`.
+    // elems + 8 + 8*i (`__sparse_get` on a SPARSE array; stashed in `s1`, the
+    // key being dead) and reads a hole as `undefined`; any other key goes
+    // through `__get`.
     emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    emit_sparse_test(function, s0);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::I32TruncSatF64U);
+    function.instruction(&Instruction::Call(helpers.sparse_get()));
+    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     emit_array_elems(function);
@@ -1668,6 +1701,7 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalSet(s1));
     emit_elem_read(function, s1);
     function.instruction(&Instruction::Else);
@@ -1829,11 +1863,12 @@ fn emit_set_call(
 }
 
 /// Emit the array arm of [`emit_index_set_node`] for the array in `s0`: an
-/// integer key `0 <= k < length` stores the element at `elems + 8 + 8*k`
-/// inline (the compares run on `f64`, so a non-number key fails them without
-/// reading memory); any other key goes to `__array_set` (growth by index,
-/// canonical index strings, `length`, named properties), followed by the
-/// pending-exception check. The caller tracks the enclosing dispatch frame.
+/// integer key `0 <= k < length` of a dense array stores the element at
+/// `elems + 8 + 8*k` inline (the compares run on `f64`, so a non-number key
+/// fails them without reading memory); any other key (or a `SPARSE` array)
+/// goes to `__array_set` (growth by index, sparse elements, canonical index
+/// strings, `length`, named properties), followed by the pending-exception
+/// check. The caller tracks the enclosing dispatch frame.
 fn emit_index_set_array(
     function: &mut Function,
     s0: u32,
@@ -1841,7 +1876,7 @@ fn emit_index_set_array(
     sval: u32,
     helpers: Helpers<'_>,
 ) {
-    emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
+    emit_dense_index_in_bounds(function, s0, s1);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
     // In bounds: store the element jsval at elems + 8 + 8*i. Mirrors
@@ -2142,7 +2177,7 @@ pub(super) fn emit_nullish_throw(strings: &HashMap<String, i32>, helpers: Helper
 /// `emit_main` scratch layout (so `emit_node` can build the error object as it
 /// would in `main`), then the message and stack string jsvals at `scratch + 24`
 /// and `scratch + 25`.
-fn type_error_helper_locals() -> Vec<(u32, ValType)> {
+pub(super) fn type_error_helper_locals() -> Vec<(u32, ValType)> {
     vec![
         (3, ValType::I64),
         (1, ValType::I32),
@@ -2196,8 +2231,7 @@ fn emit_raise_type_error(
 /// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the
 /// `TypeError` for a property store or delete the receiver cannot take, stash
 /// it in `$exc_value`, set the pending flag and clear any routed completion.
-/// [`PROP_THROW_GROW`] is an array index store beyond the dense-growth bound —
-/// [`ARRAY_GROW_MSG`]; [`PROP_THROW_PRIMITIVE`] is a store on
+/// [`PROP_THROW_PRIMITIVE`] is a store on
 /// a primitive `recv` — `Cannot create property '<String(key)>' on
 /// <number|string|boolean> '<String(recv)>'`; every other mode wraps
 /// `String(key)` in its [`PROP_KEYED_MSGS`] fragments.
@@ -2217,12 +2251,6 @@ pub(super) fn emit_prop_throw(strings: &HashMap<String, i32>, helpers: Helpers<'
         function.instruction(&Instruction::I32WrapI64);
     };
 
-    function.instruction(&Instruction::LocalGet(mode));
-    function.instruction(&Instruction::I32Const(PROP_THROW_GROW));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::I32Const(at(ARRAY_GROW_MSG)));
-    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(mode));
     function.instruction(&Instruction::I32Const(PROP_THROW_PRIMITIVE));
     function.instruction(&Instruction::I32Eq);
@@ -2268,7 +2296,6 @@ pub(super) fn emit_prop_throw(strings: &HashMap<String, i32>, helpers: Helpers<'
     concat(&mut function);
     pick(&mut function, |entry| entry.2);
     concat(&mut function);
-    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));

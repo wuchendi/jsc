@@ -117,3 +117,23 @@ const HOST_OOM: &str = "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } 
 fn host_initiated_out_of_memory() {
     assert_uncaught(HOST_OOM, "RangeError: out of memory");
 }
+
+/// A store far past the end makes the array sparse: the gap is never
+/// allocated, so a length of a million costs no ~8 MB element store.
+#[test]
+fn sparse_store_does_not_allocate_the_gap() {
+    let program = jsc_core::frontend::parse(
+        "const a = []; a[1e6] = 1; a.length",
+        jsc_core::frontend::Dialect::Js,
+    )
+    .expect("parses");
+    let ir = jsc_core::codegen::lower(&program).expect("lowers");
+    let wasm = jsc_core::emit::emit(&ir);
+    let (bits, memory) = jsc_core::run::run(&wasm).expect("runs");
+    assert_eq!(f64::from_bits(bits), 1_000_001.0);
+    assert!(
+        memory.len() < 4 * 1024 * 1024,
+        "linear memory grew to {} bytes",
+        memory.len()
+    );
+}

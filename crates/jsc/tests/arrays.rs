@@ -40,10 +40,19 @@ fn caught(body: &str) -> String {
     jsc(&["-p", &src])
 }
 
+/// Wrap `body` so the script yields `"<instanceof RangeError>|<message>"` for
+/// the error it throws (or `"none"` when it completes normally).
+fn caught_range(body: &str) -> String {
+    let src = format!(
+        "let r=\"none\"; try {{ {body} }} catch(e) {{ r=(e instanceof RangeError)+\"|\"+e.message }} r"
+    );
+    jsc(&["-p", &src])
+}
+
 /// `a[i] = v` past the length grows the array densely (within
 /// `max(2 * cap, len + 1024)`), filling the gap with holes; compound and
-/// update forms read `undefined` first. A gap beyond the dense bound throws
-/// until sparse arrays land, leaving the array untouched.
+/// update forms read `undefined` first. A gap beyond the dense bound makes
+/// the array sparse (see `sparse_arrays`).
 #[test]
 fn array_grows_by_index_assignment() {
     assert_eq!(jsc(&["-p", "let a = []; a[0] = 1; a"]), "[ 1 ]");
@@ -86,13 +95,11 @@ fn array_grows_by_index_assignment() {
         jsc(&["-p", "let a = [1]; let b = a; a[4] = 5; b.length"]),
         "5"
     );
-    // Beyond the dense bound: TypeError, nothing written.
-    let sparse = "true|Cannot grow array sparsely by index assignment yet";
-    assert_eq!(caught("let a = []; a[1024] = 1"), sparse);
-    assert_eq!(caught("let a = [1, 2]; a[5000] = 3"), sparse);
+    // Beyond the dense bound: the array turns sparse.
+    assert_eq!(jsc(&["-p", "let a = []; a[1024] = 1; a.length"]), "1025");
     assert_eq!(
-        jsc(&["-p", "let a = [1, 2]; try { a[5000] = 3 } catch (e) {} a"]),
-        "[ 1, 2 ]"
+        jsc(&["-p", "let a = [1, 2]; a[5000] = 3; a"]),
+        "[ 1, 2, <4998 empty items>, 3 ]"
     );
     // In-bounds stores (including compound/update forms) are unchanged.
     assert_eq!(jsc(&["-p", "let a=[1,2]; a[1]+=5; a[0]++; a"]), "[ 2, 7 ]");
@@ -132,10 +139,294 @@ fn array_key_routing() {
         "[ 1, 2, foo: 1 ]"
     );
     assert_eq!(jsc(&["-p", "let a = []; a.foo = 1; a"]), "[ foo: 1 ]");
-    // `length` writes are not supported yet.
+    // `length` is a key of its own, not an element.
     assert_eq!(
-        caught("let a = [1]; a[\"length\"] = 3"),
-        "true|Cannot set array property 'length' yet"
+        jsc(&["-p", "let a = [1]; a[\"length\"] = 3; a"]),
+        "[ 1, <2 empty items> ]"
+    );
+}
+
+/// `length` writes (`a.length = v`, `a["length"] = v`, compound and update
+/// forms) truncate or extend the array: a shrink leaves holes behind (so a
+/// later regrowth reads none of the old elements), an extension adds holes
+/// (or makes the array sparse past the dense bound), and a value that is not
+/// a valid array length throws a catchable `RangeError`. The assignment
+/// yields the assigned value.
+#[test]
+fn array_length_writes() {
+    assert_eq!(jsc(&["-p", "let a = [1, 2, 3]; a.length = 0; a"]), "[]");
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2, 3]; a.length = 1; a.push(9); a"]),
+        "[ 1, 9 ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1, 2, 3]; a.length = 1; console.log(a[1], a[2], 1 in a, a.length)"
+        ]),
+        "undefined undefined false 1"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2, 3]; a.length = 1; a.length = 3; a"]),
+        "[ 1, <2 empty items> ]"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a.length = 5; a"]),
+        "[ 1, <4 empty items> ]"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2]; a[\"length\"] = 1; a"]),
+        "[ 1 ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1, 2]; let k = \"len\" + \"gth\"; a[k] = 1; a"
+        ]),
+        "[ 1 ]"
+    );
+    // Every alias sees the new length (the handle never moves).
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2, 3]; let b = a; a.length = 2; b"]),
+        "[ 1, 2 ]"
+    );
+    // Compound and update forms.
+    assert_eq!(
+        jsc(&["-p", "let a = [1, 2, 3]; a.length -= 1; a"]),
+        "[ 1, 2 ]"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a.length++; a"]),
+        "[ 1, <1 empty item> ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1, 2]; let x = a.length--; x + \"|\" + a.length + \"|\" + a"
+        ]),
+        "2|1|1"
+    );
+    // The assignment yields the assigned value, not the new length.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1, 2]; let x = (a.length = \"1\"); typeof x + x + a.length"
+        ]),
+        "string11"
+    );
+    assert_eq!(jsc(&["-p", "let a = []; a.length = 3.0"]), "3");
+    // Invalid lengths: catchable RangeError, the array untouched.
+    let invalid = "true|Invalid array length";
+    assert_eq!(caught_range("let a = []; a.length = -1"), invalid);
+    assert_eq!(caught_range("let a = []; a.length = 1.5"), invalid);
+    assert_eq!(caught_range("let a = []; a.length = 2 ** 32"), invalid);
+    assert_eq!(caught_range("let a = []; a.length = NaN"), invalid);
+    assert_eq!(caught_range("let a = []; a.length = \"x\""), invalid);
+    assert_eq!(caught_range("let a = [1]; a.length += 0.5"), invalid);
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1, 2]; let n = \"\"; try { a.length = -1 } catch (e) { n = e.name } n + \"|\" + a"
+        ]),
+        "RangeError|1,2"
+    );
+    // The largest valid length.
+    assert_eq!(
+        jsc(&["-p", "let a = []; a.length = 2 ** 32 - 1; a.length"]),
+        "4294967295"
+    );
+    // `length` is an own, non-enumerable property.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1, 2]; console.log(\"length\" in a, Object.keys(a).join())"
+        ]),
+        "true 0,1"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1]; a.length = 3; let s = \"\"; for (const k in a) s += k + \";\"; s"
+        ]),
+        "0;"
+    );
+    // Non-array receivers keep their ordinary `length` behaviour.
+    assert_eq!(jsc(&["-p", "let o = {}; o.length = 3; o.length"]), "3");
+    assert_eq!(
+        caught("let s = \"ab\"; s.length = 1"),
+        "true|Cannot create property 'length' on string 'ab'"
+    );
+}
+
+/// A store far past the dense bound (`i >= max(2 * cap, len + 1024)`) makes
+/// the array sparse: the element lives in the array's own property table, the
+/// length jumps without allocating the gap, and every element operation
+/// (reads, `in`, `delete`, keys, iteration, the higher-order and host
+/// methods, `push`/`pop`, `length` writes, rendering) sees the same array.
+#[test]
+fn sparse_arrays() {
+    assert_eq!(
+        jsc(&["-p", "const a = []; a[1e6] = 1; a.length"]),
+        "1000001"
+    );
+    assert_eq!(jsc(&["-p", "const a = []; a[1e6] = 1; a[1e6]"]), "1");
+    assert_eq!(
+        jsc(&["-p", "const a = []; a[1e6] = 1; a[\"1000000\"]"]),
+        "1"
+    );
+    assert_eq!(jsc(&["-p", "const a = []; a[1e6] = 1; a[5]"]), "undefined");
+    assert_eq!(
+        jsc(&["-p", "const a = []; a[1e6] = 1; Object.keys(a)"]),
+        "[ 1000000 ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "const a = []; a[1e6] = 1; let n = 0; let at = -1; a.forEach((v, i) => { n++; at = i }); n + \"|\" + at"
+        ]),
+        "1|1000000"
+    );
+    assert_eq!(
+        jsc(&["-p", "const a = []; a[1e6] = 1; a"]),
+        "[ <1000000 empty items>, 1 ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const a = []; a[1e6] = 1; console.log(1e6 in a, 5 in a, \"length\" in a)"
+        ]),
+        "true false true"
+    );
+    // Earlier elements stay, later stores anywhere keep the array sparse.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1, 2]; a[5000] = 3; a[2] = 7; a[4000] = 8; a"
+        ]),
+        "[ 1, 2, 7, <3997 empty items>, 8, <999 empty items>, 3 ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1, 2]; a[5000] = 3; a[0] += 10; a[5000]++; a[0] + a[5000]"
+        ]),
+        "15"
+    );
+    // delete leaves a hole; the length stays.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const a = [1]; a[3000] = 2; console.log(delete a[3000], a.length, 3000 in a, a)"
+        ]),
+        "true 3001 false [ 1, <3000 empty items> ]"
+    );
+    // push/pop.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = []; a[2000] = 1; a.push(2); a.length + \"|\" + a[2001] + \"|\" + a.pop() + \"|\" + a.pop() + \"|\" + a.length"
+        ]),
+        "2002|2|2|1|2000"
+    );
+    // A length shrink drops the elements past it.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1]; a[5000] = 2; a.length = 10; console.log(a, a[5000]); a.length = 6000; console.log(a[5000], Object.keys(a).join())"
+        ]),
+        "[ 1, <9 empty items> ] undefined\nundefined 0"
+    );
+    // A length write past the dense bound makes the array sparse.
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a.length = 1e6; a[3] = 4; a"]),
+        "[ 1, <2 empty items>, 4, <999996 empty items> ]"
+    );
+    // Keys: integers ascending, then named keys.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [0]; a.x = 1; a[9000] = 2; a[5000] = 3; let s = \"\"; for (const k in a) s += k + \";\"; s"
+        ]),
+        "0;5000;9000;x;"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [0]; a[9000] = 2; a[5000] = 3; Object.values(a).join() + \"|\" + Object.entries(a).join(\";\")"
+        ]),
+        "0,3,2|0,0;5000,3;9000,2"
+    );
+}
+
+/// Iteration, the higher-order methods, the host methods, and rendering over
+/// a sparse array see its holes as an ordinary array's.
+#[test]
+fn sparse_array_iteration_and_methods() {
+    // Iteration reads holes as undefined.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1]; a[3000] = 2; let c = 0; let s = 0; for (const v of a) { c++; if (v !== undefined) s += v } c + \"|\" + s"
+        ]),
+        "3001|3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1]; a[3000] = 2; let b = [...a]; b.length + \"|\" + b[3000] + \"|\" + b[1]"
+        ]),
+        "3001|2|undefined"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1]; a[3000] = 2; const [x, y] = a; x + \"|\" + y"
+        ]),
+        "1|undefined"
+    );
+    // The higher-order methods skip the holes.
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a[3000] = 2; a.filter(v => true)"]),
+        "[ 1, 2 ]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1]; a[3000] = 2; a.reduce((s, v) => s + v, 0)"
+        ]),
+        "3"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a[3000] = 2; a.map(v => v * 2)"]),
+        "[ 2, <2999 empty items>, 4 ]"
+    );
+    // The host methods.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1]; a[3000] = 2; a.indexOf(2) + \"|\" + a.includes(undefined) + \"|\" + a.includes(2) + \"|\" + a.indexOf(undefined)"
+        ]),
+        "3000|true|true|-1"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let a = [1]; a[3000] = 2; a.join(\"\") + \"|\" + a.join().length + \"|\" + String(a).length"
+        ]),
+        "12|3002|3002"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a[3000] = 2; a.slice(2999)"]),
+        "[ <1 empty item>, 2 ]"
+    );
+    assert_eq!(
+        jsc(&["-p", "let a = []; a[2000] = 1; JSON.stringify(a).length"]),
+        "10003"
+    );
+    // Named properties render after the elements.
+    assert_eq!(
+        jsc(&["-p", "let a = [1]; a[3000] = 2; a.foo = 3; a"]),
+        "[ 1, <2999 empty items>, 2, foo: 3 ]"
     );
 }
 

@@ -73,11 +73,13 @@ import {
   UNDEFINED,
 } from './abi.js'
 import {
+  arrayElements,
   arrayLayout,
   asU64,
   decode,
   f64ToBits,
   formatValue,
+  joinElements,
   parseFloatStr,
   parseIntStr,
   toJsString,
@@ -259,14 +261,14 @@ export function createShim(): Shim {
     a: bigint,
     b: bigint,
   ): bigint | null {
-    const len = arrayLen(mem, ptr)
+    const elements = arrayElements(mem, ptr)
+    if (elements === undefined) return null
+    const [len, present] = elements
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
-    const elems: bigint[] = []
-    for (let i = start; i < end; i++) {
-      const elem = arrayElemBits(mem, ptr, i)
-      if (elem === null) return null
-      elems.push(elem)
+    const elems: bigint[] = new Array<bigint>(end - start).fill(HOLE)
+    for (const [i, bits] of present) {
+      if (i >= start && i < end) elems[i - start] = bits
     }
     const base = allocArray(elems)
     return base === null ? null : HEAP | base
@@ -906,22 +908,6 @@ function blockLen(mem: Uint8Array, ptr: number): number {
   )
 }
 
-/** The length of the array handle at `ptr` (`0` when truncated). */
-function arrayLen(mem: Uint8Array, ptr: number): number {
-  return arrayLayout(mem, ptr)?.[0] ?? 0
-}
-
-/** The raw jsval bits of element `i` of the array handle at `ptr`, or `null` when out of range. */
-function arrayElemBits(mem: Uint8Array, ptr: number, i: number): bigint | null {
-  const layout = arrayLayout(mem, ptr)
-  if (layout === undefined) return null
-  const start = layout[1] + 8 * i
-  if (start + 8 > mem.length) return null
-  let value = 0n
-  for (let k = 7; k >= 0; k--) value = (value << 8n) | BigInt(mem[start + k]!)
-  return value
-}
-
 /** The UTF-8 payload bytes of a heap STRING block, or `null` when truncated. */
 function stringBytes(mem: Uint8Array, ptr: number): Uint8Array | null {
   const len = blockLen(mem, ptr)
@@ -967,12 +953,10 @@ function strictEqBits(a: bigint, b: bigint, mem: Uint8Array): boolean {
  * reads as `undefined`.
  */
 function arrayIncludes(mem: Uint8Array, ptr: number, needle: bigint): boolean {
-  const len = arrayLen(mem, ptr)
+  const [len, present] = arrayElements(mem, ptr) ?? [0, []]
+  if (needle === UNDEFINED && present.length < len) return true
   const n = decode(needle, mem)
-  for (let i = 0; i < len; i++) {
-    let elem = arrayElemBits(mem, ptr, i)
-    if (elem === null) continue
-    if (elem === HOLE) elem = UNDEFINED
+  for (const [, elem] of present) {
     if (strictEqBits(elem, needle, mem)) return true
     const e = decode(elem, mem)
     if (
@@ -988,10 +972,9 @@ function arrayIncludes(mem: Uint8Array, ptr: number, needle: bigint): boolean {
 
 /** `array.indexOf(x)`: first index whose element `=== x`, or `-1` (a hole never matches). */
 function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
-  const len = arrayLen(mem, ptr)
-  for (let i = 0; i < len; i++) {
-    const elem = arrayElemBits(mem, ptr, i)
-    if (elem !== null && strictEqBits(elem, needle, mem)) return indexBits(i)
+  const [, present] = arrayElements(mem, ptr) ?? [0, []]
+  for (const [i, elem] of present) {
+    if (strictEqBits(elem, needle, mem)) return indexBits(i)
   }
   return f64ToBits(-1)
 }
@@ -1030,13 +1013,7 @@ function arrayJoinText(mem: Uint8Array, ptr: number, sepBits: bigint): string {
   let recv = decode(HEAP | BigInt(ptr), mem)
   if (recv.kind === 'ref') recv = recv.value
   if (recv.kind !== 'array') return ''
-  return recv.items
-    .map((v) =>
-      v.kind === 'null' || v.kind === 'undefined' || v.kind === 'hole'
-        ? ''
-        : toJsString(v),
-    )
-    .join(sep)
+  return joinElements(recv.items, sep)
 }
 
 /**
