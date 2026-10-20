@@ -2277,6 +2277,7 @@ language/expressions/in/private-field-invalid-identifier-simple.js
 language/expressions/in/private-field-invalid-rhs.js
 language/expressions/in/private-field-rhs-yield-absent.js
 language/expressions/in/rhs-yield-absent-strict.js
+language/expressions/in/rhs-yield-present.js
 language/expressions/less-than-or-equal/S11.8.3_A2.4_T1.js
 language/expressions/less-than-or-equal/S11.8.3_A2.4_T2.js
 language/expressions/less-than-or-equal/S11.8.3_A3.1_T1.3.js
@@ -2796,6 +2797,8 @@ language/expressions/yield/in-iteration-stmt.js
 language/expressions/yield/invalid-left-hand-side.js
 language/expressions/yield/iter-value-specified.js
 language/expressions/yield/iter-value-unspecified.js
+language/expressions/yield/rhs-template-middle.js
+language/expressions/yield/rhs-yield.js
 language/expressions/yield/star-array.js
 language/expressions/yield/star-in-iteration-stmt.js
 language/expressions/yield/star-string.js
@@ -4881,9 +4884,11 @@ language/statements/generators/yield-as-logical-or-expression.js
 language/statements/generators/yield-as-parameter.js
 language/statements/generators/yield-as-property-name.js
 language/statements/generators/yield-as-statement.js
+language/statements/generators/yield-as-yield-operand.js
 language/statements/generators/yield-identifier-spread-strict.js
 language/statements/generators/yield-identifier-strict.js
 language/statements/generators/yield-newline.js
+language/statements/generators/yield-spread-arr-multiple.js
 language/statements/generators/yield-star-after-newline.js
 language/statements/generators/yield-star-before-newline.js
 language/statements/generators/yield-weak-binding.js
