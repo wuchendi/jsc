@@ -657,11 +657,16 @@ export function createShim(): Shim {
   /** Run one microtask (mirrors `promise.rs::run_job`). */
   function runJob(job: Job): void {
     if (job.asyncGen !== null) {
-      if (job.state === PROMISE_FULFILLED) {
-        driveAsync(job.asyncGen, job.result, job.value)
-      } else {
-        settle(job.result, PROMISE_REJECTED, job.value)
+      let sent = job.value
+      if (job.state !== PROMISE_FULFILLED) {
+        // Resume with the reason pending so the `await` throws into the body.
+        const pending = exportGlobal(EXC_PENDING_EXPORT_NAME)
+        const excValue = exportGlobal(EXC_VALUE_EXPORT_NAME)
+        if (excValue) excValue.value = BigInt.asIntN(64, job.value)
+        if (pending) pending.value = 1
+        sent = UNDEFINED
       }
+      driveAsync(job.asyncGen, job.result, sent)
       return
     }
     if (!asFunction(memView(), job.callback)) {

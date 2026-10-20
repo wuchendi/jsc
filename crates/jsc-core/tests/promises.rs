@@ -331,14 +331,78 @@ fn async_throw_rejects_result() {
     );
 }
 
-/// `await` on a rejected promise propagates the rejection out as the async
-/// function's own rejection (no `try`/`catch` around `await` is modeled).
+/// `await` on a rejected promise with no enclosing handler propagates the
+/// rejection out as the async function's own rejection.
 #[test]
 fn async_await_rejection_propagates() {
     assert_output(
         "async function f() { await Promise.reject(\"nope\"); return 1; } \
          f().catch(e => console.log(e));",
         "nope\n",
+    );
+}
+
+/// An uncaught rejection inside an async body rejects its result promise; with
+/// no handler on the result, the run exits as an unhandled rejection.
+#[test]
+fn async_await_rejection_unhandled_is_uncaught() {
+    assert_uncaught(
+        "async function f() { await Promise.reject(\"nope\"); return 1; } f(); 0",
+        "(in promise) nope",
+    );
+}
+
+/// A rejected `await` THROWS into the body at the suspended `await`: the
+/// enclosing `catch` binds the rejection reason.
+#[test]
+fn async_await_rejection_is_caught() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(new Error(\"boom\")) } \
+         catch (e) { return \"caught \" + e.message } } f().then(v => console.log(v))",
+        "caught boom\n",
+    );
+}
+
+/// A caught rejection is not reported as an unhandled rejection.
+#[test]
+fn async_caught_rejection_is_not_unhandled() {
+    assert_eval(
+        "async function f(){ try { await Promise.reject(1) } catch (e) { return e + 1 } } await f()",
+        "2",
+    );
+}
+
+/// A non-Error rejection value is bound to the catch parameter unchanged.
+#[test]
+fn async_await_rejection_non_error_value() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(42) } catch (e) { console.log(e, typeof e) } } f()",
+        "42 number\n",
+    );
+}
+
+/// A rejected `await` inside `try`/`finally` runs the finalizer, then the
+/// rejection still rejects the result promise.
+#[test]
+fn async_await_rejection_runs_finally() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(\"r\") } finally { console.log(\"fin\") } } \
+         f().catch(e => console.log(\"rejected\", e))",
+        "fin\nrejected r\n",
+    );
+}
+
+/// After a caught rejection, later awaits in the same body (inside a `try`
+/// again) continue normally.
+#[test]
+fn async_awaits_continue_after_caught_rejection() {
+    assert_output(
+        "async function f(){ let log = \"\"; \
+         try { await Promise.reject(\"a\") } catch (e) { log = log + e } \
+         try { const v = await Promise.resolve(\"b\"); log = log + v; const w = await 3; log = log + w } \
+         catch (e) { log = log + \"!\" } \
+         return log } f().then(v => console.log(v))",
+        "ab3\n",
     );
 }
 
@@ -612,5 +676,46 @@ fn nested_await_store_targets_the_receiver_captured_before_it() {
          async function f(){ box.o.x = await 5; console.log(first.x, box.o.x); }
          f(); box.o = {x: 0};",
         "5 0\n",
+    );
+}
+
+/// An `await` in a `for-of` body over an array keeps the loop's cursor across
+/// each resume.
+#[test]
+fn await_in_a_for_of_body() {
+    assert_output(
+        "async function f(xs){ let s = 0; for (const x of xs) { s += await x } return s }
+         f([1, 2, 3]).then(v => console.log(v));",
+        "6\n",
+    );
+}
+
+/// An `await` in a `for-in` body walks every key of the snapshot.
+#[test]
+fn await_in_a_for_in_body() {
+    assert_output(
+        "async function f(o){ let out = \"\"; for (const k in o) { out = out + k + (await o[k]); } return out }
+         f({ a: 1, b: 2 }).then(v => console.log(v));",
+        "a1b2\n",
+    );
+}
+
+/// An `await` inside a `switch` case resumes into the selected clause, and
+/// `break` after the resume leaves the switch.
+#[test]
+fn await_in_a_switch_case() {
+    assert_output(
+        "async function f(x){
+           let r = \"\";
+           switch (await x) {
+             case 1: r = r + (await \"one\"); break;
+             case 2: r = r + \"two\";
+             default: r = r + (await \"dflt\");
+           }
+           return r;
+         }
+         f(1).then(v => console.log(v));
+         f(2).then(v => console.log(v));",
+        "one\ntwodflt\n",
     );
 }
