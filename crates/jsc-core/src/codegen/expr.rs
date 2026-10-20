@@ -1286,15 +1286,13 @@ impl LowerCtx<'_> {
             }
             // A member target `obj[i] = v` / `obj.k = v` (plain or compound). The
             // base is evaluated before the key; `obj.k` ≡ `obj["k"]` (a heap-string
-            // key), and `.length` is not assignable.
+            // key; `.length` on an array is the runtime's `length` write).
             AssignTarget::Simple(SimpleAssignTarget::Member(m)) => {
                 let obj = self.lower_expr(&m.obj)?;
                 let index = match &m.prop {
                     MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-                    MemberProp::Ident(id) if id.sym.as_ref() != "length" => {
-                        IrNode::Str(id.sym.as_ref().to_owned())
-                    }
-                    _ => {
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                    MemberProp::PrivateName(_) => {
                         return Err(CompileError::spanned(
                             m.span(),
                             "unsupported assignment target",
@@ -1432,10 +1430,8 @@ impl LowerCtx<'_> {
         let obj = self.lower_expr(&member.obj)?;
         let index = match &member.prop {
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::Ident(id) if id.sym.as_ref() != "length" => {
-                IrNode::Str(id.sym.as_ref().to_owned())
-            }
-            _ => {
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::PrivateName(_) => {
                 return Err(CompileError::spanned(
                     member.span(),
                     "unsupported increment/decrement target",

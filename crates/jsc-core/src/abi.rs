@@ -158,7 +158,8 @@ pub(crate) const TYPE_STRING: u8 = 0;
 /// `[len:u32 @16][elems:u32 @20]` ([`ARRAY_BLOCK_SIZE`] bytes). `elems` is the
 /// base of the [`TYPE_ELEMS`] store holding the elements (`0` while the
 /// capacity is 0). Growth replaces the store and rewrites `elems`, so the handle
-/// never moves. `props` stays 0 (no named array properties yet). Maps to
+/// never moves. `props` holds the named properties, and on an
+/// [`ARRAY_FLAG_SPARSE`] array also the elements past the store. Maps to
 /// `typeof` "object".
 pub(crate) const TYPE_ARRAY: u8 = 1;
 
@@ -171,6 +172,12 @@ pub(crate) const ARRAY_ELEMS_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
 
 /// The byte size of a [`TYPE_ARRAY`] handle.
 pub(crate) const ARRAY_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is sparse. Its store keeps
+/// elements `0..cap` (holes past `length`); every element at or past `cap` is
+/// an array-index key in its `props` table, so `length` may exceed the store.
+/// Set by a store or `length` write past the dense-growth bound; never cleared.
+pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
 
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the

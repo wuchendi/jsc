@@ -340,13 +340,13 @@ fn uncaught_throw_exits_one() {
 }
 
 /// An UNCAUGHT `TypeError` from a property write fails the process: exit 1
-/// with the message on stderr (a `length` store on an array still throws).
+/// with the message on stderr (a store on a primitive throws).
 #[test]
 fn uncaught_property_write_error_exits_one() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args([
             "-e",
-            "let a = [1]; a[\"length\"] = 1; console.log(\"unreachable\")",
+            "let s = \"x\"; s.foo = 1; console.log(\"unreachable\")",
         ])
         .output()
         .expect("failed to spawn jsc binary");
@@ -356,7 +356,7 @@ fn uncaught_property_write_error_exits_one() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Uncaught TypeError: Cannot set array property 'length' yet"),
+        stderr.contains("Uncaught TypeError: Cannot create property 'foo' on string 'x'"),
         "stderr should report the TypeError, got: {stderr}"
     );
     assert!(
@@ -365,15 +365,15 @@ fn uncaught_property_write_error_exits_one() {
     );
 }
 
-/// A property-write `TypeError` (a `length` store on an array) unwinds through
+/// A property-write `TypeError` (a store on a primitive) unwinds through
 /// `finally` and nested function frames to the nearest handler.
 #[test]
 fn property_write_error_unwinds_through_finally_and_calls() {
     assert_eq!(
         jsc(&[
             "-p",
-            "let log=\"\"; function f(o){ try { o[\"length\"] = 1; log+=\"no\" } finally { log+=\"f\" } } \
-             try { f([1]) } catch(e) { log+=\"|\"+e.name } log"
+            "let log=\"\"; function f(o){ try { o[\"foo\"] = 1; log+=\"no\" } finally { log+=\"f\" } } \
+             try { f(\"x\") } catch(e) { log+=\"|\"+e.name } log"
         ]),
         "f|TypeError"
     );

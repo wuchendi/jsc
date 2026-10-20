@@ -733,11 +733,24 @@ pub(super) fn emit_array_reserve(alloc_index: u32) -> Function {
 
 /// Emit the `__array_push(base: i32, value: i64) -> i32` in-place appender:
 /// `__array_reserve(base, len + 1)`, store `value` at slot `len` of the
-/// element store, bump `len`, and return the (unchanged) handle base. The two
-/// params occupy locals 0/1; an extra `i32` local holds `len`.
-pub(super) fn emit_array_push(reserve_index: u32) -> Function {
+/// element store, bump `len`, and return the (unchanged) handle base; a
+/// `SPARSE` array appends through `__sparse_set` (function `sparse_set`). The
+/// two params occupy locals 0/1; an extra `i32` local holds `len`.
+pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let (base, value, len) = (0, 1, 2);
+
+    // SPARSE: __sparse_set(base, len, value); return base.
+    emit_is_sparse(&mut function, base);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::Call(sparse_set));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
 
     // len = base.len; __array_reserve(base, len + 1).
     function.instruction(&Instruction::LocalGet(base));
@@ -772,10 +785,12 @@ pub(super) fn emit_array_push(reserve_index: u32) -> Function {
 /// Emit the `__array_concat(dst: i32, src: i32) -> i32` in-place joiner:
 /// `__array_reserve(dst, dlen + slen)`, append `src`'s `slen` elements after
 /// `dst`'s (a spread reads each through the iterator, so a hole is appended as
-/// `undefined`), write the combined length, and return `dst`. The two params
-/// occupy locals 0/1; extra `i32` locals hold `dlen`, `slen`, and the two
-/// element cursors, an `i64` local the element.
-pub(super) fn emit_array_concat(reserve_index: u32) -> Function {
+/// `undefined`), write the combined length, and return `dst`. A `SPARSE`
+/// `src` is read element by element through `__sparse_get` (function
+/// `sparse_get`) and appended by `__array_push`. The two params occupy locals
+/// 0/1; extra `i32` locals hold `dlen`, `slen`, and the two element cursors,
+/// an `i64` local the element.
+pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32) -> Function {
     let mut function = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
     let (dst, src, dlen, slen, to, from, elem) = (0, 1, 2, 3, 4, 5, 6);
 
@@ -787,6 +802,34 @@ pub(super) fn emit_array_concat(reserve_index: u32) -> Function {
     function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalTee(slen));
     function.instruction(&Instruction::If(BlockType::Empty));
+    // A SPARSE `src`: for (from = 0; from < slen; from++)
+    // __array_push(dst, read(__sparse_get(src, from))); return dst.
+    emit_is_sparse(&mut function, src);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(from));
+    function.instruction(&Instruction::LocalGet(slen));
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::LocalGet(src));
+    function.instruction(&Instruction::LocalGet(from));
+    function.instruction(&Instruction::Call(sparse_get));
+    function.instruction(&Instruction::LocalSet(elem));
+    emit_elem_read(&mut function, elem);
+    function.instruction(&Instruction::Call(reserve_index + 1));
+    function.instruction(&Instruction::Drop);
+    function.instruction(&Instruction::LocalGet(from));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(from));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
     // __array_reserve(dst, dlen + slen).
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(dlen));
@@ -1068,7 +1111,7 @@ pub(super) fn emit_json_str(
     concat_index: u32,
     convert_index: u32,
     escape_index: u32,
-    (own_keys_index, get_index): (u32, u32),
+    (own_keys_index, get_index, sparse_get_index): (u32, u32, u32),
     tokens: JsonTokens,
 ) -> Function {
     let mut function = Function::new(vec![(6, ValType::I32), (3, ValType::I64)]);
@@ -1123,15 +1166,9 @@ pub(super) fn emit_json_str(
     function.instruction(&Instruction::LocalGet(n));
     function.instruction(&Instruction::I32LtU);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // elem = load_i64(ptr.elems + 8*k + elem_slot) (the store is reloaded: a
-    // nested getter may grow the array).
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(elem_slot));
+    // elem = element k (the store is reloaded: a nested getter may grow the
+    // array; a SPARSE array reads through `__sparse_get`).
+    emit_elem_load(&mut function, ptr, k, sparse_get_index);
     function.instruction(&Instruction::LocalSet(elem));
     // A hole serializes like `undefined` (as `null`).
     emit_elem_read(&mut function, elem);

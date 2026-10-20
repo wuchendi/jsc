@@ -277,11 +277,17 @@ fn lowers_static_property_assignment_as_indexset() {
 }
 
 #[test]
-fn rejects_length_assignment() {
-    // `.length` is a computed header read; assigning to it stays an error.
-    assert!(
-        lower_src("let a = [1, 2]; a.length = 5").is_err(),
-        "assigning to .length is unsupported"
+fn lowers_length_assignment_as_indexset() {
+    // `a.length = v` is an ordinary member store with the `"length"` key (the
+    // runtime routes an array receiver to `__array_set_length`).
+    let program = lower_src("let a = [1, 2]; a.length = 5").expect("should lower");
+    assert_eq!(
+        program.stmts[1],
+        IrStmt::Expr(IrNode::IndexSet {
+            obj: Box::new(IrNode::Local(0)),
+            index: Box::new(IrNode::Str("length".to_owned())),
+            value: Box::new(IrNode::Num(5.0)),
+        })
     );
 }
 
@@ -487,12 +493,19 @@ fn lowers_static_property_compound_assignment_as_indexopset() {
 }
 
 #[test]
-fn rejects_length_compound_assignment() {
-    // `.length op= e` stays an error (as does plain `.length =`).
-    assert!(
-        lower_src("let a = [1, 2]; a.length += 1").is_err(),
-        "compound assigning to .length is unsupported"
-    );
+fn lowers_length_compound_assignment_and_update() {
+    // `a.length op= e` and `a.length++` are member read-modify-writes.
+    for src in [
+        "let a = [1, 2]; a.length += 1",
+        "let a = [1, 2]; a.length++",
+    ] {
+        let program = lower_src(src).expect("should lower");
+        assert!(
+            matches!(&program.stmts[1], IrStmt::Expr(IrNode::IndexOpSet { index, .. })
+                if **index == IrNode::Str("length".to_owned())),
+            "`{src}` should lower to an IndexOpSet on `length`"
+        );
+    }
 }
 
 #[test]

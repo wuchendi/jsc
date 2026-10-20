@@ -27,13 +27,14 @@ pub enum Value {
     /// encoding), so it decodes here.
     Str(String),
     /// A heap array, read from linear memory via an array-pointer jsval: its
-    /// elements (a hole is [`Value::Hole`]), decoded recursively so arrays
-    /// nest, then its own enumerable named properties as in [`Value::Object`].
-    /// Renders Node-style as `[ 1, <1 empty item>, 3, foo: 1 ]`.
+    /// elements (each run of holes one [`Value::Holes`]), decoded recursively
+    /// so arrays nest, then its own enumerable named properties as in
+    /// [`Value::Object`]. Renders Node-style as `[ 1, <1 empty item>, 3, foo: 1 ]`.
     Array(Vec<Value>, Vec<(String, Value)>),
-    /// An array hole (an element slot with no element), only ever an element
-    /// of a [`Value::Array`]. Runs of holes render as `<N empty items>`.
-    Hole,
+    /// A run of `N` consecutive array holes (element slots with no element),
+    /// only ever an element of a [`Value::Array`]; a sparse array's gap of a
+    /// million holes is one value. Renders as `<N empty items>`.
+    Holes(usize),
     /// A heap object, read from linear memory via an object-pointer jsval: its
     /// own enumerable properties in own-key order (integer keys ascending,
     /// then the other keys in insertion order), values decoded recursively, so
@@ -292,28 +293,71 @@ pub(super) fn array_layout(memory: &[u8], ptr: usize) -> Option<(usize, usize)> 
     Some((len, elems + ELEMS_DATA_OFFSET))
 }
 
-/// Resolve a heap array handle at base `ptr` into a [`Value::Array`] by
-/// decoding its `len` element jsvals from its element store (each
-/// recursively; a hole is [`Value::Hole`]) and its own named properties
-/// ([`decode_props`]). Nested arrays and strings resolve through the same
-/// `memory`.
-///
-/// Defensive: a truncated handle yields an empty array and a truncated element
-/// run stops early, so a malformed pointer never panics.
-fn decode_array(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
-    let Some((len, data)) = array_layout(memory, ptr) else {
-        return Value::Array(Vec::new(), Vec::new());
+/// The `length` of the array handle at base `ptr` and its present elements as
+/// `(index, jsval bits)` in ascending index order (holes are absent): the
+/// store slots, then — for a `SPARSE` array, whose store holds only the
+/// elements below its `cap` — the array-index keys of its own table. `None`
+/// when the handle is truncated; a truncated store stops early.
+pub(super) fn array_elements(memory: &[u8], ptr: usize) -> Option<(usize, Vec<(usize, u64)>)> {
+    use crate::abi;
+    let (len, data) = array_layout(memory, ptr)?;
+    let sparse = memory
+        .get(ptr + abi::HEADER_FLAGS_OFFSET as usize)
+        .is_some_and(|flags| flags & abi::ARRAY_FLAG_SPARSE != 0);
+    let stored = if sparse {
+        let store = read_u32(memory, ptr + ARRAY_ELEMS_OFFSET)? as usize;
+        let cap = if store == 0 {
+            0
+        } else {
+            read_u32(memory, store + abi::ELEMS_CAP_OFFSET as usize)? as usize
+        };
+        len.min(cap)
+    } else {
+        len
     };
-    let mut elems = Vec::with_capacity(len);
-    for k in 0..len {
-        let Some(elem_bits) = read_u64(memory, data + 8 * k) else {
+    let mut present = Vec::new();
+    for k in 0..stored {
+        let Some(bits) = read_u64(memory, data + 8 * k) else {
             break;
         };
-        elems.push(if elem_bits == crate::abi::HOLE {
-            Value::Hole
-        } else {
-            decode_in(elem_bits, memory, guard)
-        });
+        if bits != abi::HOLE {
+            present.push((k, bits));
+        }
+    }
+    if sparse {
+        let mut keyed: Vec<(usize, u64)> = table_entries(ptr, memory)
+            .into_iter()
+            .filter_map(|(index, _, _, bits)| Some((index? as usize, bits)))
+            .collect();
+        keyed.sort_unstable_by_key(|&(index, _)| index);
+        present.extend(keyed);
+    }
+    Some((len, present))
+}
+
+/// Resolve a heap array handle at base `ptr` into a [`Value::Array`]: its
+/// present elements ([`array_elements`], each decoded recursively) with every
+/// run of holes up to `len` as one [`Value::Holes`], then its own named
+/// properties ([`decode_props`]). Nested arrays and strings resolve through
+/// the same `memory`.
+///
+/// Defensive: a truncated handle yields an empty array, so a malformed pointer
+/// never panics.
+fn decode_array(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+    let Some((len, present)) = array_elements(memory, ptr) else {
+        return Value::Array(Vec::new(), Vec::new());
+    };
+    let mut elems = Vec::with_capacity(present.len());
+    let mut next = 0;
+    for (index, bits) in present {
+        if index > next {
+            elems.push(Value::Holes(index - next));
+        }
+        elems.push(decode_in(bits, memory, guard));
+        next = index + 1;
+    }
+    if len > next {
+        elems.push(Value::Holes(len - next));
     }
     Value::Array(elems, decode_props(ptr, memory, guard))
 }
@@ -340,6 +384,38 @@ fn read_u64(memory: &[u8], at: usize) -> Option<u64> {
 /// Defensive: a truncated table stops early, so a malformed pointer never
 /// panics.
 fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> Vec<(String, Value)> {
+    use crate::abi;
+    let array = memory.get(ptr) == Some(&TYPE_ARRAY);
+    let mut keyed = table_entries(ptr, memory);
+    // An array's integer keys are its (sparse) elements, decoded by `decode_array`.
+    keyed.retain(|(index, ..)| !(array && index.is_some()));
+    // A stable sort keeps the non-index keys in slot order after the indices.
+    keyed.sort_by_key(|(index, ..)| index.map_or((1, 0), |i| (0, i)));
+    let mut entries = Vec::with_capacity(keyed.len());
+    for (_, key, attrs, bits) in keyed {
+        let value = if attrs & abi::ATTR_ACCESSOR != 0 {
+            let pair = (bits & 0xFFFF_FFFF) as usize;
+            let half = |offset: u32| {
+                read_u64(memory, pair + offset as usize).is_some_and(|b| b != abi::UNDEFINED)
+            };
+            Value::Accessor {
+                getter: half(abi::ACCESSOR_GET_OFFSET),
+                setter: half(abi::ACCESSOR_SET_OFFSET),
+            }
+        } else {
+            decode_in(bits, memory, guard)
+        };
+        entries.push((key, value));
+    }
+    entries
+}
+
+/// The live enumerable entries of the `TYPE_PROPS` table of the object-family
+/// block at base `ptr`, in slot order, as `(index, key text, attrs, value
+/// bits)` — `index` is the value of an integer key (a string flagged
+/// `ARRAY_INDEX` in a table with `HAS_INDEX_KEYS`). Tombstones and
+/// non-enumerable entries are skipped; a truncated table stops early.
+fn table_entries(ptr: usize, memory: &[u8]) -> Vec<(Option<u32>, String, u32, u64)> {
     use crate::abi;
     let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize).unwrap_or(0) as usize;
     if props == 0 {
@@ -380,25 +456,7 @@ fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> Vec<(String, Va
             .flatten();
         keyed.push((index, text, attrs, bits));
     }
-    // A stable sort keeps the non-index keys in slot order after the indices.
-    keyed.sort_by_key(|(index, ..)| index.map_or((1, 0), |i| (0, i)));
-    let mut entries = Vec::with_capacity(keyed.len());
-    for (_, key, attrs, bits) in keyed {
-        let value = if attrs & abi::ATTR_ACCESSOR != 0 {
-            let pair = (bits & 0xFFFF_FFFF) as usize;
-            let half = |offset: u32| {
-                read_u64(memory, pair + offset as usize).is_some_and(|b| b != abi::UNDEFINED)
-            };
-            Value::Accessor {
-                getter: half(abi::ACCESSOR_GET_OFFSET),
-                setter: half(abi::ACCESSOR_SET_OFFSET),
-            }
-        } else {
-            decode_in(bits, memory, guard)
-        };
-        entries.push((key, value));
-    }
-    entries
+    keyed
 }
 
 /// Resolve a heap object block at base `ptr` from its own enumerable
@@ -614,7 +672,7 @@ pub fn format_value(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_owned(),
         // A hole outside an array (never produced) reads as `undefined`.
-        Value::Undefined | Value::Hole => "undefined".to_owned(),
+        Value::Undefined | Value::Holes(_) => "undefined".to_owned(),
         // A string renders as its raw text, with no surrounding quotes (a `typeof`
         // result is an ordinary string, so `console.log(typeof x)` prints the word).
         Value::Str(s) => s.clone(),
@@ -631,8 +689,8 @@ pub fn format_value(value: &Value) -> String {
                 }
             };
             for elem in elems {
-                if *elem == Value::Hole {
-                    holes += 1;
+                if let Value::Holes(n) = elem {
+                    holes += n;
                 } else {
                     flush(&mut parts, &mut holes);
                     parts.push(format_value(elem));
@@ -718,6 +776,34 @@ pub fn format_value(value: &Value) -> String {
     }
 }
 
+/// `Array.prototype.join` over decoded array elements: each element's
+/// `ToString` (`null`/`undefined` elements, holes, and cycle back-references
+/// are empty) separated by `sep`; a run of `N` holes contributes `N` empty
+/// pieces.
+pub(super) fn join_elements(elems: &[Value], sep: &str) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    let mut piece = |out: &mut String, text: &str| {
+        if !first {
+            out.push_str(sep);
+        }
+        first = false;
+        out.push_str(text);
+    };
+    for elem in elems {
+        match elem {
+            Value::Holes(n) => {
+                for _ in 0..*n {
+                    piece(&mut out, "");
+                }
+            }
+            Value::Null | Value::Undefined => piece(&mut out, ""),
+            other => piece(&mut out, &to_js_string(other)),
+        }
+    }
+    out
+}
+
 /// The JS `ToString` text of a decoded [`Value`] (what `String(v)`, `'' + v`
 /// and `join` produce), as opposed to [`format_value`]'s console rendering:
 /// an array joins its elements' `ToString` with `,` (`null`/`undefined`
@@ -729,14 +815,7 @@ pub fn format_value(value: &Value) -> String {
 #[must_use]
 pub fn to_js_string(value: &Value) -> String {
     match value {
-        Value::Array(elems, _) => elems
-            .iter()
-            .map(|elem| match elem {
-                Value::Null | Value::Undefined | Value::Hole => String::new(),
-                other => to_js_string(other),
-            })
-            .collect::<Vec<_>>()
-            .join(","),
+        Value::Array(elems, _) => join_elements(elems, ","),
         Value::Object(_) | Value::Instance { .. } => "[object Object]".to_owned(),
         Value::Error { name, message } => match (name.is_empty(), message.is_empty()) {
             (_, true) => name.clone(),
@@ -747,7 +826,7 @@ pub fn to_js_string(value: &Value) -> String {
         Value::Set(_) => "[object Set]".to_owned(),
         Value::Promise { .. } => "[object Promise]".to_owned(),
         Value::Generator => "[object Generator]".to_owned(),
-        Value::Accessor { .. } | Value::Circular(_) | Value::Hole => String::new(),
+        Value::Accessor { .. } | Value::Circular(_) | Value::Holes(_) => String::new(),
         Value::Ref(_, inner) => to_js_string(inner),
         Value::Number(_)
         | Value::Bool(_)

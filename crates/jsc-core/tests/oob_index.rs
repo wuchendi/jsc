@@ -62,14 +62,14 @@ fn array_store_past_end_grows() {
     assert_eq!(gap, Value::Undefined);
 }
 
-/// A hole decodes as [`Value::Hole`] inside the array and reads `undefined`.
+/// A hole decodes as a [`Value::Holes`] run inside the array and reads `undefined`.
 #[test]
 fn array_hole_decodes_and_reads_undefined() {
     let arr = compile_and_run("[1,,3]").expect("pipeline should succeed");
     assert_eq!(
         arr,
         Value::Array(
-            vec![Value::Number(1.0), Value::Hole, Value::Number(3.0)],
+            vec![Value::Number(1.0), Value::Holes(1), Value::Number(3.0)],
             Vec::new()
         )
     );

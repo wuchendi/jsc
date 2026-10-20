@@ -106,10 +106,13 @@ pub(super) fn build_type_and_function_sections<'a>(
             index();
             index()
         },
-        // `__array_set` takes the index right after `__array_concat`.
+        // `__array_set`, `__array_set_length`, `__sparse_get`, and
+        // `__sparse_set` take the indices right after `__array_concat`.
         array_concat: {
             let array_concat = index();
-            index();
+            for _ in 0..4 {
+                index();
+            }
             array_concat
         },
         json_escape: index(),
@@ -290,6 +293,12 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32, I32], &[I32]),
         // `__array_set(recv, key, v)`.
         (&[I64, I64, I64], &[]),
+        // `__array_set_length(arr, v)`.
+        (&[I32, I64], &[]),
+        // `__sparse_get(arr, i) -> v`.
+        (&[I32, I32], &[I64]),
+        // `__sparse_set(arr, i, v)`.
+        (&[I32, I32, I64], &[]),
         // `__json_escape(str) -> str` and `__json_str(v) -> str`.
         (&[I32], &[I32]),
         (&[I64], &[I32]),

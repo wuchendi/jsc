@@ -9,11 +9,13 @@ import {
   ACCESSOR_GET_OFFSET,
   ACCESSOR_SET_OFFSET,
   ARRAY_ELEMS_OFFSET,
+  ARRAY_FLAG_SPARSE,
   ARRAY_LEN_OFFSET,
   ATTR_ACCESSOR,
   ATTR_ENUMERABLE,
   CLASS_ERROR,
   DATE_MS_OFFSET,
+  ELEMS_CAP_OFFSET,
   ELEMS_DATA_OFFSET,
   FN_INFO_ADDR,
   FN_INFO_ENTRY_SIZE,
@@ -64,7 +66,7 @@ export type Value =
   | { kind: 'undefined' }
   | { kind: 'string'; value: string }
   | { kind: 'array'; items: Value[]; props: [string, Value][] }
-  | { kind: 'hole' }
+  | { kind: 'holes'; count: number }
   | { kind: 'object'; entries: [string, Value][] }
   | { kind: 'instance'; className: string; entries: [string, Value][] }
   | { kind: 'error'; name: string; message: string }
@@ -281,20 +283,61 @@ export function arrayLayout(
 }
 
 /**
- * Resolve a heap array handle at `ptr`, decoding each `i64` element
- * recursively (a hole is `hole`), then its own named properties (mirrors
- * `value.rs::decode_array`).
+ * The `length` of the array handle at `ptr` and its present elements as
+ * `[index, bits]` in ascending index order (holes are absent): the store
+ * slots, then — for a `SPARSE` array, whose store holds only the elements
+ * below its `cap` — the array-index keys of its own table (mirrors
+ * `value.rs::array_elements`).
+ */
+export function arrayElements(
+  mem: Uint8Array,
+  ptr: number,
+): [len: number, present: [number, bigint][]] | undefined {
+  const layout = arrayLayout(mem, ptr)
+  if (layout === undefined) return undefined
+  const [len, data] = layout
+  const sparse =
+    ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & ARRAY_FLAG_SPARSE) !== 0
+  let stored = len
+  if (sparse) {
+    const store = readU32(mem, ptr + ARRAY_ELEMS_OFFSET) ?? 0
+    const cap = store === 0 ? 0 : (readU32(mem, store + ELEMS_CAP_OFFSET) ?? 0)
+    stored = Math.min(len, cap)
+  }
+  const present: [number, bigint][] = []
+  for (let k = 0; k < stored; k++) {
+    const bits = readU64(mem, data + 8 * k)
+    if (bits === undefined) break
+    if (bits !== HOLE) present.push([k, bits])
+  }
+  if (sparse) {
+    const keyed: [number, bigint][] = []
+    for (const [index, , , bits] of tableEntries(ptr, mem)) {
+      if (index !== undefined) keyed.push([index, bits])
+    }
+    keyed.sort((a, b) => a[0] - b[0])
+    present.push(...keyed)
+  }
+  return [len, present]
+}
+
+/**
+ * Resolve a heap array handle at `ptr`: its present elements (each decoded
+ * recursively) with every run of holes up to `len` as one `holes`, then its
+ * own named properties (mirrors `value.rs::decode_array`).
  */
 function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const layout = arrayLayout(mem, ptr)
-  if (layout === undefined) return { kind: 'array', items: [], props: [] }
-  const [len, data] = layout
+  const elements = arrayElements(mem, ptr)
+  if (elements === undefined) return { kind: 'array', items: [], props: [] }
+  const [len, present] = elements
   const items: Value[] = []
-  for (let k = 0; k < len; k++) {
-    const elem = readU64(mem, data + 8 * k)
-    if (elem === undefined) break
-    items.push(elem === HOLE ? { kind: 'hole' } : decodeIn(elem, mem, guard))
+  let next = 0
+  for (const [index, bits] of present) {
+    if (index > next) items.push({ kind: 'holes', count: index - next })
+    items.push(decodeIn(bits, mem, guard))
+    next = index + 1
   }
+  if (len > next) items.push({ kind: 'holes', count: len - next })
   return { kind: 'array', items, props: decodeProps(ptr, mem, guard) }
 }
 
@@ -310,28 +353,11 @@ function decodeProps(
   mem: Uint8Array,
   guard: Guard,
 ): [string, Value][] {
-  const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
-  if (props === 0) return []
-  const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
-  const tflags = mem[props + PROPS_TFLAGS_OFFSET] ?? 0
-  const keyed: [number | undefined, string, number, bigint][] = []
-  for (let k = 0; k < count; k++) {
-    const entry = props + PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k
-    const key = readU32(mem, entry + PROP_KEY_OFFSET)
-    const attrs = readU32(mem, entry + PROP_ATTRS_OFFSET)
-    const bits = readU64(mem, entry + PROP_VALUE_OFFSET)
-    if (key === undefined || attrs === undefined || bits === undefined) break
-    if (key === 0) continue
-    const text = stringAt(key, mem)
-    if ((attrs & ATTR_ENUMERABLE) === 0) continue
-    const flags = mem[key + HEADER_FLAGS_OFFSET] ?? 0
-    const index =
-      (tflags & PROPS_HAS_INDEX_KEYS) !== 0 &&
-      (flags & STR_FLAG_ARRAY_INDEX) !== 0
-        ? Number(text)
-        : undefined
-    keyed.push([index, text, attrs, bits])
-  }
+  // An array's integer keys are its (sparse) elements, decoded by `decodeArray`.
+  const array = mem[ptr] === TYPE_ARRAY
+  const keyed = tableEntries(ptr, mem).filter(
+    ([index]) => !(array && index !== undefined),
+  )
   // A stable sort keeps the non-index keys in slot order after the indices.
   keyed.sort((a, b) =>
     a[0] === undefined
@@ -363,6 +389,40 @@ function decodeProps(
     }
   }
   return entries
+}
+
+/**
+ * The live enumerable entries of the property table of the object-family
+ * block at `ptr`, in slot order, as `[index, key, attrs, bits]` — `index` is
+ * the value of an integer key (mirrors `value.rs::table_entries`).
+ */
+function tableEntries(
+  ptr: number,
+  mem: Uint8Array,
+): [number | undefined, string, number, bigint][] {
+  const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
+  if (props === 0) return []
+  const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
+  const tflags = mem[props + PROPS_TFLAGS_OFFSET] ?? 0
+  const keyed: [number | undefined, string, number, bigint][] = []
+  for (let k = 0; k < count; k++) {
+    const entry = props + PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k
+    const key = readU32(mem, entry + PROP_KEY_OFFSET)
+    const attrs = readU32(mem, entry + PROP_ATTRS_OFFSET)
+    const bits = readU64(mem, entry + PROP_VALUE_OFFSET)
+    if (key === undefined || attrs === undefined || bits === undefined) break
+    if (key === 0) continue
+    const text = stringAt(key, mem)
+    if ((attrs & ATTR_ENUMERABLE) === 0) continue
+    const flags = mem[key + HEADER_FLAGS_OFFSET] ?? 0
+    const index =
+      (tflags & PROPS_HAS_INDEX_KEYS) !== 0 &&
+      (flags & STR_FLAG_ARRAY_INDEX) !== 0
+        ? Number(text)
+        : undefined
+    keyed.push([index, text, attrs, bits])
+  }
+  return keyed
 }
 
 /**
@@ -530,7 +590,7 @@ export function formatValue(value: Value): string {
     case 'array':
       return formatArray(value.items, value.props)
     // A hole outside an array (never produced) reads as `undefined`.
-    case 'hole':
+    case 'holes':
       return 'undefined'
     case 'object':
       return formatEntries(value.entries)
@@ -590,13 +650,7 @@ export function formatValue(value: Value): string {
 export function toJsString(value: Value): string {
   switch (value.kind) {
     case 'array':
-      return value.items
-        .map((v) =>
-          v.kind === 'null' || v.kind === 'undefined' || v.kind === 'hole'
-            ? ''
-            : toJsString(v),
-        )
-        .join(',')
+      return joinElements(value.items, ',')
     case 'object':
     case 'instance':
       return '[object Object]'
@@ -614,13 +668,33 @@ export function toJsString(value: Value): string {
       return '[object Generator]'
     case 'accessor':
     case 'circular':
-    case 'hole':
+    case 'holes':
       return ''
     case 'ref':
       return toJsString(value.value)
     default:
       return formatValue(value)
   }
+}
+
+/**
+ * `Array.prototype.join` over decoded array elements: each element's
+ * `ToString` (nullish elements, holes, and cycle back-references are empty)
+ * separated by `sep`; a run of `N` holes contributes `N` empty pieces (mirrors
+ * `value.rs::join_elements`).
+ */
+export function joinElements(items: Value[], sep: string): string {
+  const pieces: string[] = []
+  for (const v of items) {
+    if (v.kind === 'holes') {
+      for (let i = 0; i < v.count; i++) pieces.push('')
+    } else {
+      pieces.push(
+        v.kind === 'null' || v.kind === 'undefined' ? '' : toJsString(v),
+      )
+    }
+  }
+  return pieces.join(sep)
 }
 
 /**
@@ -636,8 +710,8 @@ function formatArray(items: Value[], props: [string, Value][]): string {
     holes = 0
   }
   for (const item of items) {
-    if (item.kind === 'hole') {
-      holes++
+    if (item.kind === 'holes') {
+      holes += item.count
     } else {
       flush()
       parts.push(formatValue(item))

@@ -670,7 +670,8 @@ pub(super) fn emit_fn_materialize(
 /// Emit the string/array exotic own lookup of the interned `key` (i32 local)
 /// on the block base in i32 local `o` whose kind byte is in i32 local `t`:
 /// `length` and an in-range canonical index return their value (an array hole
-/// reads `undefined`); a string returns `undefined` for any other key; an array
+/// reads `undefined`, a `SPARSE` array's element comes from `__sparse_get`); a
+/// string returns `undefined` for any other key; an array
 /// falls through (its named keys live in its own table). A key of `0` (never
 /// interned) returns `undefined`. `p` is i64 scratch.
 #[allow(clippy::too_many_arguments)]
@@ -705,8 +706,8 @@ fn emit_exotic_get(
     );
     emit_box_heap(function);
     wasm!(function; Else);
-    emit_elem_addr(function, o, i);
-    wasm!(function; I64Load(m64(ELEMS_DATA_OFFSET)), LocalSet(p));
+    emit_elem_load(function, o, i, helpers.sparse_get());
+    wasm!(function; LocalSet(p));
     emit_elem_read(function, p);
     wasm!(function;
         End,
@@ -849,7 +850,8 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
 
 /// `__has(key: i32, obj: i64) -> i32`: `HasProperty` of the interned `key`
 /// (`0` = a key never interned, absent everywhere): a string/array's exotic
-/// own keys (`length`, an in-range index that is not an array hole), else the
+/// own keys (`length`, an in-range index that is not an array hole, read
+/// through `__sparse_get` on a `SPARSE` array), else the
 /// own table (an array's named keys) and then each `proto`. A primitive has
 /// none.
 pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
@@ -877,9 +879,9 @@ pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
         I32Const(1),
         Else,
     );
-    emit_elem_addr(&mut f, o, i);
+    emit_elem_load(&mut f, o, i, helpers.sparse_get());
     wasm!(f;
-        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Ne,
+        I64Const(HOLE_BITS), I64Ne,
         End,
         Return,
         End,
@@ -907,7 +909,8 @@ pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
 /// object-family `obj` by tombstoning its entry (key `0`, value `undefined`,
 /// `live` decremented); a non-configurable property throws. On an array an
 /// in-range index becomes a hole and `length` (non-configurable) throws; its
-/// named keys are table entries. A primitive or string is left unchanged.
+/// named keys (and a `SPARSE` array's elements past its store) are table
+/// entries. A primitive or string is left unchanged.
 pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32)]);
     let (obj, key, o, e, t, i) = (0, 1, 2, 3, 4, 5);
@@ -929,9 +932,24 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
         LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32LtU,
         If(BlockType::Empty),
     );
+    // A store slot (any index of a dense array, `i < cap` of a SPARSE one)
+    // becomes a hole; a SPARSE element past the store is a table entry.
+    emit_is_sparse(&mut f, o);
+    wasm!(f;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(e),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(i), LocalGet(e), I32Load(m32(ELEMS_CAP_OFFSET)), I32LtU,
+        Else, I32Const(0),
+        End,
+        Else, I32Const(1),
+        End,
+        If(BlockType::Empty),
+    );
     emit_elem_addr(&mut f, o, i);
     wasm!(f;
         I64Const(HOLE_BITS), I64Store(m64(ELEMS_DATA_OFFSET)), Return,
+        End,
         End,
         End,
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
@@ -954,12 +972,12 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
 /// `__array_set(recv: i64, key: i64, v: i64)`: the slow path of a member store
 /// on the array `recv` (the inline path stores an in-range number index). An
 /// array index — a number key or a canonical index string (DF9) — takes the
-/// element path; `length` throws until `length` writes land; every other key
-/// is an ordinary property set (`__set`). An index at or past the length grows
-/// the array densely when `i < max(2 * cap, len + 1024)` (store capacity
+/// element path; `length` is `__array_set_length`; every other key is an
+/// ordinary property set (`__set`). An index at or past the length grows the
+/// array densely when `i < max(2 * cap, len + 1024)` (store capacity
 /// `max(4, 2 * cap, i + 1)`, the gap `len..i` filled with holes, `len = i + 1`);
-/// a larger gap throws until sparse arrays land. A throw leaves the exception
-/// pending.
+/// a larger gap makes the array `SPARSE`, and every element store on a
+/// `SPARSE` array is `__sparse_set`. A throw leaves the exception pending.
 pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::F64)]);
     let (recv, key, v) = (0, 1, 2);
@@ -983,13 +1001,18 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
         If(BlockType::Empty), LocalGet(k), Call(helpers.index_value), LocalSet(i), Br(1), End,
         LocalGet(k), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
         If(BlockType::Empty),
-    );
-    emit_prop_throw_return(&mut f, recv, k, PROP_THROW_ARRAY_LENGTH, helpers);
-    wasm!(f;
+        LocalGet(o), LocalGet(v), Call(helpers.array_set_length()), Return,
         End,
         LocalGet(recv), LocalGet(k), LocalGet(v), Call(helpers.set), Return,
         End,
-        // Element `i`: in range -> store.
+    );
+    // Element `i`: a SPARSE array stores through `__sparse_set`.
+    emit_is_sparse(&mut f, o);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.sparse_set()), Return,
+        End,
+        // In range -> store.
         LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalTee(len), I32LtU,
         If(BlockType::Empty),
     );
@@ -1008,7 +1031,11 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
         LocalGet(a), LocalGet(k), I32GtU, Select,
         LocalGet(i), I32LeU,
         If(BlockType::Empty),
-        LocalGet(recv), LocalGet(key), I32Const(PROP_THROW_GROW), Call(helpers.prop_throw), Return,
+    );
+    // Too far: the array turns SPARSE and stores the element there.
+    emit_sparsify(&mut f, o, k, a);
+    wasm!(f;
+        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.sparse_set()), Return,
         End,
         LocalGet(o), LocalGet(i), I32Const(1), I32Add, Call(helpers.array_reserve()),
         // Fill len..i with holes, then store element i.
@@ -1031,13 +1058,253 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
     f
 }
 
+/// Fill the store slots `from..to` (i32 locals; `from` ends at `to`) of the
+/// array whose i32 base is in local `o` with holes.
+fn emit_fill_holes(function: &mut Function, o: u32, from: u32, to: u32) {
+    wasm!(function;
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(from), LocalGet(to), I32GeU, BrIf(1),
+    );
+    emit_elem_addr(function, o, from);
+    wasm!(function;
+        I64Const(HOLE_BITS), I64Store(m64(ELEMS_DATA_OFFSET)),
+        LocalGet(from), I32Const(1), I32Add, LocalSet(from),
+        Br(0),
+        End, End,
+    );
+}
+
+/// Mark the dense array whose i32 base is in local `o` `SPARSE`, filling its
+/// store slots `len..cap` with holes (every slot of a sparse store is an
+/// element or a hole). `j`/`a` are i32 scratch.
+fn emit_sparsify(function: &mut Function, o: u32, j: u32, a: u32) {
+    wasm!(function;
+        LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_SPARSE), I32Or,
+        I32Store8(m8(FLAGS)),
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
+        If(BlockType::Empty),
+        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(j),
+        LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), LocalSet(a),
+    );
+    emit_fill_holes(function, o, j, a);
+    wasm!(function; End);
+}
+
+/// `__sparse_get(o: i32, i: i32) -> i64`: element `i` of the `SPARSE` array
+/// `o`, or [`HOLE_BITS`] when absent — its store slot when `i < cap`, else the
+/// value of its own table's array-index key whose value is `i`.
+pub(super) fn emit_sparse_get(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(4, ValType::I32)]);
+    let (o, i, a, e, end, k) = (0, 1, 2, 3, 4, 5);
+    wasm!(f;
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
+        If(BlockType::Empty),
+        LocalGet(i), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), I32LtU,
+        If(BlockType::Empty),
+    );
+    emit_elem_addr(&mut f, o, i);
+    wasm!(f;
+        I64Load(m64(ELEMS_DATA_OFFSET)), Return,
+        End,
+        End,
+        LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(e), I32Eqz,
+        If(BlockType::Empty), I64Const(HOLE_BITS), Return, End,
+        LocalGet(e), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(e), I32Add,
+        I32Const(P_HEADER), I32Add, LocalSet(end),
+        LocalGet(e), I32Const(P_HEADER), I32Add, LocalSet(e),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(e), LocalGet(end), I32GeU, BrIf(1),
+        LocalGet(e), I32Load(m32(E_KEY)), LocalTee(k),
+        If(BlockType::Empty),
+        LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
+        If(BlockType::Empty),
+        LocalGet(k), Call(helpers.index_value), LocalGet(i), I32Eq,
+        If(BlockType::Empty), LocalGet(e), I64Load(m64(E_VALUE)), Return, End,
+        End,
+        End,
+        LocalGet(e), I32Const(ENTRY), I32Add, LocalSet(e),
+        Br(0),
+        End, End,
+        I64Const(HOLE_BITS),
+        End,
+    );
+    f
+}
+
+/// `__sparse_set(o: i32, i: i32, v: i64)`: store element `i` of the `SPARSE`
+/// array `o` — in its store when `i < cap`, else as the own data property of
+/// the interned index key `i` — and raise `length` to `i + 1` when `i` is at
+/// or past it (a push at the maximum length `2^32 - 1` leaves it, since
+/// `i + 1` does not fit).
+pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, i, v, a) = (0, 1, 2, 3);
+    wasm!(f;
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(i), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), I32LtU,
+        Else, I32Const(0),
+        End,
+        If(BlockType::Empty),
+    );
+    emit_elem_addr(&mut f, o, i);
+    wasm!(f;
+        LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)),
+        Else,
+        LocalGet(o), LocalGet(i), Call(helpers.index_string), Call(helpers.intern),
+        LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
+        End,
+        LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
+        LocalGet(i), I32Const(-1), I32Ne, I32And,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(i), I32Const(1), I32Add, I32Store(m32(ARRAY_LEN_OFFSET)),
+        End,
+        End,
+    );
+    f
+}
+
+/// `__array_set_length(o: i32, v: i64)`: the `length` write `o.length = v` on
+/// the array `o` (`ArraySetLength`). `n = ToUint32(v)`; when `ToNumber(v) != n`
+/// it raises the `RangeError` "Invalid array length" (left pending) and
+/// changes nothing. A shrink (`n < len`) turns the slots `n..len` into holes
+/// and keeps the store (so a regrowth and a GC walk see no stale element); a
+/// `SPARSE` array also drops its index keys `>= n`. A growth past the length
+/// fills holes densely while `n - 1 < max(2 * cap, len + 1024)` and otherwise
+/// makes the array `SPARSE` without allocating the gap. Then `len = n`.
+#[allow(clippy::too_many_lines)] // one straight-line helper body
+pub(super) fn emit_array_set_length(
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) -> Function {
+    let (o, v) = (0, 1);
+    // The error object is built in the shared helper scratch layout after the
+    // two params; this helper's own locals follow it.
+    let scratch = 2;
+    let mut locals = type_error_helper_locals();
+    let base = scratch + locals.iter().map(|(count, _)| count).sum::<u32>();
+    locals.extend([(7, ValType::I32), (1, ValType::F64)]);
+    let mut f = Function::new(locals);
+    let (n, len, a, cap, j, e, end) = (
+        base,
+        base + 1,
+        base + 2,
+        base + 3,
+        base + 4,
+        base + 5,
+        base + 6,
+    );
+    let d = base + 7;
+    let k = j;
+    // d = ToNumber(v); a value that is not an integer in 0..2^32 is invalid.
+    emit_is_number(&mut f, v);
+    wasm!(f;
+        If(BlockType::Result(ValType::I64)),
+        LocalGet(v),
+        Else,
+        LocalGet(v), Call(helpers.to_number),
+        End,
+        F64ReinterpretI64, LocalTee(d), F64Const(0.0.into()), F64Ge,
+        LocalGet(d), F64Const(4_294_967_296.0.into()), F64Lt, I32And,
+        LocalGet(d), F64Trunc, LocalGet(d), F64Eq, I32And,
+        I32Eqz,
+        If(BlockType::Empty),
+    );
+    let error = IrNode::error_object(
+        ErrorKind::RangeError,
+        None,
+        Some(IrNode::Str(ARRAY_LENGTH_MSG.to_owned())),
+        IrNode::Str(ARRAY_LENGTH_STACK.to_owned()),
+    );
+    emit_node(&error, &mut f, scratch, strings, helpers);
+    wasm!(f;
+        GlobalSet(EXC_VALUE_GLOBAL),
+        I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
+        I32Const(0), GlobalSet(CF_KIND_GLOBAL),
+        Return,
+        End,
+        LocalGet(d), I32TruncSatF64U, LocalSet(n),
+        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(len),
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
+        If(BlockType::Result(ValType::I32)), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), Else, I32Const(0), End,
+        LocalSet(cap),
+    );
+    // SPARSE: a shrink holes the store slots n..min(len, cap) and drops the
+    // index keys >= n; the length is set either way.
+    emit_is_sparse(&mut f, o);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(n), LocalGet(len), I32LtU,
+        If(BlockType::Empty),
+        LocalGet(n), LocalSet(j),
+        LocalGet(len), LocalGet(cap), LocalGet(len), LocalGet(cap), I32LtU, Select, LocalSet(end),
+    );
+    emit_fill_holes(&mut f, o, j, end);
+    wasm!(f;
+        LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(a),
+        If(BlockType::Empty),
+        LocalGet(a), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(a), I32Add,
+        I32Const(P_HEADER), I32Add, LocalSet(end),
+        LocalGet(a), I32Const(P_HEADER), I32Add, LocalSet(e),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(e), LocalGet(end), I32GeU, BrIf(1),
+        LocalGet(e), I32Load(m32(E_KEY)), LocalTee(k),
+        If(BlockType::Empty),
+        LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
+        If(BlockType::Empty),
+        LocalGet(k), Call(helpers.index_value), LocalGet(n), I32GeU,
+        If(BlockType::Empty),
+        LocalGet(e), I64Const(0), I64Store(m64(0)),
+        LocalGet(e), I64Const(UNDEFINED_BITS), I64Store(m64(E_VALUE)),
+        LocalGet(a), LocalGet(a), I32Load(m32(P_LIVE)), I32Const(1), I32Sub, I32Store(m32(P_LIVE)),
+        End,
+        End,
+        End,
+        LocalGet(e), I32Const(ENTRY), I32Add, LocalSet(e),
+        Br(0),
+        End, End,
+        End,
+        End,
+        LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)), Return,
+        End,
+        // Dense shrink (or no change): hole the slots n..len.
+        LocalGet(n), LocalGet(len), I32LeU,
+        If(BlockType::Empty),
+        LocalGet(n), LocalSet(j),
+    );
+    emit_fill_holes(&mut f, o, j, len);
+    wasm!(f;
+        LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)), Return,
+        End,
+        // Dense growth below max(2 * cap, len + 1024), else SPARSE.
+        LocalGet(n), I32Const(1), I32Sub,
+        LocalGet(cap), I32Const(1), I32Shl, LocalTee(j),
+        LocalGet(len), I32Const(1024), I32Add, LocalTee(end),
+        LocalGet(j), LocalGet(end), I32GtU, Select,
+        I32LtU,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(n), Call(helpers.array_reserve()),
+        LocalGet(len), LocalSet(j),
+    );
+    emit_fill_holes(&mut f, o, j, n);
+    wasm!(f; Else);
+    emit_sparsify(&mut f, o, j, a);
+    wasm!(f;
+        End,
+        LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)),
+        End,
+    );
+    f
+}
+
 /// `__own_keys(obj: i64, mode: i32) -> i64`: a fresh array of `obj`'s own
 /// string keys in own-key order (2.6) — integer keys ascending (only when the
 /// table has `HAS_INDEX_KEYS`), then the other keys in slot order — filtered
 /// to the enumerable ones unless `mode` is [`OWN_ALL`], and mapped to values
 /// ([`OWN_VALUES`]) or `[key, value]` pairs ([`OWN_ENTRIES`]). A string lists
-/// its indices; an array its present (non-hole) indices, then its table keys;
-/// a primitive has no own keys.
+/// its indices; an array its present (non-hole) store indices, then its table
+/// keys (a `SPARSE` array's elements past the store sort first as integer
+/// keys); a primitive has no own keys.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
 pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(11, ValType::I32), (2, ValType::I64)]);
@@ -1125,8 +1392,19 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(p),
         LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
-        // An array: room for every element plus every live table entry.
-        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalTee(n),
+        // An array: room for every element plus every live table entry. A
+        // SPARSE array's store part is `0..min(len, cap)` (its other elements
+        // are table keys).
+        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
+    );
+    emit_is_sparse(&mut f, o);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(i),
+        If(BlockType::Result(ValType::I32)), LocalGet(i), I32Load(m32(ELEMS_CAP_OFFSET)), Else, I32Const(0), End,
+        LocalTee(i), LocalGet(n), LocalGet(i), LocalGet(n), I32LtU, Select, LocalSet(n),
+        End,
+        LocalGet(n),
         LocalGet(p), I32Load(m32(P_LIVE)), I32Const(0), LocalGet(p), Select, I32Add,
         Call(new_array), LocalSet(out),
     );
@@ -1233,9 +1511,8 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         End,
         If(BlockType::Result(ValType::I64)),
     );
-    emit_elem_addr(&mut f, o, n);
+    emit_elem_load(&mut f, o, n, helpers.sparse_get());
     wasm!(f;
-        I64Load(m64(ELEMS_DATA_OFFSET)),
         Else,
         LocalGet(obj), LocalGet(kv), I32WrapI64, Call(helpers.get),
         End,

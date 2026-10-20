@@ -288,6 +288,8 @@ const TYPE_ARRAY: i32 = abi::TYPE_ARRAY as i32;
 const ARRAY_LEN_OFFSET: u64 = abi::ARRAY_LEN_OFFSET as u64;
 const ARRAY_ELEMS_OFFSET: u64 = abi::ARRAY_ELEMS_OFFSET as u64;
 const ARRAY_BLOCK_SIZE: i32 = abi::ARRAY_BLOCK_SIZE.cast_signed();
+/// Array header `flags` bit: the array is sparse (see [`abi::ARRAY_FLAG_SPARSE`]).
+const ARRAY_SPARSE: i32 = abi::ARRAY_FLAG_SPARSE as i32;
 
 /// Type byte and field offsets of an array element store (internal): `cap`,
 /// then element `i` at `ELEMS_DATA_OFFSET + 8 * i`. See [`abi::TYPE_ELEMS`].
@@ -494,12 +496,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 5] = [
-    (
-        PROP_THROW_ARRAY_LENGTH,
-        "Cannot set array property '",
-        "' yet",
-    ),
+const PROP_KEYED_MSGS: [(i32, &str, &str); 4] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -517,9 +514,11 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 5] = [
     ),
     (PROP_THROW_DELETE, "Cannot delete property '", "' of object"),
 ];
-/// The `TypeError` message `__prop_throw` raises for an array index store
-/// beyond the dense-growth bound (sparse arrays are not supported yet).
-const ARRAY_GROW_MSG: &str = "Cannot grow array sparsely by index assignment yet";
+/// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
+/// for a `length` write whose value is not a valid array length.
+const ARRAY_LENGTH_MSG: &str = "Invalid array length";
+/// See [`ARRAY_LENGTH_MSG`].
+const ARRAY_LENGTH_STACK: &str = "RangeError: Invalid array length";
 
 /// The message fragments `__prop_throw` splices into the strict-mode
 /// `TypeError` raised by a member store on a primitive receiver:
@@ -532,12 +531,6 @@ const PRIM_CREATE_QUOTE: &str = " '";
 /// See [`PRIM_CREATE_PREFIX`].
 const PRIM_CREATE_SUFFIX: &str = "'";
 
-/// `__prop_throw`'s `mode` argument: a `length` store on an array (`length`
-/// writes are not supported yet).
-const PROP_THROW_ARRAY_LENGTH: i32 = 0;
-/// `__prop_throw`'s `mode` argument: an array index store beyond the
-/// dense-growth bound.
-const PROP_THROW_GROW: i32 = 1;
 /// `__prop_throw`'s `mode` argument: any store on a primitive receiver.
 const PROP_THROW_PRIMITIVE: i32 = 2;
 /// `__prop_throw`'s `mode` argument: an assignment to a non-writable property.
@@ -551,12 +544,13 @@ const PROP_THROW_GETTER_ONLY: i32 = 5;
 /// `__prop_throw`'s `mode` argument: deleting a non-configurable property.
 const PROP_THROW_DELETE: i32 = 6;
 
-/// The static strings `__prop_throw` needs — the message fragments (plus every
-/// [`PROP_KEYED_MSGS`] fragment). Seeded (with [`ERROR_STRS`]) by
-/// [`collect_node`] at every member store and `delete` site so their
-/// `[len][utf8]` blobs exist when it throws.
-const PROP_ERROR_STRS: [&str; 9] = [
-    ARRAY_GROW_MSG,
+/// The static strings `__prop_throw` and `__array_set_length` need — the
+/// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded (with
+/// [`ERROR_STRS`]) by [`collect_node`] at every member store and `delete` site
+/// so their `[len][utf8]` blobs exist when they throw.
+const PROP_ERROR_STRS: [&str; 10] = [
+    ARRAY_LENGTH_MSG,
+    ARRAY_LENGTH_STACK,
     TYPE_ERROR_STACK_PREFIX,
     PRIM_CREATE_PREFIX,
     PRIM_CREATE_MID,
@@ -765,8 +759,7 @@ struct Helpers<'a> {
     /// [`object::emit_nullish_guard`]).
     nullish_throw: u32,
     /// `__prop_throw(recv: i64, key: i64, mode: i32)`: build the `TypeError` for
-    /// a member store or delete the receiver cannot take — an array index
-    /// beyond the dense-growth bound ([`PROP_THROW_GROW`]), any store on a
+    /// a member store or delete the receiver cannot take — any store on a
     /// primitive `recv` ([`PROP_THROW_PRIMITIVE`]), or a keyed mode of
     /// [`PROP_KEYED_MSGS`] — and leave it in flight (`$exc_pending` set).
     prop_throw: u32,
@@ -959,6 +952,27 @@ impl Helpers<'_> {
     /// helper right after `__array_concat`.
     fn array_set(self) -> u32 {
         self.array_concat + 1
+    }
+
+    /// `__array_set_length(arr, v)`: the `length` write on the array handle
+    /// `arr` (see [`props::emit_array_set_length`]); may leave a `RangeError`
+    /// pending. It is the helper right after `__array_set`.
+    fn array_set_length(self) -> u32 {
+        self.array_concat + 2
+    }
+
+    /// `__sparse_get(arr, i) -> i64`: element `i` (or [`HOLE_BITS`]) of a
+    /// `SPARSE` array (see [`props::emit_sparse_get`]). It is the helper right
+    /// after `__array_set_length`.
+    fn sparse_get(self) -> u32 {
+        self.array_concat + 3
+    }
+
+    /// `__sparse_set(arr, i, v)`: store element `i` of a `SPARSE` array,
+    /// raising `length` past `i` (see [`props::emit_sparse_set`]). It is the
+    /// helper right after `__sparse_get`.
+    fn sparse_set(self) -> u32 {
+        self.array_concat + 4
     }
 }
 
@@ -1295,16 +1309,25 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_for_in_keys(helpers));
     code.function(&emit_rest(helpers));
     code.function(&emit_array_reserve(helpers.alloc));
-    code.function(&emit_array_push(helpers.array_reserve()));
-    code.function(&emit_array_concat(helpers.array_reserve()));
+    code.function(&emit_array_push(
+        helpers.array_reserve(),
+        helpers.sparse_set(),
+    ));
+    code.function(&emit_array_concat(
+        helpers.array_reserve(),
+        helpers.sparse_get(),
+    ));
     code.function(&emit_array_set(&offsets, helpers));
+    code.function(&emit_array_set_length(&offsets, helpers));
+    code.function(&emit_sparse_get(helpers));
+    code.function(&emit_sparse_set(helpers));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.json_str,
         helpers.concat,
         helpers.convert,
         helpers.json_escape,
-        (helpers.own_keys, helpers.get),
+        (helpers.own_keys, helpers.get, helpers.sparse_get()),
         JsonTokens::resolve(&offsets),
     ));
     code.function(&emit_same_value_zero(helpers.str_eq));
