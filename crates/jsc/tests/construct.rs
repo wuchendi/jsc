@@ -178,3 +178,44 @@ fn classes_through_construct() {
         "1 11 3 3\n6\n"
     );
 }
+
+/// The official test262 `harness/sta.js` (verbatim, comments dropped) compiles
+/// and runs: called with and without `new`, `instanceof`, a prototype method,
+/// a static thrower, and `$DONOTEVALUATE`.
+#[test]
+fn official_sta_js_constructs() {
+    const STA: &str = r#"
+function Test262Error(message) {
+  if (!(this instanceof Test262Error)) return new Test262Error(message);
+  this.message = message || "";
+}
+
+Test262Error.prototype.toString = function () {
+  return "Test262Error: " + this.message;
+};
+
+Test262Error.thrower = function (message) {
+  throw new Test262Error(message);
+};
+
+function $DONOTEVALUATE() {
+  throw "Test262: This statement should not be evaluated.";
+}
+"#;
+    assert_eq!(run(STA), "");
+    let probe = format!(
+        "{STA}
+         try {{ throw new Test262Error(\"m\") }} catch (e) {{
+           console.log(e instanceof Test262Error, e.message, e.toString(), e.constructor === Test262Error)
+         }}
+         const bare = Test262Error(\"b\");
+         console.log(bare instanceof Test262Error, bare.message);
+         console.log(new Test262Error().message === \"\");
+         try {{ Test262Error.thrower(\"t\") }} catch (e) {{ console.log(e.toString()) }}
+         try {{ $DONOTEVALUATE() }} catch (e) {{ console.log(e) }}"
+    );
+    assert_eq!(
+        run(&probe),
+        "true m Test262Error: m true\ntrue b\ntrue\nTest262Error: t\nTest262: This statement should not be evaluated.\n"
+    );
+}
