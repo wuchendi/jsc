@@ -1213,7 +1213,7 @@ fn collect_node_locals(
         | IrNode::Assign { local, .. }
         | IrNode::IncDec { local, .. }
         | IrNode::ArrayPush { local, .. }
-        | IrNode::ArrayPop { local } = node
+        | IrNode::ArrayPop { local, .. } = node
     {
         crossing.insert(*local);
     }
@@ -1293,7 +1293,7 @@ fn remap_node(node: &mut IrNode, map: &HashMap<u32, u32>) -> Result<(), &'static
         | IrNode::Assign { local, .. }
         | IrNode::IncDec { local, .. }
         | IrNode::ArrayPush { local, .. }
-        | IrNode::ArrayPop { local } => match map.get(local) {
+        | IrNode::ArrayPop { local, .. } => match map.get(local) {
             Some(&slot) => slot,
             None => return Ok(()),
         },
