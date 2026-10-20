@@ -156,3 +156,60 @@ it('rejects run() on an unhandled top-level await rejection', async () => {
     /^Uncaught boom$/,
   )
 })
+
+it('reports a host allocation past the memory cap like the Rust host', async () => {
+  // Same program as `host_initiated_out_of_memory` in
+  // crates/jsc-core/tests/memory.rs: guest strings fill ~448 MiB of the
+  // 512 MiB cap, then the 64 MiB `s.slice(1)` host allocation runs out.
+  const src =
+    "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } " +
+    'let t = s + s; let u = t + s; s.slice(1).length'
+  await expect(run(src)).rejects.toThrow(/^Uncaught RangeError: out of memory$/)
+}, 60_000)
+
+it('reports a guest allocation past the memory cap like the Rust host', async () => {
+  // Same program as `huge_allocation_is_out_of_memory` in
+  // crates/jsc-core/tests/memory.rs: the guest's own `__alloc` for the 64M
+  // element spread fails inside `main` with no host import involved.
+  const src =
+    "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } " +
+    'let a = [...s]; a.length'
+  await expect(run(src)).rejects.toThrow(/^Uncaught RangeError: out of memory$/)
+}, 60_000)
+
+it('renders cyclic structures Node-console style', async () => {
+  const cases: [string, string][] = [
+    [
+      'let a = [1, 0]; a[1] = a; console.log(a)',
+      '<ref *1> [ 1, [Circular *1] ]\n',
+    ],
+    [
+      'let o = {self: null, x: 1}; o.self = o; console.log(o)',
+      '<ref *1> { self: [Circular *1], x: 1 }\n',
+    ],
+    [
+      'let o = {x: [0]}; o.x[0] = o; console.log(o)',
+      '<ref *1> { x: [ [Circular *1] ] }\n',
+    ],
+    [
+      'let a = {b: null}; let b = {a: a}; a.b = b; console.log(a)',
+      '<ref *1> { b: { a: [Circular *1] } }\n',
+    ],
+    [
+      'let a = [1, 0, 0]; let b = [2, 0]; a[1] = b; b[1] = b; a[2] = a; console.log(a)',
+      '<ref *2> [ 1, <ref *1> [ 2, [Circular *1] ], [Circular *2] ]\n',
+    ],
+    [
+      'let a = [1, 0]; let b = [2, a, 0]; a[1] = b; b[2] = b; console.log(a)',
+      '<ref *1> [ 1, <ref *2> [ 2, [Circular *1], [Circular *2] ] ]\n',
+    ],
+    [
+      'let s = {v: 1}; let o = {p: s, q: s}; console.log(o)',
+      '{ p: { v: 1 }, q: { v: 1 } }\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+  expect((await run('let a = [1, 0]; a[1] = a; a')).result).toBe(
+    '<ref *1> [ 1, [Circular *1] ]',
+  )
+})

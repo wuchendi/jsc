@@ -1,0 +1,214 @@
+//! Drift guard for `packages/jsc/src/abi.ts`, the browser shim's hand-ported copy
+//! of this module. Every `export const` there must map to the Rust value of the
+//! same meaning in `expected()`; an unmapped export, a mapped name missing from
+//! the TS file, or a differing value fails the test.
+
+use super::{
+    ASYNC_STEP_EXPORT_NAME, CONVERT_OP_PARSE_FLOAT, CONVERT_OP_TO_NUMBER, CONVERT_OP_TO_STRING,
+    DATE_MS_OFFSET, EXC_PENDING_EXPORT_NAME, EXC_VALUE_EXPORT_NAME, FALSE, GEN_DONE_OFFSET,
+    HEADER_SIZE, HEAP, HEAP_PTR_EXPORT_NAME, HEAP_PTR_OOM, INVOKE_EXPORT_NAME, MEMORY_EXPORT_NAME,
+    MEMORY_MAX_PAGES, METHOD_OP_CHAR_AT, METHOD_OP_ENDS_WITH, METHOD_OP_INCLUDES,
+    METHOD_OP_INDEX_OF, METHOD_OP_JOIN, METHOD_OP_PAD_END, METHOD_OP_PAD_START, METHOD_OP_REPEAT,
+    METHOD_OP_SLICE, METHOD_OP_SPLIT, METHOD_OP_STARTS_WITH, METHOD_OP_SUBSTRING,
+    METHOD_OP_TO_LOWER, METHOD_OP_TO_UPPER, METHOD_OP_TRIM, METHOD_OP_TRIM_END,
+    METHOD_OP_TRIM_START, NEW_ARRAY_EXPORT_NAME, NEW_PROMISE_EXPORT_NAME, NEW_STRING_EXPORT_NAME,
+    NULL, PRINT_FLAG_END, PRINT_FLAG_NEWLINE, PRINT_FLAG_SEP, PROMISE_FULFILLED,
+    PROMISE_OP_ASYNC_SPAWN, PROMISE_OP_AWAIT, PROMISE_OP_FINALLY, PROMISE_OP_NEW,
+    PROMISE_OP_REJECT, PROMISE_OP_RESOLVE, PROMISE_OP_SETTLE_FULFILL, PROMISE_OP_SETTLE_REJECT,
+    PROMISE_PENDING, PROMISE_REJECTED, QNAN, TRUE, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION,
+    TYPE_OBJECT, TYPE_PROMISE, TYPE_STRING, UNDEFINED,
+};
+
+/// A parsed `export const` value.
+#[derive(Debug, Clone, PartialEq)]
+enum Val {
+    Int(i128),
+    Str(String),
+    Strs(Vec<String>),
+}
+
+fn int(v: impl Into<i128>) -> Val {
+    Val::Int(v.into())
+}
+
+fn s(v: &str) -> Val {
+    Val::Str(v.to_owned())
+}
+
+/// TS export name -> the Rust value it must equal.
+fn expected() -> Vec<(&'static str, Val)> {
+    vec![
+        ("QNAN", int(QNAN)),
+        ("FALSE", int(FALSE)),
+        ("TRUE", int(TRUE)),
+        ("NULL", int(NULL)),
+        ("UNDEFINED", int(UNDEFINED)),
+        ("HEAP", int(HEAP)),
+        ("HEADER_SIZE", int(HEADER_SIZE)),
+        ("TYPE_STRING", int(TYPE_STRING)),
+        ("TYPE_ARRAY", int(TYPE_ARRAY)),
+        ("TYPE_OBJECT", int(TYPE_OBJECT)),
+        ("TYPE_FUNCTION", int(TYPE_FUNCTION)),
+        ("TYPE_PROMISE", int(TYPE_PROMISE)),
+        ("TYPE_DATE", int(TYPE_DATE)),
+        ("PROMISE_PENDING", int(PROMISE_PENDING)),
+        ("PROMISE_FULFILLED", int(PROMISE_FULFILLED)),
+        ("PROMISE_REJECTED", int(PROMISE_REJECTED)),
+        ("GEN_DONE_OFFSET", int(GEN_DONE_OFFSET)),
+        ("DATE_MS_OFFSET", int(DATE_MS_OFFSET)),
+        ("MEMORY_EXPORT_NAME", s(MEMORY_EXPORT_NAME)),
+        ("HEAP_PTR_EXPORT_NAME", s(HEAP_PTR_EXPORT_NAME)),
+        ("MEMORY_MAX_PAGES", int(MEMORY_MAX_PAGES)),
+        ("HEAP_PTR_OOM", int(HEAP_PTR_OOM)),
+        ("NEW_STRING_EXPORT_NAME", s(NEW_STRING_EXPORT_NAME)),
+        ("NEW_ARRAY_EXPORT_NAME", s(NEW_ARRAY_EXPORT_NAME)),
+        ("NEW_PROMISE_EXPORT_NAME", s(NEW_PROMISE_EXPORT_NAME)),
+        ("EXC_PENDING_EXPORT_NAME", s(EXC_PENDING_EXPORT_NAME)),
+        ("EXC_VALUE_EXPORT_NAME", s(EXC_VALUE_EXPORT_NAME)),
+        ("INVOKE_EXPORT_NAME", s(INVOKE_EXPORT_NAME)),
+        ("ASYNC_STEP_EXPORT_NAME", s(ASYNC_STEP_EXPORT_NAME)),
+        ("PRINT_FLAG_SEP", int(PRINT_FLAG_SEP)),
+        ("PRINT_FLAG_END", int(PRINT_FLAG_END)),
+        ("PRINT_FLAG_NEWLINE", int(PRINT_FLAG_NEWLINE)),
+        ("CONVERT_OP_TO_STRING", int(CONVERT_OP_TO_STRING)),
+        ("CONVERT_OP_TO_NUMBER", int(CONVERT_OP_TO_NUMBER)),
+        ("CONVERT_OP_PARSE_FLOAT", int(CONVERT_OP_PARSE_FLOAT)),
+        ("METHOD_OP_INDEX_OF", int(METHOD_OP_INDEX_OF)),
+        ("METHOD_OP_INCLUDES", int(METHOD_OP_INCLUDES)),
+        ("METHOD_OP_JOIN", int(METHOD_OP_JOIN)),
+        ("METHOD_OP_SLICE", int(METHOD_OP_SLICE)),
+        ("METHOD_OP_TO_UPPER", int(METHOD_OP_TO_UPPER)),
+        ("METHOD_OP_TO_LOWER", int(METHOD_OP_TO_LOWER)),
+        ("METHOD_OP_CHAR_AT", int(METHOD_OP_CHAR_AT)),
+        ("METHOD_OP_TRIM", int(METHOD_OP_TRIM)),
+        ("METHOD_OP_TRIM_START", int(METHOD_OP_TRIM_START)),
+        ("METHOD_OP_TRIM_END", int(METHOD_OP_TRIM_END)),
+        ("METHOD_OP_REPEAT", int(METHOD_OP_REPEAT)),
+        ("METHOD_OP_STARTS_WITH", int(METHOD_OP_STARTS_WITH)),
+        ("METHOD_OP_ENDS_WITH", int(METHOD_OP_ENDS_WITH)),
+        ("METHOD_OP_PAD_START", int(METHOD_OP_PAD_START)),
+        ("METHOD_OP_PAD_END", int(METHOD_OP_PAD_END)),
+        ("METHOD_OP_SUBSTRING", int(METHOD_OP_SUBSTRING)),
+        ("METHOD_OP_SPLIT", int(METHOD_OP_SPLIT)),
+        ("PROMISE_OP_RESOLVE", int(PROMISE_OP_RESOLVE)),
+        ("PROMISE_OP_REJECT", int(PROMISE_OP_REJECT)),
+        ("PROMISE_OP_AWAIT", int(PROMISE_OP_AWAIT)),
+        ("PROMISE_OP_FINALLY", int(PROMISE_OP_FINALLY)),
+        ("PROMISE_OP_NEW", int(PROMISE_OP_NEW)),
+        ("PROMISE_OP_SETTLE_FULFILL", int(PROMISE_OP_SETTLE_FULFILL)),
+        ("PROMISE_OP_SETTLE_REJECT", int(PROMISE_OP_SETTLE_REJECT)),
+        ("PROMISE_OP_ASYNC_SPAWN", int(PROMISE_OP_ASYNC_SPAWN)),
+        // TS-only bigint normalization masks: the Rust side uses the native widths.
+        ("U64_MASK", int(u64::MAX)),
+        ("U32_MASK", int(u32::MAX)),
+    ]
+}
+
+/// Parse an integer literal: decimal or `0x` hex, `_` separators, optional `n`.
+fn parse_int(lit: &str) -> Option<i128> {
+    let digits: String = lit
+        .strip_suffix('n')
+        .unwrap_or(lit)
+        .chars()
+        .filter(|&c| c != '_')
+        .collect();
+    match digits.strip_prefix("0x") {
+        Some(hex) => i128::from_str_radix(hex, 16).ok(),
+        None => digits.parse().ok(),
+    }
+}
+
+/// Parse a `'...'` string literal (no escapes in abi.ts).
+fn parse_str(lit: &str) -> Option<String> {
+    lit.strip_prefix('\'')?
+        .strip_suffix('\'')
+        .map(str::to_owned)
+}
+
+/// Evaluate `term (+ term)*`, each term an integer literal or an earlier export.
+fn parse_sum(expr: &str, seen: &[(String, Val)]) -> Result<Val, String> {
+    let mut sum = 0i128;
+    for term in expr.split('+').map(str::trim) {
+        let value = match parse_int(term) {
+            Some(v) => v,
+            None => match seen.iter().find(|(n, _)| n == term) {
+                Some((_, Val::Int(v))) => *v,
+                _ => return Err(format!("unsupported term `{term}` in `{expr}`")),
+            },
+        };
+        sum += value;
+    }
+    Ok(Val::Int(sum))
+}
+
+/// Line-based parse of every `export const NAME = <literal>` in `src`.
+fn parse_exports(src: &str) -> Result<Vec<(String, Val)>, String> {
+    let mut out: Vec<(String, Val)> = Vec::new();
+    let mut lines = src.lines();
+    while let Some(line) = lines.next() {
+        let Some(decl) = line.strip_prefix("export const ") else {
+            continue;
+        };
+        let (name, rhs) = decl
+            .split_once(" = ")
+            .ok_or_else(|| format!("malformed export: `{line}`"))?;
+        let rhs = rhs.trim();
+        let value = if rhs == "[" {
+            let mut items = Vec::new();
+            loop {
+                let item = lines
+                    .next()
+                    .ok_or_else(|| format!("unterminated array `{name}`"))?
+                    .trim();
+                if item.starts_with(']') {
+                    break;
+                }
+                let lit = item.trim_end_matches(',');
+                items.push(
+                    parse_str(lit).ok_or_else(|| format!("bad array item `{lit}` in `{name}`"))?,
+                );
+            }
+            Val::Strs(items)
+        } else if let Some(text) = parse_str(rhs) {
+            Val::Str(text)
+        } else {
+            parse_sum(rhs, &out)?
+        };
+        out.push((name.to_owned(), value));
+    }
+    Ok(out)
+}
+
+#[test]
+fn abi_ts_matches_rust_abi() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/jsc/src/abi.ts");
+    let src = std::fs::read_to_string(path).unwrap();
+    let exports = parse_exports(&src).unwrap();
+    assert!(!exports.is_empty(), "parsed zero constants from {path}");
+
+    let expected = expected();
+    let mut errors = Vec::new();
+    for (name, value) in &exports {
+        match expected.iter().find(|(n, _)| n == name) {
+            None => errors.push(format!(
+                "abi.ts exports `{name}` with no Rust mapping in abi_drift_tests.rs"
+            )),
+            Some((_, want)) if want != value => {
+                errors.push(format!(
+                    "abi.ts `{name}` = {value:?}, Rust abi.rs = {want:?}"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (name, _) in &expected {
+        if !exports.iter().any(|(n, _)| n == name) {
+            errors.push(format!("mapped `{name}` is missing from abi.ts"));
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "abi.ts drifted from abi.rs:\n{}",
+        errors.join("\n")
+    );
+}

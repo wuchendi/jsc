@@ -363,8 +363,8 @@ fn typeof_string_literal_reports_string() {
 #[test]
 fn string_literal_emits_data_segment_and_advances_heap_ptr() {
     // The literal "foo" is an 11-byte block ([type:u8][pad×3][len:u32][utf8],
-    // HEADER_SIZE=4) packed from base offset 8, so `__heap_ptr` must initialize
-    // to 8 + 11 = 19, past it.
+    // HEADER_SIZE=4) placed at base offset 8 and padded to 8, so `__heap_ptr`
+    // must initialize to the 8-aligned 8 + 16 = 24, past it.
     let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
     validate(&bytes);
     let mut data_segments = 0;
@@ -392,7 +392,7 @@ fn string_literal_emits_data_segment_and_advances_heap_ptr() {
         }
     }
     assert_eq!(data_segments, 1, "one data segment for the single literal");
-    assert_eq!(heap_ptr_init, Some(19));
+    assert_eq!(heap_ptr_init, Some(24));
 }
 
 #[test]
@@ -724,4 +724,150 @@ fn emits_valid_closure_module_with_cells_and_env() {
         (f64::from_bits(bits) - 42.0).abs() < 1e-9,
         "closure result should be 42"
     );
+}
+
+/// Lower and emit JavaScript `src`.
+fn emit_js(src: &str) -> Vec<u8> {
+    let program = crate::codegen::lower(
+        &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
+    )
+    .expect("lower");
+    emit(&program)
+}
+
+#[test]
+fn static_string_blobs_are_8_aligned() {
+    // Odd-length literals are each padded to 8, so every blob base (and the
+    // heap start after them) is 8-aligned.
+    let program = crate::codegen::lower(
+        &crate::frontend::parse(
+            "let a = 'a'; let b = 'abc'; let c = 'abcdefghi'; a + b + c",
+            crate::frontend::Dialect::Js,
+        )
+        .expect("parse"),
+    )
+    .expect("lower");
+    let (offsets, heap_start) = super::sections::collect_strings(&program);
+    assert!(offsets.len() >= 3, "three literals interned");
+    for (text, offset) in &offsets {
+        assert_eq!(offset % 8, 0, "blob {text:?} at {offset} is not 8-aligned");
+    }
+    assert_eq!(
+        heap_start % 8,
+        0,
+        "heap start {heap_start} is not 8-aligned"
+    );
+}
+
+#[test]
+fn every_block_is_8_aligned_with_zero_header_bytes() {
+    // Guest-allocated (concat, array, object, function, Map, Date, generator)
+    // and host-allocated (String(n), string/array methods, promises) blocks
+    // all start 8-aligned with header bytes 1..3 (`gc`, `flags`, `class`) zero.
+    for src in [
+        "'x' + 1",
+        "let n = 3; [1, n]",
+        "let o = {a: 1, bc: 2}; o",
+        "let f = (x) => x; f",
+        "new Map()",
+        "new Date(0)",
+        "function* g() { yield 1 } g()",
+        "String(12345)",
+        "'abc'.toUpperCase()",
+        "'abcde'.slice(1)",
+        "[1, 2, 3].slice(1)",
+        "'a,b'.split(',')",
+        "Promise.resolve(1)",
+        "new Promise((r) => r(1))",
+    ] {
+        // Allocate an odd-sized block first so an unrounded allocator would
+        // misalign the block under test.
+        let bytes = emit_js(&format!("let pad = 'ab' + 'c'; {src}"));
+        validate(&bytes);
+        let (bits, memory) = crate::run::run(&bytes).expect("module should run");
+        assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
+        let base = (bits & 0xFFFF_FFFF) as usize;
+        assert_eq!(base % 8, 0, "{src}: block base {base} is not 8-aligned");
+        for (name, offset) in [
+            ("gc", crate::abi::HEADER_GC_OFFSET),
+            ("flags", crate::abi::HEADER_FLAGS_OFFSET),
+            ("class", crate::abi::HEADER_CLASS_OFFSET),
+        ] {
+            assert_eq!(
+                memory[base + offset as usize],
+                0,
+                "{src}: header {name} byte"
+            );
+        }
+    }
+}
+
+#[test]
+fn exported_constructors_build_aligned_zeroed_blocks() {
+    use wasmtime::{Engine, Linker, Module, Store};
+    let bytes = emit_js("let s = 'odd'; s");
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("compile");
+    let mut linker = Linker::new(&engine);
+    linker
+        .define_unknown_imports_as_traps(&module)
+        .expect("stub imports");
+    let mut store = Store::new(&engine, ());
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
+    let memory = instance.get_memory(&mut store, "memory").expect("memory");
+    let heap_ptr = instance
+        .get_global(&mut store, crate::abi::HEAP_PTR_EXPORT_NAME)
+        .expect("heap ptr");
+    let ptr = |store: &mut Store<()>| heap_ptr.get(&mut *store).i32().expect("i32");
+    assert_eq!(ptr(&mut store) % 8, 0, "heap start is 8-aligned");
+    // Dirty the free region so the constructors must WRITE the zero bytes.
+    let start = usize::try_from(ptr(&mut store)).expect("ptr");
+    memory.data_mut(&mut store)[start..start + 256].fill(0xFF);
+
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut store, crate::abi::ALLOC_EXPORT_NAME)
+        .expect("__alloc export");
+    let a = alloc.call(&mut store, 5).expect("alloc");
+    assert_eq!(a % 8, 0);
+    assert_eq!(ptr(&mut store) - a, 8, "__alloc(5) rounds up to 8");
+
+    let new_string = instance
+        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
+        .expect("__new_string export");
+    let s = new_string.call(&mut store, 3).expect("new string");
+    assert_eq!(s % 8, 0);
+    let mem = memory.data(&store);
+    let s = usize::try_from(s).expect("base");
+    assert_eq!(&mem[s..s + 4], &[crate::abi::TYPE_STRING, 0, 0, 0]);
+    assert_eq!(&mem[s + 4..s + 8], &3u32.to_le_bytes());
+
+    let new_array = instance
+        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_ARRAY_EXPORT_NAME)
+        .expect("__new_array export");
+    let arr = new_array.call(&mut store, 2).expect("new array");
+    assert_eq!(arr % 8, 0);
+    let mem = memory.data(&store);
+    let arr = usize::try_from(arr).expect("base");
+    assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
+    assert_eq!(&mem[arr + 4..arr + 8], &2u32.to_le_bytes());
+    for i in 0..2 {
+        let at = arr + 8 + 8 * i;
+        assert_eq!(&mem[at..at + 8], &crate::abi::UNDEFINED.to_le_bytes());
+    }
+
+    let new_promise = instance
+        .get_typed_func::<(), i32>(&mut store, crate::abi::NEW_PROMISE_EXPORT_NAME)
+        .expect("__new_promise export");
+    let p = new_promise.call(&mut store, ()).expect("new promise");
+    assert_eq!(p % 8, 0);
+    let mem = memory.data(&store);
+    let p = usize::try_from(p).expect("base");
+    assert_eq!(&mem[p..p + 4], &[crate::abi::TYPE_PROMISE, 0, 0, 0]);
+    assert_eq!(
+        &mem[p + 4..p + 8],
+        &crate::abi::PROMISE_PENDING.to_le_bytes()
+    );
+    assert_eq!(&mem[p + 8..p + 16], &crate::abi::UNDEFINED.to_le_bytes());
 }

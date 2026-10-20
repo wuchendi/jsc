@@ -146,6 +146,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         } else {
             0
         },
+        // The constructors follow the two settlers (present only with functions).
+        new_string: obj_get_index + 36 + if has_funcs { 2 } else { 0 },
         fn_type: if has_funcs { fn_type } else { 0 },
         max_args,
         has_funcs,
@@ -287,6 +289,15 @@ pub(super) fn build_type_and_function_sections<'a>(
         .ty()
         .function([ValType::I64, ValType::I64], [ValType::I64]);
 
+    // The exported guest constructors, the LAST defined functions:
+    // `__new_string(len: i32) -> i32`, `__new_array(len: i32) -> i32`, and
+    // `__new_promise() -> i32`. Their types follow the import types.
+    types.ty().function([ValType::I32], [ValType::I32]);
+    functions.function(helper_type_base + 48);
+    functions.function(helper_type_base + 48);
+    types.ty().function([], [ValType::I32]);
+    functions.function(helper_type_base + 49);
+
     (
         types,
         functions,
@@ -401,11 +412,12 @@ pub(super) fn emit_data_section(offsets: &HashMap<String, i32>) -> Option<DataSe
 /// Collect every distinct string literal in `program` and assign each a
 /// compile-time byte offset in linear memory.
 ///
-/// Literals are packed contiguously from [`HEAP_BASE`] in first-appearance
-/// order, each occupying `4 + byte_len` bytes (`[len:u32 LE][utf8]`). Identical
-/// literals are deduplicated onto one offset. Returns the offset map plus the
-/// first free offset after all literal data — the bump allocator's start (equal
-/// to [`HEAP_BASE`] when there are no literals).
+/// Literals are placed from [`HEAP_BASE`] in first-appearance order, each
+/// occupying its `[type][pad×3][len:u32 LE][utf8]` block padded up to
+/// [`BLOCK_ALIGN`] so every blob base is 8-aligned. Identical literals are
+/// deduplicated onto one offset. Returns the offset map plus the first free
+/// offset after all literal data — the bump allocator's (8-aligned) start, equal
+/// to [`HEAP_BASE`] when there are no literals.
 pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32) {
     let mut order: Vec<&str> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -440,9 +452,12 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     for text in order {
         offsets.insert(text.to_owned(), next);
         // Each blob is `[type=0][pad×3][len:u32][utf8]` (block header): the block
-        // header, the 4-byte length header, plus the byte length.
+        // header, the 4-byte length header, plus the byte length, padded to 8.
         let blob_len = HEADER_SIZE + 4 + i32::try_from(text.len()).unwrap_or(i32::MAX);
-        next = next.saturating_add(blob_len);
+        next = next
+            .saturating_add(blob_len)
+            .saturating_add(BLOCK_ALIGN - 1)
+            & -BLOCK_ALIGN;
     }
     (offsets, next)
 }
@@ -554,11 +569,7 @@ pub(super) fn collect_node<'a>(
         // their callee expression and every argument, plus the not-a-function
         // TypeError strings (a function-less program's indirect call throws it).
         IrNode::CallIndirect { callee, args } | IrNode::ThisCall { callee, args, .. } => {
-            for s in INTERNAL_TYPE_ERROR_STRS {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
+            seed_type_error_strs(order, seen);
             collect_node(callee, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
@@ -614,6 +625,9 @@ pub(super) fn collect_node<'a>(
         }
         IrNode::CallSpread { target, args } => {
             if let SpreadCallee::Indirect(callee) = target {
+                if !is_static_function(callee) {
+                    seed_type_error_strs(order, seen);
+                }
                 collect_node(callee, order, seen);
             }
             collect_node(args, order, seen);
@@ -638,6 +652,9 @@ pub(super) fn collect_node<'a>(
             init,
             ..
         } => {
+            if !is_static_function(callback) {
+                seed_type_error_strs(order, seen);
+            }
             collect_node(array, order, seen);
             collect_node(callback, order, seen);
             if let Some(init) = init {
@@ -653,11 +670,7 @@ pub(super) fn collect_node<'a>(
         IrNode::MethodCallUser { obj, key, args, .. } => {
             // Seed the runtime callee-is-a-function guard's branded TypeError
             // strings so their data-segment blobs exist when the guard throws.
-            for s in INTERNAL_TYPE_ERROR_STRS {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
+            seed_type_error_strs(order, seen);
             seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(key, order, seen);
@@ -671,6 +684,7 @@ pub(super) fn collect_node<'a>(
             args,
             ..
         } => {
+            seed_type_error_strs(order, seen);
             collect_node(instance, order, seen);
             collect_node(ctor, order, seen);
             for arg in args {
@@ -790,11 +804,7 @@ pub(super) fn collect_node<'a>(
             }
             // The unknown-collection-method fallback lowers to a user method call,
             // which the runtime callee guard protects — seed its TypeError strings too.
-            for s in INTERNAL_TYPE_ERROR_STRS {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
+            seed_type_error_strs(order, seen);
             collect_node(recv, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
@@ -834,11 +844,7 @@ pub(super) fn collect_node<'a>(
             }
             // The non-Date fallback lowers to a guarded user method call — seed
             // its TypeError strings too.
-            for s in INTERNAL_TYPE_ERROR_STRS {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
+            seed_type_error_strs(order, seen);
             // `toISOString()` returns the interned `"Invalid Date"` literal for a
             // non-finite timestamp, so its `[len][utf8]` blob must exist.
             if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
@@ -871,7 +877,12 @@ pub(super) fn collect_node<'a>(
         }
         // `new Promise(executor)` carries only the executor sub-expression to walk
         // (the settler functions are runtime-emitted, no literals).
-        IrNode::PromiseCtor { executor, .. } => collect_node(executor, order, seen),
+        IrNode::PromiseCtor { executor, .. } => {
+            if !is_static_function(executor) {
+                seed_type_error_strs(order, seen);
+            }
+            collect_node(executor, order, seen);
+        }
         // `AsyncSpawn` wraps the inner `MakeGenerator` — walk it so the
         // constructor's per-parameter argument reads are interned.
         IrNode::AsyncSpawn(make_generator) => collect_node(make_generator, order, seen),
@@ -890,11 +901,7 @@ pub(super) fn collect_node<'a>(
                     order.push(key);
                 }
             }
-            for s in INTERNAL_TYPE_ERROR_STRS {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
+            seed_type_error_strs(order, seen);
             collect_node(handle, order, seen);
             collect_node(sent, order, seen);
         }
@@ -934,6 +941,17 @@ pub(super) fn collect_node<'a>(
 /// finds their `[len][utf8]` blobs in the data segment; see [`collect_node`].
 fn seed_nullish_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
     for s in NULLISH_ERROR_STRS {
+        if seen.insert(s) {
+            order.push(s);
+        }
+    }
+}
+
+/// Seed the not-a-function guard's [`INTERNAL_TYPE_ERROR_STRS`] so the branded
+/// `TypeError` it throws finds their `[len][utf8]` blobs in the data segment;
+/// see [`collect_node`].
+fn seed_type_error_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
+    for s in INTERNAL_TYPE_ERROR_STRS {
         if seen.insert(s) {
             order.push(s);
         }

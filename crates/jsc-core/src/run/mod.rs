@@ -58,7 +58,7 @@ mod value;
 #[cfg(test)]
 mod tests;
 
-pub use harness::{compile_and_run, compile_and_run_capturing, run, run_capturing};
+pub use harness::{compile_and_run, compile_and_run_capturing, run, run_capturing, run_metered};
 pub use value::{Value, decode, format_number, format_value};
 
 use crate::abi;
