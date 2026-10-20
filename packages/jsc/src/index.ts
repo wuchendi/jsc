@@ -19,7 +19,7 @@ import {
   EXC_VALUE_EXPORT_NAME,
   MEMORY_EXPORT_NAME,
 } from './abi.js'
-import { createShim } from './shim.js'
+import { createShim, OUT_OF_MEMORY } from './shim.js'
 import { asU64, decode, formatValue } from './value.js'
 
 /** The decoded result of running a program: the final value and captured stdout. */
@@ -85,7 +85,16 @@ export async function run(src: string): Promise<RunResult> {
   shim.bindInstance(instance)
 
   const main = instance.exports.main as () => bigint
-  const bits = asU64(main())
+  // Out of memory (the sticky `__heap_ptr` sentinel, set by a failed guest or
+  // host grow) wins over the trap or result it caused (mirrors `harness.rs`).
+  let bits: bigint
+  try {
+    bits = asU64(main())
+  } catch (e) {
+    if (shim.heapExhausted()) throw new Error(OUT_OF_MEMORY)
+    throw e
+  }
+  if (shim.heapExhausted()) throw new Error(OUT_OF_MEMORY)
 
   // Drain microtasks scheduled but never awaited, UNLESS `main` completed
   // abruptly with a pending exception (mirrors `harness.rs`'s after-`main`

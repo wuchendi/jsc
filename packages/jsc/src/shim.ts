@@ -93,6 +93,8 @@ export interface Shim {
    * never got a handler (mirrors `harness.rs` / `promise.rs::drain_after_main`).
    */
   drainAfterMain: () => void
+  /** Whether `__heap_ptr` holds the out-of-memory sentinel (mirrors `host.rs::heap_exhausted`). */
+  heapExhausted: () => boolean
 }
 
 /**
@@ -129,7 +131,7 @@ const PROMISE_BLOCK_SIZE = HEADER_SIZE + 4 + 8
 const MEMORY_MAX_BYTES = MEMORY_MAX_PAGES * 0x1_0000
 
 /** The rendered error for an exhausted heap (mirrors `harness.rs::OUT_OF_MEMORY`). */
-const OUT_OF_MEMORY = 'Uncaught RangeError: out of memory'
+export const OUT_OF_MEMORY = 'Uncaught RangeError: out of memory'
 
 const utf8Encode = new TextEncoder()
 const utf8Decoder = new TextDecoder()
@@ -832,6 +834,7 @@ export function createShim(): Shim {
         `Uncaught (in promise) ${formatValue(decode(readValue(mem, unhandled), mem))}`,
       )
     },
+    heapExhausted,
   }
 }
 
