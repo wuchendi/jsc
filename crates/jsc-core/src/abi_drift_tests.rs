@@ -4,6 +4,12 @@
 //! the TS file, or a differing value fails the test.
 
 use super::{
+    ACCESSOR_GET_OFFSET, ACCESSOR_SET_OFFSET, ATTR_ACCESSOR, ATTR_ENUMERABLE, ERROR_KIND_KEY,
+    HEADER_FLAGS_OFFSET, OBJ_PROPS_OFFSET, PROP_ATTRS_OFFSET, PROP_ENTRY_SIZE, PROP_KEY_OFFSET,
+    PROP_VALUE_OFFSET, PROPS_COUNT_OFFSET, PROPS_HAS_INDEX_KEYS, PROPS_HEADER_SIZE,
+    PROPS_TFLAGS_OFFSET, STR_FLAG_ARRAY_INDEX,
+};
+use super::{
     ASYNC_STEP_EXPORT_NAME, CONVERT_OP_PARSE_FLOAT, CONVERT_OP_TO_NUMBER, CONVERT_OP_TO_STRING,
     DATE_MS_OFFSET, EXC_PENDING_EXPORT_NAME, EXC_VALUE_EXPORT_NAME, FALSE, GEN_DONE_OFFSET,
     HEADER_SIZE, HEAP, HEAP_PTR_EXPORT_NAME, HEAP_PTR_OOM, INVOKE_EXPORT_NAME, MEMORY_EXPORT_NAME,
@@ -17,6 +23,11 @@ use super::{
     PROMISE_OP_REJECT, PROMISE_OP_RESOLVE, PROMISE_OP_SETTLE_FULFILL, PROMISE_OP_SETTLE_REJECT,
     PROMISE_PENDING, PROMISE_REJECTED, QNAN, TRUE, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION,
     TYPE_OBJECT, TYPE_PROMISE, TYPE_STRING, UNDEFINED,
+};
+use super::{
+    FN_INFO_ADDR, FN_INFO_ENTRY_SIZE, FN_INFO_NAME_OFFSET, FUNC_FLAG_CLASS_CTOR, FUNC_INDEX_OFFSET,
+    MAP_SIZE_OFFSET, OBJ_PREFIX_SIZE, OBJ_PROTO_OFFSET, PROMISE_BLOCK_SIZE, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, TYPE_GENERATOR, TYPE_MAP, TYPE_SET,
 };
 
 /// A parsed `export const` value.
@@ -49,11 +60,41 @@ fn expected() -> Vec<(&'static str, Val)> {
         ("TYPE_ARRAY", int(TYPE_ARRAY)),
         ("TYPE_OBJECT", int(TYPE_OBJECT)),
         ("TYPE_FUNCTION", int(TYPE_FUNCTION)),
+        ("TYPE_MAP", int(TYPE_MAP)),
+        ("TYPE_SET", int(TYPE_SET)),
         ("TYPE_PROMISE", int(TYPE_PROMISE)),
+        ("TYPE_GENERATOR", int(TYPE_GENERATOR)),
         ("TYPE_DATE", int(TYPE_DATE)),
+        ("HEADER_FLAGS_OFFSET", int(HEADER_FLAGS_OFFSET)),
+        ("STR_FLAG_ARRAY_INDEX", int(STR_FLAG_ARRAY_INDEX)),
+        ("OBJ_PROPS_OFFSET", int(OBJ_PROPS_OFFSET)),
+        ("OBJ_PREFIX_SIZE", int(OBJ_PREFIX_SIZE)),
+        ("OBJ_PROTO_OFFSET", int(OBJ_PROTO_OFFSET)),
+        ("FUNC_INDEX_OFFSET", int(FUNC_INDEX_OFFSET)),
+        ("FUNC_FLAG_CLASS_CTOR", int(FUNC_FLAG_CLASS_CTOR)),
+        ("FN_INFO_ADDR", int(FN_INFO_ADDR)),
+        ("FN_INFO_ENTRY_SIZE", int(FN_INFO_ENTRY_SIZE)),
+        ("FN_INFO_NAME_OFFSET", int(FN_INFO_NAME_OFFSET)),
+        ("PROPS_TFLAGS_OFFSET", int(PROPS_TFLAGS_OFFSET)),
+        ("PROPS_COUNT_OFFSET", int(PROPS_COUNT_OFFSET)),
+        ("PROPS_HEADER_SIZE", int(PROPS_HEADER_SIZE)),
+        ("PROP_ENTRY_SIZE", int(PROP_ENTRY_SIZE)),
+        ("PROP_KEY_OFFSET", int(PROP_KEY_OFFSET)),
+        ("PROP_ATTRS_OFFSET", int(PROP_ATTRS_OFFSET)),
+        ("PROP_VALUE_OFFSET", int(PROP_VALUE_OFFSET)),
+        ("PROPS_HAS_INDEX_KEYS", int(PROPS_HAS_INDEX_KEYS)),
+        ("ATTR_ENUMERABLE", int(ATTR_ENUMERABLE)),
+        ("ATTR_ACCESSOR", int(ATTR_ACCESSOR)),
+        ("ACCESSOR_GET_OFFSET", int(ACCESSOR_GET_OFFSET)),
+        ("ACCESSOR_SET_OFFSET", int(ACCESSOR_SET_OFFSET)),
+        ("ERROR_KIND_KEY", s(ERROR_KIND_KEY)),
         ("PROMISE_PENDING", int(PROMISE_PENDING)),
         ("PROMISE_FULFILLED", int(PROMISE_FULFILLED)),
         ("PROMISE_REJECTED", int(PROMISE_REJECTED)),
+        ("MAP_SIZE_OFFSET", int(MAP_SIZE_OFFSET)),
+        ("PROMISE_STATE_OFFSET", int(PROMISE_STATE_OFFSET)),
+        ("PROMISE_VALUE_OFFSET", int(PROMISE_VALUE_OFFSET)),
+        ("PROMISE_BLOCK_SIZE", int(PROMISE_BLOCK_SIZE)),
         ("GEN_DONE_OFFSET", int(GEN_DONE_OFFSET)),
         ("DATE_MS_OFFSET", int(DATE_MS_OFFSET)),
         ("MEMORY_EXPORT_NAME", s(MEMORY_EXPORT_NAME)),
@@ -211,4 +252,110 @@ fn abi_ts_matches_rust_abi() {
         "abi.ts drifted from abi.rs:\n{}",
         errors.join("\n")
     );
+}
+
+/// Pins the object-family prefix and per-kind payload layouts to
+/// `design/object-model.md` table 2.2.
+#[test]
+fn object_family_layout_matches_design() {
+    use super::{
+        DATE_BLOCK_SIZE, FUNC_BLOCK_SIZE, FUNC_ENV_OFFSET, GEN_BLOCK_SIZE, GEN_ENV_OFFSET,
+        GEN_SM_IDX_OFFSET, GEN_STATE_OFFSET, MAP_BLOCK_SIZE, MAP_ENTRIES_OFFSET, OBJ_PROPS_OFFSET,
+    };
+    let actual = [
+        ("OBJ_PROPS_OFFSET", OBJ_PROPS_OFFSET),
+        ("OBJ_PROTO_OFFSET", OBJ_PROTO_OFFSET),
+        ("OBJ_PREFIX_SIZE", OBJ_PREFIX_SIZE),
+        ("FUNC_INDEX_OFFSET", FUNC_INDEX_OFFSET),
+        ("FUNC_ENV_OFFSET", FUNC_ENV_OFFSET),
+        ("FUNC_BLOCK_SIZE", FUNC_BLOCK_SIZE),
+        ("MAP_SIZE_OFFSET", MAP_SIZE_OFFSET),
+        ("MAP_ENTRIES_OFFSET", MAP_ENTRIES_OFFSET),
+        ("MAP_BLOCK_SIZE", MAP_BLOCK_SIZE),
+        ("PROMISE_STATE_OFFSET", PROMISE_STATE_OFFSET),
+        ("PROMISE_VALUE_OFFSET", PROMISE_VALUE_OFFSET),
+        ("PROMISE_BLOCK_SIZE", PROMISE_BLOCK_SIZE),
+        ("GEN_SM_IDX_OFFSET", GEN_SM_IDX_OFFSET),
+        ("GEN_STATE_OFFSET", GEN_STATE_OFFSET),
+        ("GEN_DONE_OFFSET", GEN_DONE_OFFSET),
+        ("GEN_ENV_OFFSET", GEN_ENV_OFFSET),
+        ("GEN_BLOCK_SIZE", GEN_BLOCK_SIZE),
+        ("DATE_MS_OFFSET", DATE_MS_OFFSET),
+        ("DATE_BLOCK_SIZE", DATE_BLOCK_SIZE),
+    ];
+    let design = [
+        4, 8, 16, // prefix
+        16, 24, 32, // function
+        16, 24, 32, // map / set
+        16, 24, 32, // promise
+        16, 20, 24, 32, 40, // generator
+        16, 24, // date
+    ];
+    for ((name, got), want) in actual.iter().zip(design) {
+        assert_eq!(*got, want, "{name}");
+    }
+    // Every i64/f64 slot is 8-byte aligned; every block size is a BLOCK_ALIGN multiple.
+    for slot in [
+        OBJ_PROTO_OFFSET,
+        FUNC_ENV_OFFSET,
+        MAP_ENTRIES_OFFSET,
+        PROMISE_VALUE_OFFSET,
+        GEN_ENV_OFFSET,
+        DATE_MS_OFFSET,
+    ] {
+        assert_eq!(slot % 8, 0);
+    }
+    for size in [
+        FUNC_BLOCK_SIZE,
+        MAP_BLOCK_SIZE,
+        PROMISE_BLOCK_SIZE,
+        GEN_BLOCK_SIZE,
+        DATE_BLOCK_SIZE,
+    ] {
+        assert_eq!(size % super::BLOCK_ALIGN, 0);
+    }
+}
+
+/// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
+/// `design/object-model.md` 2.1-2.3.
+#[test]
+fn property_table_layout_matches_design() {
+    use super::{
+        ATTR_CONFIGURABLE, ATTR_WRITABLE, ATTRS_DEFAULT, OBJ_FLAG_NOT_EXTENSIBLE, PROPS_CAP_OFFSET,
+        PROPS_HAS_NON_ENUM, PROPS_LIVE_OFFSET, STR_FLAG_INTERNED, TYPE_PROPS,
+    };
+    assert_eq!(TYPE_PROPS, 12);
+    assert_eq!(
+        [
+            PROPS_TFLAGS_OFFSET,
+            PROPS_COUNT_OFFSET,
+            PROPS_CAP_OFFSET,
+            PROPS_LIVE_OFFSET,
+            PROPS_HEADER_SIZE
+        ],
+        [2, 4, 8, 12, 16]
+    );
+    assert_eq!(
+        [
+            PROP_ENTRY_SIZE,
+            PROP_KEY_OFFSET,
+            PROP_ATTRS_OFFSET,
+            PROP_VALUE_OFFSET
+        ],
+        [16, 0, 4, 8]
+    );
+    assert_eq!(
+        [
+            ATTR_WRITABLE,
+            ATTR_ENUMERABLE,
+            ATTR_CONFIGURABLE,
+            ATTR_ACCESSOR
+        ],
+        [1, 2, 4, 8]
+    );
+    assert_eq!(ATTRS_DEFAULT, 0b0111);
+    assert_eq!([PROPS_HAS_INDEX_KEYS, PROPS_HAS_NON_ENUM], [1, 2]);
+    assert_eq!([STR_FLAG_INTERNED, STR_FLAG_ARRAY_INDEX], [1, 2]);
+    assert_eq!(OBJ_FLAG_NOT_EXTENSIBLE, 1);
+    assert_eq!(HEADER_FLAGS_OFFSET, 2);
 }

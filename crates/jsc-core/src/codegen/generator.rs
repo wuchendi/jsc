@@ -79,6 +79,7 @@ impl LowerCtx<'_> {
                 locals: 0,
                 body: Vec::new(),
                 machine: None,
+                info: FnInfo::default(),
             });
             pos
         };
@@ -110,6 +111,7 @@ impl LowerCtx<'_> {
             locals: sm_locals,
             body: Vec::new(),
             machine: Some(segments),
+            info: FnInfo::default(),
         };
 
         // The constructor: `return MakeGenerator(...)`, reading each parameter from
@@ -133,6 +135,7 @@ impl LowerCtx<'_> {
             locals: uniform_params,
             body: ctor_body,
             machine: None,
+            info: FnInfo::default(),
         })
     }
 
@@ -893,16 +896,10 @@ fn node_contains_yield(node: &IrNode) -> bool {
 /// The `TypeError` a `yield*` over a non-iterable operand throws.
 fn not_iterable_error() -> IrNode {
     let message = "yield* operand is not iterable";
-    IrNode::Object(vec![
-        ("name".to_owned(), IrNode::Str("TypeError".to_owned())),
-        ("message".to_owned(), IrNode::Str(message.to_owned())),
-        (
-            "stack".to_owned(),
-            IrNode::Str(format!("TypeError: {message}")),
-        ),
-        (
-            crate::abi::ERROR_KIND_KEY.to_owned(),
-            IrNode::Num(crate::abi::ERROR_KIND_TYPE),
-        ),
-    ])
+    IrNode::error_object(
+        IrNode::Str("TypeError".to_owned()),
+        IrNode::Str(message.to_owned()),
+        IrNode::Str(format!("TypeError: {message}")),
+        crate::abi::ERROR_KIND_TYPE,
+    )
 }

@@ -253,7 +253,7 @@ fn ctor_field_computed_init_via_eval() {
 /// Instance field declarations (`field = init`). A field is an
 /// instance-level own property initialized on construction, BEFORE the
 /// constructor body runs. The instance shape is the union of the field names and
-/// the constructor's `this.<f> = ..` assignments (no dynamic key growth).
+/// the constructor's `this.<f> = ..` assignments.
 #[test]
 fn class_fields_via_eval() {
     // A single field with a constant initializer, no constructor: a default
@@ -619,7 +619,7 @@ fn class_static_field_computed_init_via_eval() {
 /// prototype as a `TYPE_ACCESSOR` box: reading `obj.x` invokes the getter with
 /// `this` = the instance; writing `obj.x = v` invokes the setter. A half-declared
 /// accessor degrades cleanly — reading a set-only property is `undefined`, and
-/// assigning a get-only property is a silent no-op.
+/// assigning a get-only property throws a `TypeError` (strict `OrdinarySet`).
 #[test]
 fn class_instance_accessor_via_eval() {
     // A getter computes from fields.
@@ -640,13 +640,13 @@ fn class_instance_accessor_via_eval() {
         ]),
         "10"
     );
-    // Assigning a get-only accessor is silently ignored (non-strict semantics).
+    // Assigning a get-only accessor throws and leaves it unchanged.
     assert_eq!(
         jsc(&[
             "-p",
-            "class C{ get x(){return 7} } let c=new C(); c.x=99; c.x"
+            "class C{ get x(){return 7} } let c=new C(); let r; try { c.x=99 } catch(e) { r=e.name } r+c.x"
         ]),
-        "7"
+        "TypeError7"
     );
     // Reading a set-only accessor yields `undefined`.
     assert_eq!(
@@ -789,35 +789,31 @@ fn class_calls_tolerate_missing_and_extra_arguments() {
     );
 }
 
-/// Instances are fixed-shape: writing a field the constructor never set — or a
-/// method name that lives only as a data property on the prototype — throws a
-/// `TypeError`, while accessor setters keep running and get-only accessors keep
-/// silently ignoring the write.
+/// Instances are dynamic: writing a field the constructor never set adds an
+/// own property, and assigning a prototype method's name shadows it on the
+/// instance. Accessor setters run; a get-only accessor rejects the write with
+/// a `TypeError` (strict `OrdinarySet`).
 #[test]
-fn class_instance_absent_property_write_throws() {
+fn class_instance_property_writes() {
     let wrap = |body: &str| {
         format!(
             "let r=\"none\"; try {{ {body} }} catch(e) {{ r=(e instanceof TypeError)+\"|\"+e.message }} r"
         )
     };
-    let add = |key: &str| {
-        format!("true|Cannot add property '{key}': dynamic properties are not supported yet")
-    };
     assert_eq!(
         jsc(&[
             "-p",
-            &wrap("class C { constructor(){ this.a = 1 } } let c = new C(); c.z = 3")
+            "class C { constructor(){ this.a = 1 } } let c = new C(); c.z = 3; c.a + c.z"
         ]),
-        add("z")
+        "4"
     );
     assert_eq!(
         jsc(&[
             "-p",
-            &wrap("class C { m(){ return 1 } } let c = new C(); c.m = 5")
+            "class C { m(){ return 1 } } let c = new C(); let d = new C(); c.m = 5; c.m + d.m()"
         ]),
-        add("m")
+        "6"
     );
-    // Setter still invoked; get-only accessor still ignored (no throw).
     assert_eq!(
         jsc(&[
             "-p",
@@ -830,14 +826,78 @@ fn class_instance_absent_property_write_throws() {
             "-p",
             &wrap("class C{ get x(){return 7} } let c=new C(); c.x=99; r=c.x")
         ]),
-        "7"
+        "true|Cannot set property x of object which has only a getter"
     );
-    // With accessors in the program, a plain absent write still throws.
     assert_eq!(
         jsc(&[
             "-p",
-            &wrap("class C{ constructor(){this.k=0} set y(v){this.k=v} } let c=new C(); c.w=1")
+            "class C{ constructor(){this.k=0} set y(v){this.k=v} } let c=new C(); c.w=1; c.w"
         ]),
-        add("w")
+        "1"
+    );
+}
+
+/// A class value is its constructor function: `typeof` is `function`, the
+/// non-writable `prototype` links back through a non-enumerable `constructor`,
+/// statics are own properties, and prototype methods are non-enumerable.
+#[test]
+fn class_value_is_constructor_function() {
+    let class_a = "class A { constructor(){ this.x = 1 } m(){} static s(){ return 2 } }";
+    let run = |body: &str| jsc(&["-e", &format!("{class_a} {body}")]);
+    assert_eq!(run("console.log(typeof A)"), "function");
+    assert_eq!(run("console.log(A.prototype.constructor === A)"), "true");
+    assert_eq!(run("console.log(A.s())"), "2");
+    assert_eq!(run("console.log(Object.keys(A.prototype))"), "[]");
+    assert_eq!(run("console.log(Object.keys(A))"), "[]");
+    assert_eq!(
+        run("try { A.prototype = {} } catch (e) { console.log(e instanceof TypeError) }"),
+        "true"
+    );
+    assert_eq!(run("console.log(new A())"), "A { x: 1 }");
+    assert_eq!(run("console.log(A)"), "[class A]");
+    assert_eq!(run("console.log(A.name, A.length)"), "A 0");
+    assert_eq!(run("console.log(A.s.name, A.prototype.m.name)"), "s m");
+    // A static field is an enumerable own data property of the class.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class B { static f = 1; static g = B.f + 1 } console.log(Object.keys(B), B.g)"
+        ]),
+        "[ f, g ] 2"
+    );
+}
+
+/// A derived class links its prototype to the parent's, so instances are
+/// `instanceof` both; a derived class without a constructor forwards its
+/// arguments to the parent's and still runs its own field initializers.
+#[test]
+fn derived_class_prototype_chain() {
+    let classes = "class A { constructor(v){ this.v = v } get() { return this.v } } \
+                   class B extends A {}";
+    let run = |body: &str| jsc(&["-e", &format!("{classes} {body}")]);
+    assert_eq!(
+        run("let b = new B(3); console.log(b instanceof A, b instanceof B, b.get())"),
+        "true true 3"
+    );
+    assert_eq!(run("console.log(new A(1) instanceof B)"), "false");
+    assert_eq!(run("console.log(B === A, B.name)"), "false B");
+    assert_eq!(run("console.log(B)"), "[class B extends A]");
+    assert_eq!(run("console.log(new B(2))"), "B { v: 2 }");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class A { constructor(a, b){ this.s = a + b } } \
+             class B extends A { f = 9 } let b = new B(1, 2); console.log(b.s, b.f)"
+        ]),
+        "3 9"
+    );
+    // `super(...args)` spreads into the parent constructor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class A { constructor(a, b){ this.s = a + b } } \
+             class B extends A { constructor(...xs){ super(...xs) } } console.log(new B(4, 5).s)"
+        ]),
+        "9"
     );
 }

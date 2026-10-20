@@ -413,7 +413,7 @@ fn instanceof_on_caught_error() {
 }
 
 /// `instanceof` is GENERALIZED to user classes: an instance is `instanceof` its
-/// own class (a single `@@prototype`-pointer hop), whether written directly or
+/// own class (its `proto` is the class's `prototype`), whether written directly or
 /// through a binding, but not `instanceof` an unrelated class or a builtin error.
 #[test]
 fn instanceof_user_class() {

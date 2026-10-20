@@ -19,18 +19,19 @@ use crate::error::CompileError;
 /// `funcs`, including itself (recursion).
 pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::Result<IrFunction> {
     let mut ctx = LowerCtx::new(shared);
+    let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
+    let name = fn_decl.ident.sym.as_ref();
     // A top-level `function*` lowers to a generator constructor + state machine,
-    // not an ordinary function body.
-    if fn_decl.function.is_generator && !fn_decl.function.is_async {
-        return ctx.lower_generator(fn_decl);
-    }
-    // A top-level `async function` compiles its body to a generator
-    // state machine (`await` == `yield`) with a wrapper that spawns it as a
-    // promise; `lower_generator` handles both, keyed on `function.is_async`.
-    // (An `async function*` — an async generator — stays out of scope and is
-    // rejected by `reject_unsupported_function` below.)
-    if fn_decl.function.is_async && !fn_decl.function.is_generator {
-        return ctx.lower_generator(fn_decl);
+    // not an ordinary function body. A top-level `async function` compiles its
+    // body to a generator state machine (`await` == `yield`) with a wrapper that
+    // spawns it as a promise; `lower_generator` handles both, keyed on
+    // `function.is_async`. (An `async function*` — an async generator — stays
+    // out of scope and is rejected by `reject_unsupported_function` below.)
+    // Neither is a constructor.
+    if fn_decl.function.is_generator != fn_decl.function.is_async {
+        let mut func = ctx.lower_generator(fn_decl)?;
+        func.info = fn_info(name, &param_pats, FnKind::Plain);
+        return Ok(func);
     }
     let block = fn_decl
         .function
@@ -38,9 +39,23 @@ pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::R
         .as_ref()
         .ok_or_else(|| anyhow!("function declaration requires a body"))?;
     reject_unsupported_function(&fn_decl.function)?;
-    let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
-    let (func, _env) = ctx.build_function_body(&param_pats, BodyKind::Block(&block.stmts))?;
+    let (mut func, _env) = ctx.build_function_body(&param_pats, BodyKind::Block(&block.stmts))?;
+    func.info = fn_info(name, &param_pats, FnKind::Constructor);
     Ok(func)
+}
+
+/// The [`FnInfo`] of a function named `name` with parameters `param_pats`:
+/// its `length` counts the parameters before the first default or rest.
+pub(super) fn fn_info(name: &str, param_pats: &[&Pat], kind: FnKind) -> FnInfo {
+    let length = param_pats
+        .iter()
+        .take_while(|p| !matches!(p, Pat::Assign(_) | Pat::Rest(_)))
+        .count();
+    FnInfo {
+        name: name.to_owned(),
+        length: u32::try_from(length).unwrap_or(u32::MAX),
+        kind,
+    }
 }
 
 /// Reject the out-of-scope function forms — `async function` and generator
@@ -241,6 +256,7 @@ impl LowerCtx<'_> {
                 locals,
                 body,
                 machine: None,
+                info: FnInfo::default(),
             },
             env_layout,
         ))
@@ -338,10 +354,14 @@ impl LowerCtx<'_> {
     /// Lift a function/arrow to a top-level [`IrFunction`] (registered in the
     /// funcref table) and produce the [`IrNode::FuncValue`] that builds its
     /// value at the use site, with the capture sources for its environment.
+    /// `name` and `kind` become the function object's `name` and constructor
+    /// kind.
     pub(super) fn lower_lifted_function(
         &mut self,
         param_pats: &[&Pat],
         body_kind: BodyKind<'_>,
+        name: &str,
+        kind: FnKind,
     ) -> anyhow::Result<IrNode> {
         // Reserve this function's table slot before lowering its body, so any
         // function nested in the body takes a later slot.
@@ -353,6 +373,7 @@ impl LowerCtx<'_> {
                 locals: 0,
                 body: Vec::new(),
                 machine: None,
+                info: FnInfo::default(),
             });
             pos
         };
@@ -360,7 +381,7 @@ impl LowerCtx<'_> {
 
         self.push_frame();
         let built = self.build_function_body(param_pats, body_kind);
-        let (func, env_layout) = match built {
+        let (mut func, env_layout) = match built {
             Ok(pair) => pair,
             Err(e) => {
                 self.pop_frame();
@@ -368,6 +389,7 @@ impl LowerCtx<'_> {
             }
         };
         self.pop_frame();
+        func.info = fn_info(name, param_pats, kind);
         self.shared.arrows.borrow_mut()[pos] = func;
 
         // Build the capture sources in the enclosing frame (now the top frame).
@@ -378,6 +400,7 @@ impl LowerCtx<'_> {
         Ok(IrNode::FuncValue {
             table_index,
             captures,
+            kind,
         })
     }
 
@@ -417,7 +440,12 @@ impl LowerCtx<'_> {
             .ok_or_else(|| anyhow!("function declaration requires a body"))?;
         reject_unsupported_function(&fn_decl.function)?;
         let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
-        self.lower_lifted_function(&param_pats, BodyKind::Block(&block.stmts))
+        self.lower_lifted_function(
+            &param_pats,
+            BodyKind::Block(&block.stmts),
+            fn_decl.ident.sym.as_ref(),
+            FnKind::Constructor,
+        )
     }
 
     /// Lower an arrow function `(a, b) => a + b` / `x => x * x` / `(n) => { .. }`
@@ -427,8 +455,9 @@ impl LowerCtx<'_> {
     /// enclosing bindings the body references. An expression body (`=> expr`)
     /// desugars to `return expr`; a block body (`=> { .. }`) lowers its statements
     /// directly. Single-parameter (`x => ..`) and parenthesized zero/multi-parameter
-    /// forms all lower the same way. Arrows carry no `this`/`arguments`.
-    pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr) -> anyhow::Result<IrNode> {
+    /// forms all lower the same way. Arrows carry no `this`/`arguments`, and are
+    /// not constructors. `name` is the inferred `name` (`""` when anonymous).
+    pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr, name: &str) -> anyhow::Result<IrNode> {
         // `async`/generator arrows are out of scope: reject rather than
         // silently compile the body as a plain arrow (wrong result).
         if arrow.is_async {
@@ -446,6 +475,6 @@ impl LowerCtx<'_> {
             ArrowFunctionBody::FunctionBody(block) => BodyKind::Block(&block.stmts),
             ArrowFunctionBody::Expr(expr) => BodyKind::Expr(expr),
         };
-        self.lower_lifted_function(&param_pats, body_kind)
+        self.lower_lifted_function(&param_pats, body_kind, name, FnKind::Plain)
     }
 }

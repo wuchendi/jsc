@@ -591,26 +591,34 @@ fn object_decodes_and_formats() {
 
 #[test]
 fn decode_object_reads_entries_from_memory() {
-    // A hand-built heap object `{a: 7}` at base offset 20, with its key string
-    // "a" as a block at base offset 8 (with headers):
-    //   key   : [type=0][pad×3][len=1]['a']  (base 8, 9 bytes -> ends at 17)
-    //   object: [type=2][pad×3][n=1][key_ptr][7.0]  (base 20)
+    // A hand-built heap object `{a: 7}` (plus a non-enumerable `h` and a
+    // tombstone): the key strings "a" at 8 and "h" at 24, the object at 40, its
+    // property table at 56:
+    //   object: [type=2][0×3][props=56][proto=null]
+    //   table : [12][0][tflags=HAS_NON_ENUM][0][count=3][cap=3][live=2]
+    //           ["a" | attrs 7 | 7.0] [tombstone] ["h" | attrs 5 | 1.0]
+    let null = 0x7FFA_0000_0000_0000_u64;
     let mut memory = vec![0u8; 8];
-    // Key string block "a" at base offset 8.
-    memory.extend_from_slice(&[TYPE_STRING, 0, 0, 0]);
-    memory.extend_from_slice(&1u32.to_le_bytes());
-    memory.push(b'a');
-    // Pad to offset 20 (8 + 4 + 4 + 1 = 17 -> 3 bytes of padding).
-    memory.extend_from_slice(&[0u8; 3]);
-    // Object block at base offset 20: header, n=1, key_ptr jsval (HEAP_BITS|8),
-    // value 7.0.
+    for key in *b"ah" {
+        memory.extend_from_slice(&[TYPE_STRING, 0, 1, 0]);
+        memory.extend_from_slice(&1u32.to_le_bytes());
+        memory.push(key);
+        memory.resize(memory.len() + 7, 0);
+    }
+    assert_eq!(memory.len(), 40);
     memory.extend_from_slice(&[TYPE_OBJECT, 0, 0, 0]);
-    memory.extend_from_slice(&1u32.to_le_bytes());
-    let key_ptr_bits = 0x7FFD_0000_0000_0000_u64 | 0x8;
-    memory.extend_from_slice(&key_ptr_bits.to_le_bytes());
-    memory.extend_from_slice(&7.0_f64.to_bits().to_le_bytes());
-    // Object jsval: single heap tag 0b101 (HEAP_BITS) with block base offset 20.
-    let bits = 0x7FFD_0000_0000_0000_u64 | 0x14;
+    memory.extend_from_slice(&56u32.to_le_bytes());
+    memory.extend_from_slice(&null.to_le_bytes());
+    memory.extend_from_slice(&[12, 0, 2, 0]);
+    for word in [3u32, 3, 2] {
+        memory.extend_from_slice(&word.to_le_bytes());
+    }
+    for (key, attrs, value) in [(8u32, 7u32, 7.0_f64), (0, 0, 0.0), (24, 5, 1.0)] {
+        memory.extend_from_slice(&key.to_le_bytes());
+        memory.extend_from_slice(&attrs.to_le_bytes());
+        memory.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    let bits = 0x7FFD_0000_0000_0000_u64 | 0x28;
     assert_eq!(
         decode(bits, &memory),
         Value::Object(vec![("a".to_owned(), Value::Number(7.0))])
@@ -977,11 +985,21 @@ fn typeof_function_value_is_function() {
 
 #[test]
 fn bare_function_value_decodes_and_formats() {
-    // A returned bare function value decodes to `Value::Function` without a
-    // panic and renders Node-console style.
+    // A returned bare function value decodes to `Value::Function` with its
+    // `__fn_info` name and renders Node-console style.
     let value = compile_and_run("function id(x){return x} let g=id; g").expect("pipeline");
-    assert_eq!(value, Value::Function);
-    assert_eq!(format_value(&value), "[Function (anonymous)]");
+    assert_eq!(
+        value,
+        Value::Function {
+            name: "id".to_owned(),
+            class: false,
+            extends: None,
+            props: Vec::new(),
+        }
+    );
+    assert_eq!(format_value(&value), "[Function: id]");
+    let arrow = compile_and_run("let g = [() => 1]; g[0]").expect("pipeline");
+    assert_eq!(format_value(&arrow), "[Function (anonymous)]");
 }
 
 #[test]
@@ -1140,14 +1158,21 @@ fn non_capturing_function_is_unaffected() {
 
 #[test]
 fn function_value_decode_reads_type_byte() {
-    // A hand-built function block at base offset 8:
-    // [type=3][pad×3][func_idx:u32=0][env:i64=undefined].
+    // A hand-built function block at base offset 8: [type=3][pad×3][props=0]
+    // [proto=null][func_idx:u32=0][reserved:u32][env:i64=undefined], with no
+    // `__fn_info` table (its address word is 0) and so no name.
     let mut memory = vec![0u8; 8];
     memory.extend_from_slice(&[TYPE_FUNCTION, 0, 0, 0]);
     memory.extend_from_slice(&0u32.to_le_bytes());
+    memory.extend_from_slice(&0x7FFA_0000_0000_0000_u64.to_le_bytes());
+    memory.extend_from_slice(&0u32.to_le_bytes());
+    memory.extend_from_slice(&0u32.to_le_bytes());
     memory.extend_from_slice(&0x7FFB_0000_0000_0000_u64.to_le_bytes());
     let bits = 0x7FFD_0000_0000_0000_u64 | 0x8;
-    assert_eq!(decode(bits, &memory), Value::Function);
+    assert_eq!(
+        format_value(&decode(bits, &memory)),
+        "[Function (anonymous)]"
+    );
 }
 
 // The type byte, not the (single) NaN-box tag, distinguishes a

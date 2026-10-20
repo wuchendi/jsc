@@ -23,8 +23,8 @@ use wasmtime::{AsContextMut, Caller, Func, Global, Instance, Memory, Store, Stor
 use crate::abi;
 
 use super::{
-    HEADER_SIZE, HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED, TYPE_FUNCTION,
-    TYPE_PROMISE,
+    GEN_DONE_OFFSET, HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED,
+    PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, TYPE_FUNCTION, TYPE_PROMISE,
 };
 
 /// The NaN-boxed `undefined` jsval bits.
@@ -454,7 +454,7 @@ fn read_gen_done(mem: &[u8], gen_handle: u64) -> bool {
     let Some(base) = heap_ptr(gen_handle) else {
         return false;
     };
-    let at = base + abi::GEN_DONE_OFFSET as usize;
+    let at = base + GEN_DONE_OFFSET;
     mem.get(at..at + 4)
         .is_some_and(|b| i32::from_le_bytes(b.try_into().unwrap_or([0; 4])) != 0)
 }
@@ -689,12 +689,13 @@ fn write_settlement<W: Write + Send + 'static>(
     state: i32,
     value: u64,
 ) {
-    let mut buf = [0u8; 12];
-    buf[0..4].copy_from_slice(&state.to_le_bytes());
-    buf[4..12].copy_from_slice(&value.to_le_bytes());
+    let base = base as usize;
     let _ = handles
         .memory
-        .write(&mut ctx, base as usize + HEADER_SIZE, &buf);
+        .write(&mut ctx, base + PROMISE_STATE_OFFSET, &state.to_le_bytes());
+    let _ = handles
+        .memory
+        .write(&mut ctx, base + PROMISE_VALUE_OFFSET, &value.to_le_bytes());
 }
 
 /// The base offset (low 32 bits) of a heap jsval.
@@ -728,19 +729,19 @@ fn heap_ptr(bits: u64) -> Option<usize> {
     }
 }
 
-/// Read a promise block's `state` (i32 at `base + HEADER_SIZE`); a truncated
-/// block reads as [`PROMISE_PENDING`].
+/// Read a promise block's `state` (i32 at `base + PROMISE_STATE_OFFSET`); a
+/// truncated block reads as [`PROMISE_PENDING`].
 fn read_state(mem: &[u8], base: u32) -> i32 {
-    let at = base as usize + HEADER_SIZE;
+    let at = base as usize + PROMISE_STATE_OFFSET;
     mem.get(at..at + 4).map_or(PROMISE_PENDING, |b| {
         i32::from_le_bytes(b.try_into().unwrap_or([0; 4]))
     })
 }
 
-/// Read a promise block's settled `value` (i64 at `base + HEADER_SIZE + 4`); a
-/// truncated block reads as `undefined`.
+/// Read a promise block's settled `value` (i64 at `base + PROMISE_VALUE_OFFSET`);
+/// a truncated block reads as `undefined`.
 fn read_value(mem: &[u8], base: u32) -> u64 {
-    let at = base as usize + HEADER_SIZE + 4;
+    let at = base as usize + PROMISE_VALUE_OFFSET;
     mem.get(at..at + 8).map_or(UNDEFINED, |b| {
         u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))
     })

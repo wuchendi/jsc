@@ -88,9 +88,10 @@ pub(crate) const HEADER_SIZE: u32 = 4;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
-/// Header byte 2: the per-kind `flags` byte. Reserved; every block is created
-/// with it 0.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
+/// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`].
 pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
 
 /// Header byte 3: the `TYPE_OBJECT` sub-`class` byte. Reserved; every block is
@@ -102,6 +103,25 @@ pub(crate) const HEADER_CLASS_OFFSET: u32 = 3;
 /// request up to a multiple of it, and static data blobs are padded to it, so
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
 pub(crate) const BLOCK_ALIGN: u32 = 8;
+
+/// Byte offset of the object-family prefix's `props: u32` slot (right after the
+/// header): the base of the block's [`TYPE_PROPS`] own-property table, `0` = no
+/// own named properties. Shared by every object-family kind except
+/// [`TYPE_ARRAY`] (which still carries its pre-prefix layout).
+pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
+
+/// Object-family header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the object
+/// is not extensible, so adding an own property throws a `TypeError`.
+pub(crate) const OBJ_FLAG_NOT_EXTENSIBLE: u8 = 1;
+
+/// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
+/// pointer or [`NULL`]), 8-byte aligned. Every object-family block is created
+/// with it [`NULL`] until the realm's intrinsic prototypes exist.
+pub(crate) const OBJ_PROTO_OFFSET: u32 = 8;
+
+/// The byte size of the shared object-family prefix — header, `props`, and
+/// `proto` — so every kind payload begins 8-byte aligned here.
+pub(crate) const OBJ_PREFIX_SIZE: u32 = 16;
 
 /// The number of trailing (non-positional) parameters every user function carries
 /// under the uniform ABI, appended after the `K = max_arity` positional argument
@@ -122,14 +142,60 @@ pub(crate) const TYPE_STRING: u8 = 0;
 /// `[type=1][pad×3][len:u32][elem:i64 × len]`. Maps to `typeof` "object".
 pub(crate) const TYPE_ARRAY: u8 = 1;
 
-/// TYPE BYTE of a heap object block:
-/// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]`. Maps to `typeof`
+/// TYPE BYTE of an ordinary object block: the object-family prefix alone
+/// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
+/// [`TYPE_PROPS`] table at `props`, its prototype in `proto`. Maps to `typeof`
 /// "object".
 pub(crate) const TYPE_OBJECT: u8 = 2;
 
-/// TYPE BYTE of a first-class function value:
-/// `[type=3][pad×3][func_idx:u32][env:i64]`. Maps to `typeof` "function".
+/// TYPE BYTE of a first-class function value: the object-family prefix, then
+/// `[func_idx:u32 @16][reserved:u32 @20][env:i64 @24]` ([`FUNC_BLOCK_SIZE`]
+/// bytes). Maps to `typeof` "function".
 pub(crate) const TYPE_FUNCTION: u8 = 3;
+
+/// Byte offset (from a [`TYPE_FUNCTION`] block base) of the u32 funcref-table
+/// index. The following u32 at `+20` is reserved (always 0).
+pub(crate) const FUNC_INDEX_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_FUNCTION`] block base) of the i64 closure
+/// environment jsval (`undefined` for a non-capturing function).
+pub(crate) const FUNC_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_FUNCTION`] block.
+pub(crate) const FUNC_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: `length`, `name`, and (for a
+/// [`FUNC_FLAG_CONSTRUCTOR`]) `prototype` are not yet defined. The first
+/// property operation on the function calls `__fn_materialize`, which defines
+/// them from the function's [`FN_INFO_ENTRY_SIZE`]-byte info entry and clears
+/// the bit.
+pub(crate) const FUNC_FLAG_LAZY: u8 = 4;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the function is a constructor (a
+/// `function` declaration/expression or a class), so materialization gives it
+/// a `prototype` object.
+pub(crate) const FUNC_FLAG_CONSTRUCTOR: u8 = 8;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the function is a class constructor.
+/// Its `prototype` is installed by the class definition, not materialized.
+pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
+
+/// Linear-memory address of the u32 holding the base of the static function
+/// info table (inside the null guard below the first static string): entry
+/// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
+/// func_idx`, holding the function's interned `name` key at
+/// [`FN_INFO_NAME_OFFSET`] and its `length` at [`FN_INFO_LENGTH_OFFSET`]
+/// (`__fn_info`). `__fn_materialize` and the host renderers read it.
+pub(crate) const FN_INFO_ADDR: u32 = 4;
+
+/// The byte size of one function info entry (see [`FN_INFO_ADDR`]).
+pub(crate) const FN_INFO_ENTRY_SIZE: u32 = 8;
+
+/// Byte offset (within a function info entry) of the u32 interned `name` key.
+pub(crate) const FN_INFO_NAME_OFFSET: u32 = 0;
+
+/// Byte offset (within a function info entry) of the u32 `length`.
+pub(crate) const FN_INFO_LENGTH_OFFSET: u32 = 4;
 
 /// TYPE BYTE of a closure **environment** block (internal):
 /// `[type=4][pad×3][count:u32][cell_ptr:i64 × count]`. Never a user value.
@@ -140,8 +206,8 @@ pub(crate) const TYPE_ENV: u8 = 4;
 /// user value.
 pub(crate) const TYPE_CELL: u8 = 5;
 
-/// TYPE BYTE of a `Map` handle block:
-/// `[type=6][pad×3][size:u32][entries:i64]`. `size` is the logical entry count
+/// TYPE BYTE of a `Map` handle block: the object-family prefix, then
+/// `[size:u32 @16][pad:u32][entries:i64 @24]`. `size` is the logical entry count
 /// (backing `.size`); `entries` is a heap jsval pointing at a GROWABLE array that
 /// stores the `(key, value)` pairs flattened (key at even element slots, value at
 /// the following odd slot). Growth reallocs that backing array and rewrites the
@@ -149,14 +215,25 @@ pub(crate) const TYPE_CELL: u8 = 5;
 /// "object".
 pub(crate) const TYPE_MAP: u8 = 6;
 
-/// TYPE BYTE of a `Set` handle block: identical layout to [`TYPE_MAP`]
-/// (`[type=7][pad×3][size:u32][entries:i64]`). A Set reuses the same flattened
+/// TYPE BYTE of a `Set` handle block: identical layout to [`TYPE_MAP`]. A Set reuses the same flattened
 /// `(key, value)` backing with the value slot always `undefined`, so all the
 /// lookup/insert/delete machinery is shared; only the type byte (and thus the
 /// render label) differs. Maps to `typeof` "object".
 pub(crate) const TYPE_SET: u8 = 7;
 
-/// TYPE BYTE of a `Promise` block: `[type=8][pad×3][state:i32][value:i64]`.
+/// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the u32
+/// logical entry count.
+pub(crate) const MAP_SIZE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the i64
+/// `entries` backing-array jsval.
+pub(crate) const MAP_ENTRIES_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_MAP`] / [`TYPE_SET`] handle block.
+pub(crate) const MAP_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// TYPE BYTE of a `Promise` block: the object-family prefix, then
+/// `[state:i32 @16][pad:u32][value:i64 @24]`.
 /// `state` is one of [`PROMISE_PENDING`] / [`PROMISE_FULFILLED`] /
 /// [`PROMISE_REJECTED`]; `value` is the settled fulfillment/rejection jsval
 /// (`undefined` while pending). The block is the RENDERABLE mirror of a promise's
@@ -165,6 +242,15 @@ pub(crate) const TYPE_SET: u8 = 7;
 /// can decode a promise from a bare memory snapshot. Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_PROMISE: u8 = 8;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the i32 `state`.
+pub(crate) const PROMISE_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the i64 settled `value`.
+pub(crate) const PROMISE_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_PROMISE`] block.
+pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// [`TYPE_PROMISE`] `state`: the promise is unsettled.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -178,8 +264,8 @@ pub(crate) const PROMISE_FULFILLED: i32 = 1;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_REJECTED: i32 = 2;
 
-/// TYPE BYTE of a `Generator` handle block:
-/// `[type=9][pad×3][sm_idx:u32][state:i32][done:i32][env:i64]`. `sm_idx` is the
+/// TYPE BYTE of a `Generator` handle block: the object-family prefix, then
+/// `[sm_idx:u32 @16][state:i32 @20][done:i32 @24][pad:u32][env:i64 @32]`. `sm_idx` is the
 /// funcref-table index of the generator's **state-machine** function; `state` is
 /// the resume point (`0` at creation, bumped at each `yield`); `done` is `0`
 /// until the body returns/falls off, then `1`; `env` is the persistent
@@ -193,39 +279,44 @@ pub(crate) const PROMISE_REJECTED: i32 = 2;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_GENERATOR: u8 = 9;
 
-/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the `sm_idx` funcref
-/// index (u32), `state` (i32), `done` (i32), and `env` frame jsval (i64). The
-/// payload begins at [`HEADER_SIZE`]; the i64 `env` lands 8-byte aligned at 16.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_SM_IDX_OFFSET: u32 = HEADER_SIZE;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_STATE_OFFSET: u32 = HEADER_SIZE + 4;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_DONE_OFFSET: u32 = HEADER_SIZE + 8;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_ENV_OFFSET: u32 = HEADER_SIZE + 12;
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 `sm_idx`
+/// funcref-table index.
+pub(crate) const GEN_SM_IDX_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
-/// TYPE BYTE of a `Date` block: `[type=10][pad×3][pad×4][ms:f64]`. The
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 resume `state`.
+pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 `done` flag.
+pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
+/// jsval, 8-byte aligned past a u32 pad.
+pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// The byte size of a [`TYPE_GENERATOR`] block.
+pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+
+/// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the
 /// same value `Date.now()` / `d.getTime()` yield. `new Date(ms)` stores its
-/// numeric argument; `new Date()` stores the host clock (the `__now` import). The
-/// f64 lands 8-byte aligned at [`DATE_MS_OFFSET`]. Maps to `typeof` "object".
+/// numeric argument; `new Date()` stores the host clock (the `__now` import).
+/// Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_DATE: u8 = 10;
 
-/// Byte offset (from a [`TYPE_DATE`] block base) of the `ms` timestamp (f64). The
-/// payload begins at [`HEADER_SIZE`]; the f64 lands 8-byte aligned at 8.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const DATE_MS_OFFSET: u32 = HEADER_SIZE + 4;
+/// Byte offset (from a [`TYPE_DATE`] block base) of the f64 `ms` timestamp.
+pub(crate) const DATE_MS_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
-/// TYPE BYTE of an **accessor** block (P2b instance getters/setters):
-/// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds a class instance
-/// accessor property's getter and setter FUNCTION VALUES (the `undefined` bits
-/// when a half is absent). The box is stored under the property name on the
-/// class's shared `@@prototype`, so a member READ that resolves (through the
-/// prototype chain) to this box invokes the getter with `this = receiver`, and a
-/// member WRITE invokes the setter. Never a program-visible value — it is always
-/// consumed by the get/set path, so `decode`'s catch-all renders it `undefined`.
+/// The byte size of a [`TYPE_DATE`] block.
+pub(crate) const DATE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// TYPE BYTE of an **accessor** block (class and object-literal getters/setters):
+/// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds an accessor
+/// property's getter and setter FUNCTION VALUES (the `undefined` bits
+/// when a half is absent). It is the value of an [`ATTR_ACCESSOR`] property
+/// table entry, so `__get` invokes the getter with `this = receiver` and
+/// `__set` the setter. Never a program-visible value; the host decoders render
+/// the property as `[Getter]` / `[Setter]` / `[Getter/Setter]`.
 /// The two i64 payloads land 8-byte aligned at [`ACCESSOR_GET_OFFSET`] /
 /// [`ACCESSOR_SET_OFFSET`]. Maps to no `typeof` (never observed directly).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -241,13 +332,81 @@ pub(crate) const ACCESSOR_GET_OFFSET: u32 = HEADER_SIZE + 4;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const ACCESSOR_SET_OFFSET: u32 = HEADER_SIZE + 12;
 
-/// A compile-time-only interned SENTINEL key present in the string table iff the
-/// program lowers at least one instance accessor ([`crate::ir::IrNode::MakeAccessor`]).
-/// The emitter gates the accessor get/set invocation paths on its presence —
-/// exactly as it gates the `__obj_get` prototype fallback on [`CLASS_PROTOTYPE_KEY`] —
-/// so an accessor-free program keeps byte-identical member-read/write emission. It
-/// is never read at runtime (the `@@` prefix keeps it off any JS-visible surface).
-pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
+/// TYPE BYTE of an own-property table (internal, never a user value), the
+/// block an object-family `props` slot points at:
+/// `[type=12][pad][tflags:u8][pad][count:u32 @4][cap:u32 @8][live:u32 @12]`
+/// followed by `cap` [`PROP_ENTRY_SIZE`]-byte entries
+/// `[key:u32][attrs:u32][value:i64]` from [`PROPS_HEADER_SIZE`]. `key` is an
+/// interned string block base (`0` = a deleted entry's tombstone), `count` the
+/// slots used (tombstones included) and `live` the non-tombstone entries.
+/// Insertion order is slot order; growth copies the live entries into a fresh
+/// table and rewrites the owner's `props`, so the owner handle never moves.
+pub(crate) const TYPE_PROPS: u8 = 12;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the `tflags` byte
+/// ([`PROPS_HAS_INDEX_KEYS`], [`PROPS_HAS_NON_ENUM`]).
+pub(crate) const PROPS_TFLAGS_OFFSET: u32 = 2;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `count`.
+pub(crate) const PROPS_COUNT_OFFSET: u32 = 4;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `cap`.
+pub(crate) const PROPS_CAP_OFFSET: u32 = 8;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `live`.
+pub(crate) const PROPS_LIVE_OFFSET: u32 = 12;
+
+/// The byte size of a [`TYPE_PROPS`] table header; entry `k` starts at
+/// `PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k`.
+pub(crate) const PROPS_HEADER_SIZE: u32 = 16;
+
+/// The byte size of one [`TYPE_PROPS`] entry.
+pub(crate) const PROP_ENTRY_SIZE: u32 = 16;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the u32 interned key.
+pub(crate) const PROP_KEY_OFFSET: u32 = 0;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the u32 `attrs`.
+pub(crate) const PROP_ATTRS_OFFSET: u32 = 4;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the i64 value (a data value,
+/// or a [`TYPE_ACCESSOR`] pointer when [`ATTR_ACCESSOR`] is set).
+pub(crate) const PROP_VALUE_OFFSET: u32 = 8;
+
+/// [`TYPE_PROPS`] `tflags` bit: some key is a canonical array index (its
+/// string carries [`STR_FLAG_ARRAY_INDEX`]), so own-key enumeration must list
+/// the integer keys first, ascending.
+pub(crate) const PROPS_HAS_INDEX_KEYS: u8 = 1;
+
+/// [`TYPE_PROPS`] `tflags` bit: some entry lacks [`ATTR_ENUMERABLE`].
+pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
+
+/// Property `attrs` bit: a data property's value may be reassigned (ignored
+/// for an accessor).
+pub(crate) const ATTR_WRITABLE: u32 = 1;
+
+/// Property `attrs` bit: the key is listed by own-key enumeration.
+pub(crate) const ATTR_ENUMERABLE: u32 = 2;
+
+/// Property `attrs` bit: the property may be deleted or redefined.
+pub(crate) const ATTR_CONFIGURABLE: u32 = 4;
+
+/// Property `attrs` bit: the value is a [`TYPE_ACCESSOR`] getter/setter pair.
+pub(crate) const ATTR_ACCESSOR: u32 = 8;
+
+/// The `attrs` of a data property created by assignment or a literal:
+/// writable, enumerable, and configurable.
+pub(crate) const ATTRS_DEFAULT: u32 = ATTR_WRITABLE | ATTR_ENUMERABLE | ATTR_CONFIGURABLE;
+
+/// String header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the block is the
+/// canonical interned block for its content, so it may be used as a property
+/// key by pointer.
+pub(crate) const STR_FLAG_INTERNED: u8 = 1;
+
+/// String header `flags` bit: the content is a canonical array index
+/// (`"0"` or a nonzero digit followed by digits, value `< 2^32 - 1`). Set at
+/// intern time.
+pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
 /// value `undefined`). A method call `obj.m(args)` sets it to the receiver
@@ -258,29 +417,12 @@ pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
 
-/// Reserved hidden property key naming a class's shared PROTOTYPE object.
-/// A class binding stores its single prototype object under this key; every
-/// instance built by `new` stores that SAME prototype pointer under this key, so
-/// a method lookup can resolve `obj.method` by falling back to the prototype when the own
-/// property is absent. The `@@` prefix cannot begin a JS identifier, so ordinary
-/// `obj.name` source access never collides with it. Interned like any static
-/// string key and matched by byte content through `__obj_get`/`__obj_set`.
-pub(crate) const CLASS_PROTOTYPE_KEY: &str = "@@prototype";
-
-/// Reserved hidden property key naming a class's CONSTRUCTOR function value.
-/// The class binding stores its lowered constructor — an ordinary
-/// uniform-ABI function value — under this key; `new A(args)` reads it back and
-/// runs it with `this` bound to the fresh instance. Same interning/`@@`-prefix
-/// rationale as [`CLASS_PROTOTYPE_KEY`].
-pub(crate) const CLASS_CONSTRUCTOR_KEY: &str = "@@constructor";
-
 /// Reserved hidden property key marking a builtin **Error** object's kind
 /// (E-series). `new Error`/`new TypeError`/`new RangeError` store one of
 /// [`ERROR_KIND_ERROR`] / [`ERROR_KIND_TYPE`] / [`ERROR_KIND_RANGE`] under this
-/// key as a number jsval. The `@@` prefix hides it from `for-in` /
-/// `Object.keys` / `JSON.stringify` (same mechanism as [`CLASS_PROTOTYPE_KEY`]),
-/// yet `__obj_get` reads it back so `instanceof` and the value renderer can
-/// recognize an error and its kind. The stored value is never `undefined`, so
+/// key as a NON-ENUMERABLE number property, so it never surfaces in `for-in` /
+/// `Object.keys` / `JSON.stringify` / rendering, yet `__get` reads it back so
+/// `instanceof` and the host decoders can recognize an error and its kind. The stored value is never `undefined`, so
 /// "the object is an error" is testable as "the loaded marker is not
 /// `undefined`", and the concrete kind by strict-equality against the constants
 /// below.

@@ -265,18 +265,12 @@ impl<'a> LowerCtx<'a> {
         let slot = *self.shared.module_slots.get(name)?;
         let mutable = *self.shared.module_mutable.get(name)?;
         let message = format!("Cannot access '{name}' before initialization");
-        let error = IrNode::Object(vec![
-            ("name".to_owned(), IrNode::Str("ReferenceError".to_owned())),
-            ("message".to_owned(), IrNode::Str(message.clone())),
-            (
-                "stack".to_owned(),
-                IrNode::Str(format!("ReferenceError: {message}")),
-            ),
-            (
-                crate::abi::ERROR_KIND_KEY.to_owned(),
-                IrNode::Num(crate::abi::ERROR_KIND_ERROR),
-            ),
-        ]);
+        let error = IrNode::error_object(
+            IrNode::Str("ReferenceError".to_owned()),
+            IrNode::Str(message.clone()),
+            IrNode::Str(format!("ReferenceError: {message}")),
+            crate::abi::ERROR_KIND_ERROR,
+        );
         let guarded = IrNode::Ternary {
             cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
                 IrNode::ModuleCell(slot),
@@ -314,14 +308,6 @@ impl<'a> LowerCtx<'a> {
             }
         }
         None
-    }
-
-    /// The [`binding_id`] the name resolves to in the current scope chain, or
-    /// `None` when it is not a local/captured binding (a top-level function name
-    /// or an undeclared reference). Used by the static-shape unknown-method guard
-    /// to look a receiver's tracked object shape up by its declaring id.
-    pub(super) fn binding_id_of(&self, name: &str) -> Option<u32> {
-        self.find_binding(name).map(|(_, binding)| binding.id)
     }
 
     /// Ensure every frame between the declaring frame and the current frame

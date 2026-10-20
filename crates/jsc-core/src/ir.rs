@@ -224,19 +224,40 @@ pub enum MethodOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectBuiltinOp {
     /// `Object.keys(o)` — a NEW array of the object's own enumerable key strings,
-    /// in insertion order (reserved hidden `@@`-prefixed keys skipped).
+    /// integer keys ascending first, then string keys in insertion order.
     Keys,
     /// `Object.values(o)` — a NEW array of the object's own enumerable values, in
-    /// insertion order (reserved hidden `@@`-prefixed keys skipped).
+    /// [`Self::Keys`] order.
     Values,
     /// `Object.entries(o)` — a NEW array of `[key, value]` two-element arrays, one
-    /// per own enumerable entry in insertion order (reserved keys skipped).
+    /// per own enumerable property in [`Self::Keys`] order.
     Entries,
+    /// The `for-in` key snapshot (not a JS builtin): a NEW array of the
+    /// enumerable string keys of `o` and its prototype chain, each listed once
+    /// (an own key shadows an inherited one), taken at loop entry.
+    ForInKeys,
+}
+
+/// The key of one [`IrNode::Object`] entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropKey {
+    /// A compile-time string key of an enumerable data property.
+    Static(String),
+    /// A compile-time string key of a NON-enumerable (writable, configurable)
+    /// property: class prototype methods/accessors, `constructor`, static
+    /// methods, and the reserved `@@errorkind` brand.
+    Hidden(String),
+    /// A compile-time string key of a non-writable, non-enumerable,
+    /// non-configurable data property: a class's `prototype`.
+    Fixed(String),
+    /// A computed key (`{[k]: v}`, or a numeric literal key `{1: v}`), converted
+    /// with `ToPropertyKey` and interned at run time.
+    Computed(IrNode),
 }
 
 /// What the right-hand side of an `instanceof` names (E-series). Recognized
 /// syntactically at codegen from a bare identifier: a **user class** (the
-/// receiver's `@@prototype` chain is walked for the class's shared prototype)
+/// receiver's `proto` chain is walked for the class's shared prototype)
 /// takes precedence, so `class Error {}` shadows the builtin; otherwise the three
 /// builtin error constructors match the receiver's hidden brand (`Error` matches
 /// any branded error; `TypeError`/`RangeError` match only their own kind, both
@@ -266,11 +287,10 @@ pub enum InstanceOfKind {
     /// primitive string.
     Object,
     /// `instanceof C` for a user class `C`: some object on the receiver's
-    /// `@@prototype` chain must be the SAME object as `C`'s shared prototype. The
-    /// walk starts at the receiver's own `@@prototype` and follows each prototype
-    /// object's own `@@prototype` link (installed by `extends`) until a match or the
-    /// base class (no link). Carries the expression that reads the class's prototype
-    /// (`C["@@prototype"]`). Under no-`extends` the chain is one hop.
+    /// `proto` chain must be the SAME object as `Get(C, "prototype")`. The walk
+    /// starts at the receiver's `proto` slot and follows each prototype object's
+    /// own `proto` (linked by `extends`) until a match or `null`. Carries the
+    /// expression that reads the class's prototype (`C.prototype`).
     Class(Box<IrNode>),
 }
 
@@ -380,6 +400,15 @@ pub enum SpreadCallee {
     Direct(u32),
     /// An indirect call through a computed function value.
     Indirect(Box<IrNode>),
+    /// A `super(...args)` call: the parent constructor value, invoked with
+    /// `this` kept as the enclosing constructor's snapshot in `this_local`
+    /// (like [`IrNode::ThisCall`]).
+    This {
+        /// The parent constructor function value.
+        callee: Box<IrNode>,
+        /// The enclosing constructor's `this` snapshot local.
+        this_local: u32,
+    },
 }
 
 /// A node in the numeric-expression IR tree.
@@ -447,7 +476,15 @@ pub enum IrNode {
         /// slot order (empty for a non-capturing function). Each yields the
         /// jsval pointer of the boxed cell to store in the environment.
         captures: Vec<IrNode>,
+        /// The function's constructor kind (its [`FnInfo::kind`]), selecting the
+        /// header `flags` the object is created with.
+        kind: FnKind,
     },
+    /// The function object of a top-level function declaration (funcref-table
+    /// index `.0`). A top-level declaration never captures, so its one object
+    /// is a static block in the data segment: every reference yields the same
+    /// identity, and properties added to it persist.
+    DeclFunc(u32),
     /// Allocate a **boxed cell** (heap block, type byte `5`) holding the value of
     /// the sub-expression, and yield the cell's heap-pointer jsval. A
     /// captured `let`/`const`/parameter binding is stored through such a cell so
@@ -570,20 +607,39 @@ pub enum IrNode {
         /// The argument array to fold — an [`IrNode::ArraySpread`].
         args: Box<IrNode>,
     },
-    /// An object literal `{k0: e0, k1: e1, ..}` with compile-time string keys. It
-    /// lowers to a heap object (single heap tag `0b101`, type byte `2`):
-    /// `__alloc(HEADER_SIZE + 4 + 16*n)`, the type byte, a u32 `n` header, then
-    /// each entry's key heap-string pointer at `ptr + HEADER_SIZE + 4 + 16*k` and
-    /// value jsval at `+8`. Keys are
-    /// interned as static strings; value expressions are evaluated left-to-right.
-    Object(Vec<(String, IrNode)>),
+    /// An object literal `{k0: e0, [k1]: e1, ..}`: a `TYPE_OBJECT` block whose
+    /// `TYPE_PROPS` table is sized `max(entries.len(), reserve)` up front. Each
+    /// entry's key and value are evaluated left-to-right and defined as an own
+    /// property (a later duplicate key overwrites the earlier slot in place). An
+    /// [`IrNode::MakeAccessor`] value defines an accessor property. `proto` is
+    /// the `proto` slot jsval (`null` when absent).
+    Object {
+        /// The entries, in source order.
+        entries: Vec<(PropKey, IrNode)>,
+        /// The prototype link (a class instance's or derived prototype's parent).
+        proto: Option<Box<IrNode>>,
+        /// Extra table capacity to reserve beyond the entries (a class
+        /// instance's field-scan count).
+        reserve: u32,
+    },
+    /// Define own properties on an existing object: `obj` is evaluated once
+    /// into `local`, then each entry is defined (`__define`) in order with the
+    /// attributes its [`PropKey`] selects; yields `obj`. Entry values may read
+    /// `local` (a class prototype's `constructor` back-link to the class).
+    DefineProps {
+        /// The object to define the properties on.
+        obj: Box<IrNode>,
+        /// Fresh temp local holding the evaluated `obj`.
+        local: u32,
+        /// The entries, in definition order.
+        entries: Vec<(PropKey, IrNode)>,
+    },
     /// An object rest binding `let {a, ...rest} = obj`. Builds a NEW heap
     /// object holding every own key of `source` EXCEPT the statically-known
     /// destructured keys in `exclude`. `source` is evaluated once (a hidden temp
     /// read); `exclude` is an [`IrNode::Array`] of [`IrNode::Str`] key names. It
-    /// lowers to the `__obj_rest` runtime helper, which linear-scans the source
-    /// object's entries, skips any key byte-equal to an excluded one, copies the
-    /// rest into a fresh bump-allocated object, and returns it as a heap jsval.
+    /// lowers to the `__rest` runtime helper, which defines every own enumerable
+    /// property of the source whose key is not excluded on a fresh object.
     ObjectRest {
         /// The source object being spread (a heap object jsval, evaluated once).
         source: Box<IrNode>,
@@ -606,30 +662,24 @@ pub enum IrNode {
         /// The property name the access reads (for the error message).
         key: String,
     },
-    /// Computed indexing `obj[index]`, dispatched at runtime on `obj`'s TYPE BYTE.
-    /// A string block (type `0`) allocates and returns a fresh
-    /// one-character heap string holding the BYTE at `index`; an array block (type
-    /// `1`) loads and returns the element jsval at `ptr + HEADER_SIZE + 4 +
-    /// 8*index`; an object block (type `2`) linear-scans its entries for a key
-    /// whose byte content equals the string `index`, returning the matching value
-    /// jsval or `undefined`. Static property reads `obj.a` also lower here as
-    /// `obj["a"]`. For string/array, `index` is a number jsval assumed in bounds
-    /// (`0 <= index < length`); for objects, `index` is a heap-string pointer.
+    /// A member read `obj[index]` (static reads `obj.a` lower here as
+    /// `obj["a"]`). A string/array with a numeric (or `"length"`) key reads its
+    /// character/element/length; every other read is the generic `__get` with
+    /// the key converted by `ToPropertyKey` (a static string key is a constant).
     Index {
-        /// The string or array being indexed (a heap-pointer jsval).
+        /// The receiver.
         obj: Box<IrNode>,
-        /// The index (a number jsval).
+        /// The property key.
         index: Box<IrNode>,
     },
-    /// A class instance **accessor** property value (P2b getters/setters): build a
-    /// `TYPE_ACCESSOR` heap block holding the getter and setter FUNCTION VALUES
-    /// (`undefined` for an absent half). It is stored under the property name on
-    /// the class's shared `@@prototype` (alongside the plain method values), so a
-    /// member READ that resolves to this box invokes `getter()` with `this` = the
-    /// receiver, and a member WRITE invokes `setter(value)`. Both halves are
-    /// ordinary lifted function values that read `this` through the `this` carrier,
-    /// exactly like a method. Built ONCE per accessor property at class-definition
-    /// time — never copied per instance.
+    /// An **accessor** property value (class or object-literal getters/setters):
+    /// build a `TYPE_ACCESSOR` heap block holding the getter and setter FUNCTION
+    /// VALUES (`undefined` for an absent half). As an [`IrNode::Object`] /
+    /// [`IrNode::DefineProps`] entry value it defines an `ATTR_ACCESSOR`
+    /// property, so a member READ that resolves to it invokes `getter()` with
+    /// `this` = the receiver, and a member WRITE invokes `setter(value)`. Both
+    /// halves are ordinary lifted function values that read `this` through the
+    /// `this` carrier, exactly like a method.
     MakeAccessor {
         /// The getter function value, or [`IrNode::Undefined`] if the property
         /// declares only a setter.
@@ -638,16 +688,13 @@ pub enum IrNode {
         /// declares only a getter.
         setter: Box<IrNode>,
     },
-    /// Computed element assignment `obj[index] = value`. It stores `value`
-    /// into the EXISTING slot at `ptr + HEADER_SIZE + 4 + 8*index` of the array
-    /// `obj` and yields `value` (JS: `a[i] = v` evaluates to `v`). `obj` is assumed
-    /// to be an array block (type byte `1`) and `index` a number in bounds — no
-    /// bounds check and no growth. An object
-    /// target (type byte `2`) dispatches to the key-scan store instead.
+    /// Member assignment `obj[index] = value`, yielding `value`. An array stores
+    /// an in-range element (no growth yet); every other receiver goes through
+    /// the generic `__set` (adding the property when absent).
     IndexSet {
-        /// The array being written (a heap array-pointer jsval).
+        /// The receiver.
         obj: Box<IrNode>,
-        /// The index (a number jsval).
+        /// The property key.
         index: Box<IrNode>,
         /// The jsval stored into the slot; also the expression's result.
         value: Box<IrNode>,
@@ -838,8 +885,8 @@ pub enum IrNode {
     /// [`IrNode::CallIndirect`] (which resets `this` to `undefined`) and from the
     /// builtin [`IrNode::MethodCall`] (array/string host methods). `obj` is
     /// evaluated ONCE into the fresh temp `obj_local`; the callee is the function
-    /// value at member `key` of `obj` (an object read reusing the `__obj_get`
-    /// path); the `__this` global is set to `obj` immediately before the
+    /// value at member `key` of `obj` (an ordinary member read through `__get`);
+    /// the `__this` global is set to `obj` immediately before the
     /// `call_indirect`, so the callee's prologue snapshots it into its own `this`
     /// slot. Missing arguments become `undefined`; extra arguments are ignored, as
     /// with any indirect call.
@@ -863,9 +910,9 @@ pub enum IrNode {
     /// A `super(..)` / `super.m(..)` call inside a derived class (the E-series
     /// `extends`): invoke the function value `callee` with `this` kept as the
     /// CURRENT instance (the enclosing method's snapshotted `this` in `this_local`)
-    /// rather than a fresh receiver. `callee` is the parent constructor
-    /// (`Super["@@constructor"]`) for `super(..)` or a parent-prototype method
-    /// (`Super["@@prototype"].m`) for `super.m(..)`. Mirrors [`IrNode::MethodCallUser`]'s
+    /// rather than a fresh receiver. `callee` is the parent class value (its
+    /// constructor function) for `super(..)` or a parent-prototype method
+    /// (`Super.prototype.m`) for `super.m(..)`. Mirrors [`IrNode::MethodCallUser`]'s
     /// call shape — a not-a-function runtime guard, then the `__this` global is set
     /// to `this_local` immediately before the `call_indirect` — but binds the
     /// existing `this` instead of a member receiver, so the parent constructor's
@@ -880,50 +927,28 @@ pub enum IrNode {
         this_local: u32,
     },
     /// A class instantiation `new A(args)`. Allocates the fresh `instance`
-    /// object (pre-shaped with the reserved prototype link plus one slot per field
-    /// the constructor assigns via `this.<field> = ..`, since the object model has
-    /// no dynamic key growth), binds `this = instance`, runs the constructor
+    /// object (linked to the class prototype, its property table pre-sized for
+    /// the fields the constructor assigns), binds `this = instance`, runs the constructor
     /// function value `ctor` with `args` under the uniform ABI, DISCARDS the
     /// constructor's return value, and evaluates to the instance. The instance is
     /// stashed in `instance_local` so it survives the constructor call and is
     /// yielded afterward — mirroring [`IrNode::MethodCallUser`]'s `this`-binding
     /// call shape but yielding the receiver rather than the call result.
     New {
-        /// The fresh instance allocation: an [`IrNode::Object`] whose first entry
-        /// is the reserved prototype-key link and whose remaining entries slot
-        /// each constructor-assigned field to `undefined`.
+        /// The fresh instance allocation: an entry-less [`IrNode::Object`] whose
+        /// `proto` is the class prototype and whose `reserve` is the field count.
         instance: Box<IrNode>,
-        /// The constructor function value to run (read from the class binding's
-        /// reserved constructor key).
+        /// The constructor function value to run (the class binding's value).
         ctor: Box<IrNode>,
         /// The constructor argument expressions, in source order.
         args: Vec<IrNode>,
         /// Fresh temp local holding the instance across the constructor call.
         instance_local: u32,
     },
-    /// The enumerable KEY at position `index` of `obj`, produced as a heap STRING
-    /// jsval. This is the key-table iteration primitive `for-in` desugars
-    /// to (and that `Object.keys` / `JSON.stringify` reuse): a counted
-    /// loop over `0 <= index < StrLen(obj)` reads each key through this node.
-    /// Dispatches at RUNTIME on `obj`'s TYPE BYTE: an object
-    /// (`TYPE_OBJECT`) returns the key heap-string jsval already stored at entry
-    /// `index` (`ptr + HEADER_SIZE + 4 + 16*index`), in insertion order; anything
-    /// else (an array, or a string) treats `index` as a numeric position and
-    /// yields its decimal string form (`"0"`, `"1"`, ..) via the host `__convert`
-    /// to-string op, matching JS `for-in` index keys. `index` is a number jsval
-    /// assumed in range (the loop bounds it against the length).
-    ObjectKey {
-        /// The object/array being iterated (a heap-pointer jsval).
-        obj: Box<IrNode>,
-        /// The position of the key to read (a number jsval, `0..length`).
-        index: Box<IrNode>,
-    },
-    /// An `Object.keys/values/entries(arg)` collection built-in call. The
-    /// `arg` object is evaluated once to a heap-object jsval, then a runtime helper
-    /// (`__obj_keys`/`__obj_values`/`__obj_entries`) linear-scans its key table —
-    /// skipping the reserved hidden `@@`-prefixed keys — and builds a fresh growable
-    /// array of the keys, the values, or `[key, value]` pairs, returned as a heap
-    /// jsval.
+    /// An `Object.keys/values/entries(arg)` collection built-in call (or the
+    /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
+    /// `__own_keys` (`__for_in_keys`), which builds a fresh array in own-key
+    /// order (2.6), returned as a heap jsval.
     ObjectBuiltin {
         /// Which `Object.*` collection method this call performs.
         op: ObjectBuiltinOp,
@@ -931,9 +956,8 @@ pub enum IrNode {
         arg: Box<IrNode>,
     },
     /// A `key in obj` membership test, yielding a `true`/`false` jsval. Both
-    /// operands are evaluated once to heap jsvals; a runtime helper (`__obj_has`)
-    /// linear-scans `obj`'s own key table for a key whose byte content equals the
-    /// `key` heap-string (own keys only — the prototype chain is NOT walked).
+    /// operands are evaluated once; the key is converted with `ToPropertyKey` and
+    /// `__has` looks it up on `obj` and then its prototype chain.
     ObjectHas {
         /// The property-key operand (a heap-string jsval).
         key: Box<IrNode>,
@@ -944,8 +968,8 @@ pub enum IrNode {
     /// jsval. `value` is evaluated once and — via a runtime OBJECT type-byte
     /// guard — a non-heap or non-object operand (number, string, array, `Map`,
     /// …) yields `false` without trapping. For an object, `kind` selects the
-    /// test: a user class compares the receiver's `@@prototype` against the
-    /// class's; a builtin error checks the hidden [`crate::abi::ERROR_KIND_KEY`]
+    /// test: a user class walks the receiver's `proto` chain for the class's
+    /// prototype; a builtin error checks the hidden [`crate::abi::ERROR_KIND_KEY`]
     /// brand. The right-hand side is restricted at lowering to a user class or
     /// one of the three builtin error constructors (no general prototype-chain
     /// `instanceof`).
@@ -955,11 +979,9 @@ pub enum IrNode {
         /// What the right-hand side names.
         kind: InstanceOfKind,
     },
-    /// A `delete obj.k` property removal, always yielding a `true` jsval.
-    /// Both operands are evaluated once to heap jsvals; a runtime helper
-    /// (`__obj_delete`) linear-scans `obj`'s own key table for the `key`
-    /// heap-string and, on a match, compacts the entry out (shifts the trailing
-    /// entries down and decrements the `n` header) so a later read yields
+    /// A `delete obj.k` property removal, yielding a `true` jsval. Both operands
+    /// are evaluated once; `__delete` tombstones the own property (a
+    /// non-configurable one throws a `TypeError`), so a later read yields
     /// `undefined`, `in` yields `false`, and every enumerator skips it.
     ObjectDelete {
         /// The object owning the property (a heap-object jsval).
@@ -972,8 +994,7 @@ pub enum IrNode {
     /// `arg` value is evaluated once and serialized entirely in-wasm by a recursive
     /// runtime helper (`__json_str`): numbers/booleans/`null` render literally
     /// (non-finite numbers as `"null"`), strings are quoted + escaped, arrays and
-    /// objects recurse (object keys use the runtime key table, skipping reserved
-    /// `@@`-prefixed keys; `undefined`/function values are omitted as object values
+    /// objects recurse (own enumerable keys in own-key order; `undefined`/function values are omitted as object values
     /// and become `"null"` as array elements). Number formatting reuses the
     /// existing `__convert` host import (no NEW host import). See [`IrNode::JsonParse`]
     /// for the inverse.
@@ -984,11 +1005,8 @@ pub enum IrNode {
     /// A `JSON.parse(text)` call. `arg` is
     /// coerced to a string (via the `__convert` `ToString` import) and handed to
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
-    /// guest value tree — including OBJECTS with **runtime-unknown keys**, built by
-    /// allocating a fresh entry table sized to the parsed member count (the
-    /// fixed-shape object model only blocks *mutating* keys via `__obj_set`, not
-    /// allocating a fresh object; and every consumer matches keys by byte content,
-    /// so runtime heap-string keys resolve against interned literal keys). Malformed
+    /// guest value tree — including OBJECTS with runtime-unknown keys, each
+    /// member interned and defined through `__define`. Malformed
     /// input throws a branded `Error` (`.name` `SyntaxError`). The optional reviver
     /// argument is unsupported and rejected at codegen.
     JsonParse {
@@ -1294,6 +1312,33 @@ pub struct IrFunction {
     /// body is a `switch (gen.state)` dispatch over these `GenSegment`s rather
     /// than [`Self::body`]. `None` for every ordinary function.
     pub machine: Option<Vec<GenSegment>>,
+    /// The function object's static facts (its `name`, `length`, and kind).
+    pub info: FnInfo,
+}
+
+/// The static facts of a function object, laid into the `__fn_info` table
+/// and its block's header `flags`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FnInfo {
+    /// The `name` property (`""` for an anonymous function).
+    pub name: String,
+    /// The `length` property: the parameters before the first default or rest.
+    pub length: u32,
+    /// What the function constructs.
+    pub kind: FnKind,
+}
+
+/// Whether a function is a constructor (design 4.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FnKind {
+    /// Not a constructor: arrows, methods, accessors, generators, async
+    /// functions, and internal functions. No `prototype`.
+    #[default]
+    Plain,
+    /// A `function` declaration or expression: materializes a `prototype`.
+    Constructor,
+    /// A class constructor: its `prototype` is defined by the class.
+    Class,
 }
 
 /// One basic block of a generator state machine: a run of
@@ -1360,6 +1405,25 @@ pub struct IrProgram {
 }
 
 impl IrNode {
+    /// A branded error object `{ name, message, stack }` plus the non-enumerable
+    /// [`crate::abi::ERROR_KIND_KEY`] brand `kind` — the shape every builtin and
+    /// engine-raised error shares.
+    pub(crate) fn error_object(name: IrNode, message: IrNode, stack: IrNode, kind: f64) -> Self {
+        Self::Object {
+            entries: vec![
+                (PropKey::Static("name".to_owned()), name),
+                (PropKey::Static("message".to_owned()), message),
+                (PropKey::Static("stack".to_owned()), stack),
+                (
+                    PropKey::Hidden(crate::abi::ERROR_KIND_KEY.to_owned()),
+                    IrNode::Num(kind),
+                ),
+            ],
+            proto: None,
+            reserve: 0,
+        }
+    }
+
     /// Whether `f` holds for any DIRECT child expression. Exhaustive over every
     /// variant (no wildcard), so a new variant must classify its children before
     /// the tree walkers built on this compile.
@@ -1380,6 +1444,7 @@ impl IrNode {
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
+            | IrNode::DeclFunc(_)
             | IrNode::DateNow => false,
             IrNode::Assign { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -1425,7 +1490,6 @@ impl IrNode {
                 init: None,
                 ..
             }
-            | IrNode::ObjectKey { obj: a, index: b }
             | IrNode::ObjectHas { key: a, obj: b }
             | IrNode::ObjectDelete { obj: a, key: b }
             | IrNode::PromiseFinally {
@@ -1475,12 +1539,24 @@ impl IrNode {
                 args,
                 ..
             } => f(instance) || f(ctor) || args.iter().any(f),
-            IrNode::Object(entries) => entries.iter().any(|(_, value)| f(value)),
+            IrNode::Object { entries, proto, .. } => {
+                proto.as_deref().is_some_and(&mut f)
+                    || entries.iter().any(|(key, value)| {
+                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
+                    })
+            }
+            IrNode::DefineProps { obj, entries, .. } => {
+                f(obj)
+                    || entries.iter().any(|(key, value)| {
+                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
+                    })
+            }
             IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
                 SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
             }),
             IrNode::CallSpread { target, args } => {
-                matches!(target, SpreadCallee::Indirect(callee) if f(callee)) || f(args)
+                matches!(target, SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } if f(callee))
+                    || f(args)
             }
         }
     }
@@ -1505,6 +1581,7 @@ impl IrNode {
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
+            | IrNode::DeclFunc(_)
             | IrNode::DateNow => Vec::new(),
             IrNode::Assign { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -1550,7 +1627,6 @@ impl IrNode {
                 init: None,
                 ..
             }
-            | IrNode::ObjectKey { obj: a, index: b }
             | IrNode::ObjectHas { key: a, obj: b }
             | IrNode::ObjectDelete { obj: a, key: b }
             | IrNode::PromiseFinally {
@@ -1612,7 +1688,26 @@ impl IrNode {
                 .into_iter()
                 .chain(args.iter_mut())
                 .collect(),
-            IrNode::Object(entries) => entries.iter_mut().map(|(_, value)| value).collect(),
+            IrNode::Object { entries, proto, .. } => {
+                let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
+                for (key, value) in entries {
+                    if let PropKey::Computed(key) = key {
+                        out.push(key);
+                    }
+                    out.push(value);
+                }
+                out
+            }
+            IrNode::DefineProps { obj, entries, .. } => {
+                let mut out: Vec<&mut IrNode> = vec![&mut **obj];
+                for (key, value) in entries {
+                    if let PropKey::Computed(key) = key {
+                        out.push(key);
+                    }
+                    out.push(value);
+                }
+                out
+            }
             IrNode::ArraySpread(elems) => elems
                 .iter_mut()
                 .map(|elem| match elem {
@@ -1621,7 +1716,7 @@ impl IrNode {
                 .collect(),
             IrNode::CallSpread { target, args } => {
                 let mut out = Vec::new();
-                if let SpreadCallee::Indirect(callee) = target {
+                if let SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } = target {
                     out.push(&mut **callee);
                 }
                 out.push(&mut **args);
