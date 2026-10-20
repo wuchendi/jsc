@@ -620,8 +620,9 @@ impl LowerCtx<'_> {
     /// enclosing bindings the body references. An expression body (`=> expr`)
     /// desugars to `return expr`; a block body (`=> { .. }`) lowers its statements
     /// directly. Single-parameter (`x => ..`) and parenthesized zero/multi-parameter
-    /// forms all lower the same way. Arrows carry no `this`/`arguments`, and are
-    /// not constructors. `name` is the inferred `name` (`""` when anonymous).
+    /// forms all lower the same way. Arrows read the enclosing function's
+    /// `new.target`/`arguments`, and are not constructors. `name` is the
+    /// inferred `name` (`""` when anonymous).
     pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr, name: &str) -> anyhow::Result<IrNode> {
         // `async`/generator arrows are out of scope: reject rather than
         // silently compile the body as a plain arrow (wrong result).

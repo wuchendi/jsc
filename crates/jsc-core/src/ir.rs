@@ -702,8 +702,8 @@ pub enum IrNode {
         /// The prototype link (a class instance's or derived prototype's
         /// parent, an error's kind prototype).
         proto: Option<Box<IrNode>>,
-        /// The `class` byte ([`crate::abi::CLASS_ORDINARY`] or
-        /// [`crate::abi::CLASS_ERROR`]).
+        /// The `class` byte ([`crate::abi::CLASS_ORDINARY`],
+        /// [`crate::abi::CLASS_ERROR`] or [`crate::abi::CLASS_ARGUMENTS`]).
         class: u8,
         /// Extra table capacity to reserve beyond the entries (a class
         /// instance's field-scan count).
