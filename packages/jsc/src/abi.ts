@@ -29,7 +29,7 @@ export const HEADER_SIZE = 4
 
 /** TYPE BYTE of a heap string block: `[type=0][pad×3][len:u32][utf8]`. */
 export const TYPE_STRING = 0
-/** TYPE BYTE of a heap array block: `[type=1][pad×3][len:u32][elem:i64 × len]`. */
+/** TYPE BYTE of an array handle (prefix, then `len:u32`, `elems:u32` → its element store). */
 export const TYPE_ARRAY = 1
 /** TYPE BYTE of an ordinary object block: the object-family prefix; properties live in its `props` table. */
 export const TYPE_OBJECT = 2
@@ -106,6 +106,12 @@ export const GEN_DONE_OFFSET = OBJ_PREFIX_SIZE + 8
 export const DATE_MS_OFFSET = OBJ_PREFIX_SIZE
 /** Byte offset of the object-family prefix's `proto:i64` jsval slot. */
 export const OBJ_PROTO_OFFSET = 8
+/** Byte offset (from an array handle base) of the `length` (`u32`). */
+export const ARRAY_LEN_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset (from an array handle base) of its element store base (`u32`, `0` when the capacity is 0). */
+export const ARRAY_ELEMS_OFFSET = OBJ_PREFIX_SIZE + 4
+/** Byte offset (from an element store base) of element 0; element `i` is at `+ 8 * i`. */
+export const ELEMS_DATA_OFFSET = 8
 /** Byte offset (from a {@link TYPE_FUNCTION} block base) of the funcref-table index (`u32`). */
 export const FUNC_INDEX_OFFSET = OBJ_PREFIX_SIZE
 /** {@link TYPE_FUNCTION} `flags` bit: the function is a class constructor. */

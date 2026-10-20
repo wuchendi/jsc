@@ -528,11 +528,10 @@ pub(super) fn emit_json_stringify_node(
 }
 
 /// Emit a `new Map()` / `new Set()` construction, leaving the fresh handle
-/// jsval on the stack. Two blocks are bump-allocated: an empty growable backing
-/// array (`TYPE_ARRAY`, len 0) and the handle itself (`TYPE_MAP`/`TYPE_SET`), whose
-/// `size` header starts at 0 and whose `entries` slot holds the backing array's
-/// heap jsval. The handle jsval never moves afterward — growth reallocs the backing
-/// and rewrites the `entries` slot in place.
+/// jsval on the stack. Two blocks are allocated: an empty backing array
+/// (`__new_array(0)`, grown in place) and the handle itself
+/// (`TYPE_MAP`/`TYPE_SET`), whose `size` header starts at 0 and whose `entries`
+/// slot holds the backing array's heap jsval.
 pub(super) fn emit_map_new_node(
     set: bool,
     function: &mut Function,
@@ -541,16 +540,6 @@ pub(super) fn emit_map_new_node(
 ) {
     let dst = scratch + 3;
     let earr = scratch + 7;
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
     let size_slot = MemArg {
         offset: MAP_SIZE_OFFSET,
         align: 2,
@@ -562,16 +551,10 @@ pub(super) fn emit_map_new_node(
         memory_index: 0,
     };
 
-    // Empty backing array: __alloc(HEADER_SIZE + 4); TYPE_ARRAY byte; len = 0.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::Call(helpers.alloc));
-    function.instruction(&Instruction::LocalSet(earr));
-    function.instruction(&Instruction::LocalGet(earr));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(type_byte));
-    function.instruction(&Instruction::LocalGet(earr));
+    // Empty backing array: __new_array(0).
     function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::Call(helpers.new_array()));
+    function.instruction(&Instruction::LocalSet(earr));
 
     // Handle: __alloc(MAP_BLOCK_SIZE); object prefix; size = 0;
     // entries = rebox(earr).
@@ -1440,11 +1423,12 @@ pub(super) fn emit_object_rest_node(
 
 /// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for the
 /// heap array/string in `s0` (`0 <= idx < len`, `trunc(idx) == idx`), else `0`.
-/// The length is the u32 header at `+HEADER_SIZE`, shared by arrays and strings.
+/// The length is the u32 at `+len_offset` ([`ARRAY_LEN_OFFSET`] for an array,
+/// [`HEADER_SIZE`] for a string).
 /// The compares run on `f64`, where every non-number jsval (a boxed tag) and the
 /// canonical NaN read as NaN and so fail all three — a string key or `NaN`
 /// is never mistaken for index `0`.
-fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
+fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32, len_offset: u64) {
     let key_f64 = |function: &mut Function| {
         function.instruction(&Instruction::LocalGet(s1));
         function.instruction(&Instruction::F64ReinterpretI64);
@@ -1458,7 +1442,7 @@ fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: len_offset,
         align: 2,
         memory_index: 0,
     }));
@@ -1519,11 +1503,6 @@ fn emit_index_string_key(
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
-}
-
-/// Push the length header of the array/string in `s0` as a number jsval.
-fn emit_len_boxed(function: &mut Function, s0: u32) {
-    emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
 }
 
 /// Push the u32 field at byte `offset` of the block whose jsval is in `s0`,
@@ -1672,29 +1651,26 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::I32Const(TYPE_ARRAY));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // ARRAY: `"length"` reads the header; otherwise an out-of-bounds or
-    // non-index key yields `undefined`, and an in-range index loads the i64
-    // element jsval at ptr + HEADER_SIZE + 4 + 8*i. The loaded value is already a
-    // boxed jsval, so it is returned as-is.
+    // ARRAY: `"length"` reads the handle's length; otherwise an out-of-bounds
+    // or non-index key yields `undefined`, and an in-range index loads the i64
+    // element jsval at elems + 8 + 8*i. The loaded value is already a boxed
+    // jsval, so it is returned as-is.
     emit_index_string_key(function, s1, scratch, strings, helpers);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    emit_len_boxed(function, s0);
+    emit_u32_field_boxed(function, s0, ARRAY_LEN_OFFSET);
     function.instruction(&Instruction::Else);
-    emit_index_in_bounds(function, s0, s1);
+    emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
+    emit_array_elems(function);
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::I32TruncSatF64U);
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
@@ -1710,9 +1686,9 @@ fn emit_index_dynamic(
     // `__str_index` (reboxed as a heap jsval).
     emit_index_string_key(function, s1, scratch, strings, helpers);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    emit_len_boxed(function, s0);
+    emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
     function.instruction(&Instruction::Else);
-    emit_index_in_bounds(function, s0, s1);
+    emit_index_in_bounds(function, s0, s1, HEADER_SIZE as u64);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     emit_str_index_boxed(function, s0, s1, helpers);
     function.instruction(&Instruction::Else);
@@ -1824,8 +1800,8 @@ pub(super) fn emit_index_set_node(
 
 /// Emit the array arm of [`emit_index_set_node`] for the array in `s0`. A number
 /// key `k` that is a non-negative integer (`k >= 0` and `k - trunc(k) == 0`,
-/// false for `NaN`/`±Infinity`) stores the element at `ptr + HEADER_SIZE + 4 +
-/// 8*k` when `k < length`, else raises the grow `TypeError`. Any other key
+/// false for `NaN`/`±Infinity`) stores the element at `elems + 8 + 8*k` when
+/// `k < length`, else raises the grow `TypeError`. Any other key
 /// raises the named-array-property `TypeError` naming `String(key)` (S2 owns
 /// array properties). The key reinterpretation is pure, so a non-number key
 /// reads no memory. The caller tracks the enclosing dispatch frame.
@@ -1855,35 +1831,27 @@ fn emit_index_set_array(
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    // key < length (the u32 header at `ptr + HEADER_SIZE`).
+    // key < length.
     key_f64(function);
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::F64Lt);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    // In bounds: store the element jsval at ptr + HEADER_SIZE + 4 + 8*i (the
-    // header offset folded into the store's MemArg). Mirrors `emit_index_node`'s
-    // array arm.
+    // In bounds: store the element jsval at elems + 8 + 8*i. Mirrors
+    // `emit_index_node`'s array arm.
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
+    emit_array_elems(function);
     key_f64(function);
     function.instruction(&Instruction::I32TruncSatF64U);
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(sval));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Store(elem_slot(0)));
     function.instruction(&Instruction::Else);
     emit_prop_throw_call(function, s0, s1, PROP_THROW_GROW, helpers);
     leave_frame(helpers);

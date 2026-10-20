@@ -89,6 +89,60 @@ fn array_push_pop_via_eval() {
     assert_eq!(jsc(&["-p", "let a=[1,2]; a.push(3); a"]), "[ 1, 2, 3 ]");
 }
 
+/// `push`/`pop` mutate the array in place: every alias observes the change.
+#[test]
+fn array_push_pop_mutate_in_place() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1]; let b = a; a.push(2); console.log(b.length, b[1])"
+        ]),
+        "2 2",
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let a = [1, 2]; let b = a; a.pop(); console.log(b.length, b)"
+        ]),
+        "1 [ 1 ]",
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { xs: [] }; let a = o.xs; a.push(5); console.log(o.xs)"
+        ]),
+        "[ 5 ]",
+    );
+}
+
+/// Pushing past several capacity doublings keeps every element and the length;
+/// `pop` after growth shrinks in place and a later `push` reuses the slot.
+#[test]
+fn array_push_growth_keeps_elements() {
+    let src = "let a = []; for (let i = 1; i <= 100; i++) a.push(i); \
+               let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; \
+               console.log(a.length, s, a[0], a[63], a[99]); \
+               console.log(a.pop(), a.length); a.push(7); console.log(a.length, a[99]);";
+    assert_eq!(jsc(&["-e", src]), "100 5050 1 64 100\n100 99\n100 7");
+    let src = "let a = [1, 2, 3]; for (let i = 0; i < 20; i++) a.push(a.length); \
+               console.log(a.length, a[2], a[3], a[22]);";
+    assert_eq!(jsc(&["-e", src]), "23 3 3 22");
+}
+
+/// Builders that grow a fresh array (filter, spread, concat of several
+/// sources, generator spread, string split, slice) keep every element.
+#[test]
+fn array_builders_after_growth() {
+    let src = "let a = []; for (let i = 0; i < 50; i++) a.push(i); \
+               let f = a.filter(x => x % 2 == 0); \
+               let s = [...a, ...f, -1]; \
+               function* g() { for (let i = 0; i < 40; i++) yield i; } \
+               let gs = [...g()]; \
+               console.log(f.length, f[24], s.length, s[50], s[75], gs.length, gs[39]); \
+               console.log(\"a,b,c,d,e,f,g\".split(\",\").length, a.slice(10, 45).length);";
+    assert_eq!(jsc(&["-e", src]), "25 48 76 0 -1 40 39\n7 35");
+}
+
 /// Array higher-order methods `map`/`filter`/`reduce`/`forEach` end-to-end
 /// through the CLI: callbacks invoke per element via the `call_indirect` ABI,
 /// closures capturing an outer binding mutate it, and results chain.

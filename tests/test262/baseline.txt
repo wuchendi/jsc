@@ -4798,6 +4798,7 @@ language/statements/for-in/var-arguments-strict-init.js
 language/statements/for-in/var-arguments-strict.js
 language/statements/for-in/var-eval-strict-init.js
 language/statements/for-in/var-eval-strict.js
+language/statements/for-of/array-contract-expand.js
 language/statements/for-of/array-expand-contract.js
 language/statements/for-of/body-dstr-assign.js
 language/statements/for-of/break-from-catch.js
