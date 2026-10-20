@@ -231,3 +231,34 @@ it('renders object-family values like the Rust host', async () => {
     '[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function (anonymous)] } ]',
   )
 })
+
+it('renders dictionary objects like the Rust host', async () => {
+  const cases: [string, string][] = [
+    [
+      'class A { constructor(){ this.x = 1 } m(){} } let a = new A(); for (const k in a) console.log(k); console.log(Object.keys(a), JSON.stringify(a), a)',
+      'x\n[ x ] {"x":1} { x: 1 }\n',
+    ],
+    ['let n = 5; console.log(n.x, true.y)', 'undefined undefined\n'],
+    [
+      "class A { m(){} } console.log('m' in new A(), Object.keys({b:1, 2:1, a:1, 1:1}))",
+      'true [ 1, 2, b, a ]\n',
+    ],
+    [
+      'let o = {}; o.x = 1; o.y = 2; delete o.x; o.z = 3; console.log(o)',
+      '{ y: 2, z: 3 }\n',
+    ],
+    [
+      "let k = 'a' + 'b'; let o = { ab: 1 }; o[1] = 2; console.log(o[k], k in o, o['1'], o)",
+      '1 true 2 { 1: 2, ab: 1 }\n',
+    ],
+    [
+      "let k = 'c'; let o = {[k]: 1, 2.5: 'b', 1: 'a'}; console.log(Object.entries(o), o)",
+      '[ [ 1, a ], [ c, 1 ], [ 2.5, b ] ] { 1: a, c: 1, 2.5: b }\n',
+    ],
+    [
+      "console.log(new TypeError('boom'), [new Error()], Object.keys({'@x': 1}))",
+      'TypeError: boom [ Error ] [ @x ]\n',
+    ],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
+})

@@ -282,8 +282,8 @@ impl LowerCtx<'_> {
     /// `this`-binding), and a single shared PROTOTYPE object holding the methods,
     /// allocated once here. The class's instance shape — the
     /// field names the constructor assigns via `this.<field> = ..` — is registered
-    /// in [`Shared::classes`] so a later `new A(args)` can pre-slot the instance,
-    /// since the object model has no dynamic key growth. The instance shape is the
+    /// in [`Shared::classes`] so a later `new A(args)` can pre-size the instance's
+    /// property table. The instance shape is the
     /// UNION of the constructor's `this.<field> = ..` assignments and the class's
     /// instance FIELD declarations, whose initializers run before the
     /// constructor body (see the field-desugar below).
@@ -435,8 +435,8 @@ impl LowerCtx<'_> {
             None => Vec::new(),
         };
         // A derived class inherits the parent's instance fields (prepended, so the
-        // shape is parent-then-own): `new C()` must pre-slot every field the whole
-        // constructor chain assigns, since the object model has no dynamic growth.
+        // list is parent-then-own): `new C()` pre-sizes the instance's property
+        // table for every field the whole constructor chain assigns.
         let own_fields = collect_instance_fields(&combined_stmts);
         let fields = match &parent {
             Some(p) => {
@@ -473,7 +473,7 @@ impl LowerCtx<'_> {
         // The constructor value. A derived class WITHOUT its own constructor reuses
         // the parent's constructor directly (an implicit `constructor(...a){ super(...a) }`):
         // reading `Parent["@@constructor"]` forwards the arguments and sets the parent's
-        // fields on the pre-slotted instance. A subclass that declares fields but no
+        // fields on the instance. A subclass that declares fields but no
         // constructor would need the fields initialized too, which the alias skips, so
         // it must declare a constructor that calls `super()`.
         let ctor_value = if let Some(p) = &parent
@@ -496,10 +496,8 @@ impl LowerCtx<'_> {
         // Lower each instance method to a first-class function value that
         // reads `this` through the `this`-binding machinery, exactly like the constructor.
         // They are stored ONCE, on the class's single shared prototype object,
-        // under the method name — never copied per instance. Pre-slotting the
-        // prototype with one entry per method name (the `IrNode::Object` shape)
-        // lets `__obj_set` write them and lets `new`'s prototype fallback read
-        // them, since the object model has no dynamic key growth.
+        // under the method name as a non-enumerable property — never copied per
+        // instance; an instance reaches them through its `proto` slot.
         let mut proto_entries = Vec::with_capacity(methods.len());
         for m in methods {
             let f = m.function.as_ref();
@@ -509,17 +507,17 @@ impl LowerCtx<'_> {
                 .ok_or_else(|| anyhow!("class method requires a body"))?;
             let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
             let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            proto_entries.push((prop_key_name(&m.key)?, value));
+            proto_entries.push((PropKey::Hidden(prop_key_name(&m.key)?), value));
         }
         // Instance accessors (P2b): a `get x(){}` / `set x(v){}` pair sharing the
         // property name `x` collapses to ONE `TYPE_ACCESSOR` box stored on the
-        // prototype under `x`. Each half is an ordinary lifted function (a getter
+        // prototype as the accessor property `x`. Each half is an ordinary lifted function (a getter
         // takes no params; a setter takes one) that reads `this`/`super` exactly
         // like a method, so they are lowered here inside the same `current_super`
-        // region. A member read/write that resolves to the box invokes the getter /
-        // setter (see `emit_index_node` / `emit_index_set_node`); a missing half is
-        // pre-slotted `undefined` (reading a set-only property yields `undefined`;
-        // assigning a get-only property is a silent no-op).
+        // region. A member read/write that resolves to the accessor invokes the
+        // getter / setter (`__get` / `__set`); a missing half is `undefined`
+        // (reading a set-only property yields `undefined`; assigning a get-only
+        // property throws a `TypeError`).
         let mut accessor_names: Vec<String> = Vec::new();
         let mut accessor_get: Vec<IrNode> = Vec::new();
         let mut accessor_set: Vec<IrNode> = Vec::new();
@@ -552,23 +550,25 @@ impl LowerCtx<'_> {
             .zip(accessor_set)
         {
             proto_entries.push((
-                name,
+                PropKey::Hidden(name),
                 IrNode::MakeAccessor {
                     getter: Box::new(getter),
                     setter: Box::new(setter),
                 },
             ));
         }
-        // A derived class links its shared prototype to the parent's prototype under
-        // the reserved `@@prototype` key, so `__obj_get`'s prototype-fallback recursion
-        // walks the whole chain: an instance's `obj.m` misses the subclass prototype's
-        // own entries, then follows this link to resolve an inherited method. This is
-        // ALSO the chain `instanceof` walks.
-        if let Some(p) = &parent {
-            let parent_proto =
-                self.class_member_read(p, parent_span, crate::abi::CLASS_PROTOTYPE_KEY)?;
-            proto_entries.push((crate::abi::CLASS_PROTOTYPE_KEY.to_owned(), parent_proto));
-        }
+        // A derived class links its shared prototype's `proto` slot to the parent's
+        // prototype, so `__get`'s chain walk resolves an inherited method: an
+        // instance's `obj.m` misses the subclass prototype's own entries, then
+        // follows this link. This is ALSO the chain `instanceof` walks.
+        let proto_link = match &parent {
+            Some(p) => Some(Box::new(self.class_member_read(
+                p,
+                parent_span,
+                crate::abi::CLASS_PROTOTYPE_KEY,
+            )?)),
+            None => None,
+        };
 
         // Lower the static members onto the class VALUE itself (not the prototype),
         // so `C.m()` / `C.f` read them directly off the class object. A static method
@@ -579,7 +579,7 @@ impl LowerCtx<'_> {
         // derived class (the class value has no constructor-side prototype link), and
         // a static initializer that references the class or `this` is a documented gap
         // (the class binding is not yet set while the class value is being built).
-        let mut static_entries: Vec<(String, IrNode)> = Vec::new();
+        let mut static_entries: Vec<(PropKey, IrNode)> = Vec::new();
         for m in static_methods {
             let f = m.function.as_ref();
             let body = f
@@ -588,28 +588,26 @@ impl LowerCtx<'_> {
                 .ok_or_else(|| anyhow!("static class method requires a body"))?;
             let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
             let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            static_entries.push((prop_key_name(&m.key)?, value));
+            static_entries.push((PropKey::Hidden(prop_key_name(&m.key)?), value));
         }
         // A static field whose initializer is a SIMPLE literal (`static x = 1`) is
         // evaluated inline in the class value. Any other initializer may reference
         // the class, an earlier static, or `this` — none of which exist while the
-        // class value is being built — so it is PRE-SLOTTED `undefined` here and
-        // assigned AFTER the class binding is created (`C.<key> = <init>`), in source
-        // declaration order, so a later static observes earlier ones. An
-        // uninitialized `static f;` is plain `undefined`.
+        // class value is being built — so it is assigned AFTER the class binding is
+        // created (`C.<key> = <init>`, adding the property), in source declaration
+        // order, so a later static observes earlier ones (and a same-named static
+        // method stays readable until then). An uninitialized `static f;` is plain
+        // `undefined`.
         let mut deferred_statics: Vec<(String, &Expr)> = Vec::new();
         for p in static_fields {
             let key = prop_key_name(&p.key)?;
             match &p.value {
                 Some(v) if matches!(v.as_ref(), Expr::Lit(_)) => {
                     let value = self.lower_expr(v)?;
-                    static_entries.push((key, value));
+                    static_entries.push((PropKey::Static(key), value));
                 }
-                Some(v) => {
-                    static_entries.push((key.clone(), IrNode::Undefined));
-                    deferred_statics.push((key, v));
-                }
-                None => static_entries.push((key, IrNode::Undefined)),
+                Some(v) => deferred_statics.push((key, v)),
+                None => static_entries.push((PropKey::Static(key), IrNode::Undefined)),
             }
         }
 
@@ -619,16 +617,28 @@ impl LowerCtx<'_> {
 
         // The class value: a heap object holding the constructor function, the single
         // shared prototype object (populated with the instance methods), and any
-        // static members appended directly.
+        // static members appended directly. The two reserved keys are
+        // non-enumerable, so they never surface in enumeration or rendering.
         let mut class_entries = vec![
-            (crate::abi::CLASS_CONSTRUCTOR_KEY.to_owned(), ctor_value),
             (
-                crate::abi::CLASS_PROTOTYPE_KEY.to_owned(),
-                IrNode::Object(proto_entries),
+                PropKey::Hidden(crate::abi::CLASS_CONSTRUCTOR_KEY.to_owned()),
+                ctor_value,
+            ),
+            (
+                PropKey::Hidden(crate::abi::CLASS_PROTOTYPE_KEY.to_owned()),
+                IrNode::Object {
+                    entries: proto_entries,
+                    proto: proto_link,
+                    reserve: 0,
+                },
             ),
         ];
         class_entries.extend(static_entries);
-        let class_value = IrNode::Object(class_entries);
+        let class_value = IrNode::Object {
+            entries: class_entries,
+            proto: None,
+            reserve: 0,
+        };
 
         // Emit the binding (declared above). When the name is captured, allocate the
         // cell empty first and store the class value into it, so the ctor/method
@@ -1825,17 +1835,16 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a `for (const k in EXPR) body` over an object's own enumerable keys,
-    /// desugared to a counted index loop lowered to [`IrStmt::While`] — the
-    /// same shape as [`Self::lower_for_of`], but the loop binding is each KEY (a
-    /// heap STRING) rather than each element. `EXPR` is evaluated ONCE into a temp
-    /// local, its key count cached ONCE ([`IrNode::StrLen`] reads the u32 header,
-    /// which is the entry count for an object and the length for an array/string),
-    /// and an index counter walks `0..count`. Each iteration binds a fresh
-    /// block-scoped local to [`IrNode::ObjectKey`] at the current index — the key
-    /// heap-string for an object (insertion order), or the decimal index string
-    /// (`"0"`, `"1"`, ..) for an array/string — as the FIRST body statement (so a
-    /// captured binding gets a fresh cell per iteration, like a `let`). The index
+    /// Lower a `for (const k in EXPR) body` over the enumerable string keys of an
+    /// object and its prototype chain, desugared to a counted index loop lowered
+    /// to [`IrStmt::While`] — the same shape as [`Self::lower_for_of`] over the key
+    /// snapshot. `EXPR` is evaluated ONCE and its keys snapshotted ONCE into a
+    /// fresh array ([`ObjectBuiltinOp::ForInKeys`]: own keys in own-key order, then
+    /// each prototype's not-yet-seen keys; the decimal index strings for an
+    /// array/string), its length cached, and an index counter walks `0..count`.
+    /// Each iteration binds a fresh block-scoped local to the key at the current
+    /// index as the FIRST body statement (so a captured binding gets a fresh cell
+    /// per iteration, like a `let`). The index
     /// increment lives in the loop's `update` slot so a `continue` still advances it
     /// (mirroring [`Self::lower_for`]); the `for-in` head opens a lexical scope, so
     /// the binding is not visible after the loop.
@@ -1892,8 +1901,11 @@ impl LowerCtx<'_> {
 
         self.push_scope();
         let result = (|| {
-            // Evaluate the operand ONCE into a temp, then cache its key count ONCE.
-            let iter = self.lower_expr(&for_in.right)?;
+            // Snapshot the operand's keys ONCE into a temp, then cache the count.
+            let iter = IrNode::ObjectBuiltin {
+                op: ObjectBuiltinOp::ForInKeys,
+                arg: Box::new(self.lower_expr(&for_in.right)?),
+            };
             let iter_local = self.fresh();
             out.push(IrStmt::Decl {
                 local: iter_local,
@@ -1922,7 +1934,7 @@ impl LowerCtx<'_> {
             self.breakable_inc();
             self.loopable_inc();
             let mut body = Vec::new();
-            let key = IrNode::ObjectKey {
+            let key = IrNode::Index {
                 obj: Box::new(IrNode::Local(iter_local)),
                 index: Box::new(IrNode::Local(idx_local)),
             };
@@ -2159,10 +2171,8 @@ fn field_init_stmt(prop: &ClassProp) -> anyhow::Result<Stmt> {
 }
 
 /// Collect the instance field names a constructor assigns via `this.<name> = ..`,
-/// in first-seen order with duplicates removed. The object model cannot
-/// grow keys at runtime, so `new` must pre-slot exactly these fields on the fresh
-/// instance (a superset is harmless — surplus slots read back `undefined`, which
-/// is the correct JS value for an unset field). The scan walks the constructor's
+/// in first-seen order with duplicates removed: `new` reserves property-table
+/// capacity for them (a miss only costs a table regrowth). The scan walks the constructor's
 /// statements and expressions but does NOT descend into nested `function`/arrow
 /// bodies: a nested `function` rebinds `this`, and an arrow-captured `this.f = ..`
 /// running later is a documented gap.

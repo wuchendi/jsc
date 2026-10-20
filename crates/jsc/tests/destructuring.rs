@@ -160,13 +160,16 @@ fn destructuring_assignment_completion_is_rhs() {
     );
 }
 
-/// Writing an unknown property on a fixed-shape object still throws.
+/// A destructuring assignment to an absent member adds the property.
 #[test]
-fn destructuring_assignment_unknown_member_throws() {
+fn destructuring_assignment_unknown_member_adds_property() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", "const o={a:0}; [o.zz] = [1];"])
+        .args(["-e", "const o={a:0}; [o.zz] = [1]; console.log(o)"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("TypeError"));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "{ a: 0, zz: 1 }"
+    );
 }

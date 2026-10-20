@@ -232,26 +232,29 @@ pub(super) fn emit_node(
             // function/arrow prologue.
             function.instruction(&Instruction::GlobalGet(THIS_GLOBAL));
         }
-        IrNode::Object(entries) => {
-            emit_object_node(entries, function, scratch, strings, helpers);
+        IrNode::Object {
+            entries,
+            proto,
+            reserve,
+        } => {
+            emit_object_node(
+                entries,
+                proto.as_deref(),
+                *reserve,
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
         }
         IrNode::ObjectRest { source, exclude } => {
             emit_object_rest_node(source, exclude, function, scratch, strings, helpers);
         }
         IrNode::Index { obj, index } => {
             emit_index_node(obj, index, true, function, scratch, strings, helpers);
-            // A member/computed read whose object arm resolved (through the
-            // prototype chain) to an accessor box invokes the getter with `this` =
-            // the receiver, which `emit_index_node` leaves in `scratch + 17`.
-            if helpers.has_accessors {
-                emit_accessor_get(function, scratch, helpers);
-            }
         }
         IrNode::MakeAccessor { getter, setter } => {
             emit_make_accessor_node(getter, setter, function, scratch, strings, helpers);
-        }
-        IrNode::ObjectKey { obj, index } => {
-            emit_object_key_node(obj, index, function, scratch, strings, helpers);
         }
         IrNode::ObjectBuiltin { op, arg } => {
             emit_object_builtin_node(*op, arg, function, scratch, strings, helpers);
@@ -534,9 +537,6 @@ pub(super) fn emit_method_call_user(
         strings,
         helpers,
     );
-    if helpers.has_accessors {
-        emit_accessor_get(function, scratch, helpers);
-    }
     // The general i64 scratch slot (+0) is free here: the member read has already
     // left its result on the stack, and nothing below reads +0 before this call.
     let callee_val = scratch;
@@ -588,87 +588,6 @@ pub(super) fn emit_method_call_user(
     });
     // The called method can throw; unwind if it left an exception pending.
     emit_propagate_if_pending(function, helpers);
-}
-
-/// Emit the accessor-get postlude for a member/computed READ: the resolved
-/// value is on top of the stack and the receiver sits in `scratch + 17` (where
-/// [`emit_index_node`] stashed it). If the resolved value is a `TYPE_ACCESSOR`
-/// box, invoke its getter (a zero-argument function value) with `this` = the
-/// receiver and leave the getter's result; a box with no getter (a set-only
-/// property) yields `undefined`. Any non-accessor value passes through unchanged,
-/// so an ordinary data read, array element, or string char is untouched.
-///
-/// Emitted ONLY when the program declares an accessor (`helpers.has_accessors`),
-/// so an accessor-free program keeps byte-identical member-read emission.
-///
-/// The getter is a throwing call, so every enclosing `if` opened here is tracked
-/// with [`enter_frame`]/[`leave_frame`] — a getter that throws inside a `try`
-/// then computes the right handler-relative `br` depth.
-pub(super) fn emit_accessor_get(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
-    // `+18` (the index READ key slot) is free once the object arm has resolved, so
-    // it stashes the resolved value; `+17` still holds the receiver.
-    let val = scratch + 18;
-    let recv = scratch + 17;
-    let getter = scratch;
-    let base = scratch + 7;
-
-    function.instruction(&Instruction::LocalSet(val));
-    emit_is_accessor(function, val);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    enter_frame(helpers);
-    // getter = the getter jsval stored in the box.
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I64Load(MemArg {
-        offset: ACCESSOR_GET_OFFSET,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalSet(getter));
-
-    emit_is_function(function, getter);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    enter_frame(helpers);
-    // Invoke the getter: K padded `undefined` args (it takes none), `this` = the
-    // receiver bound immediately before the indirect call, then the uniform ABI
-    // trailer (env, argc, funcref index) read off the getter's function block.
-    for _ in 0..helpers.max_args {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    }
-    function.instruction(&Instruction::LocalGet(recv));
-    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
-    function.instruction(&Instruction::LocalGet(getter));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(base));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I64Load(MemArg {
-        offset: FUNC_ENV_OFFSET,
-        align: 3,
-        memory_index: 0,
-    }));
-    emit_argc(0, function);
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(MemArg {
-        offset: FUNC_INDEX_OFFSET,
-        align: 2,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::CallIndirect {
-        type_index: helpers.fn_type,
-        table_index: 0,
-    });
-    emit_propagate_if_pending(function, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::Else);
-    // A set-only accessor (no getter): reading yields `undefined`.
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::End);
-
-    leave_frame(helpers);
-    function.instruction(&Instruction::Else);
-    // Not an accessor: the resolved data value itself.
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::End);
 }
 
 /// Emit a `super(args)` / `super.m(args)` call (`IrNode::ThisCall`),
@@ -751,7 +670,7 @@ pub(super) fn emit_this_call(
 /// set to the instance immediately before the `call_indirect`. Unlike a method
 /// call, the constructor's return value is DISCARDED and the instance itself is
 /// the expression's result — so any `this.<field> = ..` the constructor performed
-/// (mutating the pre-slotted instance in place) is observed by the caller.
+/// (adding properties to the instance in place) is observed by the caller.
 pub(super) fn emit_new(
     node: &IrNode,
     function: &mut Function,

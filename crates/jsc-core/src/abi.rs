@@ -88,9 +88,9 @@ pub(crate) const HEADER_SIZE: u32 = 4;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
-/// Header byte 2: the per-kind `flags` byte. Reserved; every block is created
-/// with it 0.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`OBJ_FLAG_NOT_EXTENSIBLE`].
 pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
 
 /// Header byte 3: the `TYPE_OBJECT` sub-`class` byte. Reserved; every block is
@@ -104,12 +104,14 @@ pub(crate) const HEADER_CLASS_OFFSET: u32 = 3;
 pub(crate) const BLOCK_ALIGN: u32 = 8;
 
 /// Byte offset of the object-family prefix's `props: u32` slot (right after the
-/// header): the base of the block's `TYPE_PROPS` own-property table, `0` = no
+/// header): the base of the block's [`TYPE_PROPS`] own-property table, `0` = no
 /// own named properties. Shared by every object-family kind except
-/// [`TYPE_OBJECT`] / [`TYPE_ARRAY`] (which still carry their pre-prefix
-/// layouts); always written 0 until property tables land.
-#[cfg_attr(not(test), allow(dead_code))]
+/// [`TYPE_ARRAY`] (which still carries its pre-prefix layout).
 pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
+
+/// Object-family header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the object
+/// is not extensible, so adding an own property throws a `TypeError`.
+pub(crate) const OBJ_FLAG_NOT_EXTENSIBLE: u8 = 1;
 
 /// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
 /// pointer or [`NULL`]), 8-byte aligned. Every object-family block is created
@@ -139,8 +141,9 @@ pub(crate) const TYPE_STRING: u8 = 0;
 /// `[type=1][pad×3][len:u32][elem:i64 × len]`. Maps to `typeof` "object".
 pub(crate) const TYPE_ARRAY: u8 = 1;
 
-/// TYPE BYTE of a heap object block:
-/// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]`. Maps to `typeof`
+/// TYPE BYTE of an ordinary object block: the object-family prefix alone
+/// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
+/// [`TYPE_PROPS`] table at `props`, its prototype in `proto`. Maps to `typeof`
 /// "object".
 pub(crate) const TYPE_OBJECT: u8 = 2;
 
@@ -276,11 +279,10 @@ pub(crate) const DATE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 /// TYPE BYTE of an **accessor** block (P2b instance getters/setters):
 /// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds a class instance
 /// accessor property's getter and setter FUNCTION VALUES (the `undefined` bits
-/// when a half is absent). The box is stored under the property name on the
-/// class's shared `@@prototype`, so a member READ that resolves (through the
-/// prototype chain) to this box invokes the getter with `this = receiver`, and a
-/// member WRITE invokes the setter. Never a program-visible value — it is always
-/// consumed by the get/set path, so `decode`'s catch-all renders it `undefined`.
+/// when a half is absent). It is the value of an [`ATTR_ACCESSOR`] property
+/// table entry, so `__get` invokes the getter with `this = receiver` and
+/// `__set` the setter. Never a program-visible value; the host decoders render
+/// the property as `[Getter]` / `[Setter]` / `[Getter/Setter]`.
 /// The two i64 payloads land 8-byte aligned at [`ACCESSOR_GET_OFFSET`] /
 /// [`ACCESSOR_SET_OFFSET`]. Maps to no `typeof` (never observed directly).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -296,12 +298,87 @@ pub(crate) const ACCESSOR_GET_OFFSET: u32 = HEADER_SIZE + 4;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const ACCESSOR_SET_OFFSET: u32 = HEADER_SIZE + 12;
 
+/// TYPE BYTE of an own-property table (internal, never a user value), the
+/// block an object-family `props` slot points at:
+/// `[type=12][pad][tflags:u8][pad][count:u32 @4][cap:u32 @8][live:u32 @12]`
+/// followed by `cap` [`PROP_ENTRY_SIZE`]-byte entries
+/// `[key:u32][attrs:u32][value:i64]` from [`PROPS_HEADER_SIZE`]. `key` is an
+/// interned string block base (`0` = a deleted entry's tombstone), `count` the
+/// slots used (tombstones included) and `live` the non-tombstone entries.
+/// Insertion order is slot order; growth copies the live entries into a fresh
+/// table and rewrites the owner's `props`, so the owner handle never moves.
+pub(crate) const TYPE_PROPS: u8 = 12;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the `tflags` byte
+/// ([`PROPS_HAS_INDEX_KEYS`], [`PROPS_HAS_NON_ENUM`]).
+pub(crate) const PROPS_TFLAGS_OFFSET: u32 = 2;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `count`.
+pub(crate) const PROPS_COUNT_OFFSET: u32 = 4;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `cap`.
+pub(crate) const PROPS_CAP_OFFSET: u32 = 8;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `live`.
+pub(crate) const PROPS_LIVE_OFFSET: u32 = 12;
+
+/// The byte size of a [`TYPE_PROPS`] table header; entry `k` starts at
+/// `PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k`.
+pub(crate) const PROPS_HEADER_SIZE: u32 = 16;
+
+/// The byte size of one [`TYPE_PROPS`] entry.
+pub(crate) const PROP_ENTRY_SIZE: u32 = 16;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the u32 interned key.
+pub(crate) const PROP_KEY_OFFSET: u32 = 0;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the u32 `attrs`.
+pub(crate) const PROP_ATTRS_OFFSET: u32 = 4;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the i64 value (a data value,
+/// or a [`TYPE_ACCESSOR`] pointer when [`ATTR_ACCESSOR`] is set).
+pub(crate) const PROP_VALUE_OFFSET: u32 = 8;
+
+/// [`TYPE_PROPS`] `tflags` bit: some key is a canonical array index (its
+/// string carries [`STR_FLAG_ARRAY_INDEX`]), so own-key enumeration must list
+/// the integer keys first, ascending.
+pub(crate) const PROPS_HAS_INDEX_KEYS: u8 = 1;
+
+/// [`TYPE_PROPS`] `tflags` bit: some entry lacks [`ATTR_ENUMERABLE`].
+pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
+
+/// Property `attrs` bit: a data property's value may be reassigned (ignored
+/// for an accessor).
+pub(crate) const ATTR_WRITABLE: u32 = 1;
+
+/// Property `attrs` bit: the key is listed by own-key enumeration.
+pub(crate) const ATTR_ENUMERABLE: u32 = 2;
+
+/// Property `attrs` bit: the property may be deleted or redefined.
+pub(crate) const ATTR_CONFIGURABLE: u32 = 4;
+
+/// Property `attrs` bit: the value is a [`TYPE_ACCESSOR`] getter/setter pair.
+pub(crate) const ATTR_ACCESSOR: u32 = 8;
+
+/// The `attrs` of a data property created by assignment or a literal:
+/// writable, enumerable, and configurable.
+pub(crate) const ATTRS_DEFAULT: u32 = ATTR_WRITABLE | ATTR_ENUMERABLE | ATTR_CONFIGURABLE;
+
+/// String header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the block is the
+/// canonical interned block for its content, so it may be used as a property
+/// key by pointer.
+pub(crate) const STR_FLAG_INTERNED: u8 = 1;
+
+/// String header `flags` bit: the content is a canonical array index
+/// (`"0"` or a nonzero digit followed by digits, value `< 2^32 - 1`). Set at
+/// intern time.
+pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
+
 /// A compile-time-only interned SENTINEL key present in the string table iff the
 /// program lowers at least one instance accessor ([`crate::ir::IrNode::MakeAccessor`]).
-/// The emitter gates the accessor get/set invocation paths on its presence —
-/// exactly as it gates the `__obj_get` prototype fallback on [`CLASS_PROTOTYPE_KEY`] —
-/// so an accessor-free program keeps byte-identical member-read/write emission. It
-/// is never read at runtime (the `@@` prefix keeps it off any JS-visible surface).
+/// The emitter gates the getter/setter invocation inside `__get` / `__set` (and
+/// the post-access exception check) on its presence. It is never read at
+/// runtime (the `@@` prefix keeps it off any JS-visible surface).
 pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
 
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
@@ -313,13 +390,11 @@ pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
 
-/// Reserved hidden property key naming a class's shared PROTOTYPE object.
-/// A class binding stores its single prototype object under this key; every
-/// instance built by `new` stores that SAME prototype pointer under this key, so
-/// a method lookup can resolve `obj.method` by falling back to the prototype when the own
-/// property is absent. The `@@` prefix cannot begin a JS identifier, so ordinary
-/// `obj.name` source access never collides with it. Interned like any static
-/// string key and matched by byte content through `__obj_get`/`__obj_set`.
+/// Reserved hidden property key naming a class's shared PROTOTYPE object: the
+/// class value stores its prototype under this non-enumerable key, and `new`
+/// reads it to fill each instance's `proto` slot (a derived prototype's
+/// `proto` is the parent's). The `@@` prefix cannot begin a JS identifier, so
+/// ordinary `obj.name` source access never collides with it.
 pub(crate) const CLASS_PROTOTYPE_KEY: &str = "@@prototype";
 
 /// Reserved hidden property key naming a class's CONSTRUCTOR function value.
@@ -332,10 +407,9 @@ pub(crate) const CLASS_CONSTRUCTOR_KEY: &str = "@@constructor";
 /// Reserved hidden property key marking a builtin **Error** object's kind
 /// (E-series). `new Error`/`new TypeError`/`new RangeError` store one of
 /// [`ERROR_KIND_ERROR`] / [`ERROR_KIND_TYPE`] / [`ERROR_KIND_RANGE`] under this
-/// key as a number jsval. The `@@` prefix hides it from `for-in` /
-/// `Object.keys` / `JSON.stringify` (same mechanism as [`CLASS_PROTOTYPE_KEY`]),
-/// yet `__obj_get` reads it back so `instanceof` and the value renderer can
-/// recognize an error and its kind. The stored value is never `undefined`, so
+/// key as a NON-ENUMERABLE number property, so it never surfaces in `for-in` /
+/// `Object.keys` / `JSON.stringify` / rendering, yet `__get` reads it back so
+/// `instanceof` and the host decoders can recognize an error and its kind. The stored value is never `undefined`, so
 /// "the object is an error" is testable as "the loaded marker is not
 /// `undefined`", and the concrete kind by strict-equality against the constants
 /// below.

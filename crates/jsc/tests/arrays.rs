@@ -41,8 +41,8 @@ fn caught(body: &str) -> String {
 }
 
 /// Arrays do not grow by index assignment yet: an integer index at or past the
-/// length throws, any other key (non-number, negative, fractional, NaN) is an
-/// absent property and throws the add-property error. Nothing is written and
+/// length throws, and any other key (non-number, negative, fractional, NaN) is
+/// a named array property, which throws until arrays get property tables. Nothing is written and
 /// in-bounds stores are unaffected.
 #[test]
 fn array_out_of_bounds_and_non_index_writes_throw() {
@@ -51,9 +51,7 @@ fn array_out_of_bounds_and_non_index_writes_throw() {
     assert_eq!(caught("let a = [1, 2]; a[100] = 3"), grow);
     assert_eq!(caught("let a = []; a[0] = 1"), grow);
     assert_eq!(caught("let a = [1, 2, 3]; a.pop(); a[2] = 9"), grow);
-    let add = |key: &str| {
-        format!("true|Cannot add property '{key}': dynamic properties are not supported yet")
-    };
+    let add = |key: &str| format!("true|Cannot set named property '{key}' on an array yet");
     assert_eq!(caught("let a = [1]; a.foo = 1"), add("foo"));
     assert_eq!(caught("let a = [1]; a[\"foo\"] = 1"), add("foo"));
     assert_eq!(caught("let a = [1]; a[-1] = 1"), add("-1"));

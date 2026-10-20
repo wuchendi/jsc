@@ -4,7 +4,7 @@
 #![cfg(feature = "native-run")]
 
 use super::emit;
-use crate::ir::{BinOp, IrCase, IrFunction, IrNode, IrProgram, IrStmt};
+use crate::ir::{BinOp, IrCase, IrFunction, IrNode, IrProgram, IrStmt, PropKey};
 
 /// Wrap a single expression into a one-statement program.
 fn expr_program(node: IrNode) -> IrProgram {
@@ -273,27 +273,33 @@ fn object_property_assignment_expression_is_the_stored_value() {
 }
 
 #[test]
-fn object_property_assignment_missing_key_throws() {
-    // Fixed-shape objects: `o.b = 5` on an object without `b` raises the
-    // add-property `TypeError` instead of writing anything.
-    let err = crate::run::compile_and_run("let o = {a: 1}; o.b = 5; o.a")
-        .expect_err("absent-key write should throw");
+fn object_property_assignment_missing_key_adds_property() {
+    // `o.b = 5` on an object without `b` adds an own data property after `a`.
+    let value =
+        crate::run::compile_and_run("let o = {a: 1}; o.b = 5; o").expect("pipeline should succeed");
     assert_eq!(
-        err.to_string(),
-        "Uncaught TypeError: Cannot add property 'b': dynamic properties are not supported yet"
+        value,
+        crate::run::Value::Object(vec![
+            ("a".to_owned(), crate::run::Value::Number(1.0)),
+            ("b".to_owned(), crate::run::Value::Number(5.0)),
+        ])
     );
 }
 
 #[test]
 fn object_property_assignment_via_indexset_ir_updates_slot() {
-    // Direct IR: `IndexSet` on an object pointer dispatches to `__obj_set`,
+    // Direct IR: `IndexSet` on an object pointer dispatches to `__set`,
     // stores 42 into the "x" entry, and yields the stored value.
     let program = IrProgram {
         locals: 1,
         stmts: vec![
             IrStmt::Decl {
                 local: 0,
-                init: IrNode::Object(vec![("x".to_owned(), IrNode::Num(10.0))]),
+                init: IrNode::Object {
+                    entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
+                    proto: None,
+                    reserve: 0,
+                },
             },
             IrStmt::Expr(IrNode::IndexSet {
                 obj: Box::new(IrNode::Local(0)),
@@ -318,20 +324,28 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
 }
 
 #[test]
-fn object_property_assignment_via_indexset_ir_missing_key_throws() {
-    // Direct IR: an `IndexSet` whose key the object lacks leaves the
-    // add-property `TypeError` in flight (`__obj_set` reports the miss).
+fn object_property_assignment_via_indexset_ir_missing_key_adds() {
+    // Direct IR: an `IndexSet` whose key the object lacks appends it (`__set`
+    // adds an own data property), so a later read finds it.
     let program = IrProgram {
         locals: 1,
         stmts: vec![
             IrStmt::Decl {
                 local: 0,
-                init: IrNode::Object(vec![("x".to_owned(), IrNode::Num(10.0))]),
+                init: IrNode::Object {
+                    entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
+                    proto: None,
+                    reserve: 0,
+                },
             },
             IrStmt::Expr(IrNode::IndexSet {
                 obj: Box::new(IrNode::Local(0)),
                 index: Box::new(IrNode::Str("y".to_owned())),
                 value: Box::new(IrNode::Num(42.0)),
+            }),
+            IrStmt::Expr(IrNode::Index {
+                obj: Box::new(IrNode::Local(0)),
+                index: Box::new(IrNode::Str("y".to_owned())),
             }),
         ],
         functions: Vec::new(),
@@ -339,10 +353,10 @@ fn object_property_assignment_via_indexset_ir_missing_key_throws() {
     };
     let bytes = emit(&program);
     validate(&bytes);
-    let err = crate::run::run(&bytes).expect_err("absent-key write should throw");
+    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
     assert_eq!(
-        err.to_string(),
-        "Uncaught TypeError: Cannot add property 'y': dynamic properties are not supported yet"
+        crate::run::decode(bits, &memory),
+        crate::run::Value::Number(42.0)
     );
 }
 
@@ -362,9 +376,9 @@ fn typeof_string_literal_reports_string() {
 
 #[test]
 fn string_literal_emits_data_segment_and_advances_heap_ptr() {
-    // The literal "foo" is an 11-byte block ([type:u8][pad×3][len:u32][utf8],
-    // HEADER_SIZE=4) placed at base offset 8 and padded to 8, so `__heap_ptr`
-    // must initialize to the 8-aligned 8 + 16 = 24, past it.
+    // The always-interned "length" (a 14-byte block padded to 16) sits at base
+    // offset 8 and the literal "foo" (11 bytes, padded to 16) at 24; the
+    // 8-slot intern table follows at 40, so `__heap_ptr` starts at 40 + 32.
     let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
     validate(&bytes);
     let mut data_segments = 0;
@@ -391,13 +405,14 @@ fn string_literal_emits_data_segment_and_advances_heap_ptr() {
             _ => {}
         }
     }
-    assert_eq!(data_segments, 1, "one data segment for the single literal");
-    assert_eq!(heap_ptr_init, Some(24));
+    assert_eq!(data_segments, 3, "two string blobs plus the intern table");
+    assert_eq!(heap_ptr_init, Some(72));
 }
 
 #[test]
-fn no_literals_keeps_heap_ptr_at_base() {
-    // With no string literals, the bump allocator still starts at HEAP_BASE.
+fn no_literals_starts_heap_after_the_intern_table() {
+    // With no string literals, only "length" (16 bytes at HEAP_BASE) and the
+    // 8-slot intern table precede the bump allocator: 8 + 16 + 32.
     // The heap pointer is the FIRST global; the exception-unwinding
     // globals ($exc_pending = 0, $exc_value = 0) follow it and are ignored here.
     let bytes = emit(&expr_program(IrNode::Num(42.0)));
@@ -411,7 +426,7 @@ fn no_literals_keeps_heap_ptr_at_base() {
                 .expect("valid global");
             let mut ops = heap_ptr.init_expr.get_operators_reader();
             if let wasmparser::Operator::I32Const { value } = ops.read().expect("init operator") {
-                assert_eq!(value, 8);
+                assert_eq!(value, 56);
             }
         }
     }
@@ -610,8 +625,13 @@ fn heap_blocks_write_the_type_byte_header() {
     // Every heap block begins with its TYPE BYTE at the base offset. Run
     // a literal, take the low 32 bits of the returned jsval as the block base,
     // and assert the byte there is the expected kind (0 string / 1 array / 2
-    // object) with the three padding bytes zeroed.
-    for (src, expected_type) in [("\"hi\"", 0u8), ("[7, 8]", 1u8), ("let o = {a: 1}; o", 2u8)] {
+    // object) followed by the `gc`/`flags`/`class` bytes: zero, except a static
+    // string's `flags`, which carry `INTERNED`.
+    for (src, expected_type, flags) in [
+        ("\"hi\"", 0u8, crate::abi::STR_FLAG_INTERNED),
+        ("[7, 8]", 1u8, 0),
+        ("let o = {a: 1}; o", 2u8, 0),
+    ] {
         let program = crate::codegen::lower(
             &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
         )
@@ -625,8 +645,8 @@ fn heap_blocks_write_the_type_byte_header() {
         assert_eq!(memory[base], expected_type, "type byte for {src}");
         assert_eq!(
             &memory[base + 1..base + 4],
-            &[0, 0, 0],
-            "header padding for {src}"
+            &[0, flags, 0],
+            "header bytes for {src}"
         );
     }
 }
