@@ -76,9 +76,7 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(gen_dst));
-    function.instruction(&Instruction::LocalGet(gen_dst));
-    function.instruction(&Instruction::I32Const(TYPE_GENERATOR));
-    function.instruction(&Instruction::I32Store8(type_byte));
+    emit_object_prefix(function, gen_dst, TYPE_GENERATOR);
     // sm_idx (u32).
     function.instruction(&Instruction::LocalTee(gen_dst));
     function.instruction(&Instruction::LocalGet(gen_dst));

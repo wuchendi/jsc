@@ -35,10 +35,19 @@ export const TYPE_ARRAY = 1
 export const TYPE_OBJECT = 2
 /** TYPE BYTE of a first-class function value. Renders as `[Function (anonymous)]`. */
 export const TYPE_FUNCTION = 3
-/** TYPE BYTE of a promise block: `[type=8][pad×3][state:i32][value:i64]`. */
+/** TYPE BYTE of a `Map` handle block (prefix, then `size:u32`, `entries:i64`). */
+export const TYPE_MAP = 6
+/** TYPE BYTE of a `Set` handle block: the {@link TYPE_MAP} layout. */
+export const TYPE_SET = 7
+/** TYPE BYTE of a promise block (prefix, then `state:i32`, `value:i64`). */
 export const TYPE_PROMISE = 8
-/** TYPE BYTE of a `Date` block: `[type=10][pad×3][pad:u32][ms:f64]`. */
+/** TYPE BYTE of a generator handle block. Renders as `Object [Generator]`. */
+export const TYPE_GENERATOR = 9
+/** TYPE BYTE of a `Date` block (prefix, then `ms:f64`). */
 export const TYPE_DATE = 10
+
+/** Byte size of the object-family prefix (header, `props:u32`, `proto:i64`); payloads start here. */
+export const OBJ_PREFIX_SIZE = 16
 
 /** {@link TYPE_PROMISE} `state`: the promise is unsettled. */
 export const PROMISE_PENDING = 0
@@ -47,10 +56,18 @@ export const PROMISE_FULFILLED = 1
 /** {@link TYPE_PROMISE} `state`: the promise rejected with its `value` as the reason. */
 export const PROMISE_REJECTED = 2
 
-/** Byte offset (from a generator block base) of the `done` flag (`i32`). */
-export const GEN_DONE_OFFSET = HEADER_SIZE + 8
+/** Byte offset (from a {@link TYPE_MAP}/{@link TYPE_SET} block base) of the `size` entry count (`u32`). */
+export const MAP_SIZE_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset (from a {@link TYPE_PROMISE} block base) of the `state` (`i32`). */
+export const PROMISE_STATE_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset (from a {@link TYPE_PROMISE} block base) of the settled `value` (`i64`). */
+export const PROMISE_VALUE_OFFSET = OBJ_PREFIX_SIZE + 8
+/** Byte size of a {@link TYPE_PROMISE} block. */
+export const PROMISE_BLOCK_SIZE = OBJ_PREFIX_SIZE + 16
+/** Byte offset (from a {@link TYPE_GENERATOR} block base) of the `done` flag (`i32`). */
+export const GEN_DONE_OFFSET = OBJ_PREFIX_SIZE + 8
 /** Byte offset (from a {@link TYPE_DATE} block base) of the `ms` timestamp (`f64`). */
-export const DATE_MS_OFFSET = HEADER_SIZE + 4
+export const DATE_MS_OFFSET = OBJ_PREFIX_SIZE
 
 /** Export name of the module's linear memory. */
 export const MEMORY_EXPORT_NAME = 'memory'

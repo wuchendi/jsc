@@ -865,9 +865,101 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let mem = memory.data(&store);
     let p = usize::try_from(p).expect("base");
     assert_eq!(&mem[p..p + 4], &[crate::abi::TYPE_PROMISE, 0, 0, 0]);
+    assert_eq!(&mem[p + 4..p + 8], &0u32.to_le_bytes(), "props");
     assert_eq!(
-        &mem[p + 4..p + 8],
+        &mem[p + 8..p + 16],
+        &crate::abi::NULL.to_le_bytes(),
+        "proto"
+    );
+    assert_eq!(
+        &mem[p + 16..p + 20],
         &crate::abi::PROMISE_PENDING.to_le_bytes()
     );
-    assert_eq!(&mem[p + 8..p + 16], &crate::abi::UNDEFINED.to_le_bytes());
+    assert_eq!(&mem[p + 24..p + 32], &crate::abi::UNDEFINED.to_le_bytes());
+}
+
+#[test]
+fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
+    use crate::abi::{
+        DATE_MS_OFFSET, FUNC_ENV_OFFSET, FUNC_INDEX_OFFSET, GEN_DONE_OFFSET, GEN_ENV_OFFSET,
+        GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, NULL, OBJ_PROPS_OFFSET,
+        OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET,
+        TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_PROMISE, TYPE_SET,
+        UNDEFINED,
+    };
+    let u32_at = |mem: &[u8], at: u32| {
+        let at = at as usize;
+        u32::from_le_bytes(mem[at..at + 4].try_into().expect("u32"))
+    };
+    let u64_at = |mem: &[u8], at: u32| {
+        let at = at as usize;
+        u64::from_le_bytes(mem[at..at + 8].try_into().expect("u64"))
+    };
+    let heap = |src: &str, kind: u8| {
+        let bytes = emit_js(src);
+        validate(&bytes);
+        let (bits, memory) = crate::run::run(&bytes).expect("module should run");
+        assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
+        let base = u32::try_from(bits & 0xFFFF_FFFF).expect("base");
+        assert_eq!(base % 8, 0, "{src}: 8-aligned");
+        let at = base as usize;
+        assert_eq!(&memory[at..at + 4], &[kind, 0, 0, 0], "{src}: header");
+        assert_eq!(u32_at(&memory, base + OBJ_PROPS_OFFSET), 0, "{src}: props");
+        assert_eq!(
+            u64_at(&memory, base + OBJ_PROTO_OFFSET),
+            NULL,
+            "{src}: proto"
+        );
+        (base, memory)
+    };
+
+    let (func, mem) = heap("function f(x) { return x } f", TYPE_FUNCTION);
+    assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET), 0, "func_idx");
+    assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET + 4), 0, "reserved");
+    assert_eq!(u64_at(&mem, func + FUNC_ENV_OFFSET), UNDEFINED, "env");
+
+    let (closure, mem) = heap("let n = 1; let g = () => n; g", TYPE_FUNCTION);
+    let env = u64_at(&mem, closure + FUNC_ENV_OFFSET);
+    assert_eq!((env >> 48) & 0b111, 0b101, "closure env is a heap block");
+
+    for (src, kind, size) in [
+        (
+            "let m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m",
+            TYPE_MAP,
+            2,
+        ),
+        ("let s = new Set(); s.add(1); s", TYPE_SET, 1),
+    ] {
+        let (handle, mem) = heap(src, kind);
+        assert_eq!(u32_at(&mem, handle + MAP_SIZE_OFFSET), size, "{src}: size");
+        let entries = u64_at(&mem, handle + MAP_ENTRIES_OFFSET);
+        let arr = u32::try_from(entries & 0xFFFF_FFFF).expect("entries");
+        assert_eq!(mem[arr as usize], TYPE_ARRAY, "{src}: entries backing");
+    }
+
+    let (promise, mem) = heap("Promise.resolve(7)", TYPE_PROMISE);
+    assert_eq!(
+        u32_at(&mem, promise + PROMISE_STATE_OFFSET).cast_signed(),
+        PROMISE_FULFILLED
+    );
+    assert_eq!(
+        u64_at(&mem, promise + PROMISE_VALUE_OFFSET),
+        7.0_f64.to_bits()
+    );
+
+    let (generator, mem) = heap(
+        "function* gen() { yield 1 } let it = gen(); it.next(); it",
+        TYPE_GENERATOR,
+    );
+    assert_eq!(
+        u32_at(&mem, generator + GEN_STATE_OFFSET),
+        1,
+        "state after one yield"
+    );
+    assert_eq!(u32_at(&mem, generator + GEN_DONE_OFFSET), 0, "not done");
+    let frame = u64_at(&mem, generator + GEN_ENV_OFFSET);
+    assert_eq!((frame >> 48) & 0b111, 0b101, "frame is a heap block");
+
+    let (date, mem) = heap("new Date(1234.5)", TYPE_DATE);
+    assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234.5_f64.to_bits());
 }

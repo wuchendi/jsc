@@ -103,6 +103,23 @@ pub(crate) const HEADER_CLASS_OFFSET: u32 = 3;
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
 pub(crate) const BLOCK_ALIGN: u32 = 8;
 
+/// Byte offset of the object-family prefix's `props: u32` slot (right after the
+/// header): the base of the block's `TYPE_PROPS` own-property table, `0` = no
+/// own named properties. Shared by every object-family kind except
+/// [`TYPE_OBJECT`] / [`TYPE_ARRAY`] (which still carry their pre-prefix
+/// layouts); always written 0 until property tables land.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
+
+/// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
+/// pointer or [`NULL`]), 8-byte aligned. Every object-family block is created
+/// with it [`NULL`] until the realm's intrinsic prototypes exist.
+pub(crate) const OBJ_PROTO_OFFSET: u32 = 8;
+
+/// The byte size of the shared object-family prefix — header, `props`, and
+/// `proto` — so every kind payload begins 8-byte aligned here.
+pub(crate) const OBJ_PREFIX_SIZE: u32 = 16;
+
 /// The number of trailing (non-positional) parameters every user function carries
 /// under the uniform ABI, appended after the `K = max_arity` positional argument
 /// slots: the closure **environment** slot, then the **argument count**.
@@ -127,9 +144,21 @@ pub(crate) const TYPE_ARRAY: u8 = 1;
 /// "object".
 pub(crate) const TYPE_OBJECT: u8 = 2;
 
-/// TYPE BYTE of a first-class function value:
-/// `[type=3][pad×3][func_idx:u32][env:i64]`. Maps to `typeof` "function".
+/// TYPE BYTE of a first-class function value: the object-family prefix, then
+/// `[func_idx:u32 @16][reserved:u32 @20][env:i64 @24]` ([`FUNC_BLOCK_SIZE`]
+/// bytes). Maps to `typeof` "function".
 pub(crate) const TYPE_FUNCTION: u8 = 3;
+
+/// Byte offset (from a [`TYPE_FUNCTION`] block base) of the u32 funcref-table
+/// index. The following u32 at `+20` is reserved (always 0).
+pub(crate) const FUNC_INDEX_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_FUNCTION`] block base) of the i64 closure
+/// environment jsval (`undefined` for a non-capturing function).
+pub(crate) const FUNC_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_FUNCTION`] block.
+pub(crate) const FUNC_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// TYPE BYTE of a closure **environment** block (internal):
 /// `[type=4][pad×3][count:u32][cell_ptr:i64 × count]`. Never a user value.
@@ -140,8 +169,8 @@ pub(crate) const TYPE_ENV: u8 = 4;
 /// user value.
 pub(crate) const TYPE_CELL: u8 = 5;
 
-/// TYPE BYTE of a `Map` handle block:
-/// `[type=6][pad×3][size:u32][entries:i64]`. `size` is the logical entry count
+/// TYPE BYTE of a `Map` handle block: the object-family prefix, then
+/// `[size:u32 @16][pad:u32][entries:i64 @24]`. `size` is the logical entry count
 /// (backing `.size`); `entries` is a heap jsval pointing at a GROWABLE array that
 /// stores the `(key, value)` pairs flattened (key at even element slots, value at
 /// the following odd slot). Growth reallocs that backing array and rewrites the
@@ -149,14 +178,25 @@ pub(crate) const TYPE_CELL: u8 = 5;
 /// "object".
 pub(crate) const TYPE_MAP: u8 = 6;
 
-/// TYPE BYTE of a `Set` handle block: identical layout to [`TYPE_MAP`]
-/// (`[type=7][pad×3][size:u32][entries:i64]`). A Set reuses the same flattened
+/// TYPE BYTE of a `Set` handle block: identical layout to [`TYPE_MAP`]. A Set reuses the same flattened
 /// `(key, value)` backing with the value slot always `undefined`, so all the
 /// lookup/insert/delete machinery is shared; only the type byte (and thus the
 /// render label) differs. Maps to `typeof` "object".
 pub(crate) const TYPE_SET: u8 = 7;
 
-/// TYPE BYTE of a `Promise` block: `[type=8][pad×3][state:i32][value:i64]`.
+/// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the u32
+/// logical entry count.
+pub(crate) const MAP_SIZE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the i64
+/// `entries` backing-array jsval.
+pub(crate) const MAP_ENTRIES_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_MAP`] / [`TYPE_SET`] handle block.
+pub(crate) const MAP_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// TYPE BYTE of a `Promise` block: the object-family prefix, then
+/// `[state:i32 @16][pad:u32][value:i64 @24]`.
 /// `state` is one of [`PROMISE_PENDING`] / [`PROMISE_FULFILLED`] /
 /// [`PROMISE_REJECTED`]; `value` is the settled fulfillment/rejection jsval
 /// (`undefined` while pending). The block is the RENDERABLE mirror of a promise's
@@ -165,6 +205,15 @@ pub(crate) const TYPE_SET: u8 = 7;
 /// can decode a promise from a bare memory snapshot. Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_PROMISE: u8 = 8;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the i32 `state`.
+pub(crate) const PROMISE_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the i64 settled `value`.
+pub(crate) const PROMISE_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_PROMISE`] block.
+pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// [`TYPE_PROMISE`] `state`: the promise is unsettled.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -178,8 +227,8 @@ pub(crate) const PROMISE_FULFILLED: i32 = 1;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_REJECTED: i32 = 2;
 
-/// TYPE BYTE of a `Generator` handle block:
-/// `[type=9][pad×3][sm_idx:u32][state:i32][done:i32][env:i64]`. `sm_idx` is the
+/// TYPE BYTE of a `Generator` handle block: the object-family prefix, then
+/// `[sm_idx:u32 @16][state:i32 @20][done:i32 @24][pad:u32][env:i64 @32]`. `sm_idx` is the
 /// funcref-table index of the generator's **state-machine** function; `state` is
 /// the resume point (`0` at creation, bumped at each `yield`); `done` is `0`
 /// until the body returns/falls off, then `1`; `env` is the persistent
@@ -193,30 +242,36 @@ pub(crate) const PROMISE_REJECTED: i32 = 2;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_GENERATOR: u8 = 9;
 
-/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the `sm_idx` funcref
-/// index (u32), `state` (i32), `done` (i32), and `env` frame jsval (i64). The
-/// payload begins at [`HEADER_SIZE`]; the i64 `env` lands 8-byte aligned at 16.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_SM_IDX_OFFSET: u32 = HEADER_SIZE;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_STATE_OFFSET: u32 = HEADER_SIZE + 4;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_DONE_OFFSET: u32 = HEADER_SIZE + 8;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_ENV_OFFSET: u32 = HEADER_SIZE + 12;
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 `sm_idx`
+/// funcref-table index.
+pub(crate) const GEN_SM_IDX_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
-/// TYPE BYTE of a `Date` block: `[type=10][pad×3][pad×4][ms:f64]`. The
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 resume `state`.
+pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 `done` flag.
+pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
+/// jsval, 8-byte aligned past a u32 pad.
+pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// The byte size of a [`TYPE_GENERATOR`] block.
+pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+
+/// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the
 /// same value `Date.now()` / `d.getTime()` yield. `new Date(ms)` stores its
-/// numeric argument; `new Date()` stores the host clock (the `__now` import). The
-/// f64 lands 8-byte aligned at [`DATE_MS_OFFSET`]. Maps to `typeof` "object".
+/// numeric argument; `new Date()` stores the host clock (the `__now` import).
+/// Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_DATE: u8 = 10;
 
-/// Byte offset (from a [`TYPE_DATE`] block base) of the `ms` timestamp (f64). The
-/// payload begins at [`HEADER_SIZE`]; the f64 lands 8-byte aligned at 8.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const DATE_MS_OFFSET: u32 = HEADER_SIZE + 4;
+/// Byte offset (from a [`TYPE_DATE`] block base) of the f64 `ms` timestamp.
+pub(crate) const DATE_MS_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// The byte size of a [`TYPE_DATE`] block.
+pub(crate) const DATE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 
 /// TYPE BYTE of an **accessor** block (P2b instance getters/setters):
 /// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds a class instance

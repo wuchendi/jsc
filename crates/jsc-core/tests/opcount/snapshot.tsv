@@ -1,11 +1,11 @@
 program	user_ops	call_indirect	prop_calls	host_calls	fuel	reason
-array_hofs	1264	4	0	16	24133	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
-class_methods	9173	29	29	95	78794	S0: IsCallable check before call_indirect (DF4) on `new` constructor dispatch
+array_hofs	1276	4	0	16	24145	S1-T1: object-family prefix; +3 ops per function-value allocation (4 sites) for the proto=null store
+class_methods	9191	29	29	95	78812	S1-T1: object-family prefix; +3 ops per function-value allocation (6 sites) for the proto=null store
 console_log	385	0	0	10	1458	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
 fib	379	0	0	5	3644802	
 for_in	1103	0	1	19	12900	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
 json	1311	0	4	23	16577	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
-map_set	1995	0	2	29	37938	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
+map_set	2001	0	2	29	37944	S1-T1: object-family prefix; +3 ops per Map/Set handle allocation (2 sites) for the proto=null store
 math	3330	0	0	37	52570	
 object_reads	1986	0	5	34	22546	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors
 string_methods	938	0	0	30	12745	S0: __alloc rounds to 8 and zeroes the header; host allocations run the guest __new_* constructors

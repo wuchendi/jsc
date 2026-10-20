@@ -8,14 +8,20 @@
 import {
   DATE_MS_OFFSET,
   HEADER_SIZE,
+  MAP_SIZE_OFFSET,
   PROMISE_FULFILLED,
   PROMISE_REJECTED,
+  PROMISE_STATE_OFFSET,
+  PROMISE_VALUE_OFFSET,
   QNAN,
   TYPE_ARRAY,
   TYPE_DATE,
   TYPE_FUNCTION,
+  TYPE_GENERATOR,
+  TYPE_MAP,
   TYPE_OBJECT,
   TYPE_PROMISE,
+  TYPE_SET,
   TYPE_STRING,
   U32_MASK,
   U64_MASK,
@@ -31,7 +37,10 @@ export type Value =
   | { kind: 'array'; items: Value[] }
   | { kind: 'object'; entries: [string, Value][] }
   | { kind: 'function' }
+  | { kind: 'map'; size: number }
+  | { kind: 'set'; size: number }
   | { kind: 'promise'; state: number; value: Value }
+  | { kind: 'generator' }
   | { kind: 'date'; ms: number }
   | { kind: 'circular'; id: number }
   | { kind: 'ref'; id: number; value: Value }
@@ -153,6 +162,12 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
       return decodeString(ptr, mem)
     case TYPE_FUNCTION:
       return { kind: 'function' }
+    case TYPE_MAP:
+      return { kind: 'map', size: decodeSize(ptr, mem) }
+    case TYPE_SET:
+      return { kind: 'set', size: decodeSize(ptr, mem) }
+    case TYPE_GENERATOR:
+      return { kind: 'generator' }
     case TYPE_DATE:
       return decodeDate(ptr, mem)
     default:
@@ -162,18 +177,27 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
 
 /**
  * Resolve a heap promise block at `ptr` (mirrors `value.rs::decode_promise`):
- * the `i32` state at `ptr + HEADER_SIZE` and the settled `i64` value after it. A
- * truncated block reads as pending with an `undefined` value.
+ * the `i32` state at `ptr + PROMISE_STATE_OFFSET` and the settled `i64` value at
+ * `ptr + PROMISE_VALUE_OFFSET`. A truncated block reads as pending with an
+ * `undefined` value.
  */
 function decodePromise(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const state = readU32(mem, ptr + HEADER_SIZE)
-  const bits = readU64(mem, ptr + HEADER_SIZE + 4)
+  const state = readU32(mem, ptr + PROMISE_STATE_OFFSET)
+  const bits = readU64(mem, ptr + PROMISE_VALUE_OFFSET)
   return {
     kind: 'promise',
     state: state === undefined ? 0 : state | 0,
     value:
       bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard),
   }
+}
+
+/**
+ * The `u32` logical entry count of a Map/Set handle block at `ptr` (mirrors
+ * `value.rs::decode_size`); a truncated block reads as `0`.
+ */
+function decodeSize(ptr: number, mem: Uint8Array): number {
+  return readU32(mem, ptr + MAP_SIZE_OFFSET) ?? 0
 }
 
 /**
@@ -261,6 +285,12 @@ export function formatValue(value: Value): string {
         : `{ ${value.entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(', ')} }`
     case 'function':
       return '[Function (anonymous)]'
+    case 'map':
+      return `Map(${value.size})`
+    case 'set':
+      return `Set(${value.size})`
+    case 'generator':
+      return 'Object [Generator]'
     case 'promise':
       if (value.state === PROMISE_FULFILLED)
         return `Promise { ${formatValue(value.value)} }`
