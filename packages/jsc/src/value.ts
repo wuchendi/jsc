@@ -17,7 +17,6 @@ import {
   TYPE_OBJECT,
   TYPE_PROMISE,
   TYPE_STRING,
-  TYPEOF_STRINGS,
   U32_MASK,
   U64_MASK,
 } from './abi.js'
@@ -99,13 +98,9 @@ export function decode(bits: bigint, mem: Uint8Array): Value {
       return { kind: 'null' }
     case 0b011n:
       return { kind: 'undefined' }
-    case 0b100n: {
-      const s = TYPEOF_STRINGS[Number(u & U32_MASK)]
-      return { kind: 'typestr', value: s ?? 'undefined' }
-    }
     case 0b101n:
       return decodeHeap(u, mem)
-    // Tags 0b110/0b111 are retired and 0b000 is the canonical number NaN.
+    // Tags 0b100/0b110/0b111 are retired and 0b000 is the canonical number NaN.
     default:
       return { kind: 'number', value: bitsToF64(u) }
   }

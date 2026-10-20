@@ -21,8 +21,6 @@ export const TRUE = 0x7ff9_0000_0000_0001n
 export const NULL = 0x7ffa_0000_0000_0000n
 /** NaN-boxed `undefined` (tag `0b011`). */
 export const UNDEFINED = 0x7ffb_0000_0000_0000n
-/** `typeof`-result type-string immediate header (tag `0b100`); low bits index the table. */
-export const TYPEOF = 0x7ffc_0000_0000_0000n
 /** NaN-boxed heap-pointer header (tag `0b101`): `HEAP | (ptr as u32)`. */
 export const HEAP = 0x7ffd_0000_0000_0000n
 
@@ -133,17 +131,7 @@ export const PROMISE_OP_SETTLE_REJECT = 6
 /** `__promise` op: spawn an `async function` body from generator handle `a`. */
 export const PROMISE_OP_ASYNC_SPAWN = 7
 
-/** The `typeof` result strings, indexed by a boxed type-string immediate. */
-export const TYPEOF_STRINGS = [
-  'number',
-  'boolean',
-  'undefined',
-  'object',
-  'string',
-  'function',
-] as const
-
 /** 64-bit unsigned mask, for normalizing signed `bigint`s that cross the wasm boundary. */
 export const U64_MASK = 0xffff_ffff_ffff_ffffn
-/** 32-bit unsigned mask, for extracting the low 32 bits (heap offset / typeof index). */
+/** 32-bit unsigned mask, for extracting the low 32 bits (heap offset). */
 export const U32_MASK = 0xffff_ffffn
