@@ -461,6 +461,10 @@ struct SuperCalls {
     this_bound: bool,
     /// How many `super(..)` calls this frame has lowered.
     lowered: u32,
+    /// The hidden id of a cell holding `this`, when an arrow in the body
+    /// calls `super(..)` or reads `this` and so shares the constructor's
+    /// `this` (every derived `this` read and write then goes through the cell).
+    this_cell: Option<u32>,
 }
 
 impl Frame {

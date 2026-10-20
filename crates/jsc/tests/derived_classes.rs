@@ -284,3 +284,53 @@ fn class_expression_setter_arity() {
         "9\n"
     );
 }
+
+/// An arrow in a derived constructor shares its `this`: it may call
+/// `super(..)` (binding the constructor's `this`), and reads `this` / `super.x`
+/// with the same TDZ.
+#[test]
+fn arrow_super_and_this_in_derived_constructor() {
+    assert_eq!(
+        run("let count = 0;
+             class A { constructor(){ count++; this.a = 1 } m(){ return 5 } }
+             class B extends A { constructor(){ (() => super())(); this.b = this.a + 1 } }
+             let b = new B(); console.log(count, b.a, b.b, b instanceof B);
+             class C extends A { constructor(){
+               const g = () => this;
+               try { g() } catch (e) { console.log(e.name) }
+               super(); console.log(g() === this, (() => super.m())()) } }
+             new C();"),
+        "1 1 2 true\nReferenceError\ntrue 5\n"
+    );
+    let stderr = uncaught(
+        "class A {} class B extends A { constructor(){ let f = () => super(); f(); f() } } new B()",
+    );
+    assert!(
+        stderr.contains("ReferenceError: Super constructor may only be called once"),
+        "{stderr}"
+    );
+}
+
+/// Class member name early errors are compile errors (exit 2).
+#[test]
+fn class_member_name_early_errors() {
+    for src in [
+        "var C = class { static prototype; }",
+        "class C { static prototype(){} }",
+        "class C { static get prototype(){ return 1 } }",
+        "class C { static constructor = 1 }",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+            .args(["-e", src])
+            .output()
+            .expect("failed to spawn jsc binary");
+        assert_eq!(output.status.code(), Some(2), "{src}");
+    }
+    // `prototype` instance members and a static method named `constructor`
+    // are allowed.
+    assert_eq!(
+        run("class C { prototype = 1; static constructor(){ return 2 } }
+             console.log(new C().prototype, C.constructor());"),
+        "1 2\n"
+    );
+}

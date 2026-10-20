@@ -223,8 +223,10 @@ impl LowerCtx<'_> {
                 {
                     return Ok(self.read_hidden(frame, id));
                 }
+                if let Some(fi) = self.derived_frame() {
+                    return Ok(self.derived_this(fi));
+                }
                 match self.ensure_this_local() {
-                    Some(local) if self.frame().derived() => Ok(self.derived_this(local)),
                     Some(local) => Ok(IrNode::Local(local)),
                     None => {
                         Err(CompileError::spanned(this_expr.span, "`this` is not supported").into())
@@ -524,18 +526,18 @@ impl LowerCtx<'_> {
         call: &swc_ecma_ast::CallExpr,
         span: Span,
     ) -> anyhow::Result<IrNode> {
+        let fi = self.derived_frame();
         let scope = self
             .current_super
-            .filter(|_| self.frame().derived())
+            .filter(|_| fi.is_some())
             .and_then(|scope| scope.parent.map(|parent| (scope, parent)));
-        let Some((scope, parent)) = scope else {
+        let (Some(fi), Some((scope, parent))) = (fi, scope) else {
             return Err(CompileError::spanned(
                 span,
-                "`super(..)` is only valid directly inside a derived class constructor",
+                "`super(..)` is only valid inside a derived class constructor",
             )
             .into());
         };
-        let this_local = self.ensure_this_local().unwrap_or(0);
         let new_target = self.resolve_new_target().unwrap_or(IrNode::Undefined);
         let callee = self.read_hidden(scope.frame, parent);
         let (args, spread) = self.lower_construct_args(&call.args)?;
@@ -553,29 +555,28 @@ impl LowerCtx<'_> {
         // The body's top-level `super(..)` statement, when no other call was
         // lowered before it, is the first to run: `this` cannot be bound yet,
         // and is definitely bound from here on.
-        let supers = &mut self.frame().supers;
-        let top_level = supers.top_level == Some(call.span);
+        let top = fi == self.top();
+        let supers = &mut self.frames[fi].supers;
+        let top_level = top && supers.top_level == Some(call.span);
         let first = supers.lowered == 0 && top_level;
         supers.lowered += 1;
-        supers.this_bound |= top_level;
         let mut seq = vec![IrNode::Assign {
             local: result,
             value: Box::new(construct),
         }];
         if !first {
+            let raw = self.derived_this_raw(fi);
             seq.push(guard(
-                IrNode::IsHole(Box::new(IrNode::Local(this_local))),
+                IrNode::IsHole(Box::new(raw)),
                 reference_error("Super constructor may only be called once"),
             ));
         }
-        seq.push(IrNode::Assign {
-            local: this_local,
-            value: Box::new(IrNode::Local(result)),
-        });
-        if let Some(fields) = self.lower_field_inits(IrNode::Local(this_local))? {
+        seq.push(self.derived_bind_this(fi, IrNode::Local(result)));
+        self.frames[fi].supers.this_bound |= top_level;
+        if let Some(fields) = self.lower_field_inits(IrNode::Local(result))? {
             seq.push(fields);
         }
-        seq.push(IrNode::Local(this_local));
+        seq.push(IrNode::Local(result));
         Ok(IrNode::Seq(seq))
     }
 
@@ -603,16 +604,20 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Prefix `node` with the derived constructor's `this` TDZ check (a
-    /// `super.x` reference reads `this` first); returns `this`'s local.
+    /// Prefix `node` with the read of `this` a `super.x` reference makes first
+    /// (TDZ-checked in a derived constructor); returns the local holding it.
     fn super_this(&mut self, node: IrNode, span: Span) -> anyhow::Result<(IrNode, u32)> {
+        if let Some(fi) = self.derived_frame() {
+            let this = self.derived_this(fi);
+            let local = self.fresh();
+            let read = IrNode::Assign {
+                local,
+                value: Box::new(this),
+            };
+            return Ok((IrNode::Seq(vec![read, node]), local));
+        }
         let Some(this_local) = self.ensure_this_local() else {
             return Err(CompileError::spanned(span, "`super` is not available here").into());
-        };
-        let node = if self.frame().derived() && !self.frame().supers.this_bound {
-            IrNode::Seq(vec![this_checked(this_local), node])
-        } else {
-            node
         };
         Ok((node, this_local))
     }

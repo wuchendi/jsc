@@ -354,6 +354,7 @@ impl LowerCtx<'_> {
                 }
                 ClassMember::Method(m) => {
                     reject_out_of_scope_method(m)?;
+                    check_member_name(&m.key, m.is_static, false)?;
                     if m.is_static {
                         static_methods.push(m);
                     } else {
@@ -362,6 +363,7 @@ impl LowerCtx<'_> {
                 }
                 ClassMember::ClassProp(p) => {
                     reject_out_of_scope_field(p)?;
+                    check_member_name(&p.key, p.is_static, true)?;
                     if p.is_static {
                         static_fields.push(p);
                     } else {
@@ -607,9 +609,9 @@ impl LowerCtx<'_> {
     /// an object as is; `undefined` (or no value) the bound `this` (a
     /// `ReferenceError` before `super(..)`); anything else a `TypeError`.
     fn derived_return(&mut self, value: Option<IrNode>) -> IrNode {
-        let this_local = self.ensure_this_local().unwrap_or(0);
+        let fi = self.top();
         let Some(value) = value else {
-            return self.derived_this(this_local);
+            return self.derived_this(fi);
         };
         let tmp = self.fresh();
         IrNode::Seq(vec![
@@ -626,7 +628,7 @@ impl LowerCtx<'_> {
                         lhs: Box::new(IrNode::Local(tmp)),
                         rhs: Box::new(IrNode::Undefined),
                     }),
-                    then_branch: Box::new(self.derived_this(this_local)),
+                    then_branch: Box::new(self.derived_this(fi)),
                     else_branch: Box::new(IrNode::Throw(Box::new(type_error(IrNode::Str(
                         "Derived constructors may only return object or undefined".to_owned(),
                     ))))),
@@ -692,6 +694,14 @@ impl LowerCtx<'_> {
                     local: temp,
                     init: source,
                 });
+                // An empty pattern reads nothing, but still requires an
+                // object-coercible source (`({}) = null` throws a TypeError).
+                if obj.props.is_empty() {
+                    out.push(IrStmt::Expr(IrNode::NullishCheck {
+                        value: Box::new(IrNode::Local(temp)),
+                        key: String::new(),
+                    }));
+                }
                 // The statically-known destructured keys, excluded from a rest.
                 let mut bound_keys: Vec<String> = Vec::new();
                 for prop in &obj.props {
@@ -2023,6 +2033,31 @@ fn reject_out_of_scope_method(m: &ClassMethod) -> anyhow::Result<()> {
         return Ok(());
     };
     Err(CompileError::spanned(m.span(), msg).into())
+}
+
+/// The class-member name early errors (SyntaxErrors): a static member named
+/// `prototype`, a field named `constructor`, and an identifier starting with
+/// a character that cannot start one (ZWJ / ZWNJ, accepted by the lexer when
+/// escaped).
+fn check_member_name(key: &PropName, is_static: bool, field: bool) -> anyhow::Result<()> {
+    let name = match key {
+        PropName::Ident(id) => {
+            if id.sym.starts_with(['\u{200c}', '\u{200d}']) {
+                return Err(CompileError::spanned(key.span(), "invalid identifier start").into());
+            }
+            id.sym.as_ref().to_owned()
+        }
+        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        _ => return Ok(()),
+    };
+    let msg = if is_static && name == "prototype" {
+        "classes may not have a static property named 'prototype'"
+    } else if field && name == "constructor" {
+        "classes may not have a field named 'constructor'"
+    } else {
+        return Ok(());
+    };
+    Err(CompileError::spanned(key.span(), msg).into())
 }
 
 /// Build the spanned rejection for a non-method, non-constructor, non-field class

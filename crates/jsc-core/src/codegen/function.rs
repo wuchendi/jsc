@@ -238,6 +238,14 @@ impl LowerCtx<'_> {
             && let BodyKind::Block(stmts) = body_kind
         {
             self.frame().supers.top_level = stmts.iter().find_map(super_call_span);
+            if stmts.iter().any(|s| stmt_arrow_super(s, false)) {
+                let (cell, id) = self.hidden_local();
+                self.frame().supers.this_cell = Some(id);
+                body.push(IrStmt::Expr(IrNode::Assign {
+                    local: cell,
+                    value: Box::new(IrNode::CellNew(Box::new(IrNode::Hole))),
+                }));
+            }
         }
         match body_kind {
             BodyKind::Block(stmts) => self.lower_stmts(stmts, &mut body)?,
@@ -250,8 +258,9 @@ impl LowerCtx<'_> {
         // A derived constructor falling off its end returns `this`, which must
         // have been bound by `super(..)`.
         let derived = self.frame().derived();
-        if derived && let Some(this_local) = self.ensure_this_local() {
-            let this = self.derived_this(this_local);
+        if derived {
+            let fi = self.top();
+            let this = self.derived_this(fi);
             body.push(IrStmt::Return(Some(this)));
         }
 
@@ -676,13 +685,49 @@ impl LowerCtx<'_> {
 }
 
 impl LowerCtx<'_> {
-    /// Read a derived constructor's `this` in `local`: TDZ-checked unless a
+    /// The derived constructor frame whose `this` the current code reads: the
+    /// current frame, or the one enclosing the current arrows when its `this`
+    /// lives in a cell ([`SuperCalls::this_cell`]).
+    pub(super) fn derived_frame(&self) -> Option<usize> {
+        let fi = self.frames.iter().rposition(|f| !f.arrow)?;
+        let frame = &self.frames[fi];
+        (frame.derived() && (fi == self.top() || frame.supers.this_cell.is_some())).then_some(fi)
+    }
+
+    /// The current value of derived constructor frame `fi`'s `this` (the
+    /// hole before `super(..)`), unchecked.
+    pub(super) fn derived_this_raw(&mut self, fi: usize) -> IrNode {
+        match self.frames[fi].supers.this_cell {
+            Some(id) => IrNode::CellGet(Box::new(self.read_hidden(fi, id))),
+            None => IrNode::Local(self.ensure_this_local().unwrap_or(0)),
+        }
+    }
+
+    /// Read derived constructor frame `fi`'s `this`: TDZ-checked unless a
     /// top-level `super(..)` already bound it (see [`SuperCalls::top_level`]).
-    pub(super) fn derived_this(&mut self, local: u32) -> IrNode {
-        if self.frame().supers.this_bound {
-            IrNode::Local(local)
-        } else {
-            this_checked(local)
+    pub(super) fn derived_this(&mut self, fi: usize) -> IrNode {
+        let raw = self.derived_this_raw(fi);
+        if fi == self.top() && self.frame().supers.this_bound {
+            return raw;
+        }
+        IrNode::Ternary {
+            cond: Box::new(IrNode::IsHole(Box::new(raw.clone()))),
+            then_branch: Box::new(IrNode::Throw(Box::new(reference_error(DERIVED_THIS_TDZ)))),
+            else_branch: Box::new(raw),
+        }
+    }
+
+    /// Bind derived constructor frame `fi`'s `this` to `value`.
+    pub(super) fn derived_bind_this(&mut self, fi: usize, value: IrNode) -> IrNode {
+        match self.frames[fi].supers.this_cell {
+            Some(id) => IrNode::CellSet {
+                cell: Box::new(self.read_hidden(fi, id)),
+                value: Box::new(value),
+            },
+            None => IrNode::Assign {
+                local: self.ensure_this_local().unwrap_or(0),
+                value: Box::new(value),
+            },
         }
     }
 
@@ -726,6 +771,61 @@ fn super_call_span(stmt: &Stmt) -> Option<swc_common::Span> {
     }
 }
 
+/// Whether `stmt` contains a `super(..)` call, `this`, or `super.x` inside an
+/// arrow function (`arrow`: already inside one), not descending into non-arrow
+/// functions or classes. Conservative: an arrow `super(..)` in a shape not
+/// walked here stays a compile error.
+fn stmt_arrow_super(stmt: &Stmt, arrow: bool) -> bool {
+    let e = |x: &Expr| expr_arrow_super(x, arrow);
+    let s = |x: &Stmt| stmt_arrow_super(x, arrow);
+    match stmt {
+        Stmt::Expr(x) => e(&x.expr),
+        Stmt::Return(r) => r.arg.as_deref().is_some_and(e),
+        Stmt::Throw(t) => e(&t.arg),
+        Stmt::Block(b) => b.stmts.iter().any(s),
+        Stmt::If(i) => e(&i.test) || s(&i.cons) || i.alt.as_deref().is_some_and(s),
+        Stmt::Decl(Decl::Var(v)) => v.decls.iter().any(|d| d.init.as_deref().is_some_and(e)),
+        Stmt::Try(t) => {
+            t.block.stmts.iter().any(s)
+                || t.handler
+                    .as_ref()
+                    .is_some_and(|h| h.body.stmts.iter().any(s))
+                || t.finalizer.as_ref().is_some_and(|f| f.stmts.iter().any(s))
+        }
+        Stmt::While(w) => e(&w.test) || s(&w.body),
+        Stmt::DoWhile(w) => e(&w.test) || s(&w.body),
+        Stmt::Labeled(l) => s(&l.body),
+        _ => false,
+    }
+}
+
+/// [`stmt_arrow_super`] for an expression.
+fn expr_arrow_super(expr: &Expr, arrow: bool) -> bool {
+    let e = |x: &Expr| expr_arrow_super(x, arrow);
+    match expr {
+        Expr::Call(c) => {
+            (arrow && matches!(c.callee, Callee::Super(_)))
+                || matches!(&c.callee, Callee::Expr(x) if e(x))
+                || c.args.iter().any(|a| e(&a.expr))
+        }
+        Expr::Arrow(a) => match a.body.as_ref() {
+            ArrowFunctionBody::FunctionBody(b) => b.stmts.iter().any(|s| stmt_arrow_super(s, true)),
+            ArrowFunctionBody::Expr(x) => expr_arrow_super(x, true),
+        },
+        // An arrow's `this` / `super.x` is the constructor's (lexical) `this`.
+        Expr::This(_) | Expr::SuperProp(_) => arrow,
+        Expr::Paren(p) => e(&p.expr),
+        Expr::Seq(q) => q.exprs.iter().any(|x| e(x)),
+        Expr::Assign(a) => e(&a.right),
+        Expr::Bin(b) => e(&b.left) || e(&b.right),
+        Expr::Cond(c) => e(&c.test) || e(&c.cons) || e(&c.alt),
+        Expr::Unary(u) => e(&u.arg),
+        Expr::Member(m) => e(&m.obj),
+        Expr::New(n) => e(&n.callee) || n.args.iter().flatten().any(|a| e(&a.expr)),
+        _ => false,
+    }
+}
+
 /// The derived-constructor `this` TDZ message (design 4.5).
 pub(super) const DERIVED_THIS_TDZ: &str = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
 
@@ -760,16 +860,6 @@ pub(super) fn guard(cond: IrNode, error: IrNode) -> IrNode {
         cond: Box::new(cond),
         then_branch: Box::new(IrNode::Undefined),
         else_branch: Box::new(IrNode::Throw(Box::new(error))),
-    }
-}
-
-/// Read a derived constructor's `this` in `local`, throwing the TDZ
-/// `ReferenceError` while it is still the hole (before `super(..)`).
-pub(super) fn this_checked(local: u32) -> IrNode {
-    IrNode::Ternary {
-        cond: Box::new(IrNode::IsHole(Box::new(IrNode::Local(local)))),
-        then_branch: Box::new(IrNode::Throw(Box::new(reference_error(DERIVED_THIS_TDZ)))),
-        else_branch: Box::new(IrNode::Local(local)),
     }
 }
 

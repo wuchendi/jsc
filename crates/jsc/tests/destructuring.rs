@@ -173,3 +173,20 @@ fn destructuring_assignment_unknown_member_adds_property() {
         "{ a: 0, zz: 1 }"
     );
 }
+
+/// An empty object pattern still requires an object-coercible value:
+/// destructuring `null`/`undefined` throws a `TypeError`.
+#[test]
+fn empty_object_pattern_rejects_nullish() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let f = ({}) => 1; \
+             try { f(null) } catch (e) { console.log(e.name) } \
+             function g({} = undefined) { return 2 } \
+             try { g() } catch (e) { console.log(e.name) } \
+             console.log(f({}), g(0))"
+        ]),
+        "TypeError\nTypeError\n1 2"
+    );
+}
