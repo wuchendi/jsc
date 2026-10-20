@@ -47,13 +47,14 @@ fn console_log_booleans_null_undefined() {
     assert_output("console.log(undefined)", "undefined\n");
 }
 
-/// A function value prints Node-console style `[Function (anonymous)]`.
+/// A function value prints Node-console style with its name.
 #[test]
 fn console_log_function_value() {
     assert_output(
         "function id(x){ return x } let g = id; console.log(g)",
-        "[Function (anonymous)]\n",
+        "[Function: id]\n",
     );
+    assert_output("console.log([x => x])", "[ [Function (anonymous)] ]\n");
 }
 
 /// A zero-argument `console.log()` prints just a newline.

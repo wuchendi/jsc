@@ -1,6 +1,28 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Write the object-family prefix of the block whose base is in i32 local
+/// `base`: one i64 store at offset 0 lays down the header word (type byte
+/// `type_byte`, zero `gc`/`flags`/`class` bytes) together with a zero `props`
+/// slot (at [`abi::OBJ_PROPS_OFFSET`], no own properties), then the `proto`
+/// slot (at [`OBJ_PROTO_OFFSET`]) gets the `null` jsval. Stack neutral.
+pub(super) fn emit_object_prefix(function: &mut Function, base: u32, type_byte: i32) {
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I64Const(i64::from(type_byte)));
+    function.instruction(&Instruction::I64Store(MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I64Const(NULL_BITS));
+    function.instruction(&Instruction::I64Store(MemArg {
+        offset: OBJ_PROTO_OFFSET,
+        align: 3,
+        memory_index: 0,
+    }));
+}
+
 /// Rebox the `f64` on top of the stack as a number jsval (via `__box_f64`).
 /// Every site that turns an `f64` (arithmetic, `Math.*`, a stored `Date` payload,
 /// a host-imported clock) back into a jsval goes through here, so the number NaN
@@ -192,24 +214,6 @@ pub(super) fn emit_is_generator(function: &mut Function, local: u32) {
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
     function.instruction(&Instruction::I32Const(TYPE_GENERATOR));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-}
-
-/// Push `1` if the jsval in `local` is an ACCESSOR box (type byte `11`), else `0`
-/// (instance getters/setters). Same shape as [`emit_is_function`], guarding
-/// the type-byte read behind [`emit_is_pointer`]. Used by the member read/write
-/// paths to detect that a property resolved (through the prototype chain) to an
-/// accessor and must be dispatched as a getter/setter call rather than a plain
-/// data value. The operand may be ANY resolved value (a number, `undefined`, an
-/// object, …), so the pointer gate is essential.
-pub(super) fn emit_is_accessor(function: &mut Function, local: u32) {
-    emit_is_pointer(function, local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_ACCESSOR));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));

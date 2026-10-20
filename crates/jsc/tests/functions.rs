@@ -374,3 +374,80 @@ fn nested_function_declarations_are_hoisted() {
         "5"
     );
 }
+
+/// Functions are objects: `name`/`length` materialize on first use, ad-hoc
+/// properties persist on the one function object a declaration creates, and
+/// plain functions get a `prototype` whose `constructor` points back.
+#[test]
+fn functions_are_objects() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(a, b){}; console.log(f.name, f.length); f.tag = 1; console.log(f.tag)"
+        ]),
+        "f 2\n1"
+    );
+    assert_eq!(jsc(&["-e", "function f(){} console.log(f === f)"]), "true");
+    assert_eq!(
+        jsc(&["-e", "function f(){} let g = f; g.x = 4; console.log(f.x)"]),
+        "4"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){} console.log(typeof f.prototype, f.prototype.constructor === f)"
+        ]),
+        "object true"
+    );
+    assert_eq!(
+        jsc(&["-e", "let g = () => 1; console.log(g.name, g.prototype)"]),
+        "g undefined"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { m(x, y = 1){} }; console.log(o.m.name, o.m.length)"
+        ]),
+        "m 1"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function outer(){ function inner(){} inner.k = 2; return inner.k } console.log(outer())"
+        ]),
+        "2"
+    );
+    assert_eq!(
+        jsc(&["-e", "function f(){} console.log(typeof f)"]),
+        "function"
+    );
+    // Writes to the non-writable `name`/`caller` throw in strict code.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){} try { f.caller = 1 } catch (e) { console.log(e instanceof TypeError) }"
+        ]),
+        "true"
+    );
+}
+
+/// Functions render with their name; ad-hoc enumerable properties follow.
+#[test]
+fn function_rendering() {
+    assert_eq!(
+        jsc(&["-e", "function f(){} console.log(f)"]),
+        "[Function: f]"
+    );
+    assert_eq!(
+        jsc(&["-e", "console.log(() => 1)"]),
+        "[Function (anonymous)]"
+    );
+    assert_eq!(
+        jsc(&["-e", "let h = function(){}; console.log(h)"]),
+        "[Function: h]"
+    );
+    assert_eq!(
+        jsc(&["-e", "function f(){} f.x = 1; console.log(f)"]),
+        "[Function: f] { x: 1 }"
+    );
+}

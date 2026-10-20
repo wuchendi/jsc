@@ -48,6 +48,7 @@ import {
   NEW_STRING_EXPORT_NAME,
   PRINT_FLAG_END,
   PRINT_FLAG_SEP,
+  PROMISE_BLOCK_SIZE,
   PROMISE_FULFILLED,
   PROMISE_OP_ASYNC_SPAWN,
   PROMISE_OP_AWAIT,
@@ -59,6 +60,8 @@ import {
   PROMISE_OP_SETTLE_REJECT,
   PROMISE_PENDING,
   PROMISE_REJECTED,
+  PROMISE_STATE_OFFSET,
+  PROMISE_VALUE_OFFSET,
   QNAN,
   TRUE,
   TYPE_ARRAY,
@@ -123,9 +126,6 @@ interface Job {
   finally: boolean
   asyncGen: bigint | null
 }
-
-/** The `[type][pad×3][state:i32][value:i64]` promise block size in bytes. */
-const PROMISE_BLOCK_SIZE = HEADER_SIZE + 4 + 8
 
 /** The linear-memory cap in bytes; constructor lengths are clamped to it (mirrors `host.rs`). */
 const MEMORY_MAX_BYTES = MEMORY_MAX_PAGES * 0x1_0000
@@ -522,8 +522,8 @@ export function createShim(): Shim {
     const mem = memory()
     if (!mem || base + PROMISE_BLOCK_SIZE > mem.buffer.byteLength) return
     const dv = new DataView(mem.buffer)
-    dv.setInt32(base + HEADER_SIZE, state, true)
-    dv.setBigUint64(base + HEADER_SIZE + 4, value, true)
+    dv.setInt32(base + PROMISE_STATE_OFFSET, state, true)
+    dv.setBigUint64(base + PROMISE_VALUE_OFFSET, value, true)
   }
 
   /**
@@ -867,14 +867,14 @@ function asFunction(mem: Uint8Array, bits: bigint): boolean {
 
 /** A promise block's `i32` state; a truncated block reads as pending. */
 function readState(mem: Uint8Array, base: number): number {
-  const at = base + HEADER_SIZE
+  const at = base + PROMISE_STATE_OFFSET
   if (at + 4 > mem.length) return PROMISE_PENDING
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true)
 }
 
 /** A promise block's settled value bits; a truncated block reads as `undefined`. */
 function readValue(mem: Uint8Array, base: number): bigint {
-  const at = base + HEADER_SIZE + 4
+  const at = base + PROMISE_VALUE_OFFSET
   if (at + 8 > mem.length) return UNDEFINED
   return new DataView(mem.buffer, mem.byteOffset).getBigUint64(at, true)
 }

@@ -76,9 +76,7 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(gen_dst));
-    function.instruction(&Instruction::LocalGet(gen_dst));
-    function.instruction(&Instruction::I32Const(TYPE_GENERATOR));
-    function.instruction(&Instruction::I32Store8(type_byte));
+    emit_object_prefix(function, gen_dst, TYPE_GENERATOR);
     // sm_idx (u32).
     function.instruction(&Instruction::LocalTee(gen_dst));
     function.instruction(&Instruction::LocalGet(gen_dst));
@@ -141,7 +139,6 @@ pub(super) fn emit_gen_resume(
 ) {
     let handle_slot = scratch + 22;
     let sm_result = scratch + 23;
-    let obj_dst = scratch + 3;
 
     // 1. Evaluate the handle once into a stable scratch slot.
     emit_node(handle, function, scratch, strings, helpers);
@@ -157,7 +154,7 @@ pub(super) fn emit_gen_resume(
         return;
     }
 
-    // 2. A non-generator receiver throws a branded `TypeError`.
+    // 2. A non-generator receiver throws a `TypeError`.
     emit_is_generator(function, handle_slot);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -206,10 +203,10 @@ pub(super) fn emit_gen_resume(
 
     // 4. Build the `{ value, done }` result object from the SM's value and the
     // handle's `done` flag.
-    emit_result_object(sm_result, handle_slot, obj_dst, function, strings, helpers);
+    emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
 }
 
-/// Emit the branded-`TypeError` throw shared by the two non-generator-receiver
+/// Emit the `TypeError` throw shared by the two non-generator-receiver
 /// paths of [`emit_gen_resume`]: stash the error in `$exc_value`, set the pending
 /// flag, clear any routed completion, and unwind to the nearest handler.
 fn emit_throw_type_error(
@@ -229,65 +226,16 @@ fn emit_throw_type_error(
 
 /// Emit the `{ value, done }` iterator result object, leaving its jsval on the
 /// stack: `value` is the state machine's returned value (in `sm_result`), `done`
-/// is the handle's `done` flag (in `handle_slot`) as a boolean. `obj_dst` is the
-/// i32 scratch holding the object base across the field writes.
+/// is the handle's `done` flag (in `handle_slot`) as a boolean, staged in the
+/// general i64 scratch slot (`scratch`) before the object literal is built.
 fn emit_result_object(
     sm_result: u32,
     handle_slot: u32,
-    obj_dst: u32,
+    scratch: u32,
     function: &mut Function,
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let payload = (HEADER_SIZE + 4) as u64;
-    let value_off = strings.get("value").copied().unwrap_or(HEAP_BASE);
-    let done_off = strings.get("done").copied().unwrap_or(HEAP_BASE);
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4 + 32));
-    function.instruction(&Instruction::Call(helpers.alloc));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I32Const(TYPE_OBJECT));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
-    // Entry 0: "value" -> the state machine's returned value.
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(value_off)));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload,
-        align: 3,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::LocalGet(sm_result));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload + 8,
-        align: 3,
-        memory_index: 0,
-    }));
-    // Entry 1: "done" -> the handle's `done` flag as a boolean jsval.
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(done_off)));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload + 16,
-        align: 3,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
     function.instruction(&Instruction::I64Const(TRUE_BITS));
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::LocalGet(handle_slot));
@@ -298,16 +246,24 @@ fn emit_result_object(
         memory_index: 0,
     }));
     function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload + 24,
-        align: 3,
-        memory_index: 0,
-    }));
-
-    // Rebox the result object's base as a heap jsval.
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(scratch));
+    let entries = [
+        (
+            PropKey::Static("value".to_owned()),
+            IrNode::Local(sm_result),
+        ),
+        (PropKey::Static("done".to_owned()), IrNode::Local(scratch)),
+    ];
+    emit_object_node(
+        &entries,
+        None,
+        abi::CLASS_ORDINARY,
+        0,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
 }
 
 /// Emit a generator STATE MACHINE function. Its wasm parameters are the

@@ -1,6 +1,6 @@
 use super::lower;
 use crate::frontend::{Dialect, parse};
-use crate::ir::{BinOp, IrNode, IrStmt, OpSetKind};
+use crate::ir::{BinOp, ConvertOp, ErrorKind, IrNode, IrStmt, ObjectBuiltinOp, OpSetKind, PropKey};
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
     lower(&parse(src, Dialect::Js)?)
@@ -137,60 +137,108 @@ fn lowers_object_literal() {
     };
     assert_eq!(
         *init,
-        IrNode::Object(vec![
-            ("a".to_owned(), IrNode::Num(1.0)),
-            ("b".to_owned(), IrNode::Num(2.0)),
-        ])
-    );
-}
-
-#[test]
-fn lowers_error_constructor_to_object() {
-    // `new TypeError("bad")` lowers to a branded error object: `name`, `message`,
-    // the derived `stack`, and the hidden `@@errorkind` marker. The message is
-    // teed into a fresh temp (evaluated once) and reused by `stack`.
-    let program = lower_src("new TypeError(\"bad\")").expect("should lower");
-    let IrStmt::Expr(IrNode::Object(entries)) = &program.stmts[0] else {
-        unreachable!("expected an object literal");
-    };
-    let keys: Vec<&str> = entries.iter().map(|(key, _)| key.as_str()).collect();
-    assert_eq!(
-        keys,
-        ["name", "message", "stack", crate::abi::ERROR_KIND_KEY]
-    );
-    assert_eq!(entries[0].1, IrNode::Str("TypeError".to_owned()));
-    assert_eq!(entries[3].1, IrNode::Num(crate::abi::ERROR_KIND_TYPE));
-    let IrNode::Assign { local, value } = &entries[1].1 else {
-        unreachable!("message should tee into a temp");
-    };
-    assert_eq!(**value, IrNode::Str("bad".to_owned()));
-    assert_eq!(
-        entries[2].1,
-        IrNode::Binary {
-            op: BinOp::Add,
-            lhs: Box::new(IrNode::Str("TypeError: ".to_owned())),
-            rhs: Box::new(IrNode::Local(*local)),
+        IrNode::Object {
+            entries: vec![
+                (PropKey::Static("a".to_owned()), IrNode::Num(1.0)),
+                (PropKey::Static("b".to_owned()), IrNode::Num(2.0)),
+            ],
+            proto: None,
+            class: crate::abi::CLASS_ORDINARY,
+            reserve: 0,
         }
     );
 }
 
 #[test]
-fn lowers_error_no_arg_to_empty_message() {
-    // `new Error()` defaults `message` to "" and `stack` to just the name (no
-    // trailing colon), still carrying the hidden `@@errorkind` marker.
-    let program = lower_src("new Error()").expect("should lower");
+fn lowers_computed_and_numeric_literal_keys() {
+    // A computed key `[k]` and a numeric key `1` stay computed (converted at run
+    // time), in source order, around the static key.
+    let program = lower_src("let k = 'x'; let o = {[k]: 1, b: 2, 1: 3}; o").expect("should lower");
+    let IrStmt::Decl { init, .. } = &program.stmts[1] else {
+        unreachable!("expected a declaration");
+    };
+    let IrNode::Object { entries, .. } = init else {
+        unreachable!("expected an object literal");
+    };
+    assert!(matches!(entries[0].0, PropKey::Computed(IrNode::Local(_))));
+    assert_eq!(entries[1].0, PropKey::Static("b".to_owned()));
+    assert_eq!(entries[2].0, PropKey::Computed(IrNode::Num(1.0)));
+}
+
+#[test]
+fn lowers_error_constructor_to_object() {
+    // `new TypeError("bad")` lowers to a class-ERROR object linked to the
+    // static `%TypeError.prototype%`, owning non-enumerable `message` and
+    // `stack` (a string literal resolves both at compile time).
+    let program = lower_src("new TypeError(\"bad\")").expect("should lower");
     assert_eq!(
         program.stmts[0],
-        IrStmt::Expr(IrNode::Object(vec![
-            ("name".to_owned(), IrNode::Str("Error".to_owned())),
-            ("message".to_owned(), IrNode::Str(String::new())),
-            ("stack".to_owned(), IrNode::Str("Error".to_owned())),
-            (
-                crate::abi::ERROR_KIND_KEY.to_owned(),
-                IrNode::Num(crate::abi::ERROR_KIND_ERROR)
-            ),
-        ]))
+        IrStmt::Expr(IrNode::Object {
+            entries: vec![
+                (
+                    PropKey::Hidden("message".to_owned()),
+                    IrNode::Str("bad".to_owned())
+                ),
+                (
+                    PropKey::Hidden("stack".to_owned()),
+                    IrNode::Str("TypeError: bad".to_owned())
+                ),
+            ],
+            proto: Some(Box::new(IrNode::ErrorProto(ErrorKind::TypeError))),
+            class: crate::abi::CLASS_ERROR,
+            reserve: 0,
+        })
     );
+}
+
+#[test]
+fn lowers_error_dynamic_message_once() {
+    // A non-literal message is evaluated once into a temp: `undefined` builds
+    // an error without an own `message`, anything else its `ToString`.
+    let program = lower_src("let m = 1; new Error(m)").expect("should lower");
+    let IrStmt::Expr(IrNode::Ternary {
+        cond,
+        then_branch,
+        else_branch,
+    }) = &program.stmts[1]
+    else {
+        unreachable!("expected the undefined-message test");
+    };
+    assert!(matches!(&**cond, IrNode::Binary { op: BinOp::Eq, lhs, rhs }
+        if matches!(&**lhs, IrNode::Assign { .. }) && **rhs == IrNode::Undefined));
+    assert_eq!(
+        **then_branch,
+        IrNode::error_object(
+            ErrorKind::Error,
+            None,
+            None,
+            IrNode::Str("Error".to_owned())
+        )
+    );
+    let IrNode::Object { entries, .. } = &**else_branch else {
+        unreachable!("expected the error object");
+    };
+    assert!(matches!(&entries[0].1, IrNode::Assign { value, .. }
+        if matches!(&**value, IrNode::ConvertCall { op: ConvertOp::ToString, .. })));
+}
+
+#[test]
+fn lowers_error_no_arg_to_inherited_message() {
+    // `new Error()` and `Error()` own no `message` (the prototype's `""` is
+    // inherited) and a bare-name `stack`.
+    for src in ["new Error()", "Error()", "new Error(undefined)"] {
+        let program = lower_src(src).expect("should lower");
+        assert_eq!(
+            program.stmts[0],
+            IrStmt::Expr(IrNode::error_object(
+                ErrorKind::Error,
+                None,
+                None,
+                IrNode::Str("Error".to_owned()),
+            )),
+            "for `{src}`"
+        );
+    }
 }
 
 #[test]
@@ -241,15 +289,6 @@ fn lowers_shorthand_object_property() {
     assert!(
         lower_src("let a = 1; let o = {a}; o").is_ok(),
         "shorthand object property should lower"
-    );
-}
-
-#[test]
-fn rejects_computed_object_key() {
-    // Computed keys `{[e]: v}` are out of scope.
-    assert!(
-        lower_src("let k = \"a\"; let o = {[k]: 1}; o").is_err(),
-        "computed object key is unsupported"
     );
 }
 
@@ -584,20 +623,14 @@ fn lowers_function_declaration_and_call() {
 }
 
 #[test]
-fn lowers_function_name_in_value_position_to_func_value() {
-    // `let f = add;` binds `f` to a first-class function value (table index
-    // 0 = wasm function index 1 minus one).
+fn lowers_function_name_in_value_position_to_decl_func() {
+    // `let f = add;` binds `f` to the declaration's one static function object
+    // (table index 0 = wasm function index 1 minus one).
     let program = lower_src("function add(a, b) { return a + b } let f = add; f").expect("lower");
     let IrStmt::Decl { init, .. } = &program.stmts[0] else {
         unreachable!("expected the `let f = add` declaration");
     };
-    assert_eq!(
-        *init,
-        IrNode::FuncValue {
-            table_index: 0,
-            captures: vec![]
-        }
-    );
+    assert_eq!(*init, IrNode::DeclFunc(0));
 }
 
 #[test]
@@ -618,7 +651,7 @@ fn lowers_call_through_variable_to_call_indirect() {
 }
 
 #[test]
-fn passing_a_function_argument_lowers_to_func_value() {
+fn passing_a_function_argument_lowers_to_decl_func() {
     // `apply(dbl, 21)` passes `dbl` as a function value; `apply` is called
     // directly by name, and its `f(x)` body call is indirect.
     let program = lower_src(
@@ -630,14 +663,8 @@ fn passing_a_function_argument_lowers_to_func_value() {
         unreachable!("expected a direct call to `apply`");
     };
     assert_eq!(*func, 1);
-    // `dbl` (wasm index 2) becomes function-table index 1 in value position.
-    assert_eq!(
-        args[0],
-        IrNode::FuncValue {
-            table_index: 1,
-            captures: vec![]
-        }
-    );
+    // `dbl` (wasm index 2) is its static object (table index 1) in value position.
+    assert_eq!(args[0], IrNode::DeclFunc(1));
     assert_eq!(args[1], IrNode::Num(21.0));
     // `apply`'s body calls its `f` parameter indirectly (`f`/`x` are the
     // env-last ABI's argument slots, locals 0/1).
@@ -664,7 +691,8 @@ fn arrow_lifts_to_func_value_and_registers_a_function() {
         *init,
         IrNode::FuncValue {
             table_index: 0,
-            captures: vec![]
+            captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     assert_eq!(program.functions.len(), 1);
@@ -732,7 +760,8 @@ fn nested_arrow_is_lifted_after_its_enclosing_arrow() {
         *init,
         IrNode::FuncValue {
             table_index: 0,
-            captures: vec![]
+            captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     assert_eq!(program.functions.len(), 2);
@@ -820,6 +849,7 @@ fn non_capturing_function_has_no_cells_or_captures() {
         IrNode::FuncValue {
             table_index: 0,
             captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     // The arrow's body is a plain param read — no cell.
@@ -930,17 +960,28 @@ fn lowers_switch_with_default_and_break() {
 
 #[test]
 fn lowers_for_in_to_counted_key_loop() {
-    // `for (const k in o)` desugars to `iter/len/idx` decls + a `while`; the body's
-    // first statement rebinds `k` to the ObjectKey at the current index.
+    // `for (const k in o)` desugars to `keys/len/idx` decls + a `while`: the keys
+    // are snapshotted once, and the body's first statement rebinds `k` to the
+    // snapshot element at the current index.
     let program = lower_src("let o={a:1}; for (const k in o) { }").expect("lower");
+    assert!(program.stmts.iter().any(|stmt| matches!(
+        stmt,
+        IrStmt::Decl {
+            init: IrNode::ObjectBuiltin {
+                op: ObjectBuiltinOp::ForInKeys,
+                ..
+            },
+            ..
+        }
+    )));
     let IrStmt::While { body, update, .. } = program.stmts.last().expect("a loop") else {
         unreachable!("expected a while statement");
     };
-    // The loop binding is `k = ObjectKey { .. }` as the first body statement.
+    // The loop binding is `k = keys[i]` as the first body statement.
     let IrStmt::Decl { init, .. } = &body[0] else {
         unreachable!("expected the key-binding decl");
     };
-    assert!(matches!(init, IrNode::ObjectKey { .. }));
+    assert!(matches!(init, IrNode::Index { .. }));
     // The index increment lives in the `update` slot so a `continue` advances it.
     assert_eq!(update.len(), 1);
 }

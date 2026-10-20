@@ -92,8 +92,33 @@ pub(super) fn emit_node(
         IrNode::FuncValue {
             table_index,
             captures,
+            kind,
         } => {
-            emit_func_value(*table_index, captures, function, scratch, strings, helpers);
+            emit_func_value(
+                *table_index,
+                captures,
+                *kind,
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
+        }
+        IrNode::ErrorProto(kind) => {
+            function.instruction(&Instruction::I64Const(error_proto_bits(*kind, helpers)));
+        }
+        IrNode::DeclFunc(table_index) => {
+            let base = decl_func_base(*table_index, helpers);
+            function.instruction(&Instruction::I64Const(
+                HEAP_BITS | i64::from(base.cast_unsigned()),
+            ));
+        }
+        IrNode::DefineProps {
+            obj,
+            local,
+            entries,
+        } => {
+            emit_define_props_node(obj, *local, entries, function, scratch, strings, helpers);
         }
         IrNode::CallIndirect { callee, args } => {
             emit_call_indirect(callee, args, function, scratch, strings, helpers);
@@ -232,26 +257,31 @@ pub(super) fn emit_node(
             // function/arrow prologue.
             function.instruction(&Instruction::GlobalGet(THIS_GLOBAL));
         }
-        IrNode::Object(entries) => {
-            emit_object_node(entries, function, scratch, strings, helpers);
+        IrNode::Object {
+            entries,
+            proto,
+            class,
+            reserve,
+        } => {
+            emit_object_node(
+                entries,
+                proto.as_deref(),
+                *class,
+                *reserve,
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
         }
         IrNode::ObjectRest { source, exclude } => {
             emit_object_rest_node(source, exclude, function, scratch, strings, helpers);
         }
         IrNode::Index { obj, index } => {
             emit_index_node(obj, index, true, function, scratch, strings, helpers);
-            // A member/computed read whose object arm resolved (through the
-            // prototype chain) to an accessor box invokes the getter with `this` =
-            // the receiver, which `emit_index_node` leaves in `scratch + 17`.
-            if helpers.has_accessors {
-                emit_accessor_get(function, scratch, helpers);
-            }
         }
         IrNode::MakeAccessor { getter, setter } => {
             emit_make_accessor_node(getter, setter, function, scratch, strings, helpers);
-        }
-        IrNode::ObjectKey { obj, index } => {
-            emit_object_key_node(obj, index, function, scratch, strings, helpers);
         }
         IrNode::ObjectBuiltin { op, arg } => {
             emit_object_builtin_node(*op, arg, function, scratch, strings, helpers);
@@ -534,9 +564,6 @@ pub(super) fn emit_method_call_user(
         strings,
         helpers,
     );
-    if helpers.has_accessors {
-        emit_accessor_get(function, scratch, helpers);
-    }
     // The general i64 scratch slot (+0) is free here: the member read has already
     // left its result on the stack, and nothing below reads +0 before this call.
     let callee_val = scratch;
@@ -566,19 +593,19 @@ pub(super) fn emit_method_call_user(
     function.instruction(&Instruction::LocalGet(obj_local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 
-    // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -590,94 +617,13 @@ pub(super) fn emit_method_call_user(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Emit the accessor-get postlude for a member/computed READ: the resolved
-/// value is on top of the stack and the receiver sits in `scratch + 17` (where
-/// [`emit_index_node`] stashed it). If the resolved value is a `TYPE_ACCESSOR`
-/// box, invoke its getter (a zero-argument function value) with `this` = the
-/// receiver and leave the getter's result; a box with no getter (a set-only
-/// property) yields `undefined`. Any non-accessor value passes through unchanged,
-/// so an ordinary data read, array element, or string char is untouched.
-///
-/// Emitted ONLY when the program declares an accessor (`helpers.has_accessors`),
-/// so an accessor-free program keeps byte-identical member-read emission.
-///
-/// The getter is a throwing call, so every enclosing `if` opened here is tracked
-/// with [`enter_frame`]/[`leave_frame`] — a getter that throws inside a `try`
-/// then computes the right handler-relative `br` depth.
-pub(super) fn emit_accessor_get(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
-    // `+18` (the index READ key slot) is free once the object arm has resolved, so
-    // it stashes the resolved value; `+17` still holds the receiver.
-    let val = scratch + 18;
-    let recv = scratch + 17;
-    let getter = scratch;
-    let base = scratch + 7;
-
-    function.instruction(&Instruction::LocalSet(val));
-    emit_is_accessor(function, val);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    enter_frame(helpers);
-    // getter = the getter jsval stored in the box.
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I64Load(MemArg {
-        offset: ACCESSOR_GET_OFFSET,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalSet(getter));
-
-    emit_is_function(function, getter);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    enter_frame(helpers);
-    // Invoke the getter: K padded `undefined` args (it takes none), `this` = the
-    // receiver bound immediately before the indirect call, then the uniform ABI
-    // trailer (env, argc, funcref index) read off the getter's function block.
-    for _ in 0..helpers.max_args {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    }
-    function.instruction(&Instruction::LocalGet(recv));
-    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
-    function.instruction(&Instruction::LocalGet(getter));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(base));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 3,
-        memory_index: 0,
-    }));
-    emit_argc(0, function);
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::CallIndirect {
-        type_index: helpers.fn_type,
-        table_index: 0,
-    });
-    emit_propagate_if_pending(function, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::Else);
-    // A set-only accessor (no getter): reading yields `undefined`.
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::End);
-
-    leave_frame(helpers);
-    function.instruction(&Instruction::Else);
-    // Not an accessor: the resolved data value itself.
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::End);
-}
-
 /// Emit a `super(args)` / `super.m(args)` call (`IrNode::ThisCall`),
 /// leaving the callee's boxed result on the stack. Mirrors [`emit_method_call_user`]
 /// but binds `this` to the ENCLOSING instance (`this_local`, the current method's
 /// snapshotted `this`) rather than a member receiver, so a parent constructor's
 /// `this.<field> = ..` mutates the instance the subclass is building. `callee` is
 /// a direct function value (the parent constructor or a parent-prototype method);
-/// the same not-a-function runtime guard throws a branded `TypeError` if `super.m`
+/// the same not-a-function runtime guard throws a `TypeError` if `super.m`
 /// resolves to a non-function (e.g. a missing method).
 pub(super) fn emit_this_call(
     node: &IrNode,
@@ -706,7 +652,7 @@ pub(super) fn emit_this_call(
     function.instruction(&Instruction::LocalSet(callee_val));
 
     // Runtime guard: the callee MUST be a function value — a `super.m` that
-    // resolves to `undefined` (missing method) throws a branded TypeError instead
+    // resolves to `undefined` (missing method) throws a TypeError instead
     // of dispatching a bogus funcref index. Identical to the method-call guard.
     emit_callable_guard(function, callee_val, scratch, strings, helpers);
 
@@ -719,19 +665,19 @@ pub(super) fn emit_this_call(
     function.instruction(&Instruction::LocalGet(this_local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 
-    // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -751,7 +697,7 @@ pub(super) fn emit_this_call(
 /// set to the instance immediately before the `call_indirect`. Unlike a method
 /// call, the constructor's return value is DISCARDED and the instance itself is
 /// the expression's result — so any `this.<field> = ..` the constructor performed
-/// (mutating the pre-slotted instance in place) is observed by the caller.
+/// (adding properties to the instance in place) is observed by the caller.
 pub(super) fn emit_new(
     node: &IrNode,
     function: &mut Function,
@@ -792,19 +738,19 @@ pub(super) fn emit_new(
     function.instruction(&Instruction::LocalGet(instance_local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 
-    // Trailing env argument: the constructor's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the constructor's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -834,9 +780,10 @@ pub(super) fn emit_argc(count: usize, function: &mut Function) {
 
 /// Emit a first-class function value `IrNode::FuncValue`, leaving its jsval
 /// (single heap tag `0b101`, type byte `TYPE_FUNCTION`) on the stack.
-/// `__alloc(FUNC_BLOCK_SIZE)` reserves the block, then the type byte, the
-/// funcref-table index (at `+HEADER_SIZE`), and the environment slot (at
-/// `+HEADER_SIZE+4`) are written.
+/// `__alloc(FUNC_BLOCK_SIZE)` reserves the block, then the object-family prefix
+/// (header `flags` `LAZY` plus the function's constructor kind, no properties,
+/// `null` prototype), the funcref-table index (at [`FUNC_INDEX_OFFSET`]), and
+/// the environment slot (at [`FUNC_ENV_OFFSET`]) are written.
 ///
 /// For a non-capturing function `captures` is empty and the env slot is
 /// `undefined`. For a **closure** the environment block is built first (via
@@ -846,6 +793,7 @@ pub(super) fn emit_argc(count: usize, function: &mut Function) {
 pub(super) fn emit_func_value(
     table_index: u32,
     captures: &[IrNode],
+    kind: FnKind,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -853,19 +801,14 @@ pub(super) fn emit_func_value(
 ) {
     let dst = scratch + 3;
     let env_tmp = scratch + 6;
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
     let func_idx_slot = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     };
     let env_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+        offset: FUNC_ENV_OFFSET,
+        align: 3,
         memory_index: 0,
     };
 
@@ -882,19 +825,18 @@ pub(super) fn emit_func_value(
     function.instruction(&Instruction::I32Const(FUNC_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
 
-    // Write the TYPE_FUNCTION type byte at dst (offset 0), keeping dst on the stack.
+    // Write the TYPE_FUNCTION prefix at dst, keeping dst on the stack.
+    let flags = fn_flags(kind);
     function.instruction(&Instruction::LocalTee(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
-    function.instruction(&Instruction::I32Store8(type_byte));
+    emit_object_prefix(function, dst, TYPE_FUNCTION | i32::from(flags) << 16);
 
-    // Write the u32 funcref-table index at dst + HEADER_SIZE.
+    // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(table_index.cast_signed()));
     function.instruction(&Instruction::I32Store(func_idx_slot));
 
-    // Write the env slot at dst + HEADER_SIZE + 4.
+    // Write the env slot at dst + FUNC_ENV_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(env_tmp));
@@ -999,11 +941,11 @@ pub(super) fn emit_cell_new(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit `<string>.length` / `<array>.length`: for a heap-pointer operand (low
-/// 32 bits are the block base) read the u32 `len` header at
-/// `base + HEADER_SIZE` and rebox it as a number jsval; a primitive operand
-/// yields `undefined` without touching memory. The operand is stashed in the
-/// general i64 scratch slot (`+0`).
+/// Emit `<recv>.length`: for a string or array operand (low 32 bits are the
+/// block base) read the u32 `len` header at `base + HEADER_SIZE` and rebox it
+/// as a number jsval; any other heap operand reads its `length` property
+/// through `__get`; a primitive operand yields `undefined` without touching
+/// memory. The operand is stashed in the general i64 scratch slot (`+0`).
 pub(super) fn emit_str_len(
     operand: &IrNode,
     function: &mut Function,
@@ -1017,6 +959,18 @@ pub(super) fn emit_str_len(
     function.instruction(&Instruction::LocalSet(scratch));
     emit_is_pointer(function, scratch);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    // A string or array (kind byte <= TYPE_ARRAY) reads its length header; any
+    // other heap value (a function's `length`, an object's own) is a `__get`.
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
+    function.instruction(&Instruction::I32LeU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
@@ -1026,6 +980,17 @@ pub(super) fn emit_str_len(
     }));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::I32Const(static_key(
+        strings,
+        INDEX_LENGTH_KEY,
+    )));
+    function.instruction(&Instruction::Call(helpers.get));
+    if helpers.has_accessors {
+        emit_propagate_if_pending(function, helpers);
+    }
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
@@ -1192,14 +1157,14 @@ pub(super) fn emit_promise_ctor(
     emit_reset_this(function);
     function.instruction(&Instruction::LocalGet(exec_base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     emit_argc(2, function);
     function.instruction(&Instruction::LocalGet(exec_base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -1246,31 +1211,30 @@ fn emit_settler_value(
     // dst = __alloc(FUNC_BLOCK_SIZE); leave dst (i32) on the stack.
     function.instruction(&Instruction::I32Const(FUNC_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
-    // Write the TYPE_FUNCTION type byte at dst (offset 0).
+    // Write the TYPE_FUNCTION prefix at dst (a lazy anonymous non-constructor,
+    // its info entry right after the user functions'), keeping dst on the stack.
     function.instruction(&Instruction::LocalTee(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-    // Write the u32 funcref-table index at dst + HEADER_SIZE.
+    emit_object_prefix(
+        function,
+        dst,
+        TYPE_FUNCTION | i32::from(abi::FUNC_FLAG_LAZY) << 16,
+    );
+    // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(table_index.cast_signed()));
     function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
-    // Write the bound promise into the env slot at dst + HEADER_SIZE + 4.
+    // Write the bound promise into the env slot at dst + FUNC_ENV_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(p_local));
     function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+        offset: FUNC_ENV_OFFSET,
+        align: 3,
         memory_index: 0,
     }));
     // Rebox the block base (still on the stack) as a heap jsval.
@@ -1293,7 +1257,7 @@ pub(super) fn emit_call_indirect(
     // Evaluate the callee once; stash its block base.
     emit_node(callee, function, scratch, strings, helpers);
     // A program that declares no function has no funcref table, so the callee
-    // can never be a function value: throw the branded not-a-function TypeError
+    // can never be a function value: throw the not-a-function TypeError
     // instead of emitting an invalid `call_indirect`. The transfer leaves the
     // stack polymorphic, so the discarded operands need no cleanup.
     if !helpers.has_funcs {
@@ -1313,19 +1277,19 @@ pub(super) fn emit_call_indirect(
     // A plain indirect call binds `this = undefined` — method calls take the
     // dedicated `emit_method_call_user` path instead.
     emit_reset_this(function);
-    // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
     emit_argc(args.len(), function);
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -1337,7 +1301,7 @@ pub(super) fn emit_call_indirect(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Throw the branded not-a-function `TypeError` (see [`internal_type_error`]) and
+/// Throw the not-a-function `TypeError` (see [`internal_type_error`]) and
 /// unwind to the nearest handler. Used where a program with no funcref table
 /// would otherwise need a `call_indirect`; the transfer leaves the stack
 /// polymorphic, so any discarded operands need no cleanup.
@@ -1357,7 +1321,7 @@ pub(super) fn emit_throw_not_a_function(
 }
 
 /// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in
-/// `local` is a heap FUNCTION value, throw the branded not-a-function `TypeError`
+/// `local` is a heap FUNCTION value, throw the not-a-function `TypeError`
 /// (see [`emit_throw_not_a_function`]) and unwind. Stack-neutral on the
 /// not-thrown path. The throw path builds the error object in the low scratch
 /// slots, so `local` may itself be a scratch slot the caller re-reads afterwards
@@ -1383,7 +1347,7 @@ pub(super) fn emit_callable_guard(
 /// Whether `callee` is a function literal, so its value is statically a
 /// function and an indirect call through it needs no `IsCallable` check.
 pub(super) fn is_static_function(callee: &IrNode) -> bool {
-    matches!(callee, IrNode::FuncValue { .. })
+    matches!(callee, IrNode::FuncValue { .. } | IrNode::DeclFunc(_))
 }
 
 /// Emit a call whose argument list contains a spread `f(...a)`, leaving
@@ -1420,7 +1384,7 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             emit_propagate_if_pending(function, helpers);
         }
-        SpreadCallee::Indirect(callee) => {
+        SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } => {
             let cb = scratch + 7;
             // The callee is evaluated first (JS order) and its base stashed, then
             // the argument array is built and read.
@@ -1441,20 +1405,26 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::LocalSet(cb));
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             emit_spread_arg_slots(base, len, function, helpers);
-            // A plain indirect call binds `this = undefined`.
-            emit_reset_this(function);
-            // Trailing env argument: the callee's own environment (+HEADER_SIZE+4).
+            // A plain indirect call binds `this = undefined`; `super(...)`
+            // keeps the enclosing constructor's `this`.
+            if let SpreadCallee::This { this_local, .. } = target {
+                function.instruction(&Instruction::LocalGet(*this_local));
+                function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+            } else {
+                emit_reset_this(function);
+            }
+            // Trailing env argument: the callee's own environment (FUNC_ENV_OFFSET).
             function.instruction(&Instruction::LocalGet(cb));
             function.instruction(&Instruction::I64Load(MemArg {
-                offset: (HEADER_SIZE + 4) as u64,
+                offset: FUNC_ENV_OFFSET,
                 align: 3,
                 memory_index: 0,
             }));
             emit_spread_argc(len, function);
-            // Funcref-table index (+HEADER_SIZE), on top for call_indirect.
+            // Funcref-table index (FUNC_INDEX_OFFSET), on top for call_indirect.
             function.instruction(&Instruction::LocalGet(cb));
             function.instruction(&Instruction::I32Load(MemArg {
-                offset: HEADER_SIZE as u64,
+                offset: FUNC_INDEX_OFFSET,
                 align: 2,
                 memory_index: 0,
             }));

@@ -14,9 +14,9 @@ use super::*;
 // adds a type + function registration), not with branching complexity.
 #[allow(clippy::too_many_lines)]
 pub(super) fn build_type_and_function_sections<'a>(
-    program: &IrProgram,
+    program: &'a IrProgram,
     unwind: &'a RefCell<Unwind>,
-    has_accessors: bool,
+    layout: FnLayout,
 ) -> (
     TypeSection,
     FunctionSection,
@@ -56,83 +56,81 @@ pub(super) fn build_type_and_function_sections<'a>(
     }
 
     // Every DEFINED function index is shifted up by IMPORT_FUNC_COUNT because the
-    // host `print` import occupies the lowest function indices: `main` is
-    // function `IMPORT_FUNC_COUNT`, user function `i` is `i + 1 + IMPORT_FUNC_COUNT`,
-    // and the helpers follow.
-    let alloc_index = IMPORT_FUNC_COUNT + 1 + u32::try_from(n).unwrap_or(u32::MAX);
-    let concat_index = alloc_index + 1;
-    let str_eq_index = concat_index + 1;
-    let str_cmp_index = str_eq_index + 1;
-    let str_index_index = str_cmp_index + 1;
-    let obj_get_index = str_index_index + 1;
+    // host imports occupy the lowest function indices: `main` is function
+    // `IMPORT_FUNC_COUNT`, user function `i` is `i + 1 + IMPORT_FUNC_COUNT`, and
+    // the helpers follow in the order `helper_types` lists them (and `emit`
+    // appends their bodies).
+    let mut next = IMPORT_FUNC_COUNT + 1 + u32::try_from(n).unwrap_or(u32::MAX);
+    let mut index = || {
+        next += 1;
+        next - 1
+    };
     let helpers = Helpers {
         unwind,
-        // The host `print` import is function index 0, `__convert` index 1, and
-        // `__method` index 2 (imports come first, in declaration order).
+        // The host imports, in declaration order: `print` 0, `__convert` 1,
+        // `__method` 2, `__promise` 3, `__then` 4, `__now` 5, `__parse_int` 6.
         print: 0,
         convert: 1,
         method: 2,
-        // The host promise imports follow the `print`/`__convert`/`__method` imports in declaration
-        // order: `__promise` index 3, `__then` index 4. The host wall clock
-        // (`__now`, backing `Date`) is index 5, and `__parse_int` (backing
-        // `parseInt`) is appended last, index 6.
         promise: 3,
         then: 4,
         now: 5,
         parse_int: 6,
-        alloc: alloc_index,
-        concat: concat_index,
-        str_eq: str_eq_index,
-        str_cmp: str_cmp_index,
-        str_index: str_index_index,
-        obj_get: obj_get_index,
-        obj_set: obj_get_index + 1,
-        array_push: obj_get_index + 2,
-        obj_rest: obj_get_index + 3,
-        array_concat: obj_get_index + 4,
-        obj_keys: obj_get_index + 5,
-        obj_values: obj_get_index + 6,
-        obj_entries: obj_get_index + 7,
-        obj_has: obj_get_index + 8,
-        obj_delete: obj_get_index + 9,
-        json_escape: obj_get_index + 10,
-        json_str: obj_get_index + 11,
-        same_value_zero: obj_get_index + 12,
-        map_find: obj_get_index + 13,
-        map_set: obj_get_index + 14,
-        map_get: obj_get_index + 15,
-        map_has: obj_get_index + 16,
-        map_delete: obj_get_index + 17,
-        // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
-        // Map/Set helpers, before the `JSON.parse` family.
-        loose_eq: obj_get_index + 18,
-        str_to_array: obj_get_index + 19,
-        // The in-wasm `JSON.parse` helpers, in emitted order.
-        json_ws: obj_get_index + 20,
-        json_throw: obj_get_index + 21,
-        json_string: obj_get_index + 22,
-        json_number: obj_get_index + 23,
-        json_value: obj_get_index + 24,
-        json_array: obj_get_index + 25,
-        json_object: obj_get_index + 26,
-        array_to_object: obj_get_index + 27,
-        json_parse: obj_get_index + 28,
-        // `__gen_to_array` is appended after the Map/Set helpers and
-        // before `__invoke1`.
-        gen_to_array: obj_get_index + 29,
-        // `__nullish_throw` (the nullish-receiver guard's error build) follows it.
-        nullish_throw: obj_get_index + 30,
-        // `__prop_throw` (the absent-property / array-grow error build) follows it.
-        prop_throw: obj_get_index + 31,
-        // `__box_f64` (the canonical-NaN number rebox) follows it.
-        box_f64: obj_get_index + 32,
-        // `__to_number` (the shared ToNumber coercion) follows it.
-        to_number: obj_get_index + 33,
+        alloc: index(),
+        concat: index(),
+        str_eq: index(),
+        str_cmp: index(),
+        str_index: index(),
+        str_hash: index(),
+        intern_slot: index(),
+        intern_find: index(),
+        intern: index(),
+        index_value: index(),
+        index_string: index(),
+        to_key: index(),
+        prop_find: index(),
+        define: index(),
+        // `__fn_materialize` takes the index right after `__define`.
+        get: {
+            index();
+            index()
+        },
+        set: index(),
+        has: index(),
+        delete: index(),
+        own_keys: index(),
+        for_in_keys: index(),
+        rest: index(),
+        array_push: index(),
+        array_concat: index(),
+        json_escape: index(),
+        json_str: index(),
+        same_value_zero: index(),
+        map_find: index(),
+        map_set: index(),
+        map_get: index(),
+        map_has: index(),
+        map_delete: index(),
+        loose_eq: index(),
+        str_to_array: index(),
+        json_ws: index(),
+        json_throw: index(),
+        json_string: index(),
+        json_number: index(),
+        json_value: index(),
+        json_array: index(),
+        json_object: index(),
+        json_parse: index(),
+        gen_to_array: index(),
+        nullish_throw: index(),
+        prop_throw: index(),
+        box_f64: index(),
+        to_number: index(),
         // The `__invoke1` callback trampoline is appended after every helper
         // above; the `__async_step` trampoline follows it, then the two
         // `new Promise` settler functions.
-        invoke1: obj_get_index + 34,
-        async_step: obj_get_index + 35,
+        invoke1: index(),
+        async_step: index(),
         // The settler funcref-TABLE slots sit right after the `n` user-function
         // slots (`0..n`), so slots `n` and `n + 1`. `0` when there are no functions
         // (no table — and `new Promise` cannot occur without an executor function).
@@ -147,102 +145,22 @@ pub(super) fn build_type_and_function_sections<'a>(
             0
         },
         // The constructors follow the two settlers (present only with functions).
-        new_string: obj_get_index + 36 + if has_funcs { 2 } else { 0 },
+        new_string: index() + if has_funcs { 2 } else { 0 },
         fn_type: if has_funcs { fn_type } else { 0 },
         max_args,
         has_funcs,
-        has_accessors,
+        has_accessors: program_has_accessors(program),
+        fn_info: layout.info,
     };
     // Helper types follow the main (type 0) and uniform (type 1, only when there
-    // are functions) types, tracked by the next free type index. Scoped in a
-    // block so the closure's borrow of `types`/`functions` ends before they are
-    // returned.
-    // The first free type index after main (type 0) and the uniform function type
-    // (type 1, only when there are functions).
-    let helper_type_base = if has_funcs { 2 } else { 1 };
-    {
-        let mut next_type = helper_type_base;
-        let mut helper = |params: &[ValType], results: &[ValType]| {
-            types
-                .ty()
-                .function(params.iter().copied(), results.iter().copied());
-            functions.function(next_type);
-            next_type += 1;
-        };
-        // `__alloc` (`(i32) -> i32`), then `__concat`/`__str_eq`/`__str_cmp`/
-        // `__str_index` (each `(i32, i32) -> i32`), in function-index order.
-        helper(&[ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        // `__obj_get(obj_ptr: i32, key_ptr: i32) -> i64` and
-        // `__obj_set(obj_ptr: i32, key_ptr: i32, val: i64) -> hit: i32`.
-        helper(&[ValType::I32, ValType::I32], &[ValType::I64]);
-        helper(&[ValType::I32, ValType::I32, ValType::I64], &[ValType::I32]);
-        // `__array_push(base: i32, value: i64) -> new_base: i32`.
-        helper(&[ValType::I32, ValType::I64], &[ValType::I32]);
-        // `__obj_rest(obj_ptr: i32, excl_ptr: i32) -> new_base: i32`.
-        helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        // `__array_concat(dst: i32, src: i32) -> new_base: i32`.
-        helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        // `__obj_keys`/`__obj_values`/`__obj_entries(obj_ptr: i32) -> array_base:
-        // i32` are appended LAST, each `(i32) -> i32`.
-        helper(&[ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I32], &[ValType::I32]);
-        // `__obj_has(obj_ptr: i32, key_ptr: i32) -> i32` and
-        // `__obj_delete(obj_ptr: i32, key_ptr: i32) -> ()`.
-        helper(&[ValType::I32, ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I32], &[]);
-        // `__json_escape(str_ptr: i32) -> str_base: i32` and the recursive
-        // `__json_str(v: i64) -> str_base: i32` serializer.
-        helper(&[ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I64], &[ValType::I32]);
-        // The Map/Set runtime helpers: `__same_value_zero(a: i64, b: i64) -> i32`,
-        // `__map_find(handle: i32, key: i64) -> i32`,
-        // `__map_set(handle: i32, key: i64, val: i64)`,
-        // `__map_get(handle: i32, key: i64) -> i64`,
-        // `__map_has(handle: i32, key: i64) -> i32`, and
-        // `__map_delete(handle: i32, key: i64) -> i32`.
-        helper(&[ValType::I64, ValType::I64], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I64], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I64, ValType::I64], &[]);
-        helper(&[ValType::I32, ValType::I64], &[ValType::I64]);
-        helper(&[ValType::I32, ValType::I64], &[ValType::I32]);
-        helper(&[ValType::I32, ValType::I64], &[ValType::I32]);
-        // `__loose_eq(a: i64, b: i64) -> i32` (loose `==`) and
-        // `__str_to_array(s: i64) -> i64` (string spread).
-        helper(&[ValType::I64, ValType::I64], &[ValType::I32]);
-        helper(&[ValType::I64], &[ValType::I64]);
-        // The `JSON.parse` family, in emitted order: `__json_ws() -> ()`,
-        // `__json_throw() -> i64`, `__json_string() -> i64`,
-        // `__json_number() -> i64`, `__json_value() -> i64`,
-        // `__json_array() -> i64`, `__json_object() -> i64`,
-        // `__array_to_object(pairs: i32) -> i32`, `__json_parse(s: i64) -> i64`.
-        helper(&[], &[]);
-        helper(&[], &[ValType::I64]);
-        helper(&[], &[ValType::I64]);
-        helper(&[], &[ValType::I64]);
-        helper(&[], &[ValType::I64]);
-        helper(&[], &[ValType::I64]);
-        helper(&[], &[ValType::I64]);
-        helper(&[ValType::I32], &[ValType::I32]);
-        helper(&[ValType::I64], &[ValType::I64]);
-        // `__gen_to_array(gen: i64) -> i64`, before the trampoline.
-        helper(&[ValType::I64], &[ValType::I64]);
-        // `__nullish_throw(recv: i64, key: i64, set: i32) -> ()`.
-        helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
-        // `__prop_throw(recv: i64, key: i64, mode: i32) -> ()`.
-        helper(&[ValType::I64, ValType::I64, ValType::I32], &[]);
-        // `__box_f64(x: f64) -> i64`.
-        helper(&[ValType::F64], &[ValType::I64]);
-        // `__to_number(v: i64) -> i64`.
-        helper(&[ValType::I64], &[ValType::I64]);
-        // The `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline.
-        helper(&[ValType::I64, ValType::I64], &[ValType::I64]);
-        // The `__async_step(gen: i64, sent: i64) -> i64` trampoline.
-        helper(&[ValType::I64, ValType::I64], &[ValType::I64]);
+    // are functions) types, one per helper in function-index order.
+    let mut next_type = if has_funcs { 2 } else { 1 };
+    for (params, results) in helper_types() {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+        functions.function(next_type);
+        next_type += 1;
     }
     // The two `new Promise` settler functions reuse the uniform function
     // type (type 1) — they are called through the funcref table like any function
@@ -259,32 +177,32 @@ pub(super) fn build_type_and_function_sections<'a>(
     // function: `print(bits: i64, flag: i32) -> ()`,
     // `__convert(bits: i64, op: i32) -> i64`, and
     // `__method(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64`.
-    let print_type = helper_type_base + 41;
+    let print_type = next_type;
     types.ty().function([ValType::I64, ValType::I32], []);
-    let convert_type = helper_type_base + 42;
+    let convert_type = next_type + 1;
     types
         .ty()
         .function([ValType::I64, ValType::I32], [ValType::I64]);
-    let method_type = helper_type_base + 43;
+    let method_type = next_type + 2;
     types.ty().function(
         [ValType::I64, ValType::I32, ValType::I64, ValType::I64],
         [ValType::I64],
     );
     // The host promise import types: `__promise(op: i32, a: i64, b: i64) ->
     // i64` and `__then(p: i64, on_f: i64, on_r: i64) -> i64`.
-    let promise_type = helper_type_base + 44;
+    let promise_type = next_type + 3;
     types
         .ty()
         .function([ValType::I32, ValType::I64, ValType::I64], [ValType::I64]);
-    let then_type = helper_type_base + 45;
+    let then_type = next_type + 4;
     types
         .ty()
         .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
     // The host wall-clock import type (backing `Date`): `__now() -> f64`.
-    let now_type = helper_type_base + 46;
+    let now_type = next_type + 5;
     types.ty().function([], [ValType::F64]);
     // The host `parseInt` import type: `__parse_int(s: i64, radix: i64) -> i64`.
-    let parse_int_type = helper_type_base + 47;
+    let parse_int_type = next_type + 6;
     types
         .ty()
         .function([ValType::I64, ValType::I64], [ValType::I64]);
@@ -293,10 +211,10 @@ pub(super) fn build_type_and_function_sections<'a>(
     // `__new_string(len: i32) -> i32`, `__new_array(len: i32) -> i32`, and
     // `__new_promise() -> i32`. Their types follow the import types.
     types.ty().function([ValType::I32], [ValType::I32]);
-    functions.function(helper_type_base + 48);
-    functions.function(helper_type_base + 48);
+    functions.function(next_type + 7);
+    functions.function(next_type + 7);
     types.ty().function([], [ValType::I32]);
-    functions.function(helper_type_base + 49);
+    functions.function(next_type + 8);
 
     (
         types,
@@ -312,6 +230,94 @@ pub(super) fn build_type_and_function_sections<'a>(
     )
 }
 
+/// The `(params, results)` of every runtime helper, in function-index order
+/// (the order [`build_type_and_function_sections`] assigns their indices and
+/// [`emit`] appends their bodies).
+fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
+    use ValType::{F64, I32, I64};
+    vec![
+        // `__alloc(size) -> base`.
+        (&[I32], &[I32]),
+        // `__concat` / `__str_eq` / `__str_cmp` / `__str_index`: `(i32, i32) -> i32`.
+        (&[I32, I32], &[I32]),
+        (&[I32, I32], &[I32]),
+        (&[I32, I32], &[I32]),
+        (&[I32, I32], &[I32]),
+        // Interning: `__str_hash(s)`, `__intern_slot(s)`, `__intern_find(s)`,
+        // `__intern(s)`, `__index_value(s)`, `__index_string(n)`: `(i32) -> i32`.
+        (&[I32], &[I32]),
+        (&[I32], &[I32]),
+        (&[I32], &[I32]),
+        (&[I32], &[I32]),
+        (&[I32], &[I32]),
+        (&[I32], &[I32]),
+        // `__to_key(v, insert) -> key`.
+        (&[I64, I32], &[I32]),
+        // `__prop_find(o, key) -> entry`.
+        (&[I32, I32], &[I32]),
+        // `__define(o, key, v, attrs)`.
+        (&[I32, I32, I64, I32], &[]),
+        // `__fn_materialize(o)`.
+        (&[I32], &[]),
+        // `__get(recv, key) -> v`.
+        (&[I64, I32], &[I64]),
+        // `__set(recv, key, v)`.
+        (&[I64, I32, I64], &[]),
+        // `__has(key, obj) -> i32`.
+        (&[I32, I64], &[I32]),
+        // `__delete(obj, key)`.
+        (&[I64, I32], &[]),
+        // `__own_keys(obj, mode) -> array`.
+        (&[I64, I32], &[I64]),
+        // `__for_in_keys(obj) -> array`.
+        (&[I64], &[I64]),
+        // `__rest(src, excl) -> object`.
+        (&[I64, I64], &[I64]),
+        // `__array_push(base, value) -> new_base`.
+        (&[I32, I64], &[I32]),
+        // `__array_concat(dst, src) -> new_base`.
+        (&[I32, I32], &[I32]),
+        // `__json_escape(str) -> str` and `__json_str(v) -> str`.
+        (&[I32], &[I32]),
+        (&[I64], &[I32]),
+        // The Map/Set helpers: `__same_value_zero(a, b) -> i32`,
+        // `__map_find(handle, key) -> i32`, `__map_set(handle, key, val)`,
+        // `__map_get(handle, key) -> i64`, `__map_has(handle, key) -> i32`,
+        // `__map_delete(handle, key) -> i32`.
+        (&[I64, I64], &[I32]),
+        (&[I32, I64], &[I32]),
+        (&[I32, I64, I64], &[]),
+        (&[I32, I64], &[I64]),
+        (&[I32, I64], &[I32]),
+        (&[I32, I64], &[I32]),
+        // `__loose_eq(a, b) -> i32` and `__str_to_array(s) -> i64`.
+        (&[I64, I64], &[I32]),
+        (&[I64], &[I64]),
+        // The `JSON.parse` family: `__json_ws()`, `__json_throw() -> i64`,
+        // `__json_string`/`__json_number`/`__json_value`/`__json_array`/
+        // `__json_object() -> i64`, `__json_parse(s) -> i64`.
+        (&[], &[]),
+        (&[], &[I64]),
+        (&[], &[I64]),
+        (&[], &[I64]),
+        (&[], &[I64]),
+        (&[], &[I64]),
+        (&[], &[I64]),
+        (&[I64], &[I64]),
+        // `__gen_to_array(gen) -> i64`.
+        (&[I64], &[I64]),
+        // `__nullish_throw(recv, key, set)` and `__prop_throw(recv, key, mode)`.
+        (&[I64, I64, I32], &[]),
+        (&[I64, I64, I32], &[]),
+        // `__box_f64(x) -> i64` and `__to_number(v) -> i64`.
+        (&[F64], &[I64]),
+        (&[I64], &[I64]),
+        // The `__invoke1(fn, arg)` and `__async_step(gen, sent)` trampolines.
+        (&[I64, I64], &[I64]),
+        (&[I64, I64], &[I64]),
+    ]
+}
+
 /// Build the module's global section: the mutable bump-allocator heap pointer
 /// (`$__heap_ptr`, index [`HEAP_PTR_GLOBAL`], starting at `heap_ptr_init` — the
 /// first free offset after all static string-literal data so the allocator never
@@ -322,7 +328,11 @@ pub(super) fn build_type_and_function_sections<'a>(
 /// pending-completion kind (`$cf_kind`, i32) and routed return value
 /// (`$cf_value`, i64) — carry a `return`/`break`/`continue` through the `finally`
 /// clauses it must run.
-pub(super) fn build_globals(heap_ptr_init: i32, module_cells: u32) -> GlobalSection {
+pub(super) fn build_globals(
+    heap_ptr_init: i32,
+    intern: &InternTable,
+    module_cells: u32,
+) -> GlobalSection {
     let mut globals = GlobalSection::new();
     let mut_i32 = |init| {
         (
@@ -374,6 +384,12 @@ pub(super) fn build_globals(heap_ptr_init: i32, module_cells: u32) -> GlobalSect
         let (ty, init) = mut_i32(0);
         globals.global(ty, &init);
     }
+    // The intern-table globals (base, cap, count; all i32), initialized to the
+    // compile-time table in the data segment.
+    for init in [intern.base, intern.cap, intern.count] {
+        let (ty, init) = mut_i32(init);
+        globals.global(ty, &init);
+    }
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..module_cells {
@@ -384,29 +400,137 @@ pub(super) fn build_globals(heap_ptr_init: i32, module_cells: u32) -> GlobalSect
 }
 
 /// Build the data section from the string-literal offset map: one active segment
-/// per literal, each a `[len:u32 LE][utf8]` blob written at its compile-time
-/// offset, emitted in ascending offset order for deterministic output. Returns
-/// `None` when there are no literals (so no section is added).
-pub(super) fn emit_data_section(offsets: &HashMap<String, i32>) -> Option<DataSection> {
-    if offsets.is_empty() {
-        return None;
-    }
+/// per literal, each a string block `[type][gc][flags][class][len:u32 LE][utf8]`
+/// written at its compile-time offset (its `flags` already `INTERNED`, plus
+/// `ARRAY_INDEX` for a canonical index spelling), in ascending offset order for
+/// deterministic output, then the intern table's u32 slots.
+pub(super) fn emit_data_section(
+    offsets: &HashMap<String, i32>,
+    intern: &InternTable,
+    functions: &[IrFunction],
+    layout: FnLayout,
+) -> DataSection {
     let mut segments: Vec<(&String, i32)> = offsets.iter().map(|(s, o)| (s, *o)).collect();
     segments.sort_by_key(|(_, offset)| *offset);
     let mut data = DataSection::new();
     let header_size = HEADER_SIZE as usize;
     for (text, offset) in segments {
         let mut blob = Vec::with_capacity(header_size + 4 + text.len());
-        // Block header: the TYPE_STRING type byte at offset 0, then padding
-        // up to HEADER_SIZE (a byte-for-byte match of a runtime-allocated string).
+        // Block header: the TYPE_STRING type byte at offset 0, a zero `gc` byte,
+        // the string `flags`, and a zero `class` byte.
+        let index_flag = if is_array_index(text) {
+            abi::STR_FLAG_ARRAY_INDEX
+        } else {
+            0
+        };
         blob.push(u8::try_from(TYPE_STRING).unwrap_or(0));
+        blob.push(0);
+        blob.push(abi::STR_FLAG_INTERNED | index_flag);
         blob.resize(header_size, 0);
         let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
         blob.extend_from_slice(&len.to_le_bytes());
         blob.extend_from_slice(text.as_bytes());
         data.active(0, &ConstExpr::i32_const(offset), blob);
     }
-    Some(data)
+    let table: Vec<u8> = intern
+        .slots
+        .iter()
+        .flat_map(|slot| slot.to_le_bytes())
+        .collect();
+    data.active(0, &ConstExpr::i32_const(intern.base), table);
+    if !functions.is_empty() {
+        emit_fn_data(&mut data, offsets, functions, layout);
+    }
+    if layout.errors != 0 {
+        emit_error_protos(&mut data, offsets, layout.errors);
+    }
+    data
+}
+
+/// Lay out the static error prototypes at `base` (design 4.1/4.2), one
+/// [`ERROR_PROTO_SIZE`]-byte block per [`ErrorKind::ALL`] entry: a
+/// `TYPE_OBJECT` prefix whose `props` points right behind it at a full
+/// two-entry `TYPE_PROPS` table (so a user addition grows it onto the heap)
+/// holding `name: "<Kind>"` and `message: ""`, both writable, non-enumerable,
+/// configurable. `%Error.prototype%` has a `null` prototype (until S4); the
+/// others inherit from it.
+fn emit_error_protos(data: &mut DataSection, offsets: &HashMap<String, i32>, base: i32) {
+    let at = |s: &str| offsets.get(s).copied().unwrap_or(HEAP_BASE);
+    let heap = |addr: i32| abi::HEAP | u64::from(addr.cast_unsigned());
+    let attrs = abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE;
+    let mut blob = Vec::with_capacity(ERROR_PROTO_SIZE as usize * ErrorKind::ALL.len());
+    for (index, kind) in (0i32..).zip(ErrorKind::ALL) {
+        let addr = base + ERROR_PROTO_SIZE * index;
+        let proto = if kind == ErrorKind::Error {
+            abi::NULL
+        } else {
+            heap(base)
+        };
+        blob.extend_from_slice(&[abi::TYPE_OBJECT, 0, 0, abi::CLASS_ORDINARY]);
+        blob.extend_from_slice(&(addr + abi::OBJ_PREFIX_SIZE.cast_signed()).to_le_bytes());
+        blob.extend_from_slice(&proto.to_le_bytes());
+        blob.extend_from_slice(&[abi::TYPE_PROPS, 0, abi::PROPS_HAS_NON_ENUM, 0]);
+        for field in [2u32, 2, 2] {
+            blob.extend_from_slice(&field.to_le_bytes());
+        }
+        for (key, value) in [("name", kind.name()), ("message", "")] {
+            blob.extend_from_slice(&at(key).to_le_bytes());
+            blob.extend_from_slice(&attrs.to_le_bytes());
+            blob.extend_from_slice(&heap(at(value)).to_le_bytes());
+        }
+    }
+    data.active(0, &ConstExpr::i32_const(base), blob);
+}
+
+/// Lay out the function data: the `__fn_info` table base at
+/// [`abi::FN_INFO_ADDR`], one `[name key][length]` info entry per function
+/// (then the two settlers'), and one static `TYPE_FUNCTION` block per function — the single object of a
+/// top-level declaration ([`IrNode::DeclFunc`]), created `LAZY` with no
+/// properties, a `null` prototype, and an `undefined` environment.
+fn emit_fn_data(
+    data: &mut DataSection,
+    offsets: &HashMap<String, i32>,
+    functions: &[IrFunction],
+    layout: FnLayout,
+) {
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::FN_INFO_ADDR.cast_signed()),
+        layout.info.to_le_bytes(),
+    );
+    let mut info = Vec::with_capacity(functions.len() * abi::FN_INFO_ENTRY_SIZE as usize);
+    let mut blocks = Vec::with_capacity(functions.len() * abi::FUNC_BLOCK_SIZE as usize);
+    let anonymous = offsets.get("").copied().unwrap_or(HEAP_BASE);
+    for (index, func) in (0u32..).zip(functions) {
+        let name = offsets.get(&func.info.name).copied().unwrap_or(HEAP_BASE);
+        info.extend_from_slice(&name.to_le_bytes());
+        info.extend_from_slice(&func.info.length.to_le_bytes());
+        blocks.extend_from_slice(&[abi::TYPE_FUNCTION, 0, fn_flags(func.info.kind), 0]);
+        blocks.extend_from_slice(&0u32.to_le_bytes());
+        blocks.extend_from_slice(&abi::NULL.to_le_bytes());
+        blocks.extend_from_slice(&index.to_le_bytes());
+        blocks.extend_from_slice(&0u32.to_le_bytes());
+        blocks.extend_from_slice(&abi::UNDEFINED.to_le_bytes());
+    }
+    // The two `new Promise` settlers (table slots `n`, `n + 1`): anonymous,
+    // `length` 1.
+    for _ in 0..2 {
+        info.extend_from_slice(&anonymous.to_le_bytes());
+        info.extend_from_slice(&1u32.to_le_bytes());
+    }
+    data.active(0, &ConstExpr::i32_const(layout.info), info);
+    data.active(0, &ConstExpr::i32_const(layout.blocks), blocks);
+}
+
+/// The header `flags` a fresh function object of `kind` is created with:
+/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR`) per its kind.
+pub(super) fn fn_flags(kind: FnKind) -> u8 {
+    abi::FUNC_FLAG_LAZY
+        | match kind {
+            FnKind::Plain => 0,
+            FnKind::Constructor => abi::FUNC_FLAG_CONSTRUCTOR,
+            FnKind::Class => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR,
+        }
 }
 
 /// Collect every distinct string literal in `program` and assign each a
@@ -416,11 +540,21 @@ pub(super) fn emit_data_section(offsets: &HashMap<String, i32>) -> Option<DataSe
 /// occupying its `[type][pad×3][len:u32 LE][utf8]` block padded up to
 /// [`BLOCK_ALIGN`] so every blob base is 8-aligned. Identical literals are
 /// deduplicated onto one offset. Returns the offset map plus the first free
-/// offset after all literal data — the bump allocator's (8-aligned) start, equal
-/// to [`HEAP_BASE`] when there are no literals.
+/// offset after all literal data (8-aligned), where the intern table is placed.
 pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32) {
-    let mut order: Vec<&str> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    // `"length"` is always interned: the property helpers compare a key against
+    // it to resolve a string's or array's exotic `length`.
+    let mut order: Vec<&str> = vec![INDEX_LENGTH_KEY];
+    let mut seen: HashSet<&str> = HashSet::from([INDEX_LENGTH_KEY]);
+    // A function object's materialized keys and every function's `name`.
+    if !program.functions.is_empty() {
+        let names = program.functions.iter().map(|f| f.info.name.as_str());
+        for text in FN_KEYS.into_iter().chain(names) {
+            if seen.insert(text) {
+                order.push(text);
+            }
+        }
+    }
     for stmt in &program.stmts {
         collect_stmt(stmt, &mut order, &mut seen);
     }
@@ -609,6 +743,10 @@ pub(super) fn collect_node<'a>(
                 collect_node(capture, order, seen);
             }
         }
+        IrNode::DefineProps { obj, entries, .. } => {
+            collect_node(obj, order, seen);
+            collect_entries(entries, order, seen);
+        }
         IrNode::CellSet { cell, value } => {
             collect_node(cell, order, seen);
             collect_node(value, order, seen);
@@ -624,7 +762,7 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::CallSpread { target, args } => {
-            if let SpreadCallee::Indirect(callee) = target {
+            if let SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } = target {
                 if !is_static_function(callee) {
                     seed_type_error_strs(order, seen);
                 }
@@ -635,16 +773,14 @@ pub(super) fn collect_node<'a>(
         IrNode::MathSpread { args, .. } => {
             collect_node(args, order, seen);
         }
-        IrNode::Object(entries) => {
-            // Each key is a static string (its `[len][utf8]` blob must live in
-            // the data segment so a literal can point at it) and shares the same
-            // interning/dedup as string literals; recurse into each value.
-            for (key, value) in entries {
-                if seen.insert(key.as_str()) {
-                    order.push(key.as_str());
-                }
-                collect_node(value, order, seen);
+        IrNode::Object { entries, proto, .. } => {
+            // Each static key is an interned string (its blob must live in the
+            // data segment so a literal can name it); recurse into the proto,
+            // each computed key, and each value.
+            if let Some(proto) = proto {
+                collect_node(proto, order, seen);
             }
+            collect_entries(entries, order, seen);
         }
         IrNode::ArrayHof {
             array,
@@ -668,7 +804,7 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::MethodCallUser { obj, key, args, .. } => {
-            // Seed the runtime callee-is-a-function guard's branded TypeError
+            // Seed the runtime callee-is-a-function guard's TypeError
             // strings so their data-segment blobs exist when the guard throws.
             seed_type_error_strs(order, seen);
             seed_nullish_strs(order, seen);
@@ -700,17 +836,7 @@ pub(super) fn collect_node<'a>(
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
         }
-        IrNode::ObjectKey { obj, index } => {
-            collect_node(obj, order, seen);
-            collect_node(index, order, seen);
-        }
-        // An instance accessor: recurse into the getter/setter function values
-        // and intern the sentinel that GATES the member read/write invocation paths
-        // (present in the string table iff the program builds any accessor box).
         IrNode::MakeAccessor { getter, setter } => {
-            if seen.insert(crate::abi::ACCESSOR_MARKER_KEY) {
-                order.push(crate::abi::ACCESSOR_MARKER_KEY);
-            }
             collect_node(getter, order, seen);
             collect_node(setter, order, seen);
         }
@@ -721,18 +847,9 @@ pub(super) fn collect_node<'a>(
         IrNode::InstanceOf { value, kind } => {
             collect_node(value, order, seen);
             match kind {
-                // A user-class test reads both prototypes via `__obj_get`; the
-                // `@@prototype` key (and the class read's literals) are interned
-                // by recursing into the stored `<class>["@@prototype"]` expr.
-                InstanceOfKind::Class(class_proto) => collect_node(class_proto, order, seen),
-                // An error test reads the hidden `@@errorkind` marker via
-                // `__obj_get`, so its key must be interned even when the program
-                // never constructs an error literally.
-                InstanceOfKind::Error | InstanceOfKind::TypeError | InstanceOfKind::RangeError => {
-                    if seen.insert(crate::abi::ERROR_KIND_KEY) {
-                        order.push(crate::abi::ERROR_KIND_KEY);
-                    }
-                }
+                // A prototype walk reads `C.prototype` (or a static error
+                // prototype).
+                InstanceOfKind::Proto(proto) => collect_node(proto, order, seen),
                 // The runtime-TYPE-BYTE builtins read the receiver's own type byte
                 // only — no interned key or literal to seed.
                 InstanceOfKind::Array
@@ -742,6 +859,7 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::ObjectDelete { obj, key } => {
+            seed_prop_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(key, order, seen);
         }
@@ -759,12 +877,9 @@ pub(super) fn collect_node<'a>(
         IrNode::JsonParse { arg } => {
             collect_node(arg, order, seen);
             // Seed the syntax-error object's static strings so `__json_throw` can
-            // build a branded `Error` on malformed input.
-            for s in JSON_PARSE_ERROR_STRS {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
+            // build its `Error` on malformed input.
+            seed_strs(&ERROR_STRS, order, seen);
+            seed_strs(&JSON_PARSE_ERROR_STRS, order, seen);
         }
         IrNode::IndexSet { obj, index, value } => {
             seed_nullish_strs(order, seen);
@@ -821,11 +936,12 @@ pub(super) fn collect_node<'a>(
                 &[]
             };
             let name = [op.name()];
-            for &s in name.iter().chain(keys).chain(&INTERNAL_TYPE_ERROR_STRS) {
+            for &s in name.iter().chain(keys) {
                 if seen.insert(s) {
                     order.push(s);
                 }
             }
+            seed_type_error_strs(order, seen);
             seed_nullish_strs(order, seen);
             collect_node(recv, order, seen);
             for arg in args {
@@ -894,7 +1010,7 @@ pub(super) fn collect_node<'a>(
         }
         // `gen.next(sent)` builds a `{ value, done }` result object, so both keys'
         // `[len][utf8]` blobs must live in the data segment; a non-generator
-        // receiver throws a branded `TypeError`, so seed its strings too.
+        // receiver throws a `TypeError`, so seed its strings too.
         IrNode::GenResume { handle, sent } => {
             for key in ["value", "done"] {
                 if seen.insert(key) {
@@ -920,6 +1036,8 @@ pub(super) fn collect_node<'a>(
                 order.push("pop");
             }
         }
+        // A static error prototype must be laid out.
+        IrNode::ErrorProto(_) => seed_strs(&ERROR_STRS, order, seen),
         IrNode::Num(_)
         | IrNode::Bool(_)
         | IrNode::Null
@@ -930,6 +1048,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::SentValue
         | IrNode::ExcValue
         | IrNode::ThisGlobal
+        | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.
         | IrNode::MapNew { .. }
         | IrNode::DateNow
@@ -937,35 +1056,90 @@ pub(super) fn collect_node<'a>(
     }
 }
 
-/// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] so `__nullish_throw`
-/// finds their `[len][utf8]` blobs in the data segment; see [`collect_node`].
-fn seed_nullish_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
-    for s in NULLISH_ERROR_STRS {
+/// Record each of `strs` not yet seen, in order; see [`collect_node`].
+fn seed_strs<'a>(strs: &[&'static str], order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    for &s in strs {
         if seen.insert(s) {
             order.push(s);
         }
     }
 }
 
-/// Seed the not-a-function guard's [`INTERNAL_TYPE_ERROR_STRS`] so the branded
-/// `TypeError` it throws finds their `[len][utf8]` blobs in the data segment;
-/// see [`collect_node`].
-fn seed_type_error_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
-    for s in INTERNAL_TYPE_ERROR_STRS {
-        if seen.insert(s) {
-            order.push(s);
-        }
-    }
-}
-
-/// Seed the member-store guard's [`PROP_ERROR_STRS`] so `__prop_throw` finds
+/// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] (and the
+/// [`ERROR_STRS`] of the `TypeError` it raises) so `__nullish_throw` finds
 /// their `[len][utf8]` blobs in the data segment; see [`collect_node`].
-fn seed_prop_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
-    for s in PROP_ERROR_STRS {
+fn seed_nullish_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    seed_strs(&ERROR_STRS, order, seen);
+    seed_strs(&NULLISH_ERROR_STRS, order, seen);
+}
+
+/// Seed the not-a-function guard's [`INTERNAL_TYPE_ERROR_STRS`] (and
+/// [`ERROR_STRS`]) so the `TypeError` it throws finds their `[len][utf8]`
+/// blobs in the data segment; see [`collect_node`].
+fn seed_type_error_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    seed_strs(&ERROR_STRS, order, seen);
+    seed_strs(&INTERNAL_TYPE_ERROR_STRS, order, seen);
+}
+
+/// Seed the member-store guard's [`PROP_ERROR_STRS`] (and [`ERROR_STRS`]) so
+/// `__prop_throw` finds their `[len][utf8]` blobs in the data segment; see
+/// [`collect_node`].
+fn seed_prop_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    seed_strs(&ERROR_STRS, order, seen);
+    let keyed = PROP_KEYED_MSGS
+        .iter()
+        .flat_map(|&(_, prefix, suffix)| [prefix, suffix]);
+    for s in PROP_ERROR_STRS.into_iter().chain(keyed) {
         if seen.insert(s) {
             order.push(s);
         }
     }
+}
+
+/// Record the static keys of object-literal / defined-property `entries` (each
+/// an interned string whose blob must live in the data segment), and the
+/// literals of each computed key and value; see [`collect_node`].
+fn collect_entries<'a>(
+    entries: &'a [(PropKey, IrNode)],
+    order: &mut Vec<&'a str>,
+    seen: &mut HashSet<&'a str>,
+) {
+    for (key, value) in entries {
+        match key {
+            PropKey::Static(key) | PropKey::Hidden(key) | PropKey::Fixed(key) => {
+                if seen.insert(key.as_str()) {
+                    order.push(key.as_str());
+                }
+            }
+            PropKey::Computed(key) => collect_node(key, order, seen),
+        }
+        collect_node(value, order, seen);
+    }
+}
+
+/// Whether any function of `program` (or `main`) builds an accessor
+/// ([`IrNode::MakeAccessor`]), so `__get` / `__set` must dispatch to getters
+/// and setters.
+fn program_has_accessors(program: &IrProgram) -> bool {
+    fn node(n: &IrNode) -> bool {
+        matches!(n, IrNode::MakeAccessor { .. }) || n.any_child(node)
+    }
+    fn stmt(s: &IrStmt) -> bool {
+        s.any_node(node) || s.any_stmt(stmt)
+    }
+    program.stmts.iter().any(stmt)
+        || program.functions.iter().any(|f| {
+            f.body.iter().any(stmt)
+                || f.machine.iter().flatten().any(|segment| {
+                    segment.stmts.iter().any(stmt)
+                        || match &segment.term {
+                            crate::ir::GenTerm::Yield { value, .. }
+                            | crate::ir::GenTerm::Branch { cond: value, .. }
+                            | crate::ir::GenTerm::Return(Some(value)) => node(value),
+                            crate::ir::GenTerm::Return(None) | crate::ir::GenTerm::Jump(_) => false,
+                        }
+                })
+        })
 }
 
 /// Record the string literals of one spread element (its plain-item or

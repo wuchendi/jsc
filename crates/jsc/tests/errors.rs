@@ -339,23 +339,22 @@ fn uncaught_throw_exits_one() {
     );
 }
 
-/// An UNCAUGHT absent-property write fails the process like any uncaught
-/// `TypeError`: exit 1 with the message on stderr.
+/// An UNCAUGHT `TypeError` from a property write fails the process: exit 1
+/// with the message on stderr (a named property store on an array still
+/// throws).
 #[test]
-fn uncaught_absent_property_write_exits_one() {
+fn uncaught_property_write_error_exits_one() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", "let o = {}; o.x = 1; console.log(\"unreachable\")"])
+        .args(["-e", "let a = [1]; a.x = 1; console.log(\"unreachable\")"])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(
         output.status.code() == Some(1),
-        "an uncaught absent-property write must make jsc exit 1"
+        "an uncaught property-write error must make jsc exit 1"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(
-            "Uncaught TypeError: Cannot add property 'x': dynamic properties are not supported yet"
-        ),
+        stderr.contains("Uncaught TypeError: Cannot set named property 'x' on an array yet"),
         "stderr should report the TypeError, got: {stderr}"
     );
     assert!(
@@ -364,29 +363,25 @@ fn uncaught_absent_property_write_exits_one() {
     );
 }
 
-/// The add-property `TypeError` unwinds through `finally` and nested function
-/// frames to the nearest handler.
+/// A property-write `TypeError` (a named store on an array) unwinds through
+/// `finally` and nested function frames to the nearest handler.
 #[test]
-fn absent_property_write_unwinds_through_finally_and_calls() {
+fn property_write_error_unwinds_through_finally_and_calls() {
     assert_eq!(
         jsc(&[
             "-p",
             "let log=\"\"; function f(o){ try { o.x = 1; log+=\"no\" } finally { log+=\"f\" } } \
-             try { f({a:1}) } catch(e) { log+=\"|\"+e.name } log"
+             try { f([1]) } catch(e) { log+=\"|\"+e.name } log"
         ]),
         "f|TypeError"
     );
 }
 
-/// Out-of-scope object method forms (getter/setter, computed method name,
-/// async/generator methods) are rejected at compile time with exit code 2 and
+/// Out-of-scope object method forms (async/generator methods) are rejected at compile time with exit code 2 and
 /// an explanatory message.
 #[test]
 fn unsupported_object_methods_error() {
     let cases = [
-        ("let o={get x(){return 1}}; o.x", "getter"),
-        ("let o={set x(v){}}; 1", "setter"),
-        ("let k=\"m\"; let o={[k](){return 1}}; 1", "key"),
         ("let o={async m(){return 1}}; 1", "async"),
         ("let o={*m(){return 1}}; 1", "generator"),
     ];
