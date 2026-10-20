@@ -10,8 +10,9 @@
 //! - interning: `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`,
 //!   plus the `ToPropertyKey` conversion `__to_key` and the array-index helpers
 //!   `__index_string` / `__index_value`;
-//! - the table primitives `__prop_find` (own lookup) and `__define`
-//!   (`CreateDataProperty` / accessor install, growing the table);
+//! - the table primitives `__prop_find` (own lookup, materializing a lazy
+//!   function first) and `__define` (`CreateDataProperty` / accessor install,
+//!   growing the table), and `__fn_materialize`;
 //! - the algorithms `__get`, `__set`, `__has`, `__delete`, `__own_keys`,
 //!   `__for_in_keys`, and `__rest`.
 //!
@@ -63,6 +64,14 @@ const STR_INTERNED: i32 = abi::STR_FLAG_INTERNED as i32;
 const STR_ARRAY_INDEX: i32 = abi::STR_FLAG_ARRAY_INDEX as i32;
 /// Object-family `flags` bit: not extensible.
 const NOT_EXTENSIBLE: i32 = abi::OBJ_FLAG_NOT_EXTENSIBLE as i32;
+/// Function `flags` bits (see [`abi::FUNC_FLAG_LAZY`] ..).
+const FUNC_LAZY: i32 = abi::FUNC_FLAG_LAZY as i32;
+const FUNC_CONSTRUCTOR: i32 = abi::FUNC_FLAG_CONSTRUCTOR as i32;
+const FUNC_CLASS_CTOR: i32 = abi::FUNC_FLAG_CLASS_CTOR as i32;
+/// The header word (as a little-endian u32) of a lazy function, under
+/// [`LAZY_FN_MASK`]: kind byte `TYPE_FUNCTION`, `flags` bit `LAZY`.
+const LAZY_FN_WORD: i32 = TYPE_FUNCTION | FUNC_LAZY << 16;
+const LAZY_FN_MASK: i32 = 0xFF | FUNC_LAZY << 16;
 /// Byte offset of a string's (or array's) u32 length, and of its payload.
 const LEN: u64 = HEADER_SIZE as u64;
 const PAYLOAD: u64 = (HEADER_SIZE + 4) as u64;
@@ -473,14 +482,21 @@ pub(super) fn emit_to_key(helpers: Helpers<'_>) -> Function {
 
 /// `__prop_find(o: i32, key: i32) -> i32`: the address of the own entry of the
 /// object-family block `o` whose key is `key`, or `0` (also for `key == 0`, so
-/// a missed key never matches a tombstone).
-pub(super) fn emit_prop_find() -> Function {
+/// a missed key never matches a tombstone). A `LAZY` function (which has no
+/// table yet) is materialized first, so every property operation sees its
+/// `length`/`name`/`prototype`.
+pub(super) fn emit_prop_find(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(2, ValType::I32)]);
     let (o, key, e, end) = (0, 1, 2, 3);
     wasm!(f;
         LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(e), I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(o), I32Load(m32(0)), I32Const(LAZY_FN_MASK), I32And, I32Const(LAZY_FN_WORD), I32Ne,
         If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(o), Call(helpers.define + 1),
+        LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(e),
+        End,
         LocalGet(e), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(e), I32Add,
         I32Const(P_HEADER), I32Add, LocalSet(end),
         LocalGet(e), I32Const(P_HEADER), I32Add, LocalSet(e),
@@ -572,6 +588,61 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
         End,
         End,
     );
+    f
+}
+
+/// `__fn_materialize(o: i32)`: clear the `LAZY` flag of the function block `o`
+/// and define its own properties from its `__fn_info` entry (design 4.4):
+/// `length` and `name` (configurable only); and for a plain `CONSTRUCTOR`
+/// (not a class, whose definition installs its own `prototype`), `prototype`
+/// (writable only) = a fresh object whose non-enumerable `constructor` is `o`,
+/// plus `caller` / `arguments` as non-writable configurable `undefined`, so
+/// strict code assigning them throws (standing in for the
+/// `%Function.prototype%` poison accessors until S4).
+pub(super) fn emit_fn_materialize(
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) -> Function {
+    let mut f = Function::new(vec![(2, ValType::I32)]);
+    let (o, i, p) = (0, 1, 2);
+    // Finish a `__define(target, key, value, attrs)` whose first three
+    // operands are on the stack.
+    let define = |f: &mut Function, attrs: i32| wasm!(f; I32Const(attrs), Call(helpers.define));
+    let key = |name: &str| static_key(strings, name);
+    wasm!(f;
+        LocalGet(o),
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(!FUNC_LAZY & 0xFF), I32And,
+        I32Store8(m8(FLAGS)),
+        LocalGet(o), I32Load(m32(FUNC_INDEX_OFFSET)), I32Const(abi::FN_INFO_ENTRY_SIZE.cast_signed()),
+        I32Mul, I32Const(helpers.fn_info), I32Add, LocalSet(i),
+        LocalGet(o), I32Const(key(INDEX_LENGTH_KEY)),
+        LocalGet(i), I32Load(m32(abi::FN_INFO_LENGTH_OFFSET.into())), F64ConvertI32U, I64ReinterpretF64,
+    );
+    define(&mut f, ATTR_CONFIGURABLE);
+    wasm!(f;
+        LocalGet(o), I32Const(key("name")),
+        LocalGet(i), I32Load(m32(abi::FN_INFO_NAME_OFFSET.into())),
+    );
+    emit_box_heap(&mut f);
+    define(&mut f, ATTR_CONFIGURABLE);
+    wasm!(f;
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(FUNC_CONSTRUCTOR | FUNC_CLASS_CTOR), I32And,
+        I32Const(FUNC_CONSTRUCTOR), I32Eq,
+        If(BlockType::Empty),
+        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(p),
+    );
+    emit_object_prefix(&mut f, p, TYPE_OBJECT);
+    wasm!(f; LocalGet(p), I32Const(key("constructor")), LocalGet(o));
+    emit_box_heap(&mut f);
+    define(&mut f, ATTR_WRITABLE | ATTR_CONFIGURABLE);
+    wasm!(f; LocalGet(o), I32Const(key("prototype")), LocalGet(p));
+    emit_box_heap(&mut f);
+    define(&mut f, ATTR_WRITABLE);
+    for name in ["caller", "arguments"] {
+        wasm!(f; LocalGet(o), I32Const(key(name)), I64Const(UNDEFINED_BITS));
+        define(&mut f, ATTR_CONFIGURABLE);
+    }
+    wasm!(f; End, End);
     f
 }
 

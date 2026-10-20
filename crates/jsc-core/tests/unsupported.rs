@@ -65,8 +65,7 @@ fn rejects_top_level_this() {
     // objects suite), but a top-level `this` — outside any function, so with no
     // receiver binding — remains rejected.
     assert_rejected("this");
-    // Getter/setter/computed/async/generator methods stay out of scope.
-    assert_rejected("let o = { get x() { return 1 } }; o.x");
+    // Async/generator methods stay out of scope.
     assert_rejected("let o = { async m() { return 1 } }; o.m()");
 }
 
@@ -77,11 +76,10 @@ fn rejects_class_expressions() {
     // EXPRESSION (`let C = class{}`) remains out of scope.
     assert_rejected("let C = class {}; new C()");
     assert_rejected("let C = class { constructor() {} }; new C()");
-    // `extends` requires a NAMED class declared earlier; other superclass forms and
-    // a field-declaring subclass without a constructor stay rejected.
+    // `extends` requires a NAMED class declared earlier; other superclass forms
+    // stay rejected.
     assert_rejected("class B extends Missing {} new B()");
     assert_rejected("let X = 1; class B extends X {} new B()");
-    assert_rejected("class A {} class B extends A { x = 1 } new B()");
     // Plain instance methods, plain instance fields, and `static`
     // members are supported (see the classes suite); computed field forms remain
     // out of scope.

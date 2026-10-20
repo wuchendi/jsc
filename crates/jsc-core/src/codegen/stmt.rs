@@ -5,6 +5,8 @@ use swc_common::{Spanned, SyntaxContext};
 
 use crate::error::CompileError;
 
+use super::expr::push_accessor_half;
+
 impl LowerCtx<'_> {
     /// Lower one statement, appending the resulting [`IrStmt`](s) to `out`.
     #[allow(clippy::too_many_lines)]
@@ -131,6 +133,8 @@ impl LowerCtx<'_> {
             // `try { .. } catch (e) { .. } finally { .. }` (either clause may be
             // absent, but not both), lowered by `lower_try`.
             Stmt::Try(try_stmt) => self.lower_try(try_stmt, out),
+            // A stray `;` is an empty statement.
+            Stmt::Empty(_) => Ok(()),
             // Attach the offending statement's source range so a diagnostic
             // renderer can point at it, and describe the construct in plain
             // English rather than leaking the raw swc AST debug form.
@@ -256,9 +260,12 @@ impl LowerCtx<'_> {
         for declarator in &var_decl.decls {
             // A missing initializer (`let x;`) binds `undefined` (JS semantics); a
             // `const` with no initializer is already rejected by the parser.
-            let init = match declarator.init.as_ref() {
-                Some(init) => self.lower_expr(init)?,
-                None => IrNode::Undefined,
+            let init = match (declarator.init.as_ref(), &declarator.name) {
+                (Some(init), Pat::Ident(ident)) => {
+                    self.lower_named_expr(init, ident.id.sym.as_ref())?
+                }
+                (Some(init), _) => self.lower_expr(init)?,
+                (None, _) => IrNode::Undefined,
             };
             match &declarator.name {
                 // The `Pat::Ident` fast path: bind one local directly (a captured
@@ -276,11 +283,11 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a `class A { constructor(x){ this.v = x } }` declaration into
-    /// a class value bound to `A`. The class value is a heap object holding two
-    /// reserved entries: the lowered CONSTRUCTOR function value (an ordinary
-    /// uniform-ABI function that reads `this`, reusing the function lifting and
-    /// `this`-binding), and a single shared PROTOTYPE object holding the methods,
-    /// allocated once here. The class's instance shape — the
+    /// a class value bound to `A`. The class value is the lowered CONSTRUCTOR
+    /// function (an ordinary uniform-ABI function that reads `this`, reusing the
+    /// function lifting and `this`-binding) carrying a non-writable `prototype`
+    /// object — `constructor` plus the instance methods and accessors — and the
+    /// static members as own properties. The class's instance shape — the
     /// field names the constructor assigns via `this.<field> = ..` — is registered
     /// in [`Shared::classes`] so a later `new A(args)` can pre-size the instance's
     /// property table. The instance shape is the
@@ -288,11 +295,9 @@ impl LowerCtx<'_> {
     /// instance FIELD declarations, whose initializers run before the
     /// constructor body (see the field-desugar below).
     ///
-    /// Instance getter/setter accessors (`get x(){}` / `set x(v){}`) are supported
-    /// (P2b): they lower to a `TYPE_ACCESSOR` box on the shared prototype.
     /// Out-of-scope class forms are still rejected WITH SPANS: decorators, and
     /// unsupported members — methods that are async / generator / computed, a
-    /// STATIC getter/setter, fields that are static / computed, and private /
+    /// STATIC getter/setter, fields that are computed, and private /
     /// static-block forms. A class EXPRESSION (`let C = class{}`) never reaches
     /// here — it is rejected in expression position.
     #[allow(clippy::too_many_lines)]
@@ -335,7 +340,7 @@ impl LowerCtx<'_> {
         // Find the (at most one) constructor, collect the instance methods,
         // and collect the instance field declarations; every other member is
         // out of scope. Static members (`static m(){}` / `static f = init`) are
-        // collected separately and stored directly on the class VALUE object below,
+        // collected separately and defined directly on the class value below,
         // so `C.m()` / `C.f` read them off the class. Computed names and out-of-scope
         // method forms (getter/setter/async/generator) are rejected WITH SPANS here,
         // static or not; private fields arrive as `ClassMember::PrivateProp` and are
@@ -358,11 +363,10 @@ impl LowerCtx<'_> {
                     }
                     ctor = Some(c);
                 }
-                // A plain instance method is lowered onto the shared prototype below;
+                // A plain instance method is lowered onto the prototype below;
                 // a `static` method is lowered onto the class value. An INSTANCE
-                // getter/setter (`get x(){}` / `set x(v){}`) is an accessor property
-                // (P2b), collected separately and stored as a `MakeAccessor` box on
-                // the prototype. Every other out-of-scope form — a STATIC accessor,
+                // getter/setter (`get x(){}` / `set x(v){}`) is an accessor property,
+                // collected separately and defined on the prototype. Every other out-of-scope form — a STATIC accessor,
                 // an async/generator/computed method (accessor or not) — is rejected
                 // with a span (static or not).
                 ClassMember::Method(m) => {
@@ -470,35 +474,35 @@ impl LowerCtx<'_> {
         let prev_super = self.current_super.take();
         self.current_super.clone_from(&parent);
 
-        // The constructor value. A derived class WITHOUT its own constructor reuses
-        // the parent's constructor directly (an implicit `constructor(...a){ super(...a) }`):
-        // reading `Parent["@@constructor"]` forwards the arguments and sets the parent's
-        // fields on the instance. A subclass that declares fields but no
-        // constructor would need the fields initialized too, which the alias skips, so
-        // it must declare a constructor that calls `super()`.
-        let ctor_value = if let Some(p) = &parent
-            && ctor.is_none()
-        {
-            if !field_props.is_empty() {
-                self.current_super = prev_super;
-                return Err(CompileError::spanned(
-                    class.span(),
-                    "a subclass that declares fields must declare a constructor \
-                     that calls super()",
-                )
-                .into());
+        // The constructor function value — the class value itself. A derived
+        // class WITHOUT its own constructor gets the default
+        // `constructor(...args) { super(...args) }`, followed by its own field
+        // initializers.
+        let ctor_value = if parent.is_some() && ctor.is_none() {
+            let (rest, mut stmts) = default_derived_ctor();
+            for p in &field_props {
+                stmts.push(field_init_stmt(p)?);
             }
-            self.class_member_read(p, parent_span, crate::abi::CLASS_CONSTRUCTOR_KEY)?
+            self.lower_lifted_function(&[&rest], BodyKind::Block(&stmts), name, FnKind::Class)?
         } else {
-            self.lower_lifted_function(&param_pats, BodyKind::Block(&combined_stmts))?
+            self.lower_lifted_function(
+                &param_pats,
+                BodyKind::Block(&combined_stmts),
+                name,
+                FnKind::Class,
+            )?
         };
 
         // Lower each instance method to a first-class function value that
         // reads `this` through the `this`-binding machinery, exactly like the constructor.
-        // They are stored ONCE, on the class's single shared prototype object,
-        // under the method name as a non-enumerable property — never copied per
-        // instance; an instance reaches them through its `proto` slot.
-        let mut proto_entries = Vec::with_capacity(methods.len());
+        // They are stored ONCE, on the class's `prototype` object, under the
+        // method name as a non-enumerable property — never copied per instance;
+        // an instance reaches them through its `proto` slot.
+        let class_local = self.fresh();
+        let mut proto_entries = vec![(
+            PropKey::Hidden("constructor".to_owned()),
+            IrNode::Local(class_local),
+        )];
         for m in methods {
             let f = m.function.as_ref();
             let body = f
@@ -506,79 +510,58 @@ impl LowerCtx<'_> {
                 .as_ref()
                 .ok_or_else(|| anyhow!("class method requires a body"))?;
             let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
-            let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            proto_entries.push((PropKey::Hidden(prop_key_name(&m.key)?), value));
+            let key = prop_key_name(&m.key)?;
+            let value = self.lower_lifted_function(
+                &param_pats,
+                BodyKind::Block(&body.stmts),
+                &key,
+                FnKind::Plain,
+            )?;
+            proto_entries.push((PropKey::Hidden(key), value));
         }
-        // Instance accessors (P2b): a `get x(){}` / `set x(v){}` pair sharing the
-        // property name `x` collapses to ONE `TYPE_ACCESSOR` box stored on the
-        // prototype as the accessor property `x`. Each half is an ordinary lifted function (a getter
+        // Instance accessors: a `get x(){}` / `set x(v){}` pair sharing the
+        // property name `x` collapses to ONE non-enumerable accessor property
+        // `x` on the prototype. Each half is an ordinary lifted function (a getter
         // takes no params; a setter takes one) that reads `this`/`super` exactly
         // like a method, so they are lowered here inside the same `current_super`
         // region. A member read/write that resolves to the accessor invokes the
         // getter / setter (`__get` / `__set`); a missing half is `undefined`
         // (reading a set-only property yields `undefined`; assigning a get-only
         // property throws a `TypeError`).
-        let mut accessor_names: Vec<String> = Vec::new();
-        let mut accessor_get: Vec<IrNode> = Vec::new();
-        let mut accessor_set: Vec<IrNode> = Vec::new();
         for m in accessors {
-            let name = prop_key_name(&m.key)?;
+            let key = prop_key_name(&m.key)?;
             let f = m.function.as_ref();
             let body = f
                 .body
                 .as_ref()
                 .ok_or_else(|| anyhow!("class accessor requires a body"))?;
             let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
-            let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            let idx = if let Some(i) = accessor_names.iter().position(|n| n == &name) {
-                i
-            } else {
-                accessor_names.push(name);
-                accessor_get.push(IrNode::Undefined);
-                accessor_set.push(IrNode::Undefined);
-                accessor_names.len() - 1
-            };
-            if matches!(m.kind, MethodKind::Getter) {
-                accessor_get[idx] = value;
-            } else {
-                accessor_set[idx] = value;
-            }
+            let getter = matches!(m.kind, MethodKind::Getter);
+            let fn_name = format!("{} {key}", if getter { "get" } else { "set" });
+            let value = self.lower_lifted_function(
+                &param_pats,
+                BodyKind::Block(&body.stmts),
+                &fn_name,
+                FnKind::Plain,
+            )?;
+            push_accessor_half(&mut proto_entries, PropKey::Hidden(key), value, getter);
         }
-        for ((name, getter), setter) in accessor_names
-            .into_iter()
-            .zip(accessor_get)
-            .zip(accessor_set)
-        {
-            proto_entries.push((
-                PropKey::Hidden(name),
-                IrNode::MakeAccessor {
-                    getter: Box::new(getter),
-                    setter: Box::new(setter),
-                },
-            ));
-        }
-        // A derived class links its shared prototype's `proto` slot to the parent's
-        // prototype, so `__get`'s chain walk resolves an inherited method: an
+        // A derived class links its prototype's `proto` slot to the parent's
+        // `prototype`, so `__get`'s chain walk resolves an inherited method: an
         // instance's `obj.m` misses the subclass prototype's own entries, then
         // follows this link. This is ALSO the chain `instanceof` walks.
         let proto_link = match &parent {
-            Some(p) => Some(Box::new(self.class_member_read(
-                p,
-                parent_span,
-                crate::abi::CLASS_PROTOTYPE_KEY,
-            )?)),
+            Some(p) => Some(Box::new(self.class_prototype_read(p, parent_span)?)),
             None => None,
         };
 
-        // Lower the static members onto the class VALUE itself (not the prototype),
-        // so `C.m()` / `C.f` read them directly off the class object. A static method
-        // is an ordinary lifted function value called with `this` bound to the class
-        // (a plain `C.m()` method call); a static field's initializer is lowered as a
-        // plain expression evaluated ONCE at class-definition time (an uninitialized
-        // `static f;` stores `undefined`). Static members are NOT inherited by a
-        // derived class (the class value has no constructor-side prototype link), and
-        // a static initializer that references the class or `this` is a documented gap
-        // (the class binding is not yet set while the class value is being built).
+        // The static members are own properties of the class (constructor)
+        // function, so `C.m()` / `C.f` read them directly. A static method is an
+        // ordinary lifted function value called with `this` bound to the class (a
+        // plain `C.m()` method call) and is non-enumerable; a static field is an
+        // enumerable data property whose initializer is evaluated ONCE at
+        // class-definition time (an uninitialized `static f;` stores
+        // `undefined`). Statics are not yet inherited by a derived class.
         let mut static_entries: Vec<(PropKey, IrNode)> = Vec::new();
         for m in static_methods {
             let f = m.function.as_ref();
@@ -587,11 +570,17 @@ impl LowerCtx<'_> {
                 .as_ref()
                 .ok_or_else(|| anyhow!("static class method requires a body"))?;
             let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
-            let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            static_entries.push((PropKey::Hidden(prop_key_name(&m.key)?), value));
+            let key = prop_key_name(&m.key)?;
+            let value = self.lower_lifted_function(
+                &param_pats,
+                BodyKind::Block(&body.stmts),
+                &key,
+                FnKind::Plain,
+            )?;
+            static_entries.push((PropKey::Hidden(key), value));
         }
         // A static field whose initializer is a SIMPLE literal (`static x = 1`) is
-        // evaluated inline in the class value. Any other initializer may reference
+        // defined inline with the class. Any other initializer may reference
         // the class, an earlier static, or `this` — none of which exist while the
         // class value is being built — so it is assigned AFTER the class binding is
         // created (`C.<key> = <init>`, adding the property), in source declaration
@@ -615,29 +604,22 @@ impl LowerCtx<'_> {
         // `super` target.
         self.current_super = prev_super;
 
-        // The class value: a heap object holding the constructor function, the single
-        // shared prototype object (populated with the instance methods), and any
-        // static members appended directly. The two reserved keys are
-        // non-enumerable, so they never surface in enumeration or rendering.
-        let mut class_entries = vec![
-            (
-                PropKey::Hidden(crate::abi::CLASS_CONSTRUCTOR_KEY.to_owned()),
-                ctor_value,
-            ),
-            (
-                PropKey::Hidden(crate::abi::CLASS_PROTOTYPE_KEY.to_owned()),
-                IrNode::Object {
-                    entries: proto_entries,
-                    proto: proto_link,
-                    reserve: 0,
-                },
-            ),
-        ];
+        // The class value: the constructor function with a non-writable
+        // `prototype` (holding `constructor` and the instance methods/accessors)
+        // and the statics defined on it.
+        let mut class_entries = vec![(
+            PropKey::Fixed("prototype".to_owned()),
+            IrNode::Object {
+                entries: proto_entries,
+                proto: proto_link,
+                reserve: 0,
+            },
+        )];
         class_entries.extend(static_entries);
-        let class_value = IrNode::Object {
+        let class_value = IrNode::DefineProps {
+            obj: Box::new(ctor_value),
+            local: class_local,
             entries: class_entries,
-            proto: None,
-            reserve: 0,
         };
 
         // Emit the binding (declared above). When the name is captured, allocate the
@@ -2127,6 +2109,37 @@ fn reject_out_of_scope_field(p: &ClassProp) -> anyhow::Result<()> {
         return Ok(());
     };
     Err(CompileError::spanned(p.span(), msg).into())
+}
+
+/// The parameter and body of a derived class's default constructor,
+/// `constructor(...args) { super(...args) }`. The rest binding's name cannot
+/// be spelled in source, so field initializers appended to the body never see
+/// it.
+fn default_derived_ctor() -> (Pat, Vec<Stmt>) {
+    use swc_common::DUMMY_SP;
+    use swc_ecma_ast::{BindingIdent, CallExpr, RestPat, Super};
+    let args = Ident::new_no_ctxt("%args".into(), DUMMY_SP);
+    let rest = Pat::Rest(RestPat {
+        span: DUMMY_SP,
+        dot3_token: DUMMY_SP,
+        arg: Box::new(Pat::Ident(BindingIdent::from(args.clone()))),
+        type_ann: None,
+    });
+    let call = Expr::Call(CallExpr {
+        span: DUMMY_SP,
+        ctxt: SyntaxContext::empty(),
+        callee: Callee::Super(Super { span: DUMMY_SP }),
+        args: vec![ExprOrSpread {
+            spread: Some(DUMMY_SP),
+            expr: Box::new(Expr::Ident(args)),
+        }],
+        type_args: None,
+    });
+    let stmt = Stmt::Expr(ExprStmt {
+        span: DUMMY_SP,
+        expr: Box::new(call),
+    });
+    (rest, vec![stmt])
 }
 
 /// Desugar an instance field declaration `f = init` (or an uninitialized `f;`)

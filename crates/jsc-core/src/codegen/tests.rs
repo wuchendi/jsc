@@ -597,20 +597,14 @@ fn lowers_function_declaration_and_call() {
 }
 
 #[test]
-fn lowers_function_name_in_value_position_to_func_value() {
-    // `let f = add;` binds `f` to a first-class function value (table index
-    // 0 = wasm function index 1 minus one).
+fn lowers_function_name_in_value_position_to_decl_func() {
+    // `let f = add;` binds `f` to the declaration's one static function object
+    // (table index 0 = wasm function index 1 minus one).
     let program = lower_src("function add(a, b) { return a + b } let f = add; f").expect("lower");
     let IrStmt::Decl { init, .. } = &program.stmts[0] else {
         unreachable!("expected the `let f = add` declaration");
     };
-    assert_eq!(
-        *init,
-        IrNode::FuncValue {
-            table_index: 0,
-            captures: vec![]
-        }
-    );
+    assert_eq!(*init, IrNode::DeclFunc(0));
 }
 
 #[test]
@@ -631,7 +625,7 @@ fn lowers_call_through_variable_to_call_indirect() {
 }
 
 #[test]
-fn passing_a_function_argument_lowers_to_func_value() {
+fn passing_a_function_argument_lowers_to_decl_func() {
     // `apply(dbl, 21)` passes `dbl` as a function value; `apply` is called
     // directly by name, and its `f(x)` body call is indirect.
     let program = lower_src(
@@ -643,14 +637,8 @@ fn passing_a_function_argument_lowers_to_func_value() {
         unreachable!("expected a direct call to `apply`");
     };
     assert_eq!(*func, 1);
-    // `dbl` (wasm index 2) becomes function-table index 1 in value position.
-    assert_eq!(
-        args[0],
-        IrNode::FuncValue {
-            table_index: 1,
-            captures: vec![]
-        }
-    );
+    // `dbl` (wasm index 2) is its static object (table index 1) in value position.
+    assert_eq!(args[0], IrNode::DeclFunc(1));
     assert_eq!(args[1], IrNode::Num(21.0));
     // `apply`'s body calls its `f` parameter indirectly (`f`/`x` are the
     // env-last ABI's argument slots, locals 0/1).
@@ -677,7 +665,8 @@ fn arrow_lifts_to_func_value_and_registers_a_function() {
         *init,
         IrNode::FuncValue {
             table_index: 0,
-            captures: vec![]
+            captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     assert_eq!(program.functions.len(), 1);
@@ -745,7 +734,8 @@ fn nested_arrow_is_lifted_after_its_enclosing_arrow() {
         *init,
         IrNode::FuncValue {
             table_index: 0,
-            captures: vec![]
+            captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     assert_eq!(program.functions.len(), 2);
@@ -833,6 +823,7 @@ fn non_capturing_function_has_no_cells_or_captures() {
         IrNode::FuncValue {
             table_index: 0,
             captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     // The arrow's body is a plain param read — no cell.

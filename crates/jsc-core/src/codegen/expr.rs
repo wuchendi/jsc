@@ -27,21 +27,10 @@ impl LowerCtx<'_> {
             Expr::Ident(ident) => self.lower_ident(ident.sym.as_ref(), ident.span),
             Expr::Paren(p) => self.lower_expr(&p.expr),
             // An arrow function lifts to a top-level function value.
-            Expr::Arrow(arrow) => self.lower_arrow(arrow),
+            Expr::Arrow(arrow) => self.lower_arrow(arrow, ""),
             // A function expression `function (..) { .. }` lifts the same way as
-            // an arrow (its optional name is not bound), e.g. a closure factory's
-            // `return function(){ .. }`.
-            Expr::Fn(fn_expr) => {
-                let block = fn_expr
-                    .function
-                    .body
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("function expression requires a body"))?;
-                reject_unsupported_function(&fn_expr.function)?;
-                let param_pats: Vec<&Pat> =
-                    fn_expr.function.params.iter().map(|p| &p.pat).collect();
-                self.lower_lifted_function(&param_pats, BodyKind::Block(&block.stmts))
-            }
+            // an arrow, e.g. a closure factory's `return function(){ .. }`.
+            Expr::Fn(fn_expr) => self.lower_fn_expr(fn_expr, ""),
             Expr::Assign(assign) => self.lower_assign(assign),
             Expr::Update(update) => self.lower_update(update),
             Expr::Call(call) => self.lower_call(call),
@@ -395,10 +384,7 @@ impl LowerCtx<'_> {
         if let Some(resolved) = self.resolve(name) {
             Ok(Self::read_of(resolved.kind))
         } else if let Some(sig) = self.shared.funcs.get(name) {
-            Ok(IrNode::FuncValue {
-                table_index: sig.index - 1,
-                captures: Vec::new(),
-            })
+            Ok(IrNode::DeclFunc(sig.index - 1))
         } else {
             match name {
                 "undefined" => Ok(IrNode::Undefined),
@@ -411,18 +397,51 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Read a reserved member of a class binding by name — an [`IrNode::Index`]
-    /// over the class value for `@@constructor` / `@@prototype`. Shared by the
-    /// default-constructor alias, prototype chaining, and `super` calls (E-series).
-    pub(super) fn class_member_read(
+    /// Lower `expr` as the value of a binding or property named `name`: an
+    /// anonymous function or arrow gets `name` as its `name` (`NamedEvaluation`);
+    /// any other expression lowers as usual.
+    pub(super) fn lower_named_expr(&mut self, expr: &Expr, name: &str) -> anyhow::Result<IrNode> {
+        match expr {
+            Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
+            Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
+            _ => self.lower_expr(expr),
+        }
+    }
+
+    /// Lower a function expression to a constructor function value named by
+    /// its own identifier, else by `name` (its optional identifier is not
+    /// bound inside the body).
+    fn lower_fn_expr(
+        &mut self,
+        fn_expr: &swc_ecma_ast::FnExpr,
+        name: &str,
+    ) -> anyhow::Result<IrNode> {
+        let block = fn_expr
+            .function
+            .body
+            .as_ref()
+            .ok_or_else(|| anyhow!("function expression requires a body"))?;
+        reject_unsupported_function(&fn_expr.function)?;
+        let param_pats: Vec<&Pat> = fn_expr.function.params.iter().map(|p| &p.pat).collect();
+        let name = fn_expr.ident.as_ref().map_or(name, |id| id.sym.as_ref());
+        self.lower_lifted_function(
+            &param_pats,
+            BodyKind::Block(&block.stmts),
+            name,
+            FnKind::Constructor,
+        )
+    }
+
+    /// Read `Parent.prototype` for the class bound to `class_name`: the target of
+    /// a derived prototype's `proto` link and of `super.m(..)`.
+    pub(super) fn class_prototype_read(
         &mut self,
         class_name: &str,
         span: Span,
-        key: &str,
     ) -> anyhow::Result<IrNode> {
         Ok(IrNode::Index {
             obj: Box::new(self.lower_ident(class_name, span)?),
-            index: Box::new(IrNode::Str(key.to_owned())),
+            index: Box::new(IrNode::Str("prototype".to_owned())),
         })
     }
 
@@ -444,8 +463,29 @@ impl LowerCtx<'_> {
         let Some(this_local) = self.ensure_this_local() else {
             return Err(CompileError::spanned(span, "`super` is not available here").into());
         };
+        let callee = self.lower_ident(&parent, span)?;
+        if call.args.iter().any(|arg| arg.spread.is_some()) {
+            let parts = call
+                .args
+                .iter()
+                .map(|arg| {
+                    let value = self.lower_expr(&arg.expr)?;
+                    Ok(if arg.spread.is_some() {
+                        SpreadElem::Spread(value)
+                    } else {
+                        SpreadElem::Item(value)
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            return Ok(IrNode::CallSpread {
+                target: SpreadCallee::This {
+                    callee: Box::new(callee),
+                    this_local,
+                },
+                args: Box::new(IrNode::ArraySpread(parts)),
+            });
+        }
         let args = self.lower_super_args(call)?;
-        let callee = self.class_member_read(&parent, span, crate::abi::CLASS_CONSTRUCTOR_KEY)?;
         Ok(IrNode::ThisCall {
             callee: Box::new(callee),
             args,
@@ -454,7 +494,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower `super.m(args)` (E-series): a call to the parent prototype's method `m`
-    /// with the CURRENT `this`. `m` is resolved through `Parent["@@prototype"]`, so
+    /// with the CURRENT `this`. `m` is resolved through `Parent.prototype`, so
     /// it walks up the parent's own chain (an [`IrNode::ThisCall`]).
     fn lower_super_method_call(
         &mut self,
@@ -481,8 +521,7 @@ impl LowerCtx<'_> {
             .into());
         };
         let args = self.lower_super_args(call)?;
-        let parent_proto =
-            self.class_member_read(&parent, super_prop.span, crate::abi::CLASS_PROTOTYPE_KEY)?;
+        let parent_proto = self.class_prototype_read(&parent, super_prop.span)?;
         let callee = IrNode::Index {
             obj: Box::new(parent_proto),
             index: Box::new(IrNode::Str(id.sym.as_ref().to_owned())),
@@ -1215,7 +1254,11 @@ impl LowerCtx<'_> {
                     )
                     .into());
                 }
-                let rhs = self.lower_expr(&assign.right)?;
+                let rhs = if compound_op.is_none() {
+                    self.lower_named_expr(&assign.right, name)?
+                } else {
+                    self.lower_expr(&assign.right)?
+                };
                 // `x op= e` desugars to `x = x op e`. The target is read once, as
                 // a side-effect-free local/cell read, and reuses the binary op — so
                 // `+=` shares the `+` string/number overload (string concat when
@@ -1460,8 +1503,10 @@ impl LowerCtx<'_> {
     /// method/shorthand-method properties (`{m(){..}}` ≡ `{m: function(){..}}`, a
     /// first-class function value carrying `this`) are in scope; identifier and
     /// string keys are static, computed and numeric keys are converted at run
-    /// time. Spread, getters/setters, and async/generator methods are rejected
-    /// with spans.
+    /// time. A getter/setter (`get x(){..}` / `set x(v){..}`) defines an
+    /// accessor property; a getter and setter sharing a static key share one
+    /// accessor entry. Spread and async/generator methods are rejected with
+    /// spans.
     ///
     /// # Errors
     ///
@@ -1483,7 +1528,11 @@ impl LowerCtx<'_> {
             match prop.as_ref() {
                 Prop::KeyValue(kv) => {
                     let key = self.lower_prop_key(&kv.key)?;
-                    entries.push((key, self.lower_expr(&kv.value)?));
+                    let value = match &key {
+                        PropKey::Static(name) => self.lower_named_expr(&kv.value, name)?,
+                        _ => self.lower_expr(&kv.value)?,
+                    };
+                    entries.push((key, value));
                 }
                 // Shorthand `{n}` ≡ `{n: n}`: the value is the identifier read.
                 Prop::Shorthand(ident) => {
@@ -1503,16 +1552,50 @@ impl LowerCtx<'_> {
                         .ok_or_else(|| anyhow!("object method requires a body"))?;
                     let param_pats: Vec<&Pat> =
                         method.function.params.iter().map(|p| &p.pat).collect();
-                    let value =
-                        self.lower_lifted_function(&param_pats, BodyKind::Block(&block.stmts))?;
+                    let name = static_key_name(&key);
+                    let value = self.lower_lifted_function(
+                        &param_pats,
+                        BodyKind::Block(&block.stmts),
+                        name,
+                        FnKind::Plain,
+                    )?;
                     entries.push((key, value));
                 }
-                Prop::Getter(_) | Prop::Setter(_) => {
-                    return Err(CompileError::spanned(
-                        prop.span(),
-                        "getter and setter properties are not supported",
-                    )
-                    .into());
+                Prop::Getter(getter) => {
+                    let key = self.lower_prop_key(&getter.key)?;
+                    let block = getter
+                        .function
+                        .body
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("getter requires a body"))?;
+                    let param_pats: Vec<&Pat> =
+                        getter.function.params.iter().map(|p| &p.pat).collect();
+                    let name = format!("get {}", static_key_name(&key));
+                    let value = self.lower_lifted_function(
+                        &param_pats,
+                        BodyKind::Block(&block.stmts),
+                        &name,
+                        FnKind::Plain,
+                    )?;
+                    push_accessor_half(&mut entries, key, value, true);
+                }
+                Prop::Setter(setter) => {
+                    let key = self.lower_prop_key(&setter.key)?;
+                    let block = setter
+                        .function
+                        .body
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("setter requires a body"))?;
+                    let param_pats: Vec<&Pat> =
+                        setter.function.params.iter().map(|p| &p.pat).collect();
+                    let name = format!("set {}", static_key_name(&key));
+                    let value = self.lower_lifted_function(
+                        &param_pats,
+                        BodyKind::Block(&block.stmts),
+                        &name,
+                        FnKind::Plain,
+                    )?;
+                    push_accessor_half(&mut entries, key, value, false);
                 }
                 Prop::Assign(_) => {
                     return Err(
@@ -1575,7 +1658,7 @@ impl LowerCtx<'_> {
 
     /// Resolve the right-hand side of an `instanceof` to an [`InstanceOfKind`].
     /// A user class is matched FIRST (so a `class Error {}` shadows the builtin)
-    /// and lowers to a `@@prototype` comparison; an UNSHADOWED `Error`/
+    /// and lowers to a `proto`-chain walk against `C.prototype`; an UNSHADOWED `Error`/
     /// `TypeError`/`RangeError` identifier lowers to a hidden-brand check.
     /// Anything else — a non-identifier, a shadowed error name, or an unrelated
     /// binding — is a clean compile error.
@@ -1594,13 +1677,8 @@ impl LowerCtx<'_> {
         };
         let name = id.sym.as_ref();
         if self.shared.classes.borrow().contains_key(name) {
-            // User class: compare the receiver's `@@prototype` to the class's
-            // shared prototype (a single pointer hop — exact under no-`extends`).
-            let class_read = self.lower_ident(name, id.span)?;
-            let class_proto = IrNode::Index {
-                obj: Box::new(class_read),
-                index: Box::new(IrNode::Str(crate::abi::CLASS_PROTOTYPE_KEY.to_owned())),
-            };
+            // User class: walk the receiver's `proto` chain for `C.prototype`.
+            let class_proto = self.class_prototype_read(name, id.span)?;
             return Ok(InstanceOfKind::Class(Box::new(class_proto)));
         }
         if self.resolve(name).is_none() {
@@ -1799,11 +1877,10 @@ impl LowerCtx<'_> {
     }
 
     /// Lower `new A(args)` on a user class `A` into an [`IrNode::New`]. The
-    /// class binding `A` is read (a side-effect-free local/cell read) to reach its
-    /// reserved constructor and prototype entries; the fresh instance is an empty
-    /// object whose `proto` is the class's shared prototype and whose property
-    /// table is pre-sized for the fields the constructor chain assigns. Spread
-    /// arguments are rejected.
+    /// class binding `A` is read (a side-effect-free local/cell read): its value
+    /// is the constructor, and the fresh instance is an empty object whose
+    /// `proto` is `A.prototype` and whose property table is pre-sized for the
+    /// fields the constructor chain assigns. Spread arguments are rejected.
     fn lower_new_class(
         &mut self,
         name: &str,
@@ -1815,16 +1892,9 @@ impl LowerCtx<'_> {
             classes.get(name).map_or(0, |info| info.fields.len())
         };
         // Read the class binding twice (both are pure local/cell reads): once for
-        // the shared prototype the instance links to, once for the constructor.
-        let class_read = self.lower_ident(name, span)?;
-        let proto = IrNode::Index {
-            obj: Box::new(class_read.clone()),
-            index: Box::new(IrNode::Str(crate::abi::CLASS_PROTOTYPE_KEY.to_owned())),
-        };
-        let ctor = IrNode::Index {
-            obj: Box::new(class_read),
-            index: Box::new(IrNode::Str(crate::abi::CLASS_CONSTRUCTOR_KEY.to_owned())),
-        };
+        // the prototype the instance links to, once as the constructor.
+        let proto = self.class_prototype_read(name, span)?;
+        let ctor = self.lower_ident(name, span)?;
         let instance = IrNode::Object {
             entries: Vec::new(),
             proto: Some(Box::new(proto)),
@@ -1960,4 +2030,48 @@ fn receiver_method_op(name: &str) -> Option<ReceiverOp> {
         "next" => ReceiverOp::Next,
         _ => return None,
     })
+}
+
+/// The compile-time name of a static property key (`""` for a computed key):
+/// the `name` given to a method or accessor defined under it.
+fn static_key_name(key: &PropKey) -> &str {
+    match key {
+        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => name,
+        PropKey::Computed(_) => "",
+    }
+}
+
+/// Append one accessor half (`getter` or setter function `value`) under `key`:
+/// it completes the accessor entry of the same static key when one exists,
+/// else starts a new accessor entry with the other half `undefined`.
+pub(super) fn push_accessor_half(
+    entries: &mut Vec<(PropKey, IrNode)>,
+    key: PropKey,
+    value: IrNode,
+    getter: bool,
+) {
+    let existing = entries.iter_mut().rev().find_map(|(k, v)| match v {
+        IrNode::MakeAccessor { getter, setter }
+            if !matches!(k, PropKey::Computed(_)) && *k == key =>
+        {
+            Some((getter, setter))
+        }
+        _ => None,
+    });
+    if let Some((get, set)) = existing {
+        **if getter { get } else { set } = value;
+        return;
+    }
+    let (get, set) = if getter {
+        (value, IrNode::Undefined)
+    } else {
+        (IrNode::Undefined, value)
+    };
+    entries.push((
+        key,
+        IrNode::MakeAccessor {
+            getter: Box::new(get),
+            setter: Box::new(set),
+        },
+    ));
 }

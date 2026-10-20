@@ -243,9 +243,13 @@ pub enum ObjectBuiltinOp {
 pub enum PropKey {
     /// A compile-time string key of an enumerable data property.
     Static(String),
-    /// A compile-time string key of a NON-enumerable property: class prototype
-    /// methods/accessors, static methods, and the reserved `@@` keys.
+    /// A compile-time string key of a NON-enumerable (writable, configurable)
+    /// property: class prototype methods/accessors, `constructor`, static
+    /// methods, and the reserved `@@errorkind` brand.
     Hidden(String),
+    /// A compile-time string key of a non-writable, non-enumerable,
+    /// non-configurable data property: a class's `prototype`.
+    Fixed(String),
     /// A computed key (`{[k]: v}`, or a numeric literal key `{1: v}`), converted
     /// with `ToPropertyKey` and interned at run time.
     Computed(IrNode),
@@ -283,10 +287,10 @@ pub enum InstanceOfKind {
     /// primitive string.
     Object,
     /// `instanceof C` for a user class `C`: some object on the receiver's
-    /// `proto` chain must be the SAME object as `C`'s shared prototype. The walk
+    /// `proto` chain must be the SAME object as `Get(C, "prototype")`. The walk
     /// starts at the receiver's `proto` slot and follows each prototype object's
     /// own `proto` (linked by `extends`) until a match or `null`. Carries the
-    /// expression that reads the class's prototype (`C["@@prototype"]`).
+    /// expression that reads the class's prototype (`C.prototype`).
     Class(Box<IrNode>),
 }
 
@@ -396,6 +400,15 @@ pub enum SpreadCallee {
     Direct(u32),
     /// An indirect call through a computed function value.
     Indirect(Box<IrNode>),
+    /// A `super(...args)` call: the parent constructor value, invoked with
+    /// `this` kept as the enclosing constructor's snapshot in `this_local`
+    /// (like [`IrNode::ThisCall`]).
+    This {
+        /// The parent constructor function value.
+        callee: Box<IrNode>,
+        /// The enclosing constructor's `this` snapshot local.
+        this_local: u32,
+    },
 }
 
 /// A node in the numeric-expression IR tree.
@@ -463,7 +476,15 @@ pub enum IrNode {
         /// slot order (empty for a non-capturing function). Each yields the
         /// jsval pointer of the boxed cell to store in the environment.
         captures: Vec<IrNode>,
+        /// The function's constructor kind (its [`FnInfo::kind`]), selecting the
+        /// header `flags` the object is created with.
+        kind: FnKind,
     },
+    /// The function object of a top-level function declaration (funcref-table
+    /// index `.0`). A top-level declaration never captures, so its one object
+    /// is a static block in the data segment: every reference yields the same
+    /// identity, and properties added to it persist.
+    DeclFunc(u32),
     /// Allocate a **boxed cell** (heap block, type byte `5`) holding the value of
     /// the sub-expression, and yield the cell's heap-pointer jsval. A
     /// captured `let`/`const`/parameter binding is stored through such a cell so
@@ -601,6 +622,18 @@ pub enum IrNode {
         /// instance's field-scan count).
         reserve: u32,
     },
+    /// Define own properties on an existing object: `obj` is evaluated once
+    /// into `local`, then each entry is defined (`__define`) in order with the
+    /// attributes its [`PropKey`] selects; yields `obj`. Entry values may read
+    /// `local` (a class prototype's `constructor` back-link to the class).
+    DefineProps {
+        /// The object to define the properties on.
+        obj: Box<IrNode>,
+        /// Fresh temp local holding the evaluated `obj`.
+        local: u32,
+        /// The entries, in definition order.
+        entries: Vec<(PropKey, IrNode)>,
+    },
     /// An object rest binding `let {a, ...rest} = obj`. Builds a NEW heap
     /// object holding every own key of `source` EXCEPT the statically-known
     /// destructured keys in `exclude`. `source` is evaluated once (a hidden temp
@@ -639,15 +672,14 @@ pub enum IrNode {
         /// The property key.
         index: Box<IrNode>,
     },
-    /// A class instance **accessor** property value (P2b getters/setters): build a
-    /// `TYPE_ACCESSOR` heap block holding the getter and setter FUNCTION VALUES
-    /// (`undefined` for an absent half). It is stored under the property name on
-    /// the class's shared prototype as an `ATTR_ACCESSOR` property, so a member
-    /// READ that resolves to it invokes `getter()` with `this` = the receiver, and
-    /// a member WRITE invokes `setter(value)`. Both halves are
-    /// ordinary lifted function values that read `this` through the `this` carrier,
-    /// exactly like a method. Built ONCE per accessor property at class-definition
-    /// time — never copied per instance.
+    /// An **accessor** property value (class or object-literal getters/setters):
+    /// build a `TYPE_ACCESSOR` heap block holding the getter and setter FUNCTION
+    /// VALUES (`undefined` for an absent half). As an [`IrNode::Object`] /
+    /// [`IrNode::DefineProps`] entry value it defines an `ATTR_ACCESSOR`
+    /// property, so a member READ that resolves to it invokes `getter()` with
+    /// `this` = the receiver, and a member WRITE invokes `setter(value)`. Both
+    /// halves are ordinary lifted function values that read `this` through the
+    /// `this` carrier, exactly like a method.
     MakeAccessor {
         /// The getter function value, or [`IrNode::Undefined`] if the property
         /// declares only a setter.
@@ -878,9 +910,9 @@ pub enum IrNode {
     /// A `super(..)` / `super.m(..)` call inside a derived class (the E-series
     /// `extends`): invoke the function value `callee` with `this` kept as the
     /// CURRENT instance (the enclosing method's snapshotted `this` in `this_local`)
-    /// rather than a fresh receiver. `callee` is the parent constructor
-    /// (`Super["@@constructor"]`) for `super(..)` or a parent-prototype method
-    /// (`Super["@@prototype"].m`) for `super.m(..)`. Mirrors [`IrNode::MethodCallUser`]'s
+    /// rather than a fresh receiver. `callee` is the parent class value (its
+    /// constructor function) for `super(..)` or a parent-prototype method
+    /// (`Super.prototype.m`) for `super.m(..)`. Mirrors [`IrNode::MethodCallUser`]'s
     /// call shape — a not-a-function runtime guard, then the `__this` global is set
     /// to `this_local` immediately before the `call_indirect` — but binds the
     /// existing `this` instead of a member receiver, so the parent constructor's
@@ -906,8 +938,7 @@ pub enum IrNode {
         /// The fresh instance allocation: an entry-less [`IrNode::Object`] whose
         /// `proto` is the class prototype and whose `reserve` is the field count.
         instance: Box<IrNode>,
-        /// The constructor function value to run (read from the class binding's
-        /// reserved constructor key).
+        /// The constructor function value to run (the class binding's value).
         ctor: Box<IrNode>,
         /// The constructor argument expressions, in source order.
         args: Vec<IrNode>,
@@ -1281,6 +1312,33 @@ pub struct IrFunction {
     /// body is a `switch (gen.state)` dispatch over these `GenSegment`s rather
     /// than [`Self::body`]. `None` for every ordinary function.
     pub machine: Option<Vec<GenSegment>>,
+    /// The function object's static facts (its `name`, `length`, and kind).
+    pub info: FnInfo,
+}
+
+/// The static facts of a function object, laid into the `__fn_info` table
+/// and its block's header `flags`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FnInfo {
+    /// The `name` property (`""` for an anonymous function).
+    pub name: String,
+    /// The `length` property: the parameters before the first default or rest.
+    pub length: u32,
+    /// What the function constructs.
+    pub kind: FnKind,
+}
+
+/// Whether a function is a constructor (design 4.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FnKind {
+    /// Not a constructor: arrows, methods, accessors, generators, async
+    /// functions, and internal functions. No `prototype`.
+    #[default]
+    Plain,
+    /// A `function` declaration or expression: materializes a `prototype`.
+    Constructor,
+    /// A class constructor: its `prototype` is defined by the class.
+    Class,
 }
 
 /// One basic block of a generator state machine: a run of
@@ -1386,6 +1444,7 @@ impl IrNode {
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
+            | IrNode::DeclFunc(_)
             | IrNode::DateNow => false,
             IrNode::Assign { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -1486,11 +1545,18 @@ impl IrNode {
                         matches!(key, PropKey::Computed(key) if f(key)) || f(value)
                     })
             }
+            IrNode::DefineProps { obj, entries, .. } => {
+                f(obj)
+                    || entries.iter().any(|(key, value)| {
+                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
+                    })
+            }
             IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
                 SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
             }),
             IrNode::CallSpread { target, args } => {
-                matches!(target, SpreadCallee::Indirect(callee) if f(callee)) || f(args)
+                matches!(target, SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } if f(callee))
+                    || f(args)
             }
         }
     }
@@ -1515,6 +1581,7 @@ impl IrNode {
             | IrNode::ArrayPop { .. }
             | IrNode::IncDec { .. }
             | IrNode::MapNew { .. }
+            | IrNode::DeclFunc(_)
             | IrNode::DateNow => Vec::new(),
             IrNode::Assign { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -1631,6 +1698,16 @@ impl IrNode {
                 }
                 out
             }
+            IrNode::DefineProps { obj, entries, .. } => {
+                let mut out: Vec<&mut IrNode> = vec![&mut **obj];
+                for (key, value) in entries {
+                    if let PropKey::Computed(key) = key {
+                        out.push(key);
+                    }
+                    out.push(value);
+                }
+                out
+            }
             IrNode::ArraySpread(elems) => elems
                 .iter_mut()
                 .map(|elem| match elem {
@@ -1639,7 +1716,7 @@ impl IrNode {
                 .collect(),
             IrNode::CallSpread { target, args } => {
                 let mut out = Vec::new();
-                if let SpreadCallee::Indirect(callee) = target {
+                if let SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } = target {
                     out.push(&mut **callee);
                 }
                 out.push(&mut **args);

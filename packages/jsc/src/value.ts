@@ -12,10 +12,17 @@ import {
   ATTR_ENUMERABLE,
   DATE_MS_OFFSET,
   ERROR_KIND_KEY,
+  FN_INFO_ADDR,
+  FN_INFO_ENTRY_SIZE,
+  FN_INFO_NAME_OFFSET,
+  FUNC_FLAG_CLASS_CTOR,
+  FUNC_INDEX_OFFSET,
   HEADER_FLAGS_OFFSET,
   HEADER_SIZE,
+  HEAP,
   MAP_SIZE_OFFSET,
   OBJ_PROPS_OFFSET,
+  OBJ_PROTO_OFFSET,
   PROMISE_FULFILLED,
   PROMISE_REJECTED,
   PROMISE_STATE_OFFSET,
@@ -53,9 +60,16 @@ export type Value =
   | { kind: 'string'; value: string }
   | { kind: 'array'; items: Value[] }
   | { kind: 'object'; entries: [string, Value][] }
+  | { kind: 'instance'; className: string; entries: [string, Value][] }
   | { kind: 'error'; name: string; message: string }
   | { kind: 'accessor'; getter: boolean; setter: boolean }
-  | { kind: 'function' }
+  | {
+      kind: 'function'
+      name: string
+      isClass: boolean
+      extends: string | undefined
+      props: [string, Value][]
+    }
   | { kind: 'map'; size: number }
   | { kind: 'set'; size: number }
   | { kind: 'promise'; state: number; value: Value }
@@ -159,7 +173,12 @@ function decodeIn(bits: bigint, mem: Uint8Array, guard: Guard): Value {
 function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
   const ptr = Number(bits & U32_MASK)
   const ty = mem[ptr]
-  if (ty === TYPE_ARRAY || ty === TYPE_OBJECT || ty === TYPE_PROMISE) {
+  if (
+    ty === TYPE_ARRAY ||
+    ty === TYPE_OBJECT ||
+    ty === TYPE_PROMISE ||
+    ty === TYPE_FUNCTION
+  ) {
     if (guard.path.includes(ptr)) {
       let id = guard.refs.indexOf(ptr) + 1
       if (id === 0) id = guard.refs.push(ptr)
@@ -171,7 +190,9 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
         ? decodeArray(ptr, mem, guard)
         : ty === TYPE_OBJECT
           ? decodeObject(ptr, mem, guard)
-          : decodePromise(ptr, mem, guard)
+          : ty === TYPE_FUNCTION
+            ? decodeFunction(ptr, mem, guard)
+            : decodePromise(ptr, mem, guard)
     guard.path.pop()
     const id = guard.refs.indexOf(ptr) + 1
     return id === 0 ? value : { kind: 'ref', id, value }
@@ -179,8 +200,6 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
   switch (ty) {
     case TYPE_STRING:
       return decodeString(ptr, mem)
-    case TYPE_FUNCTION:
-      return { kind: 'function' }
     case TYPE_MAP:
       return { kind: 'map', size: decodeSize(ptr, mem) }
     case TYPE_SET:
@@ -254,16 +273,20 @@ function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
 }
 
 /**
- * Resolve a heap object block at `ptr` by walking its property table (mirrors
- * `value.rs::decode_object`): tombstones and non-enumerable entries are
- * skipped, integer keys come first in ascending order when the table has
- * `HAS_INDEX_KEYS`, then the other keys in slot order. An accessor property
- * decodes as `accessor`; an object carrying the non-enumerable `@@errorkind`
- * brand decodes as `error`.
+ * Decode the own enumerable properties of the object-family block at `ptr` by
+ * walking its property table (mirrors `value.rs::decode_props`): tombstones
+ * and non-enumerable entries are skipped, integer keys come first in
+ * ascending order when the table has `HAS_INDEX_KEYS`, then the other keys in
+ * slot order. An accessor property decodes as `accessor`. Also reports
+ * whether the table carries the non-enumerable `@@errorkind` brand.
  */
-function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
+function decodeProps(
+  ptr: number,
+  mem: Uint8Array,
+  guard: Guard,
+): [[string, Value][], boolean] {
   const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
-  if (props === 0) return { kind: 'object', entries: [] }
+  if (props === 0) return [[], false]
   const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
   const tflags = mem[props + PROPS_TFLAGS_OFFSET] ?? 0
   let isError = false
@@ -275,8 +298,7 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
     const bits = readU64(mem, entry + PROP_VALUE_OFFSET)
     if (key === undefined || attrs === undefined || bits === undefined) break
     if (key === 0) continue
-    const decodedKey = decodeString(key, mem)
-    const text = decodedKey.kind === 'string' ? decodedKey.value : ''
+    const text = stringAt(key, mem)
     if (text === ERROR_KIND_KEY) isError = true
     if ((attrs & ATTR_ENUMERABLE) === 0) continue
     const flags = mem[key + HEADER_FLAGS_OFFSET] ?? 0
@@ -317,6 +339,17 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
       entries.push([key, decodeIn(bits, mem, guard)])
     }
   }
+  return [entries, isError]
+}
+
+/**
+ * Resolve a heap object block at `ptr` from its own enumerable properties
+ * (mirrors `value.rs::decode_object`): an object carrying the `@@errorkind`
+ * brand decodes as `error`; an object with a prototype whose `constructor`
+ * names a function other than `Object` decodes as `instance`.
+ */
+function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
+  const [entries, isError] = decodeProps(ptr, mem, guard)
   if (isError) {
     const field = (name: string) => {
       const found = entries.find(([k, v]) => k === name && v.kind === 'string')
@@ -328,7 +361,121 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
       message: field('message') ?? '',
     }
   }
+  const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
+  if (proto !== undefined && heapObject(proto, mem) !== undefined) {
+    const ctor = lookupData(ptr, 'constructor', mem)
+    const className = ctor === undefined ? undefined : functionName(ctor, mem)
+    if (className !== undefined && className !== '' && className !== 'Object')
+      return { kind: 'instance', className, entries }
+  }
   return { kind: 'object', entries }
+}
+
+/** Resolve a function block at `ptr` (mirrors `value.rs::decode_function`). */
+function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
+  const isClass =
+    ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_CLASS_CTOR) !== 0
+  let parent: string | undefined
+  if (isClass) {
+    const proto = ownData(ptr, 'prototype', mem)
+    const protoPtr = proto === undefined ? undefined : heapObject(proto, mem)
+    const link =
+      protoPtr === undefined
+        ? undefined
+        : readU64(mem, protoPtr + OBJ_PROTO_OFFSET)
+    const linkPtr = link === undefined ? undefined : heapObject(link, mem)
+    const ctor =
+      linkPtr === undefined
+        ? undefined
+        : lookupData(linkPtr, 'constructor', mem)
+    parent = ctor === undefined ? undefined : functionName(ctor, mem)
+  }
+  return {
+    kind: 'function',
+    name: functionName(HEAP | BigInt(ptr), mem) ?? '',
+    isClass,
+    extends: parent,
+    props: decodeProps(ptr, mem, guard)[0],
+  }
+}
+
+/** The text of the string block at `ptr`. */
+function stringAt(ptr: number, mem: Uint8Array): string {
+  const decoded = decodeString(ptr, mem)
+  return decoded.kind === 'string' ? decoded.value : ''
+}
+
+/**
+ * The block base of `bits` when it is a heap pointer to an object-family
+ * block with a `props` slot (mirrors `value.rs::heap_object`).
+ */
+function heapObject(bits: bigint, mem: Uint8Array): number | undefined {
+  if ((bits & QNAN) !== QNAN || ((bits >> 48n) & 0b111n) !== 0b101n)
+    return undefined
+  const ptr = Number(bits & U32_MASK)
+  const ty = mem[ptr]
+  return ty === undefined || ty === TYPE_STRING || ty === TYPE_ARRAY
+    ? undefined
+    : ptr
+}
+
+/** The value bits of the own DATA property `key` at `ptr` (mirrors `value.rs::own_data`). */
+function ownData(
+  ptr: number,
+  key: string,
+  mem: Uint8Array,
+): bigint | undefined {
+  const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
+  if (props === 0) return undefined
+  const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
+  for (let k = 0; k < count; k++) {
+    const entry = props + PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k
+    const keyPtr = readU32(mem, entry + PROP_KEY_OFFSET)
+    const attrs = readU32(mem, entry + PROP_ATTRS_OFFSET)
+    if (keyPtr === undefined || attrs === undefined) return undefined
+    if (
+      keyPtr !== 0 &&
+      (attrs & ATTR_ACCESSOR) === 0 &&
+      stringAt(keyPtr, mem) === key
+    )
+      return readU64(mem, entry + PROP_VALUE_OFFSET)
+  }
+  return undefined
+}
+
+/**
+ * The value bits of the data property `key` on `ptr` or the nearest object on
+ * its `proto` chain (mirrors `value.rs::lookup_data`; bounded walk).
+ */
+function lookupData(
+  ptr: number,
+  key: string,
+  mem: Uint8Array,
+): bigint | undefined {
+  let cur = ptr
+  for (let i = 0; i < 1024; i++) {
+    const own = ownData(cur, key, mem)
+    if (own !== undefined) return own
+    const proto = readU64(mem, cur + OBJ_PROTO_OFFSET)
+    const next = proto === undefined ? undefined : heapObject(proto, mem)
+    if (next === undefined) return undefined
+    cur = next
+  }
+  return undefined
+}
+
+/** The `__fn_info` name of the function `bits` (mirrors `value.rs::function_name`). */
+function functionName(bits: bigint, mem: Uint8Array): string | undefined {
+  const ptr = heapObject(bits, mem)
+  if (ptr === undefined || mem[ptr] !== TYPE_FUNCTION) return undefined
+  const info = readU32(mem, FN_INFO_ADDR)
+  const index = readU32(mem, ptr + FUNC_INDEX_OFFSET)
+  if (info === undefined || index === undefined) return undefined
+  const key = readU32(
+    mem,
+    info + FN_INFO_ENTRY_SIZE * index + FN_INFO_NAME_OFFSET,
+  )
+  return key === undefined ? undefined : stringAt(key, mem)
 }
 
 /**
@@ -360,9 +507,10 @@ export function formatValue(value: Value): string {
         ? '[]'
         : `[ ${value.items.map(formatValue).join(', ')} ]`
     case 'object':
-      return value.entries.length === 0
-        ? '{}'
-        : `{ ${value.entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(', ')} }`
+      return formatEntries(value.entries)
+    // A class instance is prefixed with its constructor's name.
+    case 'instance':
+      return `${value.className} ${formatEntries(value.entries)}`
     // A branded Error renders as its single-line stack.
     case 'error':
       return value.message === ''
@@ -374,8 +522,16 @@ export function formatValue(value: Value): string {
         : value.setter
           ? '[Setter]'
           : '[Getter]'
-    case 'function':
-      return '[Function (anonymous)]'
+    case 'function': {
+      const head = value.isClass
+        ? `[class ${value.name === '' ? '(anonymous)' : value.name}${value.extends === undefined ? '' : ` extends ${value.extends}`}]`
+        : value.name === ''
+          ? '[Function (anonymous)]'
+          : `[Function: ${value.name}]`
+      return value.props.length === 0
+        ? head
+        : `${head} ${formatEntries(value.props)}`
+    }
     case 'map':
       return `Map(${value.size})`
     case 'set':
@@ -396,6 +552,13 @@ export function formatValue(value: Value): string {
     case 'ref':
       return `<ref *${value.id}> ${formatValue(value.value)}`
   }
+}
+
+/** Render own properties Node-console style: `{ a: 1 }`, `{}` when empty. */
+function formatEntries(entries: [string, Value][]): string {
+  return entries.length === 0
+    ? '{}'
+    : `{ ${entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(', ')} }`
 }
 
 /**

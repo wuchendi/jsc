@@ -14,9 +14,9 @@ use super::*;
 // adds a type + function registration), not with branching complexity.
 #[allow(clippy::too_many_lines)]
 pub(super) fn build_type_and_function_sections<'a>(
-    program: &IrProgram,
+    program: &'a IrProgram,
     unwind: &'a RefCell<Unwind>,
-    has_accessors: bool,
+    layout: FnLayout,
 ) -> (
     TypeSection,
     FunctionSection,
@@ -90,7 +90,11 @@ pub(super) fn build_type_and_function_sections<'a>(
         to_key: index(),
         prop_find: index(),
         define: index(),
-        get: index(),
+        // `__fn_materialize` takes the index right after `__define`.
+        get: {
+            index();
+            index()
+        },
         set: index(),
         has: index(),
         delete: index(),
@@ -145,7 +149,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         fn_type: if has_funcs { fn_type } else { 0 },
         max_args,
         has_funcs,
-        has_accessors,
+        has_accessors: program_has_accessors(program),
+        fn_info: layout.info,
     };
     // Helper types follow the main (type 0) and uniform (type 1, only when there
     // are functions) types, one per helper in function-index order.
@@ -252,6 +257,8 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32, I32], &[I32]),
         // `__define(o, key, v, attrs)`.
         (&[I32, I32, I64, I32], &[]),
+        // `__fn_materialize(o)`.
+        (&[I32], &[]),
         // `__get(recv, key) -> v`.
         (&[I64, I32], &[I64]),
         // `__set(recv, key, v)`.
@@ -400,6 +407,8 @@ pub(super) fn build_globals(
 pub(super) fn emit_data_section(
     offsets: &HashMap<String, i32>,
     intern: &InternTable,
+    functions: &[IrFunction],
+    layout: FnLayout,
 ) -> DataSection {
     let mut segments: Vec<(&String, i32)> = offsets.iter().map(|(s, o)| (s, *o)).collect();
     segments.sort_by_key(|(_, offset)| *offset);
@@ -429,7 +438,61 @@ pub(super) fn emit_data_section(
         .flat_map(|slot| slot.to_le_bytes())
         .collect();
     data.active(0, &ConstExpr::i32_const(intern.base), table);
+    if !functions.is_empty() {
+        emit_fn_data(&mut data, offsets, functions, layout);
+    }
     data
+}
+
+/// Lay out the function data: the `__fn_info` table base at
+/// [`abi::FN_INFO_ADDR`], one `[name key][length]` info entry per function
+/// (then the two settlers'), and one static `TYPE_FUNCTION` block per function — the single object of a
+/// top-level declaration ([`IrNode::DeclFunc`]), created `LAZY` with no
+/// properties, a `null` prototype, and an `undefined` environment.
+fn emit_fn_data(
+    data: &mut DataSection,
+    offsets: &HashMap<String, i32>,
+    functions: &[IrFunction],
+    layout: FnLayout,
+) {
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::FN_INFO_ADDR.cast_signed()),
+        layout.info.to_le_bytes(),
+    );
+    let mut info = Vec::with_capacity(functions.len() * abi::FN_INFO_ENTRY_SIZE as usize);
+    let mut blocks = Vec::with_capacity(functions.len() * abi::FUNC_BLOCK_SIZE as usize);
+    let anonymous = offsets.get("").copied().unwrap_or(HEAP_BASE);
+    for (index, func) in (0u32..).zip(functions) {
+        let name = offsets.get(&func.info.name).copied().unwrap_or(HEAP_BASE);
+        info.extend_from_slice(&name.to_le_bytes());
+        info.extend_from_slice(&func.info.length.to_le_bytes());
+        blocks.extend_from_slice(&[abi::TYPE_FUNCTION, 0, fn_flags(func.info.kind), 0]);
+        blocks.extend_from_slice(&0u32.to_le_bytes());
+        blocks.extend_from_slice(&abi::NULL.to_le_bytes());
+        blocks.extend_from_slice(&index.to_le_bytes());
+        blocks.extend_from_slice(&0u32.to_le_bytes());
+        blocks.extend_from_slice(&abi::UNDEFINED.to_le_bytes());
+    }
+    // The two `new Promise` settlers (table slots `n`, `n + 1`): anonymous,
+    // `length` 1.
+    for _ in 0..2 {
+        info.extend_from_slice(&anonymous.to_le_bytes());
+        info.extend_from_slice(&1u32.to_le_bytes());
+    }
+    data.active(0, &ConstExpr::i32_const(layout.info), info);
+    data.active(0, &ConstExpr::i32_const(layout.blocks), blocks);
+}
+
+/// The header `flags` a fresh function object of `kind` is created with:
+/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR`) per its kind.
+pub(super) fn fn_flags(kind: FnKind) -> u8 {
+    abi::FUNC_FLAG_LAZY
+        | match kind {
+            FnKind::Plain => 0,
+            FnKind::Constructor => abi::FUNC_FLAG_CONSTRUCTOR,
+            FnKind::Class => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR,
+        }
 }
 
 /// Collect every distinct string literal in `program` and assign each a
@@ -445,6 +508,15 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     // it to resolve a string's or array's exotic `length`.
     let mut order: Vec<&str> = vec![INDEX_LENGTH_KEY];
     let mut seen: HashSet<&str> = HashSet::from([INDEX_LENGTH_KEY]);
+    // A function object's materialized keys and every function's `name`.
+    if !program.functions.is_empty() {
+        let names = program.functions.iter().map(|f| f.info.name.as_str());
+        for text in FN_KEYS.into_iter().chain(names) {
+            if seen.insert(text) {
+                order.push(text);
+            }
+        }
+    }
     for stmt in &program.stmts {
         collect_stmt(stmt, &mut order, &mut seen);
     }
@@ -633,6 +705,10 @@ pub(super) fn collect_node<'a>(
                 collect_node(capture, order, seen);
             }
         }
+        IrNode::DefineProps { obj, entries, .. } => {
+            collect_node(obj, order, seen);
+            collect_entries(entries, order, seen);
+        }
         IrNode::CellSet { cell, value } => {
             collect_node(cell, order, seen);
             collect_node(value, order, seen);
@@ -648,7 +724,7 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::CallSpread { target, args } => {
-            if let SpreadCallee::Indirect(callee) = target {
+            if let SpreadCallee::Indirect(callee) | SpreadCallee::This { callee, .. } = target {
                 if !is_static_function(callee) {
                     seed_type_error_strs(order, seen);
                 }
@@ -666,17 +742,7 @@ pub(super) fn collect_node<'a>(
             if let Some(proto) = proto {
                 collect_node(proto, order, seen);
             }
-            for (key, value) in entries {
-                match key {
-                    PropKey::Static(key) | PropKey::Hidden(key) => {
-                        if seen.insert(key.as_str()) {
-                            order.push(key.as_str());
-                        }
-                    }
-                    PropKey::Computed(key) => collect_node(key, order, seen),
-                }
-                collect_node(value, order, seen);
-            }
+            collect_entries(entries, order, seen);
         }
         IrNode::ArrayHof {
             array,
@@ -732,13 +798,7 @@ pub(super) fn collect_node<'a>(
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
         }
-        // An instance accessor: recurse into the getter/setter function values
-        // and intern the sentinel that GATES the member read/write invocation paths
-        // (present in the string table iff the program builds any accessor box).
         IrNode::MakeAccessor { getter, setter } => {
-            if seen.insert(crate::abi::ACCESSOR_MARKER_KEY) {
-                order.push(crate::abi::ACCESSOR_MARKER_KEY);
-            }
             collect_node(getter, order, seen);
             collect_node(setter, order, seen);
         }
@@ -749,9 +809,7 @@ pub(super) fn collect_node<'a>(
         IrNode::InstanceOf { value, kind } => {
             collect_node(value, order, seen);
             match kind {
-                // A user-class test reads the class prototype; the `@@prototype`
-                // key (and the class read's literals) are interned by recursing
-                // into the stored `<class>["@@prototype"]` expr.
+                // A user-class test reads `C.prototype`.
                 InstanceOfKind::Class(class_proto) => collect_node(class_proto, order, seen),
                 // An error test reads the hidden `@@errorkind` marker via
                 // `__get`, so its key must be interned even when the program
@@ -959,6 +1017,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::SentValue
         | IrNode::ExcValue
         | IrNode::ThisGlobal
+        | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.
         | IrNode::MapNew { .. }
         | IrNode::DateNow
@@ -998,6 +1057,52 @@ fn seed_prop_strs(order: &mut Vec<&str>, seen: &mut HashSet<&str>) {
             order.push(s);
         }
     }
+}
+
+/// Record the static keys of object-literal / defined-property `entries` (each
+/// an interned string whose blob must live in the data segment), and the
+/// literals of each computed key and value; see [`collect_node`].
+fn collect_entries<'a>(
+    entries: &'a [(PropKey, IrNode)],
+    order: &mut Vec<&'a str>,
+    seen: &mut HashSet<&'a str>,
+) {
+    for (key, value) in entries {
+        match key {
+            PropKey::Static(key) | PropKey::Hidden(key) | PropKey::Fixed(key) => {
+                if seen.insert(key.as_str()) {
+                    order.push(key.as_str());
+                }
+            }
+            PropKey::Computed(key) => collect_node(key, order, seen),
+        }
+        collect_node(value, order, seen);
+    }
+}
+
+/// Whether any function of `program` (or `main`) builds an accessor
+/// ([`IrNode::MakeAccessor`]), so `__get` / `__set` must dispatch to getters
+/// and setters.
+fn program_has_accessors(program: &IrProgram) -> bool {
+    fn node(n: &IrNode) -> bool {
+        matches!(n, IrNode::MakeAccessor { .. }) || n.any_child(node)
+    }
+    fn stmt(s: &IrStmt) -> bool {
+        s.any_node(node) || s.any_stmt(stmt)
+    }
+    program.stmts.iter().any(stmt)
+        || program.functions.iter().any(|f| {
+            f.body.iter().any(stmt)
+                || f.machine.iter().flatten().any(|segment| {
+                    segment.stmts.iter().any(stmt)
+                        || match &segment.term {
+                            crate::ir::GenTerm::Yield { value, .. }
+                            | crate::ir::GenTerm::Branch { cond: value, .. }
+                            | crate::ir::GenTerm::Return(Some(value)) => node(value),
+                            crate::ir::GenTerm::Return(None) | crate::ir::GenTerm::Jump(_) => false,
+                        }
+                })
+        })
 }
 
 /// Record the string literals of one spread element (its plain-item or

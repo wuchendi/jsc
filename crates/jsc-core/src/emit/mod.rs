@@ -34,9 +34,9 @@ use wasm_encoder::{
 
 use crate::abi;
 use crate::ir::{
-    ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp,
-    SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, ConvertOp, DateOp, FnKind, InstanceOfKind, IrCase, IrFunction, IrNode,
+    IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey,
+    ReceiverOp, SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -449,6 +449,18 @@ const TYPE_ERROR_STACK_PREFIX: &str = "TypeError: ";
 /// the length header. Seeded with [`NULLISH_ERROR_STRS`], since every guarded
 /// index read site seeds those.
 const INDEX_LENGTH_KEY: &str = "length";
+
+/// The keys `__fn_materialize` defines on a function object, plus the
+/// anonymous function's empty `name`. Seeded whenever the program has
+/// functions.
+const FN_KEYS: [&str; 6] = [
+    "name",
+    "prototype",
+    "constructor",
+    "caller",
+    "arguments",
+    "",
+];
 
 /// The static strings `__nullish_throw` needs — the error object's keys, kind
 /// marker key and `name`, the receiver words, and the message fragments. Seeded
@@ -920,11 +932,38 @@ struct Helpers<'a> {
     /// provably cannot be a generator — [`generator::emit_gen_resume`] then throws
     /// a `TypeError` unconditionally instead of emitting an invalid indirect call.
     has_funcs: bool,
-    /// Whether the program lowers any instance accessor (the
-    /// [`abi::ACCESSOR_MARKER_KEY`] sentinel is interned). When `false`, `__get` /
-    /// `__set` omit the getter/setter invocation and member accesses skip the
-    /// post-call exception check. Implies `has_funcs`.
+    /// Whether the program builds any accessor ([`IrNode::MakeAccessor`]).
+    /// When `false`, `__get` / `__set` omit the getter/setter invocation and
+    /// member accesses skip the post-call exception check. Implies `has_funcs`.
     has_accessors: bool,
+    /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
+    /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
+    /// is the helper right after `__define` (`define + 1`).
+    fn_info: i32,
+}
+
+/// The address of the static function block of top-level declaration
+/// `table_index`: the blocks follow the `__fn_info` table's entries for the
+/// user functions and the two settlers (`settle_resolve_slot` is the user
+/// function count).
+fn decl_func_base(table_index: u32, helpers: Helpers<'_>) -> i32 {
+    let info_entries = helpers.settle_resolve_slot.cast_signed() + 2;
+    helpers.fn_info
+        + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_entries
+        + abi::FUNC_BLOCK_SIZE.cast_signed() * table_index.cast_signed()
+}
+
+/// Where the function data lives in the data segment: the `__fn_info` table
+/// (one [`abi::FN_INFO_ENTRY_SIZE`]-byte entry per funcref-table index,
+/// settlers included) and,
+/// after it, one static [`abi::FUNC_BLOCK_SIZE`]-byte function block per index
+/// (the object of a top-level declaration, [`IrNode::DeclFunc`]).
+#[derive(Clone, Copy)]
+struct FnLayout {
+    /// Base address of the info table.
+    info: i32,
+    /// Base address of the static function blocks.
+    blocks: i32,
 }
 
 mod array;
@@ -982,22 +1021,26 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // offset in linear memory. `heap_ptr_init` is the first free offset after all
     // literal blobs — where the bump allocator begins.
     let (offsets, strings_end) = collect_strings(program);
-    // The intern table follows the string blobs; the bump allocator begins
-    // after it.
-    let intern = intern_table(&offsets, strings_end);
-    let heap_ptr_init = strings_end + 4 * intern.cap;
+    // The function info table and the static declaration blocks follow the
+    // string blobs, then the intern table; the bump allocator begins after it.
+    // (Info entries cover the two `new Promise` settlers, present with functions.)
+    let n = program.functions.len();
+    let fn_count = i32::try_from(n).unwrap_or(i32::MAX);
+    let info_count = if n > 0 { fn_count + 2 } else { 0 };
+    let layout = FnLayout {
+        info: strings_end,
+        blocks: strings_end + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_count,
+    };
+    let intern_base = layout.blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
+    let intern = intern_table(&offsets, intern_base);
+    let heap_ptr_init = intern_base + 4 * intern.cap;
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
-    let n = program.functions.len();
     let has_funcs = n > 0;
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
-    // Instance accessors are gated on the sentinel key `collect_node` interns
-    // whenever it walks a `MakeAccessor` node — the same presence-in-the-string-table
-    // idiom the `@@prototype` prototype-fallback gate uses.
-    let has_accessors = offsets.contains_key(crate::abi::ACCESSOR_MARKER_KEY);
     let (
         types,
         functions,
@@ -1009,7 +1052,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         then_type,
         now_type,
         parse_int_type,
-    ) = build_type_and_function_sections(program, &unwind, has_accessors);
+    ) = build_type_and_function_sections(program, &unwind, layout);
     module.section(&types);
 
     // Import section: the host `print` function backing `console.log` (index 0),
@@ -1192,8 +1235,9 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_index_value());
     code.function(&emit_index_string(helpers));
     code.function(&emit_to_key(helpers));
-    code.function(&emit_prop_find());
+    code.function(&emit_prop_find(helpers));
     code.function(&emit_define(helpers));
+    code.function(&emit_fn_materialize(&offsets, helpers));
     code.function(&emit_get(&offsets, helpers));
     code.function(&emit_set(helpers));
     code.function(&emit_has(&offsets, helpers));
@@ -1255,7 +1299,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
-    module.section(&emit_data_section(&offsets, &intern));
+    module.section(&emit_data_section(
+        &offsets,
+        &intern,
+        &program.functions,
+        layout,
+    ));
 
     module.finish()
 }

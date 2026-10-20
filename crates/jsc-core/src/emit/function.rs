@@ -36,7 +36,7 @@ pub(super) fn emit_main(
     // `a[i] = (b[j] = k)`) still shares these fixed slots and is out of scope — a
     // full fix needs a depth-indexed scratch allocator.
     // Two more i64 slots (`+19` current prototype, `+20` target prototype) walk the
-    // `@@prototype` chain for a multi-hop `instanceof` (`extends`).
+    // `proto` chain for a multi-hop `instanceof` (`extends`).
     // One i32 (`+21`) holds a generator frame/env base and two i64 (`+22`/`+23`)
     // hold the generator handle and its state-machine result across a `gen.next()`
     // driver / `MakeGenerator` construction.
