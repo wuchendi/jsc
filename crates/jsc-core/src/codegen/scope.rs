@@ -19,6 +19,8 @@ impl Frame {
             this_local: None,
             arrow: false,
             new_target_local: None,
+            ctor: FnKind::Plain,
+            supers: SuperCalls::default(),
         }
     }
 }
@@ -33,12 +35,13 @@ impl<'a> LowerCtx<'a> {
             main_ctx: false,
             async_body: false,
             current_super: None,
-            static_init_class: None,
+            class_fields: Vec::new(),
+            static_init: None,
         }
     }
 
     /// The index of the innermost (current) function frame.
-    fn top(&self) -> usize {
+    pub(super) fn top(&self) -> usize {
         self.frames.len() - 1
     }
 
@@ -248,6 +251,38 @@ impl<'a> LowerCtx<'a> {
             return Some(IrNode::Local(local));
         }
         Some(IrNode::EnvLoad(self.route_env(fi, new_target_id(fi))))
+    }
+
+    /// Allocate a hidden local in the current frame for a value captured BY
+    /// VALUE into nested functions (like the `new.target` snapshot): the parent
+    /// constructor and prototype of a class, or the class value itself. Returns
+    /// the local and its synthetic binding id, read with [`Self::read_hidden`].
+    /// The local must be assigned before any closure reading it is created.
+    pub(super) fn hidden_local(&mut self) -> (u32, u32) {
+        let n = self.shared.hidden_ids.get();
+        self.shared.hidden_ids.set(n + 1);
+        let id = 0xC000_0000 | n;
+        let local = self.fresh();
+        self.frame().by_id.insert(id, local);
+        (local, id)
+    }
+
+    /// Read the hidden binding `id` declared in frame `frame` (see
+    /// [`Self::hidden_local`]): its local there, else through the environment.
+    pub(super) fn read_hidden(&mut self, frame: usize, id: u32) -> IrNode {
+        if frame == self.top() {
+            return self.frames[frame]
+                .by_id
+                .get(&id)
+                .map_or(IrNode::Undefined, |&local| IrNode::Local(local));
+        }
+        IrNode::EnvLoad(self.route_env(frame, id))
+    }
+
+    /// Whether every frame above `frame` is an arrow (so `this` there is the
+    /// one of `frame`).
+    pub(super) fn only_arrows_above(&self, frame: usize) -> bool {
+        self.frames[frame + 1..].iter().all(|f| f.arrow)
     }
 
     /// Whether the local `idx` in the current frame is a boxed cell.

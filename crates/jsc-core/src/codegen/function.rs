@@ -192,6 +192,15 @@ impl LowerCtx<'_> {
             }));
         }
 
+        // A base class constructor defines the instance fields first (design
+        // 4.5: right after allocation, before the parameters are bound).
+        if self.frame().ctor == FnKind::Class
+            && let Some(this_local) = self.ensure_this_local()
+            && let Some(fields) = self.lower_field_inits(IrNode::Local(this_local))?
+        {
+            body.push(IrStmt::Expr(fields));
+        }
+
         // Default-parameter guards, IN PARAMETER ORDER (after capture-boxing so a
         // defaulted cell param reads/writes its boxed cell).
         self.lower_default_guards(defaults, &mut body)?;
@@ -225,6 +234,11 @@ impl LowerCtx<'_> {
             self.lower_binding_pattern(pat, IrNode::Local(temp), true, &mut body)?;
         }
 
+        if self.frame().derived()
+            && let BodyKind::Block(stmts) = body_kind
+        {
+            self.frame().supers.top_level = stmts.iter().find_map(super_call_span);
+        }
         match body_kind {
             BodyKind::Block(stmts) => self.lower_stmts(stmts, &mut body)?,
             BodyKind::Expr(expr) => {
@@ -233,17 +247,30 @@ impl LowerCtx<'_> {
             }
         }
 
+        // A derived constructor falling off its end returns `this`, which must
+        // have been bound by `super(..)`.
+        let derived = self.frame().derived();
+        if derived && let Some(this_local) = self.ensure_this_local() {
+            let this = self.derived_this(this_local);
+            body.push(IrStmt::Return(Some(this)));
+        }
+
         // If the body read `this`, prepend the prologue snapshot as the VERY FIRST
         // statement: `this_slot = __this`, so a nested `this.other()` that
         // re-sets the global cannot disturb this frame's own receiver. A function
         // that never reads `this` needs no snapshot (its slot was never allocated),
-        // leaving its IR unchanged.
+        // leaving its IR unchanged. A derived constructor's `this` starts in the
+        // TDZ instead (the hole), until `super(..)` binds it.
         if let Some(this_local) = self.frame().this_local {
             body.insert(
                 0,
                 IrStmt::Expr(IrNode::Assign {
                     local: this_local,
-                    value: Box::new(IrNode::ThisGlobal),
+                    value: Box::new(if derived {
+                        IrNode::Hole
+                    } else {
+                        IrNode::ThisGlobal
+                    }),
                 }),
             );
         }
@@ -416,6 +443,9 @@ impl LowerCtx<'_> {
 
         self.push_frame();
         self.frame().arrow = arrow;
+        if matches!(kind, FnKind::Class | FnKind::DerivedClass) {
+            self.frame().ctor = kind;
+        }
         let built = self.build_function_body(param_pats, body_kind);
         let (mut func, env_layout) = match built {
             Ok(pair) => pair,
@@ -427,7 +457,7 @@ impl LowerCtx<'_> {
         self.pop_frame();
         // A class constructor called without the construct marker throws
         // before anything else runs (design 4.5).
-        if kind == FnKind::Class {
+        if matches!(kind, FnKind::Class | FnKind::DerivedClass) {
             func.body.insert(0, class_call_guard(name, func.params - 1));
         }
         func.info = fn_info(name, param_pats, kind);
@@ -517,6 +547,104 @@ impl LowerCtx<'_> {
             ArrowFunctionBody::Expr(expr) => BodyKind::Expr(expr),
         };
         self.lower_lifted(&param_pats, body_kind, name, FnKind::Plain, true)
+    }
+}
+
+impl LowerCtx<'_> {
+    /// Read a derived constructor's `this` in `local`: TDZ-checked unless a
+    /// top-level `super(..)` already bound it (see [`SuperCalls::top_level`]).
+    pub(super) fn derived_this(&mut self, local: u32) -> IrNode {
+        if self.frame().supers.this_bound {
+            IrNode::Local(local)
+        } else {
+            this_checked(local)
+        }
+    }
+
+    /// Define the current class's instance fields ([`Self::class_fields`]) on
+    /// `this` in source order with `CreateDataProperty` semantics (design 11.2
+    /// q8: `__define`, so an inherited setter is not invoked); `None` when the
+    /// class declares no fields. An uninitialized `f;` defines `undefined`.
+    pub(super) fn lower_field_inits(&mut self, this: IrNode) -> anyhow::Result<Option<IrNode>> {
+        if self.class_fields.is_empty() {
+            return Ok(None);
+        }
+        let fields = std::mem::take(&mut self.class_fields);
+        let mut entries = Vec::with_capacity(fields.len());
+        for p in &fields {
+            let key = super::stmt::prop_key_name(&p.key)?;
+            let value = match &p.value {
+                Some(init) => self.lower_named_expr(init, &key)?,
+                None => IrNode::Undefined,
+            };
+            entries.push((PropKey::Static(key), value));
+        }
+        self.class_fields = fields;
+        let local = self.fresh();
+        Ok(Some(IrNode::DefineProps {
+            obj: Box::new(this),
+            local,
+            entries,
+        }))
+    }
+}
+
+/// The span of the `super(..)` call when `stmt` is the expression statement
+/// `super(..);`.
+fn super_call_span(stmt: &Stmt) -> Option<swc_common::Span> {
+    let Stmt::Expr(expr_stmt) = stmt else {
+        return None;
+    };
+    match strip_parens(&expr_stmt.expr) {
+        Expr::Call(call) if matches!(call.callee, Callee::Super(_)) => Some(call.span),
+        _ => None,
+    }
+}
+
+/// The derived-constructor `this` TDZ message (design 4.5).
+pub(super) const DERIVED_THIS_TDZ: &str = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
+
+/// A `ReferenceError` with `message` (no `%ReferenceError.prototype%` yet, S4:
+/// an `Error` with an own `name`).
+pub(super) fn reference_error(message: &str) -> IrNode {
+    IrNode::error_object(
+        ErrorKind::Error,
+        Some("ReferenceError"),
+        Some(IrNode::Str(message.to_owned())),
+        IrNode::Str(format!("ReferenceError: {message}")),
+    )
+}
+
+/// A `TypeError` with `message`: a string literal, or a side-effect-free read
+/// of a string (evaluated twice, for `message` and `stack`).
+pub(super) fn type_error(message: IrNode) -> IrNode {
+    let stack = match &message {
+        IrNode::Str(text) => IrNode::Str(format!("TypeError: {text}")),
+        _ => IrNode::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(IrNode::Str("TypeError: ".to_owned())),
+            rhs: Box::new(message.clone()),
+        },
+    };
+    IrNode::error_object(ErrorKind::TypeError, None, Some(message), stack)
+}
+
+/// `cond ? undefined : throw error`: a guard throwing `error` unless `cond`.
+pub(super) fn guard(cond: IrNode, error: IrNode) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(cond),
+        then_branch: Box::new(IrNode::Undefined),
+        else_branch: Box::new(IrNode::Throw(Box::new(error))),
+    }
+}
+
+/// Read a derived constructor's `this` in `local`, throwing the TDZ
+/// `ReferenceError` while it is still the hole (before `super(..)`).
+pub(super) fn this_checked(local: u32) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(IrNode::IsHole(Box::new(IrNode::Local(local)))),
+        then_branch: Box::new(IrNode::Throw(Box::new(reference_error(DERIVED_THIS_TDZ)))),
+        else_branch: Box::new(IrNode::Local(local)),
     }
 }
 

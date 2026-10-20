@@ -22,12 +22,11 @@ use crate::error::CompileError;
 
 use swc_ecma_ast::{
     ArrayLit, ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget,
-    AssignTargetPat, BinaryOp, Callee, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl, Expr,
-    ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, IdentName, Lit, MemberExpr, MemberProp,
-    MethodKind, ObjectLit, ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr,
-    ParamOrTsParamProp, Pat, Program, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt,
-    SuperProp, SuperPropExpr, SwitchStmt, ThisExpr, UnaryOp, UpdateExpr, UpdateOp, VarDeclKind,
-    VarDeclOrExpr,
+    AssignTargetPat, BinaryOp, Callee, Class, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl,
+    Expr, ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, Lit, MemberProp, MethodKind, ObjectLit,
+    ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr, ParamOrTsParamProp, Pat, Program, Prop,
+    PropName, PropOrSpread, SimpleAssignTarget, Stmt, SuperProp, SuperPropExpr, SwitchStmt,
+    UnaryOp, UpdateExpr, UpdateOp, VarDeclKind, VarDeclOrExpr,
 };
 
 use crate::ir::{
@@ -145,6 +144,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         max_arity,
         captured: analysis.captured,
         classes: RefCell::new(HashMap::new()),
+        hidden_ids: Cell::new(0),
         module_slots: analysis
             .module_names
             .iter()
@@ -237,13 +237,15 @@ struct Shared<'a> {
     /// nested function, computed by [`analyze_captures`]. A declared binding
     /// whose id is in this set is boxed into a heap cell.
     captured: std::collections::HashSet<u32>,
-    /// Class declarations lowered so far, keyed by name. A `class A`
-    /// declaration records its instance shape here as it is lowered; a later
-    /// `new A(args)` reads the shape back to pre-size the fresh instance. Classes
-    /// are not hoisted (TDZ), so a `new` always follows its declaration in source
-    /// order, matching this build-then-read ordering. Interior mutability lets the
-    /// immutable-borrow lowering walk register new classes.
+    /// Classes lowered so far, keyed by name: a pure optimisation. A class
+    /// records its instance shape here as it is lowered; a later `new A(args)`
+    /// reads the shape back to pre-size the fresh instance (a rebound name only
+    /// mis-sizes the table). Interior mutability lets the immutable-borrow
+    /// lowering walk register new classes.
     classes: RefCell<HashMap<String, ClassInfo>>,
+    /// The number of hidden by-value bindings allocated so far (see
+    /// [`LowerCtx::hidden_local`]).
+    hidden_ids: Cell<u32>,
     /// Module-cell slot of each module binding name (see
     /// [`CaptureAnalysis::module_names`]). A `main` declaration of one of these
     /// names in its outermost scope stores into the module cell; a top-level
@@ -264,10 +266,9 @@ struct Shared<'a> {
 /// sizes the instance's property table for them up front (design 3.2), so the
 /// constructor's adds do not regrow it.
 struct ClassInfo {
-    /// Distinct instance field names, in first-assignment order. For a derived
-    /// class (E-series `extends`) this already includes the inherited fields
-    /// (the parent's flattened list, then this class's own), so `new C()`
-    /// reserves room for every field a constructor up the chain may assign.
+    /// Distinct instance field names, in first-assignment order. For a class
+    /// extending a recorded class name this already includes the inherited
+    /// fields (the parent's flattened list, then this class's own).
     fields: Vec<String>,
 }
 
@@ -430,6 +431,53 @@ struct Frame {
     /// entry, allocated on the first `new.target` reference in it or in a nested
     /// arrow (`None` until then).
     new_target_local: Option<u32>,
+    /// [`FnKind::Class`] for a base class constructor, which initializes the
+    /// class's instance fields ([`LowerCtx::class_fields`]) on entry;
+    /// [`FnKind::DerivedClass`] for a derived one, whose `this` starts in the
+    /// TDZ and is bound by `super(..)` (which also runs the instance fields).
+    /// [`FnKind::Plain`] otherwise.
+    ctor: FnKind,
+    /// A derived constructor's `super(..)` bookkeeping.
+    supers: SuperCalls,
+}
+
+/// A derived constructor's `super(..)` bookkeeping (see [`Frame::ctor`]).
+#[derive(Default)]
+struct SuperCalls {
+    /// The span of the first `super(..)` call that is a top-level statement of
+    /// the body. Once it is lowered, `this` is definitely bound for everything
+    /// lowered after it in this frame.
+    top_level: Option<swc_common::Span>,
+    /// Whether `this` is definitely bound (see `top_level`): reads skip the
+    /// TDZ check.
+    this_bound: bool,
+    /// How many `super(..)` calls this frame has lowered.
+    lowered: u32,
+}
+
+impl Frame {
+    /// Whether this frame is a derived class constructor.
+    fn derived(&self) -> bool {
+        self.ctor == FnKind::DerivedClass
+    }
+}
+
+/// What `super` resolves to inside a class body (design 4.5): the class
+/// frame's hidden by-value bindings of the parent constructor and of its
+/// `prototype` (the home object's prototype for instance members).
+#[derive(Clone, Copy)]
+struct SuperScope {
+    /// The frame depth holding the hidden bindings.
+    frame: usize,
+    /// Hidden id of the parent constructor (`None`: a base class).
+    parent: Option<u32>,
+    /// Hidden id of `parent.prototype`.
+    proto_parent: Option<u32>,
+    /// Whether the member being lowered is static (its home object is the
+    /// class, so `super.x` reads the parent constructor).
+    is_static: bool,
+    /// Property-table capacity `super(..)` pre-reserves on `this`.
+    reserve: u32,
 }
 
 /// Lowering context: a stack of function frames. Each frame maps
@@ -458,18 +506,17 @@ struct LowerCtx<'a> {
     /// engine) rather than a top-level `Await`. Set/cleared by
     /// [`LowerCtx::lower_generator_body`] around an async body.
     async_body: bool,
-    /// The name of the superclass whose constructor/methods `super` resolves to
-    /// while lowering a derived class's constructor and method bodies (E-series
-    /// `extends`), or `None` outside any `extends` body. Saved and restored by
-    /// [`LowerCtx::lower_class_decl`] so nested class declarations do not leak
-    /// their superclass to an enclosing one.
-    current_super: Option<String>,
-    /// The class name that `this` resolves to while lowering a deferred `static`
-    /// field initializer (P2b): a static initializer runs with `this` bound to the
-    /// class, so `static f = this.g` reads the class's own static `g`. Set/cleared
-    /// by [`LowerCtx::lower_class_decl`] around the post-binding static assignments;
-    /// `None` everywhere else, where `this` keeps its ordinary function-frame slot.
-    static_init_class: Option<String>,
+    /// What `super` resolves to while lowering a class body, or `None` outside
+    /// any class. Saved and restored by [`LowerCtx::lower_class`] so a nested
+    /// class does not leak its scope to an enclosing one.
+    current_super: Option<SuperScope>,
+    /// The instance field declarations of the class whose constructor is being
+    /// lowered: a base constructor defines them on entry, a derived one after
+    /// each `super(..)`.
+    class_fields: Vec<ClassProp>,
+    /// While lowering `static` field initializers: the class frame and the
+    /// hidden id of the class value, which `this` resolves to there.
+    static_init: Option<(usize, u32)>,
 }
 
 mod arity;

@@ -190,6 +190,11 @@ pub(crate) const FUNC_FLAG_CONSTRUCTOR: u8 = 8;
 /// Its `prototype` is installed by the class definition, not materialized.
 pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
 
+/// [`TYPE_FUNCTION`] header `flags` bit: the constructor allocates its own
+/// `this` (a derived class: `super(..)` constructs it), so `new` skips the
+/// allocation.
+pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *

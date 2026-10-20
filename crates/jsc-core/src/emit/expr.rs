@@ -161,6 +161,31 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::LocalGet(scratch + 21));
             function.instruction(&Instruction::Select);
         }
+        IrNode::Hole => {
+            function.instruction(&Instruction::I64Const(TDZ_HOLE_BITS));
+        }
+        IrNode::ClassHeritage {
+            value,
+            parent,
+            proto,
+        } => emit_class_heritage(value, *parent, *proto, function, scratch, strings, helpers),
+        IrNode::IsObject(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalSet(scratch + 22));
+            emit_is_object(function, scratch + 22);
+            emit_box_bool(function, scratch);
+        }
+        IrNode::SetProto { obj, proto } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32WrapI64);
+            emit_node(proto, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Store(MemArg {
+                offset: u64::from(abi::OBJ_PROTO_OFFSET),
+                align: 3,
+                memory_index: 0,
+            }));
+            emit_node(obj, function, scratch, strings, helpers);
+        }
         // The value passed to `.next(v)` is the state machine's first wasm
         // parameter (local 0, `sent`).
         IrNode::SentValue => {
@@ -775,6 +800,7 @@ pub(super) fn emit_this_call(
 /// is an object (else `null`, the `%Object.prototype%` placeholder), `__this` /
 /// `__new_target` are set, and the callee runs with the construct marker
 /// `argc = -(n + 1)`. An object return value replaces `this`.
+#[allow(clippy::too_many_lines)]
 pub(super) fn emit_construct(
     node: &IrNode,
     function: &mut Function,
@@ -790,11 +816,19 @@ pub(super) fn emit_construct(
         this_local,
         reserve,
         not_constructor,
+        new_target,
     } = node
     else {
         unreachable!("emit_construct is only called with a Construct node")
     };
     let (f, this) = (*callee_local, *this_local);
+    // `new.target`: the callee itself, or the derived class for `super(..)`.
+    let emit_new_target = |function: &mut Function| match new_target {
+        Some(new_target) => emit_node(new_target, function, scratch, strings, helpers),
+        None => {
+            function.instruction(&Instruction::LocalGet(f));
+        }
+    };
     let text = callee_error_text(not_constructor);
     // The spread argument array's block base and length (as in
     // `emit_call_spread`); nothing below touches them before `argc` is pushed.
@@ -813,23 +847,7 @@ pub(super) fn emit_construct(
         emit_throw_not_a_function(function, text, scratch, strings, helpers);
         return;
     }
-    // IsConstructor: a function value whose header carries CONSTRUCTOR.
-    emit_is_function(function, f);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::LocalGet(f));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I32Load8U(MemArg {
-        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::I32Const(i32::from(
-        abi::FUNC_FLAG_CONSTRUCTOR,
-    )));
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
+    emit_is_constructor(function, f);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
@@ -837,8 +855,23 @@ pub(super) fn emit_construct(
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 
-    // `this`: proto = Get(callee, "prototype") if an object, else null.
+    // A SELF_ALLOC callee (a derived class) allocates its own `this` through
+    // `super(..)`; `__this` is then unused.
     function.instruction(&Instruction::LocalGet(f));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(i32::from(abi::FUNC_FLAG_SELF_ALLOC)));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Else);
+    // `this`: proto = Get(new.target, "prototype") if an object, else null.
+    emit_new_target(function);
     function.instruction(&Instruction::I32Const(static_key(strings, "prototype")));
     function.instruction(&Instruction::Call(helpers.get));
     if helpers.has_accessors {
@@ -857,9 +890,11 @@ pub(super) fn emit_construct(
         strings,
         helpers,
     );
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalTee(this));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
-    function.instruction(&Instruction::LocalGet(f));
+    emit_new_target(function);
     function.instruction(&Instruction::GlobalSet(NEW_TARGET_GLOBAL));
 
     // env, marker argc, funcref index; call.
@@ -893,11 +928,69 @@ pub(super) fn emit_construct(
     emit_select_object(function, f, &Instruction::LocalGet(this));
 }
 
+/// Emit an [`IrNode::ClassHeritage`]: `parent = value`; a non-`null` parent
+/// must be a constructor, and its `prototype` (into `proto`) an object or
+/// `null`; a failure raises the `__prop_throw` `TypeError` naming the value.
+/// Leaves `undefined` on the stack.
+fn emit_class_heritage(
+    value: &IrNode,
+    parent: u32,
+    proto: u32,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(parent));
+    function.instruction(&Instruction::I64Const(NULL_BITS));
+    function.instruction(&Instruction::LocalSet(proto));
+    function.instruction(&Instruction::LocalGet(parent));
+    function.instruction(&Instruction::I64Const(NULL_BITS));
+    function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_is_constructor(function, parent);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_prop_throw_call(function, parent, parent, PROP_THROW_EXTENDS, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(parent));
+    function.instruction(&Instruction::I32Const(static_key(strings, "prototype")));
+    function.instruction(&Instruction::Call(helpers.get));
+    if helpers.has_accessors {
+        emit_propagate_if_pending(function, helpers);
+    }
+    function.instruction(&Instruction::LocalTee(proto));
+    function.instruction(&Instruction::I64Const(NULL_BITS));
+    function.instruction(&Instruction::I64Ne);
+    emit_is_object(function, proto);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_prop_throw_call(function, proto, proto, PROP_THROW_EXTENDS_PROTO, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+}
+
 /// Push the jsval in `local` when it is an object-family heap value (any heap
 /// kind but a string), else the i64 pushed by `alt`.
 fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(alt);
+    emit_is_object(function, local);
+    function.instruction(&Instruction::Select);
+}
+
+/// Push `1` if the jsval in `local` is an object (a heap value other than a
+/// string), else `0`.
+fn emit_is_object(function: &mut Function, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -906,6 +999,36 @@ fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
+}
+
+/// Push nonzero if the jsval in `local` is a constructor: a function value
+/// whose header carries `FUNC_FLAG_CONSTRUCTOR`, else `0`.
+fn emit_is_constructor(function: &mut Function, local: u32) {
+    emit_is_function(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(i32::from(
+        abi::FUNC_FLAG_CONSTRUCTOR,
+    )));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// Box the i32 condition on the stack as a boolean jsval (the i32 scratch
+/// `+21` carries it past the two constants).
+fn emit_box_bool(function: &mut Function, scratch: u32) {
+    function.instruction(&Instruction::LocalSet(scratch + 21));
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::LocalGet(scratch + 21));
     function.instruction(&Instruction::Select);
 }
 
@@ -1084,6 +1207,10 @@ pub(super) fn emit_cell_new(
     helpers: Helpers<'_>,
 ) {
     let dst = scratch + 3;
+    // Evaluate the value first and stash it (`+5`): building it may allocate
+    // through the same `dst` scratch.
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(scratch + 5));
     // dst = __alloc(CELL_BLOCK_SIZE).
     function.instruction(&Instruction::I32Const(CELL_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
@@ -1096,10 +1223,9 @@ pub(super) fn emit_cell_new(
         align: 0,
         memory_index: 0,
     }));
-    // Value at dst + HEADER_SIZE (evaluate after `dst` is set; `value` may itself
-    // allocate, but it is fully evaluated before this store consumes `dst`).
+    // Value at dst + HEADER_SIZE.
     function.instruction(&Instruction::LocalGet(dst));
-    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalGet(scratch + 5));
     function.instruction(&Instruction::I64Store(MemArg {
         offset: HEADER_SIZE as u64,
         align: 3,
