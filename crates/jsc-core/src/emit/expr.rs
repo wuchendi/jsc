@@ -45,6 +45,9 @@ pub(super) fn emit_node(
         IrNode::Undefined => {
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
+        IrNode::ArrayHole => {
+            function.instruction(&Instruction::I64Const(HOLE_BITS));
+        }
         IrNode::Local(index) => {
             function.instruction(&Instruction::LocalGet(*index));
         }

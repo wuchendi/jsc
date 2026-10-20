@@ -106,7 +106,12 @@ pub(super) fn build_type_and_function_sections<'a>(
             index();
             index()
         },
-        array_concat: index(),
+        // `__array_set` takes the index right after `__array_concat`.
+        array_concat: {
+            let array_concat = index();
+            index();
+            array_concat
+        },
         json_escape: index(),
         json_str: index(),
         same_value_zero: index(),
@@ -283,6 +288,8 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32, I64], &[I32]),
         // `__array_concat(dst, src) -> dst`.
         (&[I32, I32], &[I32]),
+        // `__array_set(recv, key, v)`.
+        (&[I64, I64, I64], &[]),
         // `__json_escape(str) -> str` and `__json_str(v) -> str`.
         (&[I32], &[I32]),
         (&[I64], &[I32]),
@@ -1080,6 +1087,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::Bool(_)
         | IrNode::Null
         | IrNode::Undefined
+        | IrNode::ArrayHole
         | IrNode::Local(_)
         | IrNode::EnvLoad(_)
         | IrNode::ModuleCell(_)

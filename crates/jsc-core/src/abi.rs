@@ -59,6 +59,13 @@ pub(crate) const NULL: u64 = 0x7FFA_0000_0000_0000;
 /// fallbacks.
 pub(crate) const UNDEFINED: u64 = 0x7FFB_0000_0000_0000;
 
+/// An array hole: an element slot with no element (a literal elision, a
+/// `delete`d index, or a gap left by growth by index). [`UNDEFINED`] with a
+/// nonzero payload, which no JS value produces, so it never escapes to JS: an
+/// element read that loads it yields `undefined`. The same bit pattern marks
+/// a module cell still in its TDZ.
+pub(crate) const HOLE: u64 = UNDEFINED | 1;
+
 /// The `typeof` result strings, in `typeof`-index order. A `typeof` result is a
 /// real interned HEAP STRING (tag `0b100` is retired), so these are the words
 /// `emit_typeof_node` interns and selects between; the decoder reads them back as

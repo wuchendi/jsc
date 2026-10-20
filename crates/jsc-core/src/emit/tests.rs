@@ -171,11 +171,14 @@ fn array_literal_round_trips_to_a_heap_array() {
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
     assert_eq!(
         crate::run::decode(bits, &memory),
-        crate::run::Value::Array(vec![
-            crate::run::Value::Number(1.0),
-            crate::run::Value::Number(2.0),
-            crate::run::Value::Number(3.0),
-        ])
+        crate::run::Value::Array(
+            vec![
+                crate::run::Value::Number(1.0),
+                crate::run::Value::Number(2.0),
+                crate::run::Value::Number(3.0),
+            ],
+            Vec::new()
+        )
     );
 }
 
@@ -187,7 +190,7 @@ fn empty_array_literal_round_trips() {
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
     assert_eq!(
         crate::run::decode(bits, &memory),
-        crate::run::Value::Array(Vec::new())
+        crate::run::Value::Array(Vec::new(), Vec::new())
     );
 }
 

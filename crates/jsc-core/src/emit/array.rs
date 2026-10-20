@@ -22,6 +22,21 @@ pub(super) fn elem_slot(k: u64) -> MemArg {
     }
 }
 
+/// Push the element jsval in i64 local `elem` as JS reads it: a [`HOLE_BITS`]
+/// slot reads `undefined` (`elem ^ (elem == HOLE)`, since the hole is
+/// `undefined | 1`); any other element is itself. Every element read that can
+/// meet a hole goes through here.
+// S4 adds the hole read's proto continuation (an inherited index on a dirty
+// `Array.prototype`/`Object.prototype`); until then a hole is plainly `undefined`.
+pub(super) fn emit_elem_read(function: &mut Function, elem: u32) {
+    function.instruction(&Instruction::LocalGet(elem));
+    function.instruction(&Instruction::LocalGet(elem));
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Xor);
+}
+
 /// The [`MemArg`] of an array handle's u32 `length`.
 pub(super) fn array_len_slot() -> MemArg {
     MemArg {
@@ -214,7 +229,7 @@ pub(super) fn emit_array_push_node(
 }
 
 /// Emit `array.pop()`, leaving the removed last element (or `undefined`
-/// for an empty array) on the stack. A non-array `local` throws `not_array`;
+/// for an empty array or a trailing hole) on the stack. A non-array `local` throws `not_array`;
 /// otherwise the handle read from `local` is shrunk IN PLACE — its `length`
 /// drops by one and the element at the old last slot of its store is yielded.
 pub(super) fn emit_array_pop_node(
@@ -251,14 +266,22 @@ pub(super) fn emit_array_pop_node(
     function.instruction(&Instruction::I32Sub);
     function.instruction(&Instruction::LocalTee(new_len));
     function.instruction(&Instruction::I32Store(array_len_slot()));
-    // removed = the element jsval at store + 8 + 8*new_len.
+    // removed = the element jsval at store + 8 + 8*new_len (`base` now holds
+    // that address), a hole read as `undefined` (`x ^ (x == HOLE)`).
     function.instruction(&Instruction::LocalGet(base));
     emit_array_elems(function);
     function.instruction(&Instruction::LocalGet(new_len));
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(base));
     function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Xor);
     function.instruction(&Instruction::End);
 }
 
@@ -368,7 +391,8 @@ pub(super) fn emit_hof_invoke(
 /// evaluated once into the i32 base scratch local `arr` (not rebound), its u32
 /// length header into `len`, and the callback function value's base into `cb`; a
 /// counted loop over `0..len` then invokes the callback per element through the
-/// uniform `call_indirect` ABI (env-last) via [`emit_hof_invoke`]:
+/// uniform `call_indirect` ABI (env-last) via [`emit_hof_invoke`]. A hole is
+/// skipped (no call); `Map` keeps it as a hole in the result:
 ///
 /// - `Map` fills a fresh same-length array `res[i] = fn(element_i, i)`.
 /// - `Filter` grows a fresh array in place via `__array_push` for JS-truthy
@@ -477,6 +501,12 @@ pub(super) fn emit_array_hof(
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
+    // Skip a hole: the body runs only for a present element.
+    emit_hof_load_elem(function, arr, idx);
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
 
     match op {
         ArrayHofOp::Map => {
@@ -525,6 +555,20 @@ pub(super) fn emit_array_hof(
             function.instruction(&Instruction::Drop);
         }
     }
+    if op == ArrayHofOp::Map {
+        // A hole maps to a hole.
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::LocalGet(res));
+        emit_array_elems(function);
+        function.instruction(&Instruction::LocalGet(idx));
+        function.instruction(&Instruction::I32Const(8));
+        function.instruction(&Instruction::I32Mul);
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::I64Const(HOLE_BITS));
+        function.instruction(&Instruction::I64Store(elem_slot(0)));
+    }
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 
     // idx++ and continue.
     function.instruction(&Instruction::LocalGet(idx));

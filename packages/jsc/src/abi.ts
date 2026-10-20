@@ -21,6 +21,8 @@ export const TRUE = 0x7ff9_0000_0000_0001n
 export const NULL = 0x7ffa_0000_0000_0000n
 /** NaN-boxed `undefined` (tag `0b011`). */
 export const UNDEFINED = 0x7ffb_0000_0000_0000n
+/** An array hole (`UNDEFINED | 1`): an element slot with no element; reads as `undefined`. */
+export const HOLE = 0x7ffb_0000_0000_0001n
 /** NaN-boxed heap-pointer header (tag `0b101`): `HEAP | (ptr as u32)`. */
 export const HEAP = 0x7ffd_0000_0000_0000n
 

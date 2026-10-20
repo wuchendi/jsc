@@ -23,6 +23,7 @@ import {
   HEAP,
   HEAP_PTR_EXPORT_NAME,
   HEAP_PTR_OOM,
+  HOLE,
   INVOKE_EXPORT_NAME,
   MEMORY_EXPORT_NAME,
   MEMORY_MAX_PAGES,
@@ -412,9 +413,8 @@ export function createShim(): Shim {
           return stringIndexOf(mem, ptr, arg0)
         return null
       case METHOD_OP_INCLUDES:
-        if (ptr !== null && typeByte === TYPE_ARRAY) {
-          return arrayIndexOf(mem, ptr, arg0) === f64ToBits(-1) ? FALSE : TRUE
-        }
+        if (ptr !== null && typeByte === TYPE_ARRAY)
+          return arrayIncludes(mem, ptr, arg0) ? TRUE : FALSE
         // `str.includes(sub)` — substring containment (an empty `sub` => true).
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
@@ -961,7 +961,32 @@ function strictEqBits(a: bigint, b: bigint, mem: Uint8Array): boolean {
   return a === b
 }
 
-/** `array.indexOf(x)`: first index whose element `=== x`, or `-1`. */
+/**
+ * `array.includes(x)` (mirrors `host.rs::array_includes`): some element is
+ * `SameValueZero` to `x` — `===`, except that `NaN` matches `NaN`; a hole
+ * reads as `undefined`.
+ */
+function arrayIncludes(mem: Uint8Array, ptr: number, needle: bigint): boolean {
+  const len = arrayLen(mem, ptr)
+  const n = decode(needle, mem)
+  for (let i = 0; i < len; i++) {
+    let elem = arrayElemBits(mem, ptr, i)
+    if (elem === null) continue
+    if (elem === HOLE) elem = UNDEFINED
+    if (strictEqBits(elem, needle, mem)) return true
+    const e = decode(elem, mem)
+    if (
+      e.kind === 'number' &&
+      n.kind === 'number' &&
+      Number.isNaN(e.value) &&
+      Number.isNaN(n.value)
+    )
+      return true
+  }
+  return false
+}
+
+/** `array.indexOf(x)`: first index whose element `=== x`, or `-1` (a hole never matches). */
 function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
   const len = arrayLen(mem, ptr)
   for (let i = 0; i < len; i++) {
@@ -994,7 +1019,7 @@ function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
 
 /**
  * The joined text of `array.join(sep)` (`","` when `sep` is `undefined`);
- * nullish elements and cycle back-references stringify to `""`. The receiver
+ * nullish elements, holes, and cycle back-references stringify to `""`. The receiver
  * is decoded as a whole so the decoder's cycle guard catches self-references.
  * Mirrors the pure part of `host.rs::array_join` (allocation is done by the
  * caller).
@@ -1007,7 +1032,9 @@ function arrayJoinText(mem: Uint8Array, ptr: number, sepBits: bigint): string {
   if (recv.kind !== 'array') return ''
   return recv.items
     .map((v) =>
-      v.kind === 'null' || v.kind === 'undefined' ? '' : toJsString(v),
+      v.kind === 'null' || v.kind === 'undefined' || v.kind === 'hole'
+        ? ''
+        : toJsString(v),
     )
     .join(sep)
 }
