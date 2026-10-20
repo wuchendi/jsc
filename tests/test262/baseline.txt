@@ -100,6 +100,8 @@ built-ins/GeneratorPrototype/next/lone-return.js
 built-ins/GeneratorPrototype/next/lone-yield.js
 built-ins/GeneratorPrototype/next/no-control-flow.js
 built-ins/GeneratorPrototype/next/return-yield-expr.js
+built-ins/GeneratorPrototype/return/from-state-executing.js
+built-ins/GeneratorPrototype/throw/from-state-executing.js
 built-ins/Iterator/prototype/forEach/result-is-undefined.js
 built-ins/JSON/parse/15.12.1.1-0-9.js
 built-ins/JSON/parse/15.12.1.1-g2-1.js
@@ -2980,6 +2982,8 @@ language/expressions/unary-plus/11.4.6-2-1.js
 language/expressions/unary-plus/S9.3_A4.1_T2.js
 language/expressions/yield/captured-free-vars.js
 language/expressions/yield/formal-parameters.js
+language/expressions/yield/from-catch.js
+language/expressions/yield/from-try.js
 language/expressions/yield/in-iteration-stmt.js
 language/expressions/yield/invalid-left-hand-side.js
 language/expressions/yield/iter-value-specified.js

@@ -252,3 +252,15 @@ fn generator_yield_in_for_of_and_switch_via_eval() {
         "ab"
     );
 }
+
+/// A `yield` inside `try`/`catch`/`finally`, end to end.
+#[test]
+fn generator_yield_in_try_catch_finally_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function* g(){ try { yield 1; throw new Error(\"x\") } catch (e) { yield e.message } finally { yield \"f\" } } [...g()].join()"
+        ]),
+        "1,x,f"
+    );
+}

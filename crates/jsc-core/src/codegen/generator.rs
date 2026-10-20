@@ -31,8 +31,22 @@
 //! into a chain of strict-equality test blocks and one block per clause body,
 //! with fall-through jumps and its own `break` target.
 //!
-//! Still rejected (deferred): a `yield` inside `try`/`catch`/`finally` (handler
-//! state across a suspend); a `yield` whose continuation would read a per-node
+//! A `try` crossing a suspend (or holding a `return`/`break`/`continue`) is
+//! flattened too ([`CfgBuilder::lower_try`]). Every block carries an optional
+//! HANDLER block: the state machine emits a block with a handler inside a wasm
+//! landing pad registered as the active exception handler, so a throw anywhere in
+//! it stores `gen.state = handler` and re-dispatches with the exception still
+//! pending; the handler block (a `catch` entry, or a `finally`'s on-throw entry)
+//! clears it on entry and reads the thrown value through `ExcValue`. A `finally`
+//! keeps a COMPLETION RECORD in two frame cells (kind + value), so it survives a
+//! suspend inside the `finally`: every exit from the guarded region — fall
+//! through, an uncaught throw, `return`, a `break`/`continue` leaving it — records
+//! its kind and jumps into the `finally` blocks, which end in a dispatch on the
+//! record (continue after the `try`, re-throw to the next outer handler, or
+//! resume the `return`/jump, through any outer `finally` first). A throw no
+//! handler catches leaves the state machine and completes the generator.
+//!
+//! Still rejected (deferred): a `yield` whose continuation would read a per-node
 //! scratch local set before the suspend; generator expressions/arrows/methods;
 //! and non-simple parameters.
 //!
@@ -339,8 +353,8 @@ impl LowerCtx<'_> {
 /// control can suspend anywhere. `break`/`continue`/`return` become jumps to the
 /// relevant block. A `yield` nested in an expression is linearized (see
 /// [`CfgBuilder::linearize`]); each spill cell it needs is a new frame slot, so
-/// `total` (the frame cell count) grows accordingly. Only `yield`/`try` crossing a
-/// suspend and a few corner forms are still rejected (see [`CfgBuilder::lower_stmt`]).
+/// `total` (the frame cell count) grows accordingly. Only a few corner forms are
+/// still rejected (see [`CfgBuilder::track`]).
 fn build_segments(
     stmts: &[IrStmt],
     fn_decl: &FnDecl,
@@ -354,6 +368,8 @@ fn build_segments(
         blocks: vec![PendingBlock::default()],
         cur: 0,
         loops: Vec::new(),
+        handlers: Vec::new(),
+        finallies: Vec::new(),
         next_slot,
         suspended: false,
         live: HashSet::new(),
@@ -371,16 +387,21 @@ fn build_segments(
         .map(|b| GenSegment {
             stmts: b.stmts,
             term: b.term.unwrap_or(GenTerm::Return(None)),
+            handler: b.handler,
+            catches: b.catches,
         })
         .collect())
 }
 
-/// A basic block under construction: its statements and its terminator (`None`
-/// until set — a still-open or an unreachable block).
+/// A basic block under construction: its statements, its terminator (`None`
+/// until set — a still-open or an unreachable block), and its exception handler
+/// (see [`GenSegment`]).
 #[derive(Default)]
 struct PendingBlock {
     stmts: Vec<IrStmt>,
     term: Option<GenTerm>,
+    handler: Option<u32>,
+    catches: bool,
 }
 
 /// One enclosing loop's (or `switch`'s) jump targets during CFG construction.
@@ -392,6 +413,30 @@ struct LoopCtx {
     break_block: u32,
     /// The loop's label id, for a labeled `break`/`continue`.
     label: Option<u32>,
+    /// How many `finally` clauses enclosed the loop: a jump to its targets runs
+    /// every `finally` opened inside it (those above this depth) first.
+    finally_depth: usize,
+}
+
+/// The completion-record kinds a `finally` dispatches on; a recorded jump to an
+/// outer block uses `EXIT_BASE + i` for its `exits[i]`.
+const COMPLETION_NORMAL: f64 = 0.0;
+const COMPLETION_THROW: f64 = 1.0;
+const COMPLETION_RETURN: f64 = 2.0;
+const EXIT_BASE: usize = 3;
+
+/// An enclosing `finally` during CFG construction: its completion record cells
+/// and the block its body starts in.
+struct FinallyCtx {
+    /// Frame cell holding the completion kind (`COMPLETION_*` / `EXIT_BASE + i`).
+    kind: u32,
+    /// Frame cell holding the thrown or returned value.
+    value: u32,
+    /// The first block of the `finally` body.
+    entry: u32,
+    /// The jump targets (block, its loop's `finally_depth`) routed through this
+    /// `finally`, indexed by `kind - EXIT_BASE`.
+    exits: Vec<(u32, usize)>,
 }
 
 struct CfgBuilder<'a> {
@@ -400,6 +445,11 @@ struct CfgBuilder<'a> {
     /// The block currently being filled.
     cur: usize,
     loops: Vec<LoopCtx>,
+    /// The enclosing exception handler blocks, innermost last; a new block takes
+    /// the innermost as its handler.
+    handlers: Vec<u32>,
+    /// The enclosing `finally` clauses, innermost last.
+    finallies: Vec<FinallyCtx>,
     /// The next free frame cell slot, for spill cells.
     next_slot: u32,
     /// Whether the statement being linearized has already suspended.
@@ -412,7 +462,10 @@ struct CfgBuilder<'a> {
 impl CfgBuilder<'_> {
     fn new_block(&mut self) -> u32 {
         let id = u32::try_from(self.blocks.len()).unwrap_or(u32::MAX);
-        self.blocks.push(PendingBlock::default());
+        self.blocks.push(PendingBlock {
+            handler: self.handlers.last().copied(),
+            ..PendingBlock::default()
+        });
         id
     }
 
@@ -484,7 +537,7 @@ impl CfgBuilder<'_> {
                     }
                     None => None,
                 };
-                self.terminate(GenTerm::Return(value));
+                self.return_out(value)?;
             }
             // `if (cond) then else` crossing a yield — flatten to a `Branch`.
             IrStmt::If {
@@ -540,6 +593,7 @@ impl CfgBuilder<'_> {
                     continue_block: Some(cont),
                     break_block: exit,
                     label: *label,
+                    finally_depth: self.finallies.len(),
                 });
                 self.cur = body_b as usize;
                 self.lower_stmts(body)?;
@@ -553,18 +607,18 @@ impl CfgBuilder<'_> {
                 self.cur = exit as usize;
             }
             IrStmt::Break(label) => {
-                let target = self.loop_target(*label, true)?;
-                self.terminate(GenTerm::Jump(target));
+                let (target, depth) = self.loop_target(*label, true)?;
+                self.jump_out(target, depth)?;
             }
             IrStmt::Continue(label) => {
-                let target = self.loop_target(*label, false)?;
-                self.terminate(GenTerm::Jump(target));
+                let (target, depth) = self.loop_target(*label, false)?;
+                self.jump_out(target, depth)?;
             }
-            // A `yield` inside `try`/`catch`/`finally` — exception-handler state
-            // across a suspend is out of scope (CUT A).
-            IrStmt::Try { .. } => {
-                return Err(self.unsupported("a `yield` inside try/catch/finally is not supported"));
-            }
+            IrStmt::Try {
+                body,
+                catch_body,
+                finally_body,
+            } => self.lower_try(body, catch_body.as_deref(), finally_body.as_deref())?,
             IrStmt::Switch { disc, cases, .. } => self.lower_switch(disc, cases)?,
         }
         Ok(())
@@ -612,6 +666,7 @@ impl CfgBuilder<'_> {
             continue_block: None,
             break_block: exit,
             label: None,
+            finally_depth: self.finallies.len(),
         });
         for (i, case) in cases.iter().enumerate() {
             self.cur = bodies[i] as usize;
@@ -620,6 +675,186 @@ impl CfgBuilder<'_> {
         }
         self.loops.pop();
         self.cur = exit as usize;
+        Ok(())
+    }
+
+    /// Flatten a `try` crossing a suspend (or holding a `return`/`break`/
+    /// `continue`). The guarded body runs in blocks whose handler is the catch
+    /// entry (or, with no `catch`, the `finally`'s on-throw entry); the catch body
+    /// runs under the on-throw entry. With a `finally`, every exit from the body
+    /// and catch body records a completion (see [`FinallyCtx`]) and enters the
+    /// `finally` blocks, which run under the OUTER handler and end in a dispatch
+    /// on the record.
+    fn lower_try(
+        &mut self,
+        body: &[IrStmt],
+        catch_body: Option<&[IrStmt]>,
+        finally_body: Option<&[IrStmt]>,
+    ) -> anyhow::Result<()> {
+        // Blocks outside the guarded region, created under the outer handler.
+        let after = self.new_block();
+        let finally = if finally_body.is_some() {
+            let ctx = FinallyCtx {
+                kind: self.fresh_slot(),
+                value: self.fresh_slot(),
+                entry: self.new_block(),
+                exits: Vec::new(),
+            };
+            let on_throw = self.new_block();
+            self.blocks[on_throw as usize].catches = true;
+            self.finallies.push(ctx);
+            self.handlers.push(on_throw);
+            Some(on_throw)
+        } else {
+            None
+        };
+        let catch_entry = catch_body.map(|_| {
+            let entry = self.new_block();
+            self.blocks[entry as usize].catches = true;
+            entry
+        });
+
+        // The guarded body.
+        if let Some(entry) = catch_entry {
+            self.handlers.push(entry);
+        }
+        let body_b = self.new_block();
+        self.terminate(GenTerm::Jump(body_b));
+        self.cur = body_b as usize;
+        self.lower_stmts(body)?;
+        self.complete_normally(after)?;
+        if catch_entry.is_some() {
+            self.handlers.pop();
+        }
+
+        // The catch body, entered with the exception just cleared; its leading
+        // statement binds the parameter from `ExcValue`.
+        if let (Some(entry), Some(catch_body)) = (catch_entry, catch_body) {
+            self.cur = entry as usize;
+            self.lower_stmts(catch_body)?;
+            self.complete_normally(after)?;
+        }
+
+        let (Some(on_throw), Some(finally_body)) = (finally, finally_body) else {
+            self.cur = after as usize;
+            return Ok(());
+        };
+        self.handlers.pop();
+        let Some(ctx) = self.finallies.pop() else {
+            unreachable!("the `finally` context was pushed above")
+        };
+        // An exception escaping the body / catch body: record it, run `finally`.
+        self.cur = on_throw as usize;
+        self.push(IrStmt::Expr(slot_set(
+            ctx.kind,
+            IrNode::Num(COMPLETION_THROW),
+        )))?;
+        self.push(IrStmt::Expr(slot_set(ctx.value, IrNode::ExcValue)))?;
+        self.terminate(GenTerm::Jump(ctx.entry));
+
+        // The finally body, then the dispatch on the completion record (skipped
+        // when the finally itself completes abruptly, superseding the record).
+        self.cur = ctx.entry as usize;
+        self.lower_stmts(finally_body)?;
+        let kind_is = |kind: f64| IrNode::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(slot_get(ctx.kind)),
+            rhs: Box::new(IrNode::Num(kind)),
+        };
+        let branch = |cfg: &mut Self, kind: f64| -> u32 {
+            let taken = cfg.new_block();
+            let next = cfg.new_block();
+            cfg.terminate(GenTerm::Branch {
+                cond: kind_is(kind),
+                then_block: taken,
+                else_block: next,
+            });
+            cfg.cur = taken as usize;
+            next
+        };
+        if self.terminated() {
+            self.cur = after as usize;
+            return Ok(());
+        }
+        let next = branch(self, COMPLETION_NORMAL);
+        self.terminate(GenTerm::Jump(after));
+        self.cur = next as usize;
+        let next = branch(self, COMPLETION_THROW);
+        self.push(IrStmt::Expr(IrNode::Throw(Box::new(slot_get(ctx.value)))))?;
+        self.terminate(GenTerm::Return(None)); // unreachable: the throw transfers
+        self.cur = next as usize;
+        let next = branch(self, COMPLETION_RETURN);
+        self.return_out(Some(slot_get(ctx.value)))?;
+        self.cur = next as usize;
+        for (i, &(target, depth)) in ctx.exits.iter().enumerate() {
+            let next = branch(
+                self,
+                f64::from(u32::try_from(EXIT_BASE + i).unwrap_or(u32::MAX)),
+            );
+            self.jump_out(target, depth)?;
+            self.cur = next as usize;
+        }
+        self.terminate(GenTerm::Jump(after));
+        self.cur = after as usize;
+        Ok(())
+    }
+
+    /// End a guarded body / catch body that falls through: run the innermost
+    /// `finally` with a normal completion, or continue at `after`.
+    fn complete_normally(&mut self, after: u32) -> anyhow::Result<()> {
+        if self.terminated() {
+            return Ok(());
+        }
+        match self.finallies.last() {
+            Some(ctx) => {
+                let (kind, entry) = (ctx.kind, ctx.entry);
+                self.push(IrStmt::Expr(slot_set(kind, IrNode::Num(COMPLETION_NORMAL))))?;
+                self.terminate(GenTerm::Jump(entry));
+            }
+            None => self.terminate(GenTerm::Jump(after)),
+        }
+        Ok(())
+    }
+
+    /// End the current block with a `return value`: through the innermost
+    /// `finally` (recording the value) when one is open, else directly.
+    fn return_out(&mut self, value: Option<IrNode>) -> anyhow::Result<()> {
+        let Some(ctx) = self.finallies.last() else {
+            self.terminate(GenTerm::Return(value));
+            return Ok(());
+        };
+        let (kind, slot, entry) = (ctx.kind, ctx.value, ctx.entry);
+        self.push(IrStmt::Expr(slot_set(
+            slot,
+            value.unwrap_or(IrNode::Undefined),
+        )))?;
+        self.push(IrStmt::Expr(slot_set(kind, IrNode::Num(COMPLETION_RETURN))))?;
+        self.terminate(GenTerm::Jump(entry));
+        Ok(())
+    }
+
+    /// End the current block with a jump to `target`, a loop/switch block opened
+    /// inside `depth` `finally` clauses: through the innermost `finally` opened
+    /// since (recording the target as an exit) when there is one, else directly.
+    fn jump_out(&mut self, target: u32, depth: usize) -> anyhow::Result<()> {
+        if self.finallies.len() <= depth {
+            self.terminate(GenTerm::Jump(target));
+            return Ok(());
+        }
+        let Some(ctx) = self.finallies.last_mut() else {
+            unreachable!("more `finally` clauses are open than `depth`")
+        };
+        let index = if let Some(index) = ctx.exits.iter().position(|&exit| exit == (target, depth))
+        {
+            index
+        } else {
+            ctx.exits.push((target, depth));
+            ctx.exits.len() - 1
+        };
+        let (kind, entry) = (ctx.kind, ctx.entry);
+        let code = f64::from(u32::try_from(EXIT_BASE + index).unwrap_or(u32::MAX));
+        self.push(IrStmt::Expr(slot_set(kind, IrNode::Num(code))))?;
+        self.terminate(GenTerm::Jump(entry));
         Ok(())
     }
 
@@ -864,22 +1099,27 @@ impl CfgBuilder<'_> {
 
     /// Resolve a `break`/`continue` target block: the innermost loop or `switch`
     /// for an unlabeled `break`, the innermost loop for an unlabeled `continue`,
-    /// or the loop whose label matches.
-    fn loop_target(&self, label: Option<u32>, is_break: bool) -> anyhow::Result<u32> {
+    /// or the loop whose label matches — with that loop's `finally_depth`.
+    fn loop_target(&self, label: Option<u32>, is_break: bool) -> anyhow::Result<(u32, usize)> {
         let target = match label {
-            None if is_break => self.loops.last().map(|l| l.break_block),
-            None => self.loops.iter().rev().find_map(|l| l.continue_block),
+            None if is_break => self.loops.last().map(|l| (l.break_block, l.finally_depth)),
+            None => self
+                .loops
+                .iter()
+                .rev()
+                .find_map(|l| l.continue_block.map(|b| (b, l.finally_depth))),
             Some(id) => self
                 .loops
                 .iter()
                 .rev()
                 .find(|l| l.label == Some(id))
                 .and_then(|l| {
-                    if is_break {
+                    let block = if is_break {
                         Some(l.break_block)
                     } else {
                         l.continue_block
-                    }
+                    };
+                    block.map(|b| (b, l.finally_depth))
                 }),
         };
         target
