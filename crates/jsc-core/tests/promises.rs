@@ -331,14 +331,78 @@ fn async_throw_rejects_result() {
     );
 }
 
-/// `await` on a rejected promise propagates the rejection out as the async
-/// function's own rejection (no `try`/`catch` around `await` is modeled).
+/// `await` on a rejected promise with no enclosing handler propagates the
+/// rejection out as the async function's own rejection.
 #[test]
 fn async_await_rejection_propagates() {
     assert_output(
         "async function f() { await Promise.reject(\"nope\"); return 1; } \
          f().catch(e => console.log(e));",
         "nope\n",
+    );
+}
+
+/// An uncaught rejection inside an async body rejects its result promise; with
+/// no handler on the result, the run exits as an unhandled rejection.
+#[test]
+fn async_await_rejection_unhandled_is_uncaught() {
+    assert_uncaught(
+        "async function f() { await Promise.reject(\"nope\"); return 1; } f(); 0",
+        "(in promise) nope",
+    );
+}
+
+/// A rejected `await` THROWS into the body at the suspended `await`: the
+/// enclosing `catch` binds the rejection reason.
+#[test]
+fn async_await_rejection_is_caught() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(new Error(\"boom\")) } \
+         catch (e) { return \"caught \" + e.message } } f().then(v => console.log(v))",
+        "caught boom\n",
+    );
+}
+
+/// A caught rejection is not reported as an unhandled rejection.
+#[test]
+fn async_caught_rejection_is_not_unhandled() {
+    assert_eval(
+        "async function f(){ try { await Promise.reject(1) } catch (e) { return e + 1 } } await f()",
+        "2",
+    );
+}
+
+/// A non-Error rejection value is bound to the catch parameter unchanged.
+#[test]
+fn async_await_rejection_non_error_value() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(42) } catch (e) { console.log(e, typeof e) } } f()",
+        "42 number\n",
+    );
+}
+
+/// A rejected `await` inside `try`/`finally` runs the finalizer, then the
+/// rejection still rejects the result promise.
+#[test]
+fn async_await_rejection_runs_finally() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(\"r\") } finally { console.log(\"fin\") } } \
+         f().catch(e => console.log(\"rejected\", e))",
+        "fin\nrejected r\n",
+    );
+}
+
+/// After a caught rejection, later awaits in the same body (inside a `try`
+/// again) continue normally.
+#[test]
+fn async_awaits_continue_after_caught_rejection() {
+    assert_output(
+        "async function f(){ let log = \"\"; \
+         try { await Promise.reject(\"a\") } catch (e) { log = log + e } \
+         try { const v = await Promise.resolve(\"b\"); log = log + v; const w = await 3; log = log + w } \
+         catch (e) { log = log + \"!\" } \
+         return log } f().then(v => console.log(v))",
+        "ab3\n",
     );
 }
 
