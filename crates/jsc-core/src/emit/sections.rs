@@ -1032,7 +1032,7 @@ pub(super) fn collect_node<'a>(
             collect_node(arg, order, seen);
             // Seed the serializer's literal token strings (`null`/`true`/`false`
             // and the structural punctuation) so their `[len][utf8]` blocks exist
-            // in the data segment for `__json_str` to splice via `__concat`.
+            // in the data segment for `__json_rep` / `__json_str` to splice.
             for tok in JSON_TOKEN_STRS {
                 if seen.insert(tok) {
                     order.push(tok);
