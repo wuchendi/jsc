@@ -1075,245 +1075,37 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the recursive `__json_str(v: i64) -> str_base: i32` serializer backing
-/// `JSON.stringify`. Returns the base offset of a heap string holding `v`'s
-/// JSON form, composing pieces with `__concat` (`concat_index`):
+/// Emit the `__json_str(v: i64) -> str_base: i32` primitive serializer of
+/// `JSON.stringify` (`__json_rep` serializes arrays and objects). Returns the
+/// base offset of a heap string holding `v`'s JSON form:
 ///
 /// - number: `__convert(v, TO_STRING)` when finite (reusing the EXISTING host
 ///   import — no new import), else the token `"null"` (JSON renders NaN/Infinity
 ///   as null);
-/// - `true`/`false`/`null`: the matching keyword token; `undefined`: `"null"`
-///   (its array-element rendering — object values / the top level pre-skip it);
+/// - `true`/`false`/`null`: the matching keyword token; `undefined`: `"null"`;
 /// - string: `__json_escape` (`escape_index`);
-/// - array: `"[" + elems joined "," + "]"`, each element serialized by a recursive
-///   `__json_str` (`self_index`) call, with `undefined`/function elements rendered
-///   as `"null"`;
-/// - Boolean / Number / String wrapper object: its primitive;
-/// - object: `"{" + key:value pairs joined "," + "}"` over the own enumerable
-///   keys (`__own_keys`, own-key order), reading each value through `__get` and
-///   omitting entries whose value is `undefined`/a function; keys are escaped
-///   like strings and values serialized recursively;
-/// - any other heap kind (a function value): `"null"`.
+/// - any other heap kind: `"null"`.
 ///
-/// Param `v` occupies local 0; six `i32` locals hold the wrapped pointer, type
-/// byte, entry count, loop index, the first-element flag, and the string
-/// accumulator; three `i64` locals hold the current array element / object key /
-/// object value.
-#[allow(clippy::too_many_lines)]
-pub(super) fn emit_json_str(
-    self_index: u32,
-    concat_index: u32,
-    convert_index: u32,
-    escape_index: u32,
-    (own_keys_index, get_index, sparse_get_index): (u32, u32, u32),
-    tokens: JsonTokens,
-) -> Function {
-    let mut function = Function::new(vec![(6, ValType::I32), (3, ValType::I64)]);
+/// Param `v` occupies local 0; one `i32` local holds the string accumulator.
+pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonTokens) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
     let v = 0;
-    let (ptr, tb, n, k, first, acc) = (1, 2, 3, 4, 5, 6);
-    let (elem, key, val) = (7, 8, 9);
-    let elem_slot = mem64(ELEMS_DATA_OFFSET);
+    let acc = 1;
 
-    // Emit `acc = concat(acc, <piece already on stack>)` — the piece expression
-    // must already be pushed by the caller right before invoking this.
-    let concat_into_acc = |function: &mut Function| {
-        function.instruction(&Instruction::Call(concat_index));
-        function.instruction(&Instruction::LocalSet(acc));
-    };
-
-    // if is_pointer(v) { heap kinds } else { number / bool / null / undefined }.
+    // if is_pointer(v) { string ? escape : "null" } else { primitives }.
     emit_is_pointer(&mut function, v);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // ptr = wrap(v); tb = type_byte(v).
-    function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(ptr));
+    function.instruction(&Instruction::I32Const(tokens.null));
+    function.instruction(&Instruction::LocalSet(acc));
     emit_load_type_byte(&mut function, v);
-    function.instruction(&Instruction::LocalSet(tb));
-
-    // --- string: acc = __json_escape(ptr) ---
-    function.instruction(&Instruction::LocalGet(tb));
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(ptr));
+    function.instruction(&Instruction::LocalGet(v));
+    function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(escape_index));
     function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::Else);
-
-    // --- array: "[" + elems joined "," + "]" ---
-    function.instruction(&Instruction::LocalGet(tb));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(tokens.lbrack));
-    function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
-    function.instruction(&Instruction::LocalSet(n));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalSet(first));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // elem = element k (the store is reloaded: a nested getter may grow the
-    // array; a SPARSE array reads through `__sparse_get`).
-    emit_elem_load(&mut function, ptr, k, sparse_get_index);
-    function.instruction(&Instruction::LocalSet(elem));
-    // A hole serializes like `undefined` (as `null`).
-    emit_elem_read(&mut function, elem);
-    function.instruction(&Instruction::LocalSet(elem));
-    // Separator: if !first { acc = concat(acc, ",") }.
-    function.instruction(&Instruction::LocalGet(first));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.comma));
-    concat_into_acc(&mut function);
     function.instruction(&Instruction::End);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(first));
-    // acc = concat(acc, (undefined||function) ? "null" : __json_str(elem)).
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::LocalGet(elem));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Eq);
-    emit_is_function(&mut function, elem);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::I32Const(tokens.null));
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::LocalGet(elem));
-    function.instruction(&Instruction::Call(self_index));
-    function.instruction(&Instruction::End);
-    concat_into_acc(&mut function);
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.rbrack));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::Else);
-
-    // --- object: "{" + key:value pairs joined "," + "}" over the own
-    // enumerable keys (ptr = the key array) ---
-    function.instruction(&Instruction::LocalGet(tb));
-    function.instruction(&Instruction::I32Const(TYPE_OBJECT));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // A Boolean / Number / String wrapper serializes as its primitive.
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load8U(MemArg {
-        offset: u64::from(abi::HEADER_CLASS_OFFSET),
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::I32Const(i32::from(abi::CLASS_BOOLEAN)));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Const(3));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I64Load(mem64(u64::from(
-        abi::WRAPPER_VALUE_OFFSET,
-    ))));
-    function.instruction(&Instruction::Call(self_index));
-    function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(tokens.lbrace));
-    function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32Const(OWN_KEYS));
-    function.instruction(&Instruction::Call(own_keys_index));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalTee(ptr));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
-    function.instruction(&Instruction::LocalSet(n));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalSet(first));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // key = keys[k]; val = __get(v, key).
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(3));
-    function.instruction(&Instruction::I32Shl);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(elem_slot));
-    function.instruction(&Instruction::LocalSet(key));
-    function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::Call(get_index));
-    function.instruction(&Instruction::LocalSet(val));
-    // include = !(val undefined || val function).
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Eq);
-    emit_is_function(&mut function, val);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // Separator: if !first { acc = concat(acc, ",") }.
-    function.instruction(&Instruction::LocalGet(first));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.comma));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(first));
-    // acc = concat(acc, escape(key)); acc = concat(acc, ":");
-    // acc = concat(acc, __json_str(val)).
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::Call(escape_index));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.colon));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::Call(self_index));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::End); // if include
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.rbrace));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::End); // if wrapper
-    function.instruction(&Instruction::Else);
-    // --- any other heap kind (function value): "null" ---
-    function.instruction(&Instruction::I32Const(tokens.null));
-    function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::End); // if OBJECT
-    function.instruction(&Instruction::End); // if ARRAY
-    function.instruction(&Instruction::End); // if STRING
-
     function.instruction(&Instruction::Else);
     // --- non-heap: null / true / false / undefined / number ---
     function.instruction(&Instruction::LocalGet(v));

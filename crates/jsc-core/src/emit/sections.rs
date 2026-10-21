@@ -221,8 +221,8 @@ pub(super) fn build_type_and_function_sections<'a>(
     // `__to_primitive(v: i64, hint: i32) -> i64`, `__to_string(v: i64) -> i32`,
     // `__add(a: i64, b: i64) -> i64`, `__compare(a: i64, b: i64, op: i32) -> i32`,
     // `__array_join(recv: i64, sep: i64) -> i64` and `__to_object(v: i64) -> i64`;
-    // then the `JSON` helpers `__json_rep(holder, key, value, replacer, list)
-    // -> i64`, `__json_indent(s: i32, gap: i32) -> i32` and
+    // then the `JSON` helpers `__json_rep(holder, key, value, replacer, list,
+    // stack: i32) -> i64`, `__json_indent(s: i32, gap: i32) -> i32` and
     // `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`.
     let conversions: [(&[ValType], &[ValType]); 9] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
@@ -231,7 +231,17 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I64]),
-        (&[ValType::I64; 5], &[ValType::I64]),
+        (
+            &[
+                ValType::I64,
+                ValType::I64,
+                ValType::I64,
+                ValType::I64,
+                ValType::I64,
+                ValType::I32,
+            ],
+            &[ValType::I64],
+        ),
         (&[ValType::I32, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I32, ValType::I64], &[ValType::I64]),
     ];

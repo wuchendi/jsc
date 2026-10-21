@@ -45,6 +45,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(map_set::fragments(k));
     nodes.extend(promise::fragments(k));
     nodes.extend(generator::fragments(k));
+    nodes.extend(date::fragments(k));
     nodes.extend(json::fragments());
     nodes
 }
@@ -192,6 +193,7 @@ pub(super) fn emit_builtin(
         Builtin::BooleanValueOf => number::emit_boolean(true, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::DateMethod(op) => date::emit_method(op, &mut f, frame, strings, helpers),
+        Builtin::DateToJson => date::emit_to_json(&mut f, frame, strings, helpers),
         Builtin::CollectionOp { set, op } => {
             map_set::emit_op(set, op, &mut f, frame, strings, helpers);
         }

@@ -1,8 +1,8 @@
 //! `JSON.stringify(value, replacer, space)` and `JSON.parse(text, reviver)`.
 //! Without a replacer function or property list the serialization is exactly
-//! the inline `JSON.stringify(v)` (`__json_str`); with one it runs
-//! `__json_rep`, which calls the replacer with the holder as `this` and keeps
-//! only the listed keys. A non-empty gap re-indents the compact text
+//! the inline `JSON.stringify(v)`; both run `__json_rep`, which calls a
+//! `toJSON` method and the replacer (with the holder as `this`), keeps only
+//! the listed keys, and rejects a cyclic structure. A non-empty gap re-indents the compact text
 //! (`__json_indent`). A callable reviver walks the parsed value through
 //! `__json_revive` (`InternalizeJSONProperty`).
 
@@ -12,12 +12,19 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// The `TypeError` of serializing a cyclic structure.
+const CYCLE: CalleeErrorText<'static> = [
+    "Converting circular structure to JSON",
+    "TypeError: Converting circular structure to JSON",
+];
+
 /// The static strings of this family: the serializer's tokens, the empty
-/// root key, and the parse syntax error.
+/// root key, `toJSON`, the cycle error, and the parse syntax error.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
     JSON_TOKEN_STRS
         .into_iter()
-        .chain([""])
+        .chain(["", "toJSON"])
+        .chain(CYCLE)
         .chain(JSON_PARSE_ERROR_STRS)
 }
 
@@ -115,17 +122,17 @@ fn elem_or_undefined(function: &mut Function, arr: u32, i: u32, out: u32, helper
 }
 
 /// Call the function in i64 local `target` with `this` = i64 local `this`
-/// and the arguments `(a0, a1)` (i64 locals), leaving its result.
-fn call2(function: &mut Function, target: u32, this: u32, a0: u32, a1: u32, helpers: Helpers<'_>) {
-    for slot in 0..helpers.max_args {
-        match slot {
-            0 => wasm!(function; LocalGet(a0)),
-            1 => wasm!(function; LocalGet(a1)),
-            _ => wasm!(function; I64Const(UNDEFINED_BITS)),
+/// and the arguments `args` (i64 locals), leaving its result.
+fn call_with(function: &mut Function, target: u32, this: u32, args: &[u32], helpers: Helpers<'_>) {
+    for slot in 0..helpers.max_args as usize {
+        if let Some(&arg) = args.get(slot) {
+            wasm!(function; LocalGet(arg));
+        } else {
+            wasm!(function; I64Const(UNDEFINED_BITS));
         }
     }
     wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
-    let count = 2.min(helpers.max_args as usize);
+    let count = args.len().min(helpers.max_args as usize);
     invoke(
         function,
         target,
@@ -230,7 +237,8 @@ pub(super) fn emit_stringify(
     );
     push_str(function, strings, "");
     wasm!(function;
-        LocalGet(value), LocalGet(rep), LocalGet(list), Call(helpers.json_rep()), LocalSet(s),
+        LocalGet(value), LocalGet(rep), LocalGet(list),
+        I32Const(0), Call(helpers.new_array()), Call(helpers.json_rep()), LocalSet(s),
     );
     return_if_pending(function);
     wasm!(function;
@@ -338,22 +346,31 @@ pub(super) fn emit_parse(
     );
 }
 
-/// `__json_rep(holder, key, value, replacer, list) -> i64`: the JSON text of
-/// `value` (the property `key` of `holder`) as a string jsval, or `undefined`
-/// when it is not serializable: the replacer function (when not
-/// `undefined`) maps `value` first, called with `this = holder`; a wrapper
+/// `__json_rep(holder, key, value, replacer, list, stack) -> i64`:
+/// `SerializeJSONProperty` — the JSON text of `value` (the property `key` of
+/// `holder`) as a string jsval, or `undefined` when it is not serializable.
+/// An object's callable `toJSON` maps `value` first, called with `this =
+/// value` and the key; then the replacer function (when not `undefined`),
+/// called with `this = holder`. `key` is a string jsval, or an array index
+/// as a number jsval (converted only when a callee receives it). A wrapper
 /// serializes as its primitive; an object serializes the keys of the
 /// property-list array `list` (when not `undefined`) or its own enumerable
-/// keys. Primitives are `__json_str`. A throw returns with it pending.
+/// keys. Primitives are `__json_str`. `stack` (an array handle) holds the
+/// arrays and objects being serialized: meeting one again throws a
+/// `TypeError`. A throw returns with it pending.
 #[allow(clippy::too_many_lines)]
 pub(in crate::emit) fn emit_json_rep(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) -> Function {
-    let (holder, key, value, rep, list) = (0, 1, 2, 3, 4);
-    let (ptr, t, n, i, first, acc, keys) = (5, 6, 7, 8, 9, 10, 11);
-    let (elem, s, k) = (12, 13, 14);
-    let mut f = Function::new(vec![(7, ValType::I32), (3, ValType::I64)]);
+    let (holder, key, value, rep, list, stack) = (0, 1, 2, 3, 4, 5);
+    let (ptr, n, i, first, acc, keys, j, m) = (6, 7, 8, 9, 10, 11, 12, 13);
+    let (elem, s, k, to_json) = (14, 15, 16, 17);
+    let scratch = 18;
+    let mut locals = vec![(8, ValType::I32), (4, ValType::I64)];
+    locals.extend(type_error_helper_locals());
+    let mut f = Function::new(locals);
+    helpers.unwind.borrow_mut().reset();
     let tok = |text: &str| static_key(strings, text);
     let concat = |f: &mut Function| wasm!(f; Call(helpers.concat), LocalSet(acc));
     // The recursive serialization of `elem` (property `k` of `value`) into
@@ -361,12 +378,36 @@ pub(in crate::emit) fn emit_json_rep(
     let recurse = |f: &mut Function| {
         wasm!(f;
             LocalGet(value), LocalGet(k), LocalGet(elem), LocalGet(rep), LocalGet(list),
-            Call(helpers.json_rep()), LocalSet(s),
+            LocalGet(stack), Call(helpers.json_rep()), LocalSet(s),
         );
         return_if_pending(f);
     };
+    // An array index key becomes its string.
+    let key_string = |f: &mut Function| {
+        emit_is_number(f, key);
+        wasm!(f;
+            If(BlockType::Empty),
+            LocalGet(key), F64ReinterpretI64, I32TruncF64U, Call(helpers.index_string),
+        );
+        box_heap(f);
+        wasm!(f; LocalSet(key), End);
+    };
+    emit_is_object(&mut f, value);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(value), I32Const(tok("toJSON")), Call(helpers.get), LocalSet(to_json),
+    );
+    return_if_pending(&mut f);
+    emit_is_function(&mut f, to_json);
+    wasm!(f; If(BlockType::Empty));
+    key_string(&mut f);
+    call_with(&mut f, to_json, value, &[key], helpers);
+    wasm!(f; LocalSet(value));
+    return_if_pending(&mut f);
+    wasm!(f; End, End);
     wasm!(f; LocalGet(rep), I64Const(UNDEFINED_BITS), I64Ne, If(BlockType::Empty));
-    call2(&mut f, rep, holder, key, value, helpers);
+    key_string(&mut f);
+    call_with(&mut f, rep, holder, &[key, value], helpers);
     wasm!(f; LocalSet(value));
     return_if_pending(&mut f);
     wasm!(f; End);
@@ -374,20 +415,23 @@ pub(in crate::emit) fn emit_json_rep(
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
     emit_is_function(&mut f, value);
     wasm!(f; I32Or, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
-    emit_is_pointer(&mut f, value);
-    wasm!(f; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(&mut f, value);
+    emit_is_object(&mut f, value);
     wasm!(f;
-        LocalTee(t), I32Const(TYPE_ARRAY), I32Eq, LocalGet(t), I32Const(TYPE_OBJECT), I32Eq, I32Or,
-        Else, I32Const(0), End,
         I32Eqz,
         If(BlockType::Empty), LocalGet(value), Call(helpers.json_str),
     );
     box_heap(&mut f);
+    wasm!(f; Return, End);
+    // A value already being serialized is a cycle; otherwise it joins the
+    // stack until its members are serialized.
+    emit_array_contains(&mut f, stack, value, j, m);
+    wasm!(f; If(BlockType::Empty));
+    emit_throw_error(&callee_type_error(CYCLE), &mut f, scratch, strings, helpers);
     wasm!(f;
-        Return, End,
-        LocalGet(value), I32WrapI64, LocalSet(ptr),
-        LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
+        End,
+        LocalGet(stack), LocalGet(value), Call(helpers.array_push), Drop,
+        LocalGet(value), I32WrapI64, LocalTee(ptr),
+        I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         // "[" + each element (`null` when not serializable) joined by "," + "]".
         I32Const(tok("[")), LocalSet(acc),
@@ -400,14 +444,7 @@ pub(in crate::emit) fn emit_json_rep(
     concat(&mut f);
     wasm!(f; End);
     elem_or_undefined(&mut f, ptr, i, elem, helpers);
-    wasm!(f;
-        LocalSet(elem),
-        I64Const(UNDEFINED_BITS), LocalSet(k),
-        LocalGet(rep), I64Const(UNDEFINED_BITS), I64Ne,
-        If(BlockType::Empty), LocalGet(i), Call(helpers.index_string),
-    );
-    box_heap(&mut f);
-    wasm!(f; LocalSet(k), End);
+    wasm!(f; LocalSet(elem), LocalGet(i), F64ConvertI32U, I64ReinterpretF64, LocalSet(k));
     recurse(&mut f);
     wasm!(f;
         LocalGet(acc),
@@ -463,7 +500,12 @@ pub(in crate::emit) fn emit_json_rep(
         LocalGet(acc), I32Const(tok("}")),
     );
     concat(&mut f);
-    wasm!(f; End, LocalGet(acc));
+    // Pop `value` off the stack.
+    wasm!(f;
+        End,
+        LocalGet(stack), LocalGet(stack), I32Load(ARR_LEN), I32Const(1), I32Sub, I32Store(ARR_LEN),
+        LocalGet(acc),
+    );
     box_heap(&mut f);
     wasm!(f; End);
     f
@@ -652,7 +694,7 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>) -> Function {
     );
     box_heap(&mut f);
     wasm!(f; LocalSet(name));
-    call2(&mut f, reviver, holder, name, val, helpers);
+    call_with(&mut f, reviver, holder, &[name, val], helpers);
     wasm!(f; End);
     f
 }

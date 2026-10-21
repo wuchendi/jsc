@@ -558,12 +558,11 @@ pub(super) fn emit_object_delete_node(
 }
 
 /// Emit a `JSON.stringify(arg)` call, leaving the serialized heap-string
-/// jsval on the stack (or the `undefined` jsval when `arg` is itself `undefined`
-/// or a function value — both stringify to `undefined`, not a string, in JS). The
-/// argument is lowered once and stashed in the first i64 scratch slot so the
-/// undefined/function guard can inspect it without re-evaluating; a serializable
-/// value is handed to the in-wasm `__json_str` helper and its returned string base
-/// is reboxed as a heap jsval.
+/// jsval on the stack (or the `undefined` jsval when `arg` is not
+/// serializable, e.g. `undefined` or a function value): `__json_rep` of
+/// `arg` as the property `""` of no holder, with no replacer or property
+/// list and a fresh, empty cycle stack. A throw (from a getter, a `toJSON`,
+/// or a cycle) propagates.
 pub(super) fn emit_json_stringify_node(
     arg: &IrNode,
     function: &mut Function,
@@ -573,22 +572,17 @@ pub(super) fn emit_json_stringify_node(
 ) {
     emit_node(arg, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
-    // `undefined`/function values are not serializable at the top level (they
-    // yield `undefined`); everything else serializes to a heap string.
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Const(
+        HEAP_BITS | i64::from(static_key(strings, "")),
+    ));
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Eq);
-    emit_is_function(function, scratch);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::LocalGet(scratch));
-    function.instruction(&Instruction::Call(helpers.json_str));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::Call(helpers.new_array()));
+    function.instruction(&Instruction::Call(helpers.json_rep()));
+    emit_propagate_if_pending(function, helpers);
 }
 
 /// Emit a `new Map()` / `new Set()` construction, leaving the fresh handle
