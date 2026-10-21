@@ -34,9 +34,9 @@ use wasm_encoder::{
 
 use crate::abi;
 use crate::ir::{
-    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind, InstanceOfKind, IrCase,
-    IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp,
-    OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind, GlobalIntrinsic,
+    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp,
+    MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.

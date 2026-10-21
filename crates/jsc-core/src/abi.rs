@@ -120,6 +120,9 @@ pub(crate) const CLASS_ERROR: u8 = 1;
 /// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
 pub(crate) const CLASS_ARGUMENTS: u8 = 2;
 
+/// [`TYPE_OBJECT`] `class` byte: the global object (a static realm block).
+pub(crate) const CLASS_GLOBAL: u8 = 3;
+
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.

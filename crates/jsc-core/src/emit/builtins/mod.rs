@@ -22,7 +22,10 @@ macro_rules! wasm {
 
 mod error;
 mod function;
+mod namespace;
 mod object;
+
+pub(super) use namespace::fragment;
 
 /// The locals of a builtin body: the `K` argument slots, `env` and `argc`
 /// (the parameters), four i64 and four i32 temps, then the scratch layout
@@ -110,6 +113,10 @@ pub(super) fn emit_builtin(
         Builtin::Call => function::emit_call(&mut f, frame, strings, helpers),
         Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
+        Builtin::Math(_) | Builtin::JsonStringify | Builtin::JsonParse | Builtin::ConsoleLog => {
+            let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
+            emit_node(&body, &mut f, frame.scratch(), strings, helpers);
+        }
     }
     wasm!(f; End);
     f

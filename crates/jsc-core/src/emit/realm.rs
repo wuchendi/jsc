@@ -15,9 +15,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// An intrinsic object of the realm image. (Only prototypes so far; the
-/// constructors and namespaces join them in S4.)
-#[allow(clippy::enum_variant_names)]
+/// An intrinsic object of the realm image. (The constructors join them in
+/// S4 T3.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Intrinsic {
     /// `%Object.prototype%` (`proto` `null`).
@@ -27,6 +26,25 @@ pub(super) enum Intrinsic {
     FunctionPrototype,
     /// `%<Kind>.prototype%` of a builtin error kind.
     ErrorPrototype(ErrorKind),
+    /// The global object (`class GLOBAL`).
+    Global,
+    /// The `Math` namespace object.
+    Math,
+    /// The `JSON` namespace object.
+    Json,
+    /// The `console` namespace object.
+    Console,
+}
+
+impl From<GlobalIntrinsic> for Intrinsic {
+    fn from(global: GlobalIntrinsic) -> Self {
+        match global {
+            GlobalIntrinsic::Global => Self::Global,
+            GlobalIntrinsic::Math => Self::Math,
+            GlobalIntrinsic::Json => Self::Json,
+            GlobalIntrinsic::Console => Self::Console,
+        }
+    }
 }
 
 impl Intrinsic {
@@ -34,9 +52,12 @@ impl Intrinsic {
     fn proto(self) -> Option<Intrinsic> {
         match self {
             Self::ObjectPrototype => None,
-            Self::FunctionPrototype | Self::ErrorPrototype(ErrorKind::Error) => {
-                Some(Self::ObjectPrototype)
-            }
+            Self::FunctionPrototype
+            | Self::ErrorPrototype(ErrorKind::Error)
+            | Self::Global
+            | Self::Math
+            | Self::Json
+            | Self::Console => Some(Self::ObjectPrototype),
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
         }
     }
@@ -46,6 +67,15 @@ impl Intrinsic {
     fn call(self) -> Option<Builtin> {
         (self == Self::FunctionPrototype).then_some(Builtin::FunctionPrototype)
     }
+
+    /// The `TYPE_OBJECT` class byte of a non-callable intrinsic.
+    fn class(self) -> u8 {
+        if self == Self::Global {
+            abi::CLASS_GLOBAL
+        } else {
+            abi::CLASS_ORDINARY
+        }
+    }
 }
 
 /// Every intrinsic, in image order.
@@ -53,6 +83,12 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
     [Intrinsic::ObjectPrototype, Intrinsic::FunctionPrototype]
         .into_iter()
         .chain(ErrorKind::ALL.map(Intrinsic::ErrorPrototype))
+        .chain([
+            Intrinsic::Global,
+            Intrinsic::Math,
+            Intrinsic::Json,
+            Intrinsic::Console,
+        ])
 }
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
@@ -72,11 +108,19 @@ pub(super) enum Builtin {
     Apply,
     /// `Error.prototype.toString`.
     ErrorToString,
+    /// A `Math` method (`Math.floor`, `Math.max`, ..).
+    Math(MathOp),
+    /// `JSON.stringify`.
+    JsonStringify,
+    /// `JSON.parse`.
+    JsonParse,
+    /// `console.log`.
+    ConsoleLog,
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 7] = [
+    pub(super) const ALL: [Builtin; 19] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -84,6 +128,18 @@ impl Builtin {
         Self::Call,
         Self::Apply,
         Self::ErrorToString,
+        Self::Math(MathOp::Floor),
+        Self::Math(MathOp::Ceil),
+        Self::Math(MathOp::Round),
+        Self::Math(MathOp::Trunc),
+        Self::Math(MathOp::Abs),
+        Self::Math(MathOp::Sqrt),
+        Self::Math(MathOp::Min),
+        Self::Math(MathOp::Max),
+        Self::Math(MathOp::Pow),
+        Self::JsonStringify,
+        Self::JsonParse,
+        Self::ConsoleLog,
     ];
 
     /// The function's `name`.
@@ -95,6 +151,20 @@ impl Builtin {
             Self::ValueOf => "valueOf",
             Self::Call => "call",
             Self::Apply => "apply",
+            Self::Math(op) => match op {
+                MathOp::Floor => "floor",
+                MathOp::Ceil => "ceil",
+                MathOp::Round => "round",
+                MathOp::Trunc => "trunc",
+                MathOp::Abs => "abs",
+                MathOp::Sqrt => "sqrt",
+                MathOp::Min => "min",
+                MathOp::Max => "max",
+                MathOp::Pow => "pow",
+            },
+            Self::JsonStringify => "stringify",
+            Self::JsonParse => "parse",
+            Self::ConsoleLog => "log",
         }
     }
 
@@ -104,9 +174,13 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ObjectToString
             | Self::ValueOf
-            | Self::ErrorToString => 0,
-            Self::HasOwnProperty | Self::Call => 1,
-            Self::Apply => 2,
+            | Self::ErrorToString
+            | Self::ConsoleLog => 0,
+            Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow) | Self::Apply | Self::JsonParse => {
+                2
+            }
+            Self::HasOwnProperty | Self::Call | Self::Math(_) => 1,
+            Self::JsonStringify => 3,
         }
     }
 
@@ -128,7 +202,11 @@ pub(super) enum Value {
     /// A static string.
     Str(&'static str),
     /// A number.
-    Num(u32),
+    Num(f64),
+    /// `undefined`.
+    Undefined,
+    /// Another intrinsic object.
+    Intrinsic(Intrinsic),
 }
 
 /// One own property of an intrinsic.
@@ -150,6 +228,42 @@ const METHOD_ATTRS: u32 = abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE;
 
 /// A function's `length`/`name`: configurable only.
 const FN_FACT_ATTRS: u32 = abi::ATTR_CONFIGURABLE;
+
+/// A constant (`Math.PI`, the global `NaN`/`Infinity`/`undefined`): no
+/// attributes.
+const CONST_ATTRS: u32 = 0;
+
+/// The `Math` value properties.
+const MATH_CONSTANTS: [(&str, f64); 8] = [
+    ("E", std::f64::consts::E),
+    ("LN10", std::f64::consts::LN_10),
+    ("LN2", std::f64::consts::LN_2),
+    ("LOG10E", std::f64::consts::LOG10_E),
+    ("LOG2E", std::f64::consts::LOG2_E),
+    ("PI", std::f64::consts::PI),
+    ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+    ("SQRT2", std::f64::consts::SQRT_2),
+];
+
+/// The global object's own properties, one line per global binding (design
+/// 4.2).
+const GLOBALS: [(&str, u32, Value); 7] = [
+    (
+        "globalThis",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Global),
+    ),
+    ("Infinity", CONST_ATTRS, Value::Num(f64::INFINITY)),
+    ("NaN", CONST_ATTRS, Value::Num(f64::NAN)),
+    ("undefined", CONST_ATTRS, Value::Undefined),
+    ("Math", METHOD_ATTRS, Value::Intrinsic(Intrinsic::Math)),
+    ("JSON", METHOD_ATTRS, Value::Intrinsic(Intrinsic::Json)),
+    (
+        "console",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Console),
+    ),
+];
 
 /// The registry: every own property of every intrinsic, in slot order per
 /// intrinsic. `%Object.prototype%.constructor` and
@@ -181,7 +295,7 @@ pub(super) fn registry() -> Vec<Entry> {
             METHOD_ATTRS,
             Value::Method(Builtin::ValueOf),
         ),
-        entry(FunctionPrototype, "length", FN_FACT_ATTRS, Value::Num(0)),
+        entry(FunctionPrototype, "length", FN_FACT_ATTRS, Value::Num(0.0)),
         entry(FunctionPrototype, "name", FN_FACT_ATTRS, Value::Str("")),
         entry(
             FunctionPrototype,
@@ -209,6 +323,20 @@ pub(super) fn registry() -> Vec<Entry> {
             ));
         }
     }
+    for (key, value) in MATH_CONSTANTS {
+        entries.push(entry(Intrinsic::Math, key, CONST_ATTRS, Value::Num(value)));
+    }
+    for builtin in Builtin::ALL {
+        let namespace = match builtin {
+            Builtin::Math(_) => Intrinsic::Math,
+            Builtin::JsonStringify | Builtin::JsonParse => Intrinsic::Json,
+            Builtin::ConsoleLog => Intrinsic::Console,
+            _ => continue,
+        };
+        let method = Value::Method(builtin);
+        entries.push(entry(namespace, builtin.name(), METHOD_ATTRS, method));
+    }
+    entries.extend(GLOBALS.map(|(key, attrs, value)| entry(Intrinsic::Global, key, attrs, value)));
     entries
 }
 
@@ -220,7 +348,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .flat_map(|e| {
             let value = match e.value {
                 Value::Str(s) => Some(s),
-                Value::Method(_) | Value::Num(_) => None,
+                Value::Method(_) | Value::Num(_) | Value::Undefined | Value::Intrinsic(_) => None,
             };
             [Some(e.key), value]
         })
@@ -310,7 +438,7 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
         let (header, prefix) = match intrinsic.call() {
             Some(_) => ([abi::TYPE_FUNCTION, 0, 0, 0], abi::FUNC_BLOCK_SIZE),
             None => (
-                [abi::TYPE_OBJECT, 0, 0, abi::CLASS_ORDINARY],
+                [abi::TYPE_OBJECT, 0, 0, intrinsic.class()],
                 abi::OBJ_PREFIX_SIZE,
             ),
         };
@@ -329,7 +457,10 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
             let value = match e.value {
                 Value::Method(b) => heap(base + method_offset(&registry, b)),
                 Value::Str(s) => heap(at(s)),
-                Value::Num(n) => f64::from(n).to_bits(),
+                Value::Num(n) if n.is_nan() => abi::QNAN,
+                Value::Num(n) => n.to_bits(),
+                Value::Undefined => abi::UNDEFINED,
+                Value::Intrinsic(i) => heap(base + intrinsic_offset(&registry, i)),
             };
             blob.extend_from_slice(&at(e.key).to_le_bytes());
             blob.extend_from_slice(&e.attrs.to_le_bytes());
