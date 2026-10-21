@@ -3,31 +3,6 @@
 mod common;
 use common::{assert_rejected, assert_uncaught};
 
-/// Assert `src` is rejected at COMPILE time with a clean unknown-method
-/// diagnostic: the error names the unsupported method and, critically, is
-/// NEVER the wasm-validator failure `failed to compile: wasm...` that a malformed
-/// `call_indirect` would produce.
-fn assert_unknown_method(src: &str, method: &str) {
-    let result = jsc_core::run::compile_and_run(src);
-    let msg = match &result {
-        Ok(_) => String::new(),
-        Err(err) => err.to_string(),
-    };
-    assert!(
-        result.is_err(),
-        "`{src}`: unknown method should be rejected at compile time"
-    );
-    assert_eq!(
-        msg,
-        format!("method '{method}' is not supported"),
-        "diagnostic for `{src}`"
-    );
-    assert!(
-        !msg.contains("failed to compile"),
-        "`{src}` must never emit invalid wasm, got: {msg}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Out-of-scope boundary: each of these must be REJECTED, never mis-evaluated.
 // (See DESIGN.md for the full catalogue + gaps.)
@@ -97,16 +72,18 @@ fn rejects_function_prototype_bind() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rejects_unknown_string_method() {
-    // A string-literal receiver can carry only the built-in string methods; any
-    // other name is a statically-provable unknown method. (Names here are
-    // genuinely unknown; trim/repeat/padStart/split are built in.)
-    assert_unknown_method("\"x\".zzz()", "zzz");
-    assert_unknown_method("\"hi\".charCodeAt(0)", "charCodeAt");
-    assert_unknown_method("\"x\".normalize()", "normalize");
-    // Reached through a template literal and a computed string-literal key.
-    assert_unknown_method("`t`.zzz()", "zzz");
-    assert_unknown_method("\"x\"[\"zzz\"]()", "zzz");
+fn unknown_string_method_throws_typeerror() {
+    // A primitive receiver reads its methods from its prototype at run time:
+    // an unknown name is `undefined`, and calling it throws.
+    for src in [
+        "\"x\".zzz()",
+        "\"hi\".charCodeAt(0)",
+        "`t`.zzz()",
+        "\"x\"[\"zzz\"]()",
+        "function f() { return 1 } \"x\".zzz()",
+    ] {
+        assert_uncaught(src, "TypeError: expression is not a function");
+    }
 }
 
 #[test]
@@ -242,13 +219,6 @@ fn dynamic_shape_unknown_method_throws_typeerror() {
         .expect("the guard's TypeError message must be readable"),
         jsc_core::run::Value::Str("a.bar is not a function".to_owned()),
     );
-}
-
-#[test]
-fn rejects_unknown_method_even_with_functions_present() {
-    // A primitive-literal receiver is rejected regardless of whether the program
-    // also defines functions (which would otherwise emit a funcref table).
-    assert_unknown_method("function f() { return 1 } \"x\".zzz()", "zzz");
 }
 
 #[test]

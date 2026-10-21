@@ -132,14 +132,20 @@ pub(super) fn emit_to_string(
         LocalGet(kind), I32Const(i32::from(abi::CLASS_ERROR)), I32Eq,
     );
     tag_if(function, TAG_ERROR);
-    wasm!(function; LocalGet(kind), I32Const(i32::from(abi::CLASS_ARGUMENTS)), I32Eq);
-    tag_if(function, TAG_ARGUMENTS);
+    for (class, tag) in [
+        (abi::CLASS_ARGUMENTS, TAG_ARGUMENTS),
+        (abi::CLASS_BOOLEAN, TAG_BOOLEAN),
+        (abi::CLASS_NUMBER, TAG_NUMBER),
+        (abi::CLASS_STRING, TAG_STRING),
+    ] {
+        wasm!(function; LocalGet(kind), I32Const(i32::from(class)), I32Eq);
+        tag_if(function, tag);
+    }
     wasm!(function; End);
     push_str(function, strings, TAG_OBJECT);
 }
 
-/// `Object.prototype.valueOf()`: `ToObject(this)` (a primitive stays as is
-/// until the wrapper objects of S5).
+/// `Object.prototype.valueOf()`: `ToObject(this)`.
 pub(super) fn emit_value_of(
     function: &mut Function,
     frame: Frame,
@@ -149,5 +155,5 @@ pub(super) fn emit_value_of(
     let this = frame.i64(0);
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     require_object_coercible(function, frame, this, strings, helpers);
-    wasm!(function; LocalGet(this));
+    wasm!(function; LocalGet(this), Call(helpers.to_object()));
 }

@@ -29,6 +29,7 @@ const METHOD_OP_PAD_START: i32 = abi::METHOD_OP_PAD_START;
 const METHOD_OP_PAD_END: i32 = abi::METHOD_OP_PAD_END;
 const METHOD_OP_SUBSTRING: i32 = abi::METHOD_OP_SUBSTRING;
 const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
+const METHOD_OP_NUMBER_TO_STRING: i32 = abi::METHOD_OP_NUMBER_TO_STRING;
 
 /// The NaN-boxed `true`/`false` jsval bits; see [`abi::TRUE`] / [`abi::FALSE`].
 const TRUE_BITS: u64 = abi::TRUE;
@@ -111,10 +112,14 @@ pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bo
 /// returning the result jsval bits (or `None` to yield `undefined` — a
 /// type-mismatched receiver or a failed allocation).
 ///
-/// `IndexOf`/`Slice` are overloaded on the receiver's runtime TYPE BYTE (array
-/// element vs string byte semantics); the other ops accept a single receiver
-/// kind. String byte offsets are used throughout (the ASCII subset), so multibyte
-/// UTF-8 receivers are a documented limitation.
+/// `IndexOf`/`Includes`/`Slice` are overloaded on the receiver's runtime TYPE
+/// BYTE (array element vs string byte semantics); `NumberToString` takes a
+/// number receiver; the other ops accept a string receiver. The string ops get
+/// their arguments already coerced by the guest builtins (a search string, a
+/// number or `undefined` for a position/count/limit). String byte offsets are
+/// used throughout (the ASCII subset), so multibyte UTF-8 receivers are a
+/// documented limitation.
+#[allow(clippy::too_many_lines)] // one flat dispatch over the op flags
 pub(super) fn method_dispatch<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     recv: u64,
@@ -137,19 +142,32 @@ pub(super) fn method_dispatch<W: Send + 'static>(
     match op {
         METHOD_OP_INDEX_OF => match type_byte {
             Some(TYPE_ARRAY) => Some(array_index_of(&mem, ptr?, arg0.cast_unsigned())),
-            Some(TYPE_STRING) => Some(string_index_of(&mem, ptr?, arg0.cast_unsigned())),
+            Some(TYPE_STRING) => {
+                let hay = string_bytes(&mem, ptr?)?;
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
+                Some(string_index_of(&hay, &arg_bytes(arg0, &mem), from))
+            }
             _ => None,
         },
         METHOD_OP_INCLUDES => match type_byte {
             Some(TYPE_ARRAY) => Some(bool_bits(array_includes(&mem, ptr?, arg0.cast_unsigned()))),
-            // `str.includes(sub)` — substring containment (an empty `sub` => true).
+            // `str.includes(sub, from)` — substring containment from `from`.
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
-                let needle = arg_bytes(arg0, &mem);
-                Some(bool_bits(byte_contains(&hay, &needle)))
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
+                let found = string_index_of(&hay, &arg_bytes(arg0, &mem), from);
+                Some(bool_bits(found != not_found_bits()))
             }
             _ => None,
         },
+        METHOD_OP_NUMBER_TO_STRING => {
+            let Value::Number(x) = decode(recv, &mem) else {
+                return None;
+            };
+            let radix = value_to_number(&decode(arg0.cast_unsigned(), &mem));
+            let text = number_to_radix_string(x, radix_digits(radix));
+            alloc_string(caller, &text).map(|base| HEAP | base)
+        }
         METHOD_OP_SLICE => match type_byte {
             Some(TYPE_ARRAY) => array_slice(caller, &mem, ptr?, arg0, arg1),
             Some(TYPE_STRING) => string_slice(caller, &mem, ptr?, arg0, arg1),
@@ -195,7 +213,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             _ => None,
         },
         METHOD_OP_STARTS_WITH | METHOD_OP_ENDS_WITH => match type_byte {
-            Some(TYPE_STRING) => string_starts_ends(&mem, ptr?, arg0, op),
+            Some(TYPE_STRING) => string_starts_ends(&mem, ptr?, arg0, arg1, op),
             _ => None,
         },
         METHOD_OP_PAD_START | METHOD_OP_PAD_END => match type_byte {
@@ -207,7 +225,13 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             _ => None,
         },
         METHOD_OP_SPLIT => match type_byte {
-            Some(TYPE_STRING) => string_split(caller, &mem, ptr?, arg0.cast_unsigned()),
+            Some(TYPE_STRING) => string_split(
+                caller,
+                &mem,
+                ptr?,
+                arg0.cast_unsigned(),
+                arg1.cast_unsigned(),
+            ),
             _ => None,
         },
         _ => None,
@@ -297,23 +321,101 @@ fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
         })
 }
 
-/// `string.indexOf(sub)`: the number bits of the first BYTE index where `sub`
-/// occurs (an empty `sub` => `0`), or `-1` when absent / `sub` is not a string.
-fn string_index_of(mem: &[u8], ptr: usize, sub: u64) -> u64 {
-    let Some(hay) = string_bytes(mem, ptr) else {
-        return not_found_bits();
-    };
-    let Value::Str(needle) = decode(sub, mem) else {
-        return not_found_bits();
-    };
-    let needle = needle.as_bytes();
+/// `string.indexOf(sub, from)`: the number bits of the first BYTE index at or
+/// after `from` where `sub` occurs (an empty `sub` matches at `from`), or `-1`.
+fn string_index_of(hay: &[u8], needle: &[u8], from: usize) -> u64 {
     if needle.is_empty() {
-        return index_bits(0);
+        return index_bits(from);
     }
-    match hay.windows(needle.len()).position(|w| w == needle) {
-        Some(i) => index_bits(i),
-        None => not_found_bits(),
+    hay.get(from..)
+        .and_then(|rest| rest.windows(needle.len()).position(|w| w == needle))
+        .map_or_else(not_found_bits, |i| index_bits(from + i))
+}
+
+/// The radix `Number.prototype.toString` validated (an integral `2..=36`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn radix_digits(radix: f64) -> u32 {
+    radix.clamp(2.0, 36.0) as u32
+}
+
+/// `Number.prototype.toString(radix)` for a radix other than 10: the
+/// shortest digit string that reads back as `x` (V8's `DoubleToRadixCString`).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
+pub(super) fn number_to_radix_string(x: f64, radix: u32) -> String {
+    if x.is_nan() {
+        return "NaN".to_owned();
     }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
+    if x == 0.0 {
+        return "0".to_owned();
+    }
+    let digit = |d: u32| char::from_digit(d, radix).unwrap_or('0');
+    let base = f64::from(radix);
+    let value = x.abs();
+    let mut integer = value.floor();
+    let mut fraction = value - integer;
+    // The distance to the next double, halved: digits stop once the
+    // remaining fraction is below it.
+    let next_up = f64::from_bits(value.to_bits() + 1);
+    let mut delta = (0.5 * (next_up - value)).max(f64::from_bits(1));
+    let mut fraction_digits: Vec<u32> = Vec::new();
+    if fraction >= delta {
+        loop {
+            fraction *= base;
+            delta *= base;
+            let d = fraction as u32;
+            fraction_digits.push(d);
+            fraction -= f64::from(d);
+            // Round to even.
+            if (fraction > 0.5 || (fraction == 0.5 && d & 1 == 1)) && fraction + delta > 1.0 {
+                // Carry into the already written digits.
+                loop {
+                    let Some(last) = fraction_digits.pop() else {
+                        integer += 1.0;
+                        break;
+                    };
+                    if last + 1 < radix {
+                        fraction_digits.push(last + 1);
+                        break;
+                    }
+                }
+                break;
+            }
+            if fraction < delta {
+                break;
+            }
+        }
+    }
+    // Integer digits; past 2^53 the unrepresented low digits are zeros.
+    let mut int_digits: Vec<char> = Vec::new();
+    while integer / base >= 9_007_199_254_740_992.0 {
+        integer /= base;
+        int_digits.push('0');
+    }
+    loop {
+        let remainder = integer % base;
+        int_digits.push(digit(remainder as u32));
+        integer = (integer - remainder) / base;
+        if integer <= 0.0 {
+            break;
+        }
+    }
+    let mut out = String::new();
+    if x < 0.0 {
+        out.push('-');
+    }
+    out.extend(int_digits.iter().rev());
+    if !fraction_digits.is_empty() {
+        out.push('.');
+        out.extend(fraction_digits.into_iter().map(digit));
+    }
+    out
 }
 
 /// Resolve one JS slice endpoint against a sequence `len`: `undefined` uses
@@ -412,15 +514,18 @@ fn string_repeat<W: Send + 'static>(
     alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
-/// `string.startsWith(sub)` / `endsWith(sub)`: a boolean prefix/suffix test (`sub`
-/// coerced to its string form). Returns the boolean jsval bits.
-fn string_starts_ends(mem: &[u8], ptr: usize, arg0: i64, op: i32) -> Option<u64> {
+/// `string.startsWith(sub, from)` / `endsWith(sub, end)`: a boolean prefix
+/// test at `from` (default `0`) / suffix test of the first `end` bytes
+/// (default the length). Returns the boolean jsval bits.
+fn string_starts_ends(mem: &[u8], ptr: usize, arg0: i64, arg1: i64, op: i32) -> Option<u64> {
     let hay = string_bytes(mem, ptr)?;
     let needle = arg_bytes(arg0, mem);
     let hit = if op == METHOD_OP_STARTS_WITH {
-        hay.starts_with(&needle)
+        let from = substring_index(arg1.cast_unsigned(), mem, 0, hay.len());
+        hay[from..].starts_with(&needle)
     } else {
-        hay.ends_with(&needle)
+        let end = substring_index(arg1.cast_unsigned(), mem, hay.len(), hay.len());
+        hay[..end].ends_with(&needle)
     };
     Some(bool_bits(hit))
 }
@@ -478,12 +583,6 @@ fn arg_bytes(bits: i64, mem: &[u8]) -> Vec<u8> {
     to_js_string(&decode(bits.cast_unsigned(), mem)).into_bytes()
 }
 
-/// Whether `hay` contains the contiguous byte sequence `needle` (an empty
-/// `needle` is always contained — JS `"".includes` / `str.includes("")` are true).
-fn byte_contains(hay: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
-}
-
 /// Slice `bytes` with leading and/or trailing ASCII whitespace removed. `is_ascii_whitespace`
 /// matches the same subset as the existing numeric parsers (space/`\t`/`\n`/`\r`/`\x0C`);
 /// non-ASCII whitespace is out of scope (a documented limitation).
@@ -525,7 +624,8 @@ fn pad_bytes(bytes: &[u8], target: i64, pad: &[u8], at_start: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolve one `substring` endpoint against a BYTE `len`: `undefined` uses
+/// Resolve one `substring` endpoint (or a search position) against a BYTE
+/// `len`: `undefined` uses
 /// `default`, otherwise the argument is truncated to an integer and clamped to
 /// `0..=len` (negatives and NaN become `0` — unlike `slice`, there is no
 /// negative-from-end offset).
@@ -539,8 +639,9 @@ fn substring_index(bits: u64, mem: &[u8], default: usize, len: usize) -> usize {
     usize::try_from(n.clamp(0, len_i)).unwrap_or(0)
 }
 
-/// `string.split(sep)`: a NEW heap array of substrings (each a NEW heap string) by
-/// BYTE index. `sep` omitted (`undefined`) => `[str]`; `sep === ""` => one element
+/// `string.split(sep, limit)`: a NEW heap array of substrings (each a NEW heap
+/// string) by BYTE index, at most `ToUint32(limit)` of them (`undefined`: no
+/// limit). `sep` omitted (`undefined`) => `[str]`; `sep === ""` => one element
 /// per byte; otherwise split on each non-overlapping `sep` occurrence (`sep`
 /// coerced to its string form). Returns the array's heap jsval bits.
 fn string_split<W: Send + 'static>(
@@ -548,9 +649,14 @@ fn string_split<W: Send + 'static>(
     mem: &[u8],
     ptr: usize,
     sep_bits: u64,
+    limit_bits: u64,
 ) -> Option<u64> {
     let bytes = string_bytes(mem, ptr)?;
-    let pieces: Vec<Vec<u8>> = match decode(sep_bits, mem) {
+    let limit = match decode(limit_bits, mem) {
+        Value::Undefined => usize::MAX,
+        value => usize::try_from(to_uint32(value_to_number(&value))).unwrap_or(usize::MAX),
+    };
+    let mut pieces: Vec<Vec<u8>> = match decode(sep_bits, mem) {
         // An omitted separator yields a single-element array of the whole string.
         Value::Undefined => vec![bytes.clone()],
         other => {
@@ -563,6 +669,7 @@ fn string_split<W: Send + 'static>(
             }
         }
     };
+    pieces.truncate(limit);
     // Allocate each piece as a heap string first (each is an owned byte vec,
     // independent of guest memory), collecting their jsval bits, then build the
     // backing array from them.
@@ -718,6 +825,16 @@ fn to_int32(n: f64) -> f64 {
     }
     let m = n.trunc().rem_euclid(TWO_32);
     if m >= TWO_32 / 2.0 { m - TWO_32 } else { m }
+}
+
+/// `ToUint32`: non-finite values map to 0, otherwise the truncated value wraps
+/// modulo 2^32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn to_uint32(n: f64) -> u32 {
+    if !n.is_finite() {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 /// Parse a leading decimal float from `s` (the `parseFloat` subset): skip

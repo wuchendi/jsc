@@ -1,6 +1,5 @@
 //! Integration tests: string methods and receiver-type method dispatch.
 
-use jsc_core::run::compile_and_run;
 mod common;
 use common::{assert_bool, assert_number, assert_output, assert_string};
 
@@ -76,17 +75,18 @@ fn methods_do_not_disturb_indexing() {
     assert_number("\"abc\".length", 3.0);
 }
 
-/// Arity mismatches on the fixed-arity string methods are compile errors.
+/// String methods never reject an argument count at compile time: extra
+/// arguments are evaluated and ignored, missing ones are `undefined`.
 #[test]
-fn method_arity_errors() {
-    assert!(
-        compile_and_run("\"abc\".charAt()").is_err(),
-        "charAt needs one argument"
-    );
-    assert!(
-        compile_and_run("\"abc\".toUpperCase(1)").is_err(),
-        "toUpperCase takes no arguments"
-    );
+fn method_arity_is_runtime() {
+    assert_string("\"abc\".charAt()", "a");
+    assert_string("\"abc\".toUpperCase(1)", "ABC");
+    assert_string("\"x\".trim(1)", "x");
+    assert_string("\"x\".repeat()", "");
+    assert_bool("\"undefinedx\".startsWith()", true);
+    assert_string("\"x\".padStart(3,\"_\",9)", "__x");
+    assert_number("\"a,b\".split(\",\",1).length", 1.0);
+    assert_output("let n = 0; \"a\".trim(n++, n++); console.log(n)", "2\n");
 }
 
 /// String `trim`/`trimStart`/`trimEnd` remove ASCII whitespace, producing NEW
@@ -101,14 +101,13 @@ fn string_trim() {
     assert_string("\"   \".trim()", "");
 }
 
-/// String `repeat(n)` concatenates `n` copies; `0` and a negative/NaN count both
-/// yield `""` (JS throws a `RangeError` for negatives — a documented limitation).
+/// String `repeat(n)` concatenates `n` copies; `0` and a NaN count yield `""`.
 #[test]
 fn string_repeat() {
     assert_string("\"ab\".repeat(3)", "ababab");
     assert_string("\"x\".repeat(1)", "x");
     assert_string("\"ab\".repeat(0)", "");
-    assert_string("\"ab\".repeat(-1)", "");
+    assert_string("\"ab\".repeat(NaN)", "");
     assert_string("\"\".repeat(5)", "");
 }
 
@@ -183,29 +182,71 @@ fn string_methods_compose() {
     assert_string("\"ab\".repeat(2).slice(1,3)", "ba");
 }
 
-/// Arity mismatches on the string methods are compile errors.
+/// `indexOf`/`includes`/`startsWith`/`endsWith` take a position, `split` a
+/// limit; arguments are coerced with `ToString` / `ToNumber`.
 #[test]
-fn string_method_arity_errors() {
-    assert!(
-        compile_and_run("\"x\".trim(1)").is_err(),
-        "trim takes no arguments"
+fn string_method_positions_and_coercion() {
+    assert_number("\"abcabc\".indexOf(\"b\", 2)", 4.0);
+    assert_number("\"abcabc\".indexOf(\"b\", -5)", 1.0);
+    assert_number("\"abc\".indexOf(\"\", 9)", 3.0);
+    assert_bool("\"abc\".includes(\"a\", 1)", false);
+    assert_bool("\"abc\".startsWith(\"b\", 1)", true);
+    assert_bool("\"abc\".endsWith(\"b\", 2)", true);
+    assert_number("\"a1b\".indexOf(1)", 1.0);
+    assert_number("\"xundefined\".indexOf()", 1.0);
+    assert_string("\"abc\".slice({ valueOf() { return 1 } })", "bc");
+    assert_string("\"a,b,c\".split(\",\", 2).join(\"|\")", "a|b");
+    assert_number("\"a,b,c\".split(\",\", 0).length", 0.0);
+}
+
+/// `repeat` throws a `RangeError` for a negative or infinite count.
+#[test]
+fn string_repeat_range_error() {
+    let caught = |body: &str| {
+        format!("let r=\"none\"; try {{ {body} }} catch(e) {{ r=e.name+\"|\"+e.message }} r")
+    };
+    assert_string(
+        &caught("\"ab\".repeat(-1)"),
+        "RangeError|Invalid count value: -1",
     );
-    assert!(
-        compile_and_run("\"x\".repeat()").is_err(),
-        "repeat needs one argument"
+    assert_string(
+        &caught("\"ab\".repeat(Infinity)"),
+        "RangeError|Invalid count value: Infinity",
     );
-    assert!(
-        compile_and_run("\"x\".startsWith()").is_err(),
-        "startsWith needs one argument"
+}
+
+/// DF12: user methods named like string methods are called, and overriding a
+/// `String.prototype` method is honoured by every call site.
+#[test]
+fn string_method_names_honour_user_methods() {
+    assert_string(
+        "let o = { indexOf() { return \"u1\" }, slice() { return \"u2\" }, toUpperCase() { return \"u3\" } }; o.indexOf(1) + o.slice() + o.toUpperCase()",
+        "u1u2u3",
     );
-    assert!(
-        compile_and_run("\"x\".padStart(1,\"_\",9)").is_err(),
-        "padStart takes at most two arguments"
+    assert_string(
+        "class C { trim() { return \"t\" } split(s) { return [s] } } let c = new C(); c.trim() + c.split(\"x\")[0]",
+        "tx",
     );
-    assert!(
-        compile_and_run("\"x\".split(\",\",\"y\")").is_err(),
-        "split takes at most one argument"
+    assert_string(
+        "String.prototype.toUpperCase = function () { return \"P\" }; \"a\".toUpperCase()",
+        "P",
     );
+    assert_string(
+        "String.prototype.indexOf = function (x) { return \"I\" + x }; \"a\".indexOf(\"q\")",
+        "Iq",
+    );
+    assert_string(
+        "String.prototype.foo = function () { return this + \"!\" }; \"a\".foo()",
+        "a!",
+    );
+}
+
+/// Spread calls on string methods.
+#[test]
+fn string_method_spread_calls() {
+    assert_number("let a = [\"b\", 2]; \"abcab\".indexOf(...a)", 4.0);
+    assert_string("let a = [1, 3]; \"hello\".slice(...a)", "el");
+    assert_string("let a = []; \"Hi\".toUpperCase(...a)", "HI");
 }
 
 /// Smoke test: a classic for-loop `FizzBuzz` that leans on `trim` to

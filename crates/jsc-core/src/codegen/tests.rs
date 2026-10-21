@@ -672,9 +672,15 @@ fn unknown_namespace_members_are_method_calls() {
     ));
 }
 
-/// The `sealed` flags of the [`IrNode::ProtoGuard`]s in `node`.
+/// The `sealed` flags of the [`IrNode::ProtoGuard`]s with an array fast
+/// path in `node`.
 fn proto_guards(node: &IrNode, out: &mut Vec<bool>) {
-    if let IrNode::ProtoGuard { sealed, .. } = node {
+    if let IrNode::ProtoGuard {
+        sealed,
+        array: Some(_),
+        ..
+    } = node
+    {
         out.push(*sealed);
     }
     node.any_child(|child| {
@@ -712,7 +718,7 @@ fn intrinsics_sealed_programs_skip_the_dirty_bit() {
     ] {
         assert_eq!(guards(src), [false], "`{src}` is not intrinsics-sealed");
     }
-    // A call shape without inline code is the plain generic method call.
+    // A call shape without inline code is just the generic method call.
     assert_eq!(guards("let a = [1]; a.forEach()"), Vec::<bool>::new());
     assert_eq!(guards("let a = [1]; a.push(1, 2)"), Vec::<bool>::new());
 }
