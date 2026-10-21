@@ -81,6 +81,39 @@ pub(super) fn emit_mod(
     emit_box_f64(function, helpers);
 }
 
+/// Emit subtraction/multiplication/division: stash both operands, coerce each
+/// with `ToNumber`, unbox to `f64`, compute, rebox as a number.
+fn emit_arith(
+    op: BinOp,
+    lhs: &IrNode,
+    rhs: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let s0 = scratch;
+    let s1 = scratch + 1;
+    emit_node(lhs, function, scratch, strings, helpers);
+    emit_node(rhs, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s1));
+    function.instruction(&Instruction::LocalSet(s0));
+    emit_coerce_number(function, s0, helpers);
+    emit_coerce_number(function, s1, helpers);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    let arith = match op {
+        BinOp::Sub => Instruction::F64Sub,
+        BinOp::Mul => Instruction::F64Mul,
+        BinOp::Div => Instruction::F64Div,
+        _ => unreachable!("only sub/mul/div reach here"),
+    };
+    function.instruction(&arith);
+    emit_box_f64(function, helpers);
+}
+
 /// Emit a bitwise or shift operator (`& | ^ << >> >>>`) over two jsval operands,
 /// leaving a number jsval on the stack.
 ///
@@ -779,29 +812,9 @@ pub(super) fn emit_binary(
         // `+` is a runtime type dispatch (string concat vs numeric add); see
         // [`emit_add`].
         BinOp::Add => emit_add(lhs, rhs, function, scratch, strings, helpers),
-        // Subtraction/multiplication/division: stash both operands, coerce
-        // each with ToNumber, unbox to f64, compute, rebox as a number.
+        // Subtraction/multiplication/division: see [`emit_arith`].
         BinOp::Sub | BinOp::Mul | BinOp::Div => {
-            let s0 = scratch;
-            let s1 = scratch + 1;
-            emit_node(lhs, function, scratch, strings, helpers);
-            emit_node(rhs, function, scratch, strings, helpers);
-            function.instruction(&Instruction::LocalSet(s1));
-            function.instruction(&Instruction::LocalSet(s0));
-            emit_coerce_number(function, s0, helpers);
-            emit_coerce_number(function, s1, helpers);
-            function.instruction(&Instruction::LocalGet(s0));
-            function.instruction(&Instruction::F64ReinterpretI64);
-            function.instruction(&Instruction::LocalGet(s1));
-            function.instruction(&Instruction::F64ReinterpretI64);
-            let arith = match op {
-                BinOp::Sub => Instruction::F64Sub,
-                BinOp::Mul => Instruction::F64Mul,
-                BinOp::Div => Instruction::F64Div,
-                _ => unreachable!("only sub/mul/div reach here"),
-            };
-            function.instruction(&arith);
-            emit_box_f64(function, helpers);
+            emit_arith(op, lhs, rhs, function, scratch, strings, helpers);
         }
         // Remainder: wasm has no `f64.rem`; delegate to the dedicated emitter.
         BinOp::Mod => emit_mod(lhs, rhs, function, scratch, strings, helpers),

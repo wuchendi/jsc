@@ -219,7 +219,7 @@ impl LowerCtx<'_> {
                     )
                     .into()),
                 },
-                _ => Err(CompileError::spanned(
+                UnaryOp::Void => Err(CompileError::spanned(
                     u.span(),
                     format!("unsupported unary operator `{}`", u.op.as_str()),
                 )

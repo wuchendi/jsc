@@ -1,6 +1,6 @@
 //! Integration tests: the bitwise and shift operators (`& | ^ << >> >>>`),
-//! unary `~`, and their compound assignments apply ToNumeric then
-//! ToInt32/ToUint32 per spec, including operands beyond the `i64` range.
+//! unary `~`, and their compound assignments apply `ToNumeric` then
+//! `ToInt32`/`ToUint32` per spec, including operands beyond the `i64` range.
 
 mod common;
 use common::{assert_number, assert_output, assert_string, assert_uncaught};
