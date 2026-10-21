@@ -1405,8 +1405,8 @@ pub enum IrNode {
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
     /// guest value tree — including OBJECTS with runtime-unknown keys, each
     /// member interned and defined through `__define`. Malformed
-    /// input throws an `Error` (`.name` `SyntaxError`). The optional reviver
-    /// argument is unsupported and rejected at codegen.
+    /// input throws an `Error` (`.name` `SyntaxError`). A call passing a
+    /// reviver calls the `JSON.parse` builtin instead.
     JsonParse {
         /// The single text argument, evaluated once and parsed.
         arg: Box<IrNode>,
