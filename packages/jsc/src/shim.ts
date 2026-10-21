@@ -476,7 +476,10 @@ export function createShim(): Shim {
                 needle,
               )
             : endsWithBytes(
-                hay.subarray(0, substringIndex(arg1, mem, hay.length, hay.length)),
+                hay.subarray(
+                  0,
+                  substringIndex(arg1, mem, hay.length, hay.length),
+                ),
                 needle,
               )
         return hit ? TRUE : FALSE

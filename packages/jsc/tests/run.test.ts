@@ -478,7 +478,9 @@ it('renders wrapper objects Node-console style like the Rust host', async () => 
   const { stdout } = await run(
     "console.log(new String('abc'), new Number(1), new Boolean(true), [Object('x')])",
   )
-  expect(stdout).toBe("[String: 'abc'] [Number: 1] [Boolean: true] [ [String: 'x'] ]\n")
+  expect(stdout).toBe(
+    "[String: 'abc'] [Number: 1] [Boolean: true] [ [String: 'x'] ]\n",
+  )
   expect((await run('new Number(-0)')).result).toBe('[Number: -0]')
   expect((await run('let w = new Number(2); w.x = 1; w')).result).toBe(
     '[Number: 2] { x: 1 }',

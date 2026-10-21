@@ -464,7 +464,9 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
     if (primitive.kind === 'string') {
       // A String wrapper's own indices are its characters, not properties.
       const len = utf8Encode.encode(primitive.value).length
-      entries = entries.filter(([key]) => !(/^\d+$/.test(key) && Number(key) < len))
+      entries = entries.filter(
+        ([key]) => !(/^\d+$/.test(key) && Number(key) < len),
+      )
     }
     return { kind: 'wrapper', primitive, entries }
   }
