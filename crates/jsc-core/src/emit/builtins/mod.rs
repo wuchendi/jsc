@@ -25,9 +25,12 @@ mod date;
 mod error;
 mod function;
 mod namespace;
+mod number;
 mod object;
+mod string;
 
 pub(super) use namespace::fragment;
+pub(super) use string::host_ready_args;
 
 /// The IR fragments the hand-written bodies emit with `K = k`, for the
 /// static-string scan.
@@ -64,16 +67,28 @@ impl Frame {
             (2, ValType::I64),
             (2, ValType::I32),
             (1, ValType::F64),
+            (1, ValType::I64),
         ])
     }
 
-    /// Push argument `i` (`undefined` past the `K` slots).
+    /// Push argument `i`: slot `i`, or past the `K` slots the element of the
+    /// spread argument array a call with more than `K` arguments published
+    /// (`undefined` past the argument count, or for a spread hole).
     fn arg(self, function: &mut Function, i: u32) {
         if i < self.k {
             wasm!(function; LocalGet(i));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
+            return;
         }
+        let tmp = self.scratch() + 35;
+        wasm!(function;
+            LocalGet(self.argc()), F64ReinterpretI64, F64Const(Ieee64::from(f64::from(i))), F64Gt,
+            If(BlockType::Result(ValType::I64)),
+            GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64,
+        );
+        emit_array_elems(function);
+        wasm!(function; I64Load(elem_slot(u64::from(i))), LocalSet(tmp));
+        emit_elem_read(function, tmp);
+        wasm!(function; Else, I64Const(UNDEFINED_BITS), End);
     }
 
     /// The `argc` parameter (a number jsval).
@@ -120,6 +135,9 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(error::STRINGS)
         .chain(array::strings())
         .chain(date::STRINGS)
+        .chain(string::strings())
+        .chain(number::STRINGS)
+        .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
 /// Emit the body of `builtin`.
@@ -150,6 +168,14 @@ pub(super) fn emit_builtin(
         Builtin::ArrayJoin => array::emit_join(&mut f, frame, strings, helpers),
         Builtin::ArraySlice => array::emit_slice(&mut f, frame, strings, helpers),
         Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),
+        Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
+        Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
+        Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
+        Builtin::NumberToString => number::emit_number_to_string(&mut f, frame, strings, helpers),
+        Builtin::NumberValueOf => number::emit_number_value_of(&mut f, frame, strings, helpers),
+        Builtin::BooleanToString => number::emit_boolean(false, &mut f, frame, strings, helpers),
+        Builtin::BooleanValueOf => number::emit_boolean(true, &mut f, frame, strings, helpers),
+        Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::DateToString => date::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::DateValueOf => date::emit_value_of(&mut f, frame, strings, helpers),
         Builtin::Math(_)
@@ -179,6 +205,114 @@ fn throw_type_error(
     helpers: Helpers<'_>,
 ) {
     emit_throw_not_a_function(function, text, frame.scratch(), strings, helpers);
+}
+
+/// Push `1` when the jsval in `local` is a wrapper object of `class`
+/// (design 2.4).
+pub(super) fn emit_is_wrapper(function: &mut Function, local: u32, class: u8) {
+    emit_is_pointer(function, local);
+    wasm!(function;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(local), I32WrapI64, I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }),
+        I32Const(0xff00_00ff_u32.cast_signed()), I32And,
+        I32Const(TYPE_OBJECT | (i32::from(class) << 24)), I32Eq,
+        Else, I32Const(0), End,
+    );
+}
+
+/// `this<Type>Value(this)` into i64 `out`: the primitive itself (`is_prim`),
+/// the `[[PrimitiveValue]]` of a wrapper object of `class`, else throw
+/// `text`.
+#[allow(clippy::too_many_arguments)]
+fn this_primitive(
+    function: &mut Function,
+    frame: Frame,
+    out: u32,
+    class: u8,
+    is_prim: fn(&mut Function, u32),
+    text: CalleeErrorText<'static>,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(out));
+    is_prim(function, out);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    emit_is_wrapper(function, out, class);
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(out), I32WrapI64,
+        I64Load(MemArg { offset: u64::from(abi::WRAPPER_VALUE_OFFSET), align: 3, memory_index: 0 }),
+        LocalSet(out),
+        Else,
+    );
+    throw_type_error(function, frame, text, strings, helpers);
+    wasm!(function; End, End);
+}
+
+/// `__to_object(v: i64) -> i64`: `ToObject` of a non-nullish jsval: a
+/// string, number or boolean becomes a fresh wrapper object (design 2.4) over
+/// its realm prototype; any other value (an object, or `null`/`undefined`,
+/// which callers reject first) is returned as is. A String wrapper's
+/// `length` and indices are defined as its own read-only, non-configurable
+/// properties (the indices enumerable), so every property operation sees them.
+pub(super) fn emit_to_object(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![
+        (2, ValType::I32),
+        (1, ValType::I64),
+        (3, ValType::I32),
+    ]);
+    let (v, obj, class, proto, len, idx, string) = (0, 1, 2, 3, 4, 5, 6);
+    let wrap = |f: &mut Function, c: u8, ctor: BuiltinCtor| {
+        wasm!(f;
+            I32Const(i32::from(c)), LocalSet(class),
+            I64Const(intrinsic_bits(realm::prototype_of(ctor), helpers)), LocalSet(proto),
+        );
+    };
+    emit_is_string(&mut f, v);
+    wasm!(f; If(BlockType::Empty));
+    wrap(&mut f, abi::CLASS_STRING, BuiltinCtor::String);
+    wasm!(f; Else);
+    emit_is_number(&mut f, v);
+    wasm!(f; If(BlockType::Empty));
+    wrap(&mut f, abi::CLASS_NUMBER, BuiltinCtor::Number);
+    wasm!(f;
+        Else,
+        LocalGet(v), I64Const(TRUE_BITS), I64Eq, LocalGet(v), I64Const(FALSE_BITS), I64Eq, I32Or,
+        I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End,
+    );
+    wrap(&mut f, abi::CLASS_BOOLEAN, BuiltinCtor::Boolean);
+    wasm!(f;
+        End, End,
+        I32Const(abi::WRAPPER_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(obj),
+        LocalGet(class), I32Const(24), I32Shl, I32Const(TYPE_OBJECT), I32Or,
+        I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),
+        LocalGet(obj), I32Const(0),
+        I32Store(MemArg { offset: u64::from(abi::OBJ_PROPS_OFFSET), align: 2, memory_index: 0 }),
+        LocalGet(obj), LocalGet(proto),
+        I64Store(MemArg { offset: u64::from(abi::OBJ_PROTO_OFFSET), align: 3, memory_index: 0 }),
+        LocalGet(obj), LocalGet(v),
+        I64Store(MemArg { offset: u64::from(abi::WRAPPER_VALUE_OFFSET), align: 3, memory_index: 0 }),
+        LocalGet(class), I32Const(i32::from(abi::CLASS_STRING)), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(v), I32WrapI64, LocalTee(string),
+        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }), LocalSet(len),
+        I32Const(0), LocalSet(idx),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(idx), LocalGet(len), I32GeU, BrIf(1),
+        LocalGet(obj),
+        LocalGet(idx), F64ConvertI32U, I64ReinterpretF64, I32Const(1), Call(helpers.to_key),
+        LocalGet(string), LocalGet(idx), Call(helpers.str_index), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        I32Const(abi::ATTR_ENUMERABLE.cast_signed()), Call(helpers.define),
+        LocalGet(idx), I32Const(1), I32Add, LocalSet(idx),
+        Br(0),
+        End, End,
+        LocalGet(obj), I32Const(static_key(strings, INDEX_LENGTH_KEY)),
+        LocalGet(len), F64ConvertI32U, I64ReinterpretF64, I32Const(0), Call(helpers.define),
+        End,
+        LocalGet(obj), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        End,
+    );
+    f
 }
 
 /// Push the target's environment, then (after `argc`, pushed by `argc`) its

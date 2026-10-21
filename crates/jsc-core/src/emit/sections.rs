@@ -219,14 +219,15 @@ pub(super) fn build_type_and_function_sections<'a>(
     }
     // The conversion helpers follow the builtin bodies:
     // `__to_primitive(v: i64, hint: i32) -> i64`, `__to_string(v: i64) -> i32`,
-    // `__add(a: i64, b: i64) -> i64`, `__compare(a: i64, b: i64, op: i32) -> i32`
-    // and `__array_join(recv: i64, sep: i64) -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 5] = [
+    // `__add(a: i64, b: i64) -> i64`, `__compare(a: i64, b: i64, op: i32) -> i32`,
+    // `__array_join(recv: i64, sep: i64) -> i64` and `__to_object(v: i64) -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 6] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
         (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
+        (&[ValType::I64], &[ValType::I64]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
@@ -771,6 +772,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::Not(operand)
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
+        | IrNode::ToObject(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
@@ -913,16 +915,23 @@ pub(super) fn collect_node<'a>(
         }
         IrNode::ProtoGuard {
             recv,
-            fast,
-            string,
-            slow,
+            key,
+            args,
+            array,
+            not_callable,
             ..
         } => {
+            // The generic call reads the interned key and builds the
+            // nullish-receiver or not-a-function `TypeError`.
+            seed_strs_ref(&[key, &not_callable.message], order, seen);
+            seed_nullish_strs(order, seen);
             collect_node(recv, order, seen);
-            for node in [fast, string].into_iter().flatten() {
-                collect_node(node, order, seen);
+            for arg in args {
+                collect_node(arg, order, seen);
             }
-            collect_node(slow, order, seen);
+            if let Some(array) = array {
+                collect_node(array, order, seen);
+            }
         }
         IrNode::Construct {
             callee,

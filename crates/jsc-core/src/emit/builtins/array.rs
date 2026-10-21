@@ -170,7 +170,8 @@ fn emit_drop(
     wasm!(function; Drop);
 }
 
-/// `this` into i64 `o`; `undefined`/`null` throws `nullish` (`ToObject`).
+/// `ToObject(this)` into i64 `o`: `undefined`/`null` throws `nullish`, a
+/// primitive becomes its wrapper object.
 fn this_object(
     function: &mut Function,
     frame: Frame,
@@ -183,7 +184,7 @@ fn this_object(
     emit_is_nullish(function, o);
     wasm!(function; If(BlockType::Empty));
     throw_type_error(function, frame, nullish, strings, helpers);
-    wasm!(function; End);
+    wasm!(function; End, LocalGet(o), Call(helpers.to_object()), LocalSet(o));
 }
 
 /// Push i32 `1` when the jsval in `o` is an array handle.

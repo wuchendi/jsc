@@ -690,9 +690,9 @@ pub(super) fn emit_fn_materialize(
 /// Emit the string/array exotic own lookup of the interned `key` (i32 local)
 /// on the block base in i32 local `o` whose kind byte is in i32 local `t`:
 /// `length` and an in-range canonical index return their value (an array hole
-/// reads `undefined`, a `SPARSE` array's element comes from `__sparse_get`); a
-/// string returns `undefined` for any other key; an array
-/// falls through (its named keys live in its own table). A key of `0` (never
+/// reads `undefined`, a `SPARSE` array's element comes from `__sparse_get`);
+/// any other key falls through (an array's named keys live in its own table,
+/// a string's inherited ones on `%String.prototype%`). A key of `0` (never
 /// interned) returns `undefined`. `p` is i64 scratch.
 #[allow(clippy::too_many_arguments)]
 fn emit_exotic_get(
@@ -733,8 +733,6 @@ fn emit_exotic_get(
         End,
         Return,
         End,
-        LocalGet(t), I32Const(TYPE_STRING), I32Eq,
-        If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
     );
 }
 
@@ -751,22 +749,44 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 }
 
 /// `__get(recv: i64, key: i32) -> i64`: `OrdinaryGet` of the interned `key` on
-/// any jsval. A primitive reads `undefined`; a string or array resolves its
-/// exotic own keys (`length`, indices); an object-family block (an array for
-/// its named keys) scans its own table and then each `proto`, calling an
-/// accessor's getter with `this = recv` (`undefined` when it has none).
+/// any jsval. A string or array resolves its exotic own keys (`length`,
+/// indices); an object-family block (an array for its named keys) scans its
+/// own table and then each `proto`, calling an accessor's getter with
+/// `this = recv` (`undefined` when it has none). A string, number or boolean
+/// continues at its realm prototype (design 6: no wrapper is allocated);
+/// `null`/`undefined` read `undefined`.
 pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
     let (recv, key, o, e, t, i, p) = (0, 1, 2, 3, 4, 5, 6);
     let base = t;
+    let proto_base = |ctor| {
+        let bits = intrinsic_bits(realm::prototype_of(ctor), helpers);
+        Instruction::I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed())
+    };
     emit_is_pointer(&mut f, recv);
     wasm!(f;
-        I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        If(BlockType::Empty),
         LocalGet(recv), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalSet(t),
     );
     emit_is_string_or_array_kind(&mut f, t);
     wasm!(f; If(BlockType::Empty));
     emit_exotic_get(&mut f, o, t, key, i, p, strings, helpers);
+    wasm!(f;
+        LocalGet(t), I32Const(TYPE_STRING), I32Eq,
+        If(BlockType::Empty), proto_base(BuiltinCtor::String), LocalSet(o), End,
+        End,
+        Else,
+    );
+    emit_is_number(&mut f, recv);
+    wasm!(f;
+        If(BlockType::Empty),
+        proto_base(BuiltinCtor::Number), LocalSet(o),
+        Else,
+        LocalGet(recv), I64Const(TRUE_BITS), I64Eq, LocalGet(recv), I64Const(FALSE_BITS), I64Eq, I32Or,
+        I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        proto_base(BuiltinCtor::Boolean), LocalSet(o),
+        End,
+    );
     wasm!(f;
         End,
         Loop(BlockType::Empty),
