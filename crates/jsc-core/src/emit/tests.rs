@@ -3,7 +3,8 @@
 //! the bytes.
 #![cfg(feature = "native-run")]
 
-use super::emit;
+use super::{builtin_count, collect_strings, emit, intern_table, realm};
+use crate::abi;
 use crate::ir::{BinOp, CalleeError, IrCase, IrFunction, IrNode, IrProgram, IrStmt, PropKey};
 
 /// Wrap a single expression into a one-statement program.
@@ -13,6 +14,7 @@ fn expr_program(node: IrNode) -> IrProgram {
         stmts: vec![IrStmt::Expr(node)],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     }
 }
 
@@ -224,6 +226,7 @@ fn array_element_assignment_writes_slot_and_yields_value() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
@@ -317,6 +320,7 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
@@ -355,6 +359,7 @@ fn object_property_assignment_via_indexset_ir_missing_key_adds() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
@@ -379,16 +384,11 @@ fn typeof_string_literal_reports_string() {
     );
 }
 
-#[test]
-fn string_literal_emits_data_segment_and_advances_heap_ptr() {
-    // The always-interned "length" (a 14-byte block padded to 16) sits at base
-    // offset 8 and the literal "foo" (11 bytes, padded to 16) at 24; the
-    // 8-slot intern table follows at 40, so `__heap_ptr` starts at 40 + 32.
-    let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
-    validate(&bytes);
+/// The data-segment count and the initial `__heap_ptr` of `bytes`.
+fn data_layout(bytes: &[u8]) -> (u32, Option<i32>) {
     let mut data_segments = 0;
     let mut heap_ptr_init = None;
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         match payload.expect("valid payload") {
             wasmparser::Payload::DataSection(reader) => {
                 data_segments = reader.count();
@@ -410,31 +410,36 @@ fn string_literal_emits_data_segment_and_advances_heap_ptr() {
             _ => {}
         }
     }
-    assert_eq!(data_segments, 3, "two string blobs plus the intern table");
-    assert_eq!(heap_ptr_init, Some(72));
+    (data_segments, heap_ptr_init)
+}
+
+#[test]
+fn string_literal_emits_data_segment_and_advances_heap_ptr() {
+    // The literal "foo" (11 bytes, padded to 16) is one more string blob
+    // segment ahead of the function data, the realm image, and the intern table.
+    let base = emit(&expr_program(IrNode::Num(42.0)));
+    let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
+    validate(&bytes);
+    let (segments, heap_ptr) = data_layout(&bytes);
+    let (base_segments, base_heap_ptr) = data_layout(&base);
+    assert_eq!(segments, base_segments + 1, "one more string blob");
+    assert_eq!(heap_ptr, base_heap_ptr.map(|p| p + 16));
 }
 
 #[test]
 fn no_literals_starts_heap_after_the_intern_table() {
-    // With no string literals, only "length" (16 bytes at HEAP_BASE) and the
-    // 8-slot intern table precede the bump allocator: 8 + 16 + 32.
-    // The heap pointer is the FIRST global; the exception-unwinding
-    // globals ($exc_pending = 0, $exc_value = 0) follow it and are ignored here.
-    let bytes = emit(&expr_program(IrNode::Num(42.0)));
+    // With no string literals, the static strings (the always-interned
+    // "length", the realm's and the builtins' strings), the `__fn_info` table
+    // (the two settlers and the builtins), the realm image and the intern table
+    // precede the bump allocator, in that order.
+    let program = expr_program(IrNode::Num(42.0));
+    let bytes = emit(&program);
     validate(&bytes);
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::GlobalSection(reader) = payload.expect("valid payload") {
-            let heap_ptr = reader
-                .into_iter()
-                .next()
-                .expect("at least the heap-pointer global")
-                .expect("valid global");
-            let mut ops = heap_ptr.init_expr.get_operators_reader();
-            if let wasmparser::Operator::I32Const { value } = ops.read().expect("init operator") {
-                assert_eq!(value, 56);
-            }
-        }
-    }
+    let (offsets, strings_end) = collect_strings(&program);
+    let info = abi::FN_INFO_ENTRY_SIZE.cast_signed() * (2 + builtin_count());
+    let intern_base = strings_end + info + realm::image_size();
+    let cap = intern_table(&offsets, intern_base).cap;
+    assert_eq!(data_layout(&bytes).1, Some(intern_base + 4 * cap));
 }
 
 #[test]
@@ -479,6 +484,7 @@ fn emits_valid_module_with_locals() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -514,6 +520,7 @@ fn emits_valid_module_with_while_loop() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -562,6 +569,7 @@ fn emits_valid_module_with_switch() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -579,6 +587,7 @@ fn emits_valid_module_with_boxed_condition() {
         }],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -664,6 +673,7 @@ fn emits_valid_module_with_function_and_call() {
     let program = IrProgram {
         locals: 0,
         module_cells: 0,
+        arity: 2,
         stmts: vec![IrStmt::Expr(IrNode::Call {
             func: 1,
             args: vec![IrNode::Num(40.0), IrNode::Num(2.0)],
@@ -693,6 +703,7 @@ fn emits_valid_module_with_function_value_and_indirect_call() {
     let program = IrProgram {
         locals: 1,
         module_cells: 0,
+        arity: 1,
         stmts: vec![
             IrStmt::Decl {
                 local: 0,
@@ -887,10 +898,11 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let arr = usize::try_from(arr).expect("base");
     assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
     assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
+    // `proto` = `%Array.prototype%`, an ordinary object.
     assert_eq!(
-        &mem[arr + 8..arr + 16],
-        &crate::abi::NULL.to_le_bytes(),
-        "proto"
+        mem[arr + 14..arr + 16],
+        [0xFD, 0x7F],
+        "proto is a heap pointer"
     );
     assert_eq!(&mem[arr + 16..arr + 20], &2u32.to_le_bytes(), "len");
     let elems = u32::from_le_bytes(mem[arr + 20..arr + 24].try_into().expect("elems"));
@@ -916,11 +928,8 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let p = usize::try_from(p).expect("base");
     assert_eq!(&mem[p..p + 4], &[crate::abi::TYPE_PROMISE, 0, 0, 0]);
     assert_eq!(&mem[p + 4..p + 8], &0u32.to_le_bytes(), "props");
-    assert_eq!(
-        &mem[p + 8..p + 16],
-        &crate::abi::NULL.to_le_bytes(),
-        "proto"
-    );
+    // `proto` = `%Promise.prototype%`.
+    assert_eq!(mem[p + 14..p + 16], [0xFD, 0x7F], "proto is a heap pointer");
     assert_eq!(
         &mem[p + 16..p + 20],
         &crate::abi::PROMISE_PENDING.to_le_bytes()
@@ -934,10 +943,10 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     use crate::abi::{
         ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, DATE_MS_OFFSET, ELEMS_CAP_OFFSET, ELEMS_DATA_OFFSET,
         FUNC_ENV_OFFSET, FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_LAZY, FUNC_INDEX_OFFSET, GEN_DONE_OFFSET,
-        GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, NULL,
-        OBJ_PROPS_OFFSET, OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET,
-        PROMISE_VALUE_OFFSET, TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR,
-        TYPE_MAP, TYPE_PROMISE, TYPE_SET, UNDEFINED,
+        GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, OBJ_PROPS_OFFSET,
+        OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET,
+        TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT,
+        TYPE_PROMISE, TYPE_SET, UNDEFINED,
     };
     let u32_at = |mem: &[u8], at: u32| {
         let at = at as usize;
@@ -946,6 +955,20 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     let u64_at = |mem: &[u8], at: u32| {
         let at = at as usize;
         u64::from_le_bytes(mem[at..at + 8].try_into().expect("u64"))
+    };
+    // `%Function.prototype%`: a non-lazy `TYPE_FUNCTION` block.
+    let function_proto = |mem: &[u8], bits: u64| {
+        assert_eq!(
+            (bits >> 48) & 0b111,
+            0b101,
+            "function proto is a heap block"
+        );
+        let at = usize::try_from(bits & 0xFFFF_FFFF).expect("base");
+        assert_eq!(
+            &mem[at..at + 4],
+            &[TYPE_FUNCTION, 0, 0, 0],
+            "%Function.prototype%"
+        );
     };
     let heap = |src: &str, kind: u8, flags: u8| {
         let bytes = emit_js(src);
@@ -957,11 +980,16 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let at = base as usize;
         assert_eq!(&memory[at..at + 4], &[kind, 0, flags, 0], "{src}: header");
         assert_eq!(u32_at(&memory, base + OBJ_PROPS_OFFSET), 0, "{src}: props");
-        assert_eq!(
-            u64_at(&memory, base + OBJ_PROTO_OFFSET),
-            NULL,
-            "{src}: proto"
-        );
+        let proto = u64_at(&memory, base + OBJ_PROTO_OFFSET);
+        if kind == TYPE_FUNCTION {
+            function_proto(&memory, proto);
+        } else {
+            // Arrays, Map/Set, promises and dates inherit from their realm
+            // prototype, generators from %Object.prototype%: an ordinary object.
+            assert_eq!((proto >> 48) & 0b111, 0b101, "{src}: proto is a heap block");
+            let at = usize::try_from(proto & 0xFFFF_FFFF).expect("base");
+            assert_eq!(memory[at], TYPE_OBJECT, "{src}: proto");
+        }
         (base, memory)
     };
 

@@ -162,16 +162,17 @@ fn emit_new_elems(function: &mut Function, alloc: u32, cap: u32, store: u32) {
 }
 
 /// Emit the exported `__new_array(len: i32) -> i32` constructor: a
-/// [`TYPE_ARRAY`] handle with `len` set and, when `len > 0`, a `cap = len`
+/// [`TYPE_ARRAY`] handle (`proto` = `%Array.prototype%`, the jsval `proto`)
+/// with `len` set and, when `len > 0`, a `cap = len`
 /// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
 /// locals 1/2/3 the handle base, the store base, and the element cursor.
-pub(super) fn emit_new_array(alloc: u32) -> Function {
+pub(super) fn emit_new_array(alloc: u32, proto: i64) -> Function {
     let mut function = Function::new(vec![(3, ValType::I32)]);
     let (len, base, store, at) = (0, 1, 2, 3);
     function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
     function.instruction(&Instruction::Call(alloc));
     function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, TYPE_ARRAY);
+    emit_object_prefix(&mut function, base, TYPE_ARRAY, proto);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
@@ -214,15 +215,16 @@ pub(super) fn emit_new_array(alloc: u32) -> Function {
 }
 
 /// Emit the exported `__new_promise() -> i32` constructor: a pending
-/// [`abi::TYPE_PROMISE`] block with a `null` prototype, `state = PENDING`, and
+/// [`abi::TYPE_PROMISE`] block with prototype `proto` (`%Promise.prototype%`),
+/// `state = PENDING`, and
 /// `value = undefined`. Local 0 is the base.
-pub(super) fn emit_new_promise(alloc: u32) -> Function {
+pub(super) fn emit_new_promise(alloc: u32, proto: i64) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let base = 0;
     function.instruction(&Instruction::I32Const(PROMISE_BLOCK_SIZE));
     function.instruction(&Instruction::Call(alloc));
     function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE));
+    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE), proto);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Const(abi::PROMISE_PENDING));
     function.instruction(&Instruction::I32Store(MemArg {
@@ -252,20 +254,11 @@ pub(super) fn emit_new_promise(alloc: u32) -> Function {
 /// argument count (`1`), and the funcref-table index, then `call_indirect`. The
 /// callback's result is left on the stack; a throw inside it sets `__exc_pending`
 /// (which the host checks after the call), so no propagation is emitted here.
-///
-/// When the program declares no user functions (`fn_type == 0`, so there is no
-/// funcref table), no callback can exist, so the body degenerates to returning
-/// `undefined` — keeping the exported function valid and total. The two `i64`
-/// params occupy locals 0/1; one extra `i32` local holds the callee block base.
+/// The two `i64` params occupy locals 0/1; one extra `i32` local holds the
+/// callee block base.
 pub(super) fn emit_invoke1(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let (callee, arg, base) = (0, 1, 2);
-    // No functions in the program: no table, so return `undefined` unconditionally.
-    if helpers.fn_type == 0 {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::End);
-        return function;
-    }
     // base = i32.wrap(callee).
     function.instruction(&Instruction::LocalGet(callee));
     function.instruction(&Instruction::I32WrapI64);
@@ -1407,13 +1400,14 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// `1` iff BOTH are (nullish values equal each other and nothing else); two
 /// numbers compare as `f64`; two strings by byte content (via `__str_eq`); a
 /// number and a string coerce the string via the `__convert` `ToNumber` import
-/// (at `convert_index`) and compare as `f64`; anything else compares by raw
-/// identity bits (two distinct objects differ; the same object is equal; an
-/// object vs a primitive differs). Object↔primitive `ToPrimitive` coercion is
-/// deliberately NOT modeled (so `[] == 0` is `false`, a documented v1 cut). The
-/// two `i64` params occupy locals 0/1; they are mutated in place for the boolean
-/// normalization, so no extra locals are needed.
-pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
+/// and compare as `f64`; an object against a (non-nullish) primitive is
+/// replaced by its `ToPrimitive` (hint default, `__to_primitive`) and compared
+/// again (a user `valueOf`/`toString` throw leaves it pending and yields `0`);
+/// anything else compares by raw identity bits (two distinct objects differ;
+/// the same object is equal). The two `i64` params occupy locals 0/1; they are
+/// mutated in place, so no extra locals are needed.
+pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
+    let (str_eq_index, convert_index) = (helpers.str_eq, helpers.convert);
     let mut function = Function::new(vec![]);
     let (a, b) = (0, 1);
     let one_bits = 1.0f64.to_bits().cast_signed();
@@ -1501,7 +1495,9 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::Else);
 
-    // Fallback: raw identity bits.
+    // Fallback: an object against a non-nullish primitive compares its
+    // `ToPrimitive` again; otherwise raw identity bits.
+    emit_loose_eq_to_primitive(&mut function, helpers);
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
@@ -1513,6 +1509,35 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
     // Close the function body.
     function.instruction(&Instruction::End);
     function
+}
+
+/// The object-vs-primitive arm of [`emit_loose_eq`]: an object against a
+/// non-nullish primitive is replaced by its `ToPrimitive` (hint default) and
+/// `__loose_eq` returns the comparison of the result (`0` when a user
+/// `valueOf`/`toString` threw).
+fn emit_loose_eq_to_primitive(function: &mut Function, helpers: Helpers<'_>) {
+    let (a, b) = (0, 1);
+    for (obj, prim) in [(a, b), (b, a)] {
+        emit_is_object(function, obj);
+        emit_is_object(function, prim);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::LocalGet(obj));
+        function.instruction(&Instruction::I32Const(HINT_DEFAULT));
+        function.instruction(&Instruction::Call(helpers.to_primitive()));
+        function.instruction(&Instruction::LocalSet(obj));
+        function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(a));
+        function.instruction(&Instruction::LocalGet(b));
+        function.instruction(&Instruction::Call(helpers.loose_eq));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+    }
 }
 
 /// Emit the `__str_to_array(s: i64) -> i64` string-spread helper: build a fresh

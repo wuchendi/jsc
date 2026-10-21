@@ -519,12 +519,10 @@ pub(super) fn emit_pow(
 /// Emit a conversion built-in call, leaving its result jsval on the stack.
 ///
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
-/// between the boxed `true`/`false` jsvals, no host call. `parseInt` calls the
-/// host `__parse_int` import with the string and radix jsvals. The rest delegate
-/// to the host `__convert` import — the argument jsval and a `CONVERT_OP_*` flag
-/// are pushed, and the import returns the converted jsval (a fresh heap string for
-/// `String`, a number for the rest), reusing the run stage's `format_value`/parse
-/// helpers so the number forms match `format_number`.
+/// between the boxed `true`/`false` jsvals, no host call. `Number(x)` is the
+/// shared `ToNumber`, `String(x)` the guest `__to_string`; `parseInt` /
+/// `parseFloat` convert their argument with `__to_string` and parse it on the
+/// host (`__parse_int` / the `__convert` parse-float op).
 pub(super) fn emit_convert_call(
     op: ConvertOp,
     arg: &IrNode,
@@ -553,7 +551,8 @@ pub(super) fn emit_convert_call(
         return;
     }
     if matches!(op, ConvertOp::ParseInt) {
-        // `__parse_int(s, radix)`: an omitted radix is passed as `undefined`.
+        // `__parse_int(ToString(s), radix)`: an omitted radix is passed as
+        // `undefined`. Both operands are evaluated before the conversion.
         emit_node(arg, function, scratch, strings, helpers);
         match radix {
             Some(radix) => emit_node(radix, function, scratch, strings, helpers),
@@ -561,19 +560,33 @@ pub(super) fn emit_convert_call(
                 function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
             }
         }
+        function.instruction(&Instruction::LocalSet(scratch + 1));
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_to_string_jsval(function, scratch, helpers);
+        function.instruction(&Instruction::LocalGet(scratch + 1));
         function.instruction(&Instruction::Call(helpers.parse_int));
         return;
     }
-    let flag = match op {
-        ConvertOp::ToString => CONVERT_OP_TO_STRING,
-        ConvertOp::ParseFloat => CONVERT_OP_PARSE_FLOAT,
-        ConvertOp::ToBoolean | ConvertOp::ToNumber | ConvertOp::ParseInt => {
-            unreachable!("ToBoolean/ToNumber/ParseInt handled above")
-        }
-    };
+    // `String(x)` is `ToString` in the guest; `parseFloat` parses the
+    // argument's `ToString` on the host.
     emit_node(arg, function, scratch, strings, helpers);
-    function.instruction(&Instruction::I32Const(flag));
-    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::LocalSet(scratch));
+    emit_to_string_jsval(function, scratch, helpers);
+    if matches!(op, ConvertOp::ParseFloat) {
+        function.instruction(&Instruction::I32Const(CONVERT_OP_PARSE_FLOAT));
+        function.instruction(&Instruction::Call(helpers.convert));
+    }
+}
+
+/// Push `ToString` of the jsval in `local` as a heap-string jsval (via the
+/// guest `__to_string`), propagating a throw from a user `toString`/`valueOf`.
+fn emit_to_string_jsval(function: &mut Function, local: u32, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::Call(helpers.to_str()));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    emit_propagate_if_pending(function, helpers);
 }
 
 /// Emit a non-callback array/string method call `IrNode::MethodCall`,
@@ -583,6 +596,7 @@ pub(super) fn emit_convert_call(
 /// host `__method` import — which performs the whole operation host-side,
 /// branching on the receiver's runtime TYPE BYTE for the overloaded
 /// `indexOf`/`slice` and allocating any result string/array in guest memory.
+/// `join` is the exception: the guest `__array_join`.
 pub(super) fn emit_method_call(
     op: MethodOp,
     recv: &IrNode,
@@ -593,9 +607,22 @@ pub(super) fn emit_method_call(
     helpers: Helpers<'_>,
 ) {
     let flag = match op {
+        // `join` runs in the guest so an element's `ToString` can call a user
+        // `toString` (which may throw).
+        MethodOp::Join => {
+            emit_node(recv, function, scratch, strings, helpers);
+            match args.first() {
+                Some(sep) => emit_node(sep, function, scratch, strings, helpers),
+                None => {
+                    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+                }
+            }
+            function.instruction(&Instruction::Call(helpers.array_join()));
+            emit_propagate_if_pending(function, helpers);
+            return;
+        }
         MethodOp::IndexOf => METHOD_OP_INDEX_OF,
         MethodOp::Includes => METHOD_OP_INCLUDES,
-        MethodOp::Join => METHOD_OP_JOIN,
         MethodOp::Slice => METHOD_OP_SLICE,
         MethodOp::ToUpper => METHOD_OP_TO_UPPER,
         MethodOp::ToLower => METHOD_OP_TO_LOWER,
@@ -626,41 +653,12 @@ pub(super) fn emit_method_call(
     function.instruction(&Instruction::Call(helpers.method));
 }
 
-/// Push the `ToString(ToPrimitive(v))` heap-string base (i32) of the `+`
-/// operand in `local`. An array's primitive is its `join()` string (via the host
-/// `__method` join op); every other value goes through the host `__convert`
-/// to-string op, which returns a string unchanged and stringifies the rest.
-fn emit_add_operand_to_string(function: &mut Function, local: u32, helpers: Helpers<'_>) {
-    emit_is_pointer(function, local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I32Const(METHOD_OP_JOIN));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::Call(helpers.method));
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::I32WrapI64);
-}
-
-/// Emit the `+` operator, a runtime type dispatch following `ToPrimitive`: every
-/// heap value (string, array, object, function, Date, Map/Set, promise, error)
-/// has a string primitive, so if EITHER operand is a heap pointer both sides are
-/// converted to strings ([`emit_add_operand_to_string`]) and concatenated into a
-/// freshly allocated heap string. Only when both operands are non-heap
-/// primitives (number/boolean/null/undefined) does it apply `ToNumber` to both
-/// and add. User `valueOf`/`toString`/`Symbol.toPrimitive` overrides are not
-/// consulted.
+/// Emit the `+` operator, a runtime type dispatch following `ToPrimitive`: if
+/// EITHER operand is a heap value the shared `__add` helper converts both
+/// (hint default; a user `valueOf`/`toString` may throw, propagated here) and
+/// concatenates or adds. Only when both operands are non-heap primitives
+/// (number/boolean/null/undefined) does it apply `ToNumber` to both and add
+/// inline.
 fn emit_add(
     lhs: &IrNode,
     rhs: &IrNode,
@@ -681,14 +679,11 @@ fn emit_add(
     emit_is_pointer(function, s1);
     function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // THEN: stringify both operands, concat, and rebox the result base offset as
-    // a heap jsval.
-    emit_add_operand_to_string(function, s0, helpers);
-    emit_add_operand_to_string(function, s1, helpers);
-    function.instruction(&Instruction::Call(helpers.concat));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
+    enter_frame(helpers);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::Call(helpers.add_slow()));
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::Else);
     // ELSE: numeric add — ToNumber both operands (`null` -> 0, booleans ->
     // 0/1, `undefined` -> NaN), unbox to f64, add, rebox.
@@ -700,6 +695,7 @@ fn emit_add(
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Add);
     emit_box_f64(function, helpers);
+    leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
 
@@ -743,9 +739,11 @@ pub(super) fn emit_binary(
         // Remainder: wasm has no `f64.rem`; delegate to the dedicated emitter.
         BinOp::Mod => emit_mod(lhs, rhs, function, scratch, strings, helpers),
         // Relational: a runtime type dispatch. Two heap strings compare
-        // lexicographically by bytes (`__str_cmp`); anything else coerces each
-        // operand with ToNumber and compares the `f64`s. Either path yields an i32
-        // wasm bool that is boxed as a boolean jsval (TRUE/FALSE) via `select`.
+        // lexicographically by bytes (`__str_cmp`); two numbers compare as
+        // `f64`s; anything else goes to `__compare` (ToPrimitive with hint
+        // number, whose user `valueOf`/`toString` may throw, then the same
+        // dispatch). Each path yields an i32 wasm bool that is boxed as a
+        // boolean jsval (TRUE/FALSE) via `select`.
         BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
             let s0 = scratch;
             let s1 = scratch + 1;
@@ -756,13 +754,12 @@ pub(super) fn emit_binary(
             function.instruction(&Instruction::LocalSet(s1));
             function.instruction(&Instruction::LocalSet(s0));
 
-            // both_strings = is_string(s0) & is_string(s1) — reads each operand's
-            // TYPE BYTE (gated by is_pointer) so only two heap strings take the
-            // lexicographic path; arrays/objects fall to the numeric compare.
+            // both_strings = is_string(s0) & is_string(s1).
             emit_is_string(function, s0);
             emit_is_string(function, s1);
             function.instruction(&Instruction::I32And);
             function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            enter_frame(helpers);
             // THEN: c = __str_cmp(s0, s1); map `c <op> 0` (signed, c ∈ -1/0/1).
             function.instruction(&Instruction::LocalGet(s0));
             function.instruction(&Instruction::I32WrapI64);
@@ -770,30 +767,35 @@ pub(super) fn emit_binary(
             function.instruction(&Instruction::I32WrapI64);
             function.instruction(&Instruction::Call(helpers.str_cmp));
             function.instruction(&Instruction::I32Const(0));
-            let str_cmp = match op {
-                BinOp::Lt => Instruction::I32LtS,
-                BinOp::Gt => Instruction::I32GtS,
-                BinOp::Le => Instruction::I32LeS,
-                BinOp::Ge => Instruction::I32GeS,
+            let (str_cmp, num_cmp, rel) = match op {
+                BinOp::Lt => (Instruction::I32LtS, Instruction::F64Lt, REL_LT),
+                BinOp::Gt => (Instruction::I32GtS, Instruction::F64Gt, REL_GT),
+                BinOp::Le => (Instruction::I32LeS, Instruction::F64Le, REL_LE),
+                BinOp::Ge => (Instruction::I32GeS, Instruction::F64Ge, REL_GE),
                 _ => unreachable!("non-relational ops handled elsewhere"),
             };
             function.instruction(&str_cmp);
             function.instruction(&Instruction::Else);
-            // ELSE: numeric compare — ToNumber both operands, unbox to f64.
-            emit_coerce_number(function, s0, helpers);
-            emit_coerce_number(function, s1, helpers);
+            // ELSE: two numbers compare inline; anything else via `__compare`.
+            emit_is_number(function, s0);
+            emit_is_number(function, s1);
+            function.instruction(&Instruction::I32And);
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            enter_frame(helpers);
             function.instruction(&Instruction::LocalGet(s0));
             function.instruction(&Instruction::F64ReinterpretI64);
             function.instruction(&Instruction::LocalGet(s1));
             function.instruction(&Instruction::F64ReinterpretI64);
-            let num_cmp = match op {
-                BinOp::Lt => Instruction::F64Lt,
-                BinOp::Gt => Instruction::F64Gt,
-                BinOp::Le => Instruction::F64Le,
-                BinOp::Ge => Instruction::F64Ge,
-                _ => unreachable!("non-relational ops handled elsewhere"),
-            };
             function.instruction(&num_cmp);
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::LocalGet(s0));
+            function.instruction(&Instruction::LocalGet(s1));
+            function.instruction(&Instruction::I32Const(rel));
+            function.instruction(&Instruction::Call(helpers.compare()));
+            emit_propagate_if_pending(function, helpers);
+            leave_frame(helpers);
+            function.instruction(&Instruction::End);
+            leave_frame(helpers);
             function.instruction(&Instruction::End);
             function.instruction(&Instruction::Select);
         }
@@ -810,7 +812,8 @@ pub(super) fn emit_binary(
             );
         }
         // Loose equality (`==`/`!=`): the runtime `__loose_eq` kernel does the
-        // Abstract-Equality coercion; box its i32 result (negated for `!=`) as a
+        // Abstract-Equality coercion (an object operand's `ToPrimitive` may
+        // throw, propagated here); box its i32 result (negated for `!=`) as a
         // boolean jsval via `select` over TRUE/FALSE.
         BinOp::LooseEq | BinOp::LooseNe => {
             function.instruction(&Instruction::I64Const(TRUE_BITS));
@@ -818,6 +821,7 @@ pub(super) fn emit_binary(
             emit_node(lhs, function, scratch, strings, helpers);
             emit_node(rhs, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.loose_eq));
+            emit_propagate_if_pending(function, helpers);
             if matches!(op, BinOp::LooseNe) {
                 function.instruction(&Instruction::I32Eqz);
             }

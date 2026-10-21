@@ -71,7 +71,7 @@ impl LowerCtx<'_> {
             // `Math` is in scope they lower to their `f64` literal.
             Expr::Member(member)
                 if math_member_name(member).is_some_and(|n| n == "PI" || n == "E")
-                    && self.resolve("Math").is_none() =>
+                    && self.inline_namespace("Math") =>
             {
                 match math_member_name(member) {
                     Some("PI") => Ok(IrNode::Num(std::f64::consts::PI)),
@@ -171,7 +171,17 @@ impl LowerCtx<'_> {
                     }),
                 },
                 // `typeof operand` inspects the operand's runtime type.
-                UnaryOp::TypeOf => Ok(IrNode::TypeOf(Box::new(self.lower_expr(&u.arg)?))),
+                // `typeof x` of an unresolvable `x` reads `undefined` instead
+                // of throwing.
+                UnaryOp::TypeOf => Ok(IrNode::TypeOf(Box::new(match self.lower_expr(&u.arg)? {
+                    IrNode::GlobalGet { global, .. } if matches!(*u.arg, Expr::Ident(_)) => {
+                        IrNode::GlobalGet {
+                            global,
+                            typeof_operand: true,
+                        }
+                    }
+                    operand => operand,
+                }))),
                 // `!operand` is logical NOT: boolean inverse of truthiness.
                 UnaryOp::Bang => Ok(IrNode::Not(Box::new(self.lower_expr(&u.arg)?))),
                 // `delete obj.k` / `delete obj[k]` removes an own property and
@@ -217,7 +227,7 @@ impl LowerCtx<'_> {
             // frame) there is no `this` binding, so it stays unsupported. Inside a
             // `static` field initializer `this` is the class itself; inside a
             // derived constructor it is in the TDZ until `super(..)`.
-            Expr::This(this_expr) => {
+            Expr::This(_) => {
                 if let Some((frame, id)) = self.static_init
                     && self.only_arrows_above(frame)
                 {
@@ -226,12 +236,12 @@ impl LowerCtx<'_> {
                 if let Some(fi) = self.derived_frame() {
                     return Ok(self.derived_this(fi));
                 }
-                match self.ensure_this_local() {
-                    Some(local) => Ok(IrNode::Local(local)),
-                    None => {
-                        Err(CompileError::spanned(this_expr.span, "`this` is not supported").into())
-                    }
-                }
+                // Only the top-level `main` frame binds no `this`: there it is
+                // the global object.
+                Ok(match self.ensure_this_local() {
+                    Some(local) => IrNode::Local(local),
+                    None => IrNode::Intrinsic(GlobalIntrinsic::Global),
+                })
             }
             Expr::SuperProp(super_prop) => {
                 let read = self.lower_super_prop(super_prop)?;
@@ -264,10 +274,9 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a template literal into left-folded `BinOp::Add` concatenations,
-    /// reusing the `+` string-coercion path so interpolated values render
-    /// exactly like `"a" + x + "b"` (a non-string operand coerces because the
-    /// running accumulator is always a string).
+    /// Lower a template literal into left-folded `BinOp::Add` concatenations
+    /// of the quasis and each substitution's `ToString` (`String(x)`, so an
+    /// object's `toString` is preferred over its `valueOf`).
     ///
     /// A template always has exactly one more quasi than expr, interleaved in
     /// source order. Seeding with the first quasi (an `IrNode::Str`, possibly
@@ -282,10 +291,16 @@ impl LowerCtx<'_> {
         };
         let mut acc = IrNode::Str(cooked(&tpl.quasis[0]));
         for (expr, quasi) in tpl.exprs.iter().zip(tpl.quasis.iter().skip(1)) {
+            // A substitution is `ToString`ed (hint string), not `+`'s
+            // hint default.
             acc = IrNode::Binary {
                 op: BinOp::Add,
                 lhs: Box::new(acc),
-                rhs: Box::new(self.lower_expr(expr)?),
+                rhs: Box::new(IrNode::ConvertCall {
+                    op: ConvertOp::ToString,
+                    arg: Box::new(self.lower_expr(expr)?),
+                    radix: None,
+                }),
             };
             acc = IrNode::Binary {
                 op: BinOp::Add,
@@ -471,9 +486,7 @@ impl LowerCtx<'_> {
                 "arguments" => self
                     .resolve_arguments()
                     .map_err(|msg| CompileError::spanned(span, msg).into()),
-                _ => {
-                    Err(CompileError::spanned(span, format!("undeclared variable: {name}")).into())
-                }
+                _ => Ok(self.global_read(name)),
             }
         }
     }
@@ -705,7 +718,7 @@ impl LowerCtx<'_> {
         // is recognized by its `console.log` member callee (a `console` identifier
         // that resolves to no binding) and lowered to `IrNode::ConsoleLog` so the
         // backend emits calls to the host `print` import.
-        if is_console_log(callee_expr) && self.resolve("console").is_none() {
+        if is_console_log(callee_expr) && self.inline_namespace("console") {
             return Ok(IrNode::ConsoleLog { args });
         }
         // `Math.<name>(..)` is a built-in method, not a user-function call.
@@ -713,7 +726,7 @@ impl LowerCtx<'_> {
         // (only when nothing named `Math` shadows it) and lower to an `IrNode::MathCall`
         // whose arity is validated here.
         if let Some(name) = math_method_name(callee_expr)
-            && self.resolve("Math").is_none()
+            && self.inline_namespace("Math")
         {
             return lower_math_call(name, args, callee_expr.span());
         }
@@ -748,42 +761,37 @@ impl LowerCtx<'_> {
         {
             return self.lower_method_call(op, id.sym.as_ref(), &member.obj, args);
         }
-        // `Object.keys/values/entries(o)` are collection built-ins, not user-method
-        // calls. Like `Math`, `Object` is not a real binding: recognize it
-        // syntactically (only when nothing named `Object` shadows it) and lower to
-        // an `IrNode::ObjectBuiltin` whose method name and arity are validated here.
+        // `Object.keys/values/entries(o)` keep their inline
+        // `IrNode::ObjectBuiltin` (method name and arity validated here) while
+        // `Object` is the unshadowed, sealed, non-escaping global (design 3.2);
+        // otherwise the call reads the static from the `Object` value.
         if let Some(name) = object_method_name(callee_expr)
-            && self.resolve("Object").is_none()
+            && self.inline_namespace("Object")
         {
             return lower_object_call(name, args, callee_expr.span());
         }
-        // `JSON.stringify(v)` / `JSON.parse(s)` are collection built-ins, not
-        // user-method calls. Like `Object`, `JSON` is not a real binding:
-        // recognize it syntactically (only when nothing named `JSON` shadows it)
-        // and lower to an `IrNode::JsonStringify` (or reject `parse`/unknown names).
+        // `JSON.stringify(v)` / `JSON.parse(s)` keep their inline nodes while
+        // `JSON` is inline (as `Object` above).
         if let Some(name) = json_method_name(callee_expr)
-            && self.resolve("JSON").is_none()
+            && self.inline_namespace("JSON")
         {
             return lower_json_call(name, args, callee_expr.span());
         }
-        // `Promise.resolve(v)` / `Promise.reject(v)` are the promise-creation
-        // statics. Like `Object`/`JSON`, `Promise` is not a real binding:
-        // recognize it syntactically (only when nothing named `Promise` shadows
-        // it) and lower to the corresponding promise node.
+        // `Promise.resolve(v)` / `Promise.reject(v)`: the inline promise nodes
+        // while `Promise` is inline (as `Object` above).
         if let Some(name) = promise_static_method_name(callee_expr)
-            && self.resolve("Promise").is_none()
+            && self.inline_namespace("Promise")
         {
             return lower_promise_static(name, args, callee_expr.span());
         }
-        // `Date.now()`: the host wall clock as a number. Like the other
-        // statics, `Date` is not a real binding; recognize `Date.now` syntactically
-        // (only when nothing named `Date` shadows it) and reject any argument.
+        // `Date.now()`: the host wall clock as a number, inline while `Date` is
+        // inline (as `Object` above); any argument is rejected.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let Expr::Ident(obj) = member.obj.as_ref()
             && obj.sym.as_ref() == "Date"
             && let MemberProp::Ident(id) = &member.prop
             && id.sym.as_ref() == "now"
-            && self.resolve("Date").is_none()
+            && self.inline_namespace("Date")
         {
             if !args.is_empty() {
                 return Err(CompileError::spanned(
@@ -876,20 +884,27 @@ impl LowerCtx<'_> {
                 func: sig.index,
                 args,
             })
-        } else if let Some(kind) = ErrorKind::from_name(name) {
+        } else if let Some(kind) = ErrorKind::from_name(name)
+            && self.shared.globals.sealed(name)
+        {
             // `Error(m)` without `new` constructs too (design 4.7).
             Ok(self.lower_error_construct(kind, args))
-        } else if let Some(op) = convert_builtin_op(name) {
+        } else if let Some(op) = convert_builtin_op(name)
+            && (!matches!(name, "String" | "Number" | "Boolean")
+                || self.shared.globals.sealed(name))
+        {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
             // String(){}` shadows it. Arity is validated here.
             lower_convert_call(op, name, args, ident.span())
         } else {
-            Err(
-                CompileError::spanned(ident.span(), format!("call to undeclared function: {name}"))
-                    .into(),
-            )
+            // A global-object property, read (or thrown on) at run time.
+            Ok(IrNode::CallIndirect {
+                callee: Box::new(self.global_read(name)),
+                args,
+                not_callable: CalleeError::not_a_function(name),
+            })
         }
     }
 
@@ -952,7 +967,7 @@ impl LowerCtx<'_> {
         // elements. Any other `Math.<name>` has a fixed arity, so a spread into
         // it is out of scope.
         if let Some(name) = math_method_name(callee_expr)
-            && self.resolve("Math").is_none()
+            && self.inline_namespace("Math")
         {
             let op = match name {
                 "max" => MathOp::Max,
@@ -1016,10 +1031,13 @@ impl LowerCtx<'_> {
             )
             .into())
         } else {
-            Err(
-                CompileError::spanned(ident.span(), format!("call to undeclared function: {name}"))
-                    .into(),
-            )
+            Ok(IrNode::CallSpread {
+                target: SpreadCallee::Indirect(
+                    Box::new(self.global_read(name)),
+                    CalleeError::not_a_function(name),
+                ),
+                args,
+            })
         }
     }
 
@@ -1104,7 +1122,7 @@ impl LowerCtx<'_> {
         let plain = match obj {
             Expr::Ident(id) => self.resolve(id.sym.as_ref()).and_then(|r| match r.kind {
                 AccessKind::Plain(local) => Some(local),
-                AccessKind::Cell(_) => None,
+                AccessKind::Cell(_) | AccessKind::Global(_) => None,
             }),
             _ => None,
         };
@@ -1353,13 +1371,7 @@ impl LowerCtx<'_> {
                 .into());
             };
             let name = ident.id.sym.as_ref();
-            let Some(resolved) = self.resolve(name) else {
-                return Err(CompileError::spanned(
-                    ident.span(),
-                    format!("undeclared variable: {name}"),
-                )
-                .into());
-            };
+            let resolved = self.resolve_target(name, ident.span())?;
             if !resolved.mutable {
                 return Err(CompileError::spanned(
                     ident.span(),
@@ -1388,13 +1400,7 @@ impl LowerCtx<'_> {
                 .into());
             };
             let name = ident.id.sym.as_ref();
-            let Some(resolved) = self.resolve(name) else {
-                return Err(CompileError::spanned(
-                    ident.span(),
-                    format!("undeclared variable: {name}"),
-                )
-                .into());
-            };
+            let resolved = self.resolve_target(name, ident.span())?;
             if !resolved.mutable {
                 return Err(CompileError::spanned(
                     ident.span(),
@@ -1416,13 +1422,7 @@ impl LowerCtx<'_> {
         match &assign.left {
             AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
                 let name = ident.id.sym.as_ref();
-                let Some(resolved) = self.resolve(name) else {
-                    return Err(CompileError::spanned(
-                        ident.span(),
-                        format!("undeclared variable: {name}"),
-                    )
-                    .into());
-                };
+                let resolved = self.resolve_target(name, ident.span())?;
                 // Reassigning a `const` binding (plain or compound) is rejected.
                 // Attach the target identifier's span so the diagnostic renderer
                 // can point a caret at the offending name.
@@ -1533,13 +1533,7 @@ impl LowerCtx<'_> {
             .into());
         };
         let name = ident.sym.as_ref();
-        let Some(resolved) = self.resolve(name) else {
-            return Err(CompileError::spanned(
-                ident.span(),
-                format!("undeclared variable: {name}"),
-            )
-            .into());
-        };
+        let resolved = self.resolve_target(name, ident.span())?;
         // `++`/`--` on a `const` binding is a reassignment, and is rejected.
         if !resolved.mutable {
             return Err(CompileError::spanned(
@@ -1555,23 +1549,20 @@ impl LowerCtx<'_> {
                 inc,
                 prefix: update.prefix,
             }),
-            // A captured cell: `x = ToNumber(cell) + delta` (prefix yields new);
-            // postfix yields the old value as `new - delta`.
-            AccessKind::Cell(ptr) => {
+            // A captured cell or a global: `x = ToNumber(x) + delta` (prefix
+            // yields new); postfix yields the old value as `new - delta`.
+            kind @ (AccessKind::Cell(_) | AccessKind::Global(_)) => {
                 let delta = if inc { 1.0 } else { -1.0 };
                 let new_value = IrNode::Binary {
                     op: BinOp::Add,
                     lhs: Box::new(IrNode::ConvertCall {
                         op: ConvertOp::ToNumber,
-                        arg: Box::new(IrNode::CellGet(Box::new(ptr.clone()))),
+                        arg: Box::new(Self::read_of(kind.clone())),
                         radix: None,
                     }),
                     rhs: Box::new(IrNode::Num(delta)),
                 };
-                let store = IrNode::CellSet {
-                    cell: Box::new(ptr),
-                    value: Box::new(new_value),
-                };
+                let store = Self::write_of(kind, new_value);
                 if update.prefix {
                     Ok(store)
                 } else {
@@ -1832,14 +1823,17 @@ impl LowerCtx<'_> {
     }
 
     /// Resolve the right-hand side of an `instanceof` to an [`InstanceOfKind`].
-    /// An UNSHADOWED `Error`/`TypeError`/`RangeError`/`Array`/`Function`/`Date`/
-    /// `Object` identifier (not yet a runtime value) takes its builtin test; any
-    /// other expression — including a binding that shadows one of those names —
-    /// is `OrdinaryHasInstance` on its value.
+    /// An unshadowed, sealed `Error`-family/`Array`/`Function`/`Date`/`Object`
+    /// identifier takes its builtin test; any other expression — including a
+    /// binding or declaration that shadows one of those names (DF11) — is
+    /// `OrdinaryHasInstance` on its value.
     fn instanceof_kind(&mut self, right: &Expr) -> anyhow::Result<InstanceOfKind> {
         if let Expr::Ident(id) = right {
             let name = id.sym.as_ref();
-            if self.resolve(name).is_none() {
+            if self.resolve(name).is_none()
+                && !self.shared.funcs.contains_key(name)
+                && self.shared.globals.sealed(name)
+            {
                 if let Some(kind) = ErrorKind::from_name(name) {
                     return Ok(InstanceOfKind::Proto(Box::new(IrNode::ErrorProto(kind))));
                 }
@@ -1856,12 +1850,13 @@ impl LowerCtx<'_> {
     }
 
     fn lower_new(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
-        // The builtin constructors keep their dedicated paths while unshadowed:
-        // they are not real bindings, so a user `let Map = ..` or `function
-        // Error(){}` constructs through the general path below.
+        // The builtin constructors keep their dedicated paths while unshadowed
+        // and sealed: a user `let Map = ..` or `function Error(){}` (DF11), or
+        // a reassigned global, constructs through the general path below.
         if let Expr::Ident(callee) = new_expr.callee.as_ref()
             && self.resolve(callee.sym.as_ref()).is_none()
             && !self.shared.funcs.contains_key(callee.sym.as_ref())
+            && self.shared.globals.sealed(callee.sym.as_ref())
         {
             let name = callee.sym.as_ref();
             // `new Map()` / `new Set()`: a fresh empty collection handle. Only
@@ -2008,53 +2003,15 @@ impl LowerCtx<'_> {
         };
         match message {
             None | Some(IrNode::Undefined) => {
-                IrNode::error_object(kind, None, None, IrNode::Str(name.to_owned()))
+                IrNode::error_object(kind, None, IrNode::Str(name.to_owned()))
             }
             Some(IrNode::Str(text)) => {
                 let stack = stack_of(&text);
-                IrNode::error_object(kind, None, Some(IrNode::Str(text)), stack)
+                IrNode::error_object(kind, Some(IrNode::Str(text)), stack)
             }
             Some(message) => {
-                let arg = self.fresh();
-                let msg = self.fresh();
-                let text = IrNode::Assign {
-                    local: msg,
-                    value: Box::new(IrNode::ConvertCall {
-                        op: ConvertOp::ToString,
-                        arg: Box::new(IrNode::Local(arg)),
-                        radix: None,
-                    }),
-                };
-                let stack = IrNode::Ternary {
-                    cond: Box::new(IrNode::Binary {
-                        op: BinOp::Eq,
-                        lhs: Box::new(IrNode::Local(msg)),
-                        rhs: Box::new(IrNode::Str(String::new())),
-                    }),
-                    then_branch: Box::new(IrNode::Str(name.to_owned())),
-                    else_branch: Box::new(IrNode::Binary {
-                        op: BinOp::Add,
-                        lhs: Box::new(IrNode::Str(format!("{name}: "))),
-                        rhs: Box::new(IrNode::Local(msg)),
-                    }),
-                };
-                IrNode::Ternary {
-                    cond: Box::new(IrNode::Binary {
-                        op: BinOp::Eq,
-                        lhs: Box::new(IrNode::Assign {
-                            local: arg,
-                            value: Box::new(message),
-                        }),
-                        rhs: Box::new(IrNode::Undefined),
-                    }),
-                    then_branch: Box::new(IrNode::error_object(
-                        kind,
-                        None,
-                        None,
-                        IrNode::Str(name.to_owned()),
-                    )),
-                    else_branch: Box::new(IrNode::error_object(kind, None, Some(text), stack)),
-                }
+                let (arg, msg) = (self.fresh(), self.fresh());
+                IrNode::error_from_argument(kind, IrNode::ErrorProto(kind), message, arg, msg)
             }
         }
     }
