@@ -151,15 +151,14 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
                 ),
             ])
         }
+        // The allocation only: `map_set::emit_ctor` adds the iterable's values.
         BuiltinCtor::Map | BuiltinCtor::Set => {
-            let message = format!("{} constructor arguments are not supported", ctor.name());
             let map = body.with_proto(
                 ctor,
                 IrNode::MapNew {
                     set: ctor == BuiltinCtor::Set,
                 },
             );
-            let map = ternary(is_nullish(body.arg(0)), map, throw_type_error(&message));
             body.requires_new(ctor, map)
         }
         BuiltinCtor::Promise => {
@@ -269,8 +268,8 @@ fn conversion(body: &Body, ctor: BuiltinCtor, op: ConvertOp, empty: IrNode) -> I
     ternary(body.constructing(), wrapper, value)
 }
 
-/// `new Date()` / `new Date(ms)`; called, `Date()` is the current time as a
-/// string. The calendar-field form is not supported.
+/// `new Date()` / `new Date(ms)`; called, `Date()` is the current time as
+/// `Date.prototype.toString` renders it. The calendar-field form is not supported.
 fn date(body: &Body) -> IrNode {
     let ms = IrNode::ConvertCall {
         op: ConvertOp::ToNumber,
@@ -288,13 +287,19 @@ fn date(body: &Body) -> IrNode {
             throw_type_error("the Date calendar-field constructor is not supported"),
         ),
     );
+    let now = body.temp(3);
     ternary(
         body.constructing(),
         body.with_proto(BuiltinCtor::Date, alloc),
-        IrNode::ConvertCall {
-            op: ConvertOp::ToString,
-            arg: Box::new(IrNode::DateNew { ms: None }),
-            radix: None,
-        },
+        IrNode::Seq(vec![
+            IrNode::Assign {
+                local: now,
+                value: Box::new(IrNode::DateNew { ms: None }),
+            },
+            IrNode::DateField {
+                op: DateOp::ToString,
+                recv: now,
+            },
+        ]),
     )
 }

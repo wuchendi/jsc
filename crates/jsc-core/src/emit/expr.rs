@@ -214,11 +214,13 @@ pub(super) fn emit_node(
             sm_table_index,
             slots,
             total,
+            limits,
         } => {
             generator::emit_make_generator(
                 *sm_table_index,
                 slots,
                 *total,
+                *limits,
                 function,
                 scratch,
                 strings,
@@ -397,11 +399,11 @@ pub(super) fn emit_node(
         IrNode::MapNew { set } => {
             emit_map_new_node(*set, function, scratch, helpers);
         }
-        node @ IrNode::MapMethod { .. } => {
-            emit_map_method_node(node, function, scratch, strings, helpers);
+        IrNode::SizeRead { sealed, obj } => {
+            emit_size_read(*sealed, obj, function, scratch, strings, helpers);
         }
-        node @ IrNode::ReceiverMethod { .. } => {
-            emit_receiver_method_node(node, function, scratch, strings, helpers);
+        IrNode::CollectionOp { op, handle, args } => {
+            emit_map_op(*op, *handle, args, function, scratch, strings, helpers);
         }
         IrNode::IndexSet { obj, index, value } => {
             emit_index_set_node(obj, index, value, function, scratch, strings, helpers);
@@ -503,16 +505,13 @@ pub(super) fn emit_node(
         }
         // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
         // millisecond payload. `DateNew`/`DateNow` seed from `ms` or the host clock;
-        // `DateGetTime` reads the payload back (or `NaN` for a non-Date receiver).
+        // `DateField` computes a field from a Date receiver's payload.
         IrNode::DateNew { ms } => {
             emit_date_new_node(ms.as_deref(), function, scratch, strings, helpers);
         }
         IrNode::DateNow => emit_date_now_node(function, helpers),
-        IrNode::DateGetTime { recv } => {
-            emit_date_get_time_node(recv, function, scratch, strings, helpers);
-        }
-        node @ IrNode::DateMethod { .. } => {
-            emit_date_method_node(node, function, scratch, strings, helpers);
+        IrNode::DateField { op, recv } => {
+            emit_date_field(*op, *recv, function, scratch, strings, helpers);
         }
         IrNode::Not(operand) => {
             // `!operand` = boolean(!truthy(operand)). `emit_cond` leaves the i32
@@ -875,11 +874,96 @@ pub(super) fn emit_namespace_guard(
     function.instruction(&Instruction::End);
 }
 
+/// The realm prototypes a receiver of `kind` must inherit from directly,
+/// each with the kind byte it pairs with.
+fn proto_kind_cases(kind: ProtoKind) -> &'static [(i32, Intrinsic)] {
+    const ARRAY: [(i32, Intrinsic); 1] = [(TYPE_ARRAY, Intrinsic::Prototype(BuiltinCtor::Array))];
+    const MAP: [(i32, Intrinsic); 1] = [(TYPE_MAP, Intrinsic::Prototype(BuiltinCtor::Map))];
+    const SET: [(i32, Intrinsic); 1] = [(TYPE_SET, Intrinsic::Prototype(BuiltinCtor::Set))];
+    const COLLECTION: [(i32, Intrinsic); 2] = [MAP[0], SET[0]];
+    const PROMISE: [(i32, Intrinsic); 1] = [(
+        abi::TYPE_PROMISE as i32,
+        Intrinsic::Prototype(BuiltinCtor::Promise),
+    )];
+    const DATE: [(i32, Intrinsic); 1] = [(TYPE_DATE, Intrinsic::Prototype(BuiltinCtor::Date))];
+    const GENERATOR: [(i32, Intrinsic); 1] = [(TYPE_GENERATOR, Intrinsic::GeneratorPrototype)];
+    match kind {
+        ProtoKind::Array => &ARRAY,
+        ProtoKind::Map => &MAP,
+        ProtoKind::Set => &SET,
+        ProtoKind::Collection => &COLLECTION,
+        ProtoKind::Promise => &PROMISE,
+        ProtoKind::Date => &DATE,
+        ProtoKind::Generator => &GENERATOR,
+    }
+}
+
+/// Push i32 `1` when the jsval in `local` is a receiver of `kind` whose
+/// builtin methods are provably the realm's (design 3.2): a heap block of the
+/// kind byte with no own properties (`props == 0`, one i64 load of the header
+/// and `props` words) whose `proto` is the family's prototype and, unless
+/// `sealed`, whose dirty bit is clear. `tmp` is a free i32 local.
+pub(super) fn emit_proto_kind_test(
+    function: &mut Function,
+    local: u32,
+    kind: ProtoKind,
+    sealed: bool,
+    tmp: u32,
+    helpers: Helpers<'_>,
+) {
+    let cases = proto_kind_cases(kind);
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    for (i, &(type_byte, prototype)) in cases.iter().enumerate() {
+        if i == 0 {
+            function.instruction(&Instruction::LocalGet(local));
+            function.instruction(&Instruction::I32WrapI64);
+            function.instruction(&Instruction::LocalTee(tmp));
+        } else {
+            function.instruction(&Instruction::LocalGet(tmp));
+        }
+        function.instruction(&Instruction::I64Load(MemArg {
+            offset: 0,
+            align: 3,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
+        function.instruction(&Instruction::I64And);
+        function.instruction(&Instruction::I64Const(i64::from(type_byte)));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::LocalGet(tmp));
+        function.instruction(&Instruction::I64Load(MemArg {
+            offset: OBJ_PROTO_OFFSET,
+            align: 3,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I64Const(intrinsic_bits(prototype, helpers)));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::I32And);
+        if i > 0 {
+            function.instruction(&Instruction::I32Or);
+        }
+    }
+    let bits = cases
+        .iter()
+        .filter_map(|(_, prototype)| prototype.watch_bit())
+        .fold(0, |bits, bit| bits | (1 << bit));
+    if !sealed && bits != 0 {
+        function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+        function.instruction(&Instruction::I32Const(bits));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
 /// Emit a builtin method call with guarded fast paths ([`IrNode::ProtoGuard`],
-/// design 3.2 row 3), leaving its result on the stack. An array fast path runs
-/// while `recv` is an array handle with no own properties whose `proto` is
-/// `%Array.prototype%` and (unless intrinsics-sealed) that prototype's dirty
-/// bit is clear. Every other receiver takes ONE call: the argument slots,
+/// design 3.2 rows 3-4), leaving its result on the stack. Each fast path runs
+/// while `recv` passes its [`emit_proto_kind_test`]. Every other receiver
+/// takes ONE call: the argument slots,
 /// `this = recv`, the packed `env` (interned key, not-a-function message) and
 /// `argc`, through the out-of-line generic method call — or, when `key` is a
 /// `String.prototype` builtin, straight into that builtin for a string
@@ -899,7 +983,7 @@ pub(super) fn emit_proto_guard(
         recv,
         key,
         args,
-        array,
+        fast,
         not_callable,
     } = node
     else {
@@ -970,40 +1054,11 @@ pub(super) fn emit_proto_guard(
         function.instruction(&Instruction::Else);
         opened += 1;
     }
-    if let Some(array) = array {
-        let prototype = realm::prototype_of(BuiltinCtor::Array);
-        emit_is_pointer(function, local);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-        function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32WrapI64);
-        function.instruction(&Instruction::LocalTee(scratch + 3));
-        // One load of the header word and the `props` word behind it: the kind
-        // byte matches and `props == 0`.
-        function.instruction(&Instruction::I64Load(MemArg {
-            offset: 0,
-            align: 3,
-            memory_index: 0,
-        }));
-        function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
-        function.instruction(&Instruction::I64And);
-        function.instruction(&Instruction::I64Const(i64::from(TYPE_ARRAY)));
-        function.instruction(&Instruction::I64Eq);
-        function.instruction(&Instruction::LocalGet(scratch + 3));
-        function.instruction(&Instruction::I64Load(MemArg {
-            offset: OBJ_PROTO_OFFSET,
-            align: 3,
-            memory_index: 0,
-        }));
-        function.instruction(&Instruction::I64Const(intrinsic_bits(prototype, helpers)));
-        function.instruction(&Instruction::I64Eq);
-        function.instruction(&Instruction::I32And);
-        dirty_clear(function, prototype);
-        function.instruction(&Instruction::Else);
-        function.instruction(&Instruction::I32Const(0));
-        function.instruction(&Instruction::End);
+    for (kind, path) in fast {
+        emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
-        emit_node(array, function, scratch, strings, helpers);
+        emit_node(path, function, scratch, strings, helpers);
         function.instruction(&Instruction::Else);
         opened += 1;
     }

@@ -2,23 +2,7 @@
 #![allow(clippy::expect_used)]
 
 mod common;
-use std::process::Command;
-
 use common::jsc;
-
-/// Run `jsc -e <src>` expecting compile-error exit 2, returning its stderr so a
-/// rejection message can be asserted.
-fn jsc_reject(src: &str) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", src])
-        .output()
-        .expect("failed to spawn jsc binary");
-    assert!(
-        output.status.code() == Some(2),
-        "jsc -e {src:?} should exit 2 (compile error)"
-    );
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
 
 /// Map/Set basics run inline with `-p` through the built binary.
 ///
@@ -188,18 +172,9 @@ fn method_name_fallback_to_user_method() {
     assert_eq!(jsc(&["-p", "let o={get(){return 7}}; o.get()"]), "7");
 }
 
-/// Out-of-scope forms are rejected with a span: constructor arguments beyond the
-/// empty `new Map()`/`new Set()`.
+/// The constructors take an iterable of entries / values.
 #[test]
-fn rejects_constructor_arguments() {
-    let out = jsc_reject("new Map([[1,2]])");
-    assert!(
-        out.contains("constructor arguments is unsupported"),
-        "unexpected output: {out}"
-    );
-    let out = jsc_reject("new Set([1,2])");
-    assert!(
-        out.contains("constructor arguments is unsupported"),
-        "unexpected output: {out}"
-    );
+fn iterable_constructor_arguments() {
+    assert_eq!(jsc(&["-p", "new Map([[1,2]]).get(1)"]), "2");
+    assert_eq!(jsc(&["-p", "new Set([1,2,2]).size"]), "2");
 }

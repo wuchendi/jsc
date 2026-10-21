@@ -41,10 +41,13 @@ fn syntactic_call(callee: &str) -> bool {
     matches!(callee, "String" | "Number" | "Boolean") || ErrorKind::from_name(callee).is_some()
 }
 
-/// Whether `new callee(..)` keeps its syntactic lowering while `callee` names
-/// the unshadowed builtin.
-fn syntactic_new(callee: &str) -> bool {
-    matches!(callee, "Map" | "Set" | "Promise" | "Date") || ErrorKind::from_name(callee).is_some()
+/// Whether `new callee(..)` with `args` arguments keeps its syntactic
+/// lowering while `callee` names the unshadowed builtin (`Map`/`Set` only
+/// without an iterable).
+fn syntactic_new(callee: &str, args: usize) -> bool {
+    matches!(callee, "Promise" | "Date")
+        || (matches!(callee, "Map" | "Set") && args == 0)
+        || ErrorKind::from_name(callee).is_some()
 }
 
 /// What the whole-program scan found (see the module docs).
@@ -232,7 +235,7 @@ impl Visit for Scan {
         let args = new.args.as_ref().map_or(0, Vec::len);
         self.facts.max_call_args = self.facts.max_call_args.max(args);
         if let Expr::Ident(id) = new.callee.as_ref()
-            && syntactic_new(id.sym.as_ref())
+            && syntactic_new(id.sym.as_ref(), args)
         {
             self.read(id.sym.as_ref(), false);
             new.args.visit_with(self);

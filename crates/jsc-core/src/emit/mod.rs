@@ -36,7 +36,7 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
     SpreadCallee, SpreadElem,
 };
 
@@ -413,6 +413,12 @@ fn callee_error_text(error: &CalleeError) -> CalleeErrorText<'_> {
 /// The not-a-function `TypeError` text of a guarded call whose callee has no
 /// source name (an array callback, a promise executor, a `super` call, a
 /// generator resume).
+/// The `TypeError` of resuming a generator that is already running.
+const GENERATOR_RUNNING: CalleeErrorText<'static> = [
+    "Generator is already running",
+    "TypeError: Generator is already running",
+];
+
 const EXPRESSION_NOT_A_FUNCTION: CalleeErrorText<'static> = [
     "expression is not a function",
     "TypeError: expression is not a function",

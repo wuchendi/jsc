@@ -364,8 +364,24 @@ pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 `done` flag.
 pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 resume
+/// `limits` bits ([`GEN_LIMIT_RETURN`], [`GEN_LIMIT_THROW`]), guest-only.
+pub(crate) const GEN_LIMITS_OFFSET: u32 = OBJ_PREFIX_SIZE + 12;
+
+/// Generator `limits` bit: the body has a `finally` or a `yield*`, so a
+/// `return()` at a suspended `yield` (which must run them) is unsupported.
+pub(crate) const GEN_LIMIT_RETURN: u32 = 1;
+
+/// Generator `limits` bit: the body has a `yield*`, so a `throw()` at a
+/// suspended `yield` (which must forward to the delegate) is unsupported.
+pub(crate) const GEN_LIMIT_THROW: u32 = 2;
+
+/// Generator `limits` bit: the state machine is running (set around each
+/// resume), so a `next()` / `return()` / `throw()` from its own body throws.
+pub(crate) const GEN_RUNNING: u32 = 4;
+
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
-/// jsval, 8-byte aligned past a u32 pad.
+/// jsval, 8-byte aligned past the `limits` word.
 pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// The byte size of a [`TYPE_GENERATOR`] block.

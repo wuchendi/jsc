@@ -34,7 +34,7 @@ use globals::GlobalFacts;
 use crate::ir::{
     ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, GlobalIntrinsic,
     GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp,
-    MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
+    MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind, SpreadCallee, SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].

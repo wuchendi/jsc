@@ -2,7 +2,7 @@ use super::lower;
 use crate::frontend::{Dialect, parse};
 use crate::ir::{
     BinOp, CalleeError, ConvertOp, ErrorKind, GlobalIntrinsic, GlobalRef, IrNode, IrStmt, MathOp,
-    ObjectBuiltinOp, OpSetKind, PropKey,
+    ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
 };
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
@@ -675,11 +675,8 @@ fn unknown_namespace_members_are_method_calls() {
 /// The `sealed` flags of the [`IrNode::ProtoGuard`]s with an array fast
 /// path in `node`.
 fn proto_guards(node: &IrNode, out: &mut Vec<bool>) {
-    if let IrNode::ProtoGuard {
-        sealed,
-        array: Some(_),
-        ..
-    } = node
+    if let IrNode::ProtoGuard { sealed, fast, .. } = node
+        && fast.iter().any(|(kind, _)| *kind == ProtoKind::Array)
     {
         out.push(*sealed);
     }

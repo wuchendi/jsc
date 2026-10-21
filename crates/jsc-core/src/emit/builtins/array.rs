@@ -158,18 +158,6 @@ fn strict_eq(a: u32, b: u32) -> IrNode {
     }
 }
 
-/// Emit `node` in the body's scratch layout, dropping its value.
-fn emit_drop(
-    function: &mut Function,
-    frame: Frame,
-    node: &IrNode,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    emit_node(node, function, frame.scratch(), strings, helpers);
-    wasm!(function; Drop);
-}
-
 /// `ToObject(this)` into i64 `o`: `undefined`/`null` throws `nullish`, a
 /// primitive becomes its wrapper object.
 fn this_object(
