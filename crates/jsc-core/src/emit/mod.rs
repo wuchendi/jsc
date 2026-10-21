@@ -443,34 +443,18 @@ const INSTANCEOF_NON_OBJECT_PROTOTYPE: CalleeErrorText<'static> = [
 
 /// The `TypeError` a guarded call site throws (shape of `new TypeError(m)`,
 /// see [`IrNode::error_object`]). Emitted on the throw path via [`emit_node`];
-/// its strings are seeded with [`ERROR_STRS`] by [`collect_node`].
+/// its strings are seeded by [`collect_node`].
 fn callee_type_error([message, stack]: CalleeErrorText<'_>) -> IrNode {
     IrNode::error_object(
         ErrorKind::TypeError,
-        None,
         Some(IrNode::Str(message.to_owned())),
         IrNode::Str(stack.to_owned()),
     )
 }
 
-/// The static strings every error needs: the own keys of an Error instance and
-/// the keys and values of the static error prototypes (see
-/// [`emit_error_protos`]). Seeded by [`collect_node`] wherever an error can be
-/// created or observed; the prototypes are emitted iff all are interned.
-const ERROR_STRS: [&str; 7] = [
-    "name",
-    "message",
-    "stack",
-    "",
-    "Error",
-    "TypeError",
-    "RangeError",
-];
-
-/// The byte size of one static error prototype block: the object-family
-/// prefix, then its `TYPE_PROPS` table holding `name` and `message`.
-const ERROR_PROTO_SIZE: i32 =
-    (abi::OBJ_PREFIX_SIZE + abi::PROPS_HEADER_SIZE + 2 * abi::PROP_ENTRY_SIZE).cast_signed();
+/// The own key every Error instance carries besides `message` (the realm
+/// interns the rest of the error strings).
+const STACK_KEY: &str = "stack";
 
 /// The message fragments `__nullish_throw` splices into the V8-style text of the
 /// `TypeError` raised by a member read/write on a `null`/`undefined` receiver:
@@ -506,7 +490,7 @@ const FN_KEYS: [&str; 6] = [
 ];
 
 /// The static strings `__nullish_throw` needs — the receiver words and the
-/// message fragments. Seeded (with [`ERROR_STRS`]) by [`collect_node`] at every
+/// message fragments. Seeded by [`collect_node`] at every
 /// guarded member read/write/method-call site so their `[len][utf8]` blobs
 /// exist when the guard throws.
 const NULLISH_ERROR_STRS: [&str; 9] = [
@@ -588,8 +572,8 @@ const PROP_THROW_EXTENDS: i32 = 7;
 const PROP_THROW_EXTENDS_PROTO: i32 = 8;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
-/// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded (with
-/// [`ERROR_STRS`]) by [`collect_node`] at every member store and `delete` site
+/// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
+/// [`collect_node`] at every member store and `delete` site
 /// so their `[len][utf8]` blobs exist when they throw.
 const PROP_ERROR_STRS: [&str; 10] = [
     ARRAY_LENGTH_MSG,
@@ -604,30 +588,25 @@ const PROP_ERROR_STRS: [&str; 10] = [
     "boolean",
 ];
 
-/// The `JSON.parse` syntax-error `.name`, `.message`, and `.stack` text. jsc has
-/// no `%SyntaxError.prototype%` yet, so the thrown object is an `Error` (`e
-/// instanceof Error` holds) with an own `.name` of `SyntaxError`, rendering as
-/// `SyntaxError: …`. A single generic message covers every malformed /
-/// unsupported-input case (a `\u` escape is out of v1 scope; see `json_parse`).
-const JSON_ERROR_NAME: &str = "SyntaxError";
-/// See [`JSON_ERROR_NAME`].
+/// The `JSON.parse` `SyntaxError` `.message` and `.stack` text. A single
+/// generic message covers every malformed / unsupported-input case (a `\u`
+/// escape is out of v1 scope; see `json_parse`).
 const JSON_ERROR_MSG: &str = "JSON.parse: invalid or unsupported JSON input";
-/// See [`JSON_ERROR_NAME`].
+/// See [`JSON_ERROR_MSG`].
 const JSON_ERROR_STACK: &str = "SyntaxError: JSON.parse: invalid or unsupported JSON input";
 
 /// The static strings the `JSON.parse` syntax-error object embeds, interned
-/// (with [`ERROR_STRS`]) by [`collect_node`] wherever a `JsonParse` node exists
-/// so their `[len][utf8]` blobs are in the data segment when `__json_throw`
-/// builds the object.
-const JSON_PARSE_ERROR_STRS: [&str; 3] = [JSON_ERROR_NAME, JSON_ERROR_MSG, JSON_ERROR_STACK];
+/// by [`collect_node`] wherever a `JsonParse` node exists so their
+/// `[len][utf8]` blobs are in the data segment when `__json_throw` builds the
+/// object.
+const JSON_PARSE_ERROR_STRS: [&str; 2] = [JSON_ERROR_MSG, JSON_ERROR_STACK];
 
-/// Build the syntax-error object `__json_throw` raises on malformed JSON, the
-/// same shape as [`callee_type_error`]. Emitted via [`emit_node`]; its
-/// strings are seeded by [`JSON_PARSE_ERROR_STRS`].
+/// Build the `SyntaxError` `__json_throw` raises on malformed JSON, the same
+/// shape as [`callee_type_error`]. Emitted via [`emit_node`]; its strings are
+/// seeded by [`JSON_PARSE_ERROR_STRS`].
 fn json_syntax_error() -> IrNode {
     IrNode::error_object(
-        ErrorKind::Error,
-        Some(JSON_ERROR_NAME),
+        ErrorKind::SyntaxError,
         Some(IrNode::Str(JSON_ERROR_MSG.to_owned())),
         IrNode::Str(JSON_ERROR_STACK.to_owned()),
     )
@@ -792,8 +771,7 @@ struct Helpers<'a> {
     /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
     /// array — the drain backing `[...gen]` / `f(...gen)` spread. Emitted just
-    /// before `invoke1`; a stub (returns an empty array) when the program declares
-    /// no functions (no generator can exist, so it is never called).
+    /// before `invoke1`.
     gen_to_array: u32,
     /// `__nullish_throw(recv: i64, key: i64, set: i32)`: build the V8-style
     /// `TypeError` for a member read (`set == 0`) or write (`set == 1`) on a
@@ -820,21 +798,20 @@ struct Helpers<'a> {
     /// `__async_step(gen: i64, sent: i64) -> i64`: the generator
     /// single-step trampoline the host async engine calls to advance an
     /// `async function` body's state machine by one suspend. Appended right after
-    /// `invoke1` (so it always exists, index `invoke1 + 1`, even when the program
-    /// declares no functions — a stub then), exported under
-    /// [`ASYNC_STEP_EXPORT_NAME`].
+    /// `invoke1` (index `invoke1 + 1`), exported under [`ASYNC_STEP_EXPORT_NAME`].
     async_step: u32,
     /// The funcref-TABLE slots of the two `new Promise` settler functions:
     /// `resolve` (fulfills the bound promise) and `reject`. A `new Promise`
     /// executor receives function values pointing at these slots with the target
-    /// promise in their env slot. `0` when the program declares no functions (no
-    /// table, and `new Promise` — needing an executor function — cannot occur).
+    /// promise in their env slot. They follow the `n` user-function slots, so
+    /// `settle_resolve_slot` is also the user function count.
     settle_resolve_slot: u32,
     settle_reject_slot: u32,
-    /// `__new_string(len: i32) -> i32`: the exported string constructor. The
-    /// LAST defined functions are it, `__new_array` (`new_string + 1`), and
-    /// `__new_promise` (`new_string + 2`), appended after the settlers so every
-    /// other index stays stable.
+    /// `__new_string(len: i32) -> i32`: the exported string constructor,
+    /// followed by `__new_array` (`new_string + 1`), `__new_promise`
+    /// (`new_string + 2`), `__has_own` (`new_string + 3`), and the builtin
+    /// bodies ([`Self::builtin`]), appended after the settlers so every other
+    /// index stays stable.
     new_string: u32,
     /// `__alloc(size) -> i32`: bump-allocate `size` bytes, returning the offset.
     /// Called inline by array literals.
@@ -951,22 +928,16 @@ struct Helpers<'a> {
     json_array: u32,
     json_object: u32,
     json_parse: u32,
-    /// The wasm type index of the uniform user-function signature
-    /// `(env, a0..a_{K-1}) -> i64`, used as the `call_indirect` type. `0` when
-    /// the program declares no functions (no indirect call can occur).
+    /// The wasm type index of the uniform function signature
+    /// `(a0..a_{K-1}, env, argc) -> i64`, used as the `call_indirect` type.
     fn_type: u32,
     /// The fixed positional-argument arity `K` of the uniform ABI: how many
     /// argument slots every call site pushes (padding with `undefined` or
-    /// truncating extras). `0` when there are no functions.
+    /// truncating extras).
     max_args: u32,
-    /// Whether the program declares any function (so the funcref table and the
-    /// uniform `call_indirect` type exist). When `false`, a `gen.next()` receiver
-    /// provably cannot be a generator — [`generator::emit_gen_resume`] then throws
-    /// a `TypeError` unconditionally instead of emitting an invalid indirect call.
-    has_funcs: bool,
     /// Whether the program builds any accessor ([`IrNode::MakeAccessor`]).
     /// When `false`, `__get` / `__set` omit the getter/setter invocation and
-    /// member accesses skip the post-call exception check. Implies `has_funcs`.
+    /// member accesses skip the post-call exception check.
     has_accessors: bool,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
     /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
@@ -975,6 +946,24 @@ struct Helpers<'a> {
 }
 
 impl Helpers<'_> {
+    /// Base address of the realm image (see [`realm`]): right after the
+    /// static declaration blocks.
+    fn realm(self) -> i32 {
+        decl_func_base(self.settle_resolve_slot, self)
+    }
+
+    /// `__has_own(key, obj) -> i32`: whether `obj` has the own property `key`
+    /// (see [`props::emit_has_own`]), right after `__new_promise`.
+    fn has_own(self) -> u32 {
+        self.new_string + 3
+    }
+
+    /// The wasm function index of `builtin`'s body; the bodies follow
+    /// `__has_own` in [`Builtin::ALL`] order.
+    fn builtin(self, builtin: Builtin) -> u32 {
+        self.new_string + 4 + builtin.index()
+    }
+
     /// `__new_array(len) -> i32`: the exported array constructor, right after
     /// `__new_string`.
     fn new_array(self) -> u32 {
@@ -1019,49 +1008,39 @@ impl Helpers<'_> {
     }
 }
 
-/// The heap-pointer jsval of `kind`'s static prototype block (see
-/// [`emit_error_protos`]). The prototypes directly follow the function data
-/// ([`FnLayout::errors`]); every site referencing one seeds [`ERROR_STRS`],
-/// so they are present.
-fn error_proto_bits(kind: ErrorKind, helpers: Helpers<'_>) -> i64 {
-    let base = if helpers.has_funcs {
-        decl_func_base(helpers.settle_resolve_slot, helpers)
-    } else {
-        helpers.fn_info
-    };
-    let index = ErrorKind::ALL.iter().position(|k| *k == kind).unwrap_or(0);
-    let addr = base + ERROR_PROTO_SIZE * i32::try_from(index).unwrap_or(0);
-    HEAP_BITS | i64::from(addr)
-}
-
 /// The address of the static function block of top-level declaration
 /// `table_index`: the blocks follow the `__fn_info` table's entries for the
-/// user functions and the two settlers (`settle_resolve_slot` is the user
-/// function count).
+/// user functions, the two settlers, and the builtins (`settle_resolve_slot`
+/// is the user function count).
 fn decl_func_base(table_index: u32, helpers: Helpers<'_>) -> i32 {
-    let info_entries = helpers.settle_resolve_slot.cast_signed() + 2;
+    let info_entries = helpers.settle_resolve_slot.cast_signed() + 2 + builtin_count();
     helpers.fn_info
         + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_entries
         + abi::FUNC_BLOCK_SIZE.cast_signed() * table_index.cast_signed()
 }
 
+/// The number of builtin bodies (funcref-table slots after the settlers).
+fn builtin_count() -> i32 {
+    i32::try_from(Builtin::ALL.len()).unwrap_or(0)
+}
+
 /// Where the function data lives in the data segment: the `__fn_info` table
-/// (one [`abi::FN_INFO_ENTRY_SIZE`]-byte entry per funcref-table index,
-/// settlers included) and,
-/// after it, one static [`abi::FUNC_BLOCK_SIZE`]-byte function block per index
-/// (the object of a top-level declaration, [`IrNode::DeclFunc`]).
+/// (one [`abi::FN_INFO_ENTRY_SIZE`]-byte entry per funcref-table index:
+/// user functions, settlers, builtins), after it one static
+/// [`abi::FUNC_BLOCK_SIZE`]-byte function block per user function (the object
+/// of a top-level declaration, [`IrNode::DeclFunc`]), then the realm image.
 #[derive(Clone, Copy)]
 struct FnLayout {
     /// Base address of the info table.
     info: i32,
     /// Base address of the static function blocks.
     blocks: i32,
-    /// Base address of the static error prototypes, [`ERROR_PROTO_SIZE`] bytes
-    /// each in [`ErrorKind::ALL`] order, or `0` when absent.
-    errors: i32,
+    /// Base address of the realm image.
+    realm: i32,
 }
 
 mod array;
+mod builtins;
 mod expr;
 mod function;
 mod generator;
@@ -1069,6 +1048,7 @@ mod json_parse;
 mod numeric;
 mod object;
 mod props;
+mod realm;
 mod runtime;
 mod sections;
 mod stmt;
@@ -1090,6 +1070,7 @@ use numeric::*;
 use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
+use realm::{Builtin, Intrinsic, intrinsic_bits};
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]
@@ -1116,34 +1097,26 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // offset in linear memory. `heap_ptr_init` is the first free offset after all
     // literal blobs — where the bump allocator begins.
     let (offsets, strings_end) = collect_strings(program);
-    // The function info table and the static declaration blocks follow the
-    // string blobs, then the intern table; the bump allocator begins after it.
-    // (Info entries cover the two `new Promise` settlers, present with functions.)
+    // The function info table (user functions, the two `new Promise`
+    // settlers, the builtins), the static declaration blocks, and the realm
+    // image follow the string blobs, then the intern table; the bump allocator
+    // begins after it.
     let n = program.functions.len();
     let fn_count = i32::try_from(n).unwrap_or(i32::MAX);
-    let info_count = if n > 0 { fn_count + 2 } else { 0 };
-    // The static error prototypes follow the function blocks, only when every
-    // string they and the errors need is interned (seeded wherever an error
-    // can be created or observed).
+    let info_count = fn_count + 2 + builtin_count();
     let blocks = strings_end + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_count;
-    let blocks_end = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
-    let has_errors = ERROR_STRS.iter().all(|s| offsets.contains_key(*s));
+    let realm = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
     let layout = FnLayout {
         info: strings_end,
         blocks,
-        errors: if has_errors { blocks_end } else { 0 },
+        realm,
     };
-    let intern_base = if has_errors {
-        blocks_end + ERROR_PROTO_SIZE * i32::try_from(ErrorKind::ALL.len()).unwrap_or(0)
-    } else {
-        blocks_end
-    };
+    let intern_base = realm + realm::image_size();
     let intern = intern_table(&offsets, intern_base);
     let heap_ptr_init = intern_base + 4 * intern.cap;
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
-    let has_funcs = n > 0;
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
@@ -1214,24 +1187,20 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
 
     module.section(&functions);
 
-    // Table section: a funcref table listing every user function so a
-    // function value can be called through `call_indirect`. Table slot `i` holds
-    // wasm function index `i + 1`; the element segment (below, after exports)
-    // populates it. Omitted entirely when the program declares no functions.
-    if has_funcs {
-        // `n` user-function slots plus the two `new Promise` settler slots,
-        // which occupy slots `n` and `n + 1`.
-        let table_len = (n + 2) as u64;
-        let mut tables = TableSection::new();
-        tables.table(TableType {
-            element_type: RefType::FUNCREF,
-            table64: false,
-            minimum: table_len,
-            maximum: Some(table_len),
-            shared: false,
-        });
-        module.section(&tables);
-    }
+    // Table section: a funcref table listing every user function, the two
+    // `new Promise` settlers (slots `n`, `n + 1`) and the builtins, so a
+    // function value can be called through `call_indirect`. The element
+    // segment (below, after exports) populates it.
+    let table_len = (n + 2 + Builtin::ALL.len()) as u64;
+    let mut tables = TableSection::new();
+    tables.table(TableType {
+        element_type: RefType::FUNCREF,
+        table64: false,
+        minimum: table_len,
+        maximum: Some(table_len),
+        shared: false,
+    });
+    module.section(&tables);
 
     // Memory section: one linear memory (min 1 page, capped at
     // `abi::MEMORY_MAX_PAGES`; `__alloc` grows it on demand), exported below.
@@ -1289,32 +1258,27 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     );
     module.section(&exports);
 
-    // Element section: an active segment filling the funcref table at offset 0
-    // with wasm function indices `1..=n` (the user functions), so table slot `i`
-    // resolves to function `i + 1` for `call_indirect`. Emitted between the
-    // export and code sections (the wasm section order), only when there are
-    // functions to reference.
-    if has_funcs {
-        // Table slot `i` holds DEFINED function index `i + 1 + IMPORT_FUNC_COUNT`
-        // (the user functions, shifted past `main` and the imports). The funcref
-        // table's slot indices themselves are unaffected by imports, so a
-        // `call_indirect` table index needs no adjustment.
-        let mut func_indices: Vec<u32> = (1..=u32::try_from(n).unwrap_or(u32::MAX))
-            .map(|i| i + IMPORT_FUNC_COUNT)
-            .collect();
-        // The two `new Promise` settler functions fill the trailing table
-        // slots `n`/`n + 1`; they are the last two DEFINED functions, right after
-        // the `__invoke1` and `__async_step` trampolines.
-        func_indices.push(helpers.async_step + 1);
-        func_indices.push(helpers.async_step + 2);
-        let mut elements = ElementSection::new();
-        elements.active(
-            None,
-            &ConstExpr::i32_const(0),
-            Elements::Functions(Cow::Owned(func_indices)),
-        );
-        module.section(&elements);
-    }
+    // Element section: an active segment filling the funcref table at offset
+    // 0. Table slot `i < n` holds DEFINED function index
+    // `i + 1 + IMPORT_FUNC_COUNT` (the user functions, shifted past `main` and
+    // the imports); the funcref table's slot indices themselves are unaffected
+    // by imports, so a `call_indirect` table index needs no adjustment.
+    let mut func_indices: Vec<u32> = (1..=u32::try_from(n).unwrap_or(u32::MAX))
+        .map(|i| i + IMPORT_FUNC_COUNT)
+        .collect();
+    // The two `new Promise` settler functions fill slots `n`/`n + 1`; they are
+    // the DEFINED functions right after the `__invoke1` and `__async_step`
+    // trampolines. The builtin bodies fill the slots after them.
+    func_indices.push(helpers.async_step + 1);
+    func_indices.push(helpers.async_step + 2);
+    func_indices.extend(Builtin::ALL.map(|b| helpers.builtin(b)));
+    let mut elements = ElementSection::new();
+    elements.active(
+        None,
+        &ConstExpr::i32_const(0),
+        Elements::Functions(Cow::Owned(func_indices)),
+    );
+    module.section(&elements);
 
     // Code section: `main` first, then each user function's body, then the
     // helpers last (mirroring the function-index order above).
@@ -1399,20 +1363,21 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_prop_throw(&offsets, helpers));
     // The `__invoke1` callback trampoline is appended after every helper so
     // every helper index stays stable; the `__async_step` trampoline
-    // follows it (always, so its index is deterministic), then the two
-    // `new Promise` settler functions (only when there are functions — the table
-    // exists then).
+    // follows it, then the two `new Promise` settler functions.
     code.function(&emit_box_f64_helper());
     code.function(&emit_to_number_helper(helpers));
     code.function(&emit_invoke1(helpers));
     code.function(&generator::emit_async_step(helpers));
-    if has_funcs {
-        code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
-        code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers));
-    }
+    code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
+    code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers));
     code.function(&emit_new_string(helpers.alloc));
     code.function(&emit_new_array(helpers.alloc));
     code.function(&emit_new_promise(helpers.alloc));
+    // The realm: `__has_own`, then the builtin bodies.
+    code.function(&emit_has_own(&offsets, helpers));
+    for builtin in Builtin::ALL {
+        code.function(&builtins::emit_builtin(builtin, &offsets, helpers));
+    }
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

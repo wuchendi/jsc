@@ -143,7 +143,7 @@ pub(super) fn emit_array_node(
         function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
         function.instruction(&Instruction::Call(helpers.alloc));
         function.instruction(&Instruction::LocalSet(dst));
-        emit_object_prefix(function, dst, TYPE_ARRAY);
+        emit_object_prefix(function, dst, TYPE_ARRAY, NULL_BITS);
         function.instruction(&Instruction::LocalGet(dst));
         function.instruction(&Instruction::I32Const(len));
         function.instruction(&Instruction::I32Store(array_len_slot()));
@@ -203,8 +203,7 @@ pub(super) fn emit_array_spread(
                 // jsvals); a GENERATOR is drained via `__gen_to_array`,
                 // selected by an `IsGenerator` test; any other source (an array) is
                 // passed straight through. `base` (i32) stays beneath on the
-                // operand stack throughout. When the program declares no functions
-                // no generator can exist, so that test is skipped.
+                // operand stack throughout.
                 emit_node(source, function, scratch, strings, helpers);
                 function.instruction(&Instruction::LocalSet(scratch + 22));
                 emit_is_string(function, scratch + 22);
@@ -212,17 +211,13 @@ pub(super) fn emit_array_spread(
                 function.instruction(&Instruction::LocalGet(scratch + 22));
                 function.instruction(&Instruction::Call(helpers.str_to_array));
                 function.instruction(&Instruction::Else);
-                if helpers.has_funcs {
-                    emit_is_generator(function, scratch + 22);
-                    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-                    function.instruction(&Instruction::LocalGet(scratch + 22));
-                    function.instruction(&Instruction::Call(helpers.gen_to_array));
-                    function.instruction(&Instruction::Else);
-                    function.instruction(&Instruction::LocalGet(scratch + 22));
-                    function.instruction(&Instruction::End);
-                } else {
-                    function.instruction(&Instruction::LocalGet(scratch + 22));
-                }
+                emit_is_generator(function, scratch + 22);
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+                function.instruction(&Instruction::LocalGet(scratch + 22));
+                function.instruction(&Instruction::Call(helpers.gen_to_array));
+                function.instruction(&Instruction::Else);
+                function.instruction(&Instruction::LocalGet(scratch + 22));
+                function.instruction(&Instruction::End);
                 function.instruction(&Instruction::End);
                 function.instruction(&Instruction::I32WrapI64);
                 function.instruction(&Instruction::Call(helpers.array_concat));
@@ -489,18 +484,6 @@ pub(super) fn emit_array_hof(
     function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::LocalSet(len));
     emit_node(callback, function, scratch, strings, helpers);
-    // No funcref table (a function-less program): the callback can never be a
-    // function value, so throw instead of emitting an invalid `call_indirect`.
-    if !helpers.has_funcs {
-        emit_throw_not_a_function(
-            function,
-            EXPRESSION_NOT_A_FUNCTION,
-            scratch,
-            strings,
-            helpers,
-        );
-        return;
-    }
     // IsCallable (DF4): a non-function callback throws before any iteration
     // (even over an empty array); a function literal needs no check.
     if !is_static_function(callback) {

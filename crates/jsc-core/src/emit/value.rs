@@ -5,8 +5,9 @@ use super::*;
 /// `base`: one i64 store at offset 0 lays down the header word (type byte
 /// `type_byte`, zero `gc`/`flags`/`class` bytes) together with a zero `props`
 /// slot (at [`abi::OBJ_PROPS_OFFSET`], no own properties), then the `proto`
-/// slot (at [`OBJ_PROTO_OFFSET`]) gets the `null` jsval. Stack neutral.
-pub(super) fn emit_object_prefix(function: &mut Function, base: u32, type_byte: i32) {
+/// slot (at [`OBJ_PROTO_OFFSET`]) gets the jsval `proto` (`null` or an
+/// intrinsic). Stack neutral.
+pub(super) fn emit_object_prefix(function: &mut Function, base: u32, type_byte: i32, proto: i64) {
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Const(i64::from(type_byte)));
     function.instruction(&Instruction::I64Store(MemArg {
@@ -15,7 +16,7 @@ pub(super) fn emit_object_prefix(function: &mut Function, base: u32, type_byte: 
         memory_index: 0,
     }));
     function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I64Const(NULL_BITS));
+    function.instruction(&Instruction::I64Const(proto));
     function.instruction(&Instruction::I64Store(MemArg {
         offset: OBJ_PROTO_OFFSET,
         align: 3,

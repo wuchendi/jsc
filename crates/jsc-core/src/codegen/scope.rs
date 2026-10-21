@@ -376,10 +376,8 @@ impl<'a> LowerCtx<'a> {
         let slot = *self.shared.module_slots.get(name)?;
         let mutable = *self.shared.module_mutable.get(name)?;
         let message = format!("Cannot access '{name}' before initialization");
-        // No `%ReferenceError.prototype%` yet (S4): an `Error` with an own `name`.
         let error = IrNode::error_object(
-            ErrorKind::Error,
-            Some("ReferenceError"),
+            ErrorKind::ReferenceError,
             Some(IrNode::Str(message.clone())),
             IrNode::Str(format!("ReferenceError: {message}")),
         );

@@ -210,12 +210,7 @@ fn lowers_error_dynamic_message_once() {
         if matches!(&**lhs, IrNode::Assign { .. }) && **rhs == IrNode::Undefined));
     assert_eq!(
         **then_branch,
-        IrNode::error_object(
-            ErrorKind::Error,
-            None,
-            None,
-            IrNode::Str("Error".to_owned())
-        )
+        IrNode::error_object(ErrorKind::Error, None, IrNode::Str("Error".to_owned()))
     );
     let IrNode::Object { entries, .. } = &**else_branch else {
         unreachable!("expected the error object");
@@ -234,7 +229,6 @@ fn lowers_error_no_arg_to_inherited_message() {
             program.stmts[0],
             IrStmt::Expr(IrNode::error_object(
                 ErrorKind::Error,
-                None,
                 None,
                 IrNode::Str("Error".to_owned()),
             )),
