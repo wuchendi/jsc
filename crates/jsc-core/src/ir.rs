@@ -377,6 +377,64 @@ impl CalleeError {
     }
 }
 
+/// A global intrinsic whose address is a compile-time constant (design 4.2):
+/// the global object and the namespace objects reachable from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalIntrinsic {
+    /// The global object (`globalThis`, top-level `this`).
+    Global,
+    /// `Math`.
+    Math,
+    /// `JSON`.
+    Json,
+    /// `console`.
+    Console,
+}
+
+impl GlobalIntrinsic {
+    /// The intrinsics that are values of a global-object property, with the
+    /// property name.
+    pub(crate) const NAMED: [(&'static str, GlobalIntrinsic); 4] = [
+        ("globalThis", Self::Global),
+        ("Math", Self::Math),
+        ("JSON", Self::Json),
+        ("console", Self::Console),
+    ];
+
+    /// The intrinsic bound to the global property `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::NAMED
+            .into_iter()
+            .find_map(|(n, g)| (n == name).then_some(g))
+    }
+}
+
+/// A reference to a property of the global object by an unresolved
+/// identifier (design 4.3): the property name plus the `.message` and `.stack`
+/// of the `ReferenceError` a miss throws (static strings interned at the site).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalRef {
+    /// The identifier, also the property key.
+    pub name: String,
+    /// `<name> is not defined`.
+    pub message: String,
+    /// `ReferenceError: <name> is not defined`.
+    pub stack: String,
+}
+
+impl GlobalRef {
+    /// The global reference of identifier `name`.
+    pub(crate) fn new(name: &str) -> Self {
+        let message = format!("{name} is not defined");
+        let stack = format!("ReferenceError: {message}");
+        Self {
+            name: name.to_owned(),
+            message,
+            stack,
+        }
+    }
+}
+
 /// A `Map`/`Set` instance method. Recognized syntactically from a
 /// `<expr>.<name>(args)` member callee at codegen; because these names
 /// (`set`/`get`/`has`/`add`/`delete`) can ALSO be ordinary object/class methods
@@ -582,6 +640,28 @@ pub enum IrNode {
     /// The static prototype object of a builtin error kind (a heap-pointer
     /// jsval to a data-segment block, a compile-time constant).
     ErrorProto(ErrorKind),
+    /// The static object of a global intrinsic (a compile-time constant).
+    Intrinsic(GlobalIntrinsic),
+    /// Read the global-object property of an unresolved identifier: `HasProperty`
+    /// then `Get`, throwing the reference's `ReferenceError` on a miss; as a
+    /// `typeof` operand (`typeof_operand`) a miss reads `undefined` instead.
+    GlobalGet {
+        /// The referenced global.
+        global: GlobalRef,
+        /// Whether a miss reads `undefined` (`typeof x`) instead of throwing.
+        typeof_operand: bool,
+    },
+    /// Assign `value` to the global-object property of an unresolved identifier
+    /// (strict `PutValue`): the value is evaluated first, then a missing
+    /// property throws the reference's `ReferenceError` and an existing one is
+    /// set with `OrdinarySet` (a non-writable one throws a `TypeError`). Yields
+    /// the value.
+    GlobalSet {
+        /// The referenced global.
+        global: GlobalRef,
+        /// The assigned value.
+        value: Box<IrNode>,
+    },
     /// The function object of a top-level function declaration (funcref-table
     /// index `.0`). A top-level declaration never captures, so its one object
     /// is a static block in the data segment: every reference yields the same
@@ -1649,8 +1729,11 @@ impl IrNode {
             | IrNode::MapNew { .. }
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::GlobalGet { .. }
             | IrNode::DateNow => false,
             IrNode::Assign { value: inner, .. }
+            | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
@@ -1814,8 +1897,11 @@ impl IrNode {
             | IrNode::MapNew { .. }
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::GlobalGet { .. }
             | IrNode::DateNow => Vec::new(),
             IrNode::Assign { value: inner, .. }
+            | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)

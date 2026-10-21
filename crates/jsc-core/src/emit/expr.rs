@@ -113,6 +113,19 @@ pub(super) fn emit_node(
                 helpers,
             )));
         }
+        IrNode::Intrinsic(global) => {
+            let bits = intrinsic_bits(Intrinsic::from(*global), helpers);
+            function.instruction(&Instruction::I64Const(bits));
+        }
+        IrNode::GlobalGet {
+            global,
+            typeof_operand,
+        } => {
+            emit_global_get(global, *typeof_operand, function, scratch, strings, helpers);
+        }
+        IrNode::GlobalSet { global, value } => {
+            emit_global_set(global, value, function, scratch, strings, helpers);
+        }
         IrNode::DeclFunc(table_index) => {
             let base = decl_func_base(*table_index, helpers);
             function.instruction(&Instruction::I64Const(
@@ -1623,19 +1636,130 @@ pub(super) fn emit_throw_not_a_function(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    emit_node(
+    emit_throw_error(
         &callee_type_error(text),
         function,
         scratch,
         strings,
         helpers,
     );
+}
+
+/// Throw the error object `error` builds and unwind to the nearest handler
+/// (the stack is polymorphic afterwards).
+fn emit_throw_error(
+    error: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(error, function, scratch, strings, helpers);
     function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
     emit_throw_return(function, helpers);
+}
+
+/// The `ReferenceError` an unresolvable reference to `global` throws.
+fn reference_error(global: &GlobalRef) -> IrNode {
+    IrNode::error_object(
+        ErrorKind::ReferenceError,
+        Some(IrNode::Str(global.message.clone())),
+        IrNode::Str(global.stack.clone()),
+    )
+}
+
+/// Push `HasProperty(global object, key of global)` as an i32.
+fn emit_global_has(
+    function: &mut Function,
+    global: &GlobalRef,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    function.instruction(&Instruction::I32Const(static_key(strings, &global.name)));
+    function.instruction(&Instruction::I64Const(intrinsic_bits(
+        Intrinsic::Global,
+        helpers,
+    )));
+    function.instruction(&Instruction::Call(helpers.has));
+}
+
+/// Emit a [`IrNode::GlobalGet`]: `Get` of the global-object property when it
+/// exists, else `undefined` (a `typeof` operand) or the `ReferenceError`.
+fn emit_global_get(
+    global: &GlobalRef,
+    typeof_operand: bool,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_global_has(function, global, strings, helpers);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    function.instruction(&Instruction::I64Const(intrinsic_bits(
+        Intrinsic::Global,
+        helpers,
+    )));
+    function.instruction(&Instruction::I32Const(static_key(strings, &global.name)));
+    function.instruction(&Instruction::Call(helpers.get));
+    function.instruction(&Instruction::Else);
+    if typeof_operand {
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    } else {
+        emit_throw_error(
+            &reference_error(global),
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+    }
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    if helpers.has_accessors {
+        emit_propagate_if_pending(function, helpers);
+    }
+}
+
+/// Emit a [`IrNode::GlobalSet`]: evaluate the value (stashed in the first
+/// scratch slot), throw the `ReferenceError` when the global-object property
+/// does not exist, else `__set` it; yields the value.
+fn emit_global_set(
+    global: &GlobalRef,
+    value: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(scratch));
+    emit_global_has(function, global, strings, helpers);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_throw_error(
+        &reference_error(global),
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I64Const(intrinsic_bits(
+        Intrinsic::Global,
+        helpers,
+    )));
+    function.instruction(&Instruction::I32Const(static_key(strings, &global.name)));
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::Call(helpers.set));
+    emit_propagate_if_pending(function, helpers);
+    function.instruction(&Instruction::LocalGet(scratch));
 }
 
 /// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in

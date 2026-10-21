@@ -58,11 +58,7 @@ fn rejects_spread() {
 }
 
 #[test]
-fn rejects_top_level_this() {
-    // Object methods and shorthand methods are supported (see the
-    // objects suite), but a top-level `this` — outside any function, so with no
-    // receiver binding — remains rejected.
-    assert_rejected("this");
+fn rejects_async_methods() {
     // Async/generator methods stay out of scope.
     assert_rejected("let o = { async m() { return 1 } }; o.m()");
 }

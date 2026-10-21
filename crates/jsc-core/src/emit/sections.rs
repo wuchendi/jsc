@@ -550,6 +550,10 @@ pub(super) fn fn_flags(kind: FnKind) -> u8 {
 /// deduplicated onto one offset. Returns the offset map plus the first free
 /// offset after all literal data (8-aligned), where the intern table is placed.
 pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32) {
+    let fragments: Vec<IrNode> = Builtin::ALL
+        .into_iter()
+        .filter_map(|b| builtins::fragment(b, program.arity))
+        .collect();
     // `"length"` is always interned: the property helpers compare a key against
     // it to resolve a string's or array's exotic `length`.
     let mut order: Vec<&str> = vec![INDEX_LENGTH_KEY];
@@ -566,6 +570,10 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
         if seen.insert(text) {
             order.push(text);
         }
+    }
+    // The namespace builtins' IR bodies.
+    for fragment in &fragments {
+        collect_node(fragment, &mut order, &mut seen);
     }
     for stmt in &program.stmts {
         collect_stmt(stmt, &mut order, &mut seen);
@@ -1109,7 +1117,25 @@ pub(super) fn collect_node<'a>(
         IrNode::ArrayPop { not_array, .. } => {
             seed_callee_error(callee_error_text(not_array), order, seen);
         }
+        // A global reference interns its key and, unless it reads `undefined`
+        // on a miss, its `ReferenceError` texts; a write may also throw the
+        // `__set` errors.
+        IrNode::GlobalGet {
+            global,
+            typeof_operand,
+        } => {
+            seed_strs_ref(&[&global.name], order, seen);
+            if !typeof_operand {
+                seed_strs_ref(&[&global.message, &global.stack], order, seen);
+            }
+        }
+        IrNode::GlobalSet { global, value } => {
+            seed_strs_ref(&[&global.name, &global.message, &global.stack], order, seen);
+            seed_prop_strs(order, seen);
+            collect_node(value, order, seen);
+        }
         IrNode::ErrorProto(_)
+        | IrNode::Intrinsic(_)
         | IrNode::Num(_)
         | IrNode::Bool(_)
         | IrNode::Null
@@ -1139,6 +1165,16 @@ fn seed_strs<'a>(strs: &[&'static str], order: &mut Vec<&'a str>, seen: &mut Has
     for &s in strs {
         if seen.insert(s) {
             order.push(s);
+        }
+    }
+}
+
+/// Record each of the borrowed `strs` not yet seen, in order; see
+/// [`collect_node`].
+fn seed_strs_ref<'a>(strs: &[&'a String], order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+    for s in strs {
+        if seen.insert(s.as_str()) {
+            order.push(s.as_str());
         }
     }
 }
