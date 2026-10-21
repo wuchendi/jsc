@@ -221,11 +221,15 @@ pub(super) enum Builtin {
     /// `%ThrowTypeError%`: the poison getter/setter of the strict `caller` /
     /// `arguments` properties (one identity for every installation).
     ThrowTypeError,
+    /// The global `isNaN`.
+    IsNaN,
+    /// The global `isFinite`.
+    IsFinite,
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 48] = [
+    pub(super) const ALL: [Builtin; 50] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -274,6 +278,8 @@ impl Builtin {
         Self::DateToString,
         Self::DateValueOf,
         Self::ThrowTypeError,
+        Self::IsNaN,
+        Self::IsFinite,
     ];
 
     /// The function's `name`.
@@ -311,6 +317,8 @@ impl Builtin {
             Self::PromiseReject => "reject",
             Self::DateNow => "now",
             Self::ArrayMap => "map",
+            Self::IsNaN => "isNaN",
+            Self::IsFinite => "isFinite",
         }
     }
 
@@ -340,7 +348,9 @@ impl Builtin {
             | Self::IsArray
             | Self::PromiseResolve
             | Self::PromiseReject
-            | Self::ArrayMap => 1,
+            | Self::ArrayMap
+            | Self::IsNaN
+            | Self::IsFinite => 1,
             Self::JsonStringify => 3,
         }
     }
@@ -426,7 +436,7 @@ const MATH_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 24] = [
+const GLOBALS: [(&str, u32, Value); 26] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -529,6 +539,8 @@ const GLOBALS: [(&str, u32, Value); 24] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Date)),
     ),
+    ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
+    ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
 ];
 
 /// The registry: every own property of every intrinsic, in slot order per
