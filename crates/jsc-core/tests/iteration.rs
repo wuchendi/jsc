@@ -5,7 +5,7 @@
 //! `TypeError` of every other value.
 
 mod common;
-use common::{assert_string, assert_uncaught};
+use common::{assert_rejected, assert_string, assert_uncaught};
 
 /// The JSON text of the array `out` after running `body`.
 fn collected(body: &str) -> String {
@@ -256,4 +256,10 @@ fn a_not_iterable_throw_is_catchable_and_stops_evaluation() {
          JSON.stringify(out)",
         "[true]",
     );
+}
+
+#[test]
+fn for_of_destructuring_head_rejects_duplicate_bindings() {
+    assert_rejected("for (const [x, x] of []) {}");
+    assert_rejected("for (let { a, b: [a] } of []) {}");
 }

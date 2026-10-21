@@ -1587,7 +1587,19 @@ impl LowerCtx<'_> {
                 let mutable = var_decl.kind != VarDeclKind::Const;
                 match &declarator.name {
                     Pat::Ident(ident) => ForOfHead::Decl(ident, mutable),
-                    pat @ (Pat::Array(_) | Pat::Object(_)) => ForOfHead::Pattern(pat, mutable),
+                    pat @ (Pat::Array(_) | Pat::Object(_)) => {
+                        let mut names = Vec::new();
+                        super::capture::pat_names(pat, &mut names);
+                        let mut seen = std::collections::HashSet::new();
+                        if let Some(dup) = names.iter().find(|name| !seen.insert(name.as_str())) {
+                            return Err(CompileError::spanned(
+                                pat.span(),
+                                format!("duplicate binding in for-of head: {dup}"),
+                            )
+                            .into());
+                        }
+                        ForOfHead::Pattern(pat, mutable)
+                    }
                     other => {
                         return Err(CompileError::spanned(
                             other.span(),
