@@ -497,7 +497,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 6] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 8] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -522,6 +522,16 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 6] = [
     (
         PROP_THROW_EXTENDS_PROTO,
         "Class extends value does not have valid prototype property ",
+        "",
+    ),
+    (
+        PROP_THROW_TO_OBJECT,
+        "Cannot convert undefined or null to object",
+        "",
+    ),
+    (
+        PROP_THROW_IN,
+        "Cannot use 'in' operator to search for a key in ",
         "",
     ),
 ];
@@ -560,6 +570,12 @@ const PROP_THROW_EXTENDS: i32 = 7;
 /// `__prop_throw`'s `mode` argument: a class parent whose `prototype` (the
 /// `key`) is neither an object nor `null`.
 const PROP_THROW_EXTENDS_PROTO: i32 = 8;
+/// `__prop_throw`'s `mode` argument: an `in` whose right-hand side (the
+/// `key`) is not an object.
+const PROP_THROW_IN: i32 = 9;
+/// `__prop_throw`'s `mode` argument: `ToObject` of `null`/`undefined` (the
+/// `key` is the empty string).
+const PROP_THROW_TO_OBJECT: i32 = 10;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
@@ -987,6 +1003,23 @@ impl Helpers<'_> {
     /// after `__array_join`.
     fn to_object(self) -> u32 {
         self.to_primitive() + 5
+    }
+
+    /// `__json_rep(holder, key, value, replacer, list) -> i64` (see
+    /// [`builtins::emit_json_rep`]), right after `__to_object`.
+    fn json_rep(self) -> u32 {
+        self.to_primitive() + 6
+    }
+
+    /// `__json_indent(s, gap) -> i32` (see [`builtins::emit_json_indent`]).
+    fn json_indent(self) -> u32 {
+        self.to_primitive() + 7
+    }
+
+    /// `__json_revive(holder, key, reviver) -> i64` (see
+    /// [`builtins::emit_json_revive`]).
+    fn json_revive(self) -> u32 {
+        self.to_primitive() + 8
     }
 
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
@@ -1425,6 +1458,9 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_compare(helpers));
     code.function(&emit_array_join(&offsets, helpers));
     code.function(&builtins::emit_to_object(&offsets, helpers));
+    code.function(&builtins::emit_json_rep(&offsets, helpers));
+    code.function(&builtins::emit_json_indent(helpers));
+    code.function(&builtins::emit_json_revive(helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

@@ -909,6 +909,14 @@ pub enum IrNode {
         /// The argument array to fold — an [`IrNode::ArraySpread`].
         args: Box<IrNode>,
     },
+    /// `console.log(...)` with a spread argument: builds the argument array
+    /// (like [`IrNode::ArraySpread`], carried by `args`) then prints its
+    /// elements like [`IrNode::ConsoleLog`] prints its arguments; yields
+    /// `undefined`.
+    ConsoleLogSpread {
+        /// The argument array to print — an [`IrNode::ArraySpread`].
+        args: Box<IrNode>,
+    },
     /// An object literal `{k0: e0, [k1]: e1, ..}`: a `TYPE_OBJECT` block whose
     /// `TYPE_PROPS` table is sized `max(entries.len(), reserve)` up front. Each
     /// entry's key and value are evaluated left-to-right and defined as an own
@@ -1397,8 +1405,8 @@ pub enum IrNode {
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
     /// guest value tree — including OBJECTS with runtime-unknown keys, each
     /// member interned and defined through `__define`. Malformed
-    /// input throws an `Error` (`.name` `SyntaxError`). The optional reviver
-    /// argument is unsupported and rejected at codegen.
+    /// input throws an `Error` (`.name` `SyntaxError`). A call passing a
+    /// reviver calls the `JSON.parse` builtin instead.
     JsonParse {
         /// The single text argument, evaluated once and parsed.
         arg: Box<IrNode>,
@@ -1902,6 +1910,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => f(inner),
             IrNode::InstanceOf { value, kind } => {
                 f(value)
@@ -2080,6 +2089,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
             IrNode::InstanceOf { value, kind } => match kind {
                 InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => {

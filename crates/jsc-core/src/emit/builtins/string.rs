@@ -40,17 +40,21 @@ fn coercions(op: StringOp) -> [Coerce; 2] {
 /// Whether the call-site arguments `args` of `op` are already of the types
 /// its coercions produce (string / number literals; a missing argument is
 /// `undefined`), so that on a string receiver the builtin is exactly its host
-/// op: no coercion runs, and `repeat`'s count is a valid one.
+/// op: no coercion runs (never for `repeat`, whose count is checked).
 pub(in crate::emit) fn host_ready_args(op: StringOp, args: &[IrNode]) -> bool {
-    let ready = |coerce: Coerce, arg: Option<&IrNode>| match (coerce, arg) {
-        (Coerce::None, _)
-        | (Coerce::OptString | Coerce::Number, None)
-        | (Coerce::String | Coerce::OptString, Some(IrNode::Str(_))) => true,
-        (Coerce::Number, Some(IrNode::Num(n))) => {
-            op != StringOp::Repeat || (*n >= 0.0 && n.is_finite())
-        }
-        _ => false,
+    let ready = |coerce: Coerce, arg: Option<&IrNode>| {
+        matches!(
+            (coerce, arg),
+            (Coerce::None, _)
+                | (Coerce::OptString | Coerce::Number, None)
+                | (Coerce::String | Coerce::OptString, Some(IrNode::Str(_)))
+                | (Coerce::Number, Some(IrNode::Num(_)))
+        )
     };
+    // `repeat`'s count and result length are checked by the builtin only.
+    if op == StringOp::Repeat {
+        return false;
+    }
     let [first, second] = coercions(op);
     ready(first, args.first()) && ready(second, args.get(1))
 }
@@ -125,6 +129,12 @@ const NOT_STRING_VALUE_OF: CalleeErrorText<'static> = [
 /// count (the count follows).
 const REPEAT_COUNT: [&str; 2] = ["Invalid count value: ", "RangeError: Invalid count value: "];
 
+/// The `RangeError` of a `repeat` result past [`MAX_STRING_LENGTH`].
+const REPEAT_LENGTH: [&str; 2] = ["Invalid string length", "RangeError: Invalid string length"];
+
+/// The longest string a `repeat` builds, in bytes (`2^29 - 24`, as V8).
+const MAX_STRING_LENGTH: f64 = 536_870_888.0;
+
 /// The static strings of this family.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
     OPS.into_iter()
@@ -132,6 +142,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(NOT_STRING_TO_STRING)
         .chain(NOT_STRING_VALUE_OF)
         .chain(REPEAT_COUNT)
+        .chain(REPEAT_LENGTH)
 }
 
 /// `String.prototype.toString()` / `valueOf()`: `thisStringValue(this)`.
@@ -232,6 +243,21 @@ pub(super) fn emit_method(
             ErrorKind::RangeError,
             Some(text(REPEAT_COUNT[0])),
             text(REPEAT_COUNT[1]),
+        );
+        emit_throw_error(&error, function, frame.scratch(), strings, helpers);
+        // A result past the longest string is a RangeError too.
+        wasm!(function;
+            End,
+            LocalGet(s), I32WrapI64,
+            I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
+            F64ConvertI32U, LocalGet(count), F64Mul,
+            F64Const(Ieee64::from(MAX_STRING_LENGTH)), F64Gt,
+            If(BlockType::Empty),
+        );
+        let error = IrNode::error_object(
+            ErrorKind::RangeError,
+            Some(IrNode::Str(REPEAT_LENGTH[0].to_owned())),
+            IrNode::Str(REPEAT_LENGTH[1].to_owned()),
         );
         emit_throw_error(&error, function, frame.scratch(), strings, helpers);
         wasm!(function; End, End);
