@@ -132,3 +132,17 @@ fn every_watched_write_path_sets_its_dirty_bit() {
         5.0,
     );
 }
+
+#[test]
+fn length_getter_throw_unwinds_inside_try() {
+    // With getter dispatch on, `.length` of a non-string/array goes through
+    // `__get`; a throwing getter unwinds to the enclosing handler.
+    assert_number(
+        "const o = { get length() { throw new Error('g'); } }; let r = 0; try { o.length; } catch (e) { r = 1; } r",
+        1.0,
+    );
+    assert_number(
+        "let k = 'a'; ({})[k]; let r = 0; try { r = k.length; } catch (e) { throw 2; } r",
+        1.0,
+    );
+}

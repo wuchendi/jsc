@@ -1452,7 +1452,12 @@ pub(super) fn emit_str_len(
     )));
     function.instruction(&Instruction::Call(helpers.get));
     if helpers.has_accessors {
+        // A getter may throw: unwind from two `if`s deep.
+        enter_frame(helpers);
+        enter_frame(helpers);
         emit_propagate_if_pending(function, helpers);
+        leave_frame(helpers);
+        leave_frame(helpers);
     }
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
