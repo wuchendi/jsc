@@ -80,7 +80,10 @@ pub(super) fn emit_object_node(
     match proto {
         Some(proto) => emit_node(proto, function, scratch, strings, helpers),
         None => {
-            function.instruction(&Instruction::I64Const(NULL_BITS));
+            function.instruction(&Instruction::I64Const(intrinsic_bits(
+                Intrinsic::ObjectPrototype,
+                helpers,
+            )));
         }
     }
     function.instruction(&Instruction::I64Store(mem(OBJ_PROTO_OFFSET)));
@@ -621,7 +624,12 @@ pub(super) fn emit_map_new_node(
     function.instruction(&Instruction::I32Const(MAP_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(dst));
-    emit_object_prefix(function, dst, if set { TYPE_SET } else { TYPE_MAP });
+    emit_object_prefix(
+        function,
+        dst,
+        if set { TYPE_SET } else { TYPE_MAP },
+        NULL_BITS,
+    );
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Store(size_slot));
@@ -666,7 +674,7 @@ pub(super) fn emit_date_new_node(
     function.instruction(&Instruction::I32Const(DATE_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(dst));
-    emit_object_prefix(function, dst, TYPE_DATE);
+    emit_object_prefix(function, dst, TYPE_DATE, NULL_BITS);
 
     // ms slot = f64 timestamp. Push the store address, then the f64 value.
     function.instruction(&Instruction::LocalGet(dst));
@@ -745,8 +753,7 @@ const F64_EXP_MASK: i64 = 0x7FF0_0000_0000_0000;
 /// paths — a `TYPE_DATE` block computes the field GUEST-side from its stored f64
 /// epoch-ms ([`emit_date_field`]); any other receiver falls back to an ordinary
 /// user method call `recv.<method_name>(args)`, so an object/class method of the
-/// same name still works. When the module declares no functions the fallback is
-/// dead and emits `undefined` instead of an invalid `call_indirect`.
+/// same name still works.
 pub(super) fn emit_date_method_node(
     node: &IrNode,
     function: &mut Function,
@@ -1232,9 +1239,7 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
 /// the collection op through the `__map_*` helpers (`.set`/`.add` yield the handle;
 /// `.get` the value/undefined; `.has`/`.delete` a boxed boolean); any other receiver
 /// falls back to an ordinary user method call `recv.<method_name>(args)` — so an
-/// object/class method of the same name still works. When the module declares no
-/// functions (no funcref table exists, so no object could carry a method) the
-/// fallback arm is dead and emits `undefined` instead of an invalid `call_indirect`.
+/// object/class method of the same name still works.
 pub(super) fn emit_map_method_node(
     node: &IrNode,
     function: &mut Function,
@@ -2276,7 +2281,6 @@ fn emit_raise_type_error(
 
     let error = IrNode::error_object(
         ErrorKind::TypeError,
-        None,
         Some(IrNode::Local(msg)),
         IrNode::Local(stack),
     );

@@ -2008,11 +2008,11 @@ impl LowerCtx<'_> {
         };
         match message {
             None | Some(IrNode::Undefined) => {
-                IrNode::error_object(kind, None, None, IrNode::Str(name.to_owned()))
+                IrNode::error_object(kind, None, IrNode::Str(name.to_owned()))
             }
             Some(IrNode::Str(text)) => {
                 let stack = stack_of(&text);
-                IrNode::error_object(kind, None, Some(IrNode::Str(text)), stack)
+                IrNode::error_object(kind, Some(IrNode::Str(text)), stack)
             }
             Some(message) => {
                 let arg = self.fresh();
@@ -2050,10 +2050,9 @@ impl LowerCtx<'_> {
                     then_branch: Box::new(IrNode::error_object(
                         kind,
                         None,
-                        None,
                         IrNode::Str(name.to_owned()),
                     )),
-                    else_branch: Box::new(IrNode::error_object(kind, None, Some(text), stack)),
+                    else_branch: Box::new(IrNode::error_object(kind, Some(text), stack)),
                 }
             }
         }

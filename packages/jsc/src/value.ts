@@ -430,9 +430,10 @@ function tableEntries(
 /**
  * Resolve a heap object block at `ptr` from its own enumerable properties
  * (mirrors `value.rs::decode_object`): an object of class `ERROR` decodes as
- * `error` with its (possibly inherited) `name` and `message`; an object with
- * a prototype whose `constructor` names a function other than `Object`
- * decodes as `instance`.
+ * `error` with its (possibly inherited) `name` and `message`; an object whose
+ * prototype chain (from its prototype, so a prototype object's own
+ * `constructor` back-link does not name it) holds a `constructor` naming a
+ * function other than `Object` decodes as `instance`.
  */
 function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
   if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ERROR) {
@@ -451,8 +452,9 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
   if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ARGUMENTS)
     return { kind: 'arguments', entries }
   const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
-  if (proto !== undefined && heapObject(proto, mem) !== undefined) {
-    const ctor = lookupData(ptr, 'constructor', mem)
+  const protoPtr = proto === undefined ? undefined : heapObject(proto, mem)
+  if (protoPtr !== undefined) {
+    const ctor = lookupData(protoPtr, 'constructor', mem)
     const className = ctor === undefined ? undefined : functionName(ctor, mem)
     if (className !== undefined && className !== '' && className !== 'Object')
       return { kind: 'instance', className, entries }

@@ -201,6 +201,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         stmts,
         functions,
         module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
+        arity: u32::try_from(max_arity).unwrap_or(u32::MAX),
     })
 }
 

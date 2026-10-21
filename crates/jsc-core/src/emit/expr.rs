@@ -108,7 +108,10 @@ pub(super) fn emit_node(
             );
         }
         IrNode::ErrorProto(kind) => {
-            function.instruction(&Instruction::I64Const(error_proto_bits(*kind, helpers)));
+            function.instruction(&Instruction::I64Const(intrinsic_bits(
+                Intrinsic::ErrorPrototype(*kind),
+                helpers,
+            )));
         }
         IrNode::DeclFunc(table_index) => {
             let base = decl_func_base(*table_index, helpers);
@@ -646,18 +649,6 @@ pub(super) fn emit_method_call_user(
     // left its result on the stack, and nothing below reads +0 before this call.
     let callee_val = scratch;
     function.instruction(&Instruction::LocalSet(callee_val));
-    // No funcref table (a function-less program): the member can never be a
-    // function value, so throw instead of emitting an invalid `call_indirect`.
-    if !helpers.has_funcs {
-        emit_throw_not_a_function(
-            function,
-            callee_error_text(not_callable),
-            scratch,
-            strings,
-            helpers,
-        );
-        return;
-    }
 
     // Runtime guard: the resolved member MUST be a function value. For a
     // dynamic-shape receiver — a `new`-instance, a reassigned binding, a computed
@@ -742,18 +733,6 @@ pub(super) fn emit_this_call(
     emit_node(callee, function, scratch, strings, helpers);
     let callee_val = scratch;
     function.instruction(&Instruction::LocalSet(callee_val));
-    // No funcref table (a function-less program, e.g. an optional call
-    // `o.m?.()` on a literal): the callee can never be a function value.
-    if !helpers.has_funcs {
-        emit_throw_not_a_function(
-            function,
-            EXPRESSION_NOT_A_FUNCTION,
-            scratch,
-            strings,
-            helpers,
-        );
-        return;
-    }
 
     // Runtime guard: the callee MUST be a function value — a `super.m` that
     // resolves to `undefined` (missing method) throws a TypeError instead
@@ -854,11 +833,6 @@ pub(super) fn emit_construct(
         }
         None => emit_call_args(args, function, scratch, strings, helpers),
     }
-    // No funcref table (a function-less program): nothing is a constructor.
-    if !helpers.has_funcs {
-        emit_throw_not_a_function(function, text, scratch, strings, helpers);
-        return;
-    }
     emit_is_constructor(function, f);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -882,7 +856,8 @@ pub(super) fn emit_construct(
     enter_frame(helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::Else);
-    // `this`: proto = Get(new.target, "prototype") if an object, else null.
+    // `this`: proto = Get(new.target, "prototype") if an object, else
+    // `%Object.prototype%`.
     emit_new_target(function);
     function.instruction(&Instruction::I32Const(static_key(strings, "prototype")));
     function.instruction(&Instruction::Call(helpers.get));
@@ -890,7 +865,11 @@ pub(super) fn emit_construct(
         emit_propagate_if_pending(function, helpers);
     }
     function.instruction(&Instruction::LocalSet(this));
-    emit_select_object(function, this, &Instruction::I64Const(NULL_BITS));
+    emit_select_object(
+        function,
+        this,
+        &Instruction::I64Const(intrinsic_bits(Intrinsic::ObjectPrototype, helpers)),
+    );
     function.instruction(&Instruction::LocalSet(this));
     emit_object_node(
         &[],
@@ -1003,7 +982,7 @@ fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>
 
 /// Push `1` if the jsval in `local` is an object (a heap value other than a
 /// string), else `0`.
-fn emit_is_object(function: &mut Function, local: u32) {
+pub(super) fn emit_is_object(function: &mut Function, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -1096,7 +1075,7 @@ pub(super) fn emit_argc(count: usize, function: &mut Function) {
 /// (single heap tag `0b101`, type byte `TYPE_FUNCTION`) on the stack.
 /// `__alloc(FUNC_BLOCK_SIZE)` reserves the block, then the object-family prefix
 /// (header `flags` `LAZY` plus the function's constructor kind, no properties,
-/// `null` prototype), the funcref-table index (at [`FUNC_INDEX_OFFSET`]), and
+/// `%Function.prototype%`), the funcref-table index (at [`FUNC_INDEX_OFFSET`]), and
 /// the environment slot (at [`FUNC_ENV_OFFSET`]) are written.
 ///
 /// For a non-capturing function `captures` is empty and the env slot is
@@ -1142,7 +1121,12 @@ pub(super) fn emit_func_value(
     // Write the TYPE_FUNCTION prefix at dst, keeping dst on the stack.
     let flags = fn_flags(kind);
     function.instruction(&Instruction::LocalTee(dst));
-    emit_object_prefix(function, dst, TYPE_FUNCTION | i32::from(flags) << 16);
+    emit_object_prefix(
+        function,
+        dst,
+        TYPE_FUNCTION | i32::from(flags) << 16,
+        intrinsic_bits(Intrinsic::FunctionPrototype, helpers),
+    );
 
     // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
@@ -1428,21 +1412,6 @@ pub(super) fn emit_promise_ctor(
 ) {
     let exec_base = scratch + 7;
 
-    // No funcref table (a function-less program): the executor can never be a
-    // function value, so throw instead of emitting an invalid `call_indirect`.
-    // Allocating P first is unobservable, so it is skipped.
-    if !helpers.has_funcs {
-        emit_node(executor, function, scratch, strings, helpers);
-        emit_throw_not_a_function(
-            function,
-            EXPRESSION_NOT_A_FUNCTION,
-            scratch,
-            strings,
-            helpers,
-        );
-        return;
-    }
-
     // P = __promise(NEW, undefined, undefined); stash it in p_local.
     function.instruction(&Instruction::I32Const(PROMISE_OP_NEW));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -1559,6 +1528,7 @@ fn emit_settler_value(
         function,
         dst,
         TYPE_FUNCTION | i32::from(abi::FUNC_FLAG_LAZY) << 16,
+        intrinsic_bits(Intrinsic::FunctionPrototype, helpers),
     );
     // Write the u32 funcref-table index at dst + FUNC_INDEX_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
@@ -1598,20 +1568,6 @@ pub(super) fn emit_call_indirect(
     emit_call_args(args, function, scratch, strings, helpers);
     // Evaluate the callee once; stash its block base.
     emit_node(callee, function, scratch, strings, helpers);
-    // A program that declares no function has no funcref table, so the callee
-    // can never be a function value: throw the not-a-function TypeError
-    // instead of emitting an invalid `call_indirect`. The transfer leaves the
-    // stack polymorphic, so the discarded operands need no cleanup.
-    if !helpers.has_funcs {
-        emit_throw_not_a_function(
-            function,
-            callee_error_text(not_callable),
-            scratch,
-            strings,
-            helpers,
-        );
-        return;
-    }
     // IsCallable (DF4): a non-function callee throws instead of dispatching its
     // low bits as a funcref index. The general i64 scratch slot (+0) is free:
     // every argument is already on the stack.
@@ -1658,9 +1614,8 @@ pub(super) fn emit_call_indirect(
 
 /// Throw the not-a-function `TypeError` with `text` (see
 /// [`callee_type_error`]) and unwind to the nearest handler. Used by the
-/// callable guards and where a program with no funcref table would otherwise
-/// need a `call_indirect`; the transfer leaves the stack polymorphic, so any
-/// discarded operands need no cleanup.
+/// callable guards and the builtins; the transfer leaves the stack
+/// polymorphic, so any discarded operands need no cleanup.
 pub(super) fn emit_throw_not_a_function(
     function: &mut Function,
     text: CalleeErrorText<'_>,
@@ -1762,12 +1717,6 @@ pub(super) fn emit_call_spread(
             // stack while the argument array is built (a call nested in the
             // arguments reuses the scratch locals), then stashed.
             emit_node(callee, function, scratch, strings, helpers);
-            // No funcref table (a function-less program): the callee can never
-            // be a function value, so throw instead of an invalid `call_indirect`.
-            if !helpers.has_funcs {
-                emit_throw_not_a_function(function, text, scratch, strings, helpers);
-                return;
-            }
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             // IsCallable (DF4), checked after the arguments (spec order).
             if !is_static_function(callee) {
@@ -1843,7 +1792,12 @@ fn emit_spread_args_setup(
 /// `store + ELEMS_DATA_OFFSET + 8*i`, `store` the handle's element store) when
 /// `i < len`, else `undefined`. Any element beyond `K` stays in the array,
 /// which [`emit_publish_spread_args`] hands to the callee.
-fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: Helpers<'_>) {
+pub(super) fn emit_spread_arg_slots(
+    base: u32,
+    len: u32,
+    function: &mut Function,
+    helpers: Helpers<'_>,
+) {
     for i in 0..helpers.max_args {
         // len > i ? array[i] : undefined.
         function.instruction(&Instruction::LocalGet(len));
@@ -1863,7 +1817,7 @@ fn emit_spread_arg_slots(base: u32, len: u32, function: &mut Function, helpers: 
 /// `$__spread_args` right before the call, after every argument and the callee
 /// were evaluated, so a callee gathering its arguments reads the ones beyond
 /// `K` from it (only when its argument count exceeds `K`). Stack-neutral.
-fn emit_publish_spread_args(base: u32, function: &mut Function) {
+pub(super) fn emit_publish_spread_args(base: u32, function: &mut Function) {
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
@@ -1874,7 +1828,7 @@ fn emit_publish_spread_args(base: u32, function: &mut Function) {
 /// Push a spread call's dynamic argument count `len` as a NUMBER jsval (its
 /// `f64` bit pattern), so a callee's rest parameter collects exactly the
 /// real spread arguments.
-fn emit_spread_argc(len: u32, function: &mut Function) {
+pub(super) fn emit_spread_argc(len: u32, function: &mut Function) {
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);

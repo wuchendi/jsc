@@ -652,7 +652,12 @@ pub(super) fn emit_fn_materialize(
         If(BlockType::Empty),
         I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(p),
     );
-    emit_object_prefix(&mut f, p, TYPE_OBJECT);
+    emit_object_prefix(
+        &mut f,
+        p,
+        TYPE_OBJECT,
+        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
+    );
     wasm!(f; LocalGet(p), I32Const(key("constructor")), LocalGet(o));
     emit_box_heap(&mut f);
     define(&mut f, ATTR_WRITABLE | ATTR_CONFIGURABLE);
@@ -855,6 +860,17 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
 /// own table (an array's named keys) and then each `proto`. A primitive has
 /// none.
 pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+    emit_has_lookup(strings, helpers, false)
+}
+
+/// `__has_own(key: i32, obj: i64) -> i32`: [`emit_has`] without the `proto`
+/// walk (`HasOwnProperty`, backing `Object.prototype.hasOwnProperty`).
+pub(super) fn emit_has_own(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+    emit_has_lookup(strings, helpers, true)
+}
+
+/// The body of [`emit_has`] (`own` = `false`) and [`emit_has_own`].
+fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bool) -> Function {
     let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::I64)]);
     let (key, obj, o, t, i, p) = (0, 1, 2, 3, 4, 5);
     wasm!(f; LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End);
@@ -891,6 +907,11 @@ pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
         Loop(BlockType::Empty),
         LocalGet(o), LocalGet(key), Call(helpers.prop_find),
         If(BlockType::Empty), I32Const(1), Return, End,
+    );
+    if own {
+        wasm!(f; I32Const(0), Return);
+    }
+    wasm!(f;
         LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(p),
     );
     emit_is_pointer(&mut f, p);
@@ -1212,7 +1233,6 @@ pub(super) fn emit_array_set_length(
     );
     let error = IrNode::error_object(
         ErrorKind::RangeError,
-        None,
         Some(IrNode::Str(ARRAY_LENGTH_MSG.to_owned())),
         IrNode::Str(ARRAY_LENGTH_STACK.to_owned()),
     );
@@ -1565,8 +1585,9 @@ fn emit_array_contains(function: &mut Function, arr: u32, needle: u32, i: u32, n
 
 /// `__for_in_keys(obj: i64) -> i64`: the `for-in` key snapshot — `obj`'s own
 /// enumerable string keys, then each prototype's enumerable keys not already
-/// seen (a key seen at a nearer level, enumerable or not, shadows it). A
-/// prototype-less object is just its own keys.
+/// seen (a key seen at a nearer level, enumerable or not, shadows it). An
+/// object whose prototypes have no enumerable property (an ordinary object
+/// over `%Object.prototype%`) is just its own keys.
 pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(6, ValType::I32), (4, ValType::I64)]);
     let obj = 0;
@@ -1583,9 +1604,38 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
         I32Eqz,
         If(BlockType::Empty),
         LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur),
+        // j = whether some prototype may contribute a key: a string/array
+        // (exotic keys) or a table holding a live enumerable entry.
+        I32Const(0), LocalSet(j),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
     );
     emit_is_pointer(&mut f, cur);
     wasm!(f;
+        I32Eqz, BrIf(1),
+        LocalGet(cur), I32WrapI64, LocalTee(m), I32Load8U(m8(0)), LocalSet(i),
+    );
+    emit_is_string_or_array_kind(&mut f, i);
+    wasm!(f;
+        If(BlockType::Empty), I32Const(1), LocalSet(j), Br(2), End,
+        LocalGet(m), I32Load(m32(OBJ_PROPS)), LocalTee(n),
+        If(BlockType::Empty),
+        LocalGet(n), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(n), I32Add,
+        I32Const(P_HEADER), I32Add, LocalSet(i),
+        LocalGet(n), I32Const(P_HEADER), I32Add, LocalSet(ks),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(ks), LocalGet(i), I32GeU, BrIf(1),
+        LocalGet(ks), I32Load(m32(E_KEY)), I32Const(0), I32Ne,
+        LocalGet(ks), I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And, I32Const(0), I32Ne,
+        I32And,
+        If(BlockType::Empty), I32Const(1), LocalSet(j), Br(5), End,
+        LocalGet(ks), I32Const(ENTRY), I32Add, LocalSet(ks),
+        Br(0),
+        End, End,
+        End,
+        LocalGet(m), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur),
+        Br(0),
+        End, End,
+        LocalGet(j),
         If(BlockType::Empty),
         I32Const(0), Call(new_array),
     );
@@ -1646,7 +1696,12 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(dst),
     );
-    emit_object_prefix(&mut f, dst, TYPE_OBJECT);
+    emit_object_prefix(
+        &mut f,
+        dst,
+        TYPE_OBJECT,
+        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
+    );
     wasm!(f;
         LocalGet(src), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
         I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
