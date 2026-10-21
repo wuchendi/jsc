@@ -39,7 +39,7 @@ impl Denylist {
 /// How an eligible test is run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Strict-mode directive plus harness, adapter rewrite applied.
+    /// Strict-mode directive plus the official harness.
     Strict,
     /// Source run unmodified (`raw` flag).
     Raw,
@@ -54,7 +54,7 @@ pub enum SkipReason {
     NoStrict,
     /// Denied feature.
     Feature(String),
-    /// Harness include without a jsc shim.
+    /// Harness include that does not compile with jsc, or is kept out of M1.
     Include(String),
 }
 
@@ -70,12 +70,13 @@ impl SkipReason {
     }
 }
 
-/// Classifies a test by its metadata. `shimmed` holds the harness file names
-/// available to jsc (`assert.js` / `sta.js` are implicit and never listed).
+/// Classifies a test by its metadata. `compiling` holds the harness include
+/// names that compile with jsc (`assert.js` / `sta.js` are implicit and never
+/// listed).
 pub fn classify(
     meta: &Meta,
     deny: &Denylist,
-    shimmed: &BTreeSet<String>,
+    compiling: &BTreeSet<String>,
 ) -> Result<Mode, SkipReason> {
     let has = |flag: &str| meta.flags.iter().any(|f| f == flag);
     for flag in ["module", "async", "CanBlockIsFalse", "CanBlockIsTrue"] {
@@ -100,7 +101,11 @@ pub fn classify(
     if raw {
         return Ok(Mode::Raw);
     }
-    if let Some(i) = meta.includes.iter().find(|i| !shimmed.contains(i.as_str())) {
+    if let Some(i) = meta
+        .includes
+        .iter()
+        .find(|i| !compiling.contains(i.as_str()))
+    {
         return Err(SkipReason::Include(i.clone()));
     }
     Ok(Mode::Strict)
@@ -123,8 +128,8 @@ mod tests {
 
     fn run(m: &Meta) -> Result<Mode, SkipReason> {
         let deny = Denylist::parse("# unsupported\nSymbol*\n\nProxy  # exact\n");
-        let shimmed = BTreeSet::from(["compareArray.js".to_owned()]);
-        classify(m, &deny, &shimmed)
+        let compiling = BTreeSet::from(["compareArray.js".to_owned()]);
+        classify(m, &deny, &compiling)
     }
 
     #[test]

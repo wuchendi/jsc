@@ -582,7 +582,12 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()));
     function.instruction(&Instruction::Call(alloc_index));
     function.instruction(&Instruction::LocalSet(obj));
-    emit_object_prefix(&mut function, obj, TYPE_OBJECT);
+    emit_object_prefix(
+        &mut function,
+        obj,
+        TYPE_OBJECT,
+        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
+    );
     function.instruction(&Instruction::Call(helpers.json_ws));
     // Empty object: if next is '}', consume it and skip the member loop.
     at_end(&mut function);

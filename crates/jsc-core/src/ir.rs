@@ -293,21 +293,37 @@ pub enum InstanceOfKind {
     Ctor(Box<IrNode>),
 }
 
-/// A builtin error kind with a static prototype object in the data segment
-/// (`%Error.prototype%`, `%TypeError.prototype%`, `%RangeError.prototype%`).
+/// A builtin error kind with a static prototype object in the realm image
+/// (`%Error.prototype%` and the six native-error prototypes inheriting from it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// `Error`.
     Error,
-    /// `TypeError` (its prototype inherits from `%Error.prototype%`).
+    /// `TypeError`.
     TypeError,
-    /// `RangeError` (its prototype inherits from `%Error.prototype%`).
+    /// `RangeError`.
     RangeError,
+    /// `ReferenceError`.
+    ReferenceError,
+    /// `SyntaxError`.
+    SyntaxError,
+    /// `EvalError`.
+    EvalError,
+    /// `URIError`.
+    UriError,
 }
 
 impl ErrorKind {
-    /// Every kind, in static-prototype layout order.
-    pub(crate) const ALL: [ErrorKind; 3] = [Self::Error, Self::TypeError, Self::RangeError];
+    /// Every kind, in realm-image order.
+    pub(crate) const ALL: [ErrorKind; 7] = [
+        Self::Error,
+        Self::TypeError,
+        Self::RangeError,
+        Self::ReferenceError,
+        Self::SyntaxError,
+        Self::EvalError,
+        Self::UriError,
+    ];
 
     /// The kind named by the constructor identifier `name`.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
@@ -320,6 +336,10 @@ impl ErrorKind {
             Self::Error => "Error",
             Self::TypeError => "TypeError",
             Self::RangeError => "RangeError",
+            Self::ReferenceError => "ReferenceError",
+            Self::SyntaxError => "SyntaxError",
+            Self::EvalError => "EvalError",
+            Self::UriError => "URIError",
         }
     }
 }
@@ -354,6 +374,134 @@ impl CalleeError {
     fn with_message(message: String) -> Self {
         let stack = format!("TypeError: {message}");
         Self { message, stack }
+    }
+}
+
+/// A builtin constructor function of the realm (design 4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinCtor {
+    /// `Object`.
+    Object,
+    /// `Function`.
+    Function,
+    /// `Array`.
+    Array,
+    /// `String`.
+    String,
+    /// `Number`.
+    Number,
+    /// `Boolean`.
+    Boolean,
+    /// An Error-family constructor.
+    Error(ErrorKind),
+    /// `Map`.
+    Map,
+    /// `Set`.
+    Set,
+    /// `Promise`.
+    Promise,
+    /// `Date`.
+    Date,
+}
+
+impl BuiltinCtor {
+    /// Every constructor, in realm-image order.
+    pub(crate) const ALL: [BuiltinCtor; 17] = [
+        Self::Object,
+        Self::Function,
+        Self::Array,
+        Self::String,
+        Self::Number,
+        Self::Boolean,
+        Self::Error(ErrorKind::Error),
+        Self::Error(ErrorKind::TypeError),
+        Self::Error(ErrorKind::RangeError),
+        Self::Error(ErrorKind::ReferenceError),
+        Self::Error(ErrorKind::SyntaxError),
+        Self::Error(ErrorKind::EvalError),
+        Self::Error(ErrorKind::UriError),
+        Self::Map,
+        Self::Set,
+        Self::Promise,
+        Self::Date,
+    ];
+
+    /// The constructor's global name (also its `name`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Object => "Object",
+            Self::Function => "Function",
+            Self::Array => "Array",
+            Self::String => "String",
+            Self::Number => "Number",
+            Self::Boolean => "Boolean",
+            Self::Error(kind) => kind.name(),
+            Self::Map => "Map",
+            Self::Set => "Set",
+            Self::Promise => "Promise",
+            Self::Date => "Date",
+        }
+    }
+
+    /// The constructor bound to the global `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
+}
+
+/// A global intrinsic whose address is a compile-time constant (design 4.2):
+/// the global object, the namespace objects and the constructors reachable
+/// from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalIntrinsic {
+    /// The global object (`globalThis`, top-level `this`).
+    Global,
+    /// `Math`.
+    Math,
+    /// `JSON`.
+    Json,
+    /// `console`.
+    Console,
+    /// A builtin constructor.
+    Ctor(BuiltinCtor),
+}
+
+impl GlobalIntrinsic {
+    /// The intrinsic bound to the global property `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "globalThis" => Some(Self::Global),
+            "Math" => Some(Self::Math),
+            "JSON" => Some(Self::Json),
+            "console" => Some(Self::Console),
+            _ => BuiltinCtor::from_name(name).map(Self::Ctor),
+        }
+    }
+}
+
+/// A reference to a property of the global object by an unresolved
+/// identifier (design 4.3): the property name plus the `.message` and `.stack`
+/// of the `ReferenceError` a miss throws (static strings interned at the site).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalRef {
+    /// The identifier, also the property key.
+    pub name: String,
+    /// `<name> is not defined`.
+    pub message: String,
+    /// `ReferenceError: <name> is not defined`.
+    pub stack: String,
+}
+
+impl GlobalRef {
+    /// The global reference of identifier `name`.
+    pub(crate) fn new(name: &str) -> Self {
+        let message = format!("{name} is not defined");
+        let stack = format!("ReferenceError: {message}");
+        Self {
+            name: name.to_owned(),
+            message,
+            stack,
+        }
     }
 }
 
@@ -562,6 +710,28 @@ pub enum IrNode {
     /// The static prototype object of a builtin error kind (a heap-pointer
     /// jsval to a data-segment block, a compile-time constant).
     ErrorProto(ErrorKind),
+    /// The static object of a global intrinsic (a compile-time constant).
+    Intrinsic(GlobalIntrinsic),
+    /// Read the global-object property of an unresolved identifier: `HasProperty`
+    /// then `Get`, throwing the reference's `ReferenceError` on a miss; as a
+    /// `typeof` operand (`typeof_operand`) a miss reads `undefined` instead.
+    GlobalGet {
+        /// The referenced global.
+        global: GlobalRef,
+        /// Whether a miss reads `undefined` (`typeof x`) instead of throwing.
+        typeof_operand: bool,
+    },
+    /// Assign `value` to the global-object property of an unresolved identifier
+    /// (strict `PutValue`): the value is evaluated first, then a missing
+    /// property throws the reference's `ReferenceError` and an existing one is
+    /// set with `OrdinarySet` (a non-writable one throws a `TypeError`). Yields
+    /// the value.
+    GlobalSet {
+        /// The referenced global.
+        global: GlobalRef,
+        /// The assigned value.
+        value: Box<IrNode>,
+    },
     /// The function object of a top-level function declaration (funcref-table
     /// index `.0`). A top-level declaration never captures, so its one object
     /// is a static block in the data segment: every reference yields the same
@@ -1028,6 +1198,48 @@ pub enum IrNode {
         /// The `TypeError` thrown when the member is not callable (`o.m is not
         /// a function`).
         not_callable: CalleeError,
+    },
+    /// `N.key(args)` on a builtin namespace `N` whose value is not the sealed,
+    /// non-escaping intrinsic (design 3.2 row 2). `obj` (the value of `N`) is
+    /// evaluated into `obj_local` and `args` into `arg_locals`; `fast` (the
+    /// inline code over `arg_locals`) runs while `obj_local.key` is still the
+    /// builtin method, else `slow` (the generic method call on `obj_local`).
+    /// For a watched namespace (`Math`, `JSON`, `console`) the test is
+    /// `obj_local === %N%` with its dirty bit clear, reading no member.
+    NamespaceGuard {
+        /// The namespace whose builtin `key` the fast path implements.
+        namespace: GlobalIntrinsic,
+        /// The member name.
+        key: String,
+        /// The value of the namespace binding.
+        obj: Box<IrNode>,
+        /// Scratch local holding `obj`.
+        obj_local: u32,
+        /// The argument expressions, in source order.
+        args: Vec<IrNode>,
+        /// Scratch locals holding `args`.
+        arg_locals: Vec<u32>,
+        /// The inline code over `arg_locals`.
+        fast: Box<IrNode>,
+        /// The generic method call on `obj_local` over `arg_locals`.
+        slow: Box<IrNode>,
+    },
+    /// A syntactic receiver method `recv.key(..)` whose builtin is not yet a
+    /// property of `%proto%` (design 3.2 row 3, until S5): when the dirty bit
+    /// of `%proto%` is set and `recv.key` is a function, `user` (the generic
+    /// method call) runs, else `fast`. Emitted only for a program that is not
+    /// intrinsics-sealed.
+    ProtoGuard {
+        /// The constructor whose prototype the builtin belongs to.
+        proto: BuiltinCtor,
+        /// The method name.
+        key: String,
+        /// The receiver read (a local, evaluated before this node).
+        recv: Box<IrNode>,
+        /// The syntactic fast path.
+        fast: Box<IrNode>,
+        /// The generic method call.
+        user: Box<IrNode>,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
@@ -1579,34 +1791,83 @@ pub struct IrProgram {
     pub functions: Vec<IrFunction>,
     /// The number of module cells ([`IrNode::ModuleCell`] slots `0..module_cells`).
     pub module_cells: u32,
+    /// The fixed positional-argument arity `K` of the uniform function ABI
+    /// (every function's `params` is `K` plus the trailing env and argc).
+    pub arity: u32,
 }
 
 impl IrNode {
     /// An Error instance (design 4.7): a `TYPE_OBJECT` of class
-    /// [`crate::abi::CLASS_ERROR`] whose `proto` is `kind`'s static prototype,
-    /// with the non-enumerable own properties `name` (only to override the
-    /// inherited one, for kinds without a prototype of their own), `message`
-    /// (when one was given), and `stack` — the shape every builtin and
+    /// [`crate::abi::CLASS_ERROR`] whose `proto` is `kind`'s static prototype
+    /// (`name` is inherited from it), with the non-enumerable own properties
+    /// `message` (when one was given) and `stack` — the shape every builtin and
     /// engine-raised error shares.
-    pub(crate) fn error_object(
-        kind: ErrorKind,
-        name: Option<&str>,
-        message: Option<IrNode>,
-        stack: IrNode,
-    ) -> Self {
-        let name = name.map(|name| {
-            (
-                PropKey::Hidden("name".to_owned()),
-                IrNode::Str(name.to_owned()),
-            )
-        });
+    pub(crate) fn error_object(kind: ErrorKind, message: Option<IrNode>, stack: IrNode) -> Self {
+        Self::error_with_proto(IrNode::ErrorProto(kind), message, stack)
+    }
+
+    /// An Error instance like [`Self::error_object`] whose `proto` is the
+    /// value of `proto` (a subclass prototype for `new.target`).
+    fn error_with_proto(proto: IrNode, message: Option<IrNode>, stack: IrNode) -> Self {
         let message = message.map(|message| (PropKey::Hidden("message".to_owned()), message));
         let stack = (PropKey::Hidden("stack".to_owned()), stack);
         Self::Object {
-            entries: name.into_iter().chain(message).chain([stack]).collect(),
-            proto: Some(Box::new(IrNode::ErrorProto(kind))),
+            entries: message.into_iter().chain([stack]).collect(),
+            proto: Some(Box::new(proto)),
             class: crate::abi::CLASS_ERROR,
             reserve: 0,
+        }
+    }
+
+    /// The Error instance `<kind>(argument)` constructs with prototype `proto`
+    /// (side-effect free, read in both branches): `argument` is evaluated
+    /// once into local `arg`; unless it is `undefined` the instance gets an
+    /// own `message` = `ToString(argument)` (kept in local `msg`) and `stack`
+    /// = `"<name>: <message>"` (just `<name>` for an empty message).
+    pub(crate) fn error_from_argument(
+        kind: ErrorKind,
+        proto: IrNode,
+        argument: IrNode,
+        arg: u32,
+        msg: u32,
+    ) -> Self {
+        let name = kind.name();
+        let text = IrNode::Assign {
+            local: msg,
+            value: Box::new(IrNode::ConvertCall {
+                op: ConvertOp::ToString,
+                arg: Box::new(IrNode::Local(arg)),
+                radix: None,
+            }),
+        };
+        let stack = IrNode::Ternary {
+            cond: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Local(msg)),
+                rhs: Box::new(IrNode::Str(String::new())),
+            }),
+            then_branch: Box::new(IrNode::Str(name.to_owned())),
+            else_branch: Box::new(IrNode::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(IrNode::Str(format!("{name}: "))),
+                rhs: Box::new(IrNode::Local(msg)),
+            }),
+        };
+        IrNode::Ternary {
+            cond: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Assign {
+                    local: arg,
+                    value: Box::new(argument),
+                }),
+                rhs: Box::new(IrNode::Undefined),
+            }),
+            then_branch: Box::new(Self::error_with_proto(
+                proto.clone(),
+                None,
+                IrNode::Str(name.to_owned()),
+            )),
+            else_branch: Box::new(Self::error_with_proto(proto, Some(text), stack)),
         }
     }
 
@@ -1638,8 +1899,11 @@ impl IrNode {
             | IrNode::MapNew { .. }
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::GlobalGet { .. }
             | IrNode::DateNow => false,
             IrNode::Assign { value: inner, .. }
+            | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
@@ -1740,6 +2004,16 @@ impl IrNode {
             | IrNode::ReceiverMethod { recv, args, .. }
             | IrNode::DateMethod { recv, args, .. } => f(recv) || args.iter().any(f),
             IrNode::MethodCallUser { obj, key, args, .. } => f(obj) || f(key) || args.iter().any(f),
+            IrNode::NamespaceGuard {
+                obj,
+                args,
+                fast,
+                slow,
+                ..
+            } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
+            IrNode::ProtoGuard {
+                recv, fast, user, ..
+            } => f(recv) || f(fast) || f(user),
             IrNode::Construct {
                 callee,
                 args,
@@ -1803,8 +2077,11 @@ impl IrNode {
             | IrNode::MapNew { .. }
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::GlobalGet { .. }
             | IrNode::DateNow => Vec::new(),
             IrNode::Assign { value: inner, .. }
+            | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
@@ -1913,6 +2190,19 @@ impl IrNode {
                 .into_iter()
                 .chain(args.iter_mut())
                 .collect(),
+            IrNode::NamespaceGuard {
+                obj,
+                args,
+                fast,
+                slow,
+                ..
+            } => std::iter::once(&mut **obj)
+                .chain(args.iter_mut())
+                .chain([&mut **fast, &mut **slow])
+                .collect(),
+            IrNode::ProtoGuard {
+                recv, fast, user, ..
+            } => vec![&mut **recv, &mut **fast, &mut **user],
             IrNode::Construct {
                 callee,
                 args,

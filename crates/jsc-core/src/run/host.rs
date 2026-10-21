@@ -7,7 +7,7 @@ use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
-use super::value::{array_elements, array_layout, join_elements};
+use super::value::{array_elements, array_layout};
 use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
@@ -15,7 +15,6 @@ use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_
 /// strings, so the handler branches on the receiver's runtime TYPE BYTE.
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-const METHOD_OP_JOIN: i32 = abi::METHOD_OP_JOIN;
 const METHOD_OP_SLICE: i32 = abi::METHOD_OP_SLICE;
 const METHOD_OP_TO_UPPER: i32 = abi::METHOD_OP_TO_UPPER;
 const METHOD_OP_TO_LOWER: i32 = abi::METHOD_OP_TO_LOWER;
@@ -149,10 +148,6 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                 let needle = arg_bytes(arg0, &mem);
                 Some(bool_bits(byte_contains(&hay, &needle)))
             }
-            _ => None,
-        },
-        METHOD_OP_JOIN => match type_byte {
-            Some(TYPE_ARRAY) => array_join(caller, &mem, ptr?, arg0.cast_unsigned()),
             _ => None,
         },
         METHOD_OP_SLICE => match type_byte {
@@ -319,32 +314,6 @@ fn string_index_of(mem: &[u8], ptr: usize, sub: u64) -> u64 {
         Some(i) => index_bits(i),
         None => not_found_bits(),
     }
-}
-
-/// `array.join(sep)`: build a heap string of `ToString(element)` for each element
-/// joined by `sep` (`","` when `sep` is `undefined`); `null`/`undefined` elements,
-/// holes, and cycle back-references render as `""` (JS join semantics). The receiver
-/// is decoded as a whole so a self-reference is caught by the decoder's cycle
-/// guard. Returns the result's heap jsval bits.
-fn array_join<W: Send + 'static>(
-    caller: &mut Caller<'_, W>,
-    mem: &[u8],
-    ptr: usize,
-    sep_bits: u64,
-) -> Option<u64> {
-    let sep = match decode(sep_bits, mem) {
-        Value::Undefined => ",".to_owned(),
-        other => to_js_string(&other),
-    };
-    let elems = match decode(HEAP | u64::try_from(ptr).ok()?, mem) {
-        Value::Array(elems, _) => elems,
-        Value::Ref(_, inner) => match *inner {
-            Value::Array(elems, _) => elems,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    alloc_string(caller, &join_elements(&elems, &sep)).map(|base| HEAP | base)
 }
 
 /// Resolve one JS slice endpoint against a sequence `len`: `undefined` uses

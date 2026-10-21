@@ -120,6 +120,9 @@ pub(crate) const CLASS_ERROR: u8 = 1;
 /// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
 pub(crate) const CLASS_ARGUMENTS: u8 = 2;
 
+/// [`TYPE_OBJECT`] `class` byte: the global object (a static realm block).
+pub(crate) const CLASS_GLOBAL: u8 = 3;
+
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
@@ -135,8 +138,10 @@ pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
 pub(crate) const OBJ_FLAG_NOT_EXTENSIBLE: u8 = 1;
 
 /// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
-/// pointer or [`NULL`]), 8-byte aligned. Every object-family block is created
-/// with it [`NULL`] until the realm's intrinsic prototypes exist.
+/// pointer or [`NULL`]), 8-byte aligned. Ordinary objects are created with
+/// `%Object.prototype%` and functions with `%Function.prototype%` (static
+/// realm-image blocks); the other kinds with [`NULL`] until their intrinsic
+/// prototypes exist.
 pub(crate) const OBJ_PROTO_OFFSET: u32 = 8;
 
 /// The byte size of the shared object-family prefix — header, `props`, and
@@ -182,6 +187,11 @@ pub(crate) const ARRAY_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 /// an array-index key in its `props` table, so `length` may exceed the store.
 /// Set by a store or `length` write past the dense-growth bound; never cleared.
 pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is being joined (`join`,
+/// `Array.prototype.toString`). Set for the duration of the guest join so a
+/// cyclic element joins as the empty string; cleared on every exit.
+pub(crate) const ARRAY_FLAG_JOINING: u8 = 8;
 
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
@@ -377,9 +387,13 @@ pub(crate) const ACCESSOR_GET_OFFSET: u32 = HEADER_SIZE + 4;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const ACCESSOR_SET_OFFSET: u32 = HEADER_SIZE + 12;
 
+/// The byte size of a [`TYPE_ACCESSOR`] block: the header, 4 padding bytes and
+/// the two getter/setter jsvals.
+pub(crate) const ACCESSOR_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 + 8;
+
 /// TYPE BYTE of an own-property table (internal, never a user value), the
 /// block an object-family `props` slot points at:
-/// `[type=12][pad][tflags:u8][pad][count:u32 @4][cap:u32 @8][live:u32 @12]`
+/// `[type=12][pad][tflags:u8][watch bit:u8][count:u32 @4][cap:u32 @8][live:u32 @12]`
 /// followed by `cap` [`PROP_ENTRY_SIZE`]-byte entries
 /// `[key:u32][attrs:u32][value:i64]` from [`PROPS_HEADER_SIZE`]. `key` is an
 /// interned string block base (`0` = a deleted entry's tombstone), `count` the
@@ -389,7 +403,7 @@ pub(crate) const ACCESSOR_SET_OFFSET: u32 = HEADER_SIZE + 12;
 pub(crate) const TYPE_PROPS: u8 = 12;
 
 /// Byte offset (from a [`TYPE_PROPS`] block base) of the `tflags` byte
-/// ([`PROPS_HAS_INDEX_KEYS`], [`PROPS_HAS_NON_ENUM`]).
+/// ([`PROPS_HAS_INDEX_KEYS`], [`PROPS_HAS_NON_ENUM`], [`PROPS_WATCHED`]).
 pub(crate) const PROPS_TFLAGS_OFFSET: u32 = 2;
 
 /// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `count`.
@@ -425,6 +439,15 @@ pub(crate) const PROPS_HAS_INDEX_KEYS: u8 = 1;
 
 /// [`TYPE_PROPS`] `tflags` bit: some entry lacks [`ATTR_ENUMERABLE`].
 pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
+
+/// [`TYPE_PROPS`] `tflags` bit: the table belongs to a watched intrinsic
+/// (design 3.3); its byte [`PROPS_WATCH_BIT_OFFSET`] holds the intrinsic's
+/// dirty-bit index. A rebuilt table keeps both.
+pub(crate) const PROPS_WATCHED: u8 = 4;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of a watched table's u8
+/// dirty-bit index.
+pub(crate) const PROPS_WATCH_BIT_OFFSET: u32 = 3;
 
 /// TYPE BYTE of an array element store (internal, never a user value), the
 /// block a [`TYPE_ARRAY`] handle's `elems` slot points at:
@@ -644,9 +667,6 @@ pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
 /// `__method` op flag: `includes`.
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `join`.
-pub(crate) const METHOD_OP_JOIN: i32 = 2;
 
 /// `__method` op flag: `slice` (overloaded on array/string).
 pub(crate) const METHOD_OP_SLICE: i32 = 3;

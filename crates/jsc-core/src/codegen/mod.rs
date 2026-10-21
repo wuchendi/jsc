@@ -29,10 +29,13 @@ use swc_ecma_ast::{
     UnaryOp, UpdateExpr, UpdateOp, VarDeclKind, VarDeclOrExpr,
 };
 
+use globals::GlobalFacts;
+
 use crate::ir::{
-    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, InstanceOfKind,
-    IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp, MathOp, MethodOp,
-    ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind,
+    GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp,
+    SpreadCallee, SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
@@ -125,12 +128,20 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     let has_state_machine = fn_decls
         .iter()
         .any(|f| f.function.is_generator || f.function.is_async);
+    // A builtin reached through its function value reads its arguments from
+    // the same `K` slots, so `K` then also covers the widest call.
+    let globals = GlobalFacts::scan(program);
     let max_arity = body
         .iter()
         .map(|s| scan_stmt_arity(s))
         .max()
         .unwrap_or(0)
-        .max(if has_state_machine { 2 } else { 0 });
+        .max(if has_state_machine { 2 } else { 0 })
+        .max(if globals.reaches_builtins() {
+            globals.call_arity()
+        } else {
+            0
+        });
 
     // Shared lowering state: the resolved declaration signatures, the uniform
     // arity, and the accumulator that lifted arrow functions append themselves
@@ -153,6 +164,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             .collect(),
         module_mutable: analysis.module_mutable,
         completion: Cell::new(None),
+        globals,
     };
 
     // Pass 2: the top-level statements become `main`'s body, lowered in a single
@@ -201,6 +213,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         stmts,
         functions,
         module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
+        arity: u32::try_from(max_arity).unwrap_or(u32::MAX),
     })
 }
 
@@ -259,6 +272,8 @@ struct Shared<'a> {
     /// (see [`LowerCtx::completion_local`]), so a value produced inside a nested
     /// statement body reaches `main`'s result.
     completion: Cell<Option<u32>>,
+    /// The program-level global facts (design 3.2).
+    globals: GlobalFacts,
 }
 
 /// The lowered shape of a `class` declaration: the instance field names the
@@ -369,6 +384,8 @@ enum AccessKind {
     /// A boxed cell reached through the given pointer expression (a `Local` for
     /// a cell declared in this frame, or an `EnvLoad` for a captured cell).
     Cell(IrNode),
+    /// An unresolved name: a property of the global object (design 4.3).
+    Global(GlobalRef),
 }
 
 /// A resolved name reference: how to reach it plus its mutability.
@@ -536,6 +553,7 @@ mod capture;
 mod expr;
 mod function;
 mod generator;
+mod globals;
 mod op;
 mod scope;
 mod stmt;

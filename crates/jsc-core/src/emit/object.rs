@@ -80,7 +80,10 @@ pub(super) fn emit_object_node(
     match proto {
         Some(proto) => emit_node(proto, function, scratch, strings, helpers),
         None => {
-            function.instruction(&Instruction::I64Const(NULL_BITS));
+            function.instruction(&Instruction::I64Const(intrinsic_bits(
+                Intrinsic::ObjectPrototype,
+                helpers,
+            )));
         }
     }
     function.instruction(&Instruction::I64Store(mem(OBJ_PROTO_OFFSET)));
@@ -341,8 +344,8 @@ pub(super) fn emit_object_has_node(
 /// Emit an `x instanceof RHS` identity test, leaving a `true`/`false`
 /// jsval on the stack. The operand `value` is evaluated first, then the
 /// right-hand side. The runtime-TYPE-BYTE builtins test the operand's heap kind;
-/// the prototype kinds gate the operand with [`emit_is_proto_carrier`] (a value
-/// without a `proto` slot is never an instance) and walk its `proto` chain for
+/// the prototype kinds gate the operand with [`emit_is_object`] (a primitive is
+/// never an instance) and walk its `proto` chain for
 /// the target prototype: the static error prototype ([`InstanceOfKind::Proto`])
 /// or, for [`InstanceOfKind::Ctor`] (`OrdinaryHasInstance`), `Get(C,
 /// "prototype")` of the callable-guarded right-hand side `C`, which must be an
@@ -402,7 +405,7 @@ pub(super) fn emit_instanceof_node(
         );
     }
 
-    emit_is_proto_carrier(function, cur);
+    emit_is_object(function, cur);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
     if ctor {
@@ -455,7 +458,7 @@ pub(super) fn emit_instanceof_node(
     // Loop: 1 iff `cur` reaches `tgt`, 0 iff the chain runs out.
     function.instruction(&Instruction::Block(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::Loop(BlockType::Empty));
-    emit_is_proto_carrier(function, cur);
+    emit_is_object(function, cur);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::I32Const(0));
@@ -485,24 +488,6 @@ pub(super) fn emit_instanceof_node(
     function.instruction(&Instruction::Else);
     // A receiver without a `proto` slot is never an instance.
     function.instruction(&Instruction::I64Const(FALSE_BITS));
-    function.instruction(&Instruction::End);
-}
-
-/// Push `1` if the jsval in `local` is a heap block carrying a `proto` slot
-/// (any object-family kind: not a string or an array), else `0`. The type-byte
-/// reads are gated behind [`emit_is_pointer`].
-fn emit_is_proto_carrier(function: &mut Function, local: u32) {
-    emit_is_pointer(function, local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_STRING));
-    function.instruction(&Instruction::I32Ne);
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
 }
 
@@ -621,7 +606,19 @@ pub(super) fn emit_map_new_node(
     function.instruction(&Instruction::I32Const(MAP_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(dst));
-    emit_object_prefix(function, dst, if set { TYPE_SET } else { TYPE_MAP });
+    emit_object_prefix(
+        function,
+        dst,
+        if set { TYPE_SET } else { TYPE_MAP },
+        intrinsic_bits(
+            Intrinsic::Prototype(if set {
+                BuiltinCtor::Set
+            } else {
+                BuiltinCtor::Map
+            }),
+            helpers,
+        ),
+    );
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Store(size_slot));
@@ -666,7 +663,12 @@ pub(super) fn emit_date_new_node(
     function.instruction(&Instruction::I32Const(DATE_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(dst));
-    emit_object_prefix(function, dst, TYPE_DATE);
+    emit_object_prefix(
+        function,
+        dst,
+        TYPE_DATE,
+        intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Date), helpers),
+    );
 
     // ms slot = f64 timestamp. Push the store address, then the f64 value.
     function.instruction(&Instruction::LocalGet(dst));
@@ -745,8 +747,7 @@ const F64_EXP_MASK: i64 = 0x7FF0_0000_0000_0000;
 /// paths — a `TYPE_DATE` block computes the field GUEST-side from its stored f64
 /// epoch-ms ([`emit_date_field`]); any other receiver falls back to an ordinary
 /// user method call `recv.<method_name>(args)`, so an object/class method of the
-/// same name still works. When the module declares no functions the fallback is
-/// dead and emits `undefined` instead of an invalid `call_indirect`.
+/// same name still works.
 pub(super) fn emit_date_method_node(
     node: &IrNode,
     function: &mut Function,
@@ -1232,9 +1233,7 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
 /// the collection op through the `__map_*` helpers (`.set`/`.add` yield the handle;
 /// `.get` the value/undefined; `.has`/`.delete` a boxed boolean); any other receiver
 /// falls back to an ordinary user method call `recv.<method_name>(args)` — so an
-/// object/class method of the same name still works. When the module declares no
-/// functions (no funcref table exists, so no object could carry a method) the
-/// fallback arm is dead and emits `undefined` instead of an invalid `call_indirect`.
+/// object/class method of the same name still works.
 pub(super) fn emit_map_method_node(
     node: &IrNode,
     function: &mut Function,
@@ -1982,8 +1981,9 @@ pub(super) fn emit_prop_throw_call(
 /// Emit a compound element/member assignment `obj[index] op= rhs`.
 ///
 /// `obj` and `index` are evaluated exactly once into the stable temp locals
-/// `obj_local`/`idx_local` (not scratch, which the read below clobbers), so no
-/// sub-expression side effect runs twice. The new value — current member read
+/// `obj_local`/`idx_local` (not scratch, which the read below clobbers), and an
+/// object key is converted once ([`emit_key_to_primitive`]), so no
+/// sub-expression side effect or user `toString` runs twice. The new value — current member read
 /// through those temps, combined with `rhs` via `op` (reusing the [`Binary`]
 /// overload, so `+=` on a string member concatenates) — is staged in `new_local`,
 /// then the store is delegated to [`emit_index_set_node`] over the three stable
@@ -2027,6 +2027,7 @@ pub(super) fn emit_index_op_set_node(
             helpers,
         );
     }
+    emit_key_to_primitive(function, idx_local, helpers);
 
     // new = current_member op rhs. The member read reuses the runtime type-byte
     // dispatch, reads its operands from the stable temps, and is staged in
@@ -2276,7 +2277,6 @@ fn emit_raise_type_error(
 
     let error = IrNode::error_object(
         ErrorKind::TypeError,
-        None,
         Some(IrNode::Local(msg)),
         IrNode::Local(stack),
     );
