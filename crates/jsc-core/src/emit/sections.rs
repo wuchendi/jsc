@@ -575,6 +575,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     let fragments: Vec<IrNode> = Builtin::ALL
         .into_iter()
         .filter_map(|b| builtins::fragment(b, program.arity))
+        .chain(builtins::fragments(program.arity))
         .collect();
     // `"length"` is always interned: the property helpers compare a key against
     // it to resolve a string's or array's exotic `length`.
@@ -723,15 +724,7 @@ pub(super) fn collect_node<'a>(
             }
             collect_node(value, order, seen);
         }
-        // `ArrayPush` carries its pushed value plus the not-an-array error.
-        IrNode::ArrayPush {
-            value, not_array, ..
-        } => {
-            if let Some(not_array) = not_array {
-                seed_callee_error(callee_error_text(not_array), order, seen);
-            }
-            collect_node(value, order, seen);
-        }
+        IrNode::ArrayPush { value, .. } => collect_node(value, order, seen),
         IrNode::Assign { value, .. } => {
             collect_node(value, order, seen);
         }
@@ -866,6 +859,7 @@ pub(super) fn collect_node<'a>(
             array,
             callback,
             init,
+            this_arg,
             ..
         } => {
             if !is_static_function(callback) {
@@ -873,8 +867,8 @@ pub(super) fn collect_node<'a>(
             }
             collect_node(array, order, seen);
             collect_node(callback, order, seen);
-            if let Some(init) = init {
-                collect_node(init, order, seen);
+            for node in [init, this_arg].into_iter().flatten() {
+                collect_node(node, order, seen);
             }
         }
         IrNode::MethodCall { recv, args, .. } => {
@@ -918,16 +912,17 @@ pub(super) fn collect_node<'a>(
             collect_node(slow, order, seen);
         }
         IrNode::ProtoGuard {
-            key,
             recv,
             fast,
-            user,
+            string,
+            slow,
             ..
         } => {
-            seed_strs_ref(&[key], order, seen);
             collect_node(recv, order, seen);
-            collect_node(fast, order, seen);
-            collect_node(user, order, seen);
+            for node in [fast, string].into_iter().flatten() {
+                collect_node(node, order, seen);
+            }
+            collect_node(slow, order, seen);
         }
         IrNode::Construct {
             callee,
@@ -1165,10 +1160,6 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::DateGetTime { recv } => collect_node(recv, order, seen),
-        // `pop` only needs its not-an-array error.
-        IrNode::ArrayPop { not_array, .. } => {
-            seed_callee_error(callee_error_text(not_array), order, seen);
-        }
         // A global reference interns its key and, unless it reads `undefined`
         // on a miss, its `ReferenceError` texts; a write may also throw the
         // `__set` errors.
@@ -1203,6 +1194,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::IsConstructCall(_)
         | IrNode::ArgCount(_)
         | IrNode::Hole
+        | IrNode::ArrayPop { .. }
         | IrNode::SpreadArgsGlobal
         | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.
@@ -1311,7 +1303,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 /// `__define` / `__delete` must set the bits (design 3.3).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        IrNode::ProtoGuard { .. } => true,
+        IrNode::ProtoGuard { sealed, .. } => !sealed,
         IrNode::NamespaceGuard { namespace, .. } => {
             realm::Intrinsic::from(*namespace).watch_bit().is_some()
         }

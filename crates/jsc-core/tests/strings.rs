@@ -76,13 +76,9 @@ fn methods_do_not_disturb_indexing() {
     assert_number("\"abc\".length", 3.0);
 }
 
-/// Arity mismatches on the fixed-arity methods are compile errors.
+/// Arity mismatches on the fixed-arity string methods are compile errors.
 #[test]
 fn method_arity_errors() {
-    assert!(
-        compile_and_run("[1,2,3].indexOf()").is_err(),
-        "indexOf needs one argument"
-    );
     assert!(
         compile_and_run("\"abc\".charAt()").is_err(),
         "charAt needs one argument"
@@ -90,10 +86,6 @@ fn method_arity_errors() {
     assert!(
         compile_and_run("\"abc\".toUpperCase(1)").is_err(),
         "toUpperCase takes no arguments"
-    );
-    assert!(
-        compile_and_run("[1,2,3].slice(0,1,2)").is_err(),
-        "slice takes at most two arguments"
     );
 }
 

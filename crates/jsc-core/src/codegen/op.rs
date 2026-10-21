@@ -125,17 +125,17 @@ fn lower_math_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<
     Ok(IrNode::MathCall { op, args })
 }
 
-/// Map a method name to its non-callback array/string method op, or `None`
-/// when the name is not one of them. Recognized purely syntactically from a
-/// `<expr>.<name>(..)` member callee (kept distinct from the push/pop and higher-order array
-/// methods and from `x[i]` indexing); the receiver's array-vs-string kind is
-/// resolved at runtime host-side.
+/// The `%Array.prototype%` methods with a guarded call-site fast path (the
+/// array-side names of the string/array method families).
+pub(super) const ARRAY_METHODS: [&str; 10] = [
+    "push", "pop", "map", "filter", "reduce", "forEach", "indexOf", "includes", "join", "slice",
+];
+
+/// Map a method name to its string method op, or `None` when the name is not
+/// one of them (nor a name of [`ARRAY_METHODS`], claimed first). Recognized
+/// purely syntactically from a `<expr>.<name>(..)` member callee.
 pub(super) fn non_callback_method_op(name: &str) -> Option<MethodOp> {
     Some(match name {
-        "indexOf" => MethodOp::IndexOf,
-        "includes" => MethodOp::Includes,
-        "join" => MethodOp::Join,
-        "slice" => MethodOp::Slice,
         "toUpperCase" => MethodOp::ToUpper,
         "toLowerCase" => MethodOp::ToLower,
         "charAt" => MethodOp::CharAt,
@@ -151,6 +151,28 @@ pub(super) fn non_callback_method_op(name: &str) -> Option<MethodOp> {
         "split" => MethodOp::Split,
         _ => return None,
     })
+}
+
+/// Whether the host string method `op` takes `n` arguments: `slice`,
+/// `padStart`/`padEnd`, `substring` and `split` have optional trailing
+/// arguments (defaulted host-side); the rest are fixed. At most two slots are
+/// ever passed to `__method`.
+pub(super) fn string_method_arity(op: MethodOp, n: usize) -> bool {
+    match op {
+        MethodOp::IndexOf
+        | MethodOp::Includes
+        | MethodOp::CharAt
+        | MethodOp::Repeat
+        | MethodOp::StartsWith
+        | MethodOp::EndsWith => n == 1,
+        MethodOp::ToUpper
+        | MethodOp::ToLower
+        | MethodOp::Trim
+        | MethodOp::TrimStart
+        | MethodOp::TrimEnd => n == 0,
+        MethodOp::Join | MethodOp::Split => n <= 1,
+        MethodOp::Slice | MethodOp::PadStart | MethodOp::PadEnd | MethodOp::Substring => n <= 2,
+    }
 }
 
 /// Map a bare global function name to its conversion built-in, or `None`
