@@ -335,3 +335,15 @@ fn string_receivers_keep_shared_method_names() {
         true,
     );
 }
+
+#[test]
+fn push_past_the_maximum_length_throws() {
+    both_bool(
+        "const o = { length: 2 ** 53 - 1 }; let ok = false; try { Array.prototype.push.call(o, 1); } catch (e) { ok = e instanceof TypeError; } ok",
+        true,
+    );
+    both_number(
+        "const o = { length: 2 ** 32 + 1 }; Array.prototype.push.call(o, 'x')",
+        4_294_967_298.0,
+    );
+}

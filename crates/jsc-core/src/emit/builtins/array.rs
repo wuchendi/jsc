@@ -48,6 +48,15 @@ const INCLUDES: Texts = texts!("includes");
 const JOIN_TEXTS: Texts = texts!("join");
 const SLICE: Texts = texts!("slice");
 
+/// `2^53 - 1`, the largest array-like length.
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// The `TypeError` of a `push` past [`MAX_SAFE_INTEGER`].
+const PUSH_TOO_LONG: CalleeErrorText<'static> = [
+    "Pushing past the maximum array-like length",
+    "TypeError: Pushing past the maximum array-like length",
+];
+
 /// The key `Array.prototype.toString` calls on a non-array receiver.
 const JOIN: &str = "join";
 
@@ -75,6 +84,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
     nullish
         .chain(callbacks)
         .chain(REDUCE_EMPTY)
+        .chain(PUSH_TOO_LONG)
         .chain([JOIN, COMMA, ""])
 }
 
@@ -305,7 +315,7 @@ pub(super) fn emit_push(
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (n, i, len) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (n, i) = (frame.i32(0), frame.i32(1));
     this_object(function, frame, o, PUSH.nullish, strings, helpers);
     argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
@@ -318,9 +328,26 @@ pub(super) fn emit_push(
     });
     wasm!(function; LocalGet(o), I32WrapI64, I32Load(array_len_slot()));
     wasm!(function; F64ConvertI32U, I64ReinterpretF64, Return, End);
-    length_of(function, o, len, strings, helpers);
+    // ToLength over the full integer range: `len + n` past 2^53 - 1 throws.
+    let flen = frame.f64(0);
+    wasm!(function; LocalGet(o), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get));
+    return_if_pending(function);
+    wasm!(function; Call(helpers.to_number));
+    return_if_pending(function);
+    wasm!(function;
+        F64ReinterpretI64, F64Trunc, F64Const(Ieee64::from(0.0)), F64Max,
+        F64Const(Ieee64::from(MAX_SAFE_INTEGER)), F64Min, LocalSet(flen),
+        // NaN propagates through `max`/`min`; ToLength reads it as 0.
+        LocalGet(flen), LocalGet(flen), F64Ne,
+        If(BlockType::Empty), F64Const(Ieee64::from(0.0)), LocalSet(flen), End,
+        LocalGet(flen), LocalGet(n), F64ConvertI32U, F64Add,
+        F64Const(Ieee64::from(MAX_SAFE_INTEGER)), F64Gt,
+        If(BlockType::Empty),
+    );
+    throw_type_error(function, frame, PUSH_TOO_LONG, strings, helpers);
+    wasm!(function; End);
     count_loop(function, i, n, |function| {
-        wasm!(function; LocalGet(len), F64ConvertI32U, LocalGet(i), F64ConvertI32U, F64Add);
+        wasm!(function; LocalGet(flen), LocalGet(i), F64ConvertI32U, F64Add);
         wasm!(function; I64ReinterpretF64, LocalSet(kv));
         arg_at(function, frame, i, v);
         emit_drop(
@@ -332,7 +359,7 @@ pub(super) fn emit_push(
         );
     });
     wasm!(function;
-        LocalGet(len), F64ConvertI32U, LocalGet(n), F64ConvertI32U, F64Add,
+        LocalGet(flen), LocalGet(n), F64ConvertI32U, F64Add,
         I64ReinterpretF64, LocalSet(kv),
     );
     let length = IrNode::Str(INDEX_LENGTH_KEY.to_owned());
