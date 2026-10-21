@@ -420,7 +420,7 @@ fn functions_are_objects() {
         jsc(&["-e", "function f(){} console.log(typeof f)"]),
         "function"
     );
-    // Writes to the non-writable `name`/`caller` throw in strict code.
+    // Writing `caller` calls the inherited `%ThrowTypeError%` setter.
     assert_eq!(
         jsc(&[
             "-e",

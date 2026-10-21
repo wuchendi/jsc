@@ -122,6 +122,8 @@ export const ELEMS_CAP_OFFSET = 4
 export const ELEMS_DATA_OFFSET = 8
 /** Byte offset (from a {@link TYPE_FUNCTION} block base) of the funcref-table index (`u32`). */
 export const FUNC_INDEX_OFFSET = OBJ_PREFIX_SIZE
+/** {@link TYPE_FUNCTION} `flags` bit: the function is a constructor (`new` works). */
+export const FUNC_FLAG_CONSTRUCTOR = 8
 /** {@link TYPE_FUNCTION} `flags` bit: the function is a class constructor. */
 export const FUNC_FLAG_CLASS_CTOR = 16
 /** {@link TYPE_FUNCTION} `flags` bit: the constructor allocates its own `this` (a derived class). */
@@ -174,8 +176,6 @@ export const CONVERT_OP_PARSE_FLOAT = 3
 export const METHOD_OP_INDEX_OF = 0
 /** `__method` op: `includes`. */
 export const METHOD_OP_INCLUDES = 1
-/** `__method` op: `join`. */
-export const METHOD_OP_JOIN = 2
 /** `__method` op: `slice` (overloaded on array/string). */
 export const METHOD_OP_SLICE = 3
 /** `__method` op: `toUpperCase`. */

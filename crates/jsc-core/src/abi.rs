@@ -120,6 +120,9 @@ pub(crate) const CLASS_ERROR: u8 = 1;
 /// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
 pub(crate) const CLASS_ARGUMENTS: u8 = 2;
 
+/// [`TYPE_OBJECT`] `class` byte: the global object (a static realm block).
+pub(crate) const CLASS_GLOBAL: u8 = 3;
+
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
 /// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
@@ -135,8 +138,10 @@ pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
 pub(crate) const OBJ_FLAG_NOT_EXTENSIBLE: u8 = 1;
 
 /// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
-/// pointer or [`NULL`]), 8-byte aligned. Every object-family block is created
-/// with it [`NULL`] until the realm's intrinsic prototypes exist.
+/// pointer or [`NULL`]), 8-byte aligned. Ordinary objects are created with
+/// `%Object.prototype%` and functions with `%Function.prototype%` (static
+/// realm-image blocks); the other kinds with [`NULL`] until their intrinsic
+/// prototypes exist.
 pub(crate) const OBJ_PROTO_OFFSET: u32 = 8;
 
 /// The byte size of the shared object-family prefix — header, `props`, and
@@ -182,6 +187,11 @@ pub(crate) const ARRAY_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 /// an array-index key in its `props` table, so `length` may exceed the store.
 /// Set by a store or `length` write past the dense-growth bound; never cleared.
 pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is being joined (`join`,
+/// `Array.prototype.toString`). Set for the duration of the guest join so a
+/// cyclic element joins as the empty string; cleared on every exit.
+pub(crate) const ARRAY_FLAG_JOINING: u8 = 8;
 
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
@@ -376,6 +386,10 @@ pub(crate) const ACCESSOR_GET_OFFSET: u32 = HEADER_SIZE + 4;
 /// the second 8-byte-aligned i64 right after [`ACCESSOR_GET_OFFSET`].
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const ACCESSOR_SET_OFFSET: u32 = HEADER_SIZE + 12;
+
+/// The byte size of a [`TYPE_ACCESSOR`] block: the header, 4 padding bytes and
+/// the two getter/setter jsvals.
+pub(crate) const ACCESSOR_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 + 8;
 
 /// TYPE BYTE of an own-property table (internal, never a user value), the
 /// block an object-family `props` slot points at:
@@ -644,9 +658,6 @@ pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
 /// `__method` op flag: `includes`.
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `join`.
-pub(crate) const METHOD_OP_JOIN: i32 = 2;
 
 /// `__method` op flag: `slice` (overloaded on array/string).
 pub(crate) const METHOD_OP_SLICE: i32 = 3;

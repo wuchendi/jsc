@@ -334,3 +334,22 @@ fn class_member_name_early_errors() {
         "1 2\n"
     );
 }
+
+/// Builtin parents allocate their own kind with `proto = new.target.prototype`
+/// (design 4.7): an `extends Error` instance renders and throws under its
+/// subclass name, and the class label names the builtin parent.
+#[test]
+fn builtin_parents() {
+    let class = r#"class E extends Error { constructor(m) { super(m); this.name = "E" } }"#;
+    assert_eq!(
+        run(&format!(
+            "{class} const e = new E('hi'); console.log(e instanceof E, e instanceof Error, e.message, String(e)); console.log(E)"
+        )),
+        "true true hi E: hi\n[class E extends Error]\n"
+    );
+    assert!(uncaught(&format!("{class} throw new E('boom')")).contains("E: boom"));
+    assert_eq!(
+        run("class S extends Set {} const s = new S(); s.add(1); console.log(s, s instanceof S)"),
+        "Set(1) true\n"
+    );
+}

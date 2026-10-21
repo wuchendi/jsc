@@ -82,7 +82,15 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(gen_dst));
-    emit_object_prefix(function, gen_dst, TYPE_GENERATOR);
+    // `%GeneratorPrototype%` is not in the realm yet; inheriting from
+    // `%Object.prototype%` (where its chain ends) gives a generator object its
+    // `toString` (`[object Generator]`) and `valueOf`.
+    emit_object_prefix(
+        function,
+        gen_dst,
+        TYPE_GENERATOR,
+        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
+    );
     // sm_idx (u32).
     function.instruction(&Instruction::LocalTee(gen_dst));
     function.instruction(&Instruction::LocalGet(gen_dst));
@@ -149,22 +157,6 @@ pub(super) fn emit_gen_resume(
     // 1. Evaluate the handle once into a stable scratch slot.
     emit_node(handle, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(handle_slot));
-
-    // With no functions in the program there is no funcref table / uniform call
-    // type, so no generator can exist — the receiver is provably a non-generator.
-    // Throw the `TypeError` UNCONDITIONALLY (skipping the invalid indirect call)
-    // and leave `undefined` as the fall-through result of this expression.
-    if !helpers.has_funcs {
-        emit_throw_not_a_function(
-            function,
-            EXPRESSION_NOT_A_FUNCTION,
-            scratch,
-            strings,
-            helpers,
-        );
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        return;
-    }
 
     // 2. A non-generator receiver throws a `TypeError`.
     emit_is_generator(function, handle_slot);
@@ -487,22 +479,12 @@ fn emit_segment_term(
 /// to exhaustion via `call_indirect`, collecting each yielded value into a fresh
 /// array (the generator's `return` value is NOT included, matching the
 /// iterator protocol). Backs `[...gen]` / `f(...gen)` spread.
-///
-/// When the program declares no functions there is no funcref table, so no
-/// generator can exist — a STUB (returns `undefined`, never called) keeps the
-/// helper index stable without an invalid `call_indirect`.
 pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
     // Param: gen (local 0). Locals: val (i64, local 1), arr base (i32, local 2).
     let mut function = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
     let gen_p = 0;
     let val = 1;
     let arr = 2;
-
-    if !helpers.has_funcs {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::End);
-        return function;
-    }
 
     // arr = a fresh empty array, grown in place by `__array_push`.
     function.instruction(&Instruction::I32Const(0));
@@ -577,21 +559,11 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
 /// deliberately does NOT build a `{ value, done }` object or propagate a pending
 /// exception: the host async engine reads the handle's `done` flag and the
 /// `__exc_pending`/`__exc_value` globals directly after the call.
-///
-/// When the program declares no functions there is no funcref table, so no async
-/// generator can exist — a STUB (returns `undefined`, never called) keeps the
-/// export/index stable without an invalid `call_indirect`.
 pub(super) fn emit_async_step(helpers: Helpers<'_>) -> Function {
     // Params: gen (local 0, i64), sent (local 1, i64) -> i64. No extra locals.
     let mut function = Function::new(vec![]);
     let gen_p = 0;
     let sent_p = 1;
-
-    if !helpers.has_funcs {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::End);
-        return function;
-    }
 
     // Drive the state machine: SM(sent, gen, …, env = gen.env, argc = 2). Mirrors
     // `emit_gen_resume` step 3 (an async generator forces K >= 2, so the drop
