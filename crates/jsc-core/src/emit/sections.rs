@@ -731,7 +731,10 @@ pub(super) fn collect_node<'a>(
         }
         // A direct call and a `console.log` both just collect their argument
         // literals (`console.log` has no callee expression to walk).
-        IrNode::Call { args, .. } | IrNode::ConsoleLog { args } | IrNode::MathCall { args, .. } => {
+        IrNode::Call { args, .. }
+        | IrNode::ConsoleLog { args }
+        | IrNode::MathCall { args, .. }
+        | IrNode::CollectionOp { args, .. } => {
             for arg in args {
                 collect_node(arg, order, seen);
             }
@@ -917,7 +920,7 @@ pub(super) fn collect_node<'a>(
             recv,
             key,
             args,
-            array,
+            fast,
             not_callable,
             ..
         } => {
@@ -929,8 +932,21 @@ pub(super) fn collect_node<'a>(
             for arg in args {
                 collect_node(arg, order, seen);
             }
-            if let Some(array) = array {
-                collect_node(array, order, seen);
+            for (_, path) in fast {
+                collect_node(path, order, seen);
+            }
+        }
+        // The slow path is a `size` member read.
+        IrNode::SizeRead { obj, .. } => {
+            seed_strs(&["size"], order, seen);
+            seed_nullish_strs(order, seen);
+            collect_node(obj, order, seen);
+        }
+        // `toISOString()` returns the interned `"Invalid Date"` literal for a
+        // non-finite timestamp.
+        IrNode::DateField { op, .. } => {
+            if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
+                order.push(INVALID_DATE);
             }
         }
         IrNode::Construct {
@@ -1038,79 +1054,6 @@ pub(super) fn collect_node<'a>(
             collect_node(then_branch, order, seen);
             collect_node(else_branch, order, seen);
         }
-        // A Map/Set method threads its method name (used as the user-method-fallback
-        // key) into the string table, then recurses into the receiver and arguments.
-        IrNode::MapMethod {
-            recv,
-            args,
-            method_name,
-            not_callable,
-            ..
-        } => {
-            if seen.insert(method_name.as_str()) {
-                order.push(method_name.as_str());
-            }
-            // The unknown-collection-method fallback lowers to a user method call,
-            // which the runtime callee guard protects — seed its TypeError strings too.
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            collect_node(recv, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
-        // A promise / generator method threads its method name (the user-method
-        // fallback key) into the string table; the generator path builds a
-        // `{ value, done }` result, and the guarded fallback throws a nullish /
-        // not-a-function TypeError — seed all of those strings too.
-        IrNode::ReceiverMethod {
-            op,
-            recv,
-            args,
-            not_callable,
-            ..
-        } => {
-            let keys: &[&'static str] = if matches!(op, ReceiverOp::Next) {
-                &["value", "done"]
-            } else {
-                &[]
-            };
-            let name = [op.name()];
-            for &s in name.iter().chain(keys) {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            seed_nullish_strs(order, seen);
-            collect_node(recv, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
-        IrNode::DateMethod {
-            op,
-            recv,
-            args,
-            method_name,
-            not_callable,
-            ..
-        } => {
-            if seen.insert(method_name.as_str()) {
-                order.push(method_name.as_str());
-            }
-            // The non-Date fallback lowers to a guarded user method call — seed
-            // its TypeError strings too.
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            // `toISOString()` returns the interned `"Invalid Date"` literal for a
-            // non-finite timestamp, so its `[len][utf8]` blob must exist.
-            if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
-                order.push(INVALID_DATE);
-            }
-            collect_node(recv, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
         // The promise primitives carry only sub-expressions to walk.
         IrNode::PromiseResolve(operand)
         | IrNode::PromiseReject(operand)
@@ -1158,6 +1101,7 @@ pub(super) fn collect_node<'a>(
                 }
             }
             seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
+            seed_callee_error(GENERATOR_RUNNING, order, seen);
             collect_node(handle, order, seen);
             collect_node(sent, order, seen);
         }
@@ -1168,7 +1112,6 @@ pub(super) fn collect_node<'a>(
                 collect_node(ms, order, seen);
             }
         }
-        IrNode::DateGetTime { recv } => collect_node(recv, order, seen),
         // A global reference interns its key and, unless it reads `undefined`
         // on a miss, its `ReferenceError` texts; a write may also throw the
         // `__set` errors.
@@ -1289,16 +1232,17 @@ fn collect_entries<'a>(
 }
 
 /// Whether any function of `program` (or `main`) builds an accessor
-/// ([`IrNode::MakeAccessor`]) or can reach the realm's `%Function.prototype%`
-/// `caller` / `arguments` accessors: it names them, or reads or writes a
+/// ([`IrNode::MakeAccessor`]) or can reach the realm's accessors (the
+/// `%Function.prototype%` `caller` / `arguments` poison pair, the `Map`/`Set`
+/// `size` getters): it names them, or reads or writes a
 /// member under a key computed at run time. Then `__get` / `__set` must
 /// dispatch to getters and setters. (The builtins only read fixed keys:
 /// `length`, indices, `prototype`, `name`, `message`.)
 fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
-        IrNode::MakeAccessor { .. } => true,
-        IrNode::Str(s) => s == "caller" || s == "arguments",
+        IrNode::MakeAccessor { .. } | IrNode::SizeRead { .. } => true,
+        IrNode::Str(s) => s == "caller" || s == "arguments" || s == "size",
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }
         | IrNode::IndexOpSet { index: key, .. }
@@ -1312,7 +1256,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 /// `__define` / `__delete` must set the bits (design 3.3).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        IrNode::ProtoGuard { sealed, .. } => !sealed,
+        IrNode::ProtoGuard { sealed, .. } | IrNode::SizeRead { sealed, .. } => !sealed,
         IrNode::NamespaceGuard { namespace, .. } => {
             realm::Intrinsic::from(*namespace).watch_bit().is_some()
         }

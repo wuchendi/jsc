@@ -83,6 +83,11 @@ impl LowerCtx<'_> {
                 MemberProp::Ident(id) if id.sym.as_ref() == "length" => Ok(IrNode::StrLen(
                     Box::new(nullish_check(self.lower_expr(&member.obj)?, "length")),
                 )),
+                // `obj.size`: a guarded `Map`/`Set` header read (design 3.2).
+                MemberProp::Ident(id) if id.sym.as_ref() == "size" => Ok(IrNode::SizeRead {
+                    sealed: self.shared.globals.intrinsics_sealed(),
+                    obj: Box::new(self.lower_expr(&member.obj)?),
+                }),
                 // `obj.a` ≡ `obj["a"]`: reuse the runtime `Index` dispatch, with
                 // the property name lowered to a heap-string key.
                 MemberProp::Ident(id) => Ok(IrNode::Index {
@@ -730,62 +735,19 @@ impl LowerCtx<'_> {
         {
             return self.lower_namespace_call(namespace, key, member, args);
         }
-        // `recv.push(..)` / `recv.map(..)` / `recv.trim(..)` / .. name an
-        // `%Array.prototype%` or `%String.prototype%` builtin: a generic method
-        // call with guarded fast paths (design 3.2 row 3).
+        // `recv.push(..)` / `recv.trim(..)` / `recv.get(..)` / `recv.then(..)`
+        // / `recv.getTime()` / .. name an `%Array.prototype%`,
+        // `%String.prototype%`, `%Map.prototype%`, `%Set.prototype%`,
+        // `%Promise.prototype%`, `%Date.prototype%` or `%GeneratorPrototype%`
+        // builtin: a generic method call with guarded fast paths (design 3.2
+        // rows 3-4).
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
             && (ARRAY_METHODS.contains(&id.sym.as_ref())
-                || STRING_METHODS.contains(&id.sym.as_ref()))
+                || STRING_METHODS.contains(&id.sym.as_ref())
+                || receiver_method(id.sym.as_ref()))
         {
             return self.lower_builtin_method_call(id.sym.as_ref(), member, args);
-        }
-        // `d.getTime()`: the millisecond timestamp of a Date receiver.
-        // Claimed for ANY receiver (a non-Date yields `NaN`); a user method named
-        // `getTime` is a documented out-of-scope collision.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && id.sym.as_ref() == "getTime"
-        {
-            if !args.is_empty() {
-                return Err(
-                    CompileError::spanned(member.span(), "getTime() takes no arguments").into(),
-                );
-            }
-            let recv = Box::new(nullish_check(self.lower_expr(&member.obj)?, "getTime"));
-            return Ok(IrNode::DateGetTime { recv });
-        }
-        // The `Date` field methods `d.valueOf()` / `d.getFullYear()` / ….
-        // Like the Map/Set methods, these names can ALSO be ordinary user methods,
-        // so the lowered node dispatches at runtime on the receiver's TYPE BYTE and
-        // keeps a user-method fallback — safe to claim the name here.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = date_method_op(id.sym.as_ref())
-        {
-            return self.lower_date_method(op, id.sym.as_ref(), &member.obj, args);
-        }
-        // `p.then(onF, onR)` / `p.catch(onR)` / `p.finally(fn)` and `gen.next(v)`
-        // are the promise / generator instance methods. Like the Map/Set methods,
-        // these names can ALSO be ordinary user methods (thenables, iterator
-        // objects), so the lowered node dispatches at runtime on the receiver's
-        // TYPE BYTE and keeps a user-method fallback — safe to claim the name here.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = receiver_method_op(id.sym.as_ref())
-        {
-            return self.lower_receiver_method(op, &member.obj, args);
-        }
-        // `map.set/get/has/delete(..)` / `set.add/has/delete(..)` are Map/Set
-        // methods. Unlike the builtins above these names can ALSO be ordinary
-        // object/class methods, so the lowered node keeps a user-method-call fallback
-        // and dispatches at runtime on the receiver's TYPE BYTE — it is safe to claim
-        // the name here.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = map_set_method_op(id.sym.as_ref())
-        {
-            return self.lower_map_method(op, id.sym.as_ref(), &member.obj, args);
         }
         // Any remaining member callee `obj.m(args)` / `obj[k](args)` is a USER
         // method call: it reads the function value at the member and binds
@@ -909,30 +871,6 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower a promise / generator instance method `recv.<op>(args)` into an
-    /// [`IrNode::ReceiverMethod`]. Mirrors [`Self::lower_map_method`]: the receiver
-    /// is lowered once and two fresh temps are reserved for the runtime TYPE-BYTE
-    /// dispatch. No arity check: the argument list is threaded verbatim to the
-    /// user-method fallback, which may take any number of arguments.
-    fn lower_receiver_method(
-        &mut self,
-        op: ReceiverOp,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let recv = self.lower_expr(obj)?;
-        let recv_local = self.fresh();
-        let fallback_obj_local = self.fresh();
-        Ok(IrNode::ReceiverMethod {
-            op,
-            recv: Box::new(recv),
-            args,
-            recv_local,
-            fallback_obj_local,
-            not_callable: method_not_a_function(obj, op.name()),
-        })
-    }
-
     /// Lower a call whose argument list contains a spread `f(...a)`. The
     /// argument parts are materialized into a runtime array (an
     /// [`IrNode::ArraySpread`]); the call then spreads that array into the
@@ -1001,7 +939,7 @@ impl LowerCtx<'_> {
             // it. Any other computed callee is an indirect spread call through the
             // funcref table.
             if let Expr::Member(member) = callee_expr {
-                if spread_rejecting_member(callee_expr, member) {
+                if spread_rejecting_member(callee_expr) {
                     return Err(CompileError::spanned(
                         call.span(),
                         "spread arguments are unsupported for this builtin method",
@@ -1176,68 +1114,20 @@ impl LowerCtx<'_> {
             ("join", _) => Some(method(MethodOp::Join)),
             _ => None,
         };
+        let mut fast: Vec<(ProtoKind, IrNode)> = array
+            .map(|path| (ProtoKind::Array, path))
+            .into_iter()
+            .collect();
+        fast.extend(receiver_fast_paths(name, recv_local, &args));
         seq.push(IrNode::ProtoGuard {
             sealed: self.shared.globals.intrinsics_sealed(),
             recv: recv(),
             key: name.to_owned(),
             args,
-            array: array.map(Box::new),
+            fast,
             not_callable: method_not_a_function(&member.obj, name),
         });
         Ok(IrNode::Seq(seq))
-    }
-
-    /// Lower a `Map`/`Set` method call `recv.<op>(args)` into an
-    /// [`IrNode::MapMethod`]. The receiver is lowered once; two fresh temps
-    /// are allocated — one holding the receiver across the runtime TYPE-BYTE dispatch,
-    /// one for the user-method-call fallback's own receiver stash. No arity check is
-    /// enforced: the argument list is threaded verbatim to the fallback (which may be
-    /// a user method of any arity), and the collection path treats a missing key /
-    /// value argument as `undefined`, matching JS.
-    fn lower_map_method(
-        &mut self,
-        op: MapOp,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let recv = nullish_check(self.lower_expr(obj)?, method);
-        let recv_local = self.fresh();
-        let fallback_obj_local = self.fresh();
-        Ok(IrNode::MapMethod {
-            op,
-            recv: Box::new(recv),
-            args,
-            method_name: method.to_owned(),
-            recv_local,
-            fallback_obj_local,
-            not_callable: method_not_a_function(obj, method),
-        })
-    }
-
-    /// Lower a `Date` field method `recv.<method>(args)` into an
-    /// [`IrNode::DateMethod`]. Mirrors [`Self::lower_map_method`]: the receiver is
-    /// lowered once and two fresh temps are reserved for the runtime TYPE-BYTE
-    /// dispatch (the `TYPE_DATE` compute path and the user-method fallback).
-    fn lower_date_method(
-        &mut self,
-        op: DateOp,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let recv = nullish_check(self.lower_expr(obj)?, method);
-        let recv_local = self.fresh();
-        let fallback_obj_local = self.fresh();
-        Ok(IrNode::DateMethod {
-            op,
-            recv: Box::new(recv),
-            args,
-            method_name: method.to_owned(),
-            recv_local,
-            fallback_obj_local,
-            not_callable: method_not_a_function(obj, method),
-        })
     }
 
     /// Lower a user method call `obj.m(args)` / `obj[k](args)` into an
@@ -1778,21 +1668,9 @@ impl LowerCtx<'_> {
             && self.shared.globals.sealed(callee.sym.as_ref())
         {
             let name = callee.sym.as_ref();
-            // `new Map()` / `new Set()`: a fresh empty collection handle. Only
-            // the empty constructor is in scope — arguments (e.g.
-            // `new Map([[k, v]])`) are rejected.
-            if matches!(name, "Map" | "Set") {
-                let args = new_expr.args.as_deref().unwrap_or(&[]);
-                if !args.is_empty() {
-                    return Err(CompileError::spanned(
-                        callee.span(),
-                        format!(
-                            "new {name}(..) with constructor arguments is unsupported (only the \
-                             empty `new {name}()` is supported)"
-                        ),
-                    )
-                    .into());
-                }
+            // `new Map()` / `new Set()`: a fresh empty collection handle; an
+            // iterable argument constructs through the builtin constructor.
+            if matches!(name, "Map" | "Set") && new_expr.args.as_deref().unwrap_or(&[]).is_empty() {
                 return Ok(IrNode::MapNew { set: name == "Set" });
             }
             // `new Promise(executor)`: the executor form of the Promise constructor.
@@ -2176,32 +2054,14 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     }
 }
 
-/// Map a method name to its [`ReceiverOp`], or `None` when the name is not a
-/// promise / generator instance method. Recognized purely syntactically from a
-/// `<expr>.<name>(..)` member callee; the lowered node dispatches on the
-/// receiver's runtime TYPE BYTE and falls back to a user method call.
-/// Whether a spread call through the member callee `callee` (= `member`) hits
+/// Whether a spread call through the member callee `callee` hits
 /// a builtin dispatched by name with no user-method fallback (`console.log`,
-/// the `Object`/`JSON`/`Promise` statics, `getTime`), which take no spread.
-fn spread_rejecting_member(callee: &Expr, member: &swc_ecma_ast::MemberExpr) -> bool {
+/// the `Object`/`JSON`/`Promise` statics), which take no spread.
+fn spread_rejecting_member(callee: &Expr) -> bool {
     is_console_log(callee)
         || object_method_name(callee).is_some_and(|name| inline_member("Object", name))
         || json_method_name(callee).is_some_and(|name| inline_member("JSON", name))
         || promise_static_method_name(callee).is_some_and(|name| inline_member("Promise", name))
-        || matches!(&member.prop, MemberProp::Ident(id) if {
-            let name = id.sym.as_ref();
-            name == "getTime"
-        })
-}
-
-fn receiver_method_op(name: &str) -> Option<ReceiverOp> {
-    Some(match name {
-        "then" => ReceiverOp::Then,
-        "catch" => ReceiverOp::Catch,
-        "finally" => ReceiverOp::Finally,
-        "next" => ReceiverOp::Next,
-        _ => return None,
-    })
 }
 
 /// The compile-time name of a static property key (`""` for a computed key):

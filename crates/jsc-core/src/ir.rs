@@ -468,37 +468,52 @@ impl GlobalRef {
     }
 }
 
-/// A `Map`/`Set` instance method. Recognized syntactically from a
-/// `<expr>.<name>(args)` member callee at codegen; because these names
-/// (`set`/`get`/`has`/`add`/`delete`) can ALSO be ordinary object/class methods
-/// (e.g. `class C { add(x) {..} }`), the lowered [`IrNode::MapMethod`] dispatches
-/// at RUNTIME on the receiver's TYPE BYTE: a `TYPE_MAP`/`TYPE_SET` handle takes the
-/// collection op, anything else falls back to a plain user method call.
+/// The inline body of a `%Map.prototype%` / `%Set.prototype%` method
+/// ([`IrNode::CollectionOp`]), run by its builtin and by a guarded call-site
+/// fast path (design 3.2) on a `TYPE_MAP`/`TYPE_SET` handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapOp {
     /// `map.set(k, v)` — insert or update the entry for key `k`, yielding the map
-    /// (chainable). Linear `===` scan; a new key appends `(k, v)` to the backing.
+    /// (chainable). Linear `SameValueZero` scan; a new key appends `(k, v)` to the
+    /// backing.
     Set,
-    /// `map.get(k)` — the value stored under `k` (`===` scan), or `undefined`.
+    /// `map.get(k)` — the value stored under `k`, or `undefined`.
     Get,
-    /// `map.has(k)` / `set.has(v)` — `true` iff a `===`-equal key/value is present.
+    /// `map.has(k)` / `set.has(v)` — `true` iff an equal key/value is present.
     Has,
     /// `set.add(v)` — insert `v` (with an `undefined` value slot) if not already
-    /// present (`===` dedup), yielding the set (chainable).
+    /// present, yielding the set (chainable).
     Add,
     /// `map.delete(k)` / `set.delete(v)` — remove the matching entry, yielding
     /// `true` iff one was present.
     Delete,
+    /// `map.clear()` / `set.clear()` — remove every entry, yielding `undefined`.
+    Clear,
 }
 
-/// A `Date` instance method. Like [`MapOp`], these names can ALSO be
-/// ordinary user methods, so the lowered [`IrNode::DateMethod`] dispatches at
-/// RUNTIME on the receiver's TYPE BYTE: a `TYPE_DATE` block computes the field
-/// GUEST-side from its stored f64 epoch-ms, and anything else falls back to a
-/// plain user method call. All calendar/time fields are **UTC**, derived from the
-/// stored milliseconds with the standard civil-from-days algorithm.
+impl MapOp {
+    /// The method's name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Get => "get",
+            Self::Has => "has",
+            Self::Add => "add",
+            Self::Delete => "delete",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// A `%Date.prototype%` field method ([`IrNode::DateField`]), run by its
+/// builtin and by a guarded call-site fast path on a `TYPE_DATE` block. All
+/// calendar/time fields are **UTC**, derived from the stored milliseconds with
+/// the standard civil-from-days algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateOp {
+    /// `d.getTime()` — the stored millisecond timestamp, as a number.
+    GetTime,
     /// `d.valueOf()` — the stored millisecond timestamp (identical to
     /// `d.getTime()`), as a number.
     ValueOf,
@@ -519,37 +534,72 @@ pub enum DateOp {
     /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`,
     /// built GUEST-side as a fresh heap string.
     ToIsoString,
+    /// `d.toString()` — `Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated
+    /// Universal Time)`, built GUEST-side as a fresh heap string.
+    ToString,
 }
 
-/// A promise / generator instance method claimed from a `<expr>.<name>(args)`
-/// member callee at codegen. These names (`then`/`catch`/`finally`/`next`) are
-/// just as common as ordinary user methods (thenables, iterator objects), so the
-/// lowered [`IrNode::ReceiverMethod`] dispatches at RUNTIME on the receiver's TYPE
-/// BYTE: a promise (resp. generator) takes the builtin path, anything else falls
-/// back to a plain user method call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiverOp {
-    /// `p.then(onF, onR)` on a `TYPE_PROMISE` receiver.
-    Then,
-    /// `p.catch(onR)` on a `TYPE_PROMISE` receiver.
-    Catch,
-    /// `p.finally(fn)` on a `TYPE_PROMISE` receiver.
-    Finally,
-    /// `gen.next(v)` on a `TYPE_GENERATOR` receiver.
-    Next,
-}
+impl DateOp {
+    /// Every field method, in `%Date.prototype%` order.
+    pub const ALL: [DateOp; 11] = [
+        Self::ToString,
+        Self::GetTime,
+        Self::ValueOf,
+        Self::GetFullYear,
+        Self::GetMonth,
+        Self::GetDate,
+        Self::GetDay,
+        Self::GetHours,
+        Self::GetMinutes,
+        Self::GetSeconds,
+        Self::ToIsoString,
+    ];
 
-impl ReceiverOp {
-    /// The source method name, used as the member key of the user-method fallback.
+    /// The method's name.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::Then => "then",
-            Self::Catch => "catch",
-            Self::Finally => "finally",
-            Self::Next => "next",
+            Self::GetTime => "getTime",
+            Self::ValueOf => "valueOf",
+            Self::GetFullYear => "getFullYear",
+            Self::GetMonth => "getMonth",
+            Self::GetDate => "getDate",
+            Self::GetDay => "getDay",
+            Self::GetHours => "getHours",
+            Self::GetMinutes => "getMinutes",
+            Self::GetSeconds => "getSeconds",
+            Self::ToIsoString => "toISOString",
+            Self::ToString => "toString",
         }
     }
+
+    /// The field method named `name`, if any.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.name() == name)
+    }
+}
+
+/// The receiver family of a guarded builtin-method fast path
+/// ([`IrNode::ProtoGuard`]): the kind byte (or bytes) it tests and the realm
+/// prototype the receiver's `proto` must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtoKind {
+    /// A `TYPE_ARRAY` handle over `%Array.prototype%`.
+    Array,
+    /// A `TYPE_MAP` handle over `%Map.prototype%`.
+    Map,
+    /// A `TYPE_SET` handle over `%Set.prototype%`.
+    Set,
+    /// A `TYPE_MAP` handle over `%Map.prototype%` or a `TYPE_SET` handle over
+    /// `%Set.prototype%` (the methods both share with one body).
+    Collection,
+    /// A `TYPE_PROMISE` over `%Promise.prototype%`.
+    Promise,
+    /// A `TYPE_DATE` over `%Date.prototype%`.
+    Date,
+    /// A `TYPE_GENERATOR` over `%GeneratorPrototype%`.
+    Generator,
 }
 
 /// One element of a spread-capable sequence — an array literal or a call's
@@ -785,6 +835,9 @@ pub enum IrNode {
         slots: Vec<IrNode>,
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
+        /// The resume `limits` bits of the handle ([`crate::abi::GEN_LIMIT_RETURN`],
+        /// [`crate::abi::GEN_LIMIT_THROW`]).
+        limits: u32,
     },
     /// Whether the sub-expression is a generator handle: yields a
     /// boolean jsval. Used by `for-of`/spread to branch between driving a
@@ -1184,10 +1237,10 @@ pub enum IrNode {
         slow: Box<IrNode>,
     },
     /// A call `recv.key(args)` of a builtin prototype method name (design
-    /// 3.2 row 3). When `array` is given and `recv` is an array handle with no
-    /// own properties (`props == 0`) whose `proto` is `%Array.prototype%` and
-    /// (unless `sealed`) whose dirty bit is clear, the inline `array` fast
-    /// path runs. Otherwise ONE call of the out-of-line generic method call
+    /// 3.2 rows 3-4). Each `fast` path runs while `recv` is of its
+    /// [`ProtoKind`]: a heap block of the kind byte with no own properties
+    /// (`props == 0`) whose `proto` is the family's realm prototype and
+    /// (unless `sealed`) whose dirty bit is clear. Otherwise ONE call of the out-of-line generic method call
     /// (`__get`, `IsCallable`, call with `this = recv`; it also throws for a
     /// nullish `recv`), routed straight to the `String.prototype` builtin
     /// `key` instead when `recv` is a string, `key` names one, and (unless
@@ -1205,9 +1258,8 @@ pub enum IrNode {
         /// The arguments: side-effect-free nodes (locals, literals, function
         /// literals), read by every path.
         args: Vec<IrNode>,
-        /// The inline fast path for an array receiver, if the call shape has
-        /// one.
-        array: Option<Box<IrNode>>,
+        /// The inline fast paths, by receiver family, tested in order.
+        fast: Vec<(ProtoKind, IrNode)>,
         /// The `TypeError` thrown when `recv.key` is not callable.
         not_callable: CalleeError,
     },
@@ -1362,55 +1414,19 @@ pub enum IrNode {
         /// thus the render label) differs.
         set: bool,
     },
-    /// A `Map`/`Set` method call `recv.<op>(args)`. `recv` is evaluated ONCE
-    /// into `recv_local`, then a RUNTIME dispatch on its TYPE BYTE selects the path:
-    /// a `TYPE_MAP`/`TYPE_SET` handle runs the collection op (`op`) over the shared
-    /// flattened `(key, value)` backing via the `__map_*` runtime helpers; any other
-    /// receiver falls back to an ordinary user method call `recv.<method_name>(args)`
-    /// (binding `this = recv`), so an object/class method of the same name still
-    /// works. The fallback reuses `fallback_obj_local` as its own receiver temp.
-    MapMethod {
-        /// Which collection op the map/set path performs.
+    /// The inline body of a `Map`/`Set` method ([`MapOp`]) on the handle in
+    /// `handle` (a `TYPE_MAP`/`TYPE_SET` receiver, already checked), over the
+    /// `__map_*` runtime helpers. A missing key/value argument is `undefined`;
+    /// `.set`/`.add` yield the handle, `.get` the value or `undefined`,
+    /// `.has`/`.delete` a boolean, `.clear` `undefined`.
+    CollectionOp {
+        /// Which collection op runs.
         op: MapOp,
-        /// The receiver expression (evaluated once into `recv_local`).
-        recv: Box<IrNode>,
-        /// The call arguments in source order (`[k]` for get/has/delete/add,
-        /// `[k, v]` for set); also threaded verbatim to the user-method fallback.
+        /// The local holding the receiver handle.
+        handle: u32,
+        /// The arguments (side-effect-free nodes; only the leading ones are
+        /// read).
         args: Vec<IrNode>,
-        /// The source method name (`"set"`/`"get"`/…), used as the member key of
-        /// the user-method fallback and interned as a static string.
-        method_name: String,
-        /// Fresh temp local holding the evaluated receiver across the dispatch.
-        recv_local: u32,
-        /// Fresh temp local for the fallback user method call's own receiver stash.
-        fallback_obj_local: u32,
-        /// The `TypeError` the user-method fallback throws when the member is
-        /// not callable.
-        not_callable: CalleeError,
-    },
-    /// A promise / generator instance method call `recv.<op>(args)`. Like
-    /// [`IrNode::MapMethod`], `recv` is evaluated ONCE into `recv_local`, then a
-    /// RUNTIME dispatch on its TYPE BYTE selects the path: a `TYPE_PROMISE`
-    /// receiver of `then`/`catch`/`finally` runs [`IrNode::PromiseThen`] /
-    /// [`IrNode::PromiseFinally`], a `TYPE_GENERATOR` receiver of `next` runs
-    /// [`IrNode::GenResume`]; any other receiver falls back to an ordinary user
-    /// method call `recv.<op name>(args)` (binding `this = recv`, nullish-guarded),
-    /// so a thenable or iterator object of the same shape still works.
-    ReceiverMethod {
-        /// Which builtin method the promise / generator path performs.
-        op: ReceiverOp,
-        /// The receiver expression (evaluated once into `recv_local`).
-        recv: Box<IrNode>,
-        /// The call arguments in source order; the builtin path uses the leading
-        /// handler / sent-value slots, the user-method fallback receives them all.
-        args: Vec<IrNode>,
-        /// Fresh temp local holding the evaluated receiver across the dispatch.
-        recv_local: u32,
-        /// Fresh temp local for the fallback user method call's own receiver stash.
-        fallback_obj_local: u32,
-        /// The `TypeError` the user-method fallback throws when the member is
-        /// not callable.
-        not_callable: CalleeError,
     },
     /// `Promise.resolve(v)`: build a promise already fulfilled with `v`
     /// (or return `v` unchanged when it is itself a promise). Lowers to the host
@@ -1481,39 +1497,25 @@ pub enum IrNode {
     /// `Date.now()`: the host wall-clock time in milliseconds since the
     /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
     DateNow,
-    /// `d.getTime()`: the millisecond timestamp of a `TYPE_DATE`
-    /// receiver as a number jsval. `recv` is evaluated once; a non-`Date` receiver
-    /// yields `NaN` (jsc models no method-receiver `TypeError` here).
-    DateGetTime {
-        /// The receiver expression (evaluated once).
-        recv: Box<IrNode>,
+    /// A static `obj.size` read (design 3.2 row "Map/Set `.size`"): a
+    /// `TYPE_MAP`/`TYPE_SET` receiver passing its [`ProtoKind::Collection`]
+    /// guard reads its `size` header; any other receiver is `obj["size"]`
+    /// (the `%Map.prototype%`/`%Set.prototype%` getter, or an own/user
+    /// `size`).
+    SizeRead {
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
+        /// The receiver.
+        obj: Box<IrNode>,
     },
-    /// A `Date` instance method `recv.<op>(args)`. Like
-    /// [`IrNode::MapMethod`], `recv` is evaluated ONCE into `recv_local`, then a
-    /// RUNTIME dispatch on its TYPE BYTE selects the path: a `TYPE_DATE` block
-    /// computes the field (`op`) GUEST-side from its stored f64 epoch-ms; any other
-    /// receiver falls back to an ordinary user method call `recv.<method_name>(args)`
-    /// (binding `this = recv`), so an object/class method of the same name still
-    /// works. A non-finite timestamp yields `NaN` (or `"Invalid Date"` for
-    /// `toISOString`).
-    DateMethod {
-        /// Which field the `TYPE_DATE` path computes.
+    /// The field `op` of the `TYPE_DATE` block in `recv` (already checked),
+    /// computed GUEST-side from its stored f64 epoch-ms. A non-finite
+    /// timestamp yields `NaN` (or `"Invalid Date"` for `toISOString`).
+    DateField {
+        /// Which field is computed.
         op: DateOp,
-        /// The receiver expression (evaluated once into `recv_local`).
-        recv: Box<IrNode>,
-        /// The call arguments (Date methods take none, but threaded verbatim to the
-        /// user-method fallback so a same-named user method of any arity still works).
-        args: Vec<IrNode>,
-        /// The source method name, used as the member key of the user-method
-        /// fallback and interned as a static string.
-        method_name: String,
-        /// Fresh temp local holding the evaluated receiver across the dispatch.
-        recv_local: u32,
-        /// Fresh temp local for the fallback user method call's own receiver stash.
-        fallback_obj_local: u32,
-        /// The `TypeError` the user-method fallback throws when the member is
-        /// not callable.
-        not_callable: CalleeError,
+        /// The local holding the Date receiver.
+        recv: u32,
     },
 }
 
@@ -1871,7 +1873,8 @@ impl IrNode {
             | IrNode::ErrorProto(_)
             | IrNode::Intrinsic(_)
             | IrNode::GlobalGet { .. }
-            | IrNode::DateNow => false,
+            | IrNode::DateNow
+            | IrNode::DateField { .. } => false,
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -1898,7 +1901,7 @@ impl IrNode {
                 executor: inner, ..
             }
             | IrNode::AsyncSpawn(inner)
-            | IrNode::DateGetTime { recv: inner }
+            | IrNode::SizeRead { obj: inner, .. }
             | IrNode::MathSpread { args: inner, .. } => f(inner),
             IrNode::InstanceOf { value, kind } => {
                 f(value)
@@ -1963,6 +1966,7 @@ impl IrNode {
             | IrNode::Array(args)
             | IrNode::Seq(args)
             | IrNode::ConsoleLog { args }
+            | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter().any(f),
             IrNode::CallIndirect {
                 callee: recv, args, ..
@@ -1970,10 +1974,7 @@ impl IrNode {
             | IrNode::MethodCall { recv, args, .. }
             | IrNode::ThisCall {
                 callee: recv, args, ..
-            }
-            | IrNode::MapMethod { recv, args, .. }
-            | IrNode::ReceiverMethod { recv, args, .. }
-            | IrNode::DateMethod { recv, args, .. } => f(recv) || args.iter().any(f),
+            } => f(recv) || args.iter().any(f),
             IrNode::MethodCallUser { obj, key, args, .. } => f(obj) || f(key) || args.iter().any(f),
             IrNode::NamespaceGuard {
                 obj,
@@ -1983,8 +1984,8 @@ impl IrNode {
                 ..
             } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
             IrNode::ProtoGuard {
-                recv, args, array, ..
-            } => f(recv) || args.iter().any(&mut f) || array.as_deref().is_some_and(f),
+                recv, args, fast, ..
+            } => f(recv) || args.iter().any(&mut f) || fast.iter().any(|(_, node)| f(node)),
             IrNode::Construct {
                 callee,
                 args,
@@ -2050,7 +2051,8 @@ impl IrNode {
             | IrNode::ErrorProto(_)
             | IrNode::Intrinsic(_)
             | IrNode::GlobalGet { .. }
-            | IrNode::DateNow => Vec::new(),
+            | IrNode::DateNow
+            | IrNode::DateField { .. } => Vec::new(),
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -2077,7 +2079,7 @@ impl IrNode {
                 executor: inner, ..
             }
             | IrNode::AsyncSpawn(inner)
-            | IrNode::DateGetTime { recv: inner }
+            | IrNode::SizeRead { obj: inner, .. }
             | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
             IrNode::InstanceOf { value, kind } => match kind {
                 InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => {
@@ -2144,6 +2146,7 @@ impl IrNode {
             | IrNode::Array(args)
             | IrNode::Seq(args)
             | IrNode::ConsoleLog { args }
+            | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter_mut().collect(),
             IrNode::CallIndirect {
                 callee: recv, args, ..
@@ -2151,10 +2154,7 @@ impl IrNode {
             | IrNode::MethodCall { recv, args, .. }
             | IrNode::ThisCall {
                 callee: recv, args, ..
-            }
-            | IrNode::MapMethod { recv, args, .. }
-            | IrNode::ReceiverMethod { recv, args, .. }
-            | IrNode::DateMethod { recv, args, .. } => std::iter::once(&mut **recv)
+            } => std::iter::once(&mut **recv)
                 .chain(args.iter_mut())
                 .collect(),
             IrNode::MethodCallUser { obj, key, args, .. } => [&mut **obj, &mut **key]
@@ -2172,10 +2172,10 @@ impl IrNode {
                 .chain([&mut **fast, &mut **slow])
                 .collect(),
             IrNode::ProtoGuard {
-                recv, args, array, ..
+                recv, args, fast, ..
             } => std::iter::once(&mut **recv)
                 .chain(args.iter_mut())
-                .chain(array.as_deref_mut())
+                .chain(fast.iter_mut().map(|(_, node)| node))
                 .collect(),
             IrNode::Construct {
                 callee,

@@ -24,10 +24,13 @@ mod ctor;
 mod date;
 mod error;
 mod function;
+mod generator;
 mod global;
+mod map_set;
 mod namespace;
 mod number;
 mod object;
+mod promise;
 mod string;
 
 pub(super) use namespace::fragment;
@@ -36,7 +39,11 @@ pub(super) use string::host_ready_args;
 /// The IR fragments the hand-written bodies emit with `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    array::fragments(k)
+    let mut nodes = array::fragments(k);
+    nodes.extend(map_set::fragments(k));
+    nodes.extend(promise::fragments(k));
+    nodes.extend(generator::fragments(k));
+    nodes
 }
 
 /// The locals of a builtin body: the `K` argument slots, `env` and `argc`
@@ -138,6 +145,9 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(date::STRINGS)
         .chain(string::strings())
         .chain(number::STRINGS)
+        .chain(map_set::strings())
+        .chain(promise::strings())
+        .chain(generator::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -177,8 +187,26 @@ pub(super) fn emit_builtin(
         Builtin::BooleanToString => number::emit_boolean(false, &mut f, frame, strings, helpers),
         Builtin::BooleanValueOf => number::emit_boolean(true, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
-        Builtin::DateToString => date::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::DateValueOf => date::emit_value_of(&mut f, frame, strings, helpers),
+        Builtin::DateMethod(op) => date::emit_method(op, &mut f, frame, strings, helpers),
+        Builtin::CollectionOp { set, op } => {
+            map_set::emit_op(set, op, &mut f, frame, strings, helpers);
+        }
+        Builtin::CollectionForEach { set } => {
+            map_set::emit_for_each(set, &mut f, frame, strings, helpers);
+        }
+        Builtin::CollectionSize { set } => map_set::emit_size(set, &mut f, frame, strings, helpers),
+        Builtin::Ctor(BuiltinCtor::Map) => {
+            map_set::emit_ctor(false, &mut f, frame, strings, helpers);
+        }
+        Builtin::Ctor(BuiltinCtor::Set) => {
+            map_set::emit_ctor(true, &mut f, frame, strings, helpers);
+        }
+        Builtin::PromiseThen => promise::emit_then(false, &mut f, frame, strings, helpers),
+        Builtin::PromiseCatch => promise::emit_then(true, &mut f, frame, strings, helpers),
+        Builtin::PromiseFinally => promise::emit_finally(&mut f, frame, strings, helpers),
+        Builtin::GeneratorNext => generator::emit_next(&mut f, frame, strings, helpers),
+        Builtin::GeneratorReturn => generator::emit_return(&mut f, frame, strings, helpers),
+        Builtin::GeneratorThrow => generator::emit_throw(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
         Builtin::IsFinite => global::emit_is_finite(&mut f, frame, helpers),
         Builtin::Math(_)
@@ -336,6 +364,18 @@ fn invoke(
         I32Load(MemArg { offset: FUNC_INDEX_OFFSET, align: 2, memory_index: 0 }),
         CallIndirect { type_index: helpers.fn_type, table_index: 0 },
     );
+}
+
+/// Emit `node` in the body's scratch layout, dropping its value.
+fn emit_drop(
+    function: &mut Function,
+    frame: Frame,
+    node: &IrNode,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(node, function, frame.scratch(), strings, helpers);
+    wasm!(function; Drop);
 }
 
 /// Return `undefined` when the last call left an exception pending.

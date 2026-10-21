@@ -346,41 +346,85 @@ fn lower_json_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<
     })
 }
 
-/// Map a method name to its [`MapOp`], or `None` when the name is not a
-/// recognized `Map`/`Set` method. Recognized purely syntactically from a
-/// `<expr>.<name>(..)` member callee; because these names can also be ordinary
-/// object/class methods, the lowered node dispatches on the receiver's runtime TYPE
-/// BYTE and falls back to a user method call when it is not a map/set.
-pub(super) fn map_set_method_op(name: &str) -> Option<MapOp> {
-    Some(match name {
-        "set" => MapOp::Set,
-        "get" => MapOp::Get,
-        "has" => MapOp::Has,
-        "add" => MapOp::Add,
-        "delete" => MapOp::Delete,
-        _ => return None,
-    })
+/// The `%Map.prototype%`, `%Set.prototype%`, `%Promise.prototype%` and
+/// `%GeneratorPrototype%` methods with a guarded call-site fast path (the
+/// `%Date.prototype%` ones are [`DateOp`]s).
+const RECEIVER_METHODS: [&str; 10] = [
+    "get", "set", "add", "has", "delete", "clear", "then", "catch", "finally", "next",
+];
+
+/// Whether `recv.name(..)` has a guarded fast path for a `Map`/`Set`/
+/// `Promise`/`Date`/generator receiver ([`receiver_fast_paths`]).
+pub(super) fn receiver_method(name: &str) -> bool {
+    RECEIVER_METHODS.contains(&name) || date_fast_path(name).is_some()
 }
 
-/// Map a method name to its [`DateOp`], or `None` when the name is not
-/// a recognized `Date` field method. Recognized purely syntactically from a
-/// `<expr>.<name>(..)` member callee; because these names can also be ordinary
-/// object/class methods, the lowered node dispatches on the receiver's runtime
-/// TYPE BYTE and falls back to a user method call when it is not a `Date`.
-/// `getTime` is handled separately (its own [`IrNode::DateGetTime`]).
-pub(super) fn date_method_op(name: &str) -> Option<DateOp> {
-    Some(match name {
-        "valueOf" => DateOp::ValueOf,
-        "getFullYear" => DateOp::GetFullYear,
-        "getMonth" => DateOp::GetMonth,
-        "getDate" => DateOp::GetDate,
-        "getDay" => DateOp::GetDay,
-        "getHours" => DateOp::GetHours,
-        "getMinutes" => DateOp::GetMinutes,
-        "getSeconds" => DateOp::GetSeconds,
-        "toISOString" => DateOp::ToIsoString,
-        _ => return None,
-    })
+/// The `Date` field method `name` with a call-site fast path (`toString` is
+/// called through its builtin only).
+fn date_fast_path(name: &str) -> Option<DateOp> {
+    DateOp::from_name(name).filter(|op| *op != DateOp::ToString)
+}
+
+/// The inline fast paths of `recv.name(args)` on a `Map`/`Set`/`Promise`/
+/// `Date`/generator receiver in local `recv` (design 3.2 row 4), each the
+/// body of the builtin `name` of that family over the side-effect-free
+/// `args`.
+pub(super) fn receiver_fast_paths(
+    name: &str,
+    recv: u32,
+    args: &[IrNode],
+) -> Vec<(ProtoKind, IrNode)> {
+    let arg = |i: usize| Box::new(args.get(i).cloned().unwrap_or(IrNode::Undefined));
+    let collection = |kind, op| {
+        let args = args.iter().take(2).cloned().collect();
+        vec![(
+            kind,
+            IrNode::CollectionOp {
+                op,
+                handle: recv,
+                args,
+            },
+        )]
+    };
+    let receiver = || Box::new(IrNode::Local(recv));
+    match name {
+        "get" => collection(ProtoKind::Map, MapOp::Get),
+        "set" => collection(ProtoKind::Map, MapOp::Set),
+        "add" => collection(ProtoKind::Set, MapOp::Add),
+        "has" => collection(ProtoKind::Collection, MapOp::Has),
+        "delete" => collection(ProtoKind::Collection, MapOp::Delete),
+        "clear" => collection(ProtoKind::Collection, MapOp::Clear),
+        "then" | "catch" => {
+            let (on_fulfilled, on_rejected) = if name == "then" {
+                (arg(0), arg(1))
+            } else {
+                (Box::new(IrNode::Undefined), arg(0))
+            };
+            let then = IrNode::PromiseThen {
+                promise: receiver(),
+                on_fulfilled,
+                on_rejected,
+            };
+            vec![(ProtoKind::Promise, then)]
+        }
+        "finally" => {
+            let finally = IrNode::PromiseFinally {
+                promise: receiver(),
+                on_finally: arg(0),
+            };
+            vec![(ProtoKind::Promise, finally)]
+        }
+        "next" => {
+            let next = IrNode::GenResume {
+                handle: receiver(),
+                sent: arg(0),
+            };
+            vec![(ProtoKind::Generator, next)]
+        }
+        _ => date_fast_path(name)
+            .map(|op| vec![(ProtoKind::Date, IrNode::DateField { op, recv })])
+            .unwrap_or_default(),
+    }
 }
 
 pub(super) fn map_binary_op(op: BinaryOp, span: Span) -> anyhow::Result<BinOp> {

@@ -39,10 +39,11 @@ pub(super) enum Intrinsic {
     Ctor(BuiltinCtor),
     /// `%<Ctor>.prototype%` of a constructor without a dedicated variant
     /// (`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-    /// `Date`): `constructor`, the `Array`/`String`/`Number`/`Boolean`
-    /// prototype methods and `Date.prototype.toString`/`valueOf` (the other
-    /// method families stay syntactic until later S5 tasks).
+    /// `Date`): `constructor` and the prototype methods.
     Prototype(BuiltinCtor),
+    /// `%GeneratorPrototype%`: `next`, `return`, `throw`; every generator
+    /// object's `proto`.
+    GeneratorPrototype,
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
@@ -90,7 +91,8 @@ impl Intrinsic {
             | Self::Math
             | Self::Json
             | Self::Console
-            | Self::Prototype(_) => Some(Self::ObjectPrototype),
+            | Self::Prototype(_)
+            | Self::GeneratorPrototype => Some(Self::ObjectPrototype),
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
             // The native error constructors inherit from `Error`.
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
@@ -144,6 +146,7 @@ impl Intrinsic {
             Self::Math => 10,
             Self::Json => 11,
             Self::Console => 12,
+            Self::GeneratorPrototype => 13,
             _ => return None,
         })
     }
@@ -171,6 +174,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
         ])
         .chain(BuiltinCtor::ALL.map(Intrinsic::Ctor))
         .chain(PLAIN_PROTOTYPES.map(Intrinsic::Prototype))
+        .chain([Intrinsic::GeneratorPrototype])
 }
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
@@ -240,10 +244,38 @@ pub(super) enum Builtin {
     BooleanToString,
     /// `Boolean.prototype.valueOf`.
     BooleanValueOf,
-    /// `Date.prototype.toString`.
-    DateToString,
-    /// `Date.prototype.valueOf`.
-    DateValueOf,
+    /// A `Date.prototype` method (`toString`, `getTime`, `valueOf`, ..).
+    DateMethod(DateOp),
+    /// A `%Map.prototype%` (`set == false`) / `%Set.prototype%` method with
+    /// an inline body.
+    CollectionOp {
+        /// `%Set.prototype%` rather than `%Map.prototype%`.
+        set: bool,
+        /// The method.
+        op: MapOp,
+    },
+    /// `Map.prototype.forEach` / `Set.prototype.forEach`.
+    CollectionForEach {
+        /// `%Set.prototype%` rather than `%Map.prototype%`.
+        set: bool,
+    },
+    /// The `size` getter of `%Map.prototype%` / `%Set.prototype%`.
+    CollectionSize {
+        /// `%Set.prototype%` rather than `%Map.prototype%`.
+        set: bool,
+    },
+    /// `Promise.prototype.then`.
+    PromiseThen,
+    /// `Promise.prototype.catch`.
+    PromiseCatch,
+    /// `Promise.prototype.finally`.
+    PromiseFinally,
+    /// `%GeneratorPrototype%.next`.
+    GeneratorNext,
+    /// `%GeneratorPrototype%.return`.
+    GeneratorReturn,
+    /// `%GeneratorPrototype%.throw`.
+    GeneratorThrow,
     /// `%ThrowTypeError%`: the poison getter/setter of the strict `caller` /
     /// `arguments` properties (one identity for every installation).
     ThrowTypeError,
@@ -340,7 +372,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 82] = [
+    pub(super) const ALL: [Builtin; 110] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -417,8 +449,63 @@ impl Builtin {
         Self::NumberValueOf,
         Self::BooleanToString,
         Self::BooleanValueOf,
-        Self::DateToString,
-        Self::DateValueOf,
+        Self::DateMethod(DateOp::ToString),
+        Self::DateMethod(DateOp::GetTime),
+        Self::DateMethod(DateOp::ValueOf),
+        Self::DateMethod(DateOp::GetFullYear),
+        Self::DateMethod(DateOp::GetMonth),
+        Self::DateMethod(DateOp::GetDate),
+        Self::DateMethod(DateOp::GetDay),
+        Self::DateMethod(DateOp::GetHours),
+        Self::DateMethod(DateOp::GetMinutes),
+        Self::DateMethod(DateOp::GetSeconds),
+        Self::DateMethod(DateOp::ToIsoString),
+        Self::CollectionOp {
+            set: false,
+            op: MapOp::Get,
+        },
+        Self::CollectionOp {
+            set: false,
+            op: MapOp::Set,
+        },
+        Self::CollectionOp {
+            set: false,
+            op: MapOp::Has,
+        },
+        Self::CollectionOp {
+            set: false,
+            op: MapOp::Delete,
+        },
+        Self::CollectionOp {
+            set: false,
+            op: MapOp::Clear,
+        },
+        Self::CollectionForEach { set: false },
+        Self::CollectionSize { set: false },
+        Self::CollectionOp {
+            set: true,
+            op: MapOp::Add,
+        },
+        Self::CollectionOp {
+            set: true,
+            op: MapOp::Has,
+        },
+        Self::CollectionOp {
+            set: true,
+            op: MapOp::Delete,
+        },
+        Self::CollectionOp {
+            set: true,
+            op: MapOp::Clear,
+        },
+        Self::CollectionForEach { set: true },
+        Self::CollectionSize { set: true },
+        Self::PromiseThen,
+        Self::PromiseCatch,
+        Self::PromiseFinally,
+        Self::GeneratorNext,
+        Self::GeneratorReturn,
+        Self::GeneratorThrow,
         Self::ThrowTypeError,
         Self::MethodCall,
         Self::IsNaN,
@@ -435,13 +522,19 @@ impl Builtin {
             | Self::ArrayToString
             | Self::StringToString
             | Self::NumberToString
-            | Self::BooleanToString
-            | Self::DateToString => "toString",
-            Self::ValueOf
-            | Self::StringValueOf
-            | Self::NumberValueOf
-            | Self::BooleanValueOf
-            | Self::DateValueOf => "valueOf",
+            | Self::BooleanToString => "toString",
+            Self::ValueOf | Self::StringValueOf | Self::NumberValueOf | Self::BooleanValueOf => {
+                "valueOf"
+            }
+            Self::DateMethod(op) => op.name(),
+            Self::CollectionOp { op, .. } => op.name(),
+            Self::CollectionSize { .. } => "get size",
+            Self::PromiseThen => "then",
+            Self::PromiseCatch => "catch",
+            Self::PromiseFinally => "finally",
+            Self::GeneratorNext => "next",
+            Self::GeneratorReturn => "return",
+            Self::GeneratorThrow => "throw",
             Self::StringMethod(op) => op.name(),
             Self::Call => "call",
             Self::Apply => "apply",
@@ -472,7 +565,7 @@ impl Builtin {
             Self::ArrayHof(ArrayHofOp::Map) => "map",
             Self::ArrayHof(ArrayHofOp::Filter) => "filter",
             Self::ArrayHof(ArrayHofOp::Reduce) => "reduce",
-            Self::ArrayHof(ArrayHofOp::ForEach) => "forEach",
+            Self::ArrayHof(ArrayHofOp::ForEach) | Self::CollectionForEach { .. } => "forEach",
             Self::ArrayIndexOf => "indexOf",
             Self::ArrayIncludes => "includes",
             Self::ArrayJoin => "join",
@@ -497,8 +590,11 @@ impl Builtin {
             | Self::ValueOf
             | Self::ErrorToString
             | Self::ArrayToString
-            | Self::DateToString
-            | Self::DateValueOf
+            | Self::DateMethod(_)
+            | Self::CollectionSize { .. }
+            | Self::CollectionOp {
+                op: MapOp::Clear, ..
+            }
             | Self::ConsoleLog
             | Self::DateNow
             | Self::ArrayPop
@@ -507,7 +603,9 @@ impl Builtin {
             Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow)
             | Self::Apply
             | Self::JsonParse
-            | Self::ArraySlice => 2,
+            | Self::ArraySlice
+            | Self::CollectionOp { op: MapOp::Set, .. }
+            | Self::PromiseThen => 2,
             Self::HasOwnProperty
             | Self::Call
             | Self::Math(_)
@@ -523,16 +621,23 @@ impl Builtin {
             | Self::ArrayJoin
             | Self::NumberToString
             | Self::IsNaN
-            | Self::IsFinite => 1,
+            | Self::IsFinite
+            | Self::CollectionOp { .. }
+            | Self::CollectionForEach { .. }
+            | Self::PromiseCatch
+            | Self::PromiseFinally
+            | Self::GeneratorNext
+            | Self::GeneratorReturn
+            | Self::GeneratorThrow => 1,
             Self::StringMethod(op) => op.length(),
             Self::JsonStringify => 3,
         }
     }
 
-    /// The constructor whose `%prototype%` holds this builtin as a method
-    /// (installed under its [`Self::name`]), if any.
-    fn prototype(self) -> Option<BuiltinCtor> {
-        match self {
+    /// The prototype holding this builtin as a method (installed under its
+    /// [`Self::name`]), if any.
+    fn prototype(self) -> Option<Intrinsic> {
+        let ctor = match self {
             Self::ArrayPush
             | Self::ArrayPop
             | Self::ArrayHof(_)
@@ -546,9 +651,19 @@ impl Builtin {
             }
             Self::NumberToString | Self::NumberValueOf => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
-            Self::DateToString | Self::DateValueOf => Some(BuiltinCtor::Date),
+            Self::DateMethod(_) => Some(BuiltinCtor::Date),
+            Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
+                Some(collection(set))
+            }
+            Self::PromiseThen | Self::PromiseCatch | Self::PromiseFinally => {
+                Some(BuiltinCtor::Promise)
+            }
+            Self::GeneratorNext | Self::GeneratorReturn | Self::GeneratorThrow => {
+                return Some(Intrinsic::GeneratorPrototype);
+            }
             _ => None,
-        }
+        };
+        ctor.map(Intrinsic::Prototype)
     }
 
     /// The builtin's position in [`Self::ALL`]: its offset from the first
@@ -579,8 +694,8 @@ pub(super) enum Value {
     Accessor {
         /// The getter.
         get: Builtin,
-        /// The setter.
-        set: Builtin,
+        /// The setter (`undefined` when absent).
+        set: Option<Builtin>,
     },
 }
 
@@ -608,11 +723,24 @@ const FN_FACT_ATTRS: u32 = abi::ATTR_CONFIGURABLE;
 /// `%Function.prototype%`, configurable only.
 const POISON_ATTRS: u32 = abi::ATTR_ACCESSOR | abi::ATTR_CONFIGURABLE;
 
+/// A builtin accessor property (`Map.prototype.size`): configurable, not
+/// enumerable.
+const ACCESSOR_ATTRS: u32 = abi::ATTR_ACCESSOR | abi::ATTR_CONFIGURABLE;
+
 /// The `%ThrowTypeError%` getter and setter pair.
 const POISON: Value = Value::Accessor {
     get: Builtin::ThrowTypeError,
-    set: Builtin::ThrowTypeError,
+    set: Some(Builtin::ThrowTypeError),
 };
+
+/// The `Map`/`Set` constructor of a collection.
+fn collection(set: bool) -> BuiltinCtor {
+    if set {
+        BuiltinCtor::Set
+    } else {
+        BuiltinCtor::Map
+    }
+}
 
 /// A constant (`Math.PI`, the global `NaN`/`Infinity`/`undefined`): no
 /// attributes.
@@ -866,11 +994,18 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
     }
     for builtin in Builtin::ALL {
-        if let Some(ctor) = builtin.prototype() {
+        if let Some(prototype) = builtin.prototype() {
             let method = Value::Method(builtin);
-            let key = builtin.name();
-            entries.push(entry(Intrinsic::Prototype(ctor), key, METHOD_ATTRS, method));
+            entries.push(entry(prototype, builtin.name(), METHOD_ATTRS, method));
         }
+    }
+    for set in [false, true] {
+        let size = Value::Accessor {
+            get: Builtin::CollectionSize { set },
+            set: None,
+        };
+        let prototype = Intrinsic::Prototype(collection(set));
+        entries.push(entry(prototype, "size", ACCESSOR_ATTRS, size));
     }
 }
 
@@ -924,7 +1059,7 @@ fn methods(registry: &[Entry]) -> impl Iterator<Item = Builtin> + '_ {
     Builtin::ALL.into_iter().filter(|b| {
         registry.iter().any(|e| match e.value {
             Value::Method(m) => m == *b,
-            Value::Accessor { get, set } => get == *b || set == *b,
+            Value::Accessor { get, set } => get == *b || set == Some(*b),
             _ => false,
         })
     })
@@ -1064,8 +1199,10 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
         if let Value::Accessor { get, set } = registry[i].value {
             blob.extend_from_slice(&[abi::TYPE_ACCESSOR, 0, 0, 0]);
             blob.extend_from_slice(&0u32.to_le_bytes());
-            for half in [get, set] {
-                let method = heap(base + method_offset(&registry, half));
+            for half in [Some(get), set] {
+                let method = half.map_or(abi::UNDEFINED, |half| {
+                    heap(base + method_offset(&registry, half))
+                });
                 blob.extend_from_slice(&method.to_le_bytes());
             }
         }
