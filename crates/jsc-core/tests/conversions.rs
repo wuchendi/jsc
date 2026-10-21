@@ -1,6 +1,5 @@
 //! Integration tests: `String`/`Number`/`Boolean`/`parseInt`/`parseFloat` conversions.
 
-use jsc_core::run::compile_and_run;
 mod common;
 use common::{
     assert_bool, assert_nan, assert_number, assert_output, assert_string, assert_type_str,
@@ -133,24 +132,6 @@ fn conversions_are_shadowable() {
     assert_number("let Boolean = function (x) { return 5 }; Boolean(0)", 5.0);
     // A user `function parseInt(){}` declaration also shadows the built-in.
     assert_number("function parseInt(s) { return 1 } parseInt(\"42px\")", 1.0);
-}
-
-/// Wrong argument counts are compile errors, matching the existing call style.
-#[test]
-fn conversion_arity_errors() {
-    assert!(compile_and_run("String()").is_err(), "String needs an arg");
-    assert!(
-        compile_and_run("Number(1, 2)").is_err(),
-        "Number takes one arg"
-    );
-    assert!(
-        compile_and_run("Boolean()").is_err(),
-        "Boolean needs an arg"
-    );
-    assert!(
-        compile_and_run("parseFloat(1, 2)").is_err(),
-        "parseFloat takes one arg"
-    );
 }
 
 /// Conversion results flow through `console.log` like any value.

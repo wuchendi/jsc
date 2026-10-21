@@ -659,12 +659,13 @@ impl LowerCtx<'_> {
                 Ok(())
             }
             Pat::Array(arr) => {
-                // Evaluate the initializer ONCE into a hidden temp local, then read
-                // each element out of it by index.
+                // Evaluate the initializer ONCE into a hidden temp local as its
+                // `GetIterator` snapshot array, then read each element out of
+                // it by index.
                 let temp = self.fresh();
                 out.push(IrStmt::Decl {
                     local: temp,
-                    init: source,
+                    init: iter_snapshot(source),
                 });
                 for (i, elem) in arr.elems.iter().enumerate() {
                     // A hole (`let [, b] = ..`) skips its index.
@@ -884,7 +885,6 @@ impl LowerCtx<'_> {
                 obj: Box::new(IrNode::Local(temp)),
                 index: Box::new(IrNode::Local(idx)),
             }),
-            not_array: None,
         })];
         let update = vec![IrStmt::Expr(IrNode::Assign {
             local: idx,
@@ -916,7 +916,15 @@ impl LowerCtx<'_> {
         let temp = self.fresh();
         out.push(IrStmt::Decl { local: temp, init });
         match pat {
-            AssignTargetPat::Array(arr) => self.assign_array_pat(arr, temp, out)?,
+            AssignTargetPat::Array(arr) => {
+                // The statement's value stays the RHS itself.
+                let source = self.fresh();
+                out.push(IrStmt::Decl {
+                    local: source,
+                    init: iter_snapshot(IrNode::Local(temp)),
+                });
+                self.assign_array_pat(arr, source, out)?;
+            }
             AssignTargetPat::Object(obj) => self.assign_object_pat(obj, temp, out)?,
             AssignTargetPat::Invalid(invalid) => {
                 return Err(
@@ -949,7 +957,7 @@ impl LowerCtx<'_> {
                 let temp = self.fresh();
                 out.push(IrStmt::Decl {
                     local: temp,
-                    init: value,
+                    init: iter_snapshot(value),
                 });
                 self.assign_array_pat(arr, temp, out)
             }
@@ -1576,14 +1584,30 @@ impl LowerCtx<'_> {
                     )
                     .into());
                 };
-                let Pat::Ident(ident) = &declarator.name else {
-                    return Err(CompileError::spanned(
-                        declarator.name.span(),
-                        "unsupported for-of binding pattern",
-                    )
-                    .into());
-                };
-                ForOfHead::Decl(ident, var_decl.kind != VarDeclKind::Const)
+                let mutable = var_decl.kind != VarDeclKind::Const;
+                match &declarator.name {
+                    Pat::Ident(ident) => ForOfHead::Decl(ident, mutable),
+                    pat @ (Pat::Array(_) | Pat::Object(_)) => {
+                        let mut names = Vec::new();
+                        super::capture::pat_names(pat, &mut names);
+                        let mut seen = std::collections::HashSet::new();
+                        if let Some(dup) = names.iter().find(|name| !seen.insert(name.as_str())) {
+                            return Err(CompileError::spanned(
+                                pat.span(),
+                                format!("duplicate binding in for-of head: {dup}"),
+                            )
+                            .into());
+                        }
+                        ForOfHead::Pattern(pat, mutable)
+                    }
+                    other => {
+                        return Err(CompileError::spanned(
+                            other.span(),
+                            "unsupported for-of binding pattern",
+                        )
+                        .into());
+                    }
+                }
             }
             // A bare identifier head (`for (x of ..)`) stays rejected.
             ForHead::Pat(pat) if !is_ident_target(pat) => ForOfHead::Assign(pat),
@@ -1596,25 +1620,12 @@ impl LowerCtx<'_> {
             }
         };
 
-        // Reject a statically-known non-iterable head (`for (const x of 5)`, `of
-        // {}`): only arrays and strings are supported here. Dynamic values
-        // (identifiers, calls) carry no static type in the numeric IR, so a
-        // non-iterable reaching the loop at runtime is undefined behavior, like an
-        // out-of-bounds index elsewhere.
-        if non_iterable_literal(&for_of.right) {
-            return Err(CompileError::spanned(
-                for_of.right.span(),
-                "for-of iterable must be an array or string",
-            )
-            .into());
-        }
-
         self.push_scope();
         let result = (|| {
-            // Evaluate the iterable ONCE into a temp. At runtime it is either a
-            // GENERATOR (driven via the iterator protocol) or an
-            // array/string (the ordinary index walk); a runtime `IsGenerator` test
-            // selects between the two — the index branch is unchanged.
+            // Evaluate the iterable ONCE into a temp. At runtime a GENERATOR is
+            // driven via the iterator protocol; any other value is walked by
+            // index through its `GetIterator` source (array, string, live
+            // Map/Set), which throws for a non-iterable.
             let iter = self.lower_expr(&for_of.right)?;
             let iter_local = self.fresh();
             out.push(IrStmt::Decl {
@@ -1634,10 +1645,12 @@ impl LowerCtx<'_> {
         result
     }
 
-    /// Lower the ARRAY/STRING index branch of a `for-of` (the original loop): cache
-    /// the length once, walk `0 <= i < length`, and bind the loop variable to
-    /// `iter[i]` as the first body statement, with `i++` in the loop's `update` slot
-    /// so a `continue` still advances it. Returns the branch statements.
+    /// Lower the index branch of a `for-of`: replace the iterable with its
+    /// [`IrNode::IterSource`], walk `0 <= i < IterLen(src)` (re-read per step,
+    /// so elements and entries added by the body are visited), and bind the
+    /// loop variable to `IterItem(src, i)` as the first body statement, with
+    /// `i++` in the loop's `update` slot so a `continue` still advances it.
+    /// Returns the branch statements.
     fn lower_for_of_index(
         &mut self,
         head: ForOfHead<'_>,
@@ -1645,12 +1658,13 @@ impl LowerCtx<'_> {
         for_body: &Stmt,
         label: Option<u32>,
     ) -> anyhow::Result<Vec<IrStmt>> {
-        let mut out = Vec::new();
-        let len_local = self.fresh();
-        out.push(IrStmt::Decl {
-            local: len_local,
-            init: IrNode::StrLen(Box::new(IrNode::Local(iter_local))),
-        });
+        let mut out = vec![IrStmt::Expr(IrNode::Assign {
+            local: iter_local,
+            value: Box::new(IrNode::IterSource {
+                value: Box::new(IrNode::Local(iter_local)),
+                live: true,
+            }),
+        })];
         let idx_local = self.fresh();
         out.push(IrStmt::Decl {
             local: idx_local,
@@ -1659,14 +1673,14 @@ impl LowerCtx<'_> {
         let cond = IrNode::Binary {
             op: BinOp::Lt,
             lhs: Box::new(IrNode::Local(idx_local)),
-            rhs: Box::new(IrNode::Local(len_local)),
+            rhs: Box::new(IrNode::IterLen(Box::new(IrNode::Local(iter_local)))),
         };
         let target = self.declare_for_of_head(head);
         self.breakable_inc();
         self.loopable_inc();
         let mut body = Vec::new();
-        let elem = IrNode::Index {
-            obj: Box::new(IrNode::Local(iter_local)),
+        let elem = IrNode::IterItem {
+            iterable: Box::new(IrNode::Local(iter_local)),
             index: Box::new(IrNode::Local(idx_local)),
         };
         self.bind_for_of_target(target, elem, &mut body)?;
@@ -1760,6 +1774,7 @@ impl LowerCtx<'_> {
             ForOfHead::Decl(ident, mutable) => {
                 ForOfTarget::Local(self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident)))
             }
+            ForOfHead::Pattern(pat, mutable) => ForOfTarget::Pattern(pat, mutable),
             ForOfHead::Assign(pat) => ForOfTarget::Assign(pat),
         }
     }
@@ -1776,6 +1791,9 @@ impl LowerCtx<'_> {
             ForOfTarget::Local(local) => {
                 self.push_binding(local, elem, body);
                 Ok(())
+            }
+            ForOfTarget::Pattern(pat, mutable) => {
+                self.lower_binding_pattern(pat, elem, mutable, body)
             }
             ForOfTarget::Assign(pat) => self.assign_to_target(pat, elem, body),
         }
@@ -1921,18 +1939,12 @@ impl LowerCtx<'_> {
     }
 }
 
-/// Whether `expr` is a compile-time literal that is definitely NOT a string or
-/// array — the only iterables P0.3 supports. An object literal and every
-/// non-string literal (number/boolean/null/…) qualify; a string literal and a
-/// template literal are strings, and anything dynamic (an identifier, a call, an
-/// array literal) is allowed through. Used to reject an obviously non-iterable
-/// `for-of` head with a spanned error.
-fn non_iterable_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(paren) => non_iterable_literal(&paren.expr),
-        Expr::Object(_) => true,
-        Expr::Lit(lit) => !matches!(lit, Lit::Str(_)),
-        _ => false,
+/// The `GetIterator` snapshot array an array pattern destructures `value`
+/// through.
+fn iter_snapshot(value: IrNode) -> IrNode {
+    IrNode::IterSource {
+        value: Box::new(value),
+        live: false,
     }
 }
 
@@ -1979,19 +1991,22 @@ enum AssignRef {
     Member { obj: u32, key: IrNode },
 }
 
-/// The head of a `for-of` loop: a fresh `const`/`let` binding (with its
-/// mutability), or an assignment target written each iteration.
+/// The head of a `for-of` loop: a fresh `const`/`let` binding or
+/// destructuring pattern (with its mutability), or an assignment target
+/// written each iteration.
 #[derive(Clone, Copy)]
 enum ForOfHead<'a> {
     Decl(&'a swc_ecma_ast::BindingIdent, bool),
+    Pattern(&'a Pat, bool),
     Assign(&'a Pat),
 }
 
-/// A declared `for-of` head: the per-iteration binding local, or the
-/// assignment target.
+/// A declared `for-of` head: the per-iteration binding local, the binding
+/// pattern (declared per iteration), or the assignment target.
 #[derive(Clone, Copy)]
 enum ForOfTarget<'a> {
     Local(u32),
+    Pattern(&'a Pat, bool),
     Assign(&'a Pat),
 }
 

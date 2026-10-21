@@ -221,7 +221,20 @@ pub(super) fn emit_array_spread(
                 function.instruction(&Instruction::LocalGet(scratch + 22));
                 function.instruction(&Instruction::Call(helpers.gen_to_array));
                 function.instruction(&Instruction::Else);
+                // An array is itself; any other source is `GetIterator`'s
+                // snapshot array (or its `is not iterable` throw).
+                emit_is_array_value(function, scratch + 22);
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
                 function.instruction(&Instruction::LocalGet(scratch + 22));
+                function.instruction(&Instruction::Else);
+                for _ in 0..3 {
+                    enter_frame(helpers);
+                }
+                emit_iter_source_call(scratch + 22, false, function, helpers);
+                for _ in 0..3 {
+                    leave_frame(helpers);
+                }
+                function.instruction(&Instruction::End);
                 function.instruction(&Instruction::End);
                 function.instruction(&Instruction::End);
                 function.instruction(&Instruction::I32WrapI64);
@@ -236,16 +249,151 @@ pub(super) fn emit_array_spread(
     function.instruction(&Instruction::I64Or);
 }
 
+/// Push i32 `1` when the jsval in i64 local `value` is a `TYPE_ARRAY` handle.
+fn emit_is_array_value(function: &mut Function, value: u32) {
+    emit_is_kind(function, value, &[TYPE_ARRAY]);
+}
+
+/// Push i32 `1` when the jsval in i64 local `value` is a heap block whose
+/// kind byte is one of `kinds`.
+fn emit_is_kind(function: &mut Function, value: u32, kinds: &[i32]) {
+    emit_is_pointer(function, value);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    for (i, &kind) in kinds.iter().enumerate() {
+        emit_load_type_byte(function, value);
+        function.instruction(&Instruction::I32Const(kind));
+        function.instruction(&Instruction::I32Eq);
+        if i > 0 {
+            function.instruction(&Instruction::I32Or);
+        }
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// Call the [`Builtin::IterSource`] body on the jsval in i64 local `value`
+/// (`live`: keep a `Map` / `Set` for a live walk), leaving the walkable value
+/// on the stack, and unwind if it threw.
+fn emit_iter_source_call(value: u32, live: bool, function: &mut Function, helpers: Helpers<'_>) {
+    for _ in 0..helpers.max_args {
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    }
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+    function.instruction(&Instruction::I64Const(i64::from(live)));
+    emit_argc(0, function);
+    function.instruction(&Instruction::Call(helpers.builtin(Builtin::IterSource)));
+    emit_propagate_if_pending(function, helpers);
+}
+
+/// Emit an [`IrNode::IterSource`], leaving the walkable value on the stack.
+pub(super) fn emit_iter_source(
+    value: &IrNode,
+    live: bool,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(scratch + 22));
+    emit_iter_source_call(scratch + 22, live, function, helpers);
+}
+
+/// Emit an [`IrNode::IterLen`], leaving the length (a number jsval) on the
+/// stack: a `Map` / `Set` reads its live `size`, anything else its `length`.
+pub(super) fn emit_iter_len(
+    operand: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let value = scratch + 22;
+    emit_node(operand, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(value));
+    emit_is_kind(function, value, &[TYPE_MAP, TYPE_SET]);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    emit_u32_field_boxed(function, value, MAP_SIZE_OFFSET);
+    function.instruction(&Instruction::Else);
+    enter_frame(helpers);
+    emit_str_len(&IrNode::Local(value), function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// Emit an [`IrNode::IterItem`], leaving the element on the stack: entry
+/// `index` of a `Map` (a fresh `[key, value]` array) or `Set` (its value),
+/// else `iterable[index]`.
+pub(super) fn emit_iter_item(
+    iterable: &IrNode,
+    index: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (value, at, slot) = (scratch + 22, scratch + 23, scratch + 21);
+    emit_node(iterable, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(value));
+    emit_node(index, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(at));
+    emit_is_kind(function, value, &[TYPE_MAP, TYPE_SET]);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    // slot = the address of the entry's key/value pair in the backing store.
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: MAP_ENTRIES_OFFSET,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32WrapI64);
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::I32TruncF64U);
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(slot));
+    emit_load_type_byte(function, value);
+    function.instruction(&Instruction::I32Const(TYPE_MAP));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(slot));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::LocalSet(value));
+    function.instruction(&Instruction::LocalGet(slot));
+    function.instruction(&Instruction::I64Load(elem_slot(1)));
+    function.instruction(&Instruction::LocalSet(at));
+    let entry = IrNode::Array(vec![IrNode::Local(value), IrNode::Local(at)]);
+    emit_node(&entry, function, scratch, strings, helpers);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(slot));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::End);
+    leave_frame(helpers);
+    function.instruction(&Instruction::Else);
+    enter_frame(helpers);
+    let read = IrNode::Index {
+        obj: Box::new(IrNode::Local(value)),
+        index: Box::new(IrNode::Local(at)),
+    };
+    emit_node(&read, function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
 /// Emit `array.push(value)`, leaving the new length (a number jsval) on
-/// the stack. Once `value` is evaluated, a non-array `local` throws
-/// `not_array` (when given); otherwise `__array_push` appends `value` to the
-/// handle read from `local` in place (the handle never moves, so every alias
-/// observes the growth) and returns the handle, whose `length` is then read
-/// back.
+/// the stack: `__array_push` appends `value` to the array handle read from
+/// `local` in place (the handle never moves, so every alias observes the
+/// growth) and returns the handle, whose `length` is then read back.
 pub(super) fn emit_array_push_node(
     local: u32,
     value: &IrNode,
-    not_array: Option<&CalleeError>,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -254,9 +402,6 @@ pub(super) fn emit_array_push_node(
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I32WrapI64);
     emit_node(value, function, scratch, strings, helpers);
-    if let Some(not_array) = not_array {
-        emit_array_guard(function, local, not_array, scratch, strings, helpers);
-    }
     function.instruction(&Instruction::Call(helpers.array_push));
     function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::F64ConvertI32U);
@@ -264,17 +409,15 @@ pub(super) fn emit_array_push_node(
 }
 
 /// Emit `array.pop()`, leaving the removed last element (or `undefined`
-/// for an empty array or a trailing hole) on the stack. A non-array `local` throws `not_array`;
-/// otherwise the handle read from `local` is shrunk IN PLACE — its `length`
+/// for an empty array or a trailing hole) on the stack: the array handle read
+/// from `local` is shrunk IN PLACE — its `length`
 /// drops by one and the element at the old last slot of its store is yielded
 /// (a `SPARSE` array reads it through `__sparse_get` and shrinks through
 /// `__array_set_length`, which drops it from the property table).
 pub(super) fn emit_array_pop_node(
     local: u32,
-    not_array: &CalleeError,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
     // Transient scratch locals: the handle base and the new length (i32), and
@@ -282,8 +425,6 @@ pub(super) fn emit_array_pop_node(
     let base = scratch + 3;
     let new_len = scratch + 7;
     let removed = scratch + 4;
-
-    emit_array_guard(function, local, not_array, scratch, strings, helpers);
 
     // base = wrap(array_handle).
     function.instruction(&Instruction::LocalGet(local));
@@ -344,40 +485,6 @@ pub(super) fn emit_array_pop_node(
     function.instruction(&Instruction::End);
 }
 
-/// Unless the jsval in `local` is a `TYPE_ARRAY` handle, throw the
-/// not-a-function `TypeError` `not_array` (the receiver has no `push`/`pop`)
-/// and unwind. Stack-neutral on the not-thrown path.
-fn emit_array_guard(
-    function: &mut Function,
-    local: u32,
-    not_array: &CalleeError,
-    scratch: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    emit_is_pointer(function, local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // The `if` opens a control frame around the throw transfer.
-    enter_frame(helpers);
-    emit_throw_not_a_function(
-        function,
-        callee_error_text(not_array),
-        scratch,
-        strings,
-        helpers,
-    );
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
-}
-
 /// Push the raw element jsval at `arr[idx]` (a hole as [`HOLE_BITS`]) onto the
 /// stack via [`emit_elem_load`]. `arr`/`idx` are the array-handle-base /
 /// loop-index i32 scratch locals of an [`emit_array_hof`] loop.
@@ -392,32 +499,38 @@ pub(super) fn emit_hof_load_elem(
 
 /// Push the loop index `idx` (an i32 scratch local) as a number jsval — its
 /// `f64` bit pattern in the i64 carrier.
-pub(super) fn emit_hof_index(function: &mut Function, idx: u32) {
+fn emit_hof_index(function: &mut Function, idx: u32) {
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
 }
 
 /// Emit the trailing half of a higher-order callback invocation: pad the
-/// remaining positional slots to the shared funcref arity with `undefined`, push
-/// the callback's own environment (at `+FUNC_ENV_OFFSET`) as the env-last argument
-/// and its funcref-table index (at `+FUNC_INDEX_OFFSET`), and `call_indirect`. The real
-/// positional args (already pushed by the caller) plus this padding total exactly
-/// `helpers.max_args`, which the arity scan guarantees is `>= real_args` so no
-/// funcref type mismatch can trap. Leaves the callback's boxed jsval result.
-pub(super) fn emit_hof_invoke(
+/// remaining positional slots to the shared funcref arity with `undefined`, set
+/// `this` (from i64 local `this`, else `undefined`), push the callback's own
+/// environment (at `+FUNC_ENV_OFFSET`) as the env-last argument and its
+/// funcref-table index (at `+FUNC_INDEX_OFFSET`), and `call_indirect`. The
+/// real positional args (already pushed by the caller) number at most
+/// `helpers.max_args`. Leaves the callback's boxed jsval result.
+fn emit_hof_invoke(
     function: &mut Function,
     helpers: Helpers<'_>,
     cb: u32,
+    this: Option<u32>,
     real_args: u32,
 ) {
     for _ in real_args..helpers.max_args {
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
-    // A higher-order callback is invoked with no receiver, so `this = undefined`;
-    // the real positional args are already on the stack, so resetting the
+    // The real positional args are already on the stack, so setting the
     // carrier here (stack-neutral) does not disturb them.
-    emit_reset_this(function);
+    match this {
+        Some(this) => {
+            function.instruction(&Instruction::LocalGet(this));
+            function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+        }
+        None => emit_reset_this(function),
+    }
     function.instruction(&Instruction::LocalGet(cb));
     function.instruction(&Instruction::I64Load(MemArg {
         offset: FUNC_ENV_OFFSET,
@@ -443,30 +556,41 @@ pub(super) fn emit_hof_invoke(
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Emit an array higher-order method `array.map/filter/reduce/forEach(callback)`,
-/// leaving the method's result jsval on the stack. The receiver is
-/// evaluated once into the i32 base scratch local `arr` (not rebound), its u32
-/// length header into `len`, and the callback function value's base into `cb`; a
-/// counted loop over `0..len` then invokes the callback per element through the
-/// uniform `call_indirect` ABI (env-last) via [`emit_hof_invoke`]. A hole is
-/// skipped (no call); `Map` keeps it as a hole in the result:
+/// The `TypeError` of `reduce` over no element without an initial value.
+pub(super) const REDUCE_EMPTY: CalleeErrorText<'static> = [
+    "Reduce of empty array with no initial value",
+    "TypeError: Reduce of empty array with no initial value",
+];
+
+/// Emit an array higher-order method ([`IrNode::ArrayHof`]), leaving the
+/// method's result jsval on the stack. The receiver is evaluated once into
+/// the i32 base scratch local `arr` (not rebound), its length on entry into
+/// `len`, the callback's base into `cb` (after its `IsCallable` check) and the
+/// `this_arg` into `this`; a counted loop over `0..len` then invokes the
+/// callback per element still present (below the current length, not a hole)
+/// through the uniform `call_indirect` ABI via [`emit_hof_invoke`], passing
+/// `(element, index, array)` (`reduce`: `(acc, element, index, array)`)
+/// truncated to `K`:
 ///
-/// - `Map` fills a fresh same-length array `res[i] = fn(element_i, i)`.
+/// - `Map` fills a fresh same-length array `res[i] = fn(..)`, a skipped index
+///   staying a hole.
 /// - `Filter` grows a fresh array in place via `__array_push` for JS-truthy
-///   `fn(element_i, i)`.
-/// - `Reduce` folds `acc = fn(acc, element_i, i)` from `acc = init`.
-/// - `ForEach` discards each `fn(element_i, i)` result and yields `undefined`.
+///   results.
+/// - `Reduce` folds `acc = fn(acc, ..)` from `init`, or without one from the
+///   first present element (`seeded` tracks it; none throws [`REDUCE_EMPTY`]).
+/// - `ForEach` discards each result and yields `undefined`.
 ///
-/// The receiver/callback/init sub-expressions are fully evaluated before the loop
-/// seeds the HOF scratch locals (`scratch+8`..`scratch+13`), so a nested HOF in
-/// any of them completes and frees those locals first — the loop body itself only
-/// reads memory and `call_indirect`s, never re-entering an inner HOF at this frame.
+/// The sub-expressions are fully evaluated before the loop seeds the HOF
+/// scratch locals (`scratch+8`..`scratch+14`), so a nested HOF in any of them
+/// completes and frees those locals first — the loop body itself only reads
+/// memory and `call_indirect`s, never re-entering an inner HOF at this frame.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn emit_array_hof(
     op: ArrayHofOp,
     array: &IrNode,
     callback: &IrNode,
     init: Option<&IrNode>,
+    this_arg: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -476,12 +600,16 @@ pub(super) fn emit_array_hof(
     let len = scratch + 9;
     let idx = scratch + 10;
     let cb = scratch + 11;
+    // The result array of map/filter; reduce's `seeded` flag.
     let res = scratch + 12;
+    let seeded = res;
     let acc = scratch + 13;
+    let this = scratch + 14;
 
-    // Prologue: receiver base -> `arr`, its length -> `len`, callback base -> `cb`,
-    // and `idx = 0`. The receiver is evaluated first (JS `arr.method(cb)` order),
-    // then the callback.
+    // Prologue: receiver base -> `arr`, its length -> `len`, then the
+    // callback (IsCallable, DF4: a non-function throws before any iteration,
+    // even over an empty array; a function literal needs no check), `this`
+    // and the initial accumulator.
     emit_node(array, function, scratch, strings, helpers);
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(arr));
@@ -489,8 +617,6 @@ pub(super) fn emit_array_hof(
     function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::LocalSet(len));
     emit_node(callback, function, scratch, strings, helpers);
-    // IsCallable (DF4): a non-function callback throws before any iteration
-    // (even over an empty array); a function literal needs no check.
     if !is_static_function(callback) {
         function.instruction(&Instruction::LocalSet(scratch));
         emit_callable_guard(
@@ -505,6 +631,11 @@ pub(super) fn emit_array_hof(
     }
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(cb));
+    if let Some(this_arg) = this_arg {
+        emit_node(this_arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(this));
+    }
+    let this = this_arg.map(|_| this);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(idx));
 
@@ -525,17 +656,34 @@ pub(super) fn emit_array_hof(
             function.instruction(&Instruction::LocalSet(res));
         }
         ArrayHofOp::Reduce => {
-            // acc = init (always present at lowering); an absent init would fold from
-            // `undefined`, but lowering rejects a no-init reduce before reaching here.
             if let Some(init) = init {
                 emit_node(init, function, scratch, strings, helpers);
+                function.instruction(&Instruction::LocalSet(acc));
             } else {
-                function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::LocalSet(seeded));
             }
-            function.instruction(&Instruction::LocalSet(acc));
         }
         ArrayHofOp::ForEach => {}
     }
+    // Push the callback's argument `j` of `(element, index, array)`.
+    let callback_arg = |function: &mut Function, j: u32| match j {
+        0 => emit_hof_load_elem(function, arr, idx, helpers),
+        1 => emit_hof_index(function, idx),
+        _ => {
+            function.instruction(&Instruction::LocalGet(arr));
+            function.instruction(&Instruction::I64ExtendI32U);
+            function.instruction(&Instruction::I64Const(HEAP_BITS));
+            function.instruction(&Instruction::I64Or);
+        }
+    };
+    let call = |function: &mut Function, before: u32| {
+        let n = (before + 3).min(helpers.max_args);
+        for j in before..n {
+            callback_arg(function, j - before);
+        }
+        emit_hof_invoke(function, helpers, cb, this, n);
+    };
 
     // Counted loop: `while (idx < len) { <body>; idx++ }`.
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -546,35 +694,40 @@ pub(super) fn emit_array_hof(
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
-    // Skip a hole: the body runs only for a present element.
+    // Visit a present element only: below the current length (a callback may
+    // shrink the array) and not a hole.
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::LocalGet(arr));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_hof_load_elem(function, arr, idx, helpers);
     function.instruction(&Instruction::I64Const(HOLE_BITS));
     function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
 
     match op {
         ArrayHofOp::Map => {
-            // res[idx] = callback(element, index). The slot address
-            // (res.elems + 8*idx) is pushed first and survives beneath the
-            // call_indirect, which is stack-balanced (leaves one i64); `res` is
-            // private to the loop, so its store never moves.
+            // res[idx] = callback(..). The slot address (res.elems + 8*idx) is
+            // pushed first and survives beneath the call_indirect, which is
+            // stack-balanced (leaves one i64); `res` is private to the loop,
+            // so its store never moves.
             function.instruction(&Instruction::LocalGet(res));
             emit_array_elems(function);
             function.instruction(&Instruction::LocalGet(idx));
             function.instruction(&Instruction::I32Const(8));
             function.instruction(&Instruction::I32Mul);
             function.instruction(&Instruction::I32Add);
-            emit_hof_load_elem(function, arr, idx, helpers);
-            emit_hof_index(function, idx);
-            emit_hof_invoke(function, helpers, cb, 2);
+            call(function, 0);
             function.instruction(&Instruction::I64Store(elem_slot(0)));
         }
         ArrayHofOp::Filter => {
-            // if truthy(callback(element, index)) { __array_push(res, element) }.
-            emit_hof_load_elem(function, arr, idx, helpers);
-            emit_hof_index(function, idx);
-            emit_hof_invoke(function, helpers, cb, 2);
+            // if truthy(callback(..)) { __array_push(res, element) }.
+            call(function, 0);
             function.instruction(&Instruction::LocalSet(acc));
             emit_cond(&IrNode::Local(acc), function, scratch, strings, helpers);
             function.instruction(&Instruction::If(BlockType::Empty));
@@ -585,23 +738,34 @@ pub(super) fn emit_array_hof(
             function.instruction(&Instruction::End);
         }
         ArrayHofOp::Reduce => {
-            // acc = callback(acc, element, index).
-            function.instruction(&Instruction::LocalGet(acc));
-            emit_hof_load_elem(function, arr, idx, helpers);
-            emit_hof_index(function, idx);
-            emit_hof_invoke(function, helpers, cb, 3);
+            // acc = callback(acc, ..), or the first present element seeds it.
+            if init.is_none() {
+                function.instruction(&Instruction::LocalGet(seeded));
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+                enter_frame(helpers);
+            }
+            if helpers.max_args > 0 {
+                function.instruction(&Instruction::LocalGet(acc));
+            }
+            call(function, 1);
+            if init.is_none() {
+                function.instruction(&Instruction::Else);
+                emit_hof_load_elem(function, arr, idx, helpers);
+                function.instruction(&Instruction::I32Const(1));
+                function.instruction(&Instruction::LocalSet(seeded));
+                leave_frame(helpers);
+                function.instruction(&Instruction::End);
+            }
             function.instruction(&Instruction::LocalSet(acc));
         }
         ArrayHofOp::ForEach => {
-            // callback(element, index) for side effects; discard the result.
-            emit_hof_load_elem(function, arr, idx, helpers);
-            emit_hof_index(function, idx);
-            emit_hof_invoke(function, helpers, cb, 2);
+            // callback(..) for side effects; discard the result.
+            call(function, 0);
             function.instruction(&Instruction::Drop);
         }
     }
     if op == ArrayHofOp::Map {
-        // A hole maps to a hole.
+        // A skipped index stays a hole.
         function.instruction(&Instruction::Else);
         function.instruction(&Instruction::LocalGet(res));
         emit_array_elems(function);
@@ -625,6 +789,16 @@ pub(super) fn emit_array_hof(
     function.instruction(&Instruction::End); // loop
     leave_frame(helpers); // block
     function.instruction(&Instruction::End); // block
+
+    if op == ArrayHofOp::Reduce && init.is_none() {
+        function.instruction(&Instruction::LocalGet(seeded));
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        emit_throw_not_a_function(function, REDUCE_EMPTY, scratch, strings, helpers);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
 
     // Result: the fresh array (map/filter), the accumulator (reduce), or
     // `undefined` (forEach).

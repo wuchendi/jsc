@@ -109,6 +109,17 @@ fn primitive_unknown_method_call_throws() {
 }
 
 #[test]
+fn literal_primitive_method_calls_resolve_at_run_time() {
+    assert_type_error("\"abc\".foo();", "\"abc\".foo is not a function");
+    assert_type_error("(5).foo();", "5.foo is not a function");
+    assert_type_error("true.foo();", "true.foo is not a function");
+    assert_str("(5).toString()", "5");
+    assert_str("true.toString()", "true");
+    assert_str("\"abc\".valueOf()", "abc");
+    assert_str("let n = 7; n.toString(2)", "111");
+}
+
+#[test]
 fn nullish_receivers_throw() {
     for (decl, word) in [("let v=undefined;", "undefined"), ("let v=null;", "null")] {
         assert_type_error(

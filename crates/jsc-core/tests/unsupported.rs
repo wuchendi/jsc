@@ -3,31 +3,6 @@
 mod common;
 use common::{assert_rejected, assert_uncaught};
 
-/// Assert `src` is rejected at COMPILE time with a clean unknown-method
-/// diagnostic: the error names the unsupported method and, critically, is
-/// NEVER the wasm-validator failure `failed to compile: wasm...` that a malformed
-/// `call_indirect` would produce.
-fn assert_unknown_method(src: &str, method: &str) {
-    let result = jsc_core::run::compile_and_run(src);
-    let msg = match &result {
-        Ok(_) => String::new(),
-        Err(err) => err.to_string(),
-    };
-    assert!(
-        result.is_err(),
-        "`{src}`: unknown method should be rejected at compile time"
-    );
-    assert_eq!(
-        msg,
-        format!("method '{method}' is not supported"),
-        "diagnostic for `{src}`"
-    );
-    assert!(
-        !msg.contains("failed to compile"),
-        "`{src}` must never emit invalid wasm, got: {msg}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Out-of-scope boundary: each of these must be REJECTED, never mis-evaluated.
 // (See DESIGN.md for the full catalogue + gaps.)
@@ -74,13 +49,10 @@ fn rejects_computed_class_fields() {
 
 #[test]
 fn rejects_unsupported_for_of_and_for_in() {
-    // `for-of` over arrays/strings with a `const`/`let` head is supported
-    // and `for-in` over objects/arrays is supported, but these unsupported
-    // forms still trap: an assignment-target head, a statically non-iterable
-    // `for-of` head, and a statically non-enumerable `for-in` head.
+    // A bare-identifier `for-of` head and a statically non-enumerable
+    // `for-in` head still trap (a non-iterable `for-of` source is a run-time
+    // `TypeError`, see the iteration suite).
     assert_rejected("for (x of [1, 2, 3]) { x }");
-    assert_rejected("for (const x of 5) { x }");
-    assert_rejected("for (const x of { a: 1 }) { x }");
     assert_rejected("for (const k in 5) { k }");
 }
 
@@ -91,22 +63,26 @@ fn rejects_function_prototype_bind() {
 }
 
 // ---------------------------------------------------------------------------
-// An unknown / not-yet-implemented method must be rejected at COMPILE time
-// with a clean span diagnostic — NEVER a `call_indirect` that the wasm validator
-// rejects with `failed to compile: wasm[0]::function[..]`.
+// An unknown / not-yet-implemented method is a run-time `TypeError` from the
+// prototype lookup — never a compile error, and never invalid wasm.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rejects_unknown_string_method() {
-    // A string-literal receiver can carry only the built-in string methods; any
-    // other name is a statically-provable unknown method. (Names here are
-    // genuinely unknown; trim/repeat/padStart/split are built in.)
-    assert_unknown_method("\"x\".zzz()", "zzz");
-    assert_unknown_method("\"hi\".charCodeAt(0)", "charCodeAt");
-    assert_unknown_method("\"x\".normalize()", "normalize");
-    // Reached through a template literal and a computed string-literal key.
-    assert_unknown_method("`t`.zzz()", "zzz");
-    assert_unknown_method("\"x\"[\"zzz\"]()", "zzz");
+fn unknown_string_method_throws_typeerror() {
+    // A primitive receiver reads its methods from its prototype at run time:
+    // an unknown name is `undefined`, and calling it throws.
+    for src in ["`t`.zzz()", "`hi`.charCodeAt(0)"] {
+        assert_uncaught(src, "TypeError: expression is not a function");
+    }
+    for (src, name) in [
+        ("\"x\".zzz()", "\"x\".zzz"),
+        ("(1).zzz()", "1.zzz"),
+        ("true.zzz()", "true.zzz"),
+        ("\"x\"[\"zzz\"]()", "\"x\".zzz"),
+        ("function f() { return 1 } \"x\".zzz()", "\"x\".zzz"),
+    ] {
+        assert_uncaught(src, &format!("TypeError: {name} is not a function"));
+    }
 }
 
 #[test]
@@ -245,20 +221,13 @@ fn dynamic_shape_unknown_method_throws_typeerror() {
 }
 
 #[test]
-fn rejects_unknown_method_even_with_functions_present() {
-    // A primitive-literal receiver is rejected regardless of whether the program
-    // also defines functions (which would otherwise emit a funcref table).
-    assert_unknown_method("function f() { return 1 } \"x\".zzz()", "zzz");
-}
-
-#[test]
 fn unknown_method_in_function_free_program_throws_typeerror() {
     // Genuine Map/Set methods work (see the collections suite); an unrecognized
     // one is a runtime TypeError even when the program declares no function (no
     // funcref table), never a compile-time rejection or invalid wasm.
     assert_uncaught(
-        "let m = new Map(); m.clear()",
-        "TypeError: m.clear is not a function",
+        "let m = new Map(); m.entries()",
+        "TypeError: m.entries is not a function",
     );
     assert_uncaught(
         "let o = { a: 1 }; o = { b: 2 }; o.zzz()",

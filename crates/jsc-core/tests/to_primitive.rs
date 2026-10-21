@@ -133,10 +133,12 @@ fn date_default_hint_is_string() {
     assert_number("+new Date(0)", 0.0);
     assert_number("new Date(5) - 1", 4.0);
     assert_number("new Date(0).valueOf()", 0.0);
-    assert_string("String(new Date(0))", "1970-01-01T00:00:00.000Z");
-    assert_string("'' + new Date(0)", "1970-01-01T00:00:00.000Z");
-    assert_string("new Date(0) + 1", "1970-01-01T00:00:00.000Z1");
-    assert_bool("new Date(0) == '1970-01-01T00:00:00.000Z'", true);
+    // Date.prototype.toString format (jsc dates are UTC).
+    let d = "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)";
+    assert_string("String(new Date(0))", d);
+    assert_string("'' + new Date(0)", d);
+    assert_string("new Date(0) + 1", &format!("{d}1"));
+    assert_bool(&format!("new Date(0) == '{d}'"), true);
     assert_bool("new Date(0) < new Date(1)", true);
 }
 

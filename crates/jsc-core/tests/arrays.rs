@@ -97,23 +97,6 @@ fn array_pop_then_push_length() {
     assert_number("let a=[1,2,3]; a.pop(); a.push(9); a.length", 3.0);
 }
 
-/// `push`/`pop` arities are validated at compile time.
-#[test]
-fn array_method_arity_errors() {
-    assert!(
-        compile_and_run("let a=[1]; a.push()").is_err(),
-        "push needs one argument"
-    );
-    assert!(
-        compile_and_run("let a=[1]; a.push(1, 2)").is_err(),
-        "push takes one argument"
-    );
-    assert!(
-        compile_and_run("let a=[1]; a.pop(1)").is_err(),
-        "pop takes no arguments"
-    );
-}
-
 // --- array higher-order methods (map/filter/reduce/forEach) --------------------
 
 /// Each acceptance bullet: `map`/`filter`/`reduce`/`forEach` over a literal array.
@@ -222,20 +205,19 @@ fn array_indexing_still_works_alongside_hof() {
     assert_number("[1,2,3].map(x => x)[1] + [4,5,6][0]", 6.0);
 }
 
-/// `map`/`filter`/`forEach` take exactly one argument; `reduce` requires two.
+/// Builtin arities are runtime behaviour: a missing callback throws a
+/// `TypeError`, `reduce` without an initial value folds from the first
+/// element, and `filter`'s second argument is the callback's `this`.
 #[test]
-fn array_hof_arity_errors() {
-    assert!(
-        compile_and_run("[1,2,3].map()").is_err(),
-        "map needs a callback"
+fn array_hof_arities_follow_the_spec() {
+    assert_bool(
+        "let ok = false; try { [1,2,3].map(); } catch (e) { ok = e instanceof TypeError; } ok",
+        true,
     );
-    assert!(
-        compile_and_run("[1,2,3].reduce((a,b) => a+b)").is_err(),
-        "reduce requires an initial accumulator"
-    );
-    assert!(
-        compile_and_run("[1,2,3].filter(x => x, 1)").is_err(),
-        "filter takes one argument"
+    assert_number("[1,2,3].reduce((a,b) => a+b)", 6.0);
+    assert_number(
+        "[1,2,3].filter(function (x) { return x > this.m; }, { m: 1 }).length",
+        2.0,
     );
 }
 

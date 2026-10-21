@@ -859,7 +859,7 @@ fn for_of_over_a_delegating_generator() {
 fn yield_delegate_over_a_non_iterable_throws_a_type_error() {
     assert_uncaught(
         "function* g(){ yield* 5 } [...g()]",
-        "TypeError: yield* operand is not iterable",
+        "TypeError: number 5 is not iterable",
     );
 }
 
@@ -1015,4 +1015,135 @@ fn a_nullish_next_receiver_throws_a_type_error() {
         "let n = null; n.next();",
         "TypeError: Cannot read properties of null (reading 'next')",
     );
+}
+
+// --- %GeneratorPrototype% -------------------------------------------------------
+
+#[test]
+fn generator_objects_inherit_the_generator_prototype() {
+    assert_eval("function* g() {} typeof g().next", "function");
+    assert_bool(
+        "function* g() {} function* h() {} g().next === h().next",
+        true,
+    );
+    // %GeneratorPrototype% inherits from %Object.prototype%.
+    assert_bool(
+        "function* g() {} g().hasOwnProperty === Object.prototype.hasOwnProperty",
+        true,
+    );
+    assert_eval("function* g() {} g().toString()", "[object Generator]");
+    assert_bool("function* g() {} g().hasOwnProperty('next')", false);
+    for (name, length) in [("next", 1.0), ("return", 1.0), ("throw", 1.0)] {
+        assert_eval(&format!("function* g() {{}} g().{name}.name"), name);
+        assert_number(&format!("function* g() {{}} g().{name}.length"), length);
+    }
+}
+
+#[test]
+fn next_through_a_value_and_on_a_wrong_receiver() {
+    assert_number(
+        "function* g() { yield 4 } const it = g(); const next = it.next; next.call(it).value",
+        4.0,
+    );
+    assert_uncaught(
+        "function* g() {} g().next.call({})",
+        "TypeError: next method called on incompatible receiver",
+    );
+    // DF12: a user iterator's own `next`.
+    assert_number(
+        "const it = { next() { return { value: 3, done: false } } }; it.next().value",
+        3.0,
+    );
+    // An own `next` on a generator object shadows the prototype's.
+    assert_number(
+        "function* g() { yield 1 } const it = g(); it.next = () => 8; it.next()",
+        8.0,
+    );
+}
+
+#[test]
+fn generator_return_completes_the_generator() {
+    assert_output(
+        "function* g() { yield 1; yield 2 } const it = g(); \
+         const r = it.return(5); console.log(r.value, r.done); \
+         const n = it.next(); console.log(n.value, n.done)",
+        "5 true\nundefined true\n",
+    );
+    assert_output(
+        "function* g() { yield 1; yield 2 } const it = g(); it.next(); \
+         const r = it.return(6); console.log(r.value, r.done, it.next().done)",
+        "6 true true\n",
+    );
+    // A `try`/`catch` (no `finally`) does not see a return completion.
+    assert_output(
+        "function* g() { try { yield 1 } catch (e) { console.log('no') } yield 2 } \
+         const it = g(); it.next(); console.log(it.return(7).value, it.next().done)",
+        "7 true\n",
+    );
+    assert_output(
+        "function* g() {} const it = g(); it.next(); console.log(it.return().value)",
+        "undefined\n",
+    );
+}
+
+#[test]
+fn generator_return_through_finally_is_a_named_limitation() {
+    assert_uncaught(
+        "function* g() { try { yield 1 } finally { console.log('f') } } \
+         const it = g(); it.next(); it.return(1)",
+        "TypeError: generator return() at a yield inside try/finally or yield* is not supported",
+    );
+    // Before the first `next` (or after completion) no `finally` is active.
+    assert_bool(
+        "function* g() { try { yield 1 } finally {} } g().return(1).done",
+        true,
+    );
+}
+
+#[test]
+fn generator_throw_throws_at_the_suspended_yield() {
+    assert_output(
+        "function* g() { try { yield 1 } catch (e) { console.log('caught', e); yield 2 } } \
+         const it = g(); it.next(); const r = it.throw('x'); console.log(r.value, r.done)",
+        "caught x\n2 false\n",
+    );
+    assert_uncaught(
+        "function* g() { yield 1 } const it = g(); it.next(); it.throw(new Error('boom'))",
+        "Error: boom",
+    );
+    // Not started: the generator completes without running its body.
+    assert_output(
+        "function* g() { console.log('ran'); yield 1 } const it = g(); \
+         try { it.throw(3) } catch (e) { console.log('t', e) } console.log(it.next().done)",
+        "t 3\ntrue\n",
+    );
+    // An uncaught throw completes the generator.
+    assert_output(
+        "function* g() { yield 1; yield 2 } const it = g(); it.next(); \
+         try { it.throw(4) } catch (e) {} console.log(it.next().done)",
+        "true\n",
+    );
+}
+
+#[test]
+fn generator_throw_through_yield_star_is_a_named_limitation() {
+    assert_uncaught(
+        "function* inner() { yield 1 } function* g() { yield* inner() } \
+         const it = g(); it.next(); it.throw(1)",
+        "TypeError: generator throw() at a yield* is not supported",
+    );
+}
+
+#[test]
+fn resuming_a_running_generator_throws() {
+    for method in ["next()", "return(1)", "throw(1)"] {
+        assert_output(
+            &format!(
+                "let it; function* g() {{ it.{method}; }} it = g(); \
+                 try {{ it.next() }} catch (e) {{ console.log(e.message) }} \
+                 console.log(it.next().done)"
+            ),
+            "Generator is already running\ntrue\n",
+        );
+    }
 }

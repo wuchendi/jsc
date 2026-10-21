@@ -83,6 +83,11 @@ impl LowerCtx<'_> {
                 MemberProp::Ident(id) if id.sym.as_ref() == "length" => Ok(IrNode::StrLen(
                     Box::new(nullish_check(self.lower_expr(&member.obj)?, "length")),
                 )),
+                // `obj.size`: a guarded `Map`/`Set` header read (design 3.2).
+                MemberProp::Ident(id) if id.sym.as_ref() == "size" => Ok(IrNode::SizeRead {
+                    sealed: self.shared.globals.intrinsics_sealed(),
+                    obj: Box::new(self.lower_expr(&member.obj)?),
+                }),
                 // `obj.a` ≡ `obj["a"]`: reuse the runtime `Index` dispatch, with
                 // the property name lowered to a heap-string key.
                 MemberProp::Ident(id) => Ok(IrNode::Index {
@@ -730,83 +735,19 @@ impl LowerCtx<'_> {
         {
             return self.lower_namespace_call(namespace, key, member, args);
         }
-        // `recv.push(x)` / `recv.pop()` are growing array methods, dispatched
-        // syntactically by method name (kept distinct from `x[i]` element
-        // indexing). The receiver is any expression, evaluated once.
+        // `recv.push(..)` / `recv.trim(..)` / `recv.get(..)` / `recv.then(..)`
+        // / `recv.getTime()` / .. name an `%Array.prototype%`,
+        // `%String.prototype%`, `%Map.prototype%`, `%Set.prototype%`,
+        // `%Promise.prototype%`, `%Date.prototype%` or `%GeneratorPrototype%`
+        // builtin: a generic method call with guarded fast paths (design 3.2
+        // rows 3-4).
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
-            && matches!(id.sym.as_ref(), "push" | "pop")
+            && (ARRAY_METHODS.contains(&id.sym.as_ref())
+                || STRING_METHODS.contains(&id.sym.as_ref())
+                || receiver_method(id.sym.as_ref()))
         {
-            return self.lower_array_method(id.sym.as_ref(), &member.obj, args);
-        }
-        // `array.map/filter/reduce/forEach(callback[, init])` are higher-order array
-        // methods, dispatched syntactically by method name (kept distinct
-        // from `x[i]` element indexing). The receiver is any array expression (a
-        // literal or a binding), evaluated once.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && matches!(id.sym.as_ref(), "map" | "filter" | "reduce" | "forEach")
-        {
-            return self.lower_array_hof(id.sym.as_ref(), &member.obj, args);
-        }
-        // `array/string.indexOf/includes/join/slice/toUpperCase/toLowerCase/charAt(..)`
-        // are non-callback array/string methods, dispatched syntactically by
-        // method name (kept distinct from `x[i]` element indexing). The receiver is
-        // any array/string expression, evaluated once; the whole operation runs
-        // host-side, branching on the receiver's runtime TYPE BYTE for the
-        // `indexOf`/`slice` methods that exist on both arrays and strings.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = non_callback_method_op(id.sym.as_ref())
-        {
-            return self.lower_method_call(op, id.sym.as_ref(), &member.obj, args);
-        }
-        // `d.getTime()`: the millisecond timestamp of a Date receiver.
-        // Claimed for ANY receiver (a non-Date yields `NaN`); a user method named
-        // `getTime` is a documented out-of-scope collision.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && id.sym.as_ref() == "getTime"
-        {
-            if !args.is_empty() {
-                return Err(
-                    CompileError::spanned(member.span(), "getTime() takes no arguments").into(),
-                );
-            }
-            let recv = Box::new(nullish_check(self.lower_expr(&member.obj)?, "getTime"));
-            return Ok(IrNode::DateGetTime { recv });
-        }
-        // The `Date` field methods `d.valueOf()` / `d.getFullYear()` / ….
-        // Like the Map/Set methods, these names can ALSO be ordinary user methods,
-        // so the lowered node dispatches at runtime on the receiver's TYPE BYTE and
-        // keeps a user-method fallback — safe to claim the name here.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = date_method_op(id.sym.as_ref())
-        {
-            return self.lower_date_method(op, id.sym.as_ref(), &member.obj, args);
-        }
-        // `p.then(onF, onR)` / `p.catch(onR)` / `p.finally(fn)` and `gen.next(v)`
-        // are the promise / generator instance methods. Like the Map/Set methods,
-        // these names can ALSO be ordinary user methods (thenables, iterator
-        // objects), so the lowered node dispatches at runtime on the receiver's
-        // TYPE BYTE and keeps a user-method fallback — safe to claim the name here.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = receiver_method_op(id.sym.as_ref())
-        {
-            return self.lower_receiver_method(op, &member.obj, args);
-        }
-        // `map.set/get/has/delete(..)` / `set.add/has/delete(..)` are Map/Set
-        // methods. Unlike the builtins above these names can ALSO be ordinary
-        // object/class methods, so the lowered node keeps a user-method-call fallback
-        // and dispatches at runtime on the receiver's TYPE BYTE — it is safe to claim
-        // the name here.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = map_set_method_op(id.sym.as_ref())
-        {
-            return self.lower_map_method(op, id.sym.as_ref(), &member.obj, args);
+            return self.lower_builtin_method_call(id.sym.as_ref(), member, args);
         }
         // Any remaining member callee `obj.m(args)` / `obj[k](args)` is a USER
         // method call: it reads the function value at the member and binds
@@ -855,8 +796,10 @@ impl LowerCtx<'_> {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
-            // String(){}` shadows it. Arity is validated here.
-            lower_convert_call(op, name, args, ident.span())
+            // String(){}` shadows it.
+            let empty = args.is_empty();
+            let (seq, args) = self.fit_inline_args(Some(convert_arity(op)), args);
+            Ok(seq_then(seq, convert_call(op, empty, args)))
         } else {
             // A global-object property, read (or thrown on) at run time.
             Ok(IrNode::CallIndirect {
@@ -886,9 +829,9 @@ impl LowerCtx<'_> {
     /// Lower `namespace.key(args)` (design 3.2 row 2). An inline namespace
     /// keeps exactly the inline code; otherwise the inline code runs behind an
     /// [`IrNode::NamespaceGuard`] over the namespace value. A member without
-    /// inline code (or a guarded call whose arity the inline code rejects) is
-    /// an ordinary method call: an unknown member reads `undefined` and throws
-    /// `N.key is not a function` at run time.
+    /// inline code, and a `JSON` call passing a reviver / replacer / space, is
+    /// an ordinary method call (of the builtin, or of whatever the member
+    /// holds; an unknown member throws `N.key is not a function` at run time).
     fn lower_namespace_call(
         &mut self,
         namespace: &str,
@@ -896,19 +839,28 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        if !inline_member(namespace, key) {
+        if !inline_member(namespace, key) || (namespace == "JSON" && args.len() > 1) {
             return self.lower_method_call_user(member, args);
         }
+        let arity = inline_arity(namespace, key);
         if self.shared.globals.inline(namespace) {
-            return lower_namespace_call(namespace, key, args, member.span());
+            let (seq, args) = self.fit_inline_args(arity, args);
+            let Some(fast) = inline_call(namespace, key, args) else {
+                return Err(anyhow!("{namespace}.{key} has no inline code"));
+            };
+            return Ok(seq_then(seq, fast));
         }
         let arg_locals: Vec<u32> = args.iter().map(|_| self.fresh()).collect();
         let locals: Vec<IrNode> = arg_locals.iter().map(|&l| IrNode::Local(l)).collect();
-        let Ok(fast) = lower_namespace_call(namespace, key, locals.clone(), member.span()) else {
-            return self.lower_method_call_user(member, args);
-        };
-        let Some(global) = GlobalIntrinsic::from_name(namespace) else {
-            return self.lower_method_call_user(member, args);
+        let mut fitted = locals.clone();
+        if let Some(n) = arity {
+            fitted.resize(n, IrNode::Undefined);
+        }
+        let (Some(fast), Some(global)) = (
+            inline_call(namespace, key, fitted),
+            GlobalIntrinsic::from_name(namespace),
+        ) else {
+            return Err(anyhow!("{namespace}.{key} has no inline code"));
         };
         let obj_local = self.fresh();
         let slow = IrNode::MethodCallUser {
@@ -930,28 +882,46 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower a promise / generator instance method `recv.<op>(args)` into an
-    /// [`IrNode::ReceiverMethod`]. Mirrors [`Self::lower_map_method`]: the receiver
-    /// is lowered once and two fresh temps are reserved for the runtime TYPE-BYTE
-    /// dispatch. No arity check: the argument list is threaded verbatim to the
-    /// user-method fallback, which may take any number of arguments.
-    fn lower_receiver_method(
+    /// Fit the evaluated call arguments `args` of an inline builtin to the
+    /// `arity` it reads (`None`: variadic): missing arguments are
+    /// `undefined`; with extra arguments, every argument is evaluated in order
+    /// first (the kept ones into temps, the extra ones for their side effects
+    /// only), returned as the statements to run before the inline code.
+    fn fit_inline_args(
         &mut self,
-        op: ReceiverOp,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let recv = self.lower_expr(obj)?;
-        let recv_local = self.fresh();
-        let fallback_obj_local = self.fresh();
-        Ok(IrNode::ReceiverMethod {
-            op,
-            recv: Box::new(recv),
-            args,
-            recv_local,
-            fallback_obj_local,
-            not_callable: method_not_a_function(obj, op.name()),
-        })
+        arity: Option<usize>,
+        mut args: Vec<IrNode>,
+    ) -> (Vec<IrNode>, Vec<IrNode>) {
+        let n = arity.unwrap_or(args.len());
+        if args.len() <= n {
+            args.resize(n, IrNode::Undefined);
+            return (Vec::new(), args);
+        }
+        let mut seq = Vec::new();
+        let mut kept = Vec::with_capacity(n);
+        for (i, arg) in args.into_iter().enumerate() {
+            let constant = matches!(
+                arg,
+                IrNode::Num(_)
+                    | IrNode::Str(_)
+                    | IrNode::Bool(_)
+                    | IrNode::Null
+                    | IrNode::Undefined
+            );
+            if i >= n {
+                seq.push(arg);
+            } else if constant {
+                kept.push(arg);
+            } else {
+                let local = self.fresh();
+                seq.push(IrNode::Assign {
+                    local,
+                    value: Box::new(arg),
+                });
+                kept.push(IrNode::Local(local));
+            }
+        }
+        (seq, kept)
     }
 
     /// Lower a call whose argument list contains a spread `f(...a)`. The
@@ -959,15 +929,15 @@ impl LowerCtx<'_> {
     /// [`IrNode::ArraySpread`]); the call then spreads that array into the
     /// uniform ABI's fixed `K` positional slots plus the dynamic `argc`.
     ///
-    /// Only the variadic `Math.max`/`Math.min` built-ins and ordinary
-    /// direct/indirect function calls accept a spread. Every other call form
-    /// (`console.log`, the `String`/`Number`/… conversions, and the array/string
-    /// methods) is out of scope and rejected with a span.
+    /// An inline `Math.max`/`Math.min` folds the array and an inline
+    /// `console.log` prints it; a `parseInt`/`parseFloat` conversion reads its
+    /// arguments from it; every other callee (the namespace and constructor
+    /// statics included) is called with the spread arguments.
     ///
     /// # Errors
     ///
-    /// Returns an error for a spread into an unsupported call target, or if the
-    /// callee / any argument expression is outside the supported subset.
+    /// Returns an error if the callee or any argument expression is outside
+    /// the supported subset.
     fn lower_spread_call(
         &mut self,
         call: &swc_ecma_ast::CallExpr,
@@ -985,32 +955,24 @@ impl LowerCtx<'_> {
         }
         let args = Box::new(IrNode::ArraySpread(parts));
 
-        // `Math.max(...)` / `Math.min(...)` are variadic: fold the spread
-        // elements. Any other `Math.<name>` has a fixed arity, so a spread into
-        // it is out of scope.
-        if let Some(name) = math_method_name(callee_expr)
-            && self.inline_namespace("Math")
+        if let Expr::Member(member) = callee_expr
+            && let Some((namespace, key)) = self.namespace_member(member)
+            && self.shared.globals.inline(namespace)
         {
-            match name {
-                "max" => {
+            match (namespace, key) {
+                ("Math", "max") => {
                     return Ok(IrNode::MathSpread {
                         op: MathOp::Max,
                         args,
                     });
                 }
-                "min" => {
+                ("Math", "min") => {
                     return Ok(IrNode::MathSpread {
                         op: MathOp::Min,
                         args,
                     });
                 }
-                _ if math_op(name).is_some() => {
-                    return Err(CompileError::spanned(
-                        call.span(),
-                        format!("spread arguments are unsupported for Math.{name}"),
-                    )
-                    .into());
-                }
+                ("console", "log") => return Ok(IrNode::ConsoleLogSpread { args }),
                 _ => {}
             }
         }
@@ -1021,13 +983,6 @@ impl LowerCtx<'_> {
             // it. Any other computed callee is an indirect spread call through the
             // funcref table.
             if let Expr::Member(member) = callee_expr {
-                if spread_rejecting_member(callee_expr, member) {
-                    return Err(CompileError::spanned(
-                        call.span(),
-                        "spread arguments are unsupported for this builtin method",
-                    )
-                    .into());
-                }
                 return self.lower_spread_method_call(member, args);
             }
             return Ok(IrNode::CallSpread {
@@ -1056,12 +1011,27 @@ impl LowerCtx<'_> {
                 target: SpreadCallee::Direct(sig.index),
                 args,
             })
-        } else if convert_builtin_op(name).is_some() {
-            Err(CompileError::spanned(
-                ident.span(),
-                format!("spread arguments are unsupported for {name}"),
-            )
-            .into())
+        } else if let Some(op) = convert_builtin_op(name)
+            && matches!(op, ConvertOp::ParseInt | ConvertOp::ParseFloat)
+        {
+            // `parseInt`/`parseFloat` read their arguments from the array.
+            let array = self.fresh();
+            let arg = |i: f64| IrNode::Index {
+                obj: Box::new(IrNode::Local(array)),
+                index: Box::new(IrNode::Num(i)),
+            };
+            let read = [0.0, 1.0]
+                .into_iter()
+                .take(convert_arity(op))
+                .map(arg)
+                .collect();
+            Ok(seq_then(
+                vec![IrNode::Assign {
+                    local: array,
+                    value: args,
+                }],
+                convert_call(op, false, read),
+            ))
         } else {
             Ok(IrNode::CallSpread {
                 target: SpreadCallee::Indirect(
@@ -1114,274 +1084,102 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower a growing array method call `recv.push(x)` / `recv.pop()`. The
-    /// receiver is any expression, evaluated exactly once: a plain local is
-    /// read in place, anything else (a captured or module binding, a member,
-    /// a call result) is stashed in a fresh temp. The receiver is guarded
-    /// against `null`/`undefined` (the member read), then an array receiver
-    /// grows/shrinks in place; any other receiver has no such method, so the
-    /// call throws `<recv>.<method> is not a function` once its argument is
-    /// evaluated. Arities are validated here (`push` takes one argument, `pop`
-    /// none).
-    fn lower_array_method(
+    /// Lower `recv.<name>(args)` for an `%Array.prototype%` or
+    /// `%String.prototype%` method `name` (design 3.2 row 3): the receiver
+    /// (nullish-guarded unless the generic call can throw that itself) and
+    /// then each argument with side effects are evaluated once into temps, then an [`IrNode::ProtoGuard`] runs the
+    /// inline fast path for an array receiver whose `name` is provably the
+    /// builtin, and otherwise one out-of-line generic method call (routed
+    /// straight to the `String.prototype` builtin for a string receiver).
+    /// Side-effect-free arguments (literals, locals, function literals) are
+    /// used in place by every path.
+    fn lower_builtin_method_call(
         &mut self,
-        method: &str,
-        obj: &Expr,
+        name: &str,
+        member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let value = match method {
-            "push" => {
-                let [value] = <[IrNode; 1]>::try_from(args).map_err(|args| {
-                    CompileError::spanned(
-                        obj.span(),
-                        format!("push expects 1 argument, got {}", args.len()),
-                    )
-                })?;
-                Some(value)
-            }
-            "pop" => {
-                if !args.is_empty() {
-                    return Err(CompileError::spanned(
-                        obj.span(),
-                        format!("pop expects 0 arguments, got {}", args.len()),
-                    )
-                    .into());
-                }
-                None
-            }
-            _ => unreachable!("caller restricts the method to push/pop"),
+        let recv = self.lower_expr(&member.obj)?;
+        let pure = args.iter().all(pure_arg);
+        // A `null`/`undefined` receiver throws on the method lookup, before
+        // any argument runs: with side-effect-free arguments the generic call
+        // throws it (no path before it reads the receiver as an object).
+        let recv = if pure {
+            recv
+        } else {
+            nullish_check(recv, name)
         };
-        let plain = match obj {
-            Expr::Ident(id) => self.resolve(id.sym.as_ref()).and_then(|r| match r.kind {
-                AccessKind::Plain(local) => Some(local),
-                AccessKind::Cell(_) | AccessKind::Global(_) => None,
-            }),
+        // A plain local receiver is read in place unless an argument with
+        // side effects (which might reassign it) runs after it.
+        let in_place = match recv {
+            IrNode::Local(local) if pure => Some(local),
             _ => None,
         };
-        let (local, recv) = if let Some(local) = plain {
-            (local, IrNode::Local(local))
-        } else {
-            let tmp = self.fresh();
-            let recv = IrNode::Assign {
-                local: tmp,
-                value: Box::new(self.lower_expr(obj)?),
-            };
-            (tmp, recv)
-        };
-        let not_array = method_not_a_function(obj, method);
-        if self.shared.globals.intrinsics_sealed() {
-            let grow = match value {
-                Some(value) => IrNode::ArrayPush {
-                    local,
-                    value: Box::new(value),
-                    not_array: Some(not_array),
-                },
-                None => IrNode::ArrayPop { local, not_array },
-            };
-            return Ok(IrNode::Seq(vec![nullish_check(recv, method), grow]));
+        let recv_local = in_place.unwrap_or_else(|| self.fresh());
+        let mut seq = Vec::new();
+        if in_place.is_none() {
+            seq.push(IrNode::Assign {
+                local: recv_local,
+                value: Box::new(recv),
+            });
         }
-        // `Array.prototype` may be written: a user `push`/`pop` found on the
-        // receiver once its dirty bit is set wins (design 3.2 row 3). The
-        // argument is evaluated once, before the guard.
-        let mut seq = vec![nullish_check(recv, method)];
-        let (grow, args) = match value {
-            Some(value) => {
-                let tmp = self.fresh();
+        let args: Vec<IrNode> = args
+            .into_iter()
+            .map(|arg| {
+                if pure_arg(&arg) {
+                    return arg;
+                }
+                let local = self.fresh();
                 seq.push(IrNode::Assign {
-                    local: tmp,
-                    value: Box::new(value),
+                    local,
+                    value: Box::new(arg),
                 });
-                let push = IrNode::ArrayPush {
-                    local,
-                    value: Box::new(IrNode::Local(tmp)),
-                    not_array: Some(not_array.clone()),
-                };
-                (push, vec![IrNode::Local(tmp)])
-            }
-            None => (
-                IrNode::ArrayPop {
-                    local,
-                    not_array: not_array.clone(),
-                },
-                Vec::new(),
-            ),
+                IrNode::Local(local)
+            })
+            .collect();
+        let recv = || Box::new(IrNode::Local(recv_local));
+        let arg = |i: usize| args.get(i).cloned().map(Box::new);
+        let hof = |op| IrNode::ArrayHof {
+            op,
+            array: recv(),
+            callback: Box::new(args[0].clone()),
+            init: (op == ArrayHofOp::Reduce).then(|| arg(1)).flatten(),
+            this_arg: (op != ArrayHofOp::Reduce).then(|| arg(1)).flatten(),
         };
-        let user = IrNode::MethodCallUser {
-            obj: Box::new(IrNode::Local(local)),
-            key: Box::new(IrNode::Str(method.to_owned())),
-            args,
-            obj_local: self.fresh(),
-            not_callable: not_array,
+        let method = |op| IrNode::MethodCall {
+            op,
+            recv: recv(),
+            args: args[..args.len().min(1)].to_vec(),
         };
+        let array = match (name, args.len()) {
+            ("push", 1) => Some(IrNode::ArrayPush {
+                local: recv_local,
+                value: Box::new(args[0].clone()),
+            }),
+            ("pop", _) => Some(IrNode::ArrayPop { local: recv_local }),
+            ("map", 1..) => Some(hof(ArrayHofOp::Map)),
+            ("filter", 1..) => Some(hof(ArrayHofOp::Filter)),
+            ("forEach", 1..) => Some(hof(ArrayHofOp::ForEach)),
+            ("reduce", 1..) => Some(hof(ArrayHofOp::Reduce)),
+            ("indexOf", 0 | 1) => Some(method(MethodOp::IndexOf)),
+            ("includes", 0 | 1) => Some(method(MethodOp::Includes)),
+            ("join", _) => Some(method(MethodOp::Join)),
+            _ => None,
+        };
+        let mut fast: Vec<(ProtoKind, IrNode)> = array
+            .map(|path| (ProtoKind::Array, path))
+            .into_iter()
+            .collect();
+        fast.extend(receiver_fast_paths(name, recv_local, &args));
         seq.push(IrNode::ProtoGuard {
-            proto: BuiltinCtor::Array,
-            key: method.to_owned(),
-            recv: Box::new(IrNode::Local(local)),
-            fast: Box::new(grow),
-            user: Box::new(user),
+            sealed: self.shared.globals.intrinsics_sealed(),
+            recv: recv(),
+            key: name.to_owned(),
+            args,
+            fast,
+            not_callable: method_not_a_function(&member.obj, name),
         });
         Ok(IrNode::Seq(seq))
-    }
-
-    /// Lower a higher-order array method call `array.map/filter/reduce/forEach(...)`.
-    /// The receiver is lowered as a plain expression (evaluated once into a
-    /// scratch base at emit time — no rebinding), and the callback is a function
-    /// value invoked per element via the `call_indirect` ABI. `map`, `filter`,
-    /// and `forEach` take exactly one argument (the callback); `reduce` requires two
-    /// (the callback and the initial accumulator — a no-init `reduce` is rejected
-    /// rather than defaulting to the first element, out of scope). Arities are validated here.
-    fn lower_array_hof(
-        &mut self,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let array = Box::new(nullish_check(self.lower_expr(obj)?, method));
-        match method {
-            "reduce" => {
-                let [callback, init] = <[IrNode; 2]>::try_from(args).map_err(|args| {
-                    CompileError::spanned(
-                        obj.span(),
-                        format!(
-                            "reduce expects 2 arguments (callback, init), got {}",
-                            args.len()
-                        ),
-                    )
-                })?;
-                Ok(IrNode::ArrayHof {
-                    op: ArrayHofOp::Reduce,
-                    array,
-                    callback: Box::new(callback),
-                    init: Some(Box::new(init)),
-                })
-            }
-            "map" | "filter" | "forEach" => {
-                let [callback] = <[IrNode; 1]>::try_from(args).map_err(|args| {
-                    CompileError::spanned(
-                        obj.span(),
-                        format!("{method} expects 1 argument, got {}", args.len()),
-                    )
-                })?;
-                let op = match method {
-                    "map" => ArrayHofOp::Map,
-                    "filter" => ArrayHofOp::Filter,
-                    "forEach" => ArrayHofOp::ForEach,
-                    _ => unreachable!("outer match restricts the method"),
-                };
-                Ok(IrNode::ArrayHof {
-                    op,
-                    array,
-                    callback: Box::new(callback),
-                    init: None,
-                })
-            }
-            _ => unreachable!("caller restricts the method to map/filter/reduce/forEach"),
-        }
-    }
-
-    /// Lower a non-callback array/string method call
-    /// `recv.indexOf/includes/join/slice/toUpperCase/toLowerCase/charAt(args)`.
-    /// The receiver is lowered as a plain expression (evaluated once,
-    /// host-side); arities are validated here and the result is an
-    /// [`IrNode::MethodCall`] whose emit pads to two fixed argument slots. The
-    /// receiver's array-vs-string kind is unknown at compile time — the host
-    /// `__method` handler branches on its runtime TYPE BYTE for the overloaded
-    /// `indexOf`/`slice`.
-    fn lower_method_call(
-        &mut self,
-        op: MethodOp,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        // Per-method argument arity. `join`/`slice` have optional trailing args
-        // (defaulted host-side); the rest are fixed. At most two slots are ever
-        // passed to `__method`.
-        let ok = match op {
-            MethodOp::IndexOf
-            | MethodOp::Includes
-            | MethodOp::CharAt
-            | MethodOp::Repeat
-            | MethodOp::StartsWith
-            | MethodOp::EndsWith => args.len() == 1,
-            MethodOp::ToUpper
-            | MethodOp::ToLower
-            | MethodOp::Trim
-            | MethodOp::TrimStart
-            | MethodOp::TrimEnd => args.is_empty(),
-            MethodOp::Join | MethodOp::Split => args.len() <= 1,
-            MethodOp::Slice | MethodOp::PadStart | MethodOp::PadEnd | MethodOp::Substring => {
-                args.len() <= 2
-            }
-        };
-        if !ok {
-            return Err(CompileError::spanned(
-                obj.span(),
-                format!(
-                    "{method} received an unsupported number of arguments: {}",
-                    args.len()
-                ),
-            )
-            .into());
-        }
-        Ok(IrNode::MethodCall {
-            op,
-            recv: Box::new(nullish_check(self.lower_expr(obj)?, method)),
-            args,
-        })
-    }
-
-    /// Lower a `Map`/`Set` method call `recv.<op>(args)` into an
-    /// [`IrNode::MapMethod`]. The receiver is lowered once; two fresh temps
-    /// are allocated — one holding the receiver across the runtime TYPE-BYTE dispatch,
-    /// one for the user-method-call fallback's own receiver stash. No arity check is
-    /// enforced: the argument list is threaded verbatim to the fallback (which may be
-    /// a user method of any arity), and the collection path treats a missing key /
-    /// value argument as `undefined`, matching JS.
-    fn lower_map_method(
-        &mut self,
-        op: MapOp,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let recv = nullish_check(self.lower_expr(obj)?, method);
-        let recv_local = self.fresh();
-        let fallback_obj_local = self.fresh();
-        Ok(IrNode::MapMethod {
-            op,
-            recv: Box::new(recv),
-            args,
-            method_name: method.to_owned(),
-            recv_local,
-            fallback_obj_local,
-            not_callable: method_not_a_function(obj, method),
-        })
-    }
-
-    /// Lower a `Date` field method `recv.<method>(args)` into an
-    /// [`IrNode::DateMethod`]. Mirrors [`Self::lower_map_method`]: the receiver is
-    /// lowered once and two fresh temps are reserved for the runtime TYPE-BYTE
-    /// dispatch (the `TYPE_DATE` compute path and the user-method fallback).
-    fn lower_date_method(
-        &mut self,
-        op: DateOp,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let recv = nullish_check(self.lower_expr(obj)?, method);
-        let recv_local = self.fresh();
-        let fallback_obj_local = self.fresh();
-        Ok(IrNode::DateMethod {
-            op,
-            recv: Box::new(recv),
-            args,
-            method_name: method.to_owned(),
-            recv_local,
-            fallback_obj_local,
-            not_callable: method_not_a_function(obj, method),
-        })
     }
 
     /// Lower a user method call `obj.m(args)` / `obj[k](args)` into an
@@ -1394,18 +1192,6 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        // The statically-known method name, if any: `obj.m` and `obj["m"]` name
-        // `m`; a dynamic computed key `obj[k]` is unknown until runtime.
-        let name = member_method_name(member);
-        // Reaching this generic path means the name matched none of the
-        // built-in string/array/Map/Set methods. A receiver whose type is a
-        // statically-known PRIMITIVE (string/number/boolean literal) has no
-        // prototype methods yet (S5), so the call is rejected with a span
-        // diagnostic. An array literal reads the method from
-        // `%Array.prototype%` at run time.
-        if static_primitive_receiver(&member.obj) {
-            return Err(unknown_method_error(member.span(), name.as_deref()));
-        }
         let key = match &member.prop {
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
@@ -1934,46 +1720,40 @@ impl LowerCtx<'_> {
             && self.shared.globals.sealed(callee.sym.as_ref())
         {
             let name = callee.sym.as_ref();
-            // `new Map()` / `new Set()`: a fresh empty collection handle. Only
-            // the empty constructor is in scope — arguments (e.g.
-            // `new Map([[k, v]])`) are rejected.
-            if matches!(name, "Map" | "Set") {
-                let args = new_expr.args.as_deref().unwrap_or(&[]);
-                if !args.is_empty() {
-                    return Err(CompileError::spanned(
-                        callee.span(),
-                        format!(
-                            "new {name}(..) with constructor arguments is unsupported (only the \
-                             empty `new {name}()` is supported)"
-                        ),
-                    )
-                    .into());
-                }
+            let args = new_expr.args.as_deref().unwrap_or(&[]);
+            let spread = args.iter().any(|arg| arg.spread.is_some());
+            // `new Map()` / `new Set()`: a fresh empty collection handle; an
+            // iterable argument constructs through the builtin constructor.
+            if matches!(name, "Map" | "Set") && args.is_empty() {
                 return Ok(IrNode::MapNew { set: name == "Set" });
             }
             // `new Promise(executor)`: the executor form of the Promise constructor.
-            if name == "Promise" {
-                return self.lower_new_promise(callee.span, new_expr);
+            if name == "Promise"
+                && let [executor] = args
+                && executor.spread.is_none()
+            {
+                let executor = self.lower_expr(&executor.expr)?;
+                return Ok(IrNode::PromiseCtor {
+                    executor: Box::new(executor),
+                    p_local: self.fresh(),
+                });
             }
             // `new Date()` / `new Date(ms)`.
-            if name == "Date" {
-                return self.lower_new_date(callee.span, new_expr);
+            if name == "Date" && args.len() <= 1 && !spread {
+                return self.lower_new_date(args);
             }
-            if let Some(kind) = ErrorKind::from_name(name) {
-                let mut args = Vec::new();
-                for arg in new_expr.args.as_deref().unwrap_or(&[]) {
-                    if arg.spread.is_some() {
-                        return Err(CompileError::spanned(
-                            arg.span(),
-                            "spread arguments are unsupported",
-                        )
-                        .into());
-                    }
-                    args.push(self.lower_expr(&arg.expr)?);
+            if let Some(kind) = ErrorKind::from_name(name)
+                && !spread
+            {
+                let mut lowered = Vec::with_capacity(args.len());
+                for arg in args {
+                    lowered.push(self.lower_expr(&arg.expr)?);
                 }
-                return Ok(self.lower_error_construct(kind, args));
+                return Ok(self.lower_error_construct(kind, lowered));
             }
         }
+        // Every other form (any other arity, a spread) is the builtin
+        // constructor called through the general path.
         self.lower_construct(new_expr)
     }
 
@@ -2091,76 +1871,21 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower `new Date()` / `new Date(ms)` into an [`IrNode::DateNew`].
-    /// The no-argument form seeds the payload from the host clock (`ms: None`); a
-    /// single argument is coerced to a number (`Number(arg)`) so any operand stores
-    /// its numeric value. Two-or-more arguments (the calendar-field form) and a
-    /// spread argument are rejected — only the timestamp forms are in scope.
-    fn lower_new_date(
-        &mut self,
-        span: Span,
-        new_expr: &swc_ecma_ast::NewExpr,
-    ) -> anyhow::Result<IrNode> {
-        let args = new_expr.args.as_deref().unwrap_or(&[]);
-        match args {
-            [] => Ok(IrNode::DateNew { ms: None }),
-            [arg] => {
-                if arg.spread.is_some() {
-                    return Err(CompileError::spanned(
-                        arg.span(),
-                        "spread arguments are unsupported",
-                    )
-                    .into());
-                }
-                let ms = IrNode::ConvertCall {
-                    op: ConvertOp::ToNumber,
-                    arg: Box::new(self.lower_expr(&arg.expr)?),
-                    radix: None,
-                };
-                Ok(IrNode::DateNew {
-                    ms: Some(Box::new(ms)),
-                })
-            }
-            _ => Err(CompileError::spanned(
-                span,
-                "new Date(..) supports only new Date() or new Date(ms) (the \
-                 calendar-field constructor is unsupported)",
-            )
-            .into()),
-        }
-    }
-
-    /// Lower `new Promise(executor)` into an [`IrNode::PromiseCtor`]. The
-    /// single argument is the executor function (spread / wrong arity rejected); a
-    /// dedicated local is reserved to hold the fresh promise across the executor
-    /// call so the surrounding scratch cannot clobber it.
-    fn lower_new_promise(
-        &mut self,
-        span: Span,
-        new_expr: &swc_ecma_ast::NewExpr,
-    ) -> anyhow::Result<IrNode> {
-        let args = new_expr.args.as_deref().unwrap_or(&[]);
-        if args.len() != 1 {
-            return Err(CompileError::spanned(
-                span,
-                format!(
-                    "new Promise expects 1 argument (the executor), got {}",
-                    args.len()
-                ),
-            )
-            .into());
-        }
-        let arg = &args[0];
-        if arg.spread.is_some() {
-            return Err(
-                CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
-            );
-        }
-        let executor = self.lower_expr(&arg.expr)?;
-        let p_local = self.fresh();
-        Ok(IrNode::PromiseCtor {
-            executor: Box::new(executor),
-            p_local,
+    /// Lower `new Date()` / `new Date(ms)` (at most one non-spread argument)
+    /// into an [`IrNode::DateNew`]. The no-argument form seeds the payload from
+    /// the host clock (`ms: None`); a single argument is coerced to a number
+    /// (`Number(arg)`) so any operand stores its numeric value.
+    fn lower_new_date(&mut self, args: &[ExprOrSpread]) -> anyhow::Result<IrNode> {
+        let Some(arg) = args.first() else {
+            return Ok(IrNode::DateNew { ms: None });
+        };
+        let ms = IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            arg: Box::new(self.lower_expr(&arg.expr)?),
+            radix: None,
+        };
+        Ok(IrNode::DateNew {
+            ms: Some(Box::new(ms)),
         })
     }
 }
@@ -2239,6 +1964,23 @@ fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
     }
 }
 
+/// Whether a lowered call argument has no side effects (a literal, a local
+/// read or a function literal), so it can be evaluated in place by whichever
+/// path of a guarded call runs.
+fn pure_arg(arg: &IrNode) -> bool {
+    matches!(
+        arg,
+        IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::Local(_)
+            | IrNode::FuncValue { .. }
+            | IrNode::DeclFunc(_)
+    )
+}
+
 /// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a
 /// `null`/`undefined` receiver throws `Cannot read properties of .. (reading
 /// '<key>')` instead of reading through a bogus pointer.
@@ -2272,6 +2014,13 @@ fn source_name(expr: &Expr) -> Option<String> {
         Expr::This(_) => Some("this".to_owned()),
         Expr::Paren(p) => source_name(&p.expr),
         Expr::Member(member) => member_source_name(member),
+        // A primitive literal names itself: `"x".zzz is not a function`.
+        Expr::Lit(
+            Lit::Str(swc_ecma_ast::Str { raw: Some(raw), .. })
+            | Lit::Num(swc_ecma_ast::Number { raw: Some(raw), .. }),
+        ) => Some(raw.as_ref().to_owned()),
+        Expr::Lit(Lit::Bool(b)) => Some(b.value.to_string()),
+        Expr::Lit(Lit::Null(_)) => Some("null".to_owned()),
         _ => None,
     }
 }
@@ -2301,19 +2050,6 @@ fn method_not_a_function(obj: &Expr, method: &str) -> CalleeError {
     )
 }
 
-/// Whether the receiver's type is a statically-known primitive (string / number /
-/// boolean / template string). A `null` receiver is not
-/// listed: its method lookup throws a runtime `TypeError` instead. Such a receiver
-/// can never carry a user-defined method, so a method name that reached the
-/// generic user-method path (i.e. matched no built-in) is provably unknown.
-fn static_primitive_receiver(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(p) => static_primitive_receiver(&p.expr),
-        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_)) | Expr::Tpl(_) => true,
-        _ => false,
-    }
-}
-
 /// A plain-English description of an unsupported expression, used for the
 /// user-facing diagnostic message. Never renders the raw swc AST.
 fn unsupported_expr_msg(expr: &Expr) -> &'static str {
@@ -2328,34 +2064,13 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     }
 }
 
-/// Map a method name to its [`ReceiverOp`], or `None` when the name is not a
-/// promise / generator instance method. Recognized purely syntactically from a
-/// `<expr>.<name>(..)` member callee; the lowered node dispatches on the
-/// receiver's runtime TYPE BYTE and falls back to a user method call.
-/// Whether a spread call through the member callee `callee` (= `member`) hits
-/// a builtin dispatched by name with no user-method fallback (`console.log`,
-/// the `Object`/`JSON`/`Promise` statics, the array/string methods,
-/// `getTime`), which take no spread.
-fn spread_rejecting_member(callee: &Expr, member: &swc_ecma_ast::MemberExpr) -> bool {
-    is_console_log(callee)
-        || object_method_name(callee).is_some_and(|name| inline_member("Object", name))
-        || json_method_name(callee).is_some_and(|name| inline_member("JSON", name))
-        || promise_static_method_name(callee).is_some_and(|name| inline_member("Promise", name))
-        || matches!(&member.prop, MemberProp::Ident(id) if {
-            let name = id.sym.as_ref();
-            matches!(name, "push" | "pop" | "map" | "filter" | "reduce" | "forEach" | "getTime")
-                || non_callback_method_op(name).is_some()
-        })
-}
-
-fn receiver_method_op(name: &str) -> Option<ReceiverOp> {
-    Some(match name {
-        "then" => ReceiverOp::Then,
-        "catch" => ReceiverOp::Catch,
-        "finally" => ReceiverOp::Finally,
-        "next" => ReceiverOp::Next,
-        _ => return None,
-    })
+/// `seq` (evaluated for its effects) then `last`, the value.
+fn seq_then(mut seq: Vec<IrNode>, last: IrNode) -> IrNode {
+    if seq.is_empty() {
+        return last;
+    }
+    seq.push(last);
+    IrNode::Seq(seq)
 }
 
 /// The compile-time name of a static property key (`""` for a computed key):
