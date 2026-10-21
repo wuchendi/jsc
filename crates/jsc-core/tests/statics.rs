@@ -395,3 +395,78 @@ fn repeat_past_the_string_length_limit_is_a_range_error() {
     assert_string(&caught("const n = 2 ** 31; 'ab'.repeat(n)"), "RangeError");
     assert_number("'ab'.repeat(3).length", 6.0);
 }
+
+#[test]
+fn math_applies_to_number_to_every_argument() {
+    let prelude = "const v = (n) => ({ valueOf() { return n } });";
+    for (src, expected) in [
+        ("Math.floor(v(2.5))", 2.0),
+        ("Math.ceil('1.5')", 2.0),
+        ("Math.abs(v(-3))", 3.0),
+        ("Math.round(v(2.5))", 3.0),
+        ("Math.trunc(true)", 1.0),
+        ("Math.sqrt(v(16))", 4.0),
+        ("Math.pow(v(2), v(5))", 32.0),
+        ("Math.max(v(3), v(10))", 10.0),
+        ("Math.min(v(3), '1', 7)", 1.0),
+        ("Math.max('3', '10')", 10.0),
+        ("Math.max(null, -1)", 0.0),
+        (
+            "Math.min(v(4), v(2), v(8), v(6), v(5), v(9), v(7), v(3))",
+            2.0,
+        ),
+        ("Math.max(...['3', '10'])", 10.0),
+        ("Math.min(...[v(5), '2', 9])", 2.0),
+        ("Math.floor({ toString() { return '7.5' } })", 7.0),
+    ] {
+        for program in shapes("Math", src) {
+            assert_number(&format!("{prelude} {program}"), expected);
+        }
+    }
+    for src in [
+        "Math.max(1, undefined)",
+        "Math.floor('x')",
+        "Math.min({}, 1)",
+    ] {
+        for program in shapes("Math", src) {
+            assert_nan(&program);
+        }
+    }
+    // Past the uniform ABI's positional slots, through a value.
+    let many = (1..=20)
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_number(&format!("const m = Math.max; m({many})"), 20.0);
+    assert_number(
+        &format!("{prelude} const m = Math.min; m({many}, v(0))"),
+        0.0,
+    );
+}
+
+#[test]
+fn math_converts_after_evaluating_every_argument() {
+    // Every argument is evaluated before the first `ToNumber`, which then run
+    // left to right; a throwing `valueOf` stops the later conversions.
+    let prelude = "let s = ''; const v = (c) => ({ valueOf() { s += c; return 1 } }); const t = (c, x) => { s += c; return x };";
+    for src in [
+        "Math.max(v('a'), t('b', v('c'))); s",
+        "Math.min(t('b', v('a')), v('c')); s",
+    ] {
+        for program in shapes("Math", src) {
+            assert_string(&format!("{prelude} {program}"), "bac");
+        }
+    }
+    for program in shapes(
+        "Math",
+        "let r = ''; try { Math.max(v('a'), { valueOf() { throw new RangeError('x') } }, v('b')) } catch (e) { r = e.name } r + s",
+    ) {
+        assert_string(&format!("{prelude} {program}"), "RangeErrora");
+    }
+    for program in shapes(
+        "Math",
+        "let r = ''; for (let i = 0; i < 2; i++) { try { Math.min(...[v('a'), { valueOf() { throw new RangeError('x') } }]) } catch (e) { r += e.name } } r + s",
+    ) {
+        assert_string(&format!("{prelude} {program}"), "RangeErrorRangeErroraa");
+    }
+}

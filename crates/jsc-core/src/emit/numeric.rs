@@ -183,8 +183,11 @@ fn emit_to_int32(function: &mut Function, local: u32) {
 
 /// Emit a `Math.*` built-in call, leaving its number-jsval result on the stack.
 ///
-/// The unary ops unbox their single argument to `f64`, apply a native wasm op, and
-/// rebox. `Round` uses JS semantics `floor(x + 0.5)`. `Min`/`Max` fold the native
+/// Every argument is converted with `ToNumber` (a user `valueOf`/`toString`
+/// runs, and may throw); the conversion is emitted behind one `is_number` test
+/// and skipped for an argument that always yields a number. The unary ops then
+/// unbox their single argument to `f64`, apply a native wasm op, and rebox.
+/// `Round` uses JS semantics `floor(x + 0.5)`. `Min`/`Max` fold the native
 /// `f64.min`/`f64.max` (which propagate NaN and order `-0`/`+0` like JS) over the
 /// arguments starting from the identity (`+Infinity` for min, `-Infinity` for
 /// max), so the empty-args case yields the correct infinity. `Pow` delegates to
@@ -198,7 +201,7 @@ pub(super) fn emit_math_call(
     helpers: Helpers<'_>,
 ) {
     match op {
-        // Unary native-op methods: unbox → op → rebox.
+        // Unary native-op methods: ToNumber → unbox → op → rebox.
         MathOp::Floor
         | MathOp::Ceil
         | MathOp::Trunc
@@ -206,6 +209,11 @@ pub(super) fn emit_math_call(
         | MathOp::Sqrt
         | MathOp::Round => {
             emit_node(&args[0], function, scratch, strings, helpers);
+            if !yields_number(&args[0]) {
+                function.instruction(&Instruction::LocalSet(scratch));
+                emit_coerce_number(function, scratch, helpers);
+                function.instruction(&Instruction::LocalGet(scratch));
+            }
             function.instruction(&Instruction::F64ReinterpretI64);
             match op {
                 MathOp::Floor => function.instruction(&Instruction::F64Floor),
@@ -224,36 +232,138 @@ pub(super) fn emit_math_call(
             };
             emit_box_f64(function, helpers);
         }
-        // Variadic min/max: seed with the identity infinity, then fold the native
-        // pairwise op over each argument. `f64.min`/`f64.max` already match JS on
-        // NaN (propagates) and signed zero.
-        MathOp::Min | MathOp::Max => {
-            let identity = if matches!(op, MathOp::Min) {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            };
-            function.instruction(&Instruction::F64Const(Ieee64::from(identity)));
-            for arg in args {
-                emit_node(arg, function, scratch, strings, helpers);
-                function.instruction(&Instruction::F64ReinterpretI64);
-                if matches!(op, MathOp::Min) {
-                    function.instruction(&Instruction::F64Min);
-                } else {
-                    function.instruction(&Instruction::F64Max);
-                }
-            }
-            emit_box_f64(function, helpers);
-        }
+        MathOp::Min | MathOp::Max => emit_min_max(op, args, function, scratch, strings, helpers),
         MathOp::Pow => emit_pow(&args[0], &args[1], function, scratch, strings, helpers),
+    }
+}
+
+/// The first of the i64 slots variadic `Math.min`/`Math.max` stash evaluated
+/// arguments in before converting them: the `Date` field-method scratch
+/// (`+24`..`+29`), idle while only `__to_number` runs.
+const MIN_MAX_STASH: u32 = 24;
+
+/// The number of arguments [`MIN_MAX_STASH`] holds.
+const MIN_MAX_STASH_LEN: usize = 6;
+
+/// Emit variadic `Math.min`/`Math.max` (see [`emit_math_call`]).
+///
+/// Every argument is evaluated before the first `ToNumber`. When no argument
+/// after the first can observe or cause a side effect (literals and local
+/// reads), each is converted right after its evaluation and folded at once.
+/// Otherwise all are evaluated onto the stack and stashed, then converted and
+/// folded left to right; more arguments than the stash holds go through the
+/// spread fold over a fresh array.
+fn emit_min_max(
+    op: MathOp,
+    args: &[IrNode],
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let fold = if matches!(op, MathOp::Min) {
+        Instruction::F64Min
+    } else {
+        Instruction::F64Max
+    };
+    let identity = if matches!(op, MathOp::Min) {
+        f64::INFINITY
+    } else {
+        f64::NEG_INFINITY
+    };
+    let interleaved = args.iter().skip(1).all(is_inert);
+    if !interleaved && args.len() > MIN_MAX_STASH_LEN {
+        let items = args.iter().cloned().map(SpreadElem::Item).collect();
+        let spread = IrNode::ArraySpread(items);
+        emit_math_spread(op, &spread, function, scratch, strings, helpers);
+        return;
+    }
+    if !interleaved {
+        for arg in args {
+            emit_node(arg, function, scratch, strings, helpers);
+        }
+        for i in (0..args.len()).rev() {
+            function.instruction(&Instruction::LocalSet(stash_slot(scratch, i)));
+        }
+    }
+    function.instruction(&Instruction::F64Const(Ieee64::from(identity)));
+    for (i, arg) in args.iter().enumerate() {
+        let local = if interleaved {
+            emit_node(arg, function, scratch, strings, helpers);
+            if yields_number(arg) {
+                function.instruction(&Instruction::F64ReinterpretI64);
+                function.instruction(&fold);
+                continue;
+            }
+            function.instruction(&Instruction::LocalSet(scratch));
+            scratch
+        } else {
+            stash_slot(scratch, i)
+        };
+        if !yields_number(arg) {
+            emit_coerce_number(function, local, helpers);
+        }
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::F64ReinterpretI64);
+        function.instruction(&fold);
+    }
+    emit_box_f64(function, helpers);
+}
+
+/// The stash slot of variadic `Math.min`/`Math.max` argument `i`.
+fn stash_slot(scratch: u32, i: usize) -> u32 {
+    scratch + MIN_MAX_STASH + u32::try_from(i).unwrap_or(0)
+}
+
+/// Whether evaluating `node` neither has a side effect nor reads state a
+/// user `valueOf` could change: a primitive literal or a wasm-local read.
+fn is_inert(node: &IrNode) -> bool {
+    matches!(
+        node,
+        IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::Local(_)
+    )
+}
+
+/// Whether `node` always evaluates to a number jsval, so `ToNumber` of it is
+/// the identity.
+fn yields_number(node: &IrNode) -> bool {
+    match node {
+        IrNode::Num(_)
+        | IrNode::MathCall { .. }
+        | IrNode::MathSpread { .. }
+        | IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            ..
+        } => true,
+        IrNode::Binary { op, .. } => matches!(
+            op,
+            BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::UShr
+        ),
+        _ => false,
     }
 }
 
 /// Emit `Math.max(...)` / `Math.min(...)` with a spread argument, leaving
 /// a number jsval on the stack. The `args` node (an [`IrNode::ArraySpread`]) is
 /// materialized into a heap array; a counted loop then folds `f64.max`/`f64.min`
-/// over its elements from the identity infinity — matching the fixed-arity
-/// variadic path in [`emit_math_call`], but over a runtime-length array.
+/// over its elements' `ToNumber` from the identity infinity — matching the
+/// fixed-arity variadic path in [`emit_math_call`], but over a runtime-length
+/// array. Folding has no side effect, so converting each element as it is
+/// folded runs the conversions in argument order, after every argument.
 pub(super) fn emit_math_spread(
     op: MathOp,
     args: &IrNode,
@@ -297,19 +407,25 @@ pub(super) fn emit_math_spread(
     // Counted loop: `while (idx < len) { acc = op(acc, array[idx]); idx++ }`.
     function.instruction(&Instruction::Block(BlockType::Empty));
     function.instruction(&Instruction::Loop(BlockType::Empty));
+    enter_frame(helpers);
+    enter_frame(helpers);
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
-    // acc = op(acc, array[idx]).
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::F64ReinterpretI64);
+    // acc = op(acc, ToNumber(array[idx])). The element sits in `scratch`,
+    // idle once the array is built.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::LocalSet(scratch));
+    emit_coerce_number(function, scratch, helpers);
+    function.instruction(&Instruction::LocalGet(acc));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::F64ReinterpretI64);
     if is_min {
         function.instruction(&Instruction::F64Min);
@@ -324,6 +440,8 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(idx));
     function.instruction(&Instruction::Br(0));
+    leave_frame(helpers);
+    leave_frame(helpers);
     function.instruction(&Instruction::End); // loop
     function.instruction(&Instruction::End); // block
 

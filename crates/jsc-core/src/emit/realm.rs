@@ -246,6 +246,8 @@ pub(super) enum Builtin {
     BooleanValueOf,
     /// A `Date.prototype` method (`toString`, `getTime`, `valueOf`, ..).
     DateMethod(DateOp),
+    /// `Date.prototype.toJSON`.
+    DateToJson,
     /// A `%Map.prototype%` (`set == false`) / `%Set.prototype%` method with
     /// an inline body.
     CollectionOp {
@@ -372,7 +374,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 110] = [
+    pub(super) const ALL: [Builtin; 111] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -460,6 +462,7 @@ impl Builtin {
         Self::DateMethod(DateOp::GetMinutes),
         Self::DateMethod(DateOp::GetSeconds),
         Self::DateMethod(DateOp::ToIsoString),
+        Self::DateToJson,
         Self::CollectionOp {
             set: false,
             op: MapOp::Get,
@@ -527,6 +530,7 @@ impl Builtin {
                 "valueOf"
             }
             Self::DateMethod(op) => op.name(),
+            Self::DateToJson => "toJSON",
             Self::CollectionOp { op, .. } => op.name(),
             Self::CollectionSize { .. } => "get size",
             Self::PromiseThen => "then",
@@ -622,6 +626,7 @@ impl Builtin {
             | Self::NumberToString
             | Self::IsNaN
             | Self::IsFinite
+            | Self::DateToJson
             | Self::CollectionOp { .. }
             | Self::CollectionForEach { .. }
             | Self::PromiseCatch
@@ -651,7 +656,7 @@ impl Builtin {
             }
             Self::NumberToString | Self::NumberValueOf => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
-            Self::DateMethod(_) => Some(BuiltinCtor::Date),
+            Self::DateMethod(_) | Self::DateToJson => Some(BuiltinCtor::Date),
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
                 Some(collection(set))
             }

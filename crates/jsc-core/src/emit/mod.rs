@@ -624,27 +624,21 @@ const NULL_BITS: i64 = abi::NULL.cast_signed();
 /// The literal token strings the in-wasm `JSON.stringify` serializer concatenates:
 /// the three literal keywords plus the structural punctuation. They are
 /// interned like any static string (seeded into the string table when a program
-/// contains a `JsonStringify` node, see `collect_node`) so the `__json_str` helper
-/// can splice their `[len][utf8]` blocks with `__concat`. The layout mirrors
-/// [`JsonTokens`], which resolves each to its compile-time byte offset.
+/// contains a `JsonStringify` node, see `collect_node`) so `__json_rep` can
+/// splice their `[len][utf8]` blocks with `__concat`; [`JsonTokens`] resolves
+/// the keywords `__json_str` returns to their compile-time byte offsets.
 const JSON_TOKEN_STRS: [&str; 9] = ["null", "true", "false", "[", "]", "{", "}", ",", ":"];
 
-/// The compile-time byte offsets of the [`JSON_TOKEN_STRS`] blocks in linear
-/// memory, baked into the `__json_str` serializer so it can splice each
-/// token with `__concat`. Resolved from the string-offset map; a missing token
-/// (only possible when the program has no `JsonStringify` node, so `__json_str` is
-/// dead code) falls back to [`HEAP_BASE`] to keep the emitted helper valid.
+/// The compile-time byte offsets of the keyword [`JSON_TOKEN_STRS`] blocks in
+/// linear memory, baked into the `__json_str` serializer. Resolved from the
+/// string-offset map; a missing token (only possible when the program has no
+/// `JsonStringify` node, so `__json_str` is dead code) falls back to
+/// [`HEAP_BASE`] to keep the emitted helper valid.
 #[derive(Clone, Copy)]
 struct JsonTokens {
     null: i32,
     true_ptr: i32,
     false_ptr: i32,
-    lbrack: i32,
-    rbrack: i32,
-    lbrace: i32,
-    rbrace: i32,
-    comma: i32,
-    colon: i32,
 }
 
 impl JsonTokens {
@@ -654,12 +648,6 @@ impl JsonTokens {
             null: at("null"),
             true_ptr: at("true"),
             false_ptr: at("false"),
-            lbrack: at("["),
-            rbrack: at("]"),
-            lbrace: at("{"),
-            rbrace: at("}"),
-            comma: at(","),
-            colon: at(":"),
         }
     }
 }
@@ -1005,7 +993,7 @@ impl Helpers<'_> {
         self.to_primitive() + 5
     }
 
-    /// `__json_rep(holder, key, value, replacer, list) -> i64` (see
+    /// `__json_rep(holder, key, value, replacer, list, stack) -> i64` (see
     /// [`builtins::emit_json_rep`]), right after `__to_object`.
     fn json_rep(self) -> u32 {
         self.to_primitive() + 6
@@ -1397,11 +1385,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_sparse_set(helpers));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
-        helpers.json_str,
-        helpers.concat,
         helpers.convert,
         helpers.json_escape,
-        (helpers.own_keys, helpers.get, helpers.sparse_get()),
         JsonTokens::resolve(&offsets),
     ));
     code.function(&emit_same_value_zero(helpers.str_eq));
