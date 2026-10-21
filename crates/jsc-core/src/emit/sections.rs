@@ -798,6 +798,8 @@ pub(super) fn collect_node<'a>(
         // A generator `yield e` / `IsGenerator` carries only its operand.
         | IrNode::Yield(operand)
         | IrNode::IsGenerator(operand)
+        | IrNode::IterSource { value: operand, .. }
+        | IrNode::IterLen(operand)
         | IrNode::ObjectBuiltin { arg: operand, .. } => {
             collect_node(operand, order, seen);
         }
@@ -989,7 +991,11 @@ pub(super) fn collect_node<'a>(
             collect_node(source, order, seen);
             collect_node(exclude, order, seen);
         }
-        IrNode::Index { obj, index } => {
+        IrNode::Index { obj, index }
+        | IrNode::IterItem {
+            iterable: obj,
+            index,
+        } => {
             seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(index, order, seen);

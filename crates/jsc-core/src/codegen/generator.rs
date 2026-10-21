@@ -274,16 +274,24 @@ impl LowerCtx<'_> {
             label: None,
         });
 
-        // Array/string: while ($i < $it.length) { yield $it[$i]; $i = $i + 1; }
+        // Anything else: $it = GetIterator($it) (array, string, live Map/Set,
+        // or a TypeError); while ($i < IterLen($it)) { yield IterItem($it, $i); $i++ }
+        index_body.push(IrStmt::Expr(Self::write_of(
+            source.clone(),
+            IrNode::IterSource {
+                value: Box::new(read(&source)),
+                live: true,
+            },
+        )));
         index_body.push(IrStmt::While {
             cond: IrNode::Binary {
                 op: BinOp::Lt,
                 lhs: Box::new(read(&cursor)),
-                rhs: Box::new(IrNode::StrLen(Box::new(read(&source)))),
+                rhs: Box::new(IrNode::IterLen(Box::new(read(&source)))),
             },
             body: vec![
-                IrStmt::Expr(IrNode::Yield(Box::new(IrNode::Index {
-                    obj: Box::new(read(&source)),
+                IrStmt::Expr(IrNode::Yield(Box::new(IrNode::IterItem {
+                    iterable: Box::new(read(&source)),
                     index: Box::new(read(&cursor)),
                 }))),
                 IrStmt::Expr(Self::write_of(
@@ -299,26 +307,10 @@ impl LowerCtx<'_> {
             label: None,
         });
 
-        let is_indexable = IrNode::Logical {
-            op: LogicalOp::Or,
-            lhs: Box::new(IrNode::InstanceOf {
-                value: Box::new(read(&source)),
-                kind: InstanceOfKind::Array,
-            }),
-            rhs: Box::new(IrNode::Binary {
-                op: BinOp::Eq,
-                lhs: Box::new(IrNode::TypeOf(Box::new(read(&source)))),
-                rhs: Box::new(IrNode::Str("string".to_owned())),
-            }),
-        };
         out.push(IrStmt::If {
             cond: IrNode::IsGenerator(Box::new(read(&source))),
             then_body: gen_body,
-            else_body: vec![IrStmt::If {
-                cond: is_indexable,
-                then_body: index_body,
-                else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(not_iterable_error())))],
-            }],
+            else_body: index_body,
         });
         Ok(())
     }
@@ -1409,14 +1401,4 @@ fn stmt_contains_return(stmt: &IrStmt) -> bool {
 /// child position (see [`IrNode::any_child`]).
 fn node_contains_yield(node: &IrNode) -> bool {
     matches!(node, IrNode::Yield(_)) || node.any_child(node_contains_yield)
-}
-
-/// The `TypeError` a `yield*` over a non-iterable operand throws.
-fn not_iterable_error() -> IrNode {
-    let message = "yield* operand is not iterable";
-    IrNode::error_object(
-        ErrorKind::TypeError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(format!("TypeError: {message}")),
-    )
 }

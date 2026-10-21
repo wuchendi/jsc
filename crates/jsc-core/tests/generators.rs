@@ -859,7 +859,7 @@ fn for_of_over_a_delegating_generator() {
 fn yield_delegate_over_a_non_iterable_throws_a_type_error() {
     assert_uncaught(
         "function* g(){ yield* 5 } [...g()]",
-        "TypeError: yield* operand is not iterable",
+        "TypeError: number 5 is not iterable",
     );
 }
 

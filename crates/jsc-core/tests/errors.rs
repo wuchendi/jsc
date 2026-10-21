@@ -3,9 +3,7 @@
 
 use jsc_core::run::compile_and_run_capturing;
 mod common;
-use common::{
-    assert_bool, assert_number, assert_output, assert_rejected, assert_str, assert_uncaught,
-};
+use common::{assert_bool, assert_number, assert_output, assert_str, assert_uncaught};
 
 // --- uncaught throw ---------------------------------------------------------
 
@@ -512,13 +510,32 @@ fn instanceof_any_rhs() {
     assert_bool("class X {} let Object = X; ({}) instanceof Object", false);
 }
 
-/// The `Date` builtin accepts only the timestamp constructor forms; the
-/// calendar-field constructor and a spread argument are rejected at compile
-/// time (`Date.now` and the `Date.prototype` methods take any arguments).
+/// The calendar-field `Date` constructor is a run-time `TypeError`; a spread
+/// argument constructs through the builtin constructor.
 #[test]
-fn date_unsupported_forms_rejected() {
-    assert_rejected("new Date(2024, 0, 1)");
-    assert_rejected("new Date(...[0])");
+fn date_calendar_field_form_throws_at_run_time() {
+    assert_uncaught(
+        "new Date(2024, 0, 1)",
+        "TypeError: the Date calendar-field constructor is not supported",
+    );
+    assert_number("new Date(...[7]).getTime()", 7.0);
+}
+
+/// `new Promise` / `new Error` with any arity or a spread argument construct
+/// through the builtin constructor (no compile-time arity diagnostics).
+#[test]
+fn builtin_constructors_take_any_arity() {
+    assert_bool(
+        "let r = false; try { new Promise() } catch (e) { r = e instanceof TypeError } r",
+        true,
+    );
+    assert_output(
+        "new Promise((res) => res(1), 2).then((v) => console.log(v)); \
+         new Promise(...[(res) => res(3)]).then((v) => console.log(v))",
+        "1\n3\n",
+    );
+    assert_str("new Error(...['m']).message", "m");
+    assert_str("new TypeError('a', {}, 3).message", "a");
 }
 
 /// A thrown `TypeError` is caught and both its `.name` and `.message` are

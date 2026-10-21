@@ -135,10 +135,11 @@ fn concat(a: IrNode, b: IrNode) -> IrNode {
     }
 }
 
-/// The `TypeError` for a constructor argument in `local` that is not
-/// iterable: `object is not iterable`, or `<type> <value> is not iterable`
-/// for a primitive.
-fn not_iterable(local: u32) -> IrNode {
+/// The `TypeError` for an iterated value in `local` that is not iterable:
+/// `object is not iterable` (`function is not iterable`), `null is not
+/// iterable` / `undefined is not iterable`, or `<type> <value> is not
+/// iterable` for another primitive.
+pub(super) fn not_iterable(local: u32) -> IrNode {
     let kind = IrNode::TypeOf(Box::new(IrNode::Local(local)));
     let primitive = concat(
         concat(
@@ -147,10 +148,22 @@ fn not_iterable(local: u32) -> IrNode {
         ),
         IrNode::Str(" is not iterable".to_owned()),
     );
+    let nullish = IrNode::Binary {
+        op: BinOp::LooseEq,
+        lhs: Box::new(IrNode::Local(local)),
+        rhs: Box::new(IrNode::Null),
+    };
     let message = IrNode::Ternary {
         cond: Box::new(IrNode::IsObject(Box::new(IrNode::Local(local)))),
         then_branch: Box::new(concat(kind, IrNode::Str(" is not iterable".to_owned()))),
-        else_branch: Box::new(primitive),
+        else_branch: Box::new(IrNode::Ternary {
+            cond: Box::new(nullish),
+            then_branch: Box::new(concat(
+                IrNode::Local(local),
+                IrNode::Str(" is not iterable".to_owned()),
+            )),
+            else_branch: Box::new(primitive),
+        }),
     };
     throw_message(message, local)
 }
@@ -207,7 +220,7 @@ fn this_collection(
 
 /// Push the live entry count (`2 · size` slots) of the backing array of the
 /// handle in `handle`.
-fn entries_len(function: &mut Function, handle: u32) {
+pub(super) fn entries_len(function: &mut Function, handle: u32) {
     wasm!(function;
         LocalGet(handle), I32WrapI64,
         I64Load(MemArg { offset: MAP_ENTRIES_OFFSET, align: 3, memory_index: 0 }), I32WrapI64,
@@ -217,7 +230,14 @@ fn entries_len(function: &mut Function, handle: u32) {
 
 /// Load the key and value of the backing slot pair at i32 index `i` of the
 /// handle in `handle` into `key` / `value` (`at` an i32 temp).
-fn load_entry(function: &mut Function, handle: u32, i: u32, at: u32, key: u32, value: u32) {
+pub(super) fn load_entry(
+    function: &mut Function,
+    handle: u32,
+    i: u32,
+    at: u32,
+    key: u32,
+    value: u32,
+) {
     wasm!(function;
         LocalGet(handle), I32WrapI64,
         I64Load(MemArg { offset: MAP_ENTRIES_OFFSET, align: 3, memory_index: 0 }), I32WrapI64,

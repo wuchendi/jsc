@@ -26,6 +26,7 @@ mod error;
 mod function;
 mod generator;
 mod global;
+mod iter;
 mod json;
 mod map_set;
 mod namespace;
@@ -192,6 +193,7 @@ pub(super) fn emit_builtin(
         Builtin::BooleanToString => number::emit_boolean(false, &mut f, frame, strings, helpers),
         Builtin::BooleanValueOf => number::emit_boolean(true, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
+        Builtin::IterSource => iter::emit_iter_source(&mut f, frame, strings, helpers),
         Builtin::DateMethod(op) => date::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::DateToJson => date::emit_to_json(&mut f, frame, strings, helpers),
         Builtin::CollectionOp { set, op } => {

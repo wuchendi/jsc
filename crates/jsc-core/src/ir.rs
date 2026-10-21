@@ -843,6 +843,32 @@ pub enum IrNode {
     /// boolean jsval. Used by `for-of`/spread to branch between driving a
     /// generator via `.next()` and the ordinary array/string index walk.
     IsGenerator(Box<IrNode>),
+    /// `GetIterator` of a non-generator iteration source (for-of, `yield*`,
+    /// spread, array destructuring), as a value [`IrNode::IterLen`] /
+    /// [`IrNode::IterItem`] walk by index: an array or string is itself, a
+    /// `String` wrapper its string, an `arguments` object and (when not `live`)
+    /// a generator a fresh array of its values, a `Map` / `Set` itself when
+    /// `live` and otherwise a fresh array of its `[key, value]` entries /
+    /// values. Anything else throws `<x> is not iterable`.
+    IterSource {
+        /// The iterated value.
+        value: Box<IrNode>,
+        /// Whether a `Map` / `Set` is walked live (for-of, `yield*`).
+        live: bool,
+    },
+    /// The current length of an [`IrNode::IterSource`] value: its `length`,
+    /// or the entry count of a `Map` / `Set` (re-read per step, so entries
+    /// added during the walk are visited).
+    IterLen(Box<IrNode>),
+    /// Element `index` of an [`IrNode::IterSource`] value: `iterable[index]`,
+    /// or the `index`-th entry of a `Map` (a fresh `[key, value]` array) /
+    /// `Set` (the value).
+    IterItem {
+        /// The iteration source.
+        iterable: Box<IrNode>,
+        /// The element index (a number jsval).
+        index: Box<IrNode>,
+    },
     /// Drive a generator one step — `gen.next(sent)`. Evaluate `gen` to
     /// a handle, `call_indirect` its state machine with `(sent, gen)`, then build
     /// the `{ value, done }` result object from the returned value and the
@@ -1893,6 +1919,8 @@ impl IrNode {
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::IsGenerator(inner)
+            | IrNode::IterSource { value: inner, .. }
+            | IrNode::IterLen(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
             | IrNode::NullishCheck { value: inner, .. }
@@ -1931,6 +1959,10 @@ impl IrNode {
                 exclude: b,
             }
             | IrNode::Index { obj: a, index: b }
+            | IrNode::IterItem {
+                iterable: a,
+                index: b,
+            }
             | IrNode::MakeAccessor {
                 getter: a,
                 setter: b,
@@ -2072,6 +2104,8 @@ impl IrNode {
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::IsGenerator(inner)
+            | IrNode::IterSource { value: inner, .. }
+            | IrNode::IterLen(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
             | IrNode::NullishCheck { value: inner, .. }
@@ -2109,6 +2143,10 @@ impl IrNode {
                 exclude: b,
             }
             | IrNode::Index { obj: a, index: b }
+            | IrNode::IterItem {
+                iterable: a,
+                index: b,
+            }
             | IrNode::MakeAccessor {
                 getter: a,
                 setter: b,

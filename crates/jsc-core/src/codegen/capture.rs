@@ -92,10 +92,10 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
 }
 
 /// Collect every identifier a (possibly destructuring) binding pattern binds.
-fn pat_names(pat: &Pat, names: &mut std::collections::HashSet<String>) {
+pub(super) fn pat_names(pat: &Pat, names: &mut impl Extend<String>) {
     match pat {
         Pat::Ident(ident) => {
-            names.insert(ident.id.sym.as_ref().to_owned());
+            names.extend([ident.id.sym.as_ref().to_owned()]);
         }
         Pat::Array(arr) => {
             for elem in arr.elems.iter().flatten() {
@@ -107,7 +107,7 @@ fn pat_names(pat: &Pat, names: &mut std::collections::HashSet<String>) {
                 match prop {
                     ObjectPatProp::KeyValue(kv) => pat_names(&kv.value, names),
                     ObjectPatProp::Assign(assign) => {
-                        names.insert(assign.key.id.sym.as_ref().to_owned());
+                        names.extend([assign.key.id.sym.as_ref().to_owned()]);
                     }
                     ObjectPatProp::Rest(rest) => pat_names(&rest.arg, names),
                 }
@@ -462,9 +462,8 @@ impl CaptureResolver {
         self.expr(right);
         if let ForHead::VarDecl(v) = left
             && let [declarator] = v.decls.as_slice()
-            && let Pat::Ident(ident) = &declarator.name
         {
-            self.declare(ident.id.sym.as_ref(), binding_id(ident));
+            self.declare_pat(&declarator.name);
         } else if let ForHead::Pat(pat) = left {
             self.mark_pat(pat);
         }
