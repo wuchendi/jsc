@@ -77,7 +77,7 @@ fn object_to_string_tags() {
 #[test]
 fn value_of_returns_receiver() {
     assert_bool("const o = {}; o.valueOf() === o", true);
-    assert_number("({}).valueOf.call(7)", 7.0);
+    assert_eval("({}).valueOf.call(7)", "[Number: 7]");
     assert_uncaught(
         "({}).valueOf.call(null)",
         "TypeError: Cannot convert undefined or null to object",

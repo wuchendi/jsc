@@ -31,6 +31,7 @@ import {
   METHOD_OP_ENDS_WITH,
   METHOD_OP_INCLUDES,
   METHOD_OP_INDEX_OF,
+  METHOD_OP_NUMBER_TO_STRING,
   METHOD_OP_PAD_END,
   METHOD_OP_PAD_START,
   METHOD_OP_REPEAT,
@@ -346,14 +347,21 @@ export function createShim(): Shim {
     return base === null ? null : HEAP | base
   }
 
-  /** `string.split(sep)` — NEW array of substrings (mirrors `string_split`). */
+  /** `string.split(sep, limit)` — NEW array of substrings (mirrors `string_split`). */
   function stringSplit(
     mem: Uint8Array,
     ptr: number,
     sepBits: bigint,
+    limitBits: bigint,
   ): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
+    const limitValue = decode(limitBits, mem)
+    // `ToUint32(limit)`; `undefined` is no limit.
+    const limit =
+      limitValue.kind === 'undefined'
+        ? Infinity
+        : valueToNumber(limitValue) >>> 0
     const sepValue = decode(sepBits, mem)
     let pieces: Uint8Array[]
     if (sepValue.kind === 'undefined') {
@@ -370,7 +378,7 @@ export function createShim(): Shim {
     // Allocate each piece as a heap string first (the pieces are independent
     // views/copies), then build the backing array from their bits.
     const elems: bigint[] = []
-    for (const piece of pieces) {
+    for (const piece of pieces.slice(0, limit)) {
       const base = allocString(utf8Decode(piece))
       if (base === null) return null
       elems.push(HEAP | base)
@@ -399,17 +407,24 @@ export function createShim(): Shim {
       case METHOD_OP_INDEX_OF:
         if (ptr !== null && typeByte === TYPE_ARRAY)
           return arrayIndexOf(mem, ptr, arg0)
-        if (ptr !== null && typeByte === TYPE_STRING)
-          return stringIndexOf(mem, ptr, arg0)
+        if (ptr !== null && typeByte === TYPE_STRING) {
+          const hay = stringBytes(mem, ptr)
+          if (hay === null) return null
+          const from = substringIndex(arg1, mem, 0, hay.length)
+          return stringIndexOf(hay, argBytes(arg0, mem), from)
+        }
         return null
       case METHOD_OP_INCLUDES:
         if (ptr !== null && typeByte === TYPE_ARRAY)
           return arrayIncludes(mem, ptr, arg0) ? TRUE : FALSE
-        // `str.includes(sub)` — substring containment (an empty `sub` => true).
+        // `str.includes(sub, from)` — substring containment from `from`.
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
           if (hay === null) return null
-          return byteContains(hay, argBytes(arg0, mem)) ? TRUE : FALSE
+          const from = substringIndex(arg1, mem, 0, hay.length)
+          return stringIndexOf(hay, argBytes(arg0, mem), from) !== f64ToBits(-1)
+            ? TRUE
+            : FALSE
         }
         return null
       case METHOD_OP_SLICE:
@@ -456,8 +471,17 @@ export function createShim(): Shim {
         const needle = argBytes(arg0, mem)
         const hit =
           op === METHOD_OP_STARTS_WITH
-            ? startsWithBytes(hay, needle)
-            : endsWithBytes(hay, needle)
+            ? startsWithBytes(
+                hay.subarray(substringIndex(arg1, mem, 0, hay.length)),
+                needle,
+              )
+            : endsWithBytes(
+                hay.subarray(
+                  0,
+                  substringIndex(arg1, mem, hay.length, hay.length),
+                ),
+                needle,
+              )
         return hit ? TRUE : FALSE
       }
       case METHOD_OP_PAD_START:
@@ -469,7 +493,14 @@ export function createShim(): Shim {
         return stringSubstring(mem, ptr, arg0, arg1)
       case METHOD_OP_SPLIT:
         if (ptr === null || typeByte !== TYPE_STRING) return null
-        return stringSplit(mem, ptr, arg0)
+        return stringSplit(mem, ptr, arg0, arg1)
+      case METHOD_OP_NUMBER_TO_STRING: {
+        const value = decode(recv, mem)
+        if (value.kind !== 'number') return null
+        const radix = Math.trunc(valueToNumber(decode(arg0, mem)))
+        const base = allocString(value.value.toString(radix))
+        return base === null ? null : HEAP | base
+      }
       default:
         return null
     }
@@ -973,15 +1004,17 @@ function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
   return f64ToBits(-1)
 }
 
-/** `string.indexOf(sub)`: first BYTE index where `sub` occurs (empty => 0), or `-1`. */
-function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
-  const hay = stringBytes(mem, ptr)
-  if (hay === null) return f64ToBits(-1)
-  const subValue = decode(sub, mem)
-  if (subValue.kind !== 'string') return f64ToBits(-1)
-  const needle = utf8Encode.encode(subValue.value)
-  if (needle.length === 0) return indexBits(0)
-  for (let i = 0; i + needle.length <= hay.length; i++) {
+/**
+ * `string.indexOf(sub, from)` (mirrors `host.rs::string_index_of`): the first
+ * BYTE index at or after `from` where `sub` occurs (empty => `from`), or `-1`.
+ */
+function stringIndexOf(
+  hay: Uint8Array,
+  needle: Uint8Array,
+  from: number,
+): bigint {
+  if (needle.length === 0) return indexBits(from)
+  for (let i = from; i + needle.length <= hay.length; i++) {
     let match = true
     for (let k = 0; k < needle.length; k++) {
       if (hay[i + k] !== needle[k]) {
@@ -1024,22 +1057,6 @@ function isAsciiWhitespace(b: number): boolean {
  */
 function argBytes(bits: bigint, mem: Uint8Array): Uint8Array {
   return utf8Encode.encode(toJsString(decode(bits, mem)))
-}
-
-/** Whether `hay` contains the contiguous `needle` (empty => true; mirrors `byte_contains`). */
-function byteContains(hay: Uint8Array, needle: Uint8Array): boolean {
-  if (needle.length === 0) return true
-  for (let i = 0; i + needle.length <= hay.length; i++) {
-    let match = true
-    for (let k = 0; k < needle.length; k++) {
-      if (hay[i + k] !== needle[k]) {
-        match = false
-        break
-      }
-    }
-    if (match) return true
-  }
-  return false
 }
 
 /** Whether `hay` begins with `needle`. */
@@ -1098,7 +1115,7 @@ function padBytes(
 }
 
 /**
- * Resolve one `substring` endpoint against a BYTE `len` (mirrors
+ * Resolve one `substring` endpoint (or a search position) against a BYTE `len` (mirrors
  * `host.rs::substring_index`): `undefined` uses `fallback`, otherwise the
  * argument is truncated and clamped to `0..=len` (no negative-from-end offset).
  */

@@ -314,26 +314,22 @@ fn object_keys_list_only_own_fields() {
 }
 
 /// `Object` is a syntactic built-in gated on `resolve("Object") == None`, so
-/// a user binding shadows it; a wrong arity is rejected.
+/// a user binding shadows it; a missing argument is the run-time `ToObject`
+/// `TypeError` (exit 1), not a compile error.
 #[test]
-fn object_builtin_shadowing_and_rejections() {
+fn object_builtin_shadowing_and_missing_argument() {
     use std::process::Command;
     // A user `let Object = ..` shadows the built-in (no method dispatch).
     assert_eq!(jsc(&["-p", "let Object=5; Object"]), "5");
-    // Run `jsc` expecting compile-error exit 2 and return its stderr for inspection.
-    let jsc_stderr = |src: &str| {
-        let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-            .args(["-e", src])
-            .output()
-            .expect("failed to spawn jsc binary");
-        assert!(
-            output.status.code() == Some(2),
-            "expected {src:?} to fail to compile"
-        );
-        String::from_utf8_lossy(&output.stderr).into_owned()
-    };
-    // A wrong argument count is a spanned compile error.
-    assert!(jsc_stderr("Object.keys()").contains("expects 1 argument"));
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "Object.keys()"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("TypeError: Cannot convert undefined or null to object")
+    );
 }
 
 /// The `key in obj` operator is a membership test over the own keys and the

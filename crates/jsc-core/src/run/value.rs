@@ -50,6 +50,16 @@ pub enum Value {
         /// The own enumerable properties, as in [`Value::Object`].
         entries: Vec<(String, Value)>,
     },
+    /// A Boolean/Number/String wrapper object (a `TYPE_OBJECT` of class
+    /// `BOOLEAN`/`NUMBER`/`STRING`): its `[[PrimitiveValue]]` and its own
+    /// enumerable properties (a String wrapper's indices left out). Renders
+    /// Node-style as `[String: 'abc']`, then `{ x: 1 }` when it has properties.
+    Wrapper {
+        /// The wrapped primitive.
+        primitive: Box<Value>,
+        /// The own enumerable properties, as in [`Value::Object`].
+        entries: Vec<(String, Value)>,
+    },
     /// An `arguments` object (a `TYPE_OBJECT` of class `ARGUMENTS`): its own
     /// enumerable properties, as in [`Value::Object`]. Renders Node-style as
     /// `[Arguments] { '0': 1 }`.
@@ -483,9 +493,22 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
             message: field("message").unwrap_or_default(),
         };
     }
-    let entries = decode_props(ptr, memory, guard);
-    if memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize) == Some(&abi::CLASS_ARGUMENTS) {
+    let mut entries = decode_props(ptr, memory, guard);
+    let class_byte = memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize).copied();
+    if class_byte == Some(abi::CLASS_ARGUMENTS) {
         return Value::Arguments(entries);
+    }
+    if let Some(abi::CLASS_BOOLEAN | abi::CLASS_NUMBER | abi::CLASS_STRING) = class_byte {
+        let primitive = read_u64(memory, ptr + abi::WRAPPER_VALUE_OFFSET as usize)
+            .map_or(Value::Undefined, |bits| decode_in(bits, memory, guard));
+        if let Value::Str(text) = &primitive {
+            let len = text.len();
+            entries.retain(|(key, _)| key.parse::<usize>().map_or(true, |i| i >= len));
+        }
+        return Value::Wrapper {
+            primitive: Box::new(primitive),
+            entries,
+        };
     }
     let class = read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize)
         .and_then(|bits| heap_object(bits, memory))
@@ -723,6 +746,8 @@ pub fn format_value(value: &Value) -> String {
         Value::Object(entries) => format_entries(entries),
         // A class instance is prefixed with its constructor's name.
         Value::Instance { class, entries } => format!("{class} {}", format_entries(entries)),
+        // A wrapper names its kind and quotes a wrapped string, as Node does.
+        Value::Wrapper { primitive, entries } => format_wrapper(primitive, entries),
         // An `arguments` object quotes its (index) keys, as Node does.
         Value::Arguments(entries) => {
             let quoted: Vec<(String, Value)> = entries
@@ -795,6 +820,22 @@ pub fn format_value(value: &Value) -> String {
     }
 }
 
+/// Render a wrapper object Node-console style: `[String: 'abc']`,
+/// `[Number: -0]`, `[Boolean: true]`, then its own properties when it has any.
+fn format_wrapper(primitive: &Value, entries: &[(String, Value)]) -> String {
+    let head = match primitive {
+        Value::Str(text) => format!("[String: '{text}']"),
+        Value::Number(n) if *n == 0.0 && n.is_sign_negative() => "[Number: -0]".to_owned(),
+        Value::Number(n) => format!("[Number: {}]", format_number(*n)),
+        other => format!("[Boolean: {}]", format_value(other)),
+    };
+    if entries.is_empty() {
+        head
+    } else {
+        format!("{head} {}", format_entries(entries))
+    }
+}
+
 /// `Array.prototype.join` over decoded array elements: each element's
 /// `ToString` (`null`/`undefined` elements, holes, and cycle back-references
 /// are empty) separated by `sep`; a run of `N` holes contributes `N` empty
@@ -837,6 +878,7 @@ pub fn to_js_string(value: &Value) -> String {
         Value::Array(elems, _) => join_elements(elems, ","),
         Value::Object(_) | Value::Instance { .. } => "[object Object]".to_owned(),
         Value::Arguments(_) => "[object Arguments]".to_owned(),
+        Value::Wrapper { primitive, .. } => to_js_string(primitive),
         Value::Error { name, message } => match (name.is_empty(), message.is_empty()) {
             (_, true) => name.clone(),
             (true, false) => message.clone(),

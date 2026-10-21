@@ -66,6 +66,44 @@ use crate::ir::{GenSegment, GenTerm};
 
 use super::capture::binding_id;
 
+/// The resume `limits` bits of a generator body (see
+/// [`crate::abi::GEN_LIMIT_RETURN`]): a `return()` at a suspended `yield` must
+/// run the enclosing `finally` blocks and a `throw()` / `return()` must
+/// forward to a `yield*` delegate, which the state machine cannot do.
+fn resume_limits(body: &swc_ecma_ast::FunctionBody) -> u32 {
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    /// Finds `finally` and `yield*` outside nested functions and classes.
+    #[derive(Default)]
+    struct Scan {
+        finally: bool,
+        delegate: bool,
+    }
+    impl Visit for Scan {
+        fn visit_function(&mut self, _: &swc_ecma_ast::Function) {}
+        fn visit_arrow_expr(&mut self, _: &swc_ecma_ast::ArrowExpr) {}
+        fn visit_class(&mut self, _: &swc_ecma_ast::Class) {}
+        fn visit_try_stmt(&mut self, node: &swc_ecma_ast::TryStmt) {
+            self.finally |= node.finalizer.is_some();
+            node.visit_children_with(self);
+        }
+        fn visit_yield_expr(&mut self, node: &swc_ecma_ast::YieldExpr) {
+            self.delegate |= node.delegate;
+            node.visit_children_with(self);
+        }
+    }
+    let mut scan = Scan::default();
+    body.visit_with(&mut scan);
+    let mut limits = 0;
+    if scan.finally || scan.delegate {
+        limits |= crate::abi::GEN_LIMIT_RETURN;
+    }
+    if scan.delegate {
+        limits |= crate::abi::GEN_LIMIT_THROW;
+    }
+    limits
+}
+
 impl LowerCtx<'_> {
     /// Lower a top-level `function*` declaration into its CONSTRUCTOR
     /// [`IrFunction`], registering the state-machine function in the arrow
@@ -144,6 +182,7 @@ impl LowerCtx<'_> {
             sm_table_index,
             slots,
             total,
+            limits: resume_limits(block),
         };
         let returned = if function.is_async {
             IrNode::AsyncSpawn(Box::new(make))

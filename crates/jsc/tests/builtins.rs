@@ -105,8 +105,11 @@ fn date_from_timestamp_renders_iso() {
         jsc(&["-p", "[new Date(1000)]"]),
         "[ 1970-01-01T00:00:01.000Z ]",
     );
-    // `getTime()` on a non-Date receiver yields NaN (no method-receiver TypeError).
-    assert_eq!(jsc(&["-p", "({}).getTime()"]), "NaN");
+    // `getTime` is a `Date.prototype` method: an object without one throws.
+    assert_eq!(
+        jsc(&["-p", "try { ({}).getTime() } catch (e) { e.message }"]),
+        "expression is not a function",
+    );
 }
 
 /// `Date.now()` and `new Date()` read the host wall clock, and both a
