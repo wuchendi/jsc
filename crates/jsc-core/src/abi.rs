@@ -387,6 +387,10 @@ pub(crate) const ACCESSOR_GET_OFFSET: u32 = HEADER_SIZE + 4;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const ACCESSOR_SET_OFFSET: u32 = HEADER_SIZE + 12;
 
+/// The byte size of a [`TYPE_ACCESSOR`] block: the header, 4 padding bytes and
+/// the two getter/setter jsvals.
+pub(crate) const ACCESSOR_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 + 8;
+
 /// TYPE BYTE of an own-property table (internal, never a user value), the
 /// block an object-family `props` slot points at:
 /// `[type=12][pad][tflags:u8][pad][count:u32 @4][cap:u32 @8][live:u32 @12]`

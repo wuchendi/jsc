@@ -116,6 +116,7 @@ pub(super) fn emit_builtin(
         Builtin::ValueOf => object::emit_value_of(&mut f, frame, strings, helpers),
         Builtin::Call => function::emit_call(&mut f, frame, strings, helpers),
         Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),
+        Builtin::ThrowTypeError => function::emit_throw_type_error(&mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::ArrayMap => array::emit_map(&mut f, frame, strings, helpers),
         Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),

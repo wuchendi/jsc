@@ -617,10 +617,9 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
 /// and define its own properties from its `__fn_info` entry (design 4.4):
 /// `length` and `name` (configurable only); and for a plain `CONSTRUCTOR`
 /// (not a class, whose definition installs its own `prototype`), `prototype`
-/// (writable only) = a fresh object whose non-enumerable `constructor` is `o`,
-/// plus `caller` / `arguments` as non-writable configurable `undefined`, so
-/// strict code assigning them throws (standing in for the
-/// `%Function.prototype%` poison accessors until S4).
+/// (writable only) = a fresh object whose non-enumerable `constructor` is `o`.
+/// No own `caller` / `arguments`: every function is strict, so they resolve to
+/// the `%Function.prototype%` `%ThrowTypeError%` accessors.
 pub(super) fn emit_fn_materialize(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
@@ -665,10 +664,6 @@ pub(super) fn emit_fn_materialize(
     wasm!(f; LocalGet(o), I32Const(key("prototype")), LocalGet(p));
     emit_box_heap(&mut f);
     define(&mut f, ATTR_WRITABLE);
-    for name in ["caller", "arguments"] {
-        wasm!(f; LocalGet(o), I32Const(key(name)), I64Const(UNDEFINED_BITS));
-        define(&mut f, ATTR_CONFIGURABLE);
-    }
     wasm!(f; End, End);
     f
 }

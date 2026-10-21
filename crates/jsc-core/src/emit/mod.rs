@@ -383,10 +383,9 @@ const TYPE_ACCESSOR: i32 = abi::TYPE_ACCESSOR as i32;
 const ACCESSOR_GET_OFFSET: u64 = abi::ACCESSOR_GET_OFFSET as u64;
 const ACCESSOR_SET_OFFSET: u64 = abi::ACCESSOR_SET_OFFSET as u64;
 
-/// The byte size of a `TYPE_ACCESSOR` heap block: the [`HEADER_SIZE`] header, 4
-/// padding bytes for 8-byte alignment, and the two 8-byte getter/setter jsval
-/// slots.
-const ACCESSOR_BLOCK_SIZE: i32 = HEADER_SIZE + 4 + 8 + 8;
+/// The byte size of a `TYPE_ACCESSOR` heap block. See
+/// [`abi::ACCESSOR_BLOCK_SIZE`].
+const ACCESSOR_BLOCK_SIZE: i32 = abi::ACCESSOR_BLOCK_SIZE.cast_signed();
 
 /// The fixed byte length of a `toISOString()` result (`YYYY-MM-DDTHH:MM:SS.mmmZ`)
 /// — always 24 for a 4-digit year, the in-scope range.
@@ -480,14 +479,7 @@ const INDEX_LENGTH_KEY: &str = "length";
 /// The keys `__fn_materialize` defines on a function object, plus the
 /// anonymous function's empty `name`. Seeded whenever the program has
 /// functions.
-const FN_KEYS: [&str; 6] = [
-    "name",
-    "prototype",
-    "constructor",
-    "caller",
-    "arguments",
-    "",
-];
+const FN_KEYS: [&str; 4] = ["name", "prototype", "constructor", ""];
 
 /// The static strings `__nullish_throw` needs — the receiver words and the
 /// message fragments. Seeded by [`collect_node`] at every

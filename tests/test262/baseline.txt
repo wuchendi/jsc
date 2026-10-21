@@ -449,6 +449,25 @@ built-ins/Error/prototype/toString/undefined-props.js
 built-ins/Error/the-initial-value-of-errorprototypemessage-is-the-empty-string.js
 built-ins/Error/tostring-1.js
 built-ins/Error/tostring-2.js
+built-ins/Function/15.3.5-1gs.js
+built-ins/Function/15.3.5-2gs.js
+built-ins/Function/15.3.5.4_2-15gs.js
+built-ins/Function/15.3.5.4_2-17gs.js
+built-ins/Function/15.3.5.4_2-19gs.js
+built-ins/Function/15.3.5.4_2-1gs.js
+built-ins/Function/15.3.5.4_2-21gs.js
+built-ins/Function/15.3.5.4_2-22gs.js
+built-ins/Function/15.3.5.4_2-23gs.js
+built-ins/Function/15.3.5.4_2-24gs.js
+built-ins/Function/15.3.5.4_2-25gs.js
+built-ins/Function/15.3.5.4_2-26gs.js
+built-ins/Function/15.3.5.4_2-27gs.js
+built-ins/Function/15.3.5.4_2-28gs.js
+built-ins/Function/15.3.5.4_2-29gs.js
+built-ins/Function/15.3.5.4_2-3gs.js
+built-ins/Function/15.3.5.4_2-48gs.js
+built-ins/Function/15.3.5.4_2-50gs.js
+built-ins/Function/15.3.5.4_2-5gs.js
 built-ins/Function/S10.1.1_A1_T3.js
 built-ins/Function/S15.3.3_A1.js
 built-ins/Function/S15.3.3_A2_T2.js
@@ -1600,6 +1619,7 @@ language/expressions/array/spread-mult-literal.js
 language/expressions/array/spread-sngl-empty.js
 language/expressions/array/spread-sngl-expr.js
 language/expressions/array/spread-sngl-literal.js
+language/expressions/arrow-function/ArrowFunction_restricted-properties.js
 language/expressions/arrow-function/array-destructuring-param-strict-body.js
 language/expressions/arrow-function/arrow/concisebody-lookahead-assignmentexpression-1.js
 language/expressions/arrow-function/arrow/concisebody-lookahead-assignmentexpression-2.js
@@ -3399,6 +3419,7 @@ language/expressions/class/params-dflt-meth-args-unmapped.js
 language/expressions/class/params-dflt-meth-ref-arguments.js
 language/expressions/class/params-dflt-meth-static-args-unmapped.js
 language/expressions/class/params-dflt-meth-static-ref-arguments.js
+language/expressions/class/restricted-properties.js
 language/expressions/class/scope-meth-paramsbody-var-close.js
 language/expressions/class/scope-meth-paramsbody-var-open.js
 language/expressions/class/scope-name-lex-close.js
@@ -6427,6 +6448,7 @@ language/statements/class/private-non-static-getter-static-setter-early-error.js
 language/statements/class/private-non-static-setter-static-getter-early-error.js
 language/statements/class/private-static-getter-non-static-setter-early-error.js
 language/statements/class/private-static-setter-non-static-getter-early-error.js
+language/statements/class/restricted-properties.js
 language/statements/class/scope-meth-paramsbody-var-close.js
 language/statements/class/scope-meth-paramsbody-var-open.js
 language/statements/class/scope-name-lex-close.js
@@ -7495,6 +7517,7 @@ language/statements/generators/params-trailing-comma-multiple.js
 language/statements/generators/params-trailing-comma-single.js
 language/statements/generators/rest-param-strict-body.js
 language/statements/generators/rest-params-trailing-comma-early-error.js
+language/statements/generators/restricted-properties.js
 language/statements/generators/return.js
 language/statements/generators/use-strict-with-non-simple-param.js
 language/statements/generators/yield-as-binding-identifier-escaped.js
