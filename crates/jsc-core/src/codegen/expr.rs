@@ -182,6 +182,13 @@ impl LowerCtx<'_> {
                     }
                     operand => operand,
                 }))),
+                // `~operand` is `ToInt32(operand) ^ -1`, so it reuses the
+                // `BinOp::BitXor` lowering (ToNumber, then ToInt32).
+                UnaryOp::Tilde => Ok(IrNode::Binary {
+                    op: BinOp::BitXor,
+                    lhs: Box::new(self.lower_expr(&u.arg)?),
+                    rhs: Box::new(IrNode::Num(-1.0)),
+                }),
                 // `!operand` is logical NOT: boolean inverse of truthiness.
                 UnaryOp::Bang => Ok(IrNode::Not(Box::new(self.lower_expr(&u.arg)?))),
                 // `delete obj.k` / `delete obj[k]` removes an own property and
@@ -1484,8 +1491,8 @@ impl LowerCtx<'_> {
             };
             return Ok(Self::write_of(resolved.kind, value));
         }
-        // A compound operator (`+=`/`-=`/`*=`/`/=`/`%=`) maps to the arithmetic
-        // `BinOp` it applies; plain `=` maps to `None`.
+        // A compound operator (`+=`/`-=`/`*=`/`/=`/`%=` and the bitwise/shift
+        // compounds) maps to the `BinOp` it applies; plain `=` maps to `None`.
         let compound_op = map_assign_op(assign.op, assign.span())?;
         match &assign.left {
             AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
