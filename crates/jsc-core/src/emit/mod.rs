@@ -117,20 +117,6 @@ const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-const METHOD_OP_SLICE: i32 = abi::METHOD_OP_SLICE;
-const METHOD_OP_TO_UPPER: i32 = abi::METHOD_OP_TO_UPPER;
-const METHOD_OP_TO_LOWER: i32 = abi::METHOD_OP_TO_LOWER;
-const METHOD_OP_CHAR_AT: i32 = abi::METHOD_OP_CHAR_AT;
-const METHOD_OP_TRIM: i32 = abi::METHOD_OP_TRIM;
-const METHOD_OP_TRIM_START: i32 = abi::METHOD_OP_TRIM_START;
-const METHOD_OP_TRIM_END: i32 = abi::METHOD_OP_TRIM_END;
-const METHOD_OP_REPEAT: i32 = abi::METHOD_OP_REPEAT;
-const METHOD_OP_STARTS_WITH: i32 = abi::METHOD_OP_STARTS_WITH;
-const METHOD_OP_ENDS_WITH: i32 = abi::METHOD_OP_ENDS_WITH;
-const METHOD_OP_PAD_START: i32 = abi::METHOD_OP_PAD_START;
-const METHOD_OP_PAD_END: i32 = abi::METHOD_OP_PAD_END;
-const METHOD_OP_SUBSTRING: i32 = abi::METHOD_OP_SUBSTRING;
-const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
 
 /// The name under which the bump-allocator heap pointer global is exported so the
 /// run stage can detect the out-of-memory sentinel.
@@ -991,6 +977,18 @@ impl Helpers<'_> {
         self.to_primitive() + 4
     }
 
+    /// `__to_object(v) -> i64` (see [`builtins::emit_to_object`]), right
+    /// after `__array_join`.
+    fn to_object(self) -> u32 {
+        self.to_primitive() + 5
+    }
+
+    /// The funcref-table slot of `builtin`'s body: the builtins follow the
+    /// user functions and the two settlers.
+    fn builtin_slot(self, builtin: Builtin) -> u32 {
+        self.settle_resolve_slot + 2 + builtin.index()
+    }
+
     /// `__new_array(len) -> i32`: the exported array constructor, right after
     /// `__new_string`.
     fn new_array(self) -> u32 {
@@ -1100,7 +1098,7 @@ use numeric::*;
 use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
-use realm::{Builtin, Intrinsic, intrinsic_bits};
+use realm::{Builtin, Intrinsic, StringOp, intrinsic_bits};
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]
@@ -1420,6 +1418,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_add_helper(helpers));
     code.function(&emit_compare(helpers));
     code.function(&emit_array_join(&offsets, helpers));
+    code.function(&builtins::emit_to_object(&offsets, helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

@@ -125,33 +125,29 @@ fn lower_math_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<
     Ok(IrNode::MathCall { op, args })
 }
 
-/// Map a method name to its non-callback array/string method op, or `None`
-/// when the name is not one of them. Recognized purely syntactically from a
-/// `<expr>.<name>(..)` member callee (kept distinct from the push/pop and higher-order array
-/// methods and from `x[i]` indexing); the receiver's array-vs-string kind is
-/// resolved at runtime host-side.
-pub(super) fn non_callback_method_op(name: &str) -> Option<MethodOp> {
-    Some(match name {
-        "indexOf" => MethodOp::IndexOf,
-        "includes" => MethodOp::Includes,
-        "join" => MethodOp::Join,
-        "slice" => MethodOp::Slice,
-        "toUpperCase" => MethodOp::ToUpper,
-        "toLowerCase" => MethodOp::ToLower,
-        "charAt" => MethodOp::CharAt,
-        "trim" => MethodOp::Trim,
-        "trimStart" => MethodOp::TrimStart,
-        "trimEnd" => MethodOp::TrimEnd,
-        "repeat" => MethodOp::Repeat,
-        "startsWith" => MethodOp::StartsWith,
-        "endsWith" => MethodOp::EndsWith,
-        "padStart" => MethodOp::PadStart,
-        "padEnd" => MethodOp::PadEnd,
-        "substring" => MethodOp::Substring,
-        "split" => MethodOp::Split,
-        _ => return None,
-    })
-}
+/// The `%Array.prototype%` methods with a guarded call-site fast path (the
+/// array-side names of the string/array method families).
+pub(super) const ARRAY_METHODS: [&str; 10] = [
+    "push", "pop", "map", "filter", "reduce", "forEach", "indexOf", "includes", "join", "slice",
+];
+
+/// The `%String.prototype%` methods with a guarded call-site fast path (the
+/// names not already in [`ARRAY_METHODS`]).
+pub(super) const STRING_METHODS: [&str; 13] = [
+    "toUpperCase",
+    "toLowerCase",
+    "charAt",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "repeat",
+    "startsWith",
+    "endsWith",
+    "padStart",
+    "padEnd",
+    "substring",
+    "split",
+];
 
 /// Map a bare global function name to its conversion built-in, or `None`
 /// when the name is not a recognized conversion. Used at the call site only after

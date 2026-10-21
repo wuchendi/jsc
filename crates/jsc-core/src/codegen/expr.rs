@@ -730,36 +730,15 @@ impl LowerCtx<'_> {
         {
             return self.lower_namespace_call(namespace, key, member, args);
         }
-        // `recv.push(x)` / `recv.pop()` are growing array methods, dispatched
-        // syntactically by method name (kept distinct from `x[i]` element
-        // indexing). The receiver is any expression, evaluated once.
+        // `recv.push(..)` / `recv.map(..)` / `recv.trim(..)` / .. name an
+        // `%Array.prototype%` or `%String.prototype%` builtin: a generic method
+        // call with guarded fast paths (design 3.2 row 3).
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
-            && matches!(id.sym.as_ref(), "push" | "pop")
+            && (ARRAY_METHODS.contains(&id.sym.as_ref())
+                || STRING_METHODS.contains(&id.sym.as_ref()))
         {
-            return self.lower_array_method(id.sym.as_ref(), &member.obj, args);
-        }
-        // `array.map/filter/reduce/forEach(callback[, init])` are higher-order array
-        // methods, dispatched syntactically by method name (kept distinct
-        // from `x[i]` element indexing). The receiver is any array expression (a
-        // literal or a binding), evaluated once.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && matches!(id.sym.as_ref(), "map" | "filter" | "reduce" | "forEach")
-        {
-            return self.lower_array_hof(id.sym.as_ref(), &member.obj, args);
-        }
-        // `array/string.indexOf/includes/join/slice/toUpperCase/toLowerCase/charAt(..)`
-        // are non-callback array/string methods, dispatched syntactically by
-        // method name (kept distinct from `x[i]` element indexing). The receiver is
-        // any array/string expression, evaluated once; the whole operation runs
-        // host-side, branching on the receiver's runtime TYPE BYTE for the
-        // `indexOf`/`slice` methods that exist on both arrays and strings.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let MemberProp::Ident(id) = &member.prop
-            && let Some(op) = non_callback_method_op(id.sym.as_ref())
-        {
-            return self.lower_method_call(op, id.sym.as_ref(), &member.obj, args);
+            return self.lower_builtin_method_call(id.sym.as_ref(), member, args);
         }
         // `d.getTime()`: the millisecond timestamp of a Date receiver.
         // Claimed for ANY receiver (a non-Date yields `NaN`); a user method named
@@ -959,10 +938,11 @@ impl LowerCtx<'_> {
     /// [`IrNode::ArraySpread`]); the call then spreads that array into the
     /// uniform ABI's fixed `K` positional slots plus the dynamic `argc`.
     ///
-    /// Only the variadic `Math.max`/`Math.min` built-ins and ordinary
-    /// direct/indirect function calls accept a spread. Every other call form
-    /// (`console.log`, the `String`/`Number`/… conversions, and the array/string
-    /// methods) is out of scope and rejected with a span.
+    /// The variadic `Math.max`/`Math.min` built-ins, ordinary
+    /// direct/indirect function calls and method calls (the `%Array.prototype%`
+    /// and `%String.prototype%` methods included) accept a spread. The
+    /// remaining syntactic call forms (`console.log`, the `String`/`Number`/…
+    /// conversions) are out of scope and rejected with a span.
     ///
     /// # Errors
     ///
@@ -1114,221 +1094,97 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower a growing array method call `recv.push(x)` / `recv.pop()`. The
-    /// receiver is any expression, evaluated exactly once: a plain local is
-    /// read in place, anything else (a captured or module binding, a member,
-    /// a call result) is stashed in a fresh temp. The receiver is guarded
-    /// against `null`/`undefined` (the member read), then an array receiver
-    /// grows/shrinks in place; any other receiver has no such method, so the
-    /// call throws `<recv>.<method> is not a function` once its argument is
-    /// evaluated. Arities are validated here (`push` takes one argument, `pop`
-    /// none).
-    fn lower_array_method(
+    /// Lower `recv.<name>(args)` for an `%Array.prototype%` or
+    /// `%String.prototype%` method `name` (design 3.2 row 3): the receiver
+    /// (nullish-guarded unless the generic call can throw that itself) and
+    /// then each argument with side effects are evaluated once into temps, then an [`IrNode::ProtoGuard`] runs the
+    /// inline fast path for an array receiver whose `name` is provably the
+    /// builtin, and otherwise one out-of-line generic method call (routed
+    /// straight to the `String.prototype` builtin for a string receiver).
+    /// Side-effect-free arguments (literals, locals, function literals) are
+    /// used in place by every path.
+    fn lower_builtin_method_call(
         &mut self,
-        method: &str,
-        obj: &Expr,
+        name: &str,
+        member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let value = match method {
-            "push" => {
-                let [value] = <[IrNode; 1]>::try_from(args).map_err(|args| {
-                    CompileError::spanned(
-                        obj.span(),
-                        format!("push expects 1 argument, got {}", args.len()),
-                    )
-                })?;
-                Some(value)
-            }
-            "pop" => {
-                if !args.is_empty() {
-                    return Err(CompileError::spanned(
-                        obj.span(),
-                        format!("pop expects 0 arguments, got {}", args.len()),
-                    )
-                    .into());
-                }
-                None
-            }
-            _ => unreachable!("caller restricts the method to push/pop"),
+        let recv = self.lower_expr(&member.obj)?;
+        let pure = args.iter().all(pure_arg);
+        // A `null`/`undefined` receiver throws on the method lookup, before
+        // any argument runs: with side-effect-free arguments the generic call
+        // throws it (no path before it reads the receiver as an object).
+        let recv = if pure {
+            recv
+        } else {
+            nullish_check(recv, name)
         };
-        let plain = match obj {
-            Expr::Ident(id) => self.resolve(id.sym.as_ref()).and_then(|r| match r.kind {
-                AccessKind::Plain(local) => Some(local),
-                AccessKind::Cell(_) | AccessKind::Global(_) => None,
-            }),
+        // A plain local receiver is read in place unless an argument with
+        // side effects (which might reassign it) runs after it.
+        let in_place = match recv {
+            IrNode::Local(local) if pure => Some(local),
             _ => None,
         };
-        let (local, recv) = if let Some(local) = plain {
-            (local, IrNode::Local(local))
-        } else {
-            let tmp = self.fresh();
-            let recv = IrNode::Assign {
-                local: tmp,
-                value: Box::new(self.lower_expr(obj)?),
-            };
-            (tmp, recv)
-        };
-        let not_array = method_not_a_function(obj, method);
-        if self.shared.globals.intrinsics_sealed() {
-            let grow = match value {
-                Some(value) => IrNode::ArrayPush {
-                    local,
-                    value: Box::new(value),
-                    not_array: Some(not_array),
-                },
-                None => IrNode::ArrayPop { local, not_array },
-            };
-            return Ok(IrNode::Seq(vec![nullish_check(recv, method), grow]));
+        let recv_local = in_place.unwrap_or_else(|| self.fresh());
+        let mut seq = Vec::new();
+        if in_place.is_none() {
+            seq.push(IrNode::Assign {
+                local: recv_local,
+                value: Box::new(recv),
+            });
         }
-        // `Array.prototype` may be written: a user `push`/`pop` found on the
-        // receiver once its dirty bit is set wins (design 3.2 row 3). The
-        // argument is evaluated once, before the guard.
-        let mut seq = vec![nullish_check(recv, method)];
-        let (grow, args) = match value {
-            Some(value) => {
-                let tmp = self.fresh();
+        let args: Vec<IrNode> = args
+            .into_iter()
+            .map(|arg| {
+                if pure_arg(&arg) {
+                    return arg;
+                }
+                let local = self.fresh();
                 seq.push(IrNode::Assign {
-                    local: tmp,
-                    value: Box::new(value),
+                    local,
+                    value: Box::new(arg),
                 });
-                let push = IrNode::ArrayPush {
-                    local,
-                    value: Box::new(IrNode::Local(tmp)),
-                    not_array: Some(not_array.clone()),
-                };
-                (push, vec![IrNode::Local(tmp)])
-            }
-            None => (
-                IrNode::ArrayPop {
-                    local,
-                    not_array: not_array.clone(),
-                },
-                Vec::new(),
-            ),
+                IrNode::Local(local)
+            })
+            .collect();
+        let recv = || Box::new(IrNode::Local(recv_local));
+        let arg = |i: usize| args.get(i).cloned().map(Box::new);
+        let hof = |op| IrNode::ArrayHof {
+            op,
+            array: recv(),
+            callback: Box::new(args[0].clone()),
+            init: (op == ArrayHofOp::Reduce).then(|| arg(1)).flatten(),
+            this_arg: (op != ArrayHofOp::Reduce).then(|| arg(1)).flatten(),
         };
-        let user = IrNode::MethodCallUser {
-            obj: Box::new(IrNode::Local(local)),
-            key: Box::new(IrNode::Str(method.to_owned())),
-            args,
-            obj_local: self.fresh(),
-            not_callable: not_array,
+        let method = |op| IrNode::MethodCall {
+            op,
+            recv: recv(),
+            args: args[..args.len().min(1)].to_vec(),
+        };
+        let array = match (name, args.len()) {
+            ("push", 1) => Some(IrNode::ArrayPush {
+                local: recv_local,
+                value: Box::new(args[0].clone()),
+            }),
+            ("pop", _) => Some(IrNode::ArrayPop { local: recv_local }),
+            ("map", 1..) => Some(hof(ArrayHofOp::Map)),
+            ("filter", 1..) => Some(hof(ArrayHofOp::Filter)),
+            ("forEach", 1..) => Some(hof(ArrayHofOp::ForEach)),
+            ("reduce", 1..) => Some(hof(ArrayHofOp::Reduce)),
+            ("indexOf", 0 | 1) => Some(method(MethodOp::IndexOf)),
+            ("includes", 0 | 1) => Some(method(MethodOp::Includes)),
+            ("join", _) => Some(method(MethodOp::Join)),
+            _ => None,
         };
         seq.push(IrNode::ProtoGuard {
-            proto: BuiltinCtor::Array,
-            key: method.to_owned(),
-            recv: Box::new(IrNode::Local(local)),
-            fast: Box::new(grow),
-            user: Box::new(user),
+            sealed: self.shared.globals.intrinsics_sealed(),
+            recv: recv(),
+            key: name.to_owned(),
+            args,
+            array: array.map(Box::new),
+            not_callable: method_not_a_function(&member.obj, name),
         });
         Ok(IrNode::Seq(seq))
-    }
-
-    /// Lower a higher-order array method call `array.map/filter/reduce/forEach(...)`.
-    /// The receiver is lowered as a plain expression (evaluated once into a
-    /// scratch base at emit time — no rebinding), and the callback is a function
-    /// value invoked per element via the `call_indirect` ABI. `map`, `filter`,
-    /// and `forEach` take exactly one argument (the callback); `reduce` requires two
-    /// (the callback and the initial accumulator — a no-init `reduce` is rejected
-    /// rather than defaulting to the first element, out of scope). Arities are validated here.
-    fn lower_array_hof(
-        &mut self,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        let array = Box::new(nullish_check(self.lower_expr(obj)?, method));
-        match method {
-            "reduce" => {
-                let [callback, init] = <[IrNode; 2]>::try_from(args).map_err(|args| {
-                    CompileError::spanned(
-                        obj.span(),
-                        format!(
-                            "reduce expects 2 arguments (callback, init), got {}",
-                            args.len()
-                        ),
-                    )
-                })?;
-                Ok(IrNode::ArrayHof {
-                    op: ArrayHofOp::Reduce,
-                    array,
-                    callback: Box::new(callback),
-                    init: Some(Box::new(init)),
-                })
-            }
-            "map" | "filter" | "forEach" => {
-                let [callback] = <[IrNode; 1]>::try_from(args).map_err(|args| {
-                    CompileError::spanned(
-                        obj.span(),
-                        format!("{method} expects 1 argument, got {}", args.len()),
-                    )
-                })?;
-                let op = match method {
-                    "map" => ArrayHofOp::Map,
-                    "filter" => ArrayHofOp::Filter,
-                    "forEach" => ArrayHofOp::ForEach,
-                    _ => unreachable!("outer match restricts the method"),
-                };
-                Ok(IrNode::ArrayHof {
-                    op,
-                    array,
-                    callback: Box::new(callback),
-                    init: None,
-                })
-            }
-            _ => unreachable!("caller restricts the method to map/filter/reduce/forEach"),
-        }
-    }
-
-    /// Lower a non-callback array/string method call
-    /// `recv.indexOf/includes/join/slice/toUpperCase/toLowerCase/charAt(args)`.
-    /// The receiver is lowered as a plain expression (evaluated once,
-    /// host-side); arities are validated here and the result is an
-    /// [`IrNode::MethodCall`] whose emit pads to two fixed argument slots. The
-    /// receiver's array-vs-string kind is unknown at compile time — the host
-    /// `__method` handler branches on its runtime TYPE BYTE for the overloaded
-    /// `indexOf`/`slice`.
-    fn lower_method_call(
-        &mut self,
-        op: MethodOp,
-        method: &str,
-        obj: &Expr,
-        args: Vec<IrNode>,
-    ) -> anyhow::Result<IrNode> {
-        // Per-method argument arity. `join`/`slice` have optional trailing args
-        // (defaulted host-side); the rest are fixed. At most two slots are ever
-        // passed to `__method`.
-        let ok = match op {
-            MethodOp::IndexOf
-            | MethodOp::Includes
-            | MethodOp::CharAt
-            | MethodOp::Repeat
-            | MethodOp::StartsWith
-            | MethodOp::EndsWith => args.len() == 1,
-            MethodOp::ToUpper
-            | MethodOp::ToLower
-            | MethodOp::Trim
-            | MethodOp::TrimStart
-            | MethodOp::TrimEnd => args.is_empty(),
-            MethodOp::Join | MethodOp::Split => args.len() <= 1,
-            MethodOp::Slice | MethodOp::PadStart | MethodOp::PadEnd | MethodOp::Substring => {
-                args.len() <= 2
-            }
-        };
-        if !ok {
-            return Err(CompileError::spanned(
-                obj.span(),
-                format!(
-                    "{method} received an unsupported number of arguments: {}",
-                    args.len()
-                ),
-            )
-            .into());
-        }
-        Ok(IrNode::MethodCall {
-            op,
-            recv: Box::new(nullish_check(self.lower_expr(obj)?, method)),
-            args,
-        })
     }
 
     /// Lower a `Map`/`Set` method call `recv.<op>(args)` into an
@@ -1394,18 +1250,6 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        // The statically-known method name, if any: `obj.m` and `obj["m"]` name
-        // `m`; a dynamic computed key `obj[k]` is unknown until runtime.
-        let name = member_method_name(member);
-        // Reaching this generic path means the name matched none of the
-        // built-in string/array/Map/Set methods. A receiver whose type is a
-        // statically-known PRIMITIVE (string/number/boolean literal) has no
-        // prototype methods yet (S5), so the call is rejected with a span
-        // diagnostic. An array literal reads the method from
-        // `%Array.prototype%` at run time.
-        if static_primitive_receiver(&member.obj) {
-            return Err(unknown_method_error(member.span(), name.as_deref()));
-        }
         let key = match &member.prop {
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
@@ -2239,6 +2083,23 @@ fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
     }
 }
 
+/// Whether a lowered call argument has no side effects (a literal, a local
+/// read or a function literal), so it can be evaluated in place by whichever
+/// path of a guarded call runs.
+fn pure_arg(arg: &IrNode) -> bool {
+    matches!(
+        arg,
+        IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::Local(_)
+            | IrNode::FuncValue { .. }
+            | IrNode::DeclFunc(_)
+    )
+}
+
 /// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a
 /// `null`/`undefined` receiver throws `Cannot read properties of .. (reading
 /// '<key>')` instead of reading through a bogus pointer.
@@ -2301,19 +2162,6 @@ fn method_not_a_function(obj: &Expr, method: &str) -> CalleeError {
     )
 }
 
-/// Whether the receiver's type is a statically-known primitive (string / number /
-/// boolean / template string). A `null` receiver is not
-/// listed: its method lookup throws a runtime `TypeError` instead. Such a receiver
-/// can never carry a user-defined method, so a method name that reached the
-/// generic user-method path (i.e. matched no built-in) is provably unknown.
-fn static_primitive_receiver(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(p) => static_primitive_receiver(&p.expr),
-        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_)) | Expr::Tpl(_) => true,
-        _ => false,
-    }
-}
-
 /// A plain-English description of an unsupported expression, used for the
 /// user-facing diagnostic message. Never renders the raw swc AST.
 fn unsupported_expr_msg(expr: &Expr) -> &'static str {
@@ -2334,8 +2182,7 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
 /// receiver's runtime TYPE BYTE and falls back to a user method call.
 /// Whether a spread call through the member callee `callee` (= `member`) hits
 /// a builtin dispatched by name with no user-method fallback (`console.log`,
-/// the `Object`/`JSON`/`Promise` statics, the array/string methods,
-/// `getTime`), which take no spread.
+/// the `Object`/`JSON`/`Promise` statics, `getTime`), which take no spread.
 fn spread_rejecting_member(callee: &Expr, member: &swc_ecma_ast::MemberExpr) -> bool {
     is_console_log(callee)
         || object_method_name(callee).is_some_and(|name| inline_member("Object", name))
@@ -2343,8 +2190,7 @@ fn spread_rejecting_member(callee: &Expr, member: &swc_ecma_ast::MemberExpr) -> 
         || promise_static_method_name(callee).is_some_and(|name| inline_member("Promise", name))
         || matches!(&member.prop, MemberProp::Ident(id) if {
             let name = id.sym.as_ref();
-            matches!(name, "push" | "pop" | "map" | "filter" | "reduce" | "forEach" | "getTime")
-                || non_callback_method_op(name).is_some()
+            name == "getTime"
         })
 }
 

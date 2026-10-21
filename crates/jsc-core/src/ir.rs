@@ -125,23 +125,21 @@ pub enum MathOp {
     Pow,
 }
 
-/// An array higher-order method: `map`/`filter`/`reduce`/`forEach`.
-/// Recognized syntactically from a `<expr>.<name>(callback[, init])` member callee
-/// at codegen (kept distinct from `x[i]` element indexing), each invoking the
-/// callback function value per element via the `call_indirect` ABI.
+/// An array higher-order method: `map`/`filter`/`reduce`/`forEach` (see
+/// [`IrNode::ArrayHof`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayHofOp {
     /// `arr.map(fn)` — a NEW array of the same length where `result[i] =
-    /// fn(element_i, i)`.
+    /// fn(element_i, i, arr)`.
     Map,
-    /// `arr.filter(fn)` — a NEW array of the elements for which `fn(element_i, i)`
-    /// is JS-truthy, grown via the `__array_push` helper.
+    /// `arr.filter(fn)` — a NEW array of the elements for which
+    /// `fn(element_i, i, arr)` is JS-truthy, grown via the `__array_push` helper.
     Filter,
-    /// `arr.reduce(fn, init)` — folds `acc = fn(acc, element_i, i)` from `acc =
-    /// init`, yielding the final accumulator. An `init` argument is required.
+    /// `arr.reduce(fn[, init])` — folds `acc = fn(acc, element_i, i, arr)`,
+    /// yielding the final accumulator.
     Reduce,
-    /// `arr.forEach(fn)` — calls `fn(element_i, i)` for side effects and yields
-    /// `undefined`.
+    /// `arr.forEach(fn)` — calls `fn(element_i, i, arr)` for side effects and
+    /// yields `undefined`.
     ForEach,
 }
 
@@ -166,70 +164,19 @@ pub enum ConvertOp {
     ParseFloat,
 }
 
-/// A non-callback array/string method. Recognized syntactically from a
-/// `<expr>.<name>(args)` member callee at codegen (kept distinct from `x[i]`
-/// element indexing), each dispatched host-side through the `__method` import.
-/// `IndexOf` and `Slice` exist on BOTH arrays and strings, so the host branches
-/// on the receiver's runtime TYPE BYTE (array-element vs string-byte semantics);
-/// the rest are single-type methods.
+/// The inline fast path of an `Array.prototype` search/join method on an
+/// array receiver (design 3.2 row 3), run host-side through the `__method`
+/// import (`join`: the guest `__array_join`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodOp {
-    /// `arr.indexOf(x)` — first index where element `=== x`, else `-1` (a number);
-    /// `str.indexOf(sub)` — byte index of the first `sub` occurrence, else `-1`
-    /// (empty `sub` => `0`). Overloaded: the receiver's TYPE BYTE selects the arm.
+    /// `arr.indexOf(x)` — first index where element `=== x`, else `-1`.
     IndexOf,
-    /// `arr.includes(x)` — `indexOf(x) !== -1` as a boolean (array only).
+    /// `arr.includes(x)` — `SameValueZero` membership as a boolean.
     Includes,
     /// `arr.join(sep)` — concatenate `String(element)` for each element separated
     /// by the `sep` string (`","` when `sep` is omitted); `null`/`undefined`
-    /// elements stringify to `""`. Yields a heap string (array only).
+    /// elements stringify to `""`. Yields a heap string.
     Join,
-    /// `arr.slice(a, b)` — a NEW array of elements `[a, b)`; `str.slice(a, b)` — a
-    /// NEW substring `[a, b)`. JS negative-from-end and clamp semantics; `b`
-    /// omitted => to end. Overloaded on the receiver's TYPE BYTE.
-    Slice,
-    /// `str.toUpperCase()` — a NEW ASCII-upper heap string (string only).
-    ToUpper,
-    /// `str.toLowerCase()` — a NEW ASCII-lower heap string (string only).
-    ToLower,
-    /// `str.charAt(i)` — a NEW one-char heap string at byte index `i` (`""` when
-    /// out of range) (string only).
-    CharAt,
-    /// `str.trim()` — a NEW heap string with leading and trailing ASCII whitespace
-    /// removed (string only).
-    Trim,
-    /// `str.trimStart()` — a NEW heap string with leading ASCII whitespace removed
-    /// (string only).
-    TrimStart,
-    /// `str.trimEnd()` — a NEW heap string with trailing ASCII whitespace removed
-    /// (string only).
-    TrimEnd,
-    /// `str.repeat(n)` — a NEW heap string of the receiver repeated `n` times
-    /// (`n` truncated to an integer; a negative or non-finite `n` yields `""` —
-    /// JS throws a `RangeError`, a documented limitation) (string only).
-    Repeat,
-    /// `str.startsWith(sub)` — `true` when the receiver begins with `sub` (a
-    /// boolean; `sub` is coerced to its string form) (string only).
-    StartsWith,
-    /// `str.endsWith(sub)` — `true` when the receiver ends with `sub` (a boolean;
-    /// `sub` is coerced to its string form) (string only).
-    EndsWith,
-    /// `str.padStart(len, pad)` — a NEW heap string left-padded to byte length
-    /// `len` with `pad` (default `" "`); the receiver is returned unchanged when it
-    /// is already at least `len` bytes or `pad` is empty (string only).
-    PadStart,
-    /// `str.padEnd(len, pad)` — a NEW heap string right-padded to byte length `len`
-    /// with `pad` (default `" "`); the receiver is returned unchanged when it is
-    /// already at least `len` bytes or `pad` is empty (string only).
-    PadEnd,
-    /// `str.substring(a, b)` — a NEW substring `[a, b)` by BYTE index (each endpoint
-    /// truncated to an integer, negatives/NaN clamped to `0`, and the two swapped
-    /// when `a > b`; `b` omitted => to end) (string only).
-    Substring,
-    /// `str.split(sep)` — a NEW array of substrings split on each `sep` occurrence
-    /// (`sep` omitted => `[str]`; `sep === ""` => one element per byte; BYTE
-    /// semantics, `sep` coerced to its string form) (string only).
-    Split,
 }
 
 /// An `Object.*` collection built-in: `Object.keys`/`values`/`entries`.
@@ -791,6 +738,9 @@ pub enum IrNode {
     /// Whether the value is an object (a heap value other than a string), as a
     /// boolean jsval.
     IsObject(Box<IrNode>),
+    /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
+    /// fresh wrapper object (design 2.4); an object is itself.
+    ToObject(Box<IrNode>),
     /// A class heritage `extends value` (design 4.5): evaluate `value` into
     /// `parent`; unless it is `null` it must be a constructor, and `proto` gets
     /// `Get(parent, "prototype")`, which must be an object or `null` (`proto` is
@@ -1031,67 +981,60 @@ pub enum IrNode {
         /// Whether this is a plain compound assignment or a member `++`/`--`.
         kind: OpSetKind,
     },
-    /// `array.push(value)` on the array handle held in a wasm local. Appends
-    /// `value` to the handle in place (`__array_push`, amortized store growth;
-    /// the handle never moves, so every alias observes it). Yields the new
-    /// length as a number jsval (JS semantics). Codegen evaluates any receiver
-    /// expression into the local and guards it against `null`/`undefined`
-    /// before this node runs.
+    /// `array.push(value)` on the array handle held in a wasm local (always a
+    /// `TYPE_ARRAY` handle: a compiler-built array or a receiver that passed
+    /// its [`IrNode::ProtoGuard`]). Appends `value` to the handle in place
+    /// (`__array_push`, amortized store growth; the handle never moves, so
+    /// every alias observes it). Yields the new length as a number jsval.
     ArrayPush {
         /// The wasm local holding the array handle.
         local: u32,
         /// The value appended at the new last slot.
         value: Box<IrNode>,
-        /// The `TypeError` (`<recv>.push is not a function`) thrown, after
-        /// `value` is evaluated, when the local is not a `TYPE_ARRAY` handle;
-        /// `None` for a compiler-built receiver that is always an array.
-        not_array: Option<CalleeError>,
     },
-    /// `array.pop()` on the array handle held in a wasm local (receiver
-    /// evaluation and guards as for [`IrNode::ArrayPush`]). Shrinks the handle
-    /// in place: its u32 length is decremented and the removed last element
-    /// jsval is yielded. An empty array yields `undefined`.
+    /// `array.pop()` on the array handle held in a wasm local (as for
+    /// [`IrNode::ArrayPush`]). Shrinks the handle in place: its u32 length is
+    /// decremented and the removed last element jsval is yielded. An empty
+    /// array yields `undefined`.
     ArrayPop {
         /// The wasm local holding the array whose block is decremented in place.
         local: u32,
-        /// The `TypeError` (`<recv>.pop is not a function`) thrown when the
-        /// local is not a `TYPE_ARRAY` handle.
-        not_array: CalleeError,
     },
-    /// An array higher-order method call `array.map/filter/reduce/forEach(...)`.
-    /// The `array` receiver is evaluated once into a scratch base (so any array
-    /// expression works),
-    /// then a counted wasm loop over its length invokes the `callback` FUNCTION
-    /// value per element through the `call_indirect` ABI (env-last): the
-    /// positional args are `(element, index)` for `Map`/`Filter`/`ForEach` and
-    /// `(acc, element, index)` for `Reduce`, padded with `undefined` to the shared
-    /// funcref arity. `Map` fills a fresh same-length array; `Filter` grows a fresh
-    /// array via `__array_push` for JS-truthy results; `Reduce` folds into `acc`
-    /// (seeded from `init`); `ForEach` discards each result and yields `undefined`.
+    /// `Array.prototype.map/filter/reduce/forEach` on an array handle (the
+    /// guarded fast path of a call site, and the array path of the builtin
+    /// bodies). After the `IsCallable` check of `callback`, a counted wasm loop
+    /// over the length read on entry invokes the callback per element present
+    /// at the time of the visit (below the current length, not a hole) through
+    /// the `call_indirect` ABI with `this = this_arg`: the positional args are
+    /// `(element, index, array)` for `Map`/`Filter`/`ForEach` and
+    /// `(acc, element, index, array)` for `Reduce`, truncated to the shared
+    /// funcref arity. `Map` fills a fresh same-length array (holes stay holes);
+    /// `Filter` grows a fresh array via `__array_push` for JS-truthy results;
+    /// `Reduce` folds into `acc`, seeded from `init` or, without one, from the
+    /// first present element (a `TypeError` when there is none); `ForEach`
+    /// discards each result and yields `undefined`.
     ArrayHof {
         /// Which higher-order method this call performs.
         op: ArrayHofOp,
         /// The receiver array expression (evaluated once; not rebound).
         array: Box<IrNode>,
-        /// The callback expression, yielding a FUNCTION value.
+        /// The callback expression.
         callback: Box<IrNode>,
-        /// The initial accumulator for [`ArrayHofOp::Reduce`] (`None` for the
-        /// others).
+        /// The initial accumulator of [`ArrayHofOp::Reduce`] (`None`: no
+        /// initial value; always `None` for the others).
         init: Option<Box<IrNode>>,
+        /// The callback's `this` (`None`: `undefined`).
+        this_arg: Option<Box<IrNode>>,
     },
-    /// A non-callback array/string method call `recv.method(args)`. The
-    /// receiver is evaluated once, then the whole operation runs host-side through
-    /// the `__method` import, which decodes the receiver (reading linear memory)
-    /// and branches on its runtime TYPE BYTE for the overloaded `IndexOf`/`Slice`
-    /// (array-element vs string-byte semantics), bump-allocating any result string
-    /// or array in guest memory. The (already arity-checked) `args` are passed in
-    /// two fixed jsval slots, missing trailing ones padded with `undefined`.
+    /// The inline fast path `recv.method(arg)` of an `Array.prototype`
+    /// search/join method on an array receiver (see [`MethodOp`]); a missing
+    /// argument is `undefined`.
     MethodCall {
         /// Which method this call performs.
         op: MethodOp,
-        /// The receiver expression (an array or string; evaluated once).
+        /// The array receiver.
         recv: Box<IrNode>,
-        /// The argument expressions in source order (0..=2; see [`MethodOp`]).
+        /// The argument (at most one).
         args: Vec<IrNode>,
     },
     /// The unary logical NOT `!operand`. Evaluates `operand` under JS
@@ -1193,7 +1136,7 @@ pub enum IrNode {
     ExcValue,
     /// A user method call `obj.m(args)` binding `this = obj`. Distinct from
     /// [`IrNode::CallIndirect`] (which resets `this` to `undefined`) and from the
-    /// builtin [`IrNode::MethodCall`] (array/string host methods). `obj` is
+    /// builtin [`IrNode::MethodCall`] (array host methods). `obj` is
     /// evaluated ONCE into the fresh temp `obj_local`; the callee is the function
     /// value at member `key` of `obj` (an ordinary member read through `__get`);
     /// the `__this` global is set to `obj` immediately before the
@@ -1240,22 +1183,33 @@ pub enum IrNode {
         /// The generic method call on `obj_local` over `arg_locals`.
         slow: Box<IrNode>,
     },
-    /// A syntactic receiver method `recv.key(..)` whose builtin is not yet a
-    /// property of `%proto%` (design 3.2 row 3, until S5): when the dirty bit
-    /// of `%proto%` is set and `recv.key` is a function, `user` (the generic
-    /// method call) runs, else `fast`. Emitted only for a program that is not
-    /// intrinsics-sealed.
+    /// A call `recv.key(args)` of a builtin prototype method name (design
+    /// 3.2 row 3). When `array` is given and `recv` is an array handle with no
+    /// own properties (`props == 0`) whose `proto` is `%Array.prototype%` and
+    /// (unless `sealed`) whose dirty bit is clear, the inline `array` fast
+    /// path runs. Otherwise ONE call of the out-of-line generic method call
+    /// (`__get`, `IsCallable`, call with `this = recv`; it also throws for a
+    /// nullish `recv`), routed straight to the `String.prototype` builtin
+    /// `key` instead when `recv` is a string, `key` names one, and (unless
+    /// `sealed`) `%String.prototype%`'s dirty bit is clear (a primitive has
+    /// no own properties); a string receiver runs that builtin's host op
+    /// inline when the arguments already have the types it coerces to.
     ProtoGuard {
-        /// The constructor whose prototype the builtin belongs to.
-        proto: BuiltinCtor,
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
+        /// The receiver read (a local, evaluated and nullish-checked before
+        /// this node).
+        recv: Box<IrNode>,
         /// The method name.
         key: String,
-        /// The receiver read (a local, evaluated before this node).
-        recv: Box<IrNode>,
-        /// The syntactic fast path.
-        fast: Box<IrNode>,
-        /// The generic method call.
-        user: Box<IrNode>,
+        /// The arguments: side-effect-free nodes (locals, literals, function
+        /// literals), read by every path.
+        args: Vec<IrNode>,
+        /// The inline fast path for an array receiver, if the call shape has
+        /// one.
+        array: Option<Box<IrNode>>,
+        /// The `TypeError` thrown when `recv.key` is not callable.
+        not_callable: CalleeError,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
@@ -1924,6 +1878,7 @@ impl IrNode {
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
+            | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::IsGenerator(inner)
@@ -1968,12 +1923,6 @@ impl IrNode {
                 getter: a,
                 setter: b,
             }
-            | IrNode::ArrayHof {
-                array: a,
-                callback: b,
-                init: None,
-                ..
-            }
             | IrNode::ObjectHas { key: a, obj: b }
             | IrNode::ObjectDelete { obj: a, key: b }
             | IrNode::PromiseFinally {
@@ -1997,9 +1946,15 @@ impl IrNode {
             IrNode::ArrayHof {
                 array,
                 callback,
-                init: Some(init),
+                init,
+                this_arg,
                 ..
-            } => f(array) || f(callback) || f(init),
+            } => {
+                f(array)
+                    || f(callback)
+                    || init.as_deref().is_some_and(&mut f)
+                    || this_arg.as_deref().is_some_and(f)
+            }
             IrNode::ConvertCall { arg, radix, .. } => f(arg) || radix.as_deref().is_some_and(f),
             IrNode::DateNew { ms } => ms.as_deref().is_some_and(f),
             IrNode::Call { args, .. }
@@ -2028,8 +1983,8 @@ impl IrNode {
                 ..
             } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
             IrNode::ProtoGuard {
-                recv, fast, user, ..
-            } => f(recv) || f(fast) || f(user),
+                recv, args, array, ..
+            } => f(recv) || args.iter().any(&mut f) || array.as_deref().is_some_and(f),
             IrNode::Construct {
                 callee,
                 args,
@@ -2102,6 +2057,7 @@ impl IrNode {
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
+            | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::IsGenerator(inner)
@@ -2145,12 +2101,6 @@ impl IrNode {
                 getter: a,
                 setter: b,
             }
-            | IrNode::ArrayHof {
-                array: a,
-                callback: b,
-                init: None,
-                ..
-            }
             | IrNode::ObjectHas { key: a, obj: b }
             | IrNode::ObjectDelete { obj: a, key: b }
             | IrNode::PromiseFinally {
@@ -2174,9 +2124,14 @@ impl IrNode {
             IrNode::ArrayHof {
                 array,
                 callback,
-                init: Some(init),
+                init,
+                this_arg,
                 ..
-            } => vec![&mut **array, &mut **callback, &mut **init],
+            } => [&mut **array, &mut **callback]
+                .into_iter()
+                .chain(init.as_deref_mut())
+                .chain(this_arg.as_deref_mut())
+                .collect(),
             IrNode::ConvertCall { arg, radix, .. } => {
                 let mut out = vec![&mut **arg];
                 out.extend(radix.as_deref_mut());
@@ -2217,8 +2172,11 @@ impl IrNode {
                 .chain([&mut **fast, &mut **slow])
                 .collect(),
             IrNode::ProtoGuard {
-                recv, fast, user, ..
-            } => vec![&mut **recv, &mut **fast, &mut **user],
+                recv, args, array, ..
+            } => std::iter::once(&mut **recv)
+                .chain(args.iter_mut())
+                .chain(array.as_deref_mut())
+                .collect(),
             IrNode::Construct {
                 callee,
                 args,

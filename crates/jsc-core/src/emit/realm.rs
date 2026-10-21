@@ -39,9 +39,9 @@ pub(super) enum Intrinsic {
     Ctor(BuiltinCtor),
     /// `%<Ctor>.prototype%` of a constructor without a dedicated variant
     /// (`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-    /// `Date`): `constructor` only, plus `Array.prototype.map`/`toString` and
-    /// `Date.prototype.toString`/`valueOf` (the method families stay syntactic
-    /// until S5).
+    /// `Date`): `constructor`, the `Array`/`String`/`Number`/`Boolean`
+    /// prototype methods and `Date.prototype.toString`/`valueOf` (the other
+    /// method families stay syntactic until later S5 tasks).
     Prototype(BuiltinCtor),
 }
 
@@ -210,10 +210,36 @@ pub(super) enum Builtin {
     PromiseReject,
     /// `Date.now`.
     DateNow,
-    /// `Array.prototype.map`, generic over array-likes.
-    ArrayMap,
+    /// `Array.prototype.push`.
+    ArrayPush,
+    /// `Array.prototype.pop`.
+    ArrayPop,
+    /// `Array.prototype.map` / `filter` / `reduce` / `forEach`.
+    ArrayHof(ArrayHofOp),
+    /// `Array.prototype.indexOf`.
+    ArrayIndexOf,
+    /// `Array.prototype.includes`.
+    ArrayIncludes,
+    /// `Array.prototype.join`.
+    ArrayJoin,
+    /// `Array.prototype.slice`.
+    ArraySlice,
     /// `Array.prototype.toString`.
     ArrayToString,
+    /// A `String.prototype` method backed by a host `__method` op.
+    StringMethod(StringOp),
+    /// `String.prototype.toString`.
+    StringToString,
+    /// `String.prototype.valueOf`.
+    StringValueOf,
+    /// `Number.prototype.toString`.
+    NumberToString,
+    /// `Number.prototype.valueOf`.
+    NumberValueOf,
+    /// `Boolean.prototype.toString`.
+    BooleanToString,
+    /// `Boolean.prototype.valueOf`.
+    BooleanValueOf,
     /// `Date.prototype.toString`.
     DateToString,
     /// `Date.prototype.valueOf`.
@@ -221,15 +247,100 @@ pub(super) enum Builtin {
     /// `%ThrowTypeError%`: the poison getter/setter of the strict `caller` /
     /// `arguments` properties (one identity for every installation).
     ThrowTypeError,
+    /// The out-of-line generic method call of the guarded builtin call sites
+    /// (design 3.2): `this` is the receiver, `env` packs the interned method
+    /// key (low half) and the not-a-function message (high half). Not
+    /// installed on any intrinsic.
+    MethodCall,
     /// The global `isNaN`.
     IsNaN,
     /// The global `isFinite`.
     IsFinite,
 }
 
+/// A `String.prototype` method backed by a host `__method` op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StringOp {
+    IndexOf,
+    Includes,
+    Slice,
+    ToUpperCase,
+    ToLowerCase,
+    CharAt,
+    Trim,
+    TrimStart,
+    TrimEnd,
+    Repeat,
+    StartsWith,
+    EndsWith,
+    PadStart,
+    PadEnd,
+    Substring,
+    Split,
+}
+
+impl StringOp {
+    /// The method's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::IndexOf => "indexOf",
+            Self::Includes => "includes",
+            Self::Slice => "slice",
+            Self::ToUpperCase => "toUpperCase",
+            Self::ToLowerCase => "toLowerCase",
+            Self::CharAt => "charAt",
+            Self::Trim => "trim",
+            Self::TrimStart => "trimStart",
+            Self::TrimEnd => "trimEnd",
+            Self::Repeat => "repeat",
+            Self::StartsWith => "startsWith",
+            Self::EndsWith => "endsWith",
+            Self::PadStart => "padStart",
+            Self::PadEnd => "padEnd",
+            Self::Substring => "substring",
+            Self::Split => "split",
+        }
+    }
+
+    /// The method's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::ToUpperCase
+            | Self::ToLowerCase
+            | Self::Trim
+            | Self::TrimStart
+            | Self::TrimEnd => 0,
+            Self::Slice | Self::Substring | Self::Split => 2,
+            _ => 1,
+        }
+    }
+
+    /// The host `__method` op flag.
+    pub(super) fn flag(self) -> i32 {
+        match self {
+            Self::IndexOf => abi::METHOD_OP_INDEX_OF,
+            Self::Includes => abi::METHOD_OP_INCLUDES,
+            Self::Slice => abi::METHOD_OP_SLICE,
+            Self::ToUpperCase => abi::METHOD_OP_TO_UPPER,
+            Self::ToLowerCase => abi::METHOD_OP_TO_LOWER,
+            Self::CharAt => abi::METHOD_OP_CHAR_AT,
+            Self::Trim => abi::METHOD_OP_TRIM,
+            Self::TrimStart => abi::METHOD_OP_TRIM_START,
+            Self::TrimEnd => abi::METHOD_OP_TRIM_END,
+            Self::Repeat => abi::METHOD_OP_REPEAT,
+            Self::StartsWith => abi::METHOD_OP_STARTS_WITH,
+            Self::EndsWith => abi::METHOD_OP_ENDS_WITH,
+            Self::PadStart => abi::METHOD_OP_PAD_START,
+            Self::PadEnd => abi::METHOD_OP_PAD_END,
+            Self::Substring => abi::METHOD_OP_SUBSTRING,
+            Self::Split => abi::METHOD_OP_SPLIT,
+        }
+    }
+}
+
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 50] = [
+    pub(super) const ALL: [Builtin; 82] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -273,11 +384,43 @@ impl Builtin {
         Self::PromiseResolve,
         Self::PromiseReject,
         Self::DateNow,
-        Self::ArrayMap,
+        Self::ArrayPush,
+        Self::ArrayPop,
+        Self::ArrayHof(ArrayHofOp::Map),
+        Self::ArrayHof(ArrayHofOp::Filter),
+        Self::ArrayHof(ArrayHofOp::Reduce),
+        Self::ArrayHof(ArrayHofOp::ForEach),
+        Self::ArrayIndexOf,
+        Self::ArrayIncludes,
+        Self::ArrayJoin,
+        Self::ArraySlice,
         Self::ArrayToString,
+        Self::StringMethod(StringOp::IndexOf),
+        Self::StringMethod(StringOp::Includes),
+        Self::StringMethod(StringOp::Slice),
+        Self::StringMethod(StringOp::ToUpperCase),
+        Self::StringMethod(StringOp::ToLowerCase),
+        Self::StringMethod(StringOp::CharAt),
+        Self::StringMethod(StringOp::Trim),
+        Self::StringMethod(StringOp::TrimStart),
+        Self::StringMethod(StringOp::TrimEnd),
+        Self::StringMethod(StringOp::Repeat),
+        Self::StringMethod(StringOp::StartsWith),
+        Self::StringMethod(StringOp::EndsWith),
+        Self::StringMethod(StringOp::PadStart),
+        Self::StringMethod(StringOp::PadEnd),
+        Self::StringMethod(StringOp::Substring),
+        Self::StringMethod(StringOp::Split),
+        Self::StringToString,
+        Self::StringValueOf,
+        Self::NumberToString,
+        Self::NumberValueOf,
+        Self::BooleanToString,
+        Self::BooleanValueOf,
         Self::DateToString,
         Self::DateValueOf,
         Self::ThrowTypeError,
+        Self::MethodCall,
         Self::IsNaN,
         Self::IsFinite,
     ];
@@ -285,13 +428,21 @@ impl Builtin {
     /// The function's `name`.
     pub(super) fn name(self) -> &'static str {
         match self {
-            Self::FunctionPrototype | Self::ThrowTypeError => "",
+            Self::FunctionPrototype | Self::ThrowTypeError | Self::MethodCall => "",
             Self::HasOwnProperty => "hasOwnProperty",
             Self::ObjectToString
             | Self::ErrorToString
             | Self::ArrayToString
+            | Self::StringToString
+            | Self::NumberToString
+            | Self::BooleanToString
             | Self::DateToString => "toString",
-            Self::ValueOf | Self::DateValueOf => "valueOf",
+            Self::ValueOf
+            | Self::StringValueOf
+            | Self::NumberValueOf
+            | Self::BooleanValueOf
+            | Self::DateValueOf => "valueOf",
+            Self::StringMethod(op) => op.name(),
             Self::Call => "call",
             Self::Apply => "apply",
             Self::Math(op) => match op {
@@ -316,7 +467,16 @@ impl Builtin {
             Self::PromiseResolve => "resolve",
             Self::PromiseReject => "reject",
             Self::DateNow => "now",
-            Self::ArrayMap => "map",
+            Self::ArrayPush => "push",
+            Self::ArrayPop => "pop",
+            Self::ArrayHof(ArrayHofOp::Map) => "map",
+            Self::ArrayHof(ArrayHofOp::Filter) => "filter",
+            Self::ArrayHof(ArrayHofOp::Reduce) => "reduce",
+            Self::ArrayHof(ArrayHofOp::ForEach) => "forEach",
+            Self::ArrayIndexOf => "indexOf",
+            Self::ArrayIncludes => "includes",
+            Self::ArrayJoin => "join",
+            Self::ArraySlice => "slice",
             Self::IsNaN => "isNaN",
             Self::IsFinite => "isFinite",
         }
@@ -327,6 +487,12 @@ impl Builtin {
         match self {
             Self::FunctionPrototype
             | Self::ThrowTypeError
+            | Self::MethodCall
+            | Self::StringToString
+            | Self::StringValueOf
+            | Self::NumberValueOf
+            | Self::BooleanToString
+            | Self::BooleanValueOf
             | Self::ObjectToString
             | Self::ValueOf
             | Self::ErrorToString
@@ -335,11 +501,13 @@ impl Builtin {
             | Self::DateValueOf
             | Self::ConsoleLog
             | Self::DateNow
+            | Self::ArrayPop
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
-            Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow) | Self::Apply | Self::JsonParse => {
-                2
-            }
+            Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow)
+            | Self::Apply
+            | Self::JsonParse
+            | Self::ArraySlice => 2,
             Self::HasOwnProperty
             | Self::Call
             | Self::Math(_)
@@ -348,10 +516,38 @@ impl Builtin {
             | Self::IsArray
             | Self::PromiseResolve
             | Self::PromiseReject
-            | Self::ArrayMap
+            | Self::ArrayPush
+            | Self::ArrayHof(_)
+            | Self::ArrayIndexOf
+            | Self::ArrayIncludes
+            | Self::ArrayJoin
+            | Self::NumberToString
             | Self::IsNaN
             | Self::IsFinite => 1,
+            Self::StringMethod(op) => op.length(),
             Self::JsonStringify => 3,
+        }
+    }
+
+    /// The constructor whose `%prototype%` holds this builtin as a method
+    /// (installed under its [`Self::name`]), if any.
+    fn prototype(self) -> Option<BuiltinCtor> {
+        match self {
+            Self::ArrayPush
+            | Self::ArrayPop
+            | Self::ArrayHof(_)
+            | Self::ArrayIndexOf
+            | Self::ArrayIncludes
+            | Self::ArrayJoin
+            | Self::ArraySlice
+            | Self::ArrayToString => Some(BuiltinCtor::Array),
+            Self::StringMethod(_) | Self::StringToString | Self::StringValueOf => {
+                Some(BuiltinCtor::String)
+            }
+            Self::NumberToString | Self::NumberValueOf => Some(BuiltinCtor::Number),
+            Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
+            Self::DateToString | Self::DateValueOf => Some(BuiltinCtor::Date),
+            _ => None,
         }
     }
 
@@ -621,8 +817,8 @@ pub(super) fn registry() -> Vec<Entry> {
 }
 
 /// The constructors' own properties (`length`, `name`, the non-writable
-/// `prototype`, statics), each prototype's `constructor` back-link,
-/// `Array.prototype.map`/`toString` and `Date.prototype.toString`/`valueOf`.
+/// `prototype`, statics), each prototype's `constructor` back-link, and the
+/// prototype methods ([`Builtin::prototype`]).
 fn constructor_entries(entries: &mut Vec<Entry>) {
     let entry = |intrinsic, key, attrs, value| Entry {
         intrinsic,
@@ -669,19 +865,12 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         let ctor = Value::Intrinsic(intrinsic);
         entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
     }
-    entries.push(entry(
-        Intrinsic::Prototype(BuiltinCtor::Array),
-        "map",
-        METHOD_ATTRS,
-        Value::Method(Builtin::ArrayMap),
-    ));
-    for (ctor, key, builtin) in [
-        (BuiltinCtor::Array, "toString", Builtin::ArrayToString),
-        (BuiltinCtor::Date, "toString", Builtin::DateToString),
-        (BuiltinCtor::Date, "valueOf", Builtin::DateValueOf),
-    ] {
-        let method = Value::Method(builtin);
-        entries.push(entry(Intrinsic::Prototype(ctor), key, METHOD_ATTRS, method));
+    for builtin in Builtin::ALL {
+        if let Some(ctor) = builtin.prototype() {
+            let method = Value::Method(builtin);
+            let key = builtin.name();
+            entries.push(entry(Intrinsic::Prototype(ctor), key, METHOD_ATTRS, method));
+        }
     }
 }
 

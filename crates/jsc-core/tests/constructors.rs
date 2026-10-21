@@ -109,14 +109,8 @@ fn conversion_functions_as_values() {
     assert_string("const s = String; s()", "");
     assert_number("const n = Number; n()", 0.0);
     assert_bool("const b = Boolean; b()", false);
-    assert_uncaught(
-        "const S = String; new S('a')",
-        "TypeError: String wrapper objects are not supported",
-    );
-    assert_uncaught(
-        "new Number(1)",
-        "TypeError: Number wrapper objects are not supported",
-    );
+    assert_eval("const S = String; new S('a')", "[String: 'a']");
+    assert_eval("new Number(1)", "[Number: 1]");
 }
 
 #[test]
@@ -125,10 +119,7 @@ fn object_function_array_called_and_constructed() {
     assert_string("typeof Object()", "object");
     assert_eval("new Object()", "{}");
     assert_eval("Object(null)", "{}");
-    assert_uncaught(
-        "Object(1)",
-        "TypeError: Object(primitive) wrapper objects are not supported",
-    );
+    assert_eval("Object(1)", "[Number: 1]");
     assert_uncaught(
         "Function('return 1')",
         "TypeError: the Function constructor is not supported",

@@ -1619,18 +1619,17 @@ fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Help
 /// Emit a member read `obj[index]` (`obj.k` is `obj["k"]`), leaving the
 /// resulting jsval on the stack.
 ///
-/// `obj` and `index` are each evaluated once into a scratch local. A primitive
-/// receiver (number or boolean; nullish is guarded first) reads `undefined`
-/// without touching memory. A static string key goes straight to `__get` with
-/// its interned key constant (`__get` resolves a string's or array's
-/// `length`/index keys itself); the one exception is `.size`, which a
-/// `Map`/`Set` handle answers from its header. A computed in-range integer
-/// key on an array loads the element (a hole reads `undefined`); a computed
-/// key on a string keeps the string path: `"length"`, a canonical numeric
-/// index (number or numeric string), or `undefined`. Any other computed read
-/// converts the key with `ToPropertyKey` (a lookup, so a never-interned key
-/// reads `undefined`) and calls `__get` (which routes an array's canonical
-/// index strings to its elements and its other keys to its own table).
+/// `obj` and `index` are each evaluated once into a scratch local. A static
+/// string key goes straight to `__get` with its interned key constant
+/// (`__get` resolves a string's or array's `length`/index keys itself, and a
+/// primitive receiver's inherited ones through its prototype); the one
+/// exception is `.size`, which a `Map`/`Set` handle answers from its header.
+/// A computed in-range integer key on an array loads the element (a hole
+/// reads `undefined`); a computed `"length"` or canonical numeric index on a
+/// string reads it inline. Any other computed read converts the key with
+/// `ToPropertyKey` (a lookup, so a never-interned key reads `undefined`) and
+/// calls `__get` (which routes an array's canonical index strings to its
+/// elements and its other keys to its own table).
 ///
 /// Both operands are evaluated on the operand stack before being stashed in
 /// the DEDICATED HIGH scratch slots `+17`/`+18`, so a computed index that is
@@ -1671,14 +1670,16 @@ pub(super) fn emit_index_node(
         );
     }
 
-    // A primitive receiver (number/boolean — nullish was guarded above) owns no
-    // heap block: one pointer-tag test keeps every path below from reading
-    // memory at its bits. Its properties all read `undefined` until S4.
-    emit_is_pointer(function, s0);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    // A static key other than `size` is one `__get` (which resolves a
+    // primitive receiver through its prototype); a computed key takes the
+    // inline array/string reads first. `size` reads the kind byte, so a
+    // primitive receiver (number/boolean — nullish was guarded above), which
+    // owns no heap block, takes `__get` behind one pointer-tag test.
     match index {
         IrNode::Str(name) if name == "size" => {
             // A `Map`/`Set` handle answers `.size` from its header.
+            emit_is_pointer(function, s0);
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
             emit_load_type_byte(function, s0);
             function.instruction(&Instruction::I32Const(TYPE_MAP));
             function.instruction(&Instruction::I32Eq);
@@ -1686,6 +1687,9 @@ pub(super) fn emit_index_node(
             function.instruction(&Instruction::I32Const(TYPE_SET));
             function.instruction(&Instruction::I32Eq);
             function.instruction(&Instruction::I32Or);
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::End);
             function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
             emit_u32_field_boxed(function, s0, MAP_SIZE_OFFSET);
             function.instruction(&Instruction::Else);
@@ -1695,10 +1699,6 @@ pub(super) fn emit_index_node(
         IrNode::Str(_) => emit_get_call(function, s0, index, s1, strings, helpers),
         _ => emit_index_dynamic(function, scratch, s0, s1, strings, helpers),
     }
-    // Close the pointer guard: a primitive receiver reads `undefined`.
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::End);
     if helpers.has_accessors {
         emit_propagate_if_pending(function, helpers);
     }
@@ -1719,10 +1719,11 @@ fn emit_get_call(
     function.instruction(&Instruction::Call(helpers.get));
 }
 
-/// Emit the computed-key half of [`emit_index_node`] for the heap receiver in
-/// `s0` and the key jsval in `s1`: an array loads the element of an in-range
-/// integer key, a string builds the in-range one-char string (or reads
-/// `length`), and any other key or receiver goes through `__get`.
+/// Emit the computed-key half of [`emit_index_node`] for the receiver in `s0`
+/// and the key jsval in `s1`: an array loads the element of an in-range
+/// integer key, a string reads `length` or builds the in-range one-char
+/// string, each leaving the read block early; every other key or receiver (a
+/// primitive included) falls through to the one `__get`.
 fn emit_index_dynamic(
     function: &mut Function,
     scratch: u32,
@@ -1731,16 +1732,18 @@ fn emit_index_dynamic(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+    emit_is_pointer(function, s0);
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_load_type_byte(function, s0);
     function.instruction(&Instruction::I32Const(TYPE_ARRAY));
     function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     // ARRAY: an in-range integer key loads the i64 element jsval at
     // elems + 8 + 8*i (`__sparse_get` on a SPARSE array; stashed in `s1`, the
-    // key being dead) and reads a hole as `undefined`; any other key goes
-    // through `__get`.
+    // key being dead) and reads a hole as `undefined`.
     emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_sparse_test(function, s0);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::LocalGet(s0));
@@ -1763,33 +1766,31 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalSet(s1));
     emit_elem_read(function, s1);
-    function.instruction(&Instruction::Else);
-    emit_get_dynamic(function, s0, s1, helpers);
+    function.instruction(&Instruction::Br(3));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     emit_load_type_byte(function, s0);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // STRING: `"length"` reads the header; otherwise an out-of-bounds or
-    // non-index key (an unknown property such as `"abc".foo`) yields
-    // `undefined`, and an in-range index builds a fresh one-char string via
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // STRING: `"length"` reads the header and an in-range index (a number or
+    // a canonical numeric string) builds a fresh one-char string via
     // `__str_index` (reboxed as a heap jsval).
     emit_index_string_key(function, s1, scratch, strings, helpers);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
-    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::Br(4));
+    function.instruction(&Instruction::End);
     emit_index_in_bounds(function, s0, s1, HEADER_SIZE as u64);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_str_index_boxed(function, s0, s1, helpers);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Br(4));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    function.instruction(&Instruction::Else);
-    // Every other heap receiver: the generic property read.
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    // Every other key or receiver: the generic property read.
     emit_get_dynamic(function, s0, s1, helpers);
-    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 }
 

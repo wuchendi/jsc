@@ -174,8 +174,8 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
 }
 
 /// `Object(v)`: an object argument as is; `undefined`/`null` a fresh plain
-/// object (the allocated `this` under `new`); a subclass `new.target` gets
-/// its allocated `this`. A primitive needs the wrapper objects of S5.
+/// object (the allocated `this` under `new`); a primitive its wrapper object;
+/// a subclass `new.target` gets its allocated `this`.
 fn object(body: &Body) -> IrNode {
     let subclass = IrNode::Logical {
         op: LogicalOp::And,
@@ -207,7 +207,7 @@ fn object(body: &Body) -> IrNode {
             ternary(
                 is_nullish(body.arg(0)),
                 fresh,
-                throw_type_error("Object(primitive) wrapper objects are not supported"),
+                IrNode::ToObject(Box::new(body.arg(0))),
             ),
         ),
     )
@@ -249,20 +249,24 @@ fn array(body: &Body) -> IrNode {
 }
 
 /// `String(v)` / `Number(v)` / `Boolean(v)`: the conversion of the first
-/// argument (`empty` without one). `new` would need the wrapper objects of
-/// S5.
+/// argument (`empty` without one); under `new`, its wrapper object (design
+/// 2.4) with `proto` from `new.target`.
 fn conversion(body: &Body, ctor: BuiltinCtor, op: ConvertOp, empty: IrNode) -> IrNode {
-    let message = format!("{} wrapper objects are not supported", ctor.name());
     let convert = IrNode::ConvertCall {
         op,
         arg: Box::new(body.arg(0)),
         radix: None,
     };
-    ternary(
-        body.constructing(),
-        throw_type_error(&message),
-        ternary(body.argc_is(0), empty, convert),
-    )
+    let value = ternary(body.argc_is(0), empty, convert);
+    let v = body.temp(3);
+    let wrapper = IrNode::Seq(vec![
+        IrNode::Assign {
+            local: v,
+            value: Box::new(value.clone()),
+        },
+        body.with_proto(ctor, IrNode::ToObject(Box::new(IrNode::Local(v)))),
+    ]);
+    ternary(body.constructing(), wrapper, value)
 }
 
 /// `new Date()` / `new Date(ms)`; called, `Date()` is the current time as a
