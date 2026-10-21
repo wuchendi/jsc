@@ -27,10 +27,12 @@ use crate::ir::{GenSegment, GenTerm};
 /// cells (the first `slots.len()` initialized from the constructor's argument
 /// expressions, the rest to `undefined`), then the [`abi::TYPE_GENERATOR`] block
 /// pointing at it with `sm_idx`/`state = 0`/`done = 0`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_make_generator(
     sm_table_index: u32,
     slots: &[IrNode],
     total: u32,
+    limits: u32,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -82,14 +84,11 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(gen_dst));
-    // `%GeneratorPrototype%` is not in the realm yet; inheriting from
-    // `%Object.prototype%` (where its chain ends) gives a generator object its
-    // `toString` (`[object Generator]`) and `valueOf`.
     emit_object_prefix(
         function,
         gen_dst,
         TYPE_GENERATOR,
-        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
+        intrinsic_bits(Intrinsic::GeneratorPrototype, helpers),
     );
     // sm_idx (u32).
     function.instruction(&Instruction::LocalTee(gen_dst));
@@ -115,6 +114,15 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Store(MemArg {
         offset: GEN_DONE_OFFSET,
+        align: 2,
+        memory_index: 0,
+    }));
+    // limits (u32).
+    function.instruction(&Instruction::LocalTee(gen_dst));
+    function.instruction(&Instruction::LocalGet(gen_dst));
+    function.instruction(&Instruction::I32Const(limits.cast_signed()));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
         align: 2,
         memory_index: 0,
     }));
@@ -173,6 +181,41 @@ pub(super) fn emit_gen_resume(
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 
+    // 2b. A running generator (resumed from its own body) throws; otherwise it
+    // is marked running for the resume.
+    let limits = MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    };
+    let running = abi::GEN_RUNNING.cast_signed();
+    function.instruction(&Instruction::LocalGet(handle_slot));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(limits));
+    function.instruction(&Instruction::I32Const(running));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_throw_not_a_function(function, GENERATOR_RUNNING, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    let set_running = |function: &mut Function, on: bool| {
+        function.instruction(&Instruction::LocalGet(handle_slot));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalGet(handle_slot));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Load(limits));
+        if on {
+            function.instruction(&Instruction::I32Const(running));
+            function.instruction(&Instruction::I32Or);
+        } else {
+            function.instruction(&Instruction::I32Const(!running));
+            function.instruction(&Instruction::I32And);
+        }
+        function.instruction(&Instruction::I32Store(limits));
+    };
+    set_running(function, true);
+
     // 3. Drive the state machine: SM(sent, gen, …, env = gen.env, argc = 2).
     let k = helpers.max_args as usize;
     emit_node(sent, function, scratch, strings, helpers);
@@ -208,8 +251,9 @@ pub(super) fn emit_gen_resume(
         table_index: 0,
     });
     // The state machine can throw; unwind if it left an exception pending.
-    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::LocalSet(sm_result));
+    set_running(function, false);
+    emit_propagate_if_pending(function, helpers);
 
     // 4. Build the `{ value, done }` result object from the SM's value and the
     // handle's `done` flag.

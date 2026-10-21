@@ -219,14 +219,15 @@ pub(super) fn build_type_and_function_sections<'a>(
     }
     // The conversion helpers follow the builtin bodies:
     // `__to_primitive(v: i64, hint: i32) -> i64`, `__to_string(v: i64) -> i32`,
-    // `__add(a: i64, b: i64) -> i64`, `__compare(a: i64, b: i64, op: i32) -> i32`
-    // and `__array_join(recv: i64, sep: i64) -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 5] = [
+    // `__add(a: i64, b: i64) -> i64`, `__compare(a: i64, b: i64, op: i32) -> i32`,
+    // `__array_join(recv: i64, sep: i64) -> i64` and `__to_object(v: i64) -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 6] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
         (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
+        (&[ValType::I64], &[ValType::I64]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
@@ -575,6 +576,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     let fragments: Vec<IrNode> = Builtin::ALL
         .into_iter()
         .filter_map(|b| builtins::fragment(b, program.arity))
+        .chain(builtins::fragments(program.arity))
         .collect();
     // `"length"` is always interned: the property helpers compare a key against
     // it to resolve a string's or array's exotic `length`.
@@ -723,21 +725,16 @@ pub(super) fn collect_node<'a>(
             }
             collect_node(value, order, seen);
         }
-        // `ArrayPush` carries its pushed value plus the not-an-array error.
-        IrNode::ArrayPush {
-            value, not_array, ..
-        } => {
-            if let Some(not_array) = not_array {
-                seed_callee_error(callee_error_text(not_array), order, seen);
-            }
-            collect_node(value, order, seen);
-        }
+        IrNode::ArrayPush { value, .. } => collect_node(value, order, seen),
         IrNode::Assign { value, .. } => {
             collect_node(value, order, seen);
         }
         // A direct call and a `console.log` both just collect their argument
         // literals (`console.log` has no callee expression to walk).
-        IrNode::Call { args, .. } | IrNode::ConsoleLog { args } | IrNode::MathCall { args, .. } => {
+        IrNode::Call { args, .. }
+        | IrNode::ConsoleLog { args }
+        | IrNode::MathCall { args, .. }
+        | IrNode::CollectionOp { args, .. } => {
             for arg in args {
                 collect_node(arg, order, seen);
             }
@@ -778,6 +775,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::Not(operand)
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
+        | IrNode::ToObject(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
@@ -866,6 +864,7 @@ pub(super) fn collect_node<'a>(
             array,
             callback,
             init,
+            this_arg,
             ..
         } => {
             if !is_static_function(callback) {
@@ -873,8 +872,8 @@ pub(super) fn collect_node<'a>(
             }
             collect_node(array, order, seen);
             collect_node(callback, order, seen);
-            if let Some(init) = init {
-                collect_node(init, order, seen);
+            for node in [init, this_arg].into_iter().flatten() {
+                collect_node(node, order, seen);
             }
         }
         IrNode::MethodCall { recv, args, .. } => {
@@ -918,16 +917,37 @@ pub(super) fn collect_node<'a>(
             collect_node(slow, order, seen);
         }
         IrNode::ProtoGuard {
-            key,
             recv,
+            key,
+            args,
             fast,
-            user,
+            not_callable,
             ..
         } => {
-            seed_strs_ref(&[key], order, seen);
+            // The generic call reads the interned key and builds the
+            // nullish-receiver or not-a-function `TypeError`.
+            seed_strs_ref(&[key, &not_callable.message], order, seen);
+            seed_nullish_strs(order, seen);
             collect_node(recv, order, seen);
-            collect_node(fast, order, seen);
-            collect_node(user, order, seen);
+            for arg in args {
+                collect_node(arg, order, seen);
+            }
+            for (_, path) in fast {
+                collect_node(path, order, seen);
+            }
+        }
+        // The slow path is a `size` member read.
+        IrNode::SizeRead { obj, .. } => {
+            seed_strs(&["size"], order, seen);
+            seed_nullish_strs(order, seen);
+            collect_node(obj, order, seen);
+        }
+        // `toISOString()` returns the interned `"Invalid Date"` literal for a
+        // non-finite timestamp.
+        IrNode::DateField { op, .. } => {
+            if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
+                order.push(INVALID_DATE);
+            }
         }
         IrNode::Construct {
             callee,
@@ -1034,79 +1054,6 @@ pub(super) fn collect_node<'a>(
             collect_node(then_branch, order, seen);
             collect_node(else_branch, order, seen);
         }
-        // A Map/Set method threads its method name (used as the user-method-fallback
-        // key) into the string table, then recurses into the receiver and arguments.
-        IrNode::MapMethod {
-            recv,
-            args,
-            method_name,
-            not_callable,
-            ..
-        } => {
-            if seen.insert(method_name.as_str()) {
-                order.push(method_name.as_str());
-            }
-            // The unknown-collection-method fallback lowers to a user method call,
-            // which the runtime callee guard protects — seed its TypeError strings too.
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            collect_node(recv, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
-        // A promise / generator method threads its method name (the user-method
-        // fallback key) into the string table; the generator path builds a
-        // `{ value, done }` result, and the guarded fallback throws a nullish /
-        // not-a-function TypeError — seed all of those strings too.
-        IrNode::ReceiverMethod {
-            op,
-            recv,
-            args,
-            not_callable,
-            ..
-        } => {
-            let keys: &[&'static str] = if matches!(op, ReceiverOp::Next) {
-                &["value", "done"]
-            } else {
-                &[]
-            };
-            let name = [op.name()];
-            for &s in name.iter().chain(keys) {
-                if seen.insert(s) {
-                    order.push(s);
-                }
-            }
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            seed_nullish_strs(order, seen);
-            collect_node(recv, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
-        IrNode::DateMethod {
-            op,
-            recv,
-            args,
-            method_name,
-            not_callable,
-            ..
-        } => {
-            if seen.insert(method_name.as_str()) {
-                order.push(method_name.as_str());
-            }
-            // The non-Date fallback lowers to a guarded user method call — seed
-            // its TypeError strings too.
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            // `toISOString()` returns the interned `"Invalid Date"` literal for a
-            // non-finite timestamp, so its `[len][utf8]` blob must exist.
-            if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
-                order.push(INVALID_DATE);
-            }
-            collect_node(recv, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
         // The promise primitives carry only sub-expressions to walk.
         IrNode::PromiseResolve(operand)
         | IrNode::PromiseReject(operand)
@@ -1154,6 +1101,7 @@ pub(super) fn collect_node<'a>(
                 }
             }
             seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
+            seed_callee_error(GENERATOR_RUNNING, order, seen);
             collect_node(handle, order, seen);
             collect_node(sent, order, seen);
         }
@@ -1163,11 +1111,6 @@ pub(super) fn collect_node<'a>(
             if let Some(ms) = ms {
                 collect_node(ms, order, seen);
             }
-        }
-        IrNode::DateGetTime { recv } => collect_node(recv, order, seen),
-        // `pop` only needs its not-an-array error.
-        IrNode::ArrayPop { not_array, .. } => {
-            seed_callee_error(callee_error_text(not_array), order, seen);
         }
         // A global reference interns its key and, unless it reads `undefined`
         // on a miss, its `ReferenceError` texts; a write may also throw the
@@ -1203,6 +1146,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::IsConstructCall(_)
         | IrNode::ArgCount(_)
         | IrNode::Hole
+        | IrNode::ArrayPop { .. }
         | IrNode::SpreadArgsGlobal
         | IrNode::DeclFunc(_)
         // `new Map()` / `new Set()` and `Date.now()` carry no string literals.
@@ -1288,16 +1232,17 @@ fn collect_entries<'a>(
 }
 
 /// Whether any function of `program` (or `main`) builds an accessor
-/// ([`IrNode::MakeAccessor`]) or can reach the realm's `%Function.prototype%`
-/// `caller` / `arguments` accessors: it names them, or reads or writes a
+/// ([`IrNode::MakeAccessor`]) or can reach the realm's accessors (the
+/// `%Function.prototype%` `caller` / `arguments` poison pair, the `Map`/`Set`
+/// `size` getters): it names them, or reads or writes a
 /// member under a key computed at run time. Then `__get` / `__set` must
 /// dispatch to getters and setters. (The builtins only read fixed keys:
 /// `length`, indices, `prototype`, `name`, `message`.)
 fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
-        IrNode::MakeAccessor { .. } => true,
-        IrNode::Str(s) => s == "caller" || s == "arguments",
+        IrNode::MakeAccessor { .. } | IrNode::SizeRead { .. } => true,
+        IrNode::Str(s) => s == "caller" || s == "arguments" || s == "size",
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }
         | IrNode::IndexOpSet { index: key, .. }
@@ -1311,7 +1256,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 /// `__define` / `__delete` must set the bits (design 3.3).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        IrNode::ProtoGuard { .. } => true,
+        IrNode::ProtoGuard { sealed, .. } | IrNode::SizeRead { sealed, .. } => !sealed,
         IrNode::NamespaceGuard { namespace, .. } => {
             realm::Intrinsic::from(*namespace).watch_bit().is_some()
         }

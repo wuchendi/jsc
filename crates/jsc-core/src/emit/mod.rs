@@ -36,7 +36,7 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
     SpreadCallee, SpreadElem,
 };
 
@@ -117,20 +117,6 @@ const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-const METHOD_OP_SLICE: i32 = abi::METHOD_OP_SLICE;
-const METHOD_OP_TO_UPPER: i32 = abi::METHOD_OP_TO_UPPER;
-const METHOD_OP_TO_LOWER: i32 = abi::METHOD_OP_TO_LOWER;
-const METHOD_OP_CHAR_AT: i32 = abi::METHOD_OP_CHAR_AT;
-const METHOD_OP_TRIM: i32 = abi::METHOD_OP_TRIM;
-const METHOD_OP_TRIM_START: i32 = abi::METHOD_OP_TRIM_START;
-const METHOD_OP_TRIM_END: i32 = abi::METHOD_OP_TRIM_END;
-const METHOD_OP_REPEAT: i32 = abi::METHOD_OP_REPEAT;
-const METHOD_OP_STARTS_WITH: i32 = abi::METHOD_OP_STARTS_WITH;
-const METHOD_OP_ENDS_WITH: i32 = abi::METHOD_OP_ENDS_WITH;
-const METHOD_OP_PAD_START: i32 = abi::METHOD_OP_PAD_START;
-const METHOD_OP_PAD_END: i32 = abi::METHOD_OP_PAD_END;
-const METHOD_OP_SUBSTRING: i32 = abi::METHOD_OP_SUBSTRING;
-const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
 
 /// The name under which the bump-allocator heap pointer global is exported so the
 /// run stage can detect the out-of-memory sentinel.
@@ -427,6 +413,12 @@ fn callee_error_text(error: &CalleeError) -> CalleeErrorText<'_> {
 /// The not-a-function `TypeError` text of a guarded call whose callee has no
 /// source name (an array callback, a promise executor, a `super` call, a
 /// generator resume).
+/// The `TypeError` of resuming a generator that is already running.
+const GENERATOR_RUNNING: CalleeErrorText<'static> = [
+    "Generator is already running",
+    "TypeError: Generator is already running",
+];
+
 const EXPRESSION_NOT_A_FUNCTION: CalleeErrorText<'static> = [
     "expression is not a function",
     "TypeError: expression is not a function",
@@ -991,6 +983,18 @@ impl Helpers<'_> {
         self.to_primitive() + 4
     }
 
+    /// `__to_object(v) -> i64` (see [`builtins::emit_to_object`]), right
+    /// after `__array_join`.
+    fn to_object(self) -> u32 {
+        self.to_primitive() + 5
+    }
+
+    /// The funcref-table slot of `builtin`'s body: the builtins follow the
+    /// user functions and the two settlers.
+    fn builtin_slot(self, builtin: Builtin) -> u32 {
+        self.settle_resolve_slot + 2 + builtin.index()
+    }
+
     /// `__new_array(len) -> i32`: the exported array constructor, right after
     /// `__new_string`.
     fn new_array(self) -> u32 {
@@ -1100,7 +1104,7 @@ use numeric::*;
 use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
-use realm::{Builtin, Intrinsic, intrinsic_bits};
+use realm::{Builtin, Intrinsic, StringOp, intrinsic_bits};
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]
@@ -1420,6 +1424,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_add_helper(helpers));
     code.function(&emit_compare(helpers));
     code.function(&emit_array_join(&offsets, helpers));
+    code.function(&builtins::emit_to_object(&offsets, helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

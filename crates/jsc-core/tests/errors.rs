@@ -514,12 +514,12 @@ fn instanceof_any_rhs() {
 
 /// The `Date` builtin accepts only the timestamp constructor forms and a
 /// zero-argument `Date.now()`; the calendar-field constructor, extra arguments,
-/// and a spread argument are rejected at compile time.
+/// and a spread argument are rejected at compile time (`Date.prototype`
+/// methods take any arguments).
 #[test]
 fn date_unsupported_forms_rejected() {
     assert_rejected("new Date(2024, 0, 1)");
     assert_rejected("Date.now(5)");
-    assert_rejected("new Date(0).getTime(1)");
     assert_rejected("new Date(...[0])");
 }
 

@@ -723,3 +723,79 @@ fn await_in_a_switch_case() {
         "one\ntwodflt\n",
     );
 }
+
+// --- %Promise.prototype% ------------------------------------------------------
+
+#[test]
+fn promise_methods_are_function_values() {
+    for (name, length) in [("then", 2), ("catch", 1), ("finally", 1)] {
+        assert_eval(&format!("typeof Promise.resolve(1).{name}"), "function");
+        assert_eval(
+            &format!("Promise.resolve(1).{name} === Promise.prototype.{name}"),
+            "true",
+        );
+        assert_eval(&format!("Promise.prototype.{name}.name"), name);
+        assert_eval(
+            &format!("Promise.prototype.{name}.length"),
+            &length.to_string(),
+        );
+    }
+}
+
+#[test]
+fn then_through_a_value() {
+    assert_output(
+        "const p = Promise.resolve(3); const then = p.then; \
+         await then.call(p, v => console.log('v', v));",
+        "v 3\n",
+    );
+    assert_output(
+        "await Promise.prototype.catch.call(Promise.reject(2), e => console.log('e', e));",
+        "e 2\n",
+    );
+    assert_uncaught(
+        "Promise.prototype.then.call({}, () => 1)",
+        "TypeError: Method Promise.prototype.then called on incompatible receiver",
+    );
+}
+
+#[test]
+fn catch_invokes_then_on_any_object() {
+    assert_output(
+        "const t = { then(a, b) { console.log(typeof a, typeof b); return 9 } }; \
+         console.log(Promise.prototype.catch.call(t, () => 1))",
+        "undefined function\n9\n",
+    );
+}
+
+#[test]
+fn user_then_and_extra_arguments() {
+    // DF12: a thenable's own `then` is called.
+    assert_eval(
+        "const t = { then(f) { return 'user' } }; t.then(() => 1)",
+        "user",
+    );
+    assert_eval(
+        "class C { then() { return 4 } finally() { return 5 } catch() { return 6 } } \
+         const c = new C(); '' + c.then() + c.finally() + c.catch()",
+        "456",
+    );
+    // Extra arguments are evaluated and ignored.
+    assert_output(
+        "let n = 0; await Promise.resolve(1).then(v => console.log(v), undefined, n++); \
+         console.log(n)",
+        "1\n1\n",
+    );
+    assert_output(
+        "await Promise.resolve(2).then(...[v => console.log(v)]);",
+        "2\n",
+    );
+}
+
+#[test]
+fn promise_prototype_override_is_honoured() {
+    assert_eval(
+        "Promise.prototype.then = function () { return 'mine' }; Promise.resolve(1).then()",
+        "mine",
+    );
+}

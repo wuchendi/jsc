@@ -473,3 +473,34 @@ it('converts objects with OrdinaryToPrimitive like the Rust host', async () => {
     run('String({ valueOf() { return {} }, toString() { return {} } })'),
   ).rejects.toThrow('TypeError: Cannot convert object to primitive value')
 })
+
+it('renders wrapper objects Node-console style like the Rust host', async () => {
+  const { stdout } = await run(
+    "console.log(new String('abc'), new Number(1), new Boolean(true), [Object('x')])",
+  )
+  expect(stdout).toBe(
+    "[String: 'abc'] [Number: 1] [Boolean: true] [ [String: 'x'] ]\n",
+  )
+  expect((await run('new Number(-0)')).result).toBe('[Number: -0]')
+  expect((await run('let w = new Number(2); w.x = 1; w')).result).toBe(
+    '[Number: 2] { x: 1 }',
+  )
+  expect((await run("let w = new String('ab'); w.x = 1; w")).result).toBe(
+    "[String: 'ab'] { x: 1 }",
+  )
+  expect((await run("String(new String('ab')) + new Number(3)")).result).toBe(
+    'ab3',
+  )
+})
+
+it('runs the string and number prototype host ops like the Rust host', async () => {
+  expect((await run("'abcabc'.indexOf('b', 2)")).result).toBe('4')
+  expect((await run("'abc'.includes('a', 1)")).result).toBe('false')
+  expect((await run("'abc'.startsWith('b', 1)")).result).toBe('true')
+  expect((await run("'abc'.endsWith('b', 2)")).result).toBe('true')
+  expect((await run("'a,b,c'.split(',', 2)")).result).toBe('[ a, b ]')
+  expect((await run('(255).toString(16) + (0.5).toString(2)')).result).toBe(
+    'ff0.1',
+  )
+  expect((await run('(-255).toString(36)')).result).toBe('-73')
+})
