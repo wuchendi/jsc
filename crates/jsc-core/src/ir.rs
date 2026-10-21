@@ -109,23 +109,21 @@ pub enum MathOp {
     Pow,
 }
 
-/// An array higher-order method: `map`/`filter`/`reduce`/`forEach`.
-/// Recognized syntactically from a `<expr>.<name>(callback[, init])` member callee
-/// at codegen (kept distinct from `x[i]` element indexing), each invoking the
-/// callback function value per element via the `call_indirect` ABI.
+/// An array higher-order method: `map`/`filter`/`reduce`/`forEach` (see
+/// [`IrNode::ArrayHof`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayHofOp {
     /// `arr.map(fn)` — a NEW array of the same length where `result[i] =
-    /// fn(element_i, i)`.
+    /// fn(element_i, i, arr)`.
     Map,
-    /// `arr.filter(fn)` — a NEW array of the elements for which `fn(element_i, i)`
-    /// is JS-truthy, grown via the `__array_push` helper.
+    /// `arr.filter(fn)` — a NEW array of the elements for which
+    /// `fn(element_i, i, arr)` is JS-truthy, grown via the `__array_push` helper.
     Filter,
-    /// `arr.reduce(fn, init)` — folds `acc = fn(acc, element_i, i)` from `acc =
-    /// init`, yielding the final accumulator. An `init` argument is required.
+    /// `arr.reduce(fn[, init])` — folds `acc = fn(acc, element_i, i, arr)`,
+    /// yielding the final accumulator.
     Reduce,
-    /// `arr.forEach(fn)` — calls `fn(element_i, i)` for side effects and yields
-    /// `undefined`.
+    /// `arr.forEach(fn)` — calls `fn(element_i, i, arr)` for side effects and
+    /// yields `undefined`.
     ForEach,
 }
 
@@ -1015,53 +1013,50 @@ pub enum IrNode {
         /// Whether this is a plain compound assignment or a member `++`/`--`.
         kind: OpSetKind,
     },
-    /// `array.push(value)` on the array handle held in a wasm local. Appends
-    /// `value` to the handle in place (`__array_push`, amortized store growth;
-    /// the handle never moves, so every alias observes it). Yields the new
-    /// length as a number jsval (JS semantics). Codegen evaluates any receiver
-    /// expression into the local and guards it against `null`/`undefined`
-    /// before this node runs.
+    /// `array.push(value)` on the array handle held in a wasm local (always a
+    /// `TYPE_ARRAY` handle: a compiler-built array or a receiver that passed
+    /// its [`IrNode::ProtoGuard`]). Appends `value` to the handle in place
+    /// (`__array_push`, amortized store growth; the handle never moves, so
+    /// every alias observes it). Yields the new length as a number jsval.
     ArrayPush {
         /// The wasm local holding the array handle.
         local: u32,
         /// The value appended at the new last slot.
         value: Box<IrNode>,
-        /// The `TypeError` (`<recv>.push is not a function`) thrown, after
-        /// `value` is evaluated, when the local is not a `TYPE_ARRAY` handle;
-        /// `None` for a compiler-built receiver that is always an array.
-        not_array: Option<CalleeError>,
     },
-    /// `array.pop()` on the array handle held in a wasm local (receiver
-    /// evaluation and guards as for [`IrNode::ArrayPush`]). Shrinks the handle
-    /// in place: its u32 length is decremented and the removed last element
-    /// jsval is yielded. An empty array yields `undefined`.
+    /// `array.pop()` on the array handle held in a wasm local (as for
+    /// [`IrNode::ArrayPush`]). Shrinks the handle in place: its u32 length is
+    /// decremented and the removed last element jsval is yielded. An empty
+    /// array yields `undefined`.
     ArrayPop {
         /// The wasm local holding the array whose block is decremented in place.
         local: u32,
-        /// The `TypeError` (`<recv>.pop is not a function`) thrown when the
-        /// local is not a `TYPE_ARRAY` handle.
-        not_array: CalleeError,
     },
-    /// An array higher-order method call `array.map/filter/reduce/forEach(...)`.
-    /// The `array` receiver is evaluated once into a scratch base (so any array
-    /// expression works),
-    /// then a counted wasm loop over its length invokes the `callback` FUNCTION
-    /// value per element through the `call_indirect` ABI (env-last): the
-    /// positional args are `(element, index)` for `Map`/`Filter`/`ForEach` and
-    /// `(acc, element, index)` for `Reduce`, padded with `undefined` to the shared
-    /// funcref arity. `Map` fills a fresh same-length array; `Filter` grows a fresh
-    /// array via `__array_push` for JS-truthy results; `Reduce` folds into `acc`
-    /// (seeded from `init`); `ForEach` discards each result and yields `undefined`.
+    /// `Array.prototype.map/filter/reduce/forEach` on an array handle (the
+    /// guarded fast path of a call site, and the array path of the builtin
+    /// bodies). After the `IsCallable` check of `callback`, a counted wasm loop
+    /// over the length read on entry invokes the callback per element present
+    /// at the time of the visit (below the current length, not a hole) through
+    /// the `call_indirect` ABI with `this = this_arg`: the positional args are
+    /// `(element, index, array)` for `Map`/`Filter`/`ForEach` and
+    /// `(acc, element, index, array)` for `Reduce`, truncated to the shared
+    /// funcref arity. `Map` fills a fresh same-length array (holes stay holes);
+    /// `Filter` grows a fresh array via `__array_push` for JS-truthy results;
+    /// `Reduce` folds into `acc`, seeded from `init` or, without one, from the
+    /// first present element (a `TypeError` when there is none); `ForEach`
+    /// discards each result and yields `undefined`.
     ArrayHof {
         /// Which higher-order method this call performs.
         op: ArrayHofOp,
         /// The receiver array expression (evaluated once; not rebound).
         array: Box<IrNode>,
-        /// The callback expression, yielding a FUNCTION value.
+        /// The callback expression.
         callback: Box<IrNode>,
-        /// The initial accumulator for [`ArrayHofOp::Reduce`] (`None` for the
-        /// others).
+        /// The initial accumulator of [`ArrayHofOp::Reduce`] (`None`: no
+        /// initial value; always `None` for the others).
         init: Option<Box<IrNode>>,
+        /// The callback's `this` (`None`: `undefined`).
+        this_arg: Option<Box<IrNode>>,
     },
     /// A non-callback array/string method call `recv.method(args)`. The
     /// receiver is evaluated once, then the whole operation runs host-side through
@@ -1224,22 +1219,26 @@ pub enum IrNode {
         /// The generic method call on `obj_local` over `arg_locals`.
         slow: Box<IrNode>,
     },
-    /// A syntactic receiver method `recv.key(..)` whose builtin is not yet a
-    /// property of `%proto%` (design 3.2 row 3, until S5): when the dirty bit
-    /// of `%proto%` is set and `recv.key` is a function, `user` (the generic
-    /// method call) runs, else `fast`. Emitted only for a program that is not
-    /// intrinsics-sealed.
+    /// A builtin method call `recv.key(..)` with a guarded fast path (design
+    /// 3.2 row 3): `fast` runs while `recv` is an object of `%proto%`'s kind
+    /// with no own properties (`props == 0`), whose `proto` is `%proto%`, and
+    /// (unless `sealed`) `%proto%`'s dirty bit is clear, so `recv.key` is
+    /// provably the builtin; else `string` for a string receiver (string
+    /// methods that are not yet builtins); else `slow`, the generic method
+    /// call.
     ProtoGuard {
         /// The constructor whose prototype the builtin belongs to.
         proto: BuiltinCtor,
-        /// The method name.
-        key: String,
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
         /// The receiver read (a local, evaluated before this node).
         recv: Box<IrNode>,
-        /// The syntactic fast path.
-        fast: Box<IrNode>,
+        /// The inline fast path, if the call shape has one.
+        fast: Option<Box<IrNode>>,
+        /// The string-receiver path, if the name is also a string method.
+        string: Option<Box<IrNode>>,
         /// The generic method call.
-        user: Box<IrNode>,
+        slow: Box<IrNode>,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
@@ -1952,12 +1951,6 @@ impl IrNode {
                 getter: a,
                 setter: b,
             }
-            | IrNode::ArrayHof {
-                array: a,
-                callback: b,
-                init: None,
-                ..
-            }
             | IrNode::ObjectHas { key: a, obj: b }
             | IrNode::ObjectDelete { obj: a, key: b }
             | IrNode::PromiseFinally {
@@ -1981,9 +1974,15 @@ impl IrNode {
             IrNode::ArrayHof {
                 array,
                 callback,
-                init: Some(init),
+                init,
+                this_arg,
                 ..
-            } => f(array) || f(callback) || f(init),
+            } => {
+                f(array)
+                    || f(callback)
+                    || init.as_deref().is_some_and(&mut f)
+                    || this_arg.as_deref().is_some_and(f)
+            }
             IrNode::ConvertCall { arg, radix, .. } => f(arg) || radix.as_deref().is_some_and(f),
             IrNode::DateNew { ms } => ms.as_deref().is_some_and(f),
             IrNode::Call { args, .. }
@@ -2012,8 +2011,17 @@ impl IrNode {
                 ..
             } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
             IrNode::ProtoGuard {
-                recv, fast, user, ..
-            } => f(recv) || f(fast) || f(user),
+                recv,
+                fast,
+                string,
+                slow,
+                ..
+            } => {
+                f(recv)
+                    || fast.as_deref().is_some_and(&mut f)
+                    || string.as_deref().is_some_and(&mut f)
+                    || f(slow)
+            }
             IrNode::Construct {
                 callee,
                 args,
@@ -2129,12 +2137,6 @@ impl IrNode {
                 getter: a,
                 setter: b,
             }
-            | IrNode::ArrayHof {
-                array: a,
-                callback: b,
-                init: None,
-                ..
-            }
             | IrNode::ObjectHas { key: a, obj: b }
             | IrNode::ObjectDelete { obj: a, key: b }
             | IrNode::PromiseFinally {
@@ -2158,9 +2160,14 @@ impl IrNode {
             IrNode::ArrayHof {
                 array,
                 callback,
-                init: Some(init),
+                init,
+                this_arg,
                 ..
-            } => vec![&mut **array, &mut **callback, &mut **init],
+            } => [&mut **array, &mut **callback]
+                .into_iter()
+                .chain(init.as_deref_mut())
+                .chain(this_arg.as_deref_mut())
+                .collect(),
             IrNode::ConvertCall { arg, radix, .. } => {
                 let mut out = vec![&mut **arg];
                 out.extend(radix.as_deref_mut());
@@ -2201,8 +2208,16 @@ impl IrNode {
                 .chain([&mut **fast, &mut **slow])
                 .collect(),
             IrNode::ProtoGuard {
-                recv, fast, user, ..
-            } => vec![&mut **recv, &mut **fast, &mut **user],
+                recv,
+                fast,
+                string,
+                slow,
+                ..
+            } => std::iter::once(&mut **recv)
+                .chain(fast.as_deref_mut())
+                .chain(string.as_deref_mut())
+                .chain([&mut **slow])
+                .collect(),
             IrNode::Construct {
                 callee,
                 args,

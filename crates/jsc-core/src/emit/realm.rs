@@ -39,9 +39,9 @@ pub(super) enum Intrinsic {
     Ctor(BuiltinCtor),
     /// `%<Ctor>.prototype%` of a constructor without a dedicated variant
     /// (`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-    /// `Date`): `constructor` only, plus `Array.prototype.map`/`toString` and
-    /// `Date.prototype.toString`/`valueOf` (the method families stay syntactic
-    /// until S5).
+    /// `Date`): `constructor`, the `Array.prototype` methods and
+    /// `Date.prototype.toString`/`valueOf` (the other method families stay
+    /// syntactic until later S5 tasks).
     Prototype(BuiltinCtor),
 }
 
@@ -210,8 +210,20 @@ pub(super) enum Builtin {
     PromiseReject,
     /// `Date.now`.
     DateNow,
-    /// `Array.prototype.map`, generic over array-likes.
-    ArrayMap,
+    /// `Array.prototype.push`.
+    ArrayPush,
+    /// `Array.prototype.pop`.
+    ArrayPop,
+    /// `Array.prototype.map` / `filter` / `reduce` / `forEach`.
+    ArrayHof(ArrayHofOp),
+    /// `Array.prototype.indexOf`.
+    ArrayIndexOf,
+    /// `Array.prototype.includes`.
+    ArrayIncludes,
+    /// `Array.prototype.join`.
+    ArrayJoin,
+    /// `Array.prototype.slice`.
+    ArraySlice,
     /// `Array.prototype.toString`.
     ArrayToString,
     /// `Date.prototype.toString`.
@@ -225,7 +237,7 @@ pub(super) enum Builtin {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 48] = [
+    pub(super) const ALL: [Builtin; 57] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -269,7 +281,16 @@ impl Builtin {
         Self::PromiseResolve,
         Self::PromiseReject,
         Self::DateNow,
-        Self::ArrayMap,
+        Self::ArrayPush,
+        Self::ArrayPop,
+        Self::ArrayHof(ArrayHofOp::Map),
+        Self::ArrayHof(ArrayHofOp::Filter),
+        Self::ArrayHof(ArrayHofOp::Reduce),
+        Self::ArrayHof(ArrayHofOp::ForEach),
+        Self::ArrayIndexOf,
+        Self::ArrayIncludes,
+        Self::ArrayJoin,
+        Self::ArraySlice,
         Self::ArrayToString,
         Self::DateToString,
         Self::DateValueOf,
@@ -310,7 +331,16 @@ impl Builtin {
             Self::PromiseResolve => "resolve",
             Self::PromiseReject => "reject",
             Self::DateNow => "now",
-            Self::ArrayMap => "map",
+            Self::ArrayPush => "push",
+            Self::ArrayPop => "pop",
+            Self::ArrayHof(ArrayHofOp::Map) => "map",
+            Self::ArrayHof(ArrayHofOp::Filter) => "filter",
+            Self::ArrayHof(ArrayHofOp::Reduce) => "reduce",
+            Self::ArrayHof(ArrayHofOp::ForEach) => "forEach",
+            Self::ArrayIndexOf => "indexOf",
+            Self::ArrayIncludes => "includes",
+            Self::ArrayJoin => "join",
+            Self::ArraySlice => "slice",
         }
     }
 
@@ -327,11 +357,13 @@ impl Builtin {
             | Self::DateValueOf
             | Self::ConsoleLog
             | Self::DateNow
+            | Self::ArrayPop
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
-            Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow) | Self::Apply | Self::JsonParse => {
-                2
-            }
+            Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow)
+            | Self::Apply
+            | Self::JsonParse
+            | Self::ArraySlice => 2,
             Self::HasOwnProperty
             | Self::Call
             | Self::Math(_)
@@ -340,8 +372,29 @@ impl Builtin {
             | Self::IsArray
             | Self::PromiseResolve
             | Self::PromiseReject
-            | Self::ArrayMap => 1,
+            | Self::ArrayPush
+            | Self::ArrayHof(_)
+            | Self::ArrayIndexOf
+            | Self::ArrayIncludes
+            | Self::ArrayJoin => 1,
             Self::JsonStringify => 3,
+        }
+    }
+
+    /// The constructor whose `%prototype%` holds this builtin as a method
+    /// (installed under its [`Self::name`]), if any.
+    fn prototype(self) -> Option<BuiltinCtor> {
+        match self {
+            Self::ArrayPush
+            | Self::ArrayPop
+            | Self::ArrayHof(_)
+            | Self::ArrayIndexOf
+            | Self::ArrayIncludes
+            | Self::ArrayJoin
+            | Self::ArraySlice
+            | Self::ArrayToString => Some(BuiltinCtor::Array),
+            Self::DateToString | Self::DateValueOf => Some(BuiltinCtor::Date),
+            _ => None,
         }
     }
 
@@ -609,8 +662,8 @@ pub(super) fn registry() -> Vec<Entry> {
 }
 
 /// The constructors' own properties (`length`, `name`, the non-writable
-/// `prototype`, statics), each prototype's `constructor` back-link,
-/// `Array.prototype.map`/`toString` and `Date.prototype.toString`/`valueOf`.
+/// `prototype`, statics), each prototype's `constructor` back-link, the
+/// `Array.prototype` methods and `Date.prototype.toString`/`valueOf`.
 fn constructor_entries(entries: &mut Vec<Entry>) {
     let entry = |intrinsic, key, attrs, value| Entry {
         intrinsic,
@@ -657,19 +710,12 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         let ctor = Value::Intrinsic(intrinsic);
         entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
     }
-    entries.push(entry(
-        Intrinsic::Prototype(BuiltinCtor::Array),
-        "map",
-        METHOD_ATTRS,
-        Value::Method(Builtin::ArrayMap),
-    ));
-    for (ctor, key, builtin) in [
-        (BuiltinCtor::Array, "toString", Builtin::ArrayToString),
-        (BuiltinCtor::Date, "toString", Builtin::DateToString),
-        (BuiltinCtor::Date, "valueOf", Builtin::DateValueOf),
-    ] {
-        let method = Value::Method(builtin);
-        entries.push(entry(Intrinsic::Prototype(ctor), key, METHOD_ATTRS, method));
+    for builtin in Builtin::ALL {
+        if let Some(ctor) = builtin.prototype() {
+            let method = Value::Method(builtin);
+            let key = builtin.name();
+            entries.push(entry(Intrinsic::Prototype(ctor), key, METHOD_ATTRS, method));
+        }
     }
 }
 

@@ -29,6 +29,12 @@ mod object;
 
 pub(super) use namespace::fragment;
 
+/// The IR fragments the hand-written bodies emit with `K = k`, for the
+/// static-string scan.
+pub(super) fn fragments(k: u32) -> Vec<IrNode> {
+    array::fragments(k)
+}
+
 /// The locals of a builtin body: the `K` argument slots, `env` and `argc`
 /// (the parameters), four i64 and four i32 temps, then the scratch layout
 /// [`emit_function`] declares, so IR fragments (the thrown errors) can be
@@ -55,6 +61,9 @@ impl Frame {
             (1, ValType::I32),
             (2, ValType::I64),
             (6, ValType::I64),
+            (2, ValType::I64),
+            (2, ValType::I32),
+            (1, ValType::F64),
         ])
     }
 
@@ -86,6 +95,21 @@ impl Frame {
     fn scratch(self) -> u32 {
         self.k + 10
     }
+
+    /// Extra i64 temp `n` (`0..2`), past the scratch layout.
+    fn x64(self, n: u32) -> u32 {
+        self.scratch() + 30 + n
+    }
+
+    /// Extra i32 temp `n` (`0..2`), past the scratch layout.
+    fn x32(self, n: u32) -> u32 {
+        self.scratch() + 32 + n
+    }
+
+    /// The f64 temp `n` (`0`), past the scratch layout.
+    fn f64(self, n: u32) -> u32 {
+        self.scratch() + 34 + n
+    }
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -94,7 +118,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .into_iter()
         .chain(function::STRINGS)
         .chain(error::STRINGS)
-        .chain(array::STRINGS)
+        .chain(array::strings())
         .chain(date::STRINGS)
 }
 
@@ -118,7 +142,13 @@ pub(super) fn emit_builtin(
         Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),
         Builtin::ThrowTypeError => function::emit_throw_type_error(&mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::ArrayMap => array::emit_map(&mut f, frame, strings, helpers),
+        Builtin::ArrayPush => array::emit_push(&mut f, frame, strings, helpers),
+        Builtin::ArrayPop => array::emit_pop(&mut f, frame, strings, helpers),
+        Builtin::ArrayHof(op) => array::emit_hof(op, &mut f, frame, strings, helpers),
+        Builtin::ArrayIndexOf => array::emit_search(false, &mut f, frame, strings, helpers),
+        Builtin::ArrayIncludes => array::emit_search(true, &mut f, frame, strings, helpers),
+        Builtin::ArrayJoin => array::emit_join(&mut f, frame, strings, helpers),
+        Builtin::ArraySlice => array::emit_slice(&mut f, frame, strings, helpers),
         Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::DateToString => date::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::DateValueOf => date::emit_value_of(&mut f, frame, strings, helpers),
