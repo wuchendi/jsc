@@ -377,8 +377,81 @@ impl CalleeError {
     }
 }
 
+/// A builtin constructor function of the realm (design 4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinCtor {
+    /// `Object`.
+    Object,
+    /// `Function`.
+    Function,
+    /// `Array`.
+    Array,
+    /// `String`.
+    String,
+    /// `Number`.
+    Number,
+    /// `Boolean`.
+    Boolean,
+    /// An Error-family constructor.
+    Error(ErrorKind),
+    /// `Map`.
+    Map,
+    /// `Set`.
+    Set,
+    /// `Promise`.
+    Promise,
+    /// `Date`.
+    Date,
+}
+
+impl BuiltinCtor {
+    /// Every constructor, in realm-image order.
+    pub(crate) const ALL: [BuiltinCtor; 17] = [
+        Self::Object,
+        Self::Function,
+        Self::Array,
+        Self::String,
+        Self::Number,
+        Self::Boolean,
+        Self::Error(ErrorKind::Error),
+        Self::Error(ErrorKind::TypeError),
+        Self::Error(ErrorKind::RangeError),
+        Self::Error(ErrorKind::ReferenceError),
+        Self::Error(ErrorKind::SyntaxError),
+        Self::Error(ErrorKind::EvalError),
+        Self::Error(ErrorKind::UriError),
+        Self::Map,
+        Self::Set,
+        Self::Promise,
+        Self::Date,
+    ];
+
+    /// The constructor's global name (also its `name`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Object => "Object",
+            Self::Function => "Function",
+            Self::Array => "Array",
+            Self::String => "String",
+            Self::Number => "Number",
+            Self::Boolean => "Boolean",
+            Self::Error(kind) => kind.name(),
+            Self::Map => "Map",
+            Self::Set => "Set",
+            Self::Promise => "Promise",
+            Self::Date => "Date",
+        }
+    }
+
+    /// The constructor bound to the global `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
+}
+
 /// A global intrinsic whose address is a compile-time constant (design 4.2):
-/// the global object and the namespace objects reachable from it.
+/// the global object, the namespace objects and the constructors reachable
+/// from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalIntrinsic {
     /// The global object (`globalThis`, top-level `this`).
@@ -389,23 +462,20 @@ pub enum GlobalIntrinsic {
     Json,
     /// `console`.
     Console,
+    /// A builtin constructor.
+    Ctor(BuiltinCtor),
 }
 
 impl GlobalIntrinsic {
-    /// The intrinsics that are values of a global-object property, with the
-    /// property name.
-    pub(crate) const NAMED: [(&'static str, GlobalIntrinsic); 4] = [
-        ("globalThis", Self::Global),
-        ("Math", Self::Math),
-        ("JSON", Self::Json),
-        ("console", Self::Console),
-    ];
-
     /// The intrinsic bound to the global property `name`.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::NAMED
-            .into_iter()
-            .find_map(|(n, g)| (n == name).then_some(g))
+        match name {
+            "globalThis" => Some(Self::Global),
+            "Math" => Some(Self::Math),
+            "JSON" => Some(Self::Json),
+            "console" => Some(Self::Console),
+            _ => BuiltinCtor::from_name(name).map(Self::Ctor),
+        }
     }
 }
 
@@ -1691,13 +1761,71 @@ impl IrNode {
     /// `message` (when one was given) and `stack` — the shape every builtin and
     /// engine-raised error shares.
     pub(crate) fn error_object(kind: ErrorKind, message: Option<IrNode>, stack: IrNode) -> Self {
+        Self::error_with_proto(IrNode::ErrorProto(kind), message, stack)
+    }
+
+    /// An Error instance like [`Self::error_object`] whose `proto` is the
+    /// value of `proto` (a subclass prototype for `new.target`).
+    fn error_with_proto(proto: IrNode, message: Option<IrNode>, stack: IrNode) -> Self {
         let message = message.map(|message| (PropKey::Hidden("message".to_owned()), message));
         let stack = (PropKey::Hidden("stack".to_owned()), stack);
         Self::Object {
             entries: message.into_iter().chain([stack]).collect(),
-            proto: Some(Box::new(IrNode::ErrorProto(kind))),
+            proto: Some(Box::new(proto)),
             class: crate::abi::CLASS_ERROR,
             reserve: 0,
+        }
+    }
+
+    /// The Error instance `<kind>(argument)` constructs with prototype `proto`
+    /// (side-effect free, read in both branches): `argument` is evaluated
+    /// once into local `arg`; unless it is `undefined` the instance gets an
+    /// own `message` = `ToString(argument)` (kept in local `msg`) and `stack`
+    /// = `"<name>: <message>"` (just `<name>` for an empty message).
+    pub(crate) fn error_from_argument(
+        kind: ErrorKind,
+        proto: IrNode,
+        argument: IrNode,
+        arg: u32,
+        msg: u32,
+    ) -> Self {
+        let name = kind.name();
+        let text = IrNode::Assign {
+            local: msg,
+            value: Box::new(IrNode::ConvertCall {
+                op: ConvertOp::ToString,
+                arg: Box::new(IrNode::Local(arg)),
+                radix: None,
+            }),
+        };
+        let stack = IrNode::Ternary {
+            cond: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Local(msg)),
+                rhs: Box::new(IrNode::Str(String::new())),
+            }),
+            then_branch: Box::new(IrNode::Str(name.to_owned())),
+            else_branch: Box::new(IrNode::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(IrNode::Str(format!("{name}: "))),
+                rhs: Box::new(IrNode::Local(msg)),
+            }),
+        };
+        IrNode::Ternary {
+            cond: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Assign {
+                    local: arg,
+                    value: Box::new(argument),
+                }),
+                rhs: Box::new(IrNode::Undefined),
+            }),
+            then_branch: Box::new(Self::error_with_proto(
+                proto.clone(),
+                None,
+                IrNode::Str(name.to_owned()),
+            )),
+            else_branch: Box::new(Self::error_with_proto(proto, Some(text), stack)),
         }
     }
 

@@ -15,8 +15,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// An intrinsic object of the realm image. (The constructors join them in
-/// S4 T3.)
+/// An intrinsic object of the realm image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Intrinsic {
     /// `%Object.prototype%` (`proto` `null`).
@@ -34,6 +33,35 @@ pub(super) enum Intrinsic {
     Json,
     /// The `console` namespace object.
     Console,
+    /// A builtin constructor function.
+    Ctor(BuiltinCtor),
+    /// `%<Ctor>.prototype%` of a constructor without a dedicated variant
+    /// (`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
+    /// `Date`): `constructor` only, plus `Array.prototype.map` (the method
+    /// families stay syntactic until S5).
+    Prototype(BuiltinCtor),
+}
+
+/// The constructors whose prototype is an [`Intrinsic::Prototype`].
+const PLAIN_PROTOTYPES: [BuiltinCtor; 8] = [
+    BuiltinCtor::Array,
+    BuiltinCtor::String,
+    BuiltinCtor::Number,
+    BuiltinCtor::Boolean,
+    BuiltinCtor::Map,
+    BuiltinCtor::Set,
+    BuiltinCtor::Promise,
+    BuiltinCtor::Date,
+];
+
+/// The `prototype` intrinsic of `ctor`.
+pub(super) fn prototype_of(ctor: BuiltinCtor) -> Intrinsic {
+    match ctor {
+        BuiltinCtor::Object => Intrinsic::ObjectPrototype,
+        BuiltinCtor::Function => Intrinsic::FunctionPrototype,
+        BuiltinCtor::Error(kind) => Intrinsic::ErrorPrototype(kind),
+        _ => Intrinsic::Prototype(ctor),
+    }
 }
 
 impl From<GlobalIntrinsic> for Intrinsic {
@@ -43,6 +71,7 @@ impl From<GlobalIntrinsic> for Intrinsic {
             GlobalIntrinsic::Math => Self::Math,
             GlobalIntrinsic::Json => Self::Json,
             GlobalIntrinsic::Console => Self::Console,
+            GlobalIntrinsic::Ctor(ctor) => Self::Ctor(ctor),
         }
     }
 }
@@ -57,15 +86,43 @@ impl Intrinsic {
             | Self::Global
             | Self::Math
             | Self::Json
-            | Self::Console => Some(Self::ObjectPrototype),
+            | Self::Console
+            | Self::Prototype(_) => Some(Self::ObjectPrototype),
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
+            // The native error constructors inherit from `Error`.
+            Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
+                Some(Self::Ctor(BuiltinCtor::Error(ErrorKind::Error)))
+            }
+            Self::Ctor(_) => Some(Self::FunctionPrototype),
         }
     }
 
     /// The builtin body a callable intrinsic runs, or `None` for an ordinary
     /// object.
     fn call(self) -> Option<Builtin> {
-        (self == Self::FunctionPrototype).then_some(Builtin::FunctionPrototype)
+        match self {
+            Self::FunctionPrototype => Some(Builtin::FunctionPrototype),
+            Self::Ctor(ctor) => Some(Builtin::Ctor(ctor)),
+            _ => None,
+        }
+    }
+
+    /// The header `flags` of a callable intrinsic: a constructor is
+    /// `CONSTRUCTOR`, and `SELF_ALLOC` when it allocates its own kind of
+    /// object from `new.target` (design 4.5, 4.7).
+    fn flags(self) -> u8 {
+        match self {
+            Self::Ctor(
+                BuiltinCtor::Array
+                | BuiltinCtor::Error(_)
+                | BuiltinCtor::Map
+                | BuiltinCtor::Set
+                | BuiltinCtor::Promise
+                | BuiltinCtor::Date,
+            ) => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
+            Self::Ctor(_) => abi::FUNC_FLAG_CONSTRUCTOR,
+            _ => 0,
+        }
     }
 
     /// The `TYPE_OBJECT` class byte of a non-callable intrinsic.
@@ -89,6 +146,8 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::Json,
             Intrinsic::Console,
         ])
+        .chain(BuiltinCtor::ALL.map(Intrinsic::Ctor))
+        .chain(PLAIN_PROTOTYPES.map(Intrinsic::Prototype))
 }
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
@@ -116,11 +175,25 @@ pub(super) enum Builtin {
     JsonParse,
     /// `console.log`.
     ConsoleLog,
+    /// A constructor's body (called or constructed).
+    Ctor(BuiltinCtor),
+    /// `Object.keys` / `Object.values` / `Object.entries`.
+    ObjectStatic(ObjectBuiltinOp),
+    /// `Array.isArray`.
+    IsArray,
+    /// `Promise.resolve`.
+    PromiseResolve,
+    /// `Promise.reject`.
+    PromiseReject,
+    /// `Date.now`.
+    DateNow,
+    /// `Array.prototype.map`, generic over array-likes.
+    ArrayMap,
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 19] = [
+    pub(super) const ALL: [Builtin; 44] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -140,6 +213,31 @@ impl Builtin {
         Self::JsonStringify,
         Self::JsonParse,
         Self::ConsoleLog,
+        Self::Ctor(BuiltinCtor::Object),
+        Self::Ctor(BuiltinCtor::Function),
+        Self::Ctor(BuiltinCtor::Array),
+        Self::Ctor(BuiltinCtor::String),
+        Self::Ctor(BuiltinCtor::Number),
+        Self::Ctor(BuiltinCtor::Boolean),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::Error)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::TypeError)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::RangeError)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::ReferenceError)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::SyntaxError)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::EvalError)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::UriError)),
+        Self::Ctor(BuiltinCtor::Map),
+        Self::Ctor(BuiltinCtor::Set),
+        Self::Ctor(BuiltinCtor::Promise),
+        Self::Ctor(BuiltinCtor::Date),
+        Self::ObjectStatic(ObjectBuiltinOp::Keys),
+        Self::ObjectStatic(ObjectBuiltinOp::Values),
+        Self::ObjectStatic(ObjectBuiltinOp::Entries),
+        Self::IsArray,
+        Self::PromiseResolve,
+        Self::PromiseReject,
+        Self::DateNow,
+        Self::ArrayMap,
     ];
 
     /// The function's `name`.
@@ -165,6 +263,15 @@ impl Builtin {
             Self::JsonStringify => "stringify",
             Self::JsonParse => "parse",
             Self::ConsoleLog => "log",
+            Self::Ctor(ctor) => ctor.name(),
+            Self::ObjectStatic(ObjectBuiltinOp::Keys | ObjectBuiltinOp::ForInKeys) => "keys",
+            Self::ObjectStatic(ObjectBuiltinOp::Values) => "values",
+            Self::ObjectStatic(ObjectBuiltinOp::Entries) => "entries",
+            Self::IsArray => "isArray",
+            Self::PromiseResolve => "resolve",
+            Self::PromiseReject => "reject",
+            Self::DateNow => "now",
+            Self::ArrayMap => "map",
         }
     }
 
@@ -175,11 +282,22 @@ impl Builtin {
             | Self::ObjectToString
             | Self::ValueOf
             | Self::ErrorToString
-            | Self::ConsoleLog => 0,
+            | Self::ConsoleLog
+            | Self::DateNow
+            | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
+            Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow) | Self::Apply | Self::JsonParse => {
                 2
             }
-            Self::HasOwnProperty | Self::Call | Self::Math(_) => 1,
+            Self::HasOwnProperty
+            | Self::Call
+            | Self::Math(_)
+            | Self::Ctor(_)
+            | Self::ObjectStatic(_)
+            | Self::IsArray
+            | Self::PromiseResolve
+            | Self::PromiseReject
+            | Self::ArrayMap => 1,
             Self::JsonStringify => 3,
         }
     }
@@ -247,7 +365,7 @@ const MATH_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 7] = [
+const GLOBALS: [(&str, u32, Value); 24] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -263,11 +381,97 @@ const GLOBALS: [(&str, u32, Value); 7] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Console),
     ),
+    (
+        "Object",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Object)),
+    ),
+    (
+        "Function",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Function)),
+    ),
+    (
+        "Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Array)),
+    ),
+    (
+        "String",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::String)),
+    ),
+    (
+        "Number",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Number)),
+    ),
+    (
+        "Boolean",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Boolean)),
+    ),
+    (
+        "Error",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::Error))),
+    ),
+    (
+        "TypeError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::TypeError))),
+    ),
+    (
+        "RangeError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::RangeError))),
+    ),
+    (
+        "ReferenceError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(
+            ErrorKind::ReferenceError,
+        ))),
+    ),
+    (
+        "SyntaxError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::SyntaxError))),
+    ),
+    (
+        "EvalError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::EvalError))),
+    ),
+    (
+        "URIError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::UriError))),
+    ),
+    (
+        "Map",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Map)),
+    ),
+    (
+        "Set",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Set)),
+    ),
+    (
+        "Promise",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Promise)),
+    ),
+    (
+        "Date",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Date)),
+    ),
 ];
 
 /// The registry: every own property of every intrinsic, in slot order per
-/// intrinsic. `%Object.prototype%.constructor` and
-/// `%Function.prototype%.constructor` are added with the constructors (T3).
+/// intrinsic.
 pub(super) fn registry() -> Vec<Entry> {
     use Intrinsic::{FunctionPrototype, ObjectPrototype};
     let entry = |intrinsic, key, attrs, value| Entry {
@@ -336,8 +540,66 @@ pub(super) fn registry() -> Vec<Entry> {
         let method = Value::Method(builtin);
         entries.push(entry(namespace, builtin.name(), METHOD_ATTRS, method));
     }
+    constructor_entries(&mut entries);
     entries.extend(GLOBALS.map(|(key, attrs, value)| entry(Intrinsic::Global, key, attrs, value)));
     entries
+}
+
+/// The constructors' own properties (`length`, `name`, the non-writable
+/// `prototype`, statics), each prototype's `constructor` back-link and
+/// `Array.prototype.map`.
+fn constructor_entries(entries: &mut Vec<Entry>) {
+    let entry = |intrinsic, key, attrs, value| Entry {
+        intrinsic,
+        key,
+        attrs,
+        value,
+    };
+    for ctor in BuiltinCtor::ALL {
+        let (intrinsic, prototype) = (Intrinsic::Ctor(ctor), prototype_of(ctor));
+        let length = f64::from(Builtin::Ctor(ctor).length());
+        entries.push(entry(
+            intrinsic,
+            "length",
+            FN_FACT_ATTRS,
+            Value::Num(length),
+        ));
+        entries.push(entry(
+            intrinsic,
+            "name",
+            FN_FACT_ATTRS,
+            Value::Str(ctor.name()),
+        ));
+        entries.push(entry(
+            intrinsic,
+            "prototype",
+            CONST_ATTRS,
+            Value::Intrinsic(prototype),
+        ));
+        let statics: &[Builtin] = match ctor {
+            BuiltinCtor::Object => &[
+                Builtin::ObjectStatic(ObjectBuiltinOp::Keys),
+                Builtin::ObjectStatic(ObjectBuiltinOp::Values),
+                Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
+            ],
+            BuiltinCtor::Array => &[Builtin::IsArray],
+            BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
+            BuiltinCtor::Date => &[Builtin::DateNow],
+            _ => &[],
+        };
+        for &builtin in statics {
+            let method = Value::Method(builtin);
+            entries.push(entry(intrinsic, builtin.name(), METHOD_ATTRS, method));
+        }
+        let ctor = Value::Intrinsic(intrinsic);
+        entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
+    }
+    entries.push(entry(
+        Intrinsic::Prototype(BuiltinCtor::Array),
+        "map",
+        METHOD_ATTRS,
+        Value::Method(Builtin::ArrayMap),
+    ));
 }
 
 /// Every static string the image references (keys, string values, builtin
@@ -436,7 +698,10 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
             .proto()
             .map_or(abi::NULL, |p| heap(base + intrinsic_offset(&registry, p)));
         let (header, prefix) = match intrinsic.call() {
-            Some(_) => ([abi::TYPE_FUNCTION, 0, 0, 0], abi::FUNC_BLOCK_SIZE),
+            Some(_) => (
+                [abi::TYPE_FUNCTION, 0, intrinsic.flags(), 0],
+                abi::FUNC_BLOCK_SIZE,
+            ),
             None => (
                 [abi::TYPE_OBJECT, 0, 0, intrinsic.class()],
                 abi::OBJ_PREFIX_SIZE,

@@ -162,16 +162,17 @@ fn emit_new_elems(function: &mut Function, alloc: u32, cap: u32, store: u32) {
 }
 
 /// Emit the exported `__new_array(len: i32) -> i32` constructor: a
-/// [`TYPE_ARRAY`] handle with `len` set and, when `len > 0`, a `cap = len`
+/// [`TYPE_ARRAY`] handle (`proto` = `%Array.prototype%`, the jsval `proto`)
+/// with `len` set and, when `len > 0`, a `cap = len`
 /// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
 /// locals 1/2/3 the handle base, the store base, and the element cursor.
-pub(super) fn emit_new_array(alloc: u32) -> Function {
+pub(super) fn emit_new_array(alloc: u32, proto: i64) -> Function {
     let mut function = Function::new(vec![(3, ValType::I32)]);
     let (len, base, store, at) = (0, 1, 2, 3);
     function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
     function.instruction(&Instruction::Call(alloc));
     function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, TYPE_ARRAY, NULL_BITS);
+    emit_object_prefix(&mut function, base, TYPE_ARRAY, proto);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
@@ -214,15 +215,16 @@ pub(super) fn emit_new_array(alloc: u32) -> Function {
 }
 
 /// Emit the exported `__new_promise() -> i32` constructor: a pending
-/// [`abi::TYPE_PROMISE`] block with a `null` prototype, `state = PENDING`, and
+/// [`abi::TYPE_PROMISE`] block with prototype `proto` (`%Promise.prototype%`),
+/// `state = PENDING`, and
 /// `value = undefined`. Local 0 is the base.
-pub(super) fn emit_new_promise(alloc: u32) -> Function {
+pub(super) fn emit_new_promise(alloc: u32, proto: i64) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let base = 0;
     function.instruction(&Instruction::I32Const(PROMISE_BLOCK_SIZE));
     function.instruction(&Instruction::Call(alloc));
     function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE), NULL_BITS);
+    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE), proto);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Const(abi::PROMISE_PENDING));
     function.instruction(&Instruction::I32Store(MemArg {

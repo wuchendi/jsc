@@ -898,10 +898,11 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let arr = usize::try_from(arr).expect("base");
     assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
     assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
+    // `proto` = `%Array.prototype%`, an ordinary object.
     assert_eq!(
-        &mem[arr + 8..arr + 16],
-        &crate::abi::NULL.to_le_bytes(),
-        "proto"
+        mem[arr + 14..arr + 16],
+        [0xFD, 0x7F],
+        "proto is a heap pointer"
     );
     assert_eq!(&mem[arr + 16..arr + 20], &2u32.to_le_bytes(), "len");
     let elems = u32::from_le_bytes(mem[arr + 20..arr + 24].try_into().expect("elems"));
@@ -927,11 +928,8 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let p = usize::try_from(p).expect("base");
     assert_eq!(&mem[p..p + 4], &[crate::abi::TYPE_PROMISE, 0, 0, 0]);
     assert_eq!(&mem[p + 4..p + 8], &0u32.to_le_bytes(), "props");
-    assert_eq!(
-        &mem[p + 8..p + 16],
-        &crate::abi::NULL.to_le_bytes(),
-        "proto"
-    );
+    // `proto` = `%Promise.prototype%`.
+    assert_eq!(mem[p + 14..p + 16], [0xFD, 0x7F], "proto is a heap pointer");
     assert_eq!(
         &mem[p + 16..p + 20],
         &crate::abi::PROMISE_PENDING.to_le_bytes()
@@ -945,10 +943,10 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     use crate::abi::{
         ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, DATE_MS_OFFSET, ELEMS_CAP_OFFSET, ELEMS_DATA_OFFSET,
         FUNC_ENV_OFFSET, FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_LAZY, FUNC_INDEX_OFFSET, GEN_DONE_OFFSET,
-        GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, NULL,
-        OBJ_PROPS_OFFSET, OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET,
-        PROMISE_VALUE_OFFSET, TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR,
-        TYPE_MAP, TYPE_PROMISE, TYPE_SET, UNDEFINED,
+        GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, OBJ_PROPS_OFFSET,
+        OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET,
+        TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT,
+        TYPE_PROMISE, TYPE_SET, UNDEFINED,
     };
     let u32_at = |mem: &[u8], at: u32| {
         let at = at as usize;
@@ -985,8 +983,14 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let proto = u64_at(&memory, base + OBJ_PROTO_OFFSET);
         if kind == TYPE_FUNCTION {
             function_proto(&memory, proto);
+        } else if kind == TYPE_GENERATOR {
+            assert_eq!(proto, crate::abi::NULL, "{src}: proto");
         } else {
-            assert_eq!(proto, NULL, "{src}: proto");
+            // Arrays, Map/Set, promises and dates inherit from their realm prototype,
+            // an ordinary object.
+            assert_eq!((proto >> 48) & 0b111, 0b101, "{src}: proto is a heap block");
+            let at = usize::try_from(proto & 0xFFFF_FFFF).expect("base");
+            assert_eq!(memory[at], TYPE_OBJECT, "{src}: proto");
         }
         (base, memory)
     };

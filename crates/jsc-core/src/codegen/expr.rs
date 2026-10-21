@@ -756,42 +756,37 @@ impl LowerCtx<'_> {
         {
             return self.lower_method_call(op, id.sym.as_ref(), &member.obj, args);
         }
-        // `Object.keys/values/entries(o)` are collection built-ins, not user-method
-        // calls. Like `Math`, `Object` is not a real binding: recognize it
-        // syntactically (only when nothing named `Object` shadows it) and lower to
-        // an `IrNode::ObjectBuiltin` whose method name and arity are validated here.
+        // `Object.keys/values/entries(o)` keep their inline
+        // `IrNode::ObjectBuiltin` (method name and arity validated here) while
+        // `Object` is the unshadowed, sealed, non-escaping global (design 3.2);
+        // otherwise the call reads the static from the `Object` value.
         if let Some(name) = object_method_name(callee_expr)
-            && self.resolve("Object").is_none()
+            && self.inline_namespace("Object")
         {
             return lower_object_call(name, args, callee_expr.span());
         }
-        // `JSON.stringify(v)` / `JSON.parse(s)` are collection built-ins, not
-        // user-method calls. Like `Object`, `JSON` is not a real binding:
-        // recognize it syntactically (only when nothing named `JSON` shadows it)
-        // and lower to an `IrNode::JsonStringify` (or reject `parse`/unknown names).
+        // `JSON.stringify(v)` / `JSON.parse(s)` keep their inline nodes while
+        // `JSON` is inline (as `Object` above).
         if let Some(name) = json_method_name(callee_expr)
             && self.inline_namespace("JSON")
         {
             return lower_json_call(name, args, callee_expr.span());
         }
-        // `Promise.resolve(v)` / `Promise.reject(v)` are the promise-creation
-        // statics. Like `Object`/`JSON`, `Promise` is not a real binding:
-        // recognize it syntactically (only when nothing named `Promise` shadows
-        // it) and lower to the corresponding promise node.
+        // `Promise.resolve(v)` / `Promise.reject(v)`: the inline promise nodes
+        // while `Promise` is inline (as `Object` above).
         if let Some(name) = promise_static_method_name(callee_expr)
-            && self.resolve("Promise").is_none()
+            && self.inline_namespace("Promise")
         {
             return lower_promise_static(name, args, callee_expr.span());
         }
-        // `Date.now()`: the host wall clock as a number. Like the other
-        // statics, `Date` is not a real binding; recognize `Date.now` syntactically
-        // (only when nothing named `Date` shadows it) and reject any argument.
+        // `Date.now()`: the host wall clock as a number, inline while `Date` is
+        // inline (as `Object` above); any argument is rejected.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let Expr::Ident(obj) = member.obj.as_ref()
             && obj.sym.as_ref() == "Date"
             && let MemberProp::Ident(id) = &member.prop
             && id.sym.as_ref() == "now"
-            && self.resolve("Date").is_none()
+            && self.inline_namespace("Date")
         {
             if !args.is_empty() {
                 return Err(CompileError::spanned(
@@ -884,10 +879,15 @@ impl LowerCtx<'_> {
                 func: sig.index,
                 args,
             })
-        } else if let Some(kind) = ErrorKind::from_name(name) {
+        } else if let Some(kind) = ErrorKind::from_name(name)
+            && self.shared.globals.sealed(name)
+        {
             // `Error(m)` without `new` constructs too (design 4.7).
             Ok(self.lower_error_construct(kind, args))
-        } else if let Some(op) = convert_builtin_op(name) {
+        } else if let Some(op) = convert_builtin_op(name)
+            && (!matches!(name, "String" | "Number" | "Boolean")
+                || self.shared.globals.sealed(name))
+        {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
@@ -1818,14 +1818,17 @@ impl LowerCtx<'_> {
     }
 
     /// Resolve the right-hand side of an `instanceof` to an [`InstanceOfKind`].
-    /// An UNSHADOWED `Error`/`TypeError`/`RangeError`/`Array`/`Function`/`Date`/
-    /// `Object` identifier (not yet a runtime value) takes its builtin test; any
-    /// other expression — including a binding that shadows one of those names —
-    /// is `OrdinaryHasInstance` on its value.
+    /// An unshadowed, sealed `Error`-family/`Array`/`Function`/`Date`/`Object`
+    /// identifier takes its builtin test; any other expression — including a
+    /// binding or declaration that shadows one of those names (DF11) — is
+    /// `OrdinaryHasInstance` on its value.
     fn instanceof_kind(&mut self, right: &Expr) -> anyhow::Result<InstanceOfKind> {
         if let Expr::Ident(id) = right {
             let name = id.sym.as_ref();
-            if self.resolve(name).is_none() {
+            if self.resolve(name).is_none()
+                && !self.shared.funcs.contains_key(name)
+                && self.shared.globals.sealed(name)
+            {
                 if let Some(kind) = ErrorKind::from_name(name) {
                     return Ok(InstanceOfKind::Proto(Box::new(IrNode::ErrorProto(kind))));
                 }
@@ -1842,12 +1845,13 @@ impl LowerCtx<'_> {
     }
 
     fn lower_new(&mut self, new_expr: &swc_ecma_ast::NewExpr) -> anyhow::Result<IrNode> {
-        // The builtin constructors keep their dedicated paths while unshadowed:
-        // they are not real bindings, so a user `let Map = ..` or `function
-        // Error(){}` constructs through the general path below.
+        // The builtin constructors keep their dedicated paths while unshadowed
+        // and sealed: a user `let Map = ..` or `function Error(){}` (DF11), or
+        // a reassigned global, constructs through the general path below.
         if let Expr::Ident(callee) = new_expr.callee.as_ref()
             && self.resolve(callee.sym.as_ref()).is_none()
             && !self.shared.funcs.contains_key(callee.sym.as_ref())
+            && self.shared.globals.sealed(callee.sym.as_ref())
         {
             let name = callee.sym.as_ref();
             // `new Map()` / `new Set()`: a fresh empty collection handle. Only
@@ -2001,45 +2005,8 @@ impl LowerCtx<'_> {
                 IrNode::error_object(kind, Some(IrNode::Str(text)), stack)
             }
             Some(message) => {
-                let arg = self.fresh();
-                let msg = self.fresh();
-                let text = IrNode::Assign {
-                    local: msg,
-                    value: Box::new(IrNode::ConvertCall {
-                        op: ConvertOp::ToString,
-                        arg: Box::new(IrNode::Local(arg)),
-                        radix: None,
-                    }),
-                };
-                let stack = IrNode::Ternary {
-                    cond: Box::new(IrNode::Binary {
-                        op: BinOp::Eq,
-                        lhs: Box::new(IrNode::Local(msg)),
-                        rhs: Box::new(IrNode::Str(String::new())),
-                    }),
-                    then_branch: Box::new(IrNode::Str(name.to_owned())),
-                    else_branch: Box::new(IrNode::Binary {
-                        op: BinOp::Add,
-                        lhs: Box::new(IrNode::Str(format!("{name}: "))),
-                        rhs: Box::new(IrNode::Local(msg)),
-                    }),
-                };
-                IrNode::Ternary {
-                    cond: Box::new(IrNode::Binary {
-                        op: BinOp::Eq,
-                        lhs: Box::new(IrNode::Assign {
-                            local: arg,
-                            value: Box::new(message),
-                        }),
-                        rhs: Box::new(IrNode::Undefined),
-                    }),
-                    then_branch: Box::new(IrNode::error_object(
-                        kind,
-                        None,
-                        IrNode::Str(name.to_owned()),
-                    )),
-                    else_branch: Box::new(IrNode::error_object(kind, Some(text), stack)),
-                }
+                let (arg, msg) = (self.fresh(), self.fresh());
+                IrNode::error_from_argument(kind, IrNode::ErrorProto(kind), message, arg, msg)
             }
         }
     }

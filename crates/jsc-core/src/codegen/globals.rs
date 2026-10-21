@@ -7,14 +7,28 @@
 use std::collections::HashSet;
 
 use swc_ecma_ast::{
-    AssignExpr, AssignTarget, CallExpr, Callee, Class, Expr, ForHead, Function, GetterProp,
-    MemberExpr, MemberProp, Program, SetterProp, SimpleAssignTarget, UnaryExpr, UnaryOp,
-    UpdateExpr,
+    AssignExpr, AssignTarget, BinExpr, BinaryOp, CallExpr, Callee, Class, Expr, ForHead, Function,
+    GetterProp, MemberExpr, MemberProp, NewExpr, Program, SetterProp, SimpleAssignTarget,
+    UnaryExpr, UnaryOp, UpdateExpr,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
-/// The global namespace objects with inline fast paths.
-const NAMESPACES: [&str; 3] = ["Math", "JSON", "console"];
+use crate::ir::{BuiltinCtor, ErrorKind};
+
+/// The global objects whose members have inline fast paths.
+const NAMESPACES: [&str; 6] = ["Math", "JSON", "console", "Object", "Promise", "Date"];
+
+/// Whether `callee(..)` keeps its syntactic lowering while `callee` names the
+/// unshadowed builtin (the conversions and the Error family).
+fn syntactic_call(callee: &str) -> bool {
+    matches!(callee, "String" | "Number" | "Boolean") || ErrorKind::from_name(callee).is_some()
+}
+
+/// Whether `new callee(..)` keeps its syntactic lowering while `callee` names
+/// the unshadowed builtin.
+fn syntactic_new(callee: &str) -> bool {
+    matches!(callee, "Map" | "Set" | "Promise" | "Date") || ErrorKind::from_name(callee).is_some()
+}
 
 /// What the whole-program scan found (see the module docs).
 #[derive(Default)]
@@ -58,15 +72,19 @@ impl GlobalFacts {
         self.sealed(name) && !self.escaped.contains(name)
     }
 
-    /// Whether a builtin namespace method can be called through its value.
-    /// The builtins see their arguments in the `K` positional slots, so `K`
-    /// must then cover the widest call ([`Self::call_arity`]).
+    /// Whether a builtin namespace method or constructor can be called
+    /// through its value. The builtins see their arguments in the `K`
+    /// positional slots, so `K` must then cover the widest call
+    /// ([`Self::call_arity`]).
     pub(super) fn reaches_builtins(&self) -> bool {
         self.open
             || self.member_value
             || NAMESPACES
                 .iter()
                 .any(|n| self.referenced.contains(*n) && !self.inline(n))
+            || BuiltinCtor::ALL
+                .iter()
+                .any(|c| self.escaped.contains(c.name()))
     }
 
     /// The widest argument list of any call or `new`.
@@ -145,10 +163,16 @@ impl Visit for Scan {
 
     fn visit_call_expr(&mut self, call: &CallExpr) {
         self.facts.max_call_args = self.facts.max_call_args.max(call.args.len());
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Member(member) = callee.as_ref()
-            && let Some(name) = Self::static_member_obj(member)
-        {
+        let Callee::Expr(callee) = &call.callee else {
+            call.visit_children_with(self);
+            return;
+        };
+        let name = match callee.as_ref() {
+            Expr::Member(member) => Self::static_member_obj(member),
+            Expr::Ident(id) if syntactic_call(id.sym.as_ref()) => Some(id.sym.as_ref()),
+            _ => None,
+        };
+        if let Some(name) = name {
             self.read(name, false);
             call.args.visit_with(self);
         } else {
@@ -156,10 +180,29 @@ impl Visit for Scan {
         }
     }
 
-    fn visit_new_expr(&mut self, new: &swc_ecma_ast::NewExpr) {
+    fn visit_new_expr(&mut self, new: &NewExpr) {
         let args = new.args.as_ref().map_or(0, Vec::len);
         self.facts.max_call_args = self.facts.max_call_args.max(args);
-        new.visit_children_with(self);
+        if let Expr::Ident(id) = new.callee.as_ref()
+            && syntactic_new(id.sym.as_ref())
+        {
+            self.read(id.sym.as_ref(), false);
+            new.args.visit_with(self);
+        } else {
+            new.visit_children_with(self);
+        }
+    }
+
+    fn visit_bin_expr(&mut self, bin: &BinExpr) {
+        // A builtin right-hand side of `instanceof` keeps its prototype walk.
+        if bin.op == BinaryOp::InstanceOf
+            && let Expr::Ident(id) = bin.right.as_ref()
+        {
+            self.read(id.sym.as_ref(), false);
+            bin.left.visit_with(self);
+        } else {
+            bin.visit_children_with(self);
+        }
     }
 
     fn visit_assign_expr(&mut self, assign: &AssignExpr) {
