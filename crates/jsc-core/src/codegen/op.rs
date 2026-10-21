@@ -398,17 +398,24 @@ pub(super) fn map_binary_op(op: BinaryOp, span: Span) -> anyhow::Result<BinOp> {
         BinaryOp::NotEqEq => BinOp::Ne,
         BinaryOp::EqEq => BinOp::LooseEq,
         BinaryOp::NotEq => BinOp::LooseNe,
+        BinaryOp::BitAnd => BinOp::BitAnd,
+        BinaryOp::BitOr => BinOp::BitOr,
+        BinaryOp::BitXor => BinOp::BitXor,
+        BinaryOp::LShift => BinOp::Shl,
+        BinaryOp::RShift => BinOp::Shr,
+        BinaryOp::ZeroFillRShift => BinOp::UShr,
         _ => return Err(CompileError::spanned(span, "unsupported operator").into()),
     })
 }
 
-/// Map a swc compound-assignment [`AssignOp`] to the arithmetic [`BinOp`] its
-/// desugaring applies, returning `None` for the plain `=` assignment.
+/// Map a swc compound-assignment [`AssignOp`] to the arithmetic, bitwise, or
+/// shift [`BinOp`] its desugaring applies, returning `None` for the plain `=`
+/// assignment.
 ///
 /// # Errors
 ///
-/// Returns an error for any compound operator outside the arithmetic subset
-/// (bitwise, shift, and logical compound assignments are unsupported).
+/// Returns an error for any other compound operator (`**=`, and the logical
+/// compounds, which [`map_logical_assign_op`] handles).
 pub(super) fn map_assign_op(op: AssignOp, span: Span) -> anyhow::Result<Option<BinOp>> {
     Ok(match op {
         AssignOp::Assign => None,
@@ -417,6 +424,12 @@ pub(super) fn map_assign_op(op: AssignOp, span: Span) -> anyhow::Result<Option<B
         AssignOp::MulAssign => Some(BinOp::Mul),
         AssignOp::DivAssign => Some(BinOp::Div),
         AssignOp::ModAssign => Some(BinOp::Mod),
+        AssignOp::BitAndAssign => Some(BinOp::BitAnd),
+        AssignOp::BitOrAssign => Some(BinOp::BitOr),
+        AssignOp::BitXorAssign => Some(BinOp::BitXor),
+        AssignOp::LShiftAssign => Some(BinOp::Shl),
+        AssignOp::RShiftAssign => Some(BinOp::Shr),
+        AssignOp::ZeroFillRShiftAssign => Some(BinOp::UShr),
         _ => return Err(CompileError::spanned(span, "unsupported assignment operator").into()),
     })
 }
