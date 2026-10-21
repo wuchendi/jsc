@@ -221,7 +221,20 @@ pub(super) fn emit_array_spread(
                 function.instruction(&Instruction::LocalGet(scratch + 22));
                 function.instruction(&Instruction::Call(helpers.gen_to_array));
                 function.instruction(&Instruction::Else);
+                // An array is itself; any other source is `GetIterator`'s
+                // snapshot array (or its `is not iterable` throw).
+                emit_is_array_value(function, scratch + 22);
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
                 function.instruction(&Instruction::LocalGet(scratch + 22));
+                function.instruction(&Instruction::Else);
+                for _ in 0..3 {
+                    enter_frame(helpers);
+                }
+                emit_iter_source_call(scratch + 22, false, function, helpers);
+                for _ in 0..3 {
+                    leave_frame(helpers);
+                }
+                function.instruction(&Instruction::End);
                 function.instruction(&Instruction::End);
                 function.instruction(&Instruction::End);
                 function.instruction(&Instruction::I32WrapI64);
@@ -234,6 +247,144 @@ pub(super) fn emit_array_spread(
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
+}
+
+/// Push i32 `1` when the jsval in i64 local `value` is a `TYPE_ARRAY` handle.
+fn emit_is_array_value(function: &mut Function, value: u32) {
+    emit_is_kind(function, value, &[TYPE_ARRAY]);
+}
+
+/// Push i32 `1` when the jsval in i64 local `value` is a heap block whose
+/// kind byte is one of `kinds`.
+fn emit_is_kind(function: &mut Function, value: u32, kinds: &[i32]) {
+    emit_is_pointer(function, value);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    for (i, &kind) in kinds.iter().enumerate() {
+        emit_load_type_byte(function, value);
+        function.instruction(&Instruction::I32Const(kind));
+        function.instruction(&Instruction::I32Eq);
+        if i > 0 {
+            function.instruction(&Instruction::I32Or);
+        }
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// Call the [`Builtin::IterSource`] body on the jsval in i64 local `value`
+/// (`live`: keep a `Map` / `Set` for a live walk), leaving the walkable value
+/// on the stack, and unwind if it threw.
+fn emit_iter_source_call(value: u32, live: bool, function: &mut Function, helpers: Helpers<'_>) {
+    for _ in 0..helpers.max_args {
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    }
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+    function.instruction(&Instruction::I64Const(i64::from(live)));
+    emit_argc(0, function);
+    function.instruction(&Instruction::Call(helpers.builtin(Builtin::IterSource)));
+    emit_propagate_if_pending(function, helpers);
+}
+
+/// Emit an [`IrNode::IterSource`], leaving the walkable value on the stack.
+pub(super) fn emit_iter_source(
+    value: &IrNode,
+    live: bool,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(scratch + 22));
+    emit_iter_source_call(scratch + 22, live, function, helpers);
+}
+
+/// Emit an [`IrNode::IterLen`], leaving the length (a number jsval) on the
+/// stack: a `Map` / `Set` reads its live `size`, anything else its `length`.
+pub(super) fn emit_iter_len(
+    operand: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let value = scratch + 22;
+    emit_node(operand, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(value));
+    emit_is_kind(function, value, &[TYPE_MAP, TYPE_SET]);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    emit_u32_field_boxed(function, value, MAP_SIZE_OFFSET);
+    function.instruction(&Instruction::Else);
+    enter_frame(helpers);
+    emit_str_len(&IrNode::Local(value), function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// Emit an [`IrNode::IterItem`], leaving the element on the stack: entry
+/// `index` of a `Map` (a fresh `[key, value]` array) or `Set` (its value),
+/// else `iterable[index]`.
+pub(super) fn emit_iter_item(
+    iterable: &IrNode,
+    index: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (value, at, slot) = (scratch + 22, scratch + 23, scratch + 21);
+    emit_node(iterable, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(value));
+    emit_node(index, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(at));
+    emit_is_kind(function, value, &[TYPE_MAP, TYPE_SET]);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    // slot = the address of the entry's key/value pair in the backing store.
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: MAP_ENTRIES_OFFSET,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32WrapI64);
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::I32TruncF64U);
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(slot));
+    emit_load_type_byte(function, value);
+    function.instruction(&Instruction::I32Const(TYPE_MAP));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(slot));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::LocalSet(value));
+    function.instruction(&Instruction::LocalGet(slot));
+    function.instruction(&Instruction::I64Load(elem_slot(1)));
+    function.instruction(&Instruction::LocalSet(at));
+    let entry = IrNode::Array(vec![IrNode::Local(value), IrNode::Local(at)]);
+    emit_node(&entry, function, scratch, strings, helpers);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(slot));
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::End);
+    leave_frame(helpers);
+    function.instruction(&Instruction::Else);
+    enter_frame(helpers);
+    let read = IrNode::Index {
+        obj: Box::new(IrNode::Local(value)),
+        index: Box::new(IrNode::Local(at)),
+    };
+    emit_node(&read, function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// Emit `array.push(value)`, leaving the new length (a number jsval) on

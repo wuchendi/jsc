@@ -110,9 +110,9 @@ fn primitive_unknown_method_call_throws() {
 
 #[test]
 fn literal_primitive_method_calls_resolve_at_run_time() {
-    assert_type_error("\"abc\".foo();", "expression is not a function");
-    assert_type_error("(5).foo();", "expression is not a function");
-    assert_type_error("true.foo();", "expression is not a function");
+    assert_type_error("\"abc\".foo();", "\"abc\".foo is not a function");
+    assert_type_error("(5).foo();", "5.foo is not a function");
+    assert_type_error("true.foo();", "true.foo is not a function");
     assert_str("(5).toString()", "5");
     assert_str("true.toString()", "true");
     assert_str("\"abc\".valueOf()", "abc");

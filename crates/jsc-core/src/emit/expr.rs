@@ -240,6 +240,15 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::LocalGet(scratch + 21));
             function.instruction(&Instruction::Select);
         }
+        IrNode::IterSource { value, live } => {
+            array::emit_iter_source(value, *live, function, scratch, strings, helpers);
+        }
+        IrNode::IterLen(operand) => {
+            array::emit_iter_len(operand, function, scratch, strings, helpers);
+        }
+        IrNode::IterItem { iterable, index } => {
+            array::emit_iter_item(iterable, index, function, scratch, strings, helpers);
+        }
         IrNode::GenResume { handle, sent } => {
             generator::emit_gen_resume(handle, sent, function, scratch, strings, helpers);
         }

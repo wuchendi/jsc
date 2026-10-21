@@ -462,9 +462,8 @@ impl CaptureResolver {
         self.expr(right);
         if let ForHead::VarDecl(v) = left
             && let [declarator] = v.decls.as_slice()
-            && let Pat::Ident(ident) = &declarator.name
         {
-            self.declare(ident.id.sym.as_ref(), binding_id(ident));
+            self.declare_pat(&declarator.name);
         } else if let ForHead::Pat(pat) = left {
             self.mark_pat(pat);
         }

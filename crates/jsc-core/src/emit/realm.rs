@@ -286,6 +286,10 @@ pub(super) enum Builtin {
     /// key (low half) and the not-a-function message (high half). Not
     /// installed on any intrinsic.
     MethodCall,
+    /// `GetIterator` of an [`IrNode::IterSource`]: `this` is the iterated
+    /// value, `env` is `1` for a live `Map` / `Set` walk. Not installed on
+    /// any intrinsic.
+    IterSource,
     /// The global `isNaN`.
     IsNaN,
     /// The global `isFinite`.
@@ -374,7 +378,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 111] = [
+    pub(super) const ALL: [Builtin; 112] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -511,6 +515,7 @@ impl Builtin {
         Self::GeneratorThrow,
         Self::ThrowTypeError,
         Self::MethodCall,
+        Self::IterSource,
         Self::IsNaN,
         Self::IsFinite,
     ];
@@ -518,7 +523,10 @@ impl Builtin {
     /// The function's `name`.
     pub(super) fn name(self) -> &'static str {
         match self {
-            Self::FunctionPrototype | Self::ThrowTypeError | Self::MethodCall => "",
+            Self::FunctionPrototype
+            | Self::ThrowTypeError
+            | Self::MethodCall
+            | Self::IterSource => "",
             Self::HasOwnProperty => "hasOwnProperty",
             Self::ObjectToString
             | Self::ErrorToString
@@ -585,6 +593,7 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ThrowTypeError
             | Self::MethodCall
+            | Self::IterSource
             | Self::StringToString
             | Self::StringValueOf
             | Self::NumberValueOf

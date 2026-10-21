@@ -1720,34 +1720,40 @@ impl LowerCtx<'_> {
             && self.shared.globals.sealed(callee.sym.as_ref())
         {
             let name = callee.sym.as_ref();
+            let args = new_expr.args.as_deref().unwrap_or(&[]);
+            let spread = args.iter().any(|arg| arg.spread.is_some());
             // `new Map()` / `new Set()`: a fresh empty collection handle; an
             // iterable argument constructs through the builtin constructor.
-            if matches!(name, "Map" | "Set") && new_expr.args.as_deref().unwrap_or(&[]).is_empty() {
+            if matches!(name, "Map" | "Set") && args.is_empty() {
                 return Ok(IrNode::MapNew { set: name == "Set" });
             }
             // `new Promise(executor)`: the executor form of the Promise constructor.
-            if name == "Promise" {
-                return self.lower_new_promise(callee.span, new_expr);
+            if name == "Promise"
+                && let [executor] = args
+                && executor.spread.is_none()
+            {
+                let executor = self.lower_expr(&executor.expr)?;
+                return Ok(IrNode::PromiseCtor {
+                    executor: Box::new(executor),
+                    p_local: self.fresh(),
+                });
             }
             // `new Date()` / `new Date(ms)`.
-            if name == "Date" {
-                return self.lower_new_date(callee.span, new_expr);
+            if name == "Date" && args.len() <= 1 && !spread {
+                return self.lower_new_date(args);
             }
-            if let Some(kind) = ErrorKind::from_name(name) {
-                let mut args = Vec::new();
-                for arg in new_expr.args.as_deref().unwrap_or(&[]) {
-                    if arg.spread.is_some() {
-                        return Err(CompileError::spanned(
-                            arg.span(),
-                            "spread arguments are unsupported",
-                        )
-                        .into());
-                    }
-                    args.push(self.lower_expr(&arg.expr)?);
+            if let Some(kind) = ErrorKind::from_name(name)
+                && !spread
+            {
+                let mut lowered = Vec::with_capacity(args.len());
+                for arg in args {
+                    lowered.push(self.lower_expr(&arg.expr)?);
                 }
-                return Ok(self.lower_error_construct(kind, args));
+                return Ok(self.lower_error_construct(kind, lowered));
             }
         }
+        // Every other form (any other arity, a spread) is the builtin
+        // constructor called through the general path.
         self.lower_construct(new_expr)
     }
 
@@ -1865,76 +1871,21 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower `new Date()` / `new Date(ms)` into an [`IrNode::DateNew`].
-    /// The no-argument form seeds the payload from the host clock (`ms: None`); a
-    /// single argument is coerced to a number (`Number(arg)`) so any operand stores
-    /// its numeric value. Two-or-more arguments (the calendar-field form) and a
-    /// spread argument are rejected — only the timestamp forms are in scope.
-    fn lower_new_date(
-        &mut self,
-        span: Span,
-        new_expr: &swc_ecma_ast::NewExpr,
-    ) -> anyhow::Result<IrNode> {
-        let args = new_expr.args.as_deref().unwrap_or(&[]);
-        match args {
-            [] => Ok(IrNode::DateNew { ms: None }),
-            [arg] => {
-                if arg.spread.is_some() {
-                    return Err(CompileError::spanned(
-                        arg.span(),
-                        "spread arguments are unsupported",
-                    )
-                    .into());
-                }
-                let ms = IrNode::ConvertCall {
-                    op: ConvertOp::ToNumber,
-                    arg: Box::new(self.lower_expr(&arg.expr)?),
-                    radix: None,
-                };
-                Ok(IrNode::DateNew {
-                    ms: Some(Box::new(ms)),
-                })
-            }
-            _ => Err(CompileError::spanned(
-                span,
-                "new Date(..) supports only new Date() or new Date(ms) (the \
-                 calendar-field constructor is unsupported)",
-            )
-            .into()),
-        }
-    }
-
-    /// Lower `new Promise(executor)` into an [`IrNode::PromiseCtor`]. The
-    /// single argument is the executor function (spread / wrong arity rejected); a
-    /// dedicated local is reserved to hold the fresh promise across the executor
-    /// call so the surrounding scratch cannot clobber it.
-    fn lower_new_promise(
-        &mut self,
-        span: Span,
-        new_expr: &swc_ecma_ast::NewExpr,
-    ) -> anyhow::Result<IrNode> {
-        let args = new_expr.args.as_deref().unwrap_or(&[]);
-        if args.len() != 1 {
-            return Err(CompileError::spanned(
-                span,
-                format!(
-                    "new Promise expects 1 argument (the executor), got {}",
-                    args.len()
-                ),
-            )
-            .into());
-        }
-        let arg = &args[0];
-        if arg.spread.is_some() {
-            return Err(
-                CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
-            );
-        }
-        let executor = self.lower_expr(&arg.expr)?;
-        let p_local = self.fresh();
-        Ok(IrNode::PromiseCtor {
-            executor: Box::new(executor),
-            p_local,
+    /// Lower `new Date()` / `new Date(ms)` (at most one non-spread argument)
+    /// into an [`IrNode::DateNew`]. The no-argument form seeds the payload from
+    /// the host clock (`ms: None`); a single argument is coerced to a number
+    /// (`Number(arg)`) so any operand stores its numeric value.
+    fn lower_new_date(&mut self, args: &[ExprOrSpread]) -> anyhow::Result<IrNode> {
+        let Some(arg) = args.first() else {
+            return Ok(IrNode::DateNew { ms: None });
+        };
+        let ms = IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            arg: Box::new(self.lower_expr(&arg.expr)?),
+            radix: None,
+        };
+        Ok(IrNode::DateNew {
+            ms: Some(Box::new(ms)),
         })
     }
 }
@@ -2063,6 +2014,13 @@ fn source_name(expr: &Expr) -> Option<String> {
         Expr::This(_) => Some("this".to_owned()),
         Expr::Paren(p) => source_name(&p.expr),
         Expr::Member(member) => member_source_name(member),
+        // A primitive literal names itself: `"x".zzz is not a function`.
+        Expr::Lit(
+            Lit::Str(swc_ecma_ast::Str { raw: Some(raw), .. })
+            | Lit::Num(swc_ecma_ast::Number { raw: Some(raw), .. }),
+        ) => Some(raw.as_ref().to_owned()),
+        Expr::Lit(Lit::Bool(b)) => Some(b.value.to_string()),
+        Expr::Lit(Lit::Null(_)) => Some("null".to_owned()),
         _ => None,
     }
 }

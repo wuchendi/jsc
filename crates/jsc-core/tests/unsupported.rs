@@ -49,13 +49,10 @@ fn rejects_computed_class_fields() {
 
 #[test]
 fn rejects_unsupported_for_of_and_for_in() {
-    // `for-of` over arrays/strings with a `const`/`let` head is supported
-    // and `for-in` over objects/arrays is supported, but these unsupported
-    // forms still trap: an assignment-target head, a statically non-iterable
-    // `for-of` head, and a statically non-enumerable `for-in` head.
+    // A bare-identifier `for-of` head and a statically non-enumerable
+    // `for-in` head still trap (a non-iterable `for-of` source is a run-time
+    // `TypeError`, see the iteration suite).
     assert_rejected("for (x of [1, 2, 3]) { x }");
-    assert_rejected("for (const x of 5) { x }");
-    assert_rejected("for (const x of { a: 1 }) { x }");
     assert_rejected("for (const k in 5) { k }");
 }
 
@@ -66,23 +63,25 @@ fn rejects_function_prototype_bind() {
 }
 
 // ---------------------------------------------------------------------------
-// An unknown / not-yet-implemented method must be rejected at COMPILE time
-// with a clean span diagnostic — NEVER a `call_indirect` that the wasm validator
-// rejects with `failed to compile: wasm[0]::function[..]`.
+// An unknown / not-yet-implemented method is a run-time `TypeError` from the
+// prototype lookup — never a compile error, and never invalid wasm.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn unknown_string_method_throws_typeerror() {
     // A primitive receiver reads its methods from its prototype at run time:
     // an unknown name is `undefined`, and calling it throws.
-    for src in [
-        "\"x\".zzz()",
-        "\"hi\".charCodeAt(0)",
-        "`t`.zzz()",
-        "\"x\"[\"zzz\"]()",
-        "function f() { return 1 } \"x\".zzz()",
-    ] {
+    for src in ["`t`.zzz()", "`hi`.charCodeAt(0)"] {
         assert_uncaught(src, "TypeError: expression is not a function");
+    }
+    for (src, name) in [
+        ("\"x\".zzz()", "\"x\".zzz"),
+        ("(1).zzz()", "1.zzz"),
+        ("true.zzz()", "true.zzz"),
+        ("\"x\"[\"zzz\"]()", "\"x\".zzz"),
+        ("function f() { return 1 } \"x\".zzz()", "\"x\".zzz"),
+    ] {
+        assert_uncaught(src, &format!("TypeError: {name} is not a function"));
     }
 }
 
