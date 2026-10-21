@@ -22,6 +22,7 @@ import {
   FN_INFO_ENTRY_SIZE,
   FN_INFO_NAME_OFFSET,
   FUNC_FLAG_CLASS_CTOR,
+  FUNC_FLAG_CONSTRUCTOR,
   FUNC_INDEX_OFFSET,
   HEADER_CLASS_OFFSET,
   HEADER_FLAGS_OFFSET,
@@ -430,9 +431,10 @@ function tableEntries(
 /**
  * Resolve a heap object block at `ptr` from its own enumerable properties
  * (mirrors `value.rs::decode_object`): an object of class `ERROR` decodes as
- * `error` with its (possibly inherited) `name` and `message`; an object with
- * a prototype whose `constructor` names a function other than `Object`
- * decodes as `instance`.
+ * `error` with its (possibly inherited) `name` and `message`; an object whose
+ * prototype chain (from its prototype, so a prototype object's own
+ * `constructor` back-link does not name it) holds a `constructor` naming a
+ * function other than `Object` decodes as `instance`.
  */
 function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
   if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ERROR) {
@@ -451,8 +453,9 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
   if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ARGUMENTS)
     return { kind: 'arguments', entries }
   const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
-  if (proto !== undefined && heapObject(proto, mem) !== undefined) {
-    const ctor = lookupData(ptr, 'constructor', mem)
+  const protoPtr = proto === undefined ? undefined : heapObject(proto, mem)
+  if (protoPtr !== undefined) {
+    const ctor = lookupData(protoPtr, 'constructor', mem)
     const className = ctor === undefined ? undefined : functionName(ctor, mem)
     if (className !== undefined && className !== '' && className !== 'Object')
       return { kind: 'instance', className, entries }
@@ -466,18 +469,16 @@ function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
     ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_CLASS_CTOR) !== 0
   let parent: string | undefined
   if (isClass) {
-    const proto = ownData(ptr, 'prototype', mem)
-    const protoPtr = proto === undefined ? undefined : heapObject(proto, mem)
-    const link =
-      protoPtr === undefined
-        ? undefined
-        : readU64(mem, protoPtr + OBJ_PROTO_OFFSET)
+    // The parent is the class's own [[Prototype]] when that is a constructor
+    // (a base class inherits from the non-constructor %Function.prototype%).
+    const link = readU64(mem, ptr + OBJ_PROTO_OFFSET)
     const linkPtr = link === undefined ? undefined : heapObject(link, mem)
-    const ctor =
-      linkPtr === undefined
-        ? undefined
-        : lookupData(linkPtr, 'constructor', mem)
-    parent = ctor === undefined ? undefined : functionName(ctor, mem)
+    if (
+      linkPtr !== undefined &&
+      mem[linkPtr] === TYPE_FUNCTION &&
+      ((mem[linkPtr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_CONSTRUCTOR) !== 0
+    )
+      parent = functionName(HEAP | BigInt(linkPtr), mem)
   }
   return {
     kind: 'function',
@@ -694,7 +695,7 @@ export function toJsString(value: Value): string {
  * separated by `sep`; a run of `N` holes contributes `N` empty pieces (mirrors
  * `value.rs::join_elements`).
  */
-export function joinElements(items: Value[], sep: string): string {
+function joinElements(items: Value[], sep: string): string {
   const pieces: string[] = []
   for (const v of items) {
     if (v.kind === 'holes') {

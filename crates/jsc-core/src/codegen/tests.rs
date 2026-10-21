@@ -1,7 +1,8 @@
 use super::lower;
 use crate::frontend::{Dialect, parse};
 use crate::ir::{
-    BinOp, CalleeError, ConvertOp, ErrorKind, IrNode, IrStmt, ObjectBuiltinOp, OpSetKind, PropKey,
+    BinOp, CalleeError, ConvertOp, ErrorKind, GlobalIntrinsic, GlobalRef, IrNode, IrStmt, MathOp,
+    ObjectBuiltinOp, OpSetKind, PropKey,
 };
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
@@ -210,12 +211,7 @@ fn lowers_error_dynamic_message_once() {
         if matches!(&**lhs, IrNode::Assign { .. }) && **rhs == IrNode::Undefined));
     assert_eq!(
         **then_branch,
-        IrNode::error_object(
-            ErrorKind::Error,
-            None,
-            None,
-            IrNode::Str("Error".to_owned())
-        )
+        IrNode::error_object(ErrorKind::Error, None, IrNode::Str("Error".to_owned()))
     );
     let IrNode::Object { entries, .. } = &**else_branch else {
         unreachable!("expected the error object");
@@ -235,7 +231,6 @@ fn lowers_error_no_arg_to_inherited_message() {
             IrStmt::Expr(IrNode::error_object(
                 ErrorKind::Error,
                 None,
-                None,
                 IrNode::Str("Error".to_owned()),
             )),
             "for `{src}`"
@@ -244,9 +239,10 @@ fn lowers_error_no_arg_to_inherited_message() {
 }
 
 #[test]
-fn rejects_unknown_constructor() {
-    // Only the three built-in error constructors are in scope.
-    assert!(lower_src("new Widget(1)").is_err());
+fn unknown_constructor_reads_the_global_object() {
+    // An unresolved constructor is a global-object read, checked at run time.
+    let node = lower_expr("new Widget(1)").expect("lower");
+    assert!(node.any_child(|child| *child == global_get("Widget")));
 }
 
 #[test]
@@ -527,20 +523,189 @@ fn lowers_member_update_as_indexopset() {
     );
 }
 
+/// The run-time read of the unresolved global `name`.
+fn global_get(name: &str) -> IrNode {
+    IrNode::GlobalGet {
+        global: GlobalRef::new(name),
+        typeof_operand: false,
+    }
+}
+
 #[test]
-fn rejects_undeclared_identifier() {
-    assert!(
-        lower_src("a + 1").is_err(),
-        "undeclared identifier is an error"
+fn undeclared_identifier_reads_the_global_object() {
+    assert_eq!(
+        lower_expr("a + 1").expect("lower"),
+        IrNode::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(global_get("a")),
+            rhs: Box::new(IrNode::Num(1.0)),
+        }
+    );
+    assert_eq!(
+        lower_expr("typeof a").expect("lower"),
+        IrNode::TypeOf(Box::new(IrNode::GlobalGet {
+            global: GlobalRef::new("a"),
+            typeof_operand: true,
+        }))
     );
 }
 
 #[test]
-fn rejects_assignment_to_undeclared() {
-    assert!(
-        lower_src("x = 1").is_err(),
-        "assigning an undeclared var errors"
+fn assignment_to_undeclared_writes_the_global_object() {
+    assert_eq!(
+        lower_expr("x = 1").expect("lower"),
+        IrNode::GlobalSet {
+            global: GlobalRef::new("x"),
+            value: Box::new(IrNode::Num(1.0)),
+        }
     );
+    assert!(
+        lower_src("function f() {} f = 1").is_err(),
+        "a function declaration is not assignable"
+    );
+    for src in ["eval = 1", "arguments = 1", "for ({ eval } of [{}]) ;"] {
+        assert!(lower_src(src).is_err(), "`{src}` is a strict early error");
+    }
+}
+
+#[test]
+fn sealed_namespaces_keep_inline_nodes() {
+    let math = lower_expr("Math.max(1, 2)").expect("lower");
+    assert!(matches!(
+        math,
+        IrNode::MathCall {
+            op: MathOp::Max,
+            ..
+        }
+    ));
+    assert_eq!(
+        lower_expr("Math.PI").expect("lower"),
+        IrNode::Num(std::f64::consts::PI)
+    );
+    let log = lower_expr("console.log(1)").expect("lower");
+    assert!(matches!(log, IrNode::ConsoleLog { .. }));
+    let json = lower_expr("JSON.stringify(1)").expect("lower");
+    assert!(matches!(json, IrNode::JsonStringify { .. }));
+    let json = lower_expr("JSON.parse('1')").expect("lower");
+    assert!(matches!(json, IrNode::JsonParse { .. }));
+    // A sealed bare read is the constant intrinsic.
+    let program = lower_src("let m = Math; m").expect("lower");
+    let IrStmt::Decl { init, .. } = &program.stmts[0] else {
+        unreachable!("expected a declaration");
+    };
+    assert_eq!(*init, IrNode::Intrinsic(GlobalIntrinsic::Math));
+}
+
+#[test]
+fn unsealed_namespaces_guard_the_inline_code() {
+    // `globalThis` anywhere unseals every global: the inline code runs behind a
+    // guard over the global-object read.
+    let program = lower_src("globalThis; Math.max(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard {
+        namespace,
+        key,
+        obj,
+        fast,
+        slow,
+        ..
+    }) = &program.stmts[1]
+    else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!((*namespace, key.as_str()), (GlobalIntrinsic::Math, "max"));
+    assert_eq!(**obj, global_get("Math"));
+    assert!(matches!(
+        **fast,
+        IrNode::MathCall {
+            op: MathOp::Max,
+            ..
+        }
+    ));
+    assert!(matches!(**slow, IrNode::MethodCallUser { .. }));
+    // An escaping namespace stays sealed (constant) but guards the inline call.
+    let program = lower_src("typeof JSON; JSON.stringify(1)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { obj, fast, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(**obj, IrNode::Intrinsic(GlobalIntrinsic::Json));
+    assert!(matches!(**fast, IrNode::JsonStringify { .. }));
+    // An assigned namespace is a global-object read.
+    let program = lower_src("Math = 1; Math.max(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { obj, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(**obj, global_get("Math"));
+    // A guarded call the inline code rejects (arity) is a plain method call.
+    let program = lower_src("globalThis; Math.floor(1, 2)").expect("lower");
+    assert!(matches!(
+        &program.stmts[1],
+        IrStmt::Expr(IrNode::MethodCallUser { .. })
+    ));
+    // Top-level `this` is the global object.
+    assert_eq!(
+        lower_expr("this").expect("lower"),
+        IrNode::Intrinsic(GlobalIntrinsic::Global)
+    );
+}
+
+#[test]
+fn unknown_namespace_members_are_method_calls() {
+    // G1c is gone: a member without inline code is read from the namespace
+    // object, inline or not.
+    for src in [
+        "Math.foo()",
+        "Object.freeze({})",
+        "JSON.foo(1)",
+        "Promise.all([])",
+        "console.warn(1)",
+    ] {
+        let node = lower_expr(src).expect("lower");
+        let IrNode::MethodCallUser { obj, .. } = &node else {
+            unreachable!("`{src}`: expected a method call, got {node:?}");
+        };
+        assert!(matches!(**obj, IrNode::Intrinsic(_)), "`{src}`");
+    }
+    // `[1].toString()` reads `%Array.prototype%` at run time.
+    assert!(matches!(
+        lower_expr("[1].toString()").expect("lower"),
+        IrNode::MethodCallUser { .. }
+    ));
+}
+
+/// Whether `node` contains a [`IrNode::ProtoGuard`].
+fn has_proto_guard(node: &IrNode) -> bool {
+    matches!(node, IrNode::ProtoGuard { .. }) || node.any_child(has_proto_guard)
+}
+
+#[test]
+fn intrinsics_sealed_programs_emit_no_guard() {
+    for src in [
+        "let a = []; a.push(1)",
+        "let a = [1]; a.pop()",
+        "class C { constructor() { this.a = [] } } new C().a.push(1)",
+    ] {
+        let program = lower_src(src).expect("lower");
+        let last = program.stmts.last().expect("a statement");
+        assert!(
+            !last.any_node(has_proto_guard),
+            "`{src}` is intrinsics-sealed"
+        );
+    }
+    for src in [
+        "Array.prototype.x = 1; let a = []; a.push(1)",
+        "let c = [].constructor; let a = []; a.pop()",
+        "let o = {}; o.__proto__; let a = []; a.push(1)",
+        "Object.assign; let a = []; a.push(1)",
+        "Reflect; let a = []; a.push(1)",
+        "let k = 'prototype'; let a = []; a.push(1)",
+    ] {
+        let program = lower_src(src).expect("lower");
+        let last = program.stmts.last().expect("a statement");
+        assert!(
+            last.any_node(has_proto_guard),
+            "`{src}` is not intrinsics-sealed"
+        );
+    }
 }
 
 #[test]
@@ -934,10 +1099,14 @@ fn nested_function_declaration_lowers_to_bound_func_value() {
 }
 
 #[test]
-fn rejects_call_to_undeclared_function() {
-    assert!(
-        lower_src("missing(1)").is_err(),
-        "calling an undeclared function is an error"
+fn call_to_undeclared_function_reads_the_global_object() {
+    assert_eq!(
+        lower_expr("missing(1)").expect("lower"),
+        IrNode::CallIndirect {
+            callee: Box::new(global_get("missing")),
+            args: vec![IrNode::Num(1.0)],
+            not_callable: CalleeError::not_a_function("missing"),
+        }
     );
 }
 
@@ -1086,21 +1255,18 @@ fn block_shadow_uses_distinct_local() {
 
 #[test]
 fn block_local_does_not_leak() {
-    // A binding declared only inside a block is undeclared after it.
-    assert!(
-        lower_src("{ let y = 5; } y").is_err(),
-        "block-local binding must not leak out"
-    );
+    // A binding declared only inside a block is undeclared after it: the
+    // read falls through to the global object.
+    let program = lower_src("{ let y = 5; } y").expect("lower");
+    assert_eq!(program.stmts.last(), Some(&IrStmt::Expr(global_get("y"))));
 }
 
 #[test]
 fn for_let_binding_does_not_leak() {
-    // The `for`-`let` binding is scoped to the loop; referencing it after
-    // the loop is a compile error.
-    assert!(
-        lower_src("for(let i=0;i<3;i=i+1){} i").is_err(),
-        "for-let binding must not leak past the loop"
-    );
+    // The `for`-`let` binding is scoped to the loop; a reference after the
+    // loop reads the global object.
+    let program = lower_src("for(let i=0;i<3;i=i+1){} i").expect("lower");
+    assert_eq!(program.stmts.last(), Some(&IrStmt::Expr(global_get("i"))));
 }
 
 #[test]

@@ -376,10 +376,8 @@ impl<'a> LowerCtx<'a> {
         let slot = *self.shared.module_slots.get(name)?;
         let mutable = *self.shared.module_mutable.get(name)?;
         let message = format!("Cannot access '{name}' before initialization");
-        // No `%ReferenceError.prototype%` yet (S4): an `Error` with an own `name`.
         let error = IrNode::error_object(
-            ErrorKind::Error,
-            Some("ReferenceError"),
+            ErrorKind::ReferenceError,
             Some(IrNode::Str(message.clone())),
             IrNode::Str(format!("ReferenceError: {message}")),
         );
@@ -473,11 +471,65 @@ impl<'a> LowerCtx<'a> {
         })
     }
 
+    /// Resolve `name` as an assignment target: a binding, else a property of
+    /// the global object (design 4.3). A top-level function declaration is not
+    /// assignable, and `eval`/`arguments` are not assignment targets in strict
+    /// code (an early `SyntaxError`).
+    pub(super) fn resolve_target(
+        &mut self,
+        name: &str,
+        span: swc_common::Span,
+    ) -> anyhow::Result<Resolved> {
+        if matches!(name, "eval" | "arguments") {
+            return Err(CompileError::spanned(
+                span,
+                format!("cannot assign to `{name}` in strict mode"),
+            )
+            .into());
+        }
+        if let Some(resolved) = self.resolve(name) {
+            return Ok(resolved);
+        }
+        if self.shared.funcs.contains_key(name) {
+            return Err(CompileError::spanned(
+                span,
+                format!("cannot assign to function declaration: {name}"),
+            )
+            .into());
+        }
+        Ok(Resolved {
+            kind: AccessKind::Global(GlobalRef::new(name)),
+            mutable: true,
+        })
+    }
+
+    /// The read of `name` when it resolves to no binding nor declaration: the
+    /// intrinsic's constant address when `sealed(name)` holds for a known
+    /// global, else a global-object lookup that throws on a miss.
+    pub(super) fn global_read(&self, name: &str) -> IrNode {
+        match GlobalIntrinsic::from_name(name) {
+            Some(global) if self.shared.globals.sealed(name) => IrNode::Intrinsic(global),
+            _ => Self::read_of(AccessKind::Global(GlobalRef::new(name))),
+        }
+    }
+
+    /// Whether `name.m(..)` / `name.k` keep the inline namespace code: `name`
+    /// is the unshadowed global, sealed and never escaping.
+    pub(super) fn inline_namespace(&mut self, name: &str) -> bool {
+        self.resolve(name).is_none()
+            && !self.shared.funcs.contains_key(name)
+            && self.shared.globals.inline(name)
+    }
+
     /// The read expression for a resolved access.
     pub(super) fn read_of(kind: AccessKind) -> IrNode {
         match kind {
             AccessKind::Plain(local) => IrNode::Local(local),
             AccessKind::Cell(ptr) => IrNode::CellGet(Box::new(ptr)),
+            AccessKind::Global(global) => IrNode::GlobalGet {
+                global,
+                typeof_operand: false,
+            },
         }
     }
 
@@ -490,6 +542,10 @@ impl<'a> LowerCtx<'a> {
             },
             AccessKind::Cell(ptr) => IrNode::CellSet {
                 cell: Box::new(ptr),
+                value: Box::new(value),
+            },
+            AccessKind::Global(global) => IrNode::GlobalSet {
+                global,
                 value: Box::new(value),
             },
         }

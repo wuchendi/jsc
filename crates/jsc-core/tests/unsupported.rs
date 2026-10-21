@@ -58,11 +58,7 @@ fn rejects_spread() {
 }
 
 #[test]
-fn rejects_top_level_this() {
-    // Object methods and shorthand methods are supported (see the
-    // objects suite), but a top-level `this` — outside any function, so with no
-    // receiver binding — remains rejected.
-    assert_rejected("this");
+fn rejects_async_methods() {
     // Async/generator methods stay out of scope.
     assert_rejected("let o = { async m() { return 1 } }; o.m()");
 }
@@ -89,10 +85,8 @@ fn rejects_unsupported_for_of_and_for_in() {
 }
 
 #[test]
-fn rejects_function_prototype_methods() {
-    // `bind`/`apply`/`call` are not modeled; they trap rather than mis-dispatch.
-    assert_rejected("function f(a) { return a } f.call(null, 1)");
-    assert_rejected("function f(a) { return a } f.apply(null, [1])");
+fn rejects_function_prototype_bind() {
+    // `bind` is phase 3: it throws rather than mis-dispatching.
     assert_rejected("function f(a) { return a } let g = f.bind(null); g(1)");
 }
 
@@ -113,13 +107,6 @@ fn rejects_unknown_string_method() {
     // Reached through a template literal and a computed string-literal key.
     assert_unknown_method("`t`.zzz()", "zzz");
     assert_unknown_method("\"x\"[\"zzz\"]()", "zzz");
-}
-
-#[test]
-fn rejects_unknown_array_method() {
-    assert_unknown_method("[1, 2].flat()", "flat");
-    assert_unknown_method("[1, 2, 3].reverse()", "reverse");
-    assert_unknown_method("[].concat([1])", "concat");
 }
 
 #[test]
@@ -262,7 +249,6 @@ fn rejects_unknown_method_even_with_functions_present() {
     // A primitive-literal receiver is rejected regardless of whether the program
     // also defines functions (which would otherwise emit a funcref table).
     assert_unknown_method("function f() { return 1 } \"x\".zzz()", "zzz");
-    assert_unknown_method("let id = (x) => x; [1].flat()", "flat");
 }
 
 #[test]
@@ -278,6 +264,9 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "let o = { a: 1 }; o = { b: 2 }; o.zzz()",
         "TypeError: o.zzz is not a function",
     );
+    // An array literal reads its methods from `%Array.prototype%` at run time.
+    assert_uncaught("[1, 2].flat()", "TypeError: expression is not a function");
+    assert_uncaught("[].concat([1])", "TypeError: expression is not a function");
     // A builtin-named method's user-method fallback throws too.
     assert_uncaught("let o = {}; o.get(1)", "TypeError: o.get is not a function");
     assert_uncaught(

@@ -243,3 +243,38 @@ fn object_family_values_render_through_payload_offsets() {
         Some("[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function: f] } ]")
     );
 }
+
+/// The realm's prototype methods are reached through ordinary property lookup
+/// (`%Object.prototype%`, `%Function.prototype%`, `%Error.prototype%`), and
+/// an own property shadows them.
+#[test]
+fn prototype_methods_via_eval() {
+    assert_eq!(jsc(&["-p", r#"({ a: 1 }).hasOwnProperty("a")"#]), "true");
+    assert_eq!(jsc(&["-p", "({}).toString.call([])"]), "[object Array]");
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function f(a) { return this.k + a } f.call({ k: 1 }, 2)"
+        ]),
+        "3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function f(a, b) { return a * b } f.apply(null, [6, 7])"
+        ]),
+        "42"
+    );
+    assert_eq!(
+        jsc(&["-p", r#"new ReferenceError("r").toString()"#]),
+        "ReferenceError: r"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            r#"const o = { toString() { return "own" } }; o.toString()"#
+        ]),
+        "own"
+    );
+    assert_eq!(jsc_raw_stdout(&["-e", "console.log({})"]), "{}\n");
+}

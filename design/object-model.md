@@ -738,6 +738,7 @@ the official files in `.tmp/test262/harness/` (test262 @ `2e0a5676`,
 | `thrown.constructor !== expectedErrorConstructor` (`assert.js:130`) | `.constructor` not the class; builtin errors not values | S3 (`constructor`) + S4 (error constructors) |
 | `expectedErrorConstructor.name`, `thrown.constructor.name` (`assert.js:131-132`, `:143`) | `.name` undefined/garbage | S1 (lazy `name`) |
 | `Array.prototype.map.call(arrayLike, String)` (`assert.js:179`) | `undeclared variable: String` / `Array` | S4 (`String` value, generic `map` over array-likes) |
+| `String(new Test262Error(..))`, `"" + err`, `message += …` conversions of harness objects | ToString ignores user toString/valueOf | S4 (OrdinaryToPrimitive) |
 | `$DONOTEVALUATE`, `typeof` checks, `switch`, `try/catch`, `message += ' '` | compile today | — |
 
 **M1 lands at the end of S4**, which also switches the runner:

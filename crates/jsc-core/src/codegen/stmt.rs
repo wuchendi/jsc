@@ -1149,13 +1149,7 @@ impl LowerCtx<'_> {
     /// Resolve `ident` as an assignable (declared, non-`const`) binding.
     fn assignable_binding(&mut self, ident: &Ident) -> anyhow::Result<AssignRef> {
         let name = ident.sym.as_ref();
-        let Some(resolved) = self.resolve(name) else {
-            return Err(CompileError::spanned(
-                ident.span(),
-                format!("undeclared variable: {name}"),
-            )
-            .into());
-        };
+        let resolved = self.resolve_target(name, ident.span())?;
         if !resolved.mutable {
             return Err(CompileError::spanned(
                 ident.span(),

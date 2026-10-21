@@ -86,24 +86,20 @@ fn unsupported_statement_renders_caret_diagnostic() {
     assert!(stderr.contains('^'), "got: {stderr}");
 }
 
-/// A codegen-rejected *unknown identifier* now carries the offending name's
-/// span: `NaN2 + 1` points a caret at column 1 (`NaN2`), proving the D3 span
-/// sweep reaches the `undeclared variable` path.
+/// An *unknown identifier* is resolved against the global object at run
+/// time (design 4.3): `NaN2 + 1` compiles and throws an uncaught
+/// `ReferenceError` (exit 1).
 #[test]
-fn undeclared_identifier_renders_caret_at_column_one() {
+fn undeclared_identifier_throws_reference_error_at_run_time() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "NaN2 + 1"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(output.status.code() == Some(2), "must exit 2");
+    assert!(output.status.code() == Some(1), "must exit 1");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(":1:1"),
-        "stderr should locate the unknown identifier at column 1, got: {stderr}"
-    );
-    assert!(
-        stderr.contains('^'),
-        "stderr should draw a caret under the identifier, got: {stderr}"
+        stderr.contains("Uncaught ReferenceError: NaN2 is not defined"),
+        "got: {stderr}"
     );
 }
 
@@ -215,7 +211,7 @@ fn recoverable_parse_error_renders_caret_diagnostic() {
 }
 
 /// Consolidated diagnostics contract (§9): a table of distinct compile-error
-/// classes — a `const` reassignment, an undeclared variable, a `for-of` loop,
+/// classes — a `const` reassignment, a `for-of` loop,
 /// and an swc parse error — each renders the rustc/swc-style block, so every
 /// rendered stderr must carry BOTH a `:1:` line:col locator AND a `^` caret.
 /// This spans parse rejections and every codegen-rejection path in one place.
@@ -224,7 +220,6 @@ fn compile_errors_render_locator_and_caret() {
     // (source, a human label for the failure message)
     let cases = [
         ("const c = 1; c = 2", "const reassignment"),
-        ("NaN2 + 1", "undeclared variable"),
         ("for (x of [1,2]) x", "for-of loop"),
         ("for (let i=0;i<3;i=i+1) break nope", "unknown break label"),
         ("foo: { break foo }", "label on non-loop"),
