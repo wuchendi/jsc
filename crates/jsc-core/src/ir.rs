@@ -1199,6 +1199,48 @@ pub enum IrNode {
         /// a function`).
         not_callable: CalleeError,
     },
+    /// `N.key(args)` on a builtin namespace `N` whose value is not the sealed,
+    /// non-escaping intrinsic (design 3.2 row 2). `obj` (the value of `N`) is
+    /// evaluated into `obj_local` and `args` into `arg_locals`; `fast` (the
+    /// inline code over `arg_locals`) runs while `obj_local.key` is still the
+    /// builtin method, else `slow` (the generic method call on `obj_local`).
+    /// For a watched namespace (`Math`, `JSON`, `console`) the test is
+    /// `obj_local === %N%` with its dirty bit clear, reading no member.
+    NamespaceGuard {
+        /// The namespace whose builtin `key` the fast path implements.
+        namespace: GlobalIntrinsic,
+        /// The member name.
+        key: String,
+        /// The value of the namespace binding.
+        obj: Box<IrNode>,
+        /// Scratch local holding `obj`.
+        obj_local: u32,
+        /// The argument expressions, in source order.
+        args: Vec<IrNode>,
+        /// Scratch locals holding `args`.
+        arg_locals: Vec<u32>,
+        /// The inline code over `arg_locals`.
+        fast: Box<IrNode>,
+        /// The generic method call on `obj_local` over `arg_locals`.
+        slow: Box<IrNode>,
+    },
+    /// A syntactic receiver method `recv.key(..)` whose builtin is not yet a
+    /// property of `%proto%` (design 3.2 row 3, until S5): when the dirty bit
+    /// of `%proto%` is set and `recv.key` is a function, `user` (the generic
+    /// method call) runs, else `fast`. Emitted only for a program that is not
+    /// intrinsics-sealed.
+    ProtoGuard {
+        /// The constructor whose prototype the builtin belongs to.
+        proto: BuiltinCtor,
+        /// The method name.
+        key: String,
+        /// The receiver read (a local, evaluated before this node).
+        recv: Box<IrNode>,
+        /// The syntactic fast path.
+        fast: Box<IrNode>,
+        /// The generic method call.
+        user: Box<IrNode>,
+    },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
     /// slot, so a nested method call that re-sets the global does not disturb this
@@ -1962,6 +2004,16 @@ impl IrNode {
             | IrNode::ReceiverMethod { recv, args, .. }
             | IrNode::DateMethod { recv, args, .. } => f(recv) || args.iter().any(f),
             IrNode::MethodCallUser { obj, key, args, .. } => f(obj) || f(key) || args.iter().any(f),
+            IrNode::NamespaceGuard {
+                obj,
+                args,
+                fast,
+                slow,
+                ..
+            } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
+            IrNode::ProtoGuard {
+                recv, fast, user, ..
+            } => f(recv) || f(fast) || f(user),
             IrNode::Construct {
                 callee,
                 args,
@@ -2138,6 +2190,19 @@ impl IrNode {
                 .into_iter()
                 .chain(args.iter_mut())
                 .collect(),
+            IrNode::NamespaceGuard {
+                obj,
+                args,
+                fast,
+                slow,
+                ..
+            } => std::iter::once(&mut **obj)
+                .chain(args.iter_mut())
+                .chain([&mut **fast, &mut **slow])
+                .collect(),
+            IrNode::ProtoGuard {
+                recv, fast, user, ..
+            } => vec![&mut **recv, &mut **fast, &mut **user],
             IrNode::Construct {
                 callee,
                 args,

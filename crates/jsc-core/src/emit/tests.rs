@@ -1083,3 +1083,50 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     let (date, mem) = heap("new Date(1234.5)", TYPE_DATE, 0);
     assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234.5_f64.to_bits());
 }
+
+/// The number of `global.set` of the dirty-bits global in `bytes`.
+fn dirty_bit_sets(bytes: &[u8]) -> usize {
+    let mut sets = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("valid payload") {
+            let mut ops = body.get_operators_reader().expect("operators");
+            while !ops.eof() {
+                if let wasmparser::Operator::GlobalSet { global_index } =
+                    ops.read().expect("operator")
+                    && global_index == super::DIRTY_GLOBAL
+                {
+                    sets += 1;
+                }
+            }
+        }
+    }
+    sets
+}
+
+/// Compile `src` through the front end and codegen.
+fn compile(src: &str) -> Vec<u8> {
+    let program = crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse");
+    emit(&crate::codegen::lower(&program).expect("lower"))
+}
+
+#[test]
+fn dirty_bits_are_set_only_when_tested() {
+    // Intrinsics-sealed with inline namespaces: no guard, so `__set`,
+    // `__define` and `__delete` never touch the bits.
+    assert_eq!(
+        dirty_bit_sets(&compile("let a = []; a.push(Math.max(1, 2))")),
+        0
+    );
+    // A push guard (not intrinsics-sealed) or a watched-namespace guard (an
+    // escaping `Math`) makes the three helpers set the bits.
+    assert_eq!(
+        dirty_bit_sets(&compile("Object.prototype.x = 1; let a = []; a.push(1)")),
+        3
+    );
+    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 3);
+    // An unwatched namespace guard compares the member instead.
+    assert_eq!(
+        dirty_bit_sets(&compile("let o = Object; Object.keys({})")),
+        0
+    );
+}

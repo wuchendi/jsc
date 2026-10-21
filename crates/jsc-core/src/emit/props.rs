@@ -59,6 +59,8 @@ const ATTRS_DEFAULT: i32 = abi::ATTRS_DEFAULT.cast_signed();
 /// Table `tflags` bits.
 const HAS_INDEX_KEYS: i32 = abi::PROPS_HAS_INDEX_KEYS as i32;
 const HAS_NON_ENUM: i32 = abi::PROPS_HAS_NON_ENUM as i32;
+const WATCHED: i32 = abi::PROPS_WATCHED as i32;
+const P_WATCH_BIT: u64 = abi::PROPS_WATCH_BIT_OFFSET as u64;
 /// String `flags` bits.
 const STR_INTERNED: i32 = abi::STR_FLAG_INTERNED as i32;
 const STR_ARRAY_INDEX: i32 = abi::STR_FLAG_ARRAY_INDEX as i32;
@@ -295,6 +297,18 @@ fn emit_prop_throw_return(
     wasm!(function; LocalGet(recv), LocalGet(key));
     emit_box_heap(function);
     wasm!(function; I32Const(mode), Call(helpers.prop_throw), Return);
+}
+
+/// Set the dirty bit of the property table in the i32 local `table` when it
+/// belongs to a watched intrinsic (design 3.3).
+fn emit_mark_dirty(function: &mut Function, table: u32) {
+    wasm!(function;
+        LocalGet(table), I32Load8U(m8(P_TFLAGS)), I32Const(WATCHED), I32And,
+        If(BlockType::Empty),
+        GlobalGet(DIRTY_GLOBAL), I32Const(1), LocalGet(table), I32Load8U(m8(P_WATCH_BIT)), I32Shl,
+        I32Or, GlobalSet(DIRTY_GLOBAL),
+        End,
+    );
 }
 
 /// `__str_hash(s: i32) -> i32`: the 32-bit FNV-1a hash of the string's bytes.
@@ -539,8 +553,9 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>) -> Function {
 /// `key` of the object-family block `o` (overwrite in place when present, else
 /// append; `CreateDataProperty` / accessor install). A missing table starts at
 /// capacity 4; a full one is rebuilt with capacity `max(4, 2 * live)` (the same
-/// capacity when tombstones free half), keeping the live entries in order,
-/// and `o`'s `props` slot is rewritten.
+/// capacity when tombstones free half), keeping the live entries in order
+/// (and the table's watch flag and bit), and `o`'s `props` slot is rewritten.
+/// A watched table sets its dirty bit when the program tracks them.
 pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(7, ValType::I32)]);
     let (o, key, v, attrs) = (0, 1, 2, 3);
@@ -608,8 +623,12 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
         LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_NON_ENUM), I32Or,
         I32Store8(m8(P_TFLAGS)),
         End,
-        End,
     );
+    if helpers.dirty_tracking {
+        wasm!(f; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(p));
+        emit_mark_dirty(&mut f, p);
+    }
+    wasm!(f; End);
     f
 }
 
@@ -788,7 +807,9 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
 /// decides: an accessor calls its setter with `this = recv` (a getter-only one
 /// throws), a non-writable data property throws, an own writable one is
 /// overwritten; otherwise an own `0b0111` data property is added (a
-/// non-extensible object throws). A throw leaves the exception pending.
+/// non-extensible object throws). An own overwrite on a watched table sets its
+/// dirty bit when the program tracks them (an add does so in `__define`). A
+/// throw leaves the exception pending.
 pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
     let (recv, key, v) = (0, 1, 2);
@@ -834,7 +855,14 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
         End,
         LocalGet(own),
         If(BlockType::Empty),
-        LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)), Return,
+        LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)),
+    );
+    if helpers.dirty_tracking {
+        wasm!(f; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(a));
+        emit_mark_dirty(&mut f, a);
+    }
+    wasm!(f;
+        Return,
         End,
         End,
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
@@ -927,7 +955,8 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
 /// `live` decremented); a non-configurable property throws. On an array an
 /// in-range index becomes a hole and `length` (non-configurable) throws; its
 /// named keys (and a `SPARSE` array's elements past its store) are table
-/// entries. A primitive or string is left unchanged.
+/// entries. A primitive or string is left unchanged. A delete on a watched
+/// table sets its dirty bit when the program tracks them.
 pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32)]);
     let (obj, key, o, e, t, i) = (0, 1, 2, 3, 4, 5);
@@ -981,8 +1010,11 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
         LocalGet(e), I64Const(UNDEFINED_BITS), I64Store(m64(E_VALUE)),
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(e),
         LocalGet(e), I32Load(m32(P_LIVE)), I32Const(1), I32Sub, I32Store(m32(P_LIVE)),
-        End,
     );
+    if helpers.dirty_tracking {
+        emit_mark_dirty(&mut f, e);
+    }
+    wasm!(f; End);
     f
 }
 

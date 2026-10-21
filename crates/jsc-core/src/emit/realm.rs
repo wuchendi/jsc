@@ -128,6 +128,26 @@ impl Intrinsic {
         }
     }
 
+    /// The dirty-bit index of a watched intrinsic (design 3.3), or `None`.
+    pub(super) fn watch_bit(self) -> Option<u8> {
+        Some(match self {
+            Self::ObjectPrototype => 0,
+            Self::Prototype(BuiltinCtor::Array) => 1,
+            Self::Prototype(BuiltinCtor::String) => 2,
+            Self::Prototype(BuiltinCtor::Number) => 3,
+            Self::Prototype(BuiltinCtor::Boolean) => 4,
+            Self::FunctionPrototype => 5,
+            Self::Prototype(BuiltinCtor::Promise) => 6,
+            Self::Prototype(BuiltinCtor::Map) => 7,
+            Self::Prototype(BuiltinCtor::Set) => 8,
+            Self::Prototype(BuiltinCtor::Date) => 9,
+            Self::Math => 10,
+            Self::Json => 11,
+            Self::Console => 12,
+            _ => return None,
+        })
+    }
+
     /// The `TYPE_OBJECT` class byte of a non-callable intrinsic.
     fn class(self) -> u8 {
         if self == Self::Global {
@@ -653,6 +673,14 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
     }
 }
 
+/// The builtin method `intrinsic.key` of the registry, if any.
+pub(super) fn method_of(intrinsic: Intrinsic, key: &str) -> Option<Builtin> {
+    registry().into_iter().find_map(|e| match e.value {
+        Value::Method(builtin) if e.intrinsic == intrinsic && e.key == key => Some(builtin),
+        _ => None,
+    })
+}
+
 /// Every static string the image references (keys, string values, builtin
 /// names). Interned in every program.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
@@ -799,7 +827,10 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
             fn_payload(&mut blob, builtin);
         }
         let count = entry_count(&registry, intrinsic);
-        blob.extend_from_slice(&[abi::TYPE_PROPS, 0, abi::PROPS_HAS_NON_ENUM, 0]);
+        let (watched, bit) = intrinsic
+            .watch_bit()
+            .map_or((0, 0), |bit| (abi::PROPS_WATCHED, bit));
+        blob.extend_from_slice(&[abi::TYPE_PROPS, 0, abi::PROPS_HAS_NON_ENUM | watched, bit]);
         for field in [count, count, count] {
             blob.extend_from_slice(&field.to_le_bytes());
         }
@@ -907,6 +938,15 @@ mod tests {
             let table = offset + prefix;
             let count = entry_count(&registry, intrinsic);
             assert_eq!(image[table as usize], abi::TYPE_PROPS);
+            let tflags = image[(table + abi::PROPS_TFLAGS_OFFSET) as usize];
+            let bit = image[(table + abi::PROPS_WATCH_BIT_OFFSET) as usize];
+            match intrinsic.watch_bit() {
+                Some(expected) => {
+                    assert_ne!(tflags & abi::PROPS_WATCHED, 0, "{intrinsic:?}: watched");
+                    assert_eq!(bit, expected, "{intrinsic:?}: dirty bit");
+                }
+                None => assert_eq!((tflags & abi::PROPS_WATCHED, bit), (0, 0)),
+            }
             assert_eq!(u32_at(&image, table + abi::PROPS_CAP_OFFSET), count);
             for (k, e) in (0..).zip(registry.iter().filter(|e| e.intrinsic == intrinsic)) {
                 let entry = table + abi::PROPS_HEADER_SIZE + abi::PROP_ENTRY_SIZE * k;

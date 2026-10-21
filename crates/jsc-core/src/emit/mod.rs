@@ -241,10 +241,16 @@ const NEW_TARGET_GLOBAL: u32 = 12;
 /// slots from it. Plain calls never touch it. Internal.
 const SPREAD_ARGS_GLOBAL: u32 = 13;
 
+/// The wasm global index of the intrinsics dirty bits (`$__intrinsics_dirty`,
+/// i32, init `0`; design 3.3): bit `i` is set by `__set` / `__define` /
+/// `__delete` on the watched intrinsic whose property table carries
+/// [`abi::PROPS_WATCHED`] and bit index `i`. Bits are never cleared. Internal.
+const DIRTY_GLOBAL: u32 = 14;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the spread-argument global and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 14;
+/// the dirty-bits global and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 15;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -931,6 +937,9 @@ struct Helpers<'a> {
     /// When `false`, `__get` / `__set` omit the getter/setter invocation and
     /// member accesses skip the post-call exception check.
     has_accessors: bool,
+    /// Whether the program tests an intrinsics dirty bit (design 3.3). When
+    /// `false`, `__set` / `__define` / `__delete` do not set the bits.
+    dirty_tracking: bool,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
     /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
     /// is the helper right after `__define` (`define + 1`).

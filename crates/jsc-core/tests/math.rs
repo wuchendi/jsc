@@ -3,7 +3,7 @@
 
 use jsc_core::run::{Value, compile_and_run, format_value};
 mod common;
-use common::{assert_eval, assert_number, assert_output};
+use common::{assert_eval, assert_number, assert_output, assert_uncaught};
 
 /// Each acceptance bullet: the primary result of every recognized `Math.*` method.
 #[test]
@@ -147,13 +147,12 @@ fn math_is_shadowable() {
     );
 }
 
-/// An unknown `Math.<name>` or a wrong argument count is a compile error.
+/// A wrong argument count of an inline `Math` method is a compile error; an
+/// unknown `Math.<name>` is an ordinary property read (`undefined`), so calling
+/// it throws a catchable `TypeError` at run time.
 #[test]
 fn math_unknown_method_and_arity_errors() {
-    assert!(
-        compile_and_run("Math.log(2)").is_err(),
-        "unknown method errors"
-    );
+    assert_uncaught("Math.log(2)", "TypeError: Math.log is not a function");
     assert!(
         compile_and_run("Math.floor(1, 2)").is_err(),
         "extra arg errors"

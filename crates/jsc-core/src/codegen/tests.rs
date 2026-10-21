@@ -597,30 +597,115 @@ fn sealed_namespaces_keep_inline_nodes() {
 }
 
 #[test]
-fn unsealed_namespaces_go_through_the_value() {
-    // `globalThis` anywhere unseals every global.
+fn unsealed_namespaces_guard_the_inline_code() {
+    // `globalThis` anywhere unseals every global: the inline code runs behind a
+    // guard over the global-object read.
     let program = lower_src("globalThis; Math.max(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard {
+        namespace,
+        key,
+        obj,
+        fast,
+        slow,
+        ..
+    }) = &program.stmts[1]
+    else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!((*namespace, key.as_str()), (GlobalIntrinsic::Math, "max"));
+    assert_eq!(**obj, global_get("Math"));
+    assert!(matches!(
+        **fast,
+        IrNode::MathCall {
+            op: MathOp::Max,
+            ..
+        }
+    ));
+    assert!(matches!(**slow, IrNode::MethodCallUser { .. }));
+    // An escaping namespace stays sealed (constant) but guards the inline call.
+    let program = lower_src("typeof JSON; JSON.stringify(1)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { obj, fast, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(**obj, IrNode::Intrinsic(GlobalIntrinsic::Json));
+    assert!(matches!(**fast, IrNode::JsonStringify { .. }));
+    // An assigned namespace is a global-object read.
+    let program = lower_src("Math = 1; Math.max(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { obj, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(**obj, global_get("Math"));
+    // A guarded call the inline code rejects (arity) is a plain method call.
+    let program = lower_src("globalThis; Math.floor(1, 2)").expect("lower");
     assert!(matches!(
         &program.stmts[1],
         IrStmt::Expr(IrNode::MethodCallUser { .. })
     ));
-    // An escaping namespace stays sealed (constant) but loses the inline call.
-    let program = lower_src("typeof JSON; JSON.stringify(1)").expect("lower");
-    let IrStmt::Expr(IrNode::MethodCallUser { obj, .. }) = &program.stmts[1] else {
-        unreachable!("expected a method call, got {:?}", program.stmts[1]);
-    };
-    assert_eq!(**obj, IrNode::Intrinsic(GlobalIntrinsic::Json));
-    // An assigned namespace is a global-object read.
-    let program = lower_src("Math = 1; Math.max(1, 2)").expect("lower");
-    let IrStmt::Expr(IrNode::MethodCallUser { obj, .. }) = &program.stmts[1] else {
-        unreachable!("expected a method call, got {:?}", program.stmts[1]);
-    };
-    assert_eq!(**obj, global_get("Math"));
     // Top-level `this` is the global object.
     assert_eq!(
         lower_expr("this").expect("lower"),
         IrNode::Intrinsic(GlobalIntrinsic::Global)
     );
+}
+
+#[test]
+fn unknown_namespace_members_are_method_calls() {
+    // G1c is gone: a member without inline code is read from the namespace
+    // object, inline or not.
+    for src in [
+        "Math.foo()",
+        "Object.freeze({})",
+        "JSON.foo(1)",
+        "Promise.all([])",
+        "console.warn(1)",
+    ] {
+        let node = lower_expr(src).expect("lower");
+        let IrNode::MethodCallUser { obj, .. } = &node else {
+            unreachable!("`{src}`: expected a method call, got {node:?}");
+        };
+        assert!(matches!(**obj, IrNode::Intrinsic(_)), "`{src}`");
+    }
+    // `[1].toString()` reads `%Array.prototype%` at run time.
+    assert!(matches!(
+        lower_expr("[1].toString()").expect("lower"),
+        IrNode::MethodCallUser { .. }
+    ));
+}
+
+/// Whether `node` contains a [`IrNode::ProtoGuard`].
+fn has_proto_guard(node: &IrNode) -> bool {
+    matches!(node, IrNode::ProtoGuard { .. }) || node.any_child(has_proto_guard)
+}
+
+#[test]
+fn intrinsics_sealed_programs_emit_no_guard() {
+    for src in [
+        "let a = []; a.push(1)",
+        "let a = [1]; a.pop()",
+        "class C { constructor() { this.a = [] } } new C().a.push(1)",
+    ] {
+        let program = lower_src(src).expect("lower");
+        let last = program.stmts.last().expect("a statement");
+        assert!(
+            !last.any_node(has_proto_guard),
+            "`{src}` is intrinsics-sealed"
+        );
+    }
+    for src in [
+        "Array.prototype.x = 1; let a = []; a.push(1)",
+        "let c = [].constructor; let a = []; a.pop()",
+        "let o = {}; o.__proto__; let a = []; a.push(1)",
+        "Object.assign; let a = []; a.push(1)",
+        "Reflect; let a = []; a.push(1)",
+        "let k = 'prototype'; let a = []; a.push(1)",
+    ] {
+        let program = lower_src(src).expect("lower");
+        let last = program.stmts.last().expect("a statement");
+        assert!(
+            last.any_node(has_proto_guard),
+            "`{src}` is not intrinsics-sealed"
+        );
+    }
 }
 
 #[test]
