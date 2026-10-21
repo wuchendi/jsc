@@ -1981,8 +1981,9 @@ pub(super) fn emit_prop_throw_call(
 /// Emit a compound element/member assignment `obj[index] op= rhs`.
 ///
 /// `obj` and `index` are evaluated exactly once into the stable temp locals
-/// `obj_local`/`idx_local` (not scratch, which the read below clobbers), so no
-/// sub-expression side effect runs twice. The new value — current member read
+/// `obj_local`/`idx_local` (not scratch, which the read below clobbers), and an
+/// object key is converted once ([`emit_key_to_primitive`]), so no
+/// sub-expression side effect or user `toString` runs twice. The new value — current member read
 /// through those temps, combined with `rhs` via `op` (reusing the [`Binary`]
 /// overload, so `+=` on a string member concatenates) — is staged in `new_local`,
 /// then the store is delegated to [`emit_index_set_node`] over the three stable
@@ -2026,6 +2027,7 @@ pub(super) fn emit_index_op_set_node(
             helpers,
         );
     }
+    emit_key_to_primitive(function, idx_local, helpers);
 
     // new = current_member op rhs. The member read reuses the runtime type-byte
     // dispatch, reads its operands from the stable temps, and is staged in

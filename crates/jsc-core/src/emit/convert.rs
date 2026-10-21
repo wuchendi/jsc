@@ -336,3 +336,19 @@ pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'
     );
     f
 }
+
+/// Replace an object key in i64 `local` by its `ToPropertyKey` (a string
+/// jsval), propagating a user `toString`/`valueOf` throw, so a key read and
+/// written by one expression (`o[k] op= v`, `o[k]++`) is converted once.
+pub(super) fn emit_key_to_primitive(function: &mut Function, local: u32, helpers: Helpers<'_>) {
+    emit_is_object(function, local);
+    wasm!(function; If(BlockType::Empty));
+    enter_frame(helpers);
+    wasm!(function;
+        LocalGet(local), Call(helpers.to_str()),
+        I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(local),
+    );
+    emit_propagate_if_pending(function, helpers);
+    leave_frame(helpers);
+    wasm!(function; End);
+}

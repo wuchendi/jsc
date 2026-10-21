@@ -232,3 +232,23 @@ fn console_log_is_not_a_to_string_site() {
         "{ toString: [Function: toString] } 1\n",
     );
 }
+
+/// A generator object inherits `%Object.prototype%`'s `toString`.
+#[test]
+fn generator_objects_convert() {
+    assert_string("function* g() {} String(g())", "[object Generator]");
+    assert_number(
+        "function* g() { return 1; } const o = { [g()]: 1 }; o[String(g())]",
+        1.0,
+    );
+}
+
+/// A computed key read and written by one expression is converted once.
+#[test]
+fn compound_member_key_converts_once() {
+    let k = "let n = 0; const k = { toString() { n++; return 'p'; } }; const o = { p: 1 };";
+    assert_number(
+        &format!("{k} o[k] += 2; o[k] *= 3; o[k]++; ++o[k]; n * 100 + o.p"),
+        411.0,
+    );
+}

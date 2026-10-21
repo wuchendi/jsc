@@ -450,7 +450,8 @@ it('converts values with JS ToString like the Rust host', async () => {
 })
 
 it('converts objects with OrdinaryToPrimitive like the Rust host', async () => {
-  const both = "const b = { valueOf() { return 2 }, toString() { return 'str' } };"
+  const both =
+    "const b = { valueOf() { return 2 }, toString() { return 'str' } };"
   const sta =
     "function Test262Error(message) { this.message = message || '' } " +
     "Test262Error.prototype.toString = function () { return 'Test262Error: ' + this.message };"
