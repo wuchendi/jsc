@@ -293,7 +293,8 @@ pub(super) fn emit_make_accessor_node(
 /// Emit an `Object.keys/values/entries(arg)` collection built-in (or the
 /// `for-in` key snapshot), leaving the fresh array's heap jsval on the stack:
 /// `arg` is evaluated once and handed to `__own_keys` in the matching mode (or
-/// to `__for_in_keys`). `Object.values/entries` read through `__get`, so a
+/// to `__for_in_keys`); a `null`/`undefined` `arg` of `Object.*` throws (the
+/// `ToObject` `TypeError`). `Object.values/entries` read through `__get`, so a
 /// getter that throws is propagated.
 pub(super) fn emit_object_builtin_node(
     op: ObjectBuiltinOp,
@@ -304,6 +305,23 @@ pub(super) fn emit_object_builtin_node(
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);
+    if op != ObjectBuiltinOp::ForInKeys {
+        // `ToObject(arg)`: `null`/`undefined` is a TypeError.
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_is_nullish(function, scratch);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::I64Const(
+            HEAP_BITS | i64::from(static_key(strings, "")),
+        ));
+        function.instruction(&Instruction::I32Const(PROP_THROW_TO_OBJECT));
+        function.instruction(&Instruction::Call(helpers.prop_throw));
+        emit_throw_return(function, helpers);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(scratch));
+    }
     let mode = match op {
         ObjectBuiltinOp::Keys => OWN_KEYS,
         ObjectBuiltinOp::Values => OWN_VALUES,
@@ -336,6 +354,7 @@ pub(super) fn emit_object_has_node(
     emit_key_lookup(key, function, scratch, strings, helpers);
     emit_node(obj, function, scratch, strings, helpers);
     function.instruction(&Instruction::Call(helpers.has));
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::I64Or);

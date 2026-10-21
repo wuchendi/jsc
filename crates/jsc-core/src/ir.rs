@@ -909,6 +909,14 @@ pub enum IrNode {
         /// The argument array to fold — an [`IrNode::ArraySpread`].
         args: Box<IrNode>,
     },
+    /// `console.log(...)` with a spread argument: builds the argument array
+    /// (like [`IrNode::ArraySpread`], carried by `args`) then prints its
+    /// elements like [`IrNode::ConsoleLog`] prints its arguments; yields
+    /// `undefined`.
+    ConsoleLogSpread {
+        /// The argument array to print — an [`IrNode::ArraySpread`].
+        args: Box<IrNode>,
+    },
     /// An object literal `{k0: e0, [k1]: e1, ..}`: a `TYPE_OBJECT` block whose
     /// `TYPE_PROPS` table is sized `max(entries.len(), reserve)` up front. Each
     /// entry's key and value are evaluated left-to-right and defined as an own
@@ -1902,6 +1910,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => f(inner),
             IrNode::InstanceOf { value, kind } => {
                 f(value)
@@ -2080,6 +2089,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
             IrNode::InstanceOf { value, kind } => match kind {
                 InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => {

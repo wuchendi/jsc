@@ -901,8 +901,8 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
 /// (`0` = a key never interned, absent everywhere): a string/array's exotic
 /// own keys (`length`, an in-range index that is not an array hole, read
 /// through `__sparse_get` on a `SPARSE` array), else the
-/// own table (an array's named keys) and then each `proto`. A primitive has
-/// none.
+/// own table (an array's named keys) and then each `proto`. A primitive
+/// `obj` throws the `in` `TypeError` (left pending, result `0`).
 pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     emit_has_lookup(strings, helpers, false)
 }
@@ -917,6 +917,17 @@ pub(super) fn emit_has_own(strings: &HashMap<String, i32>, helpers: Helpers<'_>)
 fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bool) -> Function {
     let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::I64)]);
     let (key, obj, o, t, i, p) = (0, 1, 2, 3, 4, 5);
+    if !own {
+        // `key in primitive` is a TypeError.
+        emit_is_object(&mut f, obj);
+        wasm!(f;
+            I32Eqz,
+            If(BlockType::Empty),
+            LocalGet(obj), LocalGet(obj), I32Const(PROP_THROW_IN), Call(helpers.prop_throw),
+            I32Const(0), Return,
+            End,
+        );
+    }
     wasm!(f; LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End);
     emit_is_pointer(&mut f, obj);
     wasm!(f;
@@ -1612,7 +1623,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
 
 /// Push `1` when the i64 jsval in local `needle` is an element of the array
 /// whose base is in i32 local `arr`, else `0` (`i`/`n` are i32 scratch).
-fn emit_array_contains(function: &mut Function, arr: u32, needle: u32, i: u32, n: u32) {
+pub(super) fn emit_array_contains(function: &mut Function, arr: u32, needle: u32, i: u32, n: u32) {
     wasm!(function;
         LocalGet(arr), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), LocalSet(i),

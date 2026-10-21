@@ -635,10 +635,18 @@ fn unsealed_namespaces_guard_the_inline_code() {
         unreachable!("expected a guard, got {:?}", program.stmts[1]);
     };
     assert_eq!(**obj, global_get("Math"));
-    // A guarded call the inline code rejects (arity) is a plain method call.
+    // A guarded call with an extra argument evaluates it and runs the
+    // inline code over the arguments it reads.
     let program = lower_src("globalThis; Math.floor(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { fast, args, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(args.len(), 2);
+    assert!(matches!(&**fast, IrNode::MathCall { args, .. } if args.len() == 1));
+    // A JSON call passing a replacer / space calls the builtin.
+    let program = lower_src("JSON.stringify({}, null, 2)").expect("lower");
     assert!(matches!(
-        &program.stmts[1],
+        &program.stmts[0],
         IrStmt::Expr(IrNode::MethodCallUser { .. })
     ));
     // Top-level `this` is the global object.

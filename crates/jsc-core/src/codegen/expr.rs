@@ -796,8 +796,10 @@ impl LowerCtx<'_> {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
-            // String(){}` shadows it. Arity is validated here.
-            lower_convert_call(op, name, args, ident.span())
+            // String(){}` shadows it.
+            let empty = args.is_empty();
+            let (seq, args) = self.fit_inline_args(Some(convert_arity(op)), args);
+            Ok(seq_then(seq, convert_call(op, empty, args)))
         } else {
             // A global-object property, read (or thrown on) at run time.
             Ok(IrNode::CallIndirect {
@@ -827,9 +829,9 @@ impl LowerCtx<'_> {
     /// Lower `namespace.key(args)` (design 3.2 row 2). An inline namespace
     /// keeps exactly the inline code; otherwise the inline code runs behind an
     /// [`IrNode::NamespaceGuard`] over the namespace value. A member without
-    /// inline code (or a guarded call whose arity the inline code rejects) is
-    /// an ordinary method call: an unknown member reads `undefined` and throws
-    /// `N.key is not a function` at run time.
+    /// inline code, and a `JSON` call passing a reviver / replacer / space, is
+    /// an ordinary method call (of the builtin, or of whatever the member
+    /// holds; an unknown member throws `N.key is not a function` at run time).
     fn lower_namespace_call(
         &mut self,
         namespace: &str,
@@ -837,19 +839,28 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        if !inline_member(namespace, key) {
+        if !inline_member(namespace, key) || (namespace == "JSON" && args.len() > 1) {
             return self.lower_method_call_user(member, args);
         }
+        let arity = inline_arity(namespace, key);
         if self.shared.globals.inline(namespace) {
-            return lower_namespace_call(namespace, key, args, member.span());
+            let (seq, args) = self.fit_inline_args(arity, args);
+            let Some(fast) = inline_call(namespace, key, args) else {
+                return Err(anyhow!("{namespace}.{key} has no inline code"));
+            };
+            return Ok(seq_then(seq, fast));
         }
         let arg_locals: Vec<u32> = args.iter().map(|_| self.fresh()).collect();
         let locals: Vec<IrNode> = arg_locals.iter().map(|&l| IrNode::Local(l)).collect();
-        let Ok(fast) = lower_namespace_call(namespace, key, locals.clone(), member.span()) else {
-            return self.lower_method_call_user(member, args);
-        };
-        let Some(global) = GlobalIntrinsic::from_name(namespace) else {
-            return self.lower_method_call_user(member, args);
+        let mut fitted = locals.clone();
+        if let Some(n) = arity {
+            fitted.resize(n, IrNode::Undefined);
+        }
+        let (Some(fast), Some(global)) = (
+            inline_call(namespace, key, fitted),
+            GlobalIntrinsic::from_name(namespace),
+        ) else {
+            return Err(anyhow!("{namespace}.{key} has no inline code"));
         };
         let obj_local = self.fresh();
         let slow = IrNode::MethodCallUser {
@@ -871,21 +882,62 @@ impl LowerCtx<'_> {
         })
     }
 
+    /// Fit the evaluated call arguments `args` of an inline builtin to the
+    /// `arity` it reads (`None`: variadic): missing arguments are
+    /// `undefined`; with extra arguments, every argument is evaluated in order
+    /// first (the kept ones into temps, the extra ones for their side effects
+    /// only), returned as the statements to run before the inline code.
+    fn fit_inline_args(
+        &mut self,
+        arity: Option<usize>,
+        mut args: Vec<IrNode>,
+    ) -> (Vec<IrNode>, Vec<IrNode>) {
+        let n = arity.unwrap_or(args.len());
+        if args.len() <= n {
+            args.resize(n, IrNode::Undefined);
+            return (Vec::new(), args);
+        }
+        let mut seq = Vec::new();
+        let mut kept = Vec::with_capacity(n);
+        for (i, arg) in args.into_iter().enumerate() {
+            let constant = matches!(
+                arg,
+                IrNode::Num(_)
+                    | IrNode::Str(_)
+                    | IrNode::Bool(_)
+                    | IrNode::Null
+                    | IrNode::Undefined
+            );
+            if i >= n {
+                seq.push(arg);
+            } else if constant {
+                kept.push(arg);
+            } else {
+                let local = self.fresh();
+                seq.push(IrNode::Assign {
+                    local,
+                    value: Box::new(arg),
+                });
+                kept.push(IrNode::Local(local));
+            }
+        }
+        (seq, kept)
+    }
+
     /// Lower a call whose argument list contains a spread `f(...a)`. The
     /// argument parts are materialized into a runtime array (an
     /// [`IrNode::ArraySpread`]); the call then spreads that array into the
     /// uniform ABI's fixed `K` positional slots plus the dynamic `argc`.
     ///
-    /// The variadic `Math.max`/`Math.min` built-ins, ordinary
-    /// direct/indirect function calls and method calls (the `%Array.prototype%`
-    /// and `%String.prototype%` methods included) accept a spread. The
-    /// remaining syntactic call forms (`console.log`, the `String`/`Number`/…
-    /// conversions) are out of scope and rejected with a span.
+    /// An inline `Math.max`/`Math.min` folds the array and an inline
+    /// `console.log` prints it; a `parseInt`/`parseFloat` conversion reads its
+    /// arguments from it; every other callee (the namespace and constructor
+    /// statics included) is called with the spread arguments.
     ///
     /// # Errors
     ///
-    /// Returns an error for a spread into an unsupported call target, or if the
-    /// callee / any argument expression is outside the supported subset.
+    /// Returns an error if the callee or any argument expression is outside
+    /// the supported subset.
     fn lower_spread_call(
         &mut self,
         call: &swc_ecma_ast::CallExpr,
@@ -903,32 +955,24 @@ impl LowerCtx<'_> {
         }
         let args = Box::new(IrNode::ArraySpread(parts));
 
-        // `Math.max(...)` / `Math.min(...)` are variadic: fold the spread
-        // elements. Any other `Math.<name>` has a fixed arity, so a spread into
-        // it is out of scope.
-        if let Some(name) = math_method_name(callee_expr)
-            && self.inline_namespace("Math")
+        if let Expr::Member(member) = callee_expr
+            && let Some((namespace, key)) = self.namespace_member(member)
+            && self.shared.globals.inline(namespace)
         {
-            match name {
-                "max" => {
+            match (namespace, key) {
+                ("Math", "max") => {
                     return Ok(IrNode::MathSpread {
                         op: MathOp::Max,
                         args,
                     });
                 }
-                "min" => {
+                ("Math", "min") => {
                     return Ok(IrNode::MathSpread {
                         op: MathOp::Min,
                         args,
                     });
                 }
-                _ if math_op(name).is_some() => {
-                    return Err(CompileError::spanned(
-                        call.span(),
-                        format!("spread arguments are unsupported for Math.{name}"),
-                    )
-                    .into());
-                }
+                ("console", "log") => return Ok(IrNode::ConsoleLogSpread { args }),
                 _ => {}
             }
         }
@@ -939,13 +983,6 @@ impl LowerCtx<'_> {
             // it. Any other computed callee is an indirect spread call through the
             // funcref table.
             if let Expr::Member(member) = callee_expr {
-                if spread_rejecting_member(callee_expr) {
-                    return Err(CompileError::spanned(
-                        call.span(),
-                        "spread arguments are unsupported for this builtin method",
-                    )
-                    .into());
-                }
                 return self.lower_spread_method_call(member, args);
             }
             return Ok(IrNode::CallSpread {
@@ -974,12 +1011,27 @@ impl LowerCtx<'_> {
                 target: SpreadCallee::Direct(sig.index),
                 args,
             })
-        } else if convert_builtin_op(name).is_some() {
-            Err(CompileError::spanned(
-                ident.span(),
-                format!("spread arguments are unsupported for {name}"),
-            )
-            .into())
+        } else if let Some(op) = convert_builtin_op(name)
+            && matches!(op, ConvertOp::ParseInt | ConvertOp::ParseFloat)
+        {
+            // `parseInt`/`parseFloat` read their arguments from the array.
+            let array = self.fresh();
+            let arg = |i: f64| IrNode::Index {
+                obj: Box::new(IrNode::Local(array)),
+                index: Box::new(IrNode::Num(i)),
+            };
+            let read = [0.0, 1.0]
+                .into_iter()
+                .take(convert_arity(op))
+                .map(arg)
+                .collect();
+            Ok(seq_then(
+                vec![IrNode::Assign {
+                    local: array,
+                    value: args,
+                }],
+                convert_call(op, false, read),
+            ))
         } else {
             Ok(IrNode::CallSpread {
                 target: SpreadCallee::Indirect(
@@ -2054,14 +2106,13 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     }
 }
 
-/// Whether a spread call through the member callee `callee` hits
-/// a builtin dispatched by name with no user-method fallback (`console.log`,
-/// the `Object`/`JSON`/`Promise` statics), which take no spread.
-fn spread_rejecting_member(callee: &Expr) -> bool {
-    is_console_log(callee)
-        || object_method_name(callee).is_some_and(|name| inline_member("Object", name))
-        || json_method_name(callee).is_some_and(|name| inline_member("JSON", name))
-        || promise_static_method_name(callee).is_some_and(|name| inline_member("Promise", name))
+/// `seq` (evaluated for its effects) then `last`, the value.
+fn seq_then(mut seq: Vec<IrNode>, last: IrNode) -> IrNode {
+    if seq.is_empty() {
+        return last;
+    }
+    seq.push(last);
+    IrNode::Seq(seq)
 }
 
 /// The compile-time name of a static property key (`""` for a computed key):

@@ -5,23 +5,6 @@ use swc_common::Span;
 
 use crate::error::CompileError;
 
-/// Map a supported swc [`BinaryOp`] to the crate's [`BinOp`], erroring on any
-/// operator outside the numeric/comparison subset.
-/// Return `true` when `callee` is the member expression `console.log` (a
-/// `console` identifier base with a static `log` property). The caller
-/// additionally checks that `console` resolves to no user binding before
-/// treating the call as a host print.
-pub(super) fn is_console_log(callee: &Expr) -> bool {
-    let Expr::Member(member) = callee else {
-        return false;
-    };
-    let Expr::Ident(obj) = member.obj.as_ref() else {
-        return false;
-    };
-    matches!(&member.prop, MemberProp::Ident(prop)
-        if obj.sym.as_ref() == "console" && prop.sym.as_ref() == "log")
-}
-
 /// Return the property name of a `Math.<name>` member expression (`Math` a bare
 /// identifier, `<name>` a plain — non-computed, non-private — property), or `None`
 /// for any other shape. Used to recognize both the `Math.PI`/`Math.E` constant
@@ -37,15 +20,6 @@ pub(super) fn math_member_name(member: &swc_ecma_ast::MemberExpr) -> Option<&str
     }
     match &member.prop {
         MemberProp::Ident(prop) => Some(prop.sym.as_ref()),
-        _ => None,
-    }
-}
-
-/// Return the method name of a `Math.<name>` call callee, or `None` when the
-/// callee is not such a member expression.
-pub(super) fn math_method_name(callee: &Expr) -> Option<&str> {
-    match callee {
-        Expr::Member(member) => math_member_name(member),
         _ => None,
     }
 }
@@ -80,49 +54,41 @@ pub(super) fn inline_member(namespace: &str, key: &str) -> bool {
     }
 }
 
-/// Lower the inline code of `namespace.key(args)` (an [`inline_member`]),
-/// validating its argument count: a wrong arity is a compile error.
-pub(super) fn lower_namespace_call(
-    namespace: &str,
-    key: &str,
-    args: Vec<IrNode>,
-    span: Span,
-) -> anyhow::Result<IrNode> {
-    match namespace {
-        "Math" => lower_math_call(key, args, span),
-        "JSON" => lower_json_call(key, args, span),
-        "console" => Ok(IrNode::ConsoleLog { args }),
-        "Object" => lower_object_call(key, args, span),
-        "Promise" => lower_promise_static(key, args, span),
-        _ if args.is_empty() => Ok(IrNode::DateNow),
-        _ => Err(CompileError::spanned(span, "Date.now() takes no arguments").into()),
+/// The number of arguments the inline code of `namespace.key` (an
+/// [`inline_member`]) reads, `None` when it is variadic. The call site pads
+/// missing arguments with `undefined` and evaluates (then ignores) extra ones.
+pub(super) fn inline_arity(namespace: &str, key: &str) -> Option<usize> {
+    match (namespace, key) {
+        ("Math", "min" | "max") | ("console", _) => None,
+        ("Math", "pow") => Some(2),
+        ("Date", _) => Some(0),
+        _ => Some(1),
     }
 }
 
-/// Lower an inline `Math.<name>(args)` call to an [`IrNode::MathCall`],
-/// validating its argument count. The unary ops take exactly one argument,
-/// `pow` exactly two, and `min`/`max` any number; a wrong arity is a compile
-/// error, matching the existing direct-call error style.
-fn lower_math_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
-    let op = math_op(name).ok_or_else(|| anyhow!("Math.{name} has no inline code"))?;
-    let expected: Option<usize> = match op {
-        MathOp::Min | MathOp::Max => None,
-        MathOp::Pow => Some(2),
-        _ => Some(1),
-    };
-    if let Some(expected) = expected
-        && args.len() != expected
-    {
-        return Err(CompileError::spanned(
-            span,
-            format!(
-                "Math.{name} expects {expected} argument(s), got {}",
-                args.len()
-            ),
-        )
-        .into());
-    }
-    Ok(IrNode::MathCall { op, args })
+/// The inline code of `namespace.key(args)` (an [`inline_member`]) over
+/// exactly its [`inline_arity`] arguments, or `None` for a member without
+/// inline code.
+pub(super) fn inline_call(namespace: &str, key: &str, args: Vec<IrNode>) -> Option<IrNode> {
+    let mut rest = args.clone().into_iter();
+    let first = Box::new(rest.next().unwrap_or(IrNode::Undefined));
+    Some(match namespace {
+        "Math" => IrNode::MathCall {
+            op: math_op(key)?,
+            args,
+        },
+        "JSON" if key == "stringify" => IrNode::JsonStringify { arg: first },
+        "JSON" => IrNode::JsonParse { arg: first },
+        "console" => IrNode::ConsoleLog { args },
+        "Object" => IrNode::ObjectBuiltin {
+            op: object_op(key)?,
+            arg: first,
+        },
+        "Promise" if key == "resolve" => IrNode::PromiseResolve(first),
+        "Promise" => IrNode::PromiseReject(first),
+        "Date" => IrNode::DateNow,
+        _ => return None,
+    })
 }
 
 /// The `%Array.prototype%` methods with a guarded call-site fast path (the
@@ -164,108 +130,28 @@ pub(super) fn convert_builtin_op(name: &str) -> Option<ConvertOp> {
     })
 }
 
-/// Lower a recognized conversion built-in call to an [`IrNode::ConvertCall`],
-/// validating its argument count. All five take one argument; `parseInt`
-/// additionally accepts a radix second argument. A wrong arity is a compile
-/// error matching the existing direct-call error style.
-pub(super) fn lower_convert_call(
-    op: ConvertOp,
-    name: &str,
-    args: Vec<IrNode>,
-    span: Span,
-) -> anyhow::Result<IrNode> {
-    // `parseInt(s, radix)` takes an optional radix; everything else takes
-    // exactly one argument.
-    let ok = if matches!(op, ConvertOp::ParseInt) {
-        args.len() == 1 || args.len() == 2
-    } else {
-        args.len() == 1
-    };
-    if !ok {
-        let expected = if matches!(op, ConvertOp::ParseInt) {
-            "1 or 2"
-        } else {
-            "1"
-        };
-        return Err(CompileError::spanned(
-            span,
-            format!("{name} expects {expected} argument(s), got {}", args.len()),
-        )
-        .into());
+/// The number of arguments the conversion `op` reads: `parseInt` takes a
+/// radix, everything else one value.
+pub(super) fn convert_arity(op: ConvertOp) -> usize {
+    if op == ConvertOp::ParseInt { 2 } else { 1 }
+}
+
+/// The conversion `op` over exactly its [`convert_arity`] arguments; `empty`
+/// when the call passed none, so `String()` is `""` and `Number()` is `0`
+/// (not the conversion of `undefined`).
+pub(super) fn convert_call(op: ConvertOp, empty: bool, args: Vec<IrNode>) -> IrNode {
+    match op {
+        ConvertOp::ToString if empty => return IrNode::Str(String::new()),
+        ConvertOp::ToNumber if empty => return IrNode::Num(0.0),
+        _ => {}
     }
-    // Take the first argument and the optional `parseInt` radix. The arity
-    // check above guarantees at least one; `ok_or_else` keeps the error total
-    // without an `expect`.
     let mut args = args.into_iter();
-    let arg = args
-        .next()
-        .ok_or_else(|| anyhow!("{name} requires an argument"))?;
-    Ok(IrNode::ConvertCall {
+    IrNode::ConvertCall {
         op,
-        arg: Box::new(arg),
-        radix: args.next().map(Box::new),
-    })
-}
-
-/// Return the method name of an `Object.<name>` call callee (`Object` a bare
-/// identifier, `<name>` a plain property), or `None` for any other callee shape.
-/// Like `Math`, whether `Object` is the built-in vs. a shadowing binding
-/// is checked separately by the caller via [`resolve`](Codegen::resolve).
-pub(super) fn object_method_name(callee: &Expr) -> Option<&str> {
-    let Expr::Member(member) = callee else {
-        return None;
-    };
-    let Expr::Ident(obj) = member.obj.as_ref() else {
-        return None;
-    };
-    if obj.sym.as_ref() != "Object" {
-        return None;
+        arg: Box::new(args.next().unwrap_or(IrNode::Undefined)),
+        radix: (op == ConvertOp::ParseInt)
+            .then(|| Box::new(args.next().unwrap_or(IrNode::Undefined))),
     }
-    match &member.prop {
-        MemberProp::Ident(prop) => Some(prop.sym.as_ref()),
-        _ => None,
-    }
-}
-
-/// Return the method name of a `Promise.<name>` call callee (`Promise` a bare
-/// identifier, `<name>` a plain property), or `None` for any other callee shape.
-/// Like `Object`/`Math`, whether `Promise` is the built-in vs. a
-/// shadowing binding is checked separately by the caller via
-/// [`resolve`](Codegen::resolve).
-pub(super) fn promise_static_method_name(callee: &Expr) -> Option<&str> {
-    let Expr::Member(member) = callee else {
-        return None;
-    };
-    let Expr::Ident(obj) = member.obj.as_ref() else {
-        return None;
-    };
-    if obj.sym.as_ref() != "Promise" {
-        return None;
-    }
-    match &member.prop {
-        MemberProp::Ident(prop) => Some(prop.sym.as_ref()),
-        _ => None,
-    }
-}
-
-/// Lower an inline `Promise.resolve(v)` / `Promise.reject(v)` static call:
-/// each takes an optional single value (a missing argument is `undefined`); a
-/// call passing more than one argument is a compile error, matching the
-/// built-in-call error style.
-fn lower_promise_static(name: &str, mut args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
-    if args.len() > 1 {
-        return Err(CompileError::spanned(
-            span,
-            format!("Promise.{name} expects 0-1 argument(s), got {}", args.len()),
-        )
-        .into());
-    }
-    let value = Box::new(args.pop().unwrap_or(IrNode::Undefined));
-    Ok(if name == "resolve" {
-        IrNode::PromiseResolve(value)
-    } else {
-        IrNode::PromiseReject(value)
-    })
 }
 
 /// The [`ObjectBuiltinOp`] of the inline `Object.<name>` static, or `None`.
@@ -275,74 +161,6 @@ fn object_op(name: &str) -> Option<ObjectBuiltinOp> {
         "values" => ObjectBuiltinOp::Values,
         "entries" => ObjectBuiltinOp::Entries,
         _ => return None,
-    })
-}
-
-/// Lower an inline `Object.keys/values/entries(arg)` call to an
-/// [`IrNode::ObjectBuiltin`], validating its single-argument arity.
-fn lower_object_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
-    let op = object_op(name).ok_or_else(|| anyhow!("Object.{name} has no inline code"))?;
-    if args.len() != 1 {
-        return Err(CompileError::spanned(
-            span,
-            format!("Object.{name} expects 1 argument(s), got {}", args.len()),
-        )
-        .into());
-    }
-    let arg = args
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("Object.{name} requires an argument"))?;
-    Ok(IrNode::ObjectBuiltin {
-        op,
-        arg: Box::new(arg),
-    })
-}
-
-/// Return the method name of a `JSON.<name>` call callee (`JSON` a bare
-/// identifier, `<name>` a plain property), or `None` for any other callee shape.
-/// Like `Object`, whether `JSON` is the built-in vs. a shadowing binding
-/// is checked separately by the caller via [`resolve`](Codegen::resolve).
-pub(super) fn json_method_name(callee: &Expr) -> Option<&str> {
-    let Expr::Member(member) = callee else {
-        return None;
-    };
-    let Expr::Ident(obj) = member.obj.as_ref() else {
-        return None;
-    };
-    if obj.sym.as_ref() != "JSON" {
-        return None;
-    }
-    match &member.prop {
-        MemberProp::Ident(prop) => Some(prop.sym.as_ref()),
-        _ => None,
-    }
-}
-
-/// Lower an inline `JSON.<name>(arg)` call. `JSON.stringify(v)` lowers to
-/// an [`IrNode::JsonStringify`] (exactly one argument; the `replacer`/`space`
-/// second/third arguments are unsupported and rejected); `JSON.parse(text)`
-/// lowers to an [`IrNode::JsonParse`].
-fn lower_json_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
-    let unsupported = if name == "stringify" {
-        "the replacer/space arguments are"
-    } else {
-        "the reviver argument is"
-    };
-    let [arg] = <[IrNode; 1]>::try_from(args).map_err(|args| {
-        CompileError::spanned(
-            span,
-            format!(
-                "JSON.{name} expects 1 argument(s), got {} ({unsupported} unsupported)",
-                args.len()
-            ),
-        )
-    })?;
-    let arg = Box::new(arg);
-    Ok(if name == "stringify" {
-        IrNode::JsonStringify { arg }
-    } else {
-        IrNode::JsonParse { arg }
     })
 }
 
@@ -427,6 +245,8 @@ pub(super) fn receiver_fast_paths(
     }
 }
 
+/// Map a supported swc [`BinaryOp`] to the crate's [`BinOp`], erroring on any
+/// operator outside the numeric/comparison subset.
 pub(super) fn map_binary_op(op: BinaryOp, span: Span) -> anyhow::Result<BinOp> {
     Ok(match op {
         BinaryOp::Add => BinOp::Add,

@@ -178,6 +178,9 @@ fn scan_expr_arity(expr: &Expr) -> usize {
                 m = m.max(match id.sym.as_ref() {
                     "reduce" => 3,
                     "map" | "filter" | "forEach" => 2,
+                    // A `JSON.stringify` replacer / `JSON.parse` reviver is
+                    // called with `(key, value)`.
+                    "stringify" | "parse" if c.args.len() > 1 => 2,
                     _ => 0,
                 });
             }

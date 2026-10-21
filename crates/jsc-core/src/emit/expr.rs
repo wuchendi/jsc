@@ -277,6 +277,9 @@ pub(super) fn emit_node(
         IrNode::MathSpread { op, args } => {
             emit_math_spread(*op, args, function, scratch, strings, helpers);
         }
+        IrNode::ConsoleLogSpread { args } => {
+            emit_console_log_spread(args, function, scratch, strings, helpers);
+        }
         IrNode::ArrayPush { local, value } => {
             emit_array_push_node(*local, value, function, scratch, strings, helpers);
         }
@@ -2304,6 +2307,62 @@ pub(super) fn emit_console_log(
         }
     }
     // `console.log(..)` evaluates to `undefined`.
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+}
+
+/// Emit a `console.log(...)` spread call: build the argument array, then print
+/// each element (a hole as `undefined`) like [`emit_console_log`] prints its
+/// arguments — a bare newline for none — and push `undefined`.
+pub(super) fn emit_console_log_spread(
+    args: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (base, len, idx, elem) = (scratch + 8, scratch + 9, scratch + 10, scratch + 13);
+    emit_node(args, function, scratch, strings, helpers);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalTee(base));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
+    function.instruction(&Instruction::LocalTee(len));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I32Const(PRINT_FLAG_NEWLINE));
+    function.instruction(&Instruction::Call(helpers.print));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(idx));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(base));
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::I32Const(8));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::LocalSet(elem));
+    emit_elem_read(function, elem);
+    // The last element ends the line; every other one is followed by a space.
+    function.instruction(&Instruction::I32Const(PRINT_FLAG_END));
+    function.instruction(&Instruction::I32Const(PRINT_FLAG_SEP));
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(idx));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::Call(helpers.print));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 

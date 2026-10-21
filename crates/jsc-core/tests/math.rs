@@ -147,20 +147,11 @@ fn math_is_shadowable() {
     );
 }
 
-/// A wrong argument count of an inline `Math` method is a compile error; an
-/// unknown `Math.<name>` is an ordinary property read (`undefined`), so calling
-/// it throws a catchable `TypeError` at run time.
+/// An unknown `Math.<name>` is an ordinary property read (`undefined`), so
+/// calling it throws a catchable `TypeError` at run time.
 #[test]
-fn math_unknown_method_and_arity_errors() {
+fn math_unknown_method_is_a_type_error() {
     assert_uncaught("Math.log(2)", "TypeError: Math.log is not a function");
-    assert!(
-        compile_and_run("Math.floor(1, 2)").is_err(),
-        "extra arg errors"
-    );
-    assert!(
-        compile_and_run("Math.pow(2)").is_err(),
-        "missing arg errors"
-    );
 }
 
 /// `Math.*` results flow through `console.log` like any number.

@@ -26,6 +26,7 @@ mod error;
 mod function;
 mod generator;
 mod global;
+mod json;
 mod map_set;
 mod namespace;
 mod number;
@@ -33,6 +34,7 @@ mod object;
 mod promise;
 mod string;
 
+pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 pub(super) use string::host_ready_args;
 
@@ -43,6 +45,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(map_set::fragments(k));
     nodes.extend(promise::fragments(k));
     nodes.extend(generator::fragments(k));
+    nodes.extend(json::fragments());
     nodes
 }
 
@@ -148,6 +151,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(map_set::strings())
         .chain(promise::strings())
         .chain(generator::strings())
+        .chain(json::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -207,11 +211,11 @@ pub(super) fn emit_builtin(
         Builtin::GeneratorNext => generator::emit_next(&mut f, frame, strings, helpers),
         Builtin::GeneratorReturn => generator::emit_return(&mut f, frame, strings, helpers),
         Builtin::GeneratorThrow => generator::emit_throw(&mut f, frame, strings, helpers),
+        Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
+        Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
         Builtin::IsFinite => global::emit_is_finite(&mut f, frame, helpers),
         Builtin::Math(_)
-        | Builtin::JsonStringify
-        | Builtin::JsonParse
         | Builtin::ConsoleLog
         | Builtin::Ctor(_)
         | Builtin::ObjectStatic(_)
