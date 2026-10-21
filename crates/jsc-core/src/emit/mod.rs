@@ -34,9 +34,10 @@ use wasm_encoder::{
 
 use crate::abi;
 use crate::ir::{
-    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind, GlobalIntrinsic,
-    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp,
-    MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp, SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
+    GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp,
+    SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -316,8 +317,8 @@ const ELEMS_DATA_OFFSET: u64 = abi::ELEMS_DATA_OFFSET as u64;
 const TYPE_OBJECT: i32 = abi::TYPE_OBJECT as i32;
 
 /// Byte offset of the object-family prefix's `proto` jsval slot (see
-/// [`abi::OBJ_PROTO_OFFSET`]); every non-`TYPE_OBJECT`/`TYPE_ARRAY`
-/// object-family block is created with it `null`.
+/// [`abi::OBJ_PROTO_OFFSET`]); arrays, Map/Set, promises and dates are created
+/// with their realm prototype, generators with `null`.
 const OBJ_PROTO_OFFSET: u64 = abi::OBJ_PROTO_OFFSET as u64;
 
 /// Type byte, field offsets, and size of a first-class function value block
@@ -1371,8 +1372,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
     code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers));
     code.function(&emit_new_string(helpers.alloc));
-    code.function(&emit_new_array(helpers.alloc));
-    code.function(&emit_new_promise(helpers.alloc));
+    code.function(&emit_new_array(
+        helpers.alloc,
+        intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Array), helpers),
+    ));
+    code.function(&emit_new_promise(
+        helpers.alloc,
+        intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers),
+    ));
     // The realm: `__has_own`, then the builtin bodies.
     code.function(&emit_has_own(&offsets, helpers));
     for builtin in Builtin::ALL {

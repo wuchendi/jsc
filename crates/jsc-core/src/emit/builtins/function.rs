@@ -47,26 +47,6 @@ fn this_callable(
     wasm!(function; End);
 }
 
-/// Push the target's environment, then (after `argc`, pushed by `argc`) its
-/// funcref slot, and `call_indirect` it: the tail every dispatch shares.
-fn invoke(
-    function: &mut Function,
-    target: u32,
-    argc: impl FnOnce(&mut Function),
-    helpers: Helpers<'_>,
-) {
-    wasm!(function;
-        LocalGet(target), I32WrapI64,
-        I64Load(MemArg { offset: FUNC_ENV_OFFSET, align: 3, memory_index: 0 }),
-    );
-    argc(function);
-    wasm!(function;
-        LocalGet(target), I32WrapI64,
-        I32Load(MemArg { offset: FUNC_INDEX_OFFSET, align: 2, memory_index: 0 }),
-        CallIndirect { type_index: helpers.fn_type, table_index: 0 },
-    );
-}
-
 /// Call the function in i64 local `target` with `this` = i64 local `this`
 /// and the elements of the fresh dense array (i32 base `args`, i32 length
 /// `len`) as its arguments, exactly like a spread call: the first `K` fill the

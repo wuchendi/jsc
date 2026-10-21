@@ -344,8 +344,8 @@ pub(super) fn emit_object_has_node(
 /// Emit an `x instanceof RHS` identity test, leaving a `true`/`false`
 /// jsval on the stack. The operand `value` is evaluated first, then the
 /// right-hand side. The runtime-TYPE-BYTE builtins test the operand's heap kind;
-/// the prototype kinds gate the operand with [`emit_is_proto_carrier`] (a value
-/// without a `proto` slot is never an instance) and walk its `proto` chain for
+/// the prototype kinds gate the operand with [`emit_is_object`] (a primitive is
+/// never an instance) and walk its `proto` chain for
 /// the target prototype: the static error prototype ([`InstanceOfKind::Proto`])
 /// or, for [`InstanceOfKind::Ctor`] (`OrdinaryHasInstance`), `Get(C,
 /// "prototype")` of the callable-guarded right-hand side `C`, which must be an
@@ -405,7 +405,7 @@ pub(super) fn emit_instanceof_node(
         );
     }
 
-    emit_is_proto_carrier(function, cur);
+    emit_is_object(function, cur);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
     if ctor {
@@ -458,7 +458,7 @@ pub(super) fn emit_instanceof_node(
     // Loop: 1 iff `cur` reaches `tgt`, 0 iff the chain runs out.
     function.instruction(&Instruction::Block(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::Loop(BlockType::Empty));
-    emit_is_proto_carrier(function, cur);
+    emit_is_object(function, cur);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::I32Const(0));
@@ -488,24 +488,6 @@ pub(super) fn emit_instanceof_node(
     function.instruction(&Instruction::Else);
     // A receiver without a `proto` slot is never an instance.
     function.instruction(&Instruction::I64Const(FALSE_BITS));
-    function.instruction(&Instruction::End);
-}
-
-/// Push `1` if the jsval in `local` is a heap block carrying a `proto` slot
-/// (any object-family kind: not a string or an array), else `0`. The type-byte
-/// reads are gated behind [`emit_is_pointer`].
-fn emit_is_proto_carrier(function: &mut Function, local: u32) {
-    emit_is_pointer(function, local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_STRING));
-    function.instruction(&Instruction::I32Ne);
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
 }
 
@@ -628,7 +610,14 @@ pub(super) fn emit_map_new_node(
         function,
         dst,
         if set { TYPE_SET } else { TYPE_MAP },
-        NULL_BITS,
+        intrinsic_bits(
+            Intrinsic::Prototype(if set {
+                BuiltinCtor::Set
+            } else {
+                BuiltinCtor::Map
+            }),
+            helpers,
+        ),
     );
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(0));
@@ -674,7 +663,12 @@ pub(super) fn emit_date_new_node(
     function.instruction(&Instruction::I32Const(DATE_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(dst));
-    emit_object_prefix(function, dst, TYPE_DATE, NULL_BITS);
+    emit_object_prefix(
+        function,
+        dst,
+        TYPE_DATE,
+        intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Date), helpers),
+    );
 
     // ms slot = f64 timestamp. Push the store address, then the f64 value.
     function.instruction(&Instruction::LocalGet(dst));

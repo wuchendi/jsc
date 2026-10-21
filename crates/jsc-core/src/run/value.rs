@@ -506,14 +506,19 @@ fn decode_function(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
         .copied()
         .unwrap_or(0);
     let class = flags & abi::FUNC_FLAG_CLASS_CTOR != 0;
+    // The parent is the class's own [[Prototype]] when that is a constructor
+    // (a base class inherits from the non-constructor %Function.prototype%).
     let extends = class
-        .then(|| own_data(ptr, "prototype", memory))
+        .then(|| read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize))
         .flatten()
-        .and_then(|proto| heap_object(proto, memory))
-        .and_then(|proto| read_u64(memory, proto + abi::OBJ_PROTO_OFFSET as usize))
         .and_then(|parent| heap_object(parent, memory))
-        .and_then(|parent| lookup_data(parent, "constructor", memory))
-        .and_then(|ctor| function_name(ctor, memory));
+        .filter(|&parent| {
+            memory.get(parent) == Some(&abi::TYPE_FUNCTION)
+                && memory
+                    .get(parent + abi::HEADER_FLAGS_OFFSET as usize)
+                    .is_some_and(|f| f & abi::FUNC_FLAG_CONSTRUCTOR != 0)
+        })
+        .and_then(|parent| function_name(abi::HEAP | parent as u64, memory));
     Value::Function {
         name: function_name(abi::HEAP | ptr as u64, memory).unwrap_or_default(),
         class,

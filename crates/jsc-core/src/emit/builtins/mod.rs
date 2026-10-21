@@ -5,8 +5,7 @@
 //! positional slots (a slot past the call's argument count holds `undefined`),
 //! and a throw leaves the exception pending and returns, like any callee.
 //!
-//! Builtins are never constructors, so `argc` never carries the construct
-//! marker.
+//! Only the constructor bodies ([`ctor`]) see the construct marker in `argc`.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -20,6 +19,8 @@ macro_rules! wasm {
     }};
 }
 
+mod array;
+mod ctor;
 mod error;
 mod function;
 mod namespace;
@@ -92,6 +93,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .into_iter()
         .chain(function::STRINGS)
         .chain(error::STRINGS)
+        .chain(array::STRINGS)
 }
 
 /// Emit the body of `builtin`.
@@ -113,7 +115,17 @@ pub(super) fn emit_builtin(
         Builtin::Call => function::emit_call(&mut f, frame, strings, helpers),
         Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::Math(_) | Builtin::JsonStringify | Builtin::JsonParse | Builtin::ConsoleLog => {
+        Builtin::ArrayMap => array::emit_map(&mut f, frame, strings, helpers),
+        Builtin::Math(_)
+        | Builtin::JsonStringify
+        | Builtin::JsonParse
+        | Builtin::ConsoleLog
+        | Builtin::Ctor(_)
+        | Builtin::ObjectStatic(_)
+        | Builtin::IsArray
+        | Builtin::PromiseResolve
+        | Builtin::PromiseReject
+        | Builtin::DateNow => {
             let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
             emit_node(&body, &mut f, frame.scratch(), strings, helpers);
         }
@@ -131,6 +143,26 @@ fn throw_type_error(
     helpers: Helpers<'_>,
 ) {
     emit_throw_not_a_function(function, text, frame.scratch(), strings, helpers);
+}
+
+/// Push the target's environment, then (after `argc`, pushed by `argc`) its
+/// funcref slot, and `call_indirect` it: the tail every dispatch shares.
+fn invoke(
+    function: &mut Function,
+    target: u32,
+    argc: impl FnOnce(&mut Function),
+    helpers: Helpers<'_>,
+) {
+    wasm!(function;
+        LocalGet(target), I32WrapI64,
+        I64Load(MemArg { offset: FUNC_ENV_OFFSET, align: 3, memory_index: 0 }),
+    );
+    argc(function);
+    wasm!(function;
+        LocalGet(target), I32WrapI64,
+        I32Load(MemArg { offset: FUNC_INDEX_OFFSET, align: 2, memory_index: 0 }),
+        CallIndirect { type_index: helpers.fn_type, table_index: 0 },
+    );
 }
 
 /// Return `undefined` when the last call left an exception pending.

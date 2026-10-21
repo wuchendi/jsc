@@ -143,7 +143,12 @@ pub(super) fn emit_array_node(
         function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
         function.instruction(&Instruction::Call(helpers.alloc));
         function.instruction(&Instruction::LocalSet(dst));
-        emit_object_prefix(function, dst, TYPE_ARRAY, NULL_BITS);
+        emit_object_prefix(
+            function,
+            dst,
+            TYPE_ARRAY,
+            intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Array), helpers),
+        );
         function.instruction(&Instruction::LocalGet(dst));
         function.instruction(&Instruction::I32Const(len));
         function.instruction(&Instruction::I32Store(array_len_slot()));

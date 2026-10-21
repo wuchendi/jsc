@@ -22,6 +22,7 @@ import {
   FN_INFO_ENTRY_SIZE,
   FN_INFO_NAME_OFFSET,
   FUNC_FLAG_CLASS_CTOR,
+  FUNC_FLAG_CONSTRUCTOR,
   FUNC_INDEX_OFFSET,
   HEADER_CLASS_OFFSET,
   HEADER_FLAGS_OFFSET,
@@ -468,18 +469,16 @@ function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
     ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_CLASS_CTOR) !== 0
   let parent: string | undefined
   if (isClass) {
-    const proto = ownData(ptr, 'prototype', mem)
-    const protoPtr = proto === undefined ? undefined : heapObject(proto, mem)
-    const link =
-      protoPtr === undefined
-        ? undefined
-        : readU64(mem, protoPtr + OBJ_PROTO_OFFSET)
+    // The parent is the class's own [[Prototype]] when that is a constructor
+    // (a base class inherits from the non-constructor %Function.prototype%).
+    const link = readU64(mem, ptr + OBJ_PROTO_OFFSET)
     const linkPtr = link === undefined ? undefined : heapObject(link, mem)
-    const ctor =
-      linkPtr === undefined
-        ? undefined
-        : lookupData(linkPtr, 'constructor', mem)
-    parent = ctor === undefined ? undefined : functionName(ctor, mem)
+    if (
+      linkPtr !== undefined &&
+      mem[linkPtr] === TYPE_FUNCTION &&
+      ((mem[linkPtr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_CONSTRUCTOR) !== 0
+    )
+      parent = functionName(HEAP | BigInt(linkPtr), mem)
   }
   return {
     kind: 'function',
