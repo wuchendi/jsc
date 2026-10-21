@@ -1377,7 +1377,6 @@ fn not_iterable_error() -> IrNode {
     let message = "yield* operand is not iterable";
     IrNode::error_object(
         ErrorKind::TypeError,
-        None,
         Some(IrNode::Str(message.to_owned())),
         IrNode::Str(format!("TypeError: {message}")),
     )

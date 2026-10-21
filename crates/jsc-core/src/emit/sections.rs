@@ -35,24 +35,17 @@ pub(super) fn build_type_and_function_sections<'a>(
     functions.function(0);
 
     let n = program.functions.len();
-    let has_funcs = n > 0;
-    // The uniform user-function type (type 1) and the fixed positional arity K.
-    // `func.params` counts the K argument slots plus the ABI_TRAILING_PARAMS
-    // (env, argc) slots, so it is identical across every function;
-    // `K = params - ABI_TRAILING_PARAMS`.
+    // The uniform function type (type 1) and the fixed positional arity K:
+    // every function's `params` is the K argument slots plus the
+    // ABI_TRAILING_PARAMS (env, argc) slots.
     let fn_type: u32 = 1;
-    let max_args = program
-        .functions
-        .first()
-        .map_or(0, |f| f.params.saturating_sub(ABI_TRAILING_PARAMS));
-    if has_funcs {
-        let leading = max_args + ABI_TRAILING_PARAMS; // K args + env + argc
-        types
-            .ty()
-            .function(vec![ValType::I64; leading as usize], [ValType::I64]);
-        for _ in 0..n {
-            functions.function(fn_type);
-        }
+    let max_args = program.arity;
+    let leading = max_args + ABI_TRAILING_PARAMS; // K args + env + argc
+    types
+        .ty()
+        .function(vec![ValType::I64; leading as usize], [ValType::I64]);
+    for _ in 0..n {
+        functions.function(fn_type);
     }
 
     // Every DEFINED function index is shifted up by IMPORT_FUNC_COUNT because the
@@ -144,29 +137,19 @@ pub(super) fn build_type_and_function_sections<'a>(
         invoke1: index(),
         async_step: index(),
         // The settler funcref-TABLE slots sit right after the `n` user-function
-        // slots (`0..n`), so slots `n` and `n + 1`. `0` when there are no functions
-        // (no table — and `new Promise` cannot occur without an executor function).
-        settle_resolve_slot: if has_funcs {
-            u32::try_from(n).unwrap_or(u32::MAX)
-        } else {
-            0
-        },
-        settle_reject_slot: if has_funcs {
-            u32::try_from(n).unwrap_or(u32::MAX).saturating_add(1)
-        } else {
-            0
-        },
-        // The constructors follow the two settlers (present only with functions).
-        new_string: index() + if has_funcs { 2 } else { 0 },
-        fn_type: if has_funcs { fn_type } else { 0 },
+        // slots (`0..n`), so slots `n` and `n + 1`.
+        settle_resolve_slot: u32::try_from(n).unwrap_or(u32::MAX),
+        settle_reject_slot: u32::try_from(n).unwrap_or(u32::MAX).saturating_add(1),
+        // The constructors follow the two settlers.
+        new_string: index() + 2,
+        fn_type,
         max_args,
-        has_funcs,
         has_accessors: program_has_accessors(program),
         fn_info: layout.info,
     };
-    // Helper types follow the main (type 0) and uniform (type 1, only when there
-    // are functions) types, one per helper in function-index order.
-    let mut next_type = if has_funcs { 2 } else { 1 };
+    // Helper types follow the main (type 0) and uniform (type 1) types, one
+    // per helper in function-index order.
+    let mut next_type = 2;
     for (params, results) in helper_types() {
         types
             .ty()
@@ -176,12 +159,9 @@ pub(super) fn build_type_and_function_sections<'a>(
     }
     // The two `new Promise` settler functions reuse the uniform function
     // type (type 1) — they are called through the funcref table like any function
-    // value — so they add a FunctionSection entry but NO new type. Emitted only
-    // when there are functions (the table exists and `new Promise` can occur).
-    if has_funcs {
-        functions.function(fn_type);
-        functions.function(fn_type);
-    }
+    // value — so they add a FunctionSection entry but NO new type.
+    functions.function(fn_type);
+    functions.function(fn_type);
 
     // Append the host import types LAST so they never disturb
     // the main/uniform/helper type indices above. All three are declared in the
@@ -227,6 +207,15 @@ pub(super) fn build_type_and_function_sections<'a>(
     functions.function(next_type + 7);
     types.ty().function([], [ValType::I32]);
     functions.function(next_type + 8);
+    // The realm functions follow: `__has_own(key: i32, obj: i64) -> i32`,
+    // then the builtin bodies with the uniform type.
+    types
+        .ty()
+        .function([ValType::I32, ValType::I64], [ValType::I32]);
+    functions.function(next_type + 9);
+    for _ in Builtin::ALL {
+        functions.function(fn_type);
+    }
 
     (
         types,
@@ -445,7 +434,8 @@ pub(super) fn build_globals(
 /// per literal, each a string block `[type][gc][flags][class][len:u32 LE][utf8]`
 /// written at its compile-time offset (its `flags` already `INTERNED`, plus
 /// `ARRAY_INDEX` for a canonical index spelling), in ascending offset order for
-/// deterministic output, then the intern table's u32 slots.
+/// deterministic output, then the intern table's u32 slots, the function data,
+/// and the realm image.
 pub(super) fn emit_data_section(
     offsets: &HashMap<String, i32>,
     intern: &InternTable,
@@ -480,55 +470,22 @@ pub(super) fn emit_data_section(
         .flat_map(|slot| slot.to_le_bytes())
         .collect();
     data.active(0, &ConstExpr::i32_const(intern.base), table);
-    if !functions.is_empty() {
-        emit_fn_data(&mut data, offsets, functions, layout);
-    }
-    if layout.errors != 0 {
-        emit_error_protos(&mut data, offsets, layout.errors);
-    }
+    emit_fn_data(&mut data, offsets, functions, layout);
+    let first_builtin_slot = u32::try_from(functions.len() + 2).unwrap_or(u32::MAX);
+    data.active(
+        0,
+        &ConstExpr::i32_const(layout.realm),
+        realm::image(layout.realm, first_builtin_slot, offsets),
+    );
     data
-}
-
-/// Lay out the static error prototypes at `base` (design 4.1/4.2), one
-/// [`ERROR_PROTO_SIZE`]-byte block per [`ErrorKind::ALL`] entry: a
-/// `TYPE_OBJECT` prefix whose `props` points right behind it at a full
-/// two-entry `TYPE_PROPS` table (so a user addition grows it onto the heap)
-/// holding `name: "<Kind>"` and `message: ""`, both writable, non-enumerable,
-/// configurable. `%Error.prototype%` has a `null` prototype (until S4); the
-/// others inherit from it.
-fn emit_error_protos(data: &mut DataSection, offsets: &HashMap<String, i32>, base: i32) {
-    let at = |s: &str| offsets.get(s).copied().unwrap_or(HEAP_BASE);
-    let heap = |addr: i32| abi::HEAP | u64::from(addr.cast_unsigned());
-    let attrs = abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE;
-    let mut blob = Vec::with_capacity(ERROR_PROTO_SIZE as usize * ErrorKind::ALL.len());
-    for (index, kind) in (0i32..).zip(ErrorKind::ALL) {
-        let addr = base + ERROR_PROTO_SIZE * index;
-        let proto = if kind == ErrorKind::Error {
-            abi::NULL
-        } else {
-            heap(base)
-        };
-        blob.extend_from_slice(&[abi::TYPE_OBJECT, 0, 0, abi::CLASS_ORDINARY]);
-        blob.extend_from_slice(&(addr + abi::OBJ_PREFIX_SIZE.cast_signed()).to_le_bytes());
-        blob.extend_from_slice(&proto.to_le_bytes());
-        blob.extend_from_slice(&[abi::TYPE_PROPS, 0, abi::PROPS_HAS_NON_ENUM, 0]);
-        for field in [2u32, 2, 2] {
-            blob.extend_from_slice(&field.to_le_bytes());
-        }
-        for (key, value) in [("name", kind.name()), ("message", "")] {
-            blob.extend_from_slice(&at(key).to_le_bytes());
-            blob.extend_from_slice(&attrs.to_le_bytes());
-            blob.extend_from_slice(&heap(at(value)).to_le_bytes());
-        }
-    }
-    data.active(0, &ConstExpr::i32_const(base), blob);
 }
 
 /// Lay out the function data: the `__fn_info` table base at
 /// [`abi::FN_INFO_ADDR`], one `[name key][length]` info entry per function
-/// (then the two settlers'), and one static `TYPE_FUNCTION` block per function — the single object of a
-/// top-level declaration ([`IrNode::DeclFunc`]), created `LAZY` with no
-/// properties, a `null` prototype, and an `undefined` environment.
+/// (then the two settlers' and the builtins'), and one static `TYPE_FUNCTION`
+/// block per function — the single object of a top-level declaration
+/// ([`IrNode::DeclFunc`]), created `LAZY` with no properties,
+/// `%Function.prototype%` as its prototype, and an `undefined` environment.
 fn emit_fn_data(
     data: &mut DataSection,
     offsets: &HashMap<String, i32>,
@@ -543,13 +500,14 @@ fn emit_fn_data(
     let mut info = Vec::with_capacity(functions.len() * abi::FN_INFO_ENTRY_SIZE as usize);
     let mut blocks = Vec::with_capacity(functions.len() * abi::FUNC_BLOCK_SIZE as usize);
     let anonymous = offsets.get("").copied().unwrap_or(HEAP_BASE);
+    let function_proto = realm::intrinsic_addr_bits(layout.realm, Intrinsic::FunctionPrototype);
     for (index, func) in (0u32..).zip(functions) {
         let name = offsets.get(&func.info.name).copied().unwrap_or(HEAP_BASE);
         info.extend_from_slice(&name.to_le_bytes());
         info.extend_from_slice(&func.info.length.to_le_bytes());
         blocks.extend_from_slice(&[abi::TYPE_FUNCTION, 0, fn_flags(func.info.kind), 0]);
         blocks.extend_from_slice(&0u32.to_le_bytes());
-        blocks.extend_from_slice(&abi::NULL.to_le_bytes());
+        blocks.extend_from_slice(&function_proto.to_le_bytes());
         blocks.extend_from_slice(&index.to_le_bytes());
         blocks.extend_from_slice(&0u32.to_le_bytes());
         blocks.extend_from_slice(&abi::UNDEFINED.to_le_bytes());
@@ -559,6 +517,11 @@ fn emit_fn_data(
     for _ in 0..2 {
         info.extend_from_slice(&anonymous.to_le_bytes());
         info.extend_from_slice(&1u32.to_le_bytes());
+    }
+    for builtin in Builtin::ALL {
+        let name = offsets.get(builtin.name()).copied().unwrap_or(HEAP_BASE);
+        info.extend_from_slice(&name.to_le_bytes());
+        info.extend_from_slice(&builtin.length().to_le_bytes());
     }
     data.active(0, &ConstExpr::i32_const(layout.info), info);
     data.active(0, &ConstExpr::i32_const(layout.blocks), blocks);
@@ -591,13 +554,17 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     // it to resolve a string's or array's exotic `length`.
     let mut order: Vec<&str> = vec![INDEX_LENGTH_KEY];
     let mut seen: HashSet<&str> = HashSet::from([INDEX_LENGTH_KEY]);
-    // A function object's materialized keys and every function's `name`.
-    if !program.functions.is_empty() {
-        let names = program.functions.iter().map(|f| f.info.name.as_str());
-        for text in FN_KEYS.into_iter().chain(names) {
-            if seen.insert(text) {
-                order.push(text);
-            }
+    // The realm's strings, the builtin bodies' strings, the Error instance
+    // `stack` key, a function object's materialized keys and every function's
+    // `name`.
+    let realm_strs = realm::strings()
+        .chain(builtins::strings())
+        .chain([STACK_KEY])
+        .chain(FN_KEYS);
+    let names = program.functions.iter().map(|f| f.info.name.as_str());
+    for text in realm_strs.map(|s| -> &str { s }).chain(names) {
+        if seen.insert(text) {
+            order.push(text);
         }
     }
     for stmt in &program.stmts {
@@ -746,7 +713,7 @@ pub(super) fn collect_node<'a>(
         }
         // An indirect call and a `super(..)`/`super.m(..)` `ThisCall` both intern
         // their callee expression and every argument, plus the not-a-function
-        // TypeError strings (a function-less program's indirect call throws it).
+        // TypeError strings (thrown on a non-callable callee).
         IrNode::CallIndirect {
             callee,
             args,
@@ -979,8 +946,7 @@ pub(super) fn collect_node<'a>(
         IrNode::JsonParse { arg } => {
             collect_node(arg, order, seen);
             // Seed the syntax-error object's static strings so `__json_throw` can
-            // build its `Error` on malformed input.
-            seed_strs(&ERROR_STRS, order, seen);
+            // build its `SyntaxError` on malformed input.
             seed_strs(&JSON_PARSE_ERROR_STRS, order, seen);
         }
         IrNode::IndexSet { obj, index, value } => {
@@ -1143,9 +1109,8 @@ pub(super) fn collect_node<'a>(
         IrNode::ArrayPop { not_array, .. } => {
             seed_callee_error(callee_error_text(not_array), order, seen);
         }
-        // A static error prototype must be laid out.
-        IrNode::ErrorProto(_) => seed_strs(&ERROR_STRS, order, seen),
-        IrNode::Num(_)
+        IrNode::ErrorProto(_)
+        | IrNode::Num(_)
         | IrNode::Bool(_)
         | IrNode::Null
         | IrNode::Undefined
@@ -1178,23 +1143,21 @@ fn seed_strs<'a>(strs: &[&'static str], order: &mut Vec<&'a str>, seen: &mut Has
     }
 }
 
-/// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] (and the
-/// [`ERROR_STRS`] of the `TypeError` it raises) so `__nullish_throw` finds
-/// their `[len][utf8]` blobs in the data segment; see [`collect_node`].
+/// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] so
+/// `__nullish_throw` finds their `[len][utf8]` blobs in the data segment; see
+/// [`collect_node`].
 fn seed_nullish_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
-    seed_strs(&ERROR_STRS, order, seen);
     seed_strs(&NULLISH_ERROR_STRS, order, seen);
 }
 
-/// Seed a not-callable guard's [`CalleeErrorText`] (and [`ERROR_STRS`]) so
-/// the `TypeError` it throws finds their `[len][utf8]` blobs in the data
-/// segment; see [`collect_node`].
+/// Seed a not-callable guard's [`CalleeErrorText`] so the `TypeError` it
+/// throws finds their `[len][utf8]` blobs in the data segment; see
+/// [`collect_node`].
 fn seed_callee_error<'a>(
     text: CalleeErrorText<'a>,
     order: &mut Vec<&'a str>,
     seen: &mut HashSet<&'a str>,
 ) {
-    seed_strs(&ERROR_STRS, order, seen);
     for s in text {
         if seen.insert(s) {
             order.push(s);
@@ -1202,11 +1165,9 @@ fn seed_callee_error<'a>(
     }
 }
 
-/// Seed the member-store guard's [`PROP_ERROR_STRS`] (and [`ERROR_STRS`]) so
-/// `__prop_throw` finds their `[len][utf8]` blobs in the data segment; see
-/// [`collect_node`].
+/// Seed the member-store guard's [`PROP_ERROR_STRS`] so `__prop_throw` finds
+/// their `[len][utf8]` blobs in the data segment; see [`collect_node`].
 fn seed_prop_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
-    seed_strs(&ERROR_STRS, order, seen);
     let keyed = PROP_KEYED_MSGS
         .iter()
         .flat_map(|&(_, prefix, suffix)| [prefix, suffix]);

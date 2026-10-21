@@ -293,21 +293,37 @@ pub enum InstanceOfKind {
     Ctor(Box<IrNode>),
 }
 
-/// A builtin error kind with a static prototype object in the data segment
-/// (`%Error.prototype%`, `%TypeError.prototype%`, `%RangeError.prototype%`).
+/// A builtin error kind with a static prototype object in the realm image
+/// (`%Error.prototype%` and the six native-error prototypes inheriting from it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// `Error`.
     Error,
-    /// `TypeError` (its prototype inherits from `%Error.prototype%`).
+    /// `TypeError`.
     TypeError,
-    /// `RangeError` (its prototype inherits from `%Error.prototype%`).
+    /// `RangeError`.
     RangeError,
+    /// `ReferenceError`.
+    ReferenceError,
+    /// `SyntaxError`.
+    SyntaxError,
+    /// `EvalError`.
+    EvalError,
+    /// `URIError`.
+    UriError,
 }
 
 impl ErrorKind {
-    /// Every kind, in static-prototype layout order.
-    pub(crate) const ALL: [ErrorKind; 3] = [Self::Error, Self::TypeError, Self::RangeError];
+    /// Every kind, in realm-image order.
+    pub(crate) const ALL: [ErrorKind; 7] = [
+        Self::Error,
+        Self::TypeError,
+        Self::RangeError,
+        Self::ReferenceError,
+        Self::SyntaxError,
+        Self::EvalError,
+        Self::UriError,
+    ];
 
     /// The kind named by the constructor identifier `name`.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
@@ -320,6 +336,10 @@ impl ErrorKind {
             Self::Error => "Error",
             Self::TypeError => "TypeError",
             Self::RangeError => "RangeError",
+            Self::ReferenceError => "ReferenceError",
+            Self::SyntaxError => "SyntaxError",
+            Self::EvalError => "EvalError",
+            Self::UriError => "URIError",
         }
     }
 }
@@ -1579,31 +1599,22 @@ pub struct IrProgram {
     pub functions: Vec<IrFunction>,
     /// The number of module cells ([`IrNode::ModuleCell`] slots `0..module_cells`).
     pub module_cells: u32,
+    /// The fixed positional-argument arity `K` of the uniform function ABI
+    /// (every function's `params` is `K` plus the trailing env and argc).
+    pub arity: u32,
 }
 
 impl IrNode {
     /// An Error instance (design 4.7): a `TYPE_OBJECT` of class
-    /// [`crate::abi::CLASS_ERROR`] whose `proto` is `kind`'s static prototype,
-    /// with the non-enumerable own properties `name` (only to override the
-    /// inherited one, for kinds without a prototype of their own), `message`
-    /// (when one was given), and `stack` — the shape every builtin and
+    /// [`crate::abi::CLASS_ERROR`] whose `proto` is `kind`'s static prototype
+    /// (`name` is inherited from it), with the non-enumerable own properties
+    /// `message` (when one was given) and `stack` — the shape every builtin and
     /// engine-raised error shares.
-    pub(crate) fn error_object(
-        kind: ErrorKind,
-        name: Option<&str>,
-        message: Option<IrNode>,
-        stack: IrNode,
-    ) -> Self {
-        let name = name.map(|name| {
-            (
-                PropKey::Hidden("name".to_owned()),
-                IrNode::Str(name.to_owned()),
-            )
-        });
+    pub(crate) fn error_object(kind: ErrorKind, message: Option<IrNode>, stack: IrNode) -> Self {
         let message = message.map(|message| (PropKey::Hidden("message".to_owned()), message));
         let stack = (PropKey::Hidden("stack".to_owned()), stack);
         Self::Object {
-            entries: name.into_iter().chain(message).chain([stack]).collect(),
+            entries: message.into_iter().chain([stack]).collect(),
             proto: Some(Box::new(IrNode::ErrorProto(kind))),
             class: crate::abi::CLASS_ERROR,
             reserve: 0,

@@ -171,7 +171,7 @@ pub(super) fn emit_new_array(alloc: u32) -> Function {
     function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
     function.instruction(&Instruction::Call(alloc));
     function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, TYPE_ARRAY);
+    emit_object_prefix(&mut function, base, TYPE_ARRAY, NULL_BITS);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
@@ -222,7 +222,7 @@ pub(super) fn emit_new_promise(alloc: u32) -> Function {
     function.instruction(&Instruction::I32Const(PROMISE_BLOCK_SIZE));
     function.instruction(&Instruction::Call(alloc));
     function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE));
+    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE), NULL_BITS);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Const(abi::PROMISE_PENDING));
     function.instruction(&Instruction::I32Store(MemArg {
@@ -252,20 +252,11 @@ pub(super) fn emit_new_promise(alloc: u32) -> Function {
 /// argument count (`1`), and the funcref-table index, then `call_indirect`. The
 /// callback's result is left on the stack; a throw inside it sets `__exc_pending`
 /// (which the host checks after the call), so no propagation is emitted here.
-///
-/// When the program declares no user functions (`fn_type == 0`, so there is no
-/// funcref table), no callback can exist, so the body degenerates to returning
-/// `undefined` — keeping the exported function valid and total. The two `i64`
-/// params occupy locals 0/1; one extra `i32` local holds the callee block base.
+/// The two `i64` params occupy locals 0/1; one extra `i32` local holds the
+/// callee block base.
 pub(super) fn emit_invoke1(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let (callee, arg, base) = (0, 1, 2);
-    // No functions in the program: no table, so return `undefined` unconditionally.
-    if helpers.fn_type == 0 {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::End);
-        return function;
-    }
     // base = i32.wrap(callee).
     function.instruction(&Instruction::LocalGet(callee));
     function.instruction(&Instruction::I32WrapI64);

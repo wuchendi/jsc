@@ -135,8 +135,10 @@ pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
 pub(crate) const OBJ_FLAG_NOT_EXTENSIBLE: u8 = 1;
 
 /// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
-/// pointer or [`NULL`]), 8-byte aligned. Every object-family block is created
-/// with it [`NULL`] until the realm's intrinsic prototypes exist.
+/// pointer or [`NULL`]), 8-byte aligned. Ordinary objects are created with
+/// `%Object.prototype%` and functions with `%Function.prototype%` (static
+/// realm-image blocks); the other kinds with [`NULL`] until their intrinsic
+/// prototypes exist.
 pub(crate) const OBJ_PROTO_OFFSET: u32 = 8;
 
 /// The byte size of the shared object-family prefix — header, `props`, and
