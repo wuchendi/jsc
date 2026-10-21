@@ -512,14 +512,12 @@ fn instanceof_any_rhs() {
     assert_bool("class X {} let Object = X; ({}) instanceof Object", false);
 }
 
-/// The `Date` builtin accepts only the timestamp constructor forms and a
-/// zero-argument `Date.now()`; the calendar-field constructor, extra arguments,
-/// and a spread argument are rejected at compile time.
+/// The `Date` builtin accepts only the timestamp constructor forms; the
+/// calendar-field constructor and a spread argument are rejected at compile
+/// time (`Date.now` and the `Date.prototype` methods take any arguments).
 #[test]
 fn date_unsupported_forms_rejected() {
     assert_rejected("new Date(2024, 0, 1)");
-    assert_rejected("Date.now(5)");
-    assert_rejected("new Date(0).getTime(1)");
     assert_rejected("new Date(...[0])");
 }
 

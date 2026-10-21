@@ -221,3 +221,56 @@ pub(super) fn emit_apply(
     );
     call_with_array(function, target, this, dst, n, helpers);
 }
+
+/// The out-of-line generic method call of the guarded builtin call sites
+/// (design 3.2): a `null`/`undefined` receiver (`this`) throws the member-read
+/// `TypeError`; else `__get` the method (low half of `env`, an interned key)
+/// from it, `IsCallable` (else the not-a-function `TypeError` whose message is
+/// the high half of `env`), then call it with the same argument slots and
+/// count and `this` = the receiver.
+pub(super) fn emit_method_call(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (recv, method, msg, stack) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let env = frame.k;
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(recv));
+    emit_is_nullish(function, recv);
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(recv),
+        LocalGet(env), I64Const(0xffff_ffff), I64And, I64Const(HEAP_BITS), I64Or,
+        I32Const(0), Call(helpers.nullish_throw),
+        I64Const(UNDEFINED_BITS), Return,
+        End,
+        LocalGet(recv), LocalGet(env), I32WrapI64, Call(helpers.get), LocalSet(method),
+    );
+    return_if_pending(function);
+    emit_is_function(function, method);
+    wasm!(function;
+        I32Eqz, If(BlockType::Empty),
+        LocalGet(env), I64Const(32), I64ShrU, I64Const(HEAP_BITS), I64Or, LocalTee(msg),
+        I32WrapI64, LocalSet(frame.i32(0)),
+        I32Const(static_key(strings, TYPE_ERROR_STACK_PREFIX)), LocalGet(frame.i32(0)),
+        Call(helpers.concat), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(stack),
+    );
+    let error = IrNode::error_object(
+        ErrorKind::TypeError,
+        Some(IrNode::Local(msg)),
+        IrNode::Local(stack),
+    );
+    emit_throw_error(&error, function, frame.scratch(), strings, helpers);
+    wasm!(function; End);
+    for slot in 0..frame.k {
+        wasm!(function; LocalGet(slot));
+    }
+    wasm!(function; LocalGet(recv), GlobalSet(THIS_GLOBAL));
+    invoke(
+        function,
+        method,
+        |function| wasm!(function; LocalGet(frame.argc())),
+        helpers,
+    );
+}

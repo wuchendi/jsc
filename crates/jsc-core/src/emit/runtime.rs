@@ -1088,6 +1088,7 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
 /// - array: `"[" + elems joined "," + "]"`, each element serialized by a recursive
 ///   `__json_str` (`self_index`) call, with `undefined`/function elements rendered
 ///   as `"null"`;
+/// - Boolean / Number / String wrapper object: its primitive;
 /// - object: `"{" + key:value pairs joined "," + "}"` over the own enumerable
 ///   keys (`__own_keys`, own-key order), reading each value through `__get` and
 ///   omitting entries whose value is `undefined`/a function; keys are escaped
@@ -1209,6 +1210,25 @@ pub(super) fn emit_json_str(
     function.instruction(&Instruction::I32Const(TYPE_OBJECT));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
+    // A Boolean / Number / String wrapper serializes as its primitive.
+    function.instruction(&Instruction::LocalGet(ptr));
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: u64::from(abi::HEADER_CLASS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(i32::from(abi::CLASS_BOOLEAN)));
+    function.instruction(&Instruction::I32Sub);
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(ptr));
+    function.instruction(&Instruction::I64Load(mem64(u64::from(
+        abi::WRAPPER_VALUE_OFFSET,
+    ))));
+    function.instruction(&Instruction::Call(self_index));
+    function.instruction(&Instruction::LocalSet(acc));
+    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(tokens.lbrace));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::LocalGet(v));
@@ -1285,6 +1305,7 @@ pub(super) fn emit_json_str(
     function.instruction(&Instruction::LocalGet(acc));
     function.instruction(&Instruction::I32Const(tokens.rbrace));
     concat_into_acc(&mut function);
+    function.instruction(&Instruction::End); // if wrapper
     function.instruction(&Instruction::Else);
     // --- any other heap kind (function value): "null" ---
     function.instruction(&Instruction::I32Const(tokens.null));

@@ -32,10 +32,9 @@ use swc_ecma_ast::{
 use globals::GlobalFacts;
 
 use crate::ir::{
-    ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind,
-    GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp,
-    SpreadCallee, SpreadElem,
+    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, GlobalIntrinsic,
+    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp,
+    MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind, SpreadCallee, SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
@@ -215,17 +214,6 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
         arity: u32::try_from(max_arity).unwrap_or(u32::MAX),
     })
-}
-
-/// Build the unknown-method span diagnostic. Names the method when it was
-/// statically known at the call site (`obj.m()` or `obj["m"]()`); falls back to a
-/// generic message for a computed call whose key is only known at runtime.
-pub(super) fn unknown_method_error(span: swc_common::Span, name: Option<&str>) -> anyhow::Error {
-    let msg = match name {
-        Some(name) => format!("method '{name}' is not supported"),
-        None => "unsupported method call".to_owned(),
-    };
-    CompileError::spanned(span, msg).into()
 }
 
 /// Shared lowering state threaded through every [`LowerCtx`]: the resolved

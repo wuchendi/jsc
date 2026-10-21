@@ -293,7 +293,8 @@ pub(super) fn emit_make_accessor_node(
 /// Emit an `Object.keys/values/entries(arg)` collection built-in (or the
 /// `for-in` key snapshot), leaving the fresh array's heap jsval on the stack:
 /// `arg` is evaluated once and handed to `__own_keys` in the matching mode (or
-/// to `__for_in_keys`). `Object.values/entries` read through `__get`, so a
+/// to `__for_in_keys`); a `null`/`undefined` `arg` of `Object.*` throws (the
+/// `ToObject` `TypeError`). `Object.values/entries` read through `__get`, so a
 /// getter that throws is propagated.
 pub(super) fn emit_object_builtin_node(
     op: ObjectBuiltinOp,
@@ -304,6 +305,23 @@ pub(super) fn emit_object_builtin_node(
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);
+    if op != ObjectBuiltinOp::ForInKeys {
+        // `ToObject(arg)`: `null`/`undefined` is a TypeError.
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_is_nullish(function, scratch);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::I64Const(
+            HEAP_BITS | i64::from(static_key(strings, "")),
+        ));
+        function.instruction(&Instruction::I32Const(PROP_THROW_TO_OBJECT));
+        function.instruction(&Instruction::Call(helpers.prop_throw));
+        emit_throw_return(function, helpers);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(scratch));
+    }
     let mode = match op {
         ObjectBuiltinOp::Keys => OWN_KEYS,
         ObjectBuiltinOp::Values => OWN_VALUES,
@@ -336,6 +354,7 @@ pub(super) fn emit_object_has_node(
     emit_key_lookup(key, function, scratch, strings, helpers);
     emit_node(obj, function, scratch, strings, helpers);
     function.instruction(&Instruction::Call(helpers.has));
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::I64Or);
@@ -697,42 +716,6 @@ pub(super) fn emit_date_now_node(function: &mut Function, helpers: Helpers<'_>) 
     emit_box_f64(function, helpers);
 }
 
-/// Emit `d.getTime()`, leaving the receiver's millisecond timestamp as
-/// a number jsval on the stack. The receiver is evaluated once and stashed; a
-/// `TYPE_DATE` receiver's f64 payload is read back (reinterpreted to a number
-/// jsval), and any other receiver yields the canonical number `NaN`.
-pub(super) fn emit_date_get_time_node(
-    recv: &IrNode,
-    function: &mut Function,
-    scratch: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    let v = scratch + 17;
-    emit_node(recv, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(v));
-
-    // is_date = is_pointer(v) & (type_byte == TYPE_DATE), gated so the type-byte
-    // read never runs for a non-pointer.
-    emit_is_pointer(function, v);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, v);
-    function.instruction(&Instruction::I32Const(TYPE_DATE));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::F64Load(date_ms_slot()));
-    emit_box_f64(function, helpers);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I64Const(QNAN_BITS));
-    function.instruction(&Instruction::End);
-}
-
 /// Milliseconds per day — the divisor splitting an epoch-ms into a whole-day count
 /// and a time-of-day remainder.
 const MS_PER_DAY: i64 = 86_400_000;
@@ -741,75 +724,13 @@ const MS_PER_DAY: i64 = 86_400_000;
 /// exponent bit is set (`bits & MASK == MASK`), tested directly on the i64 bits.
 const F64_EXP_MASK: i64 = 0x7FF0_0000_0000_0000;
 
-/// Emit a `Date` field method call `recv.<op>(args)`, leaving the op's
-/// result jsval on the stack. Mirrors [`emit_map_method_node`]: the receiver is
-/// evaluated once into `recv_local`, then a runtime TYPE-BYTE dispatch splits the
-/// paths — a `TYPE_DATE` block computes the field GUEST-side from its stored f64
-/// epoch-ms ([`emit_date_field`]); any other receiver falls back to an ordinary
-/// user method call `recv.<method_name>(args)`, so an object/class method of the
-/// same name still works.
-pub(super) fn emit_date_method_node(
-    node: &IrNode,
-    function: &mut Function,
-    scratch: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    let IrNode::DateMethod {
-        op,
-        recv,
-        args,
-        method_name,
-        recv_local,
-        fallback_obj_local,
-        not_callable,
-    } = node
-    else {
-        unreachable!("emit_date_method_node is only called with a DateMethod node")
-    };
-    let recv_local = *recv_local;
-
-    // Evaluate the receiver ONCE into a stable frame local.
-    emit_node(recv, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(recv_local));
-
-    // is_date = is_pointer(recv) && type_byte == TYPE_DATE. The pointer gate keeps
-    // the type-byte load off a non-heap receiver.
-    emit_is_pointer(function, recv_local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, recv_local);
-    function.instruction(&Instruction::I32Const(TYPE_DATE));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // Either arm may wrap a throwing sub-call one frame deeper (mirrors MapMethod).
-    enter_frame(helpers);
-    emit_date_field(*op, recv_local, function, scratch, strings, helpers);
-    function.instruction(&Instruction::Else);
-    // A program without functions throws on the fallback (see
-    // `emit_method_call_user`).
-    let fallback = IrNode::MethodCallUser {
-        obj: Box::new(IrNode::Local(recv_local)),
-        key: Box::new(IrNode::Str(method_name.clone())),
-        args: args.clone(),
-        obj_local: *fallback_obj_local,
-        not_callable: not_callable.clone(),
-    };
-    emit_method_call_user(&fallback, function, scratch, strings, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
-}
-
-/// Emit the `TYPE_DATE` compute path of [`emit_date_method_node`], leaving the
-/// field's jsval on the stack. `valueOf()` returns the raw stored ms (a `NaN`
+/// Emit the field `op` of the `TYPE_DATE` block in `recv_local`
+/// ([`IrNode::DateField`]), leaving the field's jsval on the stack. `valueOf()` returns the raw stored ms (a `NaN`
 /// timestamp passes straight through); every other field first gates on a FINITE
 /// timestamp — a `NaN`/`Infinity` date yields `NaN` (numeric fields) or the
 /// `"Invalid Date"` string (`toISOString`). The finite path derives the field from
 /// the f64 payload via [`emit_date_int_field`] / [`emit_date_iso`].
-fn emit_date_field(
+pub(super) fn emit_date_field(
     op: DateOp,
     recv_local: u32,
     function: &mut Function,
@@ -818,7 +739,7 @@ fn emit_date_field(
     helpers: Helpers<'_>,
 ) {
     // valueOf() = getTime() = the raw stored ms (a number's i64 IS its f64 bits).
-    if matches!(op, DateOp::ValueOf) {
+    if matches!(op, DateOp::ValueOf | DateOp::GetTime) {
         function.instruction(&Instruction::LocalGet(recv_local));
         function.instruction(&Instruction::I32WrapI64);
         function.instruction(&Instruction::F64Load(date_ms_slot()));
@@ -839,6 +760,8 @@ fn emit_date_field(
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     if matches!(op, DateOp::ToIsoString) {
         emit_date_iso(bits, function, scratch, helpers);
+    } else if matches!(op, DateOp::ToString) {
+        emit_date_string(bits, function, scratch, strings, helpers);
     } else {
         emit_date_int_field(op, bits, function, scratch);
         // Integer field -> a number jsval (a number's i64 IS its f64 bit pattern).
@@ -846,7 +769,7 @@ fn emit_date_field(
         function.instruction(&Instruction::I64ReinterpretF64);
     }
     function.instruction(&Instruction::Else);
-    if matches!(op, DateOp::ToIsoString) {
+    if matches!(op, DateOp::ToIsoString | DateOp::ToString) {
         let offset = strings.get(INVALID_DATE).copied().unwrap_or(HEAP_BASE);
         function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(offset)));
     } else {
@@ -1102,7 +1025,7 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
                 }
             }
         }
-        DateOp::ValueOf | DateOp::ToIsoString => {
+        DateOp::GetTime | DateOp::ValueOf | DateOp::ToIsoString | DateOp::ToString => {
             unreachable!("valueOf / toISOString are handled by emit_date_field")
         }
     }
@@ -1192,6 +1115,265 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     function.instruction(&Instruction::I64Or);
 }
 
+/// The three-letter weekday names, Sunday first (`Date.prototype.toString`).
+pub(super) const DATE_WEEKDAYS: &str = "SunMonTueWedThuFriSat";
+
+/// The three-letter month names, January first.
+pub(super) const DATE_MONTHS: &str = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+/// The `Date.prototype.toString` text after the year, its time digits
+/// overwritten per date (jsc dates are UTC).
+pub(super) const DATE_TAIL: &str = " 00:00:00 GMT+0000 (Coordinated Universal Time)";
+
+/// Emit the `Date.prototype.toString` text of the finite timestamp BITS in
+/// `bits` (`Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated Universal Time)`,
+/// the year zero-padded to four digits and signed when negative) as a fresh
+/// heap string, leaving its jsval on the stack. Uses the `Date` scratch
+/// slots of [`emit_date_iso`] plus `+0` and the i32 slots `+8..+12`.
+#[allow(clippy::too_many_lines)]
+fn emit_date_string(
+    bits: u32,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    use Instruction as I;
+    let (days, tod, year, month, day) = (
+        scratch + 26,
+        scratch + 1,
+        scratch + 29,
+        scratch + 28,
+        scratch + 27,
+    );
+    let (weekday, abs_year, t) = (scratch + 24, scratch + 25, scratch);
+    let (bptr, digits, sign, at) = (scratch + 3, scratch + 8, scratch + 9, scratch + 10);
+    let payload = u64::from((HEADER_SIZE + 4).cast_unsigned());
+    let tail = i32::try_from(DATE_TAIL.len()).unwrap_or(0);
+    let wasm = |function: &mut Function, ops: &[Instruction<'_>]| {
+        for op in ops {
+            function.instruction(op);
+        }
+    };
+    emit_days_tod(function, bits, days, tod, scratch + 25, scratch + 28);
+    emit_date_civil(
+        function,
+        days,
+        year,
+        month,
+        day,
+        scratch + 24,
+        scratch + 25,
+        scratch,
+    );
+    // weekday = (days mod 7 + 11) mod 7 (day 0 was a Thursday); |year|, its
+    // sign and its digit count (at least four).
+    wasm(
+        function,
+        &[
+            I::LocalGet(days),
+            I::I64Const(7),
+            I::I64RemS,
+            I::I64Const(11),
+            I::I64Add,
+            I::I64Const(7),
+            I::I64RemS,
+            I::LocalSet(weekday),
+            I::I64Const(0),
+            I::LocalGet(year),
+            I::I64Sub,
+            I::LocalGet(year),
+            I::LocalGet(year),
+            I::I64Const(0),
+            I::I64LtS,
+            I::LocalTee(sign),
+            I::Select,
+            I::LocalTee(abs_year),
+            I::I64Const(10_000),
+            I::I64DivU,
+            I::LocalSet(t),
+            I::I32Const(4),
+            I::LocalSet(digits),
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::LocalGet(t),
+            I::I64Eqz,
+            I::BrIf(1),
+            I::LocalGet(digits),
+            I::I32Const(1),
+            I::I32Add,
+            I::LocalSet(digits),
+            I::LocalGet(t),
+            I::I64Const(10),
+            I::I64DivU,
+            I::LocalSet(t),
+            I::Br(0),
+            I::End,
+            I::End,
+        ],
+    );
+    // The block: header + len + 58 fixed bytes + sign + digits.
+    let fixed = 11 + tail;
+    wasm(
+        function,
+        &[
+            I::I32Const(HEADER_SIZE + 4 + fixed),
+            I::LocalGet(sign),
+            I::I32Add,
+            I::LocalGet(digits),
+            I::I32Add,
+            I::Call(helpers.alloc),
+            I::LocalTee(bptr),
+            I::I32Const(TYPE_STRING),
+            I::I32Store8(MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: 0,
+            }),
+            I::LocalGet(bptr),
+            I::I32Const(fixed),
+            I::LocalGet(sign),
+            I::I32Add,
+            I::LocalGet(digits),
+            I::I32Add,
+            I::I32Store(MemArg {
+                offset: HEADER_SIZE as u64,
+                align: 2,
+                memory_index: 0,
+            }),
+        ],
+    );
+    // Weekday and month names, copied from their static tables.
+    let table = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE) + HEADER_SIZE + 4;
+    for (pos, names, index) in [(0, DATE_WEEKDAYS, weekday), (4, DATE_MONTHS, month)] {
+        wasm(
+            function,
+            &[
+                I::LocalGet(bptr),
+                I::I32Const(HEADER_SIZE + 4 + pos),
+                I::I32Add,
+                I::I32Const(table(names)),
+                I::LocalGet(index),
+            ],
+        );
+        if pos == 4 {
+            // `month` is 1-based.
+            wasm(function, &[I::I64Const(1), I::I64Sub]);
+        }
+        wasm(
+            function,
+            &[
+                I::I32WrapI64,
+                I::I32Const(3),
+                I::I32Mul,
+                I::I32Add,
+                I::I32Const(3),
+                I::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                },
+            ],
+        );
+    }
+    for pos in [3, 7, 10] {
+        emit_iso_byte(function, bptr, pos, b' ');
+    }
+    emit_iso_digits(function, bptr, 8, day, 2);
+    // The sign, then the year digits right to left from `at`.
+    wasm(
+        function,
+        &[
+            I::LocalGet(bptr),
+            I::I32Const(i32::from(b'-')),
+            I::I32Store8(MemArg {
+                offset: payload + 11,
+                align: 0,
+                memory_index: 0,
+            }),
+            I::LocalGet(bptr),
+            I::LocalGet(sign),
+            I::I32Add,
+            I::LocalGet(digits),
+            I::I32Add,
+            I::LocalSet(at),
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::LocalGet(digits),
+            I::I32Eqz,
+            I::BrIf(1),
+            I::LocalGet(at),
+            I::LocalGet(abs_year),
+            I::I64Const(10),
+            I::I64RemU,
+            I::I64Const(i64::from(b'0')),
+            I::I64Add,
+            I::I32WrapI64,
+            I::I32Store8(MemArg {
+                offset: payload + 10,
+                align: 0,
+                memory_index: 0,
+            }),
+            I::LocalGet(abs_year),
+            I::I64Const(10),
+            I::I64DivU,
+            I::LocalSet(abs_year),
+            I::LocalGet(at),
+            I::I32Const(1),
+            I::I32Sub,
+            I::LocalSet(at),
+            I::LocalGet(digits),
+            I::I32Const(1),
+            I::I32Sub,
+            I::LocalSet(digits),
+            I::Br(0),
+            I::End,
+            I::End,
+        ],
+    );
+    // The tail fills the last bytes; `at` = its offset from the payload.
+    wasm(
+        function,
+        &[
+            I::LocalGet(bptr),
+            I::I32Load(MemArg {
+                offset: HEADER_SIZE as u64,
+                align: 2,
+                memory_index: 0,
+            }),
+            I::I32Const(tail),
+            I::I32Sub,
+            I::LocalGet(bptr),
+            I::I32Add,
+            I::LocalTee(at),
+            I::I32Const(HEADER_SIZE + 4),
+            I::I32Add,
+            I::I32Const(table(DATE_TAIL)),
+            I::I32Const(tail),
+            I::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            },
+        ],
+    );
+    for (pos, div, rem) in [(1, 3_600_000_i64, 0_i64), (4, 60_000, 60), (7, 1000, 60)] {
+        wasm(function, &[I::LocalGet(tod), I::I64Const(div), I::I64DivS]);
+        if rem != 0 {
+            wasm(function, &[I::I64Const(rem), I::I64RemS]);
+        }
+        wasm(function, &[I::LocalSet(t)]);
+        emit_iso_digits(function, at, pos, t, 2);
+    }
+    wasm(
+        function,
+        &[
+            I::LocalGet(bptr),
+            I::I64ExtendI32U,
+            I::I64Const(HEAP_BITS),
+            I::I64Or,
+        ],
+    );
+}
+
 /// Write one fixed ASCII byte `ch` at payload offset `pos` of the string block in
 /// `bptr` (payload begins at `HEADER_SIZE + 4`).
 fn emit_iso_byte(function: &mut Function, bptr: u32, pos: u64, ch: u8) {
@@ -1227,185 +1409,13 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
     }
 }
 
-/// Emit a `Map`/`Set` method call `recv.<op>(args)`, leaving the op's result
-/// jsval on the stack. The receiver is evaluated once into `recv_local`, then a
-/// runtime TYPE-BYTE dispatch splits the paths: a `TYPE_MAP`/`TYPE_SET` handle runs
-/// the collection op through the `__map_*` helpers (`.set`/`.add` yield the handle;
-/// `.get` the value/undefined; `.has`/`.delete` a boxed boolean); any other receiver
-/// falls back to an ordinary user method call `recv.<method_name>(args)` — so an
-/// object/class method of the same name still works.
-pub(super) fn emit_map_method_node(
-    node: &IrNode,
-    function: &mut Function,
-    scratch: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    let IrNode::MapMethod {
-        op,
-        recv,
-        args,
-        method_name,
-        recv_local,
-        fallback_obj_local,
-        not_callable,
-    } = node
-    else {
-        unreachable!("emit_map_method_node is only called with a MapMethod node")
-    };
-    let recv_local = *recv_local;
-
-    // Evaluate the receiver ONCE into a stable frame local.
-    emit_node(recv, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(recv_local));
-
-    // is_collection = is_pointer(recv) && (type_byte == TYPE_MAP || == TYPE_SET).
-    // The pointer gate keeps the type-byte load off a non-heap receiver.
-    emit_is_pointer(function, recv_local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, recv_local);
-    function.instruction(&Instruction::I32Const(TYPE_MAP));
-    function.instruction(&Instruction::I32Eq);
-    emit_load_type_byte(function, recv_local);
-    function.instruction(&Instruction::I32Const(TYPE_SET));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // Either arm may wrap a throwing sub-call, one frame deeper (mirrors Ternary).
-    enter_frame(helpers);
-    // MAP/SET op path: `handle` is the wrapped receiver base.
-    emit_map_op(*op, recv_local, args, function, scratch, strings, helpers);
-    function.instruction(&Instruction::Else);
-    // Fallback: an ordinary user method call `recv.<name>(args)` binding
-    // `this = recv`, reusing the method-call machinery (which throws in a
-    // program without functions).
-    let fallback = IrNode::MethodCallUser {
-        obj: Box::new(IrNode::Local(recv_local)),
-        key: Box::new(IrNode::Str(method_name.clone())),
-        args: args.clone(),
-        obj_local: *fallback_obj_local,
-        not_callable: not_callable.clone(),
-    };
-    emit_method_call_user(&fallback, function, scratch, strings, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
-}
-
-/// Emit a promise / generator instance method call `recv.<op>(args)`, leaving
-/// its result jsval on the stack. The receiver is evaluated once into
-/// `recv_local`, then a runtime TYPE-BYTE dispatch splits the paths: a
-/// `TYPE_PROMISE` receiver of `then`/`catch`/`finally` registers its reactions
-/// (the host `__then` / `__promise` engine), a `TYPE_GENERATOR` receiver of `next`
-/// drives the state machine one step; any other receiver falls back to an
-/// ordinary user method call `recv.<name>(args)` — nullish-guarded, binding
-/// `this = recv`, every argument passed. Surplus builtin-path arguments are
-/// evaluated for their side effects and dropped.
-pub(super) fn emit_receiver_method_node(
-    node: &IrNode,
-    function: &mut Function,
-    scratch: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    let IrNode::ReceiverMethod {
-        op,
-        recv,
-        args,
-        recv_local,
-        fallback_obj_local,
-        not_callable,
-    } = node
-    else {
-        unreachable!("emit_receiver_method_node is only called with a ReceiverMethod node")
-    };
-    let recv_local = *recv_local;
-
-    // Evaluate the receiver ONCE into a stable frame local.
-    emit_node(recv, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(recv_local));
-
-    // is_builtin = is_pointer(recv) && type_byte == TYPE_PROMISE / TYPE_GENERATOR.
-    // The pointer gate keeps the type-byte load off a non-heap receiver.
-    let type_byte = if matches!(op, ReceiverOp::Next) {
-        TYPE_GENERATOR
-    } else {
-        i32::from(abi::TYPE_PROMISE)
-    };
-    emit_is_pointer(function, recv_local);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, recv_local);
-    function.instruction(&Instruction::I32Const(type_byte));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // Either arm may wrap a throwing sub-call, one frame deeper (mirrors Ternary).
-    enter_frame(helpers);
-    let arg = |i: usize| Box::new(args.get(i).cloned().unwrap_or(IrNode::Undefined));
-    let recv_node = Box::new(IrNode::Local(recv_local));
-    let (builtin, used) = match op {
-        ReceiverOp::Then => (
-            IrNode::PromiseThen {
-                promise: recv_node,
-                on_fulfilled: arg(0),
-                on_rejected: arg(1),
-            },
-            2,
-        ),
-        ReceiverOp::Catch => (
-            IrNode::PromiseThen {
-                promise: recv_node,
-                on_fulfilled: Box::new(IrNode::Undefined),
-                on_rejected: arg(0),
-            },
-            1,
-        ),
-        ReceiverOp::Finally => (
-            IrNode::PromiseFinally {
-                promise: recv_node,
-                on_finally: arg(0),
-            },
-            1,
-        ),
-        ReceiverOp::Next => (
-            IrNode::GenResume {
-                handle: recv_node,
-                sent: arg(0),
-            },
-            1,
-        ),
-    };
-    emit_node(&builtin, function, scratch, strings, helpers);
-    for extra in args.iter().skip(used) {
-        emit_node(extra, function, scratch, strings, helpers);
-        function.instruction(&Instruction::Drop);
-    }
-    function.instruction(&Instruction::Else);
-    let fallback = IrNode::MethodCallUser {
-        obj: Box::new(IrNode::Local(recv_local)),
-        key: Box::new(IrNode::Str(op.name().to_owned())),
-        args: args.clone(),
-        obj_local: *fallback_obj_local,
-        not_callable: not_callable.clone(),
-    };
-    emit_method_call_user(&fallback, function, scratch, strings, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
-}
-
-/// Emit the `TYPE_MAP`/`TYPE_SET` collection-op path of [`emit_map_method_node`],
-/// leaving the op's result jsval on the stack. `handle` holds the receiver jsval;
-/// its wrapped base is the first argument to each `__map_*` helper. A missing key/
-/// value argument is `undefined` (JS treats `map.set()` as `set(undefined,
-/// undefined)`); `.set`/`.add` yield the receiver handle (chainable), `.has`/
-/// `.delete` box their `1`/`0` result as a boolean jsval.
-fn emit_map_op(
+/// Emit [`IrNode::CollectionOp`], leaving the op's result jsval on the stack.
+/// `handle` holds the receiver jsval; its wrapped base is the first argument to
+/// each `__map_*` helper. A missing key/value argument is `undefined` (JS
+/// treats `map.set()` as `set(undefined, undefined)`); `.set`/`.add` yield the
+/// receiver handle (chainable), `.has`/`.delete` box their `1`/`0` result as a
+/// boolean jsval, `.clear` empties the backing and yields `undefined`.
+pub(super) fn emit_map_op(
     op: MapOp,
     handle: u32,
     args: &[IrNode],
@@ -1459,6 +1469,28 @@ fn emit_map_op(
             function.instruction(&Instruction::I64ExtendI32U);
             function.instruction(&Instruction::I64Const(FALSE_BITS));
             function.instruction(&Instruction::I64Or);
+        }
+        MapOp::Clear => {
+            // size = 0; the backing array's len = 0.
+            for (load_entries, offset) in [(false, MAP_SIZE_OFFSET), (true, ARRAY_LEN_OFFSET)] {
+                function.instruction(&Instruction::LocalGet(handle));
+                function.instruction(&Instruction::I32WrapI64);
+                if load_entries {
+                    function.instruction(&Instruction::I64Load(MemArg {
+                        offset: MAP_ENTRIES_OFFSET,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    function.instruction(&Instruction::I32WrapI64);
+                }
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::I32Store(MemArg {
+                    offset,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
     }
 }
@@ -1589,7 +1621,7 @@ fn emit_index_string_key(
 
 /// Push the u32 field at byte `offset` of the block whose jsval is in `s0`,
 /// reboxed as a number jsval.
-fn emit_u32_field_boxed(function: &mut Function, s0: u32, offset: u64) {
+pub(super) fn emit_u32_field_boxed(function: &mut Function, s0: u32, offset: u64) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
@@ -1619,18 +1651,15 @@ fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Help
 /// Emit a member read `obj[index]` (`obj.k` is `obj["k"]`), leaving the
 /// resulting jsval on the stack.
 ///
-/// `obj` and `index` are each evaluated once into a scratch local. A primitive
-/// receiver (number or boolean; nullish is guarded first) reads `undefined`
-/// without touching memory. A static string key goes straight to `__get` with
-/// its interned key constant (`__get` resolves a string's or array's
-/// `length`/index keys itself); the one exception is `.size`, which a
-/// `Map`/`Set` handle answers from its header. A computed in-range integer
-/// key on an array loads the element (a hole reads `undefined`); a computed
-/// key on a string keeps the string path: `"length"`, a canonical numeric
-/// index (number or numeric string), or `undefined`. Any other computed read
-/// converts the key with `ToPropertyKey` (a lookup, so a never-interned key
-/// reads `undefined`) and calls `__get` (which routes an array's canonical
-/// index strings to its elements and its other keys to its own table).
+/// `obj` and `index` are each evaluated once into a scratch local. A static
+/// string key goes straight to `__get` with its interned key constant
+/// (`__get` resolves a string's or array's `length`/index keys itself, and a
+/// primitive receiver's inherited ones through its prototype). A computed in-range integer key on an array loads the element (a hole
+/// reads `undefined`); a computed `"length"` or canonical numeric index on a
+/// string reads it inline. Any other computed read converts the key with
+/// `ToPropertyKey` (a lookup, so a never-interned key reads `undefined`) and
+/// calls `__get` (which routes an array's canonical index strings to its
+/// elements and its other keys to its own table).
 ///
 /// Both operands are evaluated on the operand stack before being stashed in
 /// the DEDICATED HIGH scratch slots `+17`/`+18`, so a computed index that is
@@ -1671,37 +1700,56 @@ pub(super) fn emit_index_node(
         );
     }
 
-    // A primitive receiver (number/boolean — nullish was guarded above) owns no
-    // heap block: one pointer-tag test keeps every path below from reading
-    // memory at its bits. Its properties all read `undefined` until S4.
-    emit_is_pointer(function, s0);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    // A static key is one `__get` (which resolves a primitive receiver
+    // through its prototype); a computed key takes the inline array/string
+    // reads first.
     match index {
-        IrNode::Str(name) if name == "size" => {
-            // A `Map`/`Set` handle answers `.size` from its header.
-            emit_load_type_byte(function, s0);
-            function.instruction(&Instruction::I32Const(TYPE_MAP));
-            function.instruction(&Instruction::I32Eq);
-            emit_load_type_byte(function, s0);
-            function.instruction(&Instruction::I32Const(TYPE_SET));
-            function.instruction(&Instruction::I32Eq);
-            function.instruction(&Instruction::I32Or);
-            function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-            emit_u32_field_boxed(function, s0, MAP_SIZE_OFFSET);
-            function.instruction(&Instruction::Else);
-            emit_get_call(function, s0, index, s1, strings, helpers);
-            function.instruction(&Instruction::End);
-        }
         IrNode::Str(_) => emit_get_call(function, s0, index, s1, strings, helpers),
         _ => emit_index_dynamic(function, scratch, s0, s1, strings, helpers),
     }
-    // Close the pointer guard: a primitive receiver reads `undefined`.
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::End);
     if helpers.has_accessors {
         emit_propagate_if_pending(function, helpers);
     }
+}
+
+/// Emit [`IrNode::SizeRead`], leaving `obj.size` on the stack: the `size`
+/// header of a `Map`/`Set` handle passing its guard, else the ordinary member
+/// read (the prototype getter, or an own/user `size`).
+pub(super) fn emit_size_read(
+    sealed: bool,
+    obj: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let recv = scratch + 17;
+    emit_node(obj, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(recv));
+    emit_proto_kind_test(
+        function,
+        recv,
+        ProtoKind::Collection,
+        sealed,
+        scratch + 3,
+        helpers,
+    );
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    emit_u32_field_boxed(function, recv, MAP_SIZE_OFFSET);
+    function.instruction(&Instruction::Else);
+    enter_frame(helpers);
+    let key = IrNode::Str("size".to_owned());
+    emit_index_node(
+        &IrNode::Local(recv),
+        &key,
+        true,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// Push `__get(s0, key)` for the receiver in `s0` and the property key `index`
@@ -1719,10 +1767,11 @@ fn emit_get_call(
     function.instruction(&Instruction::Call(helpers.get));
 }
 
-/// Emit the computed-key half of [`emit_index_node`] for the heap receiver in
-/// `s0` and the key jsval in `s1`: an array loads the element of an in-range
-/// integer key, a string builds the in-range one-char string (or reads
-/// `length`), and any other key or receiver goes through `__get`.
+/// Emit the computed-key half of [`emit_index_node`] for the receiver in `s0`
+/// and the key jsval in `s1`: an array loads the element of an in-range
+/// integer key, a string reads `length` or builds the in-range one-char
+/// string, each leaving the read block early; every other key or receiver (a
+/// primitive included) falls through to the one `__get`.
 fn emit_index_dynamic(
     function: &mut Function,
     scratch: u32,
@@ -1731,16 +1780,18 @@ fn emit_index_dynamic(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+    emit_is_pointer(function, s0);
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_load_type_byte(function, s0);
     function.instruction(&Instruction::I32Const(TYPE_ARRAY));
     function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     // ARRAY: an in-range integer key loads the i64 element jsval at
     // elems + 8 + 8*i (`__sparse_get` on a SPARSE array; stashed in `s1`, the
-    // key being dead) and reads a hole as `undefined`; any other key goes
-    // through `__get`.
+    // key being dead) and reads a hole as `undefined`.
     emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_sparse_test(function, s0);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::LocalGet(s0));
@@ -1763,33 +1814,31 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalSet(s1));
     emit_elem_read(function, s1);
-    function.instruction(&Instruction::Else);
-    emit_get_dynamic(function, s0, s1, helpers);
+    function.instruction(&Instruction::Br(3));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     emit_load_type_byte(function, s0);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    // STRING: `"length"` reads the header; otherwise an out-of-bounds or
-    // non-index key (an unknown property such as `"abc".foo`) yields
-    // `undefined`, and an in-range index builds a fresh one-char string via
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // STRING: `"length"` reads the header and an in-range index (a number or
+    // a canonical numeric string) builds a fresh one-char string via
     // `__str_index` (reboxed as a heap jsval).
     emit_index_string_key(function, s1, scratch, strings, helpers);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
-    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::Br(4));
+    function.instruction(&Instruction::End);
     emit_index_in_bounds(function, s0, s1, HEADER_SIZE as u64);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::If(BlockType::Empty));
     emit_str_index_boxed(function, s0, s1, helpers);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Br(4));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    function.instruction(&Instruction::Else);
-    // Every other heap receiver: the generic property read.
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    // Every other key or receiver: the generic property read.
     emit_get_dynamic(function, s0, s1, helpers);
-    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 }
 

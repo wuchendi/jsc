@@ -56,6 +56,14 @@ export const HEADER_CLASS_OFFSET = 3
 export const CLASS_ERROR = 1
 /** `TYPE_OBJECT` `class` byte of an (unmapped) `arguments` object. */
 export const CLASS_ARGUMENTS = 2
+/** `TYPE_OBJECT` `class` byte of a Boolean wrapper object. */
+export const CLASS_BOOLEAN = 3
+/** `TYPE_OBJECT` `class` byte of a Number wrapper object. */
+export const CLASS_NUMBER = 4
+/** `TYPE_OBJECT` `class` byte of a String wrapper object. */
+export const CLASS_STRING = 5
+/** Offset of a wrapper object's `[[PrimitiveValue]]` jsval. */
+export const WRAPPER_VALUE_OFFSET = 16
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
 
@@ -204,6 +212,8 @@ export const METHOD_OP_PAD_END = 14
 export const METHOD_OP_SUBSTRING = 15
 /** `__method` op: `split` (string, yields an array). */
 export const METHOD_OP_SPLIT = 16
+/** `__method` op: `Number.prototype.toString(radix)` (number receiver). */
+export const METHOD_OP_NUMBER_TO_STRING = 17
 
 /** `__promise` op: `Promise.resolve(a)`. */
 export const PROMISE_OP_RESOLVE = 0

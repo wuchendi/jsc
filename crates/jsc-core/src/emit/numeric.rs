@@ -689,14 +689,12 @@ fn emit_to_string_jsval(function: &mut Function, local: u32, helpers: Helpers<'_
     emit_propagate_if_pending(function, helpers);
 }
 
-/// Emit a non-callback array/string method call `IrNode::MethodCall`,
-/// leaving its result jsval on the stack. The receiver is pushed, then the
-/// `METHOD_OP_*` flag, then the two fixed argument slots (each the lowered
-/// argument, or `undefined` when the method takes fewer), then a `call` of the
-/// host `__method` import — which performs the whole operation host-side,
-/// branching on the receiver's runtime TYPE BYTE for the overloaded
-/// `indexOf`/`slice` and allocating any result string/array in guest memory.
-/// `join` is the exception: the guest `__array_join`.
+/// Emit the array fast path `IrNode::MethodCall`, leaving its result jsval
+/// on the stack: the receiver, then (`indexOf`/`includes`) the `METHOD_OP_*`
+/// flag, the argument (`undefined` when missing) and an unused `undefined`
+/// slot, then a `call` of the host `__method` import. `join` runs in the guest
+/// (`__array_join`) so an element's `ToString` can call a user `toString`
+/// (which may throw).
 pub(super) fn emit_method_call(
     op: MethodOp,
     recv: &IrNode,
@@ -706,51 +704,28 @@ pub(super) fn emit_method_call(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let flag = match op {
-        // `join` runs in the guest so an element's `ToString` can call a user
-        // `toString` (which may throw).
-        MethodOp::Join => {
-            emit_node(recv, function, scratch, strings, helpers);
-            match args.first() {
-                Some(sep) => emit_node(sep, function, scratch, strings, helpers),
-                None => {
-                    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-                }
-            }
-            function.instruction(&Instruction::Call(helpers.array_join()));
-            emit_propagate_if_pending(function, helpers);
-            return;
-        }
-        MethodOp::IndexOf => METHOD_OP_INDEX_OF,
-        MethodOp::Includes => METHOD_OP_INCLUDES,
-        MethodOp::Slice => METHOD_OP_SLICE,
-        MethodOp::ToUpper => METHOD_OP_TO_UPPER,
-        MethodOp::ToLower => METHOD_OP_TO_LOWER,
-        MethodOp::CharAt => METHOD_OP_CHAR_AT,
-        MethodOp::Trim => METHOD_OP_TRIM,
-        MethodOp::TrimStart => METHOD_OP_TRIM_START,
-        MethodOp::TrimEnd => METHOD_OP_TRIM_END,
-        MethodOp::Repeat => METHOD_OP_REPEAT,
-        MethodOp::StartsWith => METHOD_OP_STARTS_WITH,
-        MethodOp::EndsWith => METHOD_OP_ENDS_WITH,
-        MethodOp::PadStart => METHOD_OP_PAD_START,
-        MethodOp::PadEnd => METHOD_OP_PAD_END,
-        MethodOp::Substring => METHOD_OP_SUBSTRING,
-        MethodOp::Split => METHOD_OP_SPLIT,
-    };
-    // Receiver, then the op flag, then the two fixed argument slots (arg0, arg1)
-    // in ABI order; a missing slot is `undefined`.
     emit_node(recv, function, scratch, strings, helpers);
-    function.instruction(&Instruction::I32Const(flag));
-    for slot in 0..2 {
-        match args.get(slot) {
-            Some(arg) => emit_node(arg, function, scratch, strings, helpers),
-            None => {
-                function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-            }
+    let flag = match op {
+        MethodOp::Join => None,
+        MethodOp::IndexOf => Some(METHOD_OP_INDEX_OF),
+        MethodOp::Includes => Some(METHOD_OP_INCLUDES),
+    };
+    if let Some(flag) = flag {
+        function.instruction(&Instruction::I32Const(flag));
+    }
+    match args.first() {
+        Some(arg) => emit_node(arg, function, scratch, strings, helpers),
+        None => {
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
     }
-    function.instruction(&Instruction::Call(helpers.method));
+    if flag.is_some() {
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        function.instruction(&Instruction::Call(helpers.method));
+    } else {
+        function.instruction(&Instruction::Call(helpers.array_join()));
+        emit_propagate_if_pending(function, helpers);
+    }
 }
 
 /// Emit the `+` operator, a runtime type dispatch following `ToPrimitive`: if

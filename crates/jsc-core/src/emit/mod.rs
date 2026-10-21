@@ -36,7 +36,7 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ReceiverOp,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
     SpreadCallee, SpreadElem,
 };
 
@@ -117,20 +117,6 @@ const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-const METHOD_OP_SLICE: i32 = abi::METHOD_OP_SLICE;
-const METHOD_OP_TO_UPPER: i32 = abi::METHOD_OP_TO_UPPER;
-const METHOD_OP_TO_LOWER: i32 = abi::METHOD_OP_TO_LOWER;
-const METHOD_OP_CHAR_AT: i32 = abi::METHOD_OP_CHAR_AT;
-const METHOD_OP_TRIM: i32 = abi::METHOD_OP_TRIM;
-const METHOD_OP_TRIM_START: i32 = abi::METHOD_OP_TRIM_START;
-const METHOD_OP_TRIM_END: i32 = abi::METHOD_OP_TRIM_END;
-const METHOD_OP_REPEAT: i32 = abi::METHOD_OP_REPEAT;
-const METHOD_OP_STARTS_WITH: i32 = abi::METHOD_OP_STARTS_WITH;
-const METHOD_OP_ENDS_WITH: i32 = abi::METHOD_OP_ENDS_WITH;
-const METHOD_OP_PAD_START: i32 = abi::METHOD_OP_PAD_START;
-const METHOD_OP_PAD_END: i32 = abi::METHOD_OP_PAD_END;
-const METHOD_OP_SUBSTRING: i32 = abi::METHOD_OP_SUBSTRING;
-const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
 
 /// The name under which the bump-allocator heap pointer global is exported so the
 /// run stage can detect the out-of-memory sentinel.
@@ -427,6 +413,12 @@ fn callee_error_text(error: &CalleeError) -> CalleeErrorText<'_> {
 /// The not-a-function `TypeError` text of a guarded call whose callee has no
 /// source name (an array callback, a promise executor, a `super` call, a
 /// generator resume).
+/// The `TypeError` of resuming a generator that is already running.
+const GENERATOR_RUNNING: CalleeErrorText<'static> = [
+    "Generator is already running",
+    "TypeError: Generator is already running",
+];
+
 const EXPRESSION_NOT_A_FUNCTION: CalleeErrorText<'static> = [
     "expression is not a function",
     "TypeError: expression is not a function",
@@ -505,7 +497,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 6] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 8] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -530,6 +522,16 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 6] = [
     (
         PROP_THROW_EXTENDS_PROTO,
         "Class extends value does not have valid prototype property ",
+        "",
+    ),
+    (
+        PROP_THROW_TO_OBJECT,
+        "Cannot convert undefined or null to object",
+        "",
+    ),
+    (
+        PROP_THROW_IN,
+        "Cannot use 'in' operator to search for a key in ",
         "",
     ),
 ];
@@ -568,6 +570,12 @@ const PROP_THROW_EXTENDS: i32 = 7;
 /// `__prop_throw`'s `mode` argument: a class parent whose `prototype` (the
 /// `key`) is neither an object nor `null`.
 const PROP_THROW_EXTENDS_PROTO: i32 = 8;
+/// `__prop_throw`'s `mode` argument: an `in` whose right-hand side (the
+/// `key`) is not an object.
+const PROP_THROW_IN: i32 = 9;
+/// `__prop_throw`'s `mode` argument: `ToObject` of `null`/`undefined` (the
+/// `key` is the empty string).
+const PROP_THROW_TO_OBJECT: i32 = 10;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
@@ -991,6 +999,35 @@ impl Helpers<'_> {
         self.to_primitive() + 4
     }
 
+    /// `__to_object(v) -> i64` (see [`builtins::emit_to_object`]), right
+    /// after `__array_join`.
+    fn to_object(self) -> u32 {
+        self.to_primitive() + 5
+    }
+
+    /// `__json_rep(holder, key, value, replacer, list) -> i64` (see
+    /// [`builtins::emit_json_rep`]), right after `__to_object`.
+    fn json_rep(self) -> u32 {
+        self.to_primitive() + 6
+    }
+
+    /// `__json_indent(s, gap) -> i32` (see [`builtins::emit_json_indent`]).
+    fn json_indent(self) -> u32 {
+        self.to_primitive() + 7
+    }
+
+    /// `__json_revive(holder, key, reviver) -> i64` (see
+    /// [`builtins::emit_json_revive`]).
+    fn json_revive(self) -> u32 {
+        self.to_primitive() + 8
+    }
+
+    /// The funcref-table slot of `builtin`'s body: the builtins follow the
+    /// user functions and the two settlers.
+    fn builtin_slot(self, builtin: Builtin) -> u32 {
+        self.settle_resolve_slot + 2 + builtin.index()
+    }
+
     /// `__new_array(len) -> i32`: the exported array constructor, right after
     /// `__new_string`.
     fn new_array(self) -> u32 {
@@ -1100,7 +1137,7 @@ use numeric::*;
 use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
-use realm::{Builtin, Intrinsic, intrinsic_bits};
+use realm::{Builtin, Intrinsic, StringOp, intrinsic_bits};
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]
@@ -1420,6 +1457,10 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_add_helper(helpers));
     code.function(&emit_compare(helpers));
     code.function(&emit_array_join(&offsets, helpers));
+    code.function(&builtins::emit_to_object(&offsets, helpers));
+    code.function(&builtins::emit_json_rep(&offsets, helpers));
+    code.function(&builtins::emit_json_indent(helpers));
+    code.function(&builtins::emit_json_revive(helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

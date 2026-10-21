@@ -2,7 +2,7 @@ use super::lower;
 use crate::frontend::{Dialect, parse};
 use crate::ir::{
     BinOp, CalleeError, ConvertOp, ErrorKind, GlobalIntrinsic, GlobalRef, IrNode, IrStmt, MathOp,
-    ObjectBuiltinOp, OpSetKind, PropKey,
+    ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
 };
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
@@ -635,10 +635,18 @@ fn unsealed_namespaces_guard_the_inline_code() {
         unreachable!("expected a guard, got {:?}", program.stmts[1]);
     };
     assert_eq!(**obj, global_get("Math"));
-    // A guarded call the inline code rejects (arity) is a plain method call.
+    // A guarded call with an extra argument evaluates it and runs the
+    // inline code over the arguments it reads.
     let program = lower_src("globalThis; Math.floor(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { fast, args, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(args.len(), 2);
+    assert!(matches!(&**fast, IrNode::MathCall { args, .. } if args.len() == 1));
+    // A JSON call passing a replacer / space calls the builtin.
+    let program = lower_src("JSON.stringify({}, null, 2)").expect("lower");
     assert!(matches!(
-        &program.stmts[1],
+        &program.stmts[0],
         IrStmt::Expr(IrNode::MethodCallUser { .. })
     ));
     // Top-level `this` is the global object.
@@ -672,24 +680,38 @@ fn unknown_namespace_members_are_method_calls() {
     ));
 }
 
-/// Whether `node` contains a [`IrNode::ProtoGuard`].
-fn has_proto_guard(node: &IrNode) -> bool {
-    matches!(node, IrNode::ProtoGuard { .. }) || node.any_child(has_proto_guard)
+/// The `sealed` flags of the [`IrNode::ProtoGuard`]s with an array fast
+/// path in `node`.
+fn proto_guards(node: &IrNode, out: &mut Vec<bool>) {
+    if let IrNode::ProtoGuard { sealed, fast, .. } = node
+        && fast.iter().any(|(kind, _)| *kind == ProtoKind::Array)
+    {
+        out.push(*sealed);
+    }
+    node.any_child(|child| {
+        proto_guards(child, out);
+        false
+    });
 }
 
 #[test]
-fn intrinsics_sealed_programs_emit_no_guard() {
+fn intrinsics_sealed_programs_skip_the_dirty_bit() {
+    let guards = |src: &str| {
+        let program = lower_src(src).expect("lower");
+        let last = program.stmts.last().expect("a statement");
+        let mut out = Vec::new();
+        last.any_node(|node| {
+            proto_guards(node, &mut out);
+            false
+        });
+        out
+    };
     for src in [
         "let a = []; a.push(1)",
         "let a = [1]; a.pop()",
         "class C { constructor() { this.a = [] } } new C().a.push(1)",
     ] {
-        let program = lower_src(src).expect("lower");
-        let last = program.stmts.last().expect("a statement");
-        assert!(
-            !last.any_node(has_proto_guard),
-            "`{src}` is intrinsics-sealed"
-        );
+        assert_eq!(guards(src), [true], "`{src}` is intrinsics-sealed");
     }
     for src in [
         "Array.prototype.x = 1; let a = []; a.push(1)",
@@ -699,13 +721,11 @@ fn intrinsics_sealed_programs_emit_no_guard() {
         "Reflect; let a = []; a.push(1)",
         "let k = 'prototype'; let a = []; a.push(1)",
     ] {
-        let program = lower_src(src).expect("lower");
-        let last = program.stmts.last().expect("a statement");
-        assert!(
-            last.any_node(has_proto_guard),
-            "`{src}` is not intrinsics-sealed"
-        );
+        assert_eq!(guards(src), [false], "`{src}` is not intrinsics-sealed");
     }
+    // A call shape without inline code is just the generic method call.
+    assert_eq!(guards("let a = [1]; a.forEach()"), Vec::<bool>::new());
+    assert_eq!(guards("let a = [1]; a.push(1, 2)"), Vec::<bool>::new());
 }
 
 #[test]

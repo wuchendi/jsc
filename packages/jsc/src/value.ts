@@ -14,7 +14,9 @@ import {
   ATTR_ACCESSOR,
   ATTR_ENUMERABLE,
   CLASS_ARGUMENTS,
+  CLASS_BOOLEAN,
   CLASS_ERROR,
+  CLASS_STRING,
   DATE_MS_OFFSET,
   ELEMS_CAP_OFFSET,
   ELEMS_DATA_OFFSET,
@@ -58,6 +60,7 @@ import {
   U32_MASK,
   U64_MASK,
   UNDEFINED,
+  WRAPPER_VALUE_OFFSET,
 } from './abi.js'
 
 /** A decoded jsval — the in-scope runtime value types (mirrors `value.rs::Value`). */
@@ -72,6 +75,7 @@ export type Value =
   | { kind: 'object'; entries: [string, Value][] }
   | { kind: 'instance'; className: string; entries: [string, Value][] }
   | { kind: 'arguments'; entries: [string, Value][] }
+  | { kind: 'wrapper'; primitive: Value; entries: [string, Value][] }
   | { kind: 'error'; name: string; message: string }
   | { kind: 'accessor'; getter: boolean; setter: boolean }
   | {
@@ -141,6 +145,7 @@ function readU64(mem: Uint8Array, off: number): bigint | undefined {
 }
 
 const utf8 = new TextDecoder()
+const utf8Encode = new TextEncoder()
 
 /**
  * Decode raw jsval `bits` into a {@link Value} per the NaN-box layout.
@@ -449,9 +454,22 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
       message: field('message') ?? '',
     }
   }
-  const entries = decodeProps(ptr, mem, guard)
-  if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ARGUMENTS)
-    return { kind: 'arguments', entries }
+  let entries = decodeProps(ptr, mem, guard)
+  const classByte = mem[ptr + HEADER_CLASS_OFFSET] ?? 0
+  if (classByte === CLASS_ARGUMENTS) return { kind: 'arguments', entries }
+  if (classByte >= CLASS_BOOLEAN && classByte <= CLASS_STRING) {
+    const bits = readU64(mem, ptr + WRAPPER_VALUE_OFFSET)
+    const primitive: Value =
+      bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard)
+    if (primitive.kind === 'string') {
+      // A String wrapper's own indices are its characters, not properties.
+      const len = utf8Encode.encode(primitive.value).length
+      entries = entries.filter(
+        ([key]) => !(/^\d+$/.test(key) && Number(key) < len),
+      )
+    }
+    return { kind: 'wrapper', primitive, entries }
+  }
   const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
   const protoPtr = proto === undefined ? undefined : heapObject(proto, mem)
   if (protoPtr !== undefined) {
@@ -602,6 +620,19 @@ export function formatValue(value: Value): string {
     // A class instance is prefixed with its constructor's name.
     case 'instance':
       return `${value.className} ${formatEntries(value.entries)}`
+    // A wrapper names its kind and quotes a wrapped string, as Node does.
+    case 'wrapper': {
+      const p = value.primitive
+      const head =
+        p.kind === 'string'
+          ? `[String: '${p.value}']`
+          : p.kind === 'number'
+            ? `[Number: ${Object.is(p.value, -0) ? '-0' : formatNumber(p.value)}]`
+            : `[Boolean: ${formatValue(p)}]`
+      return value.entries.length === 0
+        ? head
+        : `${head} ${formatEntries(value.entries)}`
+    }
     // An `arguments` object quotes its (index) keys, as Node does.
     case 'arguments':
       return `[Arguments] ${formatEntries(
@@ -666,6 +697,8 @@ export function toJsString(value: Value): string {
       return '[object Object]'
     case 'arguments':
       return '[object Arguments]'
+    case 'wrapper':
+      return toJsString(value.primitive)
     case 'error':
       if (value.message === '') return value.name
       if (value.name === '') return value.message

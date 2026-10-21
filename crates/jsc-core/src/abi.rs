@@ -120,8 +120,28 @@ pub(crate) const CLASS_ERROR: u8 = 1;
 /// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
 pub(crate) const CLASS_ARGUMENTS: u8 = 2;
 
+/// [`TYPE_OBJECT`] `class` byte: a Boolean wrapper object, its
+/// `[[PrimitiveValue]]` (the boolean jsval) at [`WRAPPER_VALUE_OFFSET`].
+pub(crate) const CLASS_BOOLEAN: u8 = 3;
+
+/// [`TYPE_OBJECT`] `class` byte: a Number wrapper object, its
+/// `[[PrimitiveValue]]` (the number jsval) at [`WRAPPER_VALUE_OFFSET`].
+pub(crate) const CLASS_NUMBER: u8 = 4;
+
+/// [`TYPE_OBJECT`] `class` byte: a String wrapper object, its
+/// `[[PrimitiveValue]]` (the string jsval) at [`WRAPPER_VALUE_OFFSET`]. Its
+/// `length` and in-range indices are exotic own read-only properties.
+pub(crate) const CLASS_STRING: u8 = 5;
+
 /// [`TYPE_OBJECT`] `class` byte: the global object (a static realm block).
-pub(crate) const CLASS_GLOBAL: u8 = 3;
+pub(crate) const CLASS_GLOBAL: u8 = 6;
+
+/// Offset of a wrapper object's `[[PrimitiveValue]]` jsval (an `i64`) from
+/// its base, right after the object-family prefix.
+pub(crate) const WRAPPER_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte size of a wrapper object block.
+pub(crate) const WRAPPER_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 
 /// The alignment in bytes of every heap block base: `__alloc` rounds every
 /// request up to a multiple of it, and static data blobs are padded to it, so
@@ -344,8 +364,24 @@ pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 `done` flag.
 pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 resume
+/// `limits` bits ([`GEN_LIMIT_RETURN`], [`GEN_LIMIT_THROW`]), guest-only.
+pub(crate) const GEN_LIMITS_OFFSET: u32 = OBJ_PREFIX_SIZE + 12;
+
+/// Generator `limits` bit: the body has a `finally` or a `yield*`, so a
+/// `return()` at a suspended `yield` (which must run them) is unsupported.
+pub(crate) const GEN_LIMIT_RETURN: u32 = 1;
+
+/// Generator `limits` bit: the body has a `yield*`, so a `throw()` at a
+/// suspended `yield` (which must forward to the delegate) is unsupported.
+pub(crate) const GEN_LIMIT_THROW: u32 = 2;
+
+/// Generator `limits` bit: the state machine is running (set around each
+/// resume), so a `next()` / `return()` / `throw()` from its own body throws.
+pub(crate) const GEN_RUNNING: u32 = 4;
+
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
-/// jsval, 8-byte aligned past a u32 pad.
+/// jsval, 8-byte aligned past the `limits` word.
 pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// The byte size of a [`TYPE_GENERATOR`] block.
@@ -709,6 +745,10 @@ pub(crate) const METHOD_OP_SUBSTRING: i32 = 15;
 
 /// `__method` op flag: `split` (string, yields an array).
 pub(crate) const METHOD_OP_SPLIT: i32 = 16;
+
+/// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
+/// `arg0` an integral radix in `2..=36`).
+pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
 
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]
