@@ -214,8 +214,7 @@ fn date_method_names_fall_back_to_user_methods() {
     );
 }
 
-/// The `Date` builtins are shadowable, and only the timestamp
-/// constructor forms are accepted (the calendar-field form is rejected).
+/// The `Date` builtins are shadowable.
 #[test]
 fn date_shadowing_and_arity() {
     // A user `let Date = ..` shadows the builtin constructor.
