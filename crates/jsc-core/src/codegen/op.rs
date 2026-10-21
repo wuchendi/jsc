@@ -50,13 +50,9 @@ pub(super) fn math_method_name(callee: &Expr) -> Option<&str> {
     }
 }
 
-/// Lower a recognized `Math.<name>(args)` call to an [`IrNode::MathCall`],
-/// validating the method name and its argument count. The unary ops take
-/// exactly one argument, `pow` exactly two, and `min`/`max` any number; an unknown
-/// `Math.<name>` or a wrong arity is a compile error, matching the existing
-/// direct-call error style.
-pub(super) fn lower_math_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
-    let op = match name {
+/// The [`MathOp`] of the inline `Math.<name>` method, or `None`.
+pub(super) fn math_op(name: &str) -> Option<MathOp> {
+    Some(match name {
         "floor" => MathOp::Floor,
         "ceil" => MathOp::Ceil,
         "round" => MathOp::Round,
@@ -66,12 +62,49 @@ pub(super) fn lower_math_call(name: &str, args: Vec<IrNode>, span: Span) -> anyh
         "min" => MathOp::Min,
         "max" => MathOp::Max,
         "pow" => MathOp::Pow,
-        _ => {
-            return Err(
-                CompileError::spanned(span, format!("unknown Math method: Math.{name}")).into(),
-            );
-        }
-    };
+        _ => return None,
+    })
+}
+
+/// Whether `namespace.key(..)` has inline code (design 3.2 row 2); any other
+/// member is an ordinary property of the namespace object.
+pub(super) fn inline_member(namespace: &str, key: &str) -> bool {
+    match namespace {
+        "Math" => math_op(key).is_some(),
+        "JSON" => matches!(key, "stringify" | "parse"),
+        "console" => key == "log",
+        "Object" => object_op(key).is_some(),
+        "Promise" => matches!(key, "resolve" | "reject"),
+        "Date" => key == "now",
+        _ => false,
+    }
+}
+
+/// Lower the inline code of `namespace.key(args)` (an [`inline_member`]),
+/// validating its argument count: a wrong arity is a compile error.
+pub(super) fn lower_namespace_call(
+    namespace: &str,
+    key: &str,
+    args: Vec<IrNode>,
+    span: Span,
+) -> anyhow::Result<IrNode> {
+    match namespace {
+        "Math" => lower_math_call(key, args, span),
+        "JSON" => lower_json_call(key, args, span),
+        "console" => Ok(IrNode::ConsoleLog { args }),
+        "Object" => lower_object_call(key, args, span),
+        "Promise" => lower_promise_static(key, args, span),
+        _ if args.is_empty() => Ok(IrNode::DateNow),
+        _ => Err(CompileError::spanned(span, "Date.now() takes no arguments").into()),
+    }
+}
+
+/// Lower an inline `Math.<name>(args)` call to an [`IrNode::MathCall`],
+/// validating its argument count. The unary ops take exactly one argument,
+/// `pow` exactly two, and `min`/`max` any number; a wrong arity is a compile
+/// error, matching the existing direct-call error style.
+fn lower_math_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
+    let op = math_op(name).ok_or_else(|| anyhow!("Math.{name} has no inline code"))?;
     let expected: Option<usize> = match op {
         MathOp::Min | MathOp::Max => None,
         MathOp::Pow => Some(2),
@@ -219,23 +252,11 @@ pub(super) fn promise_static_method_name(callee: &Expr) -> Option<&str> {
     }
 }
 
-/// Lower a recognized `Promise.<name>(v)` static call: `Promise.resolve`
-/// / `Promise.reject` each take an optional single value (a missing argument is
-/// `undefined`). An unknown static (`Promise.all`/`race`/…) or a call passing
-/// more than one argument is a compile error, matching the built-in-call error
-/// style.
-pub(super) fn lower_promise_static(
-    name: &str,
-    mut args: Vec<IrNode>,
-    span: Span,
-) -> anyhow::Result<IrNode> {
-    if !matches!(name, "resolve" | "reject") {
-        return Err(CompileError::spanned(
-            span,
-            format!("unsupported Promise method: Promise.{name}"),
-        )
-        .into());
-    }
+/// Lower an inline `Promise.resolve(v)` / `Promise.reject(v)` static call:
+/// each takes an optional single value (a missing argument is `undefined`); a
+/// call passing more than one argument is a compile error, matching the
+/// built-in-call error style.
+fn lower_promise_static(name: &str, mut args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
     if args.len() > 1 {
         return Err(CompileError::spanned(
             span,
@@ -251,28 +272,20 @@ pub(super) fn lower_promise_static(
     })
 }
 
-/// Lower a recognized `Object.<name>(arg)` call to an [`IrNode::ObjectBuiltin`],
-/// validating the method name and its single-argument arity. An unknown
-/// `Object.<name>` or a wrong arity is a compile error, matching the existing
-/// built-in-call error style. Out-of-scope statics (`Object.assign`/`freeze`)
-/// fall here and are rejected by name.
-pub(super) fn lower_object_call(
-    name: &str,
-    args: Vec<IrNode>,
-    span: Span,
-) -> anyhow::Result<IrNode> {
-    let op = match name {
+/// The [`ObjectBuiltinOp`] of the inline `Object.<name>` static, or `None`.
+fn object_op(name: &str) -> Option<ObjectBuiltinOp> {
+    Some(match name {
         "keys" => ObjectBuiltinOp::Keys,
         "values" => ObjectBuiltinOp::Values,
         "entries" => ObjectBuiltinOp::Entries,
-        _ => {
-            return Err(CompileError::spanned(
-                span,
-                format!("unsupported Object method: Object.{name}"),
-            )
-            .into());
-        }
-    };
+        _ => return None,
+    })
+}
+
+/// Lower an inline `Object.keys/values/entries(arg)` call to an
+/// [`IrNode::ObjectBuiltin`], validating its single-argument arity.
+fn lower_object_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
+    let op = object_op(name).ok_or_else(|| anyhow!("Object.{name} has no inline code"))?;
     if args.len() != 1 {
         return Err(CompileError::spanned(
             span,
@@ -310,53 +323,31 @@ pub(super) fn json_method_name(callee: &Expr) -> Option<&str> {
     }
 }
 
-/// Lower a recognized `JSON.<name>(arg)` call. `JSON.stringify(v)` lowers to
+/// Lower an inline `JSON.<name>(arg)` call. `JSON.stringify(v)` lowers to
 /// an [`IrNode::JsonStringify`] (exactly one argument; the `replacer`/`space`
 /// second/third arguments are unsupported and rejected); `JSON.parse(text)`
-/// lowers to an [`IrNode::JsonParse`]. Any other `JSON.<name>` is rejected by
-/// name.
-pub(super) fn lower_json_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
-    match name {
-        "stringify" => {
-            if args.len() != 1 {
-                return Err(CompileError::spanned(
-                    span,
-                    format!(
-                        "JSON.stringify expects 1 argument(s), got {} (the replacer/space \
-                         arguments are unsupported)",
-                        args.len()
-                    ),
-                )
-                .into());
-            }
-            let arg = args
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("JSON.stringify requires an argument"))?;
-            Ok(IrNode::JsonStringify { arg: Box::new(arg) })
-        }
-        "parse" => {
-            if args.len() != 1 {
-                return Err(CompileError::spanned(
-                    span,
-                    format!(
-                        "JSON.parse expects 1 argument(s), got {} (the reviver argument is \
-                         unsupported)",
-                        args.len()
-                    ),
-                )
-                .into());
-            }
-            let arg = args
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("JSON.parse requires an argument"))?;
-            Ok(IrNode::JsonParse { arg: Box::new(arg) })
-        }
-        _ => {
-            Err(CompileError::spanned(span, format!("unsupported JSON method: JSON.{name}")).into())
-        }
-    }
+/// lowers to an [`IrNode::JsonParse`].
+fn lower_json_call(name: &str, args: Vec<IrNode>, span: Span) -> anyhow::Result<IrNode> {
+    let unsupported = if name == "stringify" {
+        "the replacer/space arguments are"
+    } else {
+        "the reviver argument is"
+    };
+    let [arg] = <[IrNode; 1]>::try_from(args).map_err(|args| {
+        CompileError::spanned(
+            span,
+            format!(
+                "JSON.{name} expects 1 argument(s), got {} ({unsupported} unsupported)",
+                args.len()
+            ),
+        )
+    })?;
+    let arg = Box::new(arg);
+    Ok(if name == "stringify" {
+        IrNode::JsonStringify { arg }
+    } else {
+        IrNode::JsonParse { arg }
+    })
 }
 
 /// Map a method name to its [`MapOp`], or `None` when the name is not a

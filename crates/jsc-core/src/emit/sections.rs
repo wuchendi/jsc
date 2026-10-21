@@ -145,6 +145,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         fn_type,
         max_args,
         has_accessors: program_has_accessors(program),
+        dirty_tracking: program_tests_dirty_bits(program),
         fn_info: layout.info,
     };
     // Helper types follow the main (type 0) and uniform (type 1) types, one
@@ -438,6 +439,10 @@ pub(super) fn build_globals(
         },
         &ConstExpr::i64_const(UNDEFINED_BITS),
     );
+    // The intrinsics dirty bits ($__intrinsics_dirty, i32, index
+    // DIRTY_GLOBAL), all clear at startup and never cleared. Internal.
+    let (dirty_ty, dirty_init) = mut_i32(0);
+    globals.global(dirty_ty, &dirty_init);
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..module_cells {
@@ -895,6 +900,35 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
+        IrNode::NamespaceGuard {
+            key,
+            obj,
+            args,
+            fast,
+            slow,
+            ..
+        } => {
+            seed_strs_ref(&[key], order, seen);
+            seed_nullish_strs(order, seen);
+            collect_node(obj, order, seen);
+            for arg in args {
+                collect_node(arg, order, seen);
+            }
+            collect_node(fast, order, seen);
+            collect_node(slow, order, seen);
+        }
+        IrNode::ProtoGuard {
+            key,
+            recv,
+            fast,
+            user,
+            ..
+        } => {
+            seed_strs_ref(&[key], order, seen);
+            collect_node(recv, order, seen);
+            collect_node(fast, order, seen);
+            collect_node(user, order, seen);
+        }
         IrNode::Construct {
             callee,
             args,
@@ -1254,27 +1288,55 @@ fn collect_entries<'a>(
 }
 
 /// Whether any function of `program` (or `main`) builds an accessor
-/// ([`IrNode::MakeAccessor`]) or names `caller` / `arguments` (the realm's
-/// `%Function.prototype%` accessors), so `__get` / `__set` must dispatch to
-/// getters and setters.
+/// ([`IrNode::MakeAccessor`]) or can reach the realm's `%Function.prototype%`
+/// `caller` / `arguments` accessors: it names them, or reads or writes a
+/// member under a key computed at run time. Then `__get` / `__set` must
+/// dispatch to getters and setters. (The builtins only read fixed keys:
+/// `length`, indices, `prototype`, `name`, `message`.)
 fn program_has_accessors(program: &IrProgram) -> bool {
-    fn node(n: &IrNode) -> bool {
-        matches!(n, IrNode::MakeAccessor { .. })
-            || matches!(n, IrNode::Str(s) if s == "caller" || s == "arguments")
-            || n.any_child(node)
+    let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
+    program_any(program, |n| match n {
+        IrNode::MakeAccessor { .. } => true,
+        IrNode::Str(s) => s == "caller" || s == "arguments",
+        IrNode::Index { index: key, .. }
+        | IrNode::IndexSet { index: key, .. }
+        | IrNode::IndexOpSet { index: key, .. }
+        | IrNode::MethodCallUser { key, .. } => computed(key),
+        _ => false,
+    })
+}
+
+/// Whether `program` tests a dirty bit (a [`IrNode::ProtoGuard`] or a
+/// [`IrNode::NamespaceGuard`] on a watched namespace), so `__set` /
+/// `__define` / `__delete` must set the bits (design 3.3).
+fn program_tests_dirty_bits(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::ProtoGuard { .. } => true,
+        IrNode::NamespaceGuard { namespace, .. } => {
+            realm::Intrinsic::from(*namespace).watch_bit().is_some()
+        }
+        _ => false,
+    })
+}
+
+/// Whether some expression of `program` (in `main`, any function body or
+/// generator segment) satisfies `pred`.
+fn program_any(program: &IrProgram, pred: impl Fn(&IrNode) -> bool + Copy) -> bool {
+    fn node(n: &IrNode, pred: impl Fn(&IrNode) -> bool + Copy) -> bool {
+        pred(n) || n.any_child(|c| node(c, pred))
     }
-    fn stmt(s: &IrStmt) -> bool {
-        s.any_node(node) || s.any_stmt(stmt)
+    fn stmt(s: &IrStmt, pred: impl Fn(&IrNode) -> bool + Copy) -> bool {
+        s.any_node(|n| node(n, pred)) || s.any_stmt(|t| stmt(t, pred))
     }
-    program.stmts.iter().any(stmt)
+    program.stmts.iter().any(|s| stmt(s, pred))
         || program.functions.iter().any(|f| {
-            f.body.iter().any(stmt)
+            f.body.iter().any(|s| stmt(s, pred))
                 || f.machine.iter().flatten().any(|segment| {
-                    segment.stmts.iter().any(stmt)
+                    segment.stmts.iter().any(|s| stmt(s, pred))
                         || match &segment.term {
                             crate::ir::GenTerm::Yield { value, .. }
                             | crate::ir::GenTerm::Branch { cond: value, .. }
-                            | crate::ir::GenTerm::Return(Some(value)) => node(value),
+                            | crate::ir::GenTerm::Return(Some(value)) => node(value, pred),
                             crate::ir::GenTerm::Return(None) | crate::ir::GenTerm::Jump(_) => false,
                         }
                 })

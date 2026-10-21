@@ -242,10 +242,14 @@ fn new_promise_wrong_arity_is_rejected() {
 
 // --- Out-of-scope boundary ----------------------------------------------------
 
-/// An unknown `Promise.<name>` static (e.g. `Promise.all`) is a compile error.
+/// An absent `Promise.<name>` static (e.g. `Promise.all`) reads `undefined`,
+/// so calling it throws a `TypeError` at run time.
 #[test]
-fn unknown_promise_static_is_rejected() {
-    assert_rejected("Promise.all([])");
+fn unknown_promise_static_throws() {
+    assert_uncaught(
+        "Promise.all([])",
+        "TypeError: Promise.all is not a function",
+    );
 }
 
 // --- async/await (generator + promise driven) ---------------------------------

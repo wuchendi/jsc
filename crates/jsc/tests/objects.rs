@@ -314,7 +314,7 @@ fn object_keys_list_only_own_fields() {
 }
 
 /// `Object` is a syntactic built-in gated on `resolve("Object") == None`, so
-/// a user binding shadows it; an unknown static and a wrong arity are rejected.
+/// a user binding shadows it; a wrong arity is rejected.
 #[test]
 fn object_builtin_shadowing_and_rejections() {
     use std::process::Command;
@@ -332,8 +332,6 @@ fn object_builtin_shadowing_and_rejections() {
         );
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
-    // An out-of-scope static is a spanned compile error.
-    assert!(jsc_stderr("Object.assign({},{})").contains("unsupported Object method"));
     // A wrong argument count is a spanned compile error.
     assert!(jsc_stderr("Object.keys()").contains("expects 1 argument"));
 }

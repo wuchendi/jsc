@@ -714,21 +714,14 @@ impl LowerCtx<'_> {
         for arg in &call.args {
             args.push(self.lower_expr(&arg.expr)?);
         }
-        // `console.log(..)` is a host print, not a user-function call. It
-        // is recognized by its `console.log` member callee (a `console` identifier
-        // that resolves to no binding) and lowered to `IrNode::ConsoleLog` so the
-        // backend emits calls to the host `print` import.
-        if is_console_log(callee_expr) && self.inline_namespace("console") {
-            return Ok(IrNode::ConsoleLog { args });
-        }
-        // `Math.<name>(..)` is a built-in method, not a user-function call.
-        // Like `console`, `Math` is not a real binding: recognize it syntactically
-        // (only when nothing named `Math` shadows it) and lower to an `IrNode::MathCall`
-        // whose arity is validated here.
-        if let Some(name) = math_method_name(callee_expr)
-            && self.inline_namespace("Math")
+        // `N.m(..)` on an unshadowed builtin namespace (`Math`, `JSON`,
+        // `console`, `Object`, `Promise`, `Date`): the inline code, guarded
+        // unless `N` is inline (design 3.2 row 2); any other member is an
+        // ordinary method call on the namespace object.
+        if let Expr::Member(member) = callee_expr.as_ref()
+            && let Some((namespace, key)) = self.namespace_member(member)
         {
-            return lower_math_call(name, args, callee_expr.span());
+            return self.lower_namespace_call(namespace, key, member, args);
         }
         // `recv.push(x)` / `recv.pop()` are growing array methods, dispatched
         // syntactically by method name (kept distinct from `x[i]` element
@@ -760,47 +753,6 @@ impl LowerCtx<'_> {
             && let Some(op) = non_callback_method_op(id.sym.as_ref())
         {
             return self.lower_method_call(op, id.sym.as_ref(), &member.obj, args);
-        }
-        // `Object.keys/values/entries(o)` keep their inline
-        // `IrNode::ObjectBuiltin` (method name and arity validated here) while
-        // `Object` is the unshadowed, sealed, non-escaping global (design 3.2);
-        // otherwise the call reads the static from the `Object` value.
-        if let Some(name) = object_method_name(callee_expr)
-            && self.inline_namespace("Object")
-        {
-            return lower_object_call(name, args, callee_expr.span());
-        }
-        // `JSON.stringify(v)` / `JSON.parse(s)` keep their inline nodes while
-        // `JSON` is inline (as `Object` above).
-        if let Some(name) = json_method_name(callee_expr)
-            && self.inline_namespace("JSON")
-        {
-            return lower_json_call(name, args, callee_expr.span());
-        }
-        // `Promise.resolve(v)` / `Promise.reject(v)`: the inline promise nodes
-        // while `Promise` is inline (as `Object` above).
-        if let Some(name) = promise_static_method_name(callee_expr)
-            && self.inline_namespace("Promise")
-        {
-            return lower_promise_static(name, args, callee_expr.span());
-        }
-        // `Date.now()`: the host wall clock as a number, inline while `Date` is
-        // inline (as `Object` above); any argument is rejected.
-        if let Expr::Member(member) = callee_expr.as_ref()
-            && let Expr::Ident(obj) = member.obj.as_ref()
-            && obj.sym.as_ref() == "Date"
-            && let MemberProp::Ident(id) = &member.prop
-            && id.sym.as_ref() == "now"
-            && self.inline_namespace("Date")
-        {
-            if !args.is_empty() {
-                return Err(CompileError::spanned(
-                    callee_expr.span(),
-                    "Date.now() takes no arguments",
-                )
-                .into());
-            }
-            return Ok(IrNode::DateNow);
         }
         // `d.getTime()`: the millisecond timestamp of a Date receiver.
         // Claimed for ANY receiver (a non-Date yields `NaN`); a user method named
@@ -908,6 +860,69 @@ impl LowerCtx<'_> {
         }
     }
 
+    /// The `(namespace, key)` of a static member `N.key` on an unshadowed
+    /// builtin namespace `N`.
+    fn namespace_member<'m>(
+        &mut self,
+        member: &'m swc_ecma_ast::MemberExpr,
+    ) -> Option<(&'m str, &'m str)> {
+        let (Expr::Ident(obj), MemberProp::Ident(key)) = (member.obj.as_ref(), &member.prop) else {
+            return None;
+        };
+        let namespace = obj.sym.as_ref();
+        (globals::NAMESPACES.contains(&namespace)
+            && self.resolve(namespace).is_none()
+            && !self.shared.funcs.contains_key(namespace))
+        .then_some((namespace, key.sym.as_ref()))
+    }
+
+    /// Lower `namespace.key(args)` (design 3.2 row 2). An inline namespace
+    /// keeps exactly the inline code; otherwise the inline code runs behind an
+    /// [`IrNode::NamespaceGuard`] over the namespace value. A member without
+    /// inline code (or a guarded call whose arity the inline code rejects) is
+    /// an ordinary method call: an unknown member reads `undefined` and throws
+    /// `N.key is not a function` at run time.
+    fn lower_namespace_call(
+        &mut self,
+        namespace: &str,
+        key: &str,
+        member: &swc_ecma_ast::MemberExpr,
+        args: Vec<IrNode>,
+    ) -> anyhow::Result<IrNode> {
+        if !inline_member(namespace, key) {
+            return self.lower_method_call_user(member, args);
+        }
+        if self.shared.globals.inline(namespace) {
+            return lower_namespace_call(namespace, key, args, member.span());
+        }
+        let arg_locals: Vec<u32> = args.iter().map(|_| self.fresh()).collect();
+        let locals: Vec<IrNode> = arg_locals.iter().map(|&l| IrNode::Local(l)).collect();
+        let Ok(fast) = lower_namespace_call(namespace, key, locals.clone(), member.span()) else {
+            return self.lower_method_call_user(member, args);
+        };
+        let Some(global) = GlobalIntrinsic::from_name(namespace) else {
+            return self.lower_method_call_user(member, args);
+        };
+        let obj_local = self.fresh();
+        let slow = IrNode::MethodCallUser {
+            obj: Box::new(IrNode::Local(obj_local)),
+            key: Box::new(IrNode::Str(key.to_owned())),
+            args: locals,
+            obj_local,
+            not_callable: not_a_function(member_source_name(member).as_deref()),
+        };
+        Ok(IrNode::NamespaceGuard {
+            namespace: global,
+            key: key.to_owned(),
+            obj: Box::new(self.global_read(namespace)),
+            obj_local,
+            args,
+            arg_locals,
+            fast: Box::new(fast),
+            slow: Box::new(slow),
+        })
+    }
+
     /// Lower a promise / generator instance method `recv.<op>(args)` into an
     /// [`IrNode::ReceiverMethod`]. Mirrors [`Self::lower_map_method`]: the receiver
     /// is lowered once and two fresh temps are reserved for the runtime TYPE-BYTE
@@ -969,18 +984,28 @@ impl LowerCtx<'_> {
         if let Some(name) = math_method_name(callee_expr)
             && self.inline_namespace("Math")
         {
-            let op = match name {
-                "max" => MathOp::Max,
-                "min" => MathOp::Min,
-                _ => {
+            match name {
+                "max" => {
+                    return Ok(IrNode::MathSpread {
+                        op: MathOp::Max,
+                        args,
+                    });
+                }
+                "min" => {
+                    return Ok(IrNode::MathSpread {
+                        op: MathOp::Min,
+                        args,
+                    });
+                }
+                _ if math_op(name).is_some() => {
                     return Err(CompileError::spanned(
                         call.span(),
                         format!("spread arguments are unsupported for Math.{name}"),
                     )
                     .into());
                 }
-            };
-            return Ok(IrNode::MathSpread { op, args });
+                _ => {}
+            }
         }
 
         let Expr::Ident(ident) = callee_expr else {
@@ -1137,15 +1162,58 @@ impl LowerCtx<'_> {
             (tmp, recv)
         };
         let not_array = method_not_a_function(obj, method);
-        let grow = match value {
-            Some(value) => IrNode::ArrayPush {
-                local,
-                value: Box::new(value),
-                not_array: Some(not_array),
-            },
-            None => IrNode::ArrayPop { local, not_array },
+        if self.shared.globals.intrinsics_sealed() {
+            let grow = match value {
+                Some(value) => IrNode::ArrayPush {
+                    local,
+                    value: Box::new(value),
+                    not_array: Some(not_array),
+                },
+                None => IrNode::ArrayPop { local, not_array },
+            };
+            return Ok(IrNode::Seq(vec![nullish_check(recv, method), grow]));
+        }
+        // `Array.prototype` may be written: a user `push`/`pop` found on the
+        // receiver once its dirty bit is set wins (design 3.2 row 3). The
+        // argument is evaluated once, before the guard.
+        let mut seq = vec![nullish_check(recv, method)];
+        let (grow, args) = match value {
+            Some(value) => {
+                let tmp = self.fresh();
+                seq.push(IrNode::Assign {
+                    local: tmp,
+                    value: Box::new(value),
+                });
+                let push = IrNode::ArrayPush {
+                    local,
+                    value: Box::new(IrNode::Local(tmp)),
+                    not_array: Some(not_array.clone()),
+                };
+                (push, vec![IrNode::Local(tmp)])
+            }
+            None => (
+                IrNode::ArrayPop {
+                    local,
+                    not_array: not_array.clone(),
+                },
+                Vec::new(),
+            ),
         };
-        Ok(IrNode::Seq(vec![nullish_check(recv, method), grow]))
+        let user = IrNode::MethodCallUser {
+            obj: Box::new(IrNode::Local(local)),
+            key: Box::new(IrNode::Str(method.to_owned())),
+            args,
+            obj_local: self.fresh(),
+            not_callable: not_array,
+        };
+        seq.push(IrNode::ProtoGuard {
+            proto: BuiltinCtor::Array,
+            key: method.to_owned(),
+            recv: Box::new(IrNode::Local(local)),
+            fast: Box::new(grow),
+            user: Box::new(user),
+        });
+        Ok(IrNode::Seq(seq))
     }
 
     /// Lower a higher-order array method call `array.map/filter/reduce/forEach(...)`.
@@ -1324,10 +1392,10 @@ impl LowerCtx<'_> {
         let name = member_method_name(member);
         // Reaching this generic path means the name matched none of the
         // built-in string/array/Map/Set methods. A receiver whose type is a
-        // statically-known PRIMITIVE (string/number/boolean literal) or an
-        // ARRAY literal can never carry a user-defined method, so the call is
-        // provably unknown — reject it with a span diagnostic instead of emitting
-        // a `call_indirect` the wasm validator (or runtime) would reject.
+        // statically-known PRIMITIVE (string/number/boolean literal) has no
+        // prototype methods yet (S5), so the call is rejected with a span
+        // diagnostic. An array literal reads the method from
+        // `%Array.prototype%` at run time.
         if static_primitive_receiver(&member.obj) {
             return Err(unknown_method_error(member.span(), name.as_deref()));
         }
@@ -2227,14 +2295,14 @@ fn method_not_a_function(obj: &Expr, method: &str) -> CalleeError {
 }
 
 /// Whether the receiver's type is a statically-known primitive (string / number /
-/// boolean / template string) or an array literal. A `null` receiver is not
+/// boolean / template string). A `null` receiver is not
 /// listed: its method lookup throws a runtime `TypeError` instead. Such a receiver
 /// can never carry a user-defined method, so a method name that reached the
 /// generic user-method path (i.e. matched no built-in) is provably unknown.
 fn static_primitive_receiver(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(p) => static_primitive_receiver(&p.expr),
-        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_)) | Expr::Tpl(_) | Expr::Array(_) => true,
+        Expr::Lit(Lit::Str(_) | Lit::Num(_) | Lit::Bool(_)) | Expr::Tpl(_) => true,
         _ => false,
     }
 }
@@ -2263,9 +2331,9 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
 /// `getTime`), which take no spread.
 fn spread_rejecting_member(callee: &Expr, member: &swc_ecma_ast::MemberExpr) -> bool {
     is_console_log(callee)
-        || object_method_name(callee).is_some()
-        || json_method_name(callee).is_some()
-        || promise_static_method_name(callee).is_some()
+        || object_method_name(callee).is_some_and(|name| inline_member("Object", name))
+        || json_method_name(callee).is_some_and(|name| inline_member("JSON", name))
+        || promise_static_method_name(callee).is_some_and(|name| inline_member("Promise", name))
         || matches!(&member.prop, MemberProp::Ident(id) if {
             let name = id.sym.as_ref();
             matches!(name, "push" | "pop" | "map" | "filter" | "reduce" | "forEach" | "getTime")

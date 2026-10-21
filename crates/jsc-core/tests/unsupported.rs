@@ -110,13 +110,6 @@ fn rejects_unknown_string_method() {
 }
 
 #[test]
-fn rejects_unknown_array_method() {
-    assert_unknown_method("[1, 2].flat()", "flat");
-    assert_unknown_method("[1, 2, 3].reverse()", "reverse");
-    assert_unknown_method("[].concat([1])", "concat");
-}
-
-#[test]
 fn unknown_object_method_throws_at_runtime() {
     // Objects are dynamic: a method absent from the receiver reads `undefined`,
     // so calling it is an uncaught `TypeError` at run time, not a compile error.
@@ -256,7 +249,6 @@ fn rejects_unknown_method_even_with_functions_present() {
     // A primitive-literal receiver is rejected regardless of whether the program
     // also defines functions (which would otherwise emit a funcref table).
     assert_unknown_method("function f() { return 1 } \"x\".zzz()", "zzz");
-    assert_unknown_method("let id = (x) => x; [1].flat()", "flat");
 }
 
 #[test]
@@ -272,6 +264,9 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "let o = { a: 1 }; o = { b: 2 }; o.zzz()",
         "TypeError: o.zzz is not a function",
     );
+    // An array literal reads its methods from `%Array.prototype%` at run time.
+    assert_uncaught("[1, 2].flat()", "TypeError: expression is not a function");
+    assert_uncaught("[].concat([1])", "TypeError: expression is not a function");
     // A builtin-named method's user-method fallback throws too.
     assert_uncaught("let o = {}; o.get(1)", "TypeError: o.get is not a function");
     assert_uncaught(

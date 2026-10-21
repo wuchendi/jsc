@@ -393,7 +393,7 @@ pub(crate) const ACCESSOR_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 + 8;
 
 /// TYPE BYTE of an own-property table (internal, never a user value), the
 /// block an object-family `props` slot points at:
-/// `[type=12][pad][tflags:u8][pad][count:u32 @4][cap:u32 @8][live:u32 @12]`
+/// `[type=12][pad][tflags:u8][watch bit:u8][count:u32 @4][cap:u32 @8][live:u32 @12]`
 /// followed by `cap` [`PROP_ENTRY_SIZE`]-byte entries
 /// `[key:u32][attrs:u32][value:i64]` from [`PROPS_HEADER_SIZE`]. `key` is an
 /// interned string block base (`0` = a deleted entry's tombstone), `count` the
@@ -403,7 +403,7 @@ pub(crate) const ACCESSOR_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 + 8;
 pub(crate) const TYPE_PROPS: u8 = 12;
 
 /// Byte offset (from a [`TYPE_PROPS`] block base) of the `tflags` byte
-/// ([`PROPS_HAS_INDEX_KEYS`], [`PROPS_HAS_NON_ENUM`]).
+/// ([`PROPS_HAS_INDEX_KEYS`], [`PROPS_HAS_NON_ENUM`], [`PROPS_WATCHED`]).
 pub(crate) const PROPS_TFLAGS_OFFSET: u32 = 2;
 
 /// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `count`.
@@ -439,6 +439,15 @@ pub(crate) const PROPS_HAS_INDEX_KEYS: u8 = 1;
 
 /// [`TYPE_PROPS`] `tflags` bit: some entry lacks [`ATTR_ENUMERABLE`].
 pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
+
+/// [`TYPE_PROPS`] `tflags` bit: the table belongs to a watched intrinsic
+/// (design 3.3); its byte [`PROPS_WATCH_BIT_OFFSET`] holds the intrinsic's
+/// dirty-bit index. A rebuilt table keeps both.
+pub(crate) const PROPS_WATCHED: u8 = 4;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of a watched table's u8
+/// dirty-bit index.
+pub(crate) const PROPS_WATCH_BIT_OFFSET: u32 = 3;
 
 /// TYPE BYTE of an array element store (internal, never a user value), the
 /// block a [`TYPE_ARRAY`] handle's `elems` slot points at:

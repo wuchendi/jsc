@@ -322,6 +322,12 @@ pub(super) fn emit_node(
         node @ IrNode::ThisCall { .. } => {
             emit_this_call(node, function, scratch, strings, helpers);
         }
+        node @ IrNode::NamespaceGuard { .. } => {
+            emit_namespace_guard(node, function, scratch, strings, helpers);
+        }
+        node @ IrNode::ProtoGuard { .. } => {
+            emit_proto_guard(node, function, scratch, strings, helpers);
+        }
         IrNode::ThisGlobal => {
             // Snapshot read of the `this`-binding carrier; emitted only in a
             // function/arrow prologue.
@@ -794,6 +800,139 @@ pub(super) fn emit_this_call(
     });
     // The parent constructor/method can throw; unwind if it left one pending.
     emit_propagate_if_pending(function, helpers);
+}
+
+/// Emit a guarded namespace member call ([`IrNode::NamespaceGuard`], design
+/// 3.2 row 2), leaving its result on the stack. The namespace value and the
+/// arguments are evaluated once into their scratch locals; the fast path runs
+/// when the value is the intrinsic with its dirty bit clear (a watched
+/// namespace), or when the member read from it is still the builtin method.
+pub(super) fn emit_namespace_guard(
+    node: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let IrNode::NamespaceGuard {
+        namespace,
+        key,
+        obj,
+        obj_local,
+        args,
+        arg_locals,
+        fast,
+        slow,
+    } = node
+    else {
+        unreachable!("emit_namespace_guard is only called with a NamespaceGuard node")
+    };
+    emit_node(obj, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(*obj_local));
+    for (arg, &local) in args.iter().zip(arg_locals) {
+        emit_node(arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(local));
+    }
+    let intrinsic = Intrinsic::from(*namespace);
+    let Some(builtin) = realm::method_of(intrinsic, key) else {
+        emit_node(slow, function, scratch, strings, helpers);
+        return;
+    };
+    // `obj.key === %builtin%`: the member read, compared with the constant.
+    let read_compare = |function: &mut Function| {
+        emit_index_node(
+            &IrNode::Local(*obj_local),
+            &IrNode::Str(key.clone()),
+            true,
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+        function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
+        function.instruction(&Instruction::I64Eq);
+    };
+    if let Some(bit) = intrinsic.watch_bit() {
+        // The intrinsic itself, never written: no member read needed.
+        function.instruction(&Instruction::LocalGet(*obj_local));
+        function.instruction(&Instruction::I64Const(intrinsic_bits(intrinsic, helpers)));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+        function.instruction(&Instruction::I32Const(1 << bit));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Else);
+        enter_frame(helpers);
+        read_compare(function);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    } else {
+        read_compare(function);
+    }
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    emit_node(fast, function, scratch, strings, helpers);
+    function.instruction(&Instruction::Else);
+    emit_node(slow, function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// Emit a guarded syntactic receiver method ([`IrNode::ProtoGuard`], design
+/// 3.2 row 3), leaving its result on the stack: while the prototype's dirty
+/// bit is clear the fast path runs with no member read; once it is set, a
+/// function found at `recv.key` (a user override) is called instead.
+pub(super) fn emit_proto_guard(
+    node: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let IrNode::ProtoGuard {
+        proto,
+        key,
+        recv,
+        fast,
+        user,
+    } = node
+    else {
+        unreachable!("emit_proto_guard is only called with a ProtoGuard node")
+    };
+    let Some(bit) = realm::prototype_of(*proto).watch_bit() else {
+        emit_node(fast, function, scratch, strings, helpers);
+        return;
+    };
+    function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+    function.instruction(&Instruction::I32Const(1 << bit));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    enter_frame(helpers);
+    emit_index_node(
+        recv,
+        &IrNode::Str(key.clone()),
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    function.instruction(&Instruction::LocalSet(scratch));
+    emit_is_function(function, scratch);
+    leave_frame(helpers);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    emit_node(user, function, scratch, strings, helpers);
+    function.instruction(&Instruction::Else);
+    emit_node(fast, function, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// Emit `new callee(args)` ([`IrNode::Construct`], design 4.5), leaving the

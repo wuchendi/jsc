@@ -1,22 +1,39 @@
 //! The program-level global facts of design 3.2, computed once by a
 //! whole-program syntactic scan before lowering: whether a global name is
 //! `sealed` (its value is the intrinsic it starts as, so a read compiles to
-//! the constant address) and whether a namespace additionally never escapes
-//! (so `N.m(..)` / `N.k` keep today's inline code).
+//! the constant address), whether a namespace additionally never escapes
+//! (so `N.m(..)` / `N.k` keep today's inline code), and whether the program is
+//! intrinsics-sealed (no builtin prototype can be mutated, so the dirty-bit
+//! guards of the syntactic receiver methods fold away).
 
 use std::collections::HashSet;
 
 use swc_ecma_ast::{
-    AssignExpr, AssignTarget, BinExpr, BinaryOp, CallExpr, Callee, Class, Expr, ForHead, Function,
-    GetterProp, MemberExpr, MemberProp, NewExpr, Program, SetterProp, SimpleAssignTarget,
-    UnaryExpr, UnaryOp, UpdateExpr,
+    AssignExpr, AssignTarget, BinExpr, BinaryOp, CallExpr, Callee, Class, Constructor, Expr,
+    ForHead, Function, GetterProp, Ident, IdentName, MemberExpr, MemberProp, NewExpr, Program,
+    SetterProp, SimpleAssignTarget, Str, UnaryExpr, UnaryOp, UpdateExpr,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
+use super::op::inline_member;
 use crate::ir::{BuiltinCtor, ErrorKind};
 
 /// The global objects whose members have inline fast paths.
-const NAMESPACES: [&str; 6] = ["Math", "JSON", "console", "Object", "Promise", "Date"];
+pub(super) const NAMESPACES: [&str; 6] = ["Math", "JSON", "console", "Object", "Promise", "Date"];
+
+/// The names whose presence lets a program reach and mutate a builtin
+/// prototype (design 3.2 intrinsics-sealed).
+const PROTOTYPE_REACHING: [&str; 9] = [
+    "prototype",
+    "constructor",
+    "__proto__",
+    "getPrototypeOf",
+    "setPrototypeOf",
+    "defineProperty",
+    "defineProperties",
+    "assign",
+    "Reflect",
+];
 
 /// Whether `callee(..)` keeps its syntactic lowering while `callee` names the
 /// unshadowed builtin (the conversions and the Error family).
@@ -48,6 +65,8 @@ pub(super) struct GlobalFacts {
     member_value: bool,
     /// The widest argument list of any call or `new`.
     max_call_args: usize,
+    /// Some [`PROTOTYPE_REACHING`] name occurs.
+    reaches_prototypes: bool,
 }
 
 impl GlobalFacts {
@@ -70,6 +89,14 @@ impl GlobalFacts {
     /// Whether `name.m(..)` / `name.k` keep the inline namespace code.
     pub(super) fn inline(&self, name: &str) -> bool {
         self.sealed(name) && !self.escaped.contains(name)
+    }
+
+    /// Whether the program is intrinsics-sealed (design 3.2): none of
+    /// [`PROTOTYPE_REACHING`] occurs as an identifier, a member or property
+    /// name, or a string literal (a class constructor's own key excepted), so
+    /// no builtin prototype can be reached and mutated.
+    pub(super) fn intrinsics_sealed(&self) -> bool {
+        !self.reaches_prototypes
     }
 
     /// Whether a builtin namespace method or constructor can be called
@@ -106,6 +133,7 @@ impl Scan {
     /// Record a read of `name`; `escapes` when not a static member read or
     /// call.
     fn read(&mut self, name: &str, escapes: bool) {
+        self.name(name);
         self.facts.referenced.insert(name.to_owned());
         if escapes {
             self.facts.escaped.insert(name.to_owned());
@@ -124,8 +152,16 @@ impl Scan {
     fn member_write(&mut self, member: &MemberExpr) {
         if let Expr::Ident(obj) = member.obj.as_ref() {
             self.read(obj.sym.as_ref(), true);
+            member.prop.visit_with(self);
         } else {
             member.visit_with(self);
+        }
+    }
+
+    /// Record a name that may reach a builtin prototype.
+    fn name(&mut self, name: &str) {
+        if PROTOTYPE_REACHING.contains(&name) {
+            self.facts.reaches_prototypes = true;
         }
     }
 
@@ -154,6 +190,7 @@ impl Visit for Scan {
                         self.facts.member_value = true;
                     }
                     self.read(name, false);
+                    member.prop.visit_with(self);
                 }
                 None => expr.visit_children_with(self),
             },
@@ -174,6 +211,17 @@ impl Visit for Scan {
         };
         if let Some(name) = name {
             self.read(name, false);
+            if let Expr::Member(member) = callee.as_ref() {
+                member.prop.visit_with(self);
+                // A namespace member without inline code is called through
+                // its value.
+                if let MemberProp::Ident(key) = &member.prop
+                    && NAMESPACES.contains(&name)
+                    && !inline_member(name, key.sym.as_ref())
+                {
+                    self.facts.member_value = true;
+                }
+            }
             call.args.visit_with(self);
         } else {
             call.visit_children_with(self);
@@ -246,9 +294,30 @@ impl Visit for Scan {
     }
 
     fn visit_binding_ident(&mut self, id: &swc_ecma_ast::BindingIdent) {
+        self.name(id.id.sym.as_ref());
         if self.target {
             self.facts.assigned.insert(id.id.sym.as_ref().to_owned());
         }
+    }
+
+    fn visit_ident(&mut self, id: &Ident) {
+        self.name(id.sym.as_ref());
+    }
+
+    fn visit_ident_name(&mut self, id: &IdentName) {
+        self.name(id.sym.as_ref());
+    }
+
+    fn visit_str(&mut self, s: &Str) {
+        if let Some(s) = s.value.as_str() {
+            self.name(s);
+        }
+    }
+
+    fn visit_constructor(&mut self, ctor: &Constructor) {
+        // The `constructor` key itself reaches nothing.
+        ctor.params.visit_with(self);
+        ctor.body.visit_with(self);
     }
 
     fn visit_function(&mut self, function: &Function) {
