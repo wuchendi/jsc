@@ -273,4 +273,9 @@ fn rendering_lists_own_properties_only() {
     assert_eval("({ a: 1 })", "{ a: 1 }");
     assert_output("console.log({}, { a: 1 })", "{} { a: 1 }\n");
     assert_output("class A { m() {} } console.log(new A())", "A {}\n");
+    // A prototype object's own `constructor` back-link does not name it.
+    assert_output(
+        "class E {} class B extends E {} function F() {} console.log(E.prototype, B.prototype, F.prototype, new F())",
+        "{} E {} {} F {}\n",
+    );
 }
