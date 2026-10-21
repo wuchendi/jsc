@@ -466,8 +466,9 @@ fn table_entries(ptr: usize, memory: &[u8]) -> Vec<(Option<u32>, String, u32, u6
 /// Resolve a heap object block at base `ptr` from its own enumerable
 /// properties ([`decode_props`]). An object of class `ERROR` decodes as
 /// [`Value::Error`] with its (possibly inherited) `name` and `message`; an
-/// object with a prototype whose `constructor` names a function other than
-/// `Object` decodes as [`Value::Instance`].
+/// object whose prototype chain (from its prototype, so a prototype object's
+/// own `constructor` back-link does not name it) holds a `constructor` naming
+/// a function other than `Object` decodes as [`Value::Instance`].
 fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     use crate::abi;
     if memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize) == Some(&CLASS_ERROR) {
@@ -486,11 +487,9 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     if memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize) == Some(&abi::CLASS_ARGUMENTS) {
         return Value::Arguments(entries);
     }
-    let has_proto = read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize)
-        .is_some_and(|bits| heap_object(bits, memory).is_some());
-    let class = has_proto
-        .then(|| lookup_data(ptr, "constructor", memory))
-        .flatten()
+    let class = read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize)
+        .and_then(|bits| heap_object(bits, memory))
+        .and_then(|proto| lookup_data(proto, "constructor", memory))
         .and_then(|bits| function_name(bits, memory))
         .filter(|name| !name.is_empty() && name != "Object");
     match class {

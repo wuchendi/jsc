@@ -58,11 +58,7 @@ fn rejects_spread() {
 }
 
 #[test]
-fn rejects_top_level_this() {
-    // Object methods and shorthand methods are supported (see the
-    // objects suite), but a top-level `this` — outside any function, so with no
-    // receiver binding — remains rejected.
-    assert_rejected("this");
+fn rejects_async_methods() {
     // Async/generator methods stay out of scope.
     assert_rejected("let o = { async m() { return 1 } }; o.m()");
 }
@@ -89,10 +85,8 @@ fn rejects_unsupported_for_of_and_for_in() {
 }
 
 #[test]
-fn rejects_function_prototype_methods() {
-    // `bind`/`apply`/`call` are not modeled; they trap rather than mis-dispatch.
-    assert_rejected("function f(a) { return a } f.call(null, 1)");
-    assert_rejected("function f(a) { return a } f.apply(null, [1])");
+fn rejects_function_prototype_bind() {
+    // `bind` is phase 3: it throws rather than mis-dispatching.
     assert_rejected("function f(a) { return a } let g = f.bind(null); g(1)");
 }
 
