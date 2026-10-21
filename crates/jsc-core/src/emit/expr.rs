@@ -275,35 +275,25 @@ pub(super) fn emit_node(
         IrNode::MathSpread { op, args } => {
             emit_math_spread(*op, args, function, scratch, strings, helpers);
         }
-        IrNode::ArrayPush {
-            local,
-            value,
-            not_array,
-        } => {
-            emit_array_push_node(
-                *local,
-                value,
-                not_array.as_ref(),
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+        IrNode::ArrayPush { local, value } => {
+            emit_array_push_node(*local, value, function, scratch, strings, helpers);
         }
-        IrNode::ArrayPop { local, not_array } => {
-            emit_array_pop_node(*local, not_array, function, scratch, strings, helpers);
+        IrNode::ArrayPop { local } => {
+            emit_array_pop_node(*local, function, scratch, helpers);
         }
         IrNode::ArrayHof {
             op,
             array,
             callback,
             init,
+            this_arg,
         } => {
             emit_array_hof(
                 *op,
                 array,
                 callback,
                 init.as_deref(),
+                this_arg.as_deref(),
                 function,
                 scratch,
                 strings,
@@ -881,10 +871,13 @@ pub(super) fn emit_namespace_guard(
     function.instruction(&Instruction::End);
 }
 
-/// Emit a guarded syntactic receiver method ([`IrNode::ProtoGuard`], design
-/// 3.2 row 3), leaving its result on the stack: while the prototype's dirty
-/// bit is clear the fast path runs with no member read; once it is set, a
-/// function found at `recv.key` (a user override) is called instead.
+/// Emit a builtin method call with a guarded fast path ([`IrNode::ProtoGuard`],
+/// design 3.2 row 3), leaving its result on the stack. `recv.key` is provably
+/// the builtin while `recv` is a block of the prototype's kind with no own
+/// properties whose `proto` is the prototype and (unless the program is
+/// intrinsics-sealed) the prototype's dirty bit is clear: then the fast path
+/// runs with no member read; else a string receiver takes the string path,
+/// and anything else the generic method call.
 pub(super) fn emit_proto_guard(
     node: &IrNode,
     function: &mut Function,
@@ -894,45 +887,91 @@ pub(super) fn emit_proto_guard(
 ) {
     let IrNode::ProtoGuard {
         proto,
-        key,
+        sealed,
         recv,
         fast,
-        user,
+        string,
+        slow,
     } = node
     else {
         unreachable!("emit_proto_guard is only called with a ProtoGuard node")
     };
-    let Some(bit) = realm::prototype_of(*proto).watch_bit() else {
-        emit_node(fast, function, scratch, strings, helpers);
-        return;
+    let mut opened = 0;
+    let local = if let IrNode::Local(local) = **recv {
+        local
+    } else {
+        emit_node(recv, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(scratch));
+        scratch
     };
-    function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
-    function.instruction(&Instruction::I32Const(1 << bit));
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    enter_frame(helpers);
-    emit_index_node(
-        recv,
-        &IrNode::Str(key.clone()),
-        false,
-        function,
-        scratch,
-        strings,
-        helpers,
-    );
-    function.instruction(&Instruction::LocalSet(scratch));
-    emit_is_function(function, scratch);
-    leave_frame(helpers);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    enter_frame(helpers);
-    emit_node(user, function, scratch, strings, helpers);
-    function.instruction(&Instruction::Else);
-    emit_node(fast, function, scratch, strings, helpers);
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
+    if let Some(fast) = fast {
+        let prototype = realm::prototype_of(*proto);
+        emit_is_pointer(function, local);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalTee(scratch + 3));
+        // One load of the header word and the `props` word behind it: the kind
+        // byte matches and `props == 0`.
+        function.instruction(&Instruction::I64Load(MemArg {
+            offset: 0,
+            align: 3,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
+        function.instruction(&Instruction::I64And);
+        function.instruction(&Instruction::I64Const(i64::from(proto_kind(*proto))));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::LocalGet(scratch + 3));
+        function.instruction(&Instruction::I64Load(MemArg {
+            offset: OBJ_PROTO_OFFSET,
+            align: 3,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I64Const(intrinsic_bits(prototype, helpers)));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::I32And);
+        if !*sealed && let Some(bit) = prototype.watch_bit() {
+            function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+            function.instruction(&Instruction::I32Const(1 << bit));
+            function.instruction(&Instruction::I32And);
+            function.instruction(&Instruction::I32Eqz);
+            function.instruction(&Instruction::I32And);
+        }
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        enter_frame(helpers);
+        emit_node(fast, function, scratch, strings, helpers);
+        function.instruction(&Instruction::Else);
+        opened += 1;
+    }
+    if let Some(string) = string {
+        emit_is_string(function, local);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        enter_frame(helpers);
+        emit_node(string, function, scratch, strings, helpers);
+        function.instruction(&Instruction::Else);
+        opened += 1;
+    }
+    emit_node(slow, function, scratch, strings, helpers);
+    for _ in 0..opened {
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
+}
+
+/// The bits of an object's first eight bytes holding its kind byte and its
+/// `props` word.
+const KIND_AND_PROPS_MASK: i64 = 0xffff_ffff_0000_00ff_u64.cast_signed();
+
+/// The kind byte of the objects whose prototype is `%proto%`.
+fn proto_kind(proto: BuiltinCtor) -> i32 {
+    match proto {
+        BuiltinCtor::Array => TYPE_ARRAY,
+        _ => TYPE_OBJECT,
+    }
 }
 
 /// Emit `new callee(args)` ([`IrNode::Construct`], design 4.5), leaving the
