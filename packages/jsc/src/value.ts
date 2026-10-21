@@ -695,7 +695,7 @@ export function toJsString(value: Value): string {
  * separated by `sep`; a run of `N` holes contributes `N` empty pieces (mirrors
  * `value.rs::join_elements`).
  */
-export function joinElements(items: Value[], sep: string): string {
+function joinElements(items: Value[], sep: string): string {
   const pieces: string[] = []
   for (const v of items) {
     if (v.kind === 'holes') {

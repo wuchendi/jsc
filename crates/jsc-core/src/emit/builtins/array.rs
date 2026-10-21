@@ -15,12 +15,16 @@ const MAP_NOT_CALLABLE: CalleeErrorText<'static> = [
     "TypeError: Array.prototype.map callback is not a function",
 ];
 
+/// The key `Array.prototype.toString` calls on a non-array receiver.
+const JOIN: &str = "join";
+
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 4] = [
+pub(super) const STRINGS: [&str; 5] = [
     MAP_NULLISH[0],
     MAP_NULLISH[1],
     MAP_NOT_CALLABLE[0],
     MAP_NOT_CALLABLE[1],
+    JOIN,
 ];
 
 /// `Array.prototype.map(callback, thisArg)`, generic over array-likes:
@@ -98,5 +102,44 @@ pub(super) fn emit_map(
         Br(0),
         End, End,
         LocalGet(dst), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+    );
+}
+
+/// `Array.prototype.toString()`: an array joins with `","`; any other
+/// receiver calls its own `join` when callable, else
+/// `%Object.prototype.toString%`.
+pub(super) fn emit_to_string(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (this, join, base) = (frame.i64(0), frame.i64(1), frame.i32(0));
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
+    emit_is_pointer(function, this);
+    wasm!(function; If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, this);
+    wasm!(function;
+        I32Const(TYPE_ARRAY), I32Eq,
+        Else, I32Const(0), End,
+        If(BlockType::Empty),
+        LocalGet(this), I64Const(UNDEFINED_BITS), Call(helpers.array_join()), Return,
+        End,
+    );
+    object::require_object_coercible(function, frame, this, strings, helpers);
+    wasm!(function; LocalGet(this), I32Const(static_key(strings, JOIN)), Call(helpers.get), LocalSet(join));
+    return_if_pending(function);
+    emit_is_function(function, join);
+    wasm!(function; If(BlockType::Result(ValType::I64)));
+    emit_accessor_call(function, join, this, None, base, helpers);
+    wasm!(function; Else);
+    for _ in 0..frame.k {
+        wasm!(function; I64Const(UNDEFINED_BITS));
+    }
+    wasm!(function;
+        LocalGet(this), GlobalSet(THIS_GLOBAL),
+        I64Const(UNDEFINED_BITS), I64Const(0),
+        Call(helpers.builtin(Builtin::ObjectToString)),
+        End,
     );
 }

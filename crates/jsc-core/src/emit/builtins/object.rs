@@ -20,10 +20,14 @@ const TAG_FUNCTION: &str = "[object Function]";
 const TAG_DATE: &str = "[object Date]";
 const TAG_ERROR: &str = "[object Error]";
 const TAG_ARGUMENTS: &str = "[object Arguments]";
+const TAG_MAP: &str = "[object Map]";
+const TAG_SET: &str = "[object Set]";
+const TAG_PROMISE: &str = "[object Promise]";
+const TAG_GENERATOR: &str = "[object Generator]";
 const TAG_OBJECT: &str = "[object Object]";
 
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 13] = [
+pub(super) const STRINGS: [&str; 17] = [
     NULLISH_TO_OBJECT[0],
     NULLISH_TO_OBJECT[1],
     TAG_UNDEFINED,
@@ -37,11 +41,15 @@ pub(super) const STRINGS: [&str; 13] = [
     TAG_ERROR,
     TAG_ARGUMENTS,
     TAG_OBJECT,
+    TAG_MAP,
+    TAG_SET,
+    TAG_PROMISE,
+    TAG_GENERATOR,
 ];
 
 /// Throw the `ToObject` `TypeError` when the `this` value in `this` is
 /// `undefined` or `null`.
-fn require_object_coercible(
+pub(super) fn require_object_coercible(
     function: &mut Function,
     frame: Frame,
     this: u32,
@@ -75,7 +83,7 @@ pub(super) fn emit_has_own_property(
 }
 
 /// `Object.prototype.toString()`: `"[object <tag>]"` with the builtin tag of
-/// `this` (`Symbol.toStringTag` is phase 3).
+/// `this`, Map/Set/Promise/Generator by kind (`Symbol.toStringTag` is phase 3).
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
@@ -105,6 +113,12 @@ pub(super) fn emit_to_string(
         (TYPE_ARRAY, TAG_ARRAY),
         (TYPE_FUNCTION, TAG_FUNCTION),
         (TYPE_DATE, TAG_DATE),
+        // The builtin `@@toStringTag`s of these kinds' prototypes (phase 3
+        // makes them real properties).
+        (TYPE_MAP, TAG_MAP),
+        (TYPE_SET, TAG_SET),
+        (i32::from(abi::TYPE_PROMISE), TAG_PROMISE),
+        (TYPE_GENERATOR, TAG_GENERATOR),
     ] {
         wasm!(function; LocalGet(kind), I32Const(type_byte), I32Eq);
         tag_if(function, tag);

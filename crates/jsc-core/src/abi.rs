@@ -188,6 +188,11 @@ pub(crate) const ARRAY_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 /// Set by a store or `length` write past the dense-growth bound; never cleared.
 pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
 
+/// [`TYPE_ARRAY`] header `flags` bit: the array is being joined (`join`,
+/// `Array.prototype.toString`). Set for the duration of the guest join so a
+/// cyclic element joins as the empty string; cleared on every exit.
+pub(crate) const ARRAY_FLAG_JOINING: u8 = 8;
+
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
 /// [`TYPE_PROPS`] table at `props`, its prototype in `proto`. Maps to `typeof`
@@ -649,9 +654,6 @@ pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
 /// `__method` op flag: `includes`.
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `join`.
-pub(crate) const METHOD_OP_JOIN: i32 = 2;
 
 /// `__method` op flag: `slice` (overloaded on array/string).
 pub(crate) const METHOD_OP_SLICE: i32 = 3;

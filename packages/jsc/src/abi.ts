@@ -176,8 +176,6 @@ export const CONVERT_OP_PARSE_FLOAT = 3
 export const METHOD_OP_INDEX_OF = 0
 /** `__method` op: `includes`. */
 export const METHOD_OP_INCLUDES = 1
-/** `__method` op: `join`. */
-export const METHOD_OP_JOIN = 2
 /** `__method` op: `slice` (overloaded on array/string). */
 export const METHOD_OP_SLICE = 3
 /** `__method` op: `toUpperCase`. */

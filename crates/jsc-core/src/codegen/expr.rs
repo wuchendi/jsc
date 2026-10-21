@@ -274,10 +274,9 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a template literal into left-folded `BinOp::Add` concatenations,
-    /// reusing the `+` string-coercion path so interpolated values render
-    /// exactly like `"a" + x + "b"` (a non-string operand coerces because the
-    /// running accumulator is always a string).
+    /// Lower a template literal into left-folded `BinOp::Add` concatenations
+    /// of the quasis and each substitution's `ToString` (`String(x)`, so an
+    /// object's `toString` is preferred over its `valueOf`).
     ///
     /// A template always has exactly one more quasi than expr, interleaved in
     /// source order. Seeding with the first quasi (an `IrNode::Str`, possibly
@@ -292,10 +291,16 @@ impl LowerCtx<'_> {
         };
         let mut acc = IrNode::Str(cooked(&tpl.quasis[0]));
         for (expr, quasi) in tpl.exprs.iter().zip(tpl.quasis.iter().skip(1)) {
+            // A substitution is `ToString`ed (hint string), not `+`'s
+            // hint default.
             acc = IrNode::Binary {
                 op: BinOp::Add,
                 lhs: Box::new(acc),
-                rhs: Box::new(self.lower_expr(expr)?),
+                rhs: Box::new(IrNode::ConvertCall {
+                    op: ConvertOp::ToString,
+                    arg: Box::new(self.lower_expr(expr)?),
+                    radix: None,
+                }),
             };
             acc = IrNode::Binary {
                 op: BinOp::Add,

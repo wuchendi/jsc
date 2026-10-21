@@ -31,7 +31,6 @@ import {
   METHOD_OP_ENDS_WITH,
   METHOD_OP_INCLUDES,
   METHOD_OP_INDEX_OF,
-  METHOD_OP_JOIN,
   METHOD_OP_PAD_END,
   METHOD_OP_PAD_START,
   METHOD_OP_REPEAT,
@@ -79,7 +78,6 @@ import {
   decode,
   f64ToBits,
   formatValue,
-  joinElements,
   parseFloatStr,
   parseIntStr,
   toJsString,
@@ -242,16 +240,6 @@ export function createShim(): Shim {
       dv.setBigUint64(at + 8 * i, bits, true)
     })
     return BigInt(base)
-  }
-
-  /** `array.join(sep)` — allocates the joined heap string (mirrors `host.rs::array_join`). */
-  function arrayJoin(
-    mem: Uint8Array,
-    ptr: number,
-    sepBits: bigint,
-  ): bigint | null {
-    const base = allocString(arrayJoinText(mem, ptr, sepBits))
-    return base === null ? null : HEAP | base
   }
 
   /** `array.slice(a, b)` — allocates a NEW heap array (mirrors `host.rs::array_slice`). */
@@ -423,10 +411,6 @@ export function createShim(): Shim {
           if (hay === null) return null
           return byteContains(hay, argBytes(arg0, mem)) ? TRUE : FALSE
         }
-        return null
-      case METHOD_OP_JOIN:
-        if (ptr !== null && typeByte === TYPE_ARRAY)
-          return arrayJoin(mem, ptr, arg0)
         return null
       case METHOD_OP_SLICE:
         if (ptr !== null && typeByte === TYPE_ARRAY)
@@ -776,6 +760,11 @@ export function createShim(): Shim {
     out += piece
   }
 
+  /**
+   * `__convert` on primitives: the guest runs `ToPrimitive` first, so the
+   * only objects it sees are a Date (`Date.prototype.toString`) and a
+   * function without a user `toString` (mirrors `harness.rs`).
+   */
   const convert = (bits: bigint, op: number): bigint => {
     const u = asU64(bits)
     const value = decode(u, memView())
@@ -1003,22 +992,6 @@ function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
     if (match) return indexBits(i)
   }
   return f64ToBits(-1)
-}
-
-/**
- * The joined text of `array.join(sep)` (`","` when `sep` is `undefined`);
- * nullish elements, holes, and cycle back-references stringify to `""`. The receiver
- * is decoded as a whole so the decoder's cycle guard catches self-references.
- * Mirrors the pure part of `host.rs::array_join` (allocation is done by the
- * caller).
- */
-function arrayJoinText(mem: Uint8Array, ptr: number, sepBits: bigint): string {
-  const sepValue = decode(sepBits, mem)
-  const sep = sepValue.kind === 'undefined' ? ',' : toJsString(sepValue)
-  let recv = decode(HEAP | BigInt(ptr), mem)
-  if (recv.kind === 'ref') recv = recv.value
-  if (recv.kind !== 'array') return ''
-  return joinElements(recv.items, sep)
 }
 
 /**

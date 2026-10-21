@@ -21,6 +21,7 @@ macro_rules! wasm {
 
 mod array;
 mod ctor;
+mod date;
 mod error;
 mod function;
 mod namespace;
@@ -94,6 +95,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(function::STRINGS)
         .chain(error::STRINGS)
         .chain(array::STRINGS)
+        .chain(date::STRINGS)
 }
 
 /// Emit the body of `builtin`.
@@ -116,6 +118,9 @@ pub(super) fn emit_builtin(
         Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::ArrayMap => array::emit_map(&mut f, frame, strings, helpers),
+        Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),
+        Builtin::DateToString => date::emit_to_string(&mut f, frame, strings, helpers),
+        Builtin::DateValueOf => date::emit_value_of(&mut f, frame, strings, helpers),
         Builtin::Math(_)
         | Builtin::JsonStringify
         | Builtin::JsonParse

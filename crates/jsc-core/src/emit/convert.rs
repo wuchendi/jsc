@@ -1,0 +1,338 @@
+//! Object -> primitive conversion in the guest: `OrdinaryToPrimitive` and
+//! the conversion helpers built on it (`ToString`, the `+` and relational
+//! slow paths, `Array.prototype.join`). Every object reaching a conversion
+//! site goes through [`emit_to_primitive`], so the host `__convert` import
+//! only ever sees primitives (and, until `Function.prototype.toString`
+//! lands, a function without a user `toString`).
+//!
+//! Each helper leaves a throw from a user `valueOf`/`toString` pending and
+//! returns a harmless value; the emitting site propagates it.
+
+#[allow(clippy::wildcard_imports)]
+use super::*;
+
+/// Emit each listed instruction in order: `wasm!(function; LocalGet(0), ..)`.
+macro_rules! wasm {
+    ($function:expr; $($op:expr),* $(,)?) => {{
+        #[allow(unused_imports)]
+        use Instruction::*;
+        $( $function.instruction(&$op); )*
+    }};
+}
+
+/// `ToPrimitive` hint `"default"` (`+`, `==`).
+pub(super) const HINT_DEFAULT: i32 = 0;
+/// `ToPrimitive` hint `"number"`.
+pub(super) const HINT_NUMBER: i32 = 1;
+/// `ToPrimitive` hint `"string"`.
+pub(super) const HINT_STRING: i32 = 2;
+
+/// `__compare` op codes, in [`BinOp`] relational order.
+pub(super) const REL_LT: i32 = 0;
+pub(super) const REL_GT: i32 = 1;
+pub(super) const REL_LE: i32 = 2;
+pub(super) const REL_GE: i32 = 3;
+
+/// The `TypeError` of an object neither of whose methods yields a primitive.
+const NO_PRIMITIVE: CalleeErrorText<'static> = [
+    "Cannot convert object to primitive value",
+    "TypeError: Cannot convert object to primitive value",
+];
+
+/// The default `join` separator.
+const COMMA: &str = ",";
+
+/// The static strings of this family.
+pub(super) const STRINGS: [&str; 6] = [
+    NO_PRIMITIVE[0],
+    NO_PRIMITIVE[1],
+    COMMA,
+    "",
+    "toString",
+    "valueOf",
+];
+
+/// Return `ret` (pushed by `ret`) when the last call left an exception pending.
+fn return_if_pending(function: &mut Function, ret: &Instruction<'_>) {
+    wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+    function.instruction(ret);
+    wasm!(function; Return, End);
+}
+
+/// `__to_primitive(v: i64, hint: i32) -> i64`: `ToPrimitive` without
+/// `Symbol.toPrimitive` (phase 3). A primitive is returned as is; an object
+/// runs `OrdinaryToPrimitive`: `valueOf` then `toString` (hint string:
+/// `toString` first, and a Date's default hint is string), each looked up
+/// through the `proto` chain, skipped unless callable, its result skipped
+/// unless a primitive; neither -> `TypeError`. A function whose `toString`
+/// is still `%Object.prototype.toString%` keeps the host rendering until
+/// `Function.prototype.toString` lands (S5).
+pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+    let (v, hint, method, result, key, second, base) = (0, 1, 2, 3, 4, 5, 6);
+    let scratch = 7;
+    let mut locals = vec![(2, ValType::I64), (3, ValType::I32)];
+    locals.extend(type_error_helper_locals());
+    let mut f = Function::new(locals);
+    helpers.unwind.borrow_mut().reset();
+    emit_is_object(&mut f, v);
+    wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End);
+    wasm!(f; LocalGet(hint), I32Eqz);
+    emit_load_type_byte(&mut f, v);
+    wasm!(f;
+        I32Const(TYPE_DATE), I32Eq, I32And,
+        If(BlockType::Empty), I32Const(HINT_STRING), LocalSet(hint), End,
+    );
+    let (to_string, value_of) = (
+        static_key(strings, "toString"),
+        static_key(strings, "valueOf"),
+    );
+    wasm!(f;
+        I32Const(to_string), I32Const(value_of),
+        LocalGet(hint), I32Const(HINT_STRING), I32Eq, Select, LocalSet(key),
+        I32Const(value_of), I32Const(to_string),
+        LocalGet(hint), I32Const(HINT_STRING), I32Eq, Select, LocalSet(second),
+    );
+    let object_to_string = realm::method_bits(Builtin::ObjectToString, helpers);
+    for pass in 0..2 {
+        if pass == 1 {
+            wasm!(f; LocalGet(second), LocalSet(key));
+        }
+        wasm!(f; LocalGet(v), LocalGet(key), Call(helpers.get), LocalSet(method));
+        return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
+        emit_is_function(&mut f, method);
+        wasm!(f; If(BlockType::Empty), LocalGet(method), I64Const(object_to_string), I64Eq);
+        emit_load_type_byte(&mut f, v);
+        wasm!(f;
+            I32Const(TYPE_FUNCTION), I32Eq, I32And,
+            If(BlockType::Empty),
+            LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), Return,
+            End,
+        );
+        emit_accessor_call(&mut f, method, v, None, base, helpers);
+        wasm!(f; LocalSet(result));
+        return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
+        emit_is_object(&mut f, result);
+        wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(result), Return, End, End);
+    }
+    emit_throw_not_a_function(&mut f, NO_PRIMITIVE, scratch, strings, helpers);
+    wasm!(f; End);
+    f
+}
+
+/// `__to_string(v: i64) -> i32`: `ToString(v)` as a heap-string base. A
+/// string is itself; an object is first converted with hint string; the
+/// remaining primitives are formatted by the host. A pending throw returns
+/// the empty string.
+pub(super) fn emit_to_string(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+    let v = 0;
+    let mut f = Function::new(vec![]);
+    emit_is_string(&mut f, v);
+    wasm!(f; If(BlockType::Result(ValType::I32)), LocalGet(v), I32WrapI64, Else);
+    emit_is_object(&mut f, v);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(v), I32Const(HINT_STRING), Call(helpers.to_primitive()), LocalSet(v),
+    );
+    return_if_pending(&mut f, &Instruction::I32Const(static_key(strings, "")));
+    wasm!(f; End);
+    emit_is_string(&mut f, v);
+    wasm!(f;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(v), I32WrapI64,
+        Else,
+        LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        End,
+        End,
+        End,
+    );
+    f
+}
+
+/// Set i32 local `kind` to the type byte of the heap value in `x`, or `-1`
+/// for a non-heap value (so `kind == 0` is a string, `kind > 0` an object).
+fn load_kind(function: &mut Function, x: u32, kind: u32) {
+    emit_is_pointer(function, x);
+    wasm!(function; If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, x);
+    wasm!(function; Else, I32Const(-1), End, LocalSet(kind));
+}
+
+/// `__add(a: i64, b: i64) -> i64`: the `+` operator once either operand is
+/// a heap value: `ToPrimitive` both (hint default; only objects call out),
+/// then concatenate the `ToString`s when either primitive is a string, else
+/// add the `ToNumber`s.
+pub(super) fn emit_add_helper(helpers: Helpers<'_>) -> Function {
+    let (a, b, ka, kb) = (0, 1, 2, 3);
+    let mut f = Function::new(vec![(2, ValType::I32)]);
+    for (x, kind) in [(a, ka), (b, kb)] {
+        load_kind(&mut f, x, kind);
+        wasm!(f;
+            LocalGet(kind), I32Const(TYPE_STRING), I32GtS,
+            If(BlockType::Empty),
+            LocalGet(x), I32Const(HINT_DEFAULT), Call(helpers.to_primitive()), LocalSet(x),
+        );
+        return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
+        load_kind(&mut f, x, kind);
+        wasm!(f; End);
+    }
+    // Both operands are primitives now: a string is its own `ToString`, the
+    // rest are formatted by the host.
+    let primitive_to_string = |f: &mut Function, x: u32, kind: u32| {
+        wasm!(f;
+            LocalGet(kind), I32Eqz,
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(x), I32WrapI64,
+            Else,
+            LocalGet(x), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+            End,
+        );
+    };
+    wasm!(f; LocalGet(ka), I32Eqz, LocalGet(kb), I32Eqz, I32Or, If(BlockType::Result(ValType::I64)));
+    primitive_to_string(&mut f, a, ka);
+    primitive_to_string(&mut f, b, kb);
+    wasm!(f;
+        Call(helpers.concat), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        Else,
+        LocalGet(a), Call(helpers.to_number), F64ReinterpretI64,
+        LocalGet(b), Call(helpers.to_number), F64ReinterpretI64,
+        F64Add, Call(helpers.box_f64),
+        End,
+        End,
+    );
+    f
+}
+
+/// Push the relational result for `op` (i32 local) from the four candidate
+/// comparisons `lt`, `gt`, `le`, `ge` each pushes.
+fn pick_relational(function: &mut Function, op: u32, cmps: [&dyn Fn(&mut Function); 4]) {
+    let [lt, gt, le, ge] = cmps;
+    lt(function);
+    gt(function);
+    wasm!(function; LocalGet(op), I32Const(REL_LT), I32Eq, Select);
+    le(function);
+    ge(function);
+    wasm!(function; LocalGet(op), I32Const(REL_LE), I32Eq, Select);
+    wasm!(function; LocalGet(op), I32Const(REL_LE), I32LtU, Select);
+}
+
+/// `__compare(a: i64, b: i64, op: i32) -> i32`: the relational operators
+/// once an operand is not a number: `ToPrimitive` both (hint number), then
+/// two strings compare by bytes and anything else by `ToNumber`.
+pub(super) fn emit_compare(helpers: Helpers<'_>) -> Function {
+    let (a, b, op, ord, lhs, rhs) = (0, 1, 2, 3, 4, 5);
+    let mut f = Function::new(vec![(1, ValType::I32), (2, ValType::F64)]);
+    for v in [a, b] {
+        wasm!(f; LocalGet(v), I32Const(HINT_NUMBER), Call(helpers.to_primitive()), LocalSet(v));
+        return_if_pending(&mut f, &Instruction::I32Const(0));
+    }
+    emit_is_string(&mut f, a);
+    emit_is_string(&mut f, b);
+    wasm!(f;
+        I32And,
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(a), I32WrapI64, LocalGet(b), I32WrapI64, Call(helpers.str_cmp), LocalSet(ord),
+    );
+    let int = |cmp: Instruction<'static>| move |function: &mut Function| wasm!(function; LocalGet(ord), I32Const(0), cmp.clone());
+    pick_relational(
+        &mut f,
+        op,
+        [
+            &int(Instruction::I32LtS),
+            &int(Instruction::I32GtS),
+            &int(Instruction::I32LeS),
+            &int(Instruction::I32GeS),
+        ],
+    );
+    wasm!(f;
+        Else,
+        LocalGet(a), Call(helpers.to_number), F64ReinterpretI64, LocalSet(lhs),
+        LocalGet(b), Call(helpers.to_number), F64ReinterpretI64, LocalSet(rhs),
+    );
+    let float = |cmp: Instruction<'static>| move |function: &mut Function| wasm!(function; LocalGet(lhs), LocalGet(rhs), cmp.clone());
+    pick_relational(
+        &mut f,
+        op,
+        [
+            &float(Instruction::F64Lt),
+            &float(Instruction::F64Gt),
+            &float(Instruction::F64Le),
+            &float(Instruction::F64Ge),
+        ],
+    );
+    wasm!(f; End, End);
+    f
+}
+
+/// `__array_join(recv: i64, sep: i64) -> i64`: `Array.prototype.join` on an
+/// array receiver (`undefined` for any other receiver): `ToString(sep)`
+/// (`","` when `undefined`), then each element's `ToString` (`null`,
+/// `undefined` and holes are empty) joined by it. An array already being
+/// joined (a cycle) joins as the empty string.
+pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+    let (recv, sep_v, arr, len, i, acc, sep, e) = (0, 1, 2, 3, 4, 5, 6, 7);
+    let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
+    let empty = static_key(strings, "");
+    let flags = MemArg {
+        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    };
+    let joining = i32::from(abi::ARRAY_FLAG_JOINING);
+    emit_is_pointer(&mut f, recv);
+    wasm!(f; If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(&mut f, recv);
+    wasm!(f;
+        I32Const(TYPE_ARRAY), I32Ne,
+        Else, I32Const(1), End,
+        If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        LocalGet(recv), I32WrapI64, LocalSet(arr),
+        LocalGet(sep_v), I64Const(UNDEFINED_BITS), I64Eq,
+        If(BlockType::Result(ValType::I32)),
+        I32Const(static_key(strings, COMMA)),
+        Else,
+        LocalGet(sep_v), Call(helpers.to_str()),
+        End,
+        LocalSet(sep),
+    );
+    return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
+    wasm!(f;
+        LocalGet(arr), I32Load8U(flags), I32Const(joining), I32And,
+        If(BlockType::Empty), I64Const(HEAP_BITS | i64::from(empty)), Return, End,
+        LocalGet(arr), LocalGet(arr), I32Load8U(flags), I32Const(joining), I32Or, I32Store8(flags),
+        LocalGet(arr), I32Load(MemArg { offset: ARRAY_LEN_OFFSET, align: 2, memory_index: 0 }),
+        LocalSet(len),
+        I32Const(empty), LocalSet(acc),
+        I32Const(0), LocalSet(i),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
+        LocalGet(i),
+        If(BlockType::Empty), LocalGet(acc), LocalGet(sep), Call(helpers.concat), LocalSet(acc), End,
+        // An element past a length shrunk by an earlier element's conversion
+        // reads `undefined`.
+        LocalGet(i), LocalGet(arr),
+        I32Load(MemArg { offset: ARRAY_LEN_OFFSET, align: 2, memory_index: 0 }),
+        I32LtU,
+        If(BlockType::Result(ValType::I64)),
+    );
+    emit_elem_load(&mut f, arr, i, helpers.sparse_get());
+    wasm!(f; Else, I64Const(UNDEFINED_BITS), End, LocalTee(e), I64Const(HOLE_BITS), I64Eq);
+    emit_is_nullish(&mut f, e);
+    wasm!(f;
+        I32Or, I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(acc), LocalGet(e), Call(helpers.to_str()), Call(helpers.concat), LocalSet(acc),
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty),
+        LocalGet(arr), LocalGet(arr), I32Load8U(flags), I32Const(!joining), I32And, I32Store8(flags),
+        I64Const(UNDEFINED_BITS), Return,
+        End,
+        End,
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+        LocalGet(arr), LocalGet(arr), I32Load8U(flags), I32Const(!joining), I32And, I32Store8(flags),
+        LocalGet(acc), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        End,
+    );
+    f
+}
