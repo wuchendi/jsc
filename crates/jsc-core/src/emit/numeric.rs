@@ -81,6 +81,106 @@ pub(super) fn emit_mod(
     emit_box_f64(function, helpers);
 }
 
+/// Emit subtraction/multiplication/division: stash both operands, coerce each
+/// with `ToNumber`, unbox to `f64`, compute, rebox as a number.
+fn emit_arith(
+    op: BinOp,
+    lhs: &IrNode,
+    rhs: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let s0 = scratch;
+    let s1 = scratch + 1;
+    emit_node(lhs, function, scratch, strings, helpers);
+    emit_node(rhs, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s1));
+    function.instruction(&Instruction::LocalSet(s0));
+    emit_coerce_number(function, s0, helpers);
+    emit_coerce_number(function, s1, helpers);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    let arith = match op {
+        BinOp::Sub => Instruction::F64Sub,
+        BinOp::Mul => Instruction::F64Mul,
+        BinOp::Div => Instruction::F64Div,
+        _ => unreachable!("only sub/mul/div reach here"),
+    };
+    function.instruction(&arith);
+    emit_box_f64(function, helpers);
+}
+
+/// Emit a bitwise or shift operator (`& | ^ << >> >>>`) over two jsval operands,
+/// leaving a number jsval on the stack.
+///
+/// Both operands are evaluated left to right, stashed, and coerced with
+/// `ToNumber` in order (a user `valueOf` on the left runs before the right's),
+/// then each is converted with [`emit_to_int32`]. The wasm shifts already mask
+/// the count to its low 5 bits (`ToUint32(rhs) & 31`). `>>>` reads its result
+/// as unsigned; every other operator as signed.
+fn emit_bitwise(
+    op: BinOp,
+    lhs: &IrNode,
+    rhs: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let s0 = scratch;
+    let s1 = scratch + 1;
+    emit_node(lhs, function, scratch, strings, helpers);
+    emit_node(rhs, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s1));
+    function.instruction(&Instruction::LocalSet(s0));
+    emit_coerce_number(function, s0, helpers);
+    emit_coerce_number(function, s1, helpers);
+    emit_to_int32(function, s0);
+    emit_to_int32(function, s1);
+    let (int_op, convert) = match op {
+        BinOp::BitAnd => (Instruction::I32And, Instruction::F64ConvertI32S),
+        BinOp::BitOr => (Instruction::I32Or, Instruction::F64ConvertI32S),
+        BinOp::BitXor => (Instruction::I32Xor, Instruction::F64ConvertI32S),
+        BinOp::Shl => (Instruction::I32Shl, Instruction::F64ConvertI32S),
+        BinOp::Shr => (Instruction::I32ShrS, Instruction::F64ConvertI32S),
+        BinOp::UShr => (Instruction::I32ShrU, Instruction::F64ConvertI32U),
+        _ => unreachable!("only bitwise/shift ops reach here"),
+    };
+    function.instruction(&int_op);
+    function.instruction(&convert);
+    // An integer conversion is never NaN, so it reinterprets directly.
+    function.instruction(&Instruction::I64ReinterpretF64);
+}
+
+/// Push the 32-bit pattern of `ToInt32` (equivalently `ToUint32`) of the number
+/// jsval in `local` as an i32.
+///
+/// Computes `m = t - 2^32 * floor(t / 2^32)` with `t = trunc(x)`. Every step is
+/// exact for any finite `x` (scaling by a power of two is exact, and `m` is an
+/// integer in `[0, 2^32)` that is a multiple of `ulp(t)`), so magnitudes beyond
+/// the i64 range still wrap correctly. NaN and ±Infinity make `m` NaN, and `-0`
+/// makes it `+0`; the saturating unsigned truncation maps both to `0` and
+/// reinterprets `[2^31, 2^32)` as the negative int32 range.
+fn emit_to_int32(function: &mut Function, local: u32) {
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::F64Trunc);
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::F64Trunc);
+    function.instruction(&Instruction::F64Const(Ieee64::from(1.0 / 4_294_967_296.0)));
+    function.instruction(&Instruction::F64Mul);
+    function.instruction(&Instruction::F64Floor);
+    function.instruction(&Instruction::F64Const(Ieee64::from(4_294_967_296.0)));
+    function.instruction(&Instruction::F64Mul);
+    function.instruction(&Instruction::F64Sub);
+    function.instruction(&Instruction::I32TruncSatF64U);
+}
+
 /// Emit a `Math.*` built-in call, leaving its number-jsval result on the stack.
 ///
 /// The unary ops unbox their single argument to `f64`, apply a native wasm op, and
@@ -687,32 +787,16 @@ pub(super) fn emit_binary(
         // `+` is a runtime type dispatch (string concat vs numeric add); see
         // [`emit_add`].
         BinOp::Add => emit_add(lhs, rhs, function, scratch, strings, helpers),
-        // Subtraction/multiplication/division: stash both operands, coerce
-        // each with ToNumber, unbox to f64, compute, rebox as a number.
+        // Subtraction/multiplication/division: see [`emit_arith`].
         BinOp::Sub | BinOp::Mul | BinOp::Div => {
-            let s0 = scratch;
-            let s1 = scratch + 1;
-            emit_node(lhs, function, scratch, strings, helpers);
-            emit_node(rhs, function, scratch, strings, helpers);
-            function.instruction(&Instruction::LocalSet(s1));
-            function.instruction(&Instruction::LocalSet(s0));
-            emit_coerce_number(function, s0, helpers);
-            emit_coerce_number(function, s1, helpers);
-            function.instruction(&Instruction::LocalGet(s0));
-            function.instruction(&Instruction::F64ReinterpretI64);
-            function.instruction(&Instruction::LocalGet(s1));
-            function.instruction(&Instruction::F64ReinterpretI64);
-            let arith = match op {
-                BinOp::Sub => Instruction::F64Sub,
-                BinOp::Mul => Instruction::F64Mul,
-                BinOp::Div => Instruction::F64Div,
-                _ => unreachable!("only sub/mul/div reach here"),
-            };
-            function.instruction(&arith);
-            emit_box_f64(function, helpers);
+            emit_arith(op, lhs, rhs, function, scratch, strings, helpers);
         }
         // Remainder: wasm has no `f64.rem`; delegate to the dedicated emitter.
         BinOp::Mod => emit_mod(lhs, rhs, function, scratch, strings, helpers),
+        // Bitwise/shift: see [`emit_bitwise`].
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::UShr => {
+            emit_bitwise(op, lhs, rhs, function, scratch, strings, helpers);
+        }
         // Relational: a runtime type dispatch. Two heap strings compare
         // lexicographically by bytes (`__str_cmp`); two numbers compare as
         // `f64`s; anything else goes to `__compare` (ToPrimitive with hint

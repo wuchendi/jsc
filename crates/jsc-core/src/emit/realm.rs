@@ -252,6 +252,10 @@ pub(super) enum Builtin {
     /// key (low half) and the not-a-function message (high half). Not
     /// installed on any intrinsic.
     MethodCall,
+    /// The global `isNaN`.
+    IsNaN,
+    /// The global `isFinite`.
+    IsFinite,
 }
 
 /// A `String.prototype` method backed by a host `__method` op.
@@ -336,7 +340,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 80] = [
+    pub(super) const ALL: [Builtin; 82] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -417,6 +421,8 @@ impl Builtin {
         Self::DateValueOf,
         Self::ThrowTypeError,
         Self::MethodCall,
+        Self::IsNaN,
+        Self::IsFinite,
     ];
 
     /// The function's `name`.
@@ -471,6 +477,8 @@ impl Builtin {
             Self::ArrayIncludes => "includes",
             Self::ArrayJoin => "join",
             Self::ArraySlice => "slice",
+            Self::IsNaN => "isNaN",
+            Self::IsFinite => "isFinite",
         }
     }
 
@@ -513,7 +521,9 @@ impl Builtin {
             | Self::ArrayIndexOf
             | Self::ArrayIncludes
             | Self::ArrayJoin
-            | Self::NumberToString => 1,
+            | Self::NumberToString
+            | Self::IsNaN
+            | Self::IsFinite => 1,
             Self::StringMethod(op) => op.length(),
             Self::JsonStringify => 3,
         }
@@ -622,7 +632,7 @@ const MATH_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 24] = [
+const GLOBALS: [(&str, u32, Value); 26] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -725,6 +735,8 @@ const GLOBALS: [(&str, u32, Value); 24] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Date)),
     ),
+    ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
+    ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
 ];
 
 /// The registry: every own property of every intrinsic, in slot order per

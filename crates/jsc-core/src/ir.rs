@@ -23,7 +23,8 @@ pub enum OpSetKind {
 /// A binary operator over jsval operands.
 ///
 /// Arithmetic operators (`Add`..`Mod`) unbox their operands to `f64` and produce
-/// a number jsval; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
+/// a number jsval; bitwise and shift operators (`BitAnd`..`UShr`) apply
+/// `ToNumber` then `ToInt32`/`ToUint32` and produce a number jsval; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
 /// (`true`/`false`). Relational operators (`Lt`..`Ge`) compare numerically;
 /// `Eq`/`Ne` are strict `===`/`!==` (type-then-value across all jsval types);
 /// `LooseEq`/`LooseNe` are loose `==`/`!=` (Abstract Equality with coercion).
@@ -40,6 +41,21 @@ pub enum BinOp {
     /// Remainder (`%`): the `f64` truncated remainder `a - b * trunc(a / b)`,
     /// matching JS `%` sign semantics.
     Mod,
+    /// Bitwise AND (`&`) over the operands' `ToInt32`.
+    BitAnd,
+    /// Bitwise OR (`|`) over the operands' `ToInt32`.
+    BitOr,
+    /// Bitwise XOR (`^`) over the operands' `ToInt32`. Unary `~x` lowers to
+    /// `x ^ -1`.
+    BitXor,
+    /// Left shift (`<<`): `ToInt32(lhs)` shifted by `ToUint32(rhs) & 31`.
+    Shl,
+    /// Sign-propagating right shift (`>>`): `ToInt32(lhs)` shifted
+    /// arithmetically by `ToUint32(rhs) & 31`.
+    Shr,
+    /// Zero-fill right shift (`>>>`): `ToUint32(lhs)` shifted logically by
+    /// `ToUint32(rhs) & 31`; the result is an unsigned 32-bit number.
+    UShr,
     /// Less-than (`<`).
     Lt,
     /// Greater-than (`>`).

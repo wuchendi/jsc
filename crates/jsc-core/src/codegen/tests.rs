@@ -735,13 +735,6 @@ fn declaration_without_initializer_binds_undefined() {
 }
 
 #[test]
-fn rejects_unsupported_operator() {
-    // `%` and `**` (exponentiation) are supported; bitwise
-    // `&` (and the other bitwise/shift operators) remains unsupported.
-    assert!(lower_src("2 & 3").is_err(), "bitwise AND is unsupported");
-}
-
-#[test]
 fn rejects_async_and_unsupported_generator_functions() {
     // An `async` function EXPRESSION / ARROW would otherwise lower as an
     // ordinary function and run to a wrong result, so each must be a clear

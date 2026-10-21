@@ -24,6 +24,7 @@ mod ctor;
 mod date;
 mod error;
 mod function;
+mod global;
 mod namespace;
 mod number;
 mod object;
@@ -178,6 +179,8 @@ pub(super) fn emit_builtin(
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::DateToString => date::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::DateValueOf => date::emit_value_of(&mut f, frame, strings, helpers),
+        Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
+        Builtin::IsFinite => global::emit_is_finite(&mut f, frame, helpers),
         Builtin::Math(_)
         | Builtin::JsonStringify
         | Builtin::JsonParse
