@@ -252,7 +252,7 @@ fn emit_exotic_len(function: &mut Function, o: u32) {
 /// i64 local `this`, passing `arg` (an i64 local) as its only argument when
 /// given; the result stays on the stack. Only emitted when the program has
 /// accessors (so the funcref table exists).
-fn emit_accessor_call(
+pub(super) fn emit_accessor_call(
     function: &mut Function,
     callee: u32,
     this: u32,
@@ -456,7 +456,8 @@ pub(super) fn emit_index_string(helpers: Helpers<'_>) -> Function {
 
 /// `__to_key(v: i64, insert: i32) -> i32`: `ToPropertyKey` of `v` as an interned
 /// key. An interned string is its own key; an integer `0 <= v < 2^32 - 1` is
-/// formatted in-guest; anything else goes through the host `ToString`. The
+/// formatted in-guest; anything else goes through `__to_string` (an object's
+/// user `toString` may throw: the exception stays pending and the key is `""`). The
 /// resulting string is then interned (`insert`) or looked up (`0` on a miss).
 /// A lookup still interns a canonical array index, so an array or string
 /// element is found by an index key that no property ever used.
@@ -481,7 +482,7 @@ pub(super) fn emit_to_key(helpers: Helpers<'_>) -> Function {
         If(BlockType::Empty),
         LocalGet(d), I32TruncSatF64U, Call(helpers.index_string), LocalSet(s),
         Else,
-        LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64, LocalSet(s),
+        LocalGet(v), Call(helpers.to_str()), LocalSet(s),
         End,
         End,
         LocalGet(insert),

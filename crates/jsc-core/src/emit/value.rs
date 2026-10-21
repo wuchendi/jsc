@@ -53,41 +53,40 @@ pub(super) fn emit_box_f64_helper() -> Function {
 
 /// Replace the jsval in `local` with its JS `ToNumber` (a number jsval). A number
 /// is left untouched (the fast path is one compare); anything else goes through
-/// the shared `__to_number` helper. Every numeric operator coerces its stashed
-/// operands with this before unboxing them.
+/// the shared `__to_number` helper, whose `valueOf`/`toString` call may throw
+/// (propagated here). Every numeric operator coerces its stashed operands with
+/// this before unboxing them.
 pub(super) fn emit_coerce_number(function: &mut Function, local: u32, helpers: Helpers<'_>) {
     emit_is_number(function, local);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::Call(helpers.to_number));
     function.instruction(&Instruction::LocalSet(local));
+    emit_propagate_if_pending(function, helpers);
+    leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
 
 /// Emit the `__to_number(v: i64) -> i64` helper backing [`emit_coerce_number`]
-/// and `Number(x)`: `ToPrimitive` then `ToNumber`. An array's primitive is its
-/// `join()` string (via the host `__method` join op), which is then parsed like
-/// any other string; every other value goes straight to the host `__convert`
-/// to-number op (primitives by the `StringToNumber` rules, other heap kinds `NaN`).
+/// and `Number(x)`: `ToPrimitive` (hint number, in the guest) then the host
+/// `__convert` to-number op on the primitive (`StringToNumber` rules). A throw
+/// from a user `valueOf`/`toString` stays pending and yields `NaN`.
 pub(super) fn emit_to_number_helper(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![]);
     let v = 0;
-    emit_is_pointer(&mut function, v);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(&mut function, v);
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
+    emit_is_object(&mut function, v);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32Const(METHOD_OP_JOIN));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::Call(helpers.method));
+    function.instruction(&Instruction::I32Const(HINT_NUMBER));
+    function.instruction(&Instruction::Call(helpers.to_primitive()));
     function.instruction(&Instruction::LocalSet(v));
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I64Const(QNAN_BITS));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));

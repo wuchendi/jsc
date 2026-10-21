@@ -117,7 +117,6 @@ const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-const METHOD_OP_JOIN: i32 = abi::METHOD_OP_JOIN;
 const METHOD_OP_SLICE: i32 = abi::METHOD_OP_SLICE;
 const METHOD_OP_TO_UPPER: i32 = abi::METHOD_OP_TO_UPPER;
 const METHOD_OP_TO_LOWER: i32 = abi::METHOD_OP_TO_LOWER;
@@ -788,8 +787,8 @@ struct Helpers<'a> {
     /// `__box_f64(x: f64) -> i64`: rebox an `f64` as a number jsval, mapping
     /// every NaN to the canonical [`abi::QNAN`] bits (see [`value::emit_box_f64`]).
     box_f64: u32,
-    /// `__to_number(v: i64) -> i64`: the JS `ToNumber` of any jsval (`ToPrimitive` of
-    /// an array is its `join()` string; see [`value::emit_to_number_helper`]).
+    /// `__to_number(v: i64) -> i64`: the JS `ToNumber` of any jsval (an object
+    /// through `__to_primitive`; see [`value::emit_to_number_helper`]).
     /// Call sites skip it for number operands (see [`value::emit_coerce_number`]).
     to_number: u32,
     /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline the
@@ -965,6 +964,32 @@ impl Helpers<'_> {
         self.new_string + 4 + builtin.index()
     }
 
+    /// `__to_primitive(v, hint) -> i64` (see [`convert::emit_to_primitive`]):
+    /// the first of the conversion helpers, which follow the builtin bodies.
+    fn to_primitive(self) -> u32 {
+        self.builtin(Builtin::ALL[Builtin::ALL.len() - 1]) + 1
+    }
+
+    /// `__to_string(v) -> i32` (see [`convert::emit_to_string`]).
+    fn to_str(self) -> u32 {
+        self.to_primitive() + 1
+    }
+
+    /// `__add(a, b) -> i64` (see [`convert::emit_add_helper`]).
+    fn add_slow(self) -> u32 {
+        self.to_primitive() + 2
+    }
+
+    /// `__compare(a, b, op) -> i32` (see [`convert::emit_compare`]).
+    fn compare(self) -> u32 {
+        self.to_primitive() + 3
+    }
+
+    /// `__array_join(recv, sep) -> i64` (see [`convert::emit_array_join`]).
+    fn array_join(self) -> u32 {
+        self.to_primitive() + 4
+    }
+
     /// `__new_array(len) -> i32`: the exported array constructor, right after
     /// `__new_string`.
     fn new_array(self) -> u32 {
@@ -1042,6 +1067,7 @@ struct FnLayout {
 
 mod array;
 mod builtins;
+mod convert;
 mod expr;
 mod function;
 mod generator;
@@ -1059,6 +1085,8 @@ mod value;
 
 #[allow(clippy::wildcard_imports)]
 use array::*;
+#[allow(clippy::wildcard_imports)]
+use convert::*;
 #[allow(clippy::wildcard_imports)]
 use expr::*;
 #[allow(clippy::wildcard_imports)]
@@ -1346,7 +1374,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_map_delete(helpers.map_find));
     // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
     // Map/Set helpers.
-    code.function(&emit_loose_eq(helpers.str_eq, helpers.convert));
+    code.function(&emit_loose_eq(helpers));
     code.function(&emit_str_to_array(helpers.new_array(), helpers.str_index));
     // The in-wasm `JSON.parse` family, in the order their indices were assigned.
     code.function(&emit_json_ws());
@@ -1385,6 +1413,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     for builtin in Builtin::ALL {
         code.function(&builtins::emit_builtin(builtin, &offsets, helpers));
     }
+    // The conversion helpers follow the builtin bodies.
+    code.function(&emit_to_primitive(&offsets, helpers));
+    code.function(&convert::emit_to_string(&offsets, helpers));
+    code.function(&emit_add_helper(helpers));
+    code.function(&emit_compare(helpers));
+    code.function(&emit_array_join(&offsets, helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

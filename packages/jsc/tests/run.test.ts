@@ -448,3 +448,28 @@ it('converts values with JS ToString like the Rust host', async () => {
   ]
   for (const [src, out] of cases) expect((await run(src)).stdout).toBe(out)
 })
+
+it('converts objects with OrdinaryToPrimitive like the Rust host', async () => {
+  const both =
+    "const b = { valueOf() { return 2 }, toString() { return 'str' } };"
+  const sta =
+    "function Test262Error(message) { this.message = message || '' } " +
+    "Test262Error.prototype.toString = function () { return 'Test262Error: ' + this.message };"
+  const cases: [string, string][] = [
+    [`${both} String(b)`, 'str'],
+    [`${both} '' + b`, '2'],
+    [`${both} +b`, '2'],
+    [`${both} \`\${b}\``, 'str'],
+    [`${both} [b, b].join('-')`, 'str-str'],
+    ['+new Date(0)', '0'],
+    ['[] + {}', '[object Object]'],
+    ['+{}', 'NaN'],
+    ['String(function f() {})', '[Function: f]'],
+    [`${sta} String(new Test262Error('m'))`, 'Test262Error: m'],
+    [`${sta} '' + new Test262Error('m')`, 'Test262Error: m'],
+  ]
+  for (const [src, out] of cases) expect((await run(src)).result).toBe(out)
+  await expect(
+    run('String({ valueOf() { return {} }, toString() { return {} } })'),
+  ).rejects.toThrow('TypeError: Cannot convert object to primitive value')
+})

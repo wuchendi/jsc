@@ -37,8 +37,9 @@ pub(super) enum Intrinsic {
     Ctor(BuiltinCtor),
     /// `%<Ctor>.prototype%` of a constructor without a dedicated variant
     /// (`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-    /// `Date`): `constructor` only, plus `Array.prototype.map` (the method
-    /// families stay syntactic until S5).
+    /// `Date`): `constructor` only, plus `Array.prototype.map`/`toString` and
+    /// `Date.prototype.toString`/`valueOf` (the method families stay syntactic
+    /// until S5).
     Prototype(BuiltinCtor),
 }
 
@@ -189,11 +190,17 @@ pub(super) enum Builtin {
     DateNow,
     /// `Array.prototype.map`, generic over array-likes.
     ArrayMap,
+    /// `Array.prototype.toString`.
+    ArrayToString,
+    /// `Date.prototype.toString`.
+    DateToString,
+    /// `Date.prototype.valueOf`.
+    DateValueOf,
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 44] = [
+    pub(super) const ALL: [Builtin; 47] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -238,6 +245,9 @@ impl Builtin {
         Self::PromiseReject,
         Self::DateNow,
         Self::ArrayMap,
+        Self::ArrayToString,
+        Self::DateToString,
+        Self::DateValueOf,
     ];
 
     /// The function's `name`.
@@ -245,8 +255,11 @@ impl Builtin {
         match self {
             Self::FunctionPrototype => "",
             Self::HasOwnProperty => "hasOwnProperty",
-            Self::ObjectToString | Self::ErrorToString => "toString",
-            Self::ValueOf => "valueOf",
+            Self::ObjectToString
+            | Self::ErrorToString
+            | Self::ArrayToString
+            | Self::DateToString => "toString",
+            Self::ValueOf | Self::DateValueOf => "valueOf",
             Self::Call => "call",
             Self::Apply => "apply",
             Self::Math(op) => match op {
@@ -282,6 +295,9 @@ impl Builtin {
             | Self::ObjectToString
             | Self::ValueOf
             | Self::ErrorToString
+            | Self::ArrayToString
+            | Self::DateToString
+            | Self::DateValueOf
             | Self::ConsoleLog
             | Self::DateNow
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
@@ -546,8 +562,8 @@ pub(super) fn registry() -> Vec<Entry> {
 }
 
 /// The constructors' own properties (`length`, `name`, the non-writable
-/// `prototype`, statics), each prototype's `constructor` back-link and
-/// `Array.prototype.map`.
+/// `prototype`, statics), each prototype's `constructor` back-link,
+/// `Array.prototype.map`/`toString` and `Date.prototype.toString`/`valueOf`.
 fn constructor_entries(entries: &mut Vec<Entry>) {
     let entry = |intrinsic, key, attrs, value| Entry {
         intrinsic,
@@ -600,6 +616,14 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         METHOD_ATTRS,
         Value::Method(Builtin::ArrayMap),
     ));
+    for (ctor, key, builtin) in [
+        (BuiltinCtor::Array, "toString", Builtin::ArrayToString),
+        (BuiltinCtor::Date, "toString", Builtin::DateToString),
+        (BuiltinCtor::Date, "valueOf", Builtin::DateValueOf),
+    ] {
+        let method = Value::Method(builtin);
+        entries.push(entry(Intrinsic::Prototype(ctor), key, METHOD_ATTRS, method));
+    }
 }
 
 /// Every static string the image references (keys, string values, builtin
@@ -674,6 +698,13 @@ pub(super) fn intrinsic_addr_bits(base: i32, intrinsic: Intrinsic) -> i64 {
 /// The heap-pointer jsval of `intrinsic` (a compile-time constant).
 pub(super) fn intrinsic_bits(intrinsic: Intrinsic, helpers: Helpers<'_>) -> i64 {
     intrinsic_addr_bits(helpers.realm(), intrinsic)
+}
+
+/// The heap-pointer jsval of `builtin`'s static method block (a
+/// compile-time constant).
+pub(super) fn method_bits(builtin: Builtin, helpers: Helpers<'_>) -> i64 {
+    let addr = helpers.realm().cast_unsigned() + method_offset(&registry(), builtin);
+    HEAP_BITS | i64::from(addr)
 }
 
 /// Build the image bytes for `base`: `first_slot` is the funcref-table slot

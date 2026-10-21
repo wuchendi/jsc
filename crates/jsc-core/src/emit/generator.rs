@@ -82,7 +82,15 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(gen_dst));
-    emit_object_prefix(function, gen_dst, TYPE_GENERATOR, NULL_BITS);
+    // `%GeneratorPrototype%` is not in the realm yet; inheriting from
+    // `%Object.prototype%` (where its chain ends) gives a generator object its
+    // `toString` (`[object Generator]`) and `valueOf`.
+    emit_object_prefix(
+        function,
+        gen_dst,
+        TYPE_GENERATOR,
+        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
+    );
     // sm_idx (u32).
     function.instruction(&Instruction::LocalTee(gen_dst));
     function.instruction(&Instruction::LocalGet(gen_dst));

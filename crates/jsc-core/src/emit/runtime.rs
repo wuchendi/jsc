@@ -1400,13 +1400,14 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// `1` iff BOTH are (nullish values equal each other and nothing else); two
 /// numbers compare as `f64`; two strings by byte content (via `__str_eq`); a
 /// number and a string coerce the string via the `__convert` `ToNumber` import
-/// (at `convert_index`) and compare as `f64`; anything else compares by raw
-/// identity bits (two distinct objects differ; the same object is equal; an
-/// object vs a primitive differs). Object↔primitive `ToPrimitive` coercion is
-/// deliberately NOT modeled (so `[] == 0` is `false`, a documented v1 cut). The
-/// two `i64` params occupy locals 0/1; they are mutated in place for the boolean
-/// normalization, so no extra locals are needed.
-pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
+/// and compare as `f64`; an object against a (non-nullish) primitive is
+/// replaced by its `ToPrimitive` (hint default, `__to_primitive`) and compared
+/// again (a user `valueOf`/`toString` throw leaves it pending and yields `0`);
+/// anything else compares by raw identity bits (two distinct objects differ;
+/// the same object is equal). The two `i64` params occupy locals 0/1; they are
+/// mutated in place, so no extra locals are needed.
+pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
+    let (str_eq_index, convert_index) = (helpers.str_eq, helpers.convert);
     let mut function = Function::new(vec![]);
     let (a, b) = (0, 1);
     let one_bits = 1.0f64.to_bits().cast_signed();
@@ -1494,7 +1495,9 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::Else);
 
-    // Fallback: raw identity bits.
+    // Fallback: an object against a non-nullish primitive compares its
+    // `ToPrimitive` again; otherwise raw identity bits.
+    emit_loose_eq_to_primitive(&mut function, helpers);
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
@@ -1506,6 +1509,35 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
     // Close the function body.
     function.instruction(&Instruction::End);
     function
+}
+
+/// The object-vs-primitive arm of [`emit_loose_eq`]: an object against a
+/// non-nullish primitive is replaced by its `ToPrimitive` (hint default) and
+/// `__loose_eq` returns the comparison of the result (`0` when a user
+/// `valueOf`/`toString` threw).
+fn emit_loose_eq_to_primitive(function: &mut Function, helpers: Helpers<'_>) {
+    let (a, b) = (0, 1);
+    for (obj, prim) in [(a, b), (b, a)] {
+        emit_is_object(function, obj);
+        emit_is_object(function, prim);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::LocalGet(obj));
+        function.instruction(&Instruction::I32Const(HINT_DEFAULT));
+        function.instruction(&Instruction::Call(helpers.to_primitive()));
+        function.instruction(&Instruction::LocalSet(obj));
+        function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(a));
+        function.instruction(&Instruction::LocalGet(b));
+        function.instruction(&Instruction::Call(helpers.loose_eq));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+    }
 }
 
 /// Emit the `__str_to_array(s: i64) -> i64` string-spread helper: build a fresh

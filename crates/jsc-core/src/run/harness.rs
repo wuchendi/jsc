@@ -177,7 +177,10 @@ fn run_with_sink<W: Write + Send + 'static>(
             let _ = caller.data_mut().sink.write_all(piece.as_bytes());
         },
     )?;
-    // The `__convert` import backs `String`/`Number`/`parseFloat`.
+    // The `__convert` import backs `String`/`Number`/`parseFloat` on
+    // primitives: the guest runs `ToPrimitive` first, so the only objects it
+    // sees are a Date (`Date.prototype.toString`) and a function without a
+    // user `toString` (rendered until `Function.prototype.toString`, S5).
     // It decodes the argument jsval (reading linear memory for heap-string
     // operands), reuses `to_js_string`/`value_to_number` and the parse helpers, and
     // returns the converted jsval. `String` allocates a fresh heap string in guest
@@ -223,7 +226,7 @@ fn run_with_sink<W: Write + Send + 'static>(
         },
     )?;
     // The `__method` import backs the non-callback array/string methods:
-    // `indexOf`/`includes`/`join`/`slice` on arrays and
+    // `indexOf`/`includes`/`slice` on arrays and
     // `toUpperCase`/`toLowerCase`/`indexOf`/`slice`/`charAt` on strings. It
     // snapshots linear memory to decode the receiver + arguments, branches on the
     // receiver's TYPE BYTE for the overloaded `indexOf`/`slice`, and returns the

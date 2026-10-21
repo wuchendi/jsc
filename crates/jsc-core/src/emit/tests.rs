@@ -983,11 +983,9 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let proto = u64_at(&memory, base + OBJ_PROTO_OFFSET);
         if kind == TYPE_FUNCTION {
             function_proto(&memory, proto);
-        } else if kind == TYPE_GENERATOR {
-            assert_eq!(proto, crate::abi::NULL, "{src}: proto");
         } else {
-            // Arrays, Map/Set, promises and dates inherit from their realm prototype,
-            // an ordinary object.
+            // Arrays, Map/Set, promises and dates inherit from their realm
+            // prototype, generators from %Object.prototype%: an ordinary object.
             assert_eq!((proto >> 48) & 0b111, 0b101, "{src}: proto is a heap block");
             let at = usize::try_from(proto & 0xFFFF_FFFF).expect("base");
             assert_eq!(memory[at], TYPE_OBJECT, "{src}: proto");

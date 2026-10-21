@@ -38,17 +38,8 @@ fn string_field(
         I32Const(static_key(strings, fallback)),
         Else,
     );
-    emit_is_string(function, value);
-    wasm!(function;
-        If(BlockType::Result(ValType::I64)),
-        LocalGet(value),
-        Else,
-        LocalGet(value), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert),
-        End,
-        I32WrapI64,
-        End,
-        LocalSet(out),
-    );
+    wasm!(function; LocalGet(value), Call(helpers.to_str()), End, LocalSet(out));
+    return_if_pending(function);
 }
 
 /// `Error.prototype.toString()`: `name` (default `"Error"`) and `message`

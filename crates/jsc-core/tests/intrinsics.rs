@@ -62,7 +62,10 @@ fn object_to_string_tags() {
     tag("new RangeError('e')", "[object Error]");
     tag("new Date(0)", "[object Date]");
     tag("{ a: 1 }", "[object Object]");
-    tag("new Map()", "[object Object]");
+    // The builtin `@@toStringTag`s of the Map/Set/Promise prototypes.
+    tag("new Map()", "[object Map]");
+    tag("new Set()", "[object Set]");
+    tag("Promise.resolve(1)", "[object Promise]");
     assert_string(
         "function f() { return ({}).toString.call(arguments); } f(1)",
         "[object Arguments]",

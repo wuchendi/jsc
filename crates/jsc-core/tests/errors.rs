@@ -869,6 +869,25 @@ fn mixed_nested_finally_ordering() {
     );
 }
 
+/// A `finally` running while an exception is in flight sees no pending
+/// exception of its own: calls and conversions inside it complete normally,
+/// and the in-flight exception is rethrown afterwards (a user call returning
+/// normally does not swallow it), unless the finally throws its own.
+#[test]
+fn finally_body_runs_clear_of_the_inflight_exception() {
+    assert_str(
+        "let log = ''; function f() { return 1; } \
+         try { try { throw new Error('x'); } finally { f(); log += 'b' + f() + `${{ toString() { return 'o'; } }}`; } } \
+         catch (e) { log += e.message; } log",
+        "b1ox",
+    );
+    assert_str(
+        "let log = ''; try { try { throw new Error('a'); } finally { throw new Error('b'); } } \
+         catch (e) { log += e.message; } log",
+        "b",
+    );
+}
+
 /// Same shape but the ordering carried through an ARRAY of side-effect markers,
 /// confirming the array/`push` path is undisturbed by the unwinding: the four
 /// markers land in order.

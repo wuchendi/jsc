@@ -799,7 +799,7 @@ pub fn format_value(value: &Value) -> String {
 /// `ToString` (`null`/`undefined` elements, holes, and cycle back-references
 /// are empty) separated by `sep`; a run of `N` holes contributes `N` empty
 /// pieces.
-pub(super) fn join_elements(elems: &[Value], sep: &str) -> String {
+fn join_elements(elems: &[Value], sep: &str) -> String {
     let mut out = String::new();
     let mut first = true;
     let mut piece = |out: &mut String, text: &str| {

@@ -216,6 +216,23 @@ pub(super) fn build_type_and_function_sections<'a>(
     for _ in Builtin::ALL {
         functions.function(fn_type);
     }
+    // The conversion helpers follow the builtin bodies:
+    // `__to_primitive(v: i64, hint: i32) -> i64`, `__to_string(v: i64) -> i32`,
+    // `__add(a: i64, b: i64) -> i64`, `__compare(a: i64, b: i64, op: i32) -> i32`
+    // and `__array_join(recv: i64, sep: i64) -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 5] = [
+        (&[ValType::I64, ValType::I32], &[ValType::I64]),
+        (&[ValType::I64], &[ValType::I32]),
+        (&[ValType::I64, ValType::I64], &[ValType::I64]),
+        (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I32]),
+        (&[ValType::I64, ValType::I64], &[ValType::I64]),
+    ];
+    for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+        functions.function(ty);
+    }
 
     (
         types,
@@ -563,6 +580,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     // `name`.
     let realm_strs = realm::strings()
         .chain(builtins::strings())
+        .chain(convert::STRINGS)
         .chain([STACK_KEY])
         .chain(FN_KEYS);
     let names = program.functions.iter().map(|f| f.info.name.as_str());
