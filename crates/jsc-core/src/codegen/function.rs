@@ -831,12 +831,10 @@ fn expr_arrow_super(expr: &Expr, arrow: bool) -> bool {
 /// The derived-constructor `this` TDZ message (design 4.5).
 pub(super) const DERIVED_THIS_TDZ: &str = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
 
-/// A `ReferenceError` with `message` (no `%ReferenceError.prototype%` yet, S4:
-/// an `Error` with an own `name`).
+/// A `ReferenceError` with `message`.
 pub(super) fn reference_error(message: &str) -> IrNode {
     IrNode::error_object(
-        ErrorKind::Error,
-        Some("ReferenceError"),
+        ErrorKind::ReferenceError,
         Some(IrNode::Str(message.to_owned())),
         IrNode::Str(format!("ReferenceError: {message}")),
     )
@@ -853,7 +851,7 @@ pub(super) fn type_error(message: IrNode) -> IrNode {
             rhs: Box::new(message.clone()),
         },
     };
-    IrNode::error_object(ErrorKind::TypeError, None, Some(message), stack)
+    IrNode::error_object(ErrorKind::TypeError, Some(message), stack)
 }
 
 /// `cond ? undefined : throw error`: a guard throwing `error` unless `cond`.
@@ -876,7 +874,6 @@ fn class_call_guard(name: &str, argc: u32) -> IrStmt {
         then_body: Vec::new(),
         else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(IrNode::error_object(
             ErrorKind::TypeError,
-            None,
             Some(IrNode::Str(message)),
             IrNode::Str(stack),
         ))))],
