@@ -1254,11 +1254,14 @@ fn collect_entries<'a>(
 }
 
 /// Whether any function of `program` (or `main`) builds an accessor
-/// ([`IrNode::MakeAccessor`]), so `__get` / `__set` must dispatch to getters
-/// and setters.
+/// ([`IrNode::MakeAccessor`]) or names `caller` / `arguments` (the realm's
+/// `%Function.prototype%` accessors), so `__get` / `__set` must dispatch to
+/// getters and setters.
 fn program_has_accessors(program: &IrProgram) -> bool {
     fn node(n: &IrNode) -> bool {
-        matches!(n, IrNode::MakeAccessor { .. }) || n.any_child(node)
+        matches!(n, IrNode::MakeAccessor { .. })
+            || matches!(n, IrNode::Str(s) if s == "caller" || s == "arguments")
+            || n.any_child(node)
     }
     fn stmt(s: &IrStmt) -> bool {
         s.any_node(node) || s.any_stmt(stmt)

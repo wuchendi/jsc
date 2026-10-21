@@ -21,15 +21,34 @@ const NOT_ARRAY_LIKE: CalleeErrorText<'static> = [
     "TypeError: CreateListFromArrayLike called on non-object",
 ];
 
+/// The `TypeError` `%ThrowTypeError%` throws.
+const RESTRICTED_PROPERTY: CalleeErrorText<'static> = [
+    "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+    "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+];
+
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 6] = [
+pub(super) const STRINGS: [&str; 8] = [
     CALL_NOT_CALLABLE[0],
     CALL_NOT_CALLABLE[1],
     APPLY_NOT_CALLABLE[0],
     APPLY_NOT_CALLABLE[1],
     NOT_ARRAY_LIKE[0],
     NOT_ARRAY_LIKE[1],
+    RESTRICTED_PROPERTY[0],
+    RESTRICTED_PROPERTY[1],
 ];
+
+/// `%ThrowTypeError%`: throw the restricted-property `TypeError`.
+pub(super) fn emit_throw_type_error(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    throw_type_error(function, frame, RESTRICTED_PROPERTY, strings, helpers);
+    wasm!(function; I64Const(UNDEFINED_BITS));
+}
 
 /// Read `this` into `target` and throw `text` unless it is callable.
 fn this_callable(

@@ -9,8 +9,10 @@
 //! then one static `TYPE_FUNCTION` block per builtin method ([`Value::Method`]):
 //! `LAZY`, no properties, `proto = %Function.prototype%`, `env = undefined`,
 //! and the funcref-table slot of its uniform-ABI wasm body
-//! ([`super::builtins`]). A static table that a user mutation overflows is
-//! rebuilt on the heap by `__define` like any other.
+//! ([`super::builtins`]), and finally one static `TYPE_ACCESSOR` block per
+//! [`Value::Accessor`] entry, holding its getter/setter method blocks. A
+//! static table that a user mutation overflows is rebuilt on the heap by
+//! `__define` like any other.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -196,11 +198,14 @@ pub(super) enum Builtin {
     DateToString,
     /// `Date.prototype.valueOf`.
     DateValueOf,
+    /// `%ThrowTypeError%`: the poison getter/setter of the strict `caller` /
+    /// `arguments` properties (one identity for every installation).
+    ThrowTypeError,
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 47] = [
+    pub(super) const ALL: [Builtin; 48] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -248,12 +253,13 @@ impl Builtin {
         Self::ArrayToString,
         Self::DateToString,
         Self::DateValueOf,
+        Self::ThrowTypeError,
     ];
 
     /// The function's `name`.
     pub(super) fn name(self) -> &'static str {
         match self {
-            Self::FunctionPrototype => "",
+            Self::FunctionPrototype | Self::ThrowTypeError => "",
             Self::HasOwnProperty => "hasOwnProperty",
             Self::ObjectToString
             | Self::ErrorToString
@@ -292,6 +298,7 @@ impl Builtin {
     pub(super) fn length(self) -> u32 {
         match self {
             Self::FunctionPrototype
+            | Self::ThrowTypeError
             | Self::ObjectToString
             | Self::ValueOf
             | Self::ErrorToString
@@ -341,6 +348,14 @@ pub(super) enum Value {
     Undefined,
     /// Another intrinsic object.
     Intrinsic(Intrinsic),
+    /// An accessor property: its static `TYPE_ACCESSOR` block holding the
+    /// method blocks of `get` and `set` (the entry has [`abi::ATTR_ACCESSOR`]).
+    Accessor {
+        /// The getter.
+        get: Builtin,
+        /// The setter.
+        set: Builtin,
+    },
 }
 
 /// One own property of an intrinsic.
@@ -362,6 +377,16 @@ const METHOD_ATTRS: u32 = abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE;
 
 /// A function's `length`/`name`: configurable only.
 const FN_FACT_ATTRS: u32 = abi::ATTR_CONFIGURABLE;
+
+/// `AddRestrictedFunctionProperties`: the `caller` / `arguments` accessors of
+/// `%Function.prototype%`, configurable only.
+const POISON_ATTRS: u32 = abi::ATTR_ACCESSOR | abi::ATTR_CONFIGURABLE;
+
+/// The `%ThrowTypeError%` getter and setter pair.
+const POISON: Value = Value::Accessor {
+    get: Builtin::ThrowTypeError,
+    set: Builtin::ThrowTypeError,
+};
 
 /// A constant (`Math.PI`, the global `NaN`/`Infinity`/`undefined`): no
 /// attributes.
@@ -529,6 +554,8 @@ pub(super) fn registry() -> Vec<Entry> {
             METHOD_ATTRS,
             Value::Method(Builtin::Apply),
         ),
+        entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
+        entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
     ];
     for kind in ErrorKind::ALL {
         let proto = Intrinsic::ErrorPrototype(kind);
@@ -634,7 +661,11 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .flat_map(|e| {
             let value = match e.value {
                 Value::Str(s) => Some(s),
-                Value::Method(_) | Value::Num(_) | Value::Undefined | Value::Intrinsic(_) => None,
+                Value::Method(_)
+                | Value::Num(_)
+                | Value::Undefined
+                | Value::Intrinsic(_)
+                | Value::Accessor { .. } => None,
             };
             [Some(e.key), value]
         })
@@ -658,11 +689,21 @@ fn block_size(registry: &[Entry], intrinsic: Intrinsic) -> u32 {
     prefix + abi::PROPS_HEADER_SIZE + abi::PROP_ENTRY_SIZE * entry_count(registry, intrinsic)
 }
 
-/// The builtins with a static method block, in image order.
+/// The builtins with a static method block (a method or an accessor half), in
+/// image order.
 fn methods(registry: &[Entry]) -> impl Iterator<Item = Builtin> + '_ {
-    Builtin::ALL
-        .into_iter()
-        .filter(|b| registry.iter().any(|e| e.value == Value::Method(*b)))
+    Builtin::ALL.into_iter().filter(|b| {
+        registry.iter().any(|e| match e.value {
+            Value::Method(m) => m == *b,
+            Value::Accessor { get, set } => get == *b || set == *b,
+            _ => false,
+        })
+    })
+}
+
+/// The registry indices of the accessor entries, in image order.
+fn accessors(registry: &[Entry]) -> impl Iterator<Item = usize> + '_ {
+    (0..registry.len()).filter(|&i| matches!(registry[i].value, Value::Accessor { .. }))
 }
 
 /// The byte offset of `intrinsic`'s block from the image base.
@@ -680,12 +721,25 @@ fn method_offset(registry: &[Entry], builtin: Builtin) -> u32 {
     objects + abi::FUNC_BLOCK_SIZE * u32::try_from(before).unwrap_or(0)
 }
 
+/// The byte offset of the accessor block of registry entry `entry` from the
+/// image base.
+fn accessor_offset(registry: &[Entry], entry: usize) -> u32 {
+    let methods = u32::try_from(methods(registry).count()).unwrap_or(0);
+    let objects: u32 = intrinsics().map(|i| block_size(registry, i)).sum();
+    let before = accessors(registry).take_while(|i| *i != entry).count();
+    objects
+        + abi::FUNC_BLOCK_SIZE * methods
+        + abi::ACCESSOR_BLOCK_SIZE * u32::try_from(before).unwrap_or(0)
+}
+
 /// The byte size of the whole image (a multiple of 8, like every block).
 pub(super) fn image_size() -> i32 {
     let registry = registry();
     let methods = u32::try_from(methods(&registry).count()).unwrap_or(0);
+    let accessors = u32::try_from(accessors(&registry).count()).unwrap_or(0);
     let size = intrinsics().map(|i| block_size(&registry, i)).sum::<u32>()
-        + abi::FUNC_BLOCK_SIZE * methods;
+        + abi::FUNC_BLOCK_SIZE * methods
+        + abi::ACCESSOR_BLOCK_SIZE * accessors;
     size.cast_signed()
 }
 
@@ -749,7 +803,11 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
         for field in [count, count, count] {
             blob.extend_from_slice(&field.to_le_bytes());
         }
-        for e in registry.iter().filter(|e| e.intrinsic == intrinsic) {
+        for (i, e) in registry
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.intrinsic == intrinsic)
+        {
             let value = match e.value {
                 Value::Method(b) => heap(base + method_offset(&registry, b)),
                 Value::Str(s) => heap(at(s)),
@@ -757,6 +815,7 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
                 Value::Num(n) => n.to_bits(),
                 Value::Undefined => abi::UNDEFINED,
                 Value::Intrinsic(i) => heap(base + intrinsic_offset(&registry, i)),
+                Value::Accessor { .. } => heap(base + accessor_offset(&registry, i)),
             };
             blob.extend_from_slice(&at(e.key).to_le_bytes());
             blob.extend_from_slice(&e.attrs.to_le_bytes());
@@ -768,6 +827,16 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
         blob.extend_from_slice(&0u32.to_le_bytes());
         blob.extend_from_slice(&function_proto.to_le_bytes());
         fn_payload(&mut blob, builtin);
+    }
+    for i in accessors(&registry) {
+        if let Value::Accessor { get, set } = registry[i].value {
+            blob.extend_from_slice(&[abi::TYPE_ACCESSOR, 0, 0, 0]);
+            blob.extend_from_slice(&0u32.to_le_bytes());
+            for half in [get, set] {
+                let method = heap(base + method_offset(&registry, half));
+                blob.extend_from_slice(&method.to_le_bytes());
+            }
+        }
     }
     blob
 }
@@ -863,6 +932,47 @@ mod tests {
                 9 + builtin.index()
             );
         }
+    }
+
+    #[test]
+    fn restricted_function_properties_share_one_throw_type_error() {
+        let (base, strings) = (4096, offsets());
+        let image = image(base, 9, &strings);
+        let registry = registry();
+        let thrower = (HEAP_BITS
+            | i64::from(base + method_offset(&registry, Builtin::ThrowTypeError).cast_signed()))
+        .cast_unsigned();
+        let table =
+            intrinsic_offset(&registry, Intrinsic::FunctionPrototype) + abi::FUNC_BLOCK_SIZE;
+        let mut found = Vec::new();
+        for (k, e) in (0..).zip(
+            registry
+                .iter()
+                .filter(|e| e.intrinsic == Intrinsic::FunctionPrototype),
+        ) {
+            if e.key != "caller" && e.key != "arguments" {
+                continue;
+            }
+            let entry = table + abi::PROPS_HEADER_SIZE + abi::PROP_ENTRY_SIZE * k;
+            assert_eq!(
+                u32_at(&image, entry + abi::PROP_ATTRS_OFFSET),
+                abi::ATTR_ACCESSOR | abi::ATTR_CONFIGURABLE,
+                "{}: attrs",
+                e.key
+            );
+            let block = u32_at(&image, entry + abi::PROP_VALUE_OFFSET) - base.cast_unsigned();
+            assert_eq!(image[block as usize], abi::TYPE_ACCESSOR);
+            // get === set === the one %ThrowTypeError% for both properties.
+            assert_eq!(u64_at(&image, block + abi::ACCESSOR_GET_OFFSET), thrower);
+            assert_eq!(u64_at(&image, block + abi::ACCESSOR_SET_OFFSET), thrower);
+            found.push(e.key);
+        }
+        assert_eq!(found, ["caller", "arguments"]);
+        // %ThrowTypeError% is a plain (non-constructor) function: length 0, name "".
+        assert_eq!(Builtin::ThrowTypeError.length(), 0);
+        assert_eq!(Builtin::ThrowTypeError.name(), "");
+        let at = method_offset(&registry, Builtin::ThrowTypeError) as usize;
+        assert_eq!(image[at + 2] & abi::FUNC_FLAG_CONSTRUCTOR, 0);
     }
 
     #[test]

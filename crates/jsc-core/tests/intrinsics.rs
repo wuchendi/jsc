@@ -282,3 +282,55 @@ fn rendering_lists_own_properties_only() {
         "{} E {} {} F {}\n",
     );
 }
+
+/// Every way of producing a function, for the `caller`/`arguments` checks.
+const FUNCTION_KINDS: [&str; 6] = [
+    "function f() {}",
+    "const f = function () {};",
+    "const f = () => {};",
+    "const f = ({ m() {} }).m;",
+    "class f {}",
+    "function* f() {}",
+];
+
+#[test]
+fn strict_caller_and_arguments_throw_through_function_prototype() {
+    for decl in FUNCTION_KINDS {
+        for access in ["f.caller", "f.arguments", "f.caller = 1", "f.arguments = 1"] {
+            assert_bool(
+                &format!(
+                    "{decl} let ok = false; try {{ {access}; }} catch (e) {{ ok = e instanceof TypeError; }} ok"
+                ),
+                true,
+            );
+        }
+        // Inherited from %Function.prototype%, never own.
+        assert_bool(
+            &format!(
+                r#"{decl} "caller" in f && "arguments" in f && !f.hasOwnProperty("caller") && !f.hasOwnProperty("arguments")"#
+            ),
+            true,
+        );
+    }
+    // A computed key reaches the same accessor.
+    assert_bool(
+        r#"function f() {} const k = "caller"; let ok = false; try { f[k]; } catch (e) { ok = e instanceof TypeError; } ok"#,
+        true,
+    );
+    // The accessors live on %Function.prototype% itself.
+    assert_bool(
+        r#"Function.prototype.hasOwnProperty("caller") && Function.prototype.hasOwnProperty("arguments")"#,
+        true,
+    );
+    assert_uncaught(
+        "function f() {} f.caller",
+        "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+    );
+}
+
+#[test]
+fn plain_objects_named_caller_are_unaffected() {
+    assert_number("({ caller: 1 }).caller", 1.0);
+    assert_number("const o = {}; o.arguments = 2; o.arguments", 2.0);
+    assert_eval("({}).caller", "undefined");
+}
