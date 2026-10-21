@@ -8,10 +8,12 @@
 //!
 //! For `negative: { phase: runtime }` tests the expected constructor name is
 //! matched against the token after `Uncaught ` on stderr. jsc prints builtin
-//! errors as `Uncaught TypeError: msg`, so builtin names match, and an
-//! uncaught user class instance Node-style with its class name
-//! (`Uncaught Test262Error { message: x }`). Harness assertion failures throw
-//! `new Error("Test262Error: ...")` and therefore report the name `Error`.
+//! errors as `Uncaught TypeError: msg`, so builtin names match, and any other
+//! uncaught object Node-style with its constructor name. The official harness
+//! throws `new Test262Error(message)` from failed assertions and
+//! `Test262Error.thrower`, which renders as `Uncaught Test262Error { message:
+//! x }` and so reports the name `Test262Error`. `$DONOTEVALUATE()` throws a
+//! string (`Uncaught Test262: This statement ...`), which never matches.
 
 use crate::frontmatter::Negative;
 
@@ -194,12 +196,24 @@ mod tests {
             classify(Status::Exited(1), class_instance, Some(&t262)),
             Outcome::Pass
         );
-        let harness = "Uncaught Error: Test262Error: Expected SameValue\n";
-        assert_eq!(uncaught_name(harness), Some("Error"));
+        let empty = "Uncaught Test262Error { message:  }\n";
         assert_eq!(
-            classify(Status::Exited(1), harness, Some(&neg("runtime", "Error"))),
+            classify(Status::Exited(1), empty, Some(&t262)),
             Outcome::Pass
         );
-        assert_eq!(uncaught_name("Uncaught str\n"), Some("str"));
+        assert_eq!(
+            classify(
+                Status::Exited(1),
+                class_instance,
+                Some(&neg("runtime", "Error"))
+            ),
+            Outcome::Fail
+        );
+        let not_evaluated = "Uncaught Test262: This statement should not be evaluated.\n";
+        assert_eq!(uncaught_name(not_evaluated), Some("Test262"));
+        assert_eq!(
+            classify(Status::Exited(1), not_evaluated, Some(&t262)),
+            Outcome::Fail
+        );
     }
 }
