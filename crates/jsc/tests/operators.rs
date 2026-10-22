@@ -278,3 +278,55 @@ fn unary_minus_negates_signed_zero() {
     // A literal `-0` is still constant-folded to `-0`.
     assert_eq!(jsc(&["-p", "1 / -0"]), "-Infinity");
 }
+
+/// A comma (sequence) expression evaluates every operand left to right and
+/// produces the last one's value, wherever an expression is allowed.
+#[test]
+fn sequence_expression_value_and_order() {
+    assert_eq!(jsc(&["-p", "(1, 2, 3)"]), "3");
+    assert_eq!(jsc(&["-p", "let s = ''; (s += 'a', s += 'b', s)"]), "ab");
+    assert_eq!(jsc(&["-p", "let x = (1, 2); x"]), "2");
+    assert_eq!(jsc(&["-p", "function f(v) { return v; } f((1, 2))"]), "2");
+    assert_eq!(jsc(&["-p", "let n = 0; (n++, n) ? 'y' : 'n'"]), "y");
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let k = 0, r; if ((k = 5, k > 3)) r = 'big'; else r = 'small'; r"
+        ]),
+        "big"
+    );
+    assert_eq!(jsc(&["-p", "let a = 0; `${(a = 7, a + 1)}`"]), "8");
+    assert_eq!(jsc(&["-p", "((1, 2), (3, (4, 5)))"]), "5");
+    assert_eq!(
+        jsc(&["-p", "function g() { let t = 1; return t++, t * 10; } g()"]),
+        "20"
+    );
+    assert_eq!(jsc(&["-p", "const h = () => (1, 'last'); h()"]), "last");
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = ''; const f = (x) => (o += x, x); console.log((f('a'), f('b'), f('c')), o)"
+        ]),
+        "c abc"
+    );
+}
+
+/// `for` heads take sequences in both the init and the update clause.
+#[test]
+fn sequence_expression_in_for_heads() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let i, j, out = ''; for (i = 0, j = 3; i < j; i++, j--) out += i + '' + j; out"
+        ]),
+        "0312"
+    );
+}
+
+/// `(0, o.m)()` reads the method as a plain value, so the call has no
+/// receiver; `o.m()` still binds `this`.
+#[test]
+fn sequence_callee_drops_this() {
+    let src = "var o = { m() { return this === o; } }; [o.m(), (0, o.m)()].join()";
+    assert_eq!(jsc(&["-p", src]), "true,false");
+}
