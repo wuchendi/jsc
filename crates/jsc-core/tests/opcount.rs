@@ -1,4 +1,4 @@
-//! Opcount/fuel snapshot gate (design/object-model.md section 3.4).
+//! Opcount/fuel snapshot gate (`DESIGN.md` section 6.4).
 //!
 //! Every `tests/opcount/*.js` program is compiled in-process and measured:
 //!
