@@ -1330,9 +1330,12 @@ Errors are printed to stderr.
   | commit | pass | eligible | total |
   |---|---|---|---|
   | `319208e` | 10185 | 23208 | 47665 |
+  | `d0f5e6a` | 10269 | 26388 | 47665 |
 
-  i.e. **10185 / 23208 eligible tests pass (≈ 43.9 %)**, out of 47665 tests in
-  the pinned checkout; `baseline.txt` holds the same 10185 paths.
+  i.e. **10269 / 26388 eligible tests pass (≈ 38.9 %)**, out of 47665 tests in
+  the pinned checkout; `baseline.txt` holds the same 10269 paths. The drop in
+  rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); the
+  previously eligible 23208 still pass 10185.
 
 **Running it** (from the repository root):
 
