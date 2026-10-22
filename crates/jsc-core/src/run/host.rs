@@ -266,7 +266,12 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         METHOD_OP_LAST_INDEX_OF => match type_byte {
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
-                string_last_index_of(&hay, &arg_bytes(arg0, &mem), arg1, &mem)
+                Some(string_last_index_of(
+                    &hay,
+                    &arg_bytes(arg0, &mem),
+                    arg1,
+                    &mem,
+                ))
             }
             _ => None,
         },
@@ -823,7 +828,7 @@ fn string_code_at<W: Send + 'static>(
 /// `string.lastIndexOf(sub, pos)`: the number bits of the last BYTE index at
 /// or before `pos` (`undefined`/`NaN`: the end) where `sub` occurs, or `-1`;
 /// [`UNSUPPORTED`] when `pos` or the hit lies past a non-ASCII byte.
-fn string_last_index_of(hay: &[u8], needle: &[u8], pos_bits: i64, mem: &[u8]) -> Option<u64> {
+fn string_last_index_of(hay: &[u8], needle: &[u8], pos_bits: i64, mem: &[u8]) -> u64 {
     let pos = value_to_number(&decode(pos_bits.cast_unsigned(), mem));
     let len = hay.len();
     let start = if pos.is_nan() {
@@ -832,18 +837,18 @@ fn string_last_index_of(hay: &[u8], needle: &[u8], pos_bits: i64, mem: &[u8]) ->
         let len_i = i64::try_from(len).unwrap_or(i64::MAX);
         let start = usize::try_from(trunc_to_int(pos).clamp(0, len_i)).unwrap_or(0);
         if !ascii_prefix(hay, start) {
-            return Some(UNSUPPORTED);
+            return UNSUPPORTED;
         }
         start
     };
     let Some(last) = len.checked_sub(needle.len()) else {
-        return Some(not_found_bits());
+        return not_found_bits();
     };
     let found = (0..=start.min(last))
         .rev()
         .find(|&i| hay[i..].starts_with(needle))
         .map_or_else(not_found_bits, index_bits);
-    Some(exact_found(hay, found))
+    exact_found(hay, found)
 }
 
 /// Whether `c` is `RegExp` pattern syntax: a string pattern of `search` /
