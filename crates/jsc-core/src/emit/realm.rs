@@ -192,6 +192,14 @@ pub(super) enum Builtin {
     Call,
     /// `Function.prototype.apply`.
     Apply,
+    /// `Function.prototype.bind`.
+    Bind,
+    /// `Function.prototype.toString`.
+    FunctionToString,
+    /// The call/construct trampoline of every bound function (DESIGN.md
+    /// §5.5): `env` is the `[target, boundThis, ...boundArgs]` array. Not
+    /// installed on any intrinsic.
+    BoundCall,
     /// `Error.prototype.toString`.
     ErrorToString,
     /// A `Math` method (`Math.floor`, `Math.max`, ..).
@@ -424,13 +432,16 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 126] = [
+    pub(super) const ALL: [Builtin; 129] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
         Self::ValueOf,
         Self::Call,
         Self::Apply,
+        Self::Bind,
+        Self::FunctionToString,
+        Self::BoundCall,
         Self::ErrorToString,
         Self::Math(MathOp::Floor),
         Self::Math(MathOp::Ceil),
@@ -586,6 +597,7 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ThrowTypeError
             | Self::MethodCall
+            | Self::BoundCall
             | Self::IterSource => "",
             Self::HasOwnProperty => "hasOwnProperty",
             Self::ObjectToString
@@ -593,7 +605,8 @@ impl Builtin {
             | Self::ArrayToString
             | Self::StringToString
             | Self::NumberToString
-            | Self::BooleanToString => "toString",
+            | Self::BooleanToString
+            | Self::FunctionToString => "toString",
             Self::ValueOf | Self::StringValueOf | Self::NumberValueOf | Self::BooleanValueOf => {
                 "valueOf"
             }
@@ -610,6 +623,7 @@ impl Builtin {
             Self::StringMethod(op) => op.name(),
             Self::Call => "call",
             Self::Apply => "apply",
+            Self::Bind => "bind",
             Self::Math(op) => match op {
                 MathOp::Floor => "floor",
                 MathOp::Ceil => "ceil",
@@ -662,7 +676,9 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ThrowTypeError
             | Self::MethodCall
+            | Self::BoundCall
             | Self::IterSource
+            | Self::FunctionToString
             | Self::StringToString
             | Self::StringValueOf
             | Self::NumberValueOf
@@ -692,6 +708,7 @@ impl Builtin {
             | Self::PromiseThen => 2,
             Self::HasOwnProperty
             | Self::Call
+            | Self::Bind
             | Self::Math(_)
             | Self::Ctor(_)
             | Self::ObjectStatic(_)
@@ -1007,6 +1024,18 @@ pub(super) fn registry() -> Vec<Entry> {
             "apply",
             METHOD_ATTRS,
             Value::Method(Builtin::Apply),
+        ),
+        entry(
+            FunctionPrototype,
+            "bind",
+            METHOD_ATTRS,
+            Value::Method(Builtin::Bind),
+        ),
+        entry(
+            FunctionPrototype,
+            "toString",
+            METHOD_ATTRS,
+            Value::Method(Builtin::FunctionToString),
         ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
