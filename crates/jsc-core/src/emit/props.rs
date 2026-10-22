@@ -34,6 +34,9 @@ macro_rules! wasm {
     }};
 }
 
+mod descriptor;
+pub(super) use descriptor::*;
+
 /// Kind byte of an own-property table (see [`abi::TYPE_PROPS`]).
 const TYPE_PROPS: i32 = abi::TYPE_PROPS as i32;
 /// Object-family `props` slot offset (see [`abi::OBJ_PROPS_OFFSET`]).
@@ -89,7 +92,7 @@ pub(super) const OWN_VALUES: i32 = 1;
 /// `__own_keys` mode: `[key, value]` pairs of the enumerable string keys.
 pub(super) const OWN_ENTRIES: i32 = 2;
 /// `__own_keys` mode: every string key, enumerable or not.
-const OWN_ALL: i32 = 3;
+pub(super) const OWN_ALL: i32 = 3;
 
 fn m8(offset: u64) -> MemArg {
     MemArg {
@@ -550,19 +553,38 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>) -> Function {
 }
 
 /// `__define(o: i32, key: i32, v: i64, attrs: i32)`: define the own property
-/// `key` of the object-family block `o` (overwrite in place when present, else
-/// append; `CreateDataProperty` / accessor install). A missing table starts at
-/// capacity 4; a full one is rebuilt with capacity `max(4, 2 * live)` (the same
-/// capacity when tombstones free half), keeping the live entries in order
-/// (and the table's watch flag and bit), and `o`'s `props` slot is rewritten.
-/// A watched table sets its dirty bit when the program tracks them.
+/// `key` of the object-family block `o` with the complete descriptor
+/// `(v, attrs)` (`CreateDataProperty` / `DefinePropertyOrThrow` / accessor
+/// install): overwrite in place when present, else append. Redefining a
+/// non-configurable property throws `Cannot redefine property: k`, and adding
+/// to a `NOT_EXTENSIBLE` object throws `Cannot define property k, object is
+/// not extensible` (both left pending, nothing changed). A missing table
+/// starts at capacity 4; a full one is rebuilt with capacity `max(4, 2 *
+/// live)` (the same capacity when tombstones free half), keeping the live
+/// entries in order (and the table's watch flag and bit), and `o`'s `props`
+/// slot is rewritten. A watched table sets its dirty bit when the program
+/// tracks them.
 pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(7, ValType::I32)]);
     let (o, key, v, attrs) = (0, 1, 2, 3);
     let (e, p, q, n, src, end, cap) = (4, 5, 6, 7, 8, 9, 10);
+    // Throw the keyed `__prop_throw` TypeError of `mode` for `o` / `key`.
+    let throw = |f: &mut Function, mode: i32| {
+        wasm!(f; LocalGet(o));
+        emit_box_heap(f);
+        wasm!(f; LocalGet(key));
+        emit_box_heap(f);
+        wasm!(f; I32Const(mode), Call(helpers.prop_throw), Return);
+    };
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
         If(BlockType::Empty),
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+        If(BlockType::Empty),
+    );
+    throw(&mut f, PROP_THROW_DEFINE_NOT_EXTENSIBLE);
+    wasm!(f;
+        End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p), I32Eqz,
         If(BlockType::Empty),
         // A fresh table: kind 12, count 0, cap 4, live 0.
@@ -612,6 +634,13 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
         If(BlockType::Empty),
         LocalGet(p), LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_INDEX_KEYS), I32Or,
         I32Store8(m8(P_TFLAGS)),
+        End,
+        Else,
+        LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_CONFIGURABLE), I32And, I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw(&mut f, PROP_THROW_REDEFINE);
+    wasm!(f;
         End,
         End,
         LocalGet(e), LocalGet(attrs), I32Store(m32(E_ATTRS)),
@@ -685,6 +714,16 @@ pub(super) fn emit_fn_materialize(
     define(&mut f, ATTR_WRITABLE);
     wasm!(f; End, End);
     f
+}
+
+/// Materialize the `LAZY` function whose block base is in i32 local `o` (a
+/// no-op for any other block), so its own `length` / `name` / `prototype`
+/// exist before a whole-table walk or an integrity change.
+pub(super) fn emit_materialize(function: &mut Function, o: u32, helpers: Helpers<'_>) {
+    wasm!(function;
+        LocalGet(o), I32Load(m32(0)), I32Const(LAZY_FN_MASK), I32And, I32Const(LAZY_FN_WORD), I32Eq,
+        If(BlockType::Empty), LocalGet(o), Call(helpers.define + 1), End,
+    );
 }
 
 /// Emit the string/array exotic own lookup of the interned `key` (i32 local)

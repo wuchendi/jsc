@@ -206,6 +206,8 @@ pub(super) enum Builtin {
     Ctor(BuiltinCtor),
     /// `Object.keys` / `Object.values` / `Object.entries`.
     ObjectStatic(ObjectBuiltinOp),
+    /// An `Object` static over property descriptors and integrity levels.
+    ObjectReflect(ReflectOp),
     /// `Array.isArray`.
     IsArray,
     /// `Promise.resolve`.
@@ -296,6 +298,63 @@ pub(super) enum Builtin {
     IsFinite,
 }
 
+/// An `Object` static over property descriptors and integrity levels
+/// (DESIGN.md §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReflectOp {
+    DefineProperty,
+    DefineProperties,
+    GetOwnPropertyDescriptor,
+    GetOwnPropertyDescriptors,
+    PreventExtensions,
+    IsExtensible,
+    Seal,
+    Freeze,
+    IsSealed,
+    IsFrozen,
+}
+
+impl ReflectOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [ReflectOp; 10] = [
+        Self::DefineProperty,
+        Self::DefineProperties,
+        Self::GetOwnPropertyDescriptor,
+        Self::GetOwnPropertyDescriptors,
+        Self::PreventExtensions,
+        Self::IsExtensible,
+        Self::Seal,
+        Self::Freeze,
+        Self::IsSealed,
+        Self::IsFrozen,
+    ];
+
+    /// The static's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::DefineProperty => "defineProperty",
+            Self::DefineProperties => "defineProperties",
+            Self::GetOwnPropertyDescriptor => "getOwnPropertyDescriptor",
+            Self::GetOwnPropertyDescriptors => "getOwnPropertyDescriptors",
+            Self::PreventExtensions => "preventExtensions",
+            Self::IsExtensible => "isExtensible",
+            Self::Seal => "seal",
+            Self::Freeze => "freeze",
+            Self::IsSealed => "isSealed",
+            Self::IsFrozen => "isFrozen",
+        }
+    }
+
+    /// The static's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::DefineProperty => 3,
+            Self::DefineProperties | Self::GetOwnPropertyDescriptor => 2,
+            _ => 1,
+        }
+    }
+}
+
 /// A `String.prototype` method backed by a host `__method` op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StringOp {
@@ -378,7 +437,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 112] = [
+    pub(super) const ALL: [Builtin; 122] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -418,6 +477,16 @@ impl Builtin {
         Self::ObjectStatic(ObjectBuiltinOp::Keys),
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
+        Self::ObjectReflect(ReflectOp::ALL[0]),
+        Self::ObjectReflect(ReflectOp::ALL[1]),
+        Self::ObjectReflect(ReflectOp::ALL[2]),
+        Self::ObjectReflect(ReflectOp::ALL[3]),
+        Self::ObjectReflect(ReflectOp::ALL[4]),
+        Self::ObjectReflect(ReflectOp::ALL[5]),
+        Self::ObjectReflect(ReflectOp::ALL[6]),
+        Self::ObjectReflect(ReflectOp::ALL[7]),
+        Self::ObjectReflect(ReflectOp::ALL[8]),
+        Self::ObjectReflect(ReflectOp::ALL[9]),
         Self::IsArray,
         Self::PromiseResolve,
         Self::PromiseReject,
@@ -568,6 +637,7 @@ impl Builtin {
             Self::ObjectStatic(ObjectBuiltinOp::Keys | ObjectBuiltinOp::ForInKeys) => "keys",
             Self::ObjectStatic(ObjectBuiltinOp::Values) => "values",
             Self::ObjectStatic(ObjectBuiltinOp::Entries) => "entries",
+            Self::ObjectReflect(op) => op.name(),
             Self::IsArray => "isArray",
             Self::PromiseResolve => "resolve",
             Self::PromiseReject => "reject",
@@ -644,6 +714,7 @@ impl Builtin {
             | Self::GeneratorReturn
             | Self::GeneratorThrow => 1,
             Self::StringMethod(op) => op.length(),
+            Self::ObjectReflect(op) => op.length(),
             Self::JsonStringify => 3,
         }
     }
@@ -990,11 +1061,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
             Value::Intrinsic(prototype),
         ));
         let statics: &[Builtin] = match ctor {
-            BuiltinCtor::Object => &[
-                Builtin::ObjectStatic(ObjectBuiltinOp::Keys),
-                Builtin::ObjectStatic(ObjectBuiltinOp::Values),
-                Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
-            ],
+            BuiltinCtor::Object => &OBJECT_STATICS,
             BuiltinCtor::Array => &[Builtin::IsArray],
             BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
             BuiltinCtor::Date => &[Builtin::DateNow],
@@ -1022,6 +1089,23 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         entries.push(entry(prototype, "size", ACCESSOR_ATTRS, size));
     }
 }
+
+/// The statics of `Object`, in slot order.
+const OBJECT_STATICS: [Builtin; 13] = [
+    Builtin::ObjectStatic(ObjectBuiltinOp::Keys),
+    Builtin::ObjectStatic(ObjectBuiltinOp::Values),
+    Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
+    Builtin::ObjectReflect(ReflectOp::ALL[0]),
+    Builtin::ObjectReflect(ReflectOp::ALL[1]),
+    Builtin::ObjectReflect(ReflectOp::ALL[2]),
+    Builtin::ObjectReflect(ReflectOp::ALL[3]),
+    Builtin::ObjectReflect(ReflectOp::ALL[4]),
+    Builtin::ObjectReflect(ReflectOp::ALL[5]),
+    Builtin::ObjectReflect(ReflectOp::ALL[6]),
+    Builtin::ObjectReflect(ReflectOp::ALL[7]),
+    Builtin::ObjectReflect(ReflectOp::ALL[8]),
+    Builtin::ObjectReflect(ReflectOp::ALL[9]),
+];
 
 /// The builtin method `intrinsic.key` of the registry, if any.
 pub(super) fn method_of(intrinsic: Intrinsic, key: &str) -> Option<Builtin> {

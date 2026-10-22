@@ -404,7 +404,8 @@ a 16-byte prefix (`OBJ_PREFIX_SIZE = 16`):
 **Flags.** Strings: bit `1` `INTERNED` (the canonical block for its content),
 bit `2` `ARRAY_INDEX` (content is a canonical array index: `"0"` or a nonzero
 digit then digits, value `< 2^32 - 1`). Object family: bit `1`
-`NOT_EXTENSIBLE`. Functions additionally: `4` `LAZY`, `8` `CONSTRUCTOR`, `16`
+`NOT_EXTENSIBLE` (set by `preventExtensions` / `seal` / `freeze`, never
+cleared; never set on an array). Functions additionally: `4` `LAZY`, `8` `CONSTRUCTOR`, `16`
 `CLASS_CTOR`, `32` `SELF_ALLOC` (§5.5). Arrays additionally: `4` `SPARSE`,
 `8` `JOINING` (set while `join` runs, so a cyclic element joins as `""`).
 
@@ -483,7 +484,8 @@ An object-family block's own named properties live in a `TYPE_PROPS` table:
 `attrs`: `1` `WRITABLE`, `2` `ENUMERABLE`, `4` `CONFIGURABLE`, `8` `ACCESSOR`
 (for which `WRITABLE` is ignored). Properties created by assignment or
 literals are `0b0111` (`ATTRS_DEFAULT`). This is the state space of a spec
-property descriptor, so descriptor reflection needs no relayout.
+property descriptor: descriptor reflection (§6.3) reads and rewrites `attrs`
+and `value` in place.
 
 - **Keys** are interned: two keys are equal iff their `u32` pointers are
   equal, so a lookup is one load and compare per entry (linear scan).
@@ -701,6 +703,7 @@ function-index order:
 | realm | `__has_own(key, obj)`, then the builtin bodies (§6.4) |
 | conversions (§6.5) | `__to_primitive(v, hint)`, `__to_string(v)`, `__add(a, b)`, `__compare(a, b, op)`, `__array_join(recv, sep)`, `__to_object(v)` |
 | JSON (§7.9) | `__json_rep(holder, key, value, replacer, list, stack)` — `SerializeJSONProperty` (`toJSON`, replacer function with `this = holder`, property list, wrapper unwrapping, cycle `TypeError` via the `stack` array); `__json_indent(s, gap)` — re-indent compact text for `space`; `__json_revive(holder, key, reviver)` — `InternalizeJSONProperty` |
+| descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already
@@ -710,8 +713,9 @@ wrapper object (§5.2) and returns any object unchanged.
 ### 6.3 Property algorithms
 
 `__get`, `__set`, `__has`, `__delete`, `__define`, `__own_keys`,
-`__for_in_keys`, and `__rest` (`emit/props.rs`) are the only code that reads or
-writes property tables. Keys are interned `u32`s.
+`__for_in_keys`, `__rest`, and the descriptor helpers (`emit/props.rs`,
+`emit/props/descriptor.rs`) are the only code that reads or writes property
+tables. Keys are interned `u32`s.
 
 - **`__get(recv, key)`** — `OrdinaryGet`. A string or array resolves its exotic
   own keys first (`length`, in-range indices; a hole reads `undefined`, a
@@ -736,9 +740,37 @@ writes property tables. Keys are interned `u32`s.
 - **`__delete(obj, key)`** — tombstones an own entry; a non-configurable
   property throws. On an array an in-range index becomes a hole and `length`
   throws.
-- **`__define(o, key, v, attrs)`** — `CreateDataProperty` / accessor install:
-  overwrite in place or append. Used by literals, class definitions, field
-  initializers, and builtins.
+- **`__define(o, key, v, attrs)`** — `CreateDataProperty` /
+  `DefinePropertyOrThrow` of a complete descriptor: overwrite in place or
+  append. Redefining a non-configurable property throws `Cannot redefine
+  property: k`; adding to a non-extensible object throws `Cannot define
+  property k, object is not extensible`. Used by literals, class definitions,
+  field initializers (a class field propagates the throw), and builtins.
+- **Descriptors.** A descriptor record is four jsvals `[desc, value, get,
+  set]`: `desc` packs the `W`/`E`/`C` values in their `attrs` bits plus
+  presence bits (`0x100` writable, `0x200` enumerable, `0x400` configurable,
+  `0x800` value, `0x1000` get, `0x2000` set); an absent `value`/`get`/`set` is
+  `undefined`. `__to_desc(attrs, list)` is `ToPropertyDescriptor` (a
+  non-object throws; fields are read in spec order through `__has` + `__get`,
+  so inherited fields and getters count; `get`/`set` must be callable or
+  `undefined`; mixing accessor and data fields throws) and appends the record
+  to the array `list`. `__define_own(o, key, desc, value, get, set)` is
+  `ValidateAndApplyPropertyDescriptor`: it never throws but returns ok,
+  rejected (non-configurable rules), not extensible, or unsupported — an
+  array's `length`, or an array index whose resulting attributes are not the
+  default ones (an index with default attributes is an element store); the
+  caller raises the `TypeError`. A kind change on a configurable property
+  keeps `E`/`C` and resets the rest; an accessor update allocates a fresh
+  `TYPE_ACCESSOR` block. `__own_desc(obj, key)` is `FromPropertyDescriptor`
+  of `[[GetOwnProperty]]` (a fresh object with `value, writable` or `get,
+  set`, then `enumerable, configurable`; an array's `length` is writable,
+  non-enumerable, non-configurable; elements have the default attributes).
+- **Integrity levels.** `__set_integrity(obj, level)` (`0` not extensible,
+  `1` sealed, `2` frozen) clears `C` on every own property (and `W` on data
+  properties when frozen), then sets `NOT_EXTENSIBLE`; a `LAZY` function is
+  materialized first, and an array throws (`Cannot freeze an array: …`).
+  `__test_integrity(obj, level)` is `IsExtensible` (level `0`) or
+  `TestIntegrityLevel`.
 - **Own-key order** (`__own_keys(obj, mode)`, behind `Object.keys/values/entries`,
   `JSON.stringify`, object rest, and the renderers): integer keys ascending
   (array elements skipping holes, then table keys flagged `ARRAY_INDEX` sorted
@@ -807,7 +839,8 @@ unresolvable name throws `ReferenceError` (strict).
   called through its value; then `K` covers the widest call (§4.2).
 
 **Dirty bits.** `$__intrinsics_dirty` has one bit per watched intrinsic, set by
-`__set` / `__define` / `__delete` on a table flagged `WATCHED` (the table's
+`__set` / `__define` / `__delete` / `__define_own` / `__set_integrity` on a
+table flagged `WATCHED` (the table's
 byte 3 holds the bit index) when the program tests any bit; bits are never
 cleared. Bits: `0` `%Object.prototype%`, `1` `%Array.prototype%`, `2`
 `%String.prototype%`, `3` `%Number.prototype%`, `4` `%Boolean.prototype%`,
@@ -1202,7 +1235,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 |---|---|
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
 | `console` | `log` |
-| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
+| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`); `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply`; `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`; `push` / `pop` (variadic, generic over array-likes), `map`, `filter`, `forEach`, `reduce` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `indexOf`, `includes`, `join`, `slice`, `toString` |
 | `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
@@ -1460,9 +1493,8 @@ Each item below is current behaviour of this tree.
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
-- The builtin library is exactly §7.9: no property-descriptor or prototype
-  reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Function.prototype.bind`, no `Array.from`, `sort`, `find`,
+- The builtin library is exactly §7.9: no prototype reflection
+  (`getPrototypeOf`, `create`, `assign`), no `Function.prototype.bind`, no `Array.from`, `sort`, `find`,
   `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
 - `parseInt` and `parseFloat` exist only as direct calls, not as global values.
@@ -1479,8 +1511,13 @@ Each item below is current behaviour of this tree.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
   the constructors collect their iterable argument eagerly, with no
   `IteratorClose`.
-- `JSON.parse` revivers cannot meet non-configurable properties correctly
-  (4 test262 tests) until property descriptors exist.
+- Arrays take no descriptor attributes yet: `Object.defineProperty` on an
+  array's `length`, or on an index with non-default attributes (including a
+  new index without all of `writable`/`enumerable`/`configurable` true), and
+  `preventExtensions` / `seal` / `freeze` of any array throw a `TypeError`.
+  So a `JSON.parse` reviver cannot meet a non-configurable array element.
+- `Object.defineProperties` reads the enumerable own keys of its
+  `Properties` argument once, before reading any descriptor.
 - `.stack` on errors is `"Name: message"` with no frames.
 
 **Functions & classes**
