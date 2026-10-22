@@ -21,6 +21,18 @@ fn many_small_strings_grow_memory() {
     );
 }
 
+/// Static data (string literals, the realm image, the intern table) past the
+/// first 64 KiB page is covered by the initial memory, so instantiation does
+/// not trap.
+#[test]
+fn static_data_beyond_one_page() {
+    let src: String = (0..3000)
+        .map(|i| format!("let s{i} = 'literal number {i} of a long program'; "))
+        .chain(["s2999.length".to_owned()])
+        .collect();
+    assert_number(&src, 37.0);
+}
+
 /// A million small string allocations complete.
 #[test]
 fn million_small_strings() {

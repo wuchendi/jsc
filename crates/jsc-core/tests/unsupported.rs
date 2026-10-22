@@ -234,8 +234,8 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "TypeError: o.zzz is not a function",
     );
     // An array literal reads its methods from `%Array.prototype%` at run time.
-    assert_uncaught("[1, 2].flat()", "TypeError: expression is not a function");
-    assert_uncaught("[].concat([1])", "TypeError: expression is not a function");
+    assert_uncaught("[1, 2].group()", "TypeError: expression is not a function");
+    assert_uncaught("[].groupBy([1])", "TypeError: expression is not a function");
     // A builtin-named method's user-method fallback throws too.
     assert_uncaught("let o = {}; o.get(1)", "TypeError: o.get is not a function");
     assert_uncaught(

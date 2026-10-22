@@ -428,8 +428,8 @@ pub(super) fn emit_hof(
     let texts = hof_texts(op);
     let (o, callback, this_arg, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (acc, result) = (frame.x64(0), frame.x64(1));
-    let (c, kv, a) = (frame.y64(0), frame.y64(1), frame.y64(4));
-    let (len, k, n, seeded) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (c, kv, target) = (frame.y64(0), frame.y64(1), frame.y64(4));
+    let (len, k, to, seeded) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
     let key = frame.x32(0);
     let reduce = op == ArrayHofOp::Reduce;
     let species = matches!(op, ArrayHofOp::Map | ArrayHofOp::Filter);
@@ -487,7 +487,7 @@ pub(super) fn emit_hof(
             wasm!(function; I64Const(0.0f64.to_bits().cast_signed()));
         }
         wasm!(function; LocalSet(kv));
-        species_from(function, frame, c, kv, a, strings, helpers);
+        species_from(function, frame, c, kv, target, strings, helpers);
     }
     if reduce {
         wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(this_arg));
@@ -514,7 +514,7 @@ pub(super) fn emit_hof(
         };
         call_fn(function, frame, callback, this_arg, args, result, helpers);
     };
-    wasm!(function; I32Const(0), LocalSet(k), I32Const(0), LocalSet(n));
+    wasm!(function; I32Const(0), LocalSet(k), I32Const(0), LocalSet(to));
     count_loop(function, k, len, |function| {
         has_index(function, o, k, key, helpers);
         wasm!(function; If(BlockType::Empty));
@@ -525,7 +525,7 @@ pub(super) fn emit_hof(
                 call(function);
                 index_value(function, k);
                 wasm!(function; LocalSet(kv));
-                create_data_property(function, frame, a, kv, result, strings, helpers);
+                create_data_property(function, frame, target, kv, result, strings, helpers);
             }
             ArrayHofOp::Filter => {
                 call(function);
@@ -537,10 +537,10 @@ pub(super) fn emit_hof(
                     helpers,
                 );
                 wasm!(function; If(BlockType::Empty));
-                index_value(function, n);
+                index_value(function, to);
                 wasm!(function; LocalSet(kv));
-                create_data_property(function, frame, a, kv, value, strings, helpers);
-                wasm!(function; LocalGet(n), I32Const(1), I32Add, LocalSet(n), End);
+                create_data_property(function, frame, target, kv, value, strings, helpers);
+                wasm!(function; LocalGet(to), I32Const(1), I32Add, LocalSet(to), End);
             }
             ArrayHofOp::Reduce => {
                 wasm!(function; LocalGet(seeded), If(BlockType::Empty));
@@ -557,7 +557,7 @@ pub(super) fn emit_hof(
         wasm!(function; End);
     });
     match op {
-        ArrayHofOp::Map | ArrayHofOp::Filter => wasm!(function; LocalGet(a)),
+        ArrayHofOp::Map | ArrayHofOp::Filter => wasm!(function; LocalGet(target)),
         ArrayHofOp::Reduce => {
             wasm!(function; LocalGet(seeded), I32Eqz, If(BlockType::Empty));
             throw_type_error(function, frame, REDUCE_EMPTY, strings, helpers);
@@ -706,8 +706,8 @@ pub(super) fn emit_slice(
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (c, count, a) = (frame.y64(0), frame.y64(1), frame.y64(4));
-    let (len, k, fin, n) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (c, count, target) = (frame.y64(0), frame.y64(1), frame.y64(4));
+    let (len, k, fin, to) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
     let key = frame.x32(1);
     let rel = frame.f64(0);
     this_object(function, frame, o, SLICE.nullish, strings, helpers);
@@ -743,8 +743,8 @@ pub(super) fn emit_slice(
         LocalGet(fin), LocalGet(k), I32Sub, I32Const(0), LocalGet(fin), LocalGet(k), I32GtU, Select,
         F64ConvertI32U, I64ReinterpretF64, LocalSet(count),
     );
-    species_from(function, frame, c, count, a, strings, helpers);
-    wasm!(function; I32Const(0), LocalSet(n));
+    species_from(function, frame, c, count, target, strings, helpers);
+    wasm!(function; I32Const(0), LocalSet(to));
     count_loop(function, k, fin, |function| {
         has_index(function, o, k, key, helpers);
         wasm!(function;
@@ -752,15 +752,15 @@ pub(super) fn emit_slice(
             LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(value),
         );
         return_if_pending(function);
-        index_value(function, n);
+        index_value(function, to);
         wasm!(function; LocalSet(kv));
-        create_data_property(function, frame, a, kv, value, strings, helpers);
-        wasm!(function; End, LocalGet(n), I32Const(1), I32Add, LocalSet(n));
+        create_data_property(function, frame, target, kv, value, strings, helpers);
+        wasm!(function; End, LocalGet(to), I32Const(1), I32Add, LocalSet(to));
     });
-    index_value(function, n);
+    index_value(function, to);
     wasm!(function; LocalSet(kv));
-    set_length(function, frame, a, kv, strings, helpers);
-    wasm!(function; LocalGet(a));
+    set_length(function, frame, target, kv, strings, helpers);
+    wasm!(function; LocalGet(target));
 }
 
 /// `Array.prototype.toString()`: an array joins with `","`; any other
@@ -1237,7 +1237,7 @@ pub(super) fn emit_of(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let (c, a, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (c, target, item, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (saved, len) = (frame.x64(0), frame.y64(1));
     let (n, i) = (frame.i32(0), frame.i32(1));
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
@@ -1245,16 +1245,16 @@ pub(super) fn emit_of(
     wasm!(function; LocalSet(n));
     index_value(function, n);
     wasm!(function; LocalSet(len), GlobalGet(THIS_GLOBAL), LocalSet(c));
-    construct_or_create(function, frame, c, Some(len), a, strings, helpers);
+    construct_or_create(function, frame, c, Some(len), target, strings, helpers);
     wasm!(function; I32Const(0), LocalSet(i));
     count_loop(function, i, n, |function| {
-        saved_arg_at(function, frame, saved, i, v);
+        saved_arg_at(function, frame, saved, i, item);
         index_value(function, i);
         wasm!(function; LocalSet(kv));
-        create_data_property(function, frame, a, kv, v, strings, helpers);
+        create_data_property(function, frame, target, kv, item, strings, helpers);
     });
-    set_length(function, frame, a, len, strings, helpers);
-    wasm!(function; LocalGet(a));
+    set_length(function, frame, target, len, strings, helpers);
+    wasm!(function; LocalGet(target));
 }
 
 /// On a pending throw, `IteratorClose` the generator in i64 `generator` (its
@@ -1672,58 +1672,58 @@ pub(super) fn emit_concat(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let (o, e, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (a, saved, zero) = (frame.x64(0), frame.x64(1), frame.y64(1));
+    let (o, item, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (target, saved, zero) = (frame.x64(0), frame.x64(1), frame.y64(1));
     let (j, argn, len, k) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
     let key = frame.x32(0);
-    let n = frame.yf64(0);
+    let count = frame.yf64(0);
     let advance = |function: &mut Function| {
-        wasm!(function; LocalGet(n), F64Const(Ieee64::from(1.0)), F64Add, LocalSet(n));
+        wasm!(function; LocalGet(count), F64Const(Ieee64::from(1.0)), F64Add, LocalSet(count));
     };
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
     this_object(function, frame, o, CONCAT.nullish, strings, helpers);
     wasm!(function; I64Const(0.0f64.to_bits().cast_signed()), LocalSet(zero));
-    species_create(function, frame, o, zero, a, strings, helpers);
+    species_create(function, frame, o, zero, target, strings, helpers);
     argc(function, frame);
     wasm!(function;
         LocalSet(argn),
-        F64Const(Ieee64::from(0.0)), LocalSet(n),
-        LocalGet(o), LocalSet(e),
+        F64Const(Ieee64::from(0.0)), LocalSet(count),
+        LocalGet(o), LocalSet(item),
         I32Const(0), LocalSet(j),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
-    is_array(function, e);
+    is_array(function, item);
     wasm!(function; If(BlockType::Empty));
-    length_of(function, e, len, strings, helpers);
+    length_of(function, item, len, strings, helpers);
     wasm!(function; I32Const(0), LocalSet(k));
     count_loop(function, k, len, |function| {
-        has_index(function, e, k, key, helpers);
+        has_index(function, item, k, key, helpers);
         wasm!(function;
             If(BlockType::Empty),
-            LocalGet(e), LocalGet(key), Call(helpers.get), LocalSet(v),
+            LocalGet(item), LocalGet(key), Call(helpers.get), LocalSet(v),
         );
         return_if_pending(function);
-        wasm!(function; LocalGet(n), I64ReinterpretF64, LocalSet(kv));
-        create_data_property(function, frame, a, kv, v, strings, helpers);
+        wasm!(function; LocalGet(count), I64ReinterpretF64, LocalSet(kv));
+        create_data_property(function, frame, target, kv, v, strings, helpers);
         wasm!(function; End);
         advance(function);
     });
-    wasm!(function; Else, LocalGet(n), I64ReinterpretF64, LocalSet(kv));
-    create_data_property(function, frame, a, kv, e, strings, helpers);
+    wasm!(function; Else, LocalGet(count), I64ReinterpretF64, LocalSet(kv));
+    create_data_property(function, frame, target, kv, item, strings, helpers);
     advance(function);
     wasm!(function;
         End,
         LocalGet(j), LocalGet(argn), I32GeU, BrIf(1),
     );
-    saved_arg_at(function, frame, saved, j, e);
+    saved_arg_at(function, frame, saved, j, item);
     wasm!(function;
         LocalGet(j), I32Const(1), I32Add, LocalSet(j),
         Br(0),
         End, End,
-        LocalGet(n), I64ReinterpretF64, LocalSet(kv),
+        LocalGet(count), I64ReinterpretF64, LocalSet(kv),
     );
-    set_length(function, frame, a, kv, strings, helpers);
-    wasm!(function; LocalGet(a));
+    set_length(function, frame, target, kv, strings, helpers);
+    wasm!(function; LocalGet(target));
 }
 
 /// `Array.prototype.flat(depth)` / `flatMap(mapper, thisArg)`:
