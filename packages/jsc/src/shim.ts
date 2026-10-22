@@ -27,14 +27,26 @@ import {
   INVOKE_EXPORT_NAME,
   MEMORY_EXPORT_NAME,
   MEMORY_MAX_PAGES,
+  METHOD_NEEDS_REGEXP,
+  METHOD_OP_AT,
   METHOD_OP_CHAR_AT,
+  METHOD_OP_CHAR_CODE_AT,
+  METHOD_OP_CODE_POINT_AT,
   METHOD_OP_ENDS_WITH,
+  METHOD_OP_FROM_CHAR_CODE,
+  METHOD_OP_FROM_CODE_POINT,
   METHOD_OP_INCLUDES,
   METHOD_OP_INDEX_OF,
+  METHOD_OP_LAST_INDEX_OF,
+  METHOD_OP_LOCALE_COMPARE,
+  METHOD_OP_NORMALIZE,
   METHOD_OP_NUMBER_TO_STRING,
   METHOD_OP_PAD_END,
   METHOD_OP_PAD_START,
   METHOD_OP_REPEAT,
+  METHOD_OP_REPLACE,
+  METHOD_OP_REPLACE_ALL,
+  METHOD_OP_SEARCH,
   METHOD_OP_SLICE,
   METHOD_OP_SPLIT,
   METHOD_OP_STARTS_WITH,
@@ -44,6 +56,8 @@ import {
   METHOD_OP_TRIM,
   METHOD_OP_TRIM_END,
   METHOD_OP_TRIM_START,
+  METHOD_RANGE_ERROR,
+  METHOD_UNSUPPORTED,
   NEW_ARRAY_EXPORT_NAME,
   NEW_PROMISE_EXPORT_NAME,
   NEW_STRING_EXPORT_NAME,
@@ -272,6 +286,7 @@ export function createShim(): Shim {
   ): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
+    if (!isAscii(bytes)) return METHOD_UNSUPPORTED
     const len = bytes.length
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
@@ -279,13 +294,18 @@ export function createShim(): Shim {
     return base === null ? null : HEAP | base
   }
 
-  /** `string.trim`/`trimStart`/`trimEnd` — NEW string minus ASCII whitespace (mirrors `string_trim`). */
+  /** `string.trim`/`trimStart`/`trimEnd` — NEW string minus JS whitespace (mirrors `string_trim`). */
   function stringTrim(mem: Uint8Array, ptr: number, op: number): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
-    const trimStart = op !== METHOD_OP_TRIM_END
-    const trimEnd = op !== METHOD_OP_TRIM_START
-    const base = allocString(utf8Decode(trimBytes(bytes, trimStart, trimEnd)))
+    const text = utf8Decode(bytes)
+    const trimmed =
+      op === METHOD_OP_TRIM_START
+        ? text.trimStart()
+        : op === METHOD_OP_TRIM_END
+          ? text.trimEnd()
+          : text.trim()
+    const base = allocString(trimmed)
     return base === null ? null : HEAP | base
   }
 
@@ -323,6 +343,7 @@ export function createShim(): Shim {
       padValue.kind === 'undefined'
         ? utf8Encode.encode(' ')
         : utf8Encode.encode(toJsString(padValue))
+    if (!isAscii(bytes) || !isAscii(pad)) return METHOD_UNSUPPORTED
     const base = allocString(
       padBytes(bytes, target, pad, op === METHOD_OP_PAD_START),
     )
@@ -338,6 +359,7 @@ export function createShim(): Shim {
   ): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
+    if (!isAscii(bytes)) return METHOD_UNSUPPORTED
     const len = bytes.length
     const a = substringIndex(arg0, mem, 0, len)
     const b = substringIndex(arg1, mem, len, len)
@@ -369,6 +391,8 @@ export function createShim(): Shim {
       pieces = [bytes]
     } else {
       const sep = utf8Encode.encode(toJsString(sepValue))
+      if (sep.length === 0 && limit > 0 && !isAscii(bytes))
+        return METHOD_UNSUPPORTED
       pieces =
         sep.length === 0
           ? // An empty separator splits into one element per byte.
@@ -384,6 +408,32 @@ export function createShim(): Shim {
       elems.push(HEAP | base)
     }
     const base = allocArray(elems)
+    return base === null ? null : HEAP | base
+  }
+
+  /**
+   * `at` / `charCodeAt` / `codePointAt` over an ASCII string (mirrors
+   * `host.rs::string_code_at`): the one-character string / code unit at the
+   * position (`at` counts a negative index from the end), or `undefined` /
+   * `NaN` (`charCodeAt`) out of range.
+   */
+  function stringCodeAt(
+    mem: Uint8Array,
+    ptr: number,
+    arg0: bigint,
+    op: number,
+  ): bigint | null {
+    const bytes = stringBytes(mem, ptr)
+    if (bytes === null) return null
+    if (!isAscii(bytes)) return METHOD_UNSUPPORTED
+    let i = truncToInt(valueToNumber(decode(arg0, mem)))
+    if (Number.isNaN(i)) i = 0
+    if (op === METHOD_OP_AT && i < 0) i += bytes.length
+    const byte = i >= 0 && i < bytes.length ? bytes[i] : undefined
+    if (byte === undefined)
+      return op === METHOD_OP_CHAR_CODE_AT ? f64ToBits(NaN) : UNDEFINED
+    if (op !== METHOD_OP_AT) return f64ToBits(byte)
+    const base = allocString(String.fromCharCode(byte))
     return base === null ? null : HEAP | base
   }
 
@@ -410,6 +460,7 @@ export function createShim(): Shim {
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
           if (hay === null) return null
+          if (!isAscii(hay)) return METHOD_UNSUPPORTED
           const from = substringIndex(arg1, mem, 0, hay.length)
           return stringIndexOf(hay, argBytes(arg0, mem), from)
         }
@@ -421,6 +472,7 @@ export function createShim(): Shim {
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
           if (hay === null) return null
+          if (!positionExact(hay, arg1)) return METHOD_UNSUPPORTED
           const from = substringIndex(arg1, mem, 0, hay.length)
           return stringIndexOf(hay, argBytes(arg0, mem), from) !== f64ToBits(-1)
             ? TRUE
@@ -438,16 +490,18 @@ export function createShim(): Shim {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const bytes = stringBytes(mem, ptr)
         if (bytes === null) return null
-        const mapped = bytes.map((byte) =>
-          op === METHOD_OP_TO_UPPER ? asciiUpper(byte) : asciiLower(byte),
+        // The full Unicode default case mappings (`ß` -> `SS`, final sigma).
+        const text = utf8Decode(bytes)
+        const base = allocString(
+          op === METHOD_OP_TO_UPPER ? text.toUpperCase() : text.toLowerCase(),
         )
-        const base = allocString(utf8Decode(mapped))
         return base === null ? null : HEAP | base
       }
       case METHOD_OP_CHAR_AT: {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const bytes = stringBytes(mem, ptr)
         if (bytes === null) return null
+        if (!isAscii(bytes)) return METHOD_UNSUPPORTED
         const i = truncToInt(valueToNumber(decode(arg0, mem)))
         // Out-of-range (a negative index) => "".
         const text =
@@ -468,6 +522,7 @@ export function createShim(): Shim {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const hay = stringBytes(mem, ptr)
         if (hay === null) return null
+        if (!positionExact(hay, arg1)) return METHOD_UNSUPPORTED
         const needle = argBytes(arg0, mem)
         const hit =
           op === METHOD_OP_STARTS_WITH
@@ -494,6 +549,79 @@ export function createShim(): Shim {
       case METHOD_OP_SPLIT:
         if (ptr === null || typeByte !== TYPE_STRING) return null
         return stringSplit(mem, ptr, arg0, arg1)
+      case METHOD_OP_AT:
+      case METHOD_OP_CHAR_CODE_AT:
+      case METHOD_OP_CODE_POINT_AT:
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        return stringCodeAt(mem, ptr, arg0, op)
+      case METHOD_OP_LAST_INDEX_OF: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const hay = stringBytes(mem, ptr)
+        if (hay === null) return null
+        if (!isAscii(hay)) return METHOD_UNSUPPORTED
+        return stringLastIndexOf(hay, argBytes(arg0, mem), arg1, mem)
+      }
+      case METHOD_OP_LOCALE_COMPARE: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const bytes = stringBytes(mem, ptr)
+        if (bytes === null) return null
+        const self = utf8Decode(bytes)
+        const that = toJsString(decode(arg0, mem))
+        // Code-unit order.
+        return f64ToBits(self < that ? -1 : self > that ? 1 : 0)
+      }
+      case METHOD_OP_NORMALIZE: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const bytes = stringBytes(mem, ptr)
+        if (bytes === null) return null
+        const formValue = decode(arg0, mem)
+        const form =
+          formValue.kind === 'undefined' ? 'NFC' : toJsString(formValue)
+        if (!['NFC', 'NFD', 'NFKC', 'NFKD'].includes(form))
+          return METHOD_RANGE_ERROR
+        // Every form maps an ASCII string to itself; Unicode normalization is
+        // not available to the native host yet.
+        return isAscii(bytes) ? recv : METHOD_UNSUPPORTED
+      }
+      case METHOD_OP_SEARCH: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const hay = stringBytes(mem, ptr)
+        if (hay === null) return null
+        const patternValue = decode(arg0, mem)
+        const pattern =
+          patternValue.kind === 'undefined' ? '' : toJsString(patternValue)
+        if (/[\\^$.*+?()[\]{}|]/.test(pattern)) return METHOD_NEEDS_REGEXP
+        if (!isAscii(hay)) return METHOD_UNSUPPORTED
+        return stringIndexOf(hay, utf8Encode.encode(pattern), 0)
+      }
+      case METHOD_OP_REPLACE:
+      case METHOD_OP_REPLACE_ALL: {
+        if (ptr === null || typeByte !== TYPE_STRING) return null
+        const bytes = stringBytes(mem, ptr)
+        if (bytes === null) return null
+        const out = replaceStr(
+          utf8Decode(bytes),
+          toJsString(decode(arg0, mem)),
+          toJsString(decode(arg1, mem)),
+          op === METHOD_OP_REPLACE_ALL,
+        )
+        if (out === null) return METHOD_UNSUPPORTED
+        const base = allocString(out)
+        return base === null ? null : HEAP | base
+      }
+      case METHOD_OP_FROM_CHAR_CODE:
+      case METHOD_OP_FROM_CODE_POINT: {
+        if (ptr === null || typeByte !== TYPE_ARRAY) return null
+        const elements = arrayElements(mem, ptr)
+        if (elements === undefined) return null
+        const numbers = elements[1].map(([, bits]) =>
+          valueToNumber(decode(bits, mem)),
+        )
+        const text = fromCodes(numbers, op === METHOD_OP_FROM_CODE_POINT)
+        if (text === null) return METHOD_UNSUPPORTED
+        const base = allocString(text)
+        return base === null ? null : HEAP | base
+      }
       case METHOD_OP_NUMBER_TO_STRING: {
         const value = decode(recv, mem)
         if (value.kind !== 'number') return null
@@ -951,14 +1079,6 @@ function indexBits(i: number): bigint {
   return f64ToBits(i >>> 0)
 }
 
-function asciiUpper(b: number): number {
-  return b >= 0x61 && b <= 0x7a ? b - 0x20 : b
-}
-
-function asciiLower(b: number): number {
-  return b >= 0x41 && b <= 0x5a ? b + 0x20 : b
-}
-
 /**
  * JS strict equality (`===`) between two raw jsval bits (mirrors
  * `host.rs::strict_eq_bits`): numbers by `f64` value, strings by content, and
@@ -1045,11 +1165,6 @@ function sliceIndex(
   return Math.max(idx, 0)
 }
 
-/** Whether `b` is ASCII whitespace (matches Rust `u8::is_ascii_whitespace`). */
-function isAsciiWhitespace(b: number): boolean {
-  return b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0c || b === 0x0d
-}
-
 /**
  * Coerce a method argument's raw bits to its JS string form as bytes (mirrors
  * `host.rs::arg_bytes`): a string yields its payload, everything else its
@@ -1073,19 +1188,6 @@ function endsWithBytes(hay: Uint8Array, needle: Uint8Array): boolean {
   for (let i = 0; i < needle.length; i++)
     if (hay[off + i] !== needle[i]) return false
   return true
-}
-
-/** Slice `bytes` minus leading/trailing ASCII whitespace (mirrors `host.rs::trim_bytes`). */
-function trimBytes(
-  bytes: Uint8Array,
-  trimStart: boolean,
-  trimEnd: boolean,
-): Uint8Array {
-  let start = 0
-  let end = bytes.length
-  if (trimStart) while (start < end && isAsciiWhitespace(bytes[start]!)) start++
-  if (trimEnd) while (end > start && isAsciiWhitespace(bytes[end - 1]!)) end--
-  return bytes.subarray(start, end)
 }
 
 /**
@@ -1157,4 +1259,135 @@ function splitOn(hay: Uint8Array, sep: Uint8Array): Uint8Array[] {
   }
   out.push(hay.subarray(start))
   return out
+}
+
+/** Whether every byte of `bytes` is ASCII. */
+function isAscii(bytes: Uint8Array): boolean {
+  return bytes.every((b) => b < 0x80)
+}
+
+/**
+ * Whether a byte position argument addresses the same place as in UTF-16 code
+ * units: no position, or an ASCII string (mirrors `host.rs::position_exact`).
+ */
+function positionExact(bytes: Uint8Array, position: bigint): boolean {
+  return position === UNDEFINED || isAscii(bytes)
+}
+
+/**
+ * `string.lastIndexOf(sub, pos)` (mirrors `host.rs::string_last_index_of`):
+ * the last BYTE index at or before `pos` (`undefined`/`NaN`: the end) where
+ * `sub` occurs, or `-1`.
+ */
+function stringLastIndexOf(
+  hay: Uint8Array,
+  needle: Uint8Array,
+  posBits: bigint,
+  mem: Uint8Array,
+): bigint {
+  const pos = valueToNumber(decode(posBits, mem))
+  const len = hay.length
+  const start = Number.isNaN(pos)
+    ? len
+    : Math.min(Math.max(truncToInt(pos), 0), len)
+  const last = len - needle.length
+  if (last < 0) return f64ToBits(-1)
+  for (let i = Math.min(start, last); i >= 0; i--) {
+    if (startsWithBytes(hay.subarray(i), needle)) return indexBits(i)
+  }
+  return f64ToBits(-1)
+}
+
+/**
+ * `replace` / `replaceAll` of the string pattern `search` in `text` by the
+ * template (mirrors `host.rs::replace_str`); `null` when an empty pattern
+ * would split a surrogate pair.
+ */
+function replaceStr(
+  text: string,
+  search: string,
+  template: string,
+  all: boolean,
+): string | null {
+  const positions: number[] = []
+  if (search.length === 0) {
+    if (/[\uD800-\uDFFF]/.test(text)) return null
+    for (let i = 0; i <= text.length; i++) positions.push(i)
+  } else {
+    let at = text.indexOf(search)
+    while (at !== -1) {
+      positions.push(at)
+      at = text.indexOf(search, at + search.length)
+    }
+  }
+  if (!all) positions.length = Math.min(positions.length, 1)
+  let out = ''
+  let end = 0
+  for (const at of positions) {
+    out += text.slice(end, at)
+    out += substitute(text, at, search.length, template)
+    end = at + search.length
+  }
+  return out + text.slice(end)
+}
+
+/**
+ * `GetSubstitution` with no captures (mirrors `host.rs::substitute`): `$$`,
+ * `$&`, `` $` `` and `$'` expand; every other `$` stays literal.
+ */
+function substitute(
+  text: string,
+  at: number,
+  matched: number,
+  template: string,
+): string {
+  let out = ''
+  for (let i = 0; i < template.length; i++) {
+    const c = template[i]
+    const next = template[i + 1]
+    if (c !== '$' || next === undefined) {
+      out += c
+      continue
+    }
+    if (next === '$') out += '$'
+    else if (next === '&') out += text.slice(at, at + matched)
+    else if (next === '`') out += text.slice(0, at)
+    else if (next === "'") out += text.slice(at + matched)
+    else {
+      out += c
+      continue
+    }
+    i++
+  }
+  return out
+}
+
+/**
+ * The string of `String.fromCharCode` (`ToUint16` code units) or
+ * `String.fromCodePoint` (validated code points), or `null` when it would
+ * hold a lone surrogate (mirrors the `host.rs` `FROM_*` ops).
+ */
+function fromCodes(numbers: number[], codePoints: boolean): string | null {
+  const units: number[] = []
+  for (const n of numbers) {
+    if (!codePoints) {
+      units.push(Number.isFinite(n) ? ((Math.trunc(n) % 0x10000) + 0x10000) % 0x10000 : 0)
+    } else if (n > 0xffff) {
+      units.push(0xd800 + ((n - 0x10000) >> 10), 0xdc00 + ((n - 0x10000) & 0x3ff))
+    } else {
+      units.push(n)
+    }
+  }
+  // A high surrogate must be followed by a low one, and a low one preceded.
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i]!
+    if (u >= 0xd800 && u <= 0xdbff) {
+      const next = units[i + 1]
+      if (next === undefined || next < 0xdc00 || next > 0xdfff) return null
+      i++
+    } else if (u >= 0xdc00 && u <= 0xdfff) {
+      return null
+    }
+  }
+  return String.fromCharCode(...units)
 }

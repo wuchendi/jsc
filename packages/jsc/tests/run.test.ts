@@ -504,3 +504,33 @@ it('runs the string and number prototype host ops like the Rust host', async () 
   )
   expect((await run('(-255).toString(36)')).result).toBe('-73')
 })
+
+it('runs the String statics and remaining string methods like the host', async () => {
+  const cases: [string, string][] = [
+    ['String.fromCharCode(104, 105, 233)', 'hié'],
+    ['String.fromCharCode(0xd83d, 0xde00) === String.fromCodePoint(0x1f600)', 'true'],
+    ["String.raw({ raw: ['a', 'b', 'c'] }, 1, 2)", 'a1b2c'],
+    ["'abc'.at(-1) + 'abc'.charCodeAt(1) + 'abc'.codePointAt(0)", 'c9897'],
+    ["'abc'.charCodeAt(5)", 'NaN'],
+    ["'abc'.at(5)", 'undefined'],
+    ["'a'.concat('b', 1, null)", 'ab1null'],
+    ["'canal'.lastIndexOf('a', 2) + ',' + 'canal'.lastIndexOf('')", '1,5'],
+    ["'a'.localeCompare('b') + ',' + 'b'.localeCompare('a')", '-1,1'],
+    ["'abc'.normalize('NFKD')", 'abc'],
+    ["'hello'.search('ll')", '2'],
+    ["'hello'.match('ll').index", '2'],
+    ["'abc'.replace('b', \"[$`$&$'$$$1]\")", 'a[abc$$1]c'],
+    ["'xaya'.replaceAll('a', (m, p) => p)", 'x1y3'],
+    ["'ab'.replaceAll('', '-')", '-a-b-'],
+    ["'éa'.replace('a', 'b')", 'éb'],
+    ["'straße'.toUpperCase()", 'STRASSE'],
+    ["' a　'.trim()", 'a'],
+    ["try { 'éa'.indexOf('a') } catch (e) { e.message }", 'String.prototype.indexOf does not support non-ASCII strings yet'],
+    ["try { 'a'.normalize('x') } catch (e) { e.name }", 'RangeError'],
+    ["try { 'a.b'.search('.') } catch (e) { e.name }", 'TypeError'],
+    ["try { String.fromCharCode(0xd800) } catch (e) { e.name }", 'TypeError'],
+  ]
+  for (const [src, expected] of cases) {
+    expect((await run(src)).result, src).toBe(expected)
+  }
+})

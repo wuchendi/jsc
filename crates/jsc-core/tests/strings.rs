@@ -1,7 +1,7 @@
 //! Integration tests: string methods and receiver-type method dispatch.
 
 mod common;
-use common::{assert_bool, assert_number, assert_output, assert_string};
+use common::{assert_bool, assert_eval, assert_nan, assert_number, assert_output, assert_string};
 
 /// String `toUpperCase`/`toLowerCase` are ASCII case folds producing NEW strings.
 #[test]
@@ -267,5 +267,304 @@ fn fizzbuzz_with_trim_smoke() {
     assert_output(
         src,
         "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n",
+    );
+}
+
+// --- String statics and the remaining prototype methods --------------------------
+
+/// Wrap `body` so the script yields `"<error name>|<message>"` for the error
+/// it throws (or `"none"` when it completes normally).
+fn caught(body: &str) -> String {
+    format!("let r=\"none\"; try {{ {body} }} catch(e) {{ r=e.name+\"|\"+e.message }} r")
+}
+
+/// Assert `body` throws a `TypeError` whose message contains `part`.
+fn assert_type_error_with(body: &str, part: &str) {
+    let src = format!(
+        "let r=\"none\"; try {{ {body} }} catch(e) {{ r=(e instanceof TypeError)+\"|\"+e.message.includes({part:?}) }} r"
+    );
+    assert_string(&src, "true|true");
+}
+
+#[test]
+fn from_char_code() {
+    assert_string("String.fromCharCode(104, 105)", "hi");
+    assert_string("String.fromCharCode()", "");
+    assert_string("String.fromCharCode(65 + 65536)", "A");
+    assert_string(
+        "String.fromCharCode(\"66\", { valueOf() { return 67 } })",
+        "BC",
+    );
+    assert_string("String.fromCharCode(233)", "\u{e9}");
+    assert_string("String.fromCharCode(0xD83D, 0xDE00)", "\u{1F600}");
+    assert_number("String.fromCharCode.length", 1.0);
+    assert_string("String.fromCharCode.name", "fromCharCode");
+    assert_string(
+        "let f = String.fromCharCode; f(97, 98, 99, 100, 101, 102)",
+        "abcdef",
+    );
+    assert_type_error_with("String.fromCharCode(0xD800)", "surrogate");
+}
+
+#[test]
+fn from_code_point() {
+    assert_string("String.fromCodePoint(104, 105)", "hi");
+    assert_string("String.fromCodePoint(0x1F600)", "\u{1F600}");
+    assert_string("String.fromCodePoint()", "");
+    assert_number("String.fromCodePoint.length", 1.0);
+    for (bad, shown) in [
+        ("-1", "-1"),
+        ("1.5", "1.5"),
+        ("0x110000", "1114112"),
+        ("NaN", "NaN"),
+        ("Infinity", "Infinity"),
+        ("undefined", "NaN"),
+        ("\"x\"", "NaN"),
+    ] {
+        assert_string(
+            &caught(&format!("String.fromCodePoint({bad})")),
+            &format!("RangeError|Invalid code point {shown}"),
+        );
+    }
+    assert_type_error_with("String.fromCodePoint(0xDC00)", "surrogate");
+}
+
+#[test]
+fn string_raw() {
+    assert_string("String.raw({ raw: [\"a\", \"b\", \"c\"] }, 1, 2)", "a1b2c");
+    assert_string("String.raw({ raw: [\"a\", \"b\", \"c\"] }, 1)", "a1bc");
+    assert_string("String.raw({ raw: [\"x\"] }, 1, 2)", "x");
+    assert_string("String.raw({ raw: { length: 0 } })", "");
+    assert_string("String.raw({ raw: \"abc\" }, \"-\", \"+\")", "a-b+c");
+    assert_string(
+        "String.raw({ raw: { length: 2, 0: 5, 1: true } }, null)",
+        "5nulltrue",
+    );
+    assert_number("String.raw.length", 1.0);
+    assert_string(
+        &caught("String.raw()"),
+        "TypeError|Cannot convert undefined or null to object",
+    );
+    assert_string(
+        &caught("String.raw({})"),
+        "TypeError|Cannot convert undefined or null to object",
+    );
+}
+
+#[test]
+fn at_char_code_at_code_point_at() {
+    assert_string("\"abc\".at(0)", "a");
+    assert_string("\"abc\".at(-1)", "c");
+    assert_eval("\"abc\".at(3)", "undefined");
+    assert_eval("\"abc\".at(-4)", "undefined");
+    assert_string("\"abc\".at()", "a");
+    assert_number("\"abc\".charCodeAt(1)", 98.0);
+    assert_number("\"abc\".charCodeAt()", 97.0);
+    assert_nan("\"abc\".charCodeAt(3)");
+    assert_nan("\"abc\".charCodeAt(-1)");
+    assert_number("\"abc\".codePointAt(2)", 99.0);
+    assert_eval("\"abc\".codePointAt(3)", "undefined");
+    assert_number("\"abc\".charCodeAt(\"1\")", 98.0);
+    assert_number("\"abc\".charCodeAt(1.9)", 98.0);
+    assert_type_error_with("\"\u{e9}t\u{e9}\".charCodeAt(0)", "non-ASCII");
+    assert_type_error_with("\"\u{e9}\".at(0)", "non-ASCII");
+    assert_type_error_with("\"\u{e9}\".codePointAt(0)", "non-ASCII");
+}
+
+#[test]
+fn concat_last_index_of_locale_compare() {
+    assert_string(
+        "\"a\".concat(\"b\", 1, null, undefined, [2, 3])",
+        "ab1nullundefined2,3",
+    );
+    assert_string("\"a\".concat()", "a");
+    assert_string("\"a\".concat({ toString() { return \"T\" } })", "aT");
+    assert_number("String.prototype.concat.length", 1.0);
+    assert_string("\"x\".concat(1, 2, 3, 4, 5, 6, 7, 8)", "x12345678");
+    assert_number("\"canal\".lastIndexOf(\"a\")", 3.0);
+    assert_number("\"canal\".lastIndexOf(\"a\", 2)", 1.0);
+    assert_number("\"canal\".lastIndexOf(\"a\", 0)", -1.0);
+    assert_number("\"canal\".lastIndexOf(\"x\")", -1.0);
+    assert_number("\"canal\".lastIndexOf(\"\")", 5.0);
+    assert_number("\"canal\".lastIndexOf(\"\", 2)", 2.0);
+    assert_number("\"canal\".lastIndexOf(\"a\", NaN)", 3.0);
+    assert_number("\"abab\".lastIndexOf(\"ab\", -5)", 0.0);
+    assert_number("String.prototype.lastIndexOf.length", 1.0);
+    assert_number("\"a\".localeCompare(\"b\")", -1.0);
+    assert_number("\"b\".localeCompare(\"a\")", 1.0);
+    assert_number("\"a\".localeCompare(\"a\")", 0.0);
+    assert_number("\"a\".localeCompare()", -1.0);
+    assert_number("\"undefined\".localeCompare()", 0.0);
+}
+
+#[test]
+fn normalize_forms() {
+    assert_string("\"abc\".normalize()", "abc");
+    for form in ["NFC", "NFD", "NFKC", "NFKD"] {
+        assert_string(&format!("\"abc\".normalize(\"{form}\")"), "abc");
+    }
+    assert_string("\"abc\".normalize(undefined)", "abc");
+    assert_string(
+        &caught("\"abc\".normalize(\"nfc\")"),
+        "RangeError|The normalization form should be one of NFC, NFD, NFKC, NFKD.",
+    );
+    assert_type_error_with("\"\u{e9}\".normalize()", "non-ASCII");
+    assert_number("String.prototype.normalize.length", 0.0);
+}
+
+#[test]
+fn search_and_match_with_string_patterns() {
+    assert_number("\"hello\".search(\"ll\")", 2.0);
+    assert_number("\"hello\".search(\"x\")", -1.0);
+    assert_number("\"hello\".search()", 0.0);
+    assert_string(
+        "let m = \"hello\".match(\"ll\"); m.length + \",\" + m[0] + \",\" + m.index + \",\" + m.input + \",\" + m.groups",
+        "1,ll,2,hello,undefined",
+    );
+    assert_eval("\"hello\".match(\"x\")", "null");
+    assert_string("\"hello\".match()[0]", "");
+    assert_type_error_with("\"a.b\".search(\".\")", "RegExp");
+    assert_type_error_with("\"a.b\".match(\"a+\")", "RegExp");
+    assert_type_error_with("\"aa\".matchAll(\"a\")", "RegExp");
+    assert_number("String.prototype.matchAll.length", 1.0);
+}
+
+#[test]
+fn replace_with_string_patterns() {
+    assert_string("\"aXbX\".replace(\"X\", \"-\")", "a-bX");
+    assert_string("\"aXbX\".replaceAll(\"X\", \"-\")", "a-b-");
+    assert_string("\"abc\".replace(\"z\", \"-\")", "abc");
+    assert_string("\"abc\".replace(\"\", \"-\")", "-abc");
+    assert_string("\"abc\".replaceAll(\"\", \"-\")", "-a-b-c-");
+    assert_string("\"abc\".replace(\"b\", \"[$&]\")", "a[b]c");
+    assert_string("\"abc\".replace(\"b\", \"[$$]\")", "a[$]c");
+    assert_string("\"abc\".replace(\"b\", \"[$`]\")", "a[a]c");
+    assert_string("\"abc\".replace(\"b\", \"[$']\")", "a[c]c");
+    assert_string("\"abc\".replace(\"b\", \"[$1$<n>$]\")", "a[$1$<n>$]c");
+    assert_string("\"abcb\".replaceAll(\"b\", \"<$`>\")", "a<a>c<abc>");
+    assert_string("\"abc\".replace(\"b\", 5)", "a5c");
+    assert_string(
+        "\"xaya\".replace(\"a\", function (m, p, s) { return m + p + s.length })",
+        "xa14ya",
+    );
+    assert_string(
+        "\"xaya\".replaceAll(\"a\", (m, p, s) => \"(\" + p + \")\")",
+        "x(1)y(3)",
+    );
+    assert_string("\"ab\".replaceAll(\"\", (m, p) => p)", "0a1b2");
+    assert_string("\"aaa\".replaceAll(\"aa\", \"b\")", "ba");
+    assert_string("\"a1\".replace(1, \"one\")", "aone");
+    assert_string("\"a\".replace({ toString() { return \"a\" } }, \"b\")", "b");
+    assert_number("String.prototype.replace.length", 2.0);
+    assert_number("String.prototype.replaceAll.length", 2.0);
+    assert_string(
+        &caught("\"a\".replace(\"a\", function () { throw new RangeError(\"r\") })"),
+        "RangeError|r",
+    );
+    assert_type_error_with("\"\u{e9}a\".replace(\"a\", (m, p) => p)", "non-ASCII");
+    assert_string("\"\u{e9}a\".replace(\"a\", \"b\")", "\u{e9}b");
+}
+
+#[test]
+fn split_coerces_limit_before_separator() {
+    assert_string(
+        "let log = \"\"; \"a,b\".split({ toString() { log += \"S\"; return \",\" } }, { valueOf() { log += \"L\"; return 1 } }); log",
+        "LS",
+    );
+    assert_string("JSON.stringify(\"a,b\".split(\",\", 0))", "[]");
+    assert_string("JSON.stringify(\"a,b\".split(undefined, 0))", "[]");
+}
+
+#[test]
+fn repeat_and_pad_audit() {
+    assert_string(
+        &caught("\"a\".repeat(-1)"),
+        "RangeError|Invalid count value: -1",
+    );
+    assert_string(
+        &caught("\"a\".repeat(Infinity)"),
+        "RangeError|Invalid count value: Infinity",
+    );
+    assert_string("\"ab\".repeat(\"2\")", "abab");
+    assert_string("\"\".repeat(5)", "");
+    assert_string("\"a\".padStart(4, 12)", "121a");
+    assert_string("\"a\".padEnd(3, { toString() { return \"z\" } })", "azz");
+    assert_string("\"a\".padStart(3, \"\")", "a");
+}
+
+#[test]
+fn unicode_case_and_trim() {
+    assert_string("\"\u{e9}t\u{e9}\".toUpperCase()", "\u{c9}T\u{c9}");
+    assert_string("\"\u{c9}T\u{c9}\".toLowerCase()", "\u{e9}t\u{e9}");
+    assert_string("\"stra\u{df}e\".toUpperCase()", "STRASSE");
+    assert_string("\"\u{a0}\u{feff}a\u{2028}\u{3000}\".trim()", "a");
+    assert_string("\"\u{a0}a\u{a0}\".trimStart()", "a\u{a0}");
+    assert_string("\"\u{a0}a\u{a0}\".trimEnd()", "\u{a0}a");
+}
+
+#[test]
+fn byte_positions_throw_on_non_ascii() {
+    for call in [
+        "\"\u{e9}a\".indexOf(\"a\")",
+        "\"\u{e9}a\".lastIndexOf(\"a\")",
+        "\"\u{e9}a\".slice(1)",
+        "\"\u{e9}a\".substring(1)",
+        "\"\u{e9}a\".charAt(1)",
+        "\"\u{e9}a\".padStart(5)",
+        "\"a\".padEnd(5, \"\u{e9}\")",
+        "\"\u{e9}a\".split(\"\")",
+        "\"\u{e9}a\".includes(\"a\", 1)",
+        "\"\u{e9}a\".startsWith(\"a\", 1)",
+        "\"\u{e9}a\".endsWith(\"a\", 1)",
+        "\"\u{e9}a\".search(\"a\")",
+    ] {
+        assert_type_error_with(call, "non-ASCII");
+    }
+    // Position-free results stay correct.
+    assert_bool("\"\u{e9}a\".includes(\"a\")", true);
+    assert_bool("\"\u{e9}a\".startsWith(\"\u{e9}\")", true);
+    assert_string("\"\u{e9},a\".split(\",\").join(\"|\")", "\u{e9}|a");
+    assert_string("\"\u{e9}\".concat(\"\u{e8}\")", "\u{e9}\u{e8}");
+    assert_string("\"\u{e9}\".repeat(2)", "\u{e9}\u{e9}");
+}
+
+#[test]
+fn generic_receivers() {
+    for name in [
+        "at",
+        "charCodeAt",
+        "codePointAt",
+        "concat",
+        "lastIndexOf",
+        "localeCompare",
+        "normalize",
+        "search",
+        "match",
+        "matchAll",
+        "replace",
+        "replaceAll",
+    ] {
+        assert_string(
+            &caught(&format!("String.prototype.{name}.call(undefined)")),
+            &format!("TypeError|String.prototype.{name} called on null or undefined"),
+        );
+        assert_string(
+            &caught(&format!("String.prototype.{name}.call(null)")),
+            &format!("TypeError|String.prototype.{name} called on null or undefined"),
+        );
+        assert_string(&format!("String.prototype.{name}.name"), name);
+        assert_bool(&format!("\"a\".{name} === String.prototype.{name}"), true);
+    }
+    assert_string("String.prototype.at.call(123, -1)", "3");
+    assert_number("String.prototype.charCodeAt.call(true, 0)", 116.0);
+    assert_string(
+        "String.prototype.concat.call({ toString() { return \"o\" } }, \"k\")",
+        "ok",
+    );
+    assert_number("String.prototype.lastIndexOf.call(1001, 1)", 3.0);
+    assert_string("String.prototype.replace.call(1234, 2, \"x\")", "1x34");
+    assert_string(
+        "class S extends String {} new S(\"abc\").at(-1) + new S(\"ab\").concat(\"c\")",
+        "cabc",
     );
 }
