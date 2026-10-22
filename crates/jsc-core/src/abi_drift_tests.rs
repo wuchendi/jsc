@@ -353,7 +353,8 @@ fn object_family_layout_matches_design() {
 #[test]
 fn property_table_layout_matches_design() {
     use super::{
-        ATTR_CONFIGURABLE, ATTR_WRITABLE, ATTRS_DEFAULT, OBJ_FLAG_NOT_EXTENSIBLE, PROPS_CAP_OFFSET,
+        ARRAY_FLAG_DICTIONARY, ARRAY_FLAG_JOINING, ARRAY_FLAG_LENGTH_READONLY, ATTR_CONFIGURABLE,
+        ATTR_WRITABLE, ATTRS_DEFAULT, OBJ_FLAG_NOT_EXTENSIBLE, PROPS_CAP_OFFSET,
         PROPS_HAS_NON_ENUM, PROPS_LIVE_OFFSET, STR_FLAG_INTERNED, TYPE_PROPS,
     };
     assert_eq!(TYPE_PROPS, 12);
@@ -389,5 +390,14 @@ fn property_table_layout_matches_design() {
     assert_eq!([PROPS_HAS_INDEX_KEYS, PROPS_HAS_NON_ENUM], [1, 2]);
     assert_eq!([STR_FLAG_INTERNED, STR_FLAG_ARRAY_INDEX], [1, 2]);
     assert_eq!(OBJ_FLAG_NOT_EXTENSIBLE, 1);
+    assert_eq!(
+        [
+            ARRAY_FLAG_SPARSE,
+            ARRAY_FLAG_JOINING,
+            ARRAY_FLAG_LENGTH_READONLY,
+            ARRAY_FLAG_DICTIONARY
+        ],
+        [4, 8, 16, 32]
+    );
     assert_eq!(HEADER_FLAGS_OFFSET, 2);
 }

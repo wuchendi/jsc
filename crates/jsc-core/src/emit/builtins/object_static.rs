@@ -109,7 +109,8 @@ fn emit_element(function: &mut Function, arr: u32, i: u32, slot: u64) {
 /// `DefinePropertyOrThrow(o, key, record j)`: apply descriptor record `j` (an
 /// i32 local) of the `__to_desc` list in i32 `list` to the own property `key`
 /// (an interned i32 local) of the object in i64 `o`, returning from the body
-/// with the `TypeError` pending when it is rejected (`r` is i32 scratch).
+/// with the `TypeError` pending when it is rejected, or with the exception an
+/// array `length` left pending (`r` is i32 scratch).
 fn emit_apply(
     function: &mut Function,
     o: u32,
@@ -127,14 +128,16 @@ fn emit_apply(
     }
     wasm!(function;
         Call(helpers.define_own()), LocalTee(r), I32Const(DEFINE_OK), I32Ne,
+        GlobalGet(EXC_PENDING_GLOBAL), I32Or,
+        If(BlockType::Empty),
+        GlobalGet(EXC_PENDING_GLOBAL), I32Eqz,
         If(BlockType::Empty),
         LocalGet(o),
         LocalGet(key), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-        I32Const(PROP_THROW_ARRAY_DEFINE),
         I32Const(PROP_THROW_DEFINE_NOT_EXTENSIBLE), I32Const(PROP_THROW_REDEFINE),
         LocalGet(r), I32Const(DEFINE_NOT_EXTENSIBLE), I32Eq, Select,
-        LocalGet(r), I32Const(DEFINE_UNSUPPORTED), I32Eq, Select,
         Call(helpers.prop_throw),
+        End,
         I64Const(UNDEFINED_BITS), Return,
         End,
     );
