@@ -65,11 +65,10 @@ fn array_push_decodes_grown_array() {
     let result = compile_and_run("let a=[1,2]; a.push(3); a").expect("pipeline should succeed");
     assert_eq!(
         result,
-        Value::Array(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
-            Value::Number(3.0),
-        ])
+        Value::Array(
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0),],
+            Vec::new()
+        )
     );
 }
 
@@ -79,7 +78,7 @@ fn array_pop_decodes_shrunk_array() {
     let result = compile_and_run("let a=[10,20,30]; a.pop(); a").expect("pipeline should succeed");
     assert_eq!(
         result,
-        Value::Array(vec![Value::Number(10.0), Value::Number(20.0)])
+        Value::Array(vec![Value::Number(10.0), Value::Number(20.0)], Vec::new())
     );
 }
 
@@ -96,33 +95,6 @@ fn array_push_preserves_string_elements() {
 #[test]
 fn array_pop_then_push_length() {
     assert_number("let a=[1,2,3]; a.pop(); a.push(9); a.length", 3.0);
-}
-
-/// Growing a captured (boxed-cell) array is out of scope: it is a compile error,
-/// not a silent miscompile.
-#[test]
-fn array_push_on_captured_array_errors() {
-    assert!(
-        compile_and_run("let a=[1,2]; let f=()=>a[0]; a.push(3)").is_err(),
-        "push on a captured array should be rejected"
-    );
-}
-
-/// `push`/`pop` arities are validated at compile time.
-#[test]
-fn array_method_arity_errors() {
-    assert!(
-        compile_and_run("let a=[1]; a.push()").is_err(),
-        "push needs one argument"
-    );
-    assert!(
-        compile_and_run("let a=[1]; a.push(1, 2)").is_err(),
-        "push takes one argument"
-    );
-    assert!(
-        compile_and_run("let a=[1]; a.pop(1)").is_err(),
-        "pop takes no arguments"
-    );
 }
 
 // --- array higher-order methods (map/filter/reduce/forEach) --------------------
@@ -233,20 +205,19 @@ fn array_indexing_still_works_alongside_hof() {
     assert_number("[1,2,3].map(x => x)[1] + [4,5,6][0]", 6.0);
 }
 
-/// `map`/`filter`/`forEach` take exactly one argument; `reduce` requires two.
+/// Builtin arities are runtime behaviour: a missing callback throws a
+/// `TypeError`, `reduce` without an initial value folds from the first
+/// element, and `filter`'s second argument is the callback's `this`.
 #[test]
-fn array_hof_arity_errors() {
-    assert!(
-        compile_and_run("[1,2,3].map()").is_err(),
-        "map needs a callback"
+fn array_hof_arities_follow_the_spec() {
+    assert_bool(
+        "let ok = false; try { [1,2,3].map(); } catch (e) { ok = e instanceof TypeError; } ok",
+        true,
     );
-    assert!(
-        compile_and_run("[1,2,3].reduce((a,b) => a+b)").is_err(),
-        "reduce requires an initial accumulator"
-    );
-    assert!(
-        compile_and_run("[1,2,3].filter(x => x, 1)").is_err(),
-        "filter takes one argument"
+    assert_number("[1,2,3].reduce((a,b) => a+b)", 6.0);
+    assert_number(
+        "[1,2,3].filter(function (x) { return x > this.m; }, { m: 1 }).length",
+        2.0,
     );
 }
 

@@ -107,6 +107,13 @@ jobs:
       - name: Build jsc (release)
         run: cargo build --release -p jsc
 
+      # M1: the official sta.js + assert.js compile and run unmodified. The
+      # tests return early without the checkout, so require it first.
+      - name: M1 harness tests
+        run: |
+          test -f .tmp/test262/harness/assert.js
+          cargo test --release -p jsc --test test262_harness -- --nocapture
+
       # Fails if any test passing in tests/test262/baseline.txt regressed.
       - name: Check against baseline
         run: cargo run --release -p jsc-test262 -- --check

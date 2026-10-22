@@ -35,42 +35,74 @@ fn caught(body: &str) -> String {
     jsc(&["-p", &src])
 }
 
-/// The expected [`caught`] output for writing the absent property `key`.
-fn add_property_error(key: &str) -> String {
-    format!("true|TypeError|Cannot add property '{key}': dynamic properties are not supported yet")
-}
-
-/// Objects are fixed-shape: writing a key the receiver does not own throws a
-/// catchable `TypeError` through every write form (dot, computed, compound,
-/// update), and the existing entries stay intact.
+/// Objects are dynamic: writing an absent key adds it through every write form
+/// (dot, computed, compound, update), after the existing keys; a deleted key is
+/// re-added at the end.
 #[test]
-fn object_absent_property_write_throws_type_error() {
-    let x = add_property_error("x");
-    assert_eq!(caught("let o = {}; o.x = 1"), x);
-    assert_eq!(caught("let o = {}; o[\"k\"] = 1"), add_property_error("k"));
-    assert_eq!(caught("let o = {a: 1}; let k = \"x\"; o[k] = 1"), x);
-    assert_eq!(caught("let o = {a: 1}; o.x += 1"), x);
-    assert_eq!(caught("let o = {a: 1}; o.x++"), x);
+fn object_absent_property_write_adds_property() {
+    assert_eq!(caught("let o = {}; o.x = 1; r = o.x"), "1");
+    assert_eq!(jsc(&["-p", "let o = {}; o[\"k\"] = 1; o.k"]), "1");
     assert_eq!(
-        caught("let o = JSON.parse('{\"a\":1}'); o.b = 2"),
-        add_property_error("b")
+        jsc(&["-p", "let o = {a: 1}; let k = \"x\"; o[k] = 2; o.x"]),
+        "2"
+    );
+    assert_eq!(jsc(&["-p", "let o = {a: 1}; o.x += 1; o.x"]), "NaN");
+    assert_eq!(jsc(&["-p", "let o = {a: 1}; o.x++; o.x"]), "NaN");
+    assert_eq!(
+        jsc(&["-p", "let o = JSON.parse('{\"a\":1}'); o.b = 2; o.a + o.b"]),
+        "3"
     );
     assert_eq!(
-        caught("let o = {a: 1}; delete o.a; o.a = 2"),
-        add_property_error("a")
+        jsc(&[
+            "-e",
+            "let o = {a: 1, b: 2}; delete o.a; o.a = 3; console.log(o)"
+        ]),
+        "{ b: 2, a: 3 }"
     );
-    assert_eq!(
-        caught("var NS; (function(NS){ NS.v = 7 })(NS || (NS = {}))"),
-        add_property_error("v")
-    );
-    // The failed write leaves the object untouched.
     assert_eq!(
         jsc(&[
             "-p",
-            "let o={a:1}; try { o.b=5 } catch(e) {} o.a + \"|\" + o.b"
+            "var NS; (function(NS){ NS.v = 7 })(NS || (NS = {})); NS.v"
         ]),
-        "1|undefined"
+        "7"
     );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = {}; o.x = 1; o.y = 2; delete o.x; o.z = 3; console.log(o)"
+        ]),
+        "{ y: 2, z: 3 }"
+    );
+}
+
+/// 100 added keys survive table growth in insertion order.
+#[test]
+fn object_growth_keeps_insertion_order() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let o = {}; for (let i = 0; i < 100; i++) o[\"k\" + i] = i; \
+             let ks = Object.keys(o); ks.length + \"|\" + ks[0] + \"|\" + ks[57] + \"|\" + ks[99] + \"|\" + o.k99"
+        ]),
+        "100|k0|k57|k99|99"
+    );
+}
+
+/// An uncaught method call on an absent property exits 1 (a runtime
+/// `TypeError`, not a compile error), and adding the method first makes it
+/// callable.
+#[test]
+fn absent_method_call_is_a_runtime_type_error() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "let o = {}; o.foo()"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Uncaught TypeError: o.foo is not a function")
+    );
+    assert_eq!(jsc(&["-p", "let o = {}; o.f = () => 1; o.f()"]), "1");
 }
 
 /// Nested arrays and objects compose — arrays and objects store full
@@ -238,9 +270,9 @@ fn member_set_computed_rhs_no_clobber() {
     assert_eq!(jsc(&["-p", "let o={v:1}; o.v = 9; o.v"]), "9");
 }
 
-/// `Object.keys` / `Object.values` / `Object.entries` build a fresh
-/// growable array from the object's runtime key table, in insertion order, via
-/// the in-wasm `__obj_keys`/`__obj_values`/`__obj_entries` helpers.
+/// `Object.keys` / `Object.values` / `Object.entries` build a fresh array from
+/// the object's property table in own-key order, via the in-wasm `__own_keys`
+/// helper.
 #[test]
 fn object_keys_values_entries_via_eval() {
     // `Object.keys` — count and insertion-order element (a heap-string key).
@@ -259,10 +291,10 @@ fn object_keys_values_entries_via_eval() {
     assert_eq!(jsc(&["-p", "Object.entries({a:1})[0][1]"]), "1");
 }
 
-/// The enumerators skip the reserved hidden `@@`-prefixed keys, so a class
-/// instance (which carries a `@@prototype` link) enumerates only its own fields.
+/// A class instance's prototype link is not an own property, so the
+/// enumerators list only its own fields.
 #[test]
-fn object_keys_skip_reserved_keys() {
+fn object_keys_list_only_own_fields() {
     assert_eq!(
         jsc(&[
             "-p",
@@ -282,32 +314,26 @@ fn object_keys_skip_reserved_keys() {
 }
 
 /// `Object` is a syntactic built-in gated on `resolve("Object") == None`, so
-/// a user binding shadows it; an unknown static and a wrong arity are rejected.
+/// a user binding shadows it; a missing argument is the run-time `ToObject`
+/// `TypeError` (exit 1), not a compile error.
 #[test]
-fn object_builtin_shadowing_and_rejections() {
+fn object_builtin_shadowing_and_missing_argument() {
     use std::process::Command;
     // A user `let Object = ..` shadows the built-in (no method dispatch).
     assert_eq!(jsc(&["-p", "let Object=5; Object"]), "5");
-    // Run `jsc` expecting compile-error exit 2 and return its stderr for inspection.
-    let jsc_stderr = |src: &str| {
-        let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-            .args(["-e", src])
-            .output()
-            .expect("failed to spawn jsc binary");
-        assert!(
-            output.status.code() == Some(2),
-            "expected {src:?} to fail to compile"
-        );
-        String::from_utf8_lossy(&output.stderr).into_owned()
-    };
-    // An out-of-scope static is a spanned compile error.
-    assert!(jsc_stderr("Object.assign({},{})").contains("unsupported Object method"));
-    // A wrong argument count is a spanned compile error.
-    assert!(jsc_stderr("Object.keys()").contains("expects 1 argument"));
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "Object.keys()"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("TypeError: Cannot convert undefined or null to object")
+    );
 }
 
-/// The `key in obj` operator is an OWN-key membership test, lowered to the
-/// in-wasm `__obj_has` linear scan (byte-content key compare, no prototype walk).
+/// The `key in obj` operator is a membership test over the own keys and the
+/// prototype chain, lowered to the in-wasm `__has` helper.
 #[test]
 fn in_operator_own_key_membership() {
     // A present key yields `true`; an absent one `false`.
@@ -526,4 +552,81 @@ fn json_parse_rejects_malformed_input() {
     ] {
         assert_eq!(jsc(&["-p", src]), "1", "expected `{src}` to throw");
     }
+}
+
+/// A property write on a primitive receiver is an uncaught `TypeError` (exit 1)
+/// with the strict-mode message; unknown primitive reads print `undefined`.
+#[test]
+fn primitive_receiver_via_eval() {
+    for (src, message) in [
+        ("let n=5; n.x=1", "Cannot create property 'x' on number '5'"),
+        (
+            "let s=\"abc\"; s[\"x\"]=1",
+            "Cannot create property 'x' on string 'abc'",
+        ),
+        (
+            "let b=true; b.x+=1",
+            "Cannot create property 'x' on boolean 'true'",
+        ),
+        (
+            "let u; u.x=1",
+            "Cannot set properties of undefined (setting 'x')",
+        ),
+        (
+            "let u=null; u.x",
+            "Cannot read properties of null (reading 'x')",
+        ),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_jsc"))
+            .args(["-p", src])
+            .output()
+            .expect("failed to spawn jsc binary");
+        assert_eq!(output.status.code(), Some(1), "exit code for `{src}`");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("Uncaught TypeError: {message}")),
+            "stderr for `{src}`: {stderr}"
+        );
+    }
+    assert_eq!(jsc(&["-p", "let n=5; n.x"]), "undefined");
+    assert_eq!(jsc(&["-p", "\"abc\".foo"]), "undefined");
+    assert_eq!(jsc(&["-p", "\"abc\"[1]"]), "b");
+    assert_eq!(jsc(&["-p", "\"abc\".length"]), "3");
+}
+
+/// Object-literal getters and setters are accessor properties: reads call the
+/// getter and writes the setter with `this` = the receiver, and a getter-only
+/// property rejects writes.
+#[test]
+fn object_literal_accessors() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { get x(){ return 1 }, set x(v){ this.y = v } }; o.x = 5; console.log(o.x, o.y, o)"
+        ]),
+        "1 5 { x: [Getter/Setter], y: 5 }"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { get x(){ return 1 } }; try { o.x = 2 } catch (e) { console.log(e instanceof TypeError) }"
+        ]),
+        "true"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { n: 2, get d(){ return this.n * 2 } }; console.log(o.d, o)"
+        ]),
+        "4 { n: 2, d: [Getter] }"
+    );
+    // Accessor bodies capture top-level bindings like any function.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let c = 0; const o = { get a(){ c++; return c }, set b(v){ c = v } }; \
+             o.a; o.b = 9; console.log(o.a, c)"
+        ]),
+        "10 10"
+    );
 }

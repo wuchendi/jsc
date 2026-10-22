@@ -21,26 +21,81 @@ export const TRUE = 0x7ff9_0000_0000_0001n
 export const NULL = 0x7ffa_0000_0000_0000n
 /** NaN-boxed `undefined` (tag `0b011`). */
 export const UNDEFINED = 0x7ffb_0000_0000_0000n
-/** `typeof`-result type-string immediate header (tag `0b100`); low bits index the table. */
-export const TYPEOF = 0x7ffc_0000_0000_0000n
+/** An array hole (`UNDEFINED | 1`): an element slot with no element; reads as `undefined`. */
+export const HOLE = 0x7ffb_0000_0000_0001n
 /** NaN-boxed heap-pointer header (tag `0b101`): `HEAP | (ptr as u32)`. */
 export const HEAP = 0x7ffd_0000_0000_0000n
 
-/** Bytes of every heap block's leading header: the TYPE BYTE plus 3 padding bytes. */
+/** Bytes of every heap block's leading header: the TYPE BYTE plus the `gc`/`flags`/`class` bytes. */
 export const HEADER_SIZE = 4
 
 /** TYPE BYTE of a heap string block: `[type=0][pad×3][len:u32][utf8]`. */
 export const TYPE_STRING = 0
-/** TYPE BYTE of a heap array block: `[type=1][pad×3][len:u32][elem:i64 × len]`. */
+/** TYPE BYTE of an array handle (prefix, then `len:u32`, `elems:u32` → its element store). */
 export const TYPE_ARRAY = 1
-/** TYPE BYTE of a heap object block: `[type=2][pad×3][n:u32][(key:i64, val:i64) × n]`. */
+/** TYPE BYTE of an ordinary object block: the object-family prefix; properties live in its `props` table. */
 export const TYPE_OBJECT = 2
-/** TYPE BYTE of a first-class function value. Renders as `[Function (anonymous)]`. */
+/** TYPE BYTE of a function object (prefix, then `func_idx:u32`, reserved `u32`, `env:i64`). */
 export const TYPE_FUNCTION = 3
-/** TYPE BYTE of a promise block: `[type=8][pad×3][state:i32][value:i64]`. */
+/** TYPE BYTE of a `Map` handle block (prefix, then `size:u32`, `entries:i64`). */
+export const TYPE_MAP = 6
+/** TYPE BYTE of a `Set` handle block: the {@link TYPE_MAP} layout. */
+export const TYPE_SET = 7
+/** TYPE BYTE of a promise block (prefix, then `state:i32`, `value:i64`). */
 export const TYPE_PROMISE = 8
-/** TYPE BYTE of a `Date` block: `[type=10][pad×3][pad:u32][ms:f64]`. */
+/** TYPE BYTE of a generator handle block. Renders as `Object [Generator]`. */
+export const TYPE_GENERATOR = 9
+/** TYPE BYTE of a `Date` block (prefix, then `ms:f64`). */
 export const TYPE_DATE = 10
+
+/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
+export const HEADER_FLAGS_OFFSET = 2
+/** Header byte 3: the `TYPE_OBJECT` sub-`class` byte. */
+export const HEADER_CLASS_OFFSET = 3
+/** `TYPE_OBJECT` `class` byte of an Error instance (its kind is its prototype). */
+export const CLASS_ERROR = 1
+/** `TYPE_OBJECT` `class` byte of an (unmapped) `arguments` object. */
+export const CLASS_ARGUMENTS = 2
+/** `TYPE_OBJECT` `class` byte of a Boolean wrapper object. */
+export const CLASS_BOOLEAN = 3
+/** `TYPE_OBJECT` `class` byte of a Number wrapper object. */
+export const CLASS_NUMBER = 4
+/** `TYPE_OBJECT` `class` byte of a String wrapper object. */
+export const CLASS_STRING = 5
+/** Offset of a wrapper object's `[[PrimitiveValue]]` jsval. */
+export const WRAPPER_VALUE_OFFSET = 16
+/** String `flags` bit: the content is a canonical array index. */
+export const STR_FLAG_ARRAY_INDEX = 2
+
+/** Byte offset of the object-family prefix's `props:u32` slot (the `TYPE_PROPS` table, `0` = none). */
+export const OBJ_PROPS_OFFSET = HEADER_SIZE
+/** Byte size of the object-family prefix (header, `props:u32`, `proto:i64`); payloads start here. */
+export const OBJ_PREFIX_SIZE = 16
+
+/** Byte offset (from a property table base) of the `tflags` byte. */
+export const PROPS_TFLAGS_OFFSET = 2
+/** Byte offset (from a property table base) of the `count` of used slots (`u32`, tombstones included). */
+export const PROPS_COUNT_OFFSET = 4
+/** Byte size of a property table header; entry `k` starts at `PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k`. */
+export const PROPS_HEADER_SIZE = 16
+/** Byte size of one property table entry. */
+export const PROP_ENTRY_SIZE = 16
+/** Byte offset (within an entry) of the interned key string base (`u32`, `0` = tombstone). */
+export const PROP_KEY_OFFSET = 0
+/** Byte offset (within an entry) of the `attrs` (`u32`). */
+export const PROP_ATTRS_OFFSET = 4
+/** Byte offset (within an entry) of the value (`i64`; an accessor pair pointer when `ATTR_ACCESSOR`). */
+export const PROP_VALUE_OFFSET = 8
+/** Property table `tflags` bit: some key is a canonical array index (list integer keys first). */
+export const PROPS_HAS_INDEX_KEYS = 1
+/** Property `attrs` bit: the key is listed by enumeration and rendering. */
+export const ATTR_ENUMERABLE = 2
+/** Property `attrs` bit: the value is a getter/setter pair. */
+export const ATTR_ACCESSOR = 8
+/** Byte offset (from an accessor pair block base) of the getter jsval. */
+export const ACCESSOR_GET_OFFSET = HEADER_SIZE + 4
+/** Byte offset (from an accessor pair block base) of the setter jsval. */
+export const ACCESSOR_SET_OFFSET = HEADER_SIZE + 12
 
 /** {@link TYPE_PROMISE} `state`: the promise is unsettled. */
 export const PROMISE_PENDING = 0
@@ -49,15 +104,59 @@ export const PROMISE_FULFILLED = 1
 /** {@link TYPE_PROMISE} `state`: the promise rejected with its `value` as the reason. */
 export const PROMISE_REJECTED = 2
 
-/** Byte offset (from a generator block base) of the `done` flag (`i32`). */
-export const GEN_DONE_OFFSET = HEADER_SIZE + 8
+/** Byte offset (from a {@link TYPE_MAP}/{@link TYPE_SET} block base) of the `size` entry count (`u32`). */
+export const MAP_SIZE_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset (from a {@link TYPE_PROMISE} block base) of the `state` (`i32`). */
+export const PROMISE_STATE_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset (from a {@link TYPE_PROMISE} block base) of the settled `value` (`i64`). */
+export const PROMISE_VALUE_OFFSET = OBJ_PREFIX_SIZE + 8
+/** Byte size of a {@link TYPE_PROMISE} block. */
+export const PROMISE_BLOCK_SIZE = OBJ_PREFIX_SIZE + 16
+/** Byte offset (from a {@link TYPE_GENERATOR} block base) of the `done` flag (`i32`). */
+export const GEN_DONE_OFFSET = OBJ_PREFIX_SIZE + 8
 /** Byte offset (from a {@link TYPE_DATE} block base) of the `ms` timestamp (`f64`). */
-export const DATE_MS_OFFSET = HEADER_SIZE + 4
+export const DATE_MS_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset of the object-family prefix's `proto:i64` jsval slot. */
+export const OBJ_PROTO_OFFSET = 8
+/** Byte offset (from an array handle base) of the `length` (`u32`). */
+export const ARRAY_LEN_OFFSET = OBJ_PREFIX_SIZE
+/** Byte offset (from an array handle base) of its element store base (`u32`, `0` when the capacity is 0). */
+export const ARRAY_ELEMS_OFFSET = OBJ_PREFIX_SIZE + 4
+/** Array `flags` bit: sparse — elements at or past the store's `cap` are array-index keys in `props`. */
+export const ARRAY_FLAG_SPARSE = 4
+/** Byte offset (from an element store base) of its capacity (`u32`). */
+export const ELEMS_CAP_OFFSET = 4
+/** Byte offset (from an element store base) of element 0; element `i` is at `+ 8 * i`. */
+export const ELEMS_DATA_OFFSET = 8
+/** Byte offset (from a {@link TYPE_FUNCTION} block base) of the funcref-table index (`u32`). */
+export const FUNC_INDEX_OFFSET = OBJ_PREFIX_SIZE
+/** {@link TYPE_FUNCTION} `flags` bit: the function is a constructor (`new` works). */
+export const FUNC_FLAG_CONSTRUCTOR = 8
+/** {@link TYPE_FUNCTION} `flags` bit: the function is a class constructor. */
+export const FUNC_FLAG_CLASS_CTOR = 16
+/** {@link TYPE_FUNCTION} `flags` bit: the constructor allocates its own `this` (a derived class). */
+export const FUNC_FLAG_SELF_ALLOC = 32
+/** Address of the `u32` base of the `__fn_info` table (`[name key:u32][length:u32]` per function). */
+export const FN_INFO_ADDR = 4
+/** Byte size of one `__fn_info` entry. */
+export const FN_INFO_ENTRY_SIZE = 8
+/** Byte offset (within a `__fn_info` entry) of the interned `name` key (`u32`). */
+export const FN_INFO_NAME_OFFSET = 0
 
 /** Export name of the module's linear memory. */
 export const MEMORY_EXPORT_NAME = 'memory'
-/** Export name of the bump-allocator heap-pointer global (host allocation). */
+/** Export name of the bump-allocator heap-pointer global (read for the OOM sentinel). */
 export const HEAP_PTR_EXPORT_NAME = '__heap_ptr'
+/** The linear-memory cap in 64 KiB wasm pages (512 MiB). */
+export const MEMORY_MAX_PAGES = 8192
+/** The sticky out-of-memory sentinel the guest stores in `__heap_ptr` (`i32`). */
+export const HEAP_PTR_OOM = -1
+/** Export name of the `__new_string(len) -> base` guest string constructor. */
+export const NEW_STRING_EXPORT_NAME = '__new_string'
+/** Export name of the `__new_array(len) -> base` guest array constructor. */
+export const NEW_ARRAY_EXPORT_NAME = '__new_array'
+/** Export name of the `__new_promise() -> base` guest pending-promise constructor. */
+export const NEW_PROMISE_EXPORT_NAME = '__new_promise'
 /** Export name of the pending-exception flag global (`i32`). */
 export const EXC_PENDING_EXPORT_NAME = '__exc_pending'
 /** Export name of the in-flight exception value global (`i64`). */
@@ -78,8 +177,6 @@ export const PRINT_FLAG_NEWLINE = 2
 export const CONVERT_OP_TO_STRING = 0
 /** `__convert` op: coerce the argument to a number (`Number(x)`). */
 export const CONVERT_OP_TO_NUMBER = 1
-/** `__convert` op: parse a leading integer (`parseInt(x)`). */
-export const CONVERT_OP_PARSE_INT = 2
 /** `__convert` op: parse a leading float (`parseFloat(x)`). */
 export const CONVERT_OP_PARSE_FLOAT = 3
 
@@ -87,8 +184,6 @@ export const CONVERT_OP_PARSE_FLOAT = 3
 export const METHOD_OP_INDEX_OF = 0
 /** `__method` op: `includes`. */
 export const METHOD_OP_INCLUDES = 1
-/** `__method` op: `join`. */
-export const METHOD_OP_JOIN = 2
 /** `__method` op: `slice` (overloaded on array/string). */
 export const METHOD_OP_SLICE = 3
 /** `__method` op: `toUpperCase`. */
@@ -117,6 +212,8 @@ export const METHOD_OP_PAD_END = 14
 export const METHOD_OP_SUBSTRING = 15
 /** `__method` op: `split` (string, yields an array). */
 export const METHOD_OP_SPLIT = 16
+/** `__method` op: `Number.prototype.toString(radix)` (number receiver). */
+export const METHOD_OP_NUMBER_TO_STRING = 17
 
 /** `__promise` op: `Promise.resolve(a)`. */
 export const PROMISE_OP_RESOLVE = 0
@@ -135,17 +232,7 @@ export const PROMISE_OP_SETTLE_REJECT = 6
 /** `__promise` op: spawn an `async function` body from generator handle `a`. */
 export const PROMISE_OP_ASYNC_SPAWN = 7
 
-/** The `typeof` result strings, indexed by a boxed type-string immediate. */
-export const TYPEOF_STRINGS = [
-  'number',
-  'boolean',
-  'undefined',
-  'object',
-  'string',
-  'function',
-] as const
-
 /** 64-bit unsigned mask, for normalizing signed `bigint`s that cross the wasm boundary. */
 export const U64_MASK = 0xffff_ffff_ffff_ffffn
-/** 32-bit unsigned mask, for extracting the low 32 bits (heap offset / typeof index). */
+/** 32-bit unsigned mask, for extracting the low 32 bits (heap offset). */
 export const U32_MASK = 0xffff_ffffn

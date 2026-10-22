@@ -103,3 +103,37 @@ fn out_of_memory_inside_try_terminates() {
         "RangeError: out of memory",
     );
 }
+
+/// A program whose guest strings fill ~448 MiB of the 512 MiB cap, so the next
+/// 64 MiB HOST allocation (`s.slice(1)`, built through the guest
+/// `__new_string` export) runs out of memory. Shared verbatim with the shim
+/// parity test in `packages/jsc/tests/run.test.ts`.
+const HOST_OOM: &str = "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } \
+     let t = s + s; let u = t + s; s.slice(1).length";
+
+/// A host-initiated allocation past the cap is the same uncaught
+/// `RangeError: out of memory` as a guest one.
+#[test]
+fn host_initiated_out_of_memory() {
+    assert_uncaught(HOST_OOM, "RangeError: out of memory");
+}
+
+/// A store far past the end makes the array sparse: the gap is never
+/// allocated, so a length of a million costs no ~8 MB element store.
+#[test]
+fn sparse_store_does_not_allocate_the_gap() {
+    let program = jsc_core::frontend::parse(
+        "const a = []; a[1e6] = 1; a.length",
+        jsc_core::frontend::Dialect::Js,
+    )
+    .expect("parses");
+    let ir = jsc_core::codegen::lower(&program).expect("lowers");
+    let wasm = jsc_core::emit::emit(&ir);
+    let (bits, memory) = jsc_core::run::run(&wasm).expect("runs");
+    assert_eq!(f64::from_bits(bits), 1_000_001.0);
+    assert!(
+        memory.len() < 4 * 1024 * 1024,
+        "linear memory grew to {} bytes",
+        memory.len()
+    );
+}

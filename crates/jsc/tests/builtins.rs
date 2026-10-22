@@ -70,6 +70,10 @@ fn conversions_via_eval() {
     // parseInt / parseFloat: leading numeric prefix.
     assert_eq!(jsc(&["-p", r#"parseInt("42px")"#]), "42");
     assert_eq!(jsc(&["-p", r#"parseInt("abc")"#]), "NaN");
+    assert_eq!(jsc(&["-p", r#"parseInt("ff", 16)"#]), "255");
+    assert_eq!(jsc(&["-p", r#"parseInt("0xff")"#]), "255");
+    assert_eq!(jsc(&["-p", r#"parseInt("101", 2)"#]), "5");
+    assert_eq!(jsc(&["-p", r#"parseInt("12", 37)"#]), "NaN");
     assert_eq!(jsc(&["-p", r#"parseFloat("3.14xyz")"#]), "3.14");
     // Shadowable by a user binding of the same name.
     assert_eq!(
@@ -101,8 +105,11 @@ fn date_from_timestamp_renders_iso() {
         jsc(&["-p", "[new Date(1000)]"]),
         "[ 1970-01-01T00:00:01.000Z ]",
     );
-    // `getTime()` on a non-Date receiver yields NaN (no method-receiver TypeError).
-    assert_eq!(jsc(&["-p", "({}).getTime()"]), "NaN");
+    // `getTime` is a `Date.prototype` method: an object without one throws.
+    assert_eq!(
+        jsc(&["-p", "try { ({}).getTime() } catch (e) { e.message }"]),
+        "expression is not a function",
+    );
 }
 
 /// `Date.now()` and `new Date()` read the host wall clock, and both a
@@ -207,8 +214,7 @@ fn date_method_names_fall_back_to_user_methods() {
     );
 }
 
-/// The `Date` builtins are shadowable, and only the timestamp
-/// constructor forms are accepted (the calendar-field form is rejected).
+/// The `Date` builtins are shadowable.
 #[test]
 fn date_shadowing_and_arity() {
     // A user `let Date = ..` shadows the builtin constructor.
@@ -216,4 +222,61 @@ fn date_shadowing_and_arity() {
         jsc(&["-p", "let Date = function () { return 7 }; Date()"]),
         "7",
     );
+}
+
+/// Object-family values render through their payload offsets (Map/Set `size`,
+/// Date `ms`, Promise `state`/`value`, generator and function blocks). The
+/// browser shim asserts the same text in `packages/jsc/tests/run.test.ts`.
+#[test]
+fn object_family_values_render_through_payload_offsets() {
+    let src = "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.delete(2); \
+               const s = new Set(); s.add(1); s.add(2); \
+               function* gen() { yield 1 } function f(x) { return x } \
+               console.log(m, s, m.size, s.size, m.get(1), new Date(5), f, gen(), \
+               Promise.resolve(4), Promise.reject(1).catch(() => 0)); \
+               [m, s, new Date(0), Promise.resolve(f)]";
+    assert_eq!(
+        jsc_raw_stdout(&["-e", src]),
+        "Map(1) Set(2) 1 2 a 1970-01-01T00:00:00.005Z [Function: f] \
+         Object [Generator] Promise { 4 } Promise { <pending> }\n"
+    );
+    assert_eq!(
+        jsc(&["-p", src]).lines().last(),
+        Some("[ Map(1), Set(2), 1970-01-01T00:00:00.000Z, Promise { [Function: f] } ]")
+    );
+}
+
+/// The realm's prototype methods are reached through ordinary property lookup
+/// (`%Object.prototype%`, `%Function.prototype%`, `%Error.prototype%`), and
+/// an own property shadows them.
+#[test]
+fn prototype_methods_via_eval() {
+    assert_eq!(jsc(&["-p", r#"({ a: 1 }).hasOwnProperty("a")"#]), "true");
+    assert_eq!(jsc(&["-p", "({}).toString.call([])"]), "[object Array]");
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function f(a) { return this.k + a } f.call({ k: 1 }, 2)"
+        ]),
+        "3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function f(a, b) { return a * b } f.apply(null, [6, 7])"
+        ]),
+        "42"
+    );
+    assert_eq!(
+        jsc(&["-p", r#"new ReferenceError("r").toString()"#]),
+        "ReferenceError: r"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            r#"const o = { toString() { return "own" } }; o.toString()"#
+        ]),
+        "own"
+    );
+    assert_eq!(jsc_raw_stdout(&["-e", "console.log({})"]), "{}\n");
 }

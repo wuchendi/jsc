@@ -2,9 +2,10 @@
 //! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
 
 use super::{
-    DATE_MS_OFFSET, ERROR_KIND_KEY, HEADER_SIZE, PROMISE_FULFILLED, PROMISE_REJECTED, QNAN,
-    TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE,
-    TYPE_SET, TYPE_STRING,
+    ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
+    HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
+    TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -25,19 +26,77 @@ pub enum Value {
     /// `typeof` result is an ordinary heap string too (there is no immediate
     /// encoding), so it decodes here.
     Str(String),
-    /// A heap array, read from linear memory via an array-pointer jsval.
-    /// Elements are decoded recursively, so arrays nest.
-    Array(Vec<Value>),
-    /// A heap object, read from linear memory via an object-pointer jsval.
-    /// Entries preserve insertion order; keys are heap strings and values are
-    /// decoded recursively, so objects nest.
+    /// A heap array, read from linear memory via an array-pointer jsval: its
+    /// elements (each run of holes one [`Value::Holes`]), decoded recursively
+    /// so arrays nest, then its own enumerable named properties as in
+    /// [`Value::Object`]. Renders Node-style as `[ 1, <1 empty item>, 3, foo: 1 ]`.
+    Array(Vec<Value>, Vec<(String, Value)>),
+    /// A run of `N` consecutive array holes (element slots with no element),
+    /// only ever an element of a [`Value::Array`]; a sparse array's gap of a
+    /// million holes is one value. Renders as `<N empty items>`.
+    Holes(usize),
+    /// A heap object, read from linear memory via an object-pointer jsval: its
+    /// own enumerable properties in own-key order (integer keys ascending,
+    /// then the other keys in insertion order), values decoded recursively, so
+    /// objects nest.
     Object(Vec<(String, Value)>),
-    /// A first-class function value, read from linear memory via a
-    /// function-pointer jsval (type byte `3`). The backing block holds a
-    /// funcref-table index and an environment slot; a returned bare function
-    /// value only needs to decode without panicking (it renders as
-    /// `[Function (anonymous)]`).
-    Function,
+    /// A heap object whose `constructor` (found by a data-property chain lookup)
+    /// is a function named other than `Object`, e.g. a class instance: the
+    /// constructor's name and the own enumerable properties. Renders Node-style
+    /// as `A { x: 1 }`.
+    Instance {
+        /// The constructor's name.
+        class: String,
+        /// The own enumerable properties, as in [`Value::Object`].
+        entries: Vec<(String, Value)>,
+    },
+    /// A Boolean/Number/String wrapper object (a `TYPE_OBJECT` of class
+    /// `BOOLEAN`/`NUMBER`/`STRING`): its `[[PrimitiveValue]]` and its own
+    /// enumerable properties (a String wrapper's indices left out). Renders
+    /// Node-style as `[String: 'abc']`, then `{ x: 1 }` when it has properties.
+    Wrapper {
+        /// The wrapped primitive.
+        primitive: Box<Value>,
+        /// The own enumerable properties, as in [`Value::Object`].
+        entries: Vec<(String, Value)>,
+    },
+    /// An `arguments` object (a `TYPE_OBJECT` of class `ARGUMENTS`): its own
+    /// enumerable properties, as in [`Value::Object`]. Renders Node-style as
+    /// `[Arguments] { '0': 1 }`.
+    Arguments(Vec<(String, Value)>),
+    /// An Error instance (a `TYPE_OBJECT` of class `ERROR`): its `name` and
+    /// `message` strings, found by a data-property chain lookup. Renders as its
+    /// single-line stack `"<name>: <message>"`.
+    Error {
+        /// The `name` property (`"Error"` when absent or not a string).
+        name: String,
+        /// The `message` property (empty when absent or not a string).
+        message: String,
+    },
+    /// An accessor property's value as rendered inside an object: which
+    /// halves (getter / setter) it has. Renders as `[Getter]`, `[Setter]`, or
+    /// `[Getter/Setter]`.
+    Accessor {
+        /// Whether the property has a getter.
+        getter: bool,
+        /// Whether the property has a setter.
+        setter: bool,
+    },
+    /// A function object (type byte `3`): its name from the `__fn_info`
+    /// table, its class-ness, and its own enumerable properties. Renders
+    /// Node-style as `[Function: f]` / `[Function (anonymous)]` /
+    /// `[class A]` / `[class B extends A]`, followed by ` { k: v }` when it has
+    /// enumerable properties.
+    Function {
+        /// The function's name (`""` when anonymous).
+        name: String,
+        /// Whether the function is a class constructor.
+        class: bool,
+        /// A derived class's parent class name (via `prototype.[[Prototype]].constructor`).
+        extends: Option<String>,
+        /// The own enumerable properties, as in [`Value::Object`].
+        props: Vec<(String, Value)>,
+    },
     /// A `Map` handle (type byte `6`). Only its logical entry count (`size`)
     /// is decoded — the backing entries are not walked — so it renders as `Map(N)`.
     Map(usize),
@@ -64,6 +123,29 @@ pub enum Value {
     /// (`1970-01-01T00:00:00.000Z`), or `Invalid Date` when the timestamp is not
     /// finite — matching Node's `console.log` of a `Date`.
     Date(f64),
+    /// A back-reference to a container still being decoded on the current path
+    /// (a cycle). Carries the cycle target's 1-based reference number and
+    /// renders Node-console style as `[Circular *N]`.
+    Circular(usize),
+    /// A container that some [`Value::Circular`] inside it points back to:
+    /// the reference number and the decoded container. Renders as
+    /// `<ref *N> ` followed by the container.
+    Ref(usize, Box<Value>),
+}
+
+/// Cycle-guard state for one [`decode`] call: the heap blocks on the current
+/// recursion path and the cycle targets numbered so far (in discovery order,
+/// matching Node's `*1`, `*2`, ... numbering).
+struct Guard {
+    path: Vec<usize>,
+    refs: Vec<usize>,
+}
+
+impl Guard {
+    /// The reference number of cycle target `ptr`, if one was assigned.
+    fn ref_of(&self, ptr: usize) -> Option<usize> {
+        self.refs.iter().position(|&p| p == ptr).map(|i| i + 1)
+    }
 }
 
 /// Decode raw jsval `bits` into a [`Value`] per the NaN-box layout.
@@ -74,6 +156,18 @@ pub enum Value {
 /// [`run`]: super::run
 #[must_use]
 pub fn decode(bits: u64, memory: &[u8]) -> Value {
+    decode_in(
+        bits,
+        memory,
+        &mut Guard {
+            path: Vec::new(),
+            refs: Vec::new(),
+        },
+    )
+}
+
+/// [`decode`] under the cycle guard `guard`.
+fn decode_in(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
     // Any value without the full QNAN mask set is an ordinary number (this also
     // covers infinities, whose exponent is all ones but quiet bit is clear).
     if bits & QNAN != QNAN {
@@ -85,7 +179,7 @@ pub fn decode(bits: u64, memory: &[u8]) -> Value {
         0b010 => Value::Null,
         0b011 => Value::Undefined,
         // Single heap tag: read the block's TYPE BYTE to pick the arm.
-        0b101 => decode_heap(bits, memory),
+        0b101 => decode_heap(bits, memory, guard),
         // Tags 0b100, 0b110 and 0b111 (unused), and 0b000
         // (the canonical number NaN). Any such pattern decodes as a NaN number,
         // keeping decode total without a panic.
@@ -98,16 +192,41 @@ pub fn decode(bits: u64, memory: &[u8]) -> Value {
 /// the string / array / object / function decoder. A function block
 /// decodes to [`Value::Function`]; an unknown or out-of-range type byte decodes
 /// as `undefined`, keeping decode total.
-fn decode_heap(bits: u64, memory: &[u8]) -> Value {
+///
+/// Containers (array / object / promise) are cycle-guarded: a block already on
+/// the recursion path decodes as [`Value::Circular`], and the block it points
+/// back to is wrapped in [`Value::Ref`] once decoded.
+fn decode_heap(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
     let ptr = (bits & 0xFFFF_FFFF) as usize;
-    match memory.get(ptr).copied() {
+    let ty = memory.get(ptr).copied();
+    if matches!(
+        ty,
+        Some(TYPE_ARRAY | TYPE_OBJECT | TYPE_PROMISE | TYPE_FUNCTION)
+    ) {
+        if guard.path.contains(&ptr) {
+            let id = guard.ref_of(ptr).unwrap_or_else(|| {
+                guard.refs.push(ptr);
+                guard.refs.len()
+            });
+            return Value::Circular(id);
+        }
+        guard.path.push(ptr);
+        let value = match ty {
+            Some(TYPE_ARRAY) => decode_array(ptr, memory, guard),
+            Some(TYPE_OBJECT) => decode_object(ptr, memory, guard),
+            Some(TYPE_FUNCTION) => decode_function(ptr, memory, guard),
+            _ => decode_promise(ptr, memory, guard),
+        };
+        guard.path.pop();
+        return match guard.ref_of(ptr) {
+            Some(id) => Value::Ref(id, Box::new(value)),
+            None => value,
+        };
+    }
+    match ty {
         Some(TYPE_STRING) => decode_string(ptr, memory),
-        Some(TYPE_ARRAY) => decode_array(ptr, memory),
-        Some(TYPE_OBJECT) => decode_object(ptr, memory),
-        Some(TYPE_FUNCTION) => Value::Function,
         Some(TYPE_MAP) => Value::Map(decode_size(ptr, memory)),
         Some(TYPE_SET) => Value::Set(decode_size(ptr, memory)),
-        Some(TYPE_PROMISE) => decode_promise(ptr, memory),
         Some(TYPE_GENERATOR) => Value::Generator,
         Some(TYPE_DATE) => decode_date(ptr, memory),
         _ => Value::Undefined,
@@ -127,19 +246,23 @@ fn decode_date(ptr: usize, memory: &[u8]) -> Value {
 }
 
 /// Resolve a heap promise block at base `ptr` into a [`Value::Promise`]:
-/// the i32 `state` at `ptr + HEADER_SIZE` and the i64 settled `value` at
-/// `ptr + HEADER_SIZE + 4` (decoded recursively). Defensive: a truncated block
+/// the i32 `state` at `ptr + PROMISE_STATE_OFFSET` and the i64 settled `value`
+/// at `ptr + PROMISE_VALUE_OFFSET` (decoded recursively). Defensive: a truncated block
 /// reads as pending with an `undefined` value.
-fn decode_promise(ptr: usize, memory: &[u8]) -> Value {
-    let state_at = ptr + HEADER_SIZE;
+fn decode_promise(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+    let state_at = ptr + PROMISE_STATE_OFFSET;
     let state = memory
         .get(state_at..state_at + 4)
         .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap_or([0; 4])));
-    let val_at = state_at + 4;
+    let val_at = ptr + PROMISE_VALUE_OFFSET;
     let value = memory
         .get(val_at..val_at + 8)
         .map_or(Value::Undefined, |b| {
-            decode(u64::from_le_bytes(b.try_into().unwrap_or([0; 8])), memory)
+            decode_in(
+                u64::from_le_bytes(b.try_into().unwrap_or([0; 8])),
+                memory,
+                guard,
+            )
         });
     Value::Promise {
         state,
@@ -147,11 +270,11 @@ fn decode_promise(ptr: usize, memory: &[u8]) -> Value {
     }
 }
 
-/// Read the u32 `size` header of a Map/Set handle block at base `ptr` (at
-/// `ptr + HEADER_SIZE`), the logical entry count. Defensive: an out-of-range
+/// Read the u32 `size` field of a Map/Set handle block at base `ptr` (at
+/// `ptr + MAP_SIZE_OFFSET`), the logical entry count. Defensive: an out-of-range
 /// header yields `0`, so a malformed pointer never panics.
 fn decode_size(ptr: usize, memory: &[u8]) -> usize {
-    let at = ptr + HEADER_SIZE;
+    let at = ptr + MAP_SIZE_OFFSET;
     memory.get(at..at + 4).map_or(0, |b| {
         u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
     })
@@ -175,64 +298,325 @@ fn decode_string(ptr: usize, memory: &[u8]) -> Value {
     Value::Str(String::from_utf8_lossy(str_bytes).into_owned())
 }
 
-/// Resolve a heap array block at base `ptr` into a [`Value::Array`] by reading the
-/// u32 `len` header at `ptr + HEADER_SIZE`, then decoding `len` consecutive i64
-/// element jsvals at `ptr + HEADER_SIZE + 4 + 8*k` (each recursively). Nested
-/// arrays and strings resolve through the same `memory`.
-///
-/// Defensive: an out-of-range header yields an empty array and a truncated
-/// element run stops early, so a malformed pointer never panics.
-fn decode_array(ptr: usize, memory: &[u8]) -> Value {
-    let len_at = ptr + HEADER_SIZE;
-    let Some(len_bytes) = memory.get(len_at..len_at + 4) else {
-        return Value::Array(Vec::new());
-    };
-    let len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
-    let mut elems = Vec::with_capacity(len);
-    for k in 0..len {
-        let start = len_at + 4 + 8 * k;
-        let Some(elem_bytes) = memory.get(start..start + 8) else {
-            break;
-        };
-        let elem_bits = u64::from_le_bytes(elem_bytes.try_into().unwrap_or([0; 8]));
-        elems.push(decode(elem_bits, memory));
-    }
-    Value::Array(elems)
+/// The length of the array handle at base `ptr` and the address of its element
+/// 0 (element `k` is the jsval at `data + 8*k` of its element store), or `None`
+/// when the handle is truncated.
+pub(super) fn array_layout(memory: &[u8], ptr: usize) -> Option<(usize, usize)> {
+    let len = read_u32(memory, ptr + ARRAY_LEN_OFFSET)? as usize;
+    let elems = read_u32(memory, ptr + ARRAY_ELEMS_OFFSET)? as usize;
+    Some((len, elems + ELEMS_DATA_OFFSET))
 }
 
-/// Resolve a heap object block at base `ptr` into a [`Value::Object`] by reading
-/// the u32 `n` header at `ptr + HEADER_SIZE`, then decoding `n` consecutive 16-byte
-/// entries at `ptr + HEADER_SIZE + 4 + 16*k`: the key jsval (a heap-string pointer)
-/// at offset `+0` and the value jsval at offset `+8` (each recursively). Nested
-/// objects, arrays, and strings resolve through the same `memory`.
-///
-/// Defensive: an out-of-range header yields an empty object and a truncated entry
-/// run stops early, so a malformed pointer never panics.
-fn decode_object(ptr: usize, memory: &[u8]) -> Value {
-    let n_at = ptr + HEADER_SIZE;
-    let Some(n_bytes) = memory.get(n_at..n_at + 4) else {
-        return Value::Object(Vec::new());
+/// The `length` of the array handle at base `ptr` and its present elements as
+/// `(index, jsval bits)` in ascending index order (holes are absent): the
+/// store slots, then — for a `SPARSE` array, whose store holds only the
+/// elements below its `cap` — the array-index keys of its own table. `None`
+/// when the handle is truncated; a truncated store stops early.
+pub(super) fn array_elements(memory: &[u8], ptr: usize) -> Option<(usize, Vec<(usize, u64)>)> {
+    use crate::abi;
+    let (len, data) = array_layout(memory, ptr)?;
+    let sparse = memory
+        .get(ptr + abi::HEADER_FLAGS_OFFSET as usize)
+        .is_some_and(|flags| flags & abi::ARRAY_FLAG_SPARSE != 0);
+    let stored = if sparse {
+        let store = read_u32(memory, ptr + ARRAY_ELEMS_OFFSET)? as usize;
+        let cap = if store == 0 {
+            0
+        } else {
+            read_u32(memory, store + abi::ELEMS_CAP_OFFSET as usize)? as usize
+        };
+        len.min(cap)
+    } else {
+        len
     };
-    let n = u32::from_le_bytes(n_bytes.try_into().unwrap_or([0; 4])) as usize;
-    let mut entries = Vec::with_capacity(n);
-    for k in 0..n {
-        let key_start = n_at + 4 + 16 * k;
-        let Some(key_bytes) = memory.get(key_start..key_start + 8) else {
+    let mut present = Vec::new();
+    for k in 0..stored {
+        let Some(bits) = read_u64(memory, data + 8 * k) else {
             break;
         };
-        let Some(val_bytes) = memory.get(key_start + 8..key_start + 16) else {
-            break;
-        };
-        let key_bits = u64::from_le_bytes(key_bytes.try_into().unwrap_or([0; 8]));
-        // The key jsval is a heap-string pointer; decode it and take its text.
-        let key = match decode(key_bits, memory) {
-            Value::Str(s) => s,
-            _ => String::new(),
-        };
-        let val_bits = u64::from_le_bytes(val_bytes.try_into().unwrap_or([0; 8]));
-        entries.push((key, decode(val_bits, memory)));
+        if bits != abi::HOLE {
+            present.push((k, bits));
+        }
     }
-    Value::Object(entries)
+    if sparse {
+        let mut keyed: Vec<(usize, u64)> = table_entries(ptr, memory)
+            .into_iter()
+            .filter_map(|(index, _, _, bits)| Some((index? as usize, bits)))
+            .collect();
+        keyed.sort_unstable_by_key(|&(index, _)| index);
+        present.extend(keyed);
+    }
+    Some((len, present))
+}
+
+/// Resolve a heap array handle at base `ptr` into a [`Value::Array`]: its
+/// present elements ([`array_elements`], each decoded recursively) with every
+/// run of holes up to `len` as one [`Value::Holes`], then its own named
+/// properties ([`decode_props`]). Nested arrays and strings resolve through
+/// the same `memory`.
+///
+/// Defensive: a truncated handle yields an empty array, so a malformed pointer
+/// never panics.
+fn decode_array(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+    let Some((len, present)) = array_elements(memory, ptr) else {
+        return Value::Array(Vec::new(), Vec::new());
+    };
+    let mut elems = Vec::with_capacity(present.len());
+    let mut next = 0;
+    for (index, bits) in present {
+        if index > next {
+            elems.push(Value::Holes(index - next));
+        }
+        elems.push(decode_in(bits, memory, guard));
+        next = index + 1;
+    }
+    if len > next {
+        elems.push(Value::Holes(len - next));
+    }
+    Value::Array(elems, decode_props(ptr, memory, guard))
+}
+
+/// Read the little-endian u32 at `at`, or `None` when out of range.
+fn read_u32(memory: &[u8], at: usize) -> Option<u32> {
+    let bytes = memory.get(at..at + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Read the little-endian u64 at `at`, or `None` when out of range.
+fn read_u64(memory: &[u8], at: usize) -> Option<u64> {
+    let bytes = memory.get(at..at + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Decode the own enumerable properties of the object-family block at base
+/// `ptr` by walking its `TYPE_PROPS` table (at the `props` slot): tombstones
+/// and non-enumerable entries are skipped, integer keys (strings flagged
+/// `ARRAY_INDEX`) come first in ascending order when the table has
+/// `HAS_INDEX_KEYS`, then the other keys in slot order. An accessor property
+/// decodes as [`Value::Accessor`].
+///
+/// Defensive: a truncated table stops early, so a malformed pointer never
+/// panics.
+fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> Vec<(String, Value)> {
+    use crate::abi;
+    let array = memory.get(ptr) == Some(&TYPE_ARRAY);
+    let mut keyed = table_entries(ptr, memory);
+    // An array's integer keys are its (sparse) elements, decoded by `decode_array`.
+    keyed.retain(|(index, ..)| !(array && index.is_some()));
+    // A stable sort keeps the non-index keys in slot order after the indices.
+    keyed.sort_by_key(|(index, ..)| index.map_or((1, 0), |i| (0, i)));
+    let mut entries = Vec::with_capacity(keyed.len());
+    for (_, key, attrs, bits) in keyed {
+        let value = if attrs & abi::ATTR_ACCESSOR != 0 {
+            let pair = (bits & 0xFFFF_FFFF) as usize;
+            let half = |offset: u32| {
+                read_u64(memory, pair + offset as usize).is_some_and(|b| b != abi::UNDEFINED)
+            };
+            Value::Accessor {
+                getter: half(abi::ACCESSOR_GET_OFFSET),
+                setter: half(abi::ACCESSOR_SET_OFFSET),
+            }
+        } else {
+            decode_in(bits, memory, guard)
+        };
+        entries.push((key, value));
+    }
+    entries
+}
+
+/// The live enumerable entries of the `TYPE_PROPS` table of the object-family
+/// block at base `ptr`, in slot order, as `(index, key text, attrs, value
+/// bits)` — `index` is the value of an integer key (a string flagged
+/// `ARRAY_INDEX` in a table with `HAS_INDEX_KEYS`). Tombstones and
+/// non-enumerable entries are skipped; a truncated table stops early.
+fn table_entries(ptr: usize, memory: &[u8]) -> Vec<(Option<u32>, String, u32, u64)> {
+    use crate::abi;
+    let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize).unwrap_or(0) as usize;
+    if props == 0 {
+        return Vec::new();
+    }
+    let count = read_u32(memory, props + abi::PROPS_COUNT_OFFSET as usize).unwrap_or(0) as usize;
+    let tflags = memory
+        .get(props + abi::PROPS_TFLAGS_OFFSET as usize)
+        .copied()
+        .unwrap_or(0);
+    // (index value for an integer key, key text, attrs, value bits)
+    let mut keyed: Vec<(Option<u32>, String, u32, u64)> = Vec::with_capacity(count);
+    for k in 0..count {
+        let entry = props + abi::PROPS_HEADER_SIZE as usize + abi::PROP_ENTRY_SIZE as usize * k;
+        let (Some(key), Some(attrs), Some(bits)) = (
+            read_u32(memory, entry + abi::PROP_KEY_OFFSET as usize),
+            read_u32(memory, entry + abi::PROP_ATTRS_OFFSET as usize),
+            read_u64(memory, entry + abi::PROP_VALUE_OFFSET as usize),
+        ) else {
+            break;
+        };
+        if key == 0 {
+            continue;
+        }
+        let Value::Str(text) = decode_string(key as usize, memory) else {
+            continue;
+        };
+        if attrs & abi::ATTR_ENUMERABLE == 0 {
+            continue;
+        }
+        let flags = memory
+            .get(key as usize + abi::HEADER_FLAGS_OFFSET as usize)
+            .copied()
+            .unwrap_or(0);
+        let index = (tflags & abi::PROPS_HAS_INDEX_KEYS != 0
+            && flags & abi::STR_FLAG_ARRAY_INDEX != 0)
+            .then(|| text.parse::<u32>().ok())
+            .flatten();
+        keyed.push((index, text, attrs, bits));
+    }
+    keyed
+}
+
+/// Resolve a heap object block at base `ptr` from its own enumerable
+/// properties ([`decode_props`]). An object of class `ERROR` decodes as
+/// [`Value::Error`] with its (possibly inherited) `name` and `message`; an
+/// object whose prototype chain (from its prototype, so a prototype object's
+/// own `constructor` back-link does not name it) holds a `constructor` naming
+/// a function other than `Object` decodes as [`Value::Instance`].
+fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+    use crate::abi;
+    if memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize) == Some(&CLASS_ERROR) {
+        let mut field = |name: &str| match lookup_data(ptr, name, memory)
+            .map(|bits| decode_in(bits, memory, guard))
+        {
+            Some(Value::Str(s)) => Some(s),
+            _ => None,
+        };
+        return Value::Error {
+            name: field("name").unwrap_or_else(|| "Error".to_owned()),
+            message: field("message").unwrap_or_default(),
+        };
+    }
+    let mut entries = decode_props(ptr, memory, guard);
+    let class_byte = memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize).copied();
+    if class_byte == Some(abi::CLASS_ARGUMENTS) {
+        return Value::Arguments(entries);
+    }
+    if let Some(abi::CLASS_BOOLEAN | abi::CLASS_NUMBER | abi::CLASS_STRING) = class_byte {
+        let primitive = read_u64(memory, ptr + abi::WRAPPER_VALUE_OFFSET as usize)
+            .map_or(Value::Undefined, |bits| decode_in(bits, memory, guard));
+        if let Value::Str(text) = &primitive {
+            let len = text.len();
+            entries.retain(|(key, _)| key.parse::<usize>().map_or(true, |i| i >= len));
+        }
+        return Value::Wrapper {
+            primitive: Box::new(primitive),
+            entries,
+        };
+    }
+    let class = read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize)
+        .and_then(|bits| heap_object(bits, memory))
+        .and_then(|proto| lookup_data(proto, "constructor", memory))
+        .and_then(|bits| function_name(bits, memory))
+        .filter(|name| !name.is_empty() && name != "Object");
+    match class {
+        Some(class) => Value::Instance { class, entries },
+        None => Value::Object(entries),
+    }
+}
+
+/// Resolve a function block at base `ptr` (see [`Value::Function`]).
+fn decode_function(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
+    use crate::abi;
+    let flags = memory
+        .get(ptr + abi::HEADER_FLAGS_OFFSET as usize)
+        .copied()
+        .unwrap_or(0);
+    let class = flags & abi::FUNC_FLAG_CLASS_CTOR != 0;
+    // The parent is the class's own [[Prototype]] when that is a constructor
+    // (a base class inherits from the non-constructor %Function.prototype%).
+    let extends = class
+        .then(|| read_u64(memory, ptr + abi::OBJ_PROTO_OFFSET as usize))
+        .flatten()
+        .and_then(|parent| heap_object(parent, memory))
+        .filter(|&parent| {
+            memory.get(parent) == Some(&abi::TYPE_FUNCTION)
+                && memory
+                    .get(parent + abi::HEADER_FLAGS_OFFSET as usize)
+                    .is_some_and(|f| f & abi::FUNC_FLAG_CONSTRUCTOR != 0)
+        })
+        .and_then(|parent| function_name(abi::HEAP | parent as u64, memory));
+    Value::Function {
+        name: function_name(abi::HEAP | ptr as u64, memory).unwrap_or_default(),
+        class,
+        extends,
+        props: decode_props(ptr, memory, guard),
+    }
+}
+
+/// The block base of `bits` when it is a heap pointer to an object-family
+/// block that carries a `props` slot (not a string or array).
+fn heap_object(bits: u64, memory: &[u8]) -> Option<usize> {
+    if bits & QNAN != QNAN || (bits >> 48) & 0b111 != 0b101 {
+        return None;
+    }
+    let ptr = (bits & 0xFFFF_FFFF) as usize;
+    let ty = *memory.get(ptr)?;
+    (ty != TYPE_STRING && ty != TYPE_ARRAY).then_some(ptr)
+}
+
+/// The value bits of the own DATA property `key` of the object-family block
+/// at `ptr` (a read-only lookup by key bytes; accessors are skipped).
+fn own_data(ptr: usize, key: &str, memory: &[u8]) -> Option<u64> {
+    use crate::abi;
+    let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize)? as usize;
+    if props == 0 {
+        return None;
+    }
+    let count = read_u32(memory, props + abi::PROPS_COUNT_OFFSET as usize)? as usize;
+    (0..count).find_map(|k| {
+        let entry = props + abi::PROPS_HEADER_SIZE as usize + abi::PROP_ENTRY_SIZE as usize * k;
+        let key_ptr = read_u32(memory, entry + abi::PROP_KEY_OFFSET as usize)?;
+        let attrs = read_u32(memory, entry + abi::PROP_ATTRS_OFFSET as usize)?;
+        let matches = key_ptr != 0
+            && attrs & abi::ATTR_ACCESSOR == 0
+            && matches!(decode_string(key_ptr as usize, memory), Value::Str(text) if text == key);
+        matches
+            .then(|| read_u64(memory, entry + abi::PROP_VALUE_OFFSET as usize))
+            .flatten()
+    })
+}
+
+/// The value bits of the data property `key` found on the object at `ptr` or
+/// the nearest object on its `proto` chain (a read-only lookup: no getter
+/// runs; a bounded walk, so a malformed chain cannot loop forever).
+fn lookup_data(ptr: usize, key: &str, memory: &[u8]) -> Option<u64> {
+    use crate::abi;
+    let mut cur = ptr;
+    for _ in 0..1024 {
+        if let Some(bits) = own_data(cur, key, memory) {
+            return Some(bits);
+        }
+        let proto = read_u64(memory, cur + abi::OBJ_PROTO_OFFSET as usize)?;
+        cur = heap_object(proto, memory)?;
+    }
+    None
+}
+
+/// The `__fn_info` name of the function `bits`, or `None` when `bits` is not
+/// a function.
+fn function_name(bits: u64, memory: &[u8]) -> Option<String> {
+    use crate::abi;
+    let ptr = heap_object(bits, memory)?;
+    if memory.get(ptr) != Some(&TYPE_FUNCTION) {
+        return None;
+    }
+    let info = read_u32(memory, abi::FN_INFO_ADDR as usize)? as usize;
+    let index = read_u32(memory, ptr + abi::FUNC_INDEX_OFFSET as usize)? as usize;
+    let key = read_u32(
+        memory,
+        info + abi::FN_INFO_ENTRY_SIZE as usize * index + abi::FN_INFO_NAME_OFFSET as usize,
+    )?;
+    match decode_string(key as usize, memory) {
+        Value::Str(name) => Some(name),
+        _ => None,
+    }
 }
 
 /// Render an `f64` the way JavaScript prints a number.
@@ -321,44 +705,97 @@ pub fn format_value(value: &Value) -> String {
         Value::Number(n) => format_number(*n),
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_owned(),
-        Value::Undefined => "undefined".to_owned(),
+        // A hole outside an array (never produced) reads as `undefined`.
+        Value::Undefined | Value::Holes(_) => "undefined".to_owned(),
         // A string renders as its raw text, with no surrounding quotes (a `typeof`
         // result is an ordinary string, so `console.log(typeof x)` prints the word).
         Value::Str(s) => s.clone(),
-        // An array renders Node-console style: `[ 1, 2, 3 ]`, `[]` when empty.
-        Value::Array(elems) => {
-            if elems.is_empty() {
+        // An array renders Node-console style: `[ 1, 2, 3 ]`, `[]` when empty,
+        // a run of holes as `<N empty items>`, named properties last.
+        Value::Array(elems, props) => {
+            let mut parts = Vec::new();
+            let mut holes = 0;
+            let flush = |parts: &mut Vec<String>, holes: &mut usize| {
+                if *holes > 0 {
+                    let s = if *holes == 1 { "" } else { "s" };
+                    parts.push(format!("<{holes} empty item{s}>"));
+                    *holes = 0;
+                }
+            };
+            for elem in elems {
+                if let Value::Holes(n) = elem {
+                    holes += n;
+                } else {
+                    flush(&mut parts, &mut holes);
+                    parts.push(format_value(elem));
+                }
+            }
+            flush(&mut parts, &mut holes);
+            parts.extend(
+                props
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {}", format_value(value))),
+            );
+            if parts.is_empty() {
                 "[]".to_owned()
             } else {
-                let inner = elems
-                    .iter()
-                    .map(format_value)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("[ {inner} ]")
+                format!("[ {} ]", parts.join(", "))
             }
         }
-        // A branded Error object renders as its single-line stack
-        // (`"<name>: <message>"`), the way a JS console prints an error's first
-        // line, rather than as a plain `{ ... }` object.
-        Value::Object(entries) if is_error_object(entries) => render_error(entries),
         // An object renders Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
-        Value::Object(entries) => {
-            if entries.is_empty() {
-                "{}".to_owned()
+        Value::Object(entries) => format_entries(entries),
+        // A class instance is prefixed with its constructor's name.
+        Value::Instance { class, entries } => format!("{class} {}", format_entries(entries)),
+        // A wrapper names its kind and quotes a wrapped string, as Node does.
+        Value::Wrapper { primitive, entries } => format_wrapper(primitive, entries),
+        // An `arguments` object quotes its (index) keys, as Node does.
+        Value::Arguments(entries) => {
+            let quoted: Vec<(String, Value)> = entries
+                .iter()
+                .map(|(key, value)| (quote_key(key), value.clone()))
+                .collect();
+            format!("[Arguments] {}", format_entries(&quoted))
+        }
+        // An Error instance renders as its single-line stack
+        // (`"<name>: <message>"`, or just the name without a message), the way
+        // a JS console prints an error's first line.
+        Value::Error { name, message } => {
+            if message.is_empty() {
+                name.clone()
             } else {
-                let inner = entries
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {}", format_value(value)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{ {inner} }}")
+                format!("{name}: {message}")
             }
         }
-        // A function value renders Node-console style. jsc does not track a
-        // function's source name through the value, so every function prints
-        // anonymously.
-        Value::Function => "[Function (anonymous)]".to_owned(),
+        Value::Accessor { getter, setter } => match (getter, setter) {
+            (true, true) => "[Getter/Setter]".to_owned(),
+            (false, true) => "[Setter]".to_owned(),
+            _ => "[Getter]".to_owned(),
+        },
+        // A function renders Node-console style by name and class-ness, then
+        // its enumerable properties.
+        Value::Function {
+            name,
+            class,
+            extends,
+            props,
+        } => {
+            let head = match (class, name.is_empty()) {
+                (true, _) => {
+                    let name = if name.is_empty() { "(anonymous)" } else { name };
+                    match extends {
+                        Some(parent) => format!("[class {name} extends {parent}]"),
+                        None => format!("[class {name}]"),
+                    }
+                }
+                (false, true) => "[Function (anonymous)]".to_owned(),
+                (false, false) => format!("[Function: {name}]"),
+            };
+            if props.is_empty() {
+                head
+            } else {
+                format!("{head} {}", format_entries(props))
+            }
+        }
         // A Map/Set renders with its entry count (the backing entries are not
         // decoded), e.g. `Map(2)` / `Set(0)`.
         Value::Map(size) => format!("Map({size})"),
@@ -377,6 +814,117 @@ pub fn format_value(value: &Value) -> String {
         Value::Generator => "Object [Generator]".to_owned(),
         // A Date renders as its ISO 8601 UTC string.
         Value::Date(ms) => format_date_iso(*ms),
+        // Cycle markers render Node-console style.
+        Value::Circular(id) => format!("[Circular *{id}]"),
+        Value::Ref(id, value) => format!("<ref *{id}> {}", format_value(value)),
+    }
+}
+
+/// Render a wrapper object Node-console style: `[String: 'abc']`,
+/// `[Number: -0]`, `[Boolean: true]`, then its own properties when it has any.
+fn format_wrapper(primitive: &Value, entries: &[(String, Value)]) -> String {
+    let head = match primitive {
+        Value::Str(text) => format!("[String: '{text}']"),
+        Value::Number(n) if *n == 0.0 && n.is_sign_negative() => "[Number: -0]".to_owned(),
+        Value::Number(n) => format!("[Number: {}]", format_number(*n)),
+        other => format!("[Boolean: {}]", format_value(other)),
+    };
+    if entries.is_empty() {
+        head
+    } else {
+        format!("{head} {}", format_entries(entries))
+    }
+}
+
+/// `Array.prototype.join` over decoded array elements: each element's
+/// `ToString` (`null`/`undefined` elements, holes, and cycle back-references
+/// are empty) separated by `sep`; a run of `N` holes contributes `N` empty
+/// pieces.
+fn join_elements(elems: &[Value], sep: &str) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    let mut piece = |out: &mut String, text: &str| {
+        if !first {
+            out.push_str(sep);
+        }
+        first = false;
+        out.push_str(text);
+    };
+    for elem in elems {
+        match elem {
+            Value::Holes(n) => {
+                for _ in 0..*n {
+                    piece(&mut out, "");
+                }
+            }
+            Value::Null | Value::Undefined => piece(&mut out, ""),
+            other => piece(&mut out, &to_js_string(other)),
+        }
+    }
+    out
+}
+
+/// The JS `ToString` text of a decoded [`Value`] (what `String(v)`, `'' + v`
+/// and `join` produce), as opposed to [`format_value`]'s console rendering:
+/// an array joins its elements' `ToString` with `,` (`null`/`undefined`
+/// elements, holes, and cycle back-references are empty, as in V8), a plain object or
+/// class instance is `[object Object]`, an error is `Error.prototype.toString`
+/// (`Name: message`, or whichever half is non-empty), and Map/Set/promise/
+/// generator use their `Object.prototype.toString` tags. Functions (no source
+/// text is kept) and Dates keep their console rendering.
+#[must_use]
+pub fn to_js_string(value: &Value) -> String {
+    match value {
+        Value::Array(elems, _) => join_elements(elems, ","),
+        Value::Object(_) | Value::Instance { .. } => "[object Object]".to_owned(),
+        Value::Arguments(_) => "[object Arguments]".to_owned(),
+        Value::Wrapper { primitive, .. } => to_js_string(primitive),
+        Value::Error { name, message } => match (name.is_empty(), message.is_empty()) {
+            (_, true) => name.clone(),
+            (true, false) => message.clone(),
+            (false, false) => format!("{name}: {message}"),
+        },
+        Value::Map(_) => "[object Map]".to_owned(),
+        Value::Set(_) => "[object Set]".to_owned(),
+        Value::Promise { .. } => "[object Promise]".to_owned(),
+        Value::Generator => "[object Generator]".to_owned(),
+        Value::Accessor { .. } | Value::Circular(_) | Value::Holes(_) => String::new(),
+        Value::Ref(_, inner) => to_js_string(inner),
+        Value::Number(_)
+        | Value::Bool(_)
+        | Value::Null
+        | Value::Undefined
+        | Value::Str(_)
+        | Value::Function { .. }
+        | Value::Date(_) => format_value(value),
+    }
+}
+
+/// A property key as Node's console prints it: an identifier-like key bare,
+/// anything else (an index key) single-quoted.
+fn quote_key(key: &str) -> String {
+    let identifier = key.chars().next().is_some_and(|c| !c.is_ascii_digit())
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    if identifier {
+        key.to_owned()
+    } else {
+        format!("'{key}'")
+    }
+}
+
+/// Render own properties Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
+fn format_entries(entries: &[(String, Value)]) -> String {
+    if entries.is_empty() {
+        "{}".to_owned()
+    } else {
+        let inner = entries
+            .iter()
+            .map(|(key, value)| format!("{key}: {}", format_value(value)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{ {inner} }}")
     }
 }
 
@@ -415,31 +963,6 @@ fn format_date_iso(ms: f64) -> String {
     let year = if month <= 2 { year + 1 } else { year };
 
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
-}
-
-/// Whether the decoded object `entries` describe a branded Error object — i.e.
-/// they carry the hidden [`ERROR_KIND_KEY`] identity marker that
-/// `new Error`/`new TypeError`/`new RangeError` attach.
-fn is_error_object(entries: &[(String, Value)]) -> bool {
-    entries.iter().any(|(key, _)| key == ERROR_KIND_KEY)
-}
-
-/// Render a branded Error object as its single-line stack: `"<name>: <message>"`,
-/// or just `"<name>"` when the message is empty. Missing/non-string `name` falls
-/// back to `"Error"`, matching how a JS console prints an error's first line.
-/// Assumes [`is_error_object`] already held.
-fn render_error(entries: &[(String, Value)]) -> String {
-    let field = |name: &str| {
-        entries.iter().find_map(|(key, value)| match value {
-            Value::Str(s) if key == name => Some(s.as_str()),
-            _ => None,
-        })
-    };
-    let name = field("name").unwrap_or("Error");
-    match field("message") {
-        Some(message) if !message.is_empty() => format!("{name}: {message}"),
-        _ => name.to_owned(),
-    }
 }
 
 #[cfg(test)]

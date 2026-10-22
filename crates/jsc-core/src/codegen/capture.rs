@@ -24,6 +24,29 @@ pub(super) fn binding_id(ident: &swc_ecma_ast::BindingIdent) -> u32 {
 /// Nested arrows and function expressions/declarations push a further scope.
 pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> CaptureAnalysis {
     let mut resolver = CaptureResolver::default();
+    // `main`'s outermost-scope bindings and their mutability, known up front so a
+    // closure referencing one declared LATER in the program resolves to it.
+    for stmt in top_stmts {
+        match stmt {
+            Stmt::Decl(Decl::Var(v)) => {
+                let mut names = std::collections::HashSet::new();
+                for d in &v.decls {
+                    pat_names(&d.name, &mut names);
+                }
+                for name in names {
+                    resolver
+                        .top_bindings
+                        .insert(name, v.kind != VarDeclKind::Const);
+                }
+            }
+            Stmt::Decl(Decl::Class(c)) => {
+                resolver
+                    .top_bindings
+                    .insert(c.ident.sym.as_ref().to_owned(), true);
+            }
+            _ => {}
+        }
+    }
     resolver.enter_function();
     for stmt in top_stmts {
         resolver.stmt(stmt);
@@ -34,26 +57,12 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
     // hoisting). A reference reaching `main` records a module binding.
     resolver.in_top_fn = true;
     for fn_decl in fn_decls {
-        resolver.enter_function();
-        for param in &fn_decl.function.params {
-            resolver.declare_param(&param.pat);
-        }
-        if let Some(block) = &fn_decl.function.body {
-            for stmt in &block.stmts {
-                resolver.stmt(stmt);
-            }
-        }
-        resolver.exit_function();
+        resolver.function(
+            &fn_decl.function.params,
+            fn_decl.function.body.as_ref().map(|b| &b.stmts),
+        );
     }
     resolver.exit_function();
-    // Finalize the object shapes: keep only the candidates whose binding name is
-    // never reassigned, so the recorded literal shape is provably fixed.
-    let object_shapes = resolver
-        .shape_candidates
-        .into_iter()
-        .filter(|(_, name, _)| !resolver.assigned.contains(name))
-        .map(|(id, _, keys)| (id, keys))
-        .collect();
     // The `var`-declared module bindings (hoisted, initialized to `undefined`).
     let mut module_vars = std::collections::HashSet::new();
     for stmt in top_stmts {
@@ -66,19 +75,27 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         }
     }
     module_vars.retain(|name| resolver.module_names.contains(name));
+    let module_mutable = resolver
+        .module_names
+        .iter()
+        .map(|name| {
+            let mutable = resolver.top_bindings.get(name).copied().unwrap_or(true);
+            (name.clone(), mutable)
+        })
+        .collect();
     CaptureAnalysis {
         captured: resolver.captured,
         module_vars,
+        module_mutable,
         module_names: resolver.module_names,
-        object_shapes,
     }
 }
 
 /// Collect every identifier a (possibly destructuring) binding pattern binds.
-fn pat_names(pat: &Pat, names: &mut std::collections::HashSet<String>) {
+pub(super) fn pat_names(pat: &Pat, names: &mut impl Extend<String>) {
     match pat {
         Pat::Ident(ident) => {
-            names.insert(ident.id.sym.as_ref().to_owned());
+            names.extend([ident.id.sym.as_ref().to_owned()]);
         }
         Pat::Array(arr) => {
             for elem in arr.elems.iter().flatten() {
@@ -90,7 +107,7 @@ fn pat_names(pat: &Pat, names: &mut std::collections::HashSet<String>) {
                 match prop {
                     ObjectPatProp::KeyValue(kv) => pat_names(&kv.value, names),
                     ObjectPatProp::Assign(assign) => {
-                        names.insert(assign.key.id.sym.as_ref().to_owned());
+                        names.extend([assign.key.id.sym.as_ref().to_owned()]);
                     }
                     ObjectPatProp::Rest(rest) => pat_names(&rest.arg, names),
                 }
@@ -130,11 +147,17 @@ impl CaptureResolver {
     }
 
     /// Declare a function/arrow parameter binding for capture analysis: a plain
-    /// `Pat::Ident` or the inner ident of a trailing rest parameter (`...rest`),
-    /// so a nested closure referencing the rest binding marks it captured.
+    /// `Pat::Ident`, a defaulted ident (`a = d`, whose default is analyzed first in
+    /// the function's frame, so an outer binding it reads is captured), or the
+    /// inner ident of a trailing rest parameter (`...rest`), so a nested closure
+    /// referencing the rest binding marks it captured.
     fn declare_param(&mut self, pat: &Pat) {
         match pat {
             Pat::Ident(ident) => self.declare(ident.id.sym.as_ref(), binding_id(ident)),
+            Pat::Assign(assign) => {
+                self.expr(&assign.right);
+                self.declare_param(&assign.left);
+            }
             Pat::Rest(rest) => {
                 if let Pat::Ident(ident) = rest.arg.as_ref() {
                     self.declare(ident.id.sym.as_ref(), binding_id(ident));
@@ -181,25 +204,8 @@ impl CaptureResolver {
         }
     }
 
-    /// Record a `let`/`const` binding initialized directly with an all-static-key
-    /// object literal as an object-shape candidate (static-shape unknown-method
-    /// guard). Only simple identifier bindings qualify; `var` is excluded because
-    /// its hoisting/redeclaration makes a single fixed shape unsound. The candidate
-    /// is dropped later if the name is ever reassigned (see [`analyze_captures`]).
-    fn record_shape_candidate(&mut self, kind: VarDeclKind, name: &Pat, init: &Expr) {
-        if !matches!(kind, VarDeclKind::Let | VarDeclKind::Const) {
-            return;
-        }
-        let Pat::Ident(ident) = name else { return };
-        if let Some(keys) = object_literal_keys(strip_parens(init)) {
-            self.shape_candidates
-                .push((binding_id(ident), ident.id.sym.as_ref().to_owned(), keys));
-        }
-    }
-
     /// Record every simple-identifier target of a destructuring assignment
-    /// (`[o] = ..`, `({o} = ..)`) as reassigned, so a rebound binding cannot keep a
-    /// trusted object shape.
+    /// (`[o] = ..`, `({o} = ..)`) as referenced.
     fn mark_assign_target_pat(&mut self, pat: &AssignTargetPat) {
         match pat {
             AssignTargetPat::Array(arr) => self.mark_array_pat(arr),
@@ -209,23 +215,28 @@ impl CaptureResolver {
     }
 
     /// Record every simple-identifier binding within an assignment/destructuring
-    /// pattern as reassigned.
+    /// pattern as referenced; member targets and defaults are
+    /// analyzed as ordinary expressions.
     fn mark_pat(&mut self, pat: &Pat) {
         match pat {
-            Pat::Ident(ident) => {
-                self.assigned.insert(ident.id.sym.as_ref().to_owned());
-            }
+            Pat::Ident(ident) => self.mark_assigned(&ident.id),
             Pat::Array(arr) => self.mark_array_pat(arr),
             Pat::Object(obj) => self.mark_object_pat(obj),
             Pat::Rest(rest) => self.mark_pat(&rest.arg),
-            Pat::Assign(assign) => self.mark_pat(&assign.left),
-            Pat::Expr(expr) => {
-                if let Expr::Ident(ident) = expr.as_ref() {
-                    self.assigned.insert(ident.sym.as_ref().to_owned());
-                }
+            Pat::Assign(assign) => {
+                self.mark_pat(&assign.left);
+                self.expr(&assign.right);
             }
+            Pat::Expr(expr) => match strip_parens(expr) {
+                Expr::Ident(ident) => self.mark_assigned(ident),
+                other => self.expr(other),
+            },
             Pat::Invalid(_) => {}
         }
+    }
+
+    fn mark_assigned(&mut self, ident: &Ident) {
+        self.reference(ident.sym.as_ref());
     }
 
     fn mark_array_pat(&mut self, arr: &ArrayPat) {
@@ -239,7 +250,10 @@ impl CaptureResolver {
             match prop {
                 ObjectPatProp::KeyValue(kv) => self.mark_pat(&kv.value),
                 ObjectPatProp::Assign(assign) => {
-                    self.assigned.insert(assign.key.id.sym.as_ref().to_owned());
+                    self.mark_assigned(&assign.key.id);
+                    if let Some(default) = &assign.value {
+                        self.expr(default);
+                    }
                 }
                 ObjectPatProp::Rest(rest) => self.mark_pat(&rest.arg),
             }
@@ -249,7 +263,10 @@ impl CaptureResolver {
     /// Resolve a name reference; if it binds in an enclosing function frame,
     /// mark that binding captured. When the reference reaches the `main` frame
     /// (0) from within a top-level function declaration, the name is also
-    /// recorded as a module binding.
+    /// recorded as a module binding. A closure nested in `main` referencing a
+    /// `main` outermost-scope binding not yet declared (it appears LATER in the
+    /// program) records a module binding too: the closure reaches it through the
+    /// TDZ-guarded module cell.
     fn reference(&mut self, name: &str) {
         let top = self.frames.len().saturating_sub(1);
         for (fi, frame) in self.frames.iter().enumerate().rev() {
@@ -257,14 +274,22 @@ impl CaptureResolver {
                 if let Some(&id) = scope.get(name) {
                     if fi != top {
                         self.captured.insert(id);
-                        if fi == 0 && self.in_top_fn && !self.module_names.iter().any(|n| n == name)
-                        {
-                            self.module_names.push(name.to_owned());
+                        if fi == 0 && self.in_top_fn {
+                            self.add_module_name(name);
                         }
                     }
                     return;
                 }
             }
+        }
+        if top > 0 && !self.in_top_fn && self.top_bindings.contains_key(name) {
+            self.add_module_name(name);
+        }
+    }
+
+    fn add_module_name(&mut self, name: &str) {
+        if !self.module_names.iter().any(|n| n == name) {
+            self.module_names.push(name.to_owned());
         }
     }
 
@@ -278,14 +303,14 @@ impl CaptureResolver {
                 for d in &v.decls {
                     if let Some(init) = &d.init {
                         self.expr(init);
-                        self.record_shape_candidate(v.kind, &d.name, init);
                     }
                     self.declare_pat(&d.name);
                 }
             }
             Stmt::Decl(Decl::Fn(f)) => {
-                // A nested function declaration: analyze its body in a fresh
-                // frame, then bind its name in the enclosing scope.
+                // A nested function declaration outside a hoisting statement list
+                // (see `stmts`): analyze its body in a fresh frame, then bind its
+                // name in the enclosing scope.
                 self.function(
                     &f.function.params,
                     f.function.body.as_ref().map(|b| &b.stmts),
@@ -293,13 +318,7 @@ impl CaptureResolver {
                 self.declare(f.ident.sym.as_ref(), f.ident.span.lo.0);
             }
             Stmt::Decl(Decl::Class(c)) => self.class_decl(c),
-            Stmt::Block(b) => {
-                self.push_scope();
-                for s in &b.stmts {
-                    self.stmt(s);
-                }
-                self.pop_scope();
-            }
+            Stmt::Block(b) => self.analyze_scoped(&b.stmts),
             Stmt::If(i) => {
                 self.expr(&i.test);
                 self.stmt(&i.cons);
@@ -368,9 +387,7 @@ impl CaptureResolver {
                     if let Some(Pat::Ident(ident)) = &handler.param {
                         self.declare(ident.id.sym.as_ref(), binding_id(ident));
                     }
-                    for s in &handler.body.stmts {
-                        self.stmt(s);
-                    }
+                    self.stmts(&handler.body.stmts);
                     self.pop_scope();
                 }
                 // The finally block is its own scope.
@@ -383,22 +400,27 @@ impl CaptureResolver {
     }
 
     /// Analyze a class declaration: bind the class name in the enclosing
-    /// scope FIRST, so a `new C()` inside the constructor or a method body resolves
-    /// to it and is marked captured across the function boundary. Each
-    /// constructor and instance-method body is then a fresh function frame (like a
-    /// nested fn declaration), so a binding it references from an enclosing scope
-    /// (including the class name) is captured.
+    /// scope, then analyze the class (see [`Self::class`]) with its inner name
+    /// binding.
     fn class_decl(&mut self, c: &ClassDecl) {
         self.declare(c.ident.sym.as_ref(), c.ident.span.lo.0);
-        // A derived class's constructor/methods implicitly reference the superclass
-        // binding through `super` (E-series): mark it referenced inside each body
-        // frame so a captured parent is boxed into a cell the lifted body can read,
-        // exactly like a `new Parent()` reference would.
-        let super_name = c.class.super_class.as_ref().and_then(|e| match e.as_ref() {
-            Expr::Ident(id) => Some(id.sym.as_ref().to_owned()),
-            _ => None,
-        });
-        for member in &c.class.body {
+        self.class(&c.class, Some(c.ident.sym.as_ref()));
+    }
+
+    /// Analyze a class, mirroring [`LowerCtx::lower_class`]: a class scope
+    /// binding the inner `name` (if any), the `extends` expression, then each
+    /// constructor, method, and field initializer as a fresh function frame, so
+    /// a binding referenced there from an enclosing scope (including the inner
+    /// name) is captured.
+    fn class(&mut self, class: &swc_ecma_ast::Class, name: Option<&str>) {
+        self.push_scope();
+        if let Some(name) = name {
+            self.declare(name, class.span.lo.0);
+        }
+        if let Some(super_class) = &class.super_class {
+            self.expr(super_class);
+        }
+        for member in &class.body {
             match member {
                 ClassMember::Constructor(ctor) => {
                     self.enter_function();
@@ -407,36 +429,17 @@ impl CaptureResolver {
                             self.declare_param(&p.pat);
                         }
                     }
-                    if let Some(sup) = &super_name {
-                        self.reference(sup);
-                    }
                     if let Some(body) = &ctor.body {
-                        for s in &body.stmts {
-                            self.stmt(s);
-                        }
+                        self.stmts(&body.stmts);
                     }
                     self.exit_function();
                 }
-                // A method body is a fresh function frame, mirroring the
-                // constructor. Inlined (rather than the `function` helper) so a
-                // derived class can reference its superclass inside the frame.
                 ClassMember::Method(m) => {
-                    self.enter_function();
-                    for param in &m.function.params {
-                        self.declare_param(&param.pat);
-                    }
-                    if let Some(sup) = &super_name {
-                        self.reference(sup);
-                    }
-                    if let Some(body) = &m.function.body {
-                        for s in &body.stmts {
-                            self.stmt(s);
-                        }
-                    }
-                    self.exit_function();
+                    self.function(
+                        &m.function.params,
+                        m.function.body.as_ref().map(|b| &b.stmts),
+                    );
                 }
-                // A field initializer runs in its own `this`-binding scope, so a
-                // binding it references from an enclosing scope is captured.
                 ClassMember::ClassProp(p) => {
                     if let Some(value) = &p.value {
                         self.enter_function();
@@ -447,6 +450,7 @@ impl CaptureResolver {
                 _ => {}
             }
         }
+        self.pop_scope();
     }
 
     /// Analyze a `for-of` / `for-in` loop, mirroring [`LowerCtx::lower_for_of`] /
@@ -458,9 +462,10 @@ impl CaptureResolver {
         self.expr(right);
         if let ForHead::VarDecl(v) = left
             && let [declarator] = v.decls.as_slice()
-            && let Pat::Ident(ident) = &declarator.name
         {
-            self.declare(ident.id.sym.as_ref(), binding_id(ident));
+            self.declare_pat(&declarator.name);
+        } else if let ForHead::Pat(pat) = left {
+            self.mark_pat(pat);
         }
         self.stmt(body);
         self.pop_scope();
@@ -470,10 +475,37 @@ impl CaptureResolver {
     /// `finally` body), so block-scoped bindings do not leak outward.
     fn analyze_scoped(&mut self, stmts: &[Stmt]) {
         self.push_scope();
-        for s in stmts {
-            self.stmt(s);
-        }
+        self.stmts(stmts);
         self.pop_scope();
+    }
+
+    /// Analyze a function body or block statement list in the current scope,
+    /// mirroring [`LowerCtx::lower_stmts`]: its function declarations are
+    /// hoisted, so their names are bound before any statement and their bodies
+    /// are analyzed last, after every binding of the list is declared (a body
+    /// may capture a `let`/`const` declared later in the list, or a sibling).
+    fn stmts(&mut self, stmts: &[Stmt]) {
+        let fns: Vec<&FnDecl> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Decl(Decl::Fn(f)) => Some(f),
+                _ => None,
+            })
+            .collect();
+        for f in &fns {
+            self.declare(f.ident.sym.as_ref(), f.ident.span.lo.0);
+        }
+        for s in stmts {
+            if !matches!(s, Stmt::Decl(Decl::Fn(_))) {
+                self.stmt(s);
+            }
+        }
+        for f in fns {
+            self.function(
+                &f.function.params,
+                f.function.body.as_ref().map(|b| &b.stmts),
+            );
+        }
     }
 
     /// Analyze an expression's references, entering a fresh frame for arrows and
@@ -496,10 +528,15 @@ impl CaptureResolver {
                     f.function.body.as_ref().map(|b| &b.stmts),
                 );
             }
+            Expr::Class(c) => self.class(&c.class, c.ident.as_ref().map(|id| id.sym.as_ref())),
+            Expr::SuperProp(sp) => {
+                if let swc_ecma_ast::SuperProp::Computed(c) = &sp.prop {
+                    self.expr(&c.expr);
+                }
+            }
             Expr::Assign(a) => {
                 if let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &a.left {
                     self.reference(ident.id.sym.as_ref());
-                    self.assigned.insert(ident.id.sym.as_ref().to_owned());
                 } else if let AssignTarget::Simple(SimpleAssignTarget::Member(m)) = &a.left {
                     self.expr(&m.obj);
                     if let MemberProp::Computed(c) = &m.prop {
@@ -507,17 +544,12 @@ impl CaptureResolver {
                     }
                 } else if let AssignTarget::Pat(pat) = &a.left {
                     // A destructuring assignment (`[o] = ..`, `({o} = ..)`) rebinds
-                    // its targets — record every simple-ident target as reassigned.
+                    // its targets — record every simple-ident target as referenced.
                     self.mark_assign_target_pat(pat);
                 }
                 self.expr(&a.right);
             }
-            Expr::Update(u) => {
-                if let Expr::Ident(ident) = u.arg.as_ref() {
-                    self.assigned.insert(ident.sym.as_ref().to_owned());
-                }
-                self.expr(&u.arg);
-            }
+            Expr::Update(u) => self.expr(&u.arg),
             Expr::Bin(b) => {
                 self.expr(&b.left);
                 self.expr(&b.right);
@@ -581,6 +613,16 @@ impl CaptureResolver {
             Expr::Object(o) => {
                 for prop in &o.props {
                     if let PropOrSpread::Prop(prop) = prop {
+                        // A computed key (`{[k]: v}`, `{[k]() {..}}`) is
+                        // evaluated in the enclosing frame.
+                        if let Prop::KeyValue(swc_ecma_ast::KeyValueProp { key, .. })
+                        | Prop::Method(swc_ecma_ast::MethodProp { key, .. })
+                        | Prop::Getter(swc_ecma_ast::GetterProp { key, .. })
+                        | Prop::Setter(swc_ecma_ast::SetterProp { key, .. }) = prop.as_ref()
+                            && let PropName::Computed(c) = key
+                        {
+                            self.expr(&c.expr);
+                        }
                         match prop.as_ref() {
                             Prop::KeyValue(kv) => self.expr(&kv.value),
                             // Shorthand `{n}` references the outer binding `n`.
@@ -592,7 +634,16 @@ impl CaptureResolver {
                                 &method.function.params,
                                 method.function.body.as_ref().map(|b| &b.stmts),
                             ),
-                            _ => {}
+                            // A getter/setter body is a function frame too.
+                            Prop::Getter(getter) => self.function(
+                                &getter.function.params,
+                                getter.function.body.as_ref().map(|b| &b.stmts),
+                            ),
+                            Prop::Setter(setter) => self.function(
+                                &setter.function.params,
+                                setter.function.body.as_ref().map(|b| &b.stmts),
+                            ),
+                            Prop::Assign(_) => {}
                         }
                     }
                 }
@@ -626,11 +677,7 @@ impl CaptureResolver {
             self.declare_param(param);
         }
         match body {
-            AnalyzeBody::Block(stmts) => {
-                for s in stmts {
-                    self.stmt(s);
-                }
-            }
+            AnalyzeBody::Block(stmts) => self.stmts(stmts),
             AnalyzeBody::Expr(e) => self.expr(e),
         }
         self.exit_function();
@@ -644,50 +691,13 @@ impl CaptureResolver {
             self.declare_param(&param.pat);
         }
         if let Some(stmts) = body {
-            for s in stmts {
-                self.stmt(s);
-            }
+            self.stmts(stmts);
         }
         self.exit_function();
     }
 }
 
-/// The own keys of an object literal when every property has a statically-known
-/// string key, or `None` when any property makes the shape non-enumerable at
-/// compile time (a spread, a computed/numeric key, or a getter/setter). Mirrors
-/// the key set [`LowerCtx::lower_object`] materializes, so a name absent here is
-/// provably absent from the runtime object (the object model has no dynamic key
-/// growth).
-pub(super) fn object_literal_keys(expr: &Expr) -> Option<Vec<String>> {
-    let Expr::Object(obj) = expr else { return None };
-    let mut keys = Vec::with_capacity(obj.props.len());
-    for prop in &obj.props {
-        let PropOrSpread::Prop(prop) = prop else {
-            return None;
-        };
-        let key = match prop.as_ref() {
-            Prop::KeyValue(kv) => static_prop_key(&kv.key)?,
-            Prop::Shorthand(ident) => ident.sym.as_ref().to_owned(),
-            Prop::Method(method) => static_prop_key(&method.key)?,
-            Prop::Getter(_) | Prop::Setter(_) | Prop::Assign(_) => return None,
-        };
-        keys.push(key);
-    }
-    Some(keys)
-}
-
-/// The static string key of a property name (an identifier or string literal),
-/// or `None` for a computed or numeric key that is not known at compile time.
-fn static_prop_key(name: &PropName) -> Option<String> {
-    match name {
-        PropName::Ident(id) => Some(id.sym.as_ref().to_owned()),
-        PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
-        _ => None,
-    }
-}
-
-/// Strip redundant parentheses from an expression, so a parenthesized object
-/// literal initializer (`const o = ({..})`) is still recognized as a shape.
+/// Strip redundant parentheses from an expression.
 pub(super) fn strip_parens(expr: &Expr) -> &Expr {
     match expr {
         Expr::Paren(p) => strip_parens(&p.expr),

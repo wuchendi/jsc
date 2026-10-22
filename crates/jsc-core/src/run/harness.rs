@@ -4,16 +4,15 @@
 
 use std::io::Write;
 
-use wasmtime::{Caller, Engine, Linker, Module, Store};
+use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 
 use super::host::{
-    heap_exhausted, host_alloc_string, method_dispatch, parse_float_str, parse_int_str,
-    value_to_number,
+    alloc_string, heap_exhausted, method_dispatch, parse_float_str, parse_int_str, value_to_number,
 };
 use super::promise::{self, Host};
 use crate::abi;
 
-use super::{HEAP, Value, decode, format_value};
+use super::{HEAP, Value, decode, format_value, to_js_string};
 
 /// The `print` host-import flags (see [`abi`]): a value plus a trailing
 /// space, or a value plus a newline.
@@ -21,11 +20,10 @@ const PRINT_FLAG_SEP: i32 = abi::PRINT_FLAG_SEP;
 const PRINT_FLAG_END: i32 = abi::PRINT_FLAG_END;
 
 /// The `__convert` host-import op flags (see [`abi`]): stringify the
-/// argument, coerce it to a number, or parse a leading int/float from its string
+/// argument, coerce it to a number, or parse a leading float from its string
 /// form.
 const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
 const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
-const CONVERT_OP_PARSE_INT: i32 = abi::CONVERT_OP_PARSE_INT;
 const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 
 /// Box a host-computed `f64` as a number jsval's raw bits, mapping every NaN to
@@ -80,7 +78,7 @@ fn oom_guard<W>(caller: &mut Caller<'_, W>, bits: i64) -> wasmtime::Result<i64> 
 pub fn run(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>)> {
     // Default sink: `console.log` output streams to the process's real stdout
     // during execution.
-    let (bits, memory, _out) = run_with_sink(wasm, std::io::stdout())?;
+    let (bits, memory, _out, _fuel) = run_with_sink(wasm, std::io::stdout(), None)?;
     Ok((bits, memory))
 }
 
@@ -95,8 +93,29 @@ pub fn run(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>)> {
 ///
 /// Returns an error under the same conditions as [`run`].
 pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
-    let (bits, memory, out) = run_with_sink(wasm, Vec::<u8>::new())?;
+    let (bits, memory, out, _fuel) = run_with_sink(wasm, Vec::<u8>::new(), None)?;
     Ok((bits, memory, String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// The fuel budget of [`run_metered`]: far above any measured program, so it
+/// never runs out in practice.
+const FUEL_BUDGET: u64 = 1 << 40;
+
+/// Like [`run_capturing`], but on an engine with wasmtime fuel metering on:
+/// returns the captured `console.log` output and the fuel consumed (executed
+/// wasm instructions, `main` plus the microtask drain).
+///
+/// For measurement only (the opcount snapshot gate in
+/// `crates/jsc-core/tests/opcount.rs`); the CLI and [`run`] keep the default
+/// unmetered engine.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`run`], or if the run
+/// exhausts the (very large) fuel budget.
+pub fn run_metered(wasm: &[u8]) -> anyhow::Result<(String, u64)> {
+    let (_bits, _memory, out, fuel) = run_with_sink(wasm, Vec::<u8>::new(), Some(FUEL_BUDGET))?;
+    Ok((String::from_utf8_lossy(&out).into_owned(), fuel))
 }
 
 /// Instantiate `wasm` with a `wasmtime::Linker` that supplies the host `print`
@@ -108,17 +127,28 @@ pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
 /// program value. `out` is any [`Write`] sink (real stdout, or an in-memory
 /// buffer for capture); it is threaded through the [`Store`] and handed back so
 /// captured output can be recovered.
-// One straight-line harness: engine setup, the six host imports (print,
-// __convert, __method, __promise, __then, __now), the call, and the after-`main`
+///
+/// With `fuel: Some(budget)` the engine meters fuel and the fourth result is the
+/// fuel consumed; with `None` it is the default unmetered engine and the fourth
+/// result is `0`.
+// One straight-line harness: engine setup, the seven host imports (print,
+// __convert, __method, __promise, __then, __now, __parse_int), the call, and the after-`main`
 // microtask drain — length reflects the import roster, not branching.
 #[allow(clippy::too_many_lines)]
 fn run_with_sink<W: Write + Send + 'static>(
     wasm: &[u8],
     out: W,
-) -> anyhow::Result<(u64, Vec<u8>, W)> {
-    let engine = Engine::default();
+    fuel: Option<u64>,
+) -> anyhow::Result<(u64, Vec<u8>, W, u64)> {
+    let engine = match fuel {
+        Some(_) => Engine::new(Config::new().consume_fuel(true))?,
+        None => Engine::default(),
+    };
     let module = Module::new(&engine, wasm)?;
     let mut store = Store::new(&engine, Host::new(out));
+    if let Some(budget) = fuel {
+        store.set_fuel(budget)?;
+    }
     let mut linker = Linker::new(&engine);
     linker.func_wrap(
         "env",
@@ -147,9 +177,12 @@ fn run_with_sink<W: Write + Send + 'static>(
             let _ = caller.data_mut().sink.write_all(piece.as_bytes());
         },
     )?;
-    // The `__convert` import backs `String`/`Number`/`parseInt`/`parseFloat`.
+    // The `__convert` import backs `String`/`Number`/`parseFloat` on
+    // primitives: the guest runs `ToPrimitive` first, so the only objects it
+    // sees are a Date (`Date.prototype.toString`) and a function without a
+    // user `toString` (rendered until `Function.prototype.toString`, S5).
     // It decodes the argument jsval (reading linear memory for heap-string
-    // operands), reuses `format_value`/`value_to_number` and the parse helpers, and
+    // operands), reuses `to_js_string`/`value_to_number` and the parse helpers, and
     // returns the converted jsval. `String` allocates a fresh heap string in guest
     // memory via the exported heap-pointer global; the rest return an immediate
     // number jsval and never allocate.
@@ -168,17 +201,17 @@ fn run_with_sink<W: Write + Send + 'static>(
             };
             let result = match op {
                 CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
-                // `parseInt`/`parseFloat` operate on the argument's string form.
-                CONVERT_OP_PARSE_INT => number_bits(parse_int_str(&format_value(&value))),
-                CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&format_value(&value))),
+                // `parseFloat` operates on the argument's string form.
+                CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&to_js_string(&value))),
                 CONVERT_OP_TO_STRING => {
                     // A string argument is returned unchanged (no allocation);
-                    // anything else is formatted and allocated as a heap string.
+                    // anything else takes its JS `ToString` text, allocated as
+                    // a heap string.
                     if matches!(value, Value::Str(_)) {
                         return Ok(bits);
                     }
-                    let text = format_value(&value);
-                    match host_alloc_string(&mut caller, &text) {
+                    let text = to_js_string(&value);
+                    match alloc_string(&mut caller, &text) {
                         Some(base) => (HEAP | base).cast_signed(),
                         // Allocation failed: out of memory traps via
                         // `oom_guard`; a missing export yields `undefined`.
@@ -193,7 +226,7 @@ fn run_with_sink<W: Write + Send + 'static>(
         },
     )?;
     // The `__method` import backs the non-callback array/string methods:
-    // `indexOf`/`includes`/`join`/`slice` on arrays and
+    // `indexOf`/`includes`/`slice` on arrays and
     // `toUpperCase`/`toLowerCase`/`indexOf`/`slice`/`charAt` on strings. It
     // snapshots linear memory to decode the receiver + arguments, branches on the
     // receiver's TYPE BYTE for the overloaded `indexOf`/`slice`, and returns the
@@ -249,6 +282,21 @@ fn run_with_sink<W: Write + Send + 'static>(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
     })?;
+    // The `__parse_int` import (`parseInt(s, radix)`): parse the string form of
+    // `s` in the radix `ToNumber(radix)` (`undefined` for an omitted radix).
+    linker.func_wrap(
+        "env",
+        "__parse_int",
+        |mut caller: Caller<'_, Host<W>>, bits: i64, radix: i64| -> i64 {
+            let mem = caller
+                .get_export("memory")
+                .and_then(wasmtime::Extern::into_memory);
+            let data = mem.map_or(&[][..], |m| m.data(&caller));
+            let text = format_value(&decode(bits.cast_unsigned(), data));
+            let radix = value_to_number(&decode(radix.cast_unsigned(), data));
+            number_bits(parse_int_str(&text, radix))
+        },
+    )?;
     let instance = linker.instantiate(&mut store, &module)?;
     let main = instance.get_typed_func::<(), i64>(&mut store, "main")?;
     // Out of memory (the sticky `__heap_ptr` sentinel, set by a failed guest or
@@ -272,12 +320,15 @@ fn run_with_sink<W: Write + Send + 'static>(
         .get_global(&mut store, EXC_PENDING_EXPORT_NAME)
         .and_then(|g| g.get(&mut store).i32())
         .unwrap_or(0);
-    if main_pending == 0 {
-        promise::drain_after_main(&mut store, &instance);
+    let unhandled = if main_pending == 0 {
+        let unhandled = promise::drain_after_main(&mut store, &instance);
         if exhausted(&mut store) {
             return Err(anyhow::anyhow!(OUT_OF_MEMORY));
         }
-    }
+        unhandled
+    } else {
+        None
+    };
     // Snapshot linear memory AFTER the drain so any promise settled by a microtask
     // renders its final state and pointer jsvals resolve against current memory.
     let memory = match instance.get_memory(&mut store, "memory") {
@@ -302,7 +353,22 @@ fn run_with_sink<W: Write + Send + 'static>(
         let rendered = format_value(&decode(value_bits, &memory));
         return Err(anyhow::anyhow!("Uncaught {rendered}"));
     }
-    Ok((result.cast_unsigned(), memory, store.into_data().sink))
+    // Unhandled-rejection check: a rejected promise that never got a handler
+    // (reported after the queue drained, so a late `.catch` still counts).
+    if let Some(value_bits) = unhandled {
+        let rendered = format_value(&decode(value_bits, &memory));
+        return Err(anyhow::anyhow!("Uncaught (in promise) {rendered}"));
+    }
+    let consumed = match fuel {
+        Some(budget) => budget.saturating_sub(store.get_fuel()?),
+        None => 0,
+    };
+    Ok((
+        result.cast_unsigned(),
+        memory,
+        store.into_data().sink,
+        consumed,
+    ))
 }
 
 /// Compile JavaScript `src` all the way to a value: parse, lower, emit, run.

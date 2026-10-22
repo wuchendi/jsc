@@ -23,7 +23,8 @@ pub enum OpSetKind {
 /// A binary operator over jsval operands.
 ///
 /// Arithmetic operators (`Add`..`Mod`) unbox their operands to `f64` and produce
-/// a number jsval; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
+/// a number jsval; bitwise and shift operators (`BitAnd`..`UShr`) apply
+/// `ToNumber` then `ToInt32`/`ToUint32` and produce a number jsval; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
 /// (`true`/`false`). Relational operators (`Lt`..`Ge`) compare numerically;
 /// `Eq`/`Ne` are strict `===`/`!==` (type-then-value across all jsval types);
 /// `LooseEq`/`LooseNe` are loose `==`/`!=` (Abstract Equality with coercion).
@@ -40,6 +41,21 @@ pub enum BinOp {
     /// Remainder (`%`): the `f64` truncated remainder `a - b * trunc(a / b)`,
     /// matching JS `%` sign semantics.
     Mod,
+    /// Bitwise AND (`&`) over the operands' `ToInt32`.
+    BitAnd,
+    /// Bitwise OR (`|`) over the operands' `ToInt32`.
+    BitOr,
+    /// Bitwise XOR (`^`) over the operands' `ToInt32`. Unary `~x` lowers to
+    /// `x ^ -1`.
+    BitXor,
+    /// Left shift (`<<`): `ToInt32(lhs)` shifted by `ToUint32(rhs) & 31`.
+    Shl,
+    /// Sign-propagating right shift (`>>`): `ToInt32(lhs)` shifted
+    /// arithmetically by `ToUint32(rhs) & 31`.
+    Shr,
+    /// Zero-fill right shift (`>>>`): `ToUint32(lhs)` shifted logically by
+    /// `ToUint32(rhs) & 31`; the result is an unsigned 32-bit number.
+    UShr,
     /// Less-than (`<`).
     Lt,
     /// Greater-than (`>`).
@@ -109,111 +125,59 @@ pub enum MathOp {
     Pow,
 }
 
-/// An array higher-order method: `map`/`filter`/`reduce`/`forEach`.
-/// Recognized syntactically from a `<expr>.<name>(callback[, init])` member callee
-/// at codegen (kept distinct from `x[i]` element indexing), each invoking the
-/// callback function value per element via the `call_indirect` ABI.
+/// An array higher-order method: `map`/`filter`/`reduce`/`forEach` (see
+/// [`IrNode::ArrayHof`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayHofOp {
     /// `arr.map(fn)` — a NEW array of the same length where `result[i] =
-    /// fn(element_i, i)`.
+    /// fn(element_i, i, arr)`.
     Map,
-    /// `arr.filter(fn)` — a NEW array of the elements for which `fn(element_i, i)`
-    /// is JS-truthy, grown via the `__array_push` helper.
+    /// `arr.filter(fn)` — a NEW array of the elements for which
+    /// `fn(element_i, i, arr)` is JS-truthy, grown via the `__array_push` helper.
     Filter,
-    /// `arr.reduce(fn, init)` — folds `acc = fn(acc, element_i, i)` from `acc =
-    /// init`, yielding the final accumulator. An `init` argument is required.
+    /// `arr.reduce(fn[, init])` — folds `acc = fn(acc, element_i, i, arr)`,
+    /// yielding the final accumulator.
     Reduce,
-    /// `arr.forEach(fn)` — calls `fn(element_i, i)` for side effects and yields
-    /// `undefined`.
+    /// `arr.forEach(fn)` — calls `fn(element_i, i, arr)` for side effects and
+    /// yields `undefined`.
     ForEach,
 }
 
-/// A conversion built-in: `String`/`Number`/`Boolean`/`parseInt`/
-/// `parseFloat`. Recognized syntactically from a bare-identifier callee at codegen
-/// (only when nothing of the same name shadows it), each taking one argument.
+/// A conversion: `String`/`Number`/`Boolean`/`parseInt`/`parseFloat` called
+/// directly by a bare unshadowed name, the `String`/`Number`/`Boolean`
+/// constructor bodies, and the internal `ToNumber` of numeric operators (see
+/// [`IrNode::ConvertCall`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertOp {
-    /// `String(x)` — the JS string form (a heap STRING jsval); reuses the run
-    /// stage's `format_value`, so `String(42) == "42"` like `format_number`.
+    /// `String(x)` — `ToString` in the guest (`__to_string`), so an object's
+    /// user `toString`/`valueOf` runs and may throw.
     ToString,
-    /// `Number(x)` — the JS numeric coercion (a number jsval); string operands are
-    /// full-string parsed (trimmed; empty => 0; non-numeric => NaN).
+    /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
+    /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
     ToNumber,
     /// `Boolean(x)` — JS truthiness (a boolean jsval). Lowered to inline wasm.
     ToBoolean,
-    /// `parseInt(s)` — leading base-10 integer of the (stringified) argument, or
-    /// NaN when none. The optional radix argument is ignored (base-10 only).
+    /// `parseInt(s, radix)` — the host `__parse_int` over `ToString(s)` and the
+    /// radix (`undefined` when omitted).
     ParseInt,
-    /// `parseFloat(s)` — leading decimal float of the (stringified) argument, or
-    /// NaN when none.
+    /// `parseFloat(s)` — the leading decimal float of `ToString(s)`, parsed on
+    /// the host, or NaN when none.
     ParseFloat,
 }
 
-/// A non-callback array/string method. Recognized syntactically from a
-/// `<expr>.<name>(args)` member callee at codegen (kept distinct from `x[i]`
-/// element indexing), each dispatched host-side through the `__method` import.
-/// `IndexOf` and `Slice` exist on BOTH arrays and strings, so the host branches
-/// on the receiver's runtime TYPE BYTE (array-element vs string-byte semantics);
-/// the rest are single-type methods.
+/// The inline fast path of an `Array.prototype` search/join method on an
+/// array receiver (DESIGN.md §6.4), run host-side through the `__method`
+/// import (`join`: the guest `__array_join`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodOp {
-    /// `arr.indexOf(x)` — first index where element `=== x`, else `-1` (a number);
-    /// `str.indexOf(sub)` — byte index of the first `sub` occurrence, else `-1`
-    /// (empty `sub` => `0`). Overloaded: the receiver's TYPE BYTE selects the arm.
+    /// `arr.indexOf(x)` — first index where element `=== x`, else `-1`.
     IndexOf,
-    /// `arr.includes(x)` — `indexOf(x) !== -1` as a boolean (array only).
+    /// `arr.includes(x)` — `SameValueZero` membership as a boolean.
     Includes,
     /// `arr.join(sep)` — concatenate `String(element)` for each element separated
     /// by the `sep` string (`","` when `sep` is omitted); `null`/`undefined`
-    /// elements stringify to `""`. Yields a heap string (array only).
+    /// elements stringify to `""`. Yields a heap string.
     Join,
-    /// `arr.slice(a, b)` — a NEW array of elements `[a, b)`; `str.slice(a, b)` — a
-    /// NEW substring `[a, b)`. JS negative-from-end and clamp semantics; `b`
-    /// omitted => to end. Overloaded on the receiver's TYPE BYTE.
-    Slice,
-    /// `str.toUpperCase()` — a NEW ASCII-upper heap string (string only).
-    ToUpper,
-    /// `str.toLowerCase()` — a NEW ASCII-lower heap string (string only).
-    ToLower,
-    /// `str.charAt(i)` — a NEW one-char heap string at byte index `i` (`""` when
-    /// out of range) (string only).
-    CharAt,
-    /// `str.trim()` — a NEW heap string with leading and trailing ASCII whitespace
-    /// removed (string only).
-    Trim,
-    /// `str.trimStart()` — a NEW heap string with leading ASCII whitespace removed
-    /// (string only).
-    TrimStart,
-    /// `str.trimEnd()` — a NEW heap string with trailing ASCII whitespace removed
-    /// (string only).
-    TrimEnd,
-    /// `str.repeat(n)` — a NEW heap string of the receiver repeated `n` times
-    /// (`n` truncated to an integer; a negative or non-finite `n` yields `""` —
-    /// JS throws a `RangeError`, a documented limitation) (string only).
-    Repeat,
-    /// `str.startsWith(sub)` — `true` when the receiver begins with `sub` (a
-    /// boolean; `sub` is coerced to its string form) (string only).
-    StartsWith,
-    /// `str.endsWith(sub)` — `true` when the receiver ends with `sub` (a boolean;
-    /// `sub` is coerced to its string form) (string only).
-    EndsWith,
-    /// `str.padStart(len, pad)` — a NEW heap string left-padded to byte length
-    /// `len` with `pad` (default `" "`); the receiver is returned unchanged when it
-    /// is already at least `len` bytes or `pad` is empty (string only).
-    PadStart,
-    /// `str.padEnd(len, pad)` — a NEW heap string right-padded to byte length `len`
-    /// with `pad` (default `" "`); the receiver is returned unchanged when it is
-    /// already at least `len` bytes or `pad` is empty (string only).
-    PadEnd,
-    /// `str.substring(a, b)` — a NEW substring `[a, b)` by BYTE index (each endpoint
-    /// truncated to an integer, negatives/NaN clamped to `0`, and the two swapped
-    /// when `a > b`; `b` omitted => to end) (string only).
-    Substring,
-    /// `str.split(sep)` — a NEW array of substrings split on each `sep` occurrence
-    /// (`sep` omitted => `[str]`; `sep === ""` => one element per byte; BYTE
-    /// semantics, `sep` coerced to its string form) (string only).
-    Split,
 }
 
 /// An `Object.*` collection built-in: `Object.keys`/`values`/`entries`.
@@ -224,23 +188,43 @@ pub enum MethodOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectBuiltinOp {
     /// `Object.keys(o)` — a NEW array of the object's own enumerable key strings,
-    /// in insertion order (reserved hidden `@@`-prefixed keys skipped).
+    /// integer keys ascending first, then string keys in insertion order.
     Keys,
     /// `Object.values(o)` — a NEW array of the object's own enumerable values, in
-    /// insertion order (reserved hidden `@@`-prefixed keys skipped).
+    /// [`Self::Keys`] order.
     Values,
     /// `Object.entries(o)` — a NEW array of `[key, value]` two-element arrays, one
-    /// per own enumerable entry in insertion order (reserved keys skipped).
+    /// per own enumerable property in [`Self::Keys`] order.
     Entries,
+    /// The `for-in` key snapshot (not a JS builtin): a NEW array of the
+    /// enumerable string keys of `o` and its prototype chain, each listed once
+    /// (an own key shadows an inherited one), taken at loop entry.
+    ForInKeys,
 }
 
-/// What the right-hand side of an `instanceof` names (E-series). Recognized
-/// syntactically at codegen from a bare identifier: a **user class** (the
-/// receiver's `@@prototype` chain is walked for the class's shared prototype)
-/// takes precedence, so `class Error {}` shadows the builtin; otherwise the three
-/// builtin error constructors match the receiver's hidden brand (`Error` matches
-/// any branded error; `TypeError`/`RangeError` match only their own kind, both
-/// still `instanceof Error`). Any other right-hand side is rejected at lowering.
+/// The key of one [`IrNode::Object`] entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropKey {
+    /// A compile-time string key of an enumerable data property.
+    Static(String),
+    /// A compile-time string key of a NON-enumerable (writable, configurable)
+    /// property: class prototype methods/accessors, `constructor`, static
+    /// methods, and an error's own `message` / `stack`.
+    Hidden(String),
+    /// A compile-time string key of a non-writable, non-enumerable,
+    /// non-configurable data property: a class's `prototype`.
+    Fixed(String),
+    /// A computed key (`{[k]: v}`, or a numeric literal key `{1: v}`), converted
+    /// with `ToPropertyKey` and interned at run time.
+    Computed(IrNode),
+}
+
+/// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
+/// is accepted: the general case is [`InstanceOfKind::Ctor`]
+/// (`OrdinaryHasInstance`). The builtin names that are not yet runtime values
+/// are recognized syntactically at codegen when no binding shadows them: the
+/// three builtin error constructors walk the receiver's `proto` chain for their
+/// static prototype ([`InstanceOfKind::Proto`]).
 ///
 /// The builtin constructors `Array`/`Object`/`Function`/`Date` match by the
 /// receiver's runtime TYPE BYTE rather than a prototype hop: `Array` /
@@ -250,12 +234,6 @@ pub enum ObjectBuiltinOp {
 /// Object`, while a string/number/boolean/null/undefined is not).
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceOfKind {
-    /// `instanceof Error` — matches any branded error (marker present).
-    Error,
-    /// `instanceof TypeError` — brand `=== ERROR_KIND_TYPE`.
-    TypeError,
-    /// `instanceof RangeError` — brand `=== ERROR_KIND_RANGE`.
-    RangeError,
     /// `instanceof Array` — the receiver is a heap `TYPE_ARRAY` block.
     Array,
     /// `instanceof Function` — the receiver is a heap `TYPE_FUNCTION` value.
@@ -265,46 +243,278 @@ pub enum InstanceOfKind {
     /// `instanceof Object` — the receiver is any heap pointer that is not a
     /// primitive string.
     Object,
-    /// `instanceof C` for a user class `C`: some object on the receiver's
-    /// `@@prototype` chain must be the SAME object as `C`'s shared prototype. The
-    /// walk starts at the receiver's own `@@prototype` and follows each prototype
-    /// object's own `@@prototype` link (installed by `extends`) until a match or the
-    /// base class (no link). Carries the expression that reads the class's prototype
-    /// (`C["@@prototype"]`). Under no-`extends` the chain is one hop.
-    Class(Box<IrNode>),
+    /// `instanceof E` for an unshadowed builtin error constructor: some object
+    /// on the receiver's `proto` chain must be the SAME object as the static
+    /// prototype the carried [`IrNode::ErrorProto`] yields. The walk starts at
+    /// the receiver's `proto` slot and follows each prototype's own `proto`
+    /// until a match or `null`.
+    Proto(Box<IrNode>),
+    /// `instanceof C` for any other right-hand side expression:
+    /// `OrdinaryHasInstance(C, x)`. A non-callable `C` throws a `TypeError`; a
+    /// non-object receiver is `false`; otherwise `Get(C, "prototype")` (a
+    /// non-object one throws a `TypeError`) is searched for on the receiver's
+    /// `proto` chain like [`InstanceOfKind::Proto`].
+    Ctor(Box<IrNode>),
 }
 
-/// A `Map`/`Set` instance method. Recognized syntactically from a
-/// `<expr>.<name>(args)` member callee at codegen; because these names
-/// (`set`/`get`/`has`/`add`/`delete`) can ALSO be ordinary object/class methods
-/// (e.g. `class C { add(x) {..} }`), the lowered [`IrNode::MapMethod`] dispatches
-/// at RUNTIME on the receiver's TYPE BYTE: a `TYPE_MAP`/`TYPE_SET` handle takes the
-/// collection op, anything else falls back to a plain user method call.
+/// A builtin error kind with a static prototype object in the realm image
+/// (`%Error.prototype%` and the six native-error prototypes inheriting from it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// `Error`.
+    Error,
+    /// `TypeError`.
+    TypeError,
+    /// `RangeError`.
+    RangeError,
+    /// `ReferenceError`.
+    ReferenceError,
+    /// `SyntaxError`.
+    SyntaxError,
+    /// `EvalError`.
+    EvalError,
+    /// `URIError`.
+    UriError,
+}
+
+impl ErrorKind {
+    /// Every kind, in realm-image order.
+    pub(crate) const ALL: [ErrorKind; 7] = [
+        Self::Error,
+        Self::TypeError,
+        Self::RangeError,
+        Self::ReferenceError,
+        Self::SyntaxError,
+        Self::EvalError,
+        Self::UriError,
+    ];
+
+    /// The kind named by the constructor identifier `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// The constructor name, which is also the prototype's `name` value.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Error => "Error",
+            Self::TypeError => "TypeError",
+            Self::RangeError => "RangeError",
+            Self::ReferenceError => "ReferenceError",
+            Self::SyntaxError => "SyntaxError",
+            Self::EvalError => "EvalError",
+            Self::UriError => "URIError",
+        }
+    }
+}
+
+/// The `TypeError` a call or `new` site throws when its callee is not callable
+/// (or not a constructor), named by codegen after the callee's source text:
+/// `x` for an identifier, `o.m` for a member with a static key, `expression`
+/// otherwise. Carries the error's `.message` and its single-line `.stack`;
+/// both are static strings interned wherever the site can throw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalleeError {
+    /// The error's `.message`, e.g. `x is not a function`.
+    pub message: String,
+    /// The error's `.stack` first line, `TypeError: <message>`.
+    pub stack: String,
+}
+
+impl CalleeError {
+    /// The source name of a callee with no nameable source text.
+    pub(crate) const EXPRESSION: &'static str = "expression";
+
+    /// `<name> is not a function`.
+    pub(crate) fn not_a_function(name: &str) -> Self {
+        Self::with_message(format!("{name} is not a function"))
+    }
+
+    /// `<name> is not a constructor`.
+    pub(crate) fn not_a_constructor(name: &str) -> Self {
+        Self::with_message(format!("{name} is not a constructor"))
+    }
+
+    fn with_message(message: String) -> Self {
+        let stack = format!("TypeError: {message}");
+        Self { message, stack }
+    }
+}
+
+/// A builtin constructor function of the realm (DESIGN.md §6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinCtor {
+    /// `Object`.
+    Object,
+    /// `Function`.
+    Function,
+    /// `Array`.
+    Array,
+    /// `String`.
+    String,
+    /// `Number`.
+    Number,
+    /// `Boolean`.
+    Boolean,
+    /// An Error-family constructor.
+    Error(ErrorKind),
+    /// `Map`.
+    Map,
+    /// `Set`.
+    Set,
+    /// `Promise`.
+    Promise,
+    /// `Date`.
+    Date,
+}
+
+impl BuiltinCtor {
+    /// Every constructor, in realm-image order.
+    pub(crate) const ALL: [BuiltinCtor; 17] = [
+        Self::Object,
+        Self::Function,
+        Self::Array,
+        Self::String,
+        Self::Number,
+        Self::Boolean,
+        Self::Error(ErrorKind::Error),
+        Self::Error(ErrorKind::TypeError),
+        Self::Error(ErrorKind::RangeError),
+        Self::Error(ErrorKind::ReferenceError),
+        Self::Error(ErrorKind::SyntaxError),
+        Self::Error(ErrorKind::EvalError),
+        Self::Error(ErrorKind::UriError),
+        Self::Map,
+        Self::Set,
+        Self::Promise,
+        Self::Date,
+    ];
+
+    /// The constructor's global name (also its `name`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Object => "Object",
+            Self::Function => "Function",
+            Self::Array => "Array",
+            Self::String => "String",
+            Self::Number => "Number",
+            Self::Boolean => "Boolean",
+            Self::Error(kind) => kind.name(),
+            Self::Map => "Map",
+            Self::Set => "Set",
+            Self::Promise => "Promise",
+            Self::Date => "Date",
+        }
+    }
+
+    /// The constructor bound to the global `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
+}
+
+/// A global intrinsic whose address is a compile-time constant (DESIGN.md §6.4):
+/// the global object, the namespace objects and the constructors reachable
+/// from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalIntrinsic {
+    /// The global object (`globalThis`, top-level `this`).
+    Global,
+    /// `Math`.
+    Math,
+    /// `JSON`.
+    Json,
+    /// `console`.
+    Console,
+    /// A builtin constructor.
+    Ctor(BuiltinCtor),
+}
+
+impl GlobalIntrinsic {
+    /// The intrinsic bound to the global property `name`.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "globalThis" => Some(Self::Global),
+            "Math" => Some(Self::Math),
+            "JSON" => Some(Self::Json),
+            "console" => Some(Self::Console),
+            _ => BuiltinCtor::from_name(name).map(Self::Ctor),
+        }
+    }
+}
+
+/// A reference to a property of the global object by an unresolved
+/// identifier (DESIGN.md §6.4): the property name plus the `.message` and `.stack`
+/// of the `ReferenceError` a miss throws (static strings interned at the site).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalRef {
+    /// The identifier, also the property key.
+    pub name: String,
+    /// `<name> is not defined`.
+    pub message: String,
+    /// `ReferenceError: <name> is not defined`.
+    pub stack: String,
+}
+
+impl GlobalRef {
+    /// The global reference of identifier `name`.
+    pub(crate) fn new(name: &str) -> Self {
+        let message = format!("{name} is not defined");
+        let stack = format!("ReferenceError: {message}");
+        Self {
+            name: name.to_owned(),
+            message,
+            stack,
+        }
+    }
+}
+
+/// The inline body of a `%Map.prototype%` / `%Set.prototype%` method
+/// ([`IrNode::CollectionOp`]), run by its builtin and by a guarded call-site
+/// fast path (DESIGN.md §6.4) on a `TYPE_MAP`/`TYPE_SET` handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapOp {
     /// `map.set(k, v)` — insert or update the entry for key `k`, yielding the map
-    /// (chainable). Linear `===` scan; a new key appends `(k, v)` to the backing.
+    /// (chainable). Linear `SameValueZero` scan; a new key appends `(k, v)` to the
+    /// backing.
     Set,
-    /// `map.get(k)` — the value stored under `k` (`===` scan), or `undefined`.
+    /// `map.get(k)` — the value stored under `k`, or `undefined`.
     Get,
-    /// `map.has(k)` / `set.has(v)` — `true` iff a `===`-equal key/value is present.
+    /// `map.has(k)` / `set.has(v)` — `true` iff an equal key/value is present.
     Has,
     /// `set.add(v)` — insert `v` (with an `undefined` value slot) if not already
-    /// present (`===` dedup), yielding the set (chainable).
+    /// present, yielding the set (chainable).
     Add,
     /// `map.delete(k)` / `set.delete(v)` — remove the matching entry, yielding
     /// `true` iff one was present.
     Delete,
+    /// `map.clear()` / `set.clear()` — remove every entry, yielding `undefined`.
+    Clear,
 }
 
-/// A `Date` instance method. Like [`MapOp`], these names can ALSO be
-/// ordinary user methods, so the lowered [`IrNode::DateMethod`] dispatches at
-/// RUNTIME on the receiver's TYPE BYTE: a `TYPE_DATE` block computes the field
-/// GUEST-side from its stored f64 epoch-ms, and anything else falls back to a
-/// plain user method call. All calendar/time fields are **UTC**, derived from the
-/// stored milliseconds with the standard civil-from-days algorithm.
+impl MapOp {
+    /// The method's name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Get => "get",
+            Self::Has => "has",
+            Self::Add => "add",
+            Self::Delete => "delete",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// A `%Date.prototype%` field method ([`IrNode::DateField`]), run by its
+/// builtin and by a guarded call-site fast path on a `TYPE_DATE` block. All
+/// calendar/time fields are **UTC**, derived from the stored milliseconds with
+/// the standard civil-from-days algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateOp {
+    /// `d.getTime()` — the stored millisecond timestamp, as a number.
+    GetTime,
     /// `d.valueOf()` — the stored millisecond timestamp (identical to
     /// `d.getTime()`), as a number.
     ValueOf,
@@ -325,6 +535,72 @@ pub enum DateOp {
     /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`,
     /// built GUEST-side as a fresh heap string.
     ToIsoString,
+    /// `d.toString()` — `Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated
+    /// Universal Time)`, built GUEST-side as a fresh heap string.
+    ToString,
+}
+
+impl DateOp {
+    /// Every field method, in `%Date.prototype%` order.
+    pub const ALL: [DateOp; 11] = [
+        Self::ToString,
+        Self::GetTime,
+        Self::ValueOf,
+        Self::GetFullYear,
+        Self::GetMonth,
+        Self::GetDate,
+        Self::GetDay,
+        Self::GetHours,
+        Self::GetMinutes,
+        Self::GetSeconds,
+        Self::ToIsoString,
+    ];
+
+    /// The method's name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GetTime => "getTime",
+            Self::ValueOf => "valueOf",
+            Self::GetFullYear => "getFullYear",
+            Self::GetMonth => "getMonth",
+            Self::GetDate => "getDate",
+            Self::GetDay => "getDay",
+            Self::GetHours => "getHours",
+            Self::GetMinutes => "getMinutes",
+            Self::GetSeconds => "getSeconds",
+            Self::ToIsoString => "toISOString",
+            Self::ToString => "toString",
+        }
+    }
+
+    /// The field method named `name`, if any.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.name() == name)
+    }
+}
+
+/// The receiver family of a guarded builtin-method fast path
+/// ([`IrNode::ProtoGuard`]): the kind byte (or bytes) it tests and the realm
+/// prototype the receiver's `proto` must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtoKind {
+    /// A `TYPE_ARRAY` handle over `%Array.prototype%`.
+    Array,
+    /// A `TYPE_MAP` handle over `%Map.prototype%`.
+    Map,
+    /// A `TYPE_SET` handle over `%Set.prototype%`.
+    Set,
+    /// A `TYPE_MAP` handle over `%Map.prototype%` or a `TYPE_SET` handle over
+    /// `%Set.prototype%` (the methods both share with one body).
+    Collection,
+    /// A `TYPE_PROMISE` over `%Promise.prototype%`.
+    Promise,
+    /// A `TYPE_DATE` over `%Date.prototype%`.
+    Date,
+    /// A `TYPE_GENERATOR` over `%GeneratorPrototype%`.
+    Generator,
 }
 
 /// One element of a spread-capable sequence — an array literal or a call's
@@ -347,8 +623,29 @@ pub enum SpreadCallee {
     /// A direct call to a known function declaration — its codegen function
     /// index (the same value carried by [`IrNode::Call`]'s `func`).
     Direct(u32),
-    /// An indirect call through a computed function value.
-    Indirect(Box<IrNode>),
+    /// An indirect call through a computed function value, with the
+    /// `TypeError` it throws when that value is not callable.
+    Indirect(Box<IrNode>, CalleeError),
+    /// A `super(...args)` call: the parent constructor value, invoked with
+    /// `this` kept as the enclosing constructor's snapshot in `this_local`
+    /// (like [`IrNode::ThisCall`]) and the construct marker as `argc`.
+    This {
+        /// The parent constructor function value.
+        callee: Box<IrNode>,
+        /// The enclosing constructor's `this` snapshot local.
+        this_local: u32,
+    },
+    /// A method call `obj.m(...args)` / `obj[k](...args)`: `callee` stores the
+    /// receiver into `this_local` and then reads the method from it, so the
+    /// call binds `this` = the receiver (like [`IrNode::MethodCallUser`]).
+    Method {
+        /// The receiver store followed by the member read.
+        callee: Box<IrNode>,
+        /// The local holding the receiver, bound as `this` for the call.
+        this_local: u32,
+        /// The `TypeError` thrown when the member is not callable.
+        not_callable: CalleeError,
+    },
 }
 
 /// A node in the numeric-expression IR tree.
@@ -368,6 +665,10 @@ pub enum IrNode {
     Null,
     /// The `undefined` value (the global identifier `undefined`).
     Undefined,
+    /// An elision in an array literal (`[1, , 3]`): the raw [`crate::abi::HOLE`]
+    /// element bits. Only ever an element of [`IrNode::Array`] or an item of
+    /// [`IrNode::ArraySpread`], so it never reaches JS as a value.
+    ArrayHole,
     /// A binary operation applied to two sub-expressions.
     Binary {
         /// The operator to apply.
@@ -416,7 +717,40 @@ pub enum IrNode {
         /// slot order (empty for a non-capturing function). Each yields the
         /// jsval pointer of the boxed cell to store in the environment.
         captures: Vec<IrNode>,
+        /// The function's constructor kind (its [`FnInfo::kind`]), selecting the
+        /// header `flags` the object is created with.
+        kind: FnKind,
     },
+    /// The static prototype object of a builtin error kind (a heap-pointer
+    /// jsval to a data-segment block, a compile-time constant).
+    ErrorProto(ErrorKind),
+    /// The static object of a global intrinsic (a compile-time constant).
+    Intrinsic(GlobalIntrinsic),
+    /// Read the global-object property of an unresolved identifier: `HasProperty`
+    /// then `Get`, throwing the reference's `ReferenceError` on a miss; as a
+    /// `typeof` operand (`typeof_operand`) a miss reads `undefined` instead.
+    GlobalGet {
+        /// The referenced global.
+        global: GlobalRef,
+        /// Whether a miss reads `undefined` (`typeof x`) instead of throwing.
+        typeof_operand: bool,
+    },
+    /// Assign `value` to the global-object property of an unresolved identifier
+    /// (strict `PutValue`): the value is evaluated first, then a missing
+    /// property throws the reference's `ReferenceError` and an existing one is
+    /// set with `OrdinarySet` (a non-writable one throws a `TypeError`). Yields
+    /// the value.
+    GlobalSet {
+        /// The referenced global.
+        global: GlobalRef,
+        /// The assigned value.
+        value: Box<IrNode>,
+    },
+    /// The function object of a top-level function declaration (funcref-table
+    /// index `.0`). A top-level declaration never captures, so its one object
+    /// is a static block in the data segment: every reference yields the same
+    /// identity, and properties added to it persist.
+    DeclFunc(u32),
     /// Allocate a **boxed cell** (heap block, type byte `5`) holding the value of
     /// the sub-expression, and yield the cell's heap-pointer jsval. A
     /// captured `let`/`const`/parameter binding is stored through such a cell so
@@ -450,6 +784,35 @@ pub enum IrNode {
     /// its binding's declaration runs, as a boolean jsval. Guards accesses to a
     /// module binding from a function body, which may run before the declaration.
     IsHole(Box<IrNode>),
+    /// The TDZ hole itself: a derived constructor's `this` before `super(..)`.
+    Hole,
+    /// Whether the value is an object (a heap value other than a string), as a
+    /// boolean jsval.
+    IsObject(Box<IrNode>),
+    /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
+    /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
+    ToObject(Box<IrNode>),
+    /// A class heritage `extends value` (DESIGN.md §7.6): evaluate `value` into
+    /// `parent`; unless it is `null` it must be a constructor, and `proto` gets
+    /// `Get(parent, "prototype")`, which must be an object or `null` (`proto` is
+    /// `null` for a `null` parent); either failure throws a `TypeError` naming
+    /// the value. Yields `undefined`.
+    ClassHeritage {
+        /// The `extends` expression.
+        value: Box<IrNode>,
+        /// Local receiving the parent constructor (or `null`).
+        parent: u32,
+        /// Local receiving the parent's `prototype` (or `null`).
+        proto: u32,
+    },
+    /// Store `proto` into the `proto` slot of the object-family value `obj` and
+    /// yield `obj`. `obj` is read twice, so it must be side-effect free.
+    SetProto {
+        /// The object whose prototype is set.
+        obj: Box<IrNode>,
+        /// The new prototype (an object or `null`).
+        proto: Box<IrNode>,
+    },
     /// A `yield expr` expression. Produced by lowering a generator
     /// body; the generator segmentation pass CONSUMES every `Yield`, turning it
     /// into a state-machine suspend point, so a `Yield` that survives to the
@@ -473,11 +836,40 @@ pub enum IrNode {
         slots: Vec<IrNode>,
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
+        /// The resume `limits` bits of the handle ([`crate::abi::GEN_LIMIT_RETURN`],
+        /// [`crate::abi::GEN_LIMIT_THROW`]).
+        limits: u32,
     },
     /// Whether the sub-expression is a generator handle: yields a
     /// boolean jsval. Used by `for-of`/spread to branch between driving a
     /// generator via `.next()` and the ordinary array/string index walk.
     IsGenerator(Box<IrNode>),
+    /// `GetIterator` of a non-generator iteration source (for-of, `yield*`,
+    /// spread, array destructuring), as a value [`IrNode::IterLen`] /
+    /// [`IrNode::IterItem`] walk by index: an array or string is itself, a
+    /// `String` wrapper its string, an `arguments` object and (when not `live`)
+    /// a generator a fresh array of its values, a `Map` / `Set` itself when
+    /// `live` and otherwise a fresh array of its `[key, value]` entries /
+    /// values. Anything else throws `<x> is not iterable`.
+    IterSource {
+        /// The iterated value.
+        value: Box<IrNode>,
+        /// Whether a `Map` / `Set` is walked live (for-of, `yield*`).
+        live: bool,
+    },
+    /// The current length of an [`IrNode::IterSource`] value: its `length`,
+    /// or the entry count of a `Map` / `Set` (re-read per step, so entries
+    /// added during the walk are visited).
+    IterLen(Box<IrNode>),
+    /// Element `index` of an [`IrNode::IterSource`] value: `iterable[index]`,
+    /// or the `index`-th entry of a `Map` (a fresh `[key, value]` array) /
+    /// `Set` (the value).
+    IterItem {
+        /// The iteration source.
+        iterable: Box<IrNode>,
+        /// The element index (a number jsval).
+        index: Box<IrNode>,
+    },
     /// Drive a generator one step — `gen.next(sent)`. Evaluate `gen` to
     /// a handle, `call_indirect` its state machine with `(sent, gen)`, then build
     /// the `{ value, done }` result object from the returned value and the
@@ -500,16 +892,20 @@ pub enum IrNode {
         callee: Box<IrNode>,
         /// The argument expressions, in source order.
         args: Vec<IrNode>,
+        /// The `TypeError` thrown when the callee is not callable, named after
+        /// the callee's source text.
+        not_callable: CalleeError,
     },
     /// The unary `typeof` operator applied to a sub-expression. It yields a
     /// boxed type-string immediate (tag `0b100`) naming the operand's runtime
     /// type (`"number"`/`"boolean"`/`"object"`/`"undefined"`).
     TypeOf(Box<IrNode>),
     /// An array literal `[e0, e1, ..]`. It lowers to a heap array (single heap tag
-    /// `0b101`, type byte `1`): `__alloc(HEADER_SIZE + 4 + 8*n)`, the type byte, a
-    /// u32 `len` header of `n`, then each element jsval stored at
-    /// `ptr + HEADER_SIZE + 4 + 8*k`.
-    /// Elements are evaluated left-to-right.
+    /// `0b101`, type byte `1`): a `cap = n` `TYPE_ELEMS` store holding each
+    /// element jsval at `store + 8 + 8*k`, then the 24-byte array handle (object
+    /// prefix, `len = n`, `elems = store`).
+    /// Elements are evaluated left-to-right; an elision is an
+    /// [`IrNode::ArrayHole`] element.
     Array(Vec<IrNode>),
     /// An array literal containing at least one spread element `[0, ...a, 9]`.
     /// Built at runtime: start from a fresh empty array and, left-to-
@@ -521,8 +917,9 @@ pub enum IrNode {
     /// The arguments are first materialized into a heap array (the same
     /// build as [`IrNode::ArraySpread`], carried by `args`); the call then
     /// spreads that array's elements into the uniform ABI's fixed `K` positional
-    /// slots (padding with `undefined`, dropping any beyond `K`) and passes the
-    /// array's length as the dynamic `argc`.
+    /// slots (padding with `undefined`) and passes the array's length as the
+    /// dynamic `argc`; the array itself is published in `__spread_args` for a
+    /// callee gathering the arguments beyond `K` ([`IrNode::SpreadArgsGlobal`]).
     CallSpread {
         /// How to reach the callee (direct index or computed value).
         target: SpreadCallee,
@@ -539,34 +936,67 @@ pub enum IrNode {
         /// The argument array to fold — an [`IrNode::ArraySpread`].
         args: Box<IrNode>,
     },
-    /// An object literal `{k0: e0, k1: e1, ..}` with compile-time string keys. It
-    /// lowers to a heap object (single heap tag `0b101`, type byte `2`):
-    /// `__alloc(HEADER_SIZE + 4 + 16*n)`, the type byte, a u32 `n` header, then
-    /// each entry's key heap-string pointer at `ptr + HEADER_SIZE + 4 + 16*k` and
-    /// value jsval at `+8`. Keys are
-    /// interned as static strings; value expressions are evaluated left-to-right.
-    Object(Vec<(String, IrNode)>),
+    /// `console.log(...)` with a spread argument: builds the argument array
+    /// (like [`IrNode::ArraySpread`], carried by `args`) then prints its
+    /// elements like [`IrNode::ConsoleLog`] prints its arguments; yields
+    /// `undefined`.
+    ConsoleLogSpread {
+        /// The argument array to print — an [`IrNode::ArraySpread`].
+        args: Box<IrNode>,
+    },
+    /// An object literal `{k0: e0, [k1]: e1, ..}`: a `TYPE_OBJECT` block whose
+    /// `TYPE_PROPS` table is sized `max(entries.len(), reserve)` up front. Each
+    /// entry's key and value are evaluated left-to-right and defined as an own
+    /// property (a later duplicate key overwrites the earlier slot in place). An
+    /// [`IrNode::MakeAccessor`] value defines an accessor property. `proto` is
+    /// the `proto` slot jsval (`null` when absent), `class` its header `class`
+    /// byte.
+    Object {
+        /// The entries, in source order.
+        entries: Vec<(PropKey, IrNode)>,
+        /// The prototype link (a class instance's or derived prototype's
+        /// parent, an error's kind prototype).
+        proto: Option<Box<IrNode>>,
+        /// The `class` byte ([`crate::abi::CLASS_ORDINARY`],
+        /// [`crate::abi::CLASS_ERROR`] or [`crate::abi::CLASS_ARGUMENTS`]).
+        class: u8,
+        /// Extra table capacity to reserve beyond the entries (a class
+        /// instance's field-scan count).
+        reserve: u32,
+    },
+    /// Define own properties on an existing object: `obj` is evaluated once
+    /// into `local`, then each entry is defined (`__define`) in order with the
+    /// attributes its [`PropKey`] selects; yields `obj`. Entry values may read
+    /// `local` (a class prototype's `constructor` back-link to the class).
+    DefineProps {
+        /// The object to define the properties on.
+        obj: Box<IrNode>,
+        /// Fresh temp local holding the evaluated `obj`.
+        local: u32,
+        /// The entries, in definition order.
+        entries: Vec<(PropKey, IrNode)>,
+    },
     /// An object rest binding `let {a, ...rest} = obj`. Builds a NEW heap
     /// object holding every own key of `source` EXCEPT the statically-known
     /// destructured keys in `exclude`. `source` is evaluated once (a hidden temp
     /// read); `exclude` is an [`IrNode::Array`] of [`IrNode::Str`] key names. It
-    /// lowers to the `__obj_rest` runtime helper, which linear-scans the source
-    /// object's entries, skips any key byte-equal to an excluded one, copies the
-    /// rest into a fresh bump-allocated object, and returns it as a heap jsval.
+    /// lowers to the `__rest` runtime helper, which defines every own enumerable
+    /// property of the source whose key is not excluded on a fresh object.
     ObjectRest {
         /// The source object being spread (a heap object jsval, evaluated once).
         source: Box<IrNode>,
         /// The excluded keys — an [`IrNode::Array`] of [`IrNode::Str`] names.
         exclude: Box<IrNode>,
     },
-    /// The `.length` member of a string or array: reads the u32 `len` header at
-    /// the operand's block base `+ HEADER_SIZE` and produces it as a number jsval.
-    /// The operand is assumed to be a string or array pointer (both
-    /// carry the same u32 header at that offset).
+    /// The `.length` member, dispatched on the receiver kind (DF2): a string or
+    /// array reads its u32 length (a string's at `+ HEADER_SIZE`, an array
+    /// handle's at `+ ARRAY_LEN_OFFSET`) as a number jsval; any other heap value reads its `length` property through
+    /// `__get`; a primitive yields `undefined`. Codegen wraps the receiver in a
+    /// [`IrNode::NullishCheck`].
     StrLen(Box<IrNode>),
     /// The nullish-receiver guard of a builtin member access (`recv.length`,
     /// `recv.push(..)`, `recv.get(..)`, ...): yields `value` unchanged, but throws
-    /// the branded `TypeError` `Cannot read properties of <null|undefined>
+    /// the `TypeError` `Cannot read properties of <null|undefined>
     /// (reading '<key>')` when it is `null`/`undefined`. Wrapped around the
     /// receiver by codegen; elided at emit for a statically non-nullish value.
     NullishCheck {
@@ -575,30 +1005,24 @@ pub enum IrNode {
         /// The property name the access reads (for the error message).
         key: String,
     },
-    /// Computed indexing `obj[index]`, dispatched at runtime on `obj`'s TYPE BYTE.
-    /// A string block (type `0`) allocates and returns a fresh
-    /// one-character heap string holding the BYTE at `index`; an array block (type
-    /// `1`) loads and returns the element jsval at `ptr + HEADER_SIZE + 4 +
-    /// 8*index`; an object block (type `2`) linear-scans its entries for a key
-    /// whose byte content equals the string `index`, returning the matching value
-    /// jsval or `undefined`. Static property reads `obj.a` also lower here as
-    /// `obj["a"]`. For string/array, `index` is a number jsval assumed in bounds
-    /// (`0 <= index < length`); for objects, `index` is a heap-string pointer.
+    /// A member read `obj[index]` (static reads `obj.a` lower here as
+    /// `obj["a"]`). A string/array with a numeric (or `"length"`) key reads its
+    /// character/element/length; every other read is the generic `__get` with
+    /// the key converted by `ToPropertyKey` (a static string key is a constant).
     Index {
-        /// The string or array being indexed (a heap-pointer jsval).
+        /// The receiver.
         obj: Box<IrNode>,
-        /// The index (a number jsval).
+        /// The property key.
         index: Box<IrNode>,
     },
-    /// A class instance **accessor** property value (P2b getters/setters): build a
-    /// `TYPE_ACCESSOR` heap block holding the getter and setter FUNCTION VALUES
-    /// (`undefined` for an absent half). It is stored under the property name on
-    /// the class's shared `@@prototype` (alongside the plain method values), so a
-    /// member READ that resolves to this box invokes `getter()` with `this` = the
-    /// receiver, and a member WRITE invokes `setter(value)`. Both halves are
-    /// ordinary lifted function values that read `this` through the `this` carrier,
-    /// exactly like a method. Built ONCE per accessor property at class-definition
-    /// time — never copied per instance.
+    /// An **accessor** property value (class or object-literal getters/setters):
+    /// build a `TYPE_ACCESSOR` heap block holding the getter and setter FUNCTION
+    /// VALUES (`undefined` for an absent half). As an [`IrNode::Object`] /
+    /// [`IrNode::DefineProps`] entry value it defines an `ATTR_ACCESSOR`
+    /// property, so a member READ that resolves to it invokes `getter()` with
+    /// `this` = the receiver, and a member WRITE invokes `setter(value)`. Both
+    /// halves are ordinary lifted function values that read `this` through the
+    /// `this` carrier, exactly like a method.
     MakeAccessor {
         /// The getter function value, or [`IrNode::Undefined`] if the property
         /// declares only a setter.
@@ -607,16 +1031,13 @@ pub enum IrNode {
         /// declares only a getter.
         setter: Box<IrNode>,
     },
-    /// Computed element assignment `obj[index] = value`. It stores `value`
-    /// into the EXISTING slot at `ptr + HEADER_SIZE + 4 + 8*index` of the array
-    /// `obj` and yields `value` (JS: `a[i] = v` evaluates to `v`). `obj` is assumed
-    /// to be an array block (type byte `1`) and `index` a number in bounds — no
-    /// bounds check and no growth. An object
-    /// target (type byte `2`) dispatches to the key-scan store instead.
+    /// Member assignment `obj[index] = value`, yielding `value`. An array stores
+    /// an in-range element (no growth yet); every other receiver goes through
+    /// the generic `__set` (adding the property when absent).
     IndexSet {
-        /// The array being written (a heap array-pointer jsval).
+        /// The receiver.
         obj: Box<IrNode>,
-        /// The index (a number jsval).
+        /// The property key.
         index: Box<IrNode>,
         /// The jsval stored into the slot; also the expression's result.
         value: Box<IrNode>,
@@ -648,62 +1069,60 @@ pub enum IrNode {
         /// Whether this is a plain compound assignment or a member `++`/`--`.
         kind: OpSetKind,
     },
-    /// `array.push(value)` on a plain-local array binding. Growing the
-    /// fixed-size array block: a runtime helper allocates a new block of `len + 1`
-    /// capacity, copies the header + existing elements, appends `value`, and bumps
-    /// the length; the `local` is then REBOUND (`local.set`) to the new block base
-    /// so subsequent reads / `.length` observe the growth. Yields the new length as
-    /// a number jsval (JS semantics). Only a plain local receiver is supported — a
-    /// captured (boxed-cell) array is rejected at codegen.
+    /// `array.push(value)` on the array handle held in a wasm local (always a
+    /// `TYPE_ARRAY` handle: a compiler-built array or a receiver that passed
+    /// its [`IrNode::ProtoGuard`]). Appends `value` to the handle in place
+    /// (`__array_push`, amortized store growth; the handle never moves, so
+    /// every alias observes it). Yields the new length as a number jsval.
     ArrayPush {
-        /// The wasm local holding the array; read for the old block, rebound to the
-        /// reallocated one.
+        /// The wasm local holding the array handle.
         local: u32,
         /// The value appended at the new last slot.
         value: Box<IrNode>,
     },
-    /// `array.pop()` on a plain-local array binding. Shrinks the block in
-    /// place: the u32 length header is decremented and the removed last element
-    /// jsval is yielded (no realloc, the local keeps its pointer). An empty array
-    /// yields `undefined`.
+    /// `array.pop()` on the array handle held in a wasm local (as for
+    /// [`IrNode::ArrayPush`]). Shrinks the handle in place: its u32 length is
+    /// decremented and the removed last element jsval is yielded. An empty
+    /// array yields `undefined`.
     ArrayPop {
         /// The wasm local holding the array whose block is decremented in place.
         local: u32,
     },
-    /// An array higher-order method call `array.map/filter/reduce/forEach(...)`.
-    /// The `array` receiver is evaluated once into a scratch base (it is
-    /// NOT rebound — unlike [`IrNode::ArrayPush`] — so any array expression works),
-    /// then a counted wasm loop over its length invokes the `callback` FUNCTION
-    /// value per element through the `call_indirect` ABI (env-last): the
-    /// positional args are `(element, index)` for `Map`/`Filter`/`ForEach` and
-    /// `(acc, element, index)` for `Reduce`, padded with `undefined` to the shared
-    /// funcref arity. `Map` fills a fresh same-length array; `Filter` grows a fresh
-    /// array via `__array_push` for JS-truthy results; `Reduce` folds into `acc`
-    /// (seeded from `init`); `ForEach` discards each result and yields `undefined`.
+    /// `Array.prototype.map/filter/reduce/forEach` on an array handle (the
+    /// guarded fast path of a call site, and the array path of the builtin
+    /// bodies). After the `IsCallable` check of `callback`, a counted wasm loop
+    /// over the length read on entry invokes the callback per element present
+    /// at the time of the visit (below the current length, not a hole) through
+    /// the `call_indirect` ABI with `this = this_arg`: the positional args are
+    /// `(element, index, array)` for `Map`/`Filter`/`ForEach` and
+    /// `(acc, element, index, array)` for `Reduce`, truncated to the shared
+    /// funcref arity. `Map` fills a fresh same-length array (holes stay holes);
+    /// `Filter` grows a fresh array via `__array_push` for JS-truthy results;
+    /// `Reduce` folds into `acc`, seeded from `init` or, without one, from the
+    /// first present element (a `TypeError` when there is none); `ForEach`
+    /// discards each result and yields `undefined`.
     ArrayHof {
         /// Which higher-order method this call performs.
         op: ArrayHofOp,
         /// The receiver array expression (evaluated once; not rebound).
         array: Box<IrNode>,
-        /// The callback expression, yielding a FUNCTION value.
+        /// The callback expression.
         callback: Box<IrNode>,
-        /// The initial accumulator for [`ArrayHofOp::Reduce`] (`None` for the
-        /// others).
+        /// The initial accumulator of [`ArrayHofOp::Reduce`] (`None`: no
+        /// initial value; always `None` for the others).
         init: Option<Box<IrNode>>,
+        /// The callback's `this` (`None`: `undefined`).
+        this_arg: Option<Box<IrNode>>,
     },
-    /// A non-callback array/string method call `recv.method(args)`. The
-    /// receiver is evaluated once, then the whole operation runs host-side through
-    /// the `__method` import, which decodes the receiver (reading linear memory)
-    /// and branches on its runtime TYPE BYTE for the overloaded `IndexOf`/`Slice`
-    /// (array-element vs string-byte semantics), bump-allocating any result string
-    /// or array in guest memory. The (already arity-checked) `args` are passed in
-    /// two fixed jsval slots, missing trailing ones padded with `undefined`.
+    /// The inline fast path `recv.method(arg)` of an `Array.prototype`
+    /// search/join method on an array receiver (see [`MethodOp`]); a missing
+    /// argument is `undefined`.
     MethodCall {
         /// Which method this call performs.
         op: MethodOp,
-        /// The receiver expression (an array or string; evaluated once).
+        /// The array receiver.
         recv: Box<IrNode>,
-        /// The argument expressions in source order (0..=2; see [`MethodOp`]).
+        /// The argument (at most one).
         args: Vec<IrNode>,
     },
     /// The unary logical NOT `!operand`. Evaluates `operand` under JS
@@ -765,15 +1184,19 @@ pub enum IrNode {
     /// `parseInt(s)` / `parseFloat(s)`. These are bare global function
     /// names, not real bindings: they are recognized syntactically at codegen
     /// (only when nothing of the same name shadows them) and take exactly one
-    /// argument. `Boolean` lowers to inline JS-truthiness wasm; the other four
-    /// delegate to the host `__convert` import, which reuses the run stage's
-    /// `format_value`/parse helpers (so `String(42) == "42"`, matching
+    /// argument (`parseInt` also an optional radix). `Boolean` lowers to inline
+    /// JS-truthiness wasm; `parseInt` calls the host `__parse_int` import; the
+    /// other three delegate to the host `__convert` import, which reuses the run
+    /// stage's `format_value`/parse helpers (so `String(42) == "42"`, matching
     /// `format_number`).
     ConvertCall {
         /// Which conversion this call performs.
         op: ConvertOp,
-        /// The single argument expression, evaluated once to a jsval.
+        /// The first argument expression, evaluated once to a jsval.
         arg: Box<IrNode>,
+        /// The `parseInt` radix argument, evaluated after `arg`; `None` for an
+        /// omitted radix and for every other conversion.
+        radix: Option<Box<IrNode>>,
     },
     /// The conditional (ternary) operator `cond ? then_branch : else_branch`.
     /// `cond` is evaluated under JS truthiness; the selected branch's jsval is
@@ -801,10 +1224,10 @@ pub enum IrNode {
     ExcValue,
     /// A user method call `obj.m(args)` binding `this = obj`. Distinct from
     /// [`IrNode::CallIndirect`] (which resets `this` to `undefined`) and from the
-    /// builtin [`IrNode::MethodCall`] (array/string host methods). `obj` is
+    /// builtin [`IrNode::MethodCall`] (array host methods). `obj` is
     /// evaluated ONCE into the fresh temp `obj_local`; the callee is the function
-    /// value at member `key` of `obj` (an object read reusing the `__obj_get`
-    /// path); the `__this` global is set to `obj` immediately before the
+    /// value at member `key` of `obj` (an ordinary member read through `__get`);
+    /// the `__this` global is set to `obj` immediately before the
     /// `call_indirect`, so the callee's prologue snapshots it into its own `this`
     /// slot. Missing arguments become `undefined`; extra arguments are ignored, as
     /// with any indirect call.
@@ -819,6 +1242,61 @@ pub enum IrNode {
         /// Fresh temp local holding the evaluated receiver across argument
         /// evaluation and the `__this` set.
         obj_local: u32,
+        /// The `TypeError` thrown when the member is not callable (`o.m is not
+        /// a function`).
+        not_callable: CalleeError,
+    },
+    /// `N.key(args)` on a builtin namespace `N` whose value is not the sealed,
+    /// non-escaping intrinsic (DESIGN.md §6.4). `obj` (the value of `N`) is
+    /// evaluated into `obj_local` and `args` into `arg_locals`; `fast` (the
+    /// inline code over `arg_locals`) runs while `obj_local.key` is still the
+    /// builtin method, else `slow` (the generic method call on `obj_local`).
+    /// For a watched namespace (`Math`, `JSON`, `console`) the test is
+    /// `obj_local === %N%` with its dirty bit clear, reading no member.
+    NamespaceGuard {
+        /// The namespace whose builtin `key` the fast path implements.
+        namespace: GlobalIntrinsic,
+        /// The member name.
+        key: String,
+        /// The value of the namespace binding.
+        obj: Box<IrNode>,
+        /// Scratch local holding `obj`.
+        obj_local: u32,
+        /// The argument expressions, in source order.
+        args: Vec<IrNode>,
+        /// Scratch locals holding `args`.
+        arg_locals: Vec<u32>,
+        /// The inline code over `arg_locals`.
+        fast: Box<IrNode>,
+        /// The generic method call on `obj_local` over `arg_locals`.
+        slow: Box<IrNode>,
+    },
+    /// A call `recv.key(args)` of a builtin prototype method name (design
+    /// 3.2 rows 3-4). Each `fast` path runs while `recv` is of its
+    /// [`ProtoKind`]: a heap block of the kind byte with no own properties
+    /// (`props == 0`) whose `proto` is the family's realm prototype and
+    /// (unless `sealed`) whose dirty bit is clear. Otherwise ONE call of the out-of-line generic method call
+    /// (`__get`, `IsCallable`, call with `this = recv`; it also throws for a
+    /// nullish `recv`), routed straight to the `String.prototype` builtin
+    /// `key` instead when `recv` is a string, `key` names one, and (unless
+    /// `sealed`) `%String.prototype%`'s dirty bit is clear (a primitive has
+    /// no own properties); a string receiver runs that builtin's host op
+    /// inline when the arguments already have the types it coerces to.
+    ProtoGuard {
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
+        /// The receiver read (a local, evaluated and nullish-checked before
+        /// this node).
+        recv: Box<IrNode>,
+        /// The method name.
+        key: String,
+        /// The arguments: side-effect-free nodes (locals, literals, function
+        /// literals), read by every path.
+        args: Vec<IrNode>,
+        /// The inline fast paths, by receiver family, tested in order.
+        fast: Vec<(ProtoKind, IrNode)>,
+        /// The `TypeError` thrown when `recv.key` is not callable.
+        not_callable: CalleeError,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
@@ -828,9 +1306,9 @@ pub enum IrNode {
     /// A `super(..)` / `super.m(..)` call inside a derived class (the E-series
     /// `extends`): invoke the function value `callee` with `this` kept as the
     /// CURRENT instance (the enclosing method's snapshotted `this` in `this_local`)
-    /// rather than a fresh receiver. `callee` is the parent constructor
-    /// (`Super["@@constructor"]`) for `super(..)` or a parent-prototype method
-    /// (`Super["@@prototype"].m`) for `super.m(..)`. Mirrors [`IrNode::MethodCallUser`]'s
+    /// rather than a fresh receiver. `callee` is the parent class value (its
+    /// constructor function) for `super(..)` or a parent-prototype method
+    /// (`Super.prototype.m`) for `super.m(..)`. Mirrors [`IrNode::MethodCallUser`]'s
     /// call shape — a not-a-function runtime guard, then the `__this` global is set
     /// to `this_local` immediately before the `call_indirect` — but binds the
     /// existing `this` instead of a member receiver, so the parent constructor's
@@ -843,52 +1321,63 @@ pub enum IrNode {
         /// The enclosing method/constructor's `this` snapshot local, rebound as
         /// `__this` for the call.
         this_local: u32,
+        /// `super(..)`: pass the construct marker (`argc = -(n + 1)`), so the
+        /// parent class constructor accepts the call.
+        construct: bool,
     },
-    /// A class instantiation `new A(args)`. Allocates the fresh `instance`
-    /// object (pre-shaped with the reserved prototype link plus one slot per field
-    /// the constructor assigns via `this.<field> = ..`, since the object model has
-    /// no dynamic key growth), binds `this = instance`, runs the constructor
-    /// function value `ctor` with `args` under the uniform ABI, DISCARDS the
-    /// constructor's return value, and evaluates to the instance. The instance is
-    /// stashed in `instance_local` so it survives the constructor call and is
-    /// yielded afterward — mirroring [`IrNode::MethodCallUser`]'s `this`-binding
-    /// call shape but yielding the receiver rather than the call result.
-    New {
-        /// The fresh instance allocation: an [`IrNode::Object`] whose first entry
-        /// is the reserved prototype-key link and whose remaining entries slot
-        /// each constructor-assigned field to `undefined`.
-        instance: Box<IrNode>,
-        /// The constructor function value to run (read from the class binding's
-        /// reserved constructor key).
-        ctor: Box<IrNode>,
-        /// The constructor argument expressions, in source order.
+    /// `new callee(args)` (DESIGN.md §7.6): evaluate `callee` into `callee_local` and
+    /// the arguments, then `IsConstructor(callee)` (a function with
+    /// `FUNC_FLAG_CONSTRUCTOR`, else throw `not_constructor`); allocate `this` = a
+    /// fresh ordinary object (in `this_local`) whose `proto` is
+    /// `Get(callee, "prototype")` when that is an object, else
+    /// `%Object.prototype%`; set `__this = this`, `__new_target = callee`, and call
+    /// `callee` with the construct marker `argc = -(n + 1)`. The result is the
+    /// return value when it is an object, else `this`.
+    Construct {
+        /// The constructor expression.
+        callee: Box<IrNode>,
+        /// The argument expressions, in source order (empty with `spread`).
         args: Vec<IrNode>,
-        /// Fresh temp local holding the instance across the constructor call.
-        instance_local: u32,
+        /// The argument array ([`IrNode::ArraySpread`]) when any argument is a
+        /// spread; its length is the dynamic argument count.
+        spread: Option<Box<IrNode>>,
+        /// Fresh temp local holding the callee across the arguments (and then
+        /// the call's return value).
+        callee_local: u32,
+        /// Fresh temp local holding the allocated `this` across the call.
+        this_local: u32,
+        /// Property-table capacity pre-reserved on `this` (an optimisation only).
+        reserve: u32,
+        /// The `TypeError` thrown when `callee` is not a constructor.
+        not_constructor: CalleeError,
+        /// `super(..)` (`__construct_with`): the `new.target` to construct
+        /// with (a side-effect-free read) instead of `callee`.
+        new_target: Option<Box<IrNode>>,
     },
-    /// The enumerable KEY at position `index` of `obj`, produced as a heap STRING
-    /// jsval. This is the key-table iteration primitive `for-in` desugars
-    /// to (and that `Object.keys` / `JSON.stringify` reuse): a counted
-    /// loop over `0 <= index < StrLen(obj)` reads each key through this node.
-    /// Dispatches at RUNTIME on `obj`'s TYPE BYTE: an object
-    /// (`TYPE_OBJECT`) returns the key heap-string jsval already stored at entry
-    /// `index` (`ptr + HEADER_SIZE + 4 + 16*index`), in insertion order; anything
-    /// else (an array, or a string) treats `index` as a numeric position and
-    /// yields its decimal string form (`"0"`, `"1"`, ..) via the host `__convert`
-    /// to-string op, matching JS `for-in` index keys. `index` is a number jsval
-    /// assumed in range (the loop bounds it against the length).
-    ObjectKey {
-        /// The object/array being iterated (a heap-pointer jsval).
-        obj: Box<IrNode>,
-        /// The position of the key to read (a number jsval, `0..length`).
-        index: Box<IrNode>,
-    },
-    /// An `Object.keys/values/entries(arg)` collection built-in call. The
-    /// `arg` object is evaluated once to a heap-object jsval, then a runtime helper
-    /// (`__obj_keys`/`__obj_values`/`__obj_entries`) linear-scans its key table —
-    /// skipping the reserved hidden `@@`-prefixed keys — and builds a fresh growable
-    /// array of the keys, the values, or `[key, value]` pairs, returned as a heap
-    /// jsval.
+    /// Read the `__new_target` wasm global. Emitted ONLY in the prologue of a
+    /// function that references `new.target`, guarded by the construct marker.
+    NewTargetGlobal,
+    /// Whether the `argc` local carries the construct marker `-(n + 1)` (its
+    /// number is negative), as a boolean.
+    IsConstructCall(u32),
+    /// The source argument count `n` held by the `argc` local, decoding the
+    /// construct marker `-(n + 1)`, as a number.
+    ArgCount(u32),
+    /// Read the `__spread_args` wasm global: the argument array of the most
+    /// recent spread call or construct, which holds the arguments beyond the
+    /// `K` positional slots. Emitted ONLY in the prologue of a function that
+    /// gathers its arguments (a rest parameter or `arguments`), which reads it
+    /// only when its decoded argument count exceeds `K`.
+    SpreadArgsGlobal,
+    /// Evaluate each expression left to right, discarding every value but the
+    /// last, which is the node's value. Built by codegen (never empty) for
+    /// operands evaluated only for their side effects: surplus `Error(..)`
+    /// arguments, and the nullish-guarded receiver of a `push`/`pop`.
+    Seq(Vec<IrNode>),
+    /// An `Object.keys/values/entries(arg)` collection built-in call (or the
+    /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
+    /// `__own_keys` (`__for_in_keys`), which builds a fresh array in own-key
+    /// order (2.6), returned as a heap jsval.
     ObjectBuiltin {
         /// Which `Object.*` collection method this call performs.
         op: ObjectBuiltinOp,
@@ -896,9 +1385,8 @@ pub enum IrNode {
         arg: Box<IrNode>,
     },
     /// A `key in obj` membership test, yielding a `true`/`false` jsval. Both
-    /// operands are evaluated once to heap jsvals; a runtime helper (`__obj_has`)
-    /// linear-scans `obj`'s own key table for a key whose byte content equals the
-    /// `key` heap-string (own keys only — the prototype chain is NOT walked).
+    /// operands are evaluated once; the key is converted with `ToPropertyKey` and
+    /// `__has` looks it up on `obj` and then its prototype chain.
     ObjectHas {
         /// The property-key operand (a heap-string jsval).
         key: Box<IrNode>,
@@ -909,22 +1397,16 @@ pub enum IrNode {
     /// jsval. `value` is evaluated once and — via a runtime OBJECT type-byte
     /// guard — a non-heap or non-object operand (number, string, array, `Map`,
     /// …) yields `false` without trapping. For an object, `kind` selects the
-    /// test: a user class compares the receiver's `@@prototype` against the
-    /// class's; a builtin error checks the hidden [`crate::abi::ERROR_KIND_KEY`]
-    /// brand. The right-hand side is restricted at lowering to a user class or
-    /// one of the three builtin error constructors (no general prototype-chain
-    /// `instanceof`).
+    /// test (see [`InstanceOfKind`]).
     InstanceOf {
         /// The left operand (any value).
         value: Box<IrNode>,
         /// What the right-hand side names.
         kind: InstanceOfKind,
     },
-    /// A `delete obj.k` property removal, always yielding a `true` jsval.
-    /// Both operands are evaluated once to heap jsvals; a runtime helper
-    /// (`__obj_delete`) linear-scans `obj`'s own key table for the `key`
-    /// heap-string and, on a match, compacts the entry out (shifts the trailing
-    /// entries down and decrements the `n` header) so a later read yields
+    /// A `delete obj.k` property removal, yielding a `true` jsval. Both operands
+    /// are evaluated once; `__delete` tombstones the own property (a
+    /// non-configurable one throws a `TypeError`), so a later read yields
     /// `undefined`, `in` yields `false`, and every enumerator skips it.
     ObjectDelete {
         /// The object owning the property (a heap-object jsval).
@@ -937,8 +1419,7 @@ pub enum IrNode {
     /// `arg` value is evaluated once and serialized entirely in-wasm by a recursive
     /// runtime helper (`__json_str`): numbers/booleans/`null` render literally
     /// (non-finite numbers as `"null"`), strings are quoted + escaped, arrays and
-    /// objects recurse (object keys use the runtime key table, skipping reserved
-    /// `@@`-prefixed keys; `undefined`/function values are omitted as object values
+    /// objects recurse (own enumerable keys in own-key order; `undefined`/function values are omitted as object values
     /// and become `"null"` as array elements). Number formatting reuses the
     /// existing `__convert` host import (no NEW host import). See [`IrNode::JsonParse`]
     /// for the inverse.
@@ -949,13 +1430,10 @@ pub enum IrNode {
     /// A `JSON.parse(text)` call. `arg` is
     /// coerced to a string (via the `__convert` `ToString` import) and handed to
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
-    /// guest value tree — including OBJECTS with **runtime-unknown keys**, built by
-    /// allocating a fresh entry table sized to the parsed member count (the
-    /// fixed-shape object model only blocks *mutating* keys via `__obj_set`, not
-    /// allocating a fresh object; and every consumer matches keys by byte content,
-    /// so runtime heap-string keys resolve against interned literal keys). Malformed
-    /// input throws a branded `Error` (`.name` `SyntaxError`). The optional reviver
-    /// argument is unsupported and rejected at codegen.
+    /// guest value tree — including OBJECTS with runtime-unknown keys, each
+    /// member interned and defined through `__define`. Malformed
+    /// input throws an `Error` (`.name` `SyntaxError`). A call passing a
+    /// reviver calls the `JSON.parse` builtin instead.
     JsonParse {
         /// The single text argument, evaluated once and parsed.
         arg: Box<IrNode>,
@@ -971,28 +1449,19 @@ pub enum IrNode {
         /// thus the render label) differs.
         set: bool,
     },
-    /// A `Map`/`Set` method call `recv.<op>(args)`. `recv` is evaluated ONCE
-    /// into `recv_local`, then a RUNTIME dispatch on its TYPE BYTE selects the path:
-    /// a `TYPE_MAP`/`TYPE_SET` handle runs the collection op (`op`) over the shared
-    /// flattened `(key, value)` backing via the `__map_*` runtime helpers; any other
-    /// receiver falls back to an ordinary user method call `recv.<method_name>(args)`
-    /// (binding `this = recv`), so an object/class method of the same name still
-    /// works. The fallback reuses `fallback_obj_local` as its own receiver temp.
-    MapMethod {
-        /// Which collection op the map/set path performs.
+    /// The inline body of a `Map`/`Set` method ([`MapOp`]) on the handle in
+    /// `handle` (a `TYPE_MAP`/`TYPE_SET` receiver, already checked), over the
+    /// `__map_*` runtime helpers. A missing key/value argument is `undefined`;
+    /// `.set`/`.add` yield the handle, `.get` the value or `undefined`,
+    /// `.has`/`.delete` a boolean, `.clear` `undefined`.
+    CollectionOp {
+        /// Which collection op runs.
         op: MapOp,
-        /// The receiver expression (evaluated once into `recv_local`).
-        recv: Box<IrNode>,
-        /// The call arguments in source order (`[k]` for get/has/delete/add,
-        /// `[k, v]` for set); also threaded verbatim to the user-method fallback.
+        /// The local holding the receiver handle.
+        handle: u32,
+        /// The arguments (side-effect-free nodes; only the leading ones are
+        /// read).
         args: Vec<IrNode>,
-        /// The source method name (`"set"`/`"get"`/…), used as the member key of
-        /// the user-method fallback and interned as a static string.
-        method_name: String,
-        /// Fresh temp local holding the evaluated receiver across the dispatch.
-        recv_local: u32,
-        /// Fresh temp local for the fallback user method call's own receiver stash.
-        fallback_obj_local: u32,
     },
     /// `Promise.resolve(v)`: build a promise already fulfilled with `v`
     /// (or return `v` unchanged when it is itself a promise). Lowers to the host
@@ -1063,36 +1532,25 @@ pub enum IrNode {
     /// `Date.now()`: the host wall-clock time in milliseconds since the
     /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
     DateNow,
-    /// `d.getTime()`: the millisecond timestamp of a `TYPE_DATE`
-    /// receiver as a number jsval. `recv` is evaluated once; a non-`Date` receiver
-    /// yields `NaN` (jsc models no method-receiver `TypeError` here).
-    DateGetTime {
-        /// The receiver expression (evaluated once).
-        recv: Box<IrNode>,
+    /// A static `obj.size` read (DESIGN.md §6.4): a
+    /// `TYPE_MAP`/`TYPE_SET` receiver passing its [`ProtoKind::Collection`]
+    /// guard reads its `size` header; any other receiver is `obj["size"]`
+    /// (the `%Map.prototype%`/`%Set.prototype%` getter, or an own/user
+    /// `size`).
+    SizeRead {
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
+        /// The receiver.
+        obj: Box<IrNode>,
     },
-    /// A `Date` instance method `recv.<op>(args)`. Like
-    /// [`IrNode::MapMethod`], `recv` is evaluated ONCE into `recv_local`, then a
-    /// RUNTIME dispatch on its TYPE BYTE selects the path: a `TYPE_DATE` block
-    /// computes the field (`op`) GUEST-side from its stored f64 epoch-ms; any other
-    /// receiver falls back to an ordinary user method call `recv.<method_name>(args)`
-    /// (binding `this = recv`), so an object/class method of the same name still
-    /// works. A non-finite timestamp yields `NaN` (or `"Invalid Date"` for
-    /// `toISOString`).
-    DateMethod {
-        /// Which field the `TYPE_DATE` path computes.
+    /// The field `op` of the `TYPE_DATE` block in `recv` (already checked),
+    /// computed GUEST-side from its stored f64 epoch-ms. A non-finite
+    /// timestamp yields `NaN` (or `"Invalid Date"` for `toISOString`).
+    DateField {
+        /// Which field is computed.
         op: DateOp,
-        /// The receiver expression (evaluated once into `recv_local`).
-        recv: Box<IrNode>,
-        /// The call arguments (Date methods take none, but threaded verbatim to the
-        /// user-method fallback so a same-named user method of any arity still works).
-        args: Vec<IrNode>,
-        /// The source method name, used as the member key of the user-method
-        /// fallback and interned as a static string.
-        method_name: String,
-        /// Fresh temp local holding the evaluated receiver across the dispatch.
-        recv_local: u32,
-        /// Fresh temp local for the fallback user method call's own receiver stash.
-        fallback_obj_local: u32,
+        /// The local holding the Date receiver.
+        recv: u32,
     },
 }
 
@@ -1238,6 +1696,36 @@ pub struct IrFunction {
     /// body is a `switch (gen.state)` dispatch over these `GenSegment`s rather
     /// than [`Self::body`]. `None` for every ordinary function.
     pub machine: Option<Vec<GenSegment>>,
+    /// The function object's static facts (its `name`, `length`, and kind).
+    pub info: FnInfo,
+}
+
+/// The static facts of a function object, laid into the `__fn_info` table
+/// and its block's header `flags`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FnInfo {
+    /// The `name` property (`""` for an anonymous function).
+    pub name: String,
+    /// The `length` property: the parameters before the first default or rest.
+    pub length: u32,
+    /// What the function constructs.
+    pub kind: FnKind,
+}
+
+/// Whether a function is a constructor (DESIGN.md §5.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FnKind {
+    /// Not a constructor: arrows, methods, accessors, generators, async
+    /// functions, and internal functions. No `prototype`.
+    #[default]
+    Plain,
+    /// A `function` declaration or expression: materializes a `prototype`.
+    Constructor,
+    /// A class constructor: its `prototype` is defined by the class.
+    Class,
+    /// A derived class constructor (`class B extends P`): also `SELF_ALLOC`,
+    /// so `new` leaves the allocation to `super(..)`.
+    DerivedClass,
 }
 
 /// One basic block of a generator state machine: a run of
@@ -1252,6 +1740,15 @@ pub struct GenSegment {
     pub stmts: Vec<IrStmt>,
     /// How the block ends.
     pub term: GenTerm,
+    /// The block a throw anywhere in this block (its statements or its
+    /// terminator) transfers to — the enclosing `try`'s catch entry, or its
+    /// finally-on-throw entry — with the exception still pending. `None` lets the
+    /// exception escape the state machine (completing the generator).
+    pub handler: Option<u32>,
+    /// Whether this block is a handler landing target: it is entered with an
+    /// exception pending, which it clears on entry (the thrown value stays
+    /// readable through [`IrNode::ExcValue`]).
+    pub catches: bool,
 }
 
 /// The terminator of a [`GenSegment`].
@@ -1301,6 +1798,537 @@ pub struct IrProgram {
     pub functions: Vec<IrFunction>,
     /// The number of module cells ([`IrNode::ModuleCell`] slots `0..module_cells`).
     pub module_cells: u32,
+    /// The fixed positional-argument arity `K` of the uniform function ABI
+    /// (every function's `params` is `K` plus the trailing env and argc).
+    pub arity: u32,
+}
+
+impl IrNode {
+    /// An Error instance (DESIGN.md §7.7): a `TYPE_OBJECT` of class
+    /// [`crate::abi::CLASS_ERROR`] whose `proto` is `kind`'s static prototype
+    /// (`name` is inherited from it), with the non-enumerable own properties
+    /// `message` (when one was given) and `stack` — the shape every builtin and
+    /// engine-raised error shares.
+    pub(crate) fn error_object(kind: ErrorKind, message: Option<IrNode>, stack: IrNode) -> Self {
+        Self::error_with_proto(IrNode::ErrorProto(kind), message, stack)
+    }
+
+    /// An Error instance like [`Self::error_object`] whose `proto` is the
+    /// value of `proto` (a subclass prototype for `new.target`).
+    fn error_with_proto(proto: IrNode, message: Option<IrNode>, stack: IrNode) -> Self {
+        let message = message.map(|message| (PropKey::Hidden("message".to_owned()), message));
+        let stack = (PropKey::Hidden("stack".to_owned()), stack);
+        Self::Object {
+            entries: message.into_iter().chain([stack]).collect(),
+            proto: Some(Box::new(proto)),
+            class: crate::abi::CLASS_ERROR,
+            reserve: 0,
+        }
+    }
+
+    /// The Error instance `<kind>(argument)` constructs with prototype `proto`
+    /// (side-effect free, read in both branches): `argument` is evaluated
+    /// once into local `arg`; unless it is `undefined` the instance gets an
+    /// own `message` = `ToString(argument)` (kept in local `msg`) and `stack`
+    /// = `"<name>: <message>"` (just `<name>` for an empty message).
+    pub(crate) fn error_from_argument(
+        kind: ErrorKind,
+        proto: IrNode,
+        argument: IrNode,
+        arg: u32,
+        msg: u32,
+    ) -> Self {
+        let name = kind.name();
+        let text = IrNode::Assign {
+            local: msg,
+            value: Box::new(IrNode::ConvertCall {
+                op: ConvertOp::ToString,
+                arg: Box::new(IrNode::Local(arg)),
+                radix: None,
+            }),
+        };
+        let stack = IrNode::Ternary {
+            cond: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Local(msg)),
+                rhs: Box::new(IrNode::Str(String::new())),
+            }),
+            then_branch: Box::new(IrNode::Str(name.to_owned())),
+            else_branch: Box::new(IrNode::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(IrNode::Str(format!("{name}: "))),
+                rhs: Box::new(IrNode::Local(msg)),
+            }),
+        };
+        IrNode::Ternary {
+            cond: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Assign {
+                    local: arg,
+                    value: Box::new(argument),
+                }),
+                rhs: Box::new(IrNode::Undefined),
+            }),
+            then_branch: Box::new(Self::error_with_proto(
+                proto.clone(),
+                None,
+                IrNode::Str(name.to_owned()),
+            )),
+            else_branch: Box::new(Self::error_with_proto(proto, Some(text), stack)),
+        }
+    }
+
+    /// Whether `f` holds for any DIRECT child expression. Exhaustive over every
+    /// variant (no wildcard), so a new variant must classify its children before
+    /// the tree walkers built on this compile.
+    #[allow(clippy::too_many_lines)]
+    pub fn any_child(&self, mut f: impl FnMut(&IrNode) -> bool) -> bool {
+        match self {
+            IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::ArrayHole
+            | IrNode::Local(_)
+            | IrNode::EnvLoad(_)
+            | IrNode::ModuleCell(_)
+            | IrNode::SentValue
+            | IrNode::ExcValue
+            | IrNode::ThisGlobal
+            | IrNode::NewTargetGlobal
+            | IrNode::IsConstructCall(_)
+            | IrNode::ArgCount(_)
+            | IrNode::Hole
+            | IrNode::SpreadArgsGlobal
+            | IrNode::ArrayPop { .. }
+            | IrNode::IncDec { .. }
+            | IrNode::MapNew { .. }
+            | IrNode::DeclFunc(_)
+            | IrNode::ErrorProto(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::GlobalGet { .. }
+            | IrNode::DateNow
+            | IrNode::DateField { .. } => false,
+            IrNode::Assign { value: inner, .. }
+            | IrNode::GlobalSet { value: inner, .. }
+            | IrNode::CellNew(inner)
+            | IrNode::CellGet(inner)
+            | IrNode::IsHole(inner)
+            | IrNode::IsObject(inner)
+            | IrNode::ToObject(inner)
+            | IrNode::ClassHeritage { value: inner, .. }
+            | IrNode::Yield(inner)
+            | IrNode::IsGenerator(inner)
+            | IrNode::IterSource { value: inner, .. }
+            | IrNode::IterLen(inner)
+            | IrNode::TypeOf(inner)
+            | IrNode::StrLen(inner)
+            | IrNode::NullishCheck { value: inner, .. }
+            | IrNode::ArrayPush { value: inner, .. }
+            | IrNode::Not(inner)
+            | IrNode::Throw(inner)
+            | IrNode::ObjectBuiltin { arg: inner, .. }
+            | IrNode::JsonStringify { arg: inner }
+            | IrNode::JsonParse { arg: inner }
+            | IrNode::PromiseResolve(inner)
+            | IrNode::PromiseReject(inner)
+            | IrNode::Await(inner)
+            | IrNode::PromiseCtor {
+                executor: inner, ..
+            }
+            | IrNode::AsyncSpawn(inner)
+            | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ConsoleLogSpread { args: inner }
+            | IrNode::MathSpread { args: inner, .. } => f(inner),
+            IrNode::InstanceOf { value, kind } => {
+                f(value)
+                    || match kind {
+                        InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => f(rhs),
+                        InstanceOfKind::Array
+                        | InstanceOfKind::Function
+                        | InstanceOfKind::Date
+                        | InstanceOfKind::Object => false,
+                    }
+            }
+            IrNode::Binary { lhs: a, rhs: b, .. }
+            | IrNode::Logical { lhs: a, rhs: b, .. }
+            | IrNode::CellSet { cell: a, value: b }
+            | IrNode::GenResume { handle: a, sent: b }
+            | IrNode::ObjectRest {
+                source: a,
+                exclude: b,
+            }
+            | IrNode::Index { obj: a, index: b }
+            | IrNode::IterItem {
+                iterable: a,
+                index: b,
+            }
+            | IrNode::MakeAccessor {
+                getter: a,
+                setter: b,
+            }
+            | IrNode::ObjectHas { key: a, obj: b }
+            | IrNode::ObjectDelete { obj: a, key: b }
+            | IrNode::PromiseFinally {
+                promise: a,
+                on_finally: b,
+            } => f(a) || f(b),
+            IrNode::IndexOpSet {
+                obj, index, rhs, ..
+            } => f(obj) || f(index) || f(rhs),
+            IrNode::IndexSet { obj, index, value } => f(obj) || f(index) || f(value),
+            IrNode::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => f(cond) || f(then_branch) || f(else_branch),
+            IrNode::PromiseThen {
+                promise,
+                on_fulfilled,
+                on_rejected,
+            } => f(promise) || f(on_fulfilled) || f(on_rejected),
+            IrNode::ArrayHof {
+                array,
+                callback,
+                init,
+                this_arg,
+                ..
+            } => {
+                f(array)
+                    || f(callback)
+                    || init.as_deref().is_some_and(&mut f)
+                    || this_arg.as_deref().is_some_and(f)
+            }
+            IrNode::ConvertCall { arg, radix, .. } => f(arg) || radix.as_deref().is_some_and(f),
+            IrNode::DateNew { ms } => ms.as_deref().is_some_and(f),
+            IrNode::Call { args, .. }
+            | IrNode::FuncValue { captures: args, .. }
+            | IrNode::MakeGenerator { slots: args, .. }
+            | IrNode::Array(args)
+            | IrNode::Seq(args)
+            | IrNode::ConsoleLog { args }
+            | IrNode::CollectionOp { args, .. }
+            | IrNode::MathCall { args, .. } => args.iter().any(f),
+            IrNode::CallIndirect {
+                callee: recv, args, ..
+            }
+            | IrNode::MethodCall { recv, args, .. }
+            | IrNode::ThisCall {
+                callee: recv, args, ..
+            } => f(recv) || args.iter().any(f),
+            IrNode::MethodCallUser { obj, key, args, .. } => f(obj) || f(key) || args.iter().any(f),
+            IrNode::NamespaceGuard {
+                obj,
+                args,
+                fast,
+                slow,
+                ..
+            } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
+            IrNode::ProtoGuard {
+                recv, args, fast, ..
+            } => f(recv) || args.iter().any(&mut f) || fast.iter().any(|(_, node)| f(node)),
+            IrNode::Construct {
+                callee,
+                args,
+                spread,
+                new_target,
+                ..
+            } => {
+                f(callee)
+                    || args.iter().any(&mut f)
+                    || spread.as_deref().is_some_and(&mut f)
+                    || new_target.as_deref().is_some_and(f)
+            }
+            IrNode::SetProto { obj, proto } => f(obj) || f(proto),
+            IrNode::Object { entries, proto, .. } => {
+                proto.as_deref().is_some_and(&mut f)
+                    || entries.iter().any(|(key, value)| {
+                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
+                    })
+            }
+            IrNode::DefineProps { obj, entries, .. } => {
+                f(obj)
+                    || entries.iter().any(|(key, value)| {
+                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
+                    })
+            }
+            IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
+                SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
+            }),
+            IrNode::CallSpread { target, args } => {
+                matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } | SpreadCallee::Method { callee, .. } if f(callee))
+                    || f(args)
+            }
+        }
+    }
+
+    /// Mutable references to every DIRECT child expression, in JS evaluation
+    /// order (the order [`Self::any_child`] visits them). Exhaustive over every
+    /// variant, like [`Self::any_child`].
+    #[allow(clippy::too_many_lines)]
+    pub fn children_mut(&mut self) -> Vec<&mut IrNode> {
+        match self {
+            IrNode::Num(_)
+            | IrNode::Str(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::ArrayHole
+            | IrNode::Local(_)
+            | IrNode::EnvLoad(_)
+            | IrNode::ModuleCell(_)
+            | IrNode::SentValue
+            | IrNode::ExcValue
+            | IrNode::ThisGlobal
+            | IrNode::NewTargetGlobal
+            | IrNode::IsConstructCall(_)
+            | IrNode::ArgCount(_)
+            | IrNode::Hole
+            | IrNode::SpreadArgsGlobal
+            | IrNode::ArrayPop { .. }
+            | IrNode::IncDec { .. }
+            | IrNode::MapNew { .. }
+            | IrNode::DeclFunc(_)
+            | IrNode::ErrorProto(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::GlobalGet { .. }
+            | IrNode::DateNow
+            | IrNode::DateField { .. } => Vec::new(),
+            IrNode::Assign { value: inner, .. }
+            | IrNode::GlobalSet { value: inner, .. }
+            | IrNode::CellNew(inner)
+            | IrNode::CellGet(inner)
+            | IrNode::IsHole(inner)
+            | IrNode::IsObject(inner)
+            | IrNode::ToObject(inner)
+            | IrNode::ClassHeritage { value: inner, .. }
+            | IrNode::Yield(inner)
+            | IrNode::IsGenerator(inner)
+            | IrNode::IterSource { value: inner, .. }
+            | IrNode::IterLen(inner)
+            | IrNode::TypeOf(inner)
+            | IrNode::StrLen(inner)
+            | IrNode::NullishCheck { value: inner, .. }
+            | IrNode::ArrayPush { value: inner, .. }
+            | IrNode::Not(inner)
+            | IrNode::Throw(inner)
+            | IrNode::ObjectBuiltin { arg: inner, .. }
+            | IrNode::JsonStringify { arg: inner }
+            | IrNode::JsonParse { arg: inner }
+            | IrNode::PromiseResolve(inner)
+            | IrNode::PromiseReject(inner)
+            | IrNode::Await(inner)
+            | IrNode::PromiseCtor {
+                executor: inner, ..
+            }
+            | IrNode::AsyncSpawn(inner)
+            | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ConsoleLogSpread { args: inner }
+            | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
+            IrNode::InstanceOf { value, kind } => match kind {
+                InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => {
+                    vec![&mut **value, &mut **rhs]
+                }
+                InstanceOfKind::Array
+                | InstanceOfKind::Function
+                | InstanceOfKind::Date
+                | InstanceOfKind::Object => vec![&mut **value],
+            },
+            IrNode::Binary { lhs: a, rhs: b, .. }
+            | IrNode::Logical { lhs: a, rhs: b, .. }
+            | IrNode::CellSet { cell: a, value: b }
+            | IrNode::GenResume { handle: a, sent: b }
+            | IrNode::ObjectRest {
+                source: a,
+                exclude: b,
+            }
+            | IrNode::Index { obj: a, index: b }
+            | IrNode::IterItem {
+                iterable: a,
+                index: b,
+            }
+            | IrNode::MakeAccessor {
+                getter: a,
+                setter: b,
+            }
+            | IrNode::ObjectHas { key: a, obj: b }
+            | IrNode::ObjectDelete { obj: a, key: b }
+            | IrNode::PromiseFinally {
+                promise: a,
+                on_finally: b,
+            } => vec![&mut **a, &mut **b],
+            IrNode::IndexOpSet {
+                obj, index, rhs, ..
+            } => vec![&mut **obj, &mut **index, &mut **rhs],
+            IrNode::IndexSet { obj, index, value } => vec![&mut **obj, &mut **index, &mut **value],
+            IrNode::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => vec![&mut **cond, &mut **then_branch, &mut **else_branch],
+            IrNode::PromiseThen {
+                promise,
+                on_fulfilled,
+                on_rejected,
+            } => vec![&mut **promise, &mut **on_fulfilled, &mut **on_rejected],
+            IrNode::ArrayHof {
+                array,
+                callback,
+                init,
+                this_arg,
+                ..
+            } => [&mut **array, &mut **callback]
+                .into_iter()
+                .chain(init.as_deref_mut())
+                .chain(this_arg.as_deref_mut())
+                .collect(),
+            IrNode::ConvertCall { arg, radix, .. } => {
+                let mut out = vec![&mut **arg];
+                out.extend(radix.as_deref_mut());
+                out
+            }
+            IrNode::DateNew { ms } => ms.as_deref_mut().into_iter().collect(),
+            IrNode::Call { args, .. }
+            | IrNode::FuncValue { captures: args, .. }
+            | IrNode::MakeGenerator { slots: args, .. }
+            | IrNode::Array(args)
+            | IrNode::Seq(args)
+            | IrNode::ConsoleLog { args }
+            | IrNode::CollectionOp { args, .. }
+            | IrNode::MathCall { args, .. } => args.iter_mut().collect(),
+            IrNode::CallIndirect {
+                callee: recv, args, ..
+            }
+            | IrNode::MethodCall { recv, args, .. }
+            | IrNode::ThisCall {
+                callee: recv, args, ..
+            } => std::iter::once(&mut **recv)
+                .chain(args.iter_mut())
+                .collect(),
+            IrNode::MethodCallUser { obj, key, args, .. } => [&mut **obj, &mut **key]
+                .into_iter()
+                .chain(args.iter_mut())
+                .collect(),
+            IrNode::NamespaceGuard {
+                obj,
+                args,
+                fast,
+                slow,
+                ..
+            } => std::iter::once(&mut **obj)
+                .chain(args.iter_mut())
+                .chain([&mut **fast, &mut **slow])
+                .collect(),
+            IrNode::ProtoGuard {
+                recv, args, fast, ..
+            } => std::iter::once(&mut **recv)
+                .chain(args.iter_mut())
+                .chain(fast.iter_mut().map(|(_, node)| node))
+                .collect(),
+            IrNode::Construct {
+                callee,
+                args,
+                spread,
+                new_target,
+                ..
+            } => std::iter::once(&mut **callee)
+                .chain(args.iter_mut())
+                .chain(spread.as_deref_mut())
+                .chain(new_target.as_deref_mut())
+                .collect(),
+            IrNode::SetProto { obj, proto } => vec![&mut **obj, &mut **proto],
+            IrNode::Object { entries, proto, .. } => {
+                let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
+                for (key, value) in entries {
+                    if let PropKey::Computed(key) = key {
+                        out.push(key);
+                    }
+                    out.push(value);
+                }
+                out
+            }
+            IrNode::DefineProps { obj, entries, .. } => {
+                let mut out: Vec<&mut IrNode> = vec![&mut **obj];
+                for (key, value) in entries {
+                    if let PropKey::Computed(key) = key {
+                        out.push(key);
+                    }
+                    out.push(value);
+                }
+                out
+            }
+            IrNode::ArraySpread(elems) => elems
+                .iter_mut()
+                .map(|elem| match elem {
+                    SpreadElem::Item(value) | SpreadElem::Spread(value) => value,
+                })
+                .collect(),
+            IrNode::CallSpread { target, args } => {
+                let mut out = Vec::new();
+                if let SpreadCallee::Indirect(callee, _)
+                | SpreadCallee::This { callee, .. }
+                | SpreadCallee::Method { callee, .. } = target
+                {
+                    out.push(&mut **callee);
+                }
+                out.push(&mut **args);
+                out
+            }
+        }
+    }
+}
+
+impl IrStmt {
+    /// Whether `f` holds for any DIRECT child expression (not descending into
+    /// nested statements). Exhaustive over every variant, like
+    /// [`IrNode::any_child`].
+    pub fn any_node(&self, mut f: impl FnMut(&IrNode) -> bool) -> bool {
+        match self {
+            IrStmt::Decl { init: node, .. }
+            | IrStmt::Expr(node)
+            | IrStmt::If { cond: node, .. }
+            | IrStmt::While { cond: node, .. } => f(node),
+            IrStmt::Return(value) => value.as_ref().is_some_and(f),
+            IrStmt::Switch { disc, cases, .. } => {
+                f(disc)
+                    || cases
+                        .iter()
+                        .any(|case| case.test.as_ref().is_some_and(&mut f))
+            }
+            IrStmt::Break(_) | IrStmt::Continue(_) | IrStmt::Try { .. } => false,
+        }
+    }
+
+    /// Whether `f` holds for any DIRECT child statement (one nesting level).
+    /// Exhaustive over every variant, like [`IrNode::any_child`].
+    pub fn any_stmt(&self, f: impl FnMut(&IrStmt) -> bool) -> bool {
+        match self {
+            IrStmt::Decl { .. }
+            | IrStmt::Expr(_)
+            | IrStmt::Return(_)
+            | IrStmt::Break(_)
+            | IrStmt::Continue(_) => false,
+            IrStmt::If {
+                then_body: a,
+                else_body: b,
+                ..
+            }
+            | IrStmt::While {
+                body: a, update: b, ..
+            } => a.iter().chain(b).any(f),
+            IrStmt::Switch { cases, .. } => cases.iter().flat_map(|case| &case.body).any(f),
+            IrStmt::Try {
+                body,
+                catch_body,
+                finally_body,
+            } => body
+                .iter()
+                .chain(catch_body.iter().flatten())
+                .chain(finally_body.iter().flatten())
+                .any(f),
+        }
+    }
 }
 
 #[cfg(test)]

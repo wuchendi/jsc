@@ -8,6 +8,7 @@
 
 mod common;
 use common::{assert_eval, assert_output, assert_rejected, assert_uncaught};
+use jsc_core::run::compile_and_run;
 
 // --- Microtask ordering -------------------------------------------------------
 
@@ -166,7 +167,7 @@ fn finally_runs_on_rejection() {
 fn promise_rendering() {
     assert_output("console.log(Promise.resolve(7));", "Promise { 7 }\n");
     assert_output(
-        "console.log(Promise.reject(\"e\"));",
+        "const p = Promise.reject(\"e\"); console.log(p); p.catch(() => {});",
         "Promise { <rejected> e }\n",
     );
     // A `.then` result is still pending when logged (its reaction is a queued
@@ -241,10 +242,14 @@ fn new_promise_wrong_arity_is_rejected() {
 
 // --- Out-of-scope boundary ----------------------------------------------------
 
-/// An unknown `Promise.<name>` static (e.g. `Promise.all`) is a compile error.
+/// An absent `Promise.<name>` static (e.g. `Promise.all`) reads `undefined`,
+/// so calling it throws a `TypeError` at run time.
 #[test]
-fn unknown_promise_static_is_rejected() {
-    assert_rejected("Promise.all([])");
+fn unknown_promise_static_throws() {
+    assert_uncaught(
+        "Promise.all([])",
+        "TypeError: Promise.all is not a function",
+    );
 }
 
 // --- async/await (generator + promise driven) ---------------------------------
@@ -330,14 +335,78 @@ fn async_throw_rejects_result() {
     );
 }
 
-/// `await` on a rejected promise propagates the rejection out as the async
-/// function's own rejection (no `try`/`catch` around `await` is modeled).
+/// `await` on a rejected promise with no enclosing handler propagates the
+/// rejection out as the async function's own rejection.
 #[test]
 fn async_await_rejection_propagates() {
     assert_output(
         "async function f() { await Promise.reject(\"nope\"); return 1; } \
          f().catch(e => console.log(e));",
         "nope\n",
+    );
+}
+
+/// An uncaught rejection inside an async body rejects its result promise; with
+/// no handler on the result, the run exits as an unhandled rejection.
+#[test]
+fn async_await_rejection_unhandled_is_uncaught() {
+    assert_uncaught(
+        "async function f() { await Promise.reject(\"nope\"); return 1; } f(); 0",
+        "(in promise) nope",
+    );
+}
+
+/// A rejected `await` THROWS into the body at the suspended `await`: the
+/// enclosing `catch` binds the rejection reason.
+#[test]
+fn async_await_rejection_is_caught() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(new Error(\"boom\")) } \
+         catch (e) { return \"caught \" + e.message } } f().then(v => console.log(v))",
+        "caught boom\n",
+    );
+}
+
+/// A caught rejection is not reported as an unhandled rejection.
+#[test]
+fn async_caught_rejection_is_not_unhandled() {
+    assert_eval(
+        "async function f(){ try { await Promise.reject(1) } catch (e) { return e + 1 } } await f()",
+        "2",
+    );
+}
+
+/// A non-Error rejection value is bound to the catch parameter unchanged.
+#[test]
+fn async_await_rejection_non_error_value() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(42) } catch (e) { console.log(e, typeof e) } } f()",
+        "42 number\n",
+    );
+}
+
+/// A rejected `await` inside `try`/`finally` runs the finalizer, then the
+/// rejection still rejects the result promise.
+#[test]
+fn async_await_rejection_runs_finally() {
+    assert_output(
+        "async function f(){ try { await Promise.reject(\"r\") } finally { console.log(\"fin\") } } \
+         f().catch(e => console.log(\"rejected\", e))",
+        "fin\nrejected r\n",
+    );
+}
+
+/// After a caught rejection, later awaits in the same body (inside a `try`
+/// again) continue normally.
+#[test]
+fn async_awaits_continue_after_caught_rejection() {
+    assert_output(
+        "async function f(){ let log = \"\"; \
+         try { await Promise.reject(\"a\") } catch (e) { log = log + e } \
+         try { const v = await Promise.resolve(\"b\"); log = log + v; const w = await 3; log = log + w } \
+         catch (e) { log = log + \"!\" } \
+         return log } f().then(v => console.log(v))",
+        "ab3\n",
     );
 }
 
@@ -406,5 +475,327 @@ fn for_let_loop_with_await_in_async_function() {
         "async function f(){ let s = \"\"; for (let i=0;i<3;i++) { const v = await Promise.resolve(i); s = s + v; } return s; }
          f().then(v => console.log(v));",
         "012\n",
+    );
+}
+
+/// `.then`/`.catch`/`.finally` are only the promise methods for a promise
+/// receiver: an object or class instance with a same-named method gets an
+/// ordinary method call (`this` bound, every argument passed).
+#[test]
+fn user_then_catch_finally_methods_are_called_on_non_promises() {
+    assert_eval("const t = { then(a) { return a + 1; } }; t.then(1)", "2");
+    assert_eval(
+        "const t = { then(a, b, c) { return a + b + c; } }; t.then(1, 2, 3)",
+        "6",
+    );
+    assert_eval(
+        "const o = { catch(e) { return e * 2; }, finally() { return \"f\"; } }; o.catch(4) + o.finally()",
+        "8f",
+    );
+    assert_eval(
+        "class T { constructor() { this.k = 3; } then(f) { return f(this.k); } }
+         new T().then(v => v * 2)",
+        "6",
+    );
+}
+
+/// A nullish `.then`/`.catch`/`.finally` receiver throws the ordinary
+/// member-read `TypeError`.
+#[test]
+fn nullish_promise_method_receiver_throws_a_type_error() {
+    assert_uncaught(
+        "let n = null; n.then();",
+        "TypeError: Cannot read properties of null (reading 'then')",
+    );
+    assert_uncaught(
+        "let u; u.catch(() => 1);",
+        "TypeError: Cannot read properties of undefined (reading 'catch')",
+    );
+    assert_uncaught(
+        "let u; u.finally();",
+        "TypeError: Cannot read properties of undefined (reading 'finally')",
+    );
+}
+
+/// A non-promise primitive without a `then` method throws "not a function".
+#[test]
+fn then_on_a_primitive_throws_a_type_error() {
+    assert_uncaught(
+        "let x = 5; x.then();",
+        "TypeError: x.then is not a function",
+    );
+}
+
+// --- Unhandled rejections -----------------------------------------------------
+
+/// Run `src` and assert it fails with `Uncaught (in promise) <expected>`.
+fn assert_unhandled(src: &str, expected: &str) {
+    let err = compile_and_run(src).expect_err("program should report an unhandled rejection");
+    assert_eq!(
+        err.to_string(),
+        format!("Uncaught (in promise) {expected}"),
+        "unhandled-rejection message for source `{src}`"
+    );
+}
+
+/// A rejection that never gets a handler fails the run, rendered like an
+/// uncaught exception (Error objects as `Name: message`, primitives as-is).
+#[test]
+fn unhandled_rejection_is_reported() {
+    assert_unhandled("Promise.reject(new Error(\"x\")); 0", "Error: x");
+    assert_unhandled("Promise.reject(new TypeError(\"t\")); 0", "TypeError: t");
+    assert_unhandled("Promise.reject(1); 0", "1");
+    assert_unhandled("new Promise((res, rej) => rej(\"s\")); 0", "s");
+}
+
+/// A `.then` without a rejection handler forwards the rejection to its result
+/// promise, which is itself unhandled.
+#[test]
+fn unhandled_rejection_through_then_passthrough() {
+    assert_unhandled("Promise.reject(2).then(v => v); 0", "2");
+}
+
+/// A throwing `.then` callback rejects the chained promise; unhandled, it fails.
+#[test]
+fn unhandled_rejection_from_throwing_reaction() {
+    assert_unhandled(
+        "Promise.resolve(1).then(v => { throw \"bang\"; }); 0",
+        "bang",
+    );
+}
+
+/// An async function that throws and is never awaited fails the run.
+#[test]
+fn unhandled_async_throw_is_reported() {
+    assert_unhandled(
+        "async function f() { throw new Error(\"a\"); } f(); 0",
+        "Error: a",
+    );
+    assert_unhandled(
+        "async function f() { await Promise.reject(\"r\"); } f(); 0",
+        "r",
+    );
+}
+
+/// The FIRST unhandled rejection (creation order) is the one reported.
+#[test]
+fn first_unhandled_rejection_wins() {
+    assert_unhandled("Promise.reject(\"a\"); Promise.reject(\"b\"); 0", "a");
+}
+
+/// A handler (catch / then / finally+catch / await / adoption) marks the
+/// rejection handled, including one attached later in the same run.
+#[test]
+fn handled_rejections_complete_normally() {
+    assert_eval("Promise.reject(1).catch(() => {}); 0", "0");
+    assert_eval("Promise.reject(1).then(v => v, e => e); 0", "0");
+    assert_eval(
+        "Promise.reject(1).finally(() => {}).catch(() => {}); 0",
+        "0",
+    );
+    assert_eval(
+        "const p = Promise.reject(1); Promise.resolve(0).then(() => p.catch(() => {})); 0",
+        "0",
+    );
+    assert_eval(
+        "async function f() { throw 1; } async function g() { await f(); } \
+         g().catch(() => {}); 0",
+        "0",
+    );
+    assert_eval(
+        "async function f() { throw 1; } f().catch(() => {}); 0",
+        "0",
+    );
+    assert_eval(
+        "new Promise((res) => res(Promise.reject(1))).catch(() => {}); 0",
+        "0",
+    );
+}
+
+/// A synchronous uncaught exception takes precedence over a pending unhandled
+/// rejection.
+#[test]
+fn sync_uncaught_beats_unhandled_rejection() {
+    assert_uncaught("Promise.reject(1); throw 2;", "2");
+}
+
+/// A closure created before an `await` captures the async frame's parameter
+/// cell and reads it after resumption.
+#[test]
+fn closure_created_before_await_captures_param() {
+    assert_output(
+        "async function a(n){ const f = () => n; await 0; return f() } a(3).then(v=>console.log(v))",
+        "3\n",
+    );
+}
+
+#[test]
+fn closure_created_after_await_captures_param() {
+    assert_output(
+        "async function a(n){ await 0; const f = () => n; return f() } a(3).then(v=>console.log(v))",
+        "3\n",
+    );
+}
+
+/// A closure and the async body share a local's cell across an `await`.
+#[test]
+fn closure_shares_async_local_across_await() {
+    assert_output(
+        "async function a(){ let s = 1; const bump = () => { s = s * 3; }; bump(); await 0; bump(); await 0; return s; }
+         a().then(v => console.log(v));",
+        "9\n",
+    );
+}
+
+/// A closure passed as a `.then` reaction inside an async body captures its
+/// local and runs after the function has already returned.
+#[test]
+fn closure_over_async_local_runs_as_reaction() {
+    assert_output(
+        "async function a(){ let tag = \"x\"; await 0; Promise.resolve(1).then(v => console.log(tag, v)); tag = \"y\"; }
+         a();",
+        "y 1\n",
+    );
+}
+
+/// An `await` nested in an expression keeps JS evaluation order: the operands
+/// before it run synchronously, the rest after the microtask resumes the body.
+#[test]
+fn nested_await_preserves_evaluation_order() {
+    assert_output(
+        "let log = \"\";
+         function t(s, v){ log = log + s; return v; }
+         async function f(){ let r = t(\"a\", 1) + (await t(\"b\", 2)) + t(\"c\", 3); console.log(r, log); }
+         f(); log = log + \"|\";",
+        "6 ab|c\n",
+    );
+}
+
+/// A store after a nested `await` targets the receiver evaluated before it.
+#[test]
+fn nested_await_store_targets_the_receiver_captured_before_it() {
+    assert_output(
+        "let box = {o: {x: 0}};
+         let first = box.o;
+         async function f(){ box.o.x = await 5; console.log(first.x, box.o.x); }
+         f(); box.o = {x: 0};",
+        "5 0\n",
+    );
+}
+
+/// An `await` in a `for-of` body over an array keeps the loop's cursor across
+/// each resume.
+#[test]
+fn await_in_a_for_of_body() {
+    assert_output(
+        "async function f(xs){ let s = 0; for (const x of xs) { s += await x } return s }
+         f([1, 2, 3]).then(v => console.log(v));",
+        "6\n",
+    );
+}
+
+/// An `await` in a `for-in` body walks every key of the snapshot.
+#[test]
+fn await_in_a_for_in_body() {
+    assert_output(
+        "async function f(o){ let out = \"\"; for (const k in o) { out = out + k + (await o[k]); } return out }
+         f({ a: 1, b: 2 }).then(v => console.log(v));",
+        "a1b2\n",
+    );
+}
+
+/// An `await` inside a `switch` case resumes into the selected clause, and
+/// `break` after the resume leaves the switch.
+#[test]
+fn await_in_a_switch_case() {
+    assert_output(
+        "async function f(x){
+           let r = \"\";
+           switch (await x) {
+             case 1: r = r + (await \"one\"); break;
+             case 2: r = r + \"two\";
+             default: r = r + (await \"dflt\");
+           }
+           return r;
+         }
+         f(1).then(v => console.log(v));
+         f(2).then(v => console.log(v));",
+        "one\ntwodflt\n",
+    );
+}
+
+// --- %Promise.prototype% ------------------------------------------------------
+
+#[test]
+fn promise_methods_are_function_values() {
+    for (name, length) in [("then", 2), ("catch", 1), ("finally", 1)] {
+        assert_eval(&format!("typeof Promise.resolve(1).{name}"), "function");
+        assert_eval(
+            &format!("Promise.resolve(1).{name} === Promise.prototype.{name}"),
+            "true",
+        );
+        assert_eval(&format!("Promise.prototype.{name}.name"), name);
+        assert_eval(
+            &format!("Promise.prototype.{name}.length"),
+            &length.to_string(),
+        );
+    }
+}
+
+#[test]
+fn then_through_a_value() {
+    assert_output(
+        "const p = Promise.resolve(3); const then = p.then; \
+         await then.call(p, v => console.log('v', v));",
+        "v 3\n",
+    );
+    assert_output(
+        "await Promise.prototype.catch.call(Promise.reject(2), e => console.log('e', e));",
+        "e 2\n",
+    );
+    assert_uncaught(
+        "Promise.prototype.then.call({}, () => 1)",
+        "TypeError: Method Promise.prototype.then called on incompatible receiver",
+    );
+}
+
+#[test]
+fn catch_invokes_then_on_any_object() {
+    assert_output(
+        "const t = { then(a, b) { console.log(typeof a, typeof b); return 9 } }; \
+         console.log(Promise.prototype.catch.call(t, () => 1))",
+        "undefined function\n9\n",
+    );
+}
+
+#[test]
+fn user_then_and_extra_arguments() {
+    // DF12: a thenable's own `then` is called.
+    assert_eval(
+        "const t = { then(f) { return 'user' } }; t.then(() => 1)",
+        "user",
+    );
+    assert_eval(
+        "class C { then() { return 4 } finally() { return 5 } catch() { return 6 } } \
+         const c = new C(); '' + c.then() + c.finally() + c.catch()",
+        "456",
+    );
+    // Extra arguments are evaluated and ignored.
+    assert_output(
+        "let n = 0; await Promise.resolve(1).then(v => console.log(v), undefined, n++); \
+         console.log(n)",
+        "1\n1\n",
+    );
+    assert_output(
+        "await Promise.resolve(2).then(...[v => console.log(v)]);",
+        "2\n",
+    );
+}
+
+#[test]
+fn promise_prototype_override_is_honoured() {
+    assert_eval(
+        "Promise.prototype.then = function () { return 'mine' }; Promise.resolve(1).then()",
+        "mine",
     );
 }

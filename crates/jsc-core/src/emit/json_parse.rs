@@ -1,18 +1,11 @@
 //! In-wasm `JSON.parse` — a recursive-descent parser emitted as a family of
 //! runtime helpers.
 //!
-//! # Why this is possible under the fixed-shape object model
+//! # Objects
 //!
-//! Object keys are interned compile-time string pointers and `__obj_set` can
-//! only write into slots the compile-time field scan reserved — it cannot *add*
-//! a key. That restricts only *mutating* an existing object, not *allocating a
-//! fresh* object with a runtime-determined entry table. And every object consumer (`__obj_get`,
-//! `__obj_has`, `for-in`, `Object.keys`) matches keys by **byte content**
-//! (`__str_eq`), so a parsed object whose keys are runtime heap strings resolves
-//! correctly against a literal key access like `parsed.name` (which interns
-//! `"name"` and compares by content). So the parser builds objects by
-//! accumulating `(key, value)` pairs into a growable array, then materializing a
-//! fresh `TYPE_OBJECT` block sized to the member count.
+//! A parsed object is a fresh `TYPE_OBJECT` whose members are interned
+//! (`__intern`) and defined (`__define`) in source order, so a literal key
+//! access like `parsed.name` finds them by key pointer like any other property.
 //!
 //! # Cursor state
 //!
@@ -26,7 +19,7 @@
 //! # Errors
 //!
 //! Malformed (or unsupported — a `\u` escape) input calls `__json_throw`, which
-//! stashes a branded `Error` in `$exc_value`, sets `$exc_pending`, and unwinds via
+//! stashes an `Error` in `$exc_value`, sets `$exc_pending`, and unwinds via
 //! the exception-unwinding mechanism. Each helper checks `$exc_pending` after a recursive call and
 //! propagates; the emit-context [`emit_json_parse_node`] issues the final
 //! post-call `emit_propagate_if_pending` so a `try`/`catch` around `JSON.parse`
@@ -102,19 +95,6 @@ fn propagate_if_pending(function: &mut Function) {
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
-}
-
-/// Allocate a fresh empty `TYPE_ARRAY` block into i32 `local` (base offset).
-fn init_empty_array(function: &mut Function, alloc_index: u32, local: u32) {
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(local));
-    function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(byte_mem()));
-    function.instruction(&Instruction::LocalGet(local));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(len_header()));
 }
 
 /// Push the boxed heap jsval of the i32 block base in `local`.
@@ -199,7 +179,7 @@ pub(super) fn emit_json_ws() -> Function {
     function
 }
 
-/// `__json_throw() -> i64`: stash a branded `SyntaxError` in `$exc_value`, set the
+/// `__json_throw() -> i64`: stash a `SyntaxError` in `$exc_value`, set the
 /// pending flag + clear any routed completion, and return a dummy `undefined`.
 pub(super) fn emit_json_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     // The full `emit_main` scratch-local layout (starting at local 0, since this
@@ -518,7 +498,7 @@ pub(super) fn emit_json_value(helpers: Helpers<'_>) -> Function {
 
 /// `__json_array() -> i64`: parse a JSON array (cursor at `[`) into a fresh heap
 /// array, growing it element by element via `__array_push`.
-pub(super) fn emit_json_array(alloc_index: u32, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_json_array(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![
         (1, ValType::I32),
         (1, ValType::I64),
@@ -527,7 +507,9 @@ pub(super) fn emit_json_array(alloc_index: u32, helpers: Helpers<'_>) -> Functio
     let (arr, elem, c) = (0, 1, 2);
 
     advance(&mut function); // consume '['
-    init_empty_array(&mut function, alloc_index, arr);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::Call(helpers.new_array()));
+    function.instruction(&Instruction::LocalSet(arr));
     function.instruction(&Instruction::Call(helpers.json_ws));
     // Empty array: if next is ']', consume it and return the empty array.
     at_end(&mut function);
@@ -549,11 +531,11 @@ pub(super) fn emit_json_array(alloc_index: u32, helpers: Helpers<'_>) -> Functio
     function.instruction(&Instruction::Call(helpers.json_value));
     function.instruction(&Instruction::LocalSet(elem));
     propagate_if_pending(&mut function);
-    // arr = __array_push(arr, element).
+    // __array_push(arr, element).
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(elem));
     function.instruction(&Instruction::Call(helpers.array_push));
-    function.instruction(&Instruction::LocalSet(arr));
+    function.instruction(&Instruction::Drop);
     function.instruction(&Instruction::Call(helpers.json_ws));
     // if at_end: unterminated -> throw.
     at_end(&mut function);
@@ -585,19 +567,27 @@ pub(super) fn emit_json_array(alloc_index: u32, helpers: Helpers<'_>) -> Functio
     function
 }
 
-/// `__json_object() -> i64`: parse a JSON object (cursor at `{`). Members are
-/// accumulated as alternating `(key, value)` elements in a growable array, then
-/// materialized into a fresh `TYPE_OBJECT` via `__array_to_object`.
+/// `__json_object() -> i64`: parse a JSON object (cursor at `{`) into a fresh
+/// `TYPE_OBJECT`, defining each member (key interned) through `__define` in
+/// source order — a duplicate key overwrites the earlier slot in place.
 pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![
         (1, ValType::I32),
         (2, ValType::I64),
         (1, ValType::I32),
     ]);
-    let (pairs, k, v, c) = (0, 1, 2, 3);
+    let (obj, k, v, c) = (0, 1, 2, 3);
 
     advance(&mut function); // consume '{'
-    init_empty_array(&mut function, alloc_index, pairs);
+    function.instruction(&Instruction::I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()));
+    function.instruction(&Instruction::Call(alloc_index));
+    function.instruction(&Instruction::LocalSet(obj));
+    emit_object_prefix(
+        &mut function,
+        obj,
+        TYPE_OBJECT,
+        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
+    );
     function.instruction(&Instruction::Call(helpers.json_ws));
     // Empty object: if next is '}', consume it and skip the member loop.
     at_end(&mut function);
@@ -649,15 +639,14 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::Call(helpers.json_value));
     function.instruction(&Instruction::LocalSet(v));
     propagate_if_pending(&mut function);
-    // pairs = push(push(pairs, k), v).
-    function.instruction(&Instruction::LocalGet(pairs));
+    // __define(obj, __intern(k), v, ATTRS_DEFAULT).
+    function.instruction(&Instruction::LocalGet(obj));
     function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::Call(helpers.array_push));
-    function.instruction(&Instruction::LocalSet(pairs));
-    function.instruction(&Instruction::LocalGet(pairs));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.intern));
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::Call(helpers.array_push));
-    function.instruction(&Instruction::LocalSet(pairs));
+    function.instruction(&Instruction::I32Const(abi::ATTRS_DEFAULT.cast_signed()));
+    function.instruction(&Instruction::Call(helpers.define));
     function.instruction(&Instruction::Call(helpers.json_ws));
     // if at_end: unterminated -> throw.
     at_end(&mut function);
@@ -685,97 +674,10 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 
-    // Materialize the object from the accumulated (key, value) pairs and box it.
-    function.instruction(&Instruction::LocalGet(pairs));
-    function.instruction(&Instruction::Call(helpers.array_to_object));
+    function.instruction(&Instruction::LocalGet(obj));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// `__array_to_object(pairs: i32) -> i32`: build a fresh `TYPE_OBJECT` block from a
-/// `pairs` array of alternating `[k0, v0, k1, v1, …]`, one entry per `(key, value)`
-/// pair. Returns the new object block base.
-pub(super) fn emit_array_to_object(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(3, ValType::I32)]);
-    let (pairs, n, obj, j) = (0, 1, 2, 3);
-    let key_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let val_slot = MemArg {
-        offset: (HEADER_SIZE + 12) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-
-    // n = load_u32(pairs + HEADER_SIZE) / 2 (entry count).
-    function.instruction(&Instruction::LocalGet(pairs));
-    function.instruction(&Instruction::I32Load(len_header()));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32ShrU);
-    function.instruction(&Instruction::LocalSet(n));
-    // obj = __alloc(HEADER_SIZE + 4 + 16*n); write TYPE_OBJECT + n header.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(obj));
-    function.instruction(&Instruction::LocalGet(obj));
-    function.instruction(&Instruction::I32Const(TYPE_OBJECT));
-    function.instruction(&Instruction::I32Store8(byte_mem()));
-    function.instruction(&Instruction::LocalGet(obj));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32Store(len_header()));
-
-    // Copy entry j: key from pairs slot 2j, value from slot 2j+1. Both source and
-    // dest entry j live at base + 16*j (key at +HEADER_SIZE+4, value at +12).
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // dst key: obj + 16*j <- load(pairs + 16*j).
-    function.instruction(&Instruction::LocalGet(obj));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(pairs));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::I64Store(key_slot));
-    // dst value: obj + 16*j <- load(pairs + 16*j) at the value slot.
-    function.instruction(&Instruction::LocalGet(obj));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(pairs));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(val_slot));
-    function.instruction(&Instruction::I64Store(val_slot));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(j));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-
-    function.instruction(&Instruction::LocalGet(obj));
     function.instruction(&Instruction::End);
     function
 }

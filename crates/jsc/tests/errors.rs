@@ -86,24 +86,20 @@ fn unsupported_statement_renders_caret_diagnostic() {
     assert!(stderr.contains('^'), "got: {stderr}");
 }
 
-/// A codegen-rejected *unknown identifier* now carries the offending name's
-/// span: `NaN2 + 1` points a caret at column 1 (`NaN2`), proving the D3 span
-/// sweep reaches the `undeclared variable` path.
+/// An *unknown identifier* is resolved against the global object at run
+/// time (DESIGN.md §6.4): `NaN2 + 1` compiles and throws an uncaught
+/// `ReferenceError` (exit 1).
 #[test]
-fn undeclared_identifier_renders_caret_at_column_one() {
+fn undeclared_identifier_throws_reference_error_at_run_time() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "NaN2 + 1"])
         .output()
         .expect("failed to spawn jsc binary");
-    assert!(output.status.code() == Some(2), "must exit 2");
+    assert!(output.status.code() == Some(1), "must exit 1");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(":1:1"),
-        "stderr should locate the unknown identifier at column 1, got: {stderr}"
-    );
-    assert!(
-        stderr.contains('^'),
-        "stderr should draw a caret under the identifier, got: {stderr}"
+        stderr.contains("Uncaught ReferenceError: NaN2 is not defined"),
+        "got: {stderr}"
     );
 }
 
@@ -215,7 +211,7 @@ fn recoverable_parse_error_renders_caret_diagnostic() {
 }
 
 /// Consolidated diagnostics contract (§9): a table of distinct compile-error
-/// classes — a `const` reassignment, an undeclared variable, a `for-of` loop,
+/// classes — a `const` reassignment, a `for-of` loop,
 /// and an swc parse error — each renders the rustc/swc-style block, so every
 /// rendered stderr must carry BOTH a `:1:` line:col locator AND a `^` caret.
 /// This spans parse rejections and every codegen-rejection path in one place.
@@ -224,7 +220,6 @@ fn compile_errors_render_locator_and_caret() {
     // (source, a human label for the failure message)
     let cases = [
         ("const c = 1; c = 2", "const reassignment"),
-        ("NaN2 + 1", "undeclared variable"),
         ("for (x of [1,2]) x", "for-of loop"),
         ("for (let i=0;i<3;i=i+1) break nope", "unknown break label"),
         ("foo: { break foo }", "label on non-loop"),
@@ -339,23 +334,24 @@ fn uncaught_throw_exits_one() {
     );
 }
 
-/// An UNCAUGHT absent-property write fails the process like any uncaught
-/// `TypeError`: exit 1 with the message on stderr.
+/// An UNCAUGHT `TypeError` from a property write fails the process: exit 1
+/// with the message on stderr (a store on a primitive throws).
 #[test]
-fn uncaught_absent_property_write_exits_one() {
+fn uncaught_property_write_error_exits_one() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", "let o = {}; o.x = 1; console.log(\"unreachable\")"])
+        .args([
+            "-e",
+            "let s = \"x\"; s.foo = 1; console.log(\"unreachable\")",
+        ])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(
         output.status.code() == Some(1),
-        "an uncaught absent-property write must make jsc exit 1"
+        "an uncaught property-write error must make jsc exit 1"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(
-            "Uncaught TypeError: Cannot add property 'x': dynamic properties are not supported yet"
-        ),
+        stderr.contains("Uncaught TypeError: Cannot create property 'foo' on string 'x'"),
         "stderr should report the TypeError, got: {stderr}"
     );
     assert!(
@@ -364,29 +360,25 @@ fn uncaught_absent_property_write_exits_one() {
     );
 }
 
-/// The add-property `TypeError` unwinds through `finally` and nested function
-/// frames to the nearest handler.
+/// A property-write `TypeError` (a store on a primitive) unwinds through
+/// `finally` and nested function frames to the nearest handler.
 #[test]
-fn absent_property_write_unwinds_through_finally_and_calls() {
+fn property_write_error_unwinds_through_finally_and_calls() {
     assert_eq!(
         jsc(&[
             "-p",
-            "let log=\"\"; function f(o){ try { o.x = 1; log+=\"no\" } finally { log+=\"f\" } } \
-             try { f({a:1}) } catch(e) { log+=\"|\"+e.name } log"
+            "let log=\"\"; function f(o){ try { o[\"foo\"] = 1; log+=\"no\" } finally { log+=\"f\" } } \
+             try { f(\"x\") } catch(e) { log+=\"|\"+e.name } log"
         ]),
         "f|TypeError"
     );
 }
 
-/// Out-of-scope object method forms (getter/setter, computed method name,
-/// async/generator methods) are rejected at compile time with exit code 2 and
+/// Out-of-scope object method forms (async/generator methods) are rejected at compile time with exit code 2 and
 /// an explanatory message.
 #[test]
 fn unsupported_object_methods_error() {
     let cases = [
-        ("let o={get x(){return 1}}; o.x", "getter"),
-        ("let o={set x(v){}}; 1", "setter"),
-        ("let k=\"m\"; let o={[k](){return 1}}; 1", "key"),
         ("let o={async m(){return 1}}; 1", "async"),
         ("let o={*m(){return 1}}; 1", "generator"),
     ];
@@ -408,19 +400,15 @@ fn unsupported_object_methods_error() {
 }
 
 /// Out-of-scope class forms are rejected at compile time with a
-/// non-zero exit and an explanatory, spanned message. A class with a constructor,
-/// plain instance methods, and `static` members is supported (see the classes
-/// suite); inheritance, decorators, and every out-of-scope method/field form
-/// (getter, setter, private, computed, async, generator) stay out of scope.
+/// non-zero exit and an explanatory, spanned message. Constructors, methods,
+/// accessors (instance and static), fields, `extends`, and class expressions
+/// are supported (see the classes suites); computed, private, async, and
+/// generator members stay out of scope.
 #[test]
 fn unsupported_class_forms_error() {
     let cases = [
-        ("class A extends B {} 1", "extends"),
         ("class A{ [k] = 1 } 1", "computed"),
-        // Instance accessors are supported; a STATIC getter/setter is not.
-        ("class A{ static get v(){return 1} } 1", "getter"),
-        ("class A{ static set v(x){} } 1", "setter"),
-        // A computed instance accessor is still rejected.
+        // A computed accessor is still rejected.
         ("class A{ get [k](){return 1} } 1", "computed"),
         ("class A{ #p = 1 } 1", "private"),
         ("class A{ [k](){} } 1", "computed"),
@@ -442,4 +430,48 @@ fn unsupported_class_forms_error() {
             "stderr for `{src}` should mention `{needle}`, got: {stderr}"
         );
     }
+}
+
+/// An unhandled promise rejection fails the process after the microtask queue
+/// drains: exit 1 with `Uncaught (in promise) <value>` on stderr.
+#[test]
+fn unhandled_rejection_exits_one() {
+    let cases = [
+        (
+            "Promise.reject(new Error(\"x\"))",
+            "Uncaught (in promise) Error: x",
+        ),
+        (
+            "async function f() { throw new TypeError(\"t\") } f()",
+            "Uncaught (in promise) TypeError: t",
+        ),
+        ("Promise.reject(1)", "Uncaught (in promise) 1"),
+    ];
+    for (src, needle) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+            .args(["-e", src])
+            .output()
+            .expect("failed to spawn jsc binary");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{src}` must make jsc exit 1"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(needle),
+            "stderr for `{src}` should contain `{needle}`, got: {stderr}"
+        );
+    }
+}
+
+/// A handled rejection exits 0 with nothing on stderr.
+#[test]
+fn handled_rejection_exits_zero() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+        .args(["-e", "Promise.reject(1).catch(() => {})"])
+        .output()
+        .expect("failed to spawn jsc binary");
+    assert_eq!(output.status.code(), Some(0), "a caught rejection exits 0");
+    assert!(output.stderr.is_empty(), "stderr must be empty");
 }

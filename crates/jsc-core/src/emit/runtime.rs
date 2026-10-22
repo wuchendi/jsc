@@ -2,10 +2,15 @@
 use super::*;
 
 /// Emit the `__alloc(size: i32) -> i32` bump allocator: return the current
-/// `__heap_ptr`, then advance it by `size`, growing linear memory on demand.
+/// `__heap_ptr`, then advance it by `size` rounded up to [`BLOCK_ALIGN`] (so
+/// every block base stays 8-aligned), growing linear memory on demand, and write
+/// the block's [`HEADER_SIZE`] header bytes 0 (the type byte the caller then
+/// stores, plus the reserved `gc`/`flags`/`class` bytes). Every caller requests
+/// at least a header, so `size > 0`.
 ///
-/// The end offset is computed in `i64` (both operands zero-extended), so it can
-/// never wrap; the fast path is one compare against `memory.size * 64 KiB`. On
+/// The end offset is computed in `i64` (both operands zero-extended), so neither
+/// the rounding nor the add can wrap; the fast path is one compare against
+/// `memory.size * 64 KiB`. On
 /// overflow the cold path grows by `max(needed, current)` pages (at least
 /// doubling), falling back to exactly the needed pages. When even that fails
 /// (the module's memory `maximum` is reached) it stores the sticky
@@ -20,12 +25,16 @@ pub(super) fn emit_alloc() -> Function {
         (1, ValType::I32),
     ]);
     let (size, old, end, need) = (0, 1, 2, 3);
-    // old = __heap_ptr; end = u64(old) + u64(size).
+    // old = __heap_ptr; end = u64(old) + ((u64(size) + 7) & !7).
     function.instruction(&Instruction::GlobalGet(HEAP_PTR_GLOBAL));
     function.instruction(&Instruction::LocalTee(old));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::LocalGet(size));
     function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(i64::from(BLOCK_ALIGN - 1)));
+    function.instruction(&Instruction::I64Add);
+    function.instruction(&Instruction::I64Const(-i64::from(BLOCK_ALIGN)));
+    function.instruction(&Instruction::I64And);
     function.instruction(&Instruction::I64Add);
     function.instruction(&Instruction::LocalTee(end));
     // if end > memory.size << 16: grow.
@@ -69,11 +78,168 @@ pub(super) fn emit_alloc() -> Function {
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    // __heap_ptr = end; return old.
+    // __heap_ptr = end; zero the header at old; return old.
     function.instruction(&Instruction::LocalGet(end));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::GlobalSet(HEAP_PTR_GLOBAL));
     function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// Emit `__alloc(size)` for a block of kind `type_byte`, store the type byte,
+/// and leave the base in local `base`.
+fn emit_new_block(function: &mut Function, alloc: u32, base: u32, type_byte: i32) {
+    function.instruction(&Instruction::Call(alloc));
+    function.instruction(&Instruction::LocalTee(base));
+    function.instruction(&Instruction::I32Const(type_byte));
+    function.instruction(&Instruction::I32Store8(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+}
+
+/// Emit the exported `__new_string(len: i32) -> i32` constructor: a
+/// [`TYPE_STRING`] block `[0][0×3][len:u32][len bytes]` whose payload the host
+/// fills. Local 0 is `len`; local 1 the base.
+pub(super) fn emit_new_string(alloc: u32) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
+    let (len, base) = (0, 1);
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Add);
+    emit_new_block(&mut function, alloc, base, TYPE_STRING);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: HEADER_SIZE as u64,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// A 4-byte-aligned `u32` [`MemArg`] at `offset`.
+fn mem32(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 2,
+        memory_index: 0,
+    }
+}
+
+/// An 8-byte-aligned `i64` [`MemArg`] at `offset`.
+fn mem64(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+/// Emit `store = __alloc(8 + 8 * cap)` as a [`TYPE_ELEMS`] block with its
+/// `cap` written, leaving the base in local `store`.
+fn emit_new_elems(function: &mut Function, alloc: u32, cap: u32, store: u32) {
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
+    function.instruction(&Instruction::I32Add);
+    emit_new_block(function, alloc, store, TYPE_ELEMS);
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::I32Store(mem32(ELEMS_CAP_OFFSET)));
+}
+
+/// Emit the exported `__new_array(len: i32) -> i32` constructor: a
+/// [`TYPE_ARRAY`] handle (`proto` = `%Array.prototype%`, the jsval `proto`)
+/// with `len` set and, when `len > 0`, a `cap = len`
+/// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
+/// locals 1/2/3 the handle base, the store base, and the element cursor.
+pub(super) fn emit_new_array(alloc: u32, proto: i64) -> Function {
+    let mut function = Function::new(vec![(3, ValType::I32)]);
+    let (len, base, store, at) = (0, 1, 2, 3);
+    function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
+    function.instruction(&Instruction::Call(alloc));
+    function.instruction(&Instruction::LocalSet(base));
+    emit_object_prefix(&mut function, base, TYPE_ARRAY, proto);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    emit_new_elems(&mut function, alloc, len, store);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
+    // for (at = store; at < store + 8 * len; at += 8) *(at + 8) = undefined.
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::LocalSet(at));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I32Const(8));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(at));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// Emit the exported `__new_promise() -> i32` constructor: a pending
+/// [`abi::TYPE_PROMISE`] block with prototype `proto` (`%Promise.prototype%`),
+/// `state = PENDING`, and
+/// `value = undefined`. Local 0 is the base.
+pub(super) fn emit_new_promise(alloc: u32, proto: i64) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
+    let base = 0;
+    function.instruction(&Instruction::I32Const(PROMISE_BLOCK_SIZE));
+    function.instruction(&Instruction::Call(alloc));
+    function.instruction(&Instruction::LocalSet(base));
+    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE), proto);
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Const(abi::PROMISE_PENDING));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: PROMISE_STATE_OFFSET,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Store(MemArg {
+        offset: PROMISE_VALUE_OFFSET,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::End);
     function
 }
@@ -88,20 +254,11 @@ pub(super) fn emit_alloc() -> Function {
 /// argument count (`1`), and the funcref-table index, then `call_indirect`. The
 /// callback's result is left on the stack; a throw inside it sets `__exc_pending`
 /// (which the host checks after the call), so no propagation is emitted here.
-///
-/// When the program declares no user functions (`fn_type == 0`, so there is no
-/// funcref table), no callback can exist, so the body degenerates to returning
-/// `undefined` — keeping the exported function valid and total. The two `i64`
-/// params occupy locals 0/1; one extra `i32` local holds the callee block base.
+/// The two `i64` params occupy locals 0/1; one extra `i32` local holds the
+/// callee block base.
 pub(super) fn emit_invoke1(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let (callee, arg, base) = (0, 1, 2);
-    // No functions in the program: no table, so return `undefined` unconditionally.
-    if helpers.fn_type == 0 {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::End);
-        return function;
-    }
     // base = i32.wrap(callee).
     function.instruction(&Instruction::LocalGet(callee));
     function.instruction(&Instruction::I32WrapI64);
@@ -117,19 +274,19 @@ pub(super) fn emit_invoke1(helpers: Helpers<'_>) -> Function {
     // A callback runs as a plain call: bind `this = undefined`.
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
-    // Trailing env argument: the callee's own environment (at +HEADER_SIZE+4).
+    // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Load(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
+        offset: FUNC_ENV_OFFSET,
         align: 3,
         memory_index: 0,
     }));
     // Argument count (env-last ABI): exactly one, as a number jsval.
     function.instruction(&Instruction::I64Const(1.0_f64.to_bits().cast_signed()));
-    // Funcref-table index (at +HEADER_SIZE), on top for call_indirect.
+    // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: FUNC_INDEX_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -491,1040 +648,228 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the `__obj_get(obj_ptr: i32, key_ptr: i32) -> i64` property reader.
+/// Emit the `__array_reserve(base: i32, need: i32)` store grower.
 ///
-/// `obj_ptr` is the byte offset of a `[n:u32][key_ptr:i64, val:i64]..` heap
-/// object; `key_ptr` is the byte offset of the `[len:u32][utf8]` key string to
-/// look up. It reads the `n` header, then linear-scans entries `0..n`: entry `k`
-/// lives at `obj_ptr + 16*k`, its key jsval at offset `+4` and its value jsval at
-/// offset `+12`. The stored key's low 32 bits are the candidate key string
-/// offset, compared by byte content against `key_ptr` via `__str_eq` (at
-/// `str_eq_index`). The first match's value jsval is returned. On an own miss, the
-/// PROTOTYPE FALLBACK kicks in when `proto_key` is `Some(off)` — the
-/// interned byte offset of the reserved `@@prototype` key: a second scan reads the
-/// object's own `@@prototype` slot, and if it holds a heap pointer (a class's
-/// shared prototype object) the lookup recurses into it via `self_index` (this
-/// function's own wasm index), so `instance.method` resolves on the prototype. Own
-/// properties always win — the fallback runs only after the own scan fails.
-/// Recursion terminates because a prototype object carries no `@@prototype` of its
-/// own (the miss there yields `undefined`, stopping the chain). If no key resolves
-/// — own or through the chain — the `undefined` bits are returned. When
-/// `proto_key` is `None` (a program with no class, so `@@prototype` is never
-/// interned) the fallback is omitted entirely, leaving the
-/// plain own-key lookup. Params occupy locals 0/1; two extra `i32` locals hold
-/// `n` and the loop index `k`, plus (with the fallback) one `i64` local for the
-/// resolved prototype value. Modeled on [`emit_str_eq`].
-// A single flat instruction stream (the own scan plus the optional prototype-
-// fallback scan), so the length reflects the two loops rather than real branching.
-#[allow(clippy::too_many_lines)]
-pub(super) fn emit_obj_get(str_eq_index: u32, self_index: u32, proto_key: Option<i32>) -> Function {
-    let locals = if proto_key.is_some() {
-        vec![(2, ValType::I32), (1, ValType::I64)]
-    } else {
-        vec![(2, ValType::I32)]
-    };
-    let mut function = Function::new(locals);
-    let (obj_ptr, key_ptr, n, k) = (0, 1, 2, 3);
-    // The resolved prototype value (i64), used only when the fallback is emitted.
-    let proto = 4;
-    // The block header shifts every slot by HEADER_SIZE: `n` at `+HEADER_SIZE`,
-    // entry `k` key at `+HEADER_SIZE+4+16*k`, its value at `+8` from the key.
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let key_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let val_slot = MemArg {
-        offset: (HEADER_SIZE + 12) as u64,
-        align: 0,
-        memory_index: 0,
-    };
+/// When the array handle's capacity (the `cap` of its [`TYPE_ELEMS`] store, `0`
+/// with no store) is below `need`, it allocates a fresh store of
+/// `cap' = max(need, 4, 2 * cap)` slots, `memory.copy`s the `len` live slots
+/// into it, and repoints the handle's `elems`; the handle never moves. Locals
+/// 0/1 are the params; extra `i32` locals hold the old store, `cap`, and the
+/// new store.
+pub(super) fn emit_array_reserve(alloc_index: u32) -> Function {
+    let mut function = Function::new(vec![(3, ValType::I32)]);
+    let (base, need, old, cap, store) = (0, 1, 2, 3, 4);
 
-    // n = load(obj_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-
-    // Scan entries; `k` starts at 0 (the fresh local's default).
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if k >= n { break -> no match }.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
+    // old = base.elems; cap = old ? old.cap : 0.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalTee(old));
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Load(mem32(ELEMS_CAP_OFFSET)));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalTee(cap));
+    // if cap >= need: nothing to do.
+    function.instruction(&Instruction::LocalGet(need));
     function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // candidate_key = i32.wrap(load_i64(obj_ptr + 16*k + 4)).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    // if __str_eq(candidate_key, key_ptr) { return load_i64(obj_ptr + 16*k + 12) }.
-    function.instruction(&Instruction::LocalGet(key_ptr));
-    function.instruction(&Instruction::Call(str_eq_index));
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(val_slot));
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
+
+    // cap = max(4, 2 * cap); cap = max(cap, need).
+    function.instruction(&Instruction::LocalGet(cap));
     function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::LocalTee(cap));
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::I32Const(4));
+    function.instruction(&Instruction::I32GtU);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::LocalTee(cap));
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::LocalGet(need));
+    function.instruction(&Instruction::I32GtU);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::LocalSet(cap));
+    emit_new_elems(&mut function, alloc_index, cap, store);
 
-    // Own miss. If the fallback is enabled, resolve the key through the object's
-    // `@@prototype` chain before giving up.
-    if let Some(proto_key) = proto_key {
-        // proto = undefined; then a second own-only scan sets it to the object's
-        // `@@prototype` value (leaving it `undefined` if the object has none).
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::LocalSet(proto));
-        function.instruction(&Instruction::I32Const(0));
-        function.instruction(&Instruction::LocalSet(k));
-        function.instruction(&Instruction::Block(BlockType::Empty));
-        function.instruction(&Instruction::Loop(BlockType::Empty));
-        // if k >= n { break -> no prototype }.
-        function.instruction(&Instruction::LocalGet(k));
-        function.instruction(&Instruction::LocalGet(n));
-        function.instruction(&Instruction::I32GeU);
-        function.instruction(&Instruction::BrIf(1));
-        // candidate_key = i32.wrap(load_i64(obj_ptr + 16*k + 4)).
-        function.instruction(&Instruction::LocalGet(obj_ptr));
-        function.instruction(&Instruction::LocalGet(k));
-        function.instruction(&Instruction::I32Const(16));
-        function.instruction(&Instruction::I32Mul);
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::I64Load(key_slot));
-        function.instruction(&Instruction::I32WrapI64);
-        // if __str_eq(candidate_key, proto_key) { proto = value; leave the scan }.
-        function.instruction(&Instruction::I32Const(proto_key));
-        function.instruction(&Instruction::Call(str_eq_index));
-        function.instruction(&Instruction::If(BlockType::Empty));
-        function.instruction(&Instruction::LocalGet(obj_ptr));
-        function.instruction(&Instruction::LocalGet(k));
-        function.instruction(&Instruction::I32Const(16));
-        function.instruction(&Instruction::I32Mul);
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::I64Load(val_slot));
-        function.instruction(&Instruction::LocalSet(proto));
-        function.instruction(&Instruction::Br(2)); // proto found; exit the scan block
-        function.instruction(&Instruction::End);
-        // k += 1; continue.
-        function.instruction(&Instruction::LocalGet(k));
-        function.instruction(&Instruction::I32Const(1));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::LocalSet(k));
-        function.instruction(&Instruction::Br(0));
-        function.instruction(&Instruction::End); // loop
-        function.instruction(&Instruction::End); // block
-        // A prototype was found (its value is not `undefined`): recurse into it for
-        // the SAME key. A prototype object has no `@@prototype`, so its own miss
-        // returns `undefined` and the chain stops.
-        function.instruction(&Instruction::LocalGet(proto));
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::I64Ne);
-        function.instruction(&Instruction::If(BlockType::Empty));
-        function.instruction(&Instruction::LocalGet(proto));
-        function.instruction(&Instruction::I32WrapI64);
-        function.instruction(&Instruction::LocalGet(key_ptr));
-        function.instruction(&Instruction::Call(self_index));
-        function.instruction(&Instruction::Return);
-        function.instruction(&Instruction::End);
-    }
-
-    // No key matched (own or through the prototype chain): yield `undefined`.
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the `__obj_set(obj_ptr: i32, key_ptr: i32, val: i64) -> i32` property
-/// writer.
-///
-/// `obj_ptr` is the byte offset of a `[n:u32][key_ptr:i64, val:i64]..` heap
-/// object; `key_ptr` is the byte offset of the `[len:u32][utf8]` key to store
-/// under. It reads the `n` header, then linear-scans entries `0..n` exactly like
-/// [`emit_obj_get`]: entry `k` lives at `obj_ptr + 16*k`, its key jsval at offset
-/// `+4`, its value jsval at offset `+12`. On the first key whose byte content
-/// equals `key_ptr` (via `__str_eq` at `str_eq_index`), `val` is stored into that
-/// entry's value slot and `1` is returned. If no key matches, nothing is written
-/// (existing keys only — growth is deferred) and `0` is returned; the caller
-/// branches on that flag into the out-of-line `__prop_throw`, so a hit costs
-/// the store plus one caller-side `i32.eqz`/`if`. Params occupy locals 0/1/2;
-/// two extra `i32` locals hold `n` and the loop index `k`.
-pub(super) fn emit_obj_set(str_eq_index: u32) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
-    let (obj_ptr, key_ptr, val, n, k) = (0, 1, 2, 3, 4);
-    // The block header shifts every slot by HEADER_SIZE: `n` at `+HEADER_SIZE`,
-    // entry `k` key at `+HEADER_SIZE+4+16*k`, its value at `+8` from the key.
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let key_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let val_slot = MemArg {
-        offset: (HEADER_SIZE + 12) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-
-    // n = load(obj_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-
-    // Scan entries; `k` starts at 0 (the fresh local's default).
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if k >= n { break -> no match }.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // candidate_key = i32.wrap(load_i64(obj_ptr + 16*k + 4)).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    // if __str_eq(candidate_key, key_ptr) { store val at obj_ptr + 16*k + 12; return 1 }.
-    function.instruction(&Instruction::LocalGet(key_ptr));
-    function.instruction(&Instruction::Call(str_eq_index));
+    // if old: memory.copy(store + 8, old + 8, 8 * len).
+    function.instruction(&Instruction::LocalGet(old));
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I64Store(val_slot));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
-
-    // No key matched: report the miss.
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the `__obj_rest(obj_ptr: i32, excl_ptr: i32) -> i32` object-rest builder.
-///
-/// `obj_ptr` is the base offset of a `[n:u32][(key_ptr:i64, val:i64) × n]` heap
-/// object; `excl_ptr` is the base offset of a `[len:u32][key_ptr:i64 × len]` heap
-/// array of the destructured key strings to EXCLUDE. It bump-allocates a fresh
-/// object of worst-case capacity `n`, then linear-scans the source entries: an
-/// entry whose key is byte-equal (via `__str_eq` at `str_eq_index`) to any
-/// excluded key is skipped, every other `(key, val)` pair is copied into the new
-/// block, and the surviving count `m` is written as the new `n` header. The
-/// abandoned surplus slots (when keys were excluded) are harmless under the bump
-/// allocator. Returns the new block base. The two `i32` params occupy locals
-/// 0/1; eight extra `i32` locals hold `n`, `excl`, `dst`, `m`, `k`, `key`,
-/// `excluded`, and `j`. Modeled on [`emit_obj_get`].
-// A single flat instruction stream (two nested scan loops), so the length is the
-// instruction count rather than any real branching complexity.
-#[allow(clippy::too_many_lines)]
-pub(super) fn emit_obj_rest(alloc_index: u32, str_eq_index: u32) -> Function {
-    let mut function = Function::new(vec![(8, ValType::I32)]);
-    let (obj_ptr, excl_ptr, n, excl, dst) = (0, 1, 2, 3, 4);
-    let (m, k, key, excluded, j) = (5, 6, 7, 8, 9);
-    // Block header: `n`/`len` at `+HEADER_SIZE`; object entry `k` key at
-    // `+HEADER_SIZE+4+16*k`, its value at `+8` from the key; array element `j` at
-    // `+HEADER_SIZE+4+8*j`.
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let key_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let val_slot = MemArg {
-        offset: (HEADER_SIZE + 12) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let elem_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-
-    // n = load(obj_ptr + HEADER_SIZE); excl = load(excl_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-    function.instruction(&Instruction::LocalGet(excl_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(excl));
-
-    // dst = __alloc(HEADER_SIZE + 4 + 16*n).
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-
-    // Write the TYPE_OBJECT type byte at dst (offset 0). `m`/`k` start at 0.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_OBJECT));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-
-    // Scan source entries `0..n`.
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // key = i32.wrap(load_i64(obj_ptr + 16*k + key_slot)).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(key));
-    // excluded = 0; j = 0.
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(excluded));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(j));
-    // Scan excluded keys `0..excl`, setting `excluded` on a byte-content match.
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::LocalGet(excl));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // if __str_eq(key, i32.wrap(load_i64(excl_ptr + 8*j + elem_slot))) { excluded = 1 }.
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::LocalGet(excl_ptr));
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(elem_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::Call(str_eq_index));
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalSet(excluded));
-    function.instruction(&Instruction::End);
-    // j += 1; continue the inner loop.
-    function.instruction(&Instruction::LocalGet(j));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(j));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if j < excl
-    function.instruction(&Instruction::End); // inner loop
-    // if !excluded: copy the (key, val) pair into dst entry m; m += 1.
-    function.instruction(&Instruction::LocalGet(excluded));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // store key: dst + 16*m + key_slot = load_i64(obj_ptr + 16*k + key_slot).
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::I64Store(key_slot));
-    // store val: dst + 16*m + val_slot = load_i64(obj_ptr + 16*k + val_slot).
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(val_slot));
-    function.instruction(&Instruction::I64Store(val_slot));
-    // m += 1.
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(m));
-    function.instruction(&Instruction::End); // if !excluded
-    // k += 1; continue the outer loop.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // outer loop
-
-    // Store the surviving count `m` as the new u32 `n` header, then return dst.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Store(header));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the `__array_push(base: i32, value: i64) -> i32` array grower.
-///
-/// The bump allocator has no free list, so growing a fixed-size array block means
-/// allocating a fresh, larger block and abandoning the old one. It reads the u32
-/// `len` header at `base + HEADER_SIZE`, bump-allocates `HEADER_SIZE + 4 + 8*(len +
-/// 1)` bytes via `__alloc` (at `alloc_index`), `memory.copy`s the entire old block
-/// prefix (`TYPE_ARRAY` byte + `len` header + `len` element slots) into it, appends
-/// `value` at the new last slot (`dst + HEADER_SIZE + 4 + 8*len`), bumps the length
-/// header to `len + 1`, and returns the new block base. The two params occupy
-/// locals 0/1; two extra `i32` locals hold `len` and `dst`.
-pub(super) fn emit_array_push(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
-    let (base, value, len, dst) = (0, 1, 2, 3);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let payload = (HEADER_SIZE + 4) as u64;
-
-    // len = load u32 header at base + HEADER_SIZE.
     function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(len));
-
-    // dst = __alloc(HEADER_SIZE + 4 + 8*(len + 1)); leave dst in its local.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-
-    // memory.copy(dst, base, HEADER_SIZE + 4 + 8*len): the type byte, the u32 len
-    // header, and every existing element slot.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::MemoryCopy {
         src_mem: 0,
         dst_mem: 0,
     });
+    function.instruction(&Instruction::End);
 
-    // Append value at dst + HEADER_SIZE + 4 + 8*len.
-    function.instruction(&Instruction::LocalGet(dst));
+    // base.elems = store.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// Emit the `__array_push(base: i32, value: i64) -> i32` in-place appender:
+/// `__array_reserve(base, len + 1)`, store `value` at slot `len` of the
+/// element store, bump `len`, and return the (unchanged) handle base; a
+/// `SPARSE` array appends through `__sparse_set` (function `sparse_set`). The
+/// two params occupy locals 0/1; an extra `i32` local holds `len`.
+pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
+    let (base, value, len) = (0, 1, 2);
+
+    // SPARSE: __sparse_set(base, len, value); return base.
+    emit_is_sparse(&mut function, base);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::Call(sparse_set));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
+
+    // len = base.len; __array_reserve(base, len + 1).
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalTee(len));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::Call(reserve_index));
+
+    // base.elems[len] = value.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(value));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload,
-        align: 0,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
 
-    // Bump the u32 len header to len + 1.
-    function.instruction(&Instruction::LocalGet(dst));
+    // base.len = len + 1; return base.
+    function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(header));
-
-    // Return the new block base.
-    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::End);
     function
 }
 
-/// Emit the `__array_concat(dst: i32, src: i32) -> i32` array joiner.
-///
-/// Like [`emit_array_push`], the bump allocator has no free list, so appending
-/// one array's elements to another means allocating a fresh block. It reads the
-/// u32 `len` headers of both source blocks, bump-allocates `HEADER_SIZE + 4 +
-/// 8*(dlen + slen)` bytes via `__alloc` (at `alloc_index`), `memory.copy`s the
-/// `dst` prefix (`TYPE_ARRAY` byte + `dlen` header + `dlen` element slots) into
-/// it, `memory.copy`s `src`'s `slen` element slots right after them, writes the
-/// combined length header, and returns the new block base. The two params occupy
-/// locals 0/1; three extra `i32` locals hold `dlen`, `slen`, and `nb`.
-pub(super) fn emit_array_concat(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(3, ValType::I32)]);
-    let (dst, src, dlen, slen, nb) = (0, 1, 2, 3, 4);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let prefix = HEADER_SIZE + 4;
+/// Emit the `__array_concat(dst: i32, src: i32) -> i32` in-place joiner:
+/// `__array_reserve(dst, dlen + slen)`, append `src`'s `slen` elements after
+/// `dst`'s (a spread reads each through the iterator, so a hole is appended as
+/// `undefined`), write the combined length, and return `dst`. A `SPARSE`
+/// `src` is read element by element through `__sparse_get` (function
+/// `sparse_get`) and appended by `__array_push`. The two params occupy locals
+/// 0/1; extra `i32` locals hold `dlen`, `slen`, and the two element cursors,
+/// an `i64` local the element.
+pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32) -> Function {
+    let mut function = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
+    let (dst, src, dlen, slen, to, from, elem) = (0, 1, 2, 3, 4, 5, 6);
 
-    // dlen = load u32 header at dst + HEADER_SIZE; slen = same for src.
+    // dlen = dst.len; slen = src.len; an empty `src` leaves `dst` as is.
     function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(dlen));
     function.instruction(&Instruction::LocalGet(src));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(slen));
-
-    // nb = __alloc(HEADER_SIZE + 4 + 8*(dlen + slen)); leave nb in its local.
-    function.instruction(&Instruction::I32Const(prefix));
-    function.instruction(&Instruction::LocalGet(dlen));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalTee(slen));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // A SPARSE `src`: for (from = 0; from < slen; from++)
+    // __array_push(dst, read(__sparse_get(src, from))); return dst.
+    emit_is_sparse(&mut function, src);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(from));
     function.instruction(&Instruction::LocalGet(slen));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(nb));
-
-    // memory.copy(nb, dst, HEADER_SIZE + 4 + 8*dlen): the type byte, the u32 len
-    // header, and every `dst` element slot.
-    function.instruction(&Instruction::LocalGet(nb));
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
     function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(prefix));
-    function.instruction(&Instruction::LocalGet(dlen));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-
-    // memory.copy(nb + HEADER_SIZE + 4 + 8*dlen, src + HEADER_SIZE + 4, 8*slen):
-    // append `src`'s element slots right after `dst`'s.
-    function.instruction(&Instruction::LocalGet(nb));
-    function.instruction(&Instruction::I32Const(prefix));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(dlen));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(src));
-    function.instruction(&Instruction::I32Const(prefix));
+    function.instruction(&Instruction::LocalGet(from));
+    function.instruction(&Instruction::Call(sparse_get));
+    function.instruction(&Instruction::LocalSet(elem));
+    emit_elem_read(&mut function, elem);
+    function.instruction(&Instruction::Call(reserve_index + 1));
+    function.instruction(&Instruction::Drop);
+    function.instruction(&Instruction::LocalGet(from));
+    function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(slen));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-
-    // Write the combined u32 len header (dlen + slen) at nb + HEADER_SIZE.
-    function.instruction(&Instruction::LocalGet(nb));
+    function.instruction(&Instruction::LocalSet(from));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
+    // __array_reserve(dst, dlen + slen).
+    function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(dlen));
     function.instruction(&Instruction::LocalGet(slen));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(header));
-
-    // Return the new block base.
-    function.instruction(&Instruction::LocalGet(nb));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// The four common object/array block `MemArg`s: the u32 `n`/`len`
-/// header at `+HEADER_SIZE`; an object entry's key at `+HEADER_SIZE+4` and value
-/// at `+HEADER_SIZE+12` (16 bytes apart); an array element at `+HEADER_SIZE+4`.
-fn obj_block_memargs() -> (MemArg, MemArg, MemArg, MemArg) {
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
-    let key_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let val_slot = MemArg {
-        offset: (HEADER_SIZE + 12) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let elem_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    (header, key_slot, val_slot, elem_slot)
-}
-
-/// Emit `entry_addr = obj_ptr + 16*k` — the base of object entry `k` (its key at
-/// `+key_slot`, value at `+val_slot`) — leaving the address on the stack.
-fn emit_obj_entry_addr(function: &mut Function, obj_ptr: u32, k: u32) {
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-}
-
-/// Emit `dst + 8*m` — the base of array slot `m` (its element at `+elem_slot`) —
-/// leaving the address on the stack.
-fn emit_array_slot_addr(function: &mut Function, dst: u32, m: u32) {
+    function.instruction(&Instruction::Call(reserve_index));
+    // to = dst.elems + 8 * dlen; from = src.elems; then `slen` element copies
+    // (the slot MemArg adds ELEMS_DATA_OFFSET).
     function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(m));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalGet(dlen));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(to));
+    function.instruction(&Instruction::LocalGet(src));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalSet(from));
+    // dst.len = dlen + slen (slen counts down below).
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::LocalGet(dlen));
+    function.instruction(&Instruction::LocalGet(slen));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(to));
+    function.instruction(&Instruction::LocalGet(from));
+    function.instruction(&Instruction::I64Load(mem64(ELEMS_DATA_OFFSET)));
+    function.instruction(&Instruction::LocalSet(elem));
+    emit_elem_read(&mut function, elem);
+    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
+    function.instruction(&Instruction::LocalGet(to));
     function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
-}
-
-/// Emit the reserved-key guard `i32.wrap(key)`'s first payload byte `!= '@'`,
-/// leaving a `1`/`0` i32 on the stack. The reserved hidden object keys
-/// (`@@prototype`/`@@constructor`) are the only keys beginning with `@`, and no
-/// JS identifier may start with it, so a `'@'` first byte marks a key that
-/// `Object.keys`/`values`/`entries` must skip. `key` (an i64 heap-string jsval)
-/// is wrapped to its pointer and its first byte read at `+HEADER_SIZE+4`.
-fn emit_key_not_reserved(function: &mut Function, key: u32) {
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I32Load8U(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::I32Const(i32::from(b'@')));
-    function.instruction(&Instruction::I32Ne);
-}
-
-/// Emit the `__obj_keys(obj_ptr: i32) -> array_base: i32` enumerator.
-///
-/// Bump-allocates a fresh `TYPE_ARRAY` block of capacity `n` (the object's entry
-/// count), linear-scans the source entries `0..n`, and appends each non-reserved
-/// key heap-string jsval into the array in insertion order, tracking the surviving
-/// count `m` written back as the array's u32 `len` header. Reserved hidden keys
-/// (`@@`-prefixed) are skipped via [`emit_key_not_reserved`]. Modeled on
-/// [`emit_obj_rest`]'s filtered single-pass copy.
-pub(super) fn emit_obj_keys(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
-    let (obj_ptr, n, dst, k, m) = (0, 1, 2, 3, 4);
-    let key = 5;
-    let (header, key_slot, _val_slot, elem_slot) = obj_block_memargs();
-
-    // n = load(obj_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-    // dst = __alloc(HEADER_SIZE + 4 + 8*n); m = 0.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(n));
+    function.instruction(&Instruction::LocalSet(to));
+    function.instruction(&Instruction::LocalGet(from));
     function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-    // Write the TYPE_ARRAY type byte at dst (offset 0). `m`/`k` start at 0.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-
-    // Scan source entries `0..n`.
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // key = load_i64(obj_ptr + 16*k + key_slot).
-    emit_obj_entry_addr(&mut function, obj_ptr, k);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::LocalSet(key));
-    // if key is not reserved: store it at dst slot m; m += 1.
-    emit_key_not_reserved(&mut function, key);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    emit_array_slot_addr(&mut function, dst, m);
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I64Store(elem_slot));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(m));
-    function.instruction(&Instruction::End); // if !reserved
-    // k += 1; continue the loop.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // loop
-
-    // Store the surviving count `m` as the u32 `len` header, then return dst.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Store(header));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the `__obj_values(obj_ptr: i32) -> array_base: i32` enumerator.
-///
-/// Like [`emit_obj_keys`] but each surviving entry contributes its VALUE jsval
-/// (loaded from the `+val_slot`) rather than its key; the key is still read to run
-/// the reserved-key guard.
-pub(super) fn emit_obj_values(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(4, ValType::I32), (2, ValType::I64)]);
-    let (obj_ptr, n, dst, k, m) = (0, 1, 2, 3, 4);
-    let (key, val) = (5, 6);
-    let (header, key_slot, val_slot, elem_slot) = obj_block_memargs();
-
-    // n = load(obj_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-    // dst = __alloc(HEADER_SIZE + 4 + 8*n); m = 0.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // key = load key_slot; val = load val_slot (both at obj_ptr + 16*k).
-    emit_obj_entry_addr(&mut function, obj_ptr, k);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::LocalSet(key));
-    emit_obj_entry_addr(&mut function, obj_ptr, k);
-    function.instruction(&Instruction::I64Load(val_slot));
-    function.instruction(&Instruction::LocalSet(val));
-    // if key is not reserved: store val at dst slot m; m += 1.
-    emit_key_not_reserved(&mut function, key);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    emit_array_slot_addr(&mut function, dst, m);
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I64Store(elem_slot));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(m));
-    function.instruction(&Instruction::End); // if !reserved
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // loop
-
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Store(header));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the `__obj_entries(obj_ptr: i32) -> array_base: i32` enumerator.
-///
-/// Like [`emit_obj_keys`] but each surviving entry contributes a FRESH two-element
-/// `[key, value]` array (bump-allocated inside the loop) whose reboxed heap jsval
-/// is stored into the outer array. The outer array's `8*n`-byte element region is
-/// reserved up front, so the inner arrays — allocated afterward at higher
-/// addresses — never overlap it.
-pub(super) fn emit_obj_entries(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(5, ValType::I32), (2, ValType::I64)]);
-    let (obj_ptr, n, dst, k, m) = (0, 1, 2, 3, 4);
-    let inner = 5;
-    let (key, val) = (6, 7);
-    let (header, key_slot, val_slot, elem_slot) = obj_block_memargs();
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-
-    // n = load(obj_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-    // dst = __alloc(HEADER_SIZE + 4 + 8*n); m = 0.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(type_byte));
-
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    emit_obj_entry_addr(&mut function, obj_ptr, k);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::LocalSet(key));
-    emit_obj_entry_addr(&mut function, obj_ptr, k);
-    function.instruction(&Instruction::I64Load(val_slot));
-    function.instruction(&Instruction::LocalSet(val));
-    // if key is not reserved: build [key, value] and store it at dst slot m.
-    emit_key_not_reserved(&mut function, key);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // inner = __alloc(HEADER_SIZE + 4 + 16); TYPE_ARRAY byte; len = 2.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4 + 16));
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(inner));
-    function.instruction(&Instruction::LocalGet(inner));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(type_byte));
-    function.instruction(&Instruction::LocalGet(inner));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32Store(header));
-    // inner[0] = key; inner[1] = val.
-    function.instruction(&Instruction::LocalGet(inner));
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I64Store(elem_slot));
-    function.instruction(&Instruction::LocalGet(inner));
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4 + 8) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
-    // dst slot m = rebox(inner) = (i64.extend_i32_u inner) | HEAP_BITS.
-    emit_array_slot_addr(&mut function, dst, m);
-    function.instruction(&Instruction::LocalGet(inner));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::I64Store(elem_slot));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(m));
-    function.instruction(&Instruction::End); // if !reserved
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // loop
-
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(m));
-    function.instruction(&Instruction::I32Store(header));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the `__obj_has(obj_ptr: i32, key_ptr: i32) -> i32` own-key probe.
-///
-/// `obj_ptr` is the base offset of a `[n:u32][(key_ptr:i64, val:i64) × n]` heap
-/// object; `key_ptr` is the base offset of the `[len:u32][utf8]` key to look for.
-/// It reads the `n` header and linear-scans entries `0..n` exactly like
-/// [`emit_obj_get`]'s own scan, returning `1` on the first key whose byte content
-/// equals `key_ptr` (via `__str_eq` at `str_eq_index`) and `0` if none match.
-/// OWN KEYS ONLY — the `@@prototype` chain is not walked (`in` is an own-key
-/// test). Params occupy locals 0/1; two extra `i32` locals hold `n` and the loop
-/// index `k`.
-pub(super) fn emit_obj_has(str_eq_index: u32) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
-    let (obj_ptr, key_ptr, n, k) = (0, 1, 2, 3);
-    let (header, key_slot, _val_slot, _elem_slot) = obj_block_memargs();
-
-    // n = load(obj_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-
-    // Scan entries; `k` starts at 0 (the fresh local's default).
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if k >= n { break -> no match }.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // candidate_key = i32.wrap(load_i64(obj_ptr + 16*k + key_slot)).
-    emit_obj_entry_addr(&mut function, obj_ptr, k);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    // if __str_eq(candidate_key, key_ptr) { return 1 }.
-    function.instruction(&Instruction::LocalGet(key_ptr));
-    function.instruction(&Instruction::Call(str_eq_index));
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
-
-    // No key matched: absent.
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the `__obj_delete(obj_ptr: i32, key_ptr: i32)` property remover.
-///
-/// `obj_ptr` is the base offset of a `[n:u32][(key_ptr:i64, val:i64) × n]` heap
-/// object; `key_ptr` is the base offset of the `[len:u32][utf8]` key to remove.
-/// It reads the `n` header and linear-scans entries `0..n` like [`emit_obj_has`];
-/// on the first key whose byte content equals `key_ptr` (via `__str_eq` at
-/// `str_eq_index`) it COMPACTS the entry out — `memory.copy` shifts the trailing
-/// entries `k+1..n` down by one 16-byte slot and the `n` header is decremented —
-/// then stops. A miss is a no-op. Because the entry is physically removed, a later
-/// `__obj_get` misses (`undefined`), `__obj_has` returns `0`, and every
-/// index-based enumerator (`for-in`, `__obj_keys`/`values`/`entries`) sees the
-/// smaller count and never visits it. Params occupy locals 0/1; two extra `i32`
-/// locals hold `n` and the loop index `k`.
-pub(super) fn emit_obj_delete(str_eq_index: u32) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
-    let (obj_ptr, key_ptr, n, k) = (0, 1, 2, 3);
-    let (header, key_slot, _val_slot, _elem_slot) = obj_block_memargs();
-    // The first entry slot starts at obj_ptr + HEADER_SIZE + 4; each entry is 16
-    // bytes (key_ptr:i64, val:i64).
-    let entries_base = HEADER_SIZE + 4;
-
-    // n = load(obj_ptr + HEADER_SIZE).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-
-    // Scan entries; `k` starts at 0 (the fresh local's default).
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if k >= n { break -> no match }.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // candidate_key = i32.wrap(load_i64(obj_ptr + 16*k + key_slot)).
-    emit_obj_entry_addr(&mut function, obj_ptr, k);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    // if __str_eq(candidate_key, key_ptr) { compact entry k out; return }.
-    function.instruction(&Instruction::LocalGet(key_ptr));
-    function.instruction(&Instruction::Call(str_eq_index));
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // memory.copy(dst = obj_ptr + entries_base + 16*k,
-    //             src = obj_ptr + entries_base + 16*(k+1),
-    //             len = 16*(n - 1 - k)): shift the trailing entries down one slot.
-    // dst = obj_ptr + 16*k + entries_base.
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(entries_base));
-    function.instruction(&Instruction::I32Add);
-    // src = obj_ptr + 16*(k+1) + entries_base (the next entry).
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(entries_base));
-    function.instruction(&Instruction::I32Add);
-    // len = 16*(n - 1 - k) (0 when deleting the last entry — a valid empty copy).
-    function.instruction(&Instruction::LocalGet(n));
+    function.instruction(&Instruction::LocalSet(from));
+    function.instruction(&Instruction::LocalGet(slen));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-    // Decrement the n header: store n - 1.
-    function.instruction(&Instruction::LocalGet(obj_ptr));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Store(header));
-    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::LocalTee(slen));
+    function.instruction(&Instruction::BrIf(0));
     function.instruction(&Instruction::End);
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
-
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::End);
     function
 }
@@ -1730,213 +1075,37 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
     function
 }
 
-/// Emit the recursive `__json_str(v: i64) -> str_base: i32` serializer backing
-/// `JSON.stringify`. Returns the base offset of a heap string holding `v`'s
-/// JSON form, composing pieces with `__concat` (`concat_index`):
+/// Emit the `__json_str(v: i64) -> str_base: i32` primitive serializer of
+/// `JSON.stringify` (`__json_rep` serializes arrays and objects). Returns the
+/// base offset of a heap string holding `v`'s JSON form:
 ///
 /// - number: `__convert(v, TO_STRING)` when finite (reusing the EXISTING host
 ///   import — no new import), else the token `"null"` (JSON renders NaN/Infinity
 ///   as null);
-/// - `true`/`false`/`null`: the matching keyword token; `undefined`: `"null"`
-///   (its array-element rendering — object values / the top level pre-skip it);
+/// - `true`/`false`/`null`: the matching keyword token; `undefined`: `"null"`;
 /// - string: `__json_escape` (`escape_index`);
-/// - array: `"[" + elems joined "," + "]"`, each element serialized by a recursive
-///   `__json_str` (`self_index`) call, with `undefined`/function elements rendered
-///   as `"null"`;
-/// - object: `"{" + key:value pairs joined "," + "}"`, skipping reserved
-///   `@@`-prefixed keys and omitting entries whose value is `undefined`/a function;
-///   keys are escaped like strings and values serialized recursively;
-/// - any other heap kind (a function value): `"null"`.
+/// - any other heap kind: `"null"`.
 ///
-/// Param `v` occupies local 0; six `i32` locals hold the wrapped pointer, type
-/// byte, entry count, loop index, the first-element flag, and the string
-/// accumulator; three `i64` locals hold the current array element / object key /
-/// object value.
-#[allow(clippy::too_many_lines)]
-pub(super) fn emit_json_str(
-    self_index: u32,
-    concat_index: u32,
-    convert_index: u32,
-    escape_index: u32,
-    tokens: JsonTokens,
-) -> Function {
-    let mut function = Function::new(vec![(6, ValType::I32), (3, ValType::I64)]);
+/// Param `v` occupies local 0; one `i32` local holds the string accumulator.
+pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonTokens) -> Function {
+    let mut function = Function::new(vec![(1, ValType::I32)]);
     let v = 0;
-    let (ptr, tb, n, k, first, acc) = (1, 2, 3, 4, 5, 6);
-    let (elem, key, val) = (7, 8, 9);
-    let (header, key_slot, val_slot, elem_slot) = obj_block_memargs();
+    let acc = 1;
 
-    // Emit `acc = concat(acc, <piece already on stack>)` — the piece expression
-    // must already be pushed by the caller right before invoking this.
-    let concat_into_acc = |function: &mut Function| {
-        function.instruction(&Instruction::Call(concat_index));
-        function.instruction(&Instruction::LocalSet(acc));
-    };
-
-    // if is_pointer(v) { heap kinds } else { number / bool / null / undefined }.
+    // if is_pointer(v) { string ? escape : "null" } else { primitives }.
     emit_is_pointer(&mut function, v);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // ptr = wrap(v); tb = type_byte(v).
-    function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(ptr));
+    function.instruction(&Instruction::I32Const(tokens.null));
+    function.instruction(&Instruction::LocalSet(acc));
     emit_load_type_byte(&mut function, v);
-    function.instruction(&Instruction::LocalSet(tb));
-
-    // --- string: acc = __json_escape(ptr) ---
-    function.instruction(&Instruction::LocalGet(tb));
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::Call(escape_index));
-    function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::Else);
-
-    // --- array: "[" + elems joined "," + "]" ---
-    function.instruction(&Instruction::LocalGet(tb));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(tokens.lbrack));
-    function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalSet(first));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // elem = load_i64(ptr + 8*k + elem_slot).
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I64Load(elem_slot));
-    function.instruction(&Instruction::LocalSet(elem));
-    // Separator: if !first { acc = concat(acc, ",") }.
-    function.instruction(&Instruction::LocalGet(first));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.comma));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(first));
-    // acc = concat(acc, (undefined||function) ? "null" : __json_str(elem)).
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::LocalGet(elem));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Eq);
-    emit_is_function(&mut function, elem);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::I32Const(tokens.null));
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::LocalGet(elem));
-    function.instruction(&Instruction::Call(self_index));
-    function.instruction(&Instruction::End);
-    concat_into_acc(&mut function);
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.rbrack));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::Else);
-
-    // --- object: "{" + key:value pairs joined "," + "}" ---
-    function.instruction(&Instruction::LocalGet(tb));
-    function.instruction(&Instruction::I32Const(TYPE_OBJECT));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(tokens.lbrace));
-    function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(n));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalSet(first));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::LocalGet(n));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // key = load key_slot; val = load val_slot (both at ptr + 16*k).
-    emit_obj_entry_addr(&mut function, ptr, k);
-    function.instruction(&Instruction::I64Load(key_slot));
-    function.instruction(&Instruction::LocalSet(key));
-    emit_obj_entry_addr(&mut function, ptr, k);
-    function.instruction(&Instruction::I64Load(val_slot));
-    function.instruction(&Instruction::LocalSet(val));
-    // include = key_not_reserved & !(val undefined || val function).
-    emit_key_not_reserved(&mut function, key);
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Eq);
-    emit_is_function(&mut function, val);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // Separator: if !first { acc = concat(acc, ",") }.
-    function.instruction(&Instruction::LocalGet(first));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.comma));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(first));
-    // acc = concat(acc, escape(key)); acc = concat(acc, ":");
-    // acc = concat(acc, __json_str(val)).
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(escape_index));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.colon));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::Call(self_index));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::End); // if include
-    // k += 1; continue.
-    function.instruction(&Instruction::LocalGet(k));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(k));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if k < n
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::I32Const(tokens.rbrace));
-    concat_into_acc(&mut function);
-    function.instruction(&Instruction::Else);
-    // --- any other heap kind (function value): "null" ---
-    function.instruction(&Instruction::I32Const(tokens.null));
     function.instruction(&Instruction::LocalSet(acc));
-    function.instruction(&Instruction::End); // if OBJECT
-    function.instruction(&Instruction::End); // if ARRAY
-    function.instruction(&Instruction::End); // if STRING
-
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     // --- non-heap: null / true / false / undefined / number ---
     function.instruction(&Instruction::LocalGet(v));
@@ -2044,13 +1213,14 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// `1` iff BOTH are (nullish values equal each other and nothing else); two
 /// numbers compare as `f64`; two strings by byte content (via `__str_eq`); a
 /// number and a string coerce the string via the `__convert` `ToNumber` import
-/// (at `convert_index`) and compare as `f64`; anything else compares by raw
-/// identity bits (two distinct objects differ; the same object is equal; an
-/// object vs a primitive differs). Object↔primitive `ToPrimitive` coercion is
-/// deliberately NOT modeled (so `[] == 0` is `false`, a documented v1 cut). The
-/// two `i64` params occupy locals 0/1; they are mutated in place for the boolean
-/// normalization, so no extra locals are needed.
-pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
+/// and compare as `f64`; an object against a (non-nullish) primitive is
+/// replaced by its `ToPrimitive` (hint default, `__to_primitive`) and compared
+/// again (a user `valueOf`/`toString` throw leaves it pending and yields `0`);
+/// anything else compares by raw identity bits (two distinct objects differ;
+/// the same object is equal). The two `i64` params occupy locals 0/1; they are
+/// mutated in place, so no extra locals are needed.
+pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
+    let (str_eq_index, convert_index) = (helpers.str_eq, helpers.convert);
     let mut function = Function::new(vec![]);
     let (a, b) = (0, 1);
     let one_bits = 1.0f64.to_bits().cast_signed();
@@ -2138,7 +1308,9 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::Else);
 
-    // Fallback: raw identity bits.
+    // Fallback: an object against a non-nullish primitive compares its
+    // `ToPrimitive` again; otherwise raw identity bits.
+    emit_loose_eq_to_primitive(&mut function, helpers);
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
@@ -2152,6 +1324,35 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
     function
 }
 
+/// The object-vs-primitive arm of [`emit_loose_eq`]: an object against a
+/// non-nullish primitive is replaced by its `ToPrimitive` (hint default) and
+/// `__loose_eq` returns the comparison of the result (`0` when a user
+/// `valueOf`/`toString` threw).
+fn emit_loose_eq_to_primitive(function: &mut Function, helpers: Helpers<'_>) {
+    let (a, b) = (0, 1);
+    for (obj, prim) in [(a, b), (b, a)] {
+        emit_is_object(function, obj);
+        emit_is_object(function, prim);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::LocalGet(obj));
+        function.instruction(&Instruction::I32Const(HINT_DEFAULT));
+        function.instruction(&Instruction::Call(helpers.to_primitive()));
+        function.instruction(&Instruction::LocalSet(obj));
+        function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(a));
+        function.instruction(&Instruction::LocalGet(b));
+        function.instruction(&Instruction::Call(helpers.loose_eq));
+        function.instruction(&Instruction::Return);
+        function.instruction(&Instruction::End);
+    }
+}
+
 /// Emit the `__str_to_array(s: i64) -> i64` string-spread helper: build a fresh
 /// `TYPE_ARRAY` whose elements are the source string's characters as one-byte
 /// heap strings (`[..."abc"]` → `["a", "b", "c"]`). The character walk is
@@ -2160,41 +1361,21 @@ pub(super) fn emit_loose_eq(str_eq_index: u32, convert_index: u32) -> Function {
 /// `s` is a heap-string jsval; the returned jsval is a boxed heap array. Fixes
 /// the pre-existing garbage-value bug where `[...str]` fell through to
 /// `__array_concat` (which reinterpreted the string's UTF-8 bytes as jsvals).
-pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Function {
-    let mut function = Function::new(vec![(4, ValType::I32)]);
-    let (s, ptr, len, arr, i) = (0, 1, 2, 3, 4);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
+pub(super) fn emit_str_to_array(new_array_index: u32, str_index_index: u32) -> Function {
+    let mut function = Function::new(vec![(5, ValType::I32)]);
+    let (s, ptr, len, arr, i, store) = (0, 1, 2, 3, 4, 5);
 
     // ptr = wrap(s); len = load_u32(ptr + HEADER_SIZE) (the string's byte length).
     function.instruction(&Instruction::LocalGet(s));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(ptr));
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(len));
-
-    // arr = __alloc(HEADER_SIZE + 4 + 8*len); write TYPE_ARRAY + u32 len header.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::LocalTee(ptr));
+    function.instruction(&Instruction::I32Load(mem32(HEADER_SIZE as u64)));
+    function.instruction(&Instruction::LocalTee(len));
+    // arr = __new_array(len); store = arr.elems.
+    function.instruction(&Instruction::Call(new_array_index));
+    function.instruction(&Instruction::LocalTee(arr));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalSet(store));
 
     // Fill element k = box(__str_index(ptr, k)) for k in 0..len; `i` starts at 0.
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -2203,11 +1384,11 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
-    // address = arr + 8*i (element slot at MemArg offset HEADER_SIZE + 4).
-    function.instruction(&Instruction::LocalGet(arr));
+    // address = store + 8*i (element slot at MemArg offset ELEMS_DATA_OFFSET).
+    function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::I32Add);
     // value = HEAP_BITS | extend_u(__str_index(ptr, i)).
     function.instruction(&Instruction::LocalGet(ptr));
@@ -2216,11 +1397,7 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
     function.instruction(&Instruction::LocalGet(i));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
@@ -2229,12 +1406,11 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 
-    // Rebox the array block base as a heap jsval.
+    // Rebox the array handle base as a heap jsval.
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
-    // Close the function body.
     function.instruction(&Instruction::End);
     function
 }
@@ -2242,23 +1418,19 @@ pub(super) fn emit_str_to_array(alloc_index: u32, str_index_index: u32) -> Funct
 /// Emit the `__map_find(handle: i32, key: i64) -> i32` Map/Set lookup.
 ///
 /// `handle` is the base of a `TYPE_MAP`/`TYPE_SET` block; its `entries` slot (at
-/// `+HEADER_SIZE+4`) holds the backing array jsval. Reads the array's u32 `len`
-/// header, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
+/// [`MAP_ENTRIES_OFFSET`]) holds the backing array jsval. Reads the array's
+/// `len` and element store, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
 /// returning the byte ADDRESS of the first slot whose value is `__same_value_zero` (at
 /// `svz_index`) to `key`, or `-1` on a miss. The value slot sits 8 bytes past the
 /// returned address. Params occupy locals 0/1; four extra `i32` locals hold the
-/// backing base, its length, the loop index, and the current slot address.
+/// backing element store, its length, the loop index, and the current slot
+/// address.
 pub(super) fn emit_map_find(svz_index: u32) -> Function {
     let mut function = Function::new(vec![(4, ValType::I32)]);
-    let (handle, key, arr, len, i, slot) = (0, 1, 2, 3, 4, 5);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    };
+    let (handle, key, store, len, i, slot) = (0, 1, 2, 3, 4, 5);
     let entries_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+        offset: MAP_ENTRIES_OFFSET,
+        align: 3,
         memory_index: 0,
     };
     let elem = MemArg {
@@ -2267,14 +1439,16 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
         memory_index: 0,
     };
 
-    // arr = wrap(load_i64(handle + entries_slot)); len = load_u32(arr + HEADER_SIZE).
+    // arr = wrap(load_i64(handle + entries_slot)); len = arr.len; store = arr.elems.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::I64Load(entries_slot));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::LocalTee(store));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(len));
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalSet(store));
 
     // Scan even key slots; `i` starts at 0 (the fresh local's default).
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -2284,13 +1458,13 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
-    // slot = arr + HEADER_SIZE + 4 + 8*i.
-    function.instruction(&Instruction::LocalGet(arr));
+    // slot = store + ELEMS_DATA_OFFSET + 8*i.
+    function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::LocalGet(i));
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(slot));
     // if __same_value_zero(load_i64(slot), key) { return slot }.
@@ -2320,22 +1494,21 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
 /// Emit the `__map_set(handle: i32, key: i64, val: i64)` Map/Set insert-or-update.
 /// Looks the key up with `__map_find` (at `map_find_index`): on a hit it
 /// overwrites the value slot (8 bytes past the found key slot); on a miss it appends
-/// `key` then `val` to the growable backing via `__array_push` (at
-/// `array_push_index`) — reboxing and REWRITING the handle's `entries` slot in place
-/// since the backing base moves on growth — and bumps the u32 `size` header by one.
-/// `set.add` reuses this with `val = undefined`. Params occupy locals 0/1/2; two
-/// extra `i32` locals hold the found address and the backing base.
+/// `key` then `val` to the backing array in place via `__array_push` (at
+/// `array_push_index`) and bumps the u32 `size` header by one. `set.add` reuses
+/// this with `val = undefined`. Params occupy locals 0/1/2; two extra `i32`
+/// locals hold the found address and the backing array base.
 pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Function {
     let mut function = Function::new(vec![(2, ValType::I32)]);
     let (handle, key, val, addr, arr) = (0, 1, 2, 3, 4);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
+    let entries_slot = MemArg {
+        offset: MAP_ENTRIES_OFFSET,
+        align: 3,
         memory_index: 0,
     };
-    let entries_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+    let size_slot = MemArg {
+        offset: MAP_SIZE_OFFSET,
+        align: 2,
         memory_index: 0,
     };
     let val_at = MemArg {
@@ -2366,29 +1539,20 @@ pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Functi
     function.instruction(&Instruction::I64Load(entries_slot));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(arr));
-    // arr = __array_push(arr, key); arr = __array_push(arr, val).
+    // __array_push(arr, key); __array_push(arr, val).
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(key));
     function.instruction(&Instruction::Call(array_push_index));
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(val));
     function.instruction(&Instruction::Call(array_push_index));
-    function.instruction(&Instruction::LocalSet(arr));
-    // Rewrite the handle's entries slot with the reboxed (grown) backing base.
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::I64Store(entries_slot));
+    function.instruction(&Instruction::Drop);
     // size += 1.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(size_slot));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::I32Store(size_slot));
     function.instruction(&Instruction::End);
     function
 }
@@ -2440,20 +1604,20 @@ pub(super) fn emit_map_has(map_find_index: u32) -> Function {
 /// Looks the key up with `__map_find` (at `map_find_index`); on a miss returns `0`.
 /// On a hit it COMPACTS the two-slot `(key, value)` entry out of the backing array —
 /// `memory.copy` shifts every trailing pair down one entry (16 bytes) — decrements
-/// the backing's u32 `len` header by 2 and the handle's u32 `size` header by 1, and
+/// the backing's u32 `len` by 2 and the handle's u32 `size` header by 1, and
 /// returns `1`. Params occupy locals 0/1; four extra `i32` locals hold the found
 /// address, the backing base, its length, and the shift byte count.
 pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
     let mut function = Function::new(vec![(4, ValType::I32)]);
     let (handle, key, addr, arr, len, count) = (0, 1, 2, 3, 4, 5);
-    let header = MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
+    let entries_slot = MemArg {
+        offset: MAP_ENTRIES_OFFSET,
+        align: 3,
         memory_index: 0,
     };
-    let entries_slot = MemArg {
-        offset: (HEADER_SIZE + 4) as u64,
-        align: 0,
+    let size_slot = MemArg {
+        offset: MAP_SIZE_OFFSET,
+        align: 2,
         memory_index: 0,
     };
 
@@ -2469,18 +1633,20 @@ pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
 
-    // arr = wrap(load_i64(handle + entries_slot)); len = load_u32(arr + HEADER_SIZE).
+    // arr = wrap(load_i64(handle + entries_slot)); len = arr.len.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::I64Load(entries_slot));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(arr));
     function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalSet(len));
 
-    // count = (arr + HEADER_SIZE + 4 + 8*len) - (addr + 16): trailing bytes to move.
+    // count = (arr.elems + ELEMS_DATA_OFFSET + 8*len) - (addr + 16): trailing
+    // bytes to move.
     function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(8));
@@ -2508,14 +1674,14 @@ pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(2));
     function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
     // size -= 1.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::I32Load(header));
+    function.instruction(&Instruction::I32Load(size_slot));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Store(header));
+    function.instruction(&Instruction::I32Store(size_slot));
 
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::End);

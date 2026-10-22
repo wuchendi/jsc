@@ -17,6 +17,12 @@ impl Frame {
             next_label: 0,
             allows_this: false,
             this_local: None,
+            arrow: false,
+            new_target_local: None,
+            ctor: FnKind::Plain,
+            supers: SuperCalls::default(),
+            arguments_local: None,
+            spread_args_local: None,
         }
     }
 }
@@ -31,12 +37,13 @@ impl<'a> LowerCtx<'a> {
             main_ctx: false,
             async_body: false,
             current_super: None,
-            static_init_class: None,
+            class_fields: Vec::new(),
+            static_init: None,
         }
     }
 
     /// The index of the innermost (current) function frame.
-    fn top(&self) -> usize {
+    pub(super) fn top(&self) -> usize {
         self.frames.len() - 1
     }
 
@@ -167,12 +174,6 @@ impl<'a> LowerCtx<'a> {
         } else {
             None
         };
-        if module.is_some() {
-            self.shared
-                .module_mutable
-                .borrow_mut()
-                .insert(name.to_owned(), mutable);
-        }
         // An `env_backed` (generator) frame boxes EVERY binding into an env cell so
         // it survives across a `yield`; an ordinary frame boxes only the bindings
         // capture analysis flagged.
@@ -226,6 +227,110 @@ impl<'a> LowerCtx<'a> {
         Some(slot)
     }
 
+    /// Resolve `new.target` (DESIGN.md §7.6): the nearest non-arrow function's
+    /// prologue snapshot, read directly in that function and captured BY VALUE
+    /// (it is immutable) through each nested arrow's environment. `undefined` in
+    /// a generator/async body (never constructed); `None` at top level.
+    pub(super) fn resolve_new_target(&mut self) -> Option<IrNode> {
+        let fi = self.frames.iter().rposition(|frame| !frame.arrow)?;
+        if fi == 0 && self.main_ctx {
+            return None;
+        }
+        if self.frames[fi].env_backed {
+            return Some(IrNode::Undefined);
+        }
+        let local = if let Some(local) = self.frames[fi].new_target_local {
+            local
+        } else {
+            let frame = &mut self.frames[fi];
+            let local = frame.next;
+            frame.next += 1;
+            frame.new_target_local = Some(local);
+            frame.by_id.insert(new_target_id(fi), local);
+            local
+        };
+        if fi == self.top() {
+            return Some(IrNode::Local(local));
+        }
+        Some(IrNode::EnvLoad(self.route_env(fi, new_target_id(fi))))
+    }
+
+    /// Allocate a hidden local in the current frame for a value captured BY
+    /// VALUE into nested functions (like the `new.target` snapshot): the parent
+    /// constructor and prototype of a class, or the class value itself. Returns
+    /// the local and its synthetic binding id, read with [`Self::read_hidden`].
+    /// The local must be assigned before any closure reading it is created.
+    pub(super) fn hidden_local(&mut self) -> (u32, u32) {
+        let n = self.shared.hidden_ids.get();
+        self.shared.hidden_ids.set(n + 1);
+        let id = 0xC000_0000 | n;
+        let local = self.fresh();
+        self.frame().by_id.insert(id, local);
+        (local, id)
+    }
+
+    /// Read the hidden binding `id` declared in frame `frame` (see
+    /// [`Self::hidden_local`]): its local there, else through the environment.
+    pub(super) fn read_hidden(&mut self, frame: usize, id: u32) -> IrNode {
+        if frame == self.top() {
+            return self.frames[frame]
+                .by_id
+                .get(&id)
+                .map_or(IrNode::Undefined, |&local| IrNode::Local(local));
+        }
+        IrNode::EnvLoad(self.route_env(frame, id))
+    }
+
+    /// Whether every frame above `frame` is an arrow (so `this` there is the
+    /// one of `frame`).
+    pub(super) fn only_arrows_above(&self, frame: usize) -> bool {
+        self.frames[frame + 1..].iter().all(|f| f.arrow)
+    }
+
+    /// Resolve `arguments`: the nearest non-arrow function's `arguments`
+    /// object, built in its prologue (allocated on first reference) and captured
+    /// BY VALUE through each nested arrow's environment (the binding is never
+    /// reassigned). `Err` with the diagnostic at top level and in a
+    /// generator/async body.
+    pub(super) fn resolve_arguments(&mut self) -> Result<IrNode, &'static str> {
+        let fi = self
+            .frames
+            .iter()
+            .rposition(|frame| !frame.arrow)
+            .unwrap_or(0);
+        if fi == 0 && self.main_ctx {
+            return Err("`arguments` is only valid inside a function");
+        }
+        if self.frames[fi].env_backed {
+            return Err("`arguments` in a generator or async function is unsupported");
+        }
+        let local = if let Some(local) = self.frames[fi].arguments_local {
+            local
+        } else {
+            let frame = &mut self.frames[fi];
+            let local = frame.next;
+            frame.next += 1;
+            frame.arguments_local = Some(local);
+            frame.by_id.insert(arguments_id(fi), local);
+            local
+        };
+        if fi == self.top() {
+            return Ok(IrNode::Local(local));
+        }
+        Ok(IrNode::EnvLoad(self.route_env(fi, arguments_id(fi))))
+    }
+
+    /// The current frame's snapshot of the `__spread_args` global, allocated
+    /// on first use (the prologue snapshot is added by `build_function_body`).
+    pub(super) fn spread_args_local(&mut self) -> u32 {
+        if let Some(local) = self.frame().spread_args_local {
+            return local;
+        }
+        let local = self.fresh();
+        self.frame().spread_args_local = Some(local);
+        local
+    }
+
     /// Whether the local `idx` in the current frame is a boxed cell.
     pub(super) fn is_cell(&self, idx: u32) -> bool {
         self.frames.last().is_some_and(|f| f.cells.contains(&idx))
@@ -260,28 +365,22 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Resolve a module binding from a top-level function body, where `main`'s
-    /// frame is absent. The body may run before the binding's declaration (the
-    /// function is hoisted), so the cell pointer is guarded: while the cell still
-    /// holds the TDZ hole, any read or write throws a `ReferenceError`.
+    /// frame is absent, or from a closure nested in `main` lowered before the
+    /// binding's declaration (a forward reference). Either may run before the
+    /// declaration, so the cell pointer is guarded: while the cell still holds the
+    /// TDZ hole, any read or write throws a `ReferenceError`.
     fn resolve_module(&self, name: &str) -> Option<Resolved> {
-        if self.main_ctx {
+        if self.main_ctx && self.frames.len() == 1 {
             return None;
         }
         let slot = *self.shared.module_slots.get(name)?;
-        let mutable = *self.shared.module_mutable.borrow().get(name)?;
+        let mutable = *self.shared.module_mutable.get(name)?;
         let message = format!("Cannot access '{name}' before initialization");
-        let error = IrNode::Object(vec![
-            ("name".to_owned(), IrNode::Str("ReferenceError".to_owned())),
-            ("message".to_owned(), IrNode::Str(message.clone())),
-            (
-                "stack".to_owned(),
-                IrNode::Str(format!("ReferenceError: {message}")),
-            ),
-            (
-                crate::abi::ERROR_KIND_KEY.to_owned(),
-                IrNode::Num(crate::abi::ERROR_KIND_ERROR),
-            ),
-        ]);
+        let error = IrNode::error_object(
+            ErrorKind::ReferenceError,
+            Some(IrNode::Str(message.clone())),
+            IrNode::Str(format!("ReferenceError: {message}")),
+        );
         let guarded = IrNode::Ternary {
             cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
                 IrNode::ModuleCell(slot),
@@ -319,14 +418,6 @@ impl<'a> LowerCtx<'a> {
             }
         }
         None
-    }
-
-    /// The [`binding_id`] the name resolves to in the current scope chain, or
-    /// `None` when it is not a local/captured binding (a top-level function name
-    /// or an undeclared reference). Used by the static-shape unknown-method guard
-    /// to look a receiver's tracked object shape up by its declaring id.
-    pub(super) fn binding_id_of(&self, name: &str) -> Option<u32> {
-        self.find_binding(name).map(|(_, binding)| binding.id)
     }
 
     /// Ensure every frame between the declaring frame and the current frame
@@ -380,11 +471,65 @@ impl<'a> LowerCtx<'a> {
         })
     }
 
+    /// Resolve `name` as an assignment target: a binding, else a property of
+    /// the global object (DESIGN.md §6.4). A top-level function declaration is not
+    /// assignable, and `eval`/`arguments` are not assignment targets in strict
+    /// code (an early `SyntaxError`).
+    pub(super) fn resolve_target(
+        &mut self,
+        name: &str,
+        span: swc_common::Span,
+    ) -> anyhow::Result<Resolved> {
+        if matches!(name, "eval" | "arguments") {
+            return Err(CompileError::spanned(
+                span,
+                format!("cannot assign to `{name}` in strict mode"),
+            )
+            .into());
+        }
+        if let Some(resolved) = self.resolve(name) {
+            return Ok(resolved);
+        }
+        if self.shared.funcs.contains_key(name) {
+            return Err(CompileError::spanned(
+                span,
+                format!("cannot assign to function declaration: {name}"),
+            )
+            .into());
+        }
+        Ok(Resolved {
+            kind: AccessKind::Global(GlobalRef::new(name)),
+            mutable: true,
+        })
+    }
+
+    /// The read of `name` when it resolves to no binding nor declaration: the
+    /// intrinsic's constant address when `sealed(name)` holds for a known
+    /// global, else a global-object lookup that throws on a miss.
+    pub(super) fn global_read(&self, name: &str) -> IrNode {
+        match GlobalIntrinsic::from_name(name) {
+            Some(global) if self.shared.globals.sealed(name) => IrNode::Intrinsic(global),
+            _ => Self::read_of(AccessKind::Global(GlobalRef::new(name))),
+        }
+    }
+
+    /// Whether `name.m(..)` / `name.k` keep the inline namespace code: `name`
+    /// is the unshadowed global, sealed and never escaping.
+    pub(super) fn inline_namespace(&mut self, name: &str) -> bool {
+        self.resolve(name).is_none()
+            && !self.shared.funcs.contains_key(name)
+            && self.shared.globals.inline(name)
+    }
+
     /// The read expression for a resolved access.
     pub(super) fn read_of(kind: AccessKind) -> IrNode {
         match kind {
             AccessKind::Plain(local) => IrNode::Local(local),
             AccessKind::Cell(ptr) => IrNode::CellGet(Box::new(ptr)),
+            AccessKind::Global(global) => IrNode::GlobalGet {
+                global,
+                typeof_operand: false,
+            },
         }
     }
 
@@ -399,6 +544,10 @@ impl<'a> LowerCtx<'a> {
                 cell: Box::new(ptr),
                 value: Box::new(value),
             },
+            AccessKind::Global(global) => IrNode::GlobalSet {
+                global,
+                value: Box::new(value),
+            },
         }
     }
 
@@ -406,10 +555,16 @@ impl<'a> LowerCtx<'a> {
     /// binding `id`, evaluated in the current (enclosing) frame while building an
     /// inner function's environment: a `Local` when this frame declares the
     /// cell, else an `EnvLoad` from this frame's own environment (routing the
-    /// capture transitively out to the declaring frame).
+    /// capture transitively out to the declaring frame). An `env_backed`
+    /// (generator) frame keeps its own cells in its environment, not in locals.
     pub(super) fn capture_source(&mut self, id: u32) -> IrNode {
         let top = self.top();
         if let Some(&local) = self.frames[top].by_id.get(&id) {
+            if self.frames[top].env_backed
+                && let Some(&slot) = self.frames[top].env_index.get(&id)
+            {
+                return IrNode::EnvLoad(slot);
+            }
             return IrNode::Local(local);
         }
         let declaring = (0..top).find(|&fi| self.frames[fi].by_id.contains_key(&id));
@@ -419,4 +574,17 @@ impl<'a> LowerCtx<'a> {
         };
         IrNode::EnvLoad(slot)
     }
+}
+
+/// The synthetic binding id of the `new.target` snapshot of the function at
+/// frame depth `frame`: above every source offset (a [`binding_id`]), unique
+/// among the frames enclosing a capture.
+fn new_target_id(frame: usize) -> u32 {
+    0x8000_0000 | u32::try_from(frame).unwrap_or(0)
+}
+
+/// The synthetic binding id of the `arguments` object of the function at frame
+/// depth `frame`, distinct from every [`new_target_id`].
+fn arguments_id(frame: usize) -> u32 {
+    0xC000_0000 | u32::try_from(frame).unwrap_or(0)
 }

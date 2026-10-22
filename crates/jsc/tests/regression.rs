@@ -271,3 +271,94 @@ fn core_language_regression() {
         "stderr should explain the const violation, got: {stderr}"
     );
 }
+
+/// A `yield`/`await` nested inside an expression shape runs with JS semantics
+/// in both a `function*` and an `async function`. Each body uses `@` for the
+/// suspend keyword with operand `7`, and the driver sends `7` back, so every
+/// suspend observes `7` in both variants. Each row lists the expected
+/// `console.log` output.
+#[test]
+fn nested_yield_and_await_run_correctly() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "let o = {x:0}; o.x = (@ 7) ? 2 : 3; console.log(o.x);",
+            "2\n",
+        ),
+        (
+            "let o = {x:0}; let k = \"x\"; o[k] = @ 7; console.log(o.x);",
+            "7\n",
+        ),
+        (
+            "let a = [1,2]; let i = 1; a[i] += @ 7; console.log(a[1]);",
+            "9\n",
+        ),
+        ("let o = {x:{y:0}}; o.x.y = @ 7; console.log(o.x.y);", "7\n"),
+        (
+            "let o = {f: function(v){ return v + 1; }}; console.log(o.f(@ 7));",
+            "8\n",
+        ),
+        (
+            "let o = {f: function(a, b, c){ return a + b + c; }}; console.log(o.f(1, @ 7, 3));",
+            "11\n",
+        ),
+        ("let p = {v: @ 7}; console.log(p.v);", "7\n"),
+        ("let p = {a: @ 7, b: 2}; console.log(p.a, p.b);", "7 2\n"),
+        ("let a = [@ 7, 1]; console.log(a[0]);", "7\n"),
+        (
+            "let a = [1, @ 7, 3]; console.log(a[0], a[1], a[2]);",
+            "1 7 3\n",
+        ),
+        ("console.log(`v=${@ 7}`);", "v=7\n"),
+        ("console.log(`${@ 7}-${2}`);", "7-2\n"),
+        (
+            "let c = true; let r = c ? (@ 7) : 0; console.log(r);",
+            "7\n",
+        ),
+        (
+            "let c = false; let r = c ? 0 : (@ 7); console.log(r);",
+            "7\n",
+        ),
+        ("let r = true && (@ 7); console.log(r);", "7\n"),
+        ("let r = false || (@ 7); console.log(r);", "7\n"),
+        ("let r = null ?? (@ 7); console.log(r);", "7\n"),
+        // Short-circuited operands never suspend.
+        ("let r = false && (@ 7); console.log(r);", "false\n"),
+        ("let r = 1 || (@ 7); console.log(r);", "1\n"),
+        ("let r = 0 ?? (@ 7); console.log(r);", "0\n"),
+        ("let x = 1; let r = (@ 7) + x; console.log(r);", "8\n"),
+        ("let x = 1; x += @ 7; console.log(x);", "8\n"),
+        ("let r = 0; if (@ 7) { r = 1; } console.log(r);", "1\n"),
+        ("let r = (@ (@ 7)) + 1; console.log(r);", "8\n"),
+        // Already-supported statement shapes keep working.
+        ("let r = 0; r = @ 7; console.log(r);", "7\n"),
+        ("@ 7; console.log(1);", "1\n"),
+        ("let r = 0; if (true) { r = @ 7; } console.log(r);", "7\n"),
+    ];
+    for (body, expected) in cases {
+        let generator = format!(
+            "function* g(){{ {} }} let it = g(); it.next(); it.next(7); it.next(7); it.next(7);",
+            body.replace('@', "yield")
+        );
+        let async_fn = format!(
+            "async function f(){{ {} }} f();",
+            body.replace('@', "await")
+        );
+        for src in [generator, async_fn] {
+            let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
+                .args(["-e", &src])
+                .output()
+                .expect("failed to spawn jsc binary");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "`{src}` should run, got {:?}: {stderr}",
+                output.status
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                *expected,
+                "for `{src}`"
+            );
+        }
+    }
+}

@@ -242,3 +242,39 @@ fn logical_assignment_via_eval() {
     // leaves the side-effecting right operand (`y=5`) unrun, so `y` stays `0`.
     assert_eq!(jsc(&["-p", "let x=1; let y=0; x ||= (y=5); y"]), "0");
 }
+
+/// Binary `+` without a string operand is `ToNumber` addition; with one it is
+/// string concatenation.
+#[test]
+fn binary_plus_coerces_primitives() {
+    assert_eq!(jsc(&["-p", "1 + null === 1"]), "true");
+    assert_eq!(jsc(&["-p", "null + 1 === 1"]), "true");
+    assert_eq!(jsc(&["-p", "null + null === 0"]), "true");
+    assert_eq!(jsc(&["-p", "true + 1 === 2"]), "true");
+    assert_eq!(jsc(&["-p", "true + true === 2"]), "true");
+    assert_eq!(jsc(&["-p", "false + 1 === 1"]), "true");
+    assert_eq!(jsc(&["-p", "undefined + 1"]), "NaN");
+    assert_eq!(jsc(&["-p", "\"x\" + null === \"xnull\""]), "true");
+    assert_eq!(jsc(&["-p", "\"a\" + true === \"atrue\""]), "true");
+    assert_eq!(jsc(&["-p", "\"a\" + undefined === \"aundefined\""]), "true");
+    assert_eq!(jsc(&["-p", "1 + \"2\" === \"12\""]), "true");
+    // An array operand is `ToPrimitive`d to its `join()` string, so `+` concatenates.
+    assert_eq!(jsc(&["-p", "[1] + 1 === \"11\""]), "true");
+    assert_eq!(jsc(&["-p", "1 + [2,3] === \"12,3\""]), "true");
+    assert_eq!(jsc(&["-p", "[] + [] === \"\""]), "true");
+    assert_eq!(jsc(&["-p", "null + [] === \"null\""]), "true");
+    assert_eq!(jsc(&["-p", "true + [1] === \"true1\""]), "true");
+}
+
+/// Unary minus on a non-literal operand negates the sign of zero: `-(+0)` is
+/// `-0` and `-(-0)` is `+0`, observable through `1 / x`.
+#[test]
+fn unary_minus_negates_signed_zero() {
+    assert_eq!(jsc(&["-p", "let z = 0; 1 / -z"]), "-Infinity");
+    assert_eq!(jsc(&["-p", "let m = -0; 1 / -m"]), "Infinity");
+    // ToNumber of the operand happens first: `-"0"` is `-0`.
+    assert_eq!(jsc(&["-p", "let s = \"0\"; 1 / -s"]), "-Infinity");
+    assert_eq!(jsc(&["-p", "let n = 5; -n === -5"]), "true");
+    // A literal `-0` is still constant-folded to `-0`.
+    assert_eq!(jsc(&["-p", "1 / -0"]), "-Infinity");
+}

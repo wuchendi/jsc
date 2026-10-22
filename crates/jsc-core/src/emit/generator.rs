@@ -10,21 +10,29 @@
 //! state and re-dispatch. `gen.next(v)` ([`emit_gen_resume`]) drives it
 //! through `call_indirect`, resuming at `state` and reaching the frame's cells
 //! through the ordinary closure `EnvLoad` path.
+//!
+//! A block with an exception handler (a `try` crossing a suspend) is wrapped in a
+//! wasm landing pad registered on the [`Unwind`] handler stack: a throw inside it
+//! stores `gen.state = handler` and re-dispatches with the exception pending. The
+//! whole dispatch sits in an outermost landing pad, so an exception no block
+//! catches marks the generator done before it leaves the state machine.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-use crate::ir::GenTerm;
+use crate::ir::{GenSegment, GenTerm};
 
 /// Emit `IrNode::MakeGenerator`: build a generator handle and its frame, leaving
 /// the handle jsval on the stack. Allocates a `TYPE_ENV` frame of `total` boxed
 /// cells (the first `slots.len()` initialized from the constructor's argument
 /// expressions, the rest to `undefined`), then the [`abi::TYPE_GENERATOR`] block
 /// pointing at it with `sm_idx`/`state = 0`/`done = 0`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_make_generator(
     sm_table_index: u32,
     slots: &[IrNode],
     total: u32,
+    limits: u32,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
@@ -76,9 +84,12 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(gen_dst));
-    function.instruction(&Instruction::LocalGet(gen_dst));
-    function.instruction(&Instruction::I32Const(TYPE_GENERATOR));
-    function.instruction(&Instruction::I32Store8(type_byte));
+    emit_object_prefix(
+        function,
+        gen_dst,
+        TYPE_GENERATOR,
+        intrinsic_bits(Intrinsic::GeneratorPrototype, helpers),
+    );
     // sm_idx (u32).
     function.instruction(&Instruction::LocalTee(gen_dst));
     function.instruction(&Instruction::LocalGet(gen_dst));
@@ -103,6 +114,15 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Store(MemArg {
         offset: GEN_DONE_OFFSET,
+        align: 2,
+        memory_index: 0,
+    }));
+    // limits (u32).
+    function.instruction(&Instruction::LocalTee(gen_dst));
+    function.instruction(&Instruction::LocalGet(gen_dst));
+    function.instruction(&Instruction::I32Const(limits.cast_signed()));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
         align: 2,
         memory_index: 0,
     }));
@@ -141,30 +161,60 @@ pub(super) fn emit_gen_resume(
 ) {
     let handle_slot = scratch + 22;
     let sm_result = scratch + 23;
-    let obj_dst = scratch + 3;
 
     // 1. Evaluate the handle once into a stable scratch slot.
     emit_node(handle, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(handle_slot));
 
-    // With no functions in the program there is no funcref table / uniform call
-    // type, so no generator can exist — the receiver is provably a non-generator.
-    // Throw the `TypeError` UNCONDITIONALLY (skipping the invalid indirect call)
-    // and leave `undefined` as the fall-through result of this expression.
-    if !helpers.has_funcs {
-        emit_throw_type_error(function, scratch, strings, helpers);
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        return;
-    }
-
-    // 2. A non-generator receiver throws a branded `TypeError`.
+    // 2. A non-generator receiver throws a `TypeError`.
     emit_is_generator(function, handle_slot);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    emit_throw_type_error(function, scratch, strings, helpers);
+    emit_throw_not_a_function(
+        function,
+        EXPRESSION_NOT_A_FUNCTION,
+        scratch,
+        strings,
+        helpers,
+    );
     leave_frame(helpers);
     function.instruction(&Instruction::End);
+
+    // 2b. A running generator (resumed from its own body) throws; otherwise it
+    // is marked running for the resume.
+    let limits = MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    };
+    let running = abi::GEN_RUNNING.cast_signed();
+    function.instruction(&Instruction::LocalGet(handle_slot));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(limits));
+    function.instruction(&Instruction::I32Const(running));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_throw_not_a_function(function, GENERATOR_RUNNING, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    let set_running = |function: &mut Function, on: bool| {
+        function.instruction(&Instruction::LocalGet(handle_slot));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalGet(handle_slot));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Load(limits));
+        if on {
+            function.instruction(&Instruction::I32Const(running));
+            function.instruction(&Instruction::I32Or);
+        } else {
+            function.instruction(&Instruction::I32Const(!running));
+            function.instruction(&Instruction::I32And);
+        }
+        function.instruction(&Instruction::I32Store(limits));
+    };
+    set_running(function, true);
 
     // 3. Drive the state machine: SM(sent, gen, …, env = gen.env, argc = 2).
     let k = helpers.max_args as usize;
@@ -201,93 +251,27 @@ pub(super) fn emit_gen_resume(
         table_index: 0,
     });
     // The state machine can throw; unwind if it left an exception pending.
-    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::LocalSet(sm_result));
+    set_running(function, false);
+    emit_propagate_if_pending(function, helpers);
 
     // 4. Build the `{ value, done }` result object from the SM's value and the
     // handle's `done` flag.
-    emit_result_object(sm_result, handle_slot, obj_dst, function, strings, helpers);
-}
-
-/// Emit the branded-`TypeError` throw shared by the two non-generator-receiver
-/// paths of [`emit_gen_resume`]: stash the error in `$exc_value`, set the pending
-/// flag, clear any routed completion, and unwind to the nearest handler.
-fn emit_throw_type_error(
-    function: &mut Function,
-    scratch: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    emit_node(&internal_type_error(), function, scratch, strings, helpers);
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
-    emit_throw_return(function, helpers);
+    emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
 }
 
 /// Emit the `{ value, done }` iterator result object, leaving its jsval on the
 /// stack: `value` is the state machine's returned value (in `sm_result`), `done`
-/// is the handle's `done` flag (in `handle_slot`) as a boolean. `obj_dst` is the
-/// i32 scratch holding the object base across the field writes.
+/// is the handle's `done` flag (in `handle_slot`) as a boolean, staged in the
+/// general i64 scratch slot (`scratch`) before the object literal is built.
 fn emit_result_object(
     sm_result: u32,
     handle_slot: u32,
-    obj_dst: u32,
+    scratch: u32,
     function: &mut Function,
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let payload = (HEADER_SIZE + 4) as u64;
-    let value_off = strings.get("value").copied().unwrap_or(HEAP_BASE);
-    let done_off = strings.get("done").copied().unwrap_or(HEAP_BASE);
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4 + 32));
-    function.instruction(&Instruction::Call(helpers.alloc));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I32Const(TYPE_OBJECT));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
-    // Entry 0: "value" -> the state machine's returned value.
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(value_off)));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload,
-        align: 3,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::LocalGet(sm_result));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload + 8,
-        align: 3,
-        memory_index: 0,
-    }));
-    // Entry 1: "done" -> the handle's `done` flag as a boolean jsval.
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
-    function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(done_off)));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload + 16,
-        align: 3,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalTee(obj_dst));
-    function.instruction(&Instruction::LocalGet(obj_dst));
     function.instruction(&Instruction::I64Const(TRUE_BITS));
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::LocalGet(handle_slot));
@@ -298,16 +282,24 @@ fn emit_result_object(
         memory_index: 0,
     }));
     function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: payload + 24,
-        align: 3,
-        memory_index: 0,
-    }));
-
-    // Rebox the result object's base as a heap jsval.
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(scratch));
+    let entries = [
+        (
+            PropKey::Static("value".to_owned()),
+            IrNode::Local(sm_result),
+        ),
+        (PropKey::Static("done".to_owned()), IrNode::Local(scratch)),
+    ];
+    emit_object_node(
+        &entries,
+        None,
+        abi::CLASS_ORDINARY,
+        0,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
 }
 
 /// Emit a generator STATE MACHINE function. Its wasm parameters are the
@@ -316,7 +308,10 @@ fn emit_result_object(
 /// segment. Each segment runs its straight-line statements and ends by either
 /// storing the next state and returning the yielded value (`done` stays `0`), or
 /// setting `done = 1` and returning the final value. Re-entry after completion
-/// hits the out-of-range default and returns `undefined`.
+/// hits the out-of-range default and returns `undefined`. A segment with a
+/// handler runs inside a landing pad that re-dispatches to the handler block on a
+/// throw; an uncaught throw lands in the outermost pad, which completes the
+/// generator and returns with the exception still pending.
 pub(super) fn emit_generator_sm(
     func: &IrFunction,
     strings: &HashMap<String, i32>,
@@ -346,6 +341,10 @@ pub(super) fn emit_generator_sm(
     // The generator handle is local 1 (a1); read/write `state`/`done` through it.
     let gen_local = 1;
 
+    // The outermost landing pad: the active handler wherever no `try` is, so an
+    // uncaught throw completes the generator (below) instead of returning with
+    // `state` unchanged.
+    open_landing_pad(&mut function, helpers);
     // A `loop` wraps the whole dispatch so a `Jump`/`Branch` terminator can store
     // the next block index and `br` back to re-dispatch (CFG flattening). Inside
     // it, one `block` per basic block plus a trailing out-of-range default, then a
@@ -354,6 +353,7 @@ pub(super) fn emit_generator_sm(
     // / a `return`) or by re-dispatching (`Jump`/`Branch`).
     function.instruction(&Instruction::Loop(BlockType::Empty));
     enter_frame(helpers);
+    let loop_depth = helpers.unwind.borrow().depth;
     for _ in 0..=n {
         function.instruction(&Instruction::Block(BlockType::Empty));
         enter_frame(helpers);
@@ -368,10 +368,27 @@ pub(super) fn emit_generator_sm(
     let targets: Vec<u32> = (0..n).collect();
     function.instruction(&Instruction::BrTable(targets.into(), n));
 
-    for segment in segments {
+    let resumes = resume_blocks(segments);
+
+    for (index, segment) in (0u32..).zip(segments) {
         // Close this block's dispatch frame; its code follows the `End`.
         function.instruction(&Instruction::End);
         leave_frame(helpers);
+        // A guarded block runs inside its landing pad, the innermost handler.
+        if segment.handler.is_some() {
+            open_landing_pad(&mut function, helpers);
+        }
+        // A handler block is entered with the exception pending: clear it (the
+        // thrown value stays in `$exc_value` for the block to read).
+        if segment.catches {
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
+        }
+        // A resume entered with the exception pending throws into this block's
+        // active handler (its landing pad, or the outermost one).
+        if resumes.contains(&index) {
+            emit_propagate_if_pending(&mut function, helpers);
+        }
         emit_stmts(
             &segment.stmts,
             &mut function,
@@ -381,9 +398,8 @@ pub(super) fn emit_generator_sm(
             None,
             None,
         );
-        // The `loop` sits at depth 1 (reset = 0, the loop is the first frame), so a
-        // re-dispatch `br` targets `unwind.depth - 1` from wherever we are now.
-        let loop_rel = helpers.unwind.borrow().depth - 1;
+        // A re-dispatch `br` targets the `loop` from wherever we are now.
+        let loop_rel = helpers.unwind.borrow().depth - loop_depth;
         emit_segment_term(
             &segment.term,
             gen_local,
@@ -394,6 +410,18 @@ pub(super) fn emit_generator_sm(
             strings,
             helpers,
         );
+        // The landing: reached only by a throw's `br`; enter the handler block.
+        if let Some(handler) = segment.handler {
+            close_landing_pad(&mut function, helpers);
+            store_gen_i32(
+                &mut function,
+                gen_local,
+                GEN_STATE_OFFSET,
+                handler.cast_signed(),
+            );
+            let loop_rel = helpers.unwind.borrow().depth - loop_depth;
+            function.instruction(&Instruction::Br(loop_rel));
+        }
     }
 
     // Close the default block: a resume with an out-of-range state (a completed
@@ -403,12 +431,30 @@ pub(super) fn emit_generator_sm(
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::Return);
     // Close the dispatch loop. Every path above `return`s or re-dispatches, so the
-    // fall-through here is unreachable; emit a dummy result to satisfy validation.
+    // fall-through here is unreachable.
     function.instruction(&Instruction::End);
     leave_frame(helpers);
+    function.instruction(&Instruction::Unreachable);
+    // Close the outermost landing pad: an uncaught throw completes the generator
+    // (`done = 1`, out-of-range state) and returns with the exception pending.
+    close_landing_pad(&mut function, helpers);
+    store_gen_i32(&mut function, gen_local, GEN_DONE_OFFSET, 1);
+    store_gen_i32(&mut function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
     function
+}
+
+/// The blocks a suspend resumes into: the resumer may enter one with an
+/// exception pending (a rejected `await`), which must throw at the suspend point.
+fn resume_blocks(segments: &[GenSegment]) -> HashSet<u32> {
+    segments
+        .iter()
+        .filter_map(|segment| match segment.term {
+            GenTerm::Yield { resume, .. } => Some(resume),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Emit a basic block's terminator. `loop_rel` is the `br` immediate
@@ -427,21 +473,23 @@ fn emit_segment_term(
 ) {
     match term {
         GenTerm::Yield { value, resume } => {
-            // state = resume; return the yielded value (done stays 0).
-            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, resume.cast_signed());
+            // Evaluate the yielded value (it may throw), then state = resume and
+            // return it (done stays 0).
             emit_node(value, function, scratch, strings, helpers);
+            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, resume.cast_signed());
             function.instruction(&Instruction::Return);
         }
         GenTerm::Return(value) => {
-            // done = 1; state = n (out of range) so re-entry yields undefined.
-            store_gen_i32(function, gen_local, GEN_DONE_OFFSET, 1);
-            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
+            // Evaluate the value (it may throw), then done = 1; state = n (out of
+            // range) so re-entry yields undefined.
             match value {
                 Some(value) => emit_node(value, function, scratch, strings, helpers),
                 None => {
                     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
                 }
             }
+            store_gen_i32(function, gen_local, GEN_DONE_OFFSET, 1);
+            store_gen_i32(function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
             function.instruction(&Instruction::Return);
         }
         GenTerm::Jump(target) => {
@@ -473,12 +521,8 @@ fn emit_segment_term(
 
 /// Emit the `__gen_to_array(gen) -> array` helper: drive the generator
 /// to exhaustion via `call_indirect`, collecting each yielded value into a fresh
-/// growable array (the generator's `return` value is NOT included, matching the
+/// array (the generator's `return` value is NOT included, matching the
 /// iterator protocol). Backs `[...gen]` / `f(...gen)` spread.
-///
-/// When the program declares no functions there is no funcref table, so no
-/// generator can exist — a STUB (returns `undefined`, never called) keeps the
-/// helper index stable without an invalid `call_indirect`.
 pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
     // Param: gen (local 0). Locals: val (i64, local 1), arr base (i32, local 2).
     let mut function = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
@@ -486,31 +530,10 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
     let val = 1;
     let arr = 2;
 
-    if !helpers.has_funcs {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::End);
-        return function;
-    }
-
-    let type_byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    // arr = a fresh empty array: __alloc(HEADER_SIZE + 4), TYPE_ARRAY byte, len 0.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::Call(helpers.alloc));
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Const(TYPE_ARRAY));
-    function.instruction(&Instruction::I32Store8(type_byte));
-    function.instruction(&Instruction::LocalGet(arr));
+    // arr = a fresh empty array, grown in place by `__array_push`.
     function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
+    function.instruction(&Instruction::Call(helpers.new_array()));
+    function.instruction(&Instruction::LocalSet(arr));
 
     let k = helpers.max_args as usize;
     function.instruction(&Instruction::Block(BlockType::Empty)); // $exit (depth 1)
@@ -554,11 +577,11 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
         memory_index: 0,
     }));
     function.instruction(&Instruction::BrIf(1)); // -> $exit
-    // arr = __array_push(arr, val).
+    // __array_push(arr, val).
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::LocalGet(val));
     function.instruction(&Instruction::Call(helpers.array_push));
-    function.instruction(&Instruction::LocalSet(arr));
+    function.instruction(&Instruction::Drop);
     function.instruction(&Instruction::Br(0)); // -> $L
     function.instruction(&Instruction::End); // $L
     function.instruction(&Instruction::End); // $exit
@@ -580,21 +603,11 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
 /// deliberately does NOT build a `{ value, done }` object or propagate a pending
 /// exception: the host async engine reads the handle's `done` flag and the
 /// `__exc_pending`/`__exc_value` globals directly after the call.
-///
-/// When the program declares no functions there is no funcref table, so no async
-/// generator can exist — a STUB (returns `undefined`, never called) keeps the
-/// export/index stable without an invalid `call_indirect`.
 pub(super) fn emit_async_step(helpers: Helpers<'_>) -> Function {
     // Params: gen (local 0, i64), sent (local 1, i64) -> i64. No extra locals.
     let mut function = Function::new(vec![]);
     let gen_p = 0;
     let sent_p = 1;
-
-    if !helpers.has_funcs {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::End);
-        return function;
-    }
 
     // Drive the state machine: SM(sent, gen, …, env = gen.env, argc = 2). Mirrors
     // `emit_gen_resume` step 3 (an async generator forces K >= 2, so the drop
@@ -635,6 +648,24 @@ pub(super) fn emit_async_step(helpers: Helpers<'_>) -> Function {
     // The SM's value is on the stack; the host reads `done`/`__exc_pending`.
     function.instruction(&Instruction::End);
     function
+}
+
+/// Open a `block` and register it as the innermost exception handler: a throw
+/// inside `br`s to just past its `End` (the landing code).
+fn open_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    let mut unwind = helpers.unwind.borrow_mut();
+    unwind.depth += 1;
+    let depth = unwind.depth;
+    unwind.handlers.push(depth);
+}
+
+/// Close a block opened with [`open_landing_pad`], unregistering its handler.
+fn close_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
+    let mut unwind = helpers.unwind.borrow_mut();
+    unwind.handlers.pop();
+    unwind.depth -= 1;
+    function.instruction(&Instruction::End);
 }
 
 /// Store the i32 constant `value` into the generator handle field at `offset`

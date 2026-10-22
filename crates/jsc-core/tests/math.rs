@@ -3,7 +3,7 @@
 
 use jsc_core::run::{Value, compile_and_run, format_value};
 mod common;
-use common::{assert_eval, assert_number, assert_output};
+use common::{assert_eval, assert_number, assert_output, assert_uncaught};
 
 /// Each acceptance bullet: the primary result of every recognized `Math.*` method.
 #[test]
@@ -92,6 +92,51 @@ fn math_pow_integer_exponents() {
     assert_number("Math.pow(Math.pow(2, 3), 2)", 64.0);
 }
 
+/// Huge-magnitude integer exponents terminate (square-and-multiply over a halving
+/// counter, not one multiply per unit) and saturate to the exact IEEE result.
+#[test]
+fn math_pow_large_exponents_terminate() {
+    assert_eval("2 ** -2147483648", "0");
+    assert_eval("1 ** -2147483648", "1");
+    assert_eval("(-1) ** 2147483648", "1");
+    assert_eval("(-1) ** 2147483647", "-1");
+    assert_eval("0.5 ** -2147483648", "Infinity");
+    assert_eval("2 ** 2147483648", "Infinity");
+    assert_eval("Math.pow(2, -2147483648)", "0");
+    assert_eval("Math.pow(-2, 1e308)", "Infinity");
+    assert_eval("Math.pow(0.5, 1e308)", "0");
+    assert_eval("Math.pow(2, 1023) === Infinity", "false");
+    assert_eval("2 ** 1024", "Infinity");
+    assert_eval("2 ** -1074 > 0", "true");
+    assert_eval("1.5 ** 3", "3.375");
+    assert_eval("4 ** 2.5", "32");
+}
+
+/// The spec's `Number::exponentiate` special cases: `NaN` and infinite exponents,
+/// `±1` with an infinite exponent, and signed zero / infinity bases under a
+/// non-integer exponent.
+#[test]
+fn math_pow_special_values() {
+    assert_eval("2 ** NaN", "NaN");
+    assert_eval("NaN ** 0", "1");
+    assert_eval("NaN ** -0", "1");
+    assert_eval("NaN ** 1", "NaN");
+    assert_eval("1 ** Infinity", "NaN");
+    assert_eval("(-1) ** -Infinity", "NaN");
+    assert_eval("2 ** Infinity", "Infinity");
+    assert_eval("2 ** -Infinity", "0");
+    assert_eval("0.5 ** Infinity", "0");
+    assert_eval("(-0.5) ** -Infinity", "Infinity");
+    assert_eval("(-8) ** (1 / 3)", "NaN");
+    assert_eval("1 / ((-0) ** 0.5)", "Infinity");
+    assert_eval("(-0) ** -0.5", "Infinity");
+    assert_eval("1 / ((-0) ** 3)", "-Infinity");
+    assert_eval("(-Infinity) ** 0.5", "Infinity");
+    assert_eval("(-Infinity) ** 3", "-Infinity");
+    assert_eval("1 / ((-Infinity) ** -3)", "-Infinity");
+    assert_eval("1 / ((-Infinity) ** -0.5)", "Infinity");
+}
+
 /// `Math` is not a real binding, so a local named `Math` shadows the built-in: the
 /// member call then resolves to the user object's function value.
 #[test]
@@ -102,21 +147,11 @@ fn math_is_shadowable() {
     );
 }
 
-/// An unknown `Math.<name>` or a wrong argument count is a compile error.
+/// An unknown `Math.<name>` is an ordinary property read (`undefined`), so
+/// calling it throws a catchable `TypeError` at run time.
 #[test]
-fn math_unknown_method_and_arity_errors() {
-    assert!(
-        compile_and_run("Math.log(2)").is_err(),
-        "unknown method errors"
-    );
-    assert!(
-        compile_and_run("Math.floor(1, 2)").is_err(),
-        "extra arg errors"
-    );
-    assert!(
-        compile_and_run("Math.pow(2)").is_err(),
-        "missing arg errors"
-    );
+fn math_unknown_method_is_a_type_error() {
+    assert_uncaught("Math.log(2)", "TypeError: Math.log is not a function");
 }
 
 /// `Math.*` results flow through `console.log` like any number.

@@ -5,10 +5,27 @@ use swc_common::{Spanned, SyntaxContext};
 
 use crate::error::CompileError;
 
+use super::expr::push_accessor_half;
+
 impl LowerCtx<'_> {
     /// Lower one statement, appending the resulting [`IrStmt`](s) to `out`.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt, out: &mut Vec<IrStmt>) -> anyhow::Result<()> {
+        // Inside a tracked top-level `try`, a compound statement completes with
+        // `undefined` when its body produces no value (UpdateEmpty).
+        if matches!(
+            stmt,
+            Stmt::If(_)
+                | Stmt::While(_)
+                | Stmt::DoWhile(_)
+                | Stmt::For(_)
+                | Stmt::ForOf(_)
+                | Stmt::ForIn(_)
+                | Stmt::Labeled(_)
+                | Stmt::Switch(_)
+        ) {
+            self.reset_completion(out);
+        }
         match stmt {
             Stmt::Expr(expr_stmt) => {
                 // `yield* iterable;` delegates to an inner generator: it
@@ -18,14 +35,30 @@ impl LowerCtx<'_> {
                 {
                     return self.lower_yield_delegate(yield_expr, out);
                 }
-                out.push(IrStmt::Expr(self.lower_expr(&expr_stmt.expr)?));
+                // `[a, o.b] = rhs;` / `({k: o.p} = rhs);` desugars to a sequence of
+                // statements, so it is lowered here rather than as an expression.
+                if let Expr::Assign(assign) = strip_parens(&expr_stmt.expr)
+                    && assign.op == AssignOp::Assign
+                    && let AssignTarget::Pat(pat) = &assign.left
+                {
+                    return self.lower_destructuring_assign(pat, &assign.right, out);
+                }
+                let value = self.lower_expr(&expr_stmt.expr)?;
+                out.push(IrStmt::Expr(match self.completion_local() {
+                    Some(local) => IrNode::Assign {
+                        local,
+                        value: Box::new(value),
+                    },
+                    None => value,
+                }));
                 Ok(())
             }
             // `let`/`const`/`var` declarations. An uninitialized `let x;` binds
             // `undefined` (a `const` with no initializer is a parser error).
             Stmt::Decl(Decl::Var(var_decl)) => self.lower_var_decl(var_decl, out),
-            // A nested `function foo(){ .. }` declaration lowers to a first-class
-            // function value bound to `foo` in the current scope.
+            // A nested `function foo(){ .. }` declaration reached outside a
+            // hoisting statement list (see `lower_stmts`) lowers in place to a
+            // first-class function value bound to `foo` in the current scope.
             Stmt::Decl(Decl::Fn(fn_decl)) => self.lower_nested_fn_decl(fn_decl, out),
             // A `class A { constructor(..){ .. } }` declaration lowers to a
             // class value (constructor function + shared prototype) bound to `A`.
@@ -36,12 +69,7 @@ impl LowerCtx<'_> {
             // the block. Inner bindings shadow outer ones and do not leak out.
             Stmt::Block(block) => {
                 self.push_scope();
-                let result = (|| {
-                    for inner in &block.stmts {
-                        self.lower_stmt(inner, out)?;
-                    }
-                    Ok(())
-                })();
+                let result = self.lower_stmts(&block.stmts, out);
                 self.pop_scope();
                 result
             }
@@ -90,6 +118,11 @@ impl LowerCtx<'_> {
                     Some(expr) => Some(self.lower_expr(expr)?),
                     None => None,
                 };
+                let value = if self.frame().derived() {
+                    Some(self.derived_return(value))
+                } else {
+                    value
+                };
                 out.push(IrStmt::Return(value));
                 Ok(())
             }
@@ -105,11 +138,117 @@ impl LowerCtx<'_> {
             // `try { .. } catch (e) { .. } finally { .. }` (either clause may be
             // absent, but not both), lowered by `lower_try`.
             Stmt::Try(try_stmt) => self.lower_try(try_stmt, out),
+            // A stray `;` is an empty statement.
+            Stmt::Empty(_) => Ok(()),
             // Attach the offending statement's source range so a diagnostic
             // renderer can point at it, and describe the construct in plain
             // English rather than leaking the raw swc AST debug form.
             other => Err(CompileError::spanned(other.span(), unsupported_stmt_msg(other)).into()),
         }
+    }
+
+    /// Lower a function body or block statement list into `out`, hoisting its
+    /// function declarations: every declaration is bound and initialized before
+    /// any statement of the list runs, so it can be called or read before its
+    /// textual position, recurse through its own name, and be mutually
+    /// recursive with its siblings.
+    ///
+    /// The declaration names are bound first (so the statements resolve them),
+    /// then the other statements are lowered, and only then the declaration
+    /// bodies — once every binding of the list is declared, so a body may
+    /// capture a `let`/`const` declared later. Such a captured binding's cell is
+    /// created up front (holding `undefined` until its declaration runs) so the
+    /// hoisted closures share it; its declaration then stores into that cell.
+    ///
+    /// A generator (`env_backed`) frame keeps the in-order lowering.
+    pub(super) fn lower_stmts(
+        &mut self,
+        stmts: &[Stmt],
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let fns: Vec<&FnDecl> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Decl(Decl::Fn(f)) => Some(f),
+                _ => None,
+            })
+            .collect();
+        if fns.is_empty() || self.frame().env_backed {
+            for stmt in stmts {
+                self.lower_stmt(stmt, out)?;
+            }
+            return Ok(());
+        }
+        let mut prefix = Vec::new();
+        let fn_locals: Vec<u32> = fns
+            .iter()
+            .map(|f| self.declare(f.ident.sym.as_ref(), true, f.ident.span.lo.0))
+            .collect();
+        for &local in &fn_locals {
+            if self.is_cell(local) {
+                prefix.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(IrNode::Undefined)),
+                });
+            }
+        }
+        let mut rest = Vec::new();
+        for stmt in stmts {
+            if !matches!(stmt, Stmt::Decl(Decl::Fn(_))) {
+                self.lower_stmt(stmt, &mut rest)?;
+            }
+        }
+        // Hoist the cell of every captured binding the list declares: create it
+        // in the prefix and turn its declaration into a store into that cell.
+        for local in self.innermost_cell_locals() {
+            if fn_locals.contains(&local) {
+                continue;
+            }
+            for stmt in &mut rest {
+                let IrStmt::Decl {
+                    local: decl_local,
+                    init: IrNode::CellNew(value),
+                } = stmt
+                else {
+                    continue;
+                };
+                if *decl_local != local {
+                    continue;
+                }
+                let value = std::mem::replace(value.as_mut(), IrNode::Undefined);
+                *stmt = IrStmt::Decl {
+                    local: self.fresh(),
+                    init: IrNode::CellSet {
+                        cell: Box::new(IrNode::Local(local)),
+                        value: Box::new(value),
+                    },
+                };
+                prefix.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(IrNode::Undefined)),
+                });
+                break;
+            }
+        }
+        for (fn_decl, local) in fns.into_iter().zip(fn_locals) {
+            let value = self.lower_nested_fn_value(fn_decl)?;
+            // A store into the pre-created cell is bound as a `Decl` of a
+            // scratch local so it never becomes `main`'s completion value.
+            prefix.push(if self.is_cell(local) {
+                IrStmt::Decl {
+                    local: self.fresh(),
+                    init: IrNode::CellSet {
+                        cell: Box::new(IrNode::Local(local)),
+                        value: Box::new(value),
+                    },
+                }
+            } else {
+                IrStmt::Decl { local, init: value }
+            });
+        }
+        out.extend(prefix);
+        out.extend(rest);
+        Ok(())
     }
 
     /// Lower a `let`/`const`/`var` declaration. A declarator with no initializer
@@ -126,9 +265,12 @@ impl LowerCtx<'_> {
         for declarator in &var_decl.decls {
             // A missing initializer (`let x;`) binds `undefined` (JS semantics); a
             // `const` with no initializer is already rejected by the parser.
-            let init = match declarator.init.as_ref() {
-                Some(init) => self.lower_expr(init)?,
-                None => IrNode::Undefined,
+            let init = match (declarator.init.as_ref(), &declarator.name) {
+                (Some(init), Pat::Ident(ident)) => {
+                    self.lower_named_expr(init, ident.id.sym.as_ref())?
+                }
+                (Some(init), _) => self.lower_expr(init)?,
+                (None, _) => IrNode::Undefined,
             };
             match &declarator.name {
                 // The `Pat::Ident` fast path: bind one local directly (a captured
@@ -145,75 +287,57 @@ impl LowerCtx<'_> {
         Ok(())
     }
 
-    /// Lower a `class A { constructor(x){ this.v = x } }` declaration into
-    /// a class value bound to `A`. The class value is a heap object holding two
-    /// reserved entries: the lowered CONSTRUCTOR function value (an ordinary
-    /// uniform-ABI function that reads `this`, reusing the function lifting and
-    /// `this`-binding), and a single shared PROTOTYPE object holding the methods,
-    /// allocated once here. The class's instance shape — the
-    /// field names the constructor assigns via `this.<field> = ..` — is registered
-    /// in [`Shared::classes`] so a later `new A(args)` can pre-slot the instance,
-    /// since the object model has no dynamic key growth. The instance shape is the
-    /// UNION of the constructor's `this.<field> = ..` assignments and the class's
-    /// instance FIELD declarations, whose initializers run before the
-    /// constructor body (see the field-desugar below).
-    ///
-    /// Instance getter/setter accessors (`get x(){}` / `set x(v){}`) are supported
-    /// (P2b): they lower to a `TYPE_ACCESSOR` box on the shared prototype.
-    /// Out-of-scope class forms are still rejected WITH SPANS: decorators, and
-    /// unsupported members — methods that are async / generator / computed, a
-    /// STATIC getter/setter, fields that are static / computed, and private /
-    /// static-block forms. A class EXPRESSION (`let C = class{}`) never reaches
-    /// here — it is rejected in expression position.
-    #[allow(clippy::too_many_lines)]
+    /// Lower a `class C {..}` declaration: the class value (see
+    /// [`Self::lower_class`]) bound to `C` in the current scope.
     fn lower_class_decl(
         &mut self,
         class_decl: &ClassDecl,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let class = class_decl.class.as_ref();
-        // `class C extends P` (E-series): the superclass must be a bare identifier
-        // naming a class declared earlier, so its prototype/constructor/fields are
-        // already recorded. `super` inside the body resolves to this name.
-        let (parent, parent_span) = match &class.super_class {
-            None => (None, class.span()),
-            Some(super_expr) => {
-                let Expr::Ident(id) = super_expr.as_ref() else {
-                    return Err(CompileError::spanned(
-                        super_expr.span(),
-                        "a class may only `extends` a named class",
-                    )
-                    .into());
-                };
-                let parent_name = id.sym.as_ref();
-                if !self.shared.classes.borrow().contains_key(parent_name) {
-                    return Err(CompileError::spanned(
-                        id.span,
-                        format!("superclass `{parent_name}` is not a declared class"),
-                    )
-                    .into());
-                }
-                (Some(parent_name.to_owned()), id.span)
-            }
-        };
+        let name = class_decl.ident.sym.as_ref();
+        let local = self.declare(name, true, class_decl.ident.span.lo.0);
+        let value = self.lower_class(&class_decl.class, name, true)?;
+        self.push_binding(local, value, out);
+        Ok(())
+    }
+
+    /// Lower a class (declaration or expression) to an expression yielding the
+    /// class value (DESIGN.md §5.5, §7.6): the constructor function carrying a
+    /// non-writable `prototype` (`constructor` plus the instance methods and
+    /// accessors) and the static members as own properties. `name` is the
+    /// class's `name`; with `inner_name` it is also bound, immutably, inside the
+    /// class body (a declaration or a named class expression).
+    ///
+    /// `extends <expr>` evaluates `<expr>` once: it must be a constructor or
+    /// `null` (else a `TypeError`); `C.[[Prototype]]` is the parent and
+    /// `C.prototype.[[Prototype]]` is `parent.prototype`. Both are held in
+    /// hidden by-value bindings that `super(..)` / `super.x` read (class
+    /// identity by binding, not by name). A derived constructor is
+    /// `SELF_ALLOC`: `super(..)` constructs `this`, then runs the instance
+    /// fields; a base constructor runs them on entry. Static fields are
+    /// defined after the class value exists, with `this` = the class.
+    ///
+    /// Out-of-scope forms are rejected WITH SPANS: decorators, computed
+    /// member names, async/generator methods, private members, static blocks.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn lower_class(
+        &mut self,
+        class: &Class,
+        name: &str,
+        inner_name: bool,
+    ) -> anyhow::Result<IrNode> {
         if !class.decorators.is_empty() {
             return Err(
                 CompileError::spanned(class.span(), "class decorators are not supported").into(),
             );
         }
 
-        // Find the (at most one) constructor, collect the instance methods,
-        // and collect the instance field declarations; every other member is
-        // out of scope. Static members (`static m(){}` / `static f = init`) are
-        // collected separately and stored directly on the class VALUE object below,
-        // so `C.m()` / `C.f` read them off the class. Computed names and out-of-scope
-        // method forms (getter/setter/async/generator) are rejected WITH SPANS here,
-        // static or not; private fields arrive as `ClassMember::PrivateProp` and are
-        // rejected by `reject_class_member`.
+        // Collect the (at most one) constructor, the methods and accessors
+        // (instance or static), and the fields; every other member is out of
+        // scope.
         let mut ctor = None;
         let mut methods: Vec<&ClassMethod> = Vec::new();
         let mut static_methods: Vec<&ClassMethod> = Vec::new();
-        let mut accessors: Vec<&ClassMethod> = Vec::new();
         let mut field_props: Vec<&ClassProp> = Vec::new();
         let mut static_fields: Vec<&ClassProp> = Vec::new();
         for member in &class.body {
@@ -228,31 +352,18 @@ impl LowerCtx<'_> {
                     }
                     ctor = Some(c);
                 }
-                // A plain instance method is lowered onto the shared prototype below;
-                // a `static` method is lowered onto the class value. An INSTANCE
-                // getter/setter (`get x(){}` / `set x(v){}`) is an accessor property
-                // (P2b), collected separately and stored as a `MakeAccessor` box on
-                // the prototype. Every other out-of-scope form — a STATIC accessor,
-                // an async/generator/computed method (accessor or not) — is rejected
-                // with a span (static or not).
                 ClassMember::Method(m) => {
-                    if matches!(m.kind, MethodKind::Getter | MethodKind::Setter) && !m.is_static {
-                        reject_out_of_scope_accessor(m)?;
-                        accessors.push(m);
+                    reject_out_of_scope_method(m)?;
+                    check_member_name(&m.key, m.is_static, false)?;
+                    if m.is_static {
+                        static_methods.push(m);
                     } else {
-                        reject_out_of_scope_method(m)?;
-                        if m.is_static {
-                            static_methods.push(m);
-                        } else {
-                            methods.push(m);
-                        }
+                        methods.push(m);
                     }
                 }
-                // A plain instance field (`f = init` / `f;`) is initialized on
-                // construction (below); a `static` field is stored on the class
-                // value. Computed field names remain out of scope.
                 ClassMember::ClassProp(p) => {
                     reject_out_of_scope_field(p)?;
+                    check_member_name(&p.key, p.is_static, true)?;
                     if p.is_static {
                         static_fields.push(p);
                     } else {
@@ -265,28 +376,87 @@ impl LowerCtx<'_> {
             }
         }
 
-        // Lower the constructor body to a first-class function value. Each instance
-        // field `f = init` is desugared to a synthetic `this.f = init` statement
-        // (an uninitialized `f;` to `this.f = undefined`), and these run BEFORE the
-        // constructor body in class-body source order — so a constructor observes
-        // the already-initialized fields. A class with fields but NO explicit
-        // constructor synthesizes a default constructor whose body is exactly these
-        // field initializers; a class with neither gets an empty function. The
-        // combined body reads `this` through the `this`-binding machinery like any method, and
-        // the instance shape (below) is the union of the field names and the
-        // constructor's own `this.<f> = ..` assignments — dedup handled by
-        // `collect_instance_fields`.
-        let mut combined_stmts: Vec<Stmt> = Vec::with_capacity(field_props.len());
-        for p in &field_props {
-            combined_stmts.push(field_init_stmt(p)?);
+        let mut seq = Vec::new();
+        // The class scope: the inner name binding (immutable).
+        self.push_scope();
+        let inner = inner_name.then(|| self.declare(name, false, class.span.lo.0));
+        if let Some(local) = inner
+            && self.is_cell(local)
+            && self.env_slot_for_local(local).is_none()
+        {
+            seq.push(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::CellNew(Box::new(IrNode::Undefined))),
+            });
         }
-        let param_pats: Vec<&Pat> = match ctor {
+
+        // `extends <expr>`: the parent constructor and its `prototype`.
+        let heritage = match &class.super_class {
+            None => None,
+            Some(super_expr) => {
+                let value = self.lower_expr(super_expr)?;
+                let (parent, parent_id) = self.hidden_local();
+                let (proto, proto_id) = self.hidden_local();
+                seq.push(IrNode::ClassHeritage {
+                    value: Box::new(value),
+                    parent,
+                    proto,
+                });
+                Some((parent, parent_id, proto, proto_id))
+            }
+        };
+
+        // The instance shape (an optimisation): the field declarations and the
+        // constructor's `this.<f> = ..` assignments, after a recorded parent's.
+        let ctor_stmts: &[Stmt] = ctor
+            .and_then(|c| c.body.as_ref())
+            .map_or(&[], |b| b.stmts.as_slice());
+        let mut fields = match class.super_class.as_deref().map(strip_parens) {
+            Some(Expr::Ident(id)) => self
+                .shared
+                .classes
+                .borrow()
+                .get(id.sym.as_ref())
+                .map(|info| info.fields.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let own = field_props
+            .iter()
+            .filter_map(|p| prop_key_name(&p.key).ok())
+            .chain(collect_instance_fields(ctor_stmts));
+        for f in own {
+            if !fields.contains(&f) {
+                fields.push(f);
+            }
+        }
+        let reserve = u32::try_from(fields.len()).unwrap_or(u32::MAX);
+        self.shared
+            .classes
+            .borrow_mut()
+            .insert(name.to_owned(), ClassInfo { fields });
+
+        let prev_super = self.current_super.replace(SuperScope {
+            frame: self.top(),
+            parent: heritage.map(|h| h.1),
+            proto_parent: heritage.map(|h| h.3),
+            is_static: false,
+            reserve,
+        });
+
+        // The constructor function value — the class value itself. A derived
+        // class without a constructor gets `constructor(...args) { super(...args) }`.
+        let prev_fields = std::mem::replace(
+            &mut self.class_fields,
+            field_props.iter().map(|p| (*p).clone()).collect(),
+        );
+        let kind = if heritage.is_some() {
+            FnKind::DerivedClass
+        } else {
+            FnKind::Class
+        };
+        let ctor_value = match ctor {
             Some(c) => {
-                let body = c
-                    .body
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("constructor requires a body"))?;
-                combined_stmts.extend(body.stmts.iter().cloned());
                 let mut pats = Vec::with_capacity(c.params.len());
                 for param in &c.params {
                     match param {
@@ -300,256 +470,171 @@ impl LowerCtx<'_> {
                         }
                     }
                 }
-                pats
+                self.lower_lifted_function(&pats, BodyKind::Block(ctor_stmts), name, kind)?
             }
-            None => Vec::new(),
-        };
-        // A derived class inherits the parent's instance fields (prepended, so the
-        // shape is parent-then-own): `new C()` must pre-slot every field the whole
-        // constructor chain assigns, since the object model has no dynamic growth.
-        let own_fields = collect_instance_fields(&combined_stmts);
-        let fields = match &parent {
-            Some(p) => {
-                let classes = self.shared.classes.borrow();
-                let mut all = classes.get(p).map(|i| i.fields.clone()).unwrap_or_default();
-                for f in own_fields {
-                    if !all.contains(&f) {
-                        all.push(f);
-                    }
-                }
-                all
+            None if heritage.is_some() => {
+                let (rest, stmts) = default_derived_ctor();
+                self.lower_lifted_function(&[&rest], BodyKind::Block(&stmts), name, kind)?
             }
-            None => own_fields,
+            None => self.lower_lifted_function(&[], BodyKind::Block(&[]), name, kind)?,
         };
+        self.class_fields = prev_fields;
 
-        // Bind the class name and record its instance shape BEFORE lowering the
-        // constructor and method bodies, so a `new C()` referencing the class from
-        // inside any of them resolves to this binding. When a body captures the
-        // name it is boxed into a cell (like a `let`); the cell is allocated empty
-        // below and filled with the class value, so the ctor/method closures capture
-        // a live cell pointer that a later `new C()` reads back.
-        let name = class_decl.ident.sym.as_ref();
-        let local = self.declare(name, true, class_decl.ident.span.lo.0);
-        self.shared
-            .classes
-            .borrow_mut()
-            .insert(name.to_owned(), ClassInfo { fields });
-
-        // `super` inside the constructor/method bodies resolves to this parent; save
-        // and restore the enclosing value so a nested class declaration is isolated.
-        let prev_super = self.current_super.take();
-        self.current_super.clone_from(&parent);
-
-        // The constructor value. A derived class WITHOUT its own constructor reuses
-        // the parent's constructor directly (an implicit `constructor(...a){ super(...a) }`):
-        // reading `Parent["@@constructor"]` forwards the arguments and sets the parent's
-        // fields on the pre-slotted instance. A subclass that declares fields but no
-        // constructor would need the fields initialized too, which the alias skips, so
-        // it must declare a constructor that calls `super()`.
-        let ctor_value = if let Some(p) = &parent
-            && ctor.is_none()
-        {
-            if !field_props.is_empty() {
-                self.current_super = prev_super;
-                return Err(CompileError::spanned(
-                    class.span(),
-                    "a subclass that declares fields must declare a constructor \
-                     that calls super()",
-                )
-                .into());
-            }
-            self.class_member_read(p, parent_span, crate::abi::CLASS_CONSTRUCTOR_KEY)?
-        } else {
-            self.lower_lifted_function(&param_pats, BodyKind::Block(&combined_stmts))?
-        };
-
-        // Lower each instance method to a first-class function value that
-        // reads `this` through the `this`-binding machinery, exactly like the constructor.
-        // They are stored ONCE, on the class's single shared prototype object,
-        // under the method name — never copied per instance. Pre-slotting the
-        // prototype with one entry per method name (the `IrNode::Object` shape)
-        // lets `__obj_set` write them and lets `new`'s prototype fallback read
-        // them, since the object model has no dynamic key growth.
-        let mut proto_entries = Vec::with_capacity(methods.len());
+        // The prototype: `constructor`, then the methods and accessors as
+        // non-enumerable properties; a `get`/`set` pair sharing a name
+        // collapses to one accessor property.
+        let (class_local, class_id) = self.hidden_local();
+        let mut proto_entries = vec![(
+            PropKey::Hidden("constructor".to_owned()),
+            IrNode::Local(class_local),
+        )];
         for m in methods {
-            let f = m.function.as_ref();
-            let body = f
-                .body
-                .as_ref()
-                .ok_or_else(|| anyhow!("class method requires a body"))?;
-            let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
-            let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            proto_entries.push((prop_key_name(&m.key)?, value));
+            self.lower_class_method(m, &mut proto_entries)?;
         }
-        // Instance accessors (P2b): a `get x(){}` / `set x(v){}` pair sharing the
-        // property name `x` collapses to ONE `TYPE_ACCESSOR` box stored on the
-        // prototype under `x`. Each half is an ordinary lifted function (a getter
-        // takes no params; a setter takes one) that reads `this`/`super` exactly
-        // like a method, so they are lowered here inside the same `current_super`
-        // region. A member read/write that resolves to the box invokes the getter /
-        // setter (see `emit_index_node` / `emit_index_set_node`); a missing half is
-        // pre-slotted `undefined` (reading a set-only property yields `undefined`;
-        // assigning a get-only property is a silent no-op).
-        let mut accessor_names: Vec<String> = Vec::new();
-        let mut accessor_get: Vec<IrNode> = Vec::new();
-        let mut accessor_set: Vec<IrNode> = Vec::new();
-        for m in accessors {
-            let name = prop_key_name(&m.key)?;
-            let f = m.function.as_ref();
-            let body = f
-                .body
-                .as_ref()
-                .ok_or_else(|| anyhow!("class accessor requires a body"))?;
-            let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
-            let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            let idx = if let Some(i) = accessor_names.iter().position(|n| n == &name) {
-                i
-            } else {
-                accessor_names.push(name);
-                accessor_get.push(IrNode::Undefined);
-                accessor_set.push(IrNode::Undefined);
-                accessor_names.len() - 1
-            };
-            if matches!(m.kind, MethodKind::Getter) {
-                accessor_get[idx] = value;
-            } else {
-                accessor_set[idx] = value;
-            }
+        let mut class_entries = vec![(
+            PropKey::Fixed("prototype".to_owned()),
+            IrNode::Object {
+                entries: proto_entries,
+                proto: heritage.map(|h| Box::new(IrNode::Local(h.2))),
+                class: crate::abi::CLASS_ORDINARY,
+                reserve: 0,
+            },
+        )];
+        // Static methods and accessors: own non-enumerable properties of the
+        // class, whose home object is the class (`super.x` reads the parent).
+        if let Some(scope) = self.current_super.as_mut() {
+            scope.is_static = true;
         }
-        for ((name, getter), setter) in accessor_names
-            .into_iter()
-            .zip(accessor_get)
-            .zip(accessor_set)
-        {
-            proto_entries.push((
-                name,
-                IrNode::MakeAccessor {
-                    getter: Box::new(getter),
-                    setter: Box::new(setter),
-                },
-            ));
+        for m in static_methods {
+            self.lower_class_method(m, &mut class_entries)?;
         }
-        // A derived class links its shared prototype to the parent's prototype under
-        // the reserved `@@prototype` key, so `__obj_get`'s prototype-fallback recursion
-        // walks the whole chain: an instance's `obj.m` misses the subclass prototype's
-        // own entries, then follows this link to resolve an inherited method. This is
-        // ALSO the chain `instanceof` walks.
-        if let Some(p) = &parent {
-            let parent_proto =
-                self.class_member_read(p, parent_span, crate::abi::CLASS_PROTOTYPE_KEY)?;
-            proto_entries.push((crate::abi::CLASS_PROTOTYPE_KEY.to_owned(), parent_proto));
+        seq.push(IrNode::DefineProps {
+            obj: Box::new(ctor_value),
+            local: class_local,
+            entries: class_entries,
+        });
+        if let Some((parent, ..)) = heritage {
+            seq.push(IrNode::SetProto {
+                obj: Box::new(IrNode::Local(class_local)),
+                proto: Box::new(IrNode::Local(parent)),
+            });
+        }
+        if let Some(local) = inner {
+            seq.push(self.init_binding(local, IrNode::Local(class_local)));
         }
 
-        // Lower the static members onto the class VALUE itself (not the prototype),
-        // so `C.m()` / `C.f` read them directly off the class object. A static method
-        // is an ordinary lifted function value called with `this` bound to the class
-        // (a plain `C.m()` method call); a static field's initializer is lowered as a
-        // plain expression evaluated ONCE at class-definition time (an uninitialized
-        // `static f;` stores `undefined`). Static members are NOT inherited by a
-        // derived class (the class value has no constructor-side prototype link), and
-        // a static initializer that references the class or `this` is a documented gap
-        // (the class binding is not yet set while the class value is being built).
-        let mut static_entries: Vec<(String, IrNode)> = Vec::new();
-        for m in static_methods {
-            let f = m.function.as_ref();
-            let body = f
-                .body
-                .as_ref()
-                .ok_or_else(|| anyhow!("static class method requires a body"))?;
-            let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
-            let value = self.lower_lifted_function(&param_pats, BodyKind::Block(&body.stmts))?;
-            static_entries.push((prop_key_name(&m.key)?, value));
-        }
-        // A static field whose initializer is a SIMPLE literal (`static x = 1`) is
-        // evaluated inline in the class value. Any other initializer may reference
-        // the class, an earlier static, or `this` — none of which exist while the
-        // class value is being built — so it is PRE-SLOTTED `undefined` here and
-        // assigned AFTER the class binding is created (`C.<key> = <init>`), in source
-        // declaration order, so a later static observes earlier ones. An
-        // uninitialized `static f;` is plain `undefined`.
-        let mut deferred_statics: Vec<(String, &Expr)> = Vec::new();
+        // Static fields, in source order, defined (CreateDataProperty) once the
+        // class value and its inner binding exist; `this` is the class.
+        let prev_static = self.static_init.replace((self.top(), class_id));
         for p in static_fields {
             let key = prop_key_name(&p.key)?;
-            match &p.value {
-                Some(v) if matches!(v.as_ref(), Expr::Lit(_)) => {
-                    let value = self.lower_expr(v)?;
-                    static_entries.push((key, value));
-                }
-                Some(v) => {
-                    static_entries.push((key.clone(), IrNode::Undefined));
-                    deferred_statics.push((key, v));
-                }
-                None => static_entries.push((key, IrNode::Undefined)),
-            }
+            let value = match &p.value {
+                Some(init) => self.lower_named_expr(init, &key)?,
+                None => IrNode::Undefined,
+            };
+            let local = self.fresh();
+            seq.push(IrNode::DefineProps {
+                obj: Box::new(IrNode::Local(class_local)),
+                local,
+                entries: vec![(PropKey::Static(key), value)],
+            });
         }
-
-        // Done lowering the constructor and method bodies: restore the enclosing
-        // `super` target.
+        self.static_init = prev_static;
         self.current_super = prev_super;
+        self.pop_scope();
+        seq.push(IrNode::Local(class_local));
+        Ok(IrNode::Seq(seq))
+    }
 
-        // The class value: a heap object holding the constructor function, the single
-        // shared prototype object (populated with the instance methods), and any
-        // static members appended directly.
-        let mut class_entries = vec![
-            (crate::abi::CLASS_CONSTRUCTOR_KEY.to_owned(), ctor_value),
-            (
-                crate::abi::CLASS_PROTOTYPE_KEY.to_owned(),
-                IrNode::Object(proto_entries),
-            ),
-        ];
-        class_entries.extend(static_entries);
-        let class_value = IrNode::Object(class_entries);
-
-        // Emit the binding (declared above). When the name is captured, allocate the
-        // cell empty first and store the class value into it, so the ctor/method
-        // closures (built while evaluating `class_value`) capture the already-bound
-        // cell pointer — a self-reference like `new C()` inside a method reads it
-        // back. When uncaptured, the value binds directly.
-        if let Some(slot) = self.module_slot_for_local(local) {
-            // A module binding: the module cell is pre-allocated, so the ctor/method
-            // bodies already reach it; just store the class value (as a `Decl`, so
-            // it never becomes `main`'s completion value).
-            out.push(IrStmt::Decl {
-                local,
-                init: IrNode::CellSet {
-                    cell: Box::new(IrNode::ModuleCell(slot)),
-                    value: Box::new(class_value),
-                },
-            });
-        } else if self.is_cell(local) {
-            out.push(IrStmt::Decl {
-                local,
-                init: IrNode::CellNew(Box::new(IrNode::Undefined)),
-            });
-            out.push(IrStmt::Expr(IrNode::CellSet {
-                cell: Box::new(IrNode::Local(local)),
-                value: Box::new(class_value),
-            }));
-        } else {
-            out.push(IrStmt::Decl {
-                local,
-                init: class_value,
-            });
-        }
-
-        // Assign the deferred static-field initializers now that the class binding
-        // exists: `C.<key> = <init>`, in source declaration order. `this` inside an
-        // initializer resolves to the class (via `static_init_class`), and a `C.<k>`
-        // reference reads a static assigned by an earlier line.
-        if !deferred_statics.is_empty() {
-            self.static_init_class = Some(name.to_owned());
-            for (key, init) in deferred_statics {
-                let obj = self.lower_ident(name, class_decl.ident.span)?;
-                let value = self.lower_expr(init)?;
-                out.push(IrStmt::Expr(IrNode::IndexSet {
-                    obj: Box::new(obj),
-                    index: Box::new(IrNode::Str(key)),
-                    value: Box::new(value),
-                }));
-            }
-            self.static_init_class = None;
+    /// Lower a class method or accessor `m` to a function value appended to
+    /// `entries` (a prototype's or the class's) as a non-enumerable property.
+    fn lower_class_method(
+        &mut self,
+        m: &ClassMethod,
+        entries: &mut Vec<(PropKey, IrNode)>,
+    ) -> anyhow::Result<()> {
+        let f = m.function.as_ref();
+        let body = f
+            .body
+            .as_ref()
+            .ok_or_else(|| anyhow!("class method requires a body"))?;
+        let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
+        let key = prop_key_name(&m.key)?;
+        let accessor = match m.kind {
+            MethodKind::Getter => Some(true),
+            MethodKind::Setter => Some(false),
+            MethodKind::Method => None,
+        };
+        let fn_name = match accessor {
+            Some(true) => format!("get {key}"),
+            Some(false) => format!("set {key}"),
+            None => key.clone(),
+        };
+        let value = self.lower_lifted_function(
+            &param_pats,
+            BodyKind::Block(&body.stmts),
+            &fn_name,
+            FnKind::Plain,
+        )?;
+        match accessor {
+            Some(getter) => push_accessor_half(entries, PropKey::Hidden(key), value, getter),
+            None => entries.push((PropKey::Hidden(key), value)),
         }
         Ok(())
+    }
+
+    /// Initialize the freshly declared binding `local` (not a module binding)
+    /// to `value`, as an expression: its generator env cell, its boxed cell
+    /// (allocated beforehand), or the plain local.
+    fn init_binding(&mut self, local: u32, value: IrNode) -> IrNode {
+        if let Some(slot) = self.env_slot_for_local(local) {
+            IrNode::CellSet {
+                cell: Box::new(IrNode::EnvLoad(slot)),
+                value: Box::new(value),
+            }
+        } else if self.is_cell(local) {
+            IrNode::CellSet {
+                cell: Box::new(IrNode::Local(local)),
+                value: Box::new(value),
+            }
+        } else {
+            IrNode::Assign {
+                local,
+                value: Box::new(value),
+            }
+        }
+    }
+
+    /// The value a derived constructor's `return value` returns (DESIGN.md §7.6):
+    /// an object as is; `undefined` (or no value) the bound `this` (a
+    /// `ReferenceError` before `super(..)`); anything else a `TypeError`.
+    fn derived_return(&mut self, value: Option<IrNode>) -> IrNode {
+        let fi = self.top();
+        let Some(value) = value else {
+            return self.derived_this(fi);
+        };
+        let tmp = self.fresh();
+        IrNode::Seq(vec![
+            IrNode::Assign {
+                local: tmp,
+                value: Box::new(value),
+            },
+            IrNode::Ternary {
+                cond: Box::new(IrNode::IsObject(Box::new(IrNode::Local(tmp)))),
+                then_branch: Box::new(IrNode::Local(tmp)),
+                else_branch: Box::new(IrNode::Ternary {
+                    cond: Box::new(IrNode::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(IrNode::Local(tmp)),
+                        rhs: Box::new(IrNode::Undefined),
+                    }),
+                    then_branch: Box::new(self.derived_this(fi)),
+                    else_branch: Box::new(IrNode::Throw(Box::new(type_error(IrNode::Str(
+                        "Derived constructors may only return object or undefined".to_owned(),
+                    ))))),
+                }),
+            },
+        ])
     }
 
     /// Desugar a binding pattern `pat`, bound to the already-lowered `source`
@@ -574,12 +659,13 @@ impl LowerCtx<'_> {
                 Ok(())
             }
             Pat::Array(arr) => {
-                // Evaluate the initializer ONCE into a hidden temp local, then read
-                // each element out of it by index.
+                // Evaluate the initializer ONCE into a hidden temp local as its
+                // `GetIterator` snapshot array, then read each element out of
+                // it by index.
                 let temp = self.fresh();
                 out.push(IrStmt::Decl {
                     local: temp,
-                    init: source,
+                    init: iter_snapshot(source),
                 });
                 for (i, elem) in arr.elems.iter().enumerate() {
                     // A hole (`let [, b] = ..`) skips its index.
@@ -609,6 +695,14 @@ impl LowerCtx<'_> {
                     local: temp,
                     init: source,
                 });
+                // An empty pattern reads nothing, but still requires an
+                // object-coercible source (`({}) = null` throws a TypeError).
+                if obj.props.is_empty() {
+                    out.push(IrStmt::Expr(IrNode::NullishCheck {
+                        value: Box::new(IrNode::Local(temp)),
+                        key: String::new(),
+                    }));
+                }
                 // The statically-known destructured keys, excluded from a rest.
                 let mut bound_keys: Vec<String> = Vec::new();
                 for prop in &obj.props {
@@ -761,6 +855,14 @@ impl LowerCtx<'_> {
         mutable: bool,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
+        let rest = self.collect_array_rest(temp, start, out);
+        self.lower_binding_pattern(target, IrNode::Local(rest), mutable, out)
+    }
+
+    /// Emit the loop collecting `temp[start..temp.length]` into a fresh array
+    /// local and return that local (shared by rest bindings and rest assignment
+    /// targets).
+    fn collect_array_rest(&mut self, temp: u32, start: usize, out: &mut Vec<IrStmt>) -> u32 {
         // The rest array grows via `push`, so it must be a plain local.
         let rest = self.fresh();
         out.push(IrStmt::Decl {
@@ -798,7 +900,284 @@ impl LowerCtx<'_> {
             update,
             label: None,
         });
-        self.lower_binding_pattern(target, IrNode::Local(rest), mutable, out)
+        rest
+    }
+
+    /// Lower a destructuring ASSIGNMENT statement `pattern = rhs` (object or array
+    /// assignment pattern). The RHS is evaluated once into a hidden temp, each
+    /// target is assigned in source order, and the statement's value is the RHS.
+    fn lower_destructuring_assign(
+        &mut self,
+        pat: &AssignTargetPat,
+        rhs: &Expr,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let init = self.lower_expr(rhs)?;
+        let temp = self.fresh();
+        out.push(IrStmt::Decl { local: temp, init });
+        match pat {
+            AssignTargetPat::Array(arr) => {
+                // The statement's value stays the RHS itself.
+                let source = self.fresh();
+                out.push(IrStmt::Decl {
+                    local: source,
+                    init: iter_snapshot(IrNode::Local(temp)),
+                });
+                self.assign_array_pat(arr, source, out)?;
+            }
+            AssignTargetPat::Object(obj) => self.assign_object_pat(obj, temp, out)?,
+            AssignTargetPat::Invalid(invalid) => {
+                return Err(
+                    CompileError::spanned(invalid.span(), "invalid assignment target").into(),
+                );
+            }
+        }
+        // The statement's value is the RHS (stored into a tracked completion).
+        out.push(IrStmt::Expr(match self.completion_local() {
+            Some(local) => IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Local(temp)),
+            },
+            None => IrNode::Local(temp),
+        }));
+        Ok(())
+    }
+
+    /// Assign `value` to a destructuring-assignment `target`: a nested pattern
+    /// recurses through a hidden temp; a simple target (identifier or member) is
+    /// resolved and written.
+    fn assign_to_target(
+        &mut self,
+        target: &Pat,
+        value: IrNode,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        match target {
+            Pat::Array(arr) => {
+                let temp = self.fresh();
+                out.push(IrStmt::Decl {
+                    local: temp,
+                    init: iter_snapshot(value),
+                });
+                self.assign_array_pat(arr, temp, out)
+            }
+            Pat::Object(obj) => {
+                let temp = self.fresh();
+                out.push(IrStmt::Decl {
+                    local: temp,
+                    init: value,
+                });
+                self.assign_object_pat(obj, temp, out)
+            }
+            _ => {
+                let target = self.prepare_assign_ref(target, out)?;
+                out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
+                Ok(())
+            }
+        }
+    }
+
+    /// Assign each element of an array assignment pattern from `temp[i]`; a hole
+    /// skips its index and a trailing rest collects the remaining elements.
+    fn assign_array_pat(
+        &mut self,
+        arr: &ArrayPat,
+        temp: u32,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        for (i, elem) in arr.elems.iter().enumerate() {
+            let Some(elem) = elem else { continue };
+            if let Pat::Rest(rest) = elem {
+                self.assign_element(&rest.arg, out, |this, out| {
+                    IrNode::Local(this.collect_array_rest(temp, i, out))
+                })?;
+                continue;
+            }
+            self.assign_element(elem, out, |_, _| IrNode::Index {
+                obj: Box::new(IrNode::Local(temp)),
+                index: Box::new(index_num(i)),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Assign each property of an object assignment pattern from `temp.key`; a
+    /// trailing rest collects every remaining own key into a new object.
+    fn assign_object_pat(
+        &mut self,
+        obj: &ObjectPat,
+        temp: u32,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let read = |key: &str| IrNode::Index {
+            obj: Box::new(IrNode::Local(temp)),
+            index: Box::new(IrNode::Str(key.to_owned())),
+        };
+        let mut bound_keys: Vec<String> = Vec::new();
+        for prop in &obj.props {
+            match prop {
+                ObjectPatProp::KeyValue(kv) => {
+                    let key = prop_key_name(&kv.key)?;
+                    let value = read(&key);
+                    bound_keys.push(key);
+                    self.assign_element(&kv.value, out, |_, _| value)?;
+                }
+                // Shorthand `{x}` / `{x = 7}` assigns the binding named by the key.
+                ObjectPatProp::Assign(assign) => {
+                    let key = assign.key.id.sym.as_ref().to_owned();
+                    let target = self.assignable_binding(&assign.key.id)?;
+                    let value = self.apply_default(read(&key), assign.value.as_deref(), out)?;
+                    bound_keys.push(key);
+                    out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
+                }
+                ObjectPatProp::Rest(rest) => {
+                    let exclude =
+                        IrNode::Array(bound_keys.iter().cloned().map(IrNode::Str).collect());
+                    self.assign_element(&rest.arg, out, |_, _| IrNode::ObjectRest {
+                        source: Box::new(IrNode::Local(temp)),
+                        exclude: Box::new(exclude),
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Assign one pattern element (optionally `target = default`) from the value
+    /// produced by `fetch`. A simple target's reference (member object, then key)
+    /// is evaluated BEFORE the value is fetched, matching JS evaluation order.
+    fn assign_element(
+        &mut self,
+        target: &Pat,
+        out: &mut Vec<IrStmt>,
+        fetch: impl FnOnce(&mut Self, &mut Vec<IrStmt>) -> IrNode,
+    ) -> anyhow::Result<()> {
+        let (target, default) = match target {
+            Pat::Assign(assign) => (assign.left.as_ref(), Some(assign.right.as_ref())),
+            other => (other, None),
+        };
+        if matches!(target, Pat::Array(_) | Pat::Object(_)) {
+            let read = fetch(self, out);
+            let value = self.apply_default(read, default, out)?;
+            return self.assign_to_target(target, value, out);
+        }
+        let target = self.prepare_assign_ref(target, out)?;
+        let read = fetch(self, out);
+        let value = self.apply_default(read, default, out)?;
+        out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
+        Ok(())
+    }
+
+    /// Apply an optional destructuring default: `read` is stashed once and the
+    /// default replaces it only when it is `undefined`. The result is stashed in
+    /// a temp too, so a `yield` in the default sits in a declaration (which the
+    /// generator segmentation diagnoses) rather than inside a member store.
+    fn apply_default(
+        &mut self,
+        read: IrNode,
+        default: Option<&Expr>,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<IrNode> {
+        let Some(default) = default else {
+            return Ok(read);
+        };
+        let value = self.fresh();
+        out.push(IrStmt::Decl {
+            local: value,
+            init: read,
+        });
+        let default = self.lower_expr(default)?;
+        let result = self.fresh();
+        out.push(IrStmt::Decl {
+            local: result,
+            init: IrNode::Ternary {
+                cond: Box::new(IrNode::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(IrNode::Local(value)),
+                    rhs: Box::new(IrNode::Undefined),
+                }),
+                then_branch: Box::new(default),
+                else_branch: Box::new(IrNode::Local(value)),
+            },
+        });
+        Ok(IrNode::Local(result))
+    }
+
+    /// Evaluate the reference of a simple destructuring-assignment target: an
+    /// assignable binding, or a member whose object (and computed key) are
+    /// stashed in hidden temps so they run exactly once, before the value.
+    fn prepare_assign_ref(
+        &mut self,
+        target: &Pat,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<AssignRef> {
+        let expr = match target {
+            Pat::Ident(ident) => return self.assignable_binding(&ident.id),
+            Pat::Expr(expr) => strip_parens(expr),
+            other => {
+                return Err(CompileError::spanned(
+                    other.span(),
+                    "unsupported destructuring assignment target",
+                )
+                .into());
+            }
+        };
+        match expr {
+            Expr::Ident(ident) => self.assignable_binding(ident),
+            Expr::Member(m) => {
+                let init = self.lower_expr(&m.obj)?;
+                let obj = self.fresh();
+                out.push(IrStmt::Decl { local: obj, init });
+                let key = match &m.prop {
+                    MemberProp::Computed(c) => {
+                        let init = self.lower_expr(&c.expr)?;
+                        let key = self.fresh();
+                        out.push(IrStmt::Decl { local: key, init });
+                        IrNode::Local(key)
+                    }
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                    MemberProp::PrivateName(_) => {
+                        return Err(CompileError::spanned(
+                            m.span(),
+                            "unsupported assignment target",
+                        )
+                        .into());
+                    }
+                };
+                Ok(AssignRef::Member { obj, key })
+            }
+            other => Err(CompileError::spanned(
+                other.span(),
+                "unsupported destructuring assignment target",
+            )
+            .into()),
+        }
+    }
+
+    /// Resolve `ident` as an assignable (declared, non-`const`) binding.
+    fn assignable_binding(&mut self, ident: &Ident) -> anyhow::Result<AssignRef> {
+        let name = ident.sym.as_ref();
+        let resolved = self.resolve_target(name, ident.span())?;
+        if !resolved.mutable {
+            return Err(CompileError::spanned(
+                ident.span(),
+                format!("cannot assign to constant binding: {name}"),
+            )
+            .into());
+        }
+        Ok(AssignRef::Binding(resolved.kind))
+    }
+
+    /// The store of `value` into a prepared assignment reference.
+    fn write_assign_ref(target: AssignRef, value: IrNode) -> IrNode {
+        match target {
+            AssignRef::Binding(kind) => Self::write_of(kind, value),
+            AssignRef::Member { obj, key } => IrNode::IndexSet {
+                obj: Box::new(IrNode::Local(obj)),
+                index: Box::new(key),
+                value: Box::new(value),
+            },
+        }
     }
 
     /// Lower a `switch (disc) { case E: .. default: .. }` statement. The
@@ -857,16 +1236,39 @@ impl LowerCtx<'_> {
             return Err(anyhow!("try without catch or finally"));
         }
 
+        // The completion value (for `-p`): a top-level `try` in `main` opens a
+        // completion local that every expression statement of its block and catch
+        // clause stores into; it is reset to `undefined` on entry (an empty `try`
+        // yields `undefined`) and pushed as `main`'s value after the statement.
+        let outermost =
+            self.main_ctx && self.frames.len() == 1 && self.shared.completion.get().is_none();
+        if outermost {
+            let local = self.fresh();
+            self.shared.completion.set(Some(local));
+        }
+        self.reset_completion(out);
+        let result = self.lower_try_clauses(try_stmt, out);
+        if outermost
+            && let Some(local) = self.shared.completion.take()
+            && result.is_ok()
+        {
+            out.push(IrStmt::Expr(IrNode::Local(local)));
+        }
+        result
+    }
+
+    /// Lower the clauses of a `try` statement (see [`Self::lower_try`]) and push
+    /// the resulting [`IrStmt::Try`].
+    fn lower_try_clauses(
+        &mut self,
+        try_stmt: &swc_ecma_ast::TryStmt,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
         // The guarded block: its own lexical scope, statements lowered inline
         // (blocks share the function's wasm locals, like `Stmt::Block`).
         self.push_scope();
         let mut body = Vec::new();
-        let body_result = (|| -> anyhow::Result<()> {
-            for inner in &try_stmt.block.stmts {
-                self.lower_stmt(inner, &mut body)?;
-            }
-            Ok(())
-        })();
+        let body_result = self.lower_stmts(&try_stmt.block.stmts, &mut body);
         self.pop_scope();
         body_result?;
 
@@ -890,10 +1292,9 @@ impl LowerCtx<'_> {
                         // the parameter is captured (mirrors a captured `let`).
                         self.push_binding(local, IrNode::ExcValue, &mut catch_body);
                     }
-                    for inner in &handler.body.stmts {
-                        self.lower_stmt(inner, &mut catch_body)?;
-                    }
-                    Ok(())
+                    // The catch clause's value replaces the guarded block's.
+                    self.reset_completion(&mut catch_body);
+                    self.lower_stmts(&handler.body.stmts, &mut catch_body)
                 })();
                 self.pop_scope();
                 catch_result?;
@@ -903,16 +1304,14 @@ impl LowerCtx<'_> {
         };
 
         // The finally clause (when present): its own lexical scope, like the body.
+        // Its value is discarded, so completion tracking is suspended inside it.
         let finally_body = match &try_stmt.finalizer {
             Some(block) => {
                 self.push_scope();
+                let completion = self.shared.completion.take();
                 let mut finally_body = Vec::new();
-                let finally_result = (|| -> anyhow::Result<()> {
-                    for inner in &block.stmts {
-                        self.lower_stmt(inner, &mut finally_body)?;
-                    }
-                    Ok(())
-                })();
+                let finally_result = self.lower_stmts(&block.stmts, &mut finally_body);
+                self.shared.completion.set(completion);
                 self.pop_scope();
                 finally_result?;
                 Some(finally_body)
@@ -926,6 +1325,27 @@ impl LowerCtx<'_> {
             finally_body,
         });
         Ok(())
+    }
+
+    /// The `main` local the current expression statement's completion value is
+    /// stored into: set only inside a top-level `try` (see [`Self::lower_try`])
+    /// and only in `main`'s own frame — a nested function body never writes it.
+    fn completion_local(&self) -> Option<u32> {
+        if self.main_ctx && self.frames.len() == 1 {
+            self.shared.completion.get()
+        } else {
+            None
+        }
+    }
+
+    /// Reset the tracked completion value to `undefined` (a no-op when untracked).
+    fn reset_completion(&self, out: &mut Vec<IrStmt>) {
+        if let Some(local) = self.completion_local() {
+            out.push(IrStmt::Expr(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Undefined),
+            }));
+        }
     }
 
     /// Lower a `while (cond) body`. `label`, when `Some`, is the loop id that a
@@ -1138,9 +1558,10 @@ impl LowerCtx<'_> {
     /// it (mirroring [`Self::lower_for`]). The `for-of` head opens a lexical
     /// scope, so the binding is not visible after the loop.
     ///
-    /// Only `const`/`let` single-identifier heads over arrays/strings are
-    /// supported; a destructuring/assignment head, `for await`, or `using` head is
-    /// a spanned error.
+    /// The head is a `const`/`let` single-identifier binding, or a member /
+    /// destructuring assignment target (`o.x`, `[o.a, b]`) written each
+    /// iteration; a bare identifier assignment head, a declared destructuring
+    /// pattern, `for await`, or a `using` head is a spanned error.
     fn lower_for_of(
         &mut self,
         for_of: &swc_ecma_ast::ForOfStmt,
@@ -1152,8 +1573,9 @@ impl LowerCtx<'_> {
                 CompileError::spanned(for_of.span(), "for-await-of is not supported").into(),
             );
         }
-        // The head must declare a single `const`/`let` identifier binding.
-        let (ident, mutable) = match &for_of.left {
+        // The head declares a single `const`/`let` identifier binding, or is a
+        // member / destructuring assignment target (`o.x`, `[o.a, o.b]`).
+        let head = match &for_of.left {
             ForHead::VarDecl(var_decl) => {
                 let [declarator] = var_decl.decls.as_slice() else {
                     return Err(CompileError::spanned(
@@ -1162,15 +1584,33 @@ impl LowerCtx<'_> {
                     )
                     .into());
                 };
-                let Pat::Ident(ident) = &declarator.name else {
-                    return Err(CompileError::spanned(
-                        declarator.name.span(),
-                        "unsupported for-of binding pattern",
-                    )
-                    .into());
-                };
-                (ident, var_decl.kind != VarDeclKind::Const)
+                let mutable = var_decl.kind != VarDeclKind::Const;
+                match &declarator.name {
+                    Pat::Ident(ident) => ForOfHead::Decl(ident, mutable),
+                    pat @ (Pat::Array(_) | Pat::Object(_)) => {
+                        let mut names = Vec::new();
+                        super::capture::pat_names(pat, &mut names);
+                        let mut seen = std::collections::HashSet::new();
+                        if let Some(dup) = names.iter().find(|name| !seen.insert(name.as_str())) {
+                            return Err(CompileError::spanned(
+                                pat.span(),
+                                format!("duplicate binding in for-of head: {dup}"),
+                            )
+                            .into());
+                        }
+                        ForOfHead::Pattern(pat, mutable)
+                    }
+                    other => {
+                        return Err(CompileError::spanned(
+                            other.span(),
+                            "unsupported for-of binding pattern",
+                        )
+                        .into());
+                    }
+                }
             }
+            // A bare identifier head (`for (x of ..)`) stays rejected.
+            ForHead::Pat(pat) if !is_ident_target(pat) => ForOfHead::Assign(pat),
             other => {
                 return Err(CompileError::spanned(
                     other.span(),
@@ -1180,35 +1620,20 @@ impl LowerCtx<'_> {
             }
         };
 
-        // Reject a statically-known non-iterable head (`for (const x of 5)`, `of
-        // {}`): only arrays and strings are supported here. Dynamic values
-        // (identifiers, calls) carry no static type in the numeric IR, so a
-        // non-iterable reaching the loop at runtime is undefined behavior, like an
-        // out-of-bounds index elsewhere.
-        if non_iterable_literal(&for_of.right) {
-            return Err(CompileError::spanned(
-                for_of.right.span(),
-                "for-of iterable must be an array or string",
-            )
-            .into());
-        }
-
         self.push_scope();
         let result = (|| {
-            // Evaluate the iterable ONCE into a temp. At runtime it is either a
-            // GENERATOR (driven via the iterator protocol) or an
-            // array/string (the ordinary index walk); a runtime `IsGenerator` test
-            // selects between the two — the index branch is unchanged.
+            // Evaluate the iterable ONCE into a temp. At runtime a GENERATOR is
+            // driven via the iterator protocol; any other value is walked by
+            // index through its `GetIterator` source (array, string, live
+            // Map/Set), which throws for a non-iterable.
             let iter = self.lower_expr(&for_of.right)?;
             let iter_local = self.fresh();
             out.push(IrStmt::Decl {
                 local: iter_local,
                 init: iter,
             });
-            let gen_body =
-                self.lower_for_of_generator(ident, mutable, iter_local, &for_of.body, label)?;
-            let index_body =
-                self.lower_for_of_index(ident, mutable, iter_local, &for_of.body, label)?;
+            let gen_body = self.lower_for_of_generator(head, iter_local, &for_of.body, label)?;
+            let index_body = self.lower_for_of_index(head, iter_local, &for_of.body, label)?;
             out.push(IrStmt::If {
                 cond: IrNode::IsGenerator(Box::new(IrNode::Local(iter_local))),
                 then_body: gen_body,
@@ -1220,24 +1645,26 @@ impl LowerCtx<'_> {
         result
     }
 
-    /// Lower the ARRAY/STRING index branch of a `for-of` (the original loop): cache
-    /// the length once, walk `0 <= i < length`, and bind the loop variable to
-    /// `iter[i]` as the first body statement, with `i++` in the loop's `update` slot
-    /// so a `continue` still advances it. Returns the branch statements.
+    /// Lower the index branch of a `for-of`: replace the iterable with its
+    /// [`IrNode::IterSource`], walk `0 <= i < IterLen(src)` (re-read per step,
+    /// so elements and entries added by the body are visited), and bind the
+    /// loop variable to `IterItem(src, i)` as the first body statement, with
+    /// `i++` in the loop's `update` slot so a `continue` still advances it.
+    /// Returns the branch statements.
     fn lower_for_of_index(
         &mut self,
-        ident: &swc_ecma_ast::BindingIdent,
-        mutable: bool,
+        head: ForOfHead<'_>,
         iter_local: u32,
         for_body: &Stmt,
         label: Option<u32>,
     ) -> anyhow::Result<Vec<IrStmt>> {
-        let mut out = Vec::new();
-        let len_local = self.fresh();
-        out.push(IrStmt::Decl {
-            local: len_local,
-            init: IrNode::StrLen(Box::new(IrNode::Local(iter_local))),
-        });
+        let mut out = vec![IrStmt::Expr(IrNode::Assign {
+            local: iter_local,
+            value: Box::new(IrNode::IterSource {
+                value: Box::new(IrNode::Local(iter_local)),
+                live: true,
+            }),
+        })];
         let idx_local = self.fresh();
         out.push(IrStmt::Decl {
             local: idx_local,
@@ -1246,18 +1673,18 @@ impl LowerCtx<'_> {
         let cond = IrNode::Binary {
             op: BinOp::Lt,
             lhs: Box::new(IrNode::Local(idx_local)),
-            rhs: Box::new(IrNode::Local(len_local)),
+            rhs: Box::new(IrNode::IterLen(Box::new(IrNode::Local(iter_local)))),
         };
-        let local = self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident));
+        let target = self.declare_for_of_head(head);
         self.breakable_inc();
         self.loopable_inc();
         let mut body = Vec::new();
-        let elem = IrNode::Index {
-            obj: Box::new(IrNode::Local(iter_local)),
+        let elem = IrNode::IterItem {
+            iterable: Box::new(IrNode::Local(iter_local)),
             index: Box::new(IrNode::Local(idx_local)),
         };
-        self.push_binding(local, elem, &mut body);
-        self.lower_stmt(for_body, &mut body)?;
+        self.bind_for_of_target(target, elem, &mut body)?;
+        self.lower_for_of_body(for_body, &mut body)?;
         self.loopable_dec();
         self.breakable_dec();
         let update = vec![IrStmt::Expr(IrNode::Assign {
@@ -1288,8 +1715,7 @@ impl LowerCtx<'_> {
     /// — with `$r` refreshed in the loop's `update` slot so a `continue` advances it.
     fn lower_for_of_generator(
         &mut self,
-        ident: &swc_ecma_ast::BindingIdent,
-        mutable: bool,
+        head: ForOfHead<'_>,
         iter_local: u32,
         for_body: &Stmt,
         label: Option<u32>,
@@ -1308,7 +1734,7 @@ impl LowerCtx<'_> {
             local: r_local,
             init: next(),
         });
-        let local = self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident));
+        let target = self.declare_for_of_head(head);
         self.breakable_inc();
         self.loopable_inc();
         let mut body = Vec::new();
@@ -1317,8 +1743,8 @@ impl LowerCtx<'_> {
             then_body: vec![IrStmt::Break(None)],
             else_body: Vec::new(),
         });
-        self.push_binding(local, member(r_local, "value"), &mut body);
-        self.lower_stmt(for_body, &mut body)?;
+        self.bind_for_of_target(target, member(r_local, "value"), &mut body)?;
+        self.lower_for_of_body(for_body, &mut body)?;
         self.loopable_dec();
         self.breakable_dec();
         out.push(IrStmt::While {
@@ -1333,17 +1759,56 @@ impl LowerCtx<'_> {
         Ok(out)
     }
 
-    /// Lower a `for (const k in EXPR) body` over an object's own enumerable keys,
-    /// desugared to a counted index loop lowered to [`IrStmt::While`] — the
-    /// same shape as [`Self::lower_for_of`], but the loop binding is each KEY (a
-    /// heap STRING) rather than each element. `EXPR` is evaluated ONCE into a temp
-    /// local, its key count cached ONCE ([`IrNode::StrLen`] reads the u32 header,
-    /// which is the entry count for an object and the length for an array/string),
-    /// and an index counter walks `0..count`. Each iteration binds a fresh
-    /// block-scoped local to [`IrNode::ObjectKey`] at the current index — the key
-    /// heap-string for an object (insertion order), or the decimal index string
-    /// (`"0"`, `"1"`, ..) for an array/string — as the FIRST body statement (so a
-    /// captured binding gets a fresh cell per iteration, like a `let`). The index
+    /// Lower a `for-of` body; an empty body (`for (o.x of xs);`) lowers to
+    /// nothing.
+    fn lower_for_of_body(&mut self, for_body: &Stmt, body: &mut Vec<IrStmt>) -> anyhow::Result<()> {
+        if matches!(for_body, Stmt::Empty(_)) {
+            return Ok(());
+        }
+        self.lower_stmt(for_body, body)
+    }
+
+    /// Declare a `for-of` head's loop binding; an assignment head declares nothing.
+    fn declare_for_of_head<'a>(&mut self, head: ForOfHead<'a>) -> ForOfTarget<'a> {
+        match head {
+            ForOfHead::Decl(ident, mutable) => {
+                ForOfTarget::Local(self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident)))
+            }
+            ForOfHead::Pattern(pat, mutable) => ForOfTarget::Pattern(pat, mutable),
+            ForOfHead::Assign(pat) => ForOfTarget::Assign(pat),
+        }
+    }
+
+    /// Bind (or assign) the current element `elem` to a `for-of` target as the
+    /// first body statement(s).
+    fn bind_for_of_target(
+        &mut self,
+        target: ForOfTarget<'_>,
+        elem: IrNode,
+        body: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        match target {
+            ForOfTarget::Local(local) => {
+                self.push_binding(local, elem, body);
+                Ok(())
+            }
+            ForOfTarget::Pattern(pat, mutable) => {
+                self.lower_binding_pattern(pat, elem, mutable, body)
+            }
+            ForOfTarget::Assign(pat) => self.assign_to_target(pat, elem, body),
+        }
+    }
+
+    /// Lower a `for (const k in EXPR) body` over the enumerable string keys of an
+    /// object and its prototype chain, desugared to a counted index loop lowered
+    /// to [`IrStmt::While`] — the same shape as [`Self::lower_for_of`] over the key
+    /// snapshot. `EXPR` is evaluated ONCE and its keys snapshotted ONCE into a
+    /// fresh array ([`ObjectBuiltinOp::ForInKeys`]: own keys in own-key order, then
+    /// each prototype's not-yet-seen keys; the decimal index strings for an
+    /// array/string), its length cached, and an index counter walks `0..count`.
+    /// Each iteration binds a fresh block-scoped local to the key at the current
+    /// index as the FIRST body statement (so a captured binding gets a fresh cell
+    /// per iteration, like a `let`). The index
     /// increment lives in the loop's `update` slot so a `continue` still advances it
     /// (mirroring [`Self::lower_for`]); the `for-in` head opens a lexical scope, so
     /// the binding is not visible after the loop.
@@ -1400,8 +1865,11 @@ impl LowerCtx<'_> {
 
         self.push_scope();
         let result = (|| {
-            // Evaluate the operand ONCE into a temp, then cache its key count ONCE.
-            let iter = self.lower_expr(&for_in.right)?;
+            // Snapshot the operand's keys ONCE into a temp, then cache the count.
+            let iter = IrNode::ObjectBuiltin {
+                op: ObjectBuiltinOp::ForInKeys,
+                arg: Box::new(self.lower_expr(&for_in.right)?),
+            };
             let iter_local = self.fresh();
             out.push(IrStmt::Decl {
                 local: iter_local,
@@ -1430,7 +1898,7 @@ impl LowerCtx<'_> {
             self.breakable_inc();
             self.loopable_inc();
             let mut body = Vec::new();
-            let key = IrNode::ObjectKey {
+            let key = IrNode::Index {
                 obj: Box::new(IrNode::Local(iter_local)),
                 index: Box::new(IrNode::Local(idx_local)),
             };
@@ -1471,18 +1939,12 @@ impl LowerCtx<'_> {
     }
 }
 
-/// Whether `expr` is a compile-time literal that is definitely NOT a string or
-/// array — the only iterables P0.3 supports. An object literal and every
-/// non-string literal (number/boolean/null/…) qualify; a string literal and a
-/// template literal are strings, and anything dynamic (an identifier, a call, an
-/// array literal) is allowed through. Used to reject an obviously non-iterable
-/// `for-of` head with a spanned error.
-fn non_iterable_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(paren) => non_iterable_literal(&paren.expr),
-        Expr::Object(_) => true,
-        Expr::Lit(lit) => !matches!(lit, Lit::Str(_)),
-        _ => false,
+/// The `GetIterator` snapshot array an array pattern destructures `value`
+/// through.
+fn iter_snapshot(value: IrNode) -> IrNode {
+    IrNode::IterSource {
+        value: Box::new(value),
+        live: false,
     }
 }
 
@@ -1505,7 +1967,7 @@ fn non_enumerable_literal(expr: &Expr) -> bool {
 /// identifier and string-literal keys are supported (mirroring the object-literal
 /// keys in [`LowerCtx::lower_object`]); a computed or numeric key is a spanned
 /// error.
-fn prop_key_name(key: &PropName) -> anyhow::Result<String> {
+pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<String> {
     match key {
         PropName::Ident(id) => Ok(id.sym.as_ref().to_owned()),
         PropName::Str(s) => Ok(s.value.to_string_lossy().into_owned()),
@@ -1520,23 +1982,57 @@ fn prop_key_name(key: &PropName) -> anyhow::Result<String> {
 
 /// A non-negative array index `i` as an [`IrNode::Num`], converted losslessly
 /// (avoiding a precision-losing `as f64` cast).
+/// The evaluated reference of a simple destructuring-assignment target.
+enum AssignRef {
+    /// An assignable binding.
+    Binding(AccessKind),
+    /// A member `obj[key]`: the object stashed in a local, the key either a
+    /// static string or a stashed local.
+    Member { obj: u32, key: IrNode },
+}
+
+/// The head of a `for-of` loop: a fresh `const`/`let` binding or
+/// destructuring pattern (with its mutability), or an assignment target
+/// written each iteration.
+#[derive(Clone, Copy)]
+enum ForOfHead<'a> {
+    Decl(&'a swc_ecma_ast::BindingIdent, bool),
+    Pattern(&'a Pat, bool),
+    Assign(&'a Pat),
+}
+
+/// A declared `for-of` head: the per-iteration binding local, the binding
+/// pattern (declared per iteration), or the assignment target.
+#[derive(Clone, Copy)]
+enum ForOfTarget<'a> {
+    Local(u32),
+    Pattern(&'a Pat, bool),
+    Assign(&'a Pat),
+}
+
+/// Whether an assignment-target pattern is a bare identifier (`x` / `(x)`).
+fn is_ident_target(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ident(_) => true,
+        Pat::Expr(expr) => matches!(strip_parens(expr), Expr::Ident(_)),
+        _ => false,
+    }
+}
+
 fn index_num(i: usize) -> IrNode {
     IrNode::Num(f64::from(u32::try_from(i).unwrap_or(u32::MAX)))
 }
 
-/// Reject an out-of-scope class method form WITH a span. Plain instance
-/// methods and `static` methods are supported; getters/setters, computed names,
-/// and async/generator methods are not (static or not). An INSTANCE getter/setter
-/// is peeled off before this call (P2b — see [`reject_out_of_scope_accessor`]), so
-/// a getter/setter reaching here is a still-unsupported STATIC accessor. Returns
-/// `Ok(())` for a supported method.
+/// Reject an out-of-scope class method form WITH a span: computed names and
+/// async/generator methods (static or not). Returns `Ok(())` for a supported
+/// method or accessor.
 fn reject_out_of_scope_method(m: &ClassMethod) -> anyhow::Result<()> {
-    let msg = if matches!(m.kind, MethodKind::Getter) {
-        "static class getter properties are not supported"
-    } else if matches!(m.kind, MethodKind::Setter) {
-        "static class setter properties are not supported"
-    } else if matches!(m.key, PropName::Computed(_)) {
-        "computed class method names are not supported"
+    let msg = if matches!(m.key, PropName::Computed(_)) {
+        if matches!(m.kind, MethodKind::Method) {
+            "computed class method names are not supported"
+        } else {
+            "computed class accessor names are not supported"
+        }
     } else if m.function.is_async {
         "async class methods are not supported"
     } else if m.function.is_generator {
@@ -1547,20 +2043,29 @@ fn reject_out_of_scope_method(m: &ClassMethod) -> anyhow::Result<()> {
     Err(CompileError::spanned(m.span(), msg).into())
 }
 
-/// Reject an out-of-scope INSTANCE accessor form WITH a span (P2b). A plain
-/// identifier/string-named `get x(){}` / `set x(v){}` is supported; a COMPUTED
-/// accessor name (`get [k](){}`) is not. (A getter/setter is never async or a
-/// generator in valid syntax, so no such check is needed.) Returns `Ok(())` for a
-/// supported instance accessor.
-fn reject_out_of_scope_accessor(m: &ClassMethod) -> anyhow::Result<()> {
-    if matches!(m.key, PropName::Computed(_)) {
-        return Err(CompileError::spanned(
-            m.span(),
-            "computed class accessor names are not supported",
-        )
-        .into());
-    }
-    Ok(())
+/// The class-member name early errors (SyntaxErrors): a static member named
+/// `prototype`, a field named `constructor`, and an identifier starting with
+/// a character that cannot start one (ZWJ / ZWNJ, accepted by the lexer when
+/// escaped).
+fn check_member_name(key: &PropName, is_static: bool, field: bool) -> anyhow::Result<()> {
+    let name = match key {
+        PropName::Ident(id) => {
+            if id.sym.starts_with(['\u{200c}', '\u{200d}']) {
+                return Err(CompileError::spanned(key.span(), "invalid identifier start").into());
+            }
+            id.sym.as_ref().to_owned()
+        }
+        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        _ => return Ok(()),
+    };
+    let msg = if is_static && name == "prototype" {
+        "classes may not have a static property named 'prototype'"
+    } else if field && name == "constructor" {
+        "classes may not have a field named 'constructor'"
+    } else {
+        return Ok(());
+    };
+    Err(CompileError::spanned(key.span(), msg).into())
 }
 
 /// Build the spanned rejection for a non-method, non-constructor, non-field class
@@ -1591,52 +2096,39 @@ fn reject_out_of_scope_field(p: &ClassProp) -> anyhow::Result<()> {
     Err(CompileError::spanned(p.span(), msg).into())
 }
 
-/// Desugar an instance field declaration `f = init` (or an uninitialized `f;`)
-/// into the synthetic statement `this.f = <init>` (`this.f = undefined` when the
-/// field carries no initializer). These synthetic statements are prepended to the
-/// constructor body so field initializers run — in class-body source order —
-/// BEFORE the constructor body, and reuse the ordinary `this.<field> = ..`
-/// lowering (member write in the constructor's `this` context) and field-shape
-/// scan. The field name is extracted via [`prop_key_name`] (identifier/string
-/// keys; a computed name is already rejected upstream by
-/// [`reject_out_of_scope_field`], a numeric key is rejected here).
-fn field_init_stmt(prop: &ClassProp) -> anyhow::Result<Stmt> {
-    let span = prop.span();
-    let name = prop_key_name(&prop.key)?;
-    // An uninitialized field (`f;`) initializes to `undefined`.
-    let value: Box<Expr> = match &prop.value {
-        Some(v) => v.clone(),
-        None => Box::new(Expr::Ident(Ident {
-            span,
-            ctxt: SyntaxContext::empty(),
-            sym: "undefined".into(),
-            optional: false,
-        })),
-    };
-    let target = MemberExpr {
-        span,
-        obj: Box::new(Expr::This(ThisExpr { span })),
-        prop: MemberProp::Ident(IdentName {
-            span,
-            sym: name.into(),
-        }),
-    };
-    Ok(Stmt::Expr(ExprStmt {
-        span,
-        expr: Box::new(Expr::Assign(AssignExpr {
-            span,
-            op: AssignOp::Assign,
-            left: AssignTarget::Simple(SimpleAssignTarget::Member(target)),
-            right: value,
-        })),
-    }))
+/// The parameter and body of a derived class's default constructor,
+/// `constructor(...args) { super(...args) }`. The rest binding's name cannot
+/// be spelled in source, so field initializers never see it.
+fn default_derived_ctor() -> (Pat, Vec<Stmt>) {
+    use swc_common::DUMMY_SP;
+    use swc_ecma_ast::{BindingIdent, CallExpr, RestPat, Super};
+    let args = Ident::new_no_ctxt("%args".into(), DUMMY_SP);
+    let rest = Pat::Rest(RestPat {
+        span: DUMMY_SP,
+        dot3_token: DUMMY_SP,
+        arg: Box::new(Pat::Ident(BindingIdent::from(args.clone()))),
+        type_ann: None,
+    });
+    let call = Expr::Call(CallExpr {
+        span: DUMMY_SP,
+        ctxt: SyntaxContext::empty(),
+        callee: Callee::Super(Super { span: DUMMY_SP }),
+        args: vec![ExprOrSpread {
+            spread: Some(DUMMY_SP),
+            expr: Box::new(Expr::Ident(args)),
+        }],
+        type_args: None,
+    });
+    let stmt = Stmt::Expr(ExprStmt {
+        span: DUMMY_SP,
+        expr: Box::new(call),
+    });
+    (rest, vec![stmt])
 }
 
 /// Collect the instance field names a constructor assigns via `this.<name> = ..`,
-/// in first-seen order with duplicates removed. The object model cannot
-/// grow keys at runtime, so `new` must pre-slot exactly these fields on the fresh
-/// instance (a superset is harmless — surplus slots read back `undefined`, which
-/// is the correct JS value for an unset field). The scan walks the constructor's
+/// in first-seen order with duplicates removed: `new` reserves property-table
+/// capacity for them (a miss only costs a table regrowth). The scan walks the constructor's
 /// statements and expressions but does NOT descend into nested `function`/arrow
 /// bodies: a nested `function` rebinds `this`, and an arrow-captured `this.f = ..`
 /// running later is a documented gap.

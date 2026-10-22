@@ -16,7 +16,10 @@ use jsc_test262::{assemble, baseline, exec, frontmatter, walk};
 
 const USAGE: &str = "usage: jsc-test262 [--test262 DIR] [--jsc PATH] [--jobs N] \
 [--timeout SECS] [--check] [--update-baseline] [--history] [PATH_PREFIX...]";
-const HARNESS_DIR: &str = "tests/test262/harness";
+/// Harness includes kept out of M1 (`DESIGN.md` section 10):
+/// `doneprintHandle.js` needs a host `print` and an async runner,
+/// `propertyHelper.js` needs phase-3 reflection.
+const EXCLUDED_INCLUDES: [&str; 2] = ["doneprintHandle.js", "propertyHelper.js"];
 const DENYLIST: &str = "tests/test262/unsupported-features.txt";
 const BASELINE: &str = "tests/test262/baseline.txt";
 const HISTORY: &str = "tests/test262/history.tsv";
@@ -91,7 +94,7 @@ struct Env {
     sta: String,
     assert: String,
     includes: BTreeMap<String, String>,
-    shimmed: BTreeSet<String>,
+    compiling: BTreeSet<String>,
     deny: Denylist,
 }
 
@@ -117,32 +120,84 @@ fn load(args: Args) -> Result<Env, String> {
             test_root.display()
         ));
     }
+    let harness = args.test262.join("harness");
+    if !harness.join("assert.js").is_file() {
+        return Err(format!(
+            "official test262 harness not found at {}; run `bash scripts/test262-fetch.sh` or pass --test262",
+            harness.display()
+        ));
+    }
     let mut includes = BTreeMap::new();
     let entries =
-        fs::read_dir(HARNESS_DIR).map_err(|e| format!("cannot read {HARNESS_DIR}: {e}"))?;
+        fs::read_dir(&harness).map_err(|e| format!("cannot read {}: {e}", harness.display()))?;
     for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read {HARNESS_DIR}: {e}"))?;
-        if let Ok(name) = entry.file_name().into_string() {
-            includes.insert(name, read(&entry.path())?);
+        let path = entry
+            .map_err(|e| format!("cannot read {}: {e}", harness.display()))?
+            .path();
+        let is_js = path.extension().is_some_and(|e| e == "js") && path.is_file();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()).filter(|_| is_js) {
+            includes.insert(name.to_owned(), read(&path)?);
         }
     }
     let mut take = |name: &str| {
         includes
             .remove(name)
-            .ok_or(format!("{HARNESS_DIR}/{name} is missing"))
+            .ok_or(format!("{}/{name} is missing", harness.display()))
     };
     let (sta, assert) = (take("sta.js")?, take("assert.js")?);
     let scratch = PathBuf::from(SCRATCH);
     fs::create_dir_all(&scratch).map_err(|e| format!("cannot create {SCRATCH}: {e}"))?;
-    Ok(Env {
+    let mut env = Env {
         test_root,
         scratch,
         sta,
         assert,
-        shimmed: includes.keys().cloned().collect(),
         includes,
+        compiling: BTreeSet::new(),
         deny: Denylist::parse(&read(Path::new(DENYLIST))?),
         args,
+    };
+    if let Err(detail) = probe(&env, 0, &[])? {
+        return Err(format!(
+            "official sta.js + assert.js do not compile with {}: {detail}",
+            env.args.jsc.display()
+        ));
+    }
+    env.includes
+        .retain(|name, _| !EXCLUDED_INCLUDES.contains(&name.as_str()));
+    let names: Vec<&String> = env.includes.keys().collect();
+    let probed = exec::pool(&names, env.args.jobs, |i, name| {
+        probe(&env, i + 1, &[env.includes[*name].as_str()])
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    env.compiling = names
+        .into_iter()
+        .zip(probed)
+        .filter(|(_, r)| r.is_ok())
+        .map(|(n, _)| n.clone())
+        .collect();
+    env.includes.retain(|name, _| env.compiling.contains(name));
+    Ok(env)
+}
+
+/// Compiles and runs `sta.js` + `assert.js` + `includes` once. The inner
+/// result is `Err(first stderr line)` when jsc rejects the program at compile
+/// time or it times out; a runtime throw still counts as compiling.
+fn probe(env: &Env, index: usize, includes: &[&str]) -> Result<Result<(), String>, String> {
+    let program = assemble::program(Mode::Strict, "", &env.sta, &env.assert, includes);
+    let name = format!("{}-probe-{index}", std::process::id());
+    let (status, stderr) = exec::run(
+        &env.args.jsc,
+        &env.scratch,
+        &name,
+        &program,
+        env.args.timeout,
+    )
+    .map_err(|e| format!("cannot run {}: {e}", env.args.jsc.display()))?;
+    Ok(match outcome::classify(status, &stderr, None) {
+        Outcome::Pass | Outcome::Fail => Ok(()),
+        Outcome::CompileError | Outcome::Timeout => Err(first_line(&stderr)),
     })
 }
 
@@ -164,7 +219,7 @@ fn run_test(env: &Env, index: usize, path: &str) -> Result<Record, String> {
         fs::read(env.test_root.join(path)).map_err(|e| format!("cannot read {path}: {e}"))?;
     let source = String::from_utf8_lossy(&bytes);
     let meta = frontmatter::parse(&source);
-    let mode = match filter::classify(&meta, &env.deny, &env.shimmed) {
+    let mode = match filter::classify(&meta, &env.deny, &env.compiling) {
         Ok(mode) => mode,
         Err(skip) => {
             return Ok(Record {
@@ -274,6 +329,8 @@ fn append_history(report: &Report) -> Result<(), String> {
 fn real_main() -> Result<ExitCode, String> {
     let args = parse_args(std::env::args().skip(1)).map_err(|e| format!("{e}\n{USAGE}"))?;
     let env = load(args)?;
+    let compiling: Vec<&str> = env.compiling.iter().map(String::as_str).collect();
+    println!("harness includes that compile: {}", compiling.join(", "));
     let started = Instant::now();
     let paths = walk::collect(&env.test_root, &env.args.filters)
         .map_err(|e| format!("cannot walk {}: {e}", env.test_root.display()))?;

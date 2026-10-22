@@ -24,34 +24,7 @@ pub(super) fn scan_stmt_arity(stmt: &Stmt) -> usize {
                 .map_or(0, |b| scan_stmts_arity(&b.stmts));
             own.max(body)
         }
-        // A class declaration: its constructor AND every method/getter/setter
-        // lift to functions, so each one's own param count and body must widen `K`
-        // like any function/arrow. A setter (P2b) matters especially — it is invoked
-        // with one argument by `obj.x = v`, an assignment no call-site arity scan
-        // covers, so its lone parameter would otherwise never widen `K`.
-        Stmt::Decl(Decl::Class(c)) => c
-            .class
-            .body
-            .iter()
-            .map(|member| match member {
-                ClassMember::Constructor(ctor) => {
-                    let own = ctor.params.len();
-                    let body = ctor.body.as_ref().map_or(0, |b| scan_stmts_arity(&b.stmts));
-                    own.max(body)
-                }
-                ClassMember::Method(m) => {
-                    let own = m.function.params.len();
-                    let body = m
-                        .function
-                        .body
-                        .as_ref()
-                        .map_or(0, |b| scan_stmts_arity(&b.stmts));
-                    own.max(body)
-                }
-                _ => 0,
-            })
-            .max()
-            .unwrap_or(0),
+        Stmt::Decl(Decl::Class(c)) => scan_class_arity(&c.class),
         Stmt::Return(r) => r.arg.as_deref().map_or(0, scan_expr_arity),
         Stmt::Throw(t) => scan_expr_arity(&t.arg),
         Stmt::If(i) => {
@@ -109,6 +82,40 @@ pub(super) fn scan_stmt_arity(stmt: &Stmt) -> usize {
     }
 }
 
+/// The greatest function arity reachable through a class: its constructor AND
+/// every method/getter/setter lift to functions, so each one's own param count
+/// and body must widen `K` like any function/arrow (a setter matters
+/// especially — it is invoked with one argument by `obj.x = v`, an assignment
+/// no call-site arity scan covers); the `extends` expression and the field
+/// initializers are scanned too.
+fn scan_class_arity(class: &swc_ecma_ast::Class) -> usize {
+    let heritage = class.super_class.as_deref().map_or(0, scan_expr_arity);
+    class
+        .body
+        .iter()
+        .map(|member| match member {
+            ClassMember::Constructor(ctor) => {
+                let own = ctor.params.len();
+                let body = ctor.body.as_ref().map_or(0, |b| scan_stmts_arity(&b.stmts));
+                own.max(body)
+            }
+            ClassMember::Method(m) => {
+                let own = m.function.params.len();
+                let body = m
+                    .function
+                    .body
+                    .as_ref()
+                    .map_or(0, |b| scan_stmts_arity(&b.stmts));
+                own.max(body)
+            }
+            ClassMember::ClassProp(p) => p.value.as_deref().map_or(0, scan_expr_arity),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+        .max(heritage)
+}
+
 /// The greatest function arity reachable across a statement list.
 fn scan_stmts_arity(stmts: &[Stmt]) -> usize {
     stmts.iter().map(scan_stmt_arity).max().unwrap_or(0)
@@ -116,6 +123,7 @@ fn scan_stmts_arity(stmts: &[Stmt]) -> usize {
 
 /// The greatest function arity reachable through an expression, including any
 /// arrow function it contains (the arrow's own param count and its body).
+#[allow(clippy::too_many_lines)]
 fn scan_expr_arity(expr: &Expr) -> usize {
     match expr {
         Expr::Arrow(a) => {
@@ -135,6 +143,7 @@ fn scan_expr_arity(expr: &Expr) -> usize {
                 .map_or(0, |b| scan_stmts_arity(&b.stmts));
             own.max(body)
         }
+        Expr::Class(c) => scan_class_arity(&c.class),
         Expr::Paren(p) => scan_expr_arity(&p.expr),
         Expr::Bin(b) => scan_expr_arity(&b.left).max(scan_expr_arity(&b.right)),
         Expr::Unary(u) => scan_expr_arity(&u.arg),
@@ -169,6 +178,9 @@ fn scan_expr_arity(expr: &Expr) -> usize {
                 m = m.max(match id.sym.as_ref() {
                     "reduce" => 3,
                     "map" | "filter" | "forEach" => 2,
+                    // A `JSON.stringify` replacer / `JSON.parse` reviver is
+                    // called with `(key, value)`.
+                    "stringify" | "parse" if c.args.len() > 1 => 2,
                     _ => 0,
                 });
             }
@@ -184,9 +196,9 @@ fn scan_expr_arity(expr: &Expr) -> usize {
         // `new A(args)` invokes the constructor through the uniform ABI, so
         // `K` must cover the argument count (like a plain call) and any arrow arg.
         Expr::New(n) => {
-            let mut m = 0;
+            let mut m = scan_expr_arity(&n.callee);
             if let Some(args) = &n.args {
-                m = args.len();
+                m = m.max(args.len());
                 for arg in args {
                     m = m.max(scan_expr_arity(&arg.expr));
                 }

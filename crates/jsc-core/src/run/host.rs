@@ -1,20 +1,20 @@
-//! Host-import handlers backing the `__convert`/`__method` env imports and the
-//! bump-allocator they share. Everything here runs host-side against a
-//! `wasmtime::Caller`, decoding the guest's linear memory and (for the methods
-//! that build a fresh value) allocating a new heap block back into it.
+//! Host-import handlers backing the `__convert`/`__method` env imports. Everything
+//! here runs host-side against a `wasmtime::Caller`, decoding the guest's linear
+//! memory and (for the methods that build a fresh value) allocating a new heap
+//! block through the guest's exported constructors.
 
-use wasmtime::{AsContextMut, Caller, Global, Memory, Val};
+use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
-use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, format_value};
+use super::value::{array_elements, array_layout};
+use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
 /// methods, dispatched host-side. `IndexOf`/`Slice` exist on both arrays and
 /// strings, so the handler branches on the receiver's runtime TYPE BYTE.
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-const METHOD_OP_JOIN: i32 = abi::METHOD_OP_JOIN;
 const METHOD_OP_SLICE: i32 = abi::METHOD_OP_SLICE;
 const METHOD_OP_TO_UPPER: i32 = abi::METHOD_OP_TO_UPPER;
 const METHOD_OP_TO_LOWER: i32 = abi::METHOD_OP_TO_LOWER;
@@ -29,102 +29,76 @@ const METHOD_OP_PAD_START: i32 = abi::METHOD_OP_PAD_START;
 const METHOD_OP_PAD_END: i32 = abi::METHOD_OP_PAD_END;
 const METHOD_OP_SUBSTRING: i32 = abi::METHOD_OP_SUBSTRING;
 const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
+const METHOD_OP_NUMBER_TO_STRING: i32 = abi::METHOD_OP_NUMBER_TO_STRING;
 
 /// The NaN-boxed `true`/`false` jsval bits; see [`abi::TRUE`] / [`abi::FALSE`].
 const TRUE_BITS: u64 = abi::TRUE;
 const FALSE_BITS: u64 = abi::FALSE;
 
-/// The name under which `crate::emit` exports the bump-allocator heap pointer
-/// global (see [`abi::HEAP_PTR_EXPORT_NAME`]) so the `__convert` import can
-/// bump-allocate a heap string.
-const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
-
 /// The out-of-memory heap-pointer sentinel; see [`abi::HEAP_PTR_OOM`].
 const HEAP_PTR_OOM: i32 = abi::HEAP_PTR_OOM;
 
-/// The size in bytes of one wasm page.
-const PAGE_SIZE: usize = 0x1_0000;
+/// The linear-memory cap in bytes. A constructor request at or past it can
+/// only run out of memory, so lengths are clamped to it before the call (which
+/// keeps the guest's `i32` size arithmetic from wrapping).
+// 512 MiB fits `usize` on every supported target.
+#[allow(clippy::cast_possible_truncation)]
+const MEMORY_MAX_BYTES: usize = abi::MEMORY_MAX_PAGES as usize * 0x1_0000;
 
-/// Bump-allocate a heap STRING block holding `text` in the caller's guest memory
-/// and return its base offset, or `None` if the required exports are
-/// missing or the write fails.
-///
-/// The block is laid out exactly like a runtime-allocated string —
-/// `[type=0][pad×3][len:u32 LE][utf8]` — so [`decode`] resolves it identically to a
-/// literal or concatenation. It reads the exported `__heap_ptr` global as the free
-/// offset, grows linear memory if the block would overflow it, writes the bytes,
-/// and advances the global past them (mirroring the guest `__alloc`).
-pub(super) fn host_alloc_string<W: Send + 'static>(
+/// Call the guest constructor export `name(len) -> base` (`__new_string` /
+/// `__new_array`) and return the new block's base offset, or `None` when the
+/// export is missing or the call traps — an out-of-memory trap leaves the
+/// [`abi::HEAP_PTR_OOM`] sentinel for the run stage to report.
+fn guest_new<W: Send + 'static>(
+    caller: &mut Caller<'_, W>,
+    name: &str,
+    len: usize,
+) -> Option<usize> {
+    let ctor = caller
+        .get_export(name)
+        .and_then(wasmtime::Extern::into_func)?
+        .typed::<i32, i32>(&*caller)
+        .ok()?;
+    let len = i32::try_from(len).ok()?;
+    let base = ctor.call(&mut *caller, len).ok()?;
+    usize::try_from(base).ok()
+}
+
+/// Allocate a heap STRING block holding `text` through the guest
+/// `__new_string` export and return its base offset, or `None` if the export is
+/// missing or the allocation/write fails. The guest writes the header; the host
+/// only fills the UTF-8 payload.
+pub(super) fn alloc_string<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     text: &str,
 ) -> Option<u64> {
-    // Build the [type=STRING][pad×3][len:u32][utf8] block, then bump-allocate it.
-    let mut block = Vec::with_capacity(HEADER_SIZE + 4 + text.len());
-    block.push(TYPE_STRING);
-    block.resize(HEADER_SIZE, 0);
-    let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
-    block.extend_from_slice(&len.to_le_bytes());
-    block.extend_from_slice(text.as_bytes());
-    host_alloc(caller, &block)
-}
-
-/// Bump-allocate a pre-built heap `block` (its leading TYPE BYTE, header, and
-/// payload already laid out exactly like a guest-allocated block) in the caller's
-/// guest memory and return its base offset, or `None` when the required exports
-/// are missing or the write fails.
-///
-/// It reads the exported `__heap_ptr` global as the free offset, grows linear
-/// memory if the block would overflow it, writes the bytes, and advances the
-/// global past them — mirroring the guest `__alloc` so [`decode`] resolves the
-/// result identically to a runtime-allocated value.
-fn host_alloc<W: Send + 'static>(caller: &mut Caller<'_, W>, block: &[u8]) -> Option<u64> {
-    let global = caller
-        .get_export(HEAP_PTR_EXPORT_NAME)
-        .and_then(wasmtime::Extern::into_global)?;
+    let len = text.len().min(MEMORY_MAX_BYTES);
+    let base = guest_new(caller, abi::NEW_STRING_EXPORT_NAME, len)?;
     let mem = caller
-        .get_export("memory")
+        .get_export(abi::MEMORY_EXPORT_NAME)
         .and_then(wasmtime::Extern::into_memory)?;
-    let base = heap_reserve(&mut *caller, global, mem, block.len())?;
-    let end = base + block.len();
-    mem.write(&mut *caller, base, block).ok()?;
-    global
-        .set(&mut *caller, Val::I32(i32::try_from(end).ok()?))
+    mem.write(&mut *caller, base + HEADER_SIZE + 4, text.as_bytes())
         .ok()?;
     Some(base as u64)
 }
 
-/// Ensure `len` bytes starting at the current `__heap_ptr` fit in linear memory,
-/// growing it with the guest `__alloc` policy (by `max(needed, current)` pages,
-/// falling back to exactly the needed pages), and return the start offset.
-///
-/// When memory cannot grow (the module's `maximum` is reached) or the pointer
-/// already holds the sticky [`abi::HEAP_PTR_OOM`] sentinel, the sentinel is
-/// (re)stored and `None` is returned; the run stage reports it as
-/// `Uncaught RangeError: out of memory`.
-pub(super) fn heap_reserve(
-    mut store: impl AsContextMut,
-    global: Global,
-    mem: Memory,
-    len: usize,
-) -> Option<usize> {
-    // The sentinel (and any other negative pointer) fails the conversion.
-    let ptr = global.get(&mut store).i32()?;
-    let reserved = usize::try_from(ptr).ok().and_then(|base| {
-        let end = base.checked_add(len)?;
-        let cur = mem.data_size(&store);
-        if end > cur {
-            let cur_pages = (cur / PAGE_SIZE) as u64;
-            let need = (end - cur).div_ceil(PAGE_SIZE) as u64;
-            if mem.grow(&mut store, need.max(cur_pages)).is_err() {
-                mem.grow(&mut store, need).ok()?;
-            }
-        }
-        Some(base)
-    });
-    if reserved.is_none() {
-        let _ = global.set(&mut store, Val::I32(HEAP_PTR_OOM));
-    }
-    reserved
+/// Allocate a heap ARRAY holding the jsval bits `elems` through the guest
+/// `__new_array` export and return its handle base offset, or `None` if the
+/// export is missing or the allocation/write fails. The guest builds the handle
+/// and its element store; the host only fills the elements.
+fn alloc_array<W: Send + 'static>(caller: &mut Caller<'_, W>, elems: &[u64]) -> Option<u64> {
+    let len = elems.len().min(MEMORY_MAX_BYTES / 8);
+    let base = guest_new(caller, abi::NEW_ARRAY_EXPORT_NAME, len)?;
+    let mem = caller
+        .get_export(abi::MEMORY_EXPORT_NAME)
+        .and_then(wasmtime::Extern::into_memory)?;
+    let (_, data) = array_layout(mem.data(&*caller), base)?;
+    let bytes: Vec<u8> = elems[..len]
+        .iter()
+        .flat_map(|bits| bits.to_le_bytes())
+        .collect();
+    mem.write(&mut *caller, data, &bytes).ok()?;
+    Some(base as u64)
 }
 
 /// Whether the heap-pointer global holds the out-of-memory sentinel: some guest
@@ -138,10 +112,14 @@ pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bo
 /// returning the result jsval bits (or `None` to yield `undefined` — a
 /// type-mismatched receiver or a failed allocation).
 ///
-/// `IndexOf`/`Slice` are overloaded on the receiver's runtime TYPE BYTE (array
-/// element vs string byte semantics); the other ops accept a single receiver
-/// kind. String byte offsets are used throughout (the ASCII subset), so multibyte
-/// UTF-8 receivers are a documented limitation.
+/// `IndexOf`/`Includes`/`Slice` are overloaded on the receiver's runtime TYPE
+/// BYTE (array element vs string byte semantics); `NumberToString` takes a
+/// number receiver; the other ops accept a string receiver. The string ops get
+/// their arguments already coerced by the guest builtins (a search string, a
+/// number or `undefined` for a position/count/limit). String byte offsets are
+/// used throughout (the ASCII subset), so multibyte UTF-8 receivers are a
+/// documented limitation.
+#[allow(clippy::too_many_lines)] // one flat dispatch over the op flags
 pub(super) fn method_dispatch<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     recv: u64,
@@ -150,8 +128,8 @@ pub(super) fn method_dispatch<W: Send + 'static>(
     arg1: i64,
 ) -> Option<u64> {
     // Snapshot memory once so every decode/raw read below is a plain slice lookup;
-    // any allocation happens afterwards through `host_alloc` (which re-borrows the
-    // memory mutably).
+    // any allocation happens afterwards through the guest constructors (which
+    // re-borrow the memory mutably).
     let mem: Vec<u8> = match caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)
@@ -164,23 +142,32 @@ pub(super) fn method_dispatch<W: Send + 'static>(
     match op {
         METHOD_OP_INDEX_OF => match type_byte {
             Some(TYPE_ARRAY) => Some(array_index_of(&mem, ptr?, arg0.cast_unsigned())),
-            Some(TYPE_STRING) => Some(string_index_of(&mem, ptr?, arg0.cast_unsigned())),
+            Some(TYPE_STRING) => {
+                let hay = string_bytes(&mem, ptr?)?;
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
+                Some(string_index_of(&hay, &arg_bytes(arg0, &mem), from))
+            }
             _ => None,
         },
         METHOD_OP_INCLUDES => match type_byte {
             Some(TYPE_ARRAY) => Some(bool_bits(array_includes(&mem, ptr?, arg0.cast_unsigned()))),
-            // `str.includes(sub)` — substring containment (an empty `sub` => true).
+            // `str.includes(sub, from)` — substring containment from `from`.
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
-                let needle = arg_bytes(arg0, &mem);
-                Some(bool_bits(byte_contains(&hay, &needle)))
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
+                let found = string_index_of(&hay, &arg_bytes(arg0, &mem), from);
+                Some(bool_bits(found != not_found_bits()))
             }
             _ => None,
         },
-        METHOD_OP_JOIN => match type_byte {
-            Some(TYPE_ARRAY) => array_join(caller, &mem, ptr?, arg0.cast_unsigned()),
-            _ => None,
-        },
+        METHOD_OP_NUMBER_TO_STRING => {
+            let Value::Number(x) = decode(recv, &mem) else {
+                return None;
+            };
+            let radix = value_to_number(&decode(arg0.cast_unsigned(), &mem));
+            let text = number_to_radix_string(x, radix_digits(radix));
+            alloc_string(caller, &text).map(|base| HEAP | base)
+        }
         METHOD_OP_SLICE => match type_byte {
             Some(TYPE_ARRAY) => array_slice(caller, &mem, ptr?, arg0, arg1),
             Some(TYPE_STRING) => string_slice(caller, &mem, ptr?, arg0, arg1),
@@ -200,7 +187,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                     })
                     .collect();
                 let text = String::from_utf8_lossy(&mapped);
-                host_alloc_string(caller, &text).map(|base| HEAP | base)
+                alloc_string(caller, &text).map(|base| HEAP | base)
             }
             _ => None,
         },
@@ -213,7 +200,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                     Some(u) => String::from_utf8_lossy(&bytes[u..=u]).into_owned(),
                     None => String::new(),
                 };
-                host_alloc_string(caller, &text).map(|base| HEAP | base)
+                alloc_string(caller, &text).map(|base| HEAP | base)
             }
             _ => None,
         },
@@ -226,7 +213,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             _ => None,
         },
         METHOD_OP_STARTS_WITH | METHOD_OP_ENDS_WITH => match type_byte {
-            Some(TYPE_STRING) => string_starts_ends(&mem, ptr?, arg0, op),
+            Some(TYPE_STRING) => string_starts_ends(&mem, ptr?, arg0, arg1, op),
             _ => None,
         },
         METHOD_OP_PAD_START | METHOD_OP_PAD_END => match type_byte {
@@ -238,7 +225,13 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             _ => None,
         },
         METHOD_OP_SPLIT => match type_byte {
-            Some(TYPE_STRING) => string_split(caller, &mem, ptr?, arg0.cast_unsigned()),
+            Some(TYPE_STRING) => string_split(
+                caller,
+                &mem,
+                ptr?,
+                arg0.cast_unsigned(),
+                arg1.cast_unsigned(),
+            ),
             _ => None,
         },
         _ => None,
@@ -255,18 +248,11 @@ fn heap_ptr(bits: u64) -> Option<usize> {
     }
 }
 
-/// The u32 `len` header of an array/string block at `ptr + HEADER_SIZE`.
+/// The u32 `len` header of a string block at `ptr + HEADER_SIZE`.
 fn block_len(mem: &[u8], ptr: usize) -> Option<usize> {
     let at = ptr.checked_add(HEADER_SIZE)?;
     let bytes = mem.get(at..at + 4)?;
     usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()
-}
-
-/// The raw jsval bits of array element `i` at `ptr + HEADER_SIZE + 4 + 8*i`.
-fn array_elem_bits(mem: &[u8], ptr: usize, i: usize) -> Option<u64> {
-    let start = ptr.checked_add(HEADER_SIZE + 4 + 8 * i)?;
-    let bytes = mem.get(start..start + 8)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// The UTF-8 payload bytes of a heap STRING block (`[len:u32][utf8]` at
@@ -312,77 +298,124 @@ fn strict_eq_bits(a: u64, b: u64, mem: &[u8]) -> bool {
 }
 
 /// `array.indexOf(x)`: the number bits of the first index whose element `=== x`,
-/// or `-1` when absent.
+/// or `-1` when absent. A hole is no element, so it never matches.
 fn array_index_of(mem: &[u8], ptr: usize, needle: u64) -> u64 {
-    let len = block_len(mem, ptr).unwrap_or(0);
-    for i in 0..len {
-        if let Some(elem) = array_elem_bits(mem, ptr, i)
-            && strict_eq_bits(elem, needle, mem)
-        {
-            return index_bits(i);
-        }
-    }
-    not_found_bits()
+    let (_, present) = array_elements(mem, ptr).unwrap_or_default();
+    present
+        .into_iter()
+        .find(|&(_, elem)| strict_eq_bits(elem, needle, mem))
+        .map_or_else(not_found_bits, |(i, _)| index_bits(i))
 }
 
 /// `array.includes(x)`: whether some element is `SameValueZero` to `x` — `===`,
-/// except that `NaN` matches `NaN`.
+/// except that `NaN` matches `NaN`; a hole reads as `undefined`.
 fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
-    let len = block_len(mem, ptr).unwrap_or(0);
-    (0..len).any(|i| {
-        array_elem_bits(mem, ptr, i).is_some_and(|elem| {
+    let (len, present) = array_elements(mem, ptr).unwrap_or_default();
+    (needle == abi::UNDEFINED && present.len() < len)
+        || present.into_iter().any(|(_, elem)| {
             strict_eq_bits(elem, needle, mem)
                 || matches!(
                     (decode(elem, mem), decode(needle, mem)),
                     (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
                 )
         })
-    })
 }
 
-/// `string.indexOf(sub)`: the number bits of the first BYTE index where `sub`
-/// occurs (an empty `sub` => `0`), or `-1` when absent / `sub` is not a string.
-fn string_index_of(mem: &[u8], ptr: usize, sub: u64) -> u64 {
-    let Some(hay) = string_bytes(mem, ptr) else {
-        return not_found_bits();
-    };
-    let Value::Str(needle) = decode(sub, mem) else {
-        return not_found_bits();
-    };
-    let needle = needle.as_bytes();
+/// `string.indexOf(sub, from)`: the number bits of the first BYTE index at or
+/// after `from` where `sub` occurs (an empty `sub` matches at `from`), or `-1`.
+fn string_index_of(hay: &[u8], needle: &[u8], from: usize) -> u64 {
     if needle.is_empty() {
-        return index_bits(0);
+        return index_bits(from);
     }
-    match hay.windows(needle.len()).position(|w| w == needle) {
-        Some(i) => index_bits(i),
-        None => not_found_bits(),
-    }
+    hay.get(from..)
+        .and_then(|rest| rest.windows(needle.len()).position(|w| w == needle))
+        .map_or_else(not_found_bits, |i| index_bits(from + i))
 }
 
-/// `array.join(sep)`: build a heap string of `String(element)` for each element
-/// joined by `sep` (`","` when `sep` is `undefined`); `null`/`undefined` elements
-/// render as `""` (JS join semantics). Returns the result's heap jsval bits.
-fn array_join<W: Send + 'static>(
-    caller: &mut Caller<'_, W>,
-    mem: &[u8],
-    ptr: usize,
-    sep_bits: u64,
-) -> Option<u64> {
-    let sep = match decode(sep_bits, mem) {
-        Value::Undefined => ",".to_owned(),
-        other => format_value(&other),
-    };
-    let len = block_len(mem, ptr).unwrap_or(0);
-    let pieces: Vec<String> = (0..len)
-        .map(
-            |i| match array_elem_bits(mem, ptr, i).map(|b| decode(b, mem)) {
-                // `null`/`undefined` elements stringify to "" in JS join.
-                Some(Value::Null | Value::Undefined) | None => String::new(),
-                Some(v) => format_value(&v),
-            },
-        )
-        .collect();
-    host_alloc_string(caller, &pieces.join(&sep)).map(|base| HEAP | base)
+/// The radix `Number.prototype.toString` validated (an integral `2..=36`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn radix_digits(radix: f64) -> u32 {
+    radix.clamp(2.0, 36.0) as u32
+}
+
+/// `Number.prototype.toString(radix)` for a radix other than 10: the
+/// shortest digit string that reads back as `x` (V8's `DoubleToRadixCString`).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
+pub(super) fn number_to_radix_string(x: f64, radix: u32) -> String {
+    if x.is_nan() {
+        return "NaN".to_owned();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
+    if x == 0.0 {
+        return "0".to_owned();
+    }
+    let digit = |d: u32| char::from_digit(d, radix).unwrap_or('0');
+    let base = f64::from(radix);
+    let value = x.abs();
+    let mut integer = value.floor();
+    let mut fraction = value - integer;
+    // The distance to the next double, halved: digits stop once the
+    // remaining fraction is below it.
+    let next_up = f64::from_bits(value.to_bits() + 1);
+    let mut delta = (0.5 * (next_up - value)).max(f64::from_bits(1));
+    let mut fraction_digits: Vec<u32> = Vec::new();
+    if fraction >= delta {
+        loop {
+            fraction *= base;
+            delta *= base;
+            let d = fraction as u32;
+            fraction_digits.push(d);
+            fraction -= f64::from(d);
+            // Round to even.
+            if (fraction > 0.5 || (fraction == 0.5 && d & 1 == 1)) && fraction + delta > 1.0 {
+                // Carry into the already written digits.
+                loop {
+                    let Some(last) = fraction_digits.pop() else {
+                        integer += 1.0;
+                        break;
+                    };
+                    if last + 1 < radix {
+                        fraction_digits.push(last + 1);
+                        break;
+                    }
+                }
+                break;
+            }
+            if fraction < delta {
+                break;
+            }
+        }
+    }
+    // Integer digits; past 2^53 the unrepresented low digits are zeros.
+    let mut int_digits: Vec<char> = Vec::new();
+    while integer / base >= 9_007_199_254_740_992.0 {
+        integer /= base;
+        int_digits.push('0');
+    }
+    loop {
+        let remainder = integer % base;
+        int_digits.push(digit(remainder as u32));
+        integer = (integer - remainder) / base;
+        if integer <= 0.0 {
+            break;
+        }
+    }
+    let mut out = String::new();
+    if x < 0.0 {
+        out.push('-');
+    }
+    out.extend(int_digits.iter().rev());
+    if !fraction_digits.is_empty() {
+        out.push('.');
+        out.extend(fraction_digits.into_iter().map(digit));
+    }
+    out
 }
 
 /// Resolve one JS slice endpoint against a sequence `len`: `undefined` uses
@@ -407,7 +440,7 @@ fn slice_index(bits: u64, mem: &[u8], default: usize, len: usize) -> usize {
 
 /// `array.slice(a, b)`: a NEW heap array of elements `[a, b)` (JS negative/clamp
 /// semantics; `b` omitted => to end). Element jsval bits are copied verbatim, so
-/// heap-reference elements stay shared. Returns the result's heap jsval bits.
+/// heap-reference elements stay shared and holes stay holes. Returns the result's heap jsval bits.
 fn array_slice<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     mem: &[u8],
@@ -415,19 +448,16 @@ fn array_slice<W: Send + 'static>(
     a: i64,
     b: i64,
 ) -> Option<u64> {
-    let len = block_len(mem, ptr)?;
+    let (len, present) = array_elements(mem, ptr)?;
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
-    let count = end - start;
-    // Build the [type=ARRAY][pad×3][len:u32][elem:i64 × count] block.
-    let mut block = Vec::with_capacity(HEADER_SIZE + 4 + 8 * count);
-    block.push(TYPE_ARRAY);
-    block.resize(HEADER_SIZE, 0);
-    block.extend_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
-    for i in start..end {
-        block.extend_from_slice(&array_elem_bits(mem, ptr, i)?.to_le_bytes());
+    let mut elems = vec![abi::HOLE; end - start];
+    for (i, bits) in present {
+        if (start..end).contains(&i) {
+            elems[i - start] = bits;
+        }
     }
-    host_alloc(caller, &block).map(|base| HEAP | base)
+    alloc_array(caller, &elems).map(|base| HEAP | base)
 }
 
 /// `string.slice(a, b)`: a NEW substring `[a, b)` by BYTE index (JS negative/clamp
@@ -444,7 +474,7 @@ fn string_slice<W: Send + 'static>(
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
     let text = String::from_utf8_lossy(&bytes[start..end]);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// `string.trim()` / `trimStart()` / `trimEnd()`: a NEW heap string with leading
@@ -460,7 +490,7 @@ fn string_trim<W: Send + 'static>(
     let trim_start = op != METHOD_OP_TRIM_END;
     let trim_end = op != METHOD_OP_TRIM_START;
     let text = String::from_utf8_lossy(trim_bytes(&bytes, trim_start, trim_end));
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// `string.repeat(n)`: a NEW heap string of the receiver repeated `n` times. A
@@ -481,18 +511,21 @@ fn string_repeat<W: Send + 'static>(
         out.extend_from_slice(&bytes);
     }
     let text = String::from_utf8_lossy(&out);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
-/// `string.startsWith(sub)` / `endsWith(sub)`: a boolean prefix/suffix test (`sub`
-/// coerced to its string form). Returns the boolean jsval bits.
-fn string_starts_ends(mem: &[u8], ptr: usize, arg0: i64, op: i32) -> Option<u64> {
+/// `string.startsWith(sub, from)` / `endsWith(sub, end)`: a boolean prefix
+/// test at `from` (default `0`) / suffix test of the first `end` bytes
+/// (default the length). Returns the boolean jsval bits.
+fn string_starts_ends(mem: &[u8], ptr: usize, arg0: i64, arg1: i64, op: i32) -> Option<u64> {
     let hay = string_bytes(mem, ptr)?;
     let needle = arg_bytes(arg0, mem);
     let hit = if op == METHOD_OP_STARTS_WITH {
-        hay.starts_with(&needle)
+        let from = substring_index(arg1.cast_unsigned(), mem, 0, hay.len());
+        hay[from..].starts_with(&needle)
     } else {
-        hay.ends_with(&needle)
+        let end = substring_index(arg1.cast_unsigned(), mem, hay.len(), hay.len());
+        hay[..end].ends_with(&needle)
     };
     Some(bool_bits(hit))
 }
@@ -513,10 +546,10 @@ fn string_pad<W: Send + 'static>(
     // The pad string defaults to a single space when omitted.
     let pad = match decode(arg1.cast_unsigned(), mem) {
         Value::Undefined => " ".to_owned(),
-        other => format_value(&other),
+        other => to_js_string(&other),
     };
     let text = pad_bytes(&bytes, target, pad.as_bytes(), op == METHOD_OP_PAD_START);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// `string.substring(a, b)`: a NEW substring `[a, b)` by BYTE index (endpoints
@@ -535,7 +568,7 @@ fn string_substring<W: Send + 'static>(
     let b = substring_index(arg1.cast_unsigned(), mem, len, len);
     let (lo, hi) = (a.min(b), a.max(b));
     let text = String::from_utf8_lossy(&bytes[lo..hi]);
-    host_alloc_string(caller, &text).map(|base| HEAP | base)
+    alloc_string(caller, &text).map(|base| HEAP | base)
 }
 
 /// The NaN-boxed jsval bits of a boolean (`abi::TRUE` / `abi::FALSE`).
@@ -544,16 +577,10 @@ fn bool_bits(b: bool) -> u64 {
 }
 
 /// Coerce a method argument's raw jsval bits to its JS string form as bytes: a
-/// string yields its payload, everything else its `format_value` rendering (so
+/// string yields its payload, everything else its JS `ToString` text (so
 /// `"5".startsWith(5)` matches on `"5"`). Used by the string search/split methods.
 fn arg_bytes(bits: i64, mem: &[u8]) -> Vec<u8> {
-    format_value(&decode(bits.cast_unsigned(), mem)).into_bytes()
-}
-
-/// Whether `hay` contains the contiguous byte sequence `needle` (an empty
-/// `needle` is always contained — JS `"".includes` / `str.includes("")` are true).
-fn byte_contains(hay: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
+    to_js_string(&decode(bits.cast_unsigned(), mem)).into_bytes()
 }
 
 /// Slice `bytes` with leading and/or trailing ASCII whitespace removed. `is_ascii_whitespace`
@@ -597,7 +624,8 @@ fn pad_bytes(bytes: &[u8], target: i64, pad: &[u8], at_start: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolve one `substring` endpoint against a BYTE `len`: `undefined` uses
+/// Resolve one `substring` endpoint (or a search position) against a BYTE
+/// `len`: `undefined` uses
 /// `default`, otherwise the argument is truncated to an integer and clamped to
 /// `0..=len` (negatives and NaN become `0` — unlike `slice`, there is no
 /// negative-from-end offset).
@@ -611,8 +639,9 @@ fn substring_index(bits: u64, mem: &[u8], default: usize, len: usize) -> usize {
     usize::try_from(n.clamp(0, len_i)).unwrap_or(0)
 }
 
-/// `string.split(sep)`: a NEW heap array of substrings (each a NEW heap string) by
-/// BYTE index. `sep` omitted (`undefined`) => `[str]`; `sep === ""` => one element
+/// `string.split(sep, limit)`: a NEW heap array of substrings (each a NEW heap
+/// string) by BYTE index, at most `ToUint32(limit)` of them (`undefined`: no
+/// limit). `sep` omitted (`undefined`) => `[str]`; `sep === ""` => one element
 /// per byte; otherwise split on each non-overlapping `sep` occurrence (`sep`
 /// coerced to its string form). Returns the array's heap jsval bits.
 fn string_split<W: Send + 'static>(
@@ -620,13 +649,18 @@ fn string_split<W: Send + 'static>(
     mem: &[u8],
     ptr: usize,
     sep_bits: u64,
+    limit_bits: u64,
 ) -> Option<u64> {
     let bytes = string_bytes(mem, ptr)?;
-    let pieces: Vec<Vec<u8>> = match decode(sep_bits, mem) {
+    let limit = match decode(limit_bits, mem) {
+        Value::Undefined => usize::MAX,
+        value => usize::try_from(to_uint32(value_to_number(&value))).unwrap_or(usize::MAX),
+    };
+    let mut pieces: Vec<Vec<u8>> = match decode(sep_bits, mem) {
         // An omitted separator yields a single-element array of the whole string.
         Value::Undefined => vec![bytes.clone()],
         other => {
-            let sep = format_value(&other).into_bytes();
+            let sep = to_js_string(&other).into_bytes();
             if sep.is_empty() {
                 // An empty separator splits into one element per byte.
                 bytes.iter().map(|b| vec![*b]).collect()
@@ -635,22 +669,16 @@ fn string_split<W: Send + 'static>(
             }
         }
     };
+    pieces.truncate(limit);
     // Allocate each piece as a heap string first (each is an owned byte vec,
     // independent of guest memory), collecting their jsval bits, then build the
-    // backing array block from them.
+    // backing array from them.
     let mut elems = Vec::with_capacity(pieces.len());
     for piece in &pieces {
         let text = String::from_utf8_lossy(piece);
-        elems.push(HEAP | host_alloc_string(caller, &text)?);
+        elems.push(HEAP | alloc_string(caller, &text)?);
     }
-    let mut block = Vec::with_capacity(HEADER_SIZE + 4 + 8 * elems.len());
-    block.push(TYPE_ARRAY);
-    block.resize(HEADER_SIZE, 0);
-    block.extend_from_slice(&u32::try_from(elems.len()).unwrap_or(u32::MAX).to_le_bytes());
-    for bits in elems {
-        block.extend_from_slice(&bits.to_le_bytes());
-    }
-    host_alloc(caller, &block).map(|base| HEAP | base)
+    alloc_array(caller, &elems).map(|base| HEAP | base)
 }
 
 /// Split `hay` on each non-overlapping occurrence of the non-empty `sep`, keeping
@@ -739,33 +767,74 @@ fn str_to_number(s: &str) -> f64 {
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// Parse a leading base-10 integer from `s` (the `parseInt` subset): skip
-/// leading ASCII whitespace, honor an optional `+`/`-` sign, then consume ASCII
-/// digits until the first non-digit. Yields `NaN` when no digit follows the sign.
-/// The radix argument is not supported (base-10 only).
-pub(super) fn parse_int_str(s: &str) -> f64 {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let mut sign = 1.0;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        if bytes[i] == b'-' {
-            sign = -1.0;
+/// `parseInt(s, radix)` on the already-stringified `s` and the already
+/// number-coerced `radix`: skip leading JS whitespace, honor an optional `+`/`-`
+/// sign, then take `R = ToInt32(radix)`. `R == 0` means 10 unless a `0x`/`0X`
+/// prefix selects 16; `R == 16` also strips an optional `0x` prefix; any other
+/// `R` outside `2..=36` yields `NaN`. The longest prefix of radix-`R` digits
+/// (letters case-insensitive) is the value; no digits yields `NaN`.
+pub(super) fn parse_int_str(s: &str, radix: f64) -> f64 {
+    let s = s.trim_start_matches(is_js_whitespace);
+    let (sign, mut s) = match s.strip_prefix('-') {
+        Some(rest) => (-1.0, rest),
+        None => (1.0, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let r = to_int32(radix);
+    let (mut radix, strip_prefix) = if r == 0.0 {
+        (10, true)
+    } else {
+        match (2_u32..=36).find(|&k| f64::from(k).total_cmp(&r).is_eq()) {
+            Some(k) => (k, k == 16),
+            None => return f64::NAN,
         }
-        i += 1;
+    };
+    if strip_prefix && let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        s = rest;
+        radix = 16;
     }
-    let start = i;
-    let mut value = 0.0_f64;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value * 10.0 + f64::from(bytes[i] - b'0');
-        i += 1;
-    }
-    if i == start {
+    let end = s.find(|c: char| !c.is_digit(radix)).unwrap_or(s.len());
+    let digits = &s[..end];
+    if digits.is_empty() {
         return f64::NAN;
     }
+    // Base 10 goes through the correctly rounded decimal parser; other radices
+    // accumulate digit by digit.
+    let value = if radix == 10 {
+        digits.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        digits.chars().fold(0.0, |acc, c| {
+            acc * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0))
+        })
+    };
     sign * value
+}
+
+/// JS `StrWhiteSpaceChar`: the `WhiteSpace` and `LineTerminator` code points
+/// (Unicode `White_Space` minus U+0085, plus U+FEFF).
+fn is_js_whitespace(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// JS `ToInt32` of a number, returned as the (integral) f64 in
+/// `-2^31..2^31`: non-finite values map to 0, otherwise the truncated value
+/// wraps modulo 2^32.
+fn to_int32(n: f64) -> f64 {
+    const TWO_32: f64 = 4_294_967_296.0;
+    if !n.is_finite() {
+        return 0.0;
+    }
+    let m = n.trunc().rem_euclid(TWO_32);
+    if m >= TWO_32 / 2.0 { m - TWO_32 } else { m }
+}
+
+/// `ToUint32`: non-finite values map to 0, otherwise the truncated value wraps
+/// modulo 2^32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn to_uint32(n: f64) -> u32 {
+    if !n.is_finite() {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 /// Parse a leading decimal float from `s` (the `parseFloat` subset): skip

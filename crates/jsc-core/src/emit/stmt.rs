@@ -271,7 +271,9 @@ fn emit_while(
 ///       <catch_body>                ;   a re-throw here `br`s to $finally_target
 ///     end
 ///   end                            ; pop $finally_target BEFORE the finally body
+///   stash $exc_pending/$exc_value  ; on the operand stack; clear the flag
 ///   <finally_body>                 ; ALWAYS runs
+///   restore the stash              ; unless the body threw its own
 ///   if $exc_pending                ; still pending after finally => re-propagate
 ///     <emit_throw_return>          ;   br to next outer handler / function return
 ///   end
@@ -380,6 +382,14 @@ pub(super) fn emit_try(
 
     // The finally body always runs — on normal fall-through and after every `br`
     // to $finally_target. It sits at the `try` statement's own control depth.
+    // An exception in flight is set aside on the operand stack (the body is
+    // stack-neutral; an abrupt exit from it discards the stash) so the body
+    // runs with `$exc_pending` clear: every call-site check inside it sees
+    // only a throw of its own.
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     emit_stmts(
         finally_body,
         function,
@@ -389,6 +399,16 @@ pub(super) fn emit_try(
         break_label,
         continue_label,
     );
+    // Restore the stashed exception unless the body threw its own (which
+    // supersedes it): value = pending ? current : stashed; pending |= stashed.
+    function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
 
     // Re-propagate: if an exception is still pending after `finally`, unwind to
     // the next outer handler (or the function boundary).
@@ -589,6 +609,10 @@ pub(super) fn emit_cond(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    if let IrNode::IsConstructCall(argc) = cond {
+        emit_is_construct_call(function, *argc);
+        return;
+    }
     emit_node(cond, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
 

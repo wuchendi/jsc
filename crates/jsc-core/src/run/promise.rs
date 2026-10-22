@@ -15,24 +15,20 @@
 //! the event loop. Reaction callbacks are guest functions, so the engine runs
 //! them by RE-ENTERING the guest through the exported `__invoke1` trampoline.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 
 use wasmtime::{AsContextMut, Caller, Func, Global, Instance, Memory, Store, StoreContextMut, Val};
 
 use crate::abi;
 
-use super::host::heap_reserve;
 use super::{
-    HEADER_SIZE, HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED, TYPE_FUNCTION,
-    TYPE_PROMISE,
+    GEN_DONE_OFFSET, HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED,
+    PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, TYPE_FUNCTION, TYPE_PROMISE,
 };
 
 /// The NaN-boxed `undefined` jsval bits.
 const UNDEFINED: u64 = abi::UNDEFINED;
-
-/// The `[type][pad×3][state:i32][value:i64]` promise block size in bytes.
-const PROMISE_BLOCK_SIZE: usize = HEADER_SIZE + 4 + 8;
 
 /// The store data threaded through `wasmtime`: the `console.log` output sink plus
 /// the promise engine. Split so the `print` import writes to `sink` while the
@@ -65,9 +61,9 @@ struct Reaction {
     result: u32,
     finally: bool,
     /// An `async function` continuation: `Some(gen_handle)` when this reaction
-    /// resumes an async body's generator `gen_handle` on fulfillment (sending the settled
-    /// value) or rejects its result promise on rejection, rather than running a
-    /// guest callback. `result` is then the async body's result promise.
+    /// resumes an async body's generator `gen_handle` with the settlement (sending
+    /// the fulfillment value, or throwing the rejection reason into the body),
+    /// rather than running a guest callback. `result` is then the async body's result promise.
     async_gen: Option<u64>,
 }
 
@@ -86,12 +82,19 @@ struct Job {
     async_gen: Option<u64>,
 }
 
-/// The host promise engine: the FIFO microtask queue and the reaction lists of
-/// each still-pending promise (keyed by block base offset).
+/// The host promise engine: the FIFO microtask queue, the reaction lists of
+/// each still-pending promise (keyed by block base offset), and the
+/// unhandled-rejection tracking reported after the final drain.
 #[derive(Default)]
 pub(super) struct PromiseEngine {
     queue: VecDeque<Job>,
     reactions: HashMap<u32, Vec<Reaction>>,
+    /// Every promise that has been rejected, by block base. Blocks are
+    /// bump-allocated, so ascending base order is creation order.
+    rejected: BTreeSet<u32>,
+    /// Every promise that has had a reaction registered on it (then / catch /
+    /// finally, `await`, or adoption into another promise).
+    handled: HashSet<u32>,
 }
 
 impl std::fmt::Debug for PromiseEngine {
@@ -99,6 +102,8 @@ impl std::fmt::Debug for PromiseEngine {
         f.debug_struct("PromiseEngine")
             .field("queued", &self.queue.len())
             .field("pending", &self.reactions.len())
+            .field("rejected", &self.rejected.len())
+            .field("handled", &self.handled.len())
             .finish()
     }
 }
@@ -109,7 +114,9 @@ impl std::fmt::Debug for PromiseEngine {
 #[derive(Clone, Copy)]
 struct Handles {
     memory: Memory,
-    heap_ptr: Global,
+    /// The `__new_promise() -> base` guest constructor every promise block is
+    /// allocated through.
+    new_promise: Func,
     exc_pending: Global,
     exc_value: Global,
     /// The `__invoke1` callback trampoline. `None` when the program declares no
@@ -126,9 +133,9 @@ impl Handles {
     fn from_caller<W: 'static>(caller: &mut Caller<'_, Host<W>>) -> Option<Self> {
         Some(Self {
             memory: caller.get_export("memory")?.into_memory()?,
-            heap_ptr: caller
-                .get_export(abi::HEAP_PTR_EXPORT_NAME)?
-                .into_global()?,
+            new_promise: caller
+                .get_export(abi::NEW_PROMISE_EXPORT_NAME)?
+                .into_func()?,
             exc_pending: caller
                 .get_export(abi::EXC_PENDING_EXPORT_NAME)?
                 .into_global()?,
@@ -149,7 +156,7 @@ impl Handles {
     fn from_instance<W: 'static>(store: &mut Store<Host<W>>, instance: &Instance) -> Option<Self> {
         Some(Self {
             memory: instance.get_memory(&mut *store, "memory")?,
-            heap_ptr: instance.get_global(&mut *store, abi::HEAP_PTR_EXPORT_NAME)?,
+            new_promise: instance.get_func(&mut *store, abi::NEW_PROMISE_EXPORT_NAME)?,
             exc_pending: instance.get_global(&mut *store, abi::EXC_PENDING_EXPORT_NAME)?,
             exc_value: instance.get_global(&mut *store, abi::EXC_VALUE_EXPORT_NAME)?,
             invoke1: instance.get_func(&mut *store, abi::INVOKE_EXPORT_NAME),
@@ -237,14 +244,22 @@ pub(super) fn then<W: Write + Send + 'static>(
 /// scheduled by `.then`/`.catch`/`.finally` that were never awaited. Runs until
 /// the queue is empty so a program that only chains (no top-level `await`) still
 /// observes its callbacks.
+///
+/// Returns the reason of the first (in creation order) rejected promise that
+/// never had a handler attached, or `None` when every rejection was handled.
 pub(super) fn drain_after_main<W: Write + Send + 'static>(
     store: &mut Store<Host<W>>,
     instance: &Instance,
-) {
-    let Some(handles) = Handles::from_instance(store, instance) else {
-        return;
-    };
+) -> Option<u64> {
+    let handles = Handles::from_instance(store, instance)?;
     drain(store.as_context_mut(), &handles);
+    let engine = &store.data().engine;
+    let base = engine
+        .rejected
+        .iter()
+        .copied()
+        .find(|base| !engine.handled.contains(base))?;
+    Some(read_value(handles.memory.data(&*store), base))
 }
 
 /// `Promise.resolve(a)`: `a` itself when it is already a promise, else a fresh
@@ -306,6 +321,7 @@ fn await_promise<W: Write + Send + 'static>(
     let Some(base) = as_promise(handles.memory.data(&ctx), p) else {
         return p;
     };
+    ctx.data_mut().engine.handled.insert(base);
     drain(ctx.as_context_mut(), handles);
     let mem = handles.memory.data(&ctx);
     match read_state(mem, base) {
@@ -349,11 +365,12 @@ fn spawn_async<W: Write + Send + 'static>(
 }
 
 /// Advance an `async function` body's generator by one step and route the outcome.
-/// `sent` resumes the pending `await` (`undefined` for the first step).
+/// `sent` resumes the pending `await` (`undefined` for the first step, or for a
+/// rejected `await` resumed with its reason pending as an exception).
 /// If the step threw, reject the result promise; if the body completed (`done`),
 /// fulfill it with the returned value; otherwise the yielded value is the awaited
-/// operand — register a continuation that resumes the body (fulfill) or rejects
-/// the result (reject) when the operand settles.
+/// operand — register a continuation that resumes the body when the operand
+/// settles.
 fn drive_async<W: Write + Send + 'static>(
     mut ctx: StoreContextMut<'_, Host<W>>,
     handles: &Handles,
@@ -438,7 +455,7 @@ fn read_gen_done(mem: &[u8], gen_handle: u64) -> bool {
     let Some(base) = heap_ptr(gen_handle) else {
         return false;
     };
-    let at = base + abi::GEN_DONE_OFFSET as usize;
+    let at = base + GEN_DONE_OFFSET;
     mem.get(at..at + 4)
         .is_some_and(|b| i32::from_le_bytes(b.try_into().unwrap_or([0; 4])) != 0)
 }
@@ -465,14 +482,20 @@ fn run_job<W: Write + Send + 'static>(
     // An `async function` continuation: the awaited value has settled.
     // On fulfillment, resume the body's generator with the settled value (which
     // may suspend again on the next `await` or complete and settle the result);
-    // on rejection, reject the async body's result promise (no `try`/`catch`
-    // around `await` is supported, so the rejection propagates straight out).
+    // on rejection, resume it with the reason pending as an exception, so the
+    // `await` throws into the body's active `catch`/`finally` (or, uncaught,
+    // completes the body and rejects the result).
     if let Some(gen_handle) = job.async_gen {
-        if job.state == PROMISE_FULFILLED {
-            drive_async(ctx, handles, gen_handle, job.result, job.value);
+        let sent = if job.state == PROMISE_FULFILLED {
+            job.value
         } else {
-            settle(ctx, handles, job.result, PROMISE_REJECTED, job.value);
-        }
+            let _ = handles
+                .exc_value
+                .set(&mut ctx, Val::I64(job.value.cast_signed()));
+            let _ = handles.exc_pending.set(&mut ctx, Val::I32(1));
+            UNDEFINED
+        };
+        drive_async(ctx, handles, gen_handle, job.result, sent);
         return;
     }
     let is_fn = as_function(handles.memory.data(&ctx), job.callback);
@@ -512,6 +535,9 @@ fn settle<W: Write + Send + 'static>(
         return;
     }
     write_settlement(ctx.as_context_mut(), handles, base, state, value);
+    if state == PROMISE_REJECTED {
+        ctx.data_mut().engine.rejected.insert(base);
+    }
     let reactions = ctx
         .data_mut()
         .engine
@@ -564,6 +590,8 @@ fn register_source<W: Write + Send + 'static>(
         return;
     };
     let state = read_state(mem, base);
+    let value = read_value(mem, base);
+    ctx.data_mut().engine.handled.insert(base);
     if state == PROMISE_PENDING {
         ctx.data_mut()
             .engine
@@ -579,7 +607,6 @@ fn register_source<W: Write + Send + 'static>(
             });
         return;
     }
-    let value = read_value(mem, base);
     let callback = if state == PROMISE_FULFILLED {
         on_fulfilled
     } else {
@@ -640,20 +667,25 @@ fn invoke1<W: Write + Send + 'static>(
     (result, false)
 }
 
-/// Bump-allocate a fresh `[type][pad×3][state:i32][value:i64]` promise block in
-/// guest memory and return its heap jsval, or `None` on a failed allocation.
+/// Allocate a fresh promise block through the guest `__new_promise` export,
+/// settle it to `state`/`value` unless pending, and return its heap jsval, or
+/// `None` on a failed allocation (an out-of-memory trap leaves the sentinel for
+/// the run stage to report).
 fn alloc_promise<W: Write + Send + 'static>(
-    ctx: StoreContextMut<'_, Host<W>>,
+    mut ctx: StoreContextMut<'_, Host<W>>,
     handles: &Handles,
     state: i32,
     value: u64,
 ) -> Option<u64> {
-    let mut block = Vec::with_capacity(PROMISE_BLOCK_SIZE);
-    block.push(TYPE_PROMISE);
-    block.resize(HEADER_SIZE, 0);
-    block.extend_from_slice(&state.to_le_bytes());
-    block.extend_from_slice(&value.to_le_bytes());
-    heap_alloc(ctx, handles, &block).map(|base| HEAP | base)
+    let new_promise = handles.new_promise.typed::<(), i32>(&ctx).ok()?;
+    let base = u32::try_from(new_promise.call(&mut ctx, ()).ok()?).ok()?;
+    if state != PROMISE_PENDING {
+        write_settlement(ctx.as_context_mut(), handles, base, state, value);
+    }
+    if state == PROMISE_REJECTED {
+        ctx.data_mut().engine.rejected.insert(base);
+    }
+    Some(HEAP | u64::from(base))
 }
 
 /// Write a promise block's settlement (`state` + `value`) into guest memory.
@@ -664,31 +696,13 @@ fn write_settlement<W: Write + Send + 'static>(
     state: i32,
     value: u64,
 ) {
-    let mut buf = [0u8; 12];
-    buf[0..4].copy_from_slice(&state.to_le_bytes());
-    buf[4..12].copy_from_slice(&value.to_le_bytes());
+    let base = base as usize;
     let _ = handles
         .memory
-        .write(&mut ctx, base as usize + HEADER_SIZE, &buf);
-}
-
-/// Bump-allocate `block` in guest memory via the exported `__heap_ptr` global
-/// (mirroring the guest `__alloc`), growing linear memory via [`heap_reserve`].
-/// Returns the block's base offset, or `None` when a read/write/grow fails (a
-/// failed grow leaves the out-of-memory sentinel for the run stage to report).
-fn heap_alloc<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
-    handles: &Handles,
-    block: &[u8],
-) -> Option<u64> {
-    let base = heap_reserve(&mut ctx, handles.heap_ptr, handles.memory, block.len())?;
-    let end = base + block.len();
-    handles.memory.write(&mut ctx, base, block).ok()?;
-    handles
-        .heap_ptr
-        .set(&mut ctx, Val::I32(i32::try_from(end).ok()?))
-        .ok()?;
-    Some(base as u64)
+        .write(&mut ctx, base + PROMISE_STATE_OFFSET, &state.to_le_bytes());
+    let _ = handles
+        .memory
+        .write(&mut ctx, base + PROMISE_VALUE_OFFSET, &value.to_le_bytes());
 }
 
 /// The base offset (low 32 bits) of a heap jsval.
@@ -722,19 +736,19 @@ fn heap_ptr(bits: u64) -> Option<usize> {
     }
 }
 
-/// Read a promise block's `state` (i32 at `base + HEADER_SIZE`); a truncated
-/// block reads as [`PROMISE_PENDING`].
+/// Read a promise block's `state` (i32 at `base + PROMISE_STATE_OFFSET`); a
+/// truncated block reads as [`PROMISE_PENDING`].
 fn read_state(mem: &[u8], base: u32) -> i32 {
-    let at = base as usize + HEADER_SIZE;
+    let at = base as usize + PROMISE_STATE_OFFSET;
     mem.get(at..at + 4).map_or(PROMISE_PENDING, |b| {
         i32::from_le_bytes(b.try_into().unwrap_or([0; 4]))
     })
 }
 
-/// Read a promise block's settled `value` (i64 at `base + HEADER_SIZE + 4`); a
-/// truncated block reads as `undefined`.
+/// Read a promise block's settled `value` (i64 at `base + PROMISE_VALUE_OFFSET`);
+/// a truncated block reads as `undefined`.
 fn read_value(mem: &[u8], base: u32) -> u64 {
-    let at = base as usize + HEADER_SIZE + 4;
+    let at = base as usize + PROMISE_VALUE_OFFSET;
     mem.get(at..at + 8).map_or(UNDEFINED, |b| {
         u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))
     })

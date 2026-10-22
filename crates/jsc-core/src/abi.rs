@@ -33,10 +33,13 @@
 //! ## Heap-block layout
 //!
 //! Every heap block opens with a [`HEADER_SIZE`]-byte header: a `TYPE_*` byte at
-//! offset 0 (see [`TYPE_STRING`] … [`TYPE_CELL`]) plus 3 padding bytes, so the
-//! per-type payload begins 4-byte aligned at [`HEADER_SIZE`]. The single [`HEAP`]
-//! tag boxes strings, arrays, objects, and functions alike; the concrete kind is
-//! the TYPE BYTE, not the NaN-box tag.
+//! offset 0 (see [`TYPE_STRING`] … [`TYPE_CELL`]) followed by the reserved
+//! [`HEADER_GC_OFFSET`], [`HEADER_FLAGS_OFFSET`], and [`HEADER_CLASS_OFFSET`]
+//! bytes, so the per-type payload begins at [`HEADER_SIZE`].
+//! Every block base is [`BLOCK_ALIGN`]-aligned: `__alloc` rounds each request up
+//! and static data blobs are padded to it. The single [`HEAP`] tag boxes
+//! strings, arrays, objects, and functions alike; the concrete kind is the TYPE
+//! BYTE, not the NaN-box tag.
 
 /// The quiet-NaN mask (exponent all ones + quiet bit): a value is a boxed
 /// immediate (or the canonical number NaN) iff `bits & QNAN == QNAN`.
@@ -55,6 +58,13 @@ pub(crate) const NULL: u64 = 0x7FFA_0000_0000_0000;
 /// bare `return;`, a program with no expression statement, and host-side
 /// fallbacks.
 pub(crate) const UNDEFINED: u64 = 0x7FFB_0000_0000_0000;
+
+/// An array hole: an element slot with no element (a literal elision, a
+/// `delete`d index, or a gap left by growth by index). [`UNDEFINED`] with a
+/// nonzero payload, which no JS value produces, so it never escapes to JS: an
+/// element read that loads it yields `undefined`. The same bit pattern marks
+/// a module cell still in its TDZ.
+pub(crate) const HOLE: u64 = UNDEFINED | 1;
 
 /// The `typeof` result strings, in `typeof`-index order. A `typeof` result is a
 /// real interned HEAP STRING (tag `0b100` is retired), so these are the words
@@ -76,8 +86,87 @@ pub(crate) const TYPEOF_STRINGS: [&str; 6] = [
 pub(crate) const HEAP: u64 = 0x7FFD_0000_0000_0000;
 
 /// The size in bytes of every heap block's leading header: the TYPE BYTE
-/// at offset 0 plus 3 padding bytes. The per-type payload begins here.
+/// at offset 0 plus the `gc`/`flags`/`class` bytes. The per-type payload begins
+/// here.
 pub(crate) const HEADER_SIZE: u32 = 4;
+
+/// Header byte 1: the `gc` byte (phase 4: bit 0 = mark). Reserved; every block
+/// is created with it 0.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const HEADER_GC_OFFSET: u32 = 1;
+
+/// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
+/// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`].
+pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
+
+/// Header byte 3: the `TYPE_OBJECT` sub-`class` byte ([`CLASS_ORDINARY`],
+/// [`CLASS_ERROR`]); `0` for every other kind.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
+pub(crate) const HEADER_CLASS_OFFSET: u32 = 3;
+
+/// [`TYPE_OBJECT`] `class` byte: an ordinary object.
+pub(crate) const CLASS_ORDINARY: u8 = 0;
+
+/// [`TYPE_OBJECT`] `class` byte: an Error instance (`[[ErrorData]]`). Its kind
+/// is its prototype (`%Error.prototype%`, `%TypeError.prototype%`,
+/// `%RangeError.prototype%`, static data-segment objects); it owns a
+/// non-enumerable `stack` (and `message` when one was given) and inherits
+/// `name`.
+pub(crate) const CLASS_ERROR: u8 = 1;
+
+/// [`TYPE_OBJECT`] `class` byte: an (unmapped) `arguments` object. It owns
+/// the indexed properties `"0".."n-1"` and a non-enumerable `length`.
+pub(crate) const CLASS_ARGUMENTS: u8 = 2;
+
+/// [`TYPE_OBJECT`] `class` byte: a Boolean wrapper object, its
+/// `[[PrimitiveValue]]` (the boolean jsval) at [`WRAPPER_VALUE_OFFSET`].
+pub(crate) const CLASS_BOOLEAN: u8 = 3;
+
+/// [`TYPE_OBJECT`] `class` byte: a Number wrapper object, its
+/// `[[PrimitiveValue]]` (the number jsval) at [`WRAPPER_VALUE_OFFSET`].
+pub(crate) const CLASS_NUMBER: u8 = 4;
+
+/// [`TYPE_OBJECT`] `class` byte: a String wrapper object, its
+/// `[[PrimitiveValue]]` (the string jsval) at [`WRAPPER_VALUE_OFFSET`]. Its
+/// `length` and in-range indices are exotic own read-only properties.
+pub(crate) const CLASS_STRING: u8 = 5;
+
+/// [`TYPE_OBJECT`] `class` byte: the global object (a static realm block).
+pub(crate) const CLASS_GLOBAL: u8 = 6;
+
+/// Offset of a wrapper object's `[[PrimitiveValue]]` jsval (an `i64`) from
+/// its base, right after the object-family prefix.
+pub(crate) const WRAPPER_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte size of a wrapper object block.
+pub(crate) const WRAPPER_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The alignment in bytes of every heap block base: `__alloc` rounds every
+/// request up to a multiple of it, and static data blobs are padded to it, so
+/// an `i64` slot at a block offset ≡ 0 (mod 8) is naturally aligned.
+pub(crate) const BLOCK_ALIGN: u32 = 8;
+
+/// Byte offset of the object-family prefix's `props: u32` slot (right after the
+/// header): the base of the block's [`TYPE_PROPS`] own-property table, `0` = no
+/// own named properties. Shared by every object-family kind.
+pub(crate) const OBJ_PROPS_OFFSET: u32 = HEADER_SIZE;
+
+/// Object-family header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the object
+/// is not extensible, so adding an own property throws a `TypeError`.
+pub(crate) const OBJ_FLAG_NOT_EXTENSIBLE: u8 = 1;
+
+/// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
+/// pointer or [`NULL`]), 8-byte aligned. Ordinary objects are created with
+/// `%Object.prototype%`, functions with `%Function.prototype%`, generators with
+/// `%GeneratorPrototype%`, and the other kinds with their realm prototype
+/// (static realm-image blocks).
+pub(crate) const OBJ_PROTO_OFFSET: u32 = 8;
+
+/// The byte size of the shared object-family prefix — header, `props`, and
+/// `proto` — so every kind payload begins 8-byte aligned here.
+pub(crate) const OBJ_PREFIX_SIZE: u32 = 16;
 
 /// The number of trailing (non-positional) parameters every user function carries
 /// under the uniform ABI, appended after the `K = max_arity` positional argument
@@ -94,18 +183,95 @@ pub(crate) const ABI_TRAILING_PARAMS: u32 = 2;
 /// `[type=0][pad×3][len:u32][utf8]`. Maps to `typeof` "string".
 pub(crate) const TYPE_STRING: u8 = 0;
 
-/// TYPE BYTE of a heap array block:
-/// `[type=1][pad×3][len:u32][elem:i64 × len]`. Maps to `typeof` "object".
+/// TYPE BYTE of an array handle: the object-family prefix, then
+/// `[len:u32 @16][elems:u32 @20]` ([`ARRAY_BLOCK_SIZE`] bytes). `elems` is the
+/// base of the [`TYPE_ELEMS`] store holding the elements (`0` while the
+/// capacity is 0). Growth replaces the store and rewrites `elems`, so the handle
+/// never moves. `props` holds the named properties, and on an
+/// [`ARRAY_FLAG_SPARSE`] array also the elements past the store. Maps to
+/// `typeof` "object".
 pub(crate) const TYPE_ARRAY: u8 = 1;
 
-/// TYPE BYTE of a heap object block:
-/// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]`. Maps to `typeof`
+/// Byte offset (from a [`TYPE_ARRAY`] handle base) of the u32 `length`.
+pub(crate) const ARRAY_LEN_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_ARRAY`] handle base) of the u32 base of its
+/// [`TYPE_ELEMS`] store, `0` when the capacity is 0.
+pub(crate) const ARRAY_ELEMS_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// The byte size of a [`TYPE_ARRAY`] handle.
+pub(crate) const ARRAY_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is sparse. Its store keeps
+/// elements `0..cap` (holes past `length`); every element at or past `cap` is
+/// an array-index key in its `props` table, so `length` may exceed the store.
+/// Set by a store or `length` write past the dense-growth bound; never cleared.
+pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is being joined (`join`,
+/// `Array.prototype.toString`). Set for the duration of the guest join so a
+/// cyclic element joins as the empty string; cleared on every exit.
+pub(crate) const ARRAY_FLAG_JOINING: u8 = 8;
+
+/// TYPE BYTE of an ordinary object block: the object-family prefix alone
+/// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
+/// [`TYPE_PROPS`] table at `props`, its prototype in `proto`. Maps to `typeof`
 /// "object".
 pub(crate) const TYPE_OBJECT: u8 = 2;
 
-/// TYPE BYTE of a first-class function value:
-/// `[type=3][pad×3][func_idx:u32][env:i64]`. Maps to `typeof` "function".
+/// TYPE BYTE of a first-class function value: the object-family prefix, then
+/// `[func_idx:u32 @16][reserved:u32 @20][env:i64 @24]` ([`FUNC_BLOCK_SIZE`]
+/// bytes). Maps to `typeof` "function".
 pub(crate) const TYPE_FUNCTION: u8 = 3;
+
+/// Byte offset (from a [`TYPE_FUNCTION`] block base) of the u32 funcref-table
+/// index. The following u32 at `+20` is reserved (always 0).
+pub(crate) const FUNC_INDEX_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_FUNCTION`] block base) of the i64 closure
+/// environment jsval (`undefined` for a non-capturing function).
+pub(crate) const FUNC_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_FUNCTION`] block.
+pub(crate) const FUNC_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: `length`, `name`, and (for a
+/// [`FUNC_FLAG_CONSTRUCTOR`]) `prototype` are not yet defined. The first
+/// property operation on the function calls `__fn_materialize`, which defines
+/// them from the function's [`FN_INFO_ENTRY_SIZE`]-byte info entry and clears
+/// the bit.
+pub(crate) const FUNC_FLAG_LAZY: u8 = 4;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the function is a constructor (a
+/// `function` declaration/expression or a class), so materialization gives it
+/// a `prototype` object.
+pub(crate) const FUNC_FLAG_CONSTRUCTOR: u8 = 8;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the function is a class constructor.
+/// Its `prototype` is installed by the class definition, not materialized.
+pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: the constructor allocates its own
+/// `this` (a derived class: `super(..)` constructs it), so `new` skips the
+/// allocation.
+pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
+
+/// Linear-memory address of the u32 holding the base of the static function
+/// info table (inside the null guard below the first static string): entry
+/// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
+/// func_idx`, holding the function's interned `name` key at
+/// [`FN_INFO_NAME_OFFSET`] and its `length` at [`FN_INFO_LENGTH_OFFSET`]
+/// (`__fn_info`). `__fn_materialize` and the host renderers read it.
+pub(crate) const FN_INFO_ADDR: u32 = 4;
+
+/// The byte size of one function info entry (see [`FN_INFO_ADDR`]).
+pub(crate) const FN_INFO_ENTRY_SIZE: u32 = 8;
+
+/// Byte offset (within a function info entry) of the u32 interned `name` key.
+pub(crate) const FN_INFO_NAME_OFFSET: u32 = 0;
+
+/// Byte offset (within a function info entry) of the u32 `length`.
+pub(crate) const FN_INFO_LENGTH_OFFSET: u32 = 4;
 
 /// TYPE BYTE of a closure **environment** block (internal):
 /// `[type=4][pad×3][count:u32][cell_ptr:i64 × count]`. Never a user value.
@@ -116,23 +282,33 @@ pub(crate) const TYPE_ENV: u8 = 4;
 /// user value.
 pub(crate) const TYPE_CELL: u8 = 5;
 
-/// TYPE BYTE of a `Map` handle block:
-/// `[type=6][pad×3][size:u32][entries:i64]`. `size` is the logical entry count
-/// (backing `.size`); `entries` is a heap jsval pointing at a GROWABLE array that
-/// stores the `(key, value)` pairs flattened (key at even element slots, value at
-/// the following odd slot). Growth reallocs that backing array and rewrites the
-/// `entries` slot IN PLACE, so the handle jsval never moves. Maps to `typeof`
-/// "object".
+/// TYPE BYTE of a `Map` handle block: the object-family prefix, then
+/// `[size:u32 @16][pad:u32][entries:i64 @24]`. `size` is the logical entry count
+/// (backing `.size`); `entries` is a heap jsval pointing at a [`TYPE_ARRAY`]
+/// that stores the `(key, value)` pairs flattened (key at even element slots,
+/// value at the following odd slot) and grows in place like any array. Maps to
+/// `typeof` "object".
 pub(crate) const TYPE_MAP: u8 = 6;
 
-/// TYPE BYTE of a `Set` handle block: identical layout to [`TYPE_MAP`]
-/// (`[type=7][pad×3][size:u32][entries:i64]`). A Set reuses the same flattened
+/// TYPE BYTE of a `Set` handle block: identical layout to [`TYPE_MAP`]. A Set reuses the same flattened
 /// `(key, value)` backing with the value slot always `undefined`, so all the
 /// lookup/insert/delete machinery is shared; only the type byte (and thus the
 /// render label) differs. Maps to `typeof` "object".
 pub(crate) const TYPE_SET: u8 = 7;
 
-/// TYPE BYTE of a `Promise` block: `[type=8][pad×3][state:i32][value:i64]`.
+/// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the u32
+/// logical entry count.
+pub(crate) const MAP_SIZE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the i64
+/// `entries` backing-array jsval.
+pub(crate) const MAP_ENTRIES_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_MAP`] / [`TYPE_SET`] handle block.
+pub(crate) const MAP_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// TYPE BYTE of a `Promise` block: the object-family prefix, then
+/// `[state:i32 @16][pad:u32][value:i64 @24]`.
 /// `state` is one of [`PROMISE_PENDING`] / [`PROMISE_FULFILLED`] /
 /// [`PROMISE_REJECTED`]; `value` is the settled fulfillment/rejection jsval
 /// (`undefined` while pending). The block is the RENDERABLE mirror of a promise's
@@ -141,6 +317,15 @@ pub(crate) const TYPE_SET: u8 = 7;
 /// can decode a promise from a bare memory snapshot. Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_PROMISE: u8 = 8;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the i32 `state`.
+pub(crate) const PROMISE_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the i64 settled `value`.
+pub(crate) const PROMISE_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_PROMISE`] block.
+pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// [`TYPE_PROMISE`] `state`: the promise is unsettled.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -154,8 +339,8 @@ pub(crate) const PROMISE_FULFILLED: i32 = 1;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_REJECTED: i32 = 2;
 
-/// TYPE BYTE of a `Generator` handle block:
-/// `[type=9][pad×3][sm_idx:u32][state:i32][done:i32][env:i64]`. `sm_idx` is the
+/// TYPE BYTE of a `Generator` handle block: the object-family prefix, then
+/// `[sm_idx:u32 @16][state:i32 @20][done:i32 @24][pad:u32][env:i64 @32]`. `sm_idx` is the
 /// funcref-table index of the generator's **state-machine** function; `state` is
 /// the resume point (`0` at creation, bumped at each `yield`); `done` is `0`
 /// until the body returns/falls off, then `1`; `env` is the persistent
@@ -169,39 +354,60 @@ pub(crate) const PROMISE_REJECTED: i32 = 2;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_GENERATOR: u8 = 9;
 
-/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the `sm_idx` funcref
-/// index (u32), `state` (i32), `done` (i32), and `env` frame jsval (i64). The
-/// payload begins at [`HEADER_SIZE`]; the i64 `env` lands 8-byte aligned at 16.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_SM_IDX_OFFSET: u32 = HEADER_SIZE;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_STATE_OFFSET: u32 = HEADER_SIZE + 4;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_DONE_OFFSET: u32 = HEADER_SIZE + 8;
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const GEN_ENV_OFFSET: u32 = HEADER_SIZE + 12;
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 `sm_idx`
+/// funcref-table index.
+pub(crate) const GEN_SM_IDX_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
-/// TYPE BYTE of a `Date` block: `[type=10][pad×3][pad×4][ms:f64]`. The
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 resume `state`.
+pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 `done` flag.
+pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 resume
+/// `limits` bits ([`GEN_LIMIT_RETURN`], [`GEN_LIMIT_THROW`]), guest-only.
+pub(crate) const GEN_LIMITS_OFFSET: u32 = OBJ_PREFIX_SIZE + 12;
+
+/// Generator `limits` bit: the body has a `finally` or a `yield*`, so a
+/// `return()` at a suspended `yield` (which must run them) is unsupported.
+pub(crate) const GEN_LIMIT_RETURN: u32 = 1;
+
+/// Generator `limits` bit: the body has a `yield*`, so a `throw()` at a
+/// suspended `yield` (which must forward to the delegate) is unsupported.
+pub(crate) const GEN_LIMIT_THROW: u32 = 2;
+
+/// Generator `limits` bit: the state machine is running (set around each
+/// resume), so a `next()` / `return()` / `throw()` from its own body throws.
+pub(crate) const GEN_RUNNING: u32 = 4;
+
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
+/// jsval, 8-byte aligned past the `limits` word.
+pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// The byte size of a [`TYPE_GENERATOR`] block.
+pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+
+/// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the
 /// same value `Date.now()` / `d.getTime()` yield. `new Date(ms)` stores its
-/// numeric argument; `new Date()` stores the host clock (the `__now` import). The
-/// f64 lands 8-byte aligned at [`DATE_MS_OFFSET`]. Maps to `typeof` "object".
+/// numeric argument; `new Date()` stores the host clock (the `__now` import).
+/// Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_DATE: u8 = 10;
 
-/// Byte offset (from a [`TYPE_DATE`] block base) of the `ms` timestamp (f64). The
-/// payload begins at [`HEADER_SIZE`]; the f64 lands 8-byte aligned at 8.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const DATE_MS_OFFSET: u32 = HEADER_SIZE + 4;
+/// Byte offset (from a [`TYPE_DATE`] block base) of the f64 `ms` timestamp.
+pub(crate) const DATE_MS_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
-/// TYPE BYTE of an **accessor** block (P2b instance getters/setters):
-/// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds a class instance
-/// accessor property's getter and setter FUNCTION VALUES (the `undefined` bits
-/// when a half is absent). The box is stored under the property name on the
-/// class's shared `@@prototype`, so a member READ that resolves (through the
-/// prototype chain) to this box invokes the getter with `this = receiver`, and a
-/// member WRITE invokes the setter. Never a program-visible value — it is always
-/// consumed by the get/set path, so `decode`'s catch-all renders it `undefined`.
+/// The byte size of a [`TYPE_DATE`] block.
+pub(crate) const DATE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// TYPE BYTE of an **accessor** block (class and object-literal getters/setters):
+/// `[type=11][pad×3][pad×4][getter:i64][setter:i64]`. It holds an accessor
+/// property's getter and setter FUNCTION VALUES (the `undefined` bits
+/// when a half is absent). It is the value of an [`ATTR_ACCESSOR`] property
+/// table entry, so `__get` invokes the getter with `this = receiver` and
+/// `__set` the setter. Never a program-visible value; the host decoders render
+/// the property as `[Getter]` / `[Setter]` / `[Getter/Setter]`.
 /// The two i64 payloads land 8-byte aligned at [`ACCESSOR_GET_OFFSET`] /
 /// [`ACCESSOR_SET_OFFSET`]. Maps to no `typeof` (never observed directly).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -217,13 +423,108 @@ pub(crate) const ACCESSOR_GET_OFFSET: u32 = HEADER_SIZE + 4;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const ACCESSOR_SET_OFFSET: u32 = HEADER_SIZE + 12;
 
-/// A compile-time-only interned SENTINEL key present in the string table iff the
-/// program lowers at least one instance accessor ([`crate::ir::IrNode::MakeAccessor`]).
-/// The emitter gates the accessor get/set invocation paths on its presence —
-/// exactly as it gates the `__obj_get` prototype fallback on [`CLASS_PROTOTYPE_KEY`] —
-/// so an accessor-free program keeps byte-identical member-read/write emission. It
-/// is never read at runtime (the `@@` prefix keeps it off any JS-visible surface).
-pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
+/// The byte size of a [`TYPE_ACCESSOR`] block: the header, 4 padding bytes and
+/// the two getter/setter jsvals.
+pub(crate) const ACCESSOR_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 + 8;
+
+/// TYPE BYTE of an own-property table (internal, never a user value), the
+/// block an object-family `props` slot points at:
+/// `[type=12][pad][tflags:u8][watch bit:u8][count:u32 @4][cap:u32 @8][live:u32 @12]`
+/// followed by `cap` [`PROP_ENTRY_SIZE`]-byte entries
+/// `[key:u32][attrs:u32][value:i64]` from [`PROPS_HEADER_SIZE`]. `key` is an
+/// interned string block base (`0` = a deleted entry's tombstone), `count` the
+/// slots used (tombstones included) and `live` the non-tombstone entries.
+/// Insertion order is slot order; growth copies the live entries into a fresh
+/// table and rewrites the owner's `props`, so the owner handle never moves.
+pub(crate) const TYPE_PROPS: u8 = 12;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the `tflags` byte
+/// ([`PROPS_HAS_INDEX_KEYS`], [`PROPS_HAS_NON_ENUM`], [`PROPS_WATCHED`]).
+pub(crate) const PROPS_TFLAGS_OFFSET: u32 = 2;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `count`.
+pub(crate) const PROPS_COUNT_OFFSET: u32 = 4;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `cap`.
+pub(crate) const PROPS_CAP_OFFSET: u32 = 8;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of the u32 `live`.
+pub(crate) const PROPS_LIVE_OFFSET: u32 = 12;
+
+/// The byte size of a [`TYPE_PROPS`] table header; entry `k` starts at
+/// `PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k`.
+pub(crate) const PROPS_HEADER_SIZE: u32 = 16;
+
+/// The byte size of one [`TYPE_PROPS`] entry.
+pub(crate) const PROP_ENTRY_SIZE: u32 = 16;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the u32 interned key.
+pub(crate) const PROP_KEY_OFFSET: u32 = 0;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the u32 `attrs`.
+pub(crate) const PROP_ATTRS_OFFSET: u32 = 4;
+
+/// Byte offset (within a [`TYPE_PROPS`] entry) of the i64 value (a data value,
+/// or a [`TYPE_ACCESSOR`] pointer when [`ATTR_ACCESSOR`] is set).
+pub(crate) const PROP_VALUE_OFFSET: u32 = 8;
+
+/// [`TYPE_PROPS`] `tflags` bit: some key is a canonical array index (its
+/// string carries [`STR_FLAG_ARRAY_INDEX`]), so own-key enumeration must list
+/// the integer keys first, ascending.
+pub(crate) const PROPS_HAS_INDEX_KEYS: u8 = 1;
+
+/// [`TYPE_PROPS`] `tflags` bit: some entry lacks [`ATTR_ENUMERABLE`].
+pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
+
+/// [`TYPE_PROPS`] `tflags` bit: the table belongs to a watched intrinsic
+/// (DESIGN.md §6.4); its byte [`PROPS_WATCH_BIT_OFFSET`] holds the intrinsic's
+/// dirty-bit index. A rebuilt table keeps both.
+pub(crate) const PROPS_WATCHED: u8 = 4;
+
+/// Byte offset (from a [`TYPE_PROPS`] block base) of a watched table's u8
+/// dirty-bit index.
+pub(crate) const PROPS_WATCH_BIT_OFFSET: u32 = 3;
+
+/// TYPE BYTE of an array element store (internal, never a user value), the
+/// block a [`TYPE_ARRAY`] handle's `elems` slot points at:
+/// `[type=13][pad×3][cap:u32 @4]` followed by `cap` element jsvals from
+/// [`ELEMS_DATA_OFFSET`] (`8 + 8 * cap` bytes). Slots at and past the owner's
+/// `length` are unused.
+pub(crate) const TYPE_ELEMS: u8 = 13;
+
+/// Byte offset (from a [`TYPE_ELEMS`] block base) of the u32 `cap`.
+pub(crate) const ELEMS_CAP_OFFSET: u32 = HEADER_SIZE;
+
+/// Byte offset (from a [`TYPE_ELEMS`] block base) of element 0; element `i`
+/// is the jsval at `ELEMS_DATA_OFFSET + 8 * i`.
+pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
+
+/// Property `attrs` bit: a data property's value may be reassigned (ignored
+/// for an accessor).
+pub(crate) const ATTR_WRITABLE: u32 = 1;
+
+/// Property `attrs` bit: the key is listed by own-key enumeration.
+pub(crate) const ATTR_ENUMERABLE: u32 = 2;
+
+/// Property `attrs` bit: the property may be deleted or redefined.
+pub(crate) const ATTR_CONFIGURABLE: u32 = 4;
+
+/// Property `attrs` bit: the value is a [`TYPE_ACCESSOR`] getter/setter pair.
+pub(crate) const ATTR_ACCESSOR: u32 = 8;
+
+/// The `attrs` of a data property created by assignment or a literal:
+/// writable, enumerable, and configurable.
+pub(crate) const ATTRS_DEFAULT: u32 = ATTR_WRITABLE | ATTR_ENUMERABLE | ATTR_CONFIGURABLE;
+
+/// String header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the block is the
+/// canonical interned block for its content, so it may be used as a property
+/// key by pointer.
+pub(crate) const STR_FLAG_INTERNED: u8 = 1;
+
+/// String header `flags` bit: the content is a canonical array index
+/// (`"0"` or a nonzero digit followed by digits, value `< 2^32 - 1`). Set at
+/// intern time.
+pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
 /// value `undefined`). A method call `obj.m(args)` sets it to the receiver
@@ -234,43 +535,6 @@ pub(crate) const ACCESSOR_MARKER_KEY: &str = "@@accessor";
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
 
-/// Reserved hidden property key naming a class's shared PROTOTYPE object.
-/// A class binding stores its single prototype object under this key; every
-/// instance built by `new` stores that SAME prototype pointer under this key, so
-/// a method lookup can resolve `obj.method` by falling back to the prototype when the own
-/// property is absent. The `@@` prefix cannot begin a JS identifier, so ordinary
-/// `obj.name` source access never collides with it. Interned like any static
-/// string key and matched by byte content through `__obj_get`/`__obj_set`.
-pub(crate) const CLASS_PROTOTYPE_KEY: &str = "@@prototype";
-
-/// Reserved hidden property key naming a class's CONSTRUCTOR function value.
-/// The class binding stores its lowered constructor — an ordinary
-/// uniform-ABI function value — under this key; `new A(args)` reads it back and
-/// runs it with `this` bound to the fresh instance. Same interning/`@@`-prefix
-/// rationale as [`CLASS_PROTOTYPE_KEY`].
-pub(crate) const CLASS_CONSTRUCTOR_KEY: &str = "@@constructor";
-
-/// Reserved hidden property key marking a builtin **Error** object's kind
-/// (E-series). `new Error`/`new TypeError`/`new RangeError` store one of
-/// [`ERROR_KIND_ERROR`] / [`ERROR_KIND_TYPE`] / [`ERROR_KIND_RANGE`] under this
-/// key as a number jsval. The `@@` prefix hides it from `for-in` /
-/// `Object.keys` / `JSON.stringify` (same mechanism as [`CLASS_PROTOTYPE_KEY`]),
-/// yet `__obj_get` reads it back so `instanceof` and the value renderer can
-/// recognize an error and its kind. The stored value is never `undefined`, so
-/// "the object is an error" is testable as "the loaded marker is not
-/// `undefined`", and the concrete kind by strict-equality against the constants
-/// below.
-pub(crate) const ERROR_KIND_KEY: &str = "@@errorkind";
-
-/// [`ERROR_KIND_KEY`] value identifying a base `Error`.
-pub(crate) const ERROR_KIND_ERROR: f64 = 0.0;
-
-/// [`ERROR_KIND_KEY`] value identifying a `TypeError` (which is also an `Error`).
-pub(crate) const ERROR_KIND_TYPE: f64 = 1.0;
-
-/// [`ERROR_KIND_KEY`] value identifying a `RangeError` (which is also an `Error`).
-pub(crate) const ERROR_KIND_RANGE: f64 = 2.0;
-
 /// The module name of every host env import (`print`/`__convert`/`__method`).
 pub(crate) const IMPORT_MODULE: &str = "env";
 
@@ -278,7 +542,7 @@ pub(crate) const IMPORT_MODULE: &str = "env";
 pub(crate) const PRINT_IMPORT_NAME: &str = "print";
 
 /// The field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseInt`/`parseFloat` conversions.
+/// `String`/`Number`/`parseFloat` conversions.
 pub(crate) const CONVERT_IMPORT_NAME: &str = "__convert";
 
 /// The field name of the host `__method` import backing the non-callback
@@ -301,6 +565,11 @@ pub(crate) const THEN_IMPORT_NAME: &str = "__then";
 /// `Date.now()` / `new Date()`. It takes no arguments and returns the current
 /// wall-clock time as an f64 count of milliseconds since the Unix epoch.
 pub(crate) const NOW_IMPORT_NAME: &str = "__now";
+
+/// The field name of the host `__parse_int` import backing `parseInt(s, radix)`.
+/// It receives the string and radix jsvals (`undefined` for an omitted radix) and
+/// returns the parsed number jsval.
+pub(crate) const PARSE_INT_IMPORT_NAME: &str = "__parse_int";
 
 /// `__promise` op flag: `Promise.resolve(a)` — a promise already fulfilled
 /// with `a` (or `a` itself when it is already a promise).
@@ -357,12 +626,35 @@ pub(crate) const INVOKE_EXPORT_NAME: &str = "__invoke1";
 /// exception via `__exc_pending`) for the host to read.
 pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
 
+/// The name under which the module exports the `__alloc(size: i32) -> base: i32`
+/// bump allocator. It rounds `size` up to [`BLOCK_ALIGN`], zeroes the block's
+/// [`HEADER_SIZE`] header bytes, and returns the 8-aligned base; on exhaustion it
+/// stores [`HEAP_PTR_OOM`] and traps.
+pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
+
+/// The name under which the module exports the `__new_string(len: i32) -> base:
+/// i32` constructor: a [`TYPE_STRING`] block with `len` set and a `len`-byte
+/// payload for the caller to fill. The hosts allocate every string through it.
+pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
+
+/// The name under which the module exports the `__new_array(len: i32) -> base:
+/// i32` constructor: a [`TYPE_ARRAY`] handle with `len` set and a `cap = len`
+/// [`TYPE_ELEMS`] store (none when `len` is 0) whose every element is
+/// `undefined`. The hosts allocate every array through it.
+pub(crate) const NEW_ARRAY_EXPORT_NAME: &str = "__new_array";
+
+/// The name under which the module exports the `__new_promise() -> base: i32`
+/// constructor: a pending [`TYPE_PROMISE`] block (value `undefined`). The hosts
+/// allocate every promise through it.
+pub(crate) const NEW_PROMISE_EXPORT_NAME: &str = "__new_promise";
+
 /// The name under which the module exports its linear memory; [`crate::run`]
 /// reads it back to resolve heap pointers.
 pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";
 
 /// The name under which the bump-allocator heap-pointer global is exported so
-/// the host `__convert`/`__method` imports can allocate in guest memory.
+/// the run stage can detect the [`HEAP_PTR_OOM`] sentinel (hosts only read it;
+/// they allocate through the constructor exports).
 pub(crate) const HEAP_PTR_EXPORT_NAME: &str = "__heap_ptr";
 
 /// The linear-memory cap in 64 KiB wasm pages (512 MiB), declared as the
@@ -403,9 +695,6 @@ pub(crate) const CONVERT_OP_TO_STRING: i32 = 0;
 /// `__convert` op flag: coerce the argument to a number (`Number(x)`).
 pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
 
-/// `__convert` op flag: parse a leading integer (`parseInt(x)`).
-pub(crate) const CONVERT_OP_PARSE_INT: i32 = 2;
-
 /// `__convert` op flag: parse a leading float (`parseFloat(x)`).
 pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;
 
@@ -414,9 +703,6 @@ pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
 /// `__method` op flag: `includes`.
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `join`.
-pub(crate) const METHOD_OP_JOIN: i32 = 2;
 
 /// `__method` op flag: `slice` (overloaded on array/string).
 pub(crate) const METHOD_OP_SLICE: i32 = 3;
@@ -459,3 +745,11 @@ pub(crate) const METHOD_OP_SUBSTRING: i32 = 15;
 
 /// `__method` op flag: `split` (string, yields an array).
 pub(crate) const METHOD_OP_SPLIT: i32 = 16;
+
+/// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
+/// `arg0` an integral radix in `2..=36`).
+pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
+
+#[cfg(test)]
+#[path = "abi_drift_tests.rs"]
+mod drift_tests;

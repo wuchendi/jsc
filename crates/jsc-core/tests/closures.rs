@@ -135,3 +135,47 @@ fn module_bindings_reachable_from_nested_shapes() {
         "3",
     );
 }
+
+/// A computed object-literal key inside a function that references an outer
+/// binding is captured like any other reference.
+#[test]
+fn computed_object_key_captures_outer_binding() {
+    assert_output(
+        "let k = 'a'; function f() { return {[k]: 1} } console.log(f())",
+        "{ a: 1 }\n",
+    );
+    assert_output(
+        "function outer() { let k = 'm'; return () => ({ [k]() { return 2 }, get [k + 'g']() { return 3 } }) } \
+         let o = outer()(); console.log(o.m(), o.mg)",
+        "2 3\n",
+    );
+}
+
+/// A captured binding initialized with a non-empty array or object literal
+/// holds that value: the literal's build must not clobber the cell it is
+/// stored into.
+#[test]
+fn captured_binding_holds_heap_literal() {
+    assert_output(
+        "let a = [7]; const f = () => a; console.log(f(), a[0])",
+        "[ 7 ] 7\n",
+    );
+    assert_output(
+        "function m() { let o = {x: 1}; const g = () => o.x; return g() } console.log(m())",
+        "1\n",
+    );
+}
+
+/// A captured binding initialized with a freshly allocated object or array
+/// keeps it: building the value must not clobber its cell.
+#[test]
+fn captured_heap_value_initializer() {
+    assert_output(
+        "let o = {tag: 'o'}; let a = [5]; let f = () => [o.tag, a[0]]; console.log(f())",
+        "[ o, 5 ]\n",
+    );
+    assert_eval(
+        "function g(){ let o = {a: 1}; return () => o.a } g()()",
+        "1",
+    );
+}

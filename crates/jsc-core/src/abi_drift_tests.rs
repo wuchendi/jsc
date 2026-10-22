@@ -1,0 +1,393 @@
+//! Drift guard for `packages/jsc/src/abi.ts`, the browser shim's hand-ported copy
+//! of this module. Every `export const` there must map to the Rust value of the
+//! same meaning in `expected()`; an unmapped export, a mapped name missing from
+//! the TS file, or a differing value fails the test.
+
+use super::{
+    ACCESSOR_GET_OFFSET, ACCESSOR_SET_OFFSET, ARRAY_ELEMS_OFFSET, ARRAY_FLAG_SPARSE,
+    ARRAY_LEN_OFFSET, ATTR_ACCESSOR, ATTR_ENUMERABLE, CLASS_ARGUMENTS, CLASS_BOOLEAN, CLASS_ERROR,
+    CLASS_NUMBER, CLASS_STRING, ELEMS_CAP_OFFSET, ELEMS_DATA_OFFSET, HEADER_CLASS_OFFSET,
+    HEADER_FLAGS_OFFSET, METHOD_OP_NUMBER_TO_STRING, OBJ_PROPS_OFFSET, PROP_ATTRS_OFFSET,
+    PROP_ENTRY_SIZE, PROP_KEY_OFFSET, PROP_VALUE_OFFSET, PROPS_COUNT_OFFSET, PROPS_HAS_INDEX_KEYS,
+    PROPS_HEADER_SIZE, PROPS_TFLAGS_OFFSET, STR_FLAG_ARRAY_INDEX, WRAPPER_VALUE_OFFSET,
+};
+use super::{
+    ASYNC_STEP_EXPORT_NAME, CONVERT_OP_PARSE_FLOAT, CONVERT_OP_TO_NUMBER, CONVERT_OP_TO_STRING,
+    DATE_MS_OFFSET, EXC_PENDING_EXPORT_NAME, EXC_VALUE_EXPORT_NAME, FALSE, GEN_DONE_OFFSET,
+    HEADER_SIZE, HEAP, HEAP_PTR_EXPORT_NAME, HEAP_PTR_OOM, HOLE, INVOKE_EXPORT_NAME,
+    MEMORY_EXPORT_NAME, MEMORY_MAX_PAGES, METHOD_OP_CHAR_AT, METHOD_OP_ENDS_WITH,
+    METHOD_OP_INCLUDES, METHOD_OP_INDEX_OF, METHOD_OP_PAD_END, METHOD_OP_PAD_START,
+    METHOD_OP_REPEAT, METHOD_OP_SLICE, METHOD_OP_SPLIT, METHOD_OP_STARTS_WITH, METHOD_OP_SUBSTRING,
+    METHOD_OP_TO_LOWER, METHOD_OP_TO_UPPER, METHOD_OP_TRIM, METHOD_OP_TRIM_END,
+    METHOD_OP_TRIM_START, NEW_ARRAY_EXPORT_NAME, NEW_PROMISE_EXPORT_NAME, NEW_STRING_EXPORT_NAME,
+    NULL, PRINT_FLAG_END, PRINT_FLAG_NEWLINE, PRINT_FLAG_SEP, PROMISE_FULFILLED,
+    PROMISE_OP_ASYNC_SPAWN, PROMISE_OP_AWAIT, PROMISE_OP_FINALLY, PROMISE_OP_NEW,
+    PROMISE_OP_REJECT, PROMISE_OP_RESOLVE, PROMISE_OP_SETTLE_FULFILL, PROMISE_OP_SETTLE_REJECT,
+    PROMISE_PENDING, PROMISE_REJECTED, QNAN, TRUE, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION,
+    TYPE_OBJECT, TYPE_PROMISE, TYPE_STRING, UNDEFINED,
+};
+use super::{
+    FN_INFO_ADDR, FN_INFO_ENTRY_SIZE, FN_INFO_NAME_OFFSET, FUNC_FLAG_CLASS_CTOR,
+    FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_SELF_ALLOC, FUNC_INDEX_OFFSET, MAP_SIZE_OFFSET,
+    OBJ_PREFIX_SIZE, OBJ_PROTO_OFFSET, PROMISE_BLOCK_SIZE, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, TYPE_GENERATOR, TYPE_MAP, TYPE_SET,
+};
+
+/// A parsed `export const` value.
+#[derive(Debug, Clone, PartialEq)]
+enum Val {
+    Int(i128),
+    Str(String),
+    Strs(Vec<String>),
+}
+
+fn int(v: impl Into<i128>) -> Val {
+    Val::Int(v.into())
+}
+
+fn s(v: &str) -> Val {
+    Val::Str(v.to_owned())
+}
+
+/// TS export name -> the Rust value it must equal.
+#[allow(clippy::too_many_lines)] // one flat table of name/value pairs
+fn expected() -> Vec<(&'static str, Val)> {
+    vec![
+        ("QNAN", int(QNAN)),
+        ("FALSE", int(FALSE)),
+        ("TRUE", int(TRUE)),
+        ("NULL", int(NULL)),
+        ("UNDEFINED", int(UNDEFINED)),
+        ("HOLE", int(HOLE)),
+        ("HEAP", int(HEAP)),
+        ("HEADER_SIZE", int(HEADER_SIZE)),
+        ("TYPE_STRING", int(TYPE_STRING)),
+        ("TYPE_ARRAY", int(TYPE_ARRAY)),
+        ("TYPE_OBJECT", int(TYPE_OBJECT)),
+        ("TYPE_FUNCTION", int(TYPE_FUNCTION)),
+        ("TYPE_MAP", int(TYPE_MAP)),
+        ("TYPE_SET", int(TYPE_SET)),
+        ("TYPE_PROMISE", int(TYPE_PROMISE)),
+        ("TYPE_GENERATOR", int(TYPE_GENERATOR)),
+        ("TYPE_DATE", int(TYPE_DATE)),
+        ("HEADER_FLAGS_OFFSET", int(HEADER_FLAGS_OFFSET)),
+        ("HEADER_CLASS_OFFSET", int(HEADER_CLASS_OFFSET)),
+        ("CLASS_ERROR", int(CLASS_ERROR)),
+        ("CLASS_ARGUMENTS", int(CLASS_ARGUMENTS)),
+        ("CLASS_BOOLEAN", int(CLASS_BOOLEAN)),
+        ("CLASS_NUMBER", int(CLASS_NUMBER)),
+        ("CLASS_STRING", int(CLASS_STRING)),
+        ("WRAPPER_VALUE_OFFSET", int(WRAPPER_VALUE_OFFSET)),
+        ("STR_FLAG_ARRAY_INDEX", int(STR_FLAG_ARRAY_INDEX)),
+        ("ARRAY_FLAG_SPARSE", int(ARRAY_FLAG_SPARSE)),
+        ("ELEMS_CAP_OFFSET", int(ELEMS_CAP_OFFSET)),
+        ("OBJ_PROPS_OFFSET", int(OBJ_PROPS_OFFSET)),
+        ("OBJ_PREFIX_SIZE", int(OBJ_PREFIX_SIZE)),
+        ("OBJ_PROTO_OFFSET", int(OBJ_PROTO_OFFSET)),
+        ("ARRAY_LEN_OFFSET", int(ARRAY_LEN_OFFSET)),
+        ("ARRAY_ELEMS_OFFSET", int(ARRAY_ELEMS_OFFSET)),
+        ("ELEMS_DATA_OFFSET", int(ELEMS_DATA_OFFSET)),
+        ("FUNC_INDEX_OFFSET", int(FUNC_INDEX_OFFSET)),
+        ("FUNC_FLAG_CONSTRUCTOR", int(FUNC_FLAG_CONSTRUCTOR)),
+        ("FUNC_FLAG_CLASS_CTOR", int(FUNC_FLAG_CLASS_CTOR)),
+        ("FUNC_FLAG_SELF_ALLOC", int(FUNC_FLAG_SELF_ALLOC)),
+        ("FN_INFO_ADDR", int(FN_INFO_ADDR)),
+        ("FN_INFO_ENTRY_SIZE", int(FN_INFO_ENTRY_SIZE)),
+        ("FN_INFO_NAME_OFFSET", int(FN_INFO_NAME_OFFSET)),
+        ("PROPS_TFLAGS_OFFSET", int(PROPS_TFLAGS_OFFSET)),
+        ("PROPS_COUNT_OFFSET", int(PROPS_COUNT_OFFSET)),
+        ("PROPS_HEADER_SIZE", int(PROPS_HEADER_SIZE)),
+        ("PROP_ENTRY_SIZE", int(PROP_ENTRY_SIZE)),
+        ("PROP_KEY_OFFSET", int(PROP_KEY_OFFSET)),
+        ("PROP_ATTRS_OFFSET", int(PROP_ATTRS_OFFSET)),
+        ("PROP_VALUE_OFFSET", int(PROP_VALUE_OFFSET)),
+        ("PROPS_HAS_INDEX_KEYS", int(PROPS_HAS_INDEX_KEYS)),
+        ("ATTR_ENUMERABLE", int(ATTR_ENUMERABLE)),
+        ("ATTR_ACCESSOR", int(ATTR_ACCESSOR)),
+        ("ACCESSOR_GET_OFFSET", int(ACCESSOR_GET_OFFSET)),
+        ("ACCESSOR_SET_OFFSET", int(ACCESSOR_SET_OFFSET)),
+        ("PROMISE_PENDING", int(PROMISE_PENDING)),
+        ("PROMISE_FULFILLED", int(PROMISE_FULFILLED)),
+        ("PROMISE_REJECTED", int(PROMISE_REJECTED)),
+        ("MAP_SIZE_OFFSET", int(MAP_SIZE_OFFSET)),
+        ("PROMISE_STATE_OFFSET", int(PROMISE_STATE_OFFSET)),
+        ("PROMISE_VALUE_OFFSET", int(PROMISE_VALUE_OFFSET)),
+        ("PROMISE_BLOCK_SIZE", int(PROMISE_BLOCK_SIZE)),
+        ("GEN_DONE_OFFSET", int(GEN_DONE_OFFSET)),
+        ("DATE_MS_OFFSET", int(DATE_MS_OFFSET)),
+        ("MEMORY_EXPORT_NAME", s(MEMORY_EXPORT_NAME)),
+        ("HEAP_PTR_EXPORT_NAME", s(HEAP_PTR_EXPORT_NAME)),
+        ("MEMORY_MAX_PAGES", int(MEMORY_MAX_PAGES)),
+        ("HEAP_PTR_OOM", int(HEAP_PTR_OOM)),
+        ("NEW_STRING_EXPORT_NAME", s(NEW_STRING_EXPORT_NAME)),
+        ("NEW_ARRAY_EXPORT_NAME", s(NEW_ARRAY_EXPORT_NAME)),
+        ("NEW_PROMISE_EXPORT_NAME", s(NEW_PROMISE_EXPORT_NAME)),
+        ("EXC_PENDING_EXPORT_NAME", s(EXC_PENDING_EXPORT_NAME)),
+        ("EXC_VALUE_EXPORT_NAME", s(EXC_VALUE_EXPORT_NAME)),
+        ("INVOKE_EXPORT_NAME", s(INVOKE_EXPORT_NAME)),
+        ("ASYNC_STEP_EXPORT_NAME", s(ASYNC_STEP_EXPORT_NAME)),
+        ("PRINT_FLAG_SEP", int(PRINT_FLAG_SEP)),
+        ("PRINT_FLAG_END", int(PRINT_FLAG_END)),
+        ("PRINT_FLAG_NEWLINE", int(PRINT_FLAG_NEWLINE)),
+        ("CONVERT_OP_TO_STRING", int(CONVERT_OP_TO_STRING)),
+        ("CONVERT_OP_TO_NUMBER", int(CONVERT_OP_TO_NUMBER)),
+        ("CONVERT_OP_PARSE_FLOAT", int(CONVERT_OP_PARSE_FLOAT)),
+        ("METHOD_OP_INDEX_OF", int(METHOD_OP_INDEX_OF)),
+        ("METHOD_OP_INCLUDES", int(METHOD_OP_INCLUDES)),
+        ("METHOD_OP_SLICE", int(METHOD_OP_SLICE)),
+        ("METHOD_OP_TO_UPPER", int(METHOD_OP_TO_UPPER)),
+        ("METHOD_OP_TO_LOWER", int(METHOD_OP_TO_LOWER)),
+        ("METHOD_OP_CHAR_AT", int(METHOD_OP_CHAR_AT)),
+        ("METHOD_OP_TRIM", int(METHOD_OP_TRIM)),
+        ("METHOD_OP_TRIM_START", int(METHOD_OP_TRIM_START)),
+        ("METHOD_OP_TRIM_END", int(METHOD_OP_TRIM_END)),
+        ("METHOD_OP_REPEAT", int(METHOD_OP_REPEAT)),
+        ("METHOD_OP_STARTS_WITH", int(METHOD_OP_STARTS_WITH)),
+        ("METHOD_OP_ENDS_WITH", int(METHOD_OP_ENDS_WITH)),
+        ("METHOD_OP_PAD_START", int(METHOD_OP_PAD_START)),
+        ("METHOD_OP_PAD_END", int(METHOD_OP_PAD_END)),
+        ("METHOD_OP_SUBSTRING", int(METHOD_OP_SUBSTRING)),
+        ("METHOD_OP_SPLIT", int(METHOD_OP_SPLIT)),
+        (
+            "METHOD_OP_NUMBER_TO_STRING",
+            int(METHOD_OP_NUMBER_TO_STRING),
+        ),
+        ("PROMISE_OP_RESOLVE", int(PROMISE_OP_RESOLVE)),
+        ("PROMISE_OP_REJECT", int(PROMISE_OP_REJECT)),
+        ("PROMISE_OP_AWAIT", int(PROMISE_OP_AWAIT)),
+        ("PROMISE_OP_FINALLY", int(PROMISE_OP_FINALLY)),
+        ("PROMISE_OP_NEW", int(PROMISE_OP_NEW)),
+        ("PROMISE_OP_SETTLE_FULFILL", int(PROMISE_OP_SETTLE_FULFILL)),
+        ("PROMISE_OP_SETTLE_REJECT", int(PROMISE_OP_SETTLE_REJECT)),
+        ("PROMISE_OP_ASYNC_SPAWN", int(PROMISE_OP_ASYNC_SPAWN)),
+        // TS-only bigint normalization masks: the Rust side uses the native widths.
+        ("U64_MASK", int(u64::MAX)),
+        ("U32_MASK", int(u32::MAX)),
+    ]
+}
+
+/// Parse an integer literal: decimal or `0x` hex, `_` separators, optional `n`.
+fn parse_int(lit: &str) -> Option<i128> {
+    let digits: String = lit
+        .strip_suffix('n')
+        .unwrap_or(lit)
+        .chars()
+        .filter(|&c| c != '_')
+        .collect();
+    match digits.strip_prefix("0x") {
+        Some(hex) => i128::from_str_radix(hex, 16).ok(),
+        None => digits.parse().ok(),
+    }
+}
+
+/// Parse a `'...'` string literal (no escapes in abi.ts).
+fn parse_str(lit: &str) -> Option<String> {
+    lit.strip_prefix('\'')?
+        .strip_suffix('\'')
+        .map(str::to_owned)
+}
+
+/// Evaluate `term (+ term)*`, each term an integer literal or an earlier export.
+fn parse_sum(expr: &str, seen: &[(String, Val)]) -> Result<Val, String> {
+    let mut sum = 0i128;
+    for term in expr.split('+').map(str::trim) {
+        let value = match parse_int(term) {
+            Some(v) => v,
+            None => match seen.iter().find(|(n, _)| n == term) {
+                Some((_, Val::Int(v))) => *v,
+                _ => return Err(format!("unsupported term `{term}` in `{expr}`")),
+            },
+        };
+        sum += value;
+    }
+    Ok(Val::Int(sum))
+}
+
+/// Line-based parse of every `export const NAME = <literal>` in `src`.
+fn parse_exports(src: &str) -> Result<Vec<(String, Val)>, String> {
+    let mut out: Vec<(String, Val)> = Vec::new();
+    let mut lines = src.lines();
+    while let Some(line) = lines.next() {
+        let Some(decl) = line.strip_prefix("export const ") else {
+            continue;
+        };
+        let (name, rhs) = decl
+            .split_once(" = ")
+            .ok_or_else(|| format!("malformed export: `{line}`"))?;
+        let rhs = rhs.trim();
+        let value = if rhs == "[" {
+            let mut items = Vec::new();
+            loop {
+                let item = lines
+                    .next()
+                    .ok_or_else(|| format!("unterminated array `{name}`"))?
+                    .trim();
+                if item.starts_with(']') {
+                    break;
+                }
+                let lit = item.trim_end_matches(',');
+                items.push(
+                    parse_str(lit).ok_or_else(|| format!("bad array item `{lit}` in `{name}`"))?,
+                );
+            }
+            Val::Strs(items)
+        } else if let Some(text) = parse_str(rhs) {
+            Val::Str(text)
+        } else {
+            parse_sum(rhs, &out)?
+        };
+        out.push((name.to_owned(), value));
+    }
+    Ok(out)
+}
+
+#[test]
+fn abi_ts_matches_rust_abi() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/jsc/src/abi.ts");
+    let src = std::fs::read_to_string(path).unwrap();
+    let exports = parse_exports(&src).unwrap();
+    assert!(!exports.is_empty(), "parsed zero constants from {path}");
+
+    let expected = expected();
+    let mut errors = Vec::new();
+    for (name, value) in &exports {
+        match expected.iter().find(|(n, _)| n == name) {
+            None => errors.push(format!(
+                "abi.ts exports `{name}` with no Rust mapping in abi_drift_tests.rs"
+            )),
+            Some((_, want)) if want != value => {
+                errors.push(format!(
+                    "abi.ts `{name}` = {value:?}, Rust abi.rs = {want:?}"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (name, _) in &expected {
+        if !exports.iter().any(|(n, _)| n == name) {
+            errors.push(format!("mapped `{name}` is missing from abi.ts"));
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "abi.ts drifted from abi.rs:\n{}",
+        errors.join("\n")
+    );
+}
+
+/// Pins the object-family prefix and per-kind payload layouts to
+/// `DESIGN.md` sections 5.1-5.2.
+#[test]
+fn object_family_layout_matches_design() {
+    use super::{
+        ARRAY_BLOCK_SIZE, DATE_BLOCK_SIZE, ELEMS_CAP_OFFSET, FUNC_BLOCK_SIZE, FUNC_ENV_OFFSET,
+        GEN_BLOCK_SIZE, GEN_ENV_OFFSET, GEN_SM_IDX_OFFSET, GEN_STATE_OFFSET, MAP_BLOCK_SIZE,
+        MAP_ENTRIES_OFFSET, OBJ_PROPS_OFFSET, TYPE_ELEMS,
+    };
+    let actual = [
+        ("OBJ_PROPS_OFFSET", OBJ_PROPS_OFFSET),
+        ("OBJ_PROTO_OFFSET", OBJ_PROTO_OFFSET),
+        ("OBJ_PREFIX_SIZE", OBJ_PREFIX_SIZE),
+        ("FUNC_INDEX_OFFSET", FUNC_INDEX_OFFSET),
+        ("FUNC_ENV_OFFSET", FUNC_ENV_OFFSET),
+        ("FUNC_BLOCK_SIZE", FUNC_BLOCK_SIZE),
+        ("MAP_SIZE_OFFSET", MAP_SIZE_OFFSET),
+        ("MAP_ENTRIES_OFFSET", MAP_ENTRIES_OFFSET),
+        ("MAP_BLOCK_SIZE", MAP_BLOCK_SIZE),
+        ("PROMISE_STATE_OFFSET", PROMISE_STATE_OFFSET),
+        ("PROMISE_VALUE_OFFSET", PROMISE_VALUE_OFFSET),
+        ("PROMISE_BLOCK_SIZE", PROMISE_BLOCK_SIZE),
+        ("GEN_SM_IDX_OFFSET", GEN_SM_IDX_OFFSET),
+        ("GEN_STATE_OFFSET", GEN_STATE_OFFSET),
+        ("GEN_DONE_OFFSET", GEN_DONE_OFFSET),
+        ("GEN_ENV_OFFSET", GEN_ENV_OFFSET),
+        ("GEN_BLOCK_SIZE", GEN_BLOCK_SIZE),
+        ("DATE_MS_OFFSET", DATE_MS_OFFSET),
+        ("DATE_BLOCK_SIZE", DATE_BLOCK_SIZE),
+        ("ARRAY_LEN_OFFSET", ARRAY_LEN_OFFSET),
+        ("ARRAY_ELEMS_OFFSET", ARRAY_ELEMS_OFFSET),
+        ("ARRAY_BLOCK_SIZE", ARRAY_BLOCK_SIZE),
+        ("ELEMS_CAP_OFFSET", ELEMS_CAP_OFFSET),
+        ("ELEMS_DATA_OFFSET", ELEMS_DATA_OFFSET),
+    ];
+    let design = [
+        4, 8, 16, // prefix
+        16, 24, 32, // function
+        16, 24, 32, // map / set
+        16, 24, 32, // promise
+        16, 20, 24, 32, 40, // generator
+        16, 24, // date
+        16, 20, 24, // array handle
+        4, 8, // element store
+    ];
+    for ((name, got), want) in actual.iter().zip(design) {
+        assert_eq!(*got, want, "{name}");
+    }
+    // Every i64/f64 slot is 8-byte aligned; every block size is a BLOCK_ALIGN multiple.
+    assert_eq!(TYPE_ELEMS, 13);
+    for slot in [
+        ELEMS_DATA_OFFSET,
+        OBJ_PROTO_OFFSET,
+        FUNC_ENV_OFFSET,
+        MAP_ENTRIES_OFFSET,
+        PROMISE_VALUE_OFFSET,
+        GEN_ENV_OFFSET,
+        DATE_MS_OFFSET,
+    ] {
+        assert_eq!(slot % 8, 0);
+    }
+    for size in [
+        ARRAY_BLOCK_SIZE,
+        FUNC_BLOCK_SIZE,
+        MAP_BLOCK_SIZE,
+        PROMISE_BLOCK_SIZE,
+        GEN_BLOCK_SIZE,
+        DATE_BLOCK_SIZE,
+    ] {
+        assert_eq!(size % super::BLOCK_ALIGN, 0);
+    }
+}
+
+/// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
+/// `DESIGN.md` sections 5.1-5.3.
+#[test]
+fn property_table_layout_matches_design() {
+    use super::{
+        ATTR_CONFIGURABLE, ATTR_WRITABLE, ATTRS_DEFAULT, OBJ_FLAG_NOT_EXTENSIBLE, PROPS_CAP_OFFSET,
+        PROPS_HAS_NON_ENUM, PROPS_LIVE_OFFSET, STR_FLAG_INTERNED, TYPE_PROPS,
+    };
+    assert_eq!(TYPE_PROPS, 12);
+    assert_eq!(
+        [
+            PROPS_TFLAGS_OFFSET,
+            PROPS_COUNT_OFFSET,
+            PROPS_CAP_OFFSET,
+            PROPS_LIVE_OFFSET,
+            PROPS_HEADER_SIZE
+        ],
+        [2, 4, 8, 12, 16]
+    );
+    assert_eq!(
+        [
+            PROP_ENTRY_SIZE,
+            PROP_KEY_OFFSET,
+            PROP_ATTRS_OFFSET,
+            PROP_VALUE_OFFSET
+        ],
+        [16, 0, 4, 8]
+    );
+    assert_eq!(
+        [
+            ATTR_WRITABLE,
+            ATTR_ENUMERABLE,
+            ATTR_CONFIGURABLE,
+            ATTR_ACCESSOR
+        ],
+        [1, 2, 4, 8]
+    );
+    assert_eq!(ATTRS_DEFAULT, 0b0111);
+    assert_eq!([PROPS_HAS_INDEX_KEYS, PROPS_HAS_NON_ENUM], [1, 2]);
+    assert_eq!([STR_FLAG_INTERNED, STR_FLAG_ARRAY_INDEX], [1, 2]);
+    assert_eq!(OBJ_FLAG_NOT_EXTENSIBLE, 1);
+    assert_eq!(HEADER_FLAGS_OFFSET, 2);
+}

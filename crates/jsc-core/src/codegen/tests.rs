@@ -1,6 +1,9 @@
 use super::lower;
 use crate::frontend::{Dialect, parse};
-use crate::ir::{BinOp, IrNode, IrStmt, OpSetKind};
+use crate::ir::{
+    BinOp, CalleeError, ConvertOp, ErrorKind, GlobalIntrinsic, GlobalRef, IrNode, IrStmt, MathOp,
+    ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
+};
 
 fn lower_src(src: &str) -> anyhow::Result<crate::ir::IrProgram> {
     lower(&parse(src, Dialect::Js)?)
@@ -137,66 +140,109 @@ fn lowers_object_literal() {
     };
     assert_eq!(
         *init,
-        IrNode::Object(vec![
-            ("a".to_owned(), IrNode::Num(1.0)),
-            ("b".to_owned(), IrNode::Num(2.0)),
-        ])
-    );
-}
-
-#[test]
-fn lowers_error_constructor_to_object() {
-    // `new TypeError("bad")` lowers to a branded error object: `name`, `message`,
-    // the derived `stack`, and the hidden `@@errorkind` marker. The message is
-    // teed into a fresh temp (evaluated once) and reused by `stack`.
-    let program = lower_src("new TypeError(\"bad\")").expect("should lower");
-    let IrStmt::Expr(IrNode::Object(entries)) = &program.stmts[0] else {
-        unreachable!("expected an object literal");
-    };
-    let keys: Vec<&str> = entries.iter().map(|(key, _)| key.as_str()).collect();
-    assert_eq!(
-        keys,
-        ["name", "message", "stack", crate::abi::ERROR_KIND_KEY]
-    );
-    assert_eq!(entries[0].1, IrNode::Str("TypeError".to_owned()));
-    assert_eq!(entries[3].1, IrNode::Num(crate::abi::ERROR_KIND_TYPE));
-    let IrNode::Assign { local, value } = &entries[1].1 else {
-        unreachable!("message should tee into a temp");
-    };
-    assert_eq!(**value, IrNode::Str("bad".to_owned()));
-    assert_eq!(
-        entries[2].1,
-        IrNode::Binary {
-            op: BinOp::Add,
-            lhs: Box::new(IrNode::Str("TypeError: ".to_owned())),
-            rhs: Box::new(IrNode::Local(*local)),
+        IrNode::Object {
+            entries: vec![
+                (PropKey::Static("a".to_owned()), IrNode::Num(1.0)),
+                (PropKey::Static("b".to_owned()), IrNode::Num(2.0)),
+            ],
+            proto: None,
+            class: crate::abi::CLASS_ORDINARY,
+            reserve: 0,
         }
     );
 }
 
 #[test]
-fn lowers_error_no_arg_to_empty_message() {
-    // `new Error()` defaults `message` to "" and `stack` to just the name (no
-    // trailing colon), still carrying the hidden `@@errorkind` marker.
-    let program = lower_src("new Error()").expect("should lower");
+fn lowers_computed_and_numeric_literal_keys() {
+    // A computed key `[k]` and a numeric key `1` stay computed (converted at run
+    // time), in source order, around the static key.
+    let program = lower_src("let k = 'x'; let o = {[k]: 1, b: 2, 1: 3}; o").expect("should lower");
+    let IrStmt::Decl { init, .. } = &program.stmts[1] else {
+        unreachable!("expected a declaration");
+    };
+    let IrNode::Object { entries, .. } = init else {
+        unreachable!("expected an object literal");
+    };
+    assert!(matches!(entries[0].0, PropKey::Computed(IrNode::Local(_))));
+    assert_eq!(entries[1].0, PropKey::Static("b".to_owned()));
+    assert_eq!(entries[2].0, PropKey::Computed(IrNode::Num(1.0)));
+}
+
+#[test]
+fn lowers_error_constructor_to_object() {
+    // `new TypeError("bad")` lowers to a class-ERROR object linked to the
+    // static `%TypeError.prototype%`, owning non-enumerable `message` and
+    // `stack` (a string literal resolves both at compile time).
+    let program = lower_src("new TypeError(\"bad\")").expect("should lower");
     assert_eq!(
         program.stmts[0],
-        IrStmt::Expr(IrNode::Object(vec![
-            ("name".to_owned(), IrNode::Str("Error".to_owned())),
-            ("message".to_owned(), IrNode::Str(String::new())),
-            ("stack".to_owned(), IrNode::Str("Error".to_owned())),
-            (
-                crate::abi::ERROR_KIND_KEY.to_owned(),
-                IrNode::Num(crate::abi::ERROR_KIND_ERROR)
-            ),
-        ]))
+        IrStmt::Expr(IrNode::Object {
+            entries: vec![
+                (
+                    PropKey::Hidden("message".to_owned()),
+                    IrNode::Str("bad".to_owned())
+                ),
+                (
+                    PropKey::Hidden("stack".to_owned()),
+                    IrNode::Str("TypeError: bad".to_owned())
+                ),
+            ],
+            proto: Some(Box::new(IrNode::ErrorProto(ErrorKind::TypeError))),
+            class: crate::abi::CLASS_ERROR,
+            reserve: 0,
+        })
     );
 }
 
 #[test]
-fn rejects_unknown_constructor() {
-    // Only the three built-in error constructors are in scope.
-    assert!(lower_src("new Widget(1)").is_err());
+fn lowers_error_dynamic_message_once() {
+    // A non-literal message is evaluated once into a temp: `undefined` builds
+    // an error without an own `message`, anything else its `ToString`.
+    let program = lower_src("let m = 1; new Error(m)").expect("should lower");
+    let IrStmt::Expr(IrNode::Ternary {
+        cond,
+        then_branch,
+        else_branch,
+    }) = &program.stmts[1]
+    else {
+        unreachable!("expected the undefined-message test");
+    };
+    assert!(matches!(&**cond, IrNode::Binary { op: BinOp::Eq, lhs, rhs }
+        if matches!(&**lhs, IrNode::Assign { .. }) && **rhs == IrNode::Undefined));
+    assert_eq!(
+        **then_branch,
+        IrNode::error_object(ErrorKind::Error, None, IrNode::Str("Error".to_owned()))
+    );
+    let IrNode::Object { entries, .. } = &**else_branch else {
+        unreachable!("expected the error object");
+    };
+    assert!(matches!(&entries[0].1, IrNode::Assign { value, .. }
+        if matches!(&**value, IrNode::ConvertCall { op: ConvertOp::ToString, .. })));
+}
+
+#[test]
+fn lowers_error_no_arg_to_inherited_message() {
+    // `new Error()` and `Error()` own no `message` (the prototype's `""` is
+    // inherited) and a bare-name `stack`.
+    for src in ["new Error()", "Error()", "new Error(undefined)"] {
+        let program = lower_src(src).expect("should lower");
+        assert_eq!(
+            program.stmts[0],
+            IrStmt::Expr(IrNode::error_object(
+                ErrorKind::Error,
+                None,
+                IrNode::Str("Error".to_owned()),
+            )),
+            "for `{src}`"
+        );
+    }
+}
+
+#[test]
+fn unknown_constructor_reads_the_global_object() {
+    // An unresolved constructor is a global-object read, checked at run time.
+    let node = lower_expr("new Widget(1)").expect("lower");
+    assert!(node.any_child(|child| *child == global_get("Widget")));
 }
 
 #[test]
@@ -227,11 +273,17 @@ fn lowers_static_property_assignment_as_indexset() {
 }
 
 #[test]
-fn rejects_length_assignment() {
-    // `.length` is a computed header read; assigning to it stays an error.
-    assert!(
-        lower_src("let a = [1, 2]; a.length = 5").is_err(),
-        "assigning to .length is unsupported"
+fn lowers_length_assignment_as_indexset() {
+    // `a.length = v` is an ordinary member store with the `"length"` key (the
+    // runtime routes an array receiver to `__array_set_length`).
+    let program = lower_src("let a = [1, 2]; a.length = 5").expect("should lower");
+    assert_eq!(
+        program.stmts[1],
+        IrStmt::Expr(IrNode::IndexSet {
+            obj: Box::new(IrNode::Local(0)),
+            index: Box::new(IrNode::Str("length".to_owned())),
+            value: Box::new(IrNode::Num(5.0)),
+        })
     );
 }
 
@@ -241,15 +293,6 @@ fn lowers_shorthand_object_property() {
     assert!(
         lower_src("let a = 1; let o = {a}; o").is_ok(),
         "shorthand object property should lower"
-    );
-}
-
-#[test]
-fn rejects_computed_object_key() {
-    // Computed keys `{[e]: v}` are out of scope.
-    assert!(
-        lower_src("let k = \"a\"; let o = {[k]: 1}; o").is_err(),
-        "computed object key is unsupported"
     );
 }
 
@@ -446,12 +489,19 @@ fn lowers_static_property_compound_assignment_as_indexopset() {
 }
 
 #[test]
-fn rejects_length_compound_assignment() {
-    // `.length op= e` stays an error (as does plain `.length =`).
-    assert!(
-        lower_src("let a = [1, 2]; a.length += 1").is_err(),
-        "compound assigning to .length is unsupported"
-    );
+fn lowers_length_compound_assignment_and_update() {
+    // `a.length op= e` and `a.length++` are member read-modify-writes.
+    for src in [
+        "let a = [1, 2]; a.length += 1",
+        "let a = [1, 2]; a.length++",
+    ] {
+        let program = lower_src(src).expect("should lower");
+        assert!(
+            matches!(&program.stmts[1], IrStmt::Expr(IrNode::IndexOpSet { index, .. })
+                if **index == IrNode::Str("length".to_owned())),
+            "`{src}` should lower to an IndexOpSet on `length`"
+        );
+    }
 }
 
 #[test]
@@ -473,20 +523,209 @@ fn lowers_member_update_as_indexopset() {
     );
 }
 
+/// The run-time read of the unresolved global `name`.
+fn global_get(name: &str) -> IrNode {
+    IrNode::GlobalGet {
+        global: GlobalRef::new(name),
+        typeof_operand: false,
+    }
+}
+
 #[test]
-fn rejects_undeclared_identifier() {
-    assert!(
-        lower_src("a + 1").is_err(),
-        "undeclared identifier is an error"
+fn undeclared_identifier_reads_the_global_object() {
+    assert_eq!(
+        lower_expr("a + 1").expect("lower"),
+        IrNode::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(global_get("a")),
+            rhs: Box::new(IrNode::Num(1.0)),
+        }
+    );
+    assert_eq!(
+        lower_expr("typeof a").expect("lower"),
+        IrNode::TypeOf(Box::new(IrNode::GlobalGet {
+            global: GlobalRef::new("a"),
+            typeof_operand: true,
+        }))
     );
 }
 
 #[test]
-fn rejects_assignment_to_undeclared() {
-    assert!(
-        lower_src("x = 1").is_err(),
-        "assigning an undeclared var errors"
+fn assignment_to_undeclared_writes_the_global_object() {
+    assert_eq!(
+        lower_expr("x = 1").expect("lower"),
+        IrNode::GlobalSet {
+            global: GlobalRef::new("x"),
+            value: Box::new(IrNode::Num(1.0)),
+        }
     );
+    assert!(
+        lower_src("function f() {} f = 1").is_err(),
+        "a function declaration is not assignable"
+    );
+    for src in ["eval = 1", "arguments = 1", "for ({ eval } of [{}]) ;"] {
+        assert!(lower_src(src).is_err(), "`{src}` is a strict early error");
+    }
+}
+
+#[test]
+fn sealed_namespaces_keep_inline_nodes() {
+    let math = lower_expr("Math.max(1, 2)").expect("lower");
+    assert!(matches!(
+        math,
+        IrNode::MathCall {
+            op: MathOp::Max,
+            ..
+        }
+    ));
+    assert_eq!(
+        lower_expr("Math.PI").expect("lower"),
+        IrNode::Num(std::f64::consts::PI)
+    );
+    let log = lower_expr("console.log(1)").expect("lower");
+    assert!(matches!(log, IrNode::ConsoleLog { .. }));
+    let json = lower_expr("JSON.stringify(1)").expect("lower");
+    assert!(matches!(json, IrNode::JsonStringify { .. }));
+    let json = lower_expr("JSON.parse('1')").expect("lower");
+    assert!(matches!(json, IrNode::JsonParse { .. }));
+    // A sealed bare read is the constant intrinsic.
+    let program = lower_src("let m = Math; m").expect("lower");
+    let IrStmt::Decl { init, .. } = &program.stmts[0] else {
+        unreachable!("expected a declaration");
+    };
+    assert_eq!(*init, IrNode::Intrinsic(GlobalIntrinsic::Math));
+}
+
+#[test]
+fn unsealed_namespaces_guard_the_inline_code() {
+    // `globalThis` anywhere unseals every global: the inline code runs behind a
+    // guard over the global-object read.
+    let program = lower_src("globalThis; Math.max(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard {
+        namespace,
+        key,
+        obj,
+        fast,
+        slow,
+        ..
+    }) = &program.stmts[1]
+    else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!((*namespace, key.as_str()), (GlobalIntrinsic::Math, "max"));
+    assert_eq!(**obj, global_get("Math"));
+    assert!(matches!(
+        **fast,
+        IrNode::MathCall {
+            op: MathOp::Max,
+            ..
+        }
+    ));
+    assert!(matches!(**slow, IrNode::MethodCallUser { .. }));
+    // An escaping namespace stays sealed (constant) but guards the inline call.
+    let program = lower_src("typeof JSON; JSON.stringify(1)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { obj, fast, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(**obj, IrNode::Intrinsic(GlobalIntrinsic::Json));
+    assert!(matches!(**fast, IrNode::JsonStringify { .. }));
+    // An assigned namespace is a global-object read.
+    let program = lower_src("Math = 1; Math.max(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { obj, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(**obj, global_get("Math"));
+    // A guarded call with an extra argument evaluates it and runs the
+    // inline code over the arguments it reads.
+    let program = lower_src("globalThis; Math.floor(1, 2)").expect("lower");
+    let IrStmt::Expr(IrNode::NamespaceGuard { fast, args, .. }) = &program.stmts[1] else {
+        unreachable!("expected a guard, got {:?}", program.stmts[1]);
+    };
+    assert_eq!(args.len(), 2);
+    assert!(matches!(&**fast, IrNode::MathCall { args, .. } if args.len() == 1));
+    // A JSON call passing a replacer / space calls the builtin.
+    let program = lower_src("JSON.stringify({}, null, 2)").expect("lower");
+    assert!(matches!(
+        &program.stmts[0],
+        IrStmt::Expr(IrNode::MethodCallUser { .. })
+    ));
+    // Top-level `this` is the global object.
+    assert_eq!(
+        lower_expr("this").expect("lower"),
+        IrNode::Intrinsic(GlobalIntrinsic::Global)
+    );
+}
+
+#[test]
+fn unknown_namespace_members_are_method_calls() {
+    // G1c is gone: a member without inline code is read from the namespace
+    // object, inline or not.
+    for src in [
+        "Math.foo()",
+        "Object.freeze({})",
+        "JSON.foo(1)",
+        "Promise.all([])",
+        "console.warn(1)",
+    ] {
+        let node = lower_expr(src).expect("lower");
+        let IrNode::MethodCallUser { obj, .. } = &node else {
+            unreachable!("`{src}`: expected a method call, got {node:?}");
+        };
+        assert!(matches!(**obj, IrNode::Intrinsic(_)), "`{src}`");
+    }
+    // `[1].toString()` reads `%Array.prototype%` at run time.
+    assert!(matches!(
+        lower_expr("[1].toString()").expect("lower"),
+        IrNode::MethodCallUser { .. }
+    ));
+}
+
+/// The `sealed` flags of the [`IrNode::ProtoGuard`]s with an array fast
+/// path in `node`.
+fn proto_guards(node: &IrNode, out: &mut Vec<bool>) {
+    if let IrNode::ProtoGuard { sealed, fast, .. } = node
+        && fast.iter().any(|(kind, _)| *kind == ProtoKind::Array)
+    {
+        out.push(*sealed);
+    }
+    node.any_child(|child| {
+        proto_guards(child, out);
+        false
+    });
+}
+
+#[test]
+fn intrinsics_sealed_programs_skip_the_dirty_bit() {
+    let guards = |src: &str| {
+        let program = lower_src(src).expect("lower");
+        let last = program.stmts.last().expect("a statement");
+        let mut out = Vec::new();
+        last.any_node(|node| {
+            proto_guards(node, &mut out);
+            false
+        });
+        out
+    };
+    for src in [
+        "let a = []; a.push(1)",
+        "let a = [1]; a.pop()",
+        "class C { constructor() { this.a = [] } } new C().a.push(1)",
+    ] {
+        assert_eq!(guards(src), [true], "`{src}` is intrinsics-sealed");
+    }
+    for src in [
+        "Array.prototype.x = 1; let a = []; a.push(1)",
+        "let c = [].constructor; let a = []; a.pop()",
+        "let o = {}; o.__proto__; let a = []; a.push(1)",
+        "Object.assign; let a = []; a.push(1)",
+        "Reflect; let a = []; a.push(1)",
+        "let k = 'prototype'; let a = []; a.push(1)",
+    ] {
+        assert_eq!(guards(src), [false], "`{src}` is not intrinsics-sealed");
+    }
+    // A call shape without inline code is just the generic method call.
+    assert_eq!(guards("let a = [1]; a.forEach()"), Vec::<bool>::new());
+    assert_eq!(guards("let a = [1]; a.push(1, 2)"), Vec::<bool>::new());
 }
 
 #[test]
@@ -498,13 +737,6 @@ fn declaration_without_initializer_binds_undefined() {
         unreachable!("expected a declaration");
     };
     assert_eq!(*init, IrNode::Undefined);
-}
-
-#[test]
-fn rejects_unsupported_operator() {
-    // `%` and `**` (exponentiation) are supported; bitwise
-    // `&` (and the other bitwise/shift operators) remains unsupported.
-    assert!(lower_src("2 & 3").is_err(), "bitwise AND is unsupported");
 }
 
 #[test]
@@ -584,20 +816,14 @@ fn lowers_function_declaration_and_call() {
 }
 
 #[test]
-fn lowers_function_name_in_value_position_to_func_value() {
-    // `let f = add;` binds `f` to a first-class function value (table index
-    // 0 = wasm function index 1 minus one).
+fn lowers_function_name_in_value_position_to_decl_func() {
+    // `let f = add;` binds `f` to the declaration's one static function object
+    // (table index 0 = wasm function index 1 minus one).
     let program = lower_src("function add(a, b) { return a + b } let f = add; f").expect("lower");
     let IrStmt::Decl { init, .. } = &program.stmts[0] else {
         unreachable!("expected the `let f = add` declaration");
     };
-    assert_eq!(
-        *init,
-        IrNode::FuncValue {
-            table_index: 0,
-            captures: vec![]
-        }
-    );
+    assert_eq!(*init, IrNode::DeclFunc(0));
 }
 
 #[test]
@@ -613,12 +839,46 @@ fn lowers_call_through_variable_to_call_indirect() {
         IrNode::CallIndirect {
             callee: Box::new(IrNode::Local(0)),
             args: vec![IrNode::Num(40.0), IrNode::Num(2.0)],
+            not_callable: CalleeError::not_a_function("f"),
         }
     );
 }
 
 #[test]
-fn passing_a_function_argument_lowers_to_func_value() {
+fn names_the_callee_of_a_guarded_call() {
+    // A member callee is named `o.m` (dot or string key); any other callee is
+    // `expression`.
+    let not_callable = |src: &str| {
+        let program = lower_src(src).expect("lower");
+        match program.stmts.last() {
+            Some(IrStmt::Expr(
+                IrNode::MethodCallUser { not_callable, .. }
+                | IrNode::CallIndirect { not_callable, .. },
+            )) => not_callable.message.clone(),
+            other => unreachable!("expected a guarded call, got {other:?}"),
+        }
+    };
+    assert_eq!(not_callable("let o = {}; o.m()"), "o.m is not a function");
+    assert_eq!(
+        not_callable("let o = {}; o['m']()"),
+        "o.m is not a function"
+    );
+    assert_eq!(
+        not_callable("let o = {}; o.a.b()"),
+        "o.a.b is not a function"
+    );
+    assert_eq!(
+        not_callable("let o = {}; let k = 'm'; o[k]()"),
+        "expression is not a function"
+    );
+    assert_eq!(
+        not_callable("let a = [{}]; a[0]()"),
+        "expression is not a function"
+    );
+}
+
+#[test]
+fn passing_a_function_argument_lowers_to_decl_func() {
     // `apply(dbl, 21)` passes `dbl` as a function value; `apply` is called
     // directly by name, and its `f(x)` body call is indirect.
     let program = lower_src(
@@ -630,14 +890,8 @@ fn passing_a_function_argument_lowers_to_func_value() {
         unreachable!("expected a direct call to `apply`");
     };
     assert_eq!(*func, 1);
-    // `dbl` (wasm index 2) becomes function-table index 1 in value position.
-    assert_eq!(
-        args[0],
-        IrNode::FuncValue {
-            table_index: 1,
-            captures: vec![]
-        }
-    );
+    // `dbl` (wasm index 2) is its static object (table index 1) in value position.
+    assert_eq!(args[0], IrNode::DeclFunc(1));
     assert_eq!(args[1], IrNode::Num(21.0));
     // `apply`'s body calls its `f` parameter indirectly (`f`/`x` are the
     // env-last ABI's argument slots, locals 0/1).
@@ -647,6 +901,7 @@ fn passing_a_function_argument_lowers_to_func_value() {
         vec![IrStmt::Return(Some(IrNode::CallIndirect {
             callee: Box::new(IrNode::Local(0)),
             args: vec![IrNode::Local(1)],
+            not_callable: CalleeError::not_a_function("f"),
         }))]
     );
 }
@@ -664,7 +919,8 @@ fn arrow_lifts_to_func_value_and_registers_a_function() {
         *init,
         IrNode::FuncValue {
             table_index: 0,
-            captures: vec![]
+            captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     assert_eq!(program.functions.len(), 1);
@@ -732,7 +988,8 @@ fn nested_arrow_is_lifted_after_its_enclosing_arrow() {
         *init,
         IrNode::FuncValue {
             table_index: 0,
-            captures: vec![]
+            captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     assert_eq!(program.functions.len(), 2);
@@ -820,6 +1077,7 @@ fn non_capturing_function_has_no_cells_or_captures() {
         IrNode::FuncValue {
             table_index: 0,
             captures: vec![],
+            kind: crate::ir::FnKind::Plain,
         }
     );
     // The arrow's body is a plain param read — no cell.
@@ -854,10 +1112,14 @@ fn nested_function_declaration_lowers_to_bound_func_value() {
 }
 
 #[test]
-fn rejects_call_to_undeclared_function() {
-    assert!(
-        lower_src("missing(1)").is_err(),
-        "calling an undeclared function is an error"
+fn call_to_undeclared_function_reads_the_global_object() {
+    assert_eq!(
+        lower_expr("missing(1)").expect("lower"),
+        IrNode::CallIndirect {
+            callee: Box::new(global_get("missing")),
+            args: vec![IrNode::Num(1.0)],
+            not_callable: CalleeError::not_a_function("missing"),
+        }
     );
 }
 
@@ -930,17 +1192,28 @@ fn lowers_switch_with_default_and_break() {
 
 #[test]
 fn lowers_for_in_to_counted_key_loop() {
-    // `for (const k in o)` desugars to `iter/len/idx` decls + a `while`; the body's
-    // first statement rebinds `k` to the ObjectKey at the current index.
+    // `for (const k in o)` desugars to `keys/len/idx` decls + a `while`: the keys
+    // are snapshotted once, and the body's first statement rebinds `k` to the
+    // snapshot element at the current index.
     let program = lower_src("let o={a:1}; for (const k in o) { }").expect("lower");
+    assert!(program.stmts.iter().any(|stmt| matches!(
+        stmt,
+        IrStmt::Decl {
+            init: IrNode::ObjectBuiltin {
+                op: ObjectBuiltinOp::ForInKeys,
+                ..
+            },
+            ..
+        }
+    )));
     let IrStmt::While { body, update, .. } = program.stmts.last().expect("a loop") else {
         unreachable!("expected a while statement");
     };
-    // The loop binding is `k = ObjectKey { .. }` as the first body statement.
+    // The loop binding is `k = keys[i]` as the first body statement.
     let IrStmt::Decl { init, .. } = &body[0] else {
         unreachable!("expected the key-binding decl");
     };
-    assert!(matches!(init, IrNode::ObjectKey { .. }));
+    assert!(matches!(init, IrNode::Index { .. }));
     // The index increment lives in the `update` slot so a `continue` advances it.
     assert_eq!(update.len(), 1);
 }
@@ -995,21 +1268,18 @@ fn block_shadow_uses_distinct_local() {
 
 #[test]
 fn block_local_does_not_leak() {
-    // A binding declared only inside a block is undeclared after it.
-    assert!(
-        lower_src("{ let y = 5; } y").is_err(),
-        "block-local binding must not leak out"
-    );
+    // A binding declared only inside a block is undeclared after it: the
+    // read falls through to the global object.
+    let program = lower_src("{ let y = 5; } y").expect("lower");
+    assert_eq!(program.stmts.last(), Some(&IrStmt::Expr(global_get("y"))));
 }
 
 #[test]
 fn for_let_binding_does_not_leak() {
-    // The `for`-`let` binding is scoped to the loop; referencing it after
-    // the loop is a compile error.
-    assert!(
-        lower_src("for(let i=0;i<3;i=i+1){} i").is_err(),
-        "for-let binding must not leak past the loop"
-    );
+    // The `for`-`let` binding is scoped to the loop; a reference after the
+    // loop reads the global object.
+    let program = lower_src("for(let i=0;i<3;i=i+1){} i").expect("lower");
+    assert_eq!(program.stmts.last(), Some(&IrStmt::Expr(global_get("i"))));
 }
 
 #[test]

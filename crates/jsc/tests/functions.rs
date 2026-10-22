@@ -207,14 +207,13 @@ fn call_spread_via_eval() {
         jsc(&["-p", "function add(a,b,c){return a+b+c} add(10,...[20,12])"]),
         "42"
     );
-    // A rest-parameter callee collects the spread via the dynamic argc. The
-    // uniform ABI passes K positional slots, so K (widened here by the 4-arg
-    // `sum(1,2,3,4)` call) must cover the spread's runtime length.
+    // A rest-parameter callee collects the whole spread via the dynamic argc,
+    // also the elements beyond the uniform ABI's K positional slots.
     assert_eq!(
         jsc(&[
             "-p",
             "function sum(...xs){let t=0;for(const x of xs)t=t+x;return t} \
-             sum(1,2,3,4); sum(...[1,2,3,4])"
+             sum(...[1,2,3,4])"
         ]),
         "10"
     );
@@ -277,4 +276,177 @@ fn direct_calls_tolerate_missing_and_extra_arguments() {
     for (src, want) in cases {
         assert_eq!(jsc(&["-p", src]), want, "{src}");
     }
+}
+
+/// User methods named `next`/`then` are ordinary method calls on non-generator,
+/// non-promise receivers.
+#[test]
+fn user_next_and_then_methods_via_eval() {
+    assert_eq!(
+        jsc(&["-p", "const o = { next() { return 7; } }; o.next()"]),
+        "7"
+    );
+    assert_eq!(
+        jsc(&["-p", "const t = { then(a) { return a + 1; } }; t.then(1)"]),
+        "2"
+    );
+}
+
+/// Nested function declarations are hoisted to the top of their enclosing
+/// function body (or block): callable and readable as a value before their
+/// textual position, mutually recursive with sibling declarations, recursive by
+/// their own name, and able to capture enclosing bindings declared later.
+#[test]
+fn nested_function_declarations_are_hoisted() {
+    // Call before the declaration.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ return h(); function h(){ return 3 } } console.log(f())"
+        ]),
+        "3"
+    );
+    // Mutual recursion between sibling nested declarations.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(n){ return even(n); function even(k){ return k===0 ? true : odd(k-1) } \
+             function odd(k){ return k===0 ? false : even(k-1) } } console.log(f(10))"
+        ]),
+        "true"
+    );
+    // Referenced as a value before the declaration.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ const g = h; return g(); function h(){ return 'v' } } console.log(f())"
+        ]),
+        "v"
+    );
+    // Captures a `let` declared after the use site, read after its initialization.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ let r = h; let x = 5; return r(); function h(){ return x } } \
+             console.log(f())"
+        ]),
+        "5"
+    );
+    // Block-level declaration hoists to the top of its block.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ { return h(); function h(){ return 1 } } } console.log(f())"
+        ]),
+        "1"
+    );
+    // Inside an arrow body.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const a = () => { return h(); function h(){ return 2 } }; console.log(a())"
+        ]),
+        "2"
+    );
+    // A hoisted nested declaration recurses through its own name.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ return fact(5); function fact(n){ return n <= 1 ? 1 : n * fact(n-1) } } \
+             console.log(f())"
+        ]),
+        "120"
+    );
+    // A hoisted declaration in a loop body sees that iteration's bindings.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){ let s = 0; for (let i = 0; i < 3; i++) { s += g(); let k = i * 10; \
+             function g(){ return i } } return s } console.log(f())"
+        ]),
+        "3"
+    );
+    // A hoisted declaration in a top-level `try` block leaves the block's
+    // completion value to its last expression statement.
+    assert_eq!(
+        jsc(&["-p", "try { f(); function f(){} 5 } catch (e) {}"]),
+        "5"
+    );
+}
+
+/// Functions are objects: `name`/`length` materialize on first use, ad-hoc
+/// properties persist on the one function object a declaration creates, and
+/// plain functions get a `prototype` whose `constructor` points back.
+#[test]
+fn functions_are_objects() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(a, b){}; console.log(f.name, f.length); f.tag = 1; console.log(f.tag)"
+        ]),
+        "f 2\n1"
+    );
+    assert_eq!(jsc(&["-e", "function f(){} console.log(f === f)"]), "true");
+    assert_eq!(
+        jsc(&["-e", "function f(){} let g = f; g.x = 4; console.log(f.x)"]),
+        "4"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){} console.log(typeof f.prototype, f.prototype.constructor === f)"
+        ]),
+        "object true"
+    );
+    assert_eq!(
+        jsc(&["-e", "let g = () => 1; console.log(g.name, g.prototype)"]),
+        "g undefined"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let o = { m(x, y = 1){} }; console.log(o.m.name, o.m.length)"
+        ]),
+        "m 1"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function outer(){ function inner(){} inner.k = 2; return inner.k } console.log(outer())"
+        ]),
+        "2"
+    );
+    assert_eq!(
+        jsc(&["-e", "function f(){} console.log(typeof f)"]),
+        "function"
+    );
+    // Writing `caller` calls the inherited `%ThrowTypeError%` setter.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "function f(){} try { f.caller = 1 } catch (e) { console.log(e instanceof TypeError) }"
+        ]),
+        "true"
+    );
+}
+
+/// Functions render with their name; ad-hoc enumerable properties follow.
+#[test]
+fn function_rendering() {
+    assert_eq!(
+        jsc(&["-e", "function f(){} console.log(f)"]),
+        "[Function: f]"
+    );
+    assert_eq!(
+        jsc(&["-e", "console.log(() => 1)"]),
+        "[Function (anonymous)]"
+    );
+    assert_eq!(
+        jsc(&["-e", "let h = function(){}; console.log(h)"]),
+        "[Function: h]"
+    );
+    assert_eq!(
+        jsc(&["-e", "function f(){} f.x = 1; console.log(f)"]),
+        "[Function: f] { x: 1 }"
+    );
 }

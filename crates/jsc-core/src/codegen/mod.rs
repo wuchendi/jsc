@@ -10,7 +10,7 @@
 //! function declarations, calls, and `return`. Anything else yields an error
 //! rather than a panic.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use std::collections::HashMap;
 
@@ -22,18 +22,19 @@ use crate::error::CompileError;
 
 use swc_ecma_ast::{
     ArrayLit, ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget,
-    AssignTargetPat, BinaryOp, Callee, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl, Expr,
-    ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, IdentName, Lit, MemberExpr, MemberProp,
-    MethodKind, ObjectLit, ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr,
-    ParamOrTsParamProp, Pat, Program, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt,
-    SuperProp, SuperPropExpr, SwitchStmt, ThisExpr, UnaryOp, UpdateExpr, UpdateOp, VarDeclKind,
-    VarDeclOrExpr,
+    AssignTargetPat, BinaryOp, Callee, Class, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl,
+    Expr, ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, Lit, MemberProp, MethodKind, ObjectLit,
+    ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr, ParamOrTsParamProp, Pat, Program, Prop,
+    PropName, PropOrSpread, SimpleAssignTarget, Stmt, SuperProp, SuperPropExpr, SwitchStmt,
+    UnaryOp, UpdateExpr, UpdateOp, VarDeclKind, VarDeclOrExpr,
 };
 
+use globals::GlobalFacts;
+
 use crate::ir::{
-    ArrayHofOp, BinOp, ConvertOp, DateOp, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram,
-    IrStmt, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, SpreadCallee,
-    SpreadElem,
+    ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, GlobalIntrinsic,
+    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp,
+    MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind, SpreadCallee, SpreadElem,
 };
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
@@ -126,12 +127,20 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     let has_state_machine = fn_decls
         .iter()
         .any(|f| f.function.is_generator || f.function.is_async);
+    // A builtin reached through its function value reads its arguments from
+    // the same `K` slots, so `K` then also covers the widest call.
+    let globals = GlobalFacts::scan(program);
     let max_arity = body
         .iter()
         .map(|s| scan_stmt_arity(s))
         .max()
         .unwrap_or(0)
-        .max(if has_state_machine { 2 } else { 0 });
+        .max(if has_state_machine { 2 } else { 0 })
+        .max(if globals.reaches_builtins() {
+            globals.call_arity()
+        } else {
+            0
+        });
 
     // Shared lowering state: the resolved declaration signatures, the uniform
     // arity, and the accumulator that lifted arrow functions append themselves
@@ -145,14 +154,16 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         max_arity,
         captured: analysis.captured,
         classes: RefCell::new(HashMap::new()),
+        hidden_ids: Cell::new(0),
         module_slots: analysis
             .module_names
             .iter()
             .zip(0u32..)
             .map(|(name, slot)| (name.clone(), slot))
             .collect(),
-        module_mutable: RefCell::new(HashMap::new()),
-        object_shapes: analysis.object_shapes,
+        module_mutable: analysis.module_mutable,
+        completion: Cell::new(None),
+        globals,
     };
 
     // Pass 2: the top-level statements become `main`'s body, lowered in a single
@@ -201,18 +212,8 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         stmts,
         functions,
         module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
+        arity: u32::try_from(max_arity).unwrap_or(u32::MAX),
     })
-}
-
-/// Build the unknown-method span diagnostic. Names the method when it was
-/// statically known at the call site (`obj.m()` or `obj["m"]()`); falls back to a
-/// generic message for a computed call whose key is only known at runtime.
-pub(super) fn unknown_method_error(span: swc_common::Span, name: Option<&str>) -> anyhow::Error {
-    let msg = match name {
-        Some(name) => format!("method '{name}' is not supported"),
-        None => "unsupported method call".to_owned(),
-    };
-    CompileError::spanned(span, msg).into()
 }
 
 /// Shared lowering state threaded through every [`LowerCtx`]: the resolved
@@ -237,40 +238,40 @@ struct Shared<'a> {
     /// nested function, computed by [`analyze_captures`]. A declared binding
     /// whose id is in this set is boxed into a heap cell.
     captured: std::collections::HashSet<u32>,
-    /// Class declarations lowered so far, keyed by name. A `class A`
-    /// declaration records its instance shape here as it is lowered; a later
-    /// `new A(args)` reads the shape back to pre-slot the fresh instance. Classes
-    /// are not hoisted (TDZ), so a `new` always follows its declaration in source
-    /// order, matching this build-then-read ordering. Interior mutability lets the
-    /// immutable-borrow lowering walk register new classes.
+    /// Classes lowered so far, keyed by name: a pure optimisation. A class
+    /// records its instance shape here as it is lowered; a later `new A(args)`
+    /// reads the shape back to pre-size the fresh instance (a rebound name only
+    /// mis-sizes the table). Interior mutability lets the immutable-borrow
+    /// lowering walk register new classes.
     classes: RefCell<HashMap<String, ClassInfo>>,
+    /// The number of hidden by-value bindings allocated so far (see
+    /// [`LowerCtx::hidden_local`]).
+    hidden_ids: Cell<u32>,
     /// Module-cell slot of each module binding name (see
     /// [`CaptureAnalysis::module_names`]). A `main` declaration of one of these
     /// names in its outermost scope stores into the module cell; a top-level
     /// function body reaches it through [`IrNode::ModuleCell`].
     module_slots: HashMap<String, u32>,
-    /// Mutability of each module binding, recorded as `main` declares it (`main`
-    /// is lowered before the top-level function bodies that read it).
-    module_mutable: RefCell<HashMap<String, bool>>,
-    /// The provably-fixed object shape of each qualifying binding (see
-    /// [`CaptureAnalysis::object_shapes`]): [`binding_id`] mapped to the own keys
-    /// of the object literal it holds. A user method call whose receiver resolves
-    /// to one of these bindings — or is itself a direct object literal — and whose
-    /// statically-known name is absent from the shape is rejected as an unknown
-    /// method, closing the wrong-value dispatch this static-shape guard targets.
-    object_shapes: HashMap<u32, Vec<String>>,
+    /// Mutability of each module binding (see [`CaptureAnalysis::module_mutable`]).
+    module_mutable: HashMap<String, bool>,
+    /// The `main` local tracking the completion value (for `-p`) of the
+    /// top-level `try` statement being lowered, or `None` outside one. While set,
+    /// every expression statement in `main`'s own frame stores its value here
+    /// (see [`LowerCtx::completion_local`]), so a value produced inside a nested
+    /// statement body reaches `main`'s result.
+    completion: Cell<Option<u32>>,
+    /// The program-level global facts (DESIGN.md §6.4).
+    globals: GlobalFacts,
 }
 
 /// The lowered shape of a `class` declaration: the instance field names the
 /// constructor assigns via `this.<field> = ..`, in first-seen order. `new A(args)`
-/// pre-allocates the instance object with one slot per field (initialized to
-/// `undefined`), because the object model has no dynamic key growth — a fresh
-/// empty object could not gain a `this.v` property at runtime.
+/// sizes the instance's property table for them up front (DESIGN.md §6.4), so the
+/// constructor's adds do not regrow it.
 struct ClassInfo {
-    /// Distinct instance field names, in first-assignment order. For a derived
-    /// class (E-series `extends`) this already includes the inherited fields
-    /// (the parent's flattened list, then this class's own), so `new C()`
-    /// pre-slots every field a constructor up the chain may assign.
+    /// Distinct instance field names, in first-assignment order. For a class
+    /// extending a recorded class name this already includes the inherited
+    /// fields (the parent's flattened list, then this class's own).
     fields: Vec<String>,
 }
 
@@ -290,25 +291,14 @@ struct CaptureResolver {
     /// this is set records a module binding.
     in_top_fn: bool,
     /// Names of `main`'s outermost-scope bindings referenced from a top-level
-    /// function declaration, in first-reference order (see
+    /// function declaration, or from a closure in `main` ahead of their
+    /// declaration, in first-reference order (see
     /// [`CaptureAnalysis::module_names`]).
     module_names: Vec<String>,
-    /// Names that are the target of an assignment (`x = ..`, `x op= ..`, `++x`,
-    /// `x--`, or a destructuring assignment) ANYWHERE in the program. A
-    /// name-based over-approximation used to disqualify object-shape candidates:
-    /// a binding whose name is ever reassigned cannot be trusted to keep its
-    /// declared literal shape, so it is excluded (see [`object_shapes`]).
-    ///
-    /// [`object_shapes`]: CaptureAnalysis::object_shapes
-    assigned: std::collections::HashSet<String>,
-    /// Provisional object-shape entries `(binding_id, name, own keys)`: every
-    /// `let`/`const` binding initialized directly with an object literal whose
-    /// keys are all statically known. Finalized in [`analyze_captures`] by
-    /// dropping any whose name appears in [`assigned`], leaving the bindings
-    /// whose literal shape is provably fixed.
-    ///
-    /// [`assigned`]: CaptureResolver::assigned
-    shape_candidates: Vec<(u32, String, Vec<String>)>,
+    /// Every binding `main`'s outermost scope declares, mapped to its mutability
+    /// (`false` for `const`). Collected before the walk so a forward reference
+    /// from a closure resolves to a module binding.
+    top_bindings: HashMap<String, bool>,
 }
 
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
@@ -326,15 +316,12 @@ struct CaptureAnalysis {
     ///
     /// [`module_names`]: CaptureAnalysis::module_names
     module_vars: std::collections::HashSet<String>,
-    /// The provably-fixed object shape of each qualifying binding: its
-    /// [`binding_id`] mapped to the own keys of the object literal it is
-    /// initialized with. A binding qualifies when it is a `let`/`const`
-    /// initialized directly with an all-static-key object literal AND its name
-    /// is never reassigned. A method call on such a receiver whose name is not
-    /// among these keys is provably unknown (the object model has no dynamic key
-    /// growth), so lowering rejects it with a span diagnostic instead of emitting
-    /// a bogus runtime dispatch.
-    object_shapes: HashMap<u32, Vec<String>>,
+    /// Mutability of each [`module_names`] binding, known from its top-level
+    /// declaration kind (`const` is immutable), so a closure lowered before the
+    /// declaration (a forward reference) still resolves it.
+    ///
+    /// [`module_names`]: CaptureAnalysis::module_names
+    module_mutable: HashMap<String, bool>,
 }
 
 /// The body shape passed to [`CaptureResolver::arrow_or_fn`].
@@ -385,6 +372,8 @@ enum AccessKind {
     /// A boxed cell reached through the given pointer expression (a `Local` for
     /// a cell declared in this frame, or an `EnvLoad` for a captured cell).
     Cell(IrNode),
+    /// An unresolved name: a property of the global object (DESIGN.md §6.4).
+    Global(GlobalRef),
 }
 
 /// A resolved name reference: how to reach it plus its mutability.
@@ -407,8 +396,9 @@ struct Frame {
     /// `breakable` that excludes `switch`). A `continue` is legal only when this
     /// is nonzero — it targets a loop, never a bare `switch`.
     loopable: u32,
-    /// Binding id → local for the boxed cells declared in this frame; used to
-    /// source a captured cell when building an inner function's environment.
+    /// Binding id → local for the boxed cells declared in this frame (and its
+    /// by-value `new.target` snapshot); used to source a captured binding when
+    /// building an inner function's environment.
     by_id: HashMap<u32, u32>,
     /// When set, EVERY binding declared in this frame is a boxed cell reached
     /// through the frame's own environment (an `EnvLoad`), not a wasm local — the
@@ -439,6 +429,72 @@ struct Frame {
     /// and for a function that never reads `this`). An `Expr::This` in this frame
     /// reads this local.
     this_local: Option<u32>,
+    /// Whether this frame is an arrow body, which has no `new.target` of its
+    /// own: it reads the enclosing function's.
+    arrow: bool,
+    /// The wasm local this (non-arrow) function snapshots `new.target` into at
+    /// entry, allocated on the first `new.target` reference in it or in a nested
+    /// arrow (`None` until then).
+    new_target_local: Option<u32>,
+    /// The wasm local this (non-arrow) function builds its `arguments` object
+    /// into at entry, allocated on the first `arguments` reference in it or in
+    /// a nested arrow (`None` until then).
+    arguments_local: Option<u32>,
+    /// The wasm local this function snapshots the `__spread_args` global into
+    /// at entry, allocated when it gathers its arguments (a rest parameter or
+    /// `arguments`) and so may read the ones beyond `K`.
+    spread_args_local: Option<u32>,
+    /// [`FnKind::Class`] for a base class constructor, which initializes the
+    /// class's instance fields ([`LowerCtx::class_fields`]) on entry;
+    /// [`FnKind::DerivedClass`] for a derived one, whose `this` starts in the
+    /// TDZ and is bound by `super(..)` (which also runs the instance fields).
+    /// [`FnKind::Plain`] otherwise.
+    ctor: FnKind,
+    /// A derived constructor's `super(..)` bookkeeping.
+    supers: SuperCalls,
+}
+
+/// A derived constructor's `super(..)` bookkeeping (see [`Frame::ctor`]).
+#[derive(Default)]
+struct SuperCalls {
+    /// The span of the first `super(..)` call that is a top-level statement of
+    /// the body. Once it is lowered, `this` is definitely bound for everything
+    /// lowered after it in this frame.
+    top_level: Option<swc_common::Span>,
+    /// Whether `this` is definitely bound (see `top_level`): reads skip the
+    /// TDZ check.
+    this_bound: bool,
+    /// How many `super(..)` calls this frame has lowered.
+    lowered: u32,
+    /// The hidden id of a cell holding `this`, when an arrow in the body
+    /// calls `super(..)` or reads `this` and so shares the constructor's
+    /// `this` (every derived `this` read and write then goes through the cell).
+    this_cell: Option<u32>,
+}
+
+impl Frame {
+    /// Whether this frame is a derived class constructor.
+    fn derived(&self) -> bool {
+        self.ctor == FnKind::DerivedClass
+    }
+}
+
+/// What `super` resolves to inside a class body (DESIGN.md §7.6): the class
+/// frame's hidden by-value bindings of the parent constructor and of its
+/// `prototype` (the home object's prototype for instance members).
+#[derive(Clone, Copy)]
+struct SuperScope {
+    /// The frame depth holding the hidden bindings.
+    frame: usize,
+    /// Hidden id of the parent constructor (`None`: a base class).
+    parent: Option<u32>,
+    /// Hidden id of `parent.prototype`.
+    proto_parent: Option<u32>,
+    /// Whether the member being lowered is static (its home object is the
+    /// class, so `super.x` reads the parent constructor).
+    is_static: bool,
+    /// Property-table capacity `super(..)` pre-reserves on `this`.
+    reserve: u32,
 }
 
 /// Lowering context: a stack of function frames. Each frame maps
@@ -467,18 +523,17 @@ struct LowerCtx<'a> {
     /// engine) rather than a top-level `Await`. Set/cleared by
     /// [`LowerCtx::lower_generator_body`] around an async body.
     async_body: bool,
-    /// The name of the superclass whose constructor/methods `super` resolves to
-    /// while lowering a derived class's constructor and method bodies (E-series
-    /// `extends`), or `None` outside any `extends` body. Saved and restored by
-    /// [`LowerCtx::lower_class_decl`] so nested class declarations do not leak
-    /// their superclass to an enclosing one.
-    current_super: Option<String>,
-    /// The class name that `this` resolves to while lowering a deferred `static`
-    /// field initializer (P2b): a static initializer runs with `this` bound to the
-    /// class, so `static f = this.g` reads the class's own static `g`. Set/cleared
-    /// by [`LowerCtx::lower_class_decl`] around the post-binding static assignments;
-    /// `None` everywhere else, where `this` keeps its ordinary function-frame slot.
-    static_init_class: Option<String>,
+    /// What `super` resolves to while lowering a class body, or `None` outside
+    /// any class. Saved and restored by [`LowerCtx::lower_class`] so a nested
+    /// class does not leak its scope to an enclosing one.
+    current_super: Option<SuperScope>,
+    /// The instance field declarations of the class whose constructor is being
+    /// lowered: a base constructor defines them on entry, a derived one after
+    /// each `super(..)`.
+    class_fields: Vec<ClassProp>,
+    /// While lowering `static` field initializers: the class frame and the
+    /// hidden id of the class value, which `this` resolves to there.
+    static_init: Option<(usize, u32)>,
 }
 
 mod arity;
@@ -486,6 +541,7 @@ mod capture;
 mod expr;
 mod function;
 mod generator;
+mod globals;
 mod op;
 mod scope;
 mod stmt;

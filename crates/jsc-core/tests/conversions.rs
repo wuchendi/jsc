@@ -1,6 +1,5 @@
 //! Integration tests: `String`/`Number`/`Boolean`/`parseInt`/`parseFloat` conversions.
 
-use jsc_core::run::compile_and_run;
 mod common;
 use common::{
     assert_bool, assert_nan, assert_number, assert_output, assert_string, assert_type_str,
@@ -72,9 +71,37 @@ fn parse_int() {
     assert_nan("parseInt(\"abc\")");
     assert_number("parseInt(\"  -7z\")", -7.0);
     assert_number("parseInt(\"3.9\")", 3.0);
-    // The radix argument is accepted but ignored (base-10 only).
-    assert_number("parseInt(\"42\", 16)", 42.0);
+    assert_number("parseInt(\"1e3\")", 1.0);
+    // `parseInt("-0")` is -0 (the sign applies to a zero value).
+    assert_number("1 / parseInt(\"-0\")", f64::NEG_INFINITY);
     assert_type_str("typeof parseInt(\"1\")", "number");
+}
+
+/// `parseInt(s, radix)` honors the radix: `ToInt32(radix)` of 0 (or an omitted /
+/// `undefined` radix) means 10 unless a `0x` prefix selects 16; 16 also strips an
+/// optional `0x` prefix; a radix outside 2..=36 yields NaN; letters are
+/// case-insensitive digits.
+#[test]
+fn parse_int_radix() {
+    assert_number("parseInt(\"ff\", 16)", 255.0);
+    assert_number("parseInt(\"0xff\")", 255.0);
+    assert_number("parseInt(\"0XFF\")", 255.0);
+    assert_number("parseInt(\"0xff\", 16)", 255.0);
+    assert_number("parseInt(\"0xff\", 10)", 0.0);
+    assert_number("parseInt(\"101\", 2)", 5.0);
+    assert_number("parseInt(\"z\", 36)", 35.0);
+    assert_number("parseInt(\"Z\", 36)", 35.0);
+    assert_nan("parseInt(\"12\", 1)");
+    assert_nan("parseInt(\"12\", 37)");
+    assert_number("parseInt(\"12\", 0)", 12.0);
+    assert_number("parseInt(\"12\", undefined)", 12.0);
+    assert_number("parseInt(\"  -7f\", 16)", -127.0);
+    assert_nan("parseInt(\"9\", 8)");
+    assert_nan("parseInt(\"0x\")");
+    // The radix goes through ToInt32: 2^32 + 16 wraps to 16, "16" coerces.
+    assert_number("parseInt(\"ff\", 4294967312)", 255.0);
+    assert_number("parseInt(\"ff\", \"16\")", 255.0);
+    assert_number("parseInt(\"11\", 2.9)", 3.0);
 }
 
 /// `parseFloat(s)` parses a leading decimal float, including a fraction or
@@ -107,29 +134,37 @@ fn conversions_are_shadowable() {
     assert_number("function parseInt(s) { return 1 } parseInt(\"42px\")", 1.0);
 }
 
-/// Wrong argument counts are compile errors, matching the existing call style.
-#[test]
-fn conversion_arity_errors() {
-    assert!(compile_and_run("String()").is_err(), "String needs an arg");
-    assert!(
-        compile_and_run("Number(1, 2)").is_err(),
-        "Number takes one arg"
-    );
-    assert!(
-        compile_and_run("Boolean()").is_err(),
-        "Boolean needs an arg"
-    );
-    assert!(
-        compile_and_run("parseFloat(1, 2)").is_err(),
-        "parseFloat takes one arg"
-    );
-}
-
 /// Conversion results flow through `console.log` like any value.
 #[test]
 fn conversions_through_console_log() {
     assert_output(
         "console.log(String(42), Number(\"8\"), Boolean(1))",
         "42 8 true\n",
+    );
+}
+
+/// `String(v)`, `'' + v`, template literals, and `join` use JS `ToString`
+/// text (not the console rendering): arrays join their elements, plain objects
+/// are `[object Object]`, errors use `Error.prototype.toString`, and a cyclic
+/// array joins its self-reference as the empty string.
+#[test]
+fn to_string_uses_js_text() {
+    assert_output(
+        "console.log(String([1, 2])); console.log([1, [2, 3]].join('-')); \
+         console.log('' + [1, 'a', null, undefined]); console.log(String({}), `${{ a: 1 }}`)",
+        "1,2\n1-2,3\n1,a,,\n[object Object] [object Object]\n",
+    );
+    assert_output(
+        "console.log(String(new TypeError('x')), String(new Error()), '' + new RangeError('r'))",
+        "TypeError: x Error RangeError: r\n",
+    );
+    assert_output(
+        "let e = new Error('m'); e.name = ''; console.log(String(e)); \
+         let a = [1, 0]; a[1] = a; console.log(String(a), a.join('-'))",
+        "m\n1, 1-\n",
+    );
+    assert_output(
+        "console.log('x'.padStart(4, [1, 2]), 'a1,2b'.split([1, 2]), parseFloat([2.5]))",
+        "1,2x [ a, b ] 2.5\n",
     );
 }

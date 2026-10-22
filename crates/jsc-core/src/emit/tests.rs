@@ -3,8 +3,9 @@
 //! the bytes.
 #![cfg(feature = "native-run")]
 
-use super::emit;
-use crate::ir::{BinOp, IrCase, IrFunction, IrNode, IrProgram, IrStmt};
+use super::{builtin_count, collect_strings, emit, intern_table, realm};
+use crate::abi;
+use crate::ir::{BinOp, CalleeError, IrCase, IrFunction, IrNode, IrProgram, IrStmt, PropKey};
 
 /// Wrap a single expression into a one-statement program.
 fn expr_program(node: IrNode) -> IrProgram {
@@ -13,6 +14,7 @@ fn expr_program(node: IrNode) -> IrProgram {
         stmts: vec![IrStmt::Expr(node)],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     }
 }
 
@@ -171,11 +173,14 @@ fn array_literal_round_trips_to_a_heap_array() {
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
     assert_eq!(
         crate::run::decode(bits, &memory),
-        crate::run::Value::Array(vec![
-            crate::run::Value::Number(1.0),
-            crate::run::Value::Number(2.0),
-            crate::run::Value::Number(3.0),
-        ])
+        crate::run::Value::Array(
+            vec![
+                crate::run::Value::Number(1.0),
+                crate::run::Value::Number(2.0),
+                crate::run::Value::Number(3.0),
+            ],
+            Vec::new()
+        )
     );
 }
 
@@ -187,7 +192,7 @@ fn empty_array_literal_round_trips() {
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
     assert_eq!(
         crate::run::decode(bits, &memory),
-        crate::run::Value::Array(Vec::new())
+        crate::run::Value::Array(Vec::new(), Vec::new())
     );
 }
 
@@ -221,6 +226,7 @@ fn array_element_assignment_writes_slot_and_yields_value() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
@@ -273,27 +279,34 @@ fn object_property_assignment_expression_is_the_stored_value() {
 }
 
 #[test]
-fn object_property_assignment_missing_key_throws() {
-    // Fixed-shape objects: `o.b = 5` on an object without `b` raises the
-    // add-property `TypeError` instead of writing anything.
-    let err = crate::run::compile_and_run("let o = {a: 1}; o.b = 5; o.a")
-        .expect_err("absent-key write should throw");
+fn object_property_assignment_missing_key_adds_property() {
+    // `o.b = 5` on an object without `b` adds an own data property after `a`.
+    let value =
+        crate::run::compile_and_run("let o = {a: 1}; o.b = 5; o").expect("pipeline should succeed");
     assert_eq!(
-        err.to_string(),
-        "Uncaught TypeError: Cannot add property 'b': dynamic properties are not supported yet"
+        value,
+        crate::run::Value::Object(vec![
+            ("a".to_owned(), crate::run::Value::Number(1.0)),
+            ("b".to_owned(), crate::run::Value::Number(5.0)),
+        ])
     );
 }
 
 #[test]
 fn object_property_assignment_via_indexset_ir_updates_slot() {
-    // Direct IR: `IndexSet` on an object pointer dispatches to `__obj_set`,
+    // Direct IR: `IndexSet` on an object pointer dispatches to `__set`,
     // stores 42 into the "x" entry, and yields the stored value.
     let program = IrProgram {
         locals: 1,
         stmts: vec![
             IrStmt::Decl {
                 local: 0,
-                init: IrNode::Object(vec![("x".to_owned(), IrNode::Num(10.0))]),
+                init: IrNode::Object {
+                    entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
+                    proto: None,
+                    class: crate::abi::CLASS_ORDINARY,
+                    reserve: 0,
+                },
             },
             IrStmt::Expr(IrNode::IndexSet {
                 obj: Box::new(IrNode::Local(0)),
@@ -307,6 +320,7 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
@@ -318,31 +332,41 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
 }
 
 #[test]
-fn object_property_assignment_via_indexset_ir_missing_key_throws() {
-    // Direct IR: an `IndexSet` whose key the object lacks leaves the
-    // add-property `TypeError` in flight (`__obj_set` reports the miss).
+fn object_property_assignment_via_indexset_ir_missing_key_adds() {
+    // Direct IR: an `IndexSet` whose key the object lacks appends it (`__set`
+    // adds an own data property), so a later read finds it.
     let program = IrProgram {
         locals: 1,
         stmts: vec![
             IrStmt::Decl {
                 local: 0,
-                init: IrNode::Object(vec![("x".to_owned(), IrNode::Num(10.0))]),
+                init: IrNode::Object {
+                    entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
+                    proto: None,
+                    class: crate::abi::CLASS_ORDINARY,
+                    reserve: 0,
+                },
             },
             IrStmt::Expr(IrNode::IndexSet {
                 obj: Box::new(IrNode::Local(0)),
                 index: Box::new(IrNode::Str("y".to_owned())),
                 value: Box::new(IrNode::Num(42.0)),
             }),
+            IrStmt::Expr(IrNode::Index {
+                obj: Box::new(IrNode::Local(0)),
+                index: Box::new(IrNode::Str("y".to_owned())),
+            }),
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     let bytes = emit(&program);
     validate(&bytes);
-    let err = crate::run::run(&bytes).expect_err("absent-key write should throw");
+    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
     assert_eq!(
-        err.to_string(),
-        "Uncaught TypeError: Cannot add property 'y': dynamic properties are not supported yet"
+        crate::run::decode(bits, &memory),
+        crate::run::Value::Number(42.0)
     );
 }
 
@@ -360,16 +384,11 @@ fn typeof_string_literal_reports_string() {
     );
 }
 
-#[test]
-fn string_literal_emits_data_segment_and_advances_heap_ptr() {
-    // The literal "foo" is an 11-byte block ([type:u8][pad×3][len:u32][utf8],
-    // HEADER_SIZE=4) packed from base offset 8, so `__heap_ptr` must initialize
-    // to 8 + 11 = 19, past it.
-    let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
-    validate(&bytes);
+/// The data-segment count and the initial `__heap_ptr` of `bytes`.
+fn data_layout(bytes: &[u8]) -> (u32, Option<i32>) {
     let mut data_segments = 0;
     let mut heap_ptr_init = None;
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         match payload.expect("valid payload") {
             wasmparser::Payload::DataSection(reader) => {
                 data_segments = reader.count();
@@ -391,30 +410,36 @@ fn string_literal_emits_data_segment_and_advances_heap_ptr() {
             _ => {}
         }
     }
-    assert_eq!(data_segments, 1, "one data segment for the single literal");
-    assert_eq!(heap_ptr_init, Some(19));
+    (data_segments, heap_ptr_init)
 }
 
 #[test]
-fn no_literals_keeps_heap_ptr_at_base() {
-    // With no string literals, the bump allocator still starts at HEAP_BASE.
-    // The heap pointer is the FIRST global; the exception-unwinding
-    // globals ($exc_pending = 0, $exc_value = 0) follow it and are ignored here.
-    let bytes = emit(&expr_program(IrNode::Num(42.0)));
+fn string_literal_emits_data_segment_and_advances_heap_ptr() {
+    // The literal "foo" (11 bytes, padded to 16) is one more string blob
+    // segment ahead of the function data, the realm image, and the intern table.
+    let base = emit(&expr_program(IrNode::Num(42.0)));
+    let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
     validate(&bytes);
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::GlobalSection(reader) = payload.expect("valid payload") {
-            let heap_ptr = reader
-                .into_iter()
-                .next()
-                .expect("at least the heap-pointer global")
-                .expect("valid global");
-            let mut ops = heap_ptr.init_expr.get_operators_reader();
-            if let wasmparser::Operator::I32Const { value } = ops.read().expect("init operator") {
-                assert_eq!(value, 8);
-            }
-        }
-    }
+    let (segments, heap_ptr) = data_layout(&bytes);
+    let (base_segments, base_heap_ptr) = data_layout(&base);
+    assert_eq!(segments, base_segments + 1, "one more string blob");
+    assert_eq!(heap_ptr, base_heap_ptr.map(|p| p + 16));
+}
+
+#[test]
+fn no_literals_starts_heap_after_the_intern_table() {
+    // With no string literals, the static strings (the always-interned
+    // "length", the realm's and the builtins' strings), the `__fn_info` table
+    // (the two settlers and the builtins), the realm image and the intern table
+    // precede the bump allocator, in that order.
+    let program = expr_program(IrNode::Num(42.0));
+    let bytes = emit(&program);
+    validate(&bytes);
+    let (offsets, strings_end) = collect_strings(&program);
+    let info = abi::FN_INFO_ENTRY_SIZE.cast_signed() * (2 + builtin_count());
+    let intern_base = strings_end + info + realm::image_size();
+    let cap = intern_table(&offsets, intern_base).cap;
+    assert_eq!(data_layout(&bytes).1, Some(intern_base + 4 * cap));
 }
 
 #[test]
@@ -459,6 +484,7 @@ fn emits_valid_module_with_locals() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -494,6 +520,7 @@ fn emits_valid_module_with_while_loop() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -542,6 +569,7 @@ fn emits_valid_module_with_switch() {
         ],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -559,6 +587,7 @@ fn emits_valid_module_with_boxed_condition() {
         }],
         functions: Vec::new(),
         module_cells: 0,
+        arity: 0,
     };
     validate(&emit(&program));
 }
@@ -610,8 +639,13 @@ fn heap_blocks_write_the_type_byte_header() {
     // Every heap block begins with its TYPE BYTE at the base offset. Run
     // a literal, take the low 32 bits of the returned jsval as the block base,
     // and assert the byte there is the expected kind (0 string / 1 array / 2
-    // object) with the three padding bytes zeroed.
-    for (src, expected_type) in [("\"hi\"", 0u8), ("[7, 8]", 1u8), ("let o = {a: 1}; o", 2u8)] {
+    // object) followed by the `gc`/`flags`/`class` bytes: zero, except a static
+    // string's `flags`, which carry `INTERNED`.
+    for (src, expected_type, flags) in [
+        ("\"hi\"", 0u8, crate::abi::STR_FLAG_INTERNED),
+        ("[7, 8]", 1u8, 0),
+        ("let o = {a: 1}; o", 2u8, 0),
+    ] {
         let program = crate::codegen::lower(
             &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
         )
@@ -625,8 +659,8 @@ fn heap_blocks_write_the_type_byte_header() {
         assert_eq!(memory[base], expected_type, "type byte for {src}");
         assert_eq!(
             &memory[base + 1..base + 4],
-            &[0, 0, 0],
-            "header padding for {src}"
+            &[0, flags, 0],
+            "header bytes for {src}"
         );
     }
 }
@@ -639,6 +673,7 @@ fn emits_valid_module_with_function_and_call() {
     let program = IrProgram {
         locals: 0,
         module_cells: 0,
+        arity: 2,
         stmts: vec![IrStmt::Expr(IrNode::Call {
             func: 1,
             args: vec![IrNode::Num(40.0), IrNode::Num(2.0)],
@@ -652,6 +687,7 @@ fn emits_valid_module_with_function_and_call() {
                 rhs: Box::new(IrNode::Local(1)),
             }))],
             machine: None,
+            info: crate::ir::FnInfo::default(),
         }],
     };
     validate(&emit(&program));
@@ -667,17 +703,20 @@ fn emits_valid_module_with_function_value_and_indirect_call() {
     let program = IrProgram {
         locals: 1,
         module_cells: 0,
+        arity: 1,
         stmts: vec![
             IrStmt::Decl {
                 local: 0,
                 init: IrNode::FuncValue {
                     table_index: 0,
                     captures: vec![],
+                    kind: crate::ir::FnKind::Plain,
                 },
             },
             IrStmt::Expr(IrNode::CallIndirect {
                 callee: Box::new(IrNode::Local(0)),
                 args: vec![IrNode::Num(42.0)],
+                not_callable: CalleeError::not_a_function("f"),
             }),
         ],
         functions: vec![IrFunction {
@@ -685,6 +724,7 @@ fn emits_valid_module_with_function_value_and_indirect_call() {
             locals: 3,
             body: vec![IrStmt::Return(Some(IrNode::Local(0)))],
             machine: None,
+            info: crate::ir::FnInfo::default(),
         }],
     };
     let bytes = emit(&program);
@@ -723,5 +763,370 @@ fn emits_valid_closure_module_with_cells_and_env() {
     assert!(
         (f64::from_bits(bits) - 42.0).abs() < 1e-9,
         "closure result should be 42"
+    );
+}
+
+/// Lower and emit JavaScript `src`.
+fn emit_js(src: &str) -> Vec<u8> {
+    let program = crate::codegen::lower(
+        &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
+    )
+    .expect("lower");
+    emit(&program)
+}
+
+#[test]
+fn static_string_blobs_are_8_aligned() {
+    // Odd-length literals are each padded to 8, so every blob base (and the
+    // heap start after them) is 8-aligned.
+    let program = crate::codegen::lower(
+        &crate::frontend::parse(
+            "let a = 'a'; let b = 'abc'; let c = 'abcdefghi'; a + b + c",
+            crate::frontend::Dialect::Js,
+        )
+        .expect("parse"),
+    )
+    .expect("lower");
+    let (offsets, heap_start) = super::sections::collect_strings(&program);
+    assert!(offsets.len() >= 3, "three literals interned");
+    for (text, offset) in &offsets {
+        assert_eq!(offset % 8, 0, "blob {text:?} at {offset} is not 8-aligned");
+    }
+    assert_eq!(
+        heap_start % 8,
+        0,
+        "heap start {heap_start} is not 8-aligned"
+    );
+}
+
+#[test]
+fn every_block_is_8_aligned_with_zero_header_bytes() {
+    // Guest-allocated (concat, array, object, function, Map, Date, generator)
+    // and host-allocated (String(n), string/array methods, promises) blocks
+    // all start 8-aligned with header bytes 1..3 (`gc`, `flags`, `class`) zero,
+    // except a fresh arrow's `flags`, which is `LAZY`.
+    for src in [
+        "'x' + 1",
+        "let n = 3; [1, n]",
+        "let o = {a: 1, bc: 2}; o",
+        "let f = (x) => x; f",
+        "new Map()",
+        "new Date(0)",
+        "function* g() { yield 1 } g()",
+        "String(12345)",
+        "'abc'.toUpperCase()",
+        "'abcde'.slice(1)",
+        "[1, 2, 3].slice(1)",
+        "'a,b'.split(',')",
+        "Promise.resolve(1)",
+        "new Promise((r) => r(1))",
+    ] {
+        // Allocate an odd-sized block first so an unrounded allocator would
+        // misalign the block under test.
+        let bytes = emit_js(&format!("let pad = 'ab' + 'c'; {src}"));
+        validate(&bytes);
+        let (bits, memory) = crate::run::run(&bytes).expect("module should run");
+        assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
+        let base = (bits & 0xFFFF_FFFF) as usize;
+        assert_eq!(base % 8, 0, "{src}: block base {base} is not 8-aligned");
+        for (name, offset) in [
+            ("gc", crate::abi::HEADER_GC_OFFSET),
+            ("flags", crate::abi::HEADER_FLAGS_OFFSET),
+            ("class", crate::abi::HEADER_CLASS_OFFSET),
+        ] {
+            let want = if name == "flags" && memory[base] == crate::abi::TYPE_FUNCTION {
+                crate::abi::FUNC_FLAG_LAZY
+            } else {
+                0
+            };
+            assert_eq!(
+                memory[base + offset as usize],
+                want,
+                "{src}: header {name} byte"
+            );
+        }
+    }
+}
+
+#[test]
+fn exported_constructors_build_aligned_zeroed_blocks() {
+    use wasmtime::{Engine, Linker, Module, Store};
+    let bytes = emit_js("let s = 'odd'; s");
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("compile");
+    let mut linker = Linker::new(&engine);
+    linker
+        .define_unknown_imports_as_traps(&module)
+        .expect("stub imports");
+    let mut store = Store::new(&engine, ());
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
+    let memory = instance.get_memory(&mut store, "memory").expect("memory");
+    let heap_ptr = instance
+        .get_global(&mut store, crate::abi::HEAP_PTR_EXPORT_NAME)
+        .expect("heap ptr");
+    let ptr = |store: &mut Store<()>| heap_ptr.get(&mut *store).i32().expect("i32");
+    assert_eq!(ptr(&mut store) % 8, 0, "heap start is 8-aligned");
+    // Dirty the free region so the constructors must WRITE the zero bytes.
+    let start = usize::try_from(ptr(&mut store)).expect("ptr");
+    memory.data_mut(&mut store)[start..start + 256].fill(0xFF);
+
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut store, crate::abi::ALLOC_EXPORT_NAME)
+        .expect("__alloc export");
+    let a = alloc.call(&mut store, 5).expect("alloc");
+    assert_eq!(a % 8, 0);
+    assert_eq!(ptr(&mut store) - a, 8, "__alloc(5) rounds up to 8");
+
+    let new_string = instance
+        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
+        .expect("__new_string export");
+    let s = new_string.call(&mut store, 3).expect("new string");
+    assert_eq!(s % 8, 0);
+    let mem = memory.data(&store);
+    let s = usize::try_from(s).expect("base");
+    assert_eq!(&mem[s..s + 4], &[crate::abi::TYPE_STRING, 0, 0, 0]);
+    assert_eq!(&mem[s + 4..s + 8], &3u32.to_le_bytes());
+
+    let new_array = instance
+        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_ARRAY_EXPORT_NAME)
+        .expect("__new_array export");
+    let arr = new_array.call(&mut store, 2).expect("new array");
+    assert_eq!(arr % 8, 0);
+    let mem = memory.data(&store);
+    let arr = usize::try_from(arr).expect("base");
+    assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
+    assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
+    // `proto` = `%Array.prototype%`, an ordinary object.
+    assert_eq!(
+        mem[arr + 14..arr + 16],
+        [0xFD, 0x7F],
+        "proto is a heap pointer"
+    );
+    assert_eq!(&mem[arr + 16..arr + 20], &2u32.to_le_bytes(), "len");
+    let elems = u32::from_le_bytes(mem[arr + 20..arr + 24].try_into().expect("elems"));
+    let elems = usize::try_from(elems).expect("elems");
+    assert_eq!(elems % 8, 0);
+    assert_eq!(&mem[elems..elems + 4], &[crate::abi::TYPE_ELEMS, 0, 0, 0]);
+    assert_eq!(&mem[elems + 4..elems + 8], &2u32.to_le_bytes(), "cap");
+    for i in 0..2 {
+        let at = elems + 8 + 8 * i;
+        assert_eq!(&mem[at..at + 8], &crate::abi::UNDEFINED.to_le_bytes());
+    }
+    let empty = new_array.call(&mut store, 0).expect("empty array");
+    let mem = memory.data(&store);
+    let empty = usize::try_from(empty).expect("base");
+    assert_eq!(&mem[empty + 16..empty + 24], &[0; 8], "len 0, no store");
+
+    let new_promise = instance
+        .get_typed_func::<(), i32>(&mut store, crate::abi::NEW_PROMISE_EXPORT_NAME)
+        .expect("__new_promise export");
+    let p = new_promise.call(&mut store, ()).expect("new promise");
+    assert_eq!(p % 8, 0);
+    let mem = memory.data(&store);
+    let p = usize::try_from(p).expect("base");
+    assert_eq!(&mem[p..p + 4], &[crate::abi::TYPE_PROMISE, 0, 0, 0]);
+    assert_eq!(&mem[p + 4..p + 8], &0u32.to_le_bytes(), "props");
+    // `proto` = `%Promise.prototype%`.
+    assert_eq!(mem[p + 14..p + 16], [0xFD, 0x7F], "proto is a heap pointer");
+    assert_eq!(
+        &mem[p + 16..p + 20],
+        &crate::abi::PROMISE_PENDING.to_le_bytes()
+    );
+    assert_eq!(&mem[p + 24..p + 32], &crate::abi::UNDEFINED.to_le_bytes());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // one straight-line layout walk per kind
+fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
+    use crate::abi::{
+        ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, DATE_MS_OFFSET, ELEMS_CAP_OFFSET, ELEMS_DATA_OFFSET,
+        FUNC_ENV_OFFSET, FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_LAZY, FUNC_INDEX_OFFSET, GEN_DONE_OFFSET,
+        GEN_ENV_OFFSET, GEN_STATE_OFFSET, MAP_ENTRIES_OFFSET, MAP_SIZE_OFFSET, OBJ_PROPS_OFFSET,
+        OBJ_PROTO_OFFSET, PROMISE_FULFILLED, PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET,
+        TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT,
+        TYPE_PROMISE, TYPE_SET, UNDEFINED,
+    };
+    let u32_at = |mem: &[u8], at: u32| {
+        let at = at as usize;
+        u32::from_le_bytes(mem[at..at + 4].try_into().expect("u32"))
+    };
+    let u64_at = |mem: &[u8], at: u32| {
+        let at = at as usize;
+        u64::from_le_bytes(mem[at..at + 8].try_into().expect("u64"))
+    };
+    // `%Function.prototype%`: a non-lazy `TYPE_FUNCTION` block.
+    let function_proto = |mem: &[u8], bits: u64| {
+        assert_eq!(
+            (bits >> 48) & 0b111,
+            0b101,
+            "function proto is a heap block"
+        );
+        let at = usize::try_from(bits & 0xFFFF_FFFF).expect("base");
+        assert_eq!(
+            &mem[at..at + 4],
+            &[TYPE_FUNCTION, 0, 0, 0],
+            "%Function.prototype%"
+        );
+    };
+    let heap = |src: &str, kind: u8, flags: u8| {
+        let bytes = emit_js(src);
+        validate(&bytes);
+        let (bits, memory) = crate::run::run(&bytes).expect("module should run");
+        assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
+        let base = u32::try_from(bits & 0xFFFF_FFFF).expect("base");
+        assert_eq!(base % 8, 0, "{src}: 8-aligned");
+        let at = base as usize;
+        assert_eq!(&memory[at..at + 4], &[kind, 0, flags, 0], "{src}: header");
+        assert_eq!(u32_at(&memory, base + OBJ_PROPS_OFFSET), 0, "{src}: props");
+        let proto = u64_at(&memory, base + OBJ_PROTO_OFFSET);
+        if kind == TYPE_FUNCTION {
+            function_proto(&memory, proto);
+        } else {
+            // Arrays, Map/Set, promises and dates inherit from their realm
+            // prototype, generators from %Object.prototype%: an ordinary object.
+            assert_eq!((proto >> 48) & 0b111, 0b101, "{src}: proto is a heap block");
+            let at = usize::try_from(proto & 0xFFFF_FFFF).expect("base");
+            assert_eq!(memory[at], TYPE_OBJECT, "{src}: proto");
+        }
+        (base, memory)
+    };
+
+    let (func, mem) = heap(
+        "function f(x) { return x } f",
+        TYPE_FUNCTION,
+        FUNC_FLAG_LAZY | FUNC_FLAG_CONSTRUCTOR,
+    );
+    assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET), 0, "func_idx");
+    assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET + 4), 0, "reserved");
+    assert_eq!(u64_at(&mem, func + FUNC_ENV_OFFSET), UNDEFINED, "env");
+
+    let (closure, mem) = heap(
+        "let n = 1; let g = () => n; g",
+        TYPE_FUNCTION,
+        FUNC_FLAG_LAZY,
+    );
+    let env = u64_at(&mem, closure + FUNC_ENV_OFFSET);
+    assert_eq!((env >> 48) & 0b111, 0b101, "closure env is a heap block");
+
+    for (src, kind, size) in [
+        (
+            "let m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m",
+            TYPE_MAP,
+            2,
+        ),
+        ("let s = new Set(); s.add(1); s", TYPE_SET, 1),
+    ] {
+        let (handle, mem) = heap(src, kind, 0);
+        assert_eq!(u32_at(&mem, handle + MAP_SIZE_OFFSET), size, "{src}: size");
+        let entries = u64_at(&mem, handle + MAP_ENTRIES_OFFSET);
+        let arr = u32::try_from(entries & 0xFFFF_FFFF).expect("entries");
+        assert_eq!(mem[arr as usize], TYPE_ARRAY, "{src}: entries backing");
+        assert_eq!(
+            u32_at(&mem, arr + ARRAY_LEN_OFFSET),
+            2 * size,
+            "{src}: pairs"
+        );
+    }
+
+    // An array literal owns a `cap = len` store; pushes grow it by doubling
+    // from 4, and the handle never moves.
+    let (lit, mem) = heap("[1, 2, 3]", TYPE_ARRAY, 0);
+    assert_eq!(u32_at(&mem, lit + ARRAY_LEN_OFFSET), 3, "literal len");
+    let store = u32_at(&mem, lit + ARRAY_ELEMS_OFFSET);
+    assert_eq!(mem[store as usize], TYPE_ELEMS, "literal store");
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 3, "literal cap");
+    assert_eq!(
+        u64_at(&mem, store + ELEMS_DATA_OFFSET + 16),
+        3.0_f64.to_bits()
+    );
+    let (grown, mem) = heap(
+        "let a = []; let b = a; for (let i = 0; i < 5; i++) a.push(i); b",
+        TYPE_ARRAY,
+        0,
+    );
+    assert_eq!(u32_at(&mem, grown + ARRAY_LEN_OFFSET), 5, "grown len");
+    let store = u32_at(&mem, grown + ARRAY_ELEMS_OFFSET);
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 8, "0 -> 4 -> 8");
+    assert_eq!(
+        u64_at(&mem, store + ELEMS_DATA_OFFSET + 32),
+        4.0_f64.to_bits()
+    );
+    let (empty, mem) = heap("[]", TYPE_ARRAY, 0);
+    assert_eq!(u32_at(&mem, empty + ARRAY_ELEMS_OFFSET), 0, "no store");
+
+    let (promise, mem) = heap("Promise.resolve(7)", TYPE_PROMISE, 0);
+    assert_eq!(
+        u32_at(&mem, promise + PROMISE_STATE_OFFSET).cast_signed(),
+        PROMISE_FULFILLED
+    );
+    assert_eq!(
+        u64_at(&mem, promise + PROMISE_VALUE_OFFSET),
+        7.0_f64.to_bits()
+    );
+
+    let (generator, mem) = heap(
+        "function* gen() { yield 1 } let it = gen(); it.next(); it",
+        TYPE_GENERATOR,
+        0,
+    );
+    assert_eq!(
+        u32_at(&mem, generator + GEN_STATE_OFFSET),
+        1,
+        "state after one yield"
+    );
+    assert_eq!(u32_at(&mem, generator + GEN_DONE_OFFSET), 0, "not done");
+    let frame = u64_at(&mem, generator + GEN_ENV_OFFSET);
+    assert_eq!((frame >> 48) & 0b111, 0b101, "frame is a heap block");
+
+    let (date, mem) = heap("new Date(1234.5)", TYPE_DATE, 0);
+    assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234.5_f64.to_bits());
+}
+
+/// The number of `global.set` of the dirty-bits global in `bytes`.
+fn dirty_bit_sets(bytes: &[u8]) -> usize {
+    let mut sets = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("valid payload") {
+            let mut ops = body.get_operators_reader().expect("operators");
+            while !ops.eof() {
+                if let wasmparser::Operator::GlobalSet { global_index } =
+                    ops.read().expect("operator")
+                    && global_index == super::DIRTY_GLOBAL
+                {
+                    sets += 1;
+                }
+            }
+        }
+    }
+    sets
+}
+
+/// Compile `src` through the front end and codegen.
+fn compile(src: &str) -> Vec<u8> {
+    let program = crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse");
+    emit(&crate::codegen::lower(&program).expect("lower"))
+}
+
+#[test]
+fn dirty_bits_are_set_only_when_tested() {
+    // Intrinsics-sealed with inline namespaces: no guard, so `__set`,
+    // `__define` and `__delete` never touch the bits.
+    assert_eq!(
+        dirty_bit_sets(&compile("let a = []; a.push(Math.max(1, 2))")),
+        0
+    );
+    // A push guard (not intrinsics-sealed) or a watched-namespace guard (an
+    // escaping `Math`) makes the three helpers set the bits.
+    assert_eq!(
+        dirty_bit_sets(&compile("Object.prototype.x = 1; let a = []; a.push(1)")),
+        3
+    );
+    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 3);
+    // An unwatched namespace guard compares the member instead.
+    assert_eq!(
+        dirty_bit_sets(&compile("let o = Object; Object.keys({})")),
+        0
     );
 }

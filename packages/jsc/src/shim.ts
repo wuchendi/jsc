@@ -1,9 +1,11 @@
 /**
  * The JS runtime shim: the `importObject` that backs the emitted module's host
  * env imports (`print` / `__convert` / `__method` / `__promise` / `__then` /
- * `__now`) plus the bump-allocator they share. A port of
- * `crates/jsc-core/src/run/harness.rs` (import wiring), `run/host.rs` (handlers +
- * allocator), and `run/promise.rs` (the promise engine + microtask queue). It
+ * `__now` / `__parse_int`). A port of `crates/jsc-core/src/run/harness.rs`
+ * (import wiring + out-of-memory guard), `run/host.rs` (handlers), and
+ * `run/promise.rs` (the promise engine + microtask queue). Every heap block is
+ * allocated through the guest's exported constructors (`__new_string` /
+ * `__new_array` / `__new_promise`), never by hand. It
  * duplicates Rust host semantics against the emitted module's memory (see
  * README, "Host parity").
  */
@@ -11,7 +13,6 @@
 import {
   ASYNC_STEP_EXPORT_NAME,
   CONVERT_OP_PARSE_FLOAT,
-  CONVERT_OP_PARSE_INT,
   CONVERT_OP_TO_NUMBER,
   CONVERT_OP_TO_STRING,
   EXC_PENDING_EXPORT_NAME,
@@ -21,13 +22,16 @@ import {
   HEADER_SIZE,
   HEAP,
   HEAP_PTR_EXPORT_NAME,
+  HEAP_PTR_OOM,
+  HOLE,
   INVOKE_EXPORT_NAME,
   MEMORY_EXPORT_NAME,
+  MEMORY_MAX_PAGES,
   METHOD_OP_CHAR_AT,
   METHOD_OP_ENDS_WITH,
   METHOD_OP_INCLUDES,
   METHOD_OP_INDEX_OF,
-  METHOD_OP_JOIN,
+  METHOD_OP_NUMBER_TO_STRING,
   METHOD_OP_PAD_END,
   METHOD_OP_PAD_START,
   METHOD_OP_REPEAT,
@@ -40,8 +44,12 @@ import {
   METHOD_OP_TRIM,
   METHOD_OP_TRIM_END,
   METHOD_OP_TRIM_START,
+  NEW_ARRAY_EXPORT_NAME,
+  NEW_PROMISE_EXPORT_NAME,
+  NEW_STRING_EXPORT_NAME,
   PRINT_FLAG_END,
   PRINT_FLAG_SEP,
+  PROMISE_BLOCK_SIZE,
   PROMISE_FULFILLED,
   PROMISE_OP_ASYNC_SPAWN,
   PROMISE_OP_AWAIT,
@@ -53,6 +61,8 @@ import {
   PROMISE_OP_SETTLE_REJECT,
   PROMISE_PENDING,
   PROMISE_REJECTED,
+  PROMISE_STATE_OFFSET,
+  PROMISE_VALUE_OFFSET,
   QNAN,
   TRUE,
   TYPE_ARRAY,
@@ -63,12 +73,15 @@ import {
   UNDEFINED,
 } from './abi.js'
 import {
+  arrayElements,
+  arrayLayout,
   asU64,
   decode,
   f64ToBits,
   formatValue,
   parseFloatStr,
   parseIntStr,
+  toJsString,
   valueToNumber,
 } from './value.js'
 
@@ -78,10 +91,17 @@ export interface Shim {
   imports: WebAssembly.Imports
   /** Everything `console.log` printed, in execution order (mirrors `run_capturing`). */
   stdout: () => string
-  /** Bind the instantiated module so the imports can read/grow its memory. */
+  /** Bind the instantiated module so the imports can read its memory and call its constructors. */
   bindInstance: (instance: WebAssembly.Instance) => void
-  /** Drain the microtask queue to empty (mirrors `promise.rs::drain_after_main`). */
+  /**
+   * Drain the microtask queue to empty, then throw
+   * `Error("Uncaught RangeError: out of memory")` if the heap is exhausted, or
+   * `Error("Uncaught (in promise) <value>")` for the first rejected promise that
+   * never got a handler (mirrors `harness.rs` / `promise.rs::drain_after_main`).
+   */
   drainAfterMain: () => void
+  /** Whether `__heap_ptr` holds the out-of-memory sentinel (mirrors `host.rs::heap_exhausted`). */
+  heapExhausted: () => boolean
 }
 
 /**
@@ -111,8 +131,11 @@ interface Job {
   asyncGen: bigint | null
 }
 
-/** The `[type][pad×3][state:i32][value:i64]` promise block size in bytes. */
-const PROMISE_BLOCK_SIZE = HEADER_SIZE + 4 + 8
+/** The linear-memory cap in bytes; constructor lengths are clamped to it (mirrors `host.rs`). */
+const MEMORY_MAX_BYTES = MEMORY_MAX_PAGES * 0x1_0000
+
+/** The rendered error for an exhausted heap (mirrors `harness.rs::OUT_OF_MEMORY`). */
+export const OUT_OF_MEMORY = 'Uncaught RangeError: out of memory'
 
 const utf8Encode = new TextEncoder()
 const utf8Decoder = new TextDecoder()
@@ -140,53 +163,84 @@ export function createShim(): Shim {
     return mem ? new Uint8Array(mem.buffer) : new Uint8Array(0)
   }
 
+  /** An exported global by name, or `undefined` when absent. */
+  function exportGlobal(name: string): WebAssembly.Global | undefined {
+    return instance?.exports[name] as WebAssembly.Global | undefined
+  }
+
+  /** Whether `__heap_ptr` holds the out-of-memory sentinel (mirrors `host.rs::heap_exhausted`). */
+  function heapExhausted(): boolean {
+    const global = exportGlobal(HEAP_PTR_EXPORT_NAME)
+    return global !== undefined && global.value === HEAP_PTR_OOM
+  }
+
   /**
-   * Bump-allocate a pre-built heap `block` in guest memory and return its base
-   * offset, or `null` when the exports are missing or the write fails. Mirrors
-   * `host.rs::host_alloc`: read `__heap_ptr`, grow memory if the block overflows,
-   * write the bytes, and advance the global.
+   * Pass a host import's result through, or throw the out-of-memory error when
+   * the import (or an earlier allocation) left the sentinel in `__heap_ptr`
+   * (mirrors `harness.rs::oom_guard`).
    */
-  function hostAlloc(block: Uint8Array): bigint | null {
-    const mem = memory()
-    const global = instance?.exports[HEAP_PTR_EXPORT_NAME] as
-      | WebAssembly.Global
+  function oomGuard(bits: bigint): bigint {
+    if (heapExhausted()) throw new Error(OUT_OF_MEMORY)
+    return bits
+  }
+
+  /**
+   * Call the guest constructor export `name(...args) -> base` and return the new
+   * block's base offset, or `null` when the export is missing or the call traps
+   * — an out-of-memory trap leaves the sentinel for {@link oomGuard} (mirrors
+   * `host.rs::guest_new`).
+   */
+  function guestNew(name: string, ...args: number[]): number | null {
+    const ctor = instance?.exports[name] as
+      | ((...a: number[]) => number)
       | undefined
-    if (!mem || !global) return null
-    const base = (global.value as number) >>> 0
-    const end = base + block.length
-    const cur = mem.buffer.byteLength
-    if (end > cur) {
-      const pages = Math.ceil((end - cur) / 0x1_0000)
-      try {
-        mem.grow(pages)
-      } catch {
-        return null
-      }
+    if (!ctor) return null
+    try {
+      return ctor(...args) >>> 0
+    } catch {
+      return null
     }
-    new Uint8Array(mem.buffer).set(block, base)
-    global.value = end
+  }
+
+  /**
+   * Allocate a heap STRING block holding `text` through `__new_string`, filling
+   * only the payload (mirrors `host.rs::alloc_string`).
+   */
+  function allocString(text: string): bigint | null {
+    const bytes = utf8Encode.encode(text)
+    const base = guestNew(
+      NEW_STRING_EXPORT_NAME,
+      Math.min(bytes.length, MEMORY_MAX_BYTES),
+    )
+    if (base === null) return null
+    const view = memView()
+    const at = base + HEADER_SIZE + 4
+    if (at + bytes.length > view.length) return null
+    view.set(bytes, at)
     return BigInt(base)
   }
 
-  /** Bump-allocate a heap STRING block holding `text` (mirrors `host.rs::host_alloc_string`). */
-  function hostAllocString(text: string): bigint | null {
-    const bytes = utf8Encode.encode(text)
-    const block = new Uint8Array(HEADER_SIZE + 4 + bytes.length)
-    block[0] = TYPE_STRING
-    // len:u32 LE at HEADER_SIZE, utf8 payload after it.
-    new DataView(block.buffer).setUint32(HEADER_SIZE, bytes.length, true)
-    block.set(bytes, HEADER_SIZE + 4)
-    return hostAlloc(block)
-  }
-
-  /** `array.join(sep)` — allocates the joined heap string (mirrors `host.rs::array_join`). */
-  function arrayJoin(
-    mem: Uint8Array,
-    ptr: number,
-    sepBits: bigint,
-  ): bigint | null {
-    const base = hostAllocString(arrayJoinText(mem, ptr, sepBits))
-    return base === null ? null : HEAP | base
+  /**
+   * Allocate a heap ARRAY holding the jsval bits `elems` through
+   * `__new_array` (which builds the handle and its element store), filling
+   * only the elements (mirrors `host.rs::alloc_array`).
+   */
+  function allocArray(elems: bigint[]): bigint | null {
+    const base = guestNew(
+      NEW_ARRAY_EXPORT_NAME,
+      Math.min(elems.length, MEMORY_MAX_BYTES / 8),
+    )
+    const mem = memory()
+    if (base === null || !mem) return null
+    const layout = arrayLayout(memView(), base)
+    if (layout === undefined) return null
+    const at = layout[1]
+    if (at + 8 * elems.length > mem.buffer.byteLength) return null
+    const dv = new DataView(mem.buffer)
+    elems.forEach((bits, i) => {
+      dv.setBigUint64(at + 8 * i, bits, true)
+    })
+    return BigInt(base)
   }
 
   /** `array.slice(a, b)` — allocates a NEW heap array (mirrors `host.rs::array_slice`). */
@@ -196,22 +250,16 @@ export function createShim(): Shim {
     a: bigint,
     b: bigint,
   ): bigint | null {
-    const len = blockLen(mem, ptr)
+    const elements = arrayElements(mem, ptr)
+    if (elements === undefined) return null
+    const [len, present] = elements
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
-    const count = end - start
-    const block = new Uint8Array(HEADER_SIZE + 4 + 8 * count)
-    block[0] = TYPE_ARRAY
-    const dv = new DataView(block.buffer)
-    dv.setUint32(HEADER_SIZE, count, true)
-    let off = HEADER_SIZE + 4
-    for (let i = start; i < end; i++) {
-      const elem = arrayElemBits(mem, ptr, i)
-      if (elem === null) return null
-      dv.setBigUint64(off, elem, true)
-      off += 8
+    const elems: bigint[] = new Array<bigint>(end - start).fill(HOLE)
+    for (const [i, bits] of present) {
+      if (i >= start && i < end) elems[i - start] = bits
     }
-    const base = hostAlloc(block)
+    const base = allocArray(elems)
     return base === null ? null : HEAP | base
   }
 
@@ -227,7 +275,7 @@ export function createShim(): Shim {
     const len = bytes.length
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
-    const base = hostAllocString(utf8Decode(bytes.subarray(start, end)))
+    const base = allocString(utf8Decode(bytes.subarray(start, end)))
     return base === null ? null : HEAP | base
   }
 
@@ -237,9 +285,7 @@ export function createShim(): Shim {
     if (bytes === null) return null
     const trimStart = op !== METHOD_OP_TRIM_END
     const trimEnd = op !== METHOD_OP_TRIM_START
-    const base = hostAllocString(
-      utf8Decode(trimBytes(bytes, trimStart, trimEnd)),
-    )
+    const base = allocString(utf8Decode(trimBytes(bytes, trimStart, trimEnd)))
     return base === null ? null : HEAP | base
   }
 
@@ -256,7 +302,7 @@ export function createShim(): Shim {
     const n = Math.max(truncToInt(valueToNumber(decode(arg0, mem))), 0)
     const out = new Uint8Array(bytes.length * n)
     for (let i = 0; i < n; i++) out.set(bytes, i * bytes.length)
-    const base = hostAllocString(utf8Decode(out))
+    const base = allocString(utf8Decode(out))
     return base === null ? null : HEAP | base
   }
 
@@ -276,8 +322,8 @@ export function createShim(): Shim {
     const pad =
       padValue.kind === 'undefined'
         ? utf8Encode.encode(' ')
-        : utf8Encode.encode(formatValue(padValue))
-    const base = hostAllocString(
+        : utf8Encode.encode(toJsString(padValue))
+    const base = allocString(
       padBytes(bytes, target, pad, op === METHOD_OP_PAD_START),
     )
     return base === null ? null : HEAP | base
@@ -297,25 +343,32 @@ export function createShim(): Shim {
     const b = substringIndex(arg1, mem, len, len)
     const lo = Math.min(a, b)
     const hi = Math.max(a, b)
-    const base = hostAllocString(utf8Decode(bytes.subarray(lo, hi)))
+    const base = allocString(utf8Decode(bytes.subarray(lo, hi)))
     return base === null ? null : HEAP | base
   }
 
-  /** `string.split(sep)` — NEW array of substrings (mirrors `string_split`). */
+  /** `string.split(sep, limit)` — NEW array of substrings (mirrors `string_split`). */
   function stringSplit(
     mem: Uint8Array,
     ptr: number,
     sepBits: bigint,
+    limitBits: bigint,
   ): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
+    const limitValue = decode(limitBits, mem)
+    // `ToUint32(limit)`; `undefined` is no limit.
+    const limit =
+      limitValue.kind === 'undefined'
+        ? Infinity
+        : valueToNumber(limitValue) >>> 0
     const sepValue = decode(sepBits, mem)
     let pieces: Uint8Array[]
     if (sepValue.kind === 'undefined') {
       // An omitted separator yields a single-element array of the whole string.
       pieces = [bytes]
     } else {
-      const sep = utf8Encode.encode(formatValue(sepValue))
+      const sep = utf8Encode.encode(toJsString(sepValue))
       pieces =
         sep.length === 0
           ? // An empty separator splits into one element per byte.
@@ -323,23 +376,14 @@ export function createShim(): Shim {
           : splitOn(bytes, sep)
     }
     // Allocate each piece as a heap string first (the pieces are independent
-    // views/copies), then build the backing array block from their bits.
+    // views/copies), then build the backing array from their bits.
     const elems: bigint[] = []
-    for (const piece of pieces) {
-      const base = hostAllocString(utf8Decode(piece))
+    for (const piece of pieces.slice(0, limit)) {
+      const base = allocString(utf8Decode(piece))
       if (base === null) return null
       elems.push(HEAP | base)
     }
-    const block = new Uint8Array(HEADER_SIZE + 4 + 8 * elems.length)
-    block[0] = TYPE_ARRAY
-    const dv = new DataView(block.buffer)
-    dv.setUint32(HEADER_SIZE, elems.length, true)
-    let off = HEADER_SIZE + 4
-    for (const bits of elems) {
-      dv.setBigUint64(off, bits, true)
-      off += 8
-    }
-    const base = hostAlloc(block)
+    const base = allocArray(elems)
     return base === null ? null : HEAP | base
   }
 
@@ -355,7 +399,7 @@ export function createShim(): Shim {
     arg1: bigint,
   ): bigint | null {
     // Snapshot memory (a copy) so reads below are stable across a later
-    // `hostAlloc` that may grow/detach the buffer — mirrors the Rust snapshot.
+    // guest allocation that may grow/detach the buffer — mirrors the Rust snapshot.
     const mem = memView().slice()
     const ptr = heapPtr(recv)
     const typeByte = ptr === null ? undefined : mem[ptr]
@@ -363,23 +407,25 @@ export function createShim(): Shim {
       case METHOD_OP_INDEX_OF:
         if (ptr !== null && typeByte === TYPE_ARRAY)
           return arrayIndexOf(mem, ptr, arg0)
-        if (ptr !== null && typeByte === TYPE_STRING)
-          return stringIndexOf(mem, ptr, arg0)
-        return null
-      case METHOD_OP_INCLUDES:
-        if (ptr !== null && typeByte === TYPE_ARRAY) {
-          return arrayIndexOf(mem, ptr, arg0) === f64ToBits(-1) ? FALSE : TRUE
-        }
-        // `str.includes(sub)` — substring containment (an empty `sub` => true).
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
           if (hay === null) return null
-          return byteContains(hay, argBytes(arg0, mem)) ? TRUE : FALSE
+          const from = substringIndex(arg1, mem, 0, hay.length)
+          return stringIndexOf(hay, argBytes(arg0, mem), from)
         }
         return null
-      case METHOD_OP_JOIN:
+      case METHOD_OP_INCLUDES:
         if (ptr !== null && typeByte === TYPE_ARRAY)
-          return arrayJoin(mem, ptr, arg0)
+          return arrayIncludes(mem, ptr, arg0) ? TRUE : FALSE
+        // `str.includes(sub, from)` — substring containment from `from`.
+        if (ptr !== null && typeByte === TYPE_STRING) {
+          const hay = stringBytes(mem, ptr)
+          if (hay === null) return null
+          const from = substringIndex(arg1, mem, 0, hay.length)
+          return stringIndexOf(hay, argBytes(arg0, mem), from) !== f64ToBits(-1)
+            ? TRUE
+            : FALSE
+        }
         return null
       case METHOD_OP_SLICE:
         if (ptr !== null && typeByte === TYPE_ARRAY)
@@ -395,7 +441,7 @@ export function createShim(): Shim {
         const mapped = bytes.map((byte) =>
           op === METHOD_OP_TO_UPPER ? asciiUpper(byte) : asciiLower(byte),
         )
-        const base = hostAllocString(utf8Decode(mapped))
+        const base = allocString(utf8Decode(mapped))
         return base === null ? null : HEAP | base
       }
       case METHOD_OP_CHAR_AT: {
@@ -406,7 +452,7 @@ export function createShim(): Shim {
         // Out-of-range (a negative index) => "".
         const text =
           i >= 0 && i < bytes.length ? utf8Decode(bytes.subarray(i, i + 1)) : ''
-        const base = hostAllocString(text)
+        const base = allocString(text)
         return base === null ? null : HEAP | base
       }
       case METHOD_OP_TRIM:
@@ -425,8 +471,17 @@ export function createShim(): Shim {
         const needle = argBytes(arg0, mem)
         const hit =
           op === METHOD_OP_STARTS_WITH
-            ? startsWithBytes(hay, needle)
-            : endsWithBytes(hay, needle)
+            ? startsWithBytes(
+                hay.subarray(substringIndex(arg1, mem, 0, hay.length)),
+                needle,
+              )
+            : endsWithBytes(
+                hay.subarray(
+                  0,
+                  substringIndex(arg1, mem, hay.length, hay.length),
+                ),
+                needle,
+              )
         return hit ? TRUE : FALSE
       }
       case METHOD_OP_PAD_START:
@@ -438,7 +493,14 @@ export function createShim(): Shim {
         return stringSubstring(mem, ptr, arg0, arg1)
       case METHOD_OP_SPLIT:
         if (ptr === null || typeByte !== TYPE_STRING) return null
-        return stringSplit(mem, ptr, arg0)
+        return stringSplit(mem, ptr, arg0, arg1)
+      case METHOD_OP_NUMBER_TO_STRING: {
+        const value = decode(recv, mem)
+        if (value.kind !== 'number') return null
+        const radix = Math.trunc(valueToNumber(decode(arg0, mem)))
+        const base = allocString(value.value.toString(radix))
+        return base === null ? null : HEAP | base
+      }
       default:
         return null
     }
@@ -450,11 +512,10 @@ export function createShim(): Shim {
   const queue: Job[] = []
   /** Reactions of each still-pending promise, keyed by block base offset. */
   const reactions = new Map<number, Reaction[]>()
-
-  /** An exported global by name, or `undefined` when absent. */
-  function exportGlobal(name: string): WebAssembly.Global | undefined {
-    return instance?.exports[name] as WebAssembly.Global | undefined
-  }
+  /** Every rejected promise, by block base (ascending base = creation order). */
+  const rejected = new Set<number>()
+  /** Every promise that had a reaction registered (then/catch/finally, await, adoption). */
+  const handled = new Set<number>()
 
   /** An exported `(i64, i64) -> i64` trampoline by name, or `undefined` when absent. */
   function exportTrampoline(
@@ -466,17 +527,16 @@ export function createShim(): Shim {
   }
 
   /**
-   * Bump-allocate a fresh promise block and return its heap jsval, or `null` on
-   * a failed allocation (mirrors `promise.rs::alloc_promise`).
+   * Allocate a fresh promise block through `__new_promise`, settle it to
+   * `state`/`value` unless pending, and return its heap jsval, or `null` on a
+   * failed allocation (mirrors `promise.rs::alloc_promise`).
    */
   function allocPromise(state: number, value: bigint): bigint | null {
-    const block = new Uint8Array(PROMISE_BLOCK_SIZE)
-    block[0] = TYPE_PROMISE
-    const dv = new DataView(block.buffer)
-    dv.setInt32(HEADER_SIZE, state, true)
-    dv.setBigUint64(HEADER_SIZE + 4, value, true)
-    const base = hostAlloc(block)
-    return base === null ? null : HEAP | base
+    const base = guestNew(NEW_PROMISE_EXPORT_NAME)
+    if (base === null) return null
+    if (state !== PROMISE_PENDING) writeSettlement(base, state, value)
+    if (state === PROMISE_REJECTED) rejected.add(base)
+    return HEAP | BigInt(base)
   }
 
   /** Write a promise block's settlement into guest memory (mirrors `write_settlement`). */
@@ -484,8 +544,8 @@ export function createShim(): Shim {
     const mem = memory()
     if (!mem || base + PROMISE_BLOCK_SIZE > mem.buffer.byteLength) return
     const dv = new DataView(mem.buffer)
-    dv.setInt32(base + HEADER_SIZE, state, true)
-    dv.setBigUint64(base + HEADER_SIZE + 4, value, true)
+    dv.setInt32(base + PROMISE_STATE_OFFSET, state, true)
+    dv.setBigUint64(base + PROMISE_VALUE_OFFSET, value, true)
   }
 
   /**
@@ -526,6 +586,7 @@ export function createShim(): Shim {
       return
     }
     writeSettlement(base, state, value)
+    if (state === PROMISE_REJECTED) rejected.add(base)
     const pendingReactions = reactions.get(base) ?? []
     reactions.delete(base)
     for (const r of pendingReactions) {
@@ -567,6 +628,7 @@ export function createShim(): Shim {
       return
     }
     const state = readState(mem, base)
+    handled.add(base)
     if (state === PROMISE_PENDING) {
       const list = reactions.get(base) ?? []
       list.push({
@@ -610,11 +672,16 @@ export function createShim(): Shim {
   /** Run one microtask (mirrors `promise.rs::run_job`). */
   function runJob(job: Job): void {
     if (job.asyncGen !== null) {
-      if (job.state === PROMISE_FULFILLED) {
-        driveAsync(job.asyncGen, job.result, job.value)
-      } else {
-        settle(job.result, PROMISE_REJECTED, job.value)
+      let sent = job.value
+      if (job.state !== PROMISE_FULFILLED) {
+        // Resume with the reason pending so the `await` throws into the body.
+        const pending = exportGlobal(EXC_PENDING_EXPORT_NAME)
+        const excValue = exportGlobal(EXC_VALUE_EXPORT_NAME)
+        if (excValue) excValue.value = BigInt.asIntN(64, job.value)
+        if (pending) pending.value = 1
+        sent = UNDEFINED
       }
+      driveAsync(job.asyncGen, job.result, sent)
       return
     }
     if (!asFunction(memView(), job.callback)) {
@@ -646,6 +713,7 @@ export function createShim(): Shim {
   function awaitPromise(p: bigint): bigint {
     const base = asPromise(memView(), p)
     if (base === null) return p
+    handled.add(base)
     drain()
     const mem = memView()
     const state = readState(mem, base)
@@ -723,20 +791,23 @@ export function createShim(): Shim {
     out += piece
   }
 
+  /**
+   * `__convert` on primitives: the guest runs `ToPrimitive` first, so the
+   * only objects it sees are a Date (`Date.prototype.toString`) and a
+   * function without a user `toString` (mirrors `harness.rs`).
+   */
   const convert = (bits: bigint, op: number): bigint => {
     const u = asU64(bits)
     const value = decode(u, memView())
     switch (op) {
       case CONVERT_OP_TO_NUMBER:
         return f64ToBits(valueToNumber(value))
-      case CONVERT_OP_PARSE_INT:
-        return f64ToBits(parseIntStr(formatValue(value)))
       case CONVERT_OP_PARSE_FLOAT:
-        return f64ToBits(parseFloatStr(formatValue(value)))
+        return f64ToBits(parseFloatStr(toJsString(value)))
       case CONVERT_OP_TO_STRING: {
         // A string argument is returned unchanged (no allocation).
         if (value.kind === 'string') return u
-        const base = hostAllocString(formatValue(value))
+        const base = allocString(toJsString(value))
         return base === null ? UNDEFINED : HEAP | base
       }
       default:
@@ -750,19 +821,30 @@ export function createShim(): Shim {
     arg0: bigint,
     arg1: bigint,
   ): bigint =>
-    methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED
+    oomGuard(
+      methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED,
+    )
 
   const imports: WebAssembly.Imports = {
     env: {
       print,
-      __convert: convert,
+      __convert: (bits: bigint, op: number): bigint =>
+        oomGuard(convert(bits, op)),
       __method: method,
       __promise: (op: number, a: bigint, b: bigint): bigint =>
-        promiseDispatch(op, asU64(a), asU64(b)),
+        oomGuard(promiseDispatch(op, asU64(a), asU64(b))),
       __then: (p: bigint, onF: bigint, onR: bigint): bigint =>
-        promiseThen(asU64(p), asU64(onF), asU64(onR)),
+        oomGuard(promiseThen(asU64(p), asU64(onF), asU64(onR))),
       // The host wall clock backing `Date.now()` / `new Date()` (ms since epoch).
       __now: (): number => Date.now(),
+      // `parseInt(s, radix)` (an omitted radix arrives as `undefined`).
+      __parse_int: (s: bigint, radix: bigint): bigint =>
+        f64ToBits(
+          parseIntStr(
+            formatValue(decode(asU64(s), memView())),
+            valueToNumber(decode(asU64(radix), memView())),
+          ),
+        ),
     },
   }
 
@@ -772,7 +854,19 @@ export function createShim(): Shim {
     bindInstance: (bound) => {
       instance = bound
     },
-    drainAfterMain: drain,
+    drainAfterMain: () => {
+      drain()
+      if (heapExhausted()) throw new Error(OUT_OF_MEMORY)
+      const unhandled = [...rejected]
+        .filter((base) => !handled.has(base))
+        .sort((a, b) => a - b)[0]
+      if (unhandled === undefined) return
+      const mem = memView()
+      throw new Error(
+        `Uncaught (in promise) ${formatValue(decode(readValue(mem, unhandled), mem))}`,
+      )
+    },
+    heapExhausted,
   }
 }
 
@@ -805,14 +899,14 @@ function asFunction(mem: Uint8Array, bits: bigint): boolean {
 
 /** A promise block's `i32` state; a truncated block reads as pending. */
 function readState(mem: Uint8Array, base: number): number {
-  const at = base + HEADER_SIZE
+  const at = base + PROMISE_STATE_OFFSET
   if (at + 4 > mem.length) return PROMISE_PENDING
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true)
 }
 
 /** A promise block's settled value bits; a truncated block reads as `undefined`. */
 function readValue(mem: Uint8Array, base: number): bigint {
-  const at = base + HEADER_SIZE + 4
+  const at = base + PROMISE_VALUE_OFFSET
   if (at + 8 > mem.length) return UNDEFINED
   return new DataView(mem.buffer, mem.byteOffset).getBigUint64(at, true)
 }
@@ -826,7 +920,7 @@ function readGenDone(mem: Uint8Array, gen: bigint): boolean {
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true) !== 0
 }
 
-/** The `u32` `len` header of an array/string block at `ptr + HEADER_SIZE`. */
+/** The `u32` `len` header of a string block at `ptr + HEADER_SIZE`. */
 function blockLen(mem: Uint8Array, ptr: number): number {
   const at = ptr + HEADER_SIZE
   if (at + 4 > mem.length) return 0
@@ -837,15 +931,6 @@ function blockLen(mem: Uint8Array, ptr: number): number {
       (mem[at + 3]! << 24)) >>>
     0
   )
-}
-
-/** The raw jsval bits of array element `i`, or `null` when out of range. */
-function arrayElemBits(mem: Uint8Array, ptr: number, i: number): bigint | null {
-  const start = ptr + HEADER_SIZE + 4 + 8 * i
-  if (start + 8 > mem.length) return null
-  let value = 0n
-  for (let k = 7; k >= 0; k--) value = (value << 8n) | BigInt(mem[start + k]!)
-  return value
 }
 
 /** The UTF-8 payload bytes of a heap STRING block, or `null` when truncated. */
@@ -887,25 +972,49 @@ function strictEqBits(a: bigint, b: bigint, mem: Uint8Array): boolean {
   return a === b
 }
 
-/** `array.indexOf(x)`: first index whose element `=== x`, or `-1`. */
+/**
+ * `array.includes(x)` (mirrors `host.rs::array_includes`): some element is
+ * `SameValueZero` to `x` — `===`, except that `NaN` matches `NaN`; a hole
+ * reads as `undefined`.
+ */
+function arrayIncludes(mem: Uint8Array, ptr: number, needle: bigint): boolean {
+  const [len, present] = arrayElements(mem, ptr) ?? [0, []]
+  if (needle === UNDEFINED && present.length < len) return true
+  const n = decode(needle, mem)
+  for (const [, elem] of present) {
+    if (strictEqBits(elem, needle, mem)) return true
+    const e = decode(elem, mem)
+    if (
+      e.kind === 'number' &&
+      n.kind === 'number' &&
+      Number.isNaN(e.value) &&
+      Number.isNaN(n.value)
+    )
+      return true
+  }
+  return false
+}
+
+/** `array.indexOf(x)`: first index whose element `=== x`, or `-1` (a hole never matches). */
 function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
-  const len = blockLen(mem, ptr)
-  for (let i = 0; i < len; i++) {
-    const elem = arrayElemBits(mem, ptr, i)
-    if (elem !== null && strictEqBits(elem, needle, mem)) return indexBits(i)
+  const [, present] = arrayElements(mem, ptr) ?? [0, []]
+  for (const [i, elem] of present) {
+    if (strictEqBits(elem, needle, mem)) return indexBits(i)
   }
   return f64ToBits(-1)
 }
 
-/** `string.indexOf(sub)`: first BYTE index where `sub` occurs (empty => 0), or `-1`. */
-function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
-  const hay = stringBytes(mem, ptr)
-  if (hay === null) return f64ToBits(-1)
-  const subValue = decode(sub, mem)
-  if (subValue.kind !== 'string') return f64ToBits(-1)
-  const needle = utf8Encode.encode(subValue.value)
-  if (needle.length === 0) return indexBits(0)
-  for (let i = 0; i + needle.length <= hay.length; i++) {
+/**
+ * `string.indexOf(sub, from)` (mirrors `host.rs::string_index_of`): the first
+ * BYTE index at or after `from` where `sub` occurs (empty => `from`), or `-1`.
+ */
+function stringIndexOf(
+  hay: Uint8Array,
+  needle: Uint8Array,
+  from: number,
+): bigint {
+  if (needle.length === 0) return indexBits(from)
+  for (let i = from; i + needle.length <= hay.length; i++) {
     let match = true
     for (let k = 0; k < needle.length; k++) {
       if (hay[i + k] !== needle[k]) {
@@ -916,28 +1025,6 @@ function stringIndexOf(mem: Uint8Array, ptr: number, sub: bigint): bigint {
     if (match) return indexBits(i)
   }
   return f64ToBits(-1)
-}
-
-/**
- * The joined text of `array.join(sep)` (`","` when `sep` is `undefined`);
- * `null`/`undefined` elements stringify to `""`. Mirrors the pure part of
- * `host.rs::array_join` (allocation is done by the caller).
- */
-function arrayJoinText(mem: Uint8Array, ptr: number, sepBits: bigint): string {
-  const sepValue = decode(sepBits, mem)
-  const sep = sepValue.kind === 'undefined' ? ',' : formatValue(sepValue)
-  const len = blockLen(mem, ptr)
-  const pieces: string[] = []
-  for (let i = 0; i < len; i++) {
-    const elem = arrayElemBits(mem, ptr, i)
-    const v = elem === null ? null : decode(elem, mem)
-    pieces.push(
-      v === null || v.kind === 'null' || v.kind === 'undefined'
-        ? ''
-        : formatValue(v),
-    )
-  }
-  return pieces.join(sep)
 }
 
 /**
@@ -966,26 +1053,10 @@ function isAsciiWhitespace(b: number): boolean {
 /**
  * Coerce a method argument's raw bits to its JS string form as bytes (mirrors
  * `host.rs::arg_bytes`): a string yields its payload, everything else its
- * `formatValue` rendering.
+ * JS `ToString` text.
  */
 function argBytes(bits: bigint, mem: Uint8Array): Uint8Array {
-  return utf8Encode.encode(formatValue(decode(bits, mem)))
-}
-
-/** Whether `hay` contains the contiguous `needle` (empty => true; mirrors `byte_contains`). */
-function byteContains(hay: Uint8Array, needle: Uint8Array): boolean {
-  if (needle.length === 0) return true
-  for (let i = 0; i + needle.length <= hay.length; i++) {
-    let match = true
-    for (let k = 0; k < needle.length; k++) {
-      if (hay[i + k] !== needle[k]) {
-        match = false
-        break
-      }
-    }
-    if (match) return true
-  }
-  return false
+  return utf8Encode.encode(toJsString(decode(bits, mem)))
 }
 
 /** Whether `hay` begins with `needle`. */
@@ -1044,7 +1115,7 @@ function padBytes(
 }
 
 /**
- * Resolve one `substring` endpoint against a BYTE `len` (mirrors
+ * Resolve one `substring` endpoint (or a search position) against a BYTE `len` (mirrors
  * `host.rs::substring_index`): `undefined` uses `fallback`, otherwise the
  * argument is truncated and clamped to `0..=len` (no negative-from-end offset).
  */
