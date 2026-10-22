@@ -1112,18 +1112,19 @@ fn compile(src: &str) -> Vec<u8> {
 #[test]
 fn dirty_bits_are_set_only_when_tested() {
     // Intrinsics-sealed with inline namespaces: no guard, so `__set`,
-    // `__define` and `__delete` never touch the bits.
+    // `__define`, `__delete`, `__define_own` and `__set_integrity` never touch
+    // the bits.
     assert_eq!(
         dirty_bit_sets(&compile("let a = []; a.push(Math.max(1, 2))")),
         0
     );
     // A push guard (not intrinsics-sealed) or a watched-namespace guard (an
-    // escaping `Math`) makes the three helpers set the bits.
+    // escaping `Math`) makes the five helpers set the bits.
     assert_eq!(
         dirty_bit_sets(&compile("Object.prototype.x = 1; let a = []; a.push(1)")),
-        3
+        5
     );
-    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 3);
+    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 5);
     // An unwatched namespace guard compares the member instead.
     assert_eq!(
         dirty_bit_sets(&compile("let o = Object; Object.keys({})")),
