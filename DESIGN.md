@@ -1538,7 +1538,7 @@ Conformance is measured on the eligible test262 subset (section 10).
 | Phase | Theme | Depends on | Milestone |
 |---|---|---|---|
 | 2 | Object model | — | M1: the official test262 `sta.js` + `assert.js` compile unchanged; M2: 30% of eligible tests pass |
-| 3 | Built-in library + string semantics | 2 | M3: about 50%; the harness shims are removed |
+| 3 | Built-in library + string semantics | 2 | M3: about 50% |
 | 4 | Runtime independence + memory management | 2, 3 | M4: modules import only WASI and run on wasmtime, Node, and browsers; GC |
 | 5 | Language completeness | 2, 4 | M5: about 70% |
 | 6 | Performance | 4, 5 | M6: benchmark suite and regression gate |
@@ -1550,9 +1550,9 @@ Conformance is measured on the eligible test262 subset (section 10).
 fixed the items in the first bullet below; 2b designed the object model; 2c
 implemented it (property tables, arrays, functions and classes as objects, the
 realm and global object, builtins on prototypes behind guarded fast paths) and
-moved the test262 runner onto the official harness. The "JS prelude" item
-(phase 3, first bullet) was delivered in 2c as in-wasm builtins installed on
-the realm's prototypes.
+moved the test262 runner onto the official harness. The planned JavaScript
+prelude was not needed: 2c delivered the built-ins as in-wasm functions
+installed on the realm's prototypes, and phase 3 extends that set.
 
 - Fixes that do not wait for the model: property writes on primitive receivers
   (pointer guard), `"abc".foo`, `1 + null`, `-0` from unary minus, unhandled
@@ -1570,16 +1570,15 @@ the realm's prototypes.
 
 ### Phase 3 — Built-in library and strings
 
-- Built-ins are written in JavaScript/TypeScript and installed on prototypes:
-  `Object` (property descriptors, `defineProperty`, `create`, `freeze`,
-  `assign`), `Array`, `String`, `Number`, `Math`, `JSON`, `Map`, `Set`, `Date`.
+- The remaining built-ins on the realm's prototypes: `Object` property
+  descriptors (`defineProperty`, `create`, `freeze`, `assign`),
+  `Function.prototype.bind`, the rest of `Array` (`from`, `sort`, species),
+  `String`, `Number`, and `Math`; `Date` parsing and local time.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
-- The full error hierarchy, `instanceof` with any right-hand side,
-  `.constructor` and `.name`.
+- `AggregateError`.
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
   and surrogate pairs.
-- The test262 runner switches to the official harness.
 
 ### Phase 4 — Runtime independence and memory
 
@@ -1591,8 +1590,8 @@ the realm's prototypes.
 
 ### Phase 5 — Language completeness
 
-- Class expressions, private fields and methods, static blocks, object-literal
-  accessors, computed keys.
+- Private fields and methods, static blocks, computed class member names,
+  object spread, generator and async methods.
 - Async generators and `for await`, labeled statements, all remaining early
   errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
