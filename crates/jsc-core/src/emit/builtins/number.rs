@@ -33,8 +33,82 @@ const BAD_RADIX: [&str; 2] = [
 const TRUE_TEXT: &str = "true";
 const FALSE_TEXT: &str = "false";
 
+/// A `Number.prototype` digit-formatting method: its name (for the
+/// receiver `TypeError`), host op and the `RangeError` text with the digit
+/// range it accepts.
+#[derive(Clone, Copy)]
+pub(super) enum NumberFormat {
+    ToFixed,
+    ToExponential,
+    ToPrecision,
+}
+
+/// The receiver `TypeError` texts of the formatting methods.
+const NOT_NUMBER_FORMAT: [CalleeErrorText<'static>; 4] = [
+    [
+        "Number.prototype.toFixed requires that 'this' be a Number",
+        "TypeError: Number.prototype.toFixed requires that 'this' be a Number",
+    ],
+    [
+        "Number.prototype.toExponential requires that 'this' be a Number",
+        "TypeError: Number.prototype.toExponential requires that 'this' be a Number",
+    ],
+    [
+        "Number.prototype.toPrecision requires that 'this' be a Number",
+        "TypeError: Number.prototype.toPrecision requires that 'this' be a Number",
+    ],
+    [
+        "Number.prototype.toLocaleString requires that 'this' be a Number",
+        "TypeError: Number.prototype.toLocaleString requires that 'this' be a Number",
+    ],
+];
+
+/// The digit-range `RangeError` texts of the formatting methods.
+const BAD_DIGITS: [[&str; 2]; 3] = [
+    [
+        "toFixed() digits argument must be between 0 and 100",
+        "RangeError: toFixed() digits argument must be between 0 and 100",
+    ],
+    [
+        "toExponential() argument must be between 0 and 100",
+        "RangeError: toExponential() argument must be between 0 and 100",
+    ],
+    [
+        "toPrecision() argument must be between 1 and 100",
+        "RangeError: toPrecision() argument must be between 1 and 100",
+    ],
+];
+
+impl NumberFormat {
+    /// The index of this method in the text tables.
+    fn index(self) -> usize {
+        match self {
+            Self::ToFixed => 0,
+            Self::ToExponential => 1,
+            Self::ToPrecision => 2,
+        }
+    }
+
+    /// The host `__method` op.
+    fn op(self) -> i32 {
+        match self {
+            Self::ToFixed => abi::METHOD_OP_NUMBER_TO_FIXED,
+            Self::ToExponential => abi::METHOD_OP_NUMBER_TO_EXPONENTIAL,
+            Self::ToPrecision => abi::METHOD_OP_NUMBER_TO_PRECISION,
+        }
+    }
+
+    /// The smallest accepted digit count (the largest is 100).
+    fn min(self) -> f64 {
+        match self {
+            Self::ToPrecision => 1.0,
+            Self::ToFixed | Self::ToExponential => 0.0,
+        }
+    }
+}
+
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 12] = [
+pub(super) const STRINGS: [&str; 26] = [
     NOT_NUMBER_TO_STRING[0],
     NOT_NUMBER_TO_STRING[1],
     NOT_NUMBER_VALUE_OF[0],
@@ -47,6 +121,20 @@ pub(super) const STRINGS: [&str; 12] = [
     BAD_RADIX[1],
     TRUE_TEXT,
     FALSE_TEXT,
+    NOT_NUMBER_FORMAT[0][0],
+    NOT_NUMBER_FORMAT[0][1],
+    NOT_NUMBER_FORMAT[1][0],
+    NOT_NUMBER_FORMAT[1][1],
+    NOT_NUMBER_FORMAT[2][0],
+    NOT_NUMBER_FORMAT[2][1],
+    NOT_NUMBER_FORMAT[3][0],
+    NOT_NUMBER_FORMAT[3][1],
+    BAD_DIGITS[0][0],
+    BAD_DIGITS[0][1],
+    BAD_DIGITS[1][0],
+    BAD_DIGITS[1][1],
+    BAD_DIGITS[2][0],
+    BAD_DIGITS[2][1],
 ];
 
 /// Push `1` when the jsval in `local` is a boolean.
@@ -134,6 +222,118 @@ pub(super) fn emit_number_to_string(
         LocalGet(radix), I64ReinterpretF64, I64Const(UNDEFINED_BITS), Call(helpers.method),
         End,
     );
+}
+
+/// Return `ToString` of the number jsval in `x`.
+fn return_to_string(function: &mut Function, x: u32, helpers: Helpers<'_>) {
+    wasm!(function;
+        LocalGet(x), Call(helpers.to_str()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Return,
+    );
+}
+
+/// `Number.prototype.toLocaleString()`: `thisNumberValue(this)`, then
+/// `ToString` (no locale data: the `toString()` rendering).
+pub(super) fn emit_number_to_locale_string(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let x = frame.i64(0);
+    let text = NOT_NUMBER_FORMAT[3];
+    this_primitive(
+        function,
+        frame,
+        x,
+        abi::CLASS_NUMBER,
+        emit_is_number,
+        text,
+        strings,
+        helpers,
+    );
+    wasm!(function; LocalGet(x), Call(helpers.to_str()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
+}
+
+/// `Number.prototype.toFixed(f)` / `toExponential(f)` / `toPrecision(p)`:
+/// `thisNumberValue(this)`, the digit count `ToIntegerOrInfinity(arg)` (a
+/// `toPrecision` with `undefined` is `ToString(x)`), then in spec order the
+/// non-finite receiver's `ToString` and the digit-range `RangeError`
+/// (`toFixed` checks the range first); the finite digits render on the host,
+/// which gets `undefined` for a `toExponential` without digits.
+pub(super) fn emit_number_format(
+    format: NumberFormat,
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (x, arg) = (frame.i64(0), frame.i64(1));
+    let digits = frame.f64(0);
+    let text = NOT_NUMBER_FORMAT[format.index()];
+    this_primitive(
+        function,
+        frame,
+        x,
+        abi::CLASS_NUMBER,
+        emit_is_number,
+        text,
+        strings,
+        helpers,
+    );
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(arg));
+    if matches!(format, NumberFormat::ToPrecision) {
+        wasm!(function; LocalGet(arg), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
+        return_to_string(function, x, helpers);
+        wasm!(function; End);
+    }
+    // `ToIntegerOrInfinity`: `trunc`, with NaN as 0.
+    wasm!(function; LocalGet(arg), Call(helpers.to_number), LocalSet(frame.i64(2)));
+    return_if_pending(function);
+    wasm!(function;
+        LocalGet(frame.i64(2)), F64ReinterpretI64, F64Trunc, LocalTee(digits),
+        F64Const(Ieee64::from(0.0)),
+        LocalGet(digits), LocalGet(digits), F64Eq,
+        Select, LocalSet(digits),
+    );
+    let check_range = |function: &mut Function| {
+        wasm!(function;
+            LocalGet(digits), F64Const(Ieee64::from(format.min())), F64Ge,
+            LocalGet(digits), F64Const(Ieee64::from(100.0)), F64Le, I32And, I32Eqz,
+            If(BlockType::Empty),
+        );
+        let [message, stack] = BAD_DIGITS[format.index()];
+        let error = IrNode::error_object(
+            ErrorKind::RangeError,
+            Some(IrNode::Str(message.to_owned())),
+            IrNode::Str(stack.to_owned()),
+        );
+        emit_throw_error(&error, function, frame.scratch(), strings, helpers);
+        wasm!(function; End);
+    };
+    if matches!(format, NumberFormat::ToFixed) {
+        check_range(function);
+    }
+    // A non-finite receiver is its `ToString`.
+    wasm!(function;
+        LocalGet(x), F64ReinterpretI64, LocalGet(x), F64ReinterpretI64, F64Sub,
+        F64Const(Ieee64::from(0.0)), F64Eq, I32Eqz, If(BlockType::Empty),
+    );
+    return_to_string(function, x, helpers);
+    wasm!(function; End);
+    if !matches!(format, NumberFormat::ToFixed) {
+        check_range(function);
+    }
+    wasm!(function; LocalGet(x), I32Const(format.op()));
+    if matches!(format, NumberFormat::ToExponential) {
+        wasm!(function;
+            LocalGet(digits), I64ReinterpretF64, I64Const(UNDEFINED_BITS),
+            LocalGet(arg), I64Const(UNDEFINED_BITS), I64Ne, Select,
+        );
+    } else {
+        wasm!(function; LocalGet(digits), I64ReinterpretF64);
+    }
+    wasm!(function; I64Const(UNDEFINED_BITS), Call(helpers.method));
 }
 
 /// `Boolean.prototype.toString()` / `valueOf()`: `thisBooleanValue(this)`,

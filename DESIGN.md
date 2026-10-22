@@ -644,7 +644,7 @@ Every module imports exactly seven functions from the `"env"` namespace
 |---|---|---|---|
 | 0 | `print` | `(bits: i64, flag: i32) -> ()` | `console.log` |
 | 1 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
-| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search/slice, string methods, `Number.prototype.toString` |
+| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search/slice, string methods, `Number.prototype` digit formatting, host `Math` functions |
 | 3 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn |
 | 4 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
 | 5 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
@@ -668,7 +668,15 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   `9` `trimEnd`, `10` `repeat`, `11` `startsWith`, `12` `endsWith`,
   `13` `padStart`, `14` `padEnd`, `15` `substring`, `16` `split`,
   `17` `Number.prototype.toString(radix)` (a number receiver and an integral
-  radix in `2..=36`). The host dispatches on the receiver's type byte for the
+  radix in `2..=36`), `40` `toFixed`, `41` `toExponential`, `42`
+  `toPrecision` (a finite number receiver and an integral digit count already
+  range-checked in the guest; `undefined` for a `toExponential` without
+  digits; rendered from the exact decimal expansion, ties away from zero),
+  `43` a `Math` function (`arg1` the `MATH_FN_*` code: `cbrt`, `log`,
+  `log2`, `log10`, `log1p`, `exp`, `expm1`, the trigonometric and
+  hyperbolic functions and their inverses, `atan2` with `x` in `arg0`, and
+  `random`; the Rust host uses the platform libm and a `xorshift64*`
+  generator, the JS shim its own `Math`). The host dispatches on the receiver's type byte for the
   names shared by arrays and strings. The calling string builtin coerces the
   receiver (`ToString`) and its arguments (`ToString` or `ToNumber`, keeping
   `undefined` where it selects the host default) in the guest first, so user
@@ -1138,12 +1146,18 @@ those of `switch` and loops are not tracked.
 ### 7.7 Errors
 
 - `Error`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`,
-  `EvalError`, `URIError` are `SELF_ALLOC` constructors (callable with or
-  without `new`). An error object is a `CLASS_ERROR` object whose `proto` is
+  `EvalError`, `URIError`, `AggregateError` are `SELF_ALLOC` constructors
+  (callable with or without `new`). An error object is a `CLASS_ERROR` object whose `proto` is
   `new.target.prototype` (one of the static `%…Error.prototype%` blocks unless
   subclassed) with own non-enumerable `message` (only when one was given) and
   `stack` (`"Name: message"`, a single line, no frames); `name` is inherited.
   `Error.prototype.toString` formats `Name: message`.
+- `AggregateError(errors, message, options)` takes the message second, adds
+  an own non-enumerable `cause` when `options` is an object with a `cause`
+  property, then an own non-enumerable `errors` array of the values iterating
+  `errors` yields (`TypeError` when it is not iterable). It always runs its
+  constructor body; the other kinds lower `Error(m)` / `new Error(m)`
+  syntactically and ignore `options` (no `cause`).
 - `throw` accepts any value.
 - **Engine-raised errors** are real error objects linked to the same static
   prototypes, catchable with `try`/`catch` and recognised by `instanceof`:
@@ -1200,14 +1214,14 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 
 | area | supported |
 |---|---|
-| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
+| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` |
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply`; `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`; `push` / `pop` (variadic, generic over array-likes), `map`, `filter`, `forEach`, `reduce` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `indexOf`, `includes`, `join`, `slice`, `toString` |
 | `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
-| `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.prototype.toString(radix)`, `valueOf`; `Boolean.prototype.toString`, `valueOf` |
-| `Math` | `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `min`, `max` (variadic), `pow`; `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
+| `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
+| `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`; Set `add`/`has`/`delete`/`clear`/`forEach`/`size` |
 | `Promise` | §6.7, §7.8 |
@@ -1463,9 +1477,15 @@ Each item below is current behaviour of this tree.
 - The builtin library is exactly §7.9: no property-descriptor or prototype
   reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
   `assign`), no `Function.prototype.bind`, no `Array.from`, `sort`, `find`,
-  `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
+  `at`, `flat`, …, no `charCodeAt`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
-- `parseInt` and `parseFloat` exist only as direct calls, not as global values.
+- A direct `parseInt(..)` / `parseFloat(..)` call always runs the builtin
+  conversion, even after the global binding is reassigned.
+- The `Number` and `Math` value properties are non-writable and
+  non-configurable as data properties, but a failed write to them is silently
+  ignored rather than throwing in strict code.
+- The `Math` transcendental functions follow the host libm (Rust) or the JS
+  engine (shim), which may differ in the last ulp.
 
 **Object model**
 
@@ -1576,7 +1596,6 @@ installed on the realm's prototypes, and phase 3 extends that set.
   `String`, `Number`, and `Math`; `Date` parsing and local time.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
-- `AggregateError`.
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
   and surrogate pairs.
 

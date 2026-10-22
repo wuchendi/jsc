@@ -25,12 +25,37 @@ import {
   HEAP_PTR_OOM,
   HOLE,
   INVOKE_EXPORT_NAME,
+  MATH_FN_ACOS,
+  MATH_FN_ACOSH,
+  MATH_FN_ASIN,
+  MATH_FN_ASINH,
+  MATH_FN_ATAN,
+  MATH_FN_ATAN2,
+  MATH_FN_ATANH,
+  MATH_FN_CBRT,
+  MATH_FN_COS,
+  MATH_FN_COSH,
+  MATH_FN_EXP,
+  MATH_FN_EXPM1,
+  MATH_FN_LOG,
+  MATH_FN_LOG10,
+  MATH_FN_LOG1P,
+  MATH_FN_LOG2,
+  MATH_FN_RANDOM,
+  MATH_FN_SIN,
+  MATH_FN_SINH,
+  MATH_FN_TAN,
+  MATH_FN_TANH,
   MEMORY_EXPORT_NAME,
   MEMORY_MAX_PAGES,
   METHOD_OP_CHAR_AT,
   METHOD_OP_ENDS_WITH,
   METHOD_OP_INCLUDES,
   METHOD_OP_INDEX_OF,
+  METHOD_OP_MATH,
+  METHOD_OP_NUMBER_TO_EXPONENTIAL,
+  METHOD_OP_NUMBER_TO_FIXED,
+  METHOD_OP_NUMBER_TO_PRECISION,
   METHOD_OP_NUMBER_TO_STRING,
   METHOD_OP_PAD_END,
   METHOD_OP_PAD_START,
@@ -392,6 +417,56 @@ export function createShim(): Shim {
    * memory, read the receiver's TYPE BYTE, and perform the array/string method,
    * returning the result jsval bits (or `null` to yield `undefined`).
    */
+  /** The host `Math` function `code` (a `MATH_FN_*`) of `x` (and `y` for `atan2`). */
+  function mathFn(code: number, x: number, y: number): number {
+    switch (code) {
+      case MATH_FN_CBRT:
+        return Math.cbrt(x)
+      case MATH_FN_LOG:
+        return Math.log(x)
+      case MATH_FN_LOG2:
+        return Math.log2(x)
+      case MATH_FN_LOG10:
+        return Math.log10(x)
+      case MATH_FN_LOG1P:
+        return Math.log1p(x)
+      case MATH_FN_EXP:
+        return Math.exp(x)
+      case MATH_FN_EXPM1:
+        return Math.expm1(x)
+      case MATH_FN_SIN:
+        return Math.sin(x)
+      case MATH_FN_COS:
+        return Math.cos(x)
+      case MATH_FN_TAN:
+        return Math.tan(x)
+      case MATH_FN_ASIN:
+        return Math.asin(x)
+      case MATH_FN_ACOS:
+        return Math.acos(x)
+      case MATH_FN_ATAN:
+        return Math.atan(x)
+      case MATH_FN_ATAN2:
+        return Math.atan2(x, y)
+      case MATH_FN_SINH:
+        return Math.sinh(x)
+      case MATH_FN_COSH:
+        return Math.cosh(x)
+      case MATH_FN_TANH:
+        return Math.tanh(x)
+      case MATH_FN_ASINH:
+        return Math.asinh(x)
+      case MATH_FN_ACOSH:
+        return Math.acosh(x)
+      case MATH_FN_ATANH:
+        return Math.atanh(x)
+      case MATH_FN_RANDOM:
+        return Math.random()
+      default:
+        return Number.NaN
+    }
+  }
+
   function methodDispatch(
     recv: bigint,
     op: number,
@@ -500,6 +575,31 @@ export function createShim(): Shim {
         const radix = Math.trunc(valueToNumber(decode(arg0, mem)))
         const base = allocString(value.value.toString(radix))
         return base === null ? null : HEAP | base
+      }
+      case METHOD_OP_NUMBER_TO_FIXED:
+      case METHOD_OP_NUMBER_TO_EXPONENTIAL:
+      case METHOD_OP_NUMBER_TO_PRECISION: {
+        const value = decode(recv, mem)
+        if (value.kind !== 'number') return null
+        const digits = decode(arg0, mem)
+        const d = digits.kind === 'number' ? Math.trunc(digits.value) : undefined
+        if (d === undefined && op !== METHOD_OP_NUMBER_TO_EXPONENTIAL) return null
+        const text =
+          op === METHOD_OP_NUMBER_TO_FIXED
+            ? value.value.toFixed(d)
+            : op === METHOD_OP_NUMBER_TO_PRECISION
+              ? value.value.toPrecision(d)
+              : value.value.toExponential(d)
+        const base = allocString(text)
+        return base === null ? null : HEAP | base
+      }
+      case METHOD_OP_MATH: {
+        const number = (bits: bigint): number => {
+          const value = decode(bits, mem)
+          return value.kind === 'number' ? value.value : Number.NaN
+        }
+        const n = mathFn(Number(arg1), number(recv), number(arg0))
+        return Number.isNaN(n) ? QNAN : f64ToBits(n)
       }
       default:
         return null

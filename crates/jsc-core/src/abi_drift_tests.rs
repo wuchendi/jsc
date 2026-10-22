@@ -32,6 +32,13 @@ use super::{
     OBJ_PREFIX_SIZE, OBJ_PROTO_OFFSET, PROMISE_BLOCK_SIZE, PROMISE_STATE_OFFSET,
     PROMISE_VALUE_OFFSET, TYPE_GENERATOR, TYPE_MAP, TYPE_SET,
 };
+use super::{
+    MATH_FN_ACOS, MATH_FN_ACOSH, MATH_FN_ASIN, MATH_FN_ASINH, MATH_FN_ATAN, MATH_FN_ATAN2,
+    MATH_FN_ATANH, MATH_FN_CBRT, MATH_FN_COS, MATH_FN_COSH, MATH_FN_EXP, MATH_FN_EXPM1,
+    MATH_FN_LOG, MATH_FN_LOG1P, MATH_FN_LOG2, MATH_FN_LOG10, MATH_FN_RANDOM, MATH_FN_SIN,
+    MATH_FN_SINH, MATH_FN_TAN, MATH_FN_TANH, METHOD_OP_MATH, METHOD_OP_NUMBER_TO_EXPONENTIAL,
+    METHOD_OP_NUMBER_TO_FIXED, METHOD_OP_NUMBER_TO_PRECISION,
+};
 
 /// A parsed `export const` value.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +159,37 @@ fn expected() -> Vec<(&'static str, Val)> {
             "METHOD_OP_NUMBER_TO_STRING",
             int(METHOD_OP_NUMBER_TO_STRING),
         ),
+        ("METHOD_OP_NUMBER_TO_FIXED", int(METHOD_OP_NUMBER_TO_FIXED)),
+        (
+            "METHOD_OP_NUMBER_TO_EXPONENTIAL",
+            int(METHOD_OP_NUMBER_TO_EXPONENTIAL),
+        ),
+        (
+            "METHOD_OP_NUMBER_TO_PRECISION",
+            int(METHOD_OP_NUMBER_TO_PRECISION),
+        ),
+        ("METHOD_OP_MATH", int(METHOD_OP_MATH)),
+        ("MATH_FN_CBRT", int(MATH_FN_CBRT)),
+        ("MATH_FN_LOG", int(MATH_FN_LOG)),
+        ("MATH_FN_LOG2", int(MATH_FN_LOG2)),
+        ("MATH_FN_LOG10", int(MATH_FN_LOG10)),
+        ("MATH_FN_LOG1P", int(MATH_FN_LOG1P)),
+        ("MATH_FN_EXP", int(MATH_FN_EXP)),
+        ("MATH_FN_EXPM1", int(MATH_FN_EXPM1)),
+        ("MATH_FN_SIN", int(MATH_FN_SIN)),
+        ("MATH_FN_COS", int(MATH_FN_COS)),
+        ("MATH_FN_TAN", int(MATH_FN_TAN)),
+        ("MATH_FN_ASIN", int(MATH_FN_ASIN)),
+        ("MATH_FN_ACOS", int(MATH_FN_ACOS)),
+        ("MATH_FN_ATAN", int(MATH_FN_ATAN)),
+        ("MATH_FN_ATAN2", int(MATH_FN_ATAN2)),
+        ("MATH_FN_SINH", int(MATH_FN_SINH)),
+        ("MATH_FN_COSH", int(MATH_FN_COSH)),
+        ("MATH_FN_TANH", int(MATH_FN_TANH)),
+        ("MATH_FN_ASINH", int(MATH_FN_ASINH)),
+        ("MATH_FN_ACOSH", int(MATH_FN_ACOSH)),
+        ("MATH_FN_ATANH", int(MATH_FN_ATANH)),
+        ("MATH_FN_RANDOM", int(MATH_FN_RANDOM)),
         ("PROMISE_OP_RESOLVE", int(PROMISE_OP_RESOLVE)),
         ("PROMISE_OP_REJECT", int(PROMISE_OP_REJECT)),
         ("PROMISE_OP_AWAIT", int(PROMISE_OP_AWAIT)),

@@ -30,6 +30,10 @@ const METHOD_OP_PAD_END: i32 = abi::METHOD_OP_PAD_END;
 const METHOD_OP_SUBSTRING: i32 = abi::METHOD_OP_SUBSTRING;
 const METHOD_OP_SPLIT: i32 = abi::METHOD_OP_SPLIT;
 const METHOD_OP_NUMBER_TO_STRING: i32 = abi::METHOD_OP_NUMBER_TO_STRING;
+const METHOD_OP_NUMBER_TO_FIXED: i32 = abi::METHOD_OP_NUMBER_TO_FIXED;
+const METHOD_OP_NUMBER_TO_EXPONENTIAL: i32 = abi::METHOD_OP_NUMBER_TO_EXPONENTIAL;
+const METHOD_OP_NUMBER_TO_PRECISION: i32 = abi::METHOD_OP_NUMBER_TO_PRECISION;
+const METHOD_OP_MATH: i32 = abi::METHOD_OP_MATH;
 
 /// The NaN-boxed `true`/`false` jsval bits; see [`abi::TRUE`] / [`abi::FALSE`].
 const TRUE_BITS: u64 = abi::TRUE;
@@ -167,6 +171,32 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             let radix = value_to_number(&decode(arg0.cast_unsigned(), &mem));
             let text = number_to_radix_string(x, radix_digits(radix));
             alloc_string(caller, &text).map(|base| HEAP | base)
+        }
+        METHOD_OP_NUMBER_TO_FIXED
+        | METHOD_OP_NUMBER_TO_EXPONENTIAL
+        | METHOD_OP_NUMBER_TO_PRECISION => {
+            let Value::Number(x) = decode(recv, &mem) else {
+                return None;
+            };
+            let digits = match decode(arg0.cast_unsigned(), &mem) {
+                Value::Number(d) => Some(trunc_to_int(d)),
+                _ => None,
+            };
+            let text = match (op, digits) {
+                (METHOD_OP_NUMBER_TO_FIXED, Some(f)) => number_to_fixed(x, f),
+                (METHOD_OP_NUMBER_TO_PRECISION, Some(p)) => number_to_precision(x, p),
+                (METHOD_OP_NUMBER_TO_EXPONENTIAL, f) => number_to_exponential(x, f),
+                _ => return None,
+            };
+            alloc_string(caller, &text).map(|base| HEAP | base)
+        }
+        METHOD_OP_MATH => {
+            let number = |bits: u64| match decode(bits, &mem) {
+                Value::Number(n) => n,
+                _ => f64::NAN,
+            };
+            let n = math_fn(arg1, number(recv), number(arg0.cast_unsigned()));
+            Some(if n.is_nan() { QNAN } else { n.to_bits() })
         }
         METHOD_OP_SLICE => match type_byte {
             Some(TYPE_ARRAY) => array_slice(caller, &mem, ptr?, arg0, arg1),
@@ -416,6 +446,202 @@ pub(super) fn number_to_radix_string(x: f64, radix: u32) -> String {
         out.extend(fraction_digits.into_iter().map(digit));
     }
     out
+}
+
+/// The host `Math` function `code` (an [`abi`] `MATH_FN_*`) of `x` (and `y`
+/// for `atan2`): the platform libm, which is correctly rounded or within an ulp.
+fn math_fn(code: i64, x: f64, y: f64) -> f64 {
+    match code {
+        abi::MATH_FN_CBRT => x.cbrt(),
+        abi::MATH_FN_LOG => x.ln(),
+        abi::MATH_FN_LOG2 => x.log2(),
+        abi::MATH_FN_LOG10 => x.log10(),
+        abi::MATH_FN_LOG1P => x.ln_1p(),
+        abi::MATH_FN_EXP => x.exp(),
+        abi::MATH_FN_EXPM1 => x.exp_m1(),
+        abi::MATH_FN_SIN => x.sin(),
+        abi::MATH_FN_COS => x.cos(),
+        abi::MATH_FN_TAN => x.tan(),
+        abi::MATH_FN_ASIN => x.asin(),
+        abi::MATH_FN_ACOS => x.acos(),
+        abi::MATH_FN_ATAN => x.atan(),
+        abi::MATH_FN_ATAN2 => x.atan2(y),
+        abi::MATH_FN_SINH => x.sinh(),
+        abi::MATH_FN_COSH => x.cosh(),
+        abi::MATH_FN_TANH => x.tanh(),
+        abi::MATH_FN_ASINH => x.asinh(),
+        abi::MATH_FN_ACOSH => x.acosh(),
+        abi::MATH_FN_ATANH => x.atanh(),
+        abi::MATH_FN_RANDOM => random(),
+        _ => f64::NAN,
+    }
+}
+
+/// The `xorshift64*` state of [`random`]; `0` until first seeded.
+static RANDOM_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `Math.random()`: a `xorshift64*` step over a process-wide state seeded from
+/// the std per-process hash keys, scaled to 53 bits in `[0, 1)`.
+fn random() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::Ordering;
+    let mut x = RANDOM_STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0x9E37_79B9_7F4A_7C15);
+        x = hasher.finish() | 1;
+    }
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    RANDOM_STATE.store(x, Ordering::Relaxed);
+    let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+    // A 53-bit integer converts to `f64` exactly.
+    #[allow(clippy::cast_precision_loss)]
+    let unit = bits as f64;
+    unit / 9_007_199_254_740_992.0
+}
+
+/// The exact decimal digits of a finite, nonzero `|x|`: `(digits, point)` with
+/// `|x| = 0.d1d2.. * 10^point`, no leading or trailing zero digits. Every
+/// double has a finite decimal expansion of at most 1074 fractional digits,
+/// which `{:.1100}` prints exactly.
+fn exact_decimal(x: f64) -> (Vec<u8>, i64) {
+    let text = format!("{:.1100}", x.abs());
+    let (int, frac) = text.split_once('.').unwrap_or((&text, ""));
+    let int = int.trim_start_matches('0');
+    let (mut digits, point): (Vec<u8>, i64) = if int.is_empty() {
+        let lead = frac.bytes().take_while(|&b| b == b'0').count();
+        let digits = frac.bytes().skip(lead).map(|b| b - b'0').collect();
+        (digits, -i64::try_from(lead).unwrap_or(0))
+    } else {
+        let digits = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
+        (digits, i64::try_from(int.len()).unwrap_or(0))
+    };
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    (digits, point)
+}
+
+/// Round `(digits, point)` to `n` significant digits, ties away from zero (the
+/// spec's "pick the larger `n`"): `n` digits (`0` when `n <= 0` rounds to
+/// zero) and the possibly carried point.
+fn round_digits(digits: &[u8], point: i64, n: i64) -> (Vec<u8>, i64) {
+    let Ok(keep) = usize::try_from(n) else {
+        return (Vec::new(), point);
+    };
+    let mut out: Vec<u8> = (0..keep).map(|i| digits.get(i).copied().unwrap_or(0)).collect();
+    if digits.get(keep).is_some_and(|&d| d >= 5) {
+        let mut i = keep;
+        loop {
+            if i == 0 {
+                out.insert(0, 1);
+                out.truncate(keep.max(1));
+                return (out, point + 1);
+            }
+            i -= 1;
+            if out[i] == 9 {
+                out[i] = 0;
+            } else {
+                out[i] += 1;
+                break;
+            }
+        }
+    }
+    (out, point)
+}
+
+/// Decimal digit values as text.
+fn digit_text(digits: &[u8]) -> String {
+    digits.iter().map(|d| char::from(b'0' + d)).collect()
+}
+
+/// `Number.prototype.toFixed(f)` of a finite `x` (`f` in `0..=100`).
+pub(super) fn number_to_fixed(x: f64, f: i64) -> String {
+    if x.abs() >= 1e21 {
+        return super::value::format_number(x);
+    }
+    let sign = if x < 0.0 { "-" } else { "" };
+    let f_len = usize::try_from(f).unwrap_or(0);
+    // `n = round(|x| * 10^f)` as a digit string.
+    let mut n = if x == 0.0 {
+        "0".to_owned()
+    } else {
+        let (digits, point) = exact_decimal(x);
+        let (rounded, point) = round_digits(&digits, point, point + f);
+        let width = usize::try_from(point + f).unwrap_or(0);
+        let mut text = digit_text(&rounded);
+        while text.len() < width {
+            text.push('0');
+        }
+        if text.is_empty() { "0".to_owned() } else { text }
+    };
+    if f_len == 0 {
+        return format!("{sign}{n}");
+    }
+    if n.len() <= f_len {
+        n = format!("{}{n}", "0".repeat(f_len + 1 - n.len()));
+    }
+    let (int, frac) = n.split_at(n.len() - f_len);
+    format!("{sign}{int}.{frac}")
+}
+
+/// `d.ddd` + `e±k` of the significant `digits` with exponent `e`.
+fn exponential_text(sign: &str, digits: &str, e: i64) -> String {
+    let (head, tail) = digits.split_at(1.min(digits.len()));
+    let dot = if tail.is_empty() { "" } else { "." };
+    let e_sign = if e < 0 { "-" } else { "+" };
+    format!("{sign}{head}{dot}{tail}e{e_sign}{}", e.abs())
+}
+
+/// `Number.prototype.toExponential(f)` of a finite `x`: `f + 1` significant
+/// digits (`f` in `0..=100`), or the shortest round-tripping digits for `None`.
+pub(super) fn number_to_exponential(x: f64, f: Option<i64>) -> String {
+    let sign = if x < 0.0 { "-" } else { "" };
+    if x == 0.0 {
+        let zeros = "0".repeat(usize::try_from(f.unwrap_or(0)).unwrap_or(0));
+        return exponential_text("", &format!("0{zeros}"), 0);
+    }
+    let (digits, e) = match f {
+        Some(f) => {
+            let (digits, point) = exact_decimal(x);
+            let (rounded, point) = round_digits(&digits, point, f + 1);
+            (digit_text(&rounded), point - 1)
+        }
+        None => {
+            let sci = format!("{:e}", x.abs());
+            let (mantissa, e) = sci.split_once('e').unwrap_or((&sci, "0"));
+            let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+            (digits, e.parse().unwrap_or(0))
+        }
+    };
+    exponential_text(sign, &digits, e)
+}
+
+/// `Number.prototype.toPrecision(p)` of a finite `x` (`p` in `1..=100`).
+pub(super) fn number_to_precision(x: f64, p: i64) -> String {
+    let sign = if x < 0.0 { "-" } else { "" };
+    let (digits, e) = if x == 0.0 {
+        (vec![0; usize::try_from(p).unwrap_or(1)], 0)
+    } else {
+        let (digits, point) = exact_decimal(x);
+        let (rounded, point) = round_digits(&digits, point, p);
+        (rounded, point - 1)
+    };
+    let text = digit_text(&digits);
+    if e < -6 || e >= p {
+        return exponential_text(sign, &text, e);
+    }
+    if e == p - 1 {
+        return format!("{sign}{text}");
+    }
+    if e >= 0 {
+        let (int, frac) = text.split_at(usize::try_from(e + 1).unwrap_or(0));
+        return format!("{sign}{int}.{frac}");
+    }
+    let zeros = "0".repeat(usize::try_from(-(e + 1)).unwrap_or(0));
+    format!("{sign}0.{zeros}{text}")
 }
 
 /// Resolve one JS slice endpoint against a sequence `len`: `undefined` uses
