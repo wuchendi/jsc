@@ -194,6 +194,7 @@ fn emit_to_int32(function: &mut Function, local: u32) {
 /// the correct infinity; `Hypot` folds its scaled sum of squares the same way
 /// ([`emit_math_spread`]). `Pow` delegates to [`emit_pow`]; the binary
 /// `Atan2` / `Imul` evaluate both arguments before converting either.
+#[allow(clippy::too_many_lines)] // one flat dispatch over the methods
 pub(super) fn emit_math_call(
     op: MathOp,
     args: &[IrNode],

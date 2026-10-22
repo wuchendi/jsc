@@ -38,9 +38,9 @@ const FALSE_TEXT: &str = "false";
 /// range it accepts.
 #[derive(Clone, Copy)]
 pub(super) enum NumberFormat {
-    ToFixed,
-    ToExponential,
-    ToPrecision,
+    Fixed,
+    Exponential,
+    Precision,
 }
 
 /// The receiver `TypeError` texts of the formatting methods.
@@ -83,26 +83,26 @@ impl NumberFormat {
     /// The index of this method in the text tables.
     fn index(self) -> usize {
         match self {
-            Self::ToFixed => 0,
-            Self::ToExponential => 1,
-            Self::ToPrecision => 2,
+            Self::Fixed => 0,
+            Self::Exponential => 1,
+            Self::Precision => 2,
         }
     }
 
     /// The host `__method` op.
     fn op(self) -> i32 {
         match self {
-            Self::ToFixed => abi::METHOD_OP_NUMBER_TO_FIXED,
-            Self::ToExponential => abi::METHOD_OP_NUMBER_TO_EXPONENTIAL,
-            Self::ToPrecision => abi::METHOD_OP_NUMBER_TO_PRECISION,
+            Self::Fixed => abi::METHOD_OP_NUMBER_TO_FIXED,
+            Self::Exponential => abi::METHOD_OP_NUMBER_TO_EXPONENTIAL,
+            Self::Precision => abi::METHOD_OP_NUMBER_TO_PRECISION,
         }
     }
 
     /// The smallest accepted digit count (the largest is 100).
     fn min(self) -> f64 {
         match self {
-            Self::ToPrecision => 1.0,
-            Self::ToFixed | Self::ToExponential => 0.0,
+            Self::Precision => 1.0,
+            Self::Fixed | Self::Exponential => 0.0,
         }
     }
 }
@@ -282,7 +282,7 @@ pub(super) fn emit_number_format(
     );
     frame.arg(function, 0);
     wasm!(function; LocalSet(arg));
-    if matches!(format, NumberFormat::ToPrecision) {
+    if matches!(format, NumberFormat::Precision) {
         wasm!(function; LocalGet(arg), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
         return_to_string(function, x, helpers);
         wasm!(function; End);
@@ -311,7 +311,7 @@ pub(super) fn emit_number_format(
         emit_throw_error(&error, function, frame.scratch(), strings, helpers);
         wasm!(function; End);
     };
-    if matches!(format, NumberFormat::ToFixed) {
+    if matches!(format, NumberFormat::Fixed) {
         check_range(function);
     }
     // A non-finite receiver is its `ToString`.
@@ -321,11 +321,11 @@ pub(super) fn emit_number_format(
     );
     return_to_string(function, x, helpers);
     wasm!(function; End);
-    if !matches!(format, NumberFormat::ToFixed) {
+    if !matches!(format, NumberFormat::Fixed) {
         check_range(function);
     }
     wasm!(function; LocalGet(x), I32Const(format.op()));
-    if matches!(format, NumberFormat::ToExponential) {
+    if matches!(format, NumberFormat::Exponential) {
         wasm!(function;
             LocalGet(digits), I64ReinterpretF64, I64Const(UNDEFINED_BITS),
             LocalGet(arg), I64Const(UNDEFINED_BITS), I64Ne, Select,

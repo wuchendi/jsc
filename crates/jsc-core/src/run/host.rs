@@ -609,18 +609,15 @@ pub(super) fn number_to_exponential(x: f64, f: Option<i64>) -> String {
         let zeros = "0".repeat(usize::try_from(f.unwrap_or(0)).unwrap_or(0));
         return exponential_text("", &format!("0{zeros}"), 0);
     }
-    let (digits, e) = match f {
-        Some(f) => {
-            let (digits, point) = exact_decimal(x);
-            let (rounded, point) = round_digits(&digits, point, f + 1);
-            (digit_text(&rounded), point - 1)
-        }
-        None => {
-            let sci = format!("{:e}", x.abs());
-            let (mantissa, e) = sci.split_once('e').unwrap_or((&sci, "0"));
-            let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-            (digits, e.parse().unwrap_or(0))
-        }
+    let (digits, e) = if let Some(f) = f {
+        let (digits, point) = exact_decimal(x);
+        let (rounded, point) = round_digits(&digits, point, f + 1);
+        (digit_text(&rounded), point - 1)
+    } else {
+        let sci = format!("{:e}", x.abs());
+        let (mantissa, e) = sci.split_once('e').unwrap_or((&sci, "0"));
+        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+        (digits, e.parse().unwrap_or(0))
     };
     exponential_text(sign, &digits, e)
 }

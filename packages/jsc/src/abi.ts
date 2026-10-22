@@ -136,6 +136,8 @@ export const FUNC_FLAG_CONSTRUCTOR = 8
 export const FUNC_FLAG_CLASS_CTOR = 16
 /** {@link TYPE_FUNCTION} `flags` bit: the constructor allocates its own `this` (a derived class). */
 export const FUNC_FLAG_SELF_ALLOC = 32
+/** {@link TYPE_FUNCTION} `flags` bit: a bound function (own `length`/`name`, `env` = `[target, boundThis, ...args]`). */
+export const FUNC_FLAG_BOUND = 64
 /** Address of the `u32` base of the `__fn_info` table (`[name key:u32][length:u32]` per function). */
 export const FN_INFO_ADDR = 4
 /** Byte size of one `__fn_info` entry. */
