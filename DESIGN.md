@@ -570,7 +570,8 @@ in the data segment (§4.2), so it has one identity for the whole run.
 ### 5.6 `__alloc` and memory growth
 
 `__alloc(size: i32) -> i32` is a bump allocator over the `$__heap_ptr` global,
-which starts at the first free offset after the static region:
+which starts at the first free offset after the static region (the module
+declares enough initial pages to hold that region):
 
 1. Round `size` up to 8; `old = __heap_ptr`; `end = u64(old) + u64(size)`
    (computed in `i64`, so it cannot wrap).
@@ -1481,9 +1482,6 @@ Each item below is current behaviour of this tree.
   `Promise.all` / `race` / `allSettled` / `any`.
 - A direct `parseInt(..)` / `parseFloat(..)` call always runs the builtin
   conversion, even after the global binding is reassigned.
-- The `Number` and `Math` value properties are non-writable and
-  non-configurable as data properties, but a failed write to them is silently
-  ignored rather than throwing in strict code.
 - The `Math` transcendental functions follow the host libm (Rust) or the JS
   engine (shim), which may differ in the last ulp.
 

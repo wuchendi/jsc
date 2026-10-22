@@ -730,7 +730,12 @@ impl Builtin {
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(
-                MathOp::Min | MathOp::Max | MathOp::Pow | MathOp::Hypot | MathOp::Atan2 | MathOp::Imul,
+                MathOp::Min
+                | MathOp::Max
+                | MathOp::Pow
+                | MathOp::Hypot
+                | MathOp::Atan2
+                | MathOp::Imul,
             )
             | Self::Ctor(BuiltinCtor::Error(ErrorKind::AggregateError))
             | Self::ParseInt
@@ -1028,7 +1033,11 @@ const GLOBALS: [(&str, u32, Value); 29] = [
     ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
-    ("parseFloat", METHOD_ATTRS, Value::Method(Builtin::ParseFloat)),
+    (
+        "parseFloat",
+        METHOD_ATTRS,
+        Value::Method(Builtin::ParseFloat),
+    ),
     ("parseInt", METHOD_ATTRS, Value::Method(Builtin::ParseInt)),
 ];
 

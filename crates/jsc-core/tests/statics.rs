@@ -513,7 +513,10 @@ fn number_parse_functions_are_the_globals() {
         ("Number.parseFloat('3.5abc')", "3.5"),
         ("Number.parseInt('ff', 16)", "255"),
         ("const p = parseInt; p('12px')", "12"),
-        ("Number.parseFloat({ toString() { return '-1e3' } })", "-1000"),
+        (
+            "Number.parseFloat({ toString() { return '-1e3' } })",
+            "-1000",
+        ),
         ("Number.parseInt(' 0x1A ')", "26"),
     ] {
         assert_eval(src, expected);
@@ -535,7 +538,10 @@ fn number_constants() {
             "try { Number.MAX_VALUE = 1 } catch (e) {} Number.MAX_VALUE",
             "1.7976931348623157e+308",
         ),
-        ("try { delete Number.EPSILON } catch (e) {} Number.EPSILON > 0", "true"),
+        (
+            "try { delete Number.EPSILON } catch (e) {} Number.EPSILON > 0",
+            "true",
+        ),
         ("Object.keys(Number).length", "0"),
         ("try { Math.PI = 3 } catch (e) {} Math.PI === 3", "false"),
     ] {

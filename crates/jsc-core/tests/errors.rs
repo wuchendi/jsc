@@ -1308,32 +1308,62 @@ fn error_constructors_evaluate_surplus_arguments() {
 #[test]
 fn aggregate_error_shape() {
     for (src, expected) in [
-        ("const e = new AggregateError([1, 2], 'm'); e.errors.length + e.message", "2m"),
+        (
+            "const e = new AggregateError([1, 2], 'm'); e.errors.length + e.message",
+            "2m",
+        ),
         ("new AggregateError([]) instanceof AggregateError", "true"),
         ("new AggregateError([]) instanceof Error", "true"),
         ("AggregateError([1]).errors[0]", "1"),
         ("AggregateError([]) instanceof AggregateError", "true"),
         ("new AggregateError([]).name", "AggregateError"),
-        ("String(new AggregateError([], 'boom'))", "AggregateError: boom"),
+        (
+            "String(new AggregateError([], 'boom'))",
+            "AggregateError: boom",
+        ),
         ("AggregateError.prototype instanceof Error", "true"),
-        ("AggregateError.prototype.constructor === AggregateError", "true"),
+        (
+            "AggregateError.prototype.constructor === AggregateError",
+            "true",
+        ),
         ("AggregateError.prototype.name", "AggregateError"),
         ("AggregateError.prototype.message", ""),
         ("AggregateError.length", "2"),
         ("AggregateError.name", "AggregateError"),
         ("new AggregateError([]).hasOwnProperty('message')", "false"),
-        ("new AggregateError([], undefined).hasOwnProperty('message')", "false"),
+        (
+            "new AggregateError([], undefined).hasOwnProperty('message')",
+            "false",
+        ),
         ("Object.keys(new AggregateError([1], 'm')).length", "0"),
         ("const a = [1]; new AggregateError(a).errors !== a", "true"),
         ("new AggregateError('ab').errors.join()", "a,b"),
         ("new AggregateError(new Set([3, 4])).errors.join()", "3,4"),
-        ("new AggregateError(new Map([[1, 2]])).errors[0].join()", "1,2"),
-        ("function* g() { yield 'x'; yield 'y' } new AggregateError(g()).errors.join()", "x,y"),
+        (
+            "new AggregateError(new Map([[1, 2]])).errors[0].join()",
+            "1,2",
+        ),
+        (
+            "function* g() { yield 'x'; yield 'y' } new AggregateError(g()).errors.join()",
+            "x,y",
+        ),
         ("new AggregateError([], 'm', { cause: 0 }).cause", "0"),
-        ("new AggregateError([], 'm', { cause: undefined }).hasOwnProperty('cause')", "true"),
-        ("new AggregateError([], 'm', {}).hasOwnProperty('cause')", "false"),
-        ("new AggregateError([], 'm', 1).hasOwnProperty('cause')", "false"),
-        ("class E extends AggregateError {} const e = new E([1], 'x'); (e instanceof E) + e.message + e.errors.length", "truex1"),
+        (
+            "new AggregateError([], 'm', { cause: undefined }).hasOwnProperty('cause')",
+            "true",
+        ),
+        (
+            "new AggregateError([], 'm', {}).hasOwnProperty('cause')",
+            "false",
+        ),
+        (
+            "new AggregateError([], 'm', 1).hasOwnProperty('cause')",
+            "false",
+        ),
+        (
+            "class E extends AggregateError {} const e = new E([1], 'x'); (e instanceof E) + e.message + e.errors.length",
+            "truex1",
+        ),
     ] {
         assert_str(src, expected);
     }

@@ -21,6 +21,16 @@ fn many_small_strings_grow_memory() {
     );
 }
 
+/// Static data (string literals, the realm image) past the first 64 KiB page
+/// fits the initial memory: the module starts with enough pages for it.
+#[test]
+fn static_data_past_the_first_page() {
+    let literals = (0..1500)
+        .map(|i| format!("s += '{i}: a static string literal long enough'.length;"))
+        .collect::<String>();
+    assert_number(&format!("let s = 0; {literals} s > 0 ? 1 : 0"), 1.0);
+}
+
 /// A million small string allocations complete.
 #[test]
 fn million_small_strings() {

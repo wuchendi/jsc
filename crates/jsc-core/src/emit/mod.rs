@@ -1257,11 +1257,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     });
     module.section(&tables);
 
-    // Memory section: one linear memory (min 1 page, capped at
-    // `abi::MEMORY_MAX_PAGES`; `__alloc` grows it on demand), exported below.
+    // Memory section: one linear memory (initially the pages holding the
+    // static data, which the active data segments fill at instantiation;
+    // capped at `abi::MEMORY_MAX_PAGES`; `__alloc` grows it on demand),
+    // exported below.
+    let static_pages = u64::from(heap_ptr_init.cast_unsigned()).div_ceil(0x1_0000);
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
-        minimum: 1,
+        minimum: static_pages.max(1),
         maximum: Some(abi::MEMORY_MAX_PAGES),
         memory64: false,
         shared: false,

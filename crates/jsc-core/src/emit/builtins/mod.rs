@@ -36,8 +36,8 @@ mod promise;
 mod string;
 
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
-use number::NumberFormat;
 pub(super) use namespace::fragment;
+use number::NumberFormat;
 pub(super) use string::host_ready_args;
 
 /// The IR fragments the hand-written bodies emit with `K = k`, for the

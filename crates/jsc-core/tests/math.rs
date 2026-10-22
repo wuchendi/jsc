@@ -258,7 +258,10 @@ fn math_integer_and_misc() {
         ("Math.hypot(1, 2, 2)", "3"),
         ("Math.hypot(...[1, 2, 2])", "3"),
         ("Math.hypot.length", "2"),
-        ("Math.max.length + Math.atan2.length + Math.imul.length", "6"),
+        (
+            "Math.max.length + Math.atan2.length + Math.imul.length",
+            "6",
+        ),
         ("Math.sin.name", "sin"),
         ("typeof Math.random()", "number"),
         (
@@ -269,11 +272,7 @@ fn math_integer_and_misc() {
     ] {
         assert_eval(src, expected);
     }
-    for expr in [
-        "Math.sign(-0)",
-        "Math.fround(-0)",
-        "Math.imul(-0, 1) * -1",
-    ] {
+    for expr in ["Math.sign(-0)", "Math.fround(-0)", "Math.imul(-0, 1) * -1"] {
         assert_eval(&sign_of(expr), "-Infinity");
     }
     assert_eval(&sign_of("Math.hypot(-0)"), "Infinity");

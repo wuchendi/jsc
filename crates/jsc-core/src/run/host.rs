@@ -531,7 +531,9 @@ fn round_digits(digits: &[u8], point: i64, n: i64) -> (Vec<u8>, i64) {
     let Ok(keep) = usize::try_from(n) else {
         return (Vec::new(), point);
     };
-    let mut out: Vec<u8> = (0..keep).map(|i| digits.get(i).copied().unwrap_or(0)).collect();
+    let mut out: Vec<u8> = (0..keep)
+        .map(|i| digits.get(i).copied().unwrap_or(0))
+        .collect();
     if digits.get(keep).is_some_and(|&d| d >= 5) {
         let mut i = keep;
         loop {
@@ -575,7 +577,11 @@ pub(super) fn number_to_fixed(x: f64, f: i64) -> String {
         while text.len() < width {
             text.push('0');
         }
-        if text.is_empty() { "0".to_owned() } else { text }
+        if text.is_empty() {
+            "0".to_owned()
+        } else {
+            text
+        }
     };
     if f_len == 0 {
         return format!("{sign}{n}");

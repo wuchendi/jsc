@@ -330,7 +330,10 @@ fn number_to_string_radix_and_receivers() {
         ("(1).toString(Infinity)", "RangeError"),
         ("Number.prototype.toString.call('1')", "TypeError"),
         ("Number.prototype.toString.call({})", "TypeError"),
-        ("Number.prototype.toLocaleString.call(Object('1'))", "TypeError"),
+        (
+            "Number.prototype.toLocaleString.call(Object('1'))",
+            "TypeError",
+        ),
     ] {
         assert_string(&caught_name(src), expected);
     }
