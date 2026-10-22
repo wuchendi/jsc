@@ -64,9 +64,7 @@ fn return_if_pending(function: &mut Function, ret: &Instruction<'_>) {
 /// runs `OrdinaryToPrimitive`: `valueOf` then `toString` (hint string:
 /// `toString` first, and a Date's default hint is string), each looked up
 /// through the `proto` chain, skipped unless callable, its result skipped
-/// unless a primitive; neither -> `TypeError`. A function whose `toString`
-/// is still `%Object.prototype.toString%` keeps the host rendering until
-/// `Function.prototype.toString` lands (S5).
+/// unless a primitive; neither -> `TypeError`.
 pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let (v, hint, method, result, key, second, base) = (0, 1, 2, 3, 4, 5, 6);
     let scratch = 7;
@@ -92,7 +90,6 @@ pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers
         I32Const(value_of), I32Const(to_string),
         LocalGet(hint), I32Const(HINT_STRING), I32Eq, Select, LocalSet(second),
     );
-    let object_to_string = realm::method_bits(Builtin::ObjectToString, helpers);
     for pass in 0..2 {
         if pass == 1 {
             wasm!(f; LocalGet(second), LocalSet(key));
@@ -100,14 +97,7 @@ pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers
         wasm!(f; LocalGet(v), LocalGet(key), Call(helpers.get), LocalSet(method));
         return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
         emit_is_function(&mut f, method);
-        wasm!(f; If(BlockType::Empty), LocalGet(method), I64Const(object_to_string), I64Eq);
-        emit_load_type_byte(&mut f, v);
-        wasm!(f;
-            I32Const(TYPE_FUNCTION), I32Eq, I32And,
-            If(BlockType::Empty),
-            LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), Return,
-            End,
-        );
+        wasm!(f; If(BlockType::Empty));
         emit_accessor_call(&mut f, method, v, None, base, helpers);
         wasm!(f; LocalSet(result));
         return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
