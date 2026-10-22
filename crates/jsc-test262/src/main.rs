@@ -16,7 +16,7 @@ use jsc_test262::{assemble, baseline, exec, frontmatter, walk};
 
 const USAGE: &str = "usage: jsc-test262 [--test262 DIR] [--jsc PATH] [--jobs N] \
 [--timeout SECS] [--check] [--update-baseline] [--history] [PATH_PREFIX...]";
-/// Harness includes kept out of M1 (`design/object-model.md` section 9):
+/// Harness includes kept out of M1 (`DESIGN.md` section 10):
 /// `doneprintHandle.js` needs a host `print` and an async runner,
 /// `propertyHelper.js` needs phase-3 reflection.
 const EXCLUDED_INCLUDES: [&str; 2] = ["doneprintHandle.js", "propertyHelper.js"];

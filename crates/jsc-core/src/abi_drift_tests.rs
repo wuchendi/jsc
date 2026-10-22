@@ -276,7 +276,7 @@ fn abi_ts_matches_rust_abi() {
 }
 
 /// Pins the object-family prefix and per-kind payload layouts to
-/// `design/object-model.md` table 2.2.
+/// `DESIGN.md` sections 5.1-5.2.
 #[test]
 fn object_family_layout_matches_design() {
     use super::{
@@ -349,7 +349,7 @@ fn object_family_layout_matches_design() {
 }
 
 /// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
-/// `design/object-model.md` 2.1-2.3.
+/// `DESIGN.md` sections 5.1-5.3.
 #[test]
 fn property_table_layout_matches_design() {
     use super::{
