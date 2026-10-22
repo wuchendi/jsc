@@ -1094,19 +1094,89 @@ Each item below is current behaviour of this tree.
 
 ## 14. Roadmap
 
-Forward-looking work, in rough order:
+Phases run in dependency order; each later phase builds on the earlier ones.
+Conformance is measured on the eligible test262 subset (section 10).
 
-1. **Generic object-model fallback.** A real property model behind the
-   compile-time specializations: dynamic key growth, computed keys, array
-   growth, and a generic property-lookup path for receivers whose shape is not
-   known statically.
-2. **Latin-1 / UTF-16 strings.** A dual string representation with JS `.length`
-   and indexing semantics, done together with the object-model rework.
-3. **JS prelude on prototypes.** Built-in methods installed on real prototype
-   objects from a JavaScript prelude instead of being recognized syntactically.
-4. **Self-contained WASI module.** Modules that import only WASI preview1
-   (output and clock); the custom `env` imports, the Rust host semantics, and the
-   TypeScript shim are removed.
-5. **Garbage collection.** A precise collector over the existing linear memory
-   and NaN-boxed values.
-6. **ES modules.** `import`/`export` across multiple source files.
+| Phase | Theme | Depends on | Milestone |
+|---|---|---|---|
+| 2 | Object model | — | M1: the official test262 `sta.js` + `assert.js` compile unchanged; M2: 30% of eligible tests pass |
+| 3 | Built-in library + string semantics | 2 | M3: about 50%; the harness shims are removed |
+| 4 | Runtime independence + memory management | 2, 3 | M4: modules import only WASI and run on wasmtime, Node, and browsers; GC |
+| 5 | Language completeness | 2, 4 | M5: about 70% |
+| 6 | Performance | 4, 5 | M6: benchmark suite and regression gate |
+| 7 | Productization | throughout | 1.0 |
+
+### Phase 2 — Object model
+
+- Fixes that do not wait for the model: property writes on primitive receivers
+  (pointer guard), `"abc".foo`, `1 + null`, `-0` from unary minus, unhandled
+  rejections exiting 0, the `Math.pow` hang, `yield*` over arrays, closures
+  inside generator/async bodies, hoisting of nested function declarations,
+  destructuring into member targets.
+- Every heap object, functions and arrays included, gets a growable property
+  table; lookups walk the prototype chain; statically known shapes keep their
+  current fast paths as optimizations over the generic path.
+- Built-in prototypes and constructors become real objects; plain functions are
+  constructible and can carry properties.
+- Arrays get a capacity/length layout: amortized `push`, growth by index,
+  `push` on captured arrays.
+- The GC design is decided here; implementation lands in phase 4.
+
+### Phase 3 — Built-in library and strings
+
+- Built-ins are written in JavaScript/TypeScript and installed on prototypes:
+  `Object` (property descriptors, `defineProperty`, `create`, `freeze`,
+  `assign`), `Array`, `String`, `Number`, `Math`, `JSON`, `Map`, `Set`, `Date`.
+- `Symbol` and a generic iteration protocol behind for-of, spread, and
+  destructuring.
+- The full error hierarchy, `instanceof` with any right-hand side,
+  `.constructor` and `.name`.
+- Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
+  and surrogate pairs.
+- The test262 runner switches to the official harness.
+
+### Phase 4 — Runtime independence and memory
+
+- Modules import only WASI (output and clock); promises and the microtask queue
+  run in the guest; the Rust host semantics and the TypeScript shim are removed.
+- A precise collector (mark-sweep, shadow-stack roots); catchable out-of-memory.
+- `WeakMap`, `WeakRef`, `FinalizationRegistry`.
+- Browsers run modules through a small WASI polyfill.
+
+### Phase 5 — Language completeness
+
+- Class expressions, private fields and methods, static blocks, object-literal
+  accessors, computed keys.
+- Async generators and `for await`, labeled statements, all remaining early
+  errors.
+- ES modules: `import`/`export` across files, bundled at compile time into one
+  module.
+- `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,
+  `Reflect`.
+
+### Phase 6 — Performance
+
+- Specialization from TypeScript types and static inference: unboxed numeric
+  locals, inline caches for property access, escape analysis.
+- `wasm-opt` on emitted modules; size and startup budgets.
+- A benchmark suite (Richards, DeltaBlue, and similar) compared against porffor
+  and QuickJS-on-wasm, with a CI regression gate.
+
+### Phase 7 — Productization
+
+- Published npm package and Rust crates with a stable embedding API;
+  multi-platform release binaries.
+- A deployed playground, documentation site, and a test262 trend chart from
+  `tests/test262/history.tsv`.
+- Source maps, `.stack` with real frames, watch mode.
+- Optional WASI preview 2 / component output.
+
+### Open decisions
+
+- `eval` and `new Function`: unsupported (recommended), or an embedded
+  interpreter.
+- `Intl`: unsupported, or an optional module.
+- Sloppy mode: strict mode only, permanently or not.
+- `RegExp` engine: written for the guest, or an existing engine compiled in
+  (decide before phase 5).
+- WASI preview 1 or preview 2 as the module target (decide before phase 4).
