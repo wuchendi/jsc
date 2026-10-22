@@ -214,17 +214,25 @@ fn probe(
     })
 }
 
-/// First non-empty stderr line, tab-free and bounded.
+/// First non-empty stderr line, tab-free and bounded, with the OS thread id
+/// dropped from a Rust panic header (`thread 'main' (1234) panicked`) so the
+/// detail is identical across runs.
 fn first_line(stderr: &str) -> String {
-    stderr
+    let line = stderr
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .replace('\t', " ")
-        .chars()
-        .take(MAX_DETAIL)
-        .collect()
+        .unwrap_or("");
+    let line = match line.split_once("' (") {
+        Some((head, rest)) if line.starts_with("thread '") => match rest.split_once(") panicked") {
+            Some((id, tail)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+                format!("{head}' panicked{tail}")
+            }
+            _ => line.to_owned(),
+        },
+        _ => line.to_owned(),
+    };
+    line.replace('\t', " ").chars().take(MAX_DETAIL).collect()
 }
 
 fn run_test(env: &Env, index: usize, path: &str) -> Result<Record, String> {
@@ -502,5 +510,14 @@ mod tests {
             "Error: Uncaught x"
         );
         assert_eq!(first_line(&"a".repeat(1000)).len(), MAX_DETAIL);
+        assert_eq!(
+            first_line("thread 'main' (2156276) panicked at src/error.rs:125:20:\nx"),
+            "thread 'main' panicked at src/error.rs:125:20:"
+        );
+        assert_eq!(first_line("a (12) panicked"), "a (12) panicked");
+        assert_eq!(
+            first_line("thread 'main' (x) panicked"),
+            "thread 'main' (x) panicked"
+        );
     }
 }
