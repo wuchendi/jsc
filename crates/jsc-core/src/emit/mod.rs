@@ -497,7 +497,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 8] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 16] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -533,6 +533,34 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 8] = [
         PROP_THROW_IN,
         "Cannot use 'in' operator to search for a key in ",
         "",
+    ),
+    (PROP_THROW_REDEFINE, "Cannot redefine property: ", ""),
+    (
+        PROP_THROW_DEFINE_NOT_EXTENSIBLE,
+        "Cannot define property ",
+        ", object is not extensible",
+    ),
+    (
+        PROP_THROW_DESC_NOT_OBJECT,
+        "Property description must be an object: ",
+        "",
+    ),
+    (PROP_THROW_GETTER, "Getter must be a function: ", ""),
+    (PROP_THROW_SETTER, "Setter must be a function: ", ""),
+    (
+        PROP_THROW_DESC_MIXED,
+        "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+        "",
+    ),
+    (
+        PROP_THROW_ARRAY_DEFINE,
+        "Cannot define property ",
+        " on an array: array length and non-default element attributes are unsupported",
+    ),
+    (
+        PROP_THROW_ARRAY_INTEGRITY,
+        "Cannot ",
+        " an array: array integrity levels are unsupported",
     ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
@@ -576,6 +604,30 @@ const PROP_THROW_IN: i32 = 9;
 /// `__prop_throw`'s `mode` argument: `ToObject` of `null`/`undefined` (the
 /// `key` is the empty string).
 const PROP_THROW_TO_OBJECT: i32 = 10;
+/// `__prop_throw`'s `mode` argument: a rejected redefinition of a
+/// non-configurable property (`ValidateAndApplyPropertyDescriptor`).
+const PROP_THROW_REDEFINE: i32 = 11;
+/// `__prop_throw`'s `mode` argument: defining a new property on a
+/// non-extensible object.
+const PROP_THROW_DEFINE_NOT_EXTENSIBLE: i32 = 12;
+/// `__prop_throw`'s `mode` argument: `ToPropertyDescriptor` of a non-object
+/// (the `key`).
+const PROP_THROW_DESC_NOT_OBJECT: i32 = 13;
+/// `__prop_throw`'s `mode` argument: a descriptor `get` (the `key`) that is
+/// neither callable nor `undefined`.
+const PROP_THROW_GETTER: i32 = 14;
+/// `__prop_throw`'s `mode` argument: a descriptor `set` (the `key`) that is
+/// neither callable nor `undefined`.
+const PROP_THROW_SETTER: i32 = 15;
+/// `__prop_throw`'s `mode` argument: a descriptor with both accessor and
+/// data fields (the `key` is the empty string).
+const PROP_THROW_DESC_MIXED: i32 = 16;
+/// `__prop_throw`'s `mode` argument: a descriptor an array cannot take yet
+/// (its `length`, or non-default attributes on an index).
+const PROP_THROW_ARRAY_DEFINE: i32 = 17;
+/// `__prop_throw`'s `mode` argument: `preventExtensions` / `seal` / `freeze`
+/// (the `key`) of an array, which cannot take an integrity level yet.
+const PROP_THROW_ARRAY_INTEGRITY: i32 = 18;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
@@ -1010,6 +1062,33 @@ impl Helpers<'_> {
         self.to_primitive() + 8
     }
 
+    /// `__define_own(o, key, desc, value, get, set) -> i32` (see
+    /// [`props::emit_define_own`]), right after `__json_revive`.
+    fn define_own(self) -> u32 {
+        self.to_primitive() + 9
+    }
+
+    /// `__to_desc(attrs, list)` (see [`props::emit_to_desc`]).
+    fn to_desc(self) -> u32 {
+        self.to_primitive() + 10
+    }
+
+    /// `__own_desc(obj, key) -> i64` (see [`props::emit_own_desc`]).
+    fn own_desc(self) -> u32 {
+        self.to_primitive() + 11
+    }
+
+    /// `__set_integrity(obj, level)` (see [`props::emit_set_integrity`]).
+    fn set_integrity(self) -> u32 {
+        self.to_primitive() + 12
+    }
+
+    /// `__test_integrity(obj, level) -> i32` (see
+    /// [`props::emit_test_integrity`]).
+    fn test_integrity(self) -> u32 {
+        self.to_primitive() + 13
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1125,7 +1204,7 @@ use numeric::*;
 use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
-use realm::{Builtin, Intrinsic, StringOp, intrinsic_bits};
+use realm::{Builtin, Intrinsic, ReflectOp, StringOp, intrinsic_bits};
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]
@@ -1446,6 +1525,11 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&builtins::emit_json_rep(&offsets, helpers));
     code.function(&builtins::emit_json_indent(helpers));
     code.function(&builtins::emit_json_revive(helpers));
+    code.function(&emit_define_own(&offsets, helpers));
+    code.function(&emit_to_desc(&offsets, helpers));
+    code.function(&emit_own_desc(&offsets, helpers));
+    code.function(&emit_set_integrity(&offsets, helpers));
+    code.function(&emit_test_integrity());
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
