@@ -536,7 +536,13 @@ pub(super) fn emit_bound_call(
         End,
         LocalGet(dst), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(args),
     );
-    emit_node(&bound_construct(frame), function, frame.scratch(), strings, helpers);
+    emit_node(
+        &bound_construct(frame),
+        function,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
     wasm!(function; Return, End, LocalGet(rec));
     emit_array_elems(function);
     wasm!(function; I64Load(elem_slot(1)), LocalSet(this));
