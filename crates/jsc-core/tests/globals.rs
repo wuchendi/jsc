@@ -1,5 +1,5 @@
 //! Integration tests: the global object, global bindings resolved at run time
-//! (design 4.3), and the `Math`/`JSON`/`console` namespace objects reached
+//! (DESIGN.md §6.4), and the `Math`/`JSON`/`console` namespace objects reached
 //! through their values.
 
 mod common;

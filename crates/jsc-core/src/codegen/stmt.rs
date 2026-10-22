@@ -302,7 +302,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a class (declaration or expression) to an expression yielding the
-    /// class value (design 4.4-4.5): the constructor function carrying a
+    /// class value (DESIGN.md §5.5, §7.6): the constructor function carrying a
     /// non-writable `prototype` (`constructor` plus the instance methods and
     /// accessors) and the static members as own properties. `name` is the
     /// class's `name`; with `inner_name` it is also bound, immutably, inside the
@@ -605,7 +605,7 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// The value a derived constructor's `return value` returns (design 4.5):
+    /// The value a derived constructor's `return value` returns (DESIGN.md §7.6):
     /// an object as is; `undefined` (or no value) the bound `this` (a
     /// `ReferenceError` before `super(..)`); anything else a `TypeError`.
     fn derived_return(&mut self, value: Option<IrNode>) -> IrNode {

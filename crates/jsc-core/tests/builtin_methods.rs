@@ -1,5 +1,5 @@
 //! Integration tests: `%Array.prototype%` methods as real builtin function
-//! values (design 4.2, S5), their guarded call-site fast paths (design 3.2)
+//! values (DESIGN.md §6.4), their guarded call-site fast paths (DESIGN.md §6.4)
 //! and their generic behaviour over array-likes.
 
 mod common;

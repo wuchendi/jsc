@@ -87,7 +87,7 @@ fn unsupported_statement_renders_caret_diagnostic() {
 }
 
 /// An *unknown identifier* is resolved against the global object at run
-/// time (design 4.3): `NaN2 + 1` compiles and throws an uncaught
+/// time (DESIGN.md §6.4): `NaN2 + 1` compiles and throws an uncaught
 /// `ReferenceError` (exit 1).
 #[test]
 fn undeclared_identifier_throws_reference_error_at_run_time() {

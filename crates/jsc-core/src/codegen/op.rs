@@ -40,7 +40,7 @@ pub(super) fn math_op(name: &str) -> Option<MathOp> {
     })
 }
 
-/// Whether `namespace.key(..)` has inline code (design 3.2 row 2); any other
+/// Whether `namespace.key(..)` has inline code (DESIGN.md §6.4); any other
 /// member is an ordinary property of the namespace object.
 pub(super) fn inline_member(namespace: &str, key: &str) -> bool {
     match namespace {
@@ -184,7 +184,7 @@ fn date_fast_path(name: &str) -> Option<DateOp> {
 }
 
 /// The inline fast paths of `recv.name(args)` on a `Map`/`Set`/`Promise`/
-/// `Date`/generator receiver in local `recv` (design 3.2 row 4), each the
+/// `Date`/generator receiver in local `recv` (DESIGN.md §6.4), each the
 /// body of the builtin `name` of that family over the side-effect-free
 /// `args`.
 pub(super) fn receiver_fast_paths(

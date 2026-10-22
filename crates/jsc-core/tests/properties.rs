@@ -1,5 +1,5 @@
 //! Integration tests: dictionary objects — property tables, key interning, and
-//! the generic get/set/has/delete/define/own-keys algorithms (design 2.3-2.6).
+//! the generic get/set/has/delete/define/own-keys algorithms (DESIGN.md §5.3, §6.3).
 //! Expected texts are Node's `console.log` output.
 #![allow(clippy::expect_used)]
 

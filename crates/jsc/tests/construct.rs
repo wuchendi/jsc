@@ -1,4 +1,4 @@
-//! Integration tests: `new X(args)` construct semantics (design 4.5) via the CLI —
+//! Integration tests: `new X(args)` construct semantics (DESIGN.md §7.6) via the CLI —
 //! plain constructor functions, return override, `new.target`, class
 //! constructors called without `new`, non-constructors, and spread arguments.
 #![allow(clippy::expect_used)]

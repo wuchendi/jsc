@@ -1,4 +1,4 @@
-//! Builtin function bodies (design 4.1): one wasm function per
+//! Builtin function bodies (DESIGN.md §6.4): one wasm function per
 //! [`Builtin`], with the uniform function ABI `(a0..a_{K-1}, env, argc) -> i64`
 //! so a builtin is called through the funcref table exactly like a user
 //! function. `this` is read from `__this` on entry, the arguments from the
@@ -247,7 +247,7 @@ fn throw_type_error(
 }
 
 /// Push `1` when the jsval in `local` is a wrapper object of `class`
-/// (design 2.4).
+/// (DESIGN.md §5.2).
 pub(super) fn emit_is_wrapper(function: &mut Function, local: u32, class: u8) {
     emit_is_pointer(function, local);
     wasm!(function;
@@ -289,7 +289,7 @@ fn this_primitive(
 }
 
 /// `__to_object(v: i64) -> i64`: `ToObject` of a non-nullish jsval: a
-/// string, number or boolean becomes a fresh wrapper object (design 2.4) over
+/// string, number or boolean becomes a fresh wrapper object (DESIGN.md §5.2) over
 /// its realm prototype; any other value (an object, or `null`/`undefined`,
 /// which callers reject first) is returned as is. A String wrapper's
 /// `length` and indices are defined as its own read-only, non-configurable

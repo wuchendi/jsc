@@ -383,8 +383,8 @@ impl LowerCtx<'_> {
     /// positional slot `j in p..k` is appended only when `j < n` —
     /// excluding the `undefined` padding beyond the real arguments — and the
     /// arguments `k..n` of a spread call are appended from the spread argument
-    /// array ([`Self::overflow_loop`]). The array is
-    /// built in a plain temp local (`ArrayPush` needs a plain array binding), then
+    /// array ([`Self::overflow_loop`]). The array is built in a temp local
+    /// ([`IrNode::ArrayPush`] appends to a handle held in a wasm local), then
     /// bound to the rest name, boxed into a cell when the binding is captured.
     fn lower_rest_param(
         &mut self,
@@ -438,8 +438,8 @@ impl LowerCtx<'_> {
     }
 
     /// The prologue building this function's `arguments` object into `local`:
-    /// an ordinary object of class ARGUMENTS (`proto` the `%Object.prototype%`
-    /// placeholder `null`) with a non-enumerable `length` = `n` and the own
+    /// an ordinary object of class ARGUMENTS (`proto` `%Object.prototype%`)
+    /// with a non-enumerable `length` = `n` and the own
     /// properties `"0".."n-1"` holding every actual argument (slots `0..k`, then
     /// the spread overflow). Unmapped: the values are copied, never aliased.
     fn lower_arguments_object(&mut self, local: u32, k: u32) -> Vec<IrStmt> {
@@ -589,7 +589,7 @@ impl LowerCtx<'_> {
         };
         self.pop_frame();
         // A class constructor called without the construct marker throws
-        // before anything else runs (design 4.5).
+        // before anything else runs (DESIGN.md §7.6).
         if matches!(kind, FnKind::Class | FnKind::DerivedClass) {
             func.body.insert(0, class_call_guard(name, func.params - 1));
         }
@@ -732,8 +732,8 @@ impl LowerCtx<'_> {
     }
 
     /// Define the current class's instance fields ([`Self::class_fields`]) on
-    /// `this` in source order with `CreateDataProperty` semantics (design 11.2
-    /// q8: `__define`, so an inherited setter is not invoked); `None` when the
+    /// `this` in source order with `CreateDataProperty` semantics
+    /// (`__define`, so an inherited setter is not invoked); `None` when the
     /// class declares no fields. An uninitialized `f;` defines `undefined`.
     pub(super) fn lower_field_inits(&mut self, this: IrNode) -> anyhow::Result<Option<IrNode>> {
         if self.class_fields.is_empty() {
@@ -826,7 +826,7 @@ fn expr_arrow_super(expr: &Expr, arrow: bool) -> bool {
     }
 }
 
-/// The derived-constructor `this` TDZ message (design 4.5).
+/// The derived-constructor `this` TDZ message (DESIGN.md §7.6).
 pub(super) const DERIVED_THIS_TDZ: &str = "Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
 
 /// A `ReferenceError` with `message`.

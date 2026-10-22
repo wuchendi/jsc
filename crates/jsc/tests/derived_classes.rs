@@ -1,4 +1,4 @@
-//! Integration tests: derived classes (design 4.4-4.5) via the CLI — `super`
+//! Integration tests: derived classes (DESIGN.md §5.5, §7.6) via the CLI — `super`
 //! construction with `SELF_ALLOC`, the derived `this` TDZ, field order and
 //! `CreateDataProperty` fields, `extends` of any expression, class expressions,
 //! and static accessors.
@@ -336,7 +336,7 @@ fn class_member_name_early_errors() {
 }
 
 /// Builtin parents allocate their own kind with `proto = new.target.prototype`
-/// (design 4.7): an `extends Error` instance renders and throws under its
+/// (DESIGN.md §7.7): an `extends Error` instance renders and throws under its
 /// subclass name, and the class label names the builtin parent.
 #[test]
 fn builtin_parents() {

@@ -911,7 +911,7 @@ fn proto_kind_cases(kind: ProtoKind) -> &'static [(i32, Intrinsic)] {
 }
 
 /// Push i32 `1` when the jsval in `local` is a receiver of `kind` whose
-/// builtin methods are provably the realm's (design 3.2): a heap block of the
+/// builtin methods are provably the realm's (DESIGN.md §6.4): a heap block of the
 /// kind byte with no own properties (`props == 0`, one i64 load of the header
 /// and `props` words) whose `proto` is the family's prototype and, unless
 /// `sealed`, whose dirty bit is clear. `tmp` is a free i32 local.
@@ -973,7 +973,7 @@ pub(super) fn emit_proto_kind_test(
 }
 
 /// Emit a builtin method call with guarded fast paths ([`IrNode::ProtoGuard`],
-/// design 3.2 rows 3-4), leaving its result on the stack. Each fast path runs
+/// DESIGN.md §6.4), leaving its result on the stack. Each fast path runs
 /// while `recv` passes its [`emit_proto_kind_test`]. Every other receiver
 /// takes ONE call: the argument slots,
 /// `this = recv`, the packed `env` (interned key, not-a-function message) and
@@ -1113,7 +1113,7 @@ pub(super) fn emit_proto_guard(
 /// `props` word.
 const KIND_AND_PROPS_MASK: i64 = 0xffff_ffff_0000_00ff_u64.cast_signed();
 
-/// Emit `new callee(args)` ([`IrNode::Construct`], design 4.5), leaving the
+/// Emit `new callee(args)` ([`IrNode::Construct`], DESIGN.md §7.6), leaving the
 /// constructed object on the stack. JS order: the callee is evaluated into
 /// `callee_local`, then the `K` argument slots are pushed (from the spread
 /// array when present); then `IsConstructor(callee)` is checked, `this` is
