@@ -223,8 +223,12 @@ pub(super) fn build_type_and_function_sections<'a>(
     // `__array_join(recv: i64, sep: i64) -> i64` and `__to_object(v: i64) -> i64`;
     // then the `JSON` helpers `__json_rep(holder, key, value, replacer, list,
     // stack: i32) -> i64`, `__json_indent(s: i32, gap: i32) -> i32` and
-    // `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 9] = [
+    // `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`; then the
+    // property-descriptor helpers `__define_own(o: i32, key: i32, desc: i32,
+    // value: i64, get: i64, set: i64) -> i32`, `__to_desc(attrs: i64, list:
+    // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
+    // i64, level: i32)` and `__test_integrity(obj: i64, level: i32) -> i32`.
+    let conversions: [(&[ValType], &[ValType]); 14] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -244,6 +248,21 @@ pub(super) fn build_type_and_function_sections<'a>(
         ),
         (&[ValType::I32, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I32, ValType::I64], &[ValType::I64]),
+        (
+            &[
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I64,
+                ValType::I64,
+                ValType::I64,
+            ],
+            &[ValType::I32],
+        ),
+        (&[ValType::I64, ValType::I32], &[]),
+        (&[ValType::I64, ValType::I32], &[ValType::I64]),
+        (&[ValType::I64, ValType::I32], &[]),
+        (&[ValType::I64, ValType::I32], &[ValType::I32]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
@@ -1254,7 +1273,8 @@ fn collect_entries<'a>(
 }
 
 /// Whether any function of `program` (or `main`) builds an accessor
-/// ([`IrNode::MakeAccessor`]) or can reach the realm's accessors (the
+/// ([`IrNode::MakeAccessor`]), can define one (it names `defineProperty` /
+/// `defineProperties`), or can reach the realm's accessors (the
 /// `%Function.prototype%` `caller` / `arguments` poison pair, the `Map`/`Set`
 /// `size` getters): it names them, or reads or writes a
 /// member under a key computed at run time. Then `__get` / `__set` must
@@ -1264,7 +1284,10 @@ fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
         IrNode::MakeAccessor { .. } | IrNode::SizeRead { .. } => true,
-        IrNode::Str(s) => s == "caller" || s == "arguments" || s == "size",
+        IrNode::Str(s) => matches!(
+            s.as_str(),
+            "caller" | "arguments" | "size" | "defineProperty" | "defineProperties"
+        ),
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }
         | IrNode::IndexOpSet { index: key, .. }
