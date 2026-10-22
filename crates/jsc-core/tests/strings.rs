@@ -520,6 +520,18 @@ fn byte_positions_throw_on_non_ascii() {
     ] {
         assert_type_error_with(call, "non-ASCII");
     }
+    // Positions over an ASCII prefix stay exact.
+    assert_number("\"a\u{ab}b\u{bb}\".indexOf(\"a\")", 0.0);
+    assert_number("\"\u{ab}x\".indexOf(\"z\")", -1.0);
+    assert_number("\"ab\u{ab}\".lastIndexOf(\"b\", 1)", 1.0);
+    assert_string("\"ab\u{ab}\".slice(0, 2)", "ab");
+    assert_string("\"ab\u{ab}\".substring(2, 0)", "ab");
+    assert_string("\"x\u{ab}\".charAt(0) + \"x\u{ab}\".at(0)", "xx");
+    assert_number("\"x\u{ab}\".charCodeAt(0)", 120.0);
+    assert_bool("\"ab\u{ab}\".startsWith(\"b\", 1)", true);
+    assert_eval("\"x\u{ab}\".at(5)", "undefined");
+    assert_type_error_with("\"ab\u{ab}\".at(-1)", "non-ASCII");
+    assert_type_error_with("\"ab\u{ab}\".slice(-1)", "non-ASCII");
     // Position-free results stay correct.
     assert_bool("\"\u{e9}a\".includes(\"a\")", true);
     assert_bool("\"\u{e9}a\".startsWith(\"\u{e9}\")", true);

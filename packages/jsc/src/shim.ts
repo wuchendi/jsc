@@ -90,6 +90,7 @@ import {
   arrayElements,
   arrayLayout,
   asU64,
+  bitsToF64,
   decode,
   f64ToBits,
   formatValue,
@@ -286,7 +287,11 @@ export function createShim(): Shim {
   ): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
-    if (!isAscii(bytes)) return METHOD_UNSUPPORTED
+    if (
+      !endpointExact(bytes, a, mem, true) ||
+      !endpointExact(bytes, b, mem, true)
+    )
+      return METHOD_UNSUPPORTED
     const len = bytes.length
     const start = sliceIndex(a, mem, 0, len)
     const end = Math.max(sliceIndex(b, mem, len, len), start)
@@ -359,7 +364,11 @@ export function createShim(): Shim {
   ): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
-    if (!isAscii(bytes)) return METHOD_UNSUPPORTED
+    if (
+      !endpointExact(bytes, arg0, mem, false) ||
+      !endpointExact(bytes, arg1, mem, false)
+    )
+      return METHOD_UNSUPPORTED
     const len = bytes.length
     const a = substringIndex(arg0, mem, 0, len)
     const b = substringIndex(arg1, mem, len, len)
@@ -425,10 +434,14 @@ export function createShim(): Shim {
   ): bigint | null {
     const bytes = stringBytes(mem, ptr)
     if (bytes === null) return null
-    if (!isAscii(bytes)) return METHOD_UNSUPPORTED
     let i = truncToInt(valueToNumber(decode(arg0, mem)))
     if (Number.isNaN(i)) i = 0
-    if (op === METHOD_OP_AT && i < 0) i += bytes.length
+    if (op === METHOD_OP_AT && i < 0) {
+      // Relative to the length, exact only for an ASCII string.
+      if (!isAscii(bytes)) return METHOD_UNSUPPORTED
+      i += bytes.length
+    }
+    if (!indexExact(bytes, i)) return METHOD_UNSUPPORTED
     const byte = i >= 0 && i < bytes.length ? bytes[i] : undefined
     if (byte === undefined)
       return op === METHOD_OP_CHAR_CODE_AT ? f64ToBits(NaN) : UNDEFINED
@@ -460,9 +473,9 @@ export function createShim(): Shim {
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
           if (hay === null) return null
-          if (!isAscii(hay)) return METHOD_UNSUPPORTED
+          if (!endpointExact(hay, arg1, mem, false)) return METHOD_UNSUPPORTED
           const from = substringIndex(arg1, mem, 0, hay.length)
-          return stringIndexOf(hay, argBytes(arg0, mem), from)
+          return exactFound(hay, stringIndexOf(hay, argBytes(arg0, mem), from))
         }
         return null
       case METHOD_OP_INCLUDES:
@@ -472,7 +485,7 @@ export function createShim(): Shim {
         if (ptr !== null && typeByte === TYPE_STRING) {
           const hay = stringBytes(mem, ptr)
           if (hay === null) return null
-          if (!positionExact(hay, arg1)) return METHOD_UNSUPPORTED
+          if (!endpointExact(hay, arg1, mem, false)) return METHOD_UNSUPPORTED
           const from = substringIndex(arg1, mem, 0, hay.length)
           return stringIndexOf(hay, argBytes(arg0, mem), from) !== f64ToBits(-1)
             ? TRUE
@@ -501,8 +514,8 @@ export function createShim(): Shim {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const bytes = stringBytes(mem, ptr)
         if (bytes === null) return null
-        if (!isAscii(bytes)) return METHOD_UNSUPPORTED
         const i = truncToInt(valueToNumber(decode(arg0, mem)))
+        if (!indexExact(bytes, i)) return METHOD_UNSUPPORTED
         // Out-of-range (a negative index) => "".
         const text =
           i >= 0 && i < bytes.length ? utf8Decode(bytes.subarray(i, i + 1)) : ''
@@ -522,7 +535,7 @@ export function createShim(): Shim {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const hay = stringBytes(mem, ptr)
         if (hay === null) return null
-        if (!positionExact(hay, arg1)) return METHOD_UNSUPPORTED
+        if (!endpointExact(hay, arg1, mem, false)) return METHOD_UNSUPPORTED
         const needle = argBytes(arg0, mem)
         const hit =
           op === METHOD_OP_STARTS_WITH
@@ -558,7 +571,6 @@ export function createShim(): Shim {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const hay = stringBytes(mem, ptr)
         if (hay === null) return null
-        if (!isAscii(hay)) return METHOD_UNSUPPORTED
         return stringLastIndexOf(hay, argBytes(arg0, mem), arg1, mem)
       }
       case METHOD_OP_LOCALE_COMPARE: {
@@ -591,8 +603,7 @@ export function createShim(): Shim {
         const pattern =
           patternValue.kind === 'undefined' ? '' : toJsString(patternValue)
         if (/[\\^$.*+?()[\]{}|]/.test(pattern)) return METHOD_NEEDS_REGEXP
-        if (!isAscii(hay)) return METHOD_UNSUPPORTED
-        return stringIndexOf(hay, utf8Encode.encode(pattern), 0)
+        return exactFound(hay, stringIndexOf(hay, utf8Encode.encode(pattern), 0))
       }
       case METHOD_OP_REPLACE:
       case METHOD_OP_REPLACE_ALL: {
@@ -1266,18 +1277,52 @@ function isAscii(bytes: Uint8Array): boolean {
   return bytes.every((b) => b < 0x80)
 }
 
+/** Whether the first `n` bytes are ASCII (mirrors `host.rs::ascii_prefix`). */
+function asciiPrefix(bytes: Uint8Array, n: number): boolean {
+  return isAscii(bytes.subarray(0, Math.min(n, bytes.length)))
+}
+
 /**
- * Whether a byte position argument addresses the same place as in UTF-16 code
- * units: no position, or an ASCII string (mirrors `host.rs::position_exact`).
+ * Whether a position argument addresses the same place as in UTF-16 code
+ * units (mirrors `host.rs::endpoint_exact`): `undefined`, `NaN`, a
+ * non-negative offset over an ASCII prefix, or a negative one (counting from
+ * the end, `fromEnd`, only for an ASCII string).
  */
-function positionExact(bytes: Uint8Array, position: bigint): boolean {
-  return position === UNDEFINED || isAscii(bytes)
+function endpointExact(
+  bytes: Uint8Array,
+  position: bigint,
+  mem: Uint8Array,
+  fromEnd: boolean,
+): boolean {
+  const decoded = decode(position, mem)
+  if (decoded.kind === 'undefined') return true
+  const n = truncToInt(valueToNumber(decoded))
+  if (Number.isNaN(n)) return true
+  if (n >= 0) return asciiPrefix(bytes, n)
+  return !fromEnd || isAscii(bytes)
+}
+
+/**
+ * Whether the character index `i` reads the same code unit as in UTF-16
+ * (mirrors `host.rs::index_exact`).
+ */
+function indexExact(bytes: Uint8Array, i: number): boolean {
+  return !(i >= 0 && i < bytes.length) || asciiPrefix(bytes, i + 1)
+}
+
+/**
+ * A search result when it is the UTF-16 index too, else `METHOD_UNSUPPORTED`
+ * (mirrors `host.rs::exact_found`).
+ */
+function exactFound(hay: Uint8Array, bits: bigint): bigint {
+  const at = bitsToF64(bits)
+  return at < 0 || asciiPrefix(hay, at) ? bits : METHOD_UNSUPPORTED
 }
 
 /**
  * `string.lastIndexOf(sub, pos)` (mirrors `host.rs::string_last_index_of`):
  * the last BYTE index at or before `pos` (`undefined`/`NaN`: the end) where
- * `sub` occurs, or `-1`.
+ * `sub` occurs, or `-1`; `METHOD_UNSUPPORTED` past a non-ASCII byte.
  */
 function stringLastIndexOf(
   hay: Uint8Array,
@@ -1290,10 +1335,12 @@ function stringLastIndexOf(
   const start = Number.isNaN(pos)
     ? len
     : Math.min(Math.max(truncToInt(pos), 0), len)
+  if (!Number.isNaN(pos) && !asciiPrefix(hay, start)) return METHOD_UNSUPPORTED
   const last = len - needle.length
   if (last < 0) return f64ToBits(-1)
   for (let i = Math.min(start, last); i >= 0; i--) {
-    if (startsWithBytes(hay.subarray(i), needle)) return indexBits(i)
+    if (startsWithBytes(hay.subarray(i), needle))
+      return exactFound(hay, indexBits(i))
   }
   return f64ToBits(-1)
 }

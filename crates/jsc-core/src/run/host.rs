@@ -162,11 +162,14 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             Some(TYPE_ARRAY) => Some(array_index_of(&mem, ptr?, arg0.cast_unsigned())),
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
-                if !hay.is_ascii() {
+                if !endpoint_exact(&hay, arg1, &mem, false) {
                     return Some(UNSUPPORTED);
                 }
                 let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
-                Some(string_index_of(&hay, &arg_bytes(arg0, &mem), from))
+                Some(exact_found(
+                    &hay,
+                    string_index_of(&hay, &arg_bytes(arg0, &mem), from),
+                ))
             }
             _ => None,
         },
@@ -175,7 +178,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             // `str.includes(sub, from)` — substring containment from `from`.
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
-                if !position_exact(&hay, arg1) {
+                if !endpoint_exact(&hay, arg1, &mem, false) {
                     return Some(UNSUPPORTED);
                 }
                 let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
@@ -213,10 +216,10 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         METHOD_OP_CHAR_AT => match type_byte {
             Some(TYPE_STRING) => {
                 let bytes = string_bytes(&mem, ptr?)?;
-                if !bytes.is_ascii() {
+                let i = trunc_to_int(value_to_number(&decode(arg0.cast_unsigned(), &mem)));
+                if !index_exact(&bytes, i) {
                     return Some(UNSUPPORTED);
                 }
-                let i = trunc_to_int(value_to_number(&decode(arg0.cast_unsigned(), &mem)));
                 // Out-of-range (a negative index fails `try_from`) => "".
                 let text = match usize::try_from(i).ok().filter(|&u| u < bytes.len()) {
                     Some(u) => String::from_utf8_lossy(&bytes[u..=u]).into_owned(),
@@ -263,15 +266,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         METHOD_OP_LAST_INDEX_OF => match type_byte {
             Some(TYPE_STRING) => {
                 let hay = string_bytes(&mem, ptr?)?;
-                if !hay.is_ascii() {
-                    return Some(UNSUPPORTED);
-                }
-                Some(string_last_index_of(
-                    &hay,
-                    &arg_bytes(arg0, &mem),
-                    arg1,
-                    &mem,
-                ))
+                string_last_index_of(&hay, &arg_bytes(arg0, &mem), arg1, &mem)
             }
             _ => None,
         },
@@ -311,10 +306,10 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                 if pattern.contains(is_regexp_syntax) {
                     return Some(NEEDS_REGEXP);
                 }
-                if !hay.is_ascii() {
-                    return Some(UNSUPPORTED);
-                }
-                Some(string_index_of(&hay, pattern.as_bytes(), 0))
+                Some(exact_found(
+                    &hay,
+                    string_index_of(&hay, pattern.as_bytes(), 0),
+                ))
             }
             _ => None,
         },
@@ -595,7 +590,7 @@ fn string_slice<W: Send + 'static>(
     b: i64,
 ) -> Option<u64> {
     let bytes = string_bytes(mem, ptr)?;
-    if !bytes.is_ascii() {
+    if !endpoint_exact(&bytes, a, mem, true) || !endpoint_exact(&bytes, b, mem, true) {
         return Some(UNSUPPORTED);
     }
     let len = bytes.len();
@@ -651,7 +646,7 @@ fn string_repeat<W: Send + 'static>(
 /// (default the length). Returns the boolean jsval bits.
 fn string_starts_ends(mem: &[u8], ptr: usize, arg0: i64, arg1: i64, op: i32) -> Option<u64> {
     let hay = string_bytes(mem, ptr)?;
-    if !position_exact(&hay, arg1) {
+    if !endpoint_exact(&hay, arg1, mem, false) {
         return Some(UNSUPPORTED);
     }
     let needle = arg_bytes(arg0, mem);
@@ -701,7 +696,7 @@ fn string_substring<W: Send + 'static>(
     arg1: i64,
 ) -> Option<u64> {
     let bytes = string_bytes(mem, ptr)?;
-    if !bytes.is_ascii() {
+    if !endpoint_exact(&bytes, arg0, mem, false) || !endpoint_exact(&bytes, arg1, mem, false) {
         return Some(UNSUPPORTED);
     }
     let len = bytes.len();
@@ -746,14 +741,49 @@ fn pad_bytes(bytes: &[u8], target: i64, pad: &[u8], at_start: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Whether a byte position argument (`undefined` or a number) addresses the
-/// same place in `bytes` as in its UTF-16 code units: no position, or an
-/// ASCII string.
-fn position_exact(bytes: &[u8], position: i64) -> bool {
-    position.cast_unsigned() == abi::UNDEFINED || bytes.is_ascii()
+/// Whether the first `n` bytes of `bytes` are ASCII, so that a byte offset up
+/// to `n` is also the UTF-16 offset.
+fn ascii_prefix(bytes: &[u8], n: usize) -> bool {
+    bytes[..n.min(bytes.len())].is_ascii()
 }
 
-/// `at(index)` / `charCodeAt(pos)` / `codePointAt(pos)` over an ASCII string
+/// Whether a position argument (`undefined` or a number) addresses the same
+/// place in `bytes` as in its UTF-16 code units: `undefined` (the default),
+/// `NaN`, a non-negative offset over an ASCII prefix, or a negative one —
+/// which clamps to 0, or counts from the end (`from_end`, exact only for an
+/// ASCII string).
+fn endpoint_exact(bytes: &[u8], position: i64, mem: &[u8], from_end: bool) -> bool {
+    let decoded = decode(position.cast_unsigned(), mem);
+    if matches!(decoded, Value::Undefined) {
+        return true;
+    }
+    let n = trunc_to_int(value_to_number(&decoded));
+    match usize::try_from(n) {
+        Ok(n) => ascii_prefix(bytes, n),
+        Err(_) => !from_end || bytes.is_ascii(),
+    }
+}
+
+/// Whether the character index `i` reads the same code unit in `bytes` as
+/// in UTF-16: out of range (`i < 0` or past the bytes), or over an ASCII
+/// prefix through `i`.
+fn index_exact(bytes: &[u8], i: i64) -> bool {
+    usize::try_from(i).map_or(true, |i| i >= bytes.len() || ascii_prefix(bytes, i + 1))
+}
+
+/// A search result (number bits, `-1` or a byte index) when it is the UTF-16
+/// index too, else [`UNSUPPORTED`].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn exact_found(hay: &[u8], bits: u64) -> u64 {
+    let at = f64::from_bits(bits);
+    if at < 0.0 || ascii_prefix(hay, at as usize) {
+        bits
+    } else {
+        UNSUPPORTED
+    }
+}
+
+/// `at(index)` / `charCodeAt(pos)` / `codePointAt(pos)` over an ASCII prefix
 /// (one code unit per byte): the one-character string / code unit at the
 /// position (`at` counts a negative index from the end), or `undefined`
 /// (`at`, `codePointAt`) / `NaN` (`charCodeAt`) out of range.
@@ -765,12 +795,16 @@ fn string_code_at<W: Send + 'static>(
     op: i32,
 ) -> Option<u64> {
     let bytes = string_bytes(mem, ptr)?;
-    if !bytes.is_ascii() {
-        return Some(UNSUPPORTED);
-    }
     let mut i = trunc_to_int(value_to_number(&decode(arg0.cast_unsigned(), mem)));
     if op == METHOD_OP_AT && i < 0 {
+        // Relative to the length, exact only for an ASCII string.
+        if !bytes.is_ascii() {
+            return Some(UNSUPPORTED);
+        }
         i += i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+    }
+    if !index_exact(&bytes, i) {
+        return Some(UNSUPPORTED);
     }
     let Some(&byte) = usize::try_from(i).ok().and_then(|u| bytes.get(u)) else {
         return Some(if op == METHOD_OP_CHAR_CODE_AT {
@@ -787,23 +821,29 @@ fn string_code_at<W: Send + 'static>(
 }
 
 /// `string.lastIndexOf(sub, pos)`: the number bits of the last BYTE index at
-/// or before `pos` (`undefined`/`NaN`: the end) where `sub` occurs, or `-1`.
-fn string_last_index_of(hay: &[u8], needle: &[u8], pos_bits: i64, mem: &[u8]) -> u64 {
+/// or before `pos` (`undefined`/`NaN`: the end) where `sub` occurs, or `-1`;
+/// [`UNSUPPORTED`] when `pos` or the hit lies past a non-ASCII byte.
+fn string_last_index_of(hay: &[u8], needle: &[u8], pos_bits: i64, mem: &[u8]) -> Option<u64> {
     let pos = value_to_number(&decode(pos_bits.cast_unsigned(), mem));
     let len = hay.len();
     let start = if pos.is_nan() {
         len
     } else {
         let len_i = i64::try_from(len).unwrap_or(i64::MAX);
-        usize::try_from(trunc_to_int(pos).clamp(0, len_i)).unwrap_or(0)
+        let start = usize::try_from(trunc_to_int(pos).clamp(0, len_i)).unwrap_or(0);
+        if !ascii_prefix(hay, start) {
+            return Some(UNSUPPORTED);
+        }
+        start
     };
     let Some(last) = len.checked_sub(needle.len()) else {
-        return not_found_bits();
+        return Some(not_found_bits());
     };
-    (0..=start.min(last))
+    let found = (0..=start.min(last))
         .rev()
         .find(|&i| hay[i..].starts_with(needle))
-        .map_or_else(not_found_bits, index_bits)
+        .map_or_else(not_found_bits, index_bits);
+    Some(exact_found(hay, found))
 }
 
 /// Whether `c` is `RegExp` pattern syntax: a string pattern of `search` /
