@@ -500,7 +500,7 @@ pub(super) fn emit_bound_call(
         I32Load(MemArg { offset: ARRAY_LEN_OFFSET, align: 2, memory_index: 0 }),
         I32Const(2), I32Sub, LocalSet(nb),
         // n = argc, decoding the construct marker -(n + 1).
-        LocalGet(frame.argc()), F64ReinterpretI64, LocalTee(c),
+        LocalGet(frame.argc()), F64ReinterpretI64, LocalSet(c),
         F64Const(Ieee64::from(-1.0)), LocalGet(c), F64Sub,
         LocalGet(c), LocalGet(c), F64Const(Ieee64::from(0.0)), F64Lt, Select,
         I32TruncSatF64U, LocalTee(n),
