@@ -1,11 +1,11 @@
 //! Own-property tables, key interning, and the generic property algorithms
-//! (design 2.3-2.6).
+//! (DESIGN.md §5.3, §6.3).
 //!
-//! Every object-family block (all kinds but strings and arrays) carries a
-//! `props` slot pointing at a [`TYPE_PROPS`] table of `(key, attrs, value)`
-//! entries and a `proto` slot; keys are interned string blocks compared by
-//! pointer. The helpers here are the only code that reads or writes those
-//! tables:
+//! Every object-family block (arrays included: their named and sparse-index
+//! properties) carries a `props` slot pointing at a [`TYPE_PROPS`] table of
+//! `(key, attrs, value)` entries and a `proto` slot; keys are interned string
+//! blocks compared by pointer. The helpers here are the only code that reads
+//! or writes those tables:
 //!
 //! - interning: `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`,
 //!   plus the `ToPropertyKey` conversion `__to_key` and the array-index helpers
@@ -300,7 +300,7 @@ fn emit_prop_throw_return(
 }
 
 /// Set the dirty bit of the property table in the i32 local `table` when it
-/// belongs to a watched intrinsic (design 3.3).
+/// belongs to a watched intrinsic (DESIGN.md §6.4).
 fn emit_mark_dirty(function: &mut Function, table: u32) {
     wasm!(function;
         LocalGet(table), I32Load8U(m8(P_TFLAGS)), I32Const(WATCHED), I32And,
@@ -633,7 +633,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
 }
 
 /// `__fn_materialize(o: i32)`: clear the `LAZY` flag of the function block `o`
-/// and define its own properties from its `__fn_info` entry (design 4.4):
+/// and define its own properties from its `__fn_info` entry (DESIGN.md §5.5):
 /// `length` and `name` (configurable only); and for a plain `CONSTRUCTOR`
 /// (not a class, whose definition installs its own `prototype`), `prototype`
 /// (writable only) = a fresh object whose non-enumerable `constructor` is `o`.
@@ -753,7 +753,7 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 /// indices); an object-family block (an array for its named keys) scans its
 /// own table and then each `proto`, calling an accessor's getter with
 /// `this = recv` (`undefined` when it has none). A string, number or boolean
-/// continues at its realm prototype (design 6: no wrapper is allocated);
+/// continues at its realm prototype without allocating a wrapper;
 /// `null`/`undefined` read `undefined`.
 pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);

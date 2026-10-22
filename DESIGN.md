@@ -1369,7 +1369,9 @@ paths: `crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
 
 **Job `test262`** (baseline regression gate, 90-minute timeout): fetch test262
 (cached on the hash of `scripts/test262-fetch.sh`), `cargo build --release -p
-jsc`, then `cargo run --release -p jsc-test262 -- --check`.
+jsc`, the M1 harness tests (`cargo test --release -p jsc --test
+test262_harness`, after asserting `.tmp/test262/harness/assert.js` exists so
+they cannot skip), then `cargo run --release -p jsc-test262 -- --check`.
 
 ### `web.yml` — JS/TS gate
 

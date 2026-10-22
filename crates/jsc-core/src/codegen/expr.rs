@@ -83,7 +83,7 @@ impl LowerCtx<'_> {
                 MemberProp::Ident(id) if id.sym.as_ref() == "length" => Ok(IrNode::StrLen(
                     Box::new(nullish_check(self.lower_expr(&member.obj)?, "length")),
                 )),
-                // `obj.size`: a guarded `Map`/`Set` header read (design 3.2).
+                // `obj.size`: a guarded `Map`/`Set` header read (DESIGN.md §6.4).
                 MemberProp::Ident(id) if id.sym.as_ref() == "size" => Ok(IrNode::SizeRead {
                     sealed: self.shared.globals.intrinsics_sealed(),
                     obj: Box::new(self.lower_expr(&member.obj)?),
@@ -132,7 +132,7 @@ impl LowerCtx<'_> {
                 key: Box::new(self.lower_expr(&b.left)?),
                 obj: Box::new(self.lower_expr(&b.right)?),
             }),
-            // `x instanceof RHS` (design 4.6): any right-hand side expression.
+            // `x instanceof RHS` (DESIGN.md §7.6): any right-hand side expression.
             Expr::Bin(b) if matches!(b.op, BinaryOp::InstanceOf) => {
                 self.lower_instanceof(&b.left, &b.right)
             }
@@ -541,7 +541,7 @@ impl LowerCtx<'_> {
         )
     }
 
-    /// Lower `super(args)` inside a derived class constructor (design 4.5):
+    /// Lower `super(args)` inside a derived class constructor (DESIGN.md §7.6):
     /// `__construct_with(parent, args, new.target)` — the parent allocates
     /// `this` with `proto = new.target.prototype` (or returns its own object) —
     /// then bind the result as `this` (a `ReferenceError` when already bound)
@@ -728,7 +728,7 @@ impl LowerCtx<'_> {
         }
         // `N.m(..)` on an unshadowed builtin namespace (`Math`, `JSON`,
         // `console`, `Object`, `Promise`, `Date`): the inline code, guarded
-        // unless `N` is inline (design 3.2 row 2); any other member is an
+        // unless `N` is inline (DESIGN.md §6.4); any other member is an
         // ordinary method call on the namespace object.
         if let Expr::Member(member) = callee_expr.as_ref()
             && let Some((namespace, key)) = self.namespace_member(member)
@@ -739,8 +739,8 @@ impl LowerCtx<'_> {
         // / `recv.getTime()` / .. name an `%Array.prototype%`,
         // `%String.prototype%`, `%Map.prototype%`, `%Set.prototype%`,
         // `%Promise.prototype%`, `%Date.prototype%` or `%GeneratorPrototype%`
-        // builtin: a generic method call with guarded fast paths (design 3.2
-        // rows 3-4).
+        // builtin: a generic method call with guarded fast paths (DESIGN.md
+        // §6.4).
         if let Expr::Member(member) = callee_expr.as_ref()
             && let MemberProp::Ident(id) = &member.prop
             && (ARRAY_METHODS.contains(&id.sym.as_ref())
@@ -787,7 +787,7 @@ impl LowerCtx<'_> {
         } else if let Some(kind) = ErrorKind::from_name(name)
             && self.shared.globals.sealed(name)
         {
-            // `Error(m)` without `new` constructs too (design 4.7).
+            // `Error(m)` without `new` constructs too (DESIGN.md §7.7).
             Ok(self.lower_error_construct(kind, args))
         } else if let Some(op) = convert_builtin_op(name)
             && (!matches!(name, "String" | "Number" | "Boolean")
@@ -826,7 +826,7 @@ impl LowerCtx<'_> {
         .then_some((namespace, key.sym.as_ref()))
     }
 
-    /// Lower `namespace.key(args)` (design 3.2 row 2). An inline namespace
+    /// Lower `namespace.key(args)` (DESIGN.md §6.4). An inline namespace
     /// keeps exactly the inline code; otherwise the inline code runs behind an
     /// [`IrNode::NamespaceGuard`] over the namespace value. A member without
     /// inline code, and a `JSON` call passing a reviver / replacer / space, is
@@ -1085,7 +1085,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower `recv.<name>(args)` for an `%Array.prototype%` or
-    /// `%String.prototype%` method `name` (design 3.2 row 3): the receiver
+    /// `%String.prototype%` method `name` (DESIGN.md §6.4): the receiver
     /// (nullish-guarded unless the generic call can throw that itself) and
     /// then each argument with side effects are evaluated once into temps, then an [`IrNode::ProtoGuard`] runs the
     /// inline fast path for an array receiver whose `name` is provably the
@@ -1673,7 +1673,7 @@ impl LowerCtx<'_> {
     ///
     /// Returns an error for any callee other than the three error identifiers,
     /// for spread arguments, or if the message expression is unsupported.
-    /// Lower `left instanceof right` (design 4.6) into an [`IrNode::InstanceOf`].
+    /// Lower `left instanceof right` (DESIGN.md §7.6) into an [`IrNode::InstanceOf`].
     /// See [`Self::instanceof_kind`] for the right-hand-side dispatch.
     fn lower_instanceof(&mut self, left: &Expr, right: &Expr) -> anyhow::Result<IrNode> {
         let value = self.lower_expr(left)?;
@@ -1758,7 +1758,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower `new X(args)` for any constructor expression `X` into an
-    /// [`IrNode::Construct`] (design 4.5). Class identity is by binding: `X` is
+    /// [`IrNode::Construct`] (DESIGN.md §7.6). Class identity is by binding: `X` is
     /// evaluated like any expression. When `X` names a recorded class, `this`'s
     /// property table is pre-sized for the fields its constructor chain assigns
     /// (capacity only; a rebound name just over-reserves).
@@ -1842,7 +1842,7 @@ impl LowerCtx<'_> {
     }
 
     /// Build the Error instance `new <kind>(message)` / `<kind>(message)`
-    /// constructs (design 4.7): an own `message` = `ToString(message)` only when
+    /// constructs (DESIGN.md §7.7): an own `message` = `ToString(message)` only when
     /// the argument is not `undefined`, and `stack` = `"<name>: <message>"`
     /// (just `<name>` for an empty or absent message — jsc keeps no runtime
     /// call frames). The argument is evaluated EXACTLY ONCE into a temp; a

@@ -227,7 +227,7 @@ impl<'a> LowerCtx<'a> {
         Some(slot)
     }
 
-    /// Resolve `new.target` (design 4.5): the nearest non-arrow function's
+    /// Resolve `new.target` (DESIGN.md §7.6): the nearest non-arrow function's
     /// prologue snapshot, read directly in that function and captured BY VALUE
     /// (it is immutable) through each nested arrow's environment. `undefined` in
     /// a generator/async body (never constructed); `None` at top level.
@@ -472,7 +472,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Resolve `name` as an assignment target: a binding, else a property of
-    /// the global object (design 4.3). A top-level function declaration is not
+    /// the global object (DESIGN.md §6.4). A top-level function declaration is not
     /// assignable, and `eval`/`arguments` are not assignment targets in strict
     /// code (an early `SyntaxError`).
     pub(super) fn resolve_target(

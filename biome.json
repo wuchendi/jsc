@@ -81,8 +81,7 @@
       "!**/public",
       "!**/wasm",
       "!**/target",
-      "!scripts/**",
-      "!tests/test262/harness/**"
+      "!scripts/**"
     ]
   }
 }

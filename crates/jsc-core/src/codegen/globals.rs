@@ -1,4 +1,4 @@
-//! The program-level global facts of design 3.2, computed once by a
+//! The program-level global facts of DESIGN.md §6.4, computed once by a
 //! whole-program syntactic scan before lowering: whether a global name is
 //! `sealed` (its value is the intrinsic it starts as, so a read compiles to
 //! the constant address), whether a namespace additionally never escapes
@@ -22,7 +22,7 @@ use crate::ir::{BuiltinCtor, ErrorKind};
 pub(super) const NAMESPACES: [&str; 6] = ["Math", "JSON", "console", "Object", "Promise", "Date"];
 
 /// The names whose presence lets a program reach and mutate a builtin
-/// prototype (design 3.2 intrinsics-sealed).
+/// prototype (DESIGN.md §6.4 intrinsics-sealed).
 const PROTOTYPE_REACHING: [&str; 9] = [
     "prototype",
     "constructor",
@@ -94,7 +94,7 @@ impl GlobalFacts {
         self.sealed(name) && !self.escaped.contains(name)
     }
 
-    /// Whether the program is intrinsics-sealed (design 3.2): none of
+    /// Whether the program is intrinsics-sealed (DESIGN.md §6.4): none of
     /// [`PROTOTYPE_REACHING`] occurs as an identifier, a member or property
     /// name, or a string literal (a class constructor's own key excepted), so
     /// no builtin prototype can be reached and mutated.

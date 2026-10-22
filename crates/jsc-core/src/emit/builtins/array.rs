@@ -1,6 +1,6 @@
 //! `%Array.prototype%` methods. Each body is generic over array-likes
 //! (`ToObject(this)`, `LengthOfArrayLike`, then `HasProperty` / `Get` / `Set`
-//! by index key) and runs the inline fast path of its call sites (design 3.2)
+//! by index key) and runs the inline fast path of its call sites (DESIGN.md §6.4)
 //! for a real array receiver.
 
 #[allow(clippy::wildcard_imports)]

@@ -1,6 +1,6 @@
 //! Integration tests: namespace members as ordinary runtime properties (G1c
-//! deleted), the guarded fast paths of design 3.2 and the intrinsics dirty
-//! bits of design 3.3.
+//! deleted), the guarded fast paths and the intrinsics dirty bits of
+//! DESIGN.md §6.4.
 
 mod common;
 use common::{assert_bool, assert_number, assert_output, assert_string, assert_uncaught};

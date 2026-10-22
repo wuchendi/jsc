@@ -1,6 +1,6 @@
 //! Integration tests: `%Map.prototype%`, `%Set.prototype%` and
-//! `%Date.prototype%` methods as real builtin function values (design 4.2,
-//! S5), their guarded call-site fast paths (design 3.2), the `size` getter,
+//! `%Date.prototype%` methods as real builtin function values (DESIGN.md
+//! §6.4), their guarded call-site fast paths, the `size` getter,
 //! the iterable `Map`/`Set` constructors and `Date()`.
 
 mod common;

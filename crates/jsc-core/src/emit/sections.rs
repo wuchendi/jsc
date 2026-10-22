@@ -1275,7 +1275,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 
 /// Whether `program` tests a dirty bit (a [`IrNode::ProtoGuard`] or a
 /// [`IrNode::NamespaceGuard`] on a watched namespace), so `__set` /
-/// `__define` / `__delete` must set the bits (design 3.3).
+/// `__define` / `__delete` must set the bits (DESIGN.md §6.4).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::ProtoGuard { sealed, .. } | IrNode::SizeRead { sealed, .. } => !sealed,
