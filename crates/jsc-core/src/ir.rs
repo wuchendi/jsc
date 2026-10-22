@@ -823,16 +823,18 @@ pub enum IrNode {
     /// `sent`). Emitted at the start of a resumed segment to bind `x = yield …`.
     SentValue,
     /// Build a `Generator` handle: allocate the [`abi::TYPE_GENERATOR`]
-    /// block, allocate `total` boxed cells for the frame (the first `slots.len()`
-    /// initialized from the constructor's argument expressions, the rest to
-    /// `undefined`), stash them in a `TYPE_ENV` frame block stored in the handle's
+    /// block, fill the `total` frame cells (the first `slots.len()` from
+    /// `slots`, the rest fresh cells holding `undefined`), stash them in a
+    /// `TYPE_ENV` frame block stored in the handle's
     /// `env` field, set `sm_idx`/`state=0`/`done=0`, and yield the handle jsval.
     /// This is the whole body of a `function*` CONSTRUCTOR.
     MakeGenerator {
         /// The funcref-table index of the state-machine function.
         sm_table_index: u32,
-        /// Initial values for the leading frame cells (the generator parameters),
-        /// in slot order — each a `Local(i)` reading the constructor's argument.
+        /// The leading frame cells, in slot order: each an expression yielding
+        /// the cell pointer — a fresh `CellNew` (a parameter's argument, the
+        /// receiver, `undefined`) or a cell captured from the constructor's
+        /// environment (an `EnvLoad`), shared by reference.
         slots: Vec<IrNode>,
         /// The total number of frame cells (parameters plus every body local).
         total: u32,

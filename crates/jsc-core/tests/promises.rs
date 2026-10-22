@@ -458,12 +458,9 @@ fn async_result_then_chain() {
     );
 }
 
-/// An async function expression, an async arrow, and an async generator remain
-/// out of scope (only top-level `async function` DECLARATIONS are supported).
+/// An async generator remains out of scope.
 #[test]
-fn async_non_declaration_forms_rejected() {
-    assert_rejected("let f = async function () { return 1 }; f()");
-    assert_rejected("let f = async () => 1; f()");
+fn async_generators_rejected() {
     assert_rejected("async function* f() { yield 1 } f().next()");
 }
 
