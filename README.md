@@ -67,17 +67,18 @@ The dialect is chosen by FILE extension:
 - `.tsx` — rejected (exit `2`); JSX is not supported.
 - any other extension, and all `-e` / `-p` input — JavaScript, so type syntax there is a compile error.
 
-`enum` and `namespace` are not supported: the strip pass lowers them to `var`-based JavaScript that codegen rejects with an `undeclared variable` compile error. Invalid input in either dialect — including errors swc recovers from, such as strict-mode early errors — is a compile error (exit `2`). The `@cdlab/jsc` package compiles JavaScript only.
+`enum` and `namespace` are not supported: the strip pass lowers them to `var`-based JavaScript whose binding is not resolved, so using one throws `ReferenceError` at run time. Invalid input in either dialect — including errors swc recovers from, such as strict-mode early errors — is a compile error (exit `2`). The `@cdlab/jsc` package compiles JavaScript only.
 
 ## Conformance
 
 test262 is the primary metric. `crates/jsc-test262` runs the official suite at a pinned commit against the release `jsc` binary:
 
 - `scripts/test262-fetch.sh` checks out tc39/test262 into `.tmp/test262`.
-- `tests/test262/harness/` holds the harness includes; `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module`, `async`, or `noStrict` are ineligible as well.
-- `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records the pass count per commit.
+- Tests run against the official harness files in that checkout, unmodified: `"use strict";` + `sta.js` + `assert.js` + the test's includes + the test source, compiled and run as `jsc FILE`. Includes that do not compile make their tests ineligible.
+- `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module`, `async`, or `noStrict` are ineligible as well.
+- `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records `pass` / `eligible` / `total` per commit from a full run (`--history`).
 
-Current result (last row of `tests/test262/history.tsv`): **5235 pass / 22992 eligible (22.8%) / 47665 total**.
+Current result (last row of `tests/test262/history.tsv`): **10185 pass / 23208 eligible (43.9%) / 47665 total**.
 
 ```bash
 bash scripts/test262-fetch.sh
@@ -91,7 +92,7 @@ cargo run --release -p jsc-test262 -- --history         # append a row to histor
 
 CI (`.github/workflows/`):
 
-- `ci.yml` — on push to `main` and on pull requests that touch Rust paths (`crates/**`, Cargo manifests and lockfile, toolchain/lint configs, `tests/test262/**`, `scripts/test262-fetch.sh`): `cargo fmt --check`, `typos`, `cargo clippy` (warnings denied), `cargo nextest`, doctests, `cargo shear`, `cargo deny`; plus a test262 job that runs `jsc-test262 --check` against the baseline.
+- `ci.yml` — on push to `main` and on pull requests that touch Rust paths (`crates/**`, Cargo manifests and lockfile, toolchain/lint configs, `tests/test262/**`, `scripts/test262-fetch.sh`): `cargo fmt --check`, `typos`, `cargo clippy` (warnings denied), `cargo nextest`, doctests, `cargo shear`, `cargo deny`; plus a test262 job that fetches test262, runs the M1 harness tests (`crates/jsc/tests/test262_harness.rs`: the official `sta.js` + `assert.js` compile and run), and runs `jsc-test262 --check` against the baseline.
 - `web.yml` — on push to `main` and pull requests that touch `crates/**`, `packages/**`, `apps/**`, `scripts/**`, Cargo or bun manifests (and manual dispatch): builds `@cdlab/jsc`, runs `biome` lint, builds the playground, and runs the package tests.
 - `release.yml` — on `v*` tags (and manual dispatch): builds the static musl binary and publishes the release.
 
@@ -100,16 +101,17 @@ CI (`.github/workflows/`):
 | Area | What works |
 | ---- | ---------- |
 | **Values** | `number`, `boolean`, `undefined`, `null`, `string`, arrays, objects, functions, `Map`, `Set`, `Promise`, `Date`, generators |
-| **Operators** | arithmetic, comparison, `==`/`===` and negations, logical and `??`, `typeof`, `instanceof`, `in`, `delete`, compound assignment, `++`/`--`, optional chaining `?.`; ToNumber coercion for arithmetic, unary, update and relational operators |
+| **Operators** | arithmetic, bitwise and shift, comparison, `==`/`===` and negations, logical and `??`, `typeof`, `instanceof`, `in`, `delete`, compound assignment, `++`/`--`, optional chaining `?.`; `ToPrimitive` / `ToNumber` / `ToString` call user `valueOf` / `toString` |
 | **Bindings** | block-scoped `let`/`const` (assigning a `const` is a compile error); array/object destructuring with defaults and rest; spread in array literals and calls |
-| **Control flow** | `if`, `for`, `while`, `for-of`, `for-in`, `switch`, labels, ternary |
-| **Functions** | declarations, arrows, closures (capture by reference), default and rest parameters; missing arguments are `undefined`, extra arguments are ignored; `function*` generators; `async` functions and top-level `await` |
-| **Classes** | fields, methods, constructors, `extends`/`super`, static methods and fields, instance getters/setters |
-| **Built-ins** | `console.log`, `Math`, `String`/`Number`/`Boolean`, `parseInt`/`parseFloat`, common array and string methods, `Object.keys`/`values`/`entries`, `Map`/`Set`, `JSON.parse`/`stringify`, `Date` |
+| **Objects** | dynamic properties with a prototype chain; object literals with computed keys, methods and getters/setters; arrays with holes, growth by index and `length` writes |
+| **Control flow** | `if`, `for`, `while`, `do`/`while`, `for-of`, `for-in`, `switch`, labels, ternary |
+| **Functions** | declarations, expressions, arrows, closures (capture by reference), default and rest parameters, `arguments`; functions are objects; `call`/`apply`; missing arguments are `undefined`, extra arguments are ignored; `function*` generators; `async` functions and top-level `await` |
+| **Classes** | class declarations and expressions, fields, methods, constructors, `extends` any constructor (including builtins)/`super`, `new.target`, static methods and fields, getters/setters |
+| **Built-ins** | function objects on real prototypes, usable as values: `console.log`, `Math`, `Object`, `String`/`Number`/`Boolean` (and wrapper objects), `parseInt`/`parseFloat`, `isNaN`/`isFinite`, `globalThis`, common array and string methods, `Map`/`Set`, `JSON.parse`/`stringify` (reviver, replacer, `space`), `Date` |
 | **Async** | `Promise` (`new Promise`, `resolve`/`reject`, `.then`/`.catch`) with a microtask queue |
-| **Errors** | `throw`, `try`/`catch`/`finally`; `Error`/`TypeError`/`RangeError` with `.name`, `.message`, `.stack` and `instanceof`; member access on `null`/`undefined` throws a catchable `TypeError`; running out of memory throws `RangeError` |
+| **Errors** | `throw`, `try`/`catch`/`finally`; `Error` and the six native error types with `.name`, `.message`, `.stack` and `instanceof`; engine errors (`null` member access, calling a non-function, unresolved names, …) are catchable error objects; running out of memory ends the run with `RangeError` |
 
-Unsupported syntax, and unknown methods on statically known receivers, are rejected at compile time with a source-span diagnostic; an unknown method on a dynamically shaped receiver throws `TypeError` at run time.
+Unsupported syntax is rejected at compile time with a source-span diagnostic; calling a missing method throws `TypeError` at run time.
 
 ## How it works
 
@@ -119,7 +121,7 @@ source ──swc──▶ AST ──codegen──▶ IR ──emit──▶ .was
 
 - **frontend** — parses source with [`swc`](https://swc.rs/).
 - **codegen** — lowers the AST to a small IR: scopes, closure capture analysis, generator/async state machines. Top-level bindings captured by top-level functions live in module cells.
-- **emit** — IR → wasm. Every value is a NaN-boxed `i64` (numbers are raw `f64` bits, with NaN canonicalized on every rebox through `__box_f64`; other kinds are tagged in the quiet-NaN space). Strings, arrays, objects, closures and environments live in linear memory behind a type-byte header, allocated by `__alloc`, a bump allocator that grows memory on demand up to 512 MiB. Exceptions use manual unwinding (no wasm exception-handling proposal). `Map`/`Set` keys compare with SameValueZero (`__same_value_zero`).
+- **emit** — IR → wasm. Every value is a NaN-boxed `i64` (numbers are raw `f64` bits, with NaN canonicalized on every rebox through `__box_f64`; other kinds are tagged in the quiet-NaN space). Strings, arrays, objects, closures and environments live in linear memory behind a type-byte header, allocated by `__alloc`, a bump allocator that grows memory on demand up to 512 MiB. Objects keep their own properties in interned-key tables and link a prototype; builtins live on a static realm image, with guarded inline fast paths for common calls. Exceptions use manual unwinding (no wasm exception-handling proposal). `Map`/`Set` keys compare with SameValueZero (`__same_value_zero`).
 - **run** — instantiates the module on `wasmtime`, provides the host imports, drains the microtask queue, and formats the result.
 
 Details are in [DESIGN.md](DESIGN.md).
@@ -127,16 +129,16 @@ Details are in [DESIGN.md](DESIGN.md).
 ## Current limitations
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
-- **Fixed-shape objects.** Computed keys (`{[k]: v}`), object spread, object-literal accessors and private class fields are rejected; writing a property an object does not have, or assigning past the end of an array, throws a `TypeError`; dynamic properties arrive with the wave-2 object model.
+- **Object model gaps.** No object spread, property-descriptor or prototype reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`, `assign`), private `#` members, static blocks, or computed class member names.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
 - **Not self-contained.** The module imports seven host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
 - **Byte strings.** Strings are byte sequences, not UTF-16: `"é".length` is `2`.
-- **Missing built-ins.** No `RegExp` (regex literals are rejected), `Symbol`, `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval`, or `Function.prototype.call`/`apply`/`bind`; no ES modules.
-- **Restricted forms.** Class and generator expressions, async arrows and async generators are rejected.
+- **Missing built-ins.** No `RegExp` (regex literals are rejected), `Symbol`, `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval`, or `Function.prototype.bind`; no ES modules.
+- **Restricted forms.** Generators and async functions must be top-level declarations: generator and async expressions, arrows, methods and nested declarations, and async generators are rejected.
 
 ## Roadmap
 
-A generic object model with a dynamic property-lookup fallback, UTF-16 strings, a JavaScript prelude for built-ins, self-contained WASI modules, GC, and ES modules.
+The built-in library and UTF-16 strings, self-contained WASI modules with GC, the remaining language features (ES modules, `RegExp`, `Symbol`, …), performance work, and productization; see [DESIGN.md](DESIGN.md#14-roadmap).
 
 ## License
 

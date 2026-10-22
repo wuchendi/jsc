@@ -1,5 +1,5 @@
-//! Integration tests: the `String`/`Number`/`Boolean` prototypes (design 4.2)
-//! and wrapper objects (design 2.4 classes 3..5, design 6): `new String(x)`,
+//! Integration tests: the `String`/`Number`/`Boolean` prototypes (DESIGN.md §6.4)
+//! and wrapper objects (DESIGN.md §5.2 classes 3..5, §6.3): `new String(x)`,
 //! `Object(primitive)`, `this` coercion of the prototype methods, and the
 //! String wrapper's exotic own `length` / index properties.
 

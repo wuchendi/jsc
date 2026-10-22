@@ -228,7 +228,7 @@ const NEW_TARGET_GLOBAL: u32 = 12;
 const SPREAD_ARGS_GLOBAL: u32 = 13;
 
 /// The wasm global index of the intrinsics dirty bits (`$__intrinsics_dirty`,
-/// i32, init `0`; design 3.3): bit `i` is set by `__set` / `__define` /
+/// i32, init `0`; DESIGN.md §6.4): bit `i` is set by `__set` / `__define` /
 /// `__delete` on the watched intrinsic whose property table carries
 /// [`abi::PROPS_WATCHED`] and bit index `i`. Bits are never cleared. Internal.
 const DIRTY_GLOBAL: u32 = 14;
@@ -302,14 +302,14 @@ const TYPE_ELEMS: i32 = abi::TYPE_ELEMS as i32;
 const ELEMS_CAP_OFFSET: u64 = abi::ELEMS_CAP_OFFSET as u64;
 const ELEMS_DATA_OFFSET: u64 = abi::ELEMS_DATA_OFFSET as u64;
 
-/// Type byte for a heap object block:
-/// `[type=2][pad×3][n:u32][(key_ptr:i64, val:i64) × n]` (payload after the
-/// [`HEADER_SIZE`] header). Maps to `typeof` "object".
+/// Type byte for an ordinary object block: the object-family prefix alone, its
+/// own properties in the `TYPE_PROPS` table at `props`. Maps to `typeof`
+/// "object". See [`abi::TYPE_OBJECT`].
 const TYPE_OBJECT: i32 = abi::TYPE_OBJECT as i32;
 
 /// Byte offset of the object-family prefix's `proto` jsval slot (see
 /// [`abi::OBJ_PROTO_OFFSET`]); arrays, Map/Set, promises and dates are created
-/// with their realm prototype, generators with `null`.
+/// with their realm prototype, generators with `%GeneratorPrototype%`.
 const OBJ_PROTO_OFFSET: u64 = abi::OBJ_PROTO_OFFSET as u64;
 
 /// Type byte, field offsets, and size of a first-class function value block
@@ -933,7 +933,7 @@ struct Helpers<'a> {
     /// When `false`, `__get` / `__set` omit the getter/setter invocation and
     /// member accesses skip the post-call exception check.
     has_accessors: bool,
-    /// Whether the program tests an intrinsics dirty bit (design 3.3). When
+    /// Whether the program tests an intrinsics dirty bit (DESIGN.md §6.4). When
     /// `false`, `__set` / `__define` / `__delete` do not set the bits.
     dirty_tracking: bool,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static

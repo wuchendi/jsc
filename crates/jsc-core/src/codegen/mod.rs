@@ -260,13 +260,13 @@ struct Shared<'a> {
     /// (see [`LowerCtx::completion_local`]), so a value produced inside a nested
     /// statement body reaches `main`'s result.
     completion: Cell<Option<u32>>,
-    /// The program-level global facts (design 3.2).
+    /// The program-level global facts (DESIGN.md §6.4).
     globals: GlobalFacts,
 }
 
 /// The lowered shape of a `class` declaration: the instance field names the
 /// constructor assigns via `this.<field> = ..`, in first-seen order. `new A(args)`
-/// sizes the instance's property table for them up front (design 3.2), so the
+/// sizes the instance's property table for them up front (DESIGN.md §6.4), so the
 /// constructor's adds do not regrow it.
 struct ClassInfo {
     /// Distinct instance field names, in first-assignment order. For a class
@@ -372,7 +372,7 @@ enum AccessKind {
     /// A boxed cell reached through the given pointer expression (a `Local` for
     /// a cell declared in this frame, or an `EnvLoad` for a captured cell).
     Cell(IrNode),
-    /// An unresolved name: a property of the global object (design 4.3).
+    /// An unresolved name: a property of the global object (DESIGN.md §6.4).
     Global(GlobalRef),
 }
 
@@ -479,7 +479,7 @@ impl Frame {
     }
 }
 
-/// What `super` resolves to inside a class body (design 4.5): the class
+/// What `super` resolves to inside a class body (DESIGN.md §7.6): the class
 /// frame's hidden by-value bindings of the parent constructor and of its
 /// `prototype` (the home object's prototype for instance members).
 #[derive(Clone, Copy)]

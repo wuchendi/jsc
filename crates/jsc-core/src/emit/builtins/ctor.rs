@@ -1,4 +1,4 @@
-//! The constructor bodies (design 4.2, 4.5, 4.7) as IR fragments over the
+//! The constructor bodies (DESIGN.md §6.4, §7.6, §7.7) as IR fragments over the
 //! argument slots. A constructed call carries the construct marker in `argc`
 //! (decoded by [`IrNode::ArgCount`]); `SELF_ALLOC` constructors allocate their
 //! own kind of object with `proto = Get(new.target, "prototype")` (falling back

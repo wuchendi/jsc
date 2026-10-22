@@ -1,4 +1,4 @@
-//! The realm image (design 4.1/4.2): every intrinsic object is a static block
+//! The realm image (DESIGN.md §6.4): every intrinsic object is a static block
 //! in the data segment, laid out by the compiler from ONE registry of
 //! `(intrinsic, key, attrs, value)` entries, so every intrinsic address is a
 //! compile-time constant and costs nothing at startup.
@@ -114,7 +114,7 @@ impl Intrinsic {
 
     /// The header `flags` of a callable intrinsic: a constructor is
     /// `CONSTRUCTOR`, and `SELF_ALLOC` when it allocates its own kind of
-    /// object from `new.target` (design 4.5, 4.7).
+    /// object from `new.target` (DESIGN.md §7.6, §7.7).
     fn flags(self) -> u8 {
         match self {
             Self::Ctor(
@@ -130,7 +130,7 @@ impl Intrinsic {
         }
     }
 
-    /// The dirty-bit index of a watched intrinsic (design 3.3), or `None`.
+    /// The dirty-bit index of a watched intrinsic (DESIGN.md §6.4), or `None`.
     pub(super) fn watch_bit(self) -> Option<u8> {
         Some(match self {
             Self::ObjectPrototype => 0,
@@ -282,7 +282,7 @@ pub(super) enum Builtin {
     /// `arguments` properties (one identity for every installation).
     ThrowTypeError,
     /// The out-of-line generic method call of the guarded builtin call sites
-    /// (design 3.2): `this` is the receiver, `env` packs the interned method
+    /// (DESIGN.md §6.4): `this` is the receiver, `env` packs the interned method
     /// key (low half) and the not-a-function message (high half). Not
     /// installed on any intrinsic.
     MethodCall,

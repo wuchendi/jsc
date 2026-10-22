@@ -36,9 +36,11 @@ Rust `wasmtime` harness. The shim reimplements the Rust runtime side:
 - `src/value.ts` ports the NaN-box decoder and value formatter from
   `crates/jsc-core/src/run/value.rs`.
 - `src/shim.ts` ports the host imports (`print` / `__convert` / `__method` /
-  `__promise` / `__then` / `__now` / `__parse_int`), the bump-allocator, and the promise engine
-  (microtask queue) from `crates/jsc-core/src/run/host.rs` + `run/promise.rs` +
-  `run/harness.rs`.
+  `__promise` / `__then` / `__now` / `__parse_int`), the out-of-memory guard,
+  and the promise engine (microtask queue) from
+  `crates/jsc-core/src/run/host.rs` + `run/promise.rs` + `run/harness.rs`.
+  Every heap block it creates is allocated by the guest's exported
+  constructors (`__new_string` / `__new_array` / `__new_promise`).
 - `src/abi.ts` copies the runtime ABI constants from
   `crates/jsc-core/src/abi.rs`.
 

@@ -223,7 +223,7 @@ pub(super) fn emit_apply(
 }
 
 /// The out-of-line generic method call of the guarded builtin call sites
-/// (design 3.2): a `null`/`undefined` receiver (`this`) throws the member-read
+/// (DESIGN.md §6.4): a `null`/`undefined` receiver (`this`) throws the member-read
 /// `TypeError`; else `__get` the method (low half of `env`, an interned key)
 /// from it, `IsCallable` (else the not-a-function `TypeError` whose message is
 /// the high half of `env`), then call it with the same argument slots and

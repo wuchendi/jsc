@@ -1,5 +1,5 @@
 //! Integration tests: the namespace and constructor statics as builtins
-//! (design 3.2 row 2): `JSON.parse` revivers, `JSON.stringify` replacers and
+//! (DESIGN.md §6.4): `JSON.parse` revivers, `JSON.stringify` replacers and
 //! indentation through every call shape (inline `JSON.x`, a guarded call on
 //! an escaping `JSON`, a call through a value), JS arity for every builtin
 //! static, variadic builtins called through a value with more than `K`

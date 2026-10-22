@@ -1,5 +1,5 @@
 //! Integration tests: the builtin constructors as real function values
-//! (design 4.2): `typeof`/`name`/`length`/`prototype` back-links, statics read
+//! (DESIGN.md §6.4): `typeof`/`name`/`length`/`prototype` back-links, statics read
 //! as values, calling vs constructing, the Error family as `SELF_ALLOC`
 //! builtins honouring `new.target` (`extends Error`), other builtin parents,
 //! generic `Array.prototype.map`, and user bindings shadowing builtin names

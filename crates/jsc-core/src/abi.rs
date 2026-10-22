@@ -159,9 +159,9 @@ pub(crate) const OBJ_FLAG_NOT_EXTENSIBLE: u8 = 1;
 
 /// Byte offset of the object-family prefix's `proto: i64` jsval slot (a heap
 /// pointer or [`NULL`]), 8-byte aligned. Ordinary objects are created with
-/// `%Object.prototype%` and functions with `%Function.prototype%` (static
-/// realm-image blocks); the other kinds with [`NULL`] until their intrinsic
-/// prototypes exist.
+/// `%Object.prototype%`, functions with `%Function.prototype%`, generators with
+/// `%GeneratorPrototype%`, and the other kinds with their realm prototype
+/// (static realm-image blocks).
 pub(crate) const OBJ_PROTO_OFFSET: u32 = 8;
 
 /// The byte size of the shared object-family prefix — header, `props`, and
@@ -477,7 +477,7 @@ pub(crate) const PROPS_HAS_INDEX_KEYS: u8 = 1;
 pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
 
 /// [`TYPE_PROPS`] `tflags` bit: the table belongs to a watched intrinsic
-/// (design 3.3); its byte [`PROPS_WATCH_BIT_OFFSET`] holds the intrinsic's
+/// (DESIGN.md §6.4); its byte [`PROPS_WATCH_BIT_OFFSET`] holds the intrinsic's
 /// dirty-bit index. A rebuilt table keeps both.
 pub(crate) const PROPS_WATCHED: u8 = 4;
 

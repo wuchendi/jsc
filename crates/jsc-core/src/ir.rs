@@ -143,29 +143,30 @@ pub enum ArrayHofOp {
     ForEach,
 }
 
-/// A conversion built-in: `String`/`Number`/`Boolean`/`parseInt`/
-/// `parseFloat`. Recognized syntactically from a bare-identifier callee at codegen
-/// (only when nothing of the same name shadows it), each taking one argument.
+/// A conversion: `String`/`Number`/`Boolean`/`parseInt`/`parseFloat` called
+/// directly by a bare unshadowed name, the `String`/`Number`/`Boolean`
+/// constructor bodies, and the internal `ToNumber` of numeric operators (see
+/// [`IrNode::ConvertCall`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertOp {
-    /// `String(x)` — the JS string form (a heap STRING jsval); reuses the run
-    /// stage's `format_value`, so `String(42) == "42"` like `format_number`.
+    /// `String(x)` — `ToString` in the guest (`__to_string`), so an object's
+    /// user `toString`/`valueOf` runs and may throw.
     ToString,
-    /// `Number(x)` — the JS numeric coercion (a number jsval); string operands are
-    /// full-string parsed (trimmed; empty => 0; non-numeric => NaN).
+    /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
+    /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
     ToNumber,
     /// `Boolean(x)` — JS truthiness (a boolean jsval). Lowered to inline wasm.
     ToBoolean,
-    /// `parseInt(s)` — leading base-10 integer of the (stringified) argument, or
-    /// NaN when none. The optional radix argument is ignored (base-10 only).
+    /// `parseInt(s, radix)` — the host `__parse_int` over `ToString(s)` and the
+    /// radix (`undefined` when omitted).
     ParseInt,
-    /// `parseFloat(s)` — leading decimal float of the (stringified) argument, or
-    /// NaN when none.
+    /// `parseFloat(s)` — the leading decimal float of `ToString(s)`, parsed on
+    /// the host, or NaN when none.
     ParseFloat,
 }
 
 /// The inline fast path of an `Array.prototype` search/join method on an
-/// array receiver (design 3.2 row 3), run host-side through the `__method`
+/// array receiver (DESIGN.md §6.4), run host-side through the `__method`
 /// import (`join`: the guest `__array_join`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodOp {
@@ -218,7 +219,7 @@ pub enum PropKey {
     Computed(IrNode),
 }
 
-/// What the right-hand side of an `instanceof` is (design 4.6). Any expression
+/// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
 /// is accepted: the general case is [`InstanceOfKind::Ctor`]
 /// (`OrdinaryHasInstance`). The builtin names that are not yet runtime values
 /// are recognized syntactically at codegen when no binding shadows them: the
@@ -340,7 +341,7 @@ impl CalleeError {
     }
 }
 
-/// A builtin constructor function of the realm (design 4.2).
+/// A builtin constructor function of the realm (DESIGN.md §6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinCtor {
     /// `Object`.
@@ -412,7 +413,7 @@ impl BuiltinCtor {
     }
 }
 
-/// A global intrinsic whose address is a compile-time constant (design 4.2):
+/// A global intrinsic whose address is a compile-time constant (DESIGN.md §6.4):
 /// the global object, the namespace objects and the constructors reachable
 /// from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,7 +444,7 @@ impl GlobalIntrinsic {
 }
 
 /// A reference to a property of the global object by an unresolved
-/// identifier (design 4.3): the property name plus the `.message` and `.stack`
+/// identifier (DESIGN.md §6.4): the property name plus the `.message` and `.stack`
 /// of the `ReferenceError` a miss throws (static strings interned at the site).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlobalRef {
@@ -470,7 +471,7 @@ impl GlobalRef {
 
 /// The inline body of a `%Map.prototype%` / `%Set.prototype%` method
 /// ([`IrNode::CollectionOp`]), run by its builtin and by a guarded call-site
-/// fast path (design 3.2) on a `TYPE_MAP`/`TYPE_SET` handle.
+/// fast path (DESIGN.md §6.4) on a `TYPE_MAP`/`TYPE_SET` handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapOp {
     /// `map.set(k, v)` — insert or update the entry for key `k`, yielding the map
@@ -789,9 +790,9 @@ pub enum IrNode {
     /// boolean jsval.
     IsObject(Box<IrNode>),
     /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
-    /// fresh wrapper object (design 2.4); an object is itself.
+    /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
     ToObject(Box<IrNode>),
-    /// A class heritage `extends value` (design 4.5): evaluate `value` into
+    /// A class heritage `extends value` (DESIGN.md §7.6): evaluate `value` into
     /// `parent`; unless it is `null` it must be a constructor, and `proto` gets
     /// `Get(parent, "prototype")`, which must be an object or `null` (`proto` is
     /// `null` for a `null` parent); either failure throws a `TypeError` naming
@@ -1246,7 +1247,7 @@ pub enum IrNode {
         not_callable: CalleeError,
     },
     /// `N.key(args)` on a builtin namespace `N` whose value is not the sealed,
-    /// non-escaping intrinsic (design 3.2 row 2). `obj` (the value of `N`) is
+    /// non-escaping intrinsic (DESIGN.md §6.4). `obj` (the value of `N`) is
     /// evaluated into `obj_local` and `args` into `arg_locals`; `fast` (the
     /// inline code over `arg_locals`) runs while `obj_local.key` is still the
     /// builtin method, else `slow` (the generic method call on `obj_local`).
@@ -1324,7 +1325,7 @@ pub enum IrNode {
         /// parent class constructor accepts the call.
         construct: bool,
     },
-    /// `new callee(args)` (design 4.5): evaluate `callee` into `callee_local` and
+    /// `new callee(args)` (DESIGN.md §7.6): evaluate `callee` into `callee_local` and
     /// the arguments, then `IsConstructor(callee)` (a function with
     /// `FUNC_FLAG_CONSTRUCTOR`, else throw `not_constructor`); allocate `this` = a
     /// fresh ordinary object (in `this_local`) whose `proto` is
@@ -1531,7 +1532,7 @@ pub enum IrNode {
     /// `Date.now()`: the host wall-clock time in milliseconds since the
     /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
     DateNow,
-    /// A static `obj.size` read (design 3.2 row "Map/Set `.size`"): a
+    /// A static `obj.size` read (DESIGN.md §6.4): a
     /// `TYPE_MAP`/`TYPE_SET` receiver passing its [`ProtoKind::Collection`]
     /// guard reads its `size` header; any other receiver is `obj["size"]`
     /// (the `%Map.prototype%`/`%Set.prototype%` getter, or an own/user
@@ -1711,7 +1712,7 @@ pub struct FnInfo {
     pub kind: FnKind,
 }
 
-/// Whether a function is a constructor (design 4.4).
+/// Whether a function is a constructor (DESIGN.md §5.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FnKind {
     /// Not a constructor: arrows, methods, accessors, generators, async
@@ -1803,7 +1804,7 @@ pub struct IrProgram {
 }
 
 impl IrNode {
-    /// An Error instance (design 4.7): a `TYPE_OBJECT` of class
+    /// An Error instance (DESIGN.md §7.7): a `TYPE_OBJECT` of class
     /// [`crate::abi::CLASS_ERROR`] whose `proto` is `kind`'s static prototype
     /// (`name` is inherited from it), with the non-enumerable own properties
     /// `message` (when one was given) and `stack` — the shape every builtin and
