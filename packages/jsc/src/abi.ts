@@ -216,6 +216,85 @@ export const METHOD_OP_SUBSTRING = 15
 export const METHOD_OP_SPLIT = 16
 /** `__method` op: `Number.prototype.toString(radix)` (number receiver). */
 export const METHOD_OP_NUMBER_TO_STRING = 17
+/** `__method` op: `String.prototype.at` (string). */
+export const METHOD_OP_AT = 18
+/** `__method` op: `String.prototype.charCodeAt` (string). */
+export const METHOD_OP_CHAR_CODE_AT = 19
+/** `__method` op: `String.prototype.codePointAt` (string). */
+export const METHOD_OP_CODE_POINT_AT = 20
+/** `__method` op: `String.prototype.lastIndexOf` (string). */
+export const METHOD_OP_LAST_INDEX_OF = 21
+/** `__method` op: `String.prototype.localeCompare` (string, code-unit order). */
+export const METHOD_OP_LOCALE_COMPARE = 22
+/** `__method` op: `String.prototype.normalize` (string). */
+export const METHOD_OP_NORMALIZE = 23
+/** `__method` op: index of a RegExp-free string pattern (`search` / `match`). */
+export const METHOD_OP_SEARCH = 24
+/** `__method` op: `String.prototype.replace` (string pattern, replacement template). */
+export const METHOD_OP_REPLACE = 25
+/** `__method` op: `String.prototype.replaceAll` (string pattern, replacement template). */
+export const METHOD_OP_REPLACE_ALL = 26
+/** `__method` op: `String.fromCharCode` (array receiver of numbers). */
+export const METHOD_OP_FROM_CHAR_CODE = 27
+/** `__method` op: `String.fromCodePoint` (array receiver of code points). */
+export const METHOD_OP_FROM_CODE_POINT = 28
+/** `__method` result: no correct result for the input yet (non-ASCII position, lone surrogate). */
+export const METHOD_UNSUPPORTED = 0x7ffb_0000_0000_0001n
+/** `__method` result: an out-of-range argument (unknown `normalize` form). */
+export const METHOD_RANGE_ERROR = 0x7ffb_0000_0000_0002n
+/** `__method` result: the pattern needs the absent `RegExp`. */
+export const METHOD_NEEDS_REGEXP = 0x7ffb_0000_0000_0003n
+/** `__method` op: `Number.prototype.toFixed(f)` (finite number receiver). */
+export const METHOD_OP_NUMBER_TO_FIXED = 40
+/** `__method` op: `Number.prototype.toExponential(f)` (finite number receiver). */
+export const METHOD_OP_NUMBER_TO_EXPONENTIAL = 41
+/** `__method` op: `Number.prototype.toPrecision(p)` (finite number receiver). */
+export const METHOD_OP_NUMBER_TO_PRECISION = 42
+/** `__method` op: a host `Math` function (`arg1` the raw `MATH_FN_*` code). */
+export const METHOD_OP_MATH = 43
+
+/** `METHOD_OP_MATH` function code: `Math.cbrt`. */
+export const MATH_FN_CBRT = 0
+/** `METHOD_OP_MATH` function code: `Math.log`. */
+export const MATH_FN_LOG = 1
+/** `METHOD_OP_MATH` function code: `Math.log2`. */
+export const MATH_FN_LOG2 = 2
+/** `METHOD_OP_MATH` function code: `Math.log10`. */
+export const MATH_FN_LOG10 = 3
+/** `METHOD_OP_MATH` function code: `Math.log1p`. */
+export const MATH_FN_LOG1P = 4
+/** `METHOD_OP_MATH` function code: `Math.exp`. */
+export const MATH_FN_EXP = 5
+/** `METHOD_OP_MATH` function code: `Math.expm1`. */
+export const MATH_FN_EXPM1 = 6
+/** `METHOD_OP_MATH` function code: `Math.sin`. */
+export const MATH_FN_SIN = 7
+/** `METHOD_OP_MATH` function code: `Math.cos`. */
+export const MATH_FN_COS = 8
+/** `METHOD_OP_MATH` function code: `Math.tan`. */
+export const MATH_FN_TAN = 9
+/** `METHOD_OP_MATH` function code: `Math.asin`. */
+export const MATH_FN_ASIN = 10
+/** `METHOD_OP_MATH` function code: `Math.acos`. */
+export const MATH_FN_ACOS = 11
+/** `METHOD_OP_MATH` function code: `Math.atan`. */
+export const MATH_FN_ATAN = 12
+/** `METHOD_OP_MATH` function code: `Math.atan2`. */
+export const MATH_FN_ATAN2 = 13
+/** `METHOD_OP_MATH` function code: `Math.sinh`. */
+export const MATH_FN_SINH = 14
+/** `METHOD_OP_MATH` function code: `Math.cosh`. */
+export const MATH_FN_COSH = 15
+/** `METHOD_OP_MATH` function code: `Math.tanh`. */
+export const MATH_FN_TANH = 16
+/** `METHOD_OP_MATH` function code: `Math.asinh`. */
+export const MATH_FN_ASINH = 17
+/** `METHOD_OP_MATH` function code: `Math.acosh`. */
+export const MATH_FN_ACOSH = 18
+/** `METHOD_OP_MATH` function code: `Math.atanh`. */
+export const MATH_FN_ATANH = 19
+/** `METHOD_OP_MATH` function code: `Math.random`. */
+export const MATH_FN_RANDOM = 20
 
 /** `__promise` op: `Promise.resolve(a)`. */
 export const PROMISE_OP_RESOLVE = 0
