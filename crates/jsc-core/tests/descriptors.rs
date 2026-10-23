@@ -488,7 +488,7 @@ fn intrinsic_redefinition_beats_fast_paths() {
 #[test]
 fn json_reviver_array_non_configurable() {
     check(&[(
-        r#"let a = JSON.parse('[1, 2]', function (key, value) { if (key === '0') { Object.defineProperty(this, '1', {configurable: false}) } if (key === '1') return 22; return value }); console.log(a[0], a[1]); let b = JSON.parse('[1, 2]', function (key, value) { if (key === '0') { Object.defineProperty(this, '1', {configurable: false}) } if (key === '1') return; return value }); console.log(b.hasOwnProperty('1'), b[1])"#,
+        r"let a = JSON.parse('[1, 2]', function (key, value) { if (key === '0') { Object.defineProperty(this, '1', {configurable: false}) } if (key === '1') return 22; return value }); console.log(a[0], a[1]); let b = JSON.parse('[1, 2]', function (key, value) { if (key === '0') { Object.defineProperty(this, '1', {configurable: false}) } if (key === '1') return; return value }); console.log(b.hasOwnProperty('1'), b[1])",
         "1 2\ntrue 2\n",
     )]);
 }
