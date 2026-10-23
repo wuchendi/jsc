@@ -603,7 +603,10 @@ export function createShim(): Shim {
         const pattern =
           patternValue.kind === 'undefined' ? '' : toJsString(patternValue)
         if (/[\\^$.*+?()[\]{}|]/.test(pattern)) return METHOD_NEEDS_REGEXP
-        return exactFound(hay, stringIndexOf(hay, utf8Encode.encode(pattern), 0))
+        return exactFound(
+          hay,
+          stringIndexOf(hay, utf8Encode.encode(pattern), 0),
+        )
       }
       case METHOD_OP_REPLACE:
       case METHOD_OP_REPLACE_ALL: {
@@ -1418,9 +1421,16 @@ function fromCodes(numbers: number[], codePoints: boolean): string | null {
   const units: number[] = []
   for (const n of numbers) {
     if (!codePoints) {
-      units.push(Number.isFinite(n) ? ((Math.trunc(n) % 0x10000) + 0x10000) % 0x10000 : 0)
+      units.push(
+        Number.isFinite(n)
+          ? ((Math.trunc(n) % 0x10000) + 0x10000) % 0x10000
+          : 0,
+      )
     } else if (n > 0xffff) {
-      units.push(0xd800 + ((n - 0x10000) >> 10), 0xdc00 + ((n - 0x10000) & 0x3ff))
+      units.push(
+        0xd800 + ((n - 0x10000) >> 10),
+        0xdc00 + ((n - 0x10000) & 0x3ff),
+      )
     } else {
       units.push(n)
     }

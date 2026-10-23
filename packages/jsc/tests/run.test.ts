@@ -508,7 +508,10 @@ it('runs the string and number prototype host ops like the Rust host', async () 
 it('runs the String statics and remaining string methods like the host', async () => {
   const cases: [string, string][] = [
     ['String.fromCharCode(104, 105, 233)', 'hié'],
-    ['String.fromCharCode(0xd83d, 0xde00) === String.fromCodePoint(0x1f600)', 'true'],
+    [
+      'String.fromCharCode(0xd83d, 0xde00) === String.fromCodePoint(0x1f600)',
+      'true',
+    ],
     ["String.raw({ raw: ['a', 'b', 'c'] }, 1, 2)", 'a1b2c'],
     ["'abc'.at(-1) + 'abc'.charCodeAt(1) + 'abc'.codePointAt(0)", 'c9897'],
     ["'abc'.charCodeAt(5)", 'NaN'],
@@ -525,10 +528,13 @@ it('runs the String statics and remaining string methods like the host', async (
     ["'éa'.replace('a', 'b')", 'éb'],
     ["'straße'.toUpperCase()", 'STRASSE'],
     ["' a　'.trim()", 'a'],
-    ["try { 'éa'.indexOf('a') } catch (e) { e.message }", 'String.prototype.indexOf does not support non-ASCII strings yet'],
+    [
+      "try { 'éa'.indexOf('a') } catch (e) { e.message }",
+      'String.prototype.indexOf does not support non-ASCII strings yet',
+    ],
     ["try { 'a'.normalize('x') } catch (e) { e.name }", 'RangeError'],
     ["try { 'a.b'.search('.') } catch (e) { e.name }", 'TypeError'],
-    ["try { String.fromCharCode(0xd800) } catch (e) { e.name }", 'TypeError'],
+    ['try { String.fromCharCode(0xd800) } catch (e) { e.name }', 'TypeError'],
   ]
   for (const [src, expected] of cases) {
     expect((await run(src)).result, src).toBe(expected)
