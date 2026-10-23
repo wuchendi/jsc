@@ -289,10 +289,10 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | `8 … 7+n` | the `n` user functions |
 | then | runtime helpers in a fixed order (§6.2): `__alloc` … `__to_number` |
 | then | `__invoke1`, `__async_step`, the two `new Promise` settlers, `__new_string`, `__new_array`, `__new_promise`, `__has_own` |
-| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 112 entries) |
+| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
 | last | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive` |
 
-**Table.** A funcref table of exactly `n + 2 + 112` entries (min = max), filled
+**Table.** A funcref table of exactly `n + 2 + 142` entries (min = max), filled
 by one active element segment: slots `0 … n-1` are the user functions, slots
 `n` and `n + 1` the two settlers, then the builtin bodies in `Builtin::ALL`
 order. A function value's `func_idx` is a slot in this table. Every module has
@@ -562,8 +562,11 @@ aliases, captured bindings, and member receivers all observe `push`.
   the highest non-configurable element `k ≥ n` (then `length = k + 1` and
   `Cannot delete property 'k'` is thrown); growing fills holes densely within
   the dense bound, else makes the array sparse without allocating the gap.
-  `defineProperty(a, "length", d)` rejects `configurable`/`enumerable` `true`
-  and accessor fields; on a read-only `length` it rejects `writable: true` and
+  `defineProperty(a, "length", d)` first converts a `value` (`ToUint32` and
+  `ToNumber`, two conversions; an abrupt one propagates and a mismatch is the
+  `RangeError`, even on a read-only `length`), then rejects
+  `configurable`/`enumerable` `true` and accessor fields; on a read-only
+  `length` it rejects `writable: true` and
   any value but the current one; otherwise a value is written as above and
   `writable: false` then sets `LENGTH_READONLY` (even when the shrink stopped
   early).
@@ -765,7 +768,9 @@ tables. Keys are interned `u32`s.
   `TypeError` before calling it).
 - **`__set(recv, key, v)`** — strict `OrdinarySet`. The first own-or-inherited
   hit decides: an accessor calls its setter with `this = recv` (a getter-only
-  accessor throws `Cannot set property k of object which has only a getter`),
+  accessor throws `Cannot set property k of object which has only a getter`;
+  with `K = 0` the value is passed in a one-element spread argument array, so
+  a builtin setter such as `__proto__`'s still receives it),
   a non-writable data property throws, an own writable one is overwritten;
   otherwise a `0b0111` own data property is added (a non-extensible object
   throws). Member stores on a primitive throw (`Cannot create property 'k' on
@@ -822,7 +827,11 @@ tables. Keys are interned `u32`s.
   own enumerable property (an array's `length` is not enumerable; a
   dense array's present elements are, a dictionary-mode element has its
   own attributes), backing `Object.assign` and
-  `propertyIsEnumerable`.
+  `propertyIsEnumerable`. `Object.prototype.__proto__` is an accessor pair
+  over the same helpers: the getter reads the `proto` of `ToObject(this)`;
+  the setter (`RequireObjectCoercible(this)`; a primitive `this` or a value
+  that is neither an object nor `null` is ignored) calls `__set_proto` and
+  throws on a rejection.
 - **Own-key order** (`__own_keys(obj, mode)`, behind `Object.keys/values/entries`,
   `JSON.stringify`, object rest, and the renderers): integer keys ascending
   (array elements skipping holes, then table keys flagged `ARRAY_INDEX` sorted
@@ -1291,7 +1300,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 |---|---|
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
 | `console` | `log` |
-| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over what `for-of` iterates); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf` |
+| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over what `for-of` iterates); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`; `push` / `pop` (variadic, generic over array-likes), `map`, `filter`, `forEach`, `reduce` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `indexOf`, `includes`, `join`, `slice`, `toString` |
 | `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
@@ -1561,9 +1570,7 @@ Each item below is current behaviour of this tree.
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
-- The builtin library is exactly §7.9: no `Object.prototype.__proto__`
-  accessor (`o.__proto__` reads and writes an ordinary property; its setter
-  would need `K >= 1` in programs without calls), no `Array.from`, `sort`,
+- The builtin library is exactly §7.9: no `Array.from`, `sort`,
   `find`,
   `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
@@ -1585,9 +1592,11 @@ Each item below is current behaviour of this tree.
   property table, so element access on a large frozen or attributed array is
   `O(n)`; the renderers print an accessor element as `undefined` and omit a
   non-enumerable one.
-- `defineProperty(a, "length", {value})` converts the value once
-  (`ToNumber`), not twice as `ArraySetLength` does; on a read-only `length`
-  an invalid value is rejected with a `TypeError`, not a `RangeError`.
+- An object literal's `__proto__: v` defines an own data property named
+  `__proto__` instead of setting the prototype.
+- `Object.values` / `Object.entries` select the enumerable own keys up front
+  (with `Object.keys`'s snapshot), so a getter that deletes or makes a later
+  key non-enumerable does not drop it from the result.
 - `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
   enumerable own keys of its `Properties` argument once, before reading any
   descriptor. `Object.fromEntries` collects its iterable eagerly, like the
@@ -1676,10 +1685,12 @@ installed on the realm's prototypes, and phase 3 extends that set.
 
 ### Phase 3 — Built-in library and strings
 
-- The remaining built-ins on the realm's prototypes: `Object` property
-  descriptors (`defineProperty`, `create`, `freeze`, `assign`),
-  the rest of `Array` (`from`, `sort`, species),
-  `String`, `Number`, and `Math`; `Date` parsing and local time.
+- The remaining built-ins on the realm's prototypes: the rest of `Array`
+  (`from`, `sort`, species), `String`, `Number`, and `Math`; `Date` parsing
+  and local time. `Object` reflection is done: property descriptors,
+  integrity levels, array dictionary mode, every `Object` static and
+  `Object.prototype` method of §7.9 (with `__proto__` and the legacy
+  accessor methods); the test262 runner includes `propertyHelper.js` tests.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
 - `AggregateError`.
