@@ -264,3 +264,23 @@ fn generator_yield_in_try_catch_finally_via_eval() {
         "1,x,f"
     );
 }
+
+/// `yield`/`await` operands of a comma (sequence) expression suspend in order,
+/// and the sequence's value is its last operand.
+#[test]
+fn sequence_expression_suspends_in_order() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "function* g(){ const v = (yield 1, yield 2); yield 'v=' + v } const it = g(); [it.next().value, it.next('a').value, it.next('b').value].join()"
+        ]),
+        "1,2,v=b"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "async function f(){ let s = ''; const r = (s += await 'a', s += await Promise.resolve('b'), s); return r } f().then(v => console.log(v))"
+        ]),
+        "ab"
+    );
+}

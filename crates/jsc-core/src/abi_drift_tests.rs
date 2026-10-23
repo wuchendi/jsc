@@ -316,7 +316,7 @@ fn object_family_layout_matches_design() {
         16, 24, 32, // function
         16, 24, 32, // map / set
         16, 24, 32, // promise
-        16, 20, 24, 32, 40, // generator
+        16, 20, 24, 32, 48, // generator
         16, 24, // date
         16, 20, 24, // array handle
         4, 8, // element store

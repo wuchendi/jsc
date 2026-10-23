@@ -276,6 +276,17 @@ pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
 /// `length` and `name` are defined at creation (it is never `LAZY`).
 pub(crate) const FUNC_FLAG_BOUND: u8 = 64;
 
+/// [`TYPE_FUNCTION`] header `flags` bit: a generator function (`function*`
+/// or a generator method). Not a constructor; materialization gives it a
+/// `prototype` object inheriting `%GeneratorPrototype%` with no
+/// `constructor`.
+pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
+
+/// [`TYPE_FUNCTION`] header `flags` bit, with [`FUNC_FLAG_GENERATOR`]: an
+/// async generator function, whose `prototype` inherits
+/// `%AsyncGeneratorPrototype%` instead.
+pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
@@ -400,12 +411,30 @@ pub(crate) const GEN_LIMIT_THROW: u32 = 2;
 /// resume), so a `next()` / `return()` / `throw()` from its own body throws.
 pub(crate) const GEN_RUNNING: u32 = 4;
 
+/// Generator `limits` bit: an async generator (`async function*`), driven
+/// by `%AsyncGeneratorPrototype%` through its request queue; never a sync
+/// iterable.
+pub(crate) const GEN_ASYNC: u32 = 8;
+
+/// Async generator `limits` bit: the state machine's last suspend was an
+/// `await` (the driver clears it before each step), not a `yield`.
+pub(crate) const GEN_AWAIT: u32 = 16;
+
+/// Async generator `limits` bit: the body is executing or awaiting (an
+/// `await` or a `return()` value), so a queued request waits.
+pub(crate) const GEN_BUSY: u32 = 32;
+
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
 /// jsval, 8-byte aligned past the `limits` word.
 pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
 
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of an async
+/// generator's u32 request-queue head (`0` when empty), guest-only; the
+/// tail follows at `+ 4`.
+pub(crate) const GEN_QUEUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 24;
+
 /// The byte size of a [`TYPE_GENERATOR`] block.
-pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 32;
 
 /// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the

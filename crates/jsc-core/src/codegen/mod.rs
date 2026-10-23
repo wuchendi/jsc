@@ -51,6 +51,7 @@ use crate::ir::{
 /// outside the supported numeric subset.
 #[allow(clippy::too_many_lines)]
 pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
+    early::check(program)?;
     let body: Vec<&Stmt> = match program {
         Program::Script(script) => script.body.iter().collect(),
         Program::Module(module) => module
@@ -120,13 +121,11 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     // sharing the same signature. Scanning the whole program up front fixes `K`
     // before any body is lowered, so a single `call_indirect` type serves them
     // all and no arrow's params can overflow the fixed argument slots.
-    // A generator's — and an `async function`'s — state machine is
+    // A generator's — and an `async` function's or arrow's — state machine is
     // driven with two positional arguments (`sent`, the handle), so `K` must be at
     // least 2 for the second slot to exist, regardless of the widest
     // source arity.
-    let has_state_machine = fn_decls
-        .iter()
-        .any(|f| f.function.is_generator || f.function.is_async);
+    let has_state_machine = has_state_machine(program);
     // A builtin reached through its function value reads its arguments from
     // the same `K` slots, so `K` then also covers the widest call.
     let globals = GlobalFacts::scan(program);
@@ -299,6 +298,9 @@ struct CaptureResolver {
     /// (`false` for `const`). Collected before the walk so a forward reference
     /// from a closure resolves to a module binding.
     top_bindings: HashMap<String, bool>,
+    /// The ids of function-scoped var bindings (parameters, `var`s, function
+    /// declarations), mirroring [`Frame::var_ids`].
+    var_ids: std::collections::HashSet<u32>,
 }
 
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
@@ -429,6 +431,10 @@ struct Frame {
     /// and for a function that never reads `this`). An `Expr::This` in this frame
     /// reads this local.
     this_local: Option<u32>,
+    /// The environment slot of an `env_backed` (generator) frame's `this` cell,
+    /// seeded by the generator constructor with its call's receiver; allocated
+    /// on the first `this` in the body (`None` until then).
+    gen_this: Option<u32>,
     /// Whether this frame is an arrow body, which has no `new.target` of its
     /// own: it reads the enclosing function's.
     arrow: bool,
@@ -448,10 +454,37 @@ struct Frame {
     /// class's instance fields ([`LowerCtx::class_fields`]) on entry;
     /// [`FnKind::DerivedClass`] for a derived one, whose `this` starts in the
     /// TDZ and is bound by `super(..)` (which also runs the instance fields).
+    /// [`FnKind::Generator`] for a generator or async function's constructor,
+    /// which binds the parameters: every binding it declares is a boxed cell,
+    /// so the body (a nested `env_backed` frame) shares it by reference.
     /// [`FnKind::Plain`] otherwise.
     ctor: FnKind,
     /// A derived constructor's `super(..)` bookkeeping.
     supers: SuperCalls,
+    /// The kind of the generator/async body this (`env_backed`) frame lowers,
+    /// `None` for every other frame.
+    machine: Option<Machine>,
+    /// The ids of this function's var-scoped bindings (parameters, `var`s and
+    /// function declarations): a `var` redeclaring one reuses it rather than
+    /// declaring a fresh binding (DESIGN.md §7.4).
+    var_ids: std::collections::HashSet<u32>,
+    /// The parameter names and ids of this function when its list has
+    /// parameter expressions, else empty (see [`LowerCtx::bind_var_copies`]).
+    params: Vec<(String, u32)>,
+    /// While this frame's parameters are being bound: the ids still in their
+    /// TDZ (empty for a list without parameter expressions, which cannot
+    /// observe it), and whether a destructured or rest name binds its
+    /// pre-declared local (see [`LowerCtx::bind_params`]).
+    binding: Option<ParamBinding>,
+}
+
+/// The in-progress parameter binding of a [`Frame`].
+struct ParamBinding {
+    /// Whether the list has parameter expressions: a captured parameter's
+    /// cell then holds the TDZ hole until its binding initializes it.
+    tdz: bool,
+    /// The parameter ids not yet initialized.
+    pending: std::collections::HashSet<u32>,
 }
 
 /// A derived constructor's `super(..)` bookkeeping (see [`Frame::ctor`]).
@@ -534,10 +567,14 @@ struct LowerCtx<'a> {
     /// While lowering `static` field initializers: the class frame and the
     /// hidden id of the class value, which `this` resolves to there.
     static_init: Option<(usize, u32)>,
+    /// Whether a `var` declaration's pattern is being bound (see
+    /// [`LowerCtx::var_redeclaration`]).
+    binding_var: bool,
 }
 
 mod arity;
 mod capture;
+mod early;
 mod expr;
 mod function;
 mod generator;
@@ -557,3 +594,26 @@ use op::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `program` contains any generator or async function or arrow (a
+/// body compiled to a state machine).
+fn has_state_machine(program: &Program) -> bool {
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    /// Finds a `function*` / `async` function or arrow anywhere.
+    #[derive(Default)]
+    struct Scan(bool);
+    impl Visit for Scan {
+        fn visit_function(&mut self, node: &swc_ecma_ast::Function) {
+            self.0 |= node.is_generator || node.is_async;
+            node.visit_children_with(self);
+        }
+        fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
+            self.0 |= node.is_async;
+            node.visit_children_with(self);
+        }
+    }
+    let mut scan = Scan::default();
+    program.visit_with(&mut scan);
+    scan.0
+}

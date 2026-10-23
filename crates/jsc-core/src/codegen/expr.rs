@@ -26,6 +26,14 @@ impl LowerCtx<'_> {
             // reads through its boxed cell.
             Expr::Ident(ident) => self.lower_ident(ident.sym.as_ref(), ident.span),
             Expr::Paren(p) => self.lower_expr(&p.expr),
+            // `a, b, c`: every operand runs left to right; the value is the
+            // last one (a plain value, so `(0, o.m)()` has no receiver).
+            Expr::Seq(seq) => Ok(IrNode::Seq(
+                seq.exprs
+                    .iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect::<anyhow::Result<_>>()?,
+            )),
             // An arrow function lifts to a top-level function value.
             Expr::Arrow(arrow) => self.lower_arrow(arrow, ""),
             // A function expression `function (..) { .. }` lifts the same way as
@@ -39,9 +47,13 @@ impl LowerCtx<'_> {
             // an `async function` body, the body is compiled as a
             // generator state machine, so `await e` becomes a `yield e` — the host
             // async engine resumes the machine with the awaited settled value.
+            // In an async generator, an `await` suspend is marked so its driver
+            // awaits the value instead of yielding it.
             Expr::Await(await_expr) => {
                 let arg = self.lower_expr(&await_expr.arg)?;
-                if self.async_body {
+                if self.frame().machine == Some(Machine::AsyncGenerator) {
+                    Ok(generator::await_suspend(arg))
+                } else if self.async_body {
                     Ok(IrNode::Yield(Box::new(arg)))
                 } else {
                     Ok(IrNode::Await(Box::new(arg)))
@@ -51,10 +63,16 @@ impl LowerCtx<'_> {
             // generator segmentation pass consumes every `Yield`; one that reaches
             // the backend means an unsupported yield position (rejected there).
             // `yield*` (delegate) is a statement, lowered by `lower_yield_delegate`.
+            // In an async generator `yield e` first awaits `e`.
             Expr::Yield(yield_expr) if !yield_expr.delegate => {
                 let arg = match &yield_expr.arg {
                     Some(arg) => self.lower_expr(arg)?,
                     None => IrNode::Undefined,
+                };
+                let arg = if self.frame().machine == Some(Machine::AsyncGenerator) {
+                    generator::await_suspend(arg)
+                } else {
+                    arg
                 };
                 Ok(IrNode::Yield(Box::new(arg)))
             }
@@ -247,6 +265,12 @@ impl LowerCtx<'_> {
                 }
                 if let Some(fi) = self.derived_frame() {
                     return Ok(self.derived_this(fi));
+                }
+                if let Some(this) = self.lexical_this() {
+                    return Ok(this);
+                }
+                if let Some(this) = self.generator_this() {
+                    return Ok(this);
                 }
                 // Only the top-level `main` frame binds no `this`: there it is
                 // the global object.
@@ -517,28 +541,48 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a function expression to a constructor function value named by
-    /// its own identifier, else by `name` (its optional identifier is not
-    /// bound inside the body).
+    /// Lower a function expression to a function value named by its own
+    /// identifier, else by `name`. A generator/async expression's identifier is
+    /// bound, read-only, inside its own body (for self-reference): a cell in a
+    /// scope of its own, created before the value and set to it, which the body
+    /// captures. An ordinary function expression's identifier is not bound.
     fn lower_fn_expr(
         &mut self,
         fn_expr: &swc_ecma_ast::FnExpr,
         name: &str,
     ) -> anyhow::Result<IrNode> {
-        let block = fn_expr
-            .function
-            .body
-            .as_ref()
-            .ok_or_else(|| anyhow!("function expression requires a body"))?;
-        reject_unsupported_function(&fn_expr.function)?;
-        let param_pats: Vec<&Pat> = fn_expr.function.params.iter().map(|p| &p.pat).collect();
-        let name = fn_expr.ident.as_ref().map_or(name, |id| id.sym.as_ref());
-        self.lower_lifted_function(
-            &param_pats,
-            BodyKind::Block(&block.stmts),
-            name,
-            FnKind::Constructor,
-        )
+        let function = &fn_expr.function;
+        let Some(ident) = &fn_expr.ident else {
+            return self.lower_function_value(function, name);
+        };
+        let name = ident.sym.as_ref();
+        let id = ident.span.lo.0;
+        if !(function.is_generator || function.is_async) || !self.shared.captured.contains(&id) {
+            return self.lower_function_value(function, name);
+        }
+        self.push_scope();
+        let local = self.declare(name, false, id);
+        let env_slot = self.env_slot_for_local(local);
+        let value = self.lower_function_value(function, name);
+        self.pop_scope();
+        let value = value?;
+        // In a generator frame the cell is a pre-created frame cell.
+        if let Some(slot) = env_slot {
+            return Ok(IrNode::CellSet {
+                cell: Box::new(IrNode::EnvLoad(slot)),
+                value: Box::new(value),
+            });
+        }
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local,
+                value: Box::new(IrNode::CellNew(Box::new(IrNode::Undefined))),
+            },
+            IrNode::CellSet {
+                cell: Box::new(IrNode::Local(local)),
+                value: Box::new(value),
+            },
+        ]))
     }
 
     /// Lower `super(args)` inside a derived class constructor (DESIGN.md §7.6):
@@ -641,6 +685,17 @@ impl LowerCtx<'_> {
             };
             return Ok((IrNode::Seq(vec![read, node]), local));
         }
+        // An arrow's `this` is its enclosing function's, and a generator/async
+        // method's lives in its frame cell: snapshot it into a local for the
+        // call.
+        if let Some(this) = self.lexical_this().or_else(|| self.generator_this()) {
+            let local = self.fresh();
+            let read = IrNode::Assign {
+                local,
+                value: Box::new(this),
+            };
+            return Ok((IrNode::Seq(vec![read, node]), local));
+        }
         let Some(this_local) = self.ensure_this_local() else {
             return Err(CompileError::spanned(span, "`super` is not available here").into());
         };
@@ -712,6 +767,12 @@ impl LowerCtx<'_> {
         let Callee::Expr(callee_expr) = &call.callee else {
             return Err(CompileError::spanned(call.span(), "unsupported call target").into());
         };
+        // Parentheses keep the Reference: `(o.m)()` calls with `this = o`
+        // (only a non-reference such as `(0, o.m)` drops it).
+        let mut callee_expr = callee_expr;
+        while let Expr::Paren(p) = callee_expr.as_ref() {
+            callee_expr = &p.expr;
+        }
         // `super.m(..)` — a parent prototype method call inside a derived class.
         if let Expr::SuperProp(super_prop) = callee_expr.as_ref() {
             return self.lower_super_method_call(call, super_prop);
@@ -790,16 +851,36 @@ impl LowerCtx<'_> {
             // `Error(m)` without `new` constructs too (DESIGN.md §7.7).
             Ok(self.lower_error_construct(kind, args))
         } else if let Some(op) = convert_builtin_op(name)
-            && (!matches!(name, "String" | "Number" | "Boolean")
-                || self.shared.globals.sealed(name))
+            && self.shared.globals.sealed(name)
         {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
-            // String(){}` shadows it.
+            // String(){}` shadows it, and only while sealed, so a reassigned
+            // global is called instead.
             let empty = args.is_empty();
             let (seq, args) = self.fit_inline_args(Some(convert_arity(op)), args);
             Ok(seq_then(seq, convert_call(op, empty, args)))
+        } else if let Some(op) = convert_builtin_op(name)
+            && is_parse(op)
+        {
+            // An unsealed `parseInt`/`parseFloat`: the global object has no
+            // such property unless the program stored one, which is called;
+            // otherwise the builtin conversion runs.
+            let empty = args.is_empty();
+            let (mut seq, has, callee) = self.user_global(name);
+            let args: Vec<IrNode> = args
+                .into_iter()
+                .map(|arg| self.spill(&mut seq, arg))
+                .collect();
+            let user = IrNode::CallIndirect {
+                callee: Box::new(IrNode::Local(callee)),
+                args: args.clone(),
+                not_callable: CalleeError::not_a_function(name),
+            };
+            let (fit, args) = self.fit_inline_args(Some(convert_arity(op)), args);
+            let builtin = seq_then(fit, convert_call(op, empty, args));
+            Ok(seq_then(seq, ternary(IrNode::Local(has), user, builtin)))
         } else {
             // A global-object property, read (or thrown on) at run time.
             Ok(IrNode::CallIndirect {
@@ -1012,26 +1093,9 @@ impl LowerCtx<'_> {
                 args,
             })
         } else if let Some(op) = convert_builtin_op(name)
-            && matches!(op, ConvertOp::ParseInt | ConvertOp::ParseFloat)
+            && is_parse(op)
         {
-            // `parseInt`/`parseFloat` read their arguments from the array.
-            let array = self.fresh();
-            let arg = |i: f64| IrNode::Index {
-                obj: Box::new(IrNode::Local(array)),
-                index: Box::new(IrNode::Num(i)),
-            };
-            let read = [0.0, 1.0]
-                .into_iter()
-                .take(convert_arity(op))
-                .map(arg)
-                .collect();
-            Ok(seq_then(
-                vec![IrNode::Assign {
-                    local: array,
-                    value: args,
-                }],
-                convert_call(op, false, read),
-            ))
+            Ok(self.lower_spread_parse(name, op, args))
         } else {
             Ok(IrNode::CallSpread {
                 target: SpreadCallee::Indirect(
@@ -1041,6 +1105,52 @@ impl LowerCtx<'_> {
                 args,
             })
         }
+    }
+
+    /// Lower a spread `parseInt(...a)` / `parseFloat(...a)` call over the
+    /// argument array `args`.
+    fn lower_spread_parse(&mut self, name: &str, op: ConvertOp, args: Box<IrNode>) -> IrNode {
+        // `parseInt`/`parseFloat` read their arguments from the array;
+        // unsealed, a user value stored on the global object is called
+        // instead (see [`Self::user_global`]).
+        let (mut seq, guard) = if self.shared.globals.sealed(name) {
+            (Vec::new(), None)
+        } else {
+            let (seq, has, callee) = self.user_global(name);
+            (seq, Some((has, callee)))
+        };
+        let array = self.fresh();
+        let arg = |i: f64| IrNode::Index {
+            obj: Box::new(IrNode::Local(array)),
+            index: Box::new(IrNode::Num(i)),
+        };
+        let read = [0.0, 1.0]
+            .into_iter()
+            .take(convert_arity(op))
+            .map(arg)
+            .collect();
+        seq.push(IrNode::Assign {
+            local: array,
+            value: args,
+        });
+        let builtin = convert_call(op, false, read);
+        seq_then(
+            seq,
+            match guard {
+                Some((has, callee)) => ternary(
+                    IrNode::Local(has),
+                    IrNode::CallSpread {
+                        target: SpreadCallee::Indirect(
+                            Box::new(IrNode::Local(callee)),
+                            CalleeError::not_a_function(name),
+                        ),
+                        args: Box::new(IrNode::Local(array)),
+                    },
+                    builtin,
+                ),
+                None => builtin,
+            },
+        )
     }
 
     /// Lower a spread method call `obj.m(...args)` / `obj[k](...args)` (the
@@ -1569,22 +1679,8 @@ impl LowerCtx<'_> {
                 // A method / shorthand method `{m(){..}}` lifts to a first-class
                 // function value (like an arrow) that carries `this`.
                 Prop::Method(method) => {
-                    reject_unsupported_function(&method.function)?;
                     let key = self.lower_prop_key(&method.key)?;
-                    let block = method
-                        .function
-                        .body
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("object method requires a body"))?;
-                    let param_pats: Vec<&Pat> =
-                        method.function.params.iter().map(|p| &p.pat).collect();
-                    let name = static_key_name(&key);
-                    let value = self.lower_lifted_function(
-                        &param_pats,
-                        BodyKind::Block(&block.stmts),
-                        name,
-                        FnKind::Plain,
-                    )?;
+                    let value = self.lower_method(&method.function, static_key_name(&key))?;
                     entries.push((key, value));
                 }
                 Prop::Getter(getter) => {
@@ -1815,30 +1911,79 @@ impl LowerCtx<'_> {
     }
 
     /// Build the Error instance `<kind>(args)` / `new <kind>(args)` constructs:
-    /// the first argument is the message (see [`Self::lower_error_object`]);
-    /// surplus arguments are evaluated after it, left to right, for their side
-    /// effects only.
+    /// the first argument is the message (see [`Self::lower_error_object`]),
+    /// the second the options whose `cause` the instance installs (see
+    /// [`IrNode::install_error_cause`]); surplus arguments are evaluated after
+    /// them, left to right, for their side effects only.
     fn lower_error_construct(&mut self, kind: ErrorKind, args: Vec<IrNode>) -> IrNode {
         let mut args = args.into_iter();
         let mut message = args.next();
+        let options = args.next();
         let extra: Vec<IrNode> = args.collect();
-        if extra.is_empty() {
+        if options.is_none() {
             return self.lower_error_object(kind, message);
         }
-        // A non-literal message is evaluated into a temp before the surplus
-        // arguments run.
-        let head = message
-            .take_if(|message| !matches!(message, IrNode::Str(_) | IrNode::Undefined))
-            .map(|value| {
-                let local = self.fresh();
-                message = Some(IrNode::Local(local));
-                IrNode::Assign {
-                    local,
-                    value: Box::new(value),
-                }
-            });
+        // A non-literal message or options value is evaluated into a temp
+        // before the arguments after it run; a literal options value is a
+        // primitive, so it installs no cause.
+        let mut head = Vec::new();
+        if let Some(value) = message.take_if(|message| !is_literal(message)) {
+            message = Some(self.spill(&mut head, value));
+        }
+        let options = options
+            .filter(|options| !is_literal(options))
+            .map(|value| self.spill(&mut head, value));
+        head.extend(extra);
         let error = self.lower_error_object(kind, message);
-        IrNode::Seq(head.into_iter().chain(extra).chain([error]).collect())
+        let error = match options {
+            Some(options) => {
+                let (obj, scratch) = (self.fresh(), self.fresh());
+                IrNode::install_error_cause(error, options, obj, scratch)
+            }
+            None => error,
+        };
+        if head.is_empty() {
+            return error;
+        }
+        IrNode::Seq(head.into_iter().chain([error]).collect())
+    }
+
+    /// The callee reference of an unsealed `parseInt`/`parseFloat` call,
+    /// resolved before its arguments run: the statements setting local `has`
+    /// to whether the global object has the property `name` (only a value
+    /// the program stored: these builtins are not global properties) and
+    /// local `callee` to that value.
+    fn user_global(&mut self, name: &str) -> (Vec<IrNode>, u32, u32) {
+        let (has, callee) = (self.fresh(), self.fresh());
+        let seq = vec![
+            IrNode::Assign {
+                local: has,
+                value: Box::new(IrNode::ObjectHas {
+                    key: Box::new(IrNode::Str(name.to_owned())),
+                    obj: Box::new(IrNode::Intrinsic(GlobalIntrinsic::Global)),
+                }),
+            },
+            IrNode::Assign {
+                local: callee,
+                value: Box::new(ternary(
+                    IrNode::Local(has),
+                    self.global_read(name),
+                    IrNode::Undefined,
+                )),
+            },
+        ];
+        (seq, has, callee)
+    }
+
+    /// Append the evaluation of `value` into a fresh temp to `head`; yields
+    /// the temp's read.
+    fn spill(&mut self, head: &mut Vec<IrNode>, value: IrNode) -> IrNode {
+        let local = self.fresh();
+        head.push(IrNode::Assign {
+            local,
+            value: Box::new(value),
+        });
+        IrNode::Local(local)
     }
 
     /// Build the Error instance `new <kind>(message)` / `<kind>(message)`
@@ -2049,12 +2194,34 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
-        Expr::Yield(_) => "yield expressions are not supported",
-        Expr::Seq(_) => "comma (sequence) expressions are not supported",
+        Expr::Yield(_) => "`yield*` is only supported as a statement",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
     }
+}
+
+/// `cond ? then_branch : else_branch`.
+fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(cond),
+        then_branch: Box::new(then_branch),
+        else_branch: Box::new(else_branch),
+    }
+}
+
+/// Whether `op` is `parseInt` / `parseFloat` (not global values, so never
+/// reachable through the global object unless the program stores one).
+fn is_parse(op: ConvertOp) -> bool {
+    matches!(op, ConvertOp::ParseInt | ConvertOp::ParseFloat)
+}
+
+/// Whether `node` is a literal primitive (no side effects, no object).
+fn is_literal(node: &IrNode) -> bool {
+    matches!(
+        node,
+        IrNode::Num(_) | IrNode::Str(_) | IrNode::Bool(_) | IrNode::Null | IrNode::Undefined
+    )
 }
 
 /// `seq` (evaluated for its effects) then `last`, the value.

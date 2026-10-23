@@ -73,6 +73,8 @@ const NOT_EXTENSIBLE: i32 = abi::OBJ_FLAG_NOT_EXTENSIBLE as i32;
 const FUNC_LAZY: i32 = abi::FUNC_FLAG_LAZY as i32;
 const FUNC_CONSTRUCTOR: i32 = abi::FUNC_FLAG_CONSTRUCTOR as i32;
 const FUNC_CLASS_CTOR: i32 = abi::FUNC_FLAG_CLASS_CTOR as i32;
+const FUNC_GENERATOR: i32 = abi::FUNC_FLAG_GENERATOR as i32;
+const FUNC_ASYNC: i32 = abi::FUNC_FLAG_ASYNC as i32;
 /// The header word (as a little-endian u32) of a lazy function, under
 /// [`LAZY_FN_MASK`]: kind byte `TYPE_FUNCTION`, `flags` bit `LAZY`.
 const LAZY_FN_WORD: i32 = TYPE_FUNCTION | FUNC_LAZY << 16;
@@ -747,7 +749,10 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
 /// and define its own properties from its `__fn_info` entry (DESIGN.md §5.5):
 /// `length` and `name` (configurable only); and for a plain `CONSTRUCTOR`
 /// (not a class, whose definition installs its own `prototype`), `prototype`
-/// (writable only) = a fresh object whose non-enumerable `constructor` is `o`.
+/// (writable only) = a fresh object whose non-enumerable `constructor` is `o`;
+/// for a `GENERATOR`, `prototype` (writable only) = a fresh object inheriting
+/// `%GeneratorPrototype%` (`%AsyncGeneratorPrototype%` when also `ASYNC`),
+/// with no `constructor`.
 /// No own `caller` / `arguments`: every function is strict, so they resolve to
 /// the `%Function.prototype%` `%ThrowTypeError%` accessors.
 pub(super) fn emit_fn_materialize(
@@ -792,6 +797,28 @@ pub(super) fn emit_fn_materialize(
     emit_box_heap(&mut f);
     define(&mut f, ATTR_WRITABLE | ATTR_CONFIGURABLE);
     wasm!(f; LocalGet(o), I32Const(key("prototype")), LocalGet(p));
+    emit_box_heap(&mut f);
+    define(&mut f, ATTR_WRITABLE);
+    wasm!(f;
+        End,
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(FUNC_GENERATOR), I32And,
+        If(BlockType::Empty),
+        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(p),
+    );
+    emit_object_prefix(
+        &mut f,
+        p,
+        TYPE_OBJECT,
+        intrinsic_bits(Intrinsic::GeneratorPrototype, helpers),
+    );
+    wasm!(f;
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(FUNC_ASYNC), I32And,
+        If(BlockType::Empty),
+        LocalGet(p), I64Const(intrinsic_bits(Intrinsic::AsyncGeneratorPrototype, helpers)),
+        I64Store(m64(OBJ_PROTO_OFFSET)),
+        End,
+        LocalGet(o), I32Const(key("prototype")), LocalGet(p),
+    );
     emit_box_heap(&mut f);
     define(&mut f, ATTR_WRITABLE);
     wasm!(f; End, End);

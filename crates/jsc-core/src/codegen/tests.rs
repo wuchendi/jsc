@@ -740,20 +740,15 @@ fn declaration_without_initializer_binds_undefined() {
 }
 
 #[test]
-fn rejects_async_and_unsupported_generator_functions() {
-    // An `async` function EXPRESSION / ARROW would otherwise lower as an
-    // ordinary function and run to a wrong result, so each must be a clear
-    // compile error. A TOP-LEVEL `async function` declaration and a TOP-LEVEL
-    // `function*` declaration are supported; a generator EXPRESSION / ARROW and
-    // an `async` generator remain out of scope.
-    let msg = |src: &str| format!("{:#}", lower_src(src).unwrap_err());
-    assert!(msg("let f = async function(){ return 1 };").contains("async"));
-    assert!(msg("let f = async () => 1;").contains("async"));
-    assert!(msg("let g = function*(){ return 1 };").contains("generator"));
-    // A top-level `function* g(){}` declaration compiles, as does a top-level
-    // `async function f(){}` declaration.
+fn lowers_generator_async_and_async_generator_functions() {
+    // Generator, async and async generator functions compile in every
+    // function position.
+    assert!(lower_src("async function* g(){ yield 1 } g().next();").is_ok());
+    assert!(lower_src("const o = { async *m(){ yield await 1 } };").is_ok());
     assert!(lower_src("function* g(){ yield 1 } g().next();").is_ok());
     assert!(lower_src("async function f(){ return 1 } f();").is_ok());
+    assert!(lower_src("let g = function*(){ return 1 };").is_ok());
+    assert!(lower_src("let f = async () => 1;").is_ok());
 }
 
 #[test]

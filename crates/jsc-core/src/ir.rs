@@ -819,21 +819,29 @@ pub enum IrNode {
     /// into a state-machine suspend point, so a `Yield` that survives to the
     /// backend is an unsupported yield position (rejected by codegen before emit).
     Yield(Box<IrNode>),
+    /// The operand of the suspend an `await` in an async generator body
+    /// lowers to (`Yield(AwaitMark(e))`): evaluate `e`, then flag the running
+    /// generator (`gen` is the state machine's local 1) with
+    /// [`crate::abi::GEN_AWAIT`], so its driver awaits the suspended value
+    /// instead of yielding it.
+    AwaitMark(Box<IrNode>),
     /// Read the value passed to the generator's `.next(v)` for the `yield` that is
     /// resuming: the state machine's first wasm parameter (local `0`,
     /// `sent`). Emitted at the start of a resumed segment to bind `x = yield …`.
     SentValue,
     /// Build a `Generator` handle: allocate the [`abi::TYPE_GENERATOR`]
-    /// block, allocate `total` boxed cells for the frame (the first `slots.len()`
-    /// initialized from the constructor's argument expressions, the rest to
-    /// `undefined`), stash them in a `TYPE_ENV` frame block stored in the handle's
+    /// block, fill the `total` frame cells (the first `slots.len()` from
+    /// `slots`, the rest fresh cells holding `undefined`), stash them in a
+    /// `TYPE_ENV` frame block stored in the handle's
     /// `env` field, set `sm_idx`/`state=0`/`done=0`, and yield the handle jsval.
     /// This is the whole body of a `function*` CONSTRUCTOR.
     MakeGenerator {
         /// The funcref-table index of the state-machine function.
         sm_table_index: u32,
-        /// Initial values for the leading frame cells (the generator parameters),
-        /// in slot order — each a `Local(i)` reading the constructor's argument.
+        /// The leading frame cells, in slot order: each an expression yielding
+        /// the cell pointer — a fresh `CellNew` (a parameter's argument, the
+        /// receiver, `undefined`) or a cell captured from the constructor's
+        /// environment (an `EnvLoad`), shared by reference.
         slots: Vec<IrNode>,
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
@@ -1367,8 +1375,9 @@ pub enum IrNode {
     /// Read the `__spread_args` wasm global: the argument array of the most
     /// recent spread call or construct, which holds the arguments beyond the
     /// `K` positional slots. Emitted ONLY in the prologue of a function that
-    /// gathers its arguments (a rest parameter or `arguments`), which reads it
-    /// only when its decoded argument count exceeds `K`.
+    /// gathers its arguments (a rest parameter or `arguments`) or of a builtin
+    /// constructor reading an argument past `K`, which reads it only when its
+    /// decoded argument count exceeds `K`.
     SpreadArgsGlobal,
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
@@ -1717,10 +1726,16 @@ pub struct FnInfo {
 /// Whether a function is a constructor (DESIGN.md §5.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FnKind {
-    /// Not a constructor: arrows, methods, accessors, generators, async
-    /// functions, and internal functions. No `prototype`.
+    /// Not a constructor: arrows, methods, accessors, async functions, and
+    /// internal functions. No `prototype`.
     #[default]
     Plain,
+    /// A generator function or method: not a constructor, but materializes a
+    /// `prototype` inheriting `%GeneratorPrototype%` (no `constructor`).
+    Generator,
+    /// An async generator function or method: like [`Self::Generator`], its
+    /// `prototype` inheriting `%AsyncGeneratorPrototype%`.
+    AsyncGenerator,
     /// A `function` declaration or expression: materializes a `prototype`.
     Constructor,
     /// A class constructor: its `prototype` is defined by the class.
@@ -1880,6 +1895,50 @@ impl IrNode {
         }
     }
 
+    /// `InstallErrorCause` (DESIGN.md §7.7): the Error instance `error` is
+    /// evaluated into local `obj` and, when `options` (side-effect free, read
+    /// repeatedly) is an object with a `cause` property (own or inherited),
+    /// gets an own non-enumerable `cause` = `options.cause` (defined through
+    /// local `scratch`); yields the instance.
+    pub(crate) fn install_error_cause(
+        error: IrNode,
+        options: IrNode,
+        obj: u32,
+        scratch: u32,
+    ) -> Self {
+        let cause = || IrNode::Str("cause".to_owned());
+        let has_cause = IrNode::Logical {
+            op: LogicalOp::And,
+            lhs: Box::new(IrNode::IsObject(Box::new(options.clone()))),
+            rhs: Box::new(IrNode::ObjectHas {
+                key: Box::new(cause()),
+                obj: Box::new(options.clone()),
+            }),
+        };
+        let define = IrNode::DefineProps {
+            obj: Box::new(IrNode::Local(obj)),
+            local: scratch,
+            entries: vec![(
+                PropKey::Hidden("cause".to_owned()),
+                IrNode::Index {
+                    obj: Box::new(options),
+                    index: Box::new(cause()),
+                },
+            )],
+        };
+        IrNode::Seq(vec![
+            IrNode::Assign {
+                local: obj,
+                value: Box::new(error),
+            },
+            IrNode::Ternary {
+                cond: Box::new(has_cause),
+                then_branch: Box::new(define),
+                else_branch: Box::new(IrNode::Local(obj)),
+            },
+        ])
+    }
+
     /// Whether `f` holds for any DIRECT child expression. Exhaustive over every
     /// variant (no wildcard), so a new variant must classify its children before
     /// the tree walkers built on this compile.
@@ -1921,6 +1980,7 @@ impl IrNode {
             | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::AwaitMark(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::IterSource { value: inner, .. }
             | IrNode::IterLen(inner)
@@ -2106,6 +2166,7 @@ impl IrNode {
             | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::AwaitMark(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::IterSource { value: inner, .. }
             | IrNode::IterLen(inner)
