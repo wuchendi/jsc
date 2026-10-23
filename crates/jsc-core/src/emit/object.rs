@@ -197,7 +197,10 @@ fn emit_define_entry(
 
 /// Emit an [`IrNode::DefineProps`]: evaluate `obj` into `local`, define each
 /// entry on it in order (entry values may read `local`), and leave `obj` on
-/// the stack.
+/// the stack. An enumerable entry (a class field) is `CreateDataPropertyOrThrow`
+/// on an object user code may have frozen or made non-extensible, so a
+/// rejected `__define` propagates; the non-enumerable entries (methods, the
+/// class `prototype`) target objects no user code has seen yet.
 pub(super) fn emit_define_props_node(
     obj: &IrNode,
     local: u32,
@@ -213,6 +216,9 @@ pub(super) fn emit_define_props_node(
         function.instruction(&Instruction::LocalGet(local));
         function.instruction(&Instruction::I32WrapI64);
         emit_define_entry(key, value, function, scratch, strings, helpers);
+        if matches!(key, PropKey::Static(_) | PropKey::Computed(_)) {
+            emit_propagate_if_pending(function, helpers);
+        }
     }
     function.instruction(&Instruction::LocalGet(local));
 }
