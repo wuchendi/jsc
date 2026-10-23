@@ -26,6 +26,14 @@ impl LowerCtx<'_> {
             // reads through its boxed cell.
             Expr::Ident(ident) => self.lower_ident(ident.sym.as_ref(), ident.span),
             Expr::Paren(p) => self.lower_expr(&p.expr),
+            // `a, b, c`: every operand runs left to right; the value is the
+            // last one (a plain value, so `(0, o.m)()` has no receiver).
+            Expr::Seq(seq) => Ok(IrNode::Seq(
+                seq.exprs
+                    .iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect::<anyhow::Result<_>>()?,
+            )),
             // An arrow function lifts to a top-level function value.
             Expr::Arrow(arrow) => self.lower_arrow(arrow, ""),
             // A function expression `function (..) { .. }` lifts the same way as
@@ -2057,7 +2065,6 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
         Expr::Yield(_) => "yield expressions are not supported",
-        Expr::Seq(_) => "comma (sequence) expressions are not supported",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",

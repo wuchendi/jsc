@@ -1026,6 +1026,9 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 - **Conditional** `c ? a : b`, optional chaining `a?.b`, `a?.[k]`, `a?.()`,
   `a?.m()` (a nullish base short-circuits the rest of the chain to
   `undefined`).
+- **Comma** `a, b, c` evaluates every operand left to right and yields the last
+  (a plain value: `(0, o.m)()` calls without a receiver); `yield`/`await`
+  operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
   (`__delete`).
 - **Member access on `null`/`undefined`** throws a `TypeError`
@@ -1241,9 +1244,8 @@ is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`, `comma (sequence) expressions
-are not supported`, `private class fields are not supported`, `class static
-blocks are not supported`, `computed class method names are not supported`,
+supported`, `with statements are not supported`, `private class fields are not
+supported`, `class static blocks are not supported`, `computed class method names are not supported`,
 `generator functions are unsupported`, `a label may only be applied to a loop`,
 `destructuring assignment is only supported as an expression statement`.
 
@@ -1455,7 +1457,7 @@ Each item below is current behaviour of this tree.
 - Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
   `slice`, `charAt`, `split("")`, string spread, and `for-of` over a string all
   work per byte (`"é".length` is `2`). Case mapping and trimming are ASCII-only.
-- No comma/sequence expressions, no `void`.
+- No `void`.
 - Not available: `RegExp` (literals and constructor), `Symbol` (so no
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
