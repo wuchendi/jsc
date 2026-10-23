@@ -1369,6 +1369,36 @@ fn aggregate_error_shape() {
     }
 }
 
+/// A spread call or construct passing more arguments than the `K` slots
+/// still hands `AggregateError` its message and options (the programs keep
+/// `K = 1`), read before the message's `toString` can publish another spread
+/// argument array.
+#[test]
+fn aggregate_error_reads_spread_arguments_past_the_slots() {
+    for (src, expected) in [
+        (
+            "const e = new AggregateError(...[[1, 2], 'm', { cause: 3 }]); e.message + e.cause + e.errors.length",
+            "m32",
+        ),
+        (
+            "const e = AggregateError(...[[1], 'c']); e.message + e.hasOwnProperty('cause')",
+            "cfalse",
+        ),
+        (
+            "class E extends AggregateError { constructor(...a) { super(...a) } } \
+             const e = new E(...[[1], 'x', { cause: 'y' }]); (e instanceof E) + e.message + e.cause",
+            "truexy",
+        ),
+        (
+            "const m = { toString() { return String(...['q']) } }; \
+             const e = new AggregateError(...[[1], m, { cause: 4 }]); e.message + e.cause",
+            "q4",
+        ),
+    ] {
+        assert_str(src, expected);
+    }
+}
+
 #[test]
 fn aggregate_error_rejects_non_iterables() {
     for src in [

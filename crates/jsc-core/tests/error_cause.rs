@@ -3,7 +3,7 @@
 //! reassigned or shadowed global.
 
 mod common;
-use common::{assert_number, assert_string};
+use common::{assert_number, assert_string, assert_uncaught};
 
 /// The native error constructors.
 const KINDS: [&str; 7] = [
@@ -176,11 +176,38 @@ fn unsealed_programs_keep_the_builtins() {
           TypeError('t').message].join()",
         "12,1.5,7,2.5,1,2,false,3,t",
     );
-    // A failed assignment (strict, no global `parseInt` property) leaves the
-    // builtin in place.
+}
+
+/// A direct or spread `parseInt` / `parseFloat` call after a plain
+/// assignment to the global binding calls the assigned value.
+#[test]
+fn reassigned_parse_functions_are_honoured() {
+    assert_number("parseInt = function () { return 7 }; parseInt('1')", 7.0);
     assert_number(
-        "try { parseInt = function () { return 1 } } catch (e) {} parseInt('5')",
-        5.0,
+        "parseInt = function () { return 7 }; parseInt(...['1'])",
+        7.0,
+    );
+    assert_number(
+        "parseFloat = function (s) { return s + 1 }; parseFloat(1)",
+        2.0,
+    );
+    assert_number(
+        "parseFloat = function () { return 6 }; parseFloat(...['1', 2])",
+        6.0,
+    );
+}
+
+/// `parseInt` / `parseFloat` deleted from the global object are unresolvable:
+/// a direct or spread call throws a `ReferenceError`.
+#[test]
+fn deleted_parse_functions_throw_reference_error() {
+    assert_uncaught(
+        "delete globalThis.parseInt; parseInt('1')",
+        "ReferenceError: parseInt is not defined",
+    );
+    assert_uncaught(
+        "delete globalThis.parseFloat; parseFloat(...['1'])",
+        "ReferenceError: parseFloat is not defined",
     );
 }
 

@@ -1041,7 +1041,6 @@ impl Builtin {
             Self::HasOwnProperty => "hasOwnProperty",
             Self::IsPrototypeOf => "isPrototypeOf",
             Self::PropertyIsEnumerable => "propertyIsEnumerable",
-            Self::ToLocaleString => "toLocaleString",
             Self::DefineAccessor { set: false } => "__defineGetter__",
             Self::DefineAccessor { set: true } => "__defineSetter__",
             Self::LookupAccessor { set: false } => "__lookupGetter__",
@@ -1080,7 +1079,9 @@ impl Builtin {
             Self::NumberToFixed => "toFixed",
             Self::NumberToExponential => "toExponential",
             Self::NumberToPrecision => "toPrecision",
-            Self::NumberToLocaleString | Self::ArrayToLocaleString => "toLocaleString",
+            Self::ToLocaleString | Self::NumberToLocaleString | Self::ArrayToLocaleString => {
+                "toLocaleString"
+            }
             Self::NumberIs(test) => test.name(),
             Self::ParseFloat => "parseFloat",
             Self::ParseInt => "parseInt",
@@ -1187,59 +1188,11 @@ impl Builtin {
             | Self::CollectionOp { op: MapOp::Set, .. }
             | Self::PromiseThen
             | Self::DefineAccessor { .. } => 2,
-            Self::HasOwnProperty
-            | Self::IsPrototypeOf
-            | Self::PropertyIsEnumerable
-            | Self::LookupAccessor { .. }
-            | Self::ProtoSet
-            | Self::Call
-            | Self::Bind
-            | Self::Math(_)
-            | Self::Ctor(_)
-            | Self::ObjectStatic(_)
-            | Self::IsArray
-            | Self::PromiseResolve
-            | Self::PromiseReject
-            | Self::ArrayPush
-            | Self::ArrayHof(_)
-            | Self::ArrayIndexOf
-            | Self::ArrayIncludes
-            | Self::ArrayJoin
-            | Self::ArrayFrom
-            | Self::ArrayAt
-            | Self::ArrayFind(_)
-            | Self::ArrayReduceRight
-            | Self::ArrayLastIndexOf
-            | Self::ArrayConcat
-            | Self::ArrayFlat { map: true }
-            | Self::ArraySort
-            | Self::ArrayUnshift
-            | Self::ArrayFill
-            | Self::ArrayCopy(ArrayCopyOp::ToSorted)
-            | Self::NumberToString
-            | Self::NumberToFixed
-            | Self::NumberToExponential
-            | Self::NumberToPrecision
-            | Self::NumberIs(_)
-            | Self::ParseFloat
-            | Self::IsNaN
-            | Self::IsFinite
-            | Self::DateToJson
-            | Self::CollectionOp { .. }
-            | Self::CollectionForEach { .. }
-            | Self::PromiseCatch
-            | Self::PromiseFinally
-            | Self::GeneratorNext
-            | Self::GeneratorReturn
-            | Self::GeneratorThrow
-            | Self::AsyncGeneratorMethod(_)
-            | Self::AsyncGeneratorReaction(_)
-            | Self::StringFromCharCode
-            | Self::StringFromCodePoint
-            | Self::StringRaw => 1,
             Self::StringMethod(op) => op.length(),
             Self::ObjectReflect(op) => op.length(),
             Self::JsonStringify => 3,
+            // Every other builtin takes one argument.
+            _ => 1,
         }
     }
 

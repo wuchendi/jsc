@@ -956,8 +956,7 @@ path, never semantics:
 | site | fast path | taken when | otherwise |
 |---|---|---|---|
 | `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
-| `String/Number/Boolean(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property |
-| `parseInt/parseFloat(..)` | inline conversion | `sealed(N)`, or else the global object has no such property (they are not global values, so only a program-stored one) | a call of the stored global property |
+| `String/Number/Boolean/parseInt/parseFloat(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance (a spread `parseInt(...a)` / `parseFloat(...a)` converts the array's first elements) | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property (a `ReferenceError` once it is deleted) |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear; `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
@@ -1320,12 +1319,12 @@ those of `switch` and loops are not tracked.
   non-enumerable `cause` = `options.cause`, read after the message's
   `ToString`; otherwise it has no `cause`.
   `Error.prototype.toString` formats `Name: message`.
-- `AggregateError(errors, message, options)` takes the message second, adds
-  an own non-enumerable `cause` when `options` is an object with a `cause`
-  property, then an own non-enumerable `errors` array of the values iterating
-  `errors` yields (`TypeError` when it is not iterable). It always runs its
-  constructor body; the other kinds lower `Error(m)` / `new Error(m)`
-  syntactically and ignore `options` (no `cause`).
+- `AggregateError(errors, message, options)` takes the message second and
+  reads all three arguments first (past the `K` slots from a spread call's
+  argument array), then runs `InstallErrorCause` from `options` and adds an
+  own non-enumerable `errors` array of the values iterating `errors` yields
+  (`TypeError` when it is not iterable). It always runs its constructor
+  body.
 - `throw` accepts any value.
 - **Engine-raised errors** are real error objects linked to the same static
   prototypes, catchable with `try`/`catch` and recognised by `instanceof`:
@@ -1787,8 +1786,6 @@ Each item below is current behaviour of this tree.
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16
   code-unit order only between astral characters and `U+E000`..`U+FFFF`.
-- Generator functions have no `prototype` property; generator objects inherit
-  `%GeneratorPrototype%` directly.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
   the constructors collect their iterable argument eagerly, with no
   `IteratorClose`.
