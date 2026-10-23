@@ -264,6 +264,12 @@ pub(super) enum Builtin {
     StringToString,
     /// `String.prototype.valueOf`.
     StringValueOf,
+    /// `String.fromCharCode`.
+    StringFromCharCode,
+    /// `String.fromCodePoint`.
+    StringFromCodePoint,
+    /// `String.raw`.
+    StringRaw,
     /// `Number.prototype.toString`.
     NumberToString,
     /// `Number.prototype.valueOf`.
@@ -350,7 +356,8 @@ impl ArrayFindOp {
     }
 }
 
-/// A `String.prototype` method backed by a host `__method` op.
+/// A generic `String.prototype` method: most are backed by a host `__method`
+/// op ([`StringOp::flag`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StringOp {
     IndexOf,
@@ -369,6 +376,18 @@ pub(super) enum StringOp {
     PadEnd,
     Substring,
     Split,
+    At,
+    CharCodeAt,
+    CodePointAt,
+    Concat,
+    LastIndexOf,
+    LocaleCompare,
+    Normalize,
+    Search,
+    Match,
+    MatchAll,
+    Replace,
+    ReplaceAll,
 }
 
 impl StringOp {
@@ -391,6 +410,18 @@ impl StringOp {
             Self::PadEnd => "padEnd",
             Self::Substring => "substring",
             Self::Split => "split",
+            Self::At => "at",
+            Self::CharCodeAt => "charCodeAt",
+            Self::CodePointAt => "codePointAt",
+            Self::Concat => "concat",
+            Self::LastIndexOf => "lastIndexOf",
+            Self::LocaleCompare => "localeCompare",
+            Self::Normalize => "normalize",
+            Self::Search => "search",
+            Self::Match => "match",
+            Self::MatchAll => "matchAll",
+            Self::Replace => "replace",
+            Self::ReplaceAll => "replaceAll",
         }
     }
 
@@ -401,15 +432,16 @@ impl StringOp {
             | Self::ToLowerCase
             | Self::Trim
             | Self::TrimStart
-            | Self::TrimEnd => 0,
-            Self::Slice | Self::Substring | Self::Split => 2,
+            | Self::TrimEnd
+            | Self::Normalize => 0,
+            Self::Slice | Self::Substring | Self::Split | Self::Replace | Self::ReplaceAll => 2,
             _ => 1,
         }
     }
 
-    /// The host `__method` op flag.
-    pub(super) fn flag(self) -> i32 {
-        match self {
+    /// The host `__method` op flag (`concat` and `matchAll` have none).
+    pub(super) fn flag(self) -> Option<i32> {
+        Some(match self {
             Self::IndexOf => abi::METHOD_OP_INDEX_OF,
             Self::Includes => abi::METHOD_OP_INCLUDES,
             Self::Slice => abi::METHOD_OP_SLICE,
@@ -426,13 +458,23 @@ impl StringOp {
             Self::PadEnd => abi::METHOD_OP_PAD_END,
             Self::Substring => abi::METHOD_OP_SUBSTRING,
             Self::Split => abi::METHOD_OP_SPLIT,
-        }
+            Self::At => abi::METHOD_OP_AT,
+            Self::CharCodeAt => abi::METHOD_OP_CHAR_CODE_AT,
+            Self::CodePointAt => abi::METHOD_OP_CODE_POINT_AT,
+            Self::LastIndexOf => abi::METHOD_OP_LAST_INDEX_OF,
+            Self::LocaleCompare => abi::METHOD_OP_LOCALE_COMPARE,
+            Self::Normalize => abi::METHOD_OP_NORMALIZE,
+            Self::Search | Self::Match => abi::METHOD_OP_SEARCH,
+            Self::Replace => abi::METHOD_OP_REPLACE,
+            Self::ReplaceAll => abi::METHOD_OP_REPLACE_ALL,
+            Self::Concat | Self::MatchAll => return None,
+        })
     }
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 129] = [
+    pub(super) const ALL: [Builtin; 144] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -520,8 +562,23 @@ impl Builtin {
         Self::StringMethod(StringOp::PadEnd),
         Self::StringMethod(StringOp::Substring),
         Self::StringMethod(StringOp::Split),
+        Self::StringMethod(StringOp::At),
+        Self::StringMethod(StringOp::CharCodeAt),
+        Self::StringMethod(StringOp::CodePointAt),
+        Self::StringMethod(StringOp::Concat),
+        Self::StringMethod(StringOp::LastIndexOf),
+        Self::StringMethod(StringOp::LocaleCompare),
+        Self::StringMethod(StringOp::Normalize),
+        Self::StringMethod(StringOp::Search),
+        Self::StringMethod(StringOp::Match),
+        Self::StringMethod(StringOp::MatchAll),
+        Self::StringMethod(StringOp::Replace),
+        Self::StringMethod(StringOp::ReplaceAll),
         Self::StringToString,
         Self::StringValueOf,
+        Self::StringFromCharCode,
+        Self::StringFromCodePoint,
+        Self::StringRaw,
         Self::NumberToString,
         Self::NumberValueOf,
         Self::BooleanToString,
@@ -621,6 +678,9 @@ impl Builtin {
             Self::GeneratorReturn => "return",
             Self::GeneratorThrow => "throw",
             Self::StringMethod(op) => op.name(),
+            Self::StringFromCharCode => "fromCharCode",
+            Self::StringFromCodePoint => "fromCodePoint",
+            Self::StringRaw => "raw",
             Self::Call => "call",
             Self::Apply => "apply",
             Self::Bind => "bind",
@@ -737,7 +797,10 @@ impl Builtin {
             | Self::PromiseFinally
             | Self::GeneratorNext
             | Self::GeneratorReturn
-            | Self::GeneratorThrow => 1,
+            | Self::GeneratorThrow
+            | Self::StringFromCharCode
+            | Self::StringFromCodePoint
+            | Self::StringRaw => 1,
             Self::StringMethod(op) => op.length(),
             Self::JsonStringify => 3,
         }
@@ -1109,6 +1172,11 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
             ],
             BuiltinCtor::Array => &[Builtin::IsArray, Builtin::ArrayOf, Builtin::ArrayFrom],
+            BuiltinCtor::String => &[
+                Builtin::StringFromCharCode,
+                Builtin::StringFromCodePoint,
+                Builtin::StringRaw,
+            ],
             BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
             BuiltinCtor::Date => &[Builtin::DateNow],
             _ => &[],
