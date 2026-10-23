@@ -175,12 +175,19 @@ fn this_object(
     wasm!(function; End, LocalGet(o), Call(helpers.to_object()), LocalSet(o));
 }
 
-/// Push i32 `1` when the jsval in `o` is an array handle.
+/// Push i32 `1` when the jsval in `o` is an array handle that is not in
+/// dictionary mode (whose elements may carry any attributes, so it takes the
+/// generic per-index path).
 fn is_array(function: &mut Function, o: u32) {
     emit_is_pointer(function, o);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, o);
-    wasm!(function; I32Const(TYPE_ARRAY), I32Eq, Else, I32Const(0), End);
+    wasm!(function;
+        I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(o), I32WrapI64, I32Load8U(MemArg { offset: u64::from(abi::HEADER_FLAGS_OFFSET), align: 0, memory_index: 0 }),
+        I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
+        Else, I32Const(0), End,
+    );
 }
 
 /// `LengthOfArrayLike(o)` into i32 `len`: `ToLength(Get(o, "length"))` (NaN

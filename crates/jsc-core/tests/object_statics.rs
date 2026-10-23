@@ -380,3 +380,24 @@ fn realm() {
         ),
     ]);
 }
+
+/// Arrays in dictionary mode (DESIGN.md §5.4): `getOwnPropertyNames`,
+/// `propertyIsEnumerable` and `assign` read each table element's own
+/// attributes; `length` stays non-enumerable, also when frozen.
+#[test]
+fn dictionary_arrays() {
+    check(&[
+        (
+            r"let a = [1, 2, 3]; a.k = 0; Object.defineProperty(a, '1', {enumerable: false}); console.log(Object.getOwnPropertyNames(a).join(), a.propertyIsEnumerable(0), a.propertyIsEnumerable(1), a.propertyIsEnumerable('length'), Object.keys(a).join(), JSON.stringify(Object.assign({}, a)))",
+            "0,1,2,length,k true false false 0,2,k {\"0\":1,\"2\":3,\"k\":0}\n",
+        ),
+        (
+            r"let a = Object.freeze([1, , 3]); console.log(Object.getOwnPropertyNames(a).join(), a.propertyIsEnumerable(0), a.propertyIsEnumerable(1), a.propertyIsEnumerable('length'), Object.hasOwn(a, 'length'))",
+            "0,2,length true false false true\n",
+        ),
+        (
+            r"let a = [0]; Object.defineProperty(a, '2', {get: function () { return 9 }, enumerable: true}); console.log(Object.getOwnPropertyNames(a).join(), a.propertyIsEnumerable(2), JSON.stringify(Object.assign({}, a)))",
+            "0,2,length true {\"0\":0,\"2\":9}\n",
+        ),
+    ]);
+}

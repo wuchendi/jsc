@@ -405,9 +405,12 @@ a 16-byte prefix (`OBJ_PREFIX_SIZE = 16`):
 bit `2` `ARRAY_INDEX` (content is a canonical array index: `"0"` or a nonzero
 digit then digits, value `< 2^32 - 1`). Object family: bit `1`
 `NOT_EXTENSIBLE` (set by `preventExtensions` / `seal` / `freeze`, never
-cleared; never set on an array). Functions additionally: `4` `LAZY`, `8` `CONSTRUCTOR`, `16`
+cleared; only on a `DICTIONARY` array). Functions additionally: `4` `LAZY`, `8` `CONSTRUCTOR`, `16`
 `CLASS_CTOR`, `32` `SELF_ALLOC` (§5.5). Arrays additionally: `4` `SPARSE`,
-`8` `JOINING` (set while `join` runs, so a cyclic element joins as `""`).
+`8` `JOINING` (set while `join` runs, so a cyclic element joins as `""`),
+`16` `LENGTH_READONLY` (`length` is non-writable; only on a `DICTIONARY`
+array), `32` `DICTIONARY` (§5.4). None of the array bits is ever cleared
+(except `JOINING`).
 
 ### 5.2 Block layouts
 
@@ -535,12 +538,35 @@ aliases, captured bindings, and member receivers all observe `push`.
   array-index key in the handle's own property table. `length` may then exceed
   the store; every element operation on a sparse array goes through
   `__sparse_get` / `__sparse_set`.
-- **`length`** is an own, non-enumerable, non-configurable exotic property.
-  Writes go through `__array_set_length` (`ArraySetLength`): `ToUint32(v)` must
-  equal `ToNumber(v)`, else `RangeError: Invalid array length`; shrinking turns
-  `n..len` into holes (keeping the store) and drops a sparse array's index keys
-  `≥ n`; growing fills holes densely within the dense bound, else makes the
-  array sparse without allocating the gap.
+- **Dictionary mode.** Before an element takes non-default attributes
+  (`defineProperty` with `writable`/`enumerable`/`configurable` false or an
+  accessor), before the array becomes non-extensible (`preventExtensions` /
+  `seal` / `freeze`), and before `length` becomes read-only, the whole array
+  turns `SPARSE | DICTIONARY`: every present store element moves into the own
+  table under its index key with the default attributes and the store is
+  dropped (`elems = 0`). Every element is then a table entry carrying its own
+  attributes, reached through the sparse paths: `__sparse_get` calls an
+  accessor's getter, `__sparse_set` is `__set` of the index key (read-only,
+  setter, and non-extensible rules) and throws `Cannot add property i, object
+  is not extensible` when it would grow a read-only `length`; `__delete`
+  honours `configurable`. The builtin fast paths (the `ProtoGuard` receiver
+  test, the `Array.prototype` bodies' array branches, the host search/slice)
+  skip a dictionary array, which takes the generic per-index path. The mode is
+  never left.
+- **`length`** is an own, non-enumerable, non-configurable exotic property,
+  writable unless `LENGTH_READONLY`. Writes go through `__array_set_length`
+  (`ArraySetLength`): a read-only `length` throws `Cannot assign to read only
+  property 'length'`; `ToUint32(v)` must equal `ToNumber(v)`, else
+  `RangeError: Invalid array length`; shrinking turns `n..len` into holes
+  (keeping the store) and drops a sparse array's index keys `≥ n`, stopping at
+  the highest non-configurable element `k ≥ n` (then `length = k + 1` and
+  `Cannot delete property 'k'` is thrown); growing fills holes densely within
+  the dense bound, else makes the array sparse without allocating the gap.
+  `defineProperty(a, "length", d)` rejects `configurable`/`enumerable` `true`
+  and accessor fields; on a read-only `length` it rejects `writable: true` and
+  any value but the current one; otherwise a value is written as above and
+  `writable: false` then sets `LENGTH_READONLY` (even when the shrink stopped
+  early).
 - **Keys.** Number keys and canonical index strings take the element path;
   every other key (`a.foo`, `a["-1"]`) is an ordinary named property in the
   handle's table.
@@ -755,29 +781,35 @@ tables. Keys are interned `u32`s.
   so inherited fields and getters count; `get`/`set` must be callable or
   `undefined`; mixing accessor and data fields throws) and appends the record
   to the array `list`. `__define_own(o, key, desc, value, get, set)` is
-  `ValidateAndApplyPropertyDescriptor`: it never throws but returns ok,
-  rejected (non-configurable rules), not extensible, or unsupported — an
-  array's `length`, or an array index whose resulting attributes are not the
-  default ones (an index with default attributes is an element store); the
-  caller raises the `TypeError`. A kind change on a configurable property
+  `ValidateAndApplyPropertyDescriptor`: it returns ok, rejected
+  (non-configurable rules), or not extensible, and the caller raises the
+  `TypeError`; only an array's `length` (`ArraySetLength`, §5.4) may leave an
+  exception pending instead. On a non-`SPARSE` array an index whose resulting
+  attributes are the default ones is an element store; any other index puts
+  the array in dictionary mode (§5.4) and is an ordinary table property (a new
+  one at or past `length` rejects on a read-only `length` and raises `length`
+  otherwise). A kind change on a configurable property
   keeps `E`/`C` and resets the rest; an accessor update allocates a fresh
   `TYPE_ACCESSOR` block. `__own_desc(obj, key)` is `FromPropertyDescriptor`
   of `[[GetOwnProperty]]` (a fresh object with `value, writable` or `get,
-  set`, then `enumerable, configurable`; an array's `length` is writable,
-  non-enumerable, non-configurable; elements have the default attributes).
+  set`, then `enumerable, configurable`; an array's `length` is
+  non-enumerable, non-configurable, and writable unless `LENGTH_READONLY`;
+  store elements have the default attributes, table elements their own).
 - **Integrity levels.** `__set_integrity(obj, level)` (`0` not extensible,
   `1` sealed, `2` frozen) clears `C` on every own property (and `W` on data
   properties when frozen), then sets `NOT_EXTENSIBLE`; a `LAZY` function is
-  materialized first, and an array throws (`Cannot freeze an array: …`).
+  materialized first, and an array is put in dictionary mode first (so the
+  level reaches its elements; freezing also sets `LENGTH_READONLY`).
   `__test_integrity(obj, level)` is `IsExtensible` (level `0`) or
-  `TestIntegrityLevel`.
+  `TestIntegrityLevel` (a frozen array also needs a read-only `length`).
 - **Prototypes.** `__set_proto(o, proto)` is `OrdinarySetPrototypeOf`: the
   same `proto` succeeds; `%Object.prototype%` (an immutable prototype exotic
   object), a non-extensible object, and a `proto` whose chain reaches `o`
   are rejected (it returns the `__prop_throw` mode; the caller throws); a
   watched intrinsic sets its dirty bit. `__own_enum(obj, key)` tests for an
-  own enumerable property (an array's `length` is not enumerable, its
-  present elements are), backing `Object.assign` and
+  own enumerable property (an array's `length` is not enumerable; a
+  dense array's present elements are, a dictionary-mode element has its
+  own attributes), backing `Object.assign` and
   `propertyIsEnumerable`.
 - **Own-key order** (`__own_keys(obj, mode)`, behind `Object.keys/values/entries`,
   `JSON.stringify`, object rest, and the renderers): integer keys ascending
@@ -865,7 +897,7 @@ path, never semantics:
 | `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
-| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0`, `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
+| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
@@ -1522,11 +1554,13 @@ Each item below is current behaviour of this tree.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
   the constructors collect their iterable argument eagerly, with no
   `IteratorClose`.
-- Arrays take no descriptor attributes yet: `Object.defineProperty` on an
-  array's `length`, or on an index with non-default attributes (including a
-  new index without all of `writable`/`enumerable`/`configurable` true), and
-  `preventExtensions` / `seal` / `freeze` of any array throw a `TypeError`.
-  So a `JSON.parse` reviver cannot meet a non-configurable array element.
+- An array in dictionary mode (§5.4) keeps every element in its linear-scan
+  property table, so element access on a large frozen or attributed array is
+  `O(n)`; the renderers print an accessor element as `undefined` and omit a
+  non-enumerable one.
+- `defineProperty(a, "length", {value})` converts the value once
+  (`ToNumber`), not twice as `ArraySetLength` does; on a read-only `length`
+  an invalid value is rejected with a `TypeError`, not a `RangeError`.
 - `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
   enumerable own keys of its `Properties` argument once, before reading any
   descriptor. `Object.fromEntries` collects its iterable eagerly, like the
