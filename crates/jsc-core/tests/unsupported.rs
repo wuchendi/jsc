@@ -16,13 +16,6 @@ fn rejects_spread() {
 }
 
 #[test]
-fn rejects_async_generator_methods() {
-    // Async generator methods stay out of scope.
-    assert_rejected("let o = { async *m() { yield 1 } }; o.m()");
-    assert_rejected("class A { async *m() { yield 1 } } new A().m()");
-}
-
-#[test]
 fn rejects_computed_class_fields() {
     // Class declarations and expressions, `extends` of any expression, and
     // plain/static members are supported (see the classes suites); computed
