@@ -78,7 +78,7 @@ mod tests;
 
 /// Reject an `async` method whose `async` is followed by a line terminator
 /// before its name (`async [no LineTerminator here] PropertyName`), which
-/// swc accepts: the SyntaxError points at the method name.
+/// swc accepts: the `SyntaxError` points at the method name.
 fn check_async_methods(program: &Program, src: &str, start: BytePos) -> anyhow::Result<()> {
     /// Collects the name span of each async method.
     struct Scan(Vec<Span>);
