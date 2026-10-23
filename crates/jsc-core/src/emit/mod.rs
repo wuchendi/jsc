@@ -1124,7 +1124,7 @@ use numeric::*;
 use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
-use realm::{Builtin, Intrinsic, StringOp, intrinsic_bits};
+use realm::{AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, StringOp, intrinsic_bits};
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]

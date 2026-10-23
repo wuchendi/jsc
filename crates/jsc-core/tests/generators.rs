@@ -1139,3 +1139,36 @@ fn resuming_a_running_generator_throws() {
         );
     }
 }
+
+#[test]
+fn array_push_and_pop_run_inside_a_loop_that_suspends() {
+    assert_output(
+        "function* g(){ const out = []; let i = 0; while ((yield i) !== 'stop') { out.push(i++); } out.pop(); return out; }
+         const it = g(); it.next(); it.next(); it.next(); it.next();
+         console.log(it.next('stop').value);
+         (async () => { const xs = []; let r; while (!(r = await { done: xs.length > 1 }).done) xs.push(r.done); console.log(xs); })();",
+        "[ 0, 1 ]\n[ false, false ]\n",
+    );
+}
+
+#[test]
+fn variadic_math_and_date_methods_run_in_a_generator_body() {
+    assert_output(
+        "function* g(){ const r = Math.min(3, yield 2); yield Math.max(r, yield 0, 7, r); yield new Date(5).getTime(); }
+         const it = g(); const out = [it.next().value, it.next(1).value];
+         out.push(it.next(9).value, it.next().value);
+         console.log(out);
+         (async () => console.log(Math.max(1, await 4, 2)))();",
+        "[ 2, 0, 9, 5 ]\n4\n",
+    );
+}
+
+#[test]
+fn map_set_and_date_methods_take_a_suspending_argument() {
+    assert_output(
+        "function* g(){ const m = new Map(); m.set(yield 1, yield 2); const s = new Set(); s.add(yield 3);
+           const d = new Date(7); console.log(m.get('k'), s.has('v'), d.getTime(yield 4)); }
+         const it = g(); it.next(); it.next('k'); it.next(9); it.next('v'); it.next();",
+        "9 true 7\n",
+    );
+}

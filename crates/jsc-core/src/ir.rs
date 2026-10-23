@@ -819,6 +819,12 @@ pub enum IrNode {
     /// into a state-machine suspend point, so a `Yield` that survives to the
     /// backend is an unsupported yield position (rejected by codegen before emit).
     Yield(Box<IrNode>),
+    /// The operand of the suspend an `await` in an async generator body
+    /// lowers to (`Yield(AwaitMark(e))`): evaluate `e`, then flag the running
+    /// generator (`gen` is the state machine's local 1) with
+    /// [`crate::abi::GEN_AWAIT`], so its driver awaits the suspended value
+    /// instead of yielding it.
+    AwaitMark(Box<IrNode>),
     /// Read the value passed to the generator's `.next(v)` for the `yield` that is
     /// resuming: the state machine's first wasm parameter (local `0`,
     /// `sent`). Emitted at the start of a resumed segment to bind `x = yield …`.
@@ -1726,6 +1732,9 @@ pub enum FnKind {
     /// A generator function or method: not a constructor, but materializes a
     /// `prototype` inheriting `%GeneratorPrototype%` (no `constructor`).
     Generator,
+    /// An async generator function or method: like [`Self::Generator`], its
+    /// `prototype` inheriting `%AsyncGeneratorPrototype%`.
+    AsyncGenerator,
     /// A `function` declaration or expression: materializes a `prototype`.
     Constructor,
     /// A class constructor: its `prototype` is defined by the class.
@@ -1926,6 +1935,7 @@ impl IrNode {
             | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::AwaitMark(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::IterSource { value: inner, .. }
             | IrNode::IterLen(inner)
@@ -2111,6 +2121,7 @@ impl IrNode {
             | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::AwaitMark(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::IterSource { value: inner, .. }
             | IrNode::IterLen(inner)

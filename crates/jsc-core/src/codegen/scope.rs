@@ -24,6 +24,7 @@ impl Frame {
             supers: SuperCalls::default(),
             arguments_local: None,
             spread_args_local: None,
+            machine: None,
         }
     }
 }
@@ -424,6 +425,55 @@ impl<'a> LowerCtx<'a> {
         Some(IrNode::CellGet(Box::new(IrNode::EnvLoad(slot))))
     }
 
+    /// `this` inside an arrow (DESIGN.md §7.4): the `this` of the nearest
+    /// enclosing non-arrow function, never the arrow's own receiver. An
+    /// ordinary function's snapshot is captured BY VALUE (it is never
+    /// reassigned); a generator/async body's `this` cell is captured by
+    /// reference. At top level it is the global object. `None` outside an
+    /// arrow (the current frame binds its own `this`).
+    pub(super) fn lexical_this(&mut self) -> Option<IrNode> {
+        let top = self.top();
+        let fi = self.frames.iter().rposition(|frame| !frame.arrow)?;
+        if fi == top {
+            return None;
+        }
+        if fi == 0 && self.main_ctx {
+            return Some(IrNode::Intrinsic(GlobalIntrinsic::Global));
+        }
+        let id = this_id(fi);
+        if self.frames[fi].env_backed {
+            let frame = &mut self.frames[fi];
+            let slot = if let Some(slot) = frame.gen_this {
+                slot
+            } else {
+                let slot = u32::try_from(frame.env.len()).unwrap_or(u32::MAX);
+                frame.env.push(u32::MAX);
+                frame.gen_this = Some(slot);
+                slot
+            };
+            if !frame.env_index.contains_key(&id) {
+                let local = frame.next;
+                frame.next += 1;
+                frame.env_index.insert(id, slot);
+                frame.by_id.insert(id, local);
+            }
+            return Some(IrNode::CellGet(Box::new(IrNode::EnvLoad(
+                self.route_env(fi, id),
+            ))));
+        }
+        let frame = &mut self.frames[fi];
+        let local = if let Some(local) = frame.this_local {
+            local
+        } else {
+            let local = frame.next;
+            frame.next += 1;
+            frame.this_local = Some(local);
+            local
+        };
+        frame.by_id.insert(id, local);
+        Some(IrNode::EnvLoad(self.route_env(fi, id)))
+    }
+
     /// Find the binding a name resolves to: the frame index it lives in and its
     /// [`Binding`] (walking innermost scope/frame outward), or `None`.
     fn find_binding(&self, name: &str) -> Option<(usize, Binding)> {
@@ -598,6 +648,12 @@ impl<'a> LowerCtx<'a> {
 /// among the frames enclosing a capture.
 fn new_target_id(frame: usize) -> u32 {
     0x8000_0000 | u32::try_from(frame).unwrap_or(0)
+}
+
+/// The synthetic binding id of the `this` of the function at frame depth
+/// `frame`, distinct from every [`new_target_id`] and [`arguments_id`].
+fn this_id(frame: usize) -> u32 {
+    0xA000_0000 | u32::try_from(frame).unwrap_or(0)
 }
 
 /// The synthetic binding id of the `arguments` object of the function at frame

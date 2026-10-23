@@ -48,6 +48,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(map_set::fragments(k));
     nodes.extend(promise::fragments(k));
     nodes.extend(generator::fragments(k));
+    nodes.extend(generator::async_fragments(k));
     nodes.extend(date::fragments(k));
     nodes.extend(json::fragments());
     nodes
@@ -155,6 +156,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(map_set::strings())
         .chain(promise::strings())
         .chain(generator::strings())
+        .chain(generator::async_strings())
         .chain(json::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
@@ -220,6 +222,16 @@ pub(super) fn emit_builtin(
         Builtin::GeneratorNext => generator::emit_next(&mut f, frame, strings, helpers),
         Builtin::GeneratorReturn => generator::emit_return(&mut f, frame, strings, helpers),
         Builtin::GeneratorThrow => generator::emit_throw(&mut f, frame, strings, helpers),
+        Builtin::AsyncGeneratorMethod(request) => {
+            generator::emit_async_method(request, &mut f, frame, strings, helpers);
+        }
+        Builtin::AsyncGeneratorDrain => {
+            generator::emit_async_drain(&mut f, frame, strings, helpers);
+        }
+        Builtin::AsyncGeneratorStep => generator::emit_async_step(&mut f, frame, strings, helpers),
+        Builtin::AsyncGeneratorReaction(reaction) => {
+            generator::emit_async_reaction(reaction, &mut f, frame, strings, helpers);
+        }
         Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),

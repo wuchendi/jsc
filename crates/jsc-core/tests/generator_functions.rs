@@ -185,17 +185,9 @@ fn an_async_arrow_returns_a_promise_and_is_not_a_constructor() {
 }
 
 #[test]
-fn async_generators_stay_a_compile_error() {
+fn yield_star_in_expression_position_is_a_precise_compile_error() {
     assert_compile_error(
-        "async function* f(){ yield 1 } f().next()",
-        "async generator functions are unsupported",
-    );
-    assert_compile_error(
-        "const f = async function*(){ yield 1 }; f().next()",
-        "async generator functions are unsupported",
-    );
-    assert_compile_error(
-        "function o(){ async function* f(){ yield 1 } return f }",
-        "async generator functions are unsupported",
+        "function* g(){ const r = yield* [1]; }",
+        "`yield*` is only supported as a statement",
     );
 }

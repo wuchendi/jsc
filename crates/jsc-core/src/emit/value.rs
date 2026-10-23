@@ -188,17 +188,38 @@ pub(super) fn emit_is_function(function: &mut Function, local: u32) {
     function.instruction(&Instruction::End);
 }
 
-/// Push `1` if the jsval in `local` is a heap GENERATOR handle (type byte `9`),
-/// else `0`. Same shape as [`emit_is_function`], guarding the type-byte
-/// read behind [`emit_is_pointer`]. Used by `gen.next(v)` to reject a
-/// non-generator receiver with a `TypeError`.
+/// Push `1` if the jsval in `local` is a heap GENERATOR handle (type byte `9`)
+/// that is not an async generator, else `0`. Same shape as
+/// [`emit_is_function`], guarding the type-byte read behind
+/// [`emit_is_pointer`]. Used by `gen.next(v)` to reject a non-generator
+/// receiver with a `TypeError`, and by `for-of` / spread to step a generator.
 pub(super) fn emit_is_generator(function: &mut Function, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
     function.instruction(&Instruction::I32Const(TYPE_GENERATOR));
     function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_generator_async_bit(function, local);
+    function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// Push the [`abi::GEN_ASYNC`] bit of the generator handle in `local`
+/// (nonzero for an async generator).
+pub(super) fn emit_generator_async_bit(function: &mut Function, local: u32) {
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(abi::GEN_ASYNC.cast_signed()));
+    function.instruction(&Instruction::I32And);
 }

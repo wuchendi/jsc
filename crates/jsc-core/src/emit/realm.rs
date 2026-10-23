@@ -44,6 +44,9 @@ pub(super) enum Intrinsic {
     /// `%GeneratorPrototype%`: `next`, `return`, `throw`; every generator
     /// object's `proto`.
     GeneratorPrototype,
+    /// `%AsyncGeneratorPrototype%`: the promise-returning `next`, `return`,
+    /// `throw` of every async generator object.
+    AsyncGeneratorPrototype,
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
@@ -92,7 +95,8 @@ impl Intrinsic {
             | Self::Json
             | Self::Console
             | Self::Prototype(_)
-            | Self::GeneratorPrototype => Some(Self::ObjectPrototype),
+            | Self::GeneratorPrototype
+            | Self::AsyncGeneratorPrototype => Some(Self::ObjectPrototype),
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
             // The native error constructors inherit from `Error`.
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
@@ -174,7 +178,10 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
         ])
         .chain(BuiltinCtor::ALL.map(Intrinsic::Ctor))
         .chain(PLAIN_PROTOTYPES.map(Intrinsic::Prototype))
-        .chain([Intrinsic::GeneratorPrototype])
+        .chain([
+            Intrinsic::GeneratorPrototype,
+            Intrinsic::AsyncGeneratorPrototype,
+        ])
 }
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
@@ -286,6 +293,22 @@ pub(super) enum Builtin {
     GeneratorReturn,
     /// `%GeneratorPrototype%.throw`.
     GeneratorThrow,
+    /// `%AsyncGeneratorPrototype%.next` / `return` / `throw`: queue the
+    /// request and return its promise.
+    AsyncGeneratorMethod(AsyncGenRequest),
+    /// Serve an async generator's queued requests (argument 0 is the
+    /// generator) until it suspends on an `await` or the queue empties. Not
+    /// installed on any intrinsic.
+    AsyncGeneratorDrain,
+    /// Resume an async generator's body once (argument 0 is the generator,
+    /// argument 1 the sent value, thrown at the suspend when `env` is
+    /// `true`) and settle the front request from the outcome. Not installed
+    /// on any intrinsic.
+    AsyncGeneratorStep,
+    /// A promise reaction of an async generator (`env` is the generator):
+    /// the settlement of an `await`, or of a `return()` value. Not installed
+    /// on any intrinsic.
+    AsyncGeneratorReaction(AsyncGenReaction),
     /// `%ThrowTypeError%`: the poison getter/setter of the strict `caller` /
     /// `arguments` properties (one identity for every installation).
     ThrowTypeError,
@@ -302,6 +325,42 @@ pub(super) enum Builtin {
     IsNaN,
     /// The global `isFinite`.
     IsFinite,
+}
+
+/// An async generator request (`%AsyncGeneratorPrototype%` method).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AsyncGenRequest {
+    /// `next(v)`.
+    Next,
+    /// `throw(e)`.
+    Throw,
+    /// `return(v)`.
+    Return,
+}
+
+impl AsyncGenRequest {
+    /// The method's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Throw => "throw",
+            Self::Return => "return",
+        }
+    }
+}
+
+/// The promise reactions an async generator registers (see
+/// [`Builtin::AsyncGeneratorReaction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AsyncGenReaction {
+    /// An awaited value fulfilled: resume the body with it.
+    AwaitFulfilled,
+    /// An awaited value rejected: throw the reason at the `await`.
+    AwaitRejected,
+    /// A `return(v)` value fulfilled: the request completes `{ v, done }`.
+    ReturnFulfilled,
+    /// A `return(v)` value rejected: the request rejects.
+    ReturnRejected,
 }
 
 /// A `String.prototype` method backed by a host `__method` op.
@@ -386,7 +445,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 115] = [
+    pub(super) const ALL: [Builtin; 124] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -524,6 +583,15 @@ impl Builtin {
         Self::GeneratorNext,
         Self::GeneratorReturn,
         Self::GeneratorThrow,
+        Self::AsyncGeneratorMethod(AsyncGenRequest::Next),
+        Self::AsyncGeneratorMethod(AsyncGenRequest::Return),
+        Self::AsyncGeneratorMethod(AsyncGenRequest::Throw),
+        Self::AsyncGeneratorDrain,
+        Self::AsyncGeneratorStep,
+        Self::AsyncGeneratorReaction(AsyncGenReaction::AwaitFulfilled),
+        Self::AsyncGeneratorReaction(AsyncGenReaction::AwaitRejected),
+        Self::AsyncGeneratorReaction(AsyncGenReaction::ReturnFulfilled),
+        Self::AsyncGeneratorReaction(AsyncGenReaction::ReturnRejected),
         Self::ThrowTypeError,
         Self::MethodCall,
         Self::IterSource,
@@ -538,7 +606,10 @@ impl Builtin {
             | Self::ThrowTypeError
             | Self::MethodCall
             | Self::BoundCall
-            | Self::IterSource => "",
+            | Self::IterSource
+            | Self::AsyncGeneratorDrain
+            | Self::AsyncGeneratorStep
+            | Self::AsyncGeneratorReaction(_) => "",
             Self::HasOwnProperty => "hasOwnProperty",
             Self::ObjectToString
             | Self::ErrorToString
@@ -560,6 +631,7 @@ impl Builtin {
             Self::GeneratorNext => "next",
             Self::GeneratorReturn => "return",
             Self::GeneratorThrow => "throw",
+            Self::AsyncGeneratorMethod(request) => request.name(),
             Self::StringMethod(op) => op.name(),
             Self::Call => "call",
             Self::Apply => "apply",
@@ -609,6 +681,8 @@ impl Builtin {
             | Self::MethodCall
             | Self::BoundCall
             | Self::IterSource
+            | Self::AsyncGeneratorDrain
+            | Self::AsyncGeneratorStep
             | Self::FunctionToString
             | Self::StringToString
             | Self::StringValueOf
@@ -659,7 +733,9 @@ impl Builtin {
             | Self::PromiseFinally
             | Self::GeneratorNext
             | Self::GeneratorReturn
-            | Self::GeneratorThrow => 1,
+            | Self::GeneratorThrow
+            | Self::AsyncGeneratorMethod(_)
+            | Self::AsyncGeneratorReaction(_) => 1,
             Self::StringMethod(op) => op.length(),
             Self::JsonStringify => 3,
         }
@@ -692,6 +768,7 @@ impl Builtin {
             Self::GeneratorNext | Self::GeneratorReturn | Self::GeneratorThrow => {
                 return Some(Intrinsic::GeneratorPrototype);
             }
+            Self::AsyncGeneratorMethod(_) => return Some(Intrinsic::AsyncGeneratorPrototype),
             _ => None,
         };
         ctor.map(Intrinsic::Prototype)

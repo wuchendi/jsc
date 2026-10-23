@@ -458,6 +458,9 @@ struct Frame {
     ctor: FnKind,
     /// A derived constructor's `super(..)` bookkeeping.
     supers: SuperCalls,
+    /// The kind of the generator/async body this (`env_backed`) frame lowers,
+    /// `None` for every other frame.
+    machine: Option<Machine>,
 }
 
 /// A derived constructor's `super(..)` bookkeeping (see [`Frame::ctor`]).
