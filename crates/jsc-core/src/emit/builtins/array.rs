@@ -1863,6 +1863,13 @@ const SHIFT: Texts = texts!("shift");
 const UNSHIFT: Texts = texts!("unshift");
 const FILL: Texts = texts!("fill");
 const COPY_WITHIN: Texts = texts!("copyWithin");
+const WITH: Texts = texts!("with");
+const TO_REVERSED: Texts = texts!("toReversed");
+const TO_SORTED: Texts = texts!("toSorted");
+const TO_SPLICED: Texts = texts!("toSpliced");
+
+/// The `RangeError` of `with` with an index outside the receiver.
+const WITH_OUT_OF_RANGE: CalleeErrorText<'static> = ["Invalid index", "RangeError: Invalid index"];
 
 /// The `TypeError` of `sort` with a comparator neither callable nor
 /// `undefined`.
@@ -1888,9 +1895,14 @@ fn mutating_strings() -> impl Iterator<Item = &'static str> {
         &UNSHIFT,
         &FILL,
         &COPY_WITHIN,
+        &WITH,
+        &TO_REVERSED,
+        &TO_SORTED,
+        &TO_SPLICED,
     ]
     .into_iter()
     .flat_map(|t| t.nullish)
+    .chain(WITH_OUT_OF_RANGE)
     .chain(SORT_NOT_CALLABLE)
     .chain(TOO_LONG)
 }
@@ -2470,8 +2482,14 @@ fn pair_at(function: &mut Function, buf: u32, p: u32) {
 /// the `undefined`s and (by `DeletePropertyOrThrow` up to `len`) the holes
 /// are written back. A throw from a getter, `ToString` or the comparator
 /// leaves `O` unchanged.
+///
+/// `Array.prototype.toSorted(comparefn)` (`copy`) is the same sort into `A =
+/// ArrayCreate(len)` (created before any element is read): every index is
+/// read by `Get` alone (a hole is an `undefined`), and the values and the
+/// `undefined`s are defined on `A`, which is returned.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_sort(
+    copy: bool,
     function: &mut Function,
     frame: Frame,
     strings: &HashMap<String, i32>,
@@ -2486,6 +2504,11 @@ pub(super) fn emit_sort(
     // not yet started there).
     let key = lo;
     let (len, k, undefs) = (frame.yf64(0), frame.yf64(1), frame.zf64(0));
+    let (texts, target) = if copy {
+        (&TO_SORTED, frame.y64(0))
+    } else {
+        (&SORT, o)
+    };
     frame.arg(function, 0);
     wasm!(function;
         LocalTee(cmp), I64Const(UNDEFINED_BITS), I64Ne,
@@ -2493,8 +2516,11 @@ pub(super) fn emit_sort(
     );
     require_callable(function, frame, cmp, SORT_NOT_CALLABLE, strings, helpers);
     wasm!(function; End);
-    this_object(function, frame, o, SORT.nullish, strings, helpers);
+    this_object(function, frame, o, texts.nullish, strings, helpers);
     length_of_f64(function, o, len, strings, helpers);
+    if copy {
+        array_create_f64(function, frame, (len, kv, target), strings, helpers);
+    }
     let default_order = |function: &mut Function| {
         wasm!(function; LocalGet(cmp), I64Const(UNDEFINED_BITS), I64Eq);
     };
@@ -2508,9 +2534,16 @@ pub(super) fn emit_sort(
         function,
         |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
         |function| {
-            has_at(function, o, k, key, helpers);
+            if copy {
+                get_at(function, o, k, key, v, helpers);
+                wasm!(function; I32Const(1));
+            } else {
+                has_at(function, o, k, key, helpers);
+            }
             wasm!(function; If(BlockType::Empty));
-            get_key(function, o, key, v, helpers);
+            if !copy {
+                get_key(function, o, key, v, helpers);
+            }
             wasm!(function; LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
             bump(function, undefs, 1.0);
             wasm!(function; Else, LocalGet(v), LocalSet(lhs));
@@ -2624,11 +2657,18 @@ pub(super) fn emit_sort(
         },
     );
     // Write back the values, the `undefined`s, then delete up to `len`.
+    let put = |function: &mut Function| {
+        if copy {
+            put_at(function, frame, (target, k, v, kv), strings, helpers);
+        } else {
+            set_at(function, frame, (o, k, v, kv), strings, helpers);
+        }
+    };
     wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k), I32Const(0), LocalSet(left));
     count_loop(function, left, pairs, |function| {
         pair_at(function, src, left);
         wasm!(function; I64Load(elem_slot(1)), LocalSet(v));
-        set_at(function, frame, (o, k, v, kv), strings, helpers);
+        put(function);
         bump(function, k, 1.0);
     });
     wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(v));
@@ -2636,18 +2676,238 @@ pub(super) fn emit_sort(
         function,
         |function| wasm!(function; LocalGet(undefs), F64Const(Ieee64::from(0.0)), F64Gt),
         |function| {
-            set_at(function, frame, (o, k, v, kv), strings, helpers);
+            put(function);
             bump(function, k, 1.0);
             bump(function, undefs, -1.0);
         },
     );
+    if !copy {
+        while_loop(
+            function,
+            |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+            |function| {
+                delete_at(function, frame, (o, k, kv), strings, helpers);
+                bump(function, k, 1.0);
+            },
+        );
+    }
+    wasm!(function; LocalGet(target));
+}
+
+// --- with / toReversed / toSpliced ----------------------------------------------------
+
+/// `Get(o, f)` into i64 `v` for the f64 index in local `f` (`key` an i32
+/// temp); a throwing getter returns.
+fn get_at(function: &mut Function, o: u32, f: u32, key: u32, v: u32, helpers: Helpers<'_>) {
+    num(function, f);
+    wasm!(function; I32Const(1), Call(helpers.to_key), LocalSet(key));
+    get_key(function, o, key, v, helpers);
+}
+
+/// `CreateDataPropertyOrThrow(a, f, v)` for the f64 index in local `f` (`kv`
+/// an i64 temp).
+fn put_at(
+    function: &mut Function,
+    frame: Frame,
+    (a, f, v, kv): (u32, u32, u32, u32),
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    num(function, f);
+    wasm!(function; LocalSet(kv));
+    create_data_property(function, frame, a, kv, v, strings, helpers);
+}
+
+/// `ArrayCreate(len)` into i64 `out` for the f64 length in local `len` (`kv`
+/// an i64 temp): a length past `2^32 - 1` throws the `RangeError`.
+fn array_create_f64(
+    function: &mut Function,
+    frame: Frame,
+    (len, kv, out): (u32, u32, u32),
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    num(function, len);
+    wasm!(function; LocalSet(kv));
+    array_create(function, frame, kv, out, strings, helpers);
+    return_if_pending(function);
+}
+
+/// `Array.prototype.with(index, value)`: `actualIndex` is `index` relative to
+/// `len` (no clamping); outside `[0, len)` throws a `RangeError`; `A =
+/// ArrayCreate(len)` gets `value` at `actualIndex` and `Get(O, k)` (holes
+/// read `undefined`) everywhere else.
+pub(super) fn emit_with(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, value, kv, index_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (a, v) = (frame.x64(0), frame.x64(1));
+    let key = frame.i32(0);
+    let r = frame.f64(0);
+    let (len, k) = (frame.yf64(0), frame.yf64(1));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(index_v));
+    frame.arg(function, 1);
+    wasm!(function; LocalSet(value));
+    this_object(function, frame, o, WITH.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    wasm!(function; LocalGet(index_v));
+    to_integer(function, r, helpers);
+    wasm!(function;
+        LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
+        If(BlockType::Empty), LocalGet(len), LocalGet(r), F64Add, LocalSet(r), End,
+        LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
+        LocalGet(r), LocalGet(len), F64Ge, I32Or,
+        If(BlockType::Empty),
+    );
+    let error = IrNode::error_object(
+        ErrorKind::RangeError,
+        Some(IrNode::Str(WITH_OUT_OF_RANGE[0].to_owned())),
+        IrNode::Str(WITH_OUT_OF_RANGE[1].to_owned()),
+    );
+    emit_throw_error(&error, function, frame.scratch(), strings, helpers);
+    wasm!(function; End);
+    array_create_f64(function, frame, (len, kv, a), strings, helpers);
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k));
     while_loop(
         function,
         |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
         |function| {
-            delete_at(function, frame, (o, k, kv), strings, helpers);
+            wasm!(function;
+                LocalGet(k), LocalGet(r), F64Eq,
+                If(BlockType::Empty), LocalGet(value), LocalSet(v), Else,
+            );
+            get_at(function, o, k, key, v, helpers);
+            wasm!(function; End);
+            put_at(function, frame, (a, k, v, kv), strings, helpers);
             bump(function, k, 1.0);
         },
     );
-    wasm!(function; LocalGet(o));
+    wasm!(function; LocalGet(a));
+}
+
+/// `Array.prototype.toReversed()`: `A = ArrayCreate(len)` gets `Get(O, len -
+/// 1 - k)` at each `k` (holes read `undefined`).
+pub(super) fn emit_to_reversed(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, a, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let key = frame.i32(0);
+    let (len, k, from) = (frame.yf64(0), frame.yf64(1), frame.zf64(0));
+    this_object(function, frame, o, TO_REVERSED.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    array_create_f64(function, frame, (len, kv, a), strings, helpers);
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+        |function| {
+            wasm!(function;
+                LocalGet(len), LocalGet(k), F64Sub, F64Const(Ieee64::from(1.0)), F64Sub,
+                LocalSet(from),
+            );
+            get_at(function, o, from, key, v, helpers);
+            put_at(function, frame, (a, k, v, kv), strings, helpers);
+            bump(function, k, 1.0);
+        },
+    );
+    wasm!(function; LocalGet(a));
+}
+
+/// `Array.prototype.toSpliced(start, skipCount, ...items)`: `actualStart` and
+/// `actualSkipCount` as in `splice`; a new length past `2^53 - 1` throws a
+/// `TypeError`, then `A = ArrayCreate(newLen)` (past `2^32 - 1` a
+/// `RangeError`) gets `Get(O, i)` for `i < actualStart`, the items, then
+/// `Get(O, i + actualSkipCount - itemCount)` up to `newLen` (holes read
+/// `undefined`).
+pub(super) fn emit_to_spliced(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, v, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (sc_v, saved, a) = (frame.x64(0), frame.x64(1), frame.y64(0));
+    let (key, arg_i, argn) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let r = frame.f64(0);
+    let (len, start) = (frame.yf64(0), frame.yf64(1));
+    let (sc, items, i) = (frame.zf64(0), frame.zf64(1), frame.zf64(2));
+    let (from, new_len) = (frame.zf64(3), frame.zf64(4));
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(start_v));
+    frame.arg(function, 1);
+    wasm!(function; LocalSet(sc_v));
+    argc(function, frame);
+    wasm!(function; LocalSet(argn));
+    this_object(function, frame, o, TO_SPLICED.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    relative_arg(function, start_v, false, r, len, start, helpers);
+    wasm!(function;
+        // itemCount = max(argc - 2, 0)
+        LocalGet(argn), I32Const(2), I32Sub, I32Const(0), LocalGet(argn), I32Const(2), I32GtU, Select,
+        F64ConvertI32U, LocalSet(items),
+        LocalGet(argn), I32Eqz,
+        If(BlockType::Empty),
+        F64Const(Ieee64::from(0.0)), LocalSet(sc),
+        Else,
+        LocalGet(len), LocalGet(start), F64Sub, LocalSet(sc),
+        LocalGet(argn), I32Const(1), I32GtU,
+        If(BlockType::Empty),
+        LocalGet(sc_v),
+    );
+    to_integer(function, r, helpers);
+    wasm!(function;
+        LocalGet(r), F64Const(Ieee64::from(0.0)), F64Max, LocalGet(sc), F64Min, LocalSet(sc),
+        End,
+        End,
+    );
+    check_new_length(
+        function,
+        frame,
+        len,
+        |function| wasm!(function; LocalGet(items), LocalGet(sc), F64Sub),
+        strings,
+        helpers,
+    );
+    wasm!(function;
+        LocalGet(len), LocalGet(items), F64Add, LocalGet(sc), F64Sub, LocalSet(new_len),
+    );
+    array_create_f64(function, frame, (new_len, kv, a), strings, helpers);
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(i));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(i), LocalGet(start), F64Lt),
+        |function| {
+            get_at(function, o, i, key, v, helpers);
+            put_at(function, frame, (a, i, v, kv), strings, helpers);
+            bump(function, i, 1.0);
+        },
+    );
+    wasm!(function; I32Const(2), LocalSet(arg_i));
+    count_loop(function, arg_i, argn, |function| {
+        saved_arg_at(function, frame, saved, arg_i, v);
+        put_at(function, frame, (a, i, v, kv), strings, helpers);
+        bump(function, i, 1.0);
+    });
+    wasm!(function;
+        LocalGet(start), LocalGet(sc), F64Add, LocalSet(from),
+    );
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(i), LocalGet(new_len), F64Lt),
+        |function| {
+            get_at(function, o, from, key, v, helpers);
+            put_at(function, frame, (a, i, v, kv), strings, helpers);
+            bump(function, i, 1.0);
+            bump(function, from, 1.0);
+        },
+    );
+    wasm!(function; LocalGet(a));
 }

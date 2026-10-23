@@ -229,7 +229,11 @@ pub(super) fn emit_builtin(
         | Builtin::ArrayShift
         | Builtin::ArrayUnshift
         | Builtin::ArrayFill
-        | Builtin::ArrayCopyWithin => emit_array_family(builtin, &mut f, frame, strings, helpers),
+        | Builtin::ArrayCopyWithin
+        | Builtin::ArrayWith
+        | Builtin::ArrayToReversed
+        | Builtin::ArrayToSorted
+        | Builtin::ArrayToSpliced => emit_array_family(builtin, &mut f, frame, strings, helpers),
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
@@ -319,12 +323,16 @@ fn emit_array_family(
         Builtin::ArrayConcat => array::emit_concat(f, frame, strings, helpers),
         Builtin::ArrayFlat { map } => array::emit_flat(map, f, frame, strings, helpers),
         Builtin::ArraySplice => array::emit_splice(f, frame, strings, helpers),
-        Builtin::ArraySort => array::emit_sort(f, frame, strings, helpers),
+        Builtin::ArraySort => array::emit_sort(false, f, frame, strings, helpers),
         Builtin::ArrayReverse => array::emit_reverse(f, frame, strings, helpers),
         Builtin::ArrayShift => array::emit_shift(f, frame, strings, helpers),
         Builtin::ArrayUnshift => array::emit_unshift(f, frame, strings, helpers),
         Builtin::ArrayFill => array::emit_fill(f, frame, strings, helpers),
         Builtin::ArrayCopyWithin => array::emit_copy_within(f, frame, strings, helpers),
+        Builtin::ArrayWith => array::emit_with(f, frame, strings, helpers),
+        Builtin::ArrayToReversed => array::emit_to_reversed(f, frame, strings, helpers),
+        Builtin::ArrayToSorted => array::emit_sort(true, f, frame, strings, helpers),
+        Builtin::ArrayToSpliced => array::emit_to_spliced(f, frame, strings, helpers),
         // Only the variants `emit_builtin` routes here reach this match.
         _ => {}
     }
