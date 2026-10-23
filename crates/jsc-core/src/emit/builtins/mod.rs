@@ -233,11 +233,9 @@ pub(super) fn emit_builtin(
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
-        Builtin::StringFromCharCode => {
-            string::emit_from_char_code(false, &mut f, frame, strings, helpers);
-        }
-        Builtin::StringFromCodePoint => {
-            string::emit_from_char_code(true, &mut f, frame, strings, helpers);
+        Builtin::StringFromCharCode | Builtin::StringFromCodePoint => {
+            let code_point = builtin == Builtin::StringFromCodePoint;
+            string::emit_from_char_code(code_point, &mut f, frame, strings, helpers);
         }
         Builtin::StringRaw => string::emit_raw(&mut f, frame, strings, helpers),
         Builtin::NumberToString
