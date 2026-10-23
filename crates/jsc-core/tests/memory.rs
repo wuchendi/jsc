@@ -3,6 +3,8 @@
 //! backtrace).
 #![allow(clippy::expect_used)]
 
+use std::fmt::Write as _;
+
 use jsc_core::run::compile_and_run;
 mod common;
 use common::{assert_number, assert_str, assert_uncaught};
@@ -25,9 +27,13 @@ fn many_small_strings_grow_memory() {
 /// fits the initial memory: the module starts with enough pages for it.
 #[test]
 fn static_data_past_the_first_page() {
-    let literals = (0..1500)
-        .map(|i| format!("s += '{i}: a static string literal long enough'.length;"))
-        .collect::<String>();
+    let literals = (0..1500).fold(String::new(), |mut out, i| {
+        let _ = write!(
+            out,
+            "s += '{i}: a static string literal long enough'.length;"
+        );
+        out
+    });
     assert_number(&format!("let s = 0; {literals} s > 0 ? 1 : 0"), 1.0);
 }
 
