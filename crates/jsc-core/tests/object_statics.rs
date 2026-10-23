@@ -451,5 +451,9 @@ fn legacy_accessor_methods() {
             r"let p = Object.prototype; console.log(p.__defineGetter__.length, p.__defineGetter__.name, p.__defineSetter__.length, p.__lookupGetter__.length, p.__lookupSetter__.name, (1).__lookupGetter__('x'), [1].__lookupGetter__(0))",
             "2 __defineGetter__ 2 1 __lookupSetter__ undefined undefined\n",
         ),
+        (
+            r"Object.prototype.get = 'g'; Object.prototype.set = 's'; let o = {d: 1}; console.log(o.__lookupGetter__('d'), o.__lookupSetter__('d'), Object.create(o).__lookupGetter__('d'))",
+            "undefined undefined undefined\n",
+        ),
     ]);
 }

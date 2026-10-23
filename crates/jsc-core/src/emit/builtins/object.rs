@@ -343,7 +343,15 @@ pub(super) fn emit_lookup_accessor(
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(o), LocalGet(key), Call(helpers.own_desc()), LocalTee(desc),
         I64Const(UNDEFINED_BITS), I64Ne,
-        If(BlockType::Empty), LocalGet(desc), I32Const(half), Call(helpers.get), Return, End,
+        // A data descriptor has no own `get` / `set` (one inherited from
+        // `%Object.prototype%` must not be read).
+        If(BlockType::Empty),
+        I32Const(half), LocalGet(desc), Call(helpers.has_own()),
+        If(BlockType::Result(ValType::I64)),
+        LocalGet(desc), I32Const(half), Call(helpers.get),
+        Else, I64Const(UNDEFINED_BITS), End,
+        Return,
+        End,
         LocalGet(o), I32WrapI64, I64Load(MemArg { offset: OBJ_PROTO_OFFSET, align: 3, memory_index: 0 }),
         LocalTee(o), I64Const(NULL_BITS), I64Eq, BrIf(1),
         Br(0),
