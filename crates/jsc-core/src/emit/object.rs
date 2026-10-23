@@ -428,6 +428,8 @@ pub(super) fn emit_instanceof_node(
             strings,
             helpers,
         );
+        // OrdinaryHasInstance step 2: a bound `C` tests its target instead.
+        emit_unwrap_bound(function, tgt);
     }
 
     emit_is_object(function, cur);
@@ -513,6 +515,38 @@ pub(super) fn emit_instanceof_node(
     function.instruction(&Instruction::Else);
     // A receiver without a `proto` slot is never an instance.
     function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::End);
+}
+
+/// Replace the function in i64 local `f` by its bound target while it is a
+/// bound function (the first element of its `env` array, DESIGN.md §5.5).
+fn emit_unwrap_bound(function: &mut Function, f: u32) {
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(f));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: u64::from(abi::HEADER_FLAGS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(i32::from(abi::FUNC_FLAG_BOUND)));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(f));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: FUNC_ENV_OFFSET,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32WrapI64);
+    emit_array_elems(function);
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::LocalSet(f));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 }
 
