@@ -227,27 +227,17 @@ pub(super) fn emit_builtin(
             string::emit_from_char_code(true, &mut f, frame, strings, helpers);
         }
         Builtin::StringRaw => string::emit_raw(&mut f, frame, strings, helpers),
-        Builtin::NumberToString => number::emit_number_to_string(&mut f, frame, strings, helpers),
-        Builtin::NumberValueOf => number::emit_number_value_of(&mut f, frame, strings, helpers),
-        Builtin::NumberToFixed => {
-            number::emit_number_format(NumberFormat::Fixed, &mut f, frame, strings, helpers);
-        }
-        Builtin::NumberToExponential => {
-            let format = NumberFormat::Exponential;
-            number::emit_number_format(format, &mut f, frame, strings, helpers);
-        }
-        Builtin::NumberToPrecision => {
-            let format = NumberFormat::Precision;
-            number::emit_number_format(format, &mut f, frame, strings, helpers);
-        }
-        Builtin::NumberToLocaleString => {
-            number::emit_number_to_locale_string(&mut f, frame, strings, helpers);
-        }
-        Builtin::NumberIs(test) => global::emit_number_is(test, &mut f, frame),
-        Builtin::ParseFloat => global::emit_parse(false, &mut f, frame, strings, helpers),
-        Builtin::ParseInt => global::emit_parse(true, &mut f, frame, strings, helpers),
-        Builtin::BooleanToString => number::emit_boolean(false, &mut f, frame, strings, helpers),
-        Builtin::BooleanValueOf => number::emit_boolean(true, &mut f, frame, strings, helpers),
+        Builtin::NumberToString
+        | Builtin::NumberValueOf
+        | Builtin::NumberToFixed
+        | Builtin::NumberToExponential
+        | Builtin::NumberToPrecision
+        | Builtin::NumberToLocaleString
+        | Builtin::NumberIs(_)
+        | Builtin::ParseFloat
+        | Builtin::ParseInt
+        | Builtin::BooleanToString
+        | Builtin::BooleanValueOf => emit_number_family(builtin, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::IterSource => iter::emit_iter_source(&mut f, frame, strings, helpers),
         Builtin::DateMethod(op) => date::emit_method(op, &mut f, frame, strings, helpers),
@@ -289,6 +279,43 @@ pub(super) fn emit_builtin(
     }
     wasm!(f; End);
     f
+}
+
+/// Emit the body of a `Number` / `Boolean` prototype method, a `Number`
+/// static or a global number function into `f` (the variants
+/// [`emit_builtin`] routes here).
+fn emit_number_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::NumberToString => number::emit_number_to_string(f, frame, strings, helpers),
+        Builtin::NumberValueOf => number::emit_number_value_of(f, frame, strings, helpers),
+        Builtin::NumberToFixed => {
+            number::emit_number_format(NumberFormat::Fixed, f, frame, strings, helpers);
+        }
+        Builtin::NumberToExponential => {
+            let format = NumberFormat::Exponential;
+            number::emit_number_format(format, f, frame, strings, helpers);
+        }
+        Builtin::NumberToPrecision => {
+            let format = NumberFormat::Precision;
+            number::emit_number_format(format, f, frame, strings, helpers);
+        }
+        Builtin::NumberToLocaleString => {
+            number::emit_number_to_locale_string(f, frame, strings, helpers);
+        }
+        Builtin::NumberIs(test) => global::emit_number_is(test, f, frame),
+        Builtin::ParseFloat => global::emit_parse(false, f, frame, strings, helpers),
+        Builtin::ParseInt => global::emit_parse(true, f, frame, strings, helpers),
+        Builtin::BooleanToString => number::emit_boolean(false, f, frame, strings, helpers),
+        Builtin::BooleanValueOf => number::emit_boolean(true, f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
 }
 
 /// Throw a `TypeError` with `text` (`[message, stack]`) and return.
