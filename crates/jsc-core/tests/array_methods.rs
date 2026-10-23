@@ -2,7 +2,8 @@
 //! `%Array.prototype%` methods (`at`, `find*`, `some`, `every`,
 //! `reduceRight`, `lastIndexOf`, `concat`, `flat`, `flatMap`), the mutating
 //! ones (`splice`, `sort`, `reverse`, `shift`, `unshift`, `fill`,
-//! `copyWithin`) and `ArraySpeciesCreate` by `constructor` (DESIGN.md §6.4,
+//! `copyWithin`), the change-by-copy ones (`with`, `toReversed`, `toSorted`,
+//! `toSpliced`) and `ArraySpeciesCreate` by `constructor` (DESIGN.md §6.4,
 //! §13): generic over array-likes, holes, subclass receivers.
 
 mod common;
@@ -836,4 +837,208 @@ fn mutating_methods_on_primitive_receivers() {
     both_string("typeof Array.prototype.fill.call(true, 0)", "object");
     both_bool("Array.prototype.shift.call(5) === undefined", true);
     throws_type_error("Array.prototype.reverse.call('ab')");
+}
+
+// --- change-by-copy methods ----------------------------------------------------
+
+/// Assert `src` throws a `RangeError` (caught and tested in the program).
+fn throws_range_error(src: &str) {
+    both_bool(
+        &format!(
+            "let ok = false; try {{ {src}; }} catch (e) {{ ok = e instanceof RangeError; }} ok"
+        ),
+        true,
+    );
+}
+
+#[test]
+fn change_by_copy_methods_have_name_and_length() {
+    for (name, length) in [
+        ("with", 2.0),
+        ("toReversed", 0.0),
+        ("toSorted", 1.0),
+        ("toSpliced", 2.0),
+    ] {
+        both_string(&format!("Array.prototype.{name}.name"), name);
+        both_number(&format!("Array.prototype.{name}.length"), length);
+    }
+}
+
+#[test]
+fn with_replaces_one_index_in_a_copy() {
+    both_string(
+        "const a = [1, 2, 3]; a.with(1, 9).join() + ':' + a.join()",
+        "1,9,3:1,2,3",
+    );
+    both_string("[1, 2, 3].with(-1, 9).join()", "1,2,9");
+    both_string("[1, 2, 3].with(1.7, 9).join()", "1,9,3");
+    both_bool("const a = [1]; a.with(0, 1) !== a", true);
+    // Holes read as `undefined`.
+    both_string(
+        "const b = [, 2].with(1, 3); (0 in b) + ':' + b.length",
+        "true:2",
+    );
+    throws_range_error("[1, 2].with(2, 0)");
+    throws_range_error("[1, 2].with(-3, 0)");
+    throws_range_error("[].with(0, 0)");
+    both_string(
+        &format!(
+            "{LIKE}const b = Array.prototype.with.call(o, 1, 'x'); Array.isArray(b) + b.join()"
+        ),
+        "truea,x,,d",
+    );
+    both_string(
+        &format!(
+            "{SUB}const b = A.from([1, 2]).with(0, 3); (b instanceof A) + ':' + Array.isArray(b)"
+        ),
+        "false:true",
+    );
+    throws_type_error("Array.prototype.with.call(null, 0, 0)");
+}
+
+#[test]
+fn to_reversed_copies_in_reverse() {
+    both_string(
+        "const a = [1, 2, 3]; a.toReversed().join() + ':' + a.join()",
+        "3,2,1:1,2,3",
+    );
+    both_string("[].toReversed().length + ''", "0");
+    both_string(
+        "const b = [1, , 3].toReversed(); (1 in b) + ':' + b[1]",
+        "true:undefined",
+    );
+    both_string(
+        &format!("{LIKE}Array.prototype.toReversed.call(o).join()"),
+        "d,,b,a",
+    );
+    both_string(
+        &format!("{SUB}const b = A.from([1, 2]).toReversed(); (b instanceof A) + b.join()"),
+        "false2,1",
+    );
+    throws_type_error("Array.prototype.toReversed.call(undefined)");
+}
+
+#[test]
+fn to_sorted_sorts_a_copy() {
+    both_string(
+        "const a = [3, 1, 2]; a.toSorted().join() + ':' + a.join()",
+        "1,2,3:3,1,2",
+    );
+    both_string("[10, 9, 1].toSorted().join()", "1,10,9");
+    both_string("[1, 3, 2].toSorted((x, y) => y - x).join()", "3,2,1");
+    // Holes become `undefined`, sorted last.
+    both_string(
+        "const b = [3, , 1, undefined].toSorted(); b.length + ':' + (1 in b) + (3 in b) + b[0] + b[1]",
+        "4:truetrue13",
+    );
+    both_string(
+        &format!("{LIKE}Array.prototype.toSorted.call(o).join()"),
+        "a,b,d,",
+    );
+    both_string(
+        &format!("{SUB}const b = A.from([2, 1]).toSorted(); (b instanceof A) + b.join()"),
+        "false1,2",
+    );
+    // The comparator check comes before `ToObject(this)`.
+    throws_type_error("Array.prototype.toSorted.call(null, 1)");
+    throws_type_error("[1, 2].toSorted(null)");
+    // Stable.
+    both_string(
+        "[{k: 1, v: 'a'}, {k: 0, v: 'b'}, {k: 1, v: 'c'}, {k: 0, v: 'd'}].toSorted((x, y) => x.k - y.k).map(e => e.v).join('')",
+        "bdac",
+    );
+}
+
+#[test]
+fn to_spliced_splices_a_copy() {
+    both_string(
+        "const a = [1, 2, 3, 4]; a.toSpliced(1, 2, 'x').join() + ':' + a.join()",
+        "1,x,4:1,2,3,4",
+    );
+    both_string("[1, 2, 3].toSpliced().join()", "1,2,3");
+    both_string("[1, 2, 3].toSpliced(1).join()", "1");
+    both_string("[1, 2, 3].toSpliced(-1, 0, 'a', 'b').join()", "1,2,a,b,3");
+    both_string("[1, 2, 3].toSpliced(1, -5, 'a').join()", "1,a,2,3");
+    both_string("[1, 2, 3].toSpliced(1, 99).join()", "1");
+    both_string(
+        "[1, 2, 3].toSpliced(0, 0, 4, 5, 6, 7, 8, 9).join()",
+        "4,5,6,7,8,9,1,2,3",
+    );
+    both_string(
+        "const b = [1, , 3].toSpliced(0, 0); (1 in b) + ':' + b.length",
+        "true:3",
+    );
+    both_string(
+        &format!("{LIKE}Array.prototype.toSpliced.call(o, 1, 1).join()"),
+        "a,,d",
+    );
+    both_string(
+        &format!("{SUB}const b = A.from([1, 2]).toSpliced(0, 1); (b instanceof A) + b.join()"),
+        "false2",
+    );
+    throws_type_error("Array.prototype.toSpliced.call({ length: 2 ** 53 - 1 }, 0, 0, 1)");
+    throws_range_error("Array.prototype.toSpliced.call({ length: 2 ** 32 }, 0, 0)");
+    throws_range_error("Array.prototype.toReversed.call({ length: 2 ** 32 })");
+    throws_range_error("Array.prototype.toSorted.call({ length: 2 ** 32 })");
+    throws_range_error("Array.prototype.with.call({ length: 2 ** 32 }, 0, 0)");
+}
+
+#[test]
+fn generic_methods_use_the_full_length_range() {
+    const BIG: &str = "const n = 2 ** 53 - 1; ";
+    both_string(
+        &format!(
+            "{BIG}const o = {{ length: Infinity }}; o[n - 1] = 'x'; Array.prototype.pop.call(o) + ':' + (o.length === n - 1)"
+        ),
+        "x:true",
+    );
+    both_bool(
+        &format!("{BIG}const o = {{ length: n }}; o[n - 2] = 'c'; [].includes.call(o, 'c', n - 2)"),
+        true,
+    );
+    both_bool(
+        &format!(
+            "{BIG}const o = {{ length: n }}; o[n - 2] = 'c'; [].indexOf.call(o, 'c', n - 3) === n - 2"
+        ),
+        true,
+    );
+    both_bool(
+        &format!(
+            "{BIG}const o = {{ length: n }}; o[n - 3] = 'c'; [].lastIndexOf.call(o, 'c', n - 2) === n - 3"
+        ),
+        true,
+    );
+    both_bool(
+        &format!(
+            "{BIG}let seen = -1; [].findLast.call({{ length: Infinity }}, (v, i) => {{ seen = i; return true; }}); seen === n - 1"
+        ),
+        true,
+    );
+    both_bool(
+        &format!("{BIG}[].findLastIndex.call({{ length: Infinity }}, () => true) === n - 1"),
+        true,
+    );
+    both_string(
+        &format!(
+            "{BIG}const o = {{ length: n }}; o[n - 1] = 1; o[n - 3] = 3; const r = []; try {{ [].reduceRight.call(o, (acc, v) => {{ r.push(v); if (v === 3) throw 0; return acc; }}, 0); }} catch (e) {{}} r.join()"
+        ),
+        "1,3",
+    );
+    both_string(
+        &format!(
+            "{BIG}const o = {{ length: n, [n - 2]: 'a', [n - 3]: 'b' }}; [].slice.call(o, n - 3, n - 1).join()"
+        ),
+        "b,a",
+    );
+    throws_range_error("[].slice.call({ length: 2 ** 32 + 1 }, 0)");
+    throws_range_error("[].map.call({ length: 2 ** 32 }, () => 0)");
+}
+
+#[test]
+fn push_past_the_array_length_limit_throws() {
+    throws_range_error("const y = []; y.length = 2 ** 32 - 1; Array.prototype.push.call(y, 'x')");
+    both_string(
+        "const y = []; y.length = 2 ** 32 - 1; try { Array.prototype.push.call(y, 'x'); } catch (e) {} y[2 ** 32 - 1] + ':' + (y.length === 2 ** 32 - 1)",
+        "x:true",
+    );
 }

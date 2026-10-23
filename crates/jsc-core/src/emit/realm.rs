@@ -272,6 +272,8 @@ pub(super) enum Builtin {
     ArrayFill,
     /// `Array.prototype.copyWithin`.
     ArrayCopyWithin,
+    /// `Array.prototype.with` / `toReversed` / `toSorted` / `toSpliced`.
+    ArrayCopy(ArrayCopyOp),
     /// A `String.prototype` method backed by a host `__method` op.
     StringMethod(StringOp),
     /// `String.prototype.toString`.
@@ -450,6 +452,28 @@ impl ArrayFindOp {
     }
 }
 
+/// An `Array.prototype` method that returns a changed copy of its receiver as
+/// a plain array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayCopyOp {
+    With,
+    ToReversed,
+    ToSorted,
+    ToSpliced,
+}
+
+impl ArrayCopyOp {
+    /// The method's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::With => "with",
+            Self::ToReversed => "toReversed",
+            Self::ToSorted => "toSorted",
+            Self::ToSpliced => "toSpliced",
+        }
+    }
+}
+
 /// A generic `String.prototype` method: most are backed by a host `__method`
 /// op ([`StringOp::flag`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,7 +592,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 188] = [
+    pub(super) const ALL: [Builtin; 192] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -674,6 +698,10 @@ impl Builtin {
         Self::ArrayUnshift,
         Self::ArrayFill,
         Self::ArrayCopyWithin,
+        Self::ArrayCopy(ArrayCopyOp::With),
+        Self::ArrayCopy(ArrayCopyOp::ToReversed),
+        Self::ArrayCopy(ArrayCopyOp::ToSorted),
+        Self::ArrayCopy(ArrayCopyOp::ToSpliced),
         Self::StringMethod(StringOp::IndexOf),
         Self::StringMethod(StringOp::Includes),
         Self::StringMethod(StringOp::Slice),
@@ -867,6 +895,7 @@ impl Builtin {
             Self::ArrayUnshift => "unshift",
             Self::ArrayFill => "fill",
             Self::ArrayCopyWithin => "copyWithin",
+            Self::ArrayCopy(op) => op.name(),
             Self::IsNaN => "isNaN",
             Self::IsFinite => "isFinite",
         }
@@ -904,6 +933,7 @@ impl Builtin {
             | Self::ArrayFlat { map: false }
             | Self::ArrayReverse
             | Self::ArrayShift
+            | Self::ArrayCopy(ArrayCopyOp::ToReversed)
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(
@@ -921,6 +951,7 @@ impl Builtin {
             | Self::ArraySlice
             | Self::ArraySplice
             | Self::ArrayCopyWithin
+            | Self::ArrayCopy(ArrayCopyOp::With | ArrayCopyOp::ToSpliced)
             | Self::CollectionOp { op: MapOp::Set, .. }
             | Self::PromiseThen => 2,
             Self::HasOwnProperty
@@ -947,6 +978,7 @@ impl Builtin {
             | Self::ArraySort
             | Self::ArrayUnshift
             | Self::ArrayFill
+            | Self::ArrayCopy(ArrayCopyOp::ToSorted)
             | Self::NumberToString
             | Self::NumberToFixed
             | Self::NumberToExponential
@@ -995,7 +1027,8 @@ impl Builtin {
             | Self::ArrayShift
             | Self::ArrayUnshift
             | Self::ArrayFill
-            | Self::ArrayCopyWithin => Some(BuiltinCtor::Array),
+            | Self::ArrayCopyWithin
+            | Self::ArrayCopy(_) => Some(BuiltinCtor::Array),
             Self::StringMethod(_) | Self::StringToString | Self::StringValueOf => {
                 Some(BuiltinCtor::String)
             }
