@@ -831,13 +831,13 @@ impl LowerCtx<'_> {
             // `Error(m)` without `new` constructs too (DESIGN.md §7.7).
             Ok(self.lower_error_construct(kind, args))
         } else if let Some(op) = convert_builtin_op(name)
-            && (!matches!(name, "String" | "Number" | "Boolean")
-                || self.shared.globals.sealed(name))
+            && self.shared.globals.sealed(name)
         {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
-            // String(){}` shadows it.
+            // String(){}` shadows it, and only while sealed, so a reassigned
+            // global is called instead.
             let empty = args.is_empty();
             let (seq, args) = self.fit_inline_args(Some(convert_arity(op)), args);
             Ok(seq_then(seq, convert_call(op, empty, args)))
@@ -1054,8 +1054,10 @@ impl LowerCtx<'_> {
             })
         } else if let Some(op) = convert_builtin_op(name)
             && matches!(op, ConvertOp::ParseInt | ConvertOp::ParseFloat)
+            && self.shared.globals.sealed(name)
         {
-            // `parseInt`/`parseFloat` read their arguments from the array.
+            // A sealed `parseInt`/`parseFloat` reads its arguments from the
+            // array.
             let array = self.fresh();
             let arg = |i: f64| IrNode::Index {
                 obj: Box::new(IrNode::Local(array)),
@@ -1842,30 +1844,52 @@ impl LowerCtx<'_> {
     }
 
     /// Build the Error instance `<kind>(args)` / `new <kind>(args)` constructs:
-    /// the first argument is the message (see [`Self::lower_error_object`]);
-    /// surplus arguments are evaluated after it, left to right, for their side
-    /// effects only.
+    /// the first argument is the message (see [`Self::lower_error_object`]),
+    /// the second the options whose `cause` the instance installs (see
+    /// [`IrNode::install_error_cause`]); surplus arguments are evaluated after
+    /// them, left to right, for their side effects only.
     fn lower_error_construct(&mut self, kind: ErrorKind, args: Vec<IrNode>) -> IrNode {
         let mut args = args.into_iter();
         let mut message = args.next();
+        let options = args.next();
         let extra: Vec<IrNode> = args.collect();
-        if extra.is_empty() {
+        if options.is_none() {
             return self.lower_error_object(kind, message);
         }
-        // A non-literal message is evaluated into a temp before the surplus
-        // arguments run.
-        let head = message
-            .take_if(|message| !matches!(message, IrNode::Str(_) | IrNode::Undefined))
-            .map(|value| {
-                let local = self.fresh();
-                message = Some(IrNode::Local(local));
-                IrNode::Assign {
-                    local,
-                    value: Box::new(value),
-                }
-            });
+        // A non-literal message or options value is evaluated into a temp
+        // before the arguments after it run; a literal options value is a
+        // primitive, so it installs no cause.
+        let mut head = Vec::new();
+        if let Some(value) = message.take_if(|message| !is_literal(message)) {
+            message = Some(self.spill(&mut head, value));
+        }
+        let options = options
+            .filter(|options| !is_literal(options))
+            .map(|value| self.spill(&mut head, value));
+        head.extend(extra);
         let error = self.lower_error_object(kind, message);
-        IrNode::Seq(head.into_iter().chain(extra).chain([error]).collect())
+        let error = match options {
+            Some(options) => {
+                let (obj, scratch) = (self.fresh(), self.fresh());
+                IrNode::install_error_cause(error, options, obj, scratch)
+            }
+            None => error,
+        };
+        if head.is_empty() {
+            return error;
+        }
+        IrNode::Seq(head.into_iter().chain([error]).collect())
+    }
+
+    /// Append the evaluation of `value` into a fresh temp to `head`; yields
+    /// the temp's read.
+    fn spill(&mut self, head: &mut Vec<IrNode>, value: IrNode) -> IrNode {
+        let local = self.fresh();
+        head.push(IrNode::Assign {
+            local,
+            value: Box::new(value),
+        });
+        IrNode::Local(local)
     }
 
     /// Build the Error instance `new <kind>(message)` / `<kind>(message)`
@@ -2081,6 +2105,14 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
     }
+}
+
+/// Whether `node` is a literal primitive (no side effects, no object).
+fn is_literal(node: &IrNode) -> bool {
+    matches!(
+        node,
+        IrNode::Num(_) | IrNode::Str(_) | IrNode::Bool(_) | IrNode::Null | IrNode::Undefined
+    )
 }
 
 /// `seq` (evaluated for its effects) then `last`, the value.

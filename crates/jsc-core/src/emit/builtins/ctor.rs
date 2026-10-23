@@ -23,6 +23,28 @@ impl Body {
         }
     }
 
+    /// Argument `i`, past the `K` slots the element of the argument array a
+    /// spread call or construct with more arguments published (`undefined`
+    /// past the argument count). Read it before any user code runs: a nested
+    /// spread call replaces that array.
+    fn spread_arg(&self, i: u32) -> IrNode {
+        if i < self.k {
+            return IrNode::Local(i);
+        }
+        ternary(
+            IrNode::Binary {
+                op: BinOp::Gt,
+                lhs: Box::new(IrNode::ArgCount(self.k + 1)),
+                rhs: Box::new(IrNode::Num(f64::from(i))),
+            },
+            IrNode::Index {
+                obj: Box::new(IrNode::SpreadArgsGlobal),
+                index: Box::new(IrNode::Num(f64::from(i))),
+            },
+            IrNode::Undefined,
+        )
+    }
+
     /// Temp local `n` (`0..4`).
     fn temp(&self, n: u32) -> u32 {
         self.k + 2 + n
@@ -136,19 +158,24 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         BuiltinCtor::Number => conversion(&body, ctor, ConvertOp::ToNumber, IrNode::Num(0.0)),
         BuiltinCtor::Boolean => conversion(&body, ctor, ConvertOp::ToBoolean, IrNode::Bool(false)),
         BuiltinCtor::Error(kind) => {
-            let proto = body.temp(1);
+            let (proto, options) = (body.temp(1), body.temp(3));
+            let error = IrNode::error_from_argument(
+                kind,
+                IrNode::Local(proto),
+                body.arg(0),
+                body.temp(0),
+                body.temp(2),
+            );
             IrNode::Seq(vec![
+                IrNode::Assign {
+                    local: options,
+                    value: Box::new(body.spread_arg(1)),
+                },
                 IrNode::Assign {
                     local: proto,
                     value: Box::new(body.proto(ctor)),
                 },
-                IrNode::error_from_argument(
-                    kind,
-                    IrNode::Local(proto),
-                    body.arg(0),
-                    body.temp(2),
-                    body.temp(3),
-                ),
+                IrNode::install_error_cause(error, IrNode::Local(options), proto, body.temp(0)),
             ])
         }
         // The allocation only: `map_set::emit_ctor` adds the iterable's values.

@@ -810,8 +810,9 @@ unresolvable name throws `ReferenceError` (strict).
 **Global facts** (`codegen/globals.rs`, one whole-program syntactic scan):
 
 - **`sealed(N)`** — `N` names an unshadowed global, is never assigned, and the
-  program contains no `globalThis`, top-level `this`, or `delete` of an
-  identifier. A namespace (`Math`, `JSON`, `console`, `Object`, `Promise`,
+  program contains no escaping `globalThis` (anything but a static
+  `globalThis.k` read or call — a member write escapes), top-level `this`, or
+  `delete` of an identifier. A namespace (`Math`, `JSON`, `console`, `Object`, `Promise`,
   `Date`) is additionally **inline** when it never escapes (only `N.k` reads
   and `N.m(..)` calls); then its members compile to inline code.
 - **intrinsics-sealed** — none of `prototype`, `constructor`, `__proto__`,
@@ -837,6 +838,7 @@ path, never semantics:
 | site | fast path | taken when | otherwise |
 |---|---|---|---|
 | `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
+| `String/Number/Boolean/parseInt/parseFloat(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0`, `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
@@ -1168,6 +1170,10 @@ those of `switch` and loops are not tracked.
   `new.target.prototype` (one of the static `%…Error.prototype%` blocks unless
   subclassed) with own non-enumerable `message` (only when one was given) and
   `stack` (`"Name: message"`, a single line, no frames); `name` is inherited.
+  `InstallErrorCause`: when the second argument is an object with a `cause`
+  property (own or inherited, even `undefined`), the instance gets an own
+  non-enumerable `cause` = `options.cause`, read after the message's
+  `ToString`; otherwise it has no `cause`.
   `Error.prototype.toString` formats `Name: message`.
 - `throw` accepts any value.
 - **Engine-raised errors** are real error objects linked to the same static
@@ -1239,7 +1245,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 
 | area | supported |
 |---|---|
-| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
+| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls (while sealed, §6.4) |
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
@@ -1516,7 +1522,9 @@ Each item below is current behaviour of this tree.
   `assign`), no `Array.from`, `sort`, `find`,
   `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
-- `parseInt` and `parseFloat` exist only as direct calls, not as global values.
+- `parseInt` and `parseFloat` exist only as direct calls, not as global values:
+  in a program where they are not sealed (§6.4) a call reads the global
+  property, which throws `ReferenceError` unless the program installed one.
 
 **Object model**
 

@@ -1369,8 +1369,9 @@ pub enum IrNode {
     /// Read the `__spread_args` wasm global: the argument array of the most
     /// recent spread call or construct, which holds the arguments beyond the
     /// `K` positional slots. Emitted ONLY in the prologue of a function that
-    /// gathers its arguments (a rest parameter or `arguments`), which reads it
-    /// only when its decoded argument count exceeds `K`.
+    /// gathers its arguments (a rest parameter or `arguments`) or of a builtin
+    /// constructor reading an argument past `K`, which reads it only when its
+    /// decoded argument count exceeds `K`.
     SpreadArgsGlobal,
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
@@ -1883,6 +1884,50 @@ impl IrNode {
             )),
             else_branch: Box::new(Self::error_with_proto(proto, Some(text), stack)),
         }
+    }
+
+    /// `InstallErrorCause` (DESIGN.md §7.7): the Error instance `error` is
+    /// evaluated into local `obj` and, when `options` (side-effect free, read
+    /// repeatedly) is an object with a `cause` property (own or inherited),
+    /// gets an own non-enumerable `cause` = `options.cause` (defined through
+    /// local `scratch`); yields the instance.
+    pub(crate) fn install_error_cause(
+        error: IrNode,
+        options: IrNode,
+        obj: u32,
+        scratch: u32,
+    ) -> Self {
+        let cause = || IrNode::Str("cause".to_owned());
+        let has_cause = IrNode::Logical {
+            op: LogicalOp::And,
+            lhs: Box::new(IrNode::IsObject(Box::new(options.clone()))),
+            rhs: Box::new(IrNode::ObjectHas {
+                key: Box::new(cause()),
+                obj: Box::new(options.clone()),
+            }),
+        };
+        let define = IrNode::DefineProps {
+            obj: Box::new(IrNode::Local(obj)),
+            local: scratch,
+            entries: vec![(
+                PropKey::Hidden("cause".to_owned()),
+                IrNode::Index {
+                    obj: Box::new(options),
+                    index: Box::new(cause()),
+                },
+            )],
+        };
+        IrNode::Seq(vec![
+            IrNode::Assign {
+                local: obj,
+                value: Box::new(error),
+            },
+            IrNode::Ternary {
+                cond: Box::new(has_cause),
+                then_branch: Box::new(define),
+                else_branch: Box::new(IrNode::Local(obj)),
+            },
+        ])
     }
 
     /// Whether `f` holds for any DIRECT child expression. Exhaustive over every
