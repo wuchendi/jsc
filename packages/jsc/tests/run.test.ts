@@ -474,7 +474,7 @@ it('converts objects with OrdinaryToPrimitive like the Rust host', async () => {
     ['+new Date(0)', '0'],
     ['[] + {}', '[object Object]'],
     ['+{}', 'NaN'],
-    ['String(function f() {})', '[Function: f]'],
+    ['String(function f() {})', 'function f() { [native code] }'],
     [`${sta} String(new Test262Error('m'))`, 'Test262Error: m'],
     [`${sta} '' + new Test262Error('m')`, 'Test262Error: m'],
   ]

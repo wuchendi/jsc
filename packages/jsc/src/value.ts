@@ -23,6 +23,7 @@ import {
   FN_INFO_ADDR,
   FN_INFO_ENTRY_SIZE,
   FN_INFO_NAME_OFFSET,
+  FUNC_FLAG_BOUND,
   FUNC_FLAG_CLASS_CTOR,
   FUNC_FLAG_CONSTRUCTOR,
   FUNC_INDEX_OFFSET,
@@ -498,9 +499,18 @@ function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
     )
       parent = functionName(HEAP | BigInt(linkPtr), mem)
   }
+  // A bound function's name is its own `name` property (`bound f`).
+  let name: string | undefined
+  if (((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_BOUND) === 0) {
+    name = functionName(HEAP | BigInt(ptr), mem)
+  } else {
+    const bits = ownData(ptr, 'name', mem)
+    const own = bits === undefined ? undefined : decode(bits, mem)
+    name = own?.kind === 'string' ? own.value : undefined
+  }
   return {
     kind: 'function',
-    name: functionName(HEAP | BigInt(ptr), mem) ?? '',
+    name: name ?? '',
     isClass,
     extends: parent,
     props: decodeProps(ptr, mem, guard),

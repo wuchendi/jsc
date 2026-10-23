@@ -56,12 +56,6 @@ fn rejects_unsupported_for_of_and_for_in() {
     assert_rejected("for (const k in 5) { k }");
 }
 
-#[test]
-fn rejects_function_prototype_bind() {
-    // `bind` is phase 3: it throws rather than mis-dispatching.
-    assert_rejected("function f(a) { return a } let g = f.bind(null); g(1)");
-}
-
 // ---------------------------------------------------------------------------
 // An unknown / not-yet-implemented method is a run-time `TypeError` from the
 // prototype lookup — never a compile error, and never invalid wasm.
