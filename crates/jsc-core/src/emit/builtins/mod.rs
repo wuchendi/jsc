@@ -38,6 +38,7 @@ mod string;
 
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
+use number::NumberFormat;
 pub(super) use string::{emit_is_method_refusal, inline_host_op};
 
 /// The IR fragments the hand-written bodies emit with `K = k`, for the
@@ -226,10 +227,17 @@ pub(super) fn emit_builtin(
             string::emit_from_char_code(true, &mut f, frame, strings, helpers);
         }
         Builtin::StringRaw => string::emit_raw(&mut f, frame, strings, helpers),
-        Builtin::NumberToString => number::emit_number_to_string(&mut f, frame, strings, helpers),
-        Builtin::NumberValueOf => number::emit_number_value_of(&mut f, frame, strings, helpers),
-        Builtin::BooleanToString => number::emit_boolean(false, &mut f, frame, strings, helpers),
-        Builtin::BooleanValueOf => number::emit_boolean(true, &mut f, frame, strings, helpers),
+        Builtin::NumberToString
+        | Builtin::NumberValueOf
+        | Builtin::NumberToFixed
+        | Builtin::NumberToExponential
+        | Builtin::NumberToPrecision
+        | Builtin::NumberToLocaleString
+        | Builtin::NumberIs(_)
+        | Builtin::ParseFloat
+        | Builtin::ParseInt
+        | Builtin::BooleanToString
+        | Builtin::BooleanValueOf => emit_number_family(builtin, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::IterSource => iter::emit_iter_source(&mut f, frame, strings, helpers),
         Builtin::DateMethod(op) => date::emit_method(op, &mut f, frame, strings, helpers),
@@ -273,6 +281,43 @@ pub(super) fn emit_builtin(
     f
 }
 
+/// Emit the body of a `Number` / `Boolean` prototype method, a `Number`
+/// static or a global number function into `f` (the variants
+/// [`emit_builtin`] routes here).
+fn emit_number_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::NumberToString => number::emit_number_to_string(f, frame, strings, helpers),
+        Builtin::NumberValueOf => number::emit_number_value_of(f, frame, strings, helpers),
+        Builtin::NumberToFixed => {
+            number::emit_number_format(NumberFormat::Fixed, f, frame, strings, helpers);
+        }
+        Builtin::NumberToExponential => {
+            let format = NumberFormat::Exponential;
+            number::emit_number_format(format, f, frame, strings, helpers);
+        }
+        Builtin::NumberToPrecision => {
+            let format = NumberFormat::Precision;
+            number::emit_number_format(format, f, frame, strings, helpers);
+        }
+        Builtin::NumberToLocaleString => {
+            number::emit_number_to_locale_string(f, frame, strings, helpers);
+        }
+        Builtin::NumberIs(test) => global::emit_number_is(test, f, frame),
+        Builtin::ParseFloat => global::emit_parse(false, f, frame, strings, helpers),
+        Builtin::ParseInt => global::emit_parse(true, f, frame, strings, helpers),
+        Builtin::BooleanToString => number::emit_boolean(false, f, frame, strings, helpers),
+        Builtin::BooleanValueOf => number::emit_boolean(true, f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
+}
+
 /// Throw a `TypeError` with `text` (`[message, stack]`) and return.
 fn throw_type_error(
     function: &mut Function,
@@ -298,8 +343,8 @@ pub(super) fn emit_is_wrapper(function: &mut Function, local: u32, class: u8) {
 }
 
 /// `this<Type>Value(this)` into i64 `out`: the primitive itself (`is_prim`),
-/// the `[[PrimitiveValue]]` of a wrapper object of `class`, else throw
-/// `text`.
+/// the `[[PrimitiveValue]]` of a wrapper object of `class` (`+0` for
+/// `%Number.prototype%`, itself a Number object), else throw `text`.
 #[allow(clippy::too_many_arguments)]
 fn this_primitive(
     function: &mut Function,
@@ -314,6 +359,14 @@ fn this_primitive(
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(out));
     is_prim(function, out);
     wasm!(function; I32Eqz, If(BlockType::Empty));
+    let number_proto = class == abi::CLASS_NUMBER;
+    if number_proto {
+        let proto = intrinsic_bits(realm::prototype_of(BuiltinCtor::Number), helpers);
+        wasm!(function;
+            LocalGet(out), I64Const(proto), I64Eq,
+            If(BlockType::Empty), I64Const(0), LocalSet(out), Else,
+        );
+    }
     emit_is_wrapper(function, out, class);
     wasm!(function;
         If(BlockType::Empty),
@@ -324,6 +377,9 @@ fn this_primitive(
     );
     throw_type_error(function, frame, text, strings, helpers);
     wasm!(function; End, End);
+    if number_proto {
+        wasm!(function; End);
+    }
 }
 
 /// `__to_object(v: i64) -> i64`: `ToObject` of a non-nullish jsval: a

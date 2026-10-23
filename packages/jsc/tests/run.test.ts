@@ -505,6 +505,24 @@ it('runs the string and number prototype host ops like the Rust host', async () 
   expect((await run('(-255).toString(36)')).result).toBe('-73')
 })
 
+it('runs the number formatting and Math host ops like the Rust host', async () => {
+  expect((await run('(1.25).toFixed(1) + (2.5).toFixed(0)')).result).toBe(
+    '1.33',
+  )
+  expect((await run('(123456).toExponential(2)')).result).toBe('1.23e+5')
+  expect((await run('(123456).toExponential()')).result).toBe('1.23456e+5')
+  expect((await run('(0.000123).toPrecision(2)')).result).toBe('0.00012')
+  expect(
+    (await run('Math.log(1) + Math.cos(0) + Math.atan2(0, 1)')).result,
+  ).toBe('1')
+  expect((await run('Math.cbrt(27) + Math.log2(8)')).result).toBe('6')
+  expect((await run('1 / Math.sin(-0)')).result).toBe('-Infinity')
+  expect((await run('Math.acosh(0.5)')).result).toBe('NaN')
+  expect((await run('const r = Math.random(); r >= 0 && r < 1')).result).toBe(
+    'true',
+  )
+})
+
 it('runs the String statics and remaining string methods like the host', async () => {
   const cases: [string, string][] = [
     ['String.fromCharCode(104, 105, 233)', 'hié'],

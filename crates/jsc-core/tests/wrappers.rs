@@ -294,3 +294,140 @@ fn wrapper_rendering() {
     assert_output("console.log([Object(\"x\")])", "[ [String: 'x'] ]\n");
     assert_eval("new Number(-0)", "[Number: -0]");
 }
+
+// --- Number.prototype formatting ---------------------------------------------
+
+/// Wrap `body` so the script yields the name of the error it throws.
+fn caught_name(body: &str) -> String {
+    format!("let r=\"none\"; try {{ {body} }} catch(e) {{ r=e.name }} r")
+}
+
+#[test]
+fn number_to_string_radix_and_receivers() {
+    for (src, expected) in [
+        ("(0.1).toString()", "0.1"),
+        ("(1e21).toString()", "1e+21"),
+        ("(123.456).toString(10)", "123.456"),
+        ("(-0).toString(2)", "0"),
+        ("(255).toString(16.9)", "ff"),
+        ("(255).toString('16')", "ff"),
+        ("(0.5).toString(36)", "0.i"),
+        ("(-255.5).toString(16)", "-ff.8"),
+        ("(1e21).toString(36)", "5v1j4f4ds7c000"),
+        ("new Number(10).toString(2)", "1010"),
+        ("Number.prototype.toString.call(Object(7), 8)", "7"),
+        ("Number.prototype.toString()", "0"),
+        ("Number.prototype.toString.length", "1"),
+        ("Number.prototype.toLocaleString.name", "toLocaleString"),
+        ("Number.prototype.toLocaleString.length", "0"),
+        ("(12.5).toLocaleString()", "12.5"),
+    ] {
+        assert_eval(src, expected);
+    }
+    for (src, expected) in [
+        ("(1).toString(0)", "RangeError"),
+        ("(1).toString(NaN)", "RangeError"),
+        ("(1).toString(Infinity)", "RangeError"),
+        ("Number.prototype.toString.call('1')", "TypeError"),
+        ("Number.prototype.toString.call({})", "TypeError"),
+        (
+            "Number.prototype.toLocaleString.call(Object('1'))",
+            "TypeError",
+        ),
+    ] {
+        assert_string(&caught_name(src), expected);
+    }
+}
+
+#[test]
+fn number_to_fixed() {
+    for (src, expected) in [
+        ("(1.005).toFixed(2)", "1.00"),
+        ("(1.45).toFixed(1)", "1.4"),
+        ("(2.5).toFixed(0)", "3"),
+        ("(0.5).toFixed(0)", "1"),
+        ("(-1.5).toFixed(0)", "-2"),
+        ("(1.25).toFixed(1)", "1.3"),
+        ("(123.456).toFixed(2)", "123.46"),
+        ("(0.000001).toFixed(3)", "0.000"),
+        ("(-0.0000001).toFixed(2)", "-0.00"),
+        ("(-0).toFixed(2)", "0.00"),
+        ("(42).toFixed()", "42"),
+        ("(42).toFixed(NaN)", "42"),
+        ("(1.1).toFixed(20)", "1.10000000000000008882"),
+        ("(1e21).toFixed(2)", "1e+21"),
+        ("(1e20).toFixed(2)", "100000000000000000000.00"),
+        ("NaN.toFixed(2)", "NaN"),
+        ("(-Infinity).toFixed(1)", "-Infinity"),
+        ("(0).toFixed(100).length", "102"),
+        ("Number.prototype.toFixed.length", "1"),
+        ("new Number(3.14159).toFixed(3)", "3.142"),
+    ] {
+        assert_eval(src, expected);
+    }
+    for (src, expected) in [
+        ("(1).toFixed(101)", "RangeError"),
+        ("(1).toFixed(-1)", "RangeError"),
+        ("(1).toFixed(Infinity)", "RangeError"),
+        ("NaN.toFixed(Infinity)", "RangeError"),
+        ("Number.prototype.toFixed.call('1', 1)", "TypeError"),
+    ] {
+        assert_string(&caught_name(src), expected);
+    }
+}
+
+#[test]
+fn number_to_exponential() {
+    for (src, expected) in [
+        ("(123456).toExponential(2)", "1.23e+5"),
+        ("(123456).toExponential()", "1.23456e+5"),
+        ("(0.00015).toExponential(1)", "1.5e-4"),
+        ("(1.25).toExponential(1)", "1.3e+0"),
+        ("(-5).toExponential(3)", "-5.000e+0"),
+        ("(0).toExponential()", "0e+0"),
+        ("(0).toExponential(2)", "0.00e+0"),
+        ("(-0).toExponential(1)", "0.0e+0"),
+        ("(1e21).toExponential()", "1e+21"),
+        ("(5e-324).toExponential()", "5e-324"),
+        ("NaN.toExponential(1000)", "NaN"),
+        ("Infinity.toExponential(-5)", "Infinity"),
+        ("Number.prototype.toExponential.length", "1"),
+    ] {
+        assert_eval(src, expected);
+    }
+    for (src, expected) in [
+        ("(1).toExponential(101)", "RangeError"),
+        ("(1).toExponential(-1)", "RangeError"),
+        ("Number.prototype.toExponential.call(true)", "TypeError"),
+    ] {
+        assert_string(&caught_name(src), expected);
+    }
+}
+
+#[test]
+fn number_to_precision() {
+    for (src, expected) in [
+        ("(123.456).toPrecision(4)", "123.5"),
+        ("(123.456).toPrecision(2)", "1.2e+2"),
+        ("(0.000123).toPrecision(2)", "0.00012"),
+        ("(0.0000001).toPrecision(1)", "1e-7"),
+        ("(123456).toPrecision(6)", "123456"),
+        ("(123456).toPrecision(3)", "1.23e+5"),
+        ("(1.25).toPrecision(2)", "1.3"),
+        ("(0).toPrecision(3)", "0.00"),
+        ("(-1.5).toPrecision(1)", "-2"),
+        ("(25).toPrecision(1)", "3e+1"),
+        ("(1.5).toPrecision()", "1.5"),
+        ("NaN.toPrecision(1000)", "NaN"),
+        ("Number.prototype.toPrecision.length", "1"),
+    ] {
+        assert_eval(src, expected);
+    }
+    for (src, expected) in [
+        ("(1).toPrecision(0)", "RangeError"),
+        ("(1).toPrecision(101)", "RangeError"),
+        ("Number.prototype.toPrecision.call(null, 1)", "TypeError"),
+    ] {
+        assert_string(&caught_name(src), expected);
+    }
+}

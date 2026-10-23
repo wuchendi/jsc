@@ -808,6 +808,67 @@ pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
 /// `__method` result: the pattern has `RegExp` syntax, which needs the absent
 /// `RegExp`; the calling builtin throws a `TypeError`.
 pub(crate) const METHOD_NEEDS_REGEXP: u64 = UNDEFINED | 3;
+/// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
+/// receiver, `arg0` an integral `f` in `0..=100`).
+pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;
+
+/// `__method` op flag: `Number.prototype.toExponential(f)` (a finite number
+/// receiver, `arg0` an integral `f` in `0..=100`, or `undefined` for the
+/// shortest round-tripping digits).
+pub(crate) const METHOD_OP_NUMBER_TO_EXPONENTIAL: i32 = 41;
+
+/// `__method` op flag: `Number.prototype.toPrecision(p)` (a finite number
+/// receiver, `arg0` an integral `p` in `1..=100`).
+pub(crate) const METHOD_OP_NUMBER_TO_PRECISION: i32 = 42;
+
+/// `__method` op flag: a host `Math` function. The receiver is the first
+/// number operand, `arg0` the second (`Math.atan2`'s `x`; `undefined` for
+/// the unary functions) and `arg1` the raw `MATH_FN_*` code; the result is a
+/// number jsval.
+pub(crate) const METHOD_OP_MATH: i32 = 43;
+
+/// `METHOD_OP_MATH` function code: `Math.cbrt`.
+pub(crate) const MATH_FN_CBRT: i64 = 0;
+/// `METHOD_OP_MATH` function code: `Math.log`.
+pub(crate) const MATH_FN_LOG: i64 = 1;
+/// `METHOD_OP_MATH` function code: `Math.log2`.
+pub(crate) const MATH_FN_LOG2: i64 = 2;
+/// `METHOD_OP_MATH` function code: `Math.log10`.
+pub(crate) const MATH_FN_LOG10: i64 = 3;
+/// `METHOD_OP_MATH` function code: `Math.log1p`.
+pub(crate) const MATH_FN_LOG1P: i64 = 4;
+/// `METHOD_OP_MATH` function code: `Math.exp`.
+pub(crate) const MATH_FN_EXP: i64 = 5;
+/// `METHOD_OP_MATH` function code: `Math.expm1`.
+pub(crate) const MATH_FN_EXPM1: i64 = 6;
+/// `METHOD_OP_MATH` function code: `Math.sin`.
+pub(crate) const MATH_FN_SIN: i64 = 7;
+/// `METHOD_OP_MATH` function code: `Math.cos`.
+pub(crate) const MATH_FN_COS: i64 = 8;
+/// `METHOD_OP_MATH` function code: `Math.tan`.
+pub(crate) const MATH_FN_TAN: i64 = 9;
+/// `METHOD_OP_MATH` function code: `Math.asin`.
+pub(crate) const MATH_FN_ASIN: i64 = 10;
+/// `METHOD_OP_MATH` function code: `Math.acos`.
+pub(crate) const MATH_FN_ACOS: i64 = 11;
+/// `METHOD_OP_MATH` function code: `Math.atan`.
+pub(crate) const MATH_FN_ATAN: i64 = 12;
+/// `METHOD_OP_MATH` function code: `Math.atan2` (`y` the receiver, `x` in `arg0`).
+pub(crate) const MATH_FN_ATAN2: i64 = 13;
+/// `METHOD_OP_MATH` function code: `Math.sinh`.
+pub(crate) const MATH_FN_SINH: i64 = 14;
+/// `METHOD_OP_MATH` function code: `Math.cosh`.
+pub(crate) const MATH_FN_COSH: i64 = 15;
+/// `METHOD_OP_MATH` function code: `Math.tanh`.
+pub(crate) const MATH_FN_TANH: i64 = 16;
+/// `METHOD_OP_MATH` function code: `Math.asinh`.
+pub(crate) const MATH_FN_ASINH: i64 = 17;
+/// `METHOD_OP_MATH` function code: `Math.acosh`.
+pub(crate) const MATH_FN_ACOSH: i64 = 18;
+/// `METHOD_OP_MATH` function code: `Math.atanh`.
+pub(crate) const MATH_FN_ATANH: i64 = 19;
+/// `METHOD_OP_MATH` function code: `Math.random` (operands ignored).
+pub(crate) const MATH_FN_RANDOM: i64 = 20;
 
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]
