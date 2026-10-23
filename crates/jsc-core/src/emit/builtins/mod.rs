@@ -186,7 +186,6 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 }
 
 /// Emit the body of `builtin`.
-#[allow(clippy::too_many_lines)]
 pub(super) fn emit_builtin(
     builtin: Builtin,
     strings: &HashMap<String, i32>,
@@ -233,14 +232,12 @@ pub(super) fn emit_builtin(
         | Builtin::ArrayFill
         | Builtin::ArrayCopyWithin
         | Builtin::ArrayCopy(_) => emit_array_family(builtin, &mut f, frame, strings, helpers),
-        Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
-        Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
-        Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
-        Builtin::StringFromCharCode | Builtin::StringFromCodePoint => {
-            let code_point = builtin == Builtin::StringFromCodePoint;
-            string::emit_from_char_code(code_point, &mut f, frame, strings, helpers);
-        }
-        Builtin::StringRaw => string::emit_raw(&mut f, frame, strings, helpers),
+        Builtin::StringMethod(_)
+        | Builtin::StringToString
+        | Builtin::StringValueOf
+        | Builtin::StringFromCharCode
+        | Builtin::StringFromCodePoint
+        | Builtin::StringRaw => emit_string_family(builtin, &mut f, frame, strings, helpers),
         Builtin::NumberToString
         | Builtin::NumberValueOf
         | Builtin::NumberToFixed
@@ -254,27 +251,18 @@ pub(super) fn emit_builtin(
         | Builtin::BooleanValueOf => emit_number_family(builtin, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::IterSource => iter::emit_iter_source(&mut f, frame, strings, helpers),
-        Builtin::DateMethod(op) => date::emit_method(op, &mut f, frame, strings, helpers),
-        Builtin::DateToJson => date::emit_to_json(&mut f, frame, strings, helpers),
-        Builtin::CollectionOp { set, op } => {
-            map_set::emit_op(set, op, &mut f, frame, strings, helpers);
-        }
-        Builtin::CollectionForEach { set } => {
-            map_set::emit_for_each(set, &mut f, frame, strings, helpers);
-        }
-        Builtin::CollectionSize { set } => map_set::emit_size(set, &mut f, frame, strings, helpers),
-        Builtin::Ctor(BuiltinCtor::Map) => {
-            map_set::emit_ctor(false, &mut f, frame, strings, helpers);
-        }
-        Builtin::Ctor(BuiltinCtor::Set) => {
-            map_set::emit_ctor(true, &mut f, frame, strings, helpers);
-        }
-        Builtin::PromiseThen => promise::emit_then(false, &mut f, frame, strings, helpers),
-        Builtin::PromiseCatch => promise::emit_then(true, &mut f, frame, strings, helpers),
-        Builtin::PromiseFinally => promise::emit_finally(&mut f, frame, strings, helpers),
-        Builtin::GeneratorNext => generator::emit_next(&mut f, frame, strings, helpers),
-        Builtin::GeneratorReturn => generator::emit_return(&mut f, frame, strings, helpers),
-        Builtin::GeneratorThrow => generator::emit_throw(&mut f, frame, strings, helpers),
+        Builtin::DateMethod(_)
+        | Builtin::DateToJson
+        | Builtin::CollectionOp { .. }
+        | Builtin::CollectionForEach { .. }
+        | Builtin::CollectionSize { .. }
+        | Builtin::Ctor(BuiltinCtor::Map | BuiltinCtor::Set)
+        | Builtin::PromiseThen
+        | Builtin::PromiseCatch
+        | Builtin::PromiseFinally
+        | Builtin::GeneratorNext
+        | Builtin::GeneratorReturn
+        | Builtin::GeneratorThrow => emit_object_family(builtin, &mut f, frame, strings, helpers),
         Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
@@ -293,6 +281,60 @@ pub(super) fn emit_builtin(
     }
     wasm!(f; End);
     f
+}
+
+/// Emit the body of a `String` static or `%String.prototype%` method into `f`
+/// (the variants [`emit_builtin`] routes here).
+fn emit_string_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::StringMethod(op) => string::emit_method(op, f, frame, strings, helpers),
+        Builtin::StringToString => string::emit_this_value(false, f, frame, strings, helpers),
+        Builtin::StringValueOf => string::emit_this_value(true, f, frame, strings, helpers),
+        Builtin::StringFromCharCode | Builtin::StringFromCodePoint => {
+            let code_point = builtin == Builtin::StringFromCodePoint;
+            string::emit_from_char_code(code_point, f, frame, strings, helpers);
+        }
+        Builtin::StringRaw => string::emit_raw(f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
+}
+
+/// Emit the body of a `Date`, `Map` / `Set`, `Promise` or
+/// `%GeneratorPrototype%` builtin into `f` (the variants [`emit_builtin`]
+/// routes here).
+fn emit_object_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::DateMethod(op) => date::emit_method(op, f, frame, strings, helpers),
+        Builtin::DateToJson => date::emit_to_json(f, frame, strings, helpers),
+        Builtin::CollectionOp { set, op } => map_set::emit_op(set, op, f, frame, strings, helpers),
+        Builtin::CollectionForEach { set } => {
+            map_set::emit_for_each(set, f, frame, strings, helpers);
+        }
+        Builtin::CollectionSize { set } => map_set::emit_size(set, f, frame, strings, helpers),
+        Builtin::Ctor(BuiltinCtor::Map) => map_set::emit_ctor(false, f, frame, strings, helpers),
+        Builtin::Ctor(BuiltinCtor::Set) => map_set::emit_ctor(true, f, frame, strings, helpers),
+        Builtin::PromiseThen => promise::emit_then(false, f, frame, strings, helpers),
+        Builtin::PromiseCatch => promise::emit_then(true, f, frame, strings, helpers),
+        Builtin::PromiseFinally => promise::emit_finally(f, frame, strings, helpers),
+        Builtin::GeneratorNext => generator::emit_next(f, frame, strings, helpers),
+        Builtin::GeneratorReturn => generator::emit_return(f, frame, strings, helpers),
+        Builtin::GeneratorThrow => generator::emit_throw(f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
 }
 
 /// Emit the body of an `Array` static or `%Array.prototype%` method into `f`
