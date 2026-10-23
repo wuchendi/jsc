@@ -624,14 +624,15 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
 /// `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`:
 /// `InternalizeJSONProperty` — the value of property `key` of `holder` with
 /// each array element / own enumerable property first replaced by its own
-/// revived value (deleted when that is `undefined`), then passed to the
+/// revived value (`CreateDataProperty`, deleted when that is `undefined`; a
+/// non-configurable property rejects both silently), then passed to the
 /// reviver as `(key, value)` with `this = holder`. A throw returns with it
 /// pending.
 pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>) -> Function {
     let (holder, key, reviver) = (0, 1, 2);
     let (val, result, name) = (3, 4, 5);
-    let (ptr, n, i, k, array) = (6, 7, 8, 9, 10);
-    let mut f = Function::new(vec![(3, ValType::I64), (5, ValType::I32)]);
+    let (ptr, n, i, k, array, e) = (6, 7, 8, 9, 10, 11);
+    let mut f = Function::new(vec![(3, ValType::I64), (6, ValType::I32)]);
     wasm!(f; LocalGet(holder), LocalGet(key), Call(helpers.get), LocalSet(val));
     return_if_pending(&mut f);
     emit_is_pointer(&mut f, val);
@@ -668,19 +669,19 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         LocalGet(result), I64Const(UNDEFINED_BITS), I64Eq,
         If(BlockType::Empty),
-        LocalGet(val), LocalGet(k), Call(helpers.delete),
-        Else,
-        LocalGet(array),
-        If(BlockType::Empty),
-        LocalGet(val), LocalGet(k),
-    );
-    box_heap(&mut f);
-    wasm!(f;
-        LocalGet(result), Call(helpers.array_set()),
-        Else,
-        LocalGet(val), I32WrapI64, LocalGet(k), LocalGet(result),
-        I32Const(abi::ATTRS_DEFAULT.cast_signed()), Call(helpers.define),
+        // `[[Delete]]`: a non-configurable property stays (no throw).
+        LocalGet(val), I32WrapI64, LocalGet(k), Call(helpers.prop_find), LocalTee(e),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(e), I32Load(MemArg { offset: u64::from(abi::PROP_ATTRS_OFFSET), align: 2, memory_index: 0 }),
+        I32Const(abi::ATTR_CONFIGURABLE.cast_signed()), I32And,
+        Else, I32Const(1),
         End,
+        If(BlockType::Empty), LocalGet(val), LocalGet(k), Call(helpers.delete), End,
+        Else,
+        // `CreateDataProperty` (an array index included): a rejection is
+        // ignored.
+        LocalGet(val), I32WrapI64, LocalGet(k), I32Const(DESC_DATA_DEFAULT), LocalGet(result),
+        I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS), Call(helpers.define_own()), Drop,
         End,
     );
     return_if_pending(&mut f);

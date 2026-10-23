@@ -16,9 +16,6 @@ use jsc_test262::{assemble, baseline, exec, frontmatter, walk};
 
 const USAGE: &str = "usage: jsc-test262 [--test262 DIR] [--jsc PATH] [--jobs N] \
 [--timeout SECS] [--check] [--update-baseline] [--history] [PATH_PREFIX...]";
-/// Harness includes never probed (`DESIGN.md` section 10):
-/// `propertyHelper.js` needs descriptor reflection.
-const EXCLUDED_INCLUDES: [&str; 1] = ["propertyHelper.js"];
 const DENYLIST: &str = "tests/test262/unsupported-features.txt";
 const BASELINE: &str = "tests/test262/baseline.txt";
 const HISTORY: &str = "tests/test262/history.tsv";
@@ -163,8 +160,6 @@ fn load(args: Args) -> Result<Env, String> {
             env.args.jsc.display()
         ));
     }
-    env.includes
-        .retain(|name, _| !EXCLUDED_INCLUDES.contains(&name.as_str()));
     let names: Vec<&String> = env.includes.keys().collect();
     let probed = exec::pool(&names, env.args.jobs, |i, name| {
         // `doneprintHandle.js` is probed as async tests use it: after the

@@ -213,6 +213,20 @@ pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
 /// cyclic element joins as the empty string; cleared on every exit.
 pub(crate) const ARRAY_FLAG_JOINING: u8 = 8;
 
+/// [`TYPE_ARRAY`] header `flags` bit: the array's `length` is non-writable
+/// (`defineProperty(a, "length", {writable: false})`, `freeze`), so every
+/// `length` write and every store that would grow the array throws. Only set
+/// on an [`ARRAY_FLAG_DICTIONARY`] array; never cleared.
+pub(crate) const ARRAY_FLAG_LENGTH_READONLY: u8 = 16;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is in dictionary mode — it is
+/// [`ARRAY_FLAG_SPARSE`] with no store (`elems = 0`), so every element is an
+/// array-index key of its `props` table carrying its own attributes. Set before
+/// an element takes non-default attributes, before the array becomes
+/// non-extensible, and before its `length` becomes read-only; never cleared.
+/// The builtin fast paths skip such an array.
+pub(crate) const ARRAY_FLAG_DICTIONARY: u8 = 32;
+
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
 /// [`TYPE_PROPS`] table at `props`, its prototype in `proto`. Maps to `typeof`
