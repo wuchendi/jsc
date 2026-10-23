@@ -276,6 +276,36 @@ fn keys_values_entries() {
     )]);
 }
 
+/// `Object.values` / `entries` (EnumerableOwnProperties): the key list is
+/// taken once, then each key is re-checked when visited, so a getter that
+/// deletes a later key or makes it non-enumerable drops it, and a key a
+/// getter adds does not appear.
+#[test]
+fn values_entries_recheck_per_key() {
+    check(&[
+        (
+            r"let o = {get a() { delete this.b; return 1 }, b: 2, c: 3}; console.log(Object.values(o).join()); o = {get a() { delete this.b; return 1 }, b: 2, c: 3}; console.log(JSON.stringify(Object.entries(o)))",
+            "1,3\n[[\"a\",1],[\"c\",3]]\n",
+        ),
+        (
+            r"let o = {get a() { Object.defineProperty(this, 'b', {enumerable: false}); return 1 }, b: 2, c: 3}; console.log(Object.values(o).join(), JSON.stringify(Object.entries(o)), Object.keys(o).join())",
+            "1,3 [[\"a\",1],[\"c\",3]] a,c\n",
+        ),
+        (
+            r"let o = {get a() { this.z = 9; return 1 }, b: 2}; console.log(Object.values(o).join()); delete o.z; console.log(JSON.stringify(Object.entries(o)))",
+            "1,2\n[[\"a\",1],[\"b\",2]]\n",
+        ),
+        (
+            r"let a = [1, 2, 3]; Object.defineProperty(a, 0, {get: function () { Object.defineProperty(a, 2, {enumerable: false}); return 7 }, enumerable: true, configurable: true}); console.log(Object.values(a).join()); Object.defineProperty(a, 2, {enumerable: true}); console.log(JSON.stringify(Object.entries(a)))",
+            "7,2\n[[\"0\",7],[\"1\",2]]\n",
+        ),
+        (
+            r"let a = [1, 2, 3, 4]; Object.defineProperty(a, 0, {get: function () { a.length = 2; return 7 }, enumerable: true, configurable: true}); console.log(Object.values(a).join(), JSON.stringify(Object.entries([5, , 6])), Object.values('ab').join())",
+            "7,2 [[\"0\",5],[\"2\",6]] a,b\n",
+        ),
+    ]);
+}
+
 /// `Object.prototype.isPrototypeOf`: a non-object argument is `false`
 /// before `ToObject(this)`.
 #[test]

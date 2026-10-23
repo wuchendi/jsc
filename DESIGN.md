@@ -837,7 +837,13 @@ tables. Keys are interned `u32`s.
   (array elements skipping holes, then table keys flagged `ARRAY_INDEX` sorted
   numerically when the table has `HAS_INDEX_KEYS`), then the other string keys
   in insertion order. `mode` selects enumerable keys, values, entries, or all
-  keys.
+  keys. Values and entries follow EnumerableOwnProperties: the key list is
+  taken once, then each key is re-checked as own and enumerable (`__own_enum`)
+  when visited and skipped if a getter deleted it or made it non-enumerable;
+  a key a getter adds is not visited. Only a getter can run between the
+  snapshot and a visit, so the re-check (and the `[[Get]]` of every key) runs
+  only when the own table holds an accessor entry; otherwise array elements
+  load from the store directly.
 - **`for-in`** (`__for_in_keys`): a snapshot taken at loop entry — own
   enumerable string keys, then each prototype's enumerable keys not already
   seen (a key seen at a nearer level, enumerable or not, shadows it).
@@ -1596,9 +1602,6 @@ Each item below is current behaviour of this tree.
   non-enumerable one.
 - An object literal's `__proto__: v` defines an own data property named
   `__proto__` instead of setting the prototype.
-- `Object.values` / `Object.entries` select the enumerable own keys up front
-  (with `Object.keys`'s snapshot), so a getter that deletes or makes a later
-  key non-enumerable does not drop it from the result.
 - `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
   enumerable own keys of its `Properties` argument once, before reading any
   descriptor. `Object.fromEntries` collects its iterable eagerly, like the

@@ -1606,12 +1606,26 @@ pub(super) fn emit_array_set_length(
 /// its indices; an array its present (non-hole) store indices, then its table
 /// keys (a `SPARSE` array's elements past the store sort first as integer
 /// keys); a primitive has no own keys.
+///
+/// Values / entries follow EnumerableOwnProperties (ECMA-262 7.3.23): the
+/// key list is taken once, then each key is re-checked as own and enumerable
+/// (`__own_enum`) when visited, so a getter that deletes a later key or makes
+/// it non-enumerable drops it. Only a getter can change the object between
+/// the snapshot and a visit, so the re-check runs only when the own table
+/// holds an accessor entry (a string, a store element and a data property
+/// run no code).
 #[allow(clippy::too_many_lines)] // one straight-line helper body
 pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(11, ValType::I32), (2, ValType::I64)]);
+    let mut f = Function::new(vec![
+        (11, ValType::I32),
+        (2, ValType::I64),
+        (2, ValType::I32),
+    ]);
     let (obj, mode) = (0, 1);
     let (o, t, n, out, j, p, e, end, k, i, x) = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
     let (kv, val) = (13, 14);
+    // `w`: the values/entries write index; `recheck`: the table has an accessor.
+    let (w, recheck) = (15, 16);
     let new_array = helpers.new_string + 1;
     // include(e) = key != 0 && (mode == ALL || attrs & ENUMERABLE)
     let include = |f: &mut Function| {
@@ -1785,27 +1799,57 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         End,
         LocalGet(out), LocalGet(j), I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
-        // Values / entries: map each key in place.
+        // Values / entries: map each key in place, compacting out the keys
+        // the visit-time re-check drops.
         LocalGet(mode), I32Const(OWN_VALUES), I32Eq,
         LocalGet(mode), I32Const(OWN_ENTRIES), I32Eq, I32Or,
         If(BlockType::Empty),
+        // recheck = the own table (a string has none: p == 0) has a live
+        // accessor entry.
+        LocalGet(p),
+        If(BlockType::Empty),
+    );
+    entry_loop_head(&mut f);
+    wasm!(f;
+        LocalGet(e), I32Load(m32(E_KEY)), I32Const(0), I32Ne,
+        LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_ACCESSOR), I32And, I32Const(0), I32Ne,
+        I32And,
+        If(BlockType::Empty), I32Const(1), LocalSet(recheck), Br(2), End,
+    );
+    entry_loop_tail(&mut f);
+    wasm!(f;
+        End,
         I32Const(0), LocalSet(i),
+        I32Const(0), LocalSet(w),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(j), I32GeU, BrIf(1),
     );
     emit_elem_addr(&mut f, out, i);
     wasm!(f;
         I64Load(m64(ELEMS_DATA_OFFSET)), LocalSet(kv),
+        // Re-check: kv = the interned key; not own and enumerable now -> skip.
+        LocalGet(recheck),
+        If(BlockType::Empty),
+        LocalGet(kv), I32Const(1), Call(helpers.to_key),
+        I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(kv),
+        LocalGet(obj), LocalGet(kv), I32WrapI64, Call(helpers.own_enum()),
+        I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(2),
+        End,
+        End,
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Result(ValType::I64)),
         LocalGet(o), LocalGet(i), Call(helpers.str_index),
     );
     emit_box_heap(&mut f);
     // An array's element key (a fresh, uninterned index string) loads the
-    // element; a table key goes through `__get`.
+    // element; a table key (and, under the re-check, every key) goes through
+    // `__get`.
     wasm!(f;
         Else,
-        LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(t), I32Const(TYPE_ARRAY), I32Eq, LocalGet(recheck), I32Eqz, I32And,
         If(BlockType::Result(ValType::I32)),
         LocalGet(kv), I32WrapI64, Call(helpers.index_value), LocalTee(n), I32Const(-1), I32Ne,
         Else, I32Const(0),
@@ -1829,12 +1873,14 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalSet(val), End);
-    emit_elem_addr(&mut f, out, i);
+    emit_elem_addr(&mut f, out, w);
     wasm!(f;
         LocalGet(val), I64Store(m64(ELEMS_DATA_OFFSET)),
+        LocalGet(w), I32Const(1), I32Add, LocalSet(w),
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
+        LocalGet(out), LocalGet(w), I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
         LocalGet(out),
     );
