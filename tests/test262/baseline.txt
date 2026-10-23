@@ -1563,6 +1563,8 @@ built-ins/Date/S15.9.3.2_A3_T1.1.js
 built-ins/Date/S15.9.3.2_A3_T1.2.js
 built-ins/Date/S15.9.4_A1.js
 built-ins/Date/S15.9.4_A5.js
+built-ins/Date/TimeClip_negative_zero.js
+built-ins/Date/construct_with_date.js
 built-ins/Date/now/15.9.4.4-0-1.js
 built-ins/Date/now/15.9.4.4-0-2.js
 built-ins/Date/now/15.9.4.4-0-3.js
@@ -1594,8 +1596,10 @@ built-ins/Date/prototype/getSeconds/this-value-invalid-date.js
 built-ins/Date/prototype/getSeconds/this-value-non-date.js
 built-ins/Date/prototype/getTime/this-value-invalid-date.js
 built-ins/Date/prototype/getTime/this-value-non-date.js
+built-ins/Date/prototype/getTime/this-value-valid-date.js
 built-ins/Date/prototype/no-date-value.js
 built-ins/Date/prototype/setFullYear/15.9.5.40_1.js
+built-ins/Date/prototype/toISOString/15.9.5.43-0-13.js
 built-ins/Date/prototype/toISOString/15.9.5.43-0-16.js
 built-ins/Date/prototype/toISOString/15.9.5.43-0-2.js
 built-ins/Date/prototype/toISOString/15.9.5.43-0-3.js
@@ -1609,6 +1613,8 @@ built-ins/Date/prototype/toJSON/non-finite.js
 built-ins/Date/prototype/toJSON/to-primitive-value-of.js
 built-ins/Date/prototype/toString/invalid-date.js
 built-ins/Date/prototype/toString/non-date-receiver.js
+built-ins/Date/prototype/valueOf/S9.4_A3_T1.js
+built-ins/Date/prototype/valueOf/S9.4_A3_T2.js
 built-ins/Date/year-zero.js
 built-ins/Error/error-message-tostring-toprimitive.js
 built-ins/Error/length.js

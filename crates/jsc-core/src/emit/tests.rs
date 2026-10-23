@@ -1080,8 +1080,9 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     let frame = u64_at(&mem, generator + GEN_ENV_OFFSET);
     assert_eq!((frame >> 48) & 0b111, 0b101, "frame is a heap block");
 
+    // The payload is the TimeClip'd time value (truncated toward zero).
     let (date, mem) = heap("new Date(1234.5)", TYPE_DATE, 0);
-    assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234.5_f64.to_bits());
+    assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234_f64.to_bits());
 }
 
 /// The number of `global.set` of the dirty-bits global in `bytes`.
