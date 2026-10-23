@@ -960,13 +960,17 @@ pub(super) fn collect_node<'a>(
             seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
         }
-        // `toISOString()` returns the interned `"Invalid Date"` literal for a
-        // non-finite timestamp.
-        IrNode::DateField { op, .. } => {
-            if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
-                order.push(INVALID_DATE);
+        // An invalid date's `toString()` is the interned `"Invalid Date"`
+        // literal; its `toISOString()` throws a `RangeError`.
+        IrNode::DateField { op, .. } => match op {
+            DateOp::ToString => {
+                if seen.insert(INVALID_DATE) {
+                    order.push(INVALID_DATE);
+                }
             }
-        }
+            DateOp::ToIsoString => seed_strs(&INVALID_TIME_VALUE, order, seen),
+            _ => {}
+        },
         IrNode::Construct {
             callee,
             args,
@@ -1129,9 +1133,9 @@ pub(super) fn collect_node<'a>(
         }
         // The `Date` builtins carry no string literals; recurse into
         // the timestamp / receiver sub-expressions (`Date.now()` has neither).
-        IrNode::DateNew { ms } => {
-            if let Some(ms) = ms {
-                collect_node(ms, order, seen);
+        IrNode::DateNew { arg } => {
+            if let Some(arg) = arg {
+                collect_node(arg, order, seen);
             }
         }
         // A global reference interns its key and, unless it reads `undefined`

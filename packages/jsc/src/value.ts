@@ -795,8 +795,7 @@ function formatEntries(entries: [string, Value][]): string {
  * Render a millisecond epoch timestamp as `YYYY-MM-DDTHH:MM:SS.mmmZ` (mirrors
  * `value.rs::format_date_iso`, Howard Hinnant's `civil_from_days`); a
  * non-finite timestamp renders as `Invalid Date`. Ported rather than delegated
- * to `Date.prototype.toISOString`, which uses extended `±YYYYYY` years and
- * throws out of range.
+ * to `Date.prototype.toISOString`, which throws for an invalid time value.
  */
 function formatDateIso(ms: number): string {
   if (!Number.isFinite(ms)) return 'Invalid Date'
@@ -826,7 +825,7 @@ function formatDateIso(ms: number): string {
   const month = mp < 10 ? mp + 3 : mp - 9
   const year = yoe + era * 400 + (month <= 2 ? 1 : 0)
 
-  return `${padSigned(year, 4)}-${pad2(month)}-${pad2(day)}T${pad2(hours)}:${pad2(mins)}:${pad2(secs)}.${String(millis).padStart(3, '0')}Z`
+  return `${isoYear(year)}-${pad2(month)}-${pad2(day)}T${pad2(hours)}:${pad2(mins)}:${pad2(secs)}.${String(millis).padStart(3, '0')}Z`
 }
 
 /** Zero-pad to two digits (Rust `{:02}` for a non-negative integer). */
@@ -834,10 +833,10 @@ function pad2(n: number): string {
   return String(n).padStart(2, '0')
 }
 
-/** Zero-pad to `width` chars counting the sign (Rust `{:0width}` for a signed integer). */
-function padSigned(n: number, width: number): string {
-  const sign = n < 0 ? '-' : ''
-  return sign + String(Math.abs(n)).padStart(width - sign.length, '0')
+/** Four digits, or an expanded `±YYYYYY` year outside `0..=9999`. */
+function isoYear(year: number): string {
+  if (year >= 0 && year <= 9999) return String(year).padStart(4, '0')
+  return (year < 0 ? '-' : '+') + String(Math.abs(year)).padStart(6, '0')
 }
 
 /**

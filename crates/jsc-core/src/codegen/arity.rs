@@ -2,28 +2,16 @@
 use super::*;
 
 /// The greatest function arity reachable through a statement, including nested
-/// arrow functions and function declarations. Used to fix the uniform ABI's `K`
+/// functions, arrows, methods, accessors, and classes, and every expression
+/// position that can hold one (default parameter values, destructuring
+/// defaults, computed keys, loop heads). Used to fix the uniform ABI's `K`
 /// before any body is lowered. Statements outside the supported subset contribute
 /// `0` (they error later during lowering).
 pub(super) fn scan_stmt_arity(stmt: &Stmt) -> usize {
     match stmt {
         Stmt::Expr(e) => scan_expr_arity(&e.expr),
-        Stmt::Decl(Decl::Var(v)) => v
-            .decls
-            .iter()
-            .filter_map(|d| d.init.as_deref())
-            .map(scan_expr_arity)
-            .max()
-            .unwrap_or(0),
-        Stmt::Decl(Decl::Fn(f)) => {
-            let own = f.function.params.len();
-            let body = f
-                .function
-                .body
-                .as_ref()
-                .map_or(0, |b| scan_stmts_arity(&b.stmts));
-            own.max(body)
-        }
+        Stmt::Decl(Decl::Var(v)) => scan_var_decl_arity(v),
+        Stmt::Decl(Decl::Fn(f)) => scan_function_arity(&f.function),
         Stmt::Decl(Decl::Class(c)) => scan_class_arity(&c.class),
         Stmt::Return(r) => r.arg.as_deref().map_or(0, scan_expr_arity),
         Stmt::Throw(t) => scan_expr_arity(&t.arg),
@@ -35,17 +23,11 @@ pub(super) fn scan_stmt_arity(stmt: &Stmt) -> usize {
             m
         }
         Stmt::While(w) => scan_expr_arity(&w.test).max(scan_stmt_arity(&w.body)),
+        Stmt::DoWhile(w) => scan_expr_arity(&w.test).max(scan_stmt_arity(&w.body)),
         Stmt::For(f) => {
             let mut m = 0;
             if let Some(VarDeclOrExpr::VarDecl(v)) = &f.init {
-                m = m.max(
-                    v.decls
-                        .iter()
-                        .filter_map(|d| d.init.as_deref())
-                        .map(scan_expr_arity)
-                        .max()
-                        .unwrap_or(0),
-                );
+                m = m.max(scan_var_decl_arity(v));
             } else if let Some(VarDeclOrExpr::Expr(e)) = &f.init {
                 m = m.max(scan_expr_arity(e));
             }
@@ -57,6 +39,13 @@ pub(super) fn scan_stmt_arity(stmt: &Stmt) -> usize {
             }
             m.max(scan_stmt_arity(&f.body))
         }
+        Stmt::ForIn(f) => scan_for_head_arity(&f.left)
+            .max(scan_expr_arity(&f.right))
+            .max(scan_stmt_arity(&f.body)),
+        Stmt::ForOf(f) => scan_for_head_arity(&f.left)
+            .max(scan_expr_arity(&f.right))
+            .max(scan_stmt_arity(&f.body)),
+        Stmt::Labeled(l) => scan_stmt_arity(&l.body),
         Stmt::Switch(s) => {
             let mut m = scan_expr_arity(&s.discriminant);
             for case in &s.cases {
@@ -82,12 +71,95 @@ pub(super) fn scan_stmt_arity(stmt: &Stmt) -> usize {
     }
 }
 
+/// The greatest function arity reachable through a `var`/`let`/`const`
+/// declaration: each binding pattern (its destructuring defaults) and
+/// initializer.
+fn scan_var_decl_arity(v: &swc_ecma_ast::VarDecl) -> usize {
+    v.decls
+        .iter()
+        .map(|d| scan_pat_arity(&d.name).max(d.init.as_deref().map_or(0, scan_expr_arity)))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The greatest function arity reachable through a for-in/for-of head.
+fn scan_for_head_arity(head: &ForHead) -> usize {
+    match head {
+        ForHead::VarDecl(v) => scan_var_decl_arity(v),
+        ForHead::Pat(p) => scan_pat_arity(p),
+        ForHead::UsingDecl(_) => 0,
+    }
+}
+
+/// A function's own param count, its parameter default values, and its body.
+fn scan_function_arity(function: &swc_ecma_ast::Function) -> usize {
+    let own = function.params.len();
+    let params = function
+        .params
+        .iter()
+        .map(|p| scan_pat_arity(&p.pat))
+        .max()
+        .unwrap_or(0);
+    let body = function
+        .body
+        .as_ref()
+        .map_or(0, |b| scan_stmts_arity(&b.stmts));
+    own.max(params).max(body)
+}
+
+/// The greatest function arity reachable through a binding or assignment
+/// pattern: its default values and computed keys.
+fn scan_pat_arity(pat: &Pat) -> usize {
+    match pat {
+        Pat::Assign(a) => scan_pat_arity(&a.left).max(scan_expr_arity(&a.right)),
+        Pat::Array(a) => scan_array_pat_arity(a),
+        Pat::Object(o) => scan_object_pat_arity(o),
+        Pat::Rest(r) => scan_pat_arity(&r.arg),
+        Pat::Expr(e) => scan_expr_arity(e),
+        Pat::Ident(_) | Pat::Invalid(_) => 0,
+    }
+}
+
+/// [`scan_pat_arity`] for an array pattern's elements.
+fn scan_array_pat_arity(pat: &ArrayPat) -> usize {
+    pat.elems
+        .iter()
+        .flatten()
+        .map(scan_pat_arity)
+        .max()
+        .unwrap_or(0)
+}
+
+/// [`scan_pat_arity`] for an object pattern's properties.
+fn scan_object_pat_arity(pat: &ObjectPat) -> usize {
+    pat.props
+        .iter()
+        .map(|p| match p {
+            ObjectPatProp::KeyValue(kv) => {
+                scan_prop_name_arity(&kv.key).max(scan_pat_arity(&kv.value))
+            }
+            ObjectPatProp::Assign(a) => a.value.as_deref().map_or(0, scan_expr_arity),
+            ObjectPatProp::Rest(r) => scan_pat_arity(&r.arg),
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A computed property name's key expression (`{ [expr]: .. }`).
+fn scan_prop_name_arity(key: &PropName) -> usize {
+    match key {
+        PropName::Computed(c) => scan_expr_arity(&c.expr),
+        _ => 0,
+    }
+}
+
 /// The greatest function arity reachable through a class: its constructor AND
-/// every method/getter/setter lift to functions, so each one's own param count
-/// and body must widen `K` like any function/arrow (a setter matters
-/// especially — it is invoked with one argument by `obj.x = v`, an assignment
-/// no call-site arity scan covers); the `extends` expression and the field
-/// initializers are scanned too.
+/// every method/getter/setter (instance or static) lift to functions, so each
+/// one's own param count, parameter defaults, and body must widen `K` like any
+/// function/arrow (a setter matters especially — it is invoked with one
+/// argument by `obj.x = v`, an assignment no call-site arity scan covers); the
+/// `extends` expression and the (instance or static) field initializers are
+/// scanned too.
 fn scan_class_arity(class: &swc_ecma_ast::Class) -> usize {
     let heritage = class.super_class.as_deref().map_or(0, scan_expr_arity);
     class
@@ -96,18 +168,19 @@ fn scan_class_arity(class: &swc_ecma_ast::Class) -> usize {
         .map(|member| match member {
             ClassMember::Constructor(ctor) => {
                 let own = ctor.params.len();
+                let params = ctor
+                    .params
+                    .iter()
+                    .map(|p| match p {
+                        ParamOrTsParamProp::Param(p) => scan_pat_arity(&p.pat),
+                        ParamOrTsParamProp::TsParamProp(_) => 0,
+                    })
+                    .max()
+                    .unwrap_or(0);
                 let body = ctor.body.as_ref().map_or(0, |b| scan_stmts_arity(&b.stmts));
-                own.max(body)
+                own.max(params).max(body)
             }
-            ClassMember::Method(m) => {
-                let own = m.function.params.len();
-                let body = m
-                    .function
-                    .body
-                    .as_ref()
-                    .map_or(0, |b| scan_stmts_arity(&b.stmts));
-                own.max(body)
-            }
+            ClassMember::Method(m) => scan_function_arity(&m.function),
             ClassMember::ClassProp(p) => p.value.as_deref().map_or(0, scan_expr_arity),
             _ => 0,
         })
@@ -121,28 +194,64 @@ fn scan_stmts_arity(stmts: &[Stmt]) -> usize {
     stmts.iter().map(scan_stmt_arity).max().unwrap_or(0)
 }
 
+/// The greatest arity a call (plain or optional) needs: its callee, its
+/// arguments, and its argument count.
+fn scan_call_arity(callee: Option<&Expr>, args: &[ExprOrSpread]) -> usize {
+    let mut m = callee.map_or(0, scan_expr_arity);
+    for arg in args {
+        m = m.max(scan_expr_arity(&arg.expr));
+    }
+    // The uniform ABI pads every call to `K` positional slots, so a call
+    // passing more arguments than any function's declared arity must still
+    // widen `K` — otherwise a trailing rest parameter would receive
+    // only `K` of them, the surplus having been dropped at the call site.
+    m = m.max(args.len());
+    // An array higher-order method invokes its callback with extra
+    // positional args beyond the callback's own arity — `(element, index)`
+    // for map/filter/forEach and `(acc, element, index)` for reduce. Widen
+    // the uniform ABI so those pushes never overflow the shared funcref
+    // signature (a `call_indirect` type mismatch would trap). Detected
+    // syntactically; over-counting under a shadowed name is harmless.
+    if let Some(Expr::Member(mem)) = callee
+        && let MemberProp::Ident(id) = &mem.prop
+    {
+        m = m.max(match id.sym.as_ref() {
+            "reduce" => 3,
+            "map" | "filter" | "forEach" => 2,
+            // A `JSON.stringify` replacer / `JSON.parse` reviver is
+            // called with `(key, value)`.
+            "stringify" | "parse" if args.len() > 1 => 2,
+            _ => 0,
+        });
+    }
+    m
+}
+
+/// The greatest arity reachable through a member expression: its object and
+/// any computed key.
+fn scan_member_arity(m: &swc_ecma_ast::MemberExpr) -> usize {
+    let mut r = scan_expr_arity(&m.obj);
+    if let MemberProp::Computed(c) = &m.prop {
+        r = r.max(scan_expr_arity(&c.expr));
+    }
+    r
+}
+
 /// The greatest function arity reachable through an expression, including any
-/// arrow function it contains (the arrow's own param count and its body).
-#[allow(clippy::too_many_lines)]
+/// function, arrow, method, accessor, or class it contains (each one's own
+/// param count, parameter defaults, and body).
 fn scan_expr_arity(expr: &Expr) -> usize {
     match expr {
         Expr::Arrow(a) => {
             let own = a.params.len();
+            let params = a.params.iter().map(scan_pat_arity).max().unwrap_or(0);
             let body = match &*a.body {
                 ArrowFunctionBody::FunctionBody(b) => scan_stmts_arity(&b.stmts),
                 ArrowFunctionBody::Expr(e) => scan_expr_arity(e),
             };
-            own.max(body)
+            own.max(params).max(body)
         }
-        Expr::Fn(f) => {
-            let own = f.function.params.len();
-            let body = f
-                .function
-                .body
-                .as_ref()
-                .map_or(0, |b| scan_stmts_arity(&b.stmts));
-            own.max(body)
-        }
+        Expr::Fn(f) => scan_function_arity(&f.function),
         Expr::Class(c) => scan_class_arity(&c.class),
         Expr::Paren(p) => scan_expr_arity(&p.expr),
         Expr::Bin(b) => scan_expr_arity(&b.left).max(scan_expr_arity(&b.right)),
@@ -151,48 +260,28 @@ fn scan_expr_arity(expr: &Expr) -> usize {
         Expr::Cond(c) => scan_expr_arity(&c.test)
             .max(scan_expr_arity(&c.cons))
             .max(scan_expr_arity(&c.alt)),
-        Expr::Assign(a) => scan_expr_arity(&a.right),
-        Expr::Call(c) => {
-            let mut m = match &c.callee {
-                Callee::Expr(e) => scan_expr_arity(e),
+        // The target's computed member key or destructuring defaults, then the
+        // assigned value.
+        Expr::Assign(a) => {
+            let target = match &a.left {
+                AssignTarget::Simple(SimpleAssignTarget::Member(m)) => scan_member_arity(m),
+                AssignTarget::Pat(AssignTargetPat::Array(p)) => scan_array_pat_arity(p),
+                AssignTarget::Pat(AssignTargetPat::Object(p)) => scan_object_pat_arity(p),
                 _ => 0,
             };
-            for arg in &c.args {
-                m = m.max(scan_expr_arity(&arg.expr));
-            }
-            // The uniform ABI pads every call to `K` positional slots, so a call
-            // passing more arguments than any function's declared arity must still
-            // widen `K` — otherwise a trailing rest parameter would receive
-            // only `K` of them, the surplus having been dropped at the call site.
-            m = m.max(c.args.len());
-            // An array higher-order method invokes its callback with extra
-            // positional args beyond the callback's own arity — `(element, index)`
-            // for map/filter/forEach and `(acc, element, index)` for reduce. Widen
-            // the uniform ABI so those pushes never overflow the shared funcref
-            // signature (a `call_indirect` type mismatch would trap). Detected
-            // syntactically; over-counting under a shadowed name is harmless.
-            if let Callee::Expr(e) = &c.callee
-                && let Expr::Member(mem) = e.as_ref()
-                && let MemberProp::Ident(id) = &mem.prop
-            {
-                m = m.max(match id.sym.as_ref() {
-                    "reduce" => 3,
-                    "map" | "filter" | "forEach" => 2,
-                    // A `JSON.stringify` replacer / `JSON.parse` reviver is
-                    // called with `(key, value)`.
-                    "stringify" | "parse" if c.args.len() > 1 => 2,
-                    _ => 0,
-                });
-            }
-            m
+            target.max(scan_expr_arity(&a.right))
         }
-        Expr::Member(m) => {
-            let mut r = scan_expr_arity(&m.obj);
-            if let MemberProp::Computed(c) = &m.prop {
-                r = r.max(scan_expr_arity(&c.expr));
-            }
-            r
-        }
+        Expr::Call(c) => match &c.callee {
+            Callee::Expr(e) => scan_call_arity(Some(e), &c.args),
+            _ => scan_call_arity(None, &c.args),
+        },
+        Expr::Member(m) => scan_member_arity(m),
+        // `a?.b`, `a?.[k]`, `f?.(args)`: an optional call pads to `K` like a
+        // plain call.
+        Expr::OptChain(chain) => match chain.base.as_ref() {
+            OptChainBase::Member(m) => scan_member_arity(m),
+            OptChainBase::Call(c) => scan_call_arity(Some(&c.callee), &c.args),
+        },
         // `new A(args)` invokes the constructor through the uniform ABI, so
         // `K` must cover the argument count (like a plain call) and any arrow arg.
         Expr::New(n) => {
@@ -217,6 +306,13 @@ fn scan_expr_arity(expr: &Expr) -> usize {
         // `await e`: scan the awaited expression so a `new Promise` executor
         // (or any function) nested under it still widens the uniform ABI arity.
         Expr::Await(a) => scan_expr_arity(&a.arg),
+        Expr::Yield(y) => y.arg.as_deref().map_or(0, scan_expr_arity),
+        Expr::Tpl(t) => t
+            .exprs
+            .iter()
+            .map(|e| scan_expr_arity(e))
+            .max()
+            .unwrap_or(0),
         Expr::Array(a) => a
             .elems
             .iter()
@@ -229,17 +325,21 @@ fn scan_expr_arity(expr: &Expr) -> usize {
             .iter()
             .filter_map(|p| match p {
                 PropOrSpread::Prop(prop) => match prop.as_ref() {
-                    Prop::KeyValue(kv) => Some(scan_expr_arity(&kv.value)),
-                    // A method lifts to a function; its own param count and
-                    // body must widen `K` like any arrow/function.
-                    Prop::Method(method) => {
-                        let own = method.function.params.len();
-                        let body = method
-                            .function
-                            .body
-                            .as_ref()
-                            .map_or(0, |b| scan_stmts_arity(&b.stmts));
-                        Some(own.max(body))
+                    Prop::KeyValue(kv) => {
+                        Some(scan_prop_name_arity(&kv.key).max(scan_expr_arity(&kv.value)))
+                    }
+                    // A method or accessor lifts to a function; its own param
+                    // count, defaults, and body must widen `K` like any
+                    // arrow/function (a setter is invoked with one argument by
+                    // `obj.x = v`, which no call-site scan covers).
+                    Prop::Method(m) => {
+                        Some(scan_prop_name_arity(&m.key).max(scan_function_arity(&m.function)))
+                    }
+                    Prop::Getter(g) => {
+                        Some(scan_prop_name_arity(&g.key).max(scan_function_arity(&g.function)))
+                    }
+                    Prop::Setter(set) => {
+                        Some(scan_prop_name_arity(&set.key).max(scan_function_arity(&set.function)))
                     }
                     _ => None,
                 },

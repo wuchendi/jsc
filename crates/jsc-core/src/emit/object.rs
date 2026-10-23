@@ -692,19 +692,54 @@ fn date_ms_slot() -> MemArg {
     }
 }
 
-/// Emit `new Date()` / `new Date(ms)`, leaving the fresh `TYPE_DATE`
-/// handle jsval on the stack. A [`DATE_BLOCK_SIZE`] block is bump-allocated; its
-/// object-family prefix is written and its f64 payload set to the millisecond timestamp —
-/// either `ms` (a number jsval, whose raw i64 IS the f64 bit pattern, reinterpreted
-/// here) or, when `ms` is `None`, the host wall clock (`__now`, already an f64).
+/// Emit `new Date()` / `new Date(value)`, leaving the fresh `TYPE_DATE`
+/// handle jsval on the stack. The time value is computed first — `value`'s
+/// own time value when it is a Date (`thisTimeValue`, not `ToPrimitive`),
+/// else `ToNumber(value)`; when `arg` is `None`, the host wall clock (`__now`,
+/// already an f64) — and passed through [`emit_time_clip`], the single point
+/// every stored Date time value goes through. Only then is a
+/// [`DATE_BLOCK_SIZE`] block bump-allocated, its object-family prefix
+/// written and its f64 payload set.
 pub(super) fn emit_date_new_node(
-    ms: Option<&IrNode>,
+    arg: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    let v = scratch;
     let dst = scratch + 3;
+    let time = scratch + 24;
+
+    match arg {
+        Some(node) => {
+            emit_node(node, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalSet(v));
+            // A Date argument contributes its stored time value.
+            emit_is_pointer(function, v);
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            emit_load_type_byte(function, v);
+            function.instruction(&Instruction::I32Const(TYPE_DATE));
+            function.instruction(&Instruction::I32Eq);
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::End);
+            function.instruction(&Instruction::If(BlockType::Empty));
+            function.instruction(&Instruction::LocalGet(v));
+            function.instruction(&Instruction::I32WrapI64);
+            function.instruction(&Instruction::I64Load(date_ms_slot()));
+            function.instruction(&Instruction::LocalSet(v));
+            function.instruction(&Instruction::End);
+            // A number (a Date's time value included) passes through.
+            emit_coerce_number(function, v, helpers);
+            function.instruction(&Instruction::LocalGet(v));
+            function.instruction(&Instruction::F64ReinterpretI64);
+        }
+        None => {
+            function.instruction(&Instruction::Call(helpers.now));
+        }
+    }
+    emit_time_clip(function, time);
 
     // dst = __alloc(DATE_BLOCK_SIZE); write the TYPE_DATE object prefix.
     function.instruction(&Instruction::I32Const(DATE_BLOCK_SIZE));
@@ -717,17 +752,10 @@ pub(super) fn emit_date_new_node(
         intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Date), helpers),
     );
 
-    // ms slot = f64 timestamp. Push the store address, then the f64 value.
+    // ms slot = the clipped f64 time value.
     function.instruction(&Instruction::LocalGet(dst));
-    match ms {
-        Some(node) => {
-            emit_node(node, function, scratch, strings, helpers);
-            function.instruction(&Instruction::F64ReinterpretI64);
-        }
-        None => {
-            function.instruction(&Instruction::Call(helpers.now));
-        }
-    }
+    function.instruction(&Instruction::LocalGet(time));
+    function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Store(date_ms_slot()));
 
     // Rebox the block base as a heap jsval.
@@ -737,10 +765,41 @@ pub(super) fn emit_date_new_node(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit `Date.now()`: call the host `__now` clock (an f64 ms count) and
-/// reinterpret it to a number jsval (a number's raw i64 IS its f64 bit pattern).
-pub(super) fn emit_date_now_node(function: &mut Function, helpers: Helpers<'_>) {
+/// The largest magnitude of a valid Date time value (ES2024 §21.4.1.1).
+const MAX_TIME_VALUE: f64 = 8.64e15;
+
+/// `TimeClip` (ES2024 §21.4.1.31) of the f64 on the stack, leaving its bits in
+/// i64 `out`: `NaN` unless finite with `|t| <= 8.64e15`, else `t` truncated
+/// toward zero with `-0` normalized to `+0`.
+fn emit_time_clip(function: &mut Function, out: u32) {
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::LocalSet(out));
+    // trunc(t) + 0 turns a -0 into +0.
+    function.instruction(&Instruction::LocalGet(out));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::F64Trunc);
+    function.instruction(&Instruction::F64Const(Ieee64::from(0.0)));
+    function.instruction(&Instruction::F64Add);
+    function.instruction(&Instruction::F64Const(Ieee64::from(f64::NAN)));
+    // |t| <= MAX_TIME_VALUE is false for NaN and the infinities.
+    function.instruction(&Instruction::LocalGet(out));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::F64Abs);
+    function.instruction(&Instruction::F64Const(Ieee64::from(MAX_TIME_VALUE)));
+    function.instruction(&Instruction::F64Le);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::LocalSet(out));
+}
+
+/// Emit `Date.now()`: the host `__now` clock (an f64 ms count) through
+/// [`emit_time_clip`] (a time value is integral), boxed as a number jsval.
+pub(super) fn emit_date_now_node(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
+    let time = scratch + 24;
     function.instruction(&Instruction::Call(helpers.now));
+    emit_time_clip(function, time);
+    function.instruction(&Instruction::LocalGet(time));
+    function.instruction(&Instruction::F64ReinterpretI64);
     emit_box_f64(function, helpers);
 }
 
@@ -752,12 +811,27 @@ const MS_PER_DAY: i64 = 86_400_000;
 /// exponent bit is set (`bits & MASK == MASK`), tested directly on the i64 bits.
 const F64_EXP_MASK: i64 = 0x7FF0_0000_0000_0000;
 
+/// The `RangeError` `toISOString()` throws for an invalid time value
+/// (`[message, stack]`).
+pub(super) const INVALID_TIME_VALUE: [&str; 2] =
+    ["Invalid time value", "RangeError: Invalid time value"];
+
+/// The [`INVALID_TIME_VALUE`] error object.
+fn invalid_time_value() -> IrNode {
+    IrNode::error_object(
+        ErrorKind::RangeError,
+        Some(IrNode::Str(INVALID_TIME_VALUE[0].to_owned())),
+        IrNode::Str(INVALID_TIME_VALUE[1].to_owned()),
+    )
+}
+
 /// Emit the field `op` of the `TYPE_DATE` block in `recv_local`
 /// ([`IrNode::DateField`]), leaving the field's jsval on the stack. `valueOf()` returns the raw stored ms (a `NaN`
 /// timestamp passes straight through); every other field first gates on a FINITE
-/// timestamp — a `NaN`/`Infinity` date yields `NaN` (numeric fields) or the
-/// `"Invalid Date"` string (`toISOString`). The finite path derives the field from
-/// the f64 payload via [`emit_date_int_field`] / [`emit_date_iso`].
+/// timestamp — an invalid (`NaN`) date yields `NaN` (numeric fields), the
+/// `"Invalid Date"` string (`toString`) or throws [`invalid_time_value`]
+/// (`toISOString`). The finite path derives the field from the f64 payload via
+/// [`emit_date_int_field`] / [`emit_date_iso`] / [`emit_date_string`].
 pub(super) fn emit_date_field(
     op: DateOp,
     recv_local: u32,
@@ -786,6 +860,7 @@ pub(super) fn emit_date_field(
     function.instruction(&Instruction::I64Const(F64_EXP_MASK));
     function.instruction(&Instruction::I64Ne);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
     if matches!(op, DateOp::ToIsoString) {
         emit_date_iso(bits, function, scratch, helpers);
     } else if matches!(op, DateOp::ToString) {
@@ -797,12 +872,19 @@ pub(super) fn emit_date_field(
         function.instruction(&Instruction::I64ReinterpretF64);
     }
     function.instruction(&Instruction::Else);
-    if matches!(op, DateOp::ToIsoString | DateOp::ToString) {
-        let offset = strings.get(INVALID_DATE).copied().unwrap_or(HEAP_BASE);
-        function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(offset)));
-    } else {
-        function.instruction(&Instruction::I64Const(QNAN_BITS));
+    match op {
+        DateOp::ToIsoString => {
+            emit_throw_error(&invalid_time_value(), function, scratch, strings, helpers);
+        }
+        DateOp::ToString => {
+            let offset = strings.get(INVALID_DATE).copied().unwrap_or(HEAP_BASE);
+            function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(offset)));
+        }
+        _ => {
+            function.instruction(&Instruction::I64Const(QNAN_BITS));
+        }
     }
+    leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
 
@@ -1059,11 +1141,12 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
     }
 }
 
-/// Emit `toISOString()`, leaving a fresh 24-byte heap string jsval
-/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`, UTC) on the stack. The date/time fields are derived
-/// from the finite payload BITS in `bits`; a fixed-width buffer is bump-allocated
-/// and each separator/digit written at its known payload offset. Years outside
-/// `0..=9999` render with a truncated 4-digit field (a documented cut).
+/// Emit `toISOString()`, leaving a fresh heap string jsval
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`, UTC) on the stack. The date/time fields are
+/// derived from the finite payload BITS in `bits`; a buffer is bump-allocated
+/// and each separator/digit written at its known payload offset. A year
+/// outside `0..=9999` is the expanded `±YYYYYY` form, three bytes longer: every
+/// field after the year is written through `at` = `bptr + 3` instead of `bptr`.
 fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
     let days = scratch + 26;
     let tod = scratch + 1;
@@ -1071,7 +1154,9 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     let month = scratch + 28;
     let day = scratch + 27;
     let tmp = scratch + 24;
+    let abs_year = scratch + 25;
     let bptr = scratch + 3;
+    let at = scratch + 8;
     emit_days_tod(function, bits, days, tod, scratch + 25, scratch + 28);
     emit_date_civil(
         function,
@@ -1084,8 +1169,18 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
         scratch,
     );
 
-    // Allocate the block: HEADER + u32 len + 24 payload bytes; write type + len.
+    // The expanded-year shift (0 or 3) -> `at`, as a byte count for now.
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::I64Const(9999));
+    function.instruction(&Instruction::I64GtU);
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Mul);
+    function.instruction(&Instruction::LocalSet(at));
+
+    // Allocate the block: HEADER + u32 len + payload; write type + len.
     function.instruction(&Instruction::I32Const(HEADER_SIZE + 4 + ISO_STRING_LEN));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalSet(bptr));
     function.instruction(&Instruction::LocalGet(bptr));
@@ -1097,11 +1192,19 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     }));
     function.instruction(&Instruction::LocalGet(bptr));
     function.instruction(&Instruction::I32Const(ISO_STRING_LEN));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I32Store(MemArg {
         offset: HEADER_SIZE as u64,
         align: 2,
         memory_index: 0,
     }));
+
+    emit_iso_year(function, bptr, at, year, abs_year);
+    function.instruction(&Instruction::LocalGet(bptr));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(at));
 
     // Fixed separator bytes at their payload offsets.
     for (pos, ch) in [
@@ -1113,12 +1216,11 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
         (19, b'.'),
         (23, b'Z'),
     ] {
-        emit_iso_byte(function, bptr, pos, ch);
+        emit_iso_byte(function, at, pos, ch);
     }
     // Date fields, then time fields (each computed just before it is written).
-    emit_iso_digits(function, bptr, 0, year, 4);
-    emit_iso_digits(function, bptr, 5, month, 2);
-    emit_iso_digits(function, bptr, 8, day, 2);
+    emit_iso_digits(function, at, 5, month, 2);
+    emit_iso_digits(function, at, 8, day, 2);
     for (pos, div, rem, ndigits) in [
         (11, 3_600_000_i64, 0_i64, 2),
         (14, 60_000, 60, 2),
@@ -1133,7 +1235,7 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
             function.instruction(&Instruction::I64RemS);
         }
         function.instruction(&Instruction::LocalSet(tmp));
-        emit_iso_digits(function, bptr, pos, tmp, ndigits);
+        emit_iso_digits(function, at, pos, tmp, ndigits);
     }
 
     // Rebox the block base as a heap jsval.
@@ -1141,6 +1243,39 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
+}
+
+/// Write the `toISOString()` year field of the i64 `year` at the start of the
+/// string block in `bptr`: four digits, or (when the shift in i32 `at` is
+/// nonzero) a sign and six digits of `|year|`, kept in i64 `abs_year`.
+fn emit_iso_year(function: &mut Function, bptr: u32, at: u32, year: u32, abs_year: u32) {
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(bptr));
+    function.instruction(&Instruction::I32Const(i32::from(b'+')));
+    function.instruction(&Instruction::I32Const(i32::from(b'-')));
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::I64GeS);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::I32Store8(MemArg {
+        offset: (HEADER_SIZE as u64) + 4,
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::I64Sub);
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::I64LtS);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::LocalSet(abs_year));
+    emit_iso_digits(function, bptr, 1, abs_year, 6);
+    function.instruction(&Instruction::Else);
+    emit_iso_digits(function, bptr, 0, year, 4);
+    function.instruction(&Instruction::End);
 }
 
 /// The three-letter weekday names, Sunday first (`Date.prototype.toString`).

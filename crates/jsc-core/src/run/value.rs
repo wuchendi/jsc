@@ -938,8 +938,9 @@ fn format_entries(entries: &[(String, Value)]) -> String {
 }
 
 /// Render a millisecond epoch timestamp as an ISO 8601 UTC string
-/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), matching `Date.prototype.toISOString` and Node's
-/// `console.log` of a `Date`. A non-finite timestamp renders as `Invalid Date`.
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`, an expanded `±YYYYYY` year outside `0..=9999`),
+/// matching `Date.prototype.toISOString` and Node's `console.log` of a `Date`.
+/// A non-finite timestamp renders as `Invalid Date`.
 /// The civil date is derived from the day count with Howard Hinnant's
 /// `civil_from_days` algorithm; time-of-day fields come from the millisecond
 /// remainder. `div_euclid`/`rem_euclid` keep the split correct for pre-epoch
@@ -971,7 +972,14 @@ fn format_date_iso(ms: f64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = if month <= 2 { year + 1 } else { year };
 
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
+    // An expanded `±YYYYYY` year outside `0..=9999`.
+    let year = if (0..=9999).contains(&year) {
+        format!("{year:04}")
+    } else {
+        let sign = if year < 0 { '-' } else { '+' };
+        format!("{sign}{:06}", year.abs())
+    };
+    format!("{year}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
 }
 
 #[cfg(test)]
