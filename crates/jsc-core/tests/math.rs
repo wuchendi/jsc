@@ -151,11 +151,160 @@ fn math_is_shadowable() {
 /// calling it throws a catchable `TypeError` at run time.
 #[test]
 fn math_unknown_method_is_a_type_error() {
-    assert_uncaught("Math.log(2)", "TypeError: Math.log is not a function");
+    assert_uncaught("Math.nope(2)", "TypeError: Math.nope is not a function");
 }
 
 /// `Math.*` results flow through `console.log` like any number.
 #[test]
 fn math_through_console_log() {
     assert_output("console.log(Math.max(1, 42), Math.floor(3.7))", "42 3\n");
+}
+
+/// `1 / x`, so a signed zero renders as `Infinity` / `-Infinity`.
+fn sign_of(expr: &str) -> String {
+    format!("1 / ({expr})")
+}
+
+/// The transcendental and remaining ES2025 `Math` functions: primary results,
+/// `ToNumber` of the argument, and the NaN / signed-zero / infinity cases.
+#[test]
+fn math_transcendentals() {
+    for (src, expected) in [
+        ("Math.log(Math.E)", "1"),
+        ("Math.log(1)", "0"),
+        ("Math.log(0)", "-Infinity"),
+        ("Math.log(-1)", "NaN"),
+        ("Math.log2(8)", "3"),
+        ("Math.log10(1000)", "3"),
+        ("Math.log1p(0)", "0"),
+        ("Math.log1p(-1)", "-Infinity"),
+        ("Math.exp(0)", "1"),
+        ("Math.exp(-Infinity)", "0"),
+        ("Math.expm1(0)", "0"),
+        ("Math.expm1(-Infinity)", "-1"),
+        ("Math.cbrt(27)", "3"),
+        ("Math.cbrt(-8)", "-2"),
+        ("Math.sin(0)", "0"),
+        ("Math.cos(0)", "1"),
+        ("Math.tan(0)", "0"),
+        ("Math.asin(1) * 2 === Math.PI", "true"),
+        ("Math.acos(1)", "0"),
+        ("Math.atan(Infinity) * 2 === Math.PI", "true"),
+        ("Math.atan2(1, 1) * 4 === Math.PI", "true"),
+        ("Math.atan2(0, -1) === Math.PI", "true"),
+        ("Math.sinh(0)", "0"),
+        ("Math.cosh(0)", "1"),
+        ("Math.tanh(Infinity)", "1"),
+        ("Math.asinh(0)", "0"),
+        ("Math.acosh(1)", "0"),
+        ("Math.atanh(1)", "Infinity"),
+        ("Math.sin('0')", "0"),
+        ("Math.exp({ valueOf() { return 0 } })", "1"),
+        ("Math.cos(NaN)", "NaN"),
+        ("Math.sin(Infinity)", "NaN"),
+        ("Math.acosh(0.5)", "NaN"),
+        ("Math.cosh(-Infinity)", "Infinity"),
+    ] {
+        assert_eval(src, expected);
+    }
+    for expr in [
+        "Math.sin(-0)",
+        "Math.tan(-0)",
+        "Math.asin(-0)",
+        "Math.atan(-0)",
+        "Math.sinh(-0)",
+        "Math.tanh(-0)",
+        "Math.asinh(-0)",
+        "Math.atanh(-0)",
+        "Math.cbrt(-0)",
+        "Math.expm1(-0)",
+        "Math.log1p(-0)",
+        "Math.atan2(-0, 0)",
+    ] {
+        assert_eval(&sign_of(expr), "-Infinity");
+    }
+}
+
+/// `sign`, `clz32`, `fround`, `imul`, `hypot` and `random`.
+#[test]
+fn math_integer_and_misc() {
+    for (src, expected) in [
+        ("Math.sign(-3)", "-1"),
+        ("Math.sign(5)", "1"),
+        ("Math.sign(NaN)", "NaN"),
+        ("Math.sign('-2')", "-1"),
+        ("Math.clz32(1)", "31"),
+        ("Math.clz32(0)", "32"),
+        ("Math.clz32(-1)", "0"),
+        ("Math.clz32(2 ** 32)", "32"),
+        ("Math.clz32(NaN)", "32"),
+        ("Math.clz32(0.5)", "32"),
+        ("Math.fround(5.5)", "5.5"),
+        ("Math.fround(5.05)", "5.050000190734863"),
+        ("Math.fround(2 ** 128)", "Infinity"),
+        ("Math.fround(NaN)", "NaN"),
+        ("Math.imul(2, 4)", "8"),
+        ("Math.imul(-1, 8)", "-8"),
+        ("Math.imul(0xffffffff, 5)", "-5"),
+        ("Math.imul(0xfffffffe, 5)", "-10"),
+        ("Math.imul('3', { valueOf() { return 4 } })", "12"),
+        ("Math.hypot()", "0"),
+        ("Math.hypot(3, 4)", "5"),
+        ("Math.hypot(-3)", "3"),
+        ("Math.hypot(NaN, 1)", "NaN"),
+        ("Math.hypot(NaN, Infinity)", "Infinity"),
+        ("Math.hypot(-Infinity, NaN)", "Infinity"),
+        ("Math.hypot(1e200, 1e200) > 1e200", "true"),
+        ("Math.hypot(1, 2, 2)", "3"),
+        ("Math.hypot(...[1, 2, 2])", "3"),
+        ("Math.hypot.length", "2"),
+        (
+            "Math.max.length + Math.atan2.length + Math.imul.length",
+            "6",
+        ),
+        ("Math.sin.name", "sin"),
+        ("typeof Math.random()", "number"),
+        (
+            "let ok = true; for (let i = 0; i < 100; i++) { const r = Math.random(); if (!(r >= 0 && r < 1)) ok = false } ok",
+            "true",
+        ),
+        ("Math.random() !== Math.random()", "true"),
+    ] {
+        assert_eval(src, expected);
+    }
+    for expr in ["Math.sign(-0)", "Math.fround(-0)", "Math.imul(-0, 1) * -1"] {
+        assert_eval(&sign_of(expr), "-Infinity");
+    }
+    assert_eval(&sign_of("Math.hypot(-0)"), "Infinity");
+    assert_eval(&sign_of("Math.hypot(-0, -0)"), "Infinity");
+}
+
+/// Every argument of a multi-argument `Math` function is converted with
+/// `ToNumber` in order, before the `Infinity` / `NaN` rules apply.
+#[test]
+fn math_converts_every_argument_in_order() {
+    let prelude = "let s = ''; const v = (c, n) => ({ valueOf() { s += c; return n } });";
+    for src in [
+        "Math.hypot(v('a', Infinity), v('b', NaN), v('c', 1)); s",
+        "Math.atan2(v('a', 1), v('b', 2)); s",
+        "Math.imul(v('a', 1), v('b', 2)); s",
+        "Math.hypot(...[v('a', NaN), v('b', 1), v('c', 2)]); s",
+    ] {
+        let expected = if src.contains("'c'") { "abc" } else { "ab" };
+        assert_eval(&format!("{prelude} {src}"), expected);
+    }
+}
+
+/// `Math.round` rounds half up without the `x + 0.5` error, keeps `-0` for
+/// `[-0.5, -0]`, and leaves large integers alone.
+#[test]
+fn math_round_edges() {
+    assert_eval("Math.round(0.49999999999999994)", "0");
+    assert_eval("Math.round(4503599627370497)", "4503599627370497");
+    assert_eval("Math.round(-4503599627370497)", "-4503599627370497");
+    assert_eval(&sign_of("Math.round(-0.4)"), "-Infinity");
+    assert_eval(&sign_of("Math.round(-0.5)"), "-Infinity");
+    assert_eval(&sign_of("Math.round(-0)"), "-Infinity");
+    assert_eval("Math.round(-0.6)", "-1");
+    assert_eval("Math.round(Infinity)", "Infinity");
 }

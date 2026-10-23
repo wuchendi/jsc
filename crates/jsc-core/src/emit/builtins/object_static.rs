@@ -609,9 +609,9 @@ fn emit_assign(
 ) {
     let (to, from, kv, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (n, i, ks, len) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let (at, spread) = (frame.x32(0), frame.x32(1));
+    let (at, spread) = (frame.x32(0), frame.x64(0));
     // The spread argument array, before a getter's spread call republishes it.
-    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64, LocalSet(spread));
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
     arg_to_object(function, frame, 0, to, strings, helpers);
     wasm!(function;
         LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U, LocalSet(n),

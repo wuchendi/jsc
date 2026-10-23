@@ -157,6 +157,7 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         }
         BuiltinCtor::Number => conversion(&body, ctor, ConvertOp::ToNumber, IrNode::Num(0.0)),
         BuiltinCtor::Boolean => conversion(&body, ctor, ConvertOp::ToBoolean, IrNode::Bool(false)),
+        BuiltinCtor::Error(ErrorKind::AggregateError) => aggregate_error(&body),
         BuiltinCtor::Error(kind) => {
             let (proto, options) = (body.temp(1), body.temp(3));
             let error = IrNode::error_from_argument(
@@ -197,6 +198,54 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         }
         BuiltinCtor::Date => date(&body),
     }
+}
+
+/// `AggregateError(errors, message, options)` (called or constructed): the
+/// Error instance of `message` over `GetPrototypeFromConstructor`, an own
+/// non-enumerable `cause` when `options` is an object with a `cause`
+/// property (`InstallErrorCause`), then an own non-enumerable `errors` array
+/// of the values iterating `errors` yields (a `TypeError` for a
+/// non-iterable).
+fn aggregate_error(body: &Body) -> IrNode {
+    let ctor = BuiltinCtor::Error(ErrorKind::AggregateError);
+    let (obj, proto) = (body.temp(0), body.temp(1));
+    let options = body.arg(2);
+    let has_cause = IrNode::Logical {
+        op: LogicalOp::And,
+        lhs: Box::new(IrNode::IsObject(Box::new(options.clone()))),
+        rhs: Box::new(IrNode::ObjectHas {
+            key: Box::new(IrNode::Str("cause".to_owned())),
+            obj: Box::new(options.clone()),
+        }),
+    };
+    let define = |key: &str, value: IrNode| IrNode::DefineProps {
+        obj: Box::new(IrNode::Local(obj)),
+        local: proto,
+        entries: vec![(PropKey::Hidden(key.to_owned()), value)],
+    };
+    let cause = IrNode::Index {
+        obj: Box::new(options),
+        index: Box::new(IrNode::Str("cause".to_owned())),
+    };
+    let errors = IrNode::ArraySpread(vec![SpreadElem::Spread(body.arg(0))]);
+    IrNode::Seq(vec![
+        IrNode::Assign {
+            local: proto,
+            value: Box::new(body.proto(ctor)),
+        },
+        IrNode::Assign {
+            local: obj,
+            value: Box::new(IrNode::error_from_argument(
+                ErrorKind::AggregateError,
+                IrNode::Local(proto),
+                body.arg(1),
+                body.temp(2),
+                body.temp(3),
+            )),
+        },
+        ternary(has_cause, define("cause", cause), IrNode::Undefined),
+        define("errors", errors),
+    ])
 }
 
 /// `Object(v)`: an object argument as is; `undefined`/`null` a fresh plain

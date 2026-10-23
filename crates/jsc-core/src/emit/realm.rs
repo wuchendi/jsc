@@ -245,6 +245,10 @@ pub(super) enum Builtin {
     ObjectReflect(ReflectOp),
     /// `Array.isArray`.
     IsArray,
+    /// `Array.of`.
+    ArrayOf,
+    /// `Array.from`.
+    ArrayFrom,
     /// `Promise.resolve`.
     PromiseResolve,
     /// `Promise.reject`.
@@ -267,16 +271,66 @@ pub(super) enum Builtin {
     ArraySlice,
     /// `Array.prototype.toString`.
     ArrayToString,
+    /// `Array.prototype.toLocaleString`.
+    ArrayToLocaleString,
+    /// `Array.prototype.at`.
+    ArrayAt,
+    /// `Array.prototype.find` / `findIndex` / `findLast` / `findLastIndex` /
+    /// `some` / `every`.
+    ArrayFind(ArrayFindOp),
+    /// `Array.prototype.reduceRight`.
+    ArrayReduceRight,
+    /// `Array.prototype.lastIndexOf`.
+    ArrayLastIndexOf,
+    /// `Array.prototype.concat`.
+    ArrayConcat,
+    /// `Array.prototype.flat` (`map == false`) / `flatMap`.
+    ArrayFlat {
+        /// `flatMap`: map each top-level element first.
+        map: bool,
+    },
+    /// `Array.prototype.splice`.
+    ArraySplice,
+    /// `Array.prototype.sort`.
+    ArraySort,
+    /// `Array.prototype.reverse`.
+    ArrayReverse,
+    /// `Array.prototype.shift`.
+    ArrayShift,
+    /// `Array.prototype.unshift`.
+    ArrayUnshift,
+    /// `Array.prototype.fill`.
+    ArrayFill,
+    /// `Array.prototype.copyWithin`.
+    ArrayCopyWithin,
+    /// `Array.prototype.with` / `toReversed` / `toSorted` / `toSpliced`.
+    ArrayCopy(ArrayCopyOp),
     /// A `String.prototype` method backed by a host `__method` op.
     StringMethod(StringOp),
     /// `String.prototype.toString`.
     StringToString,
     /// `String.prototype.valueOf`.
     StringValueOf,
+    /// `String.fromCharCode`.
+    StringFromCharCode,
+    /// `String.fromCodePoint`.
+    StringFromCodePoint,
+    /// `String.raw`.
+    StringRaw,
     /// `Number.prototype.toString`.
     NumberToString,
     /// `Number.prototype.valueOf`.
     NumberValueOf,
+    /// `Number.prototype.toFixed`.
+    NumberToFixed,
+    /// `Number.prototype.toExponential`.
+    NumberToExponential,
+    /// `Number.prototype.toPrecision`.
+    NumberToPrecision,
+    /// `Number.prototype.toLocaleString`: `toString()` (no locale data).
+    NumberToLocaleString,
+    /// A `Number` predicate static (`Number.isInteger`, ..): no coercion.
+    NumberIs(NumberTest),
     /// `Boolean.prototype.toString`.
     BooleanToString,
     /// `Boolean.prototype.valueOf`.
@@ -347,6 +401,10 @@ pub(super) enum Builtin {
     IsNaN,
     /// The global `isFinite`.
     IsFinite,
+    /// The global `parseFloat` (also `Number.parseFloat`).
+    ParseFloat,
+    /// The global `parseInt` (also `Number.parseInt`).
+    ParseInt,
 }
 
 /// An async generator request (`%AsyncGeneratorPrototype%` method).
@@ -367,6 +425,97 @@ impl AsyncGenRequest {
             Self::Next => "next",
             Self::Throw => "throw",
             Self::Return => "return",
+        }
+    }
+}
+/// A `Number` predicate static.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumberTest {
+    /// `Number.isInteger`.
+    Integer,
+    /// `Number.isSafeInteger`.
+    SafeInteger,
+    /// `Number.isFinite`.
+    Finite,
+    /// `Number.isNaN`.
+    NaN,
+}
+
+impl NumberTest {
+    /// The static's name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Integer => "isInteger",
+            Self::SafeInteger => "isSafeInteger",
+            Self::Finite => "isFinite",
+            Self::NaN => "isNaN",
+        }
+    }
+}
+
+/// The name of a `Math` method.
+fn math_name(op: MathOp) -> &'static str {
+    match op {
+        MathOp::Floor => "floor",
+        MathOp::Ceil => "ceil",
+        MathOp::Round => "round",
+        MathOp::Trunc => "trunc",
+        MathOp::Abs => "abs",
+        MathOp::Sqrt => "sqrt",
+        MathOp::Min => "min",
+        MathOp::Max => "max",
+        MathOp::Pow => "pow",
+        MathOp::Sign => "sign",
+        MathOp::Hypot => "hypot",
+        MathOp::Clz32 => "clz32",
+        MathOp::Fround => "fround",
+        MathOp::Imul => "imul",
+        MathOp::Cbrt => "cbrt",
+        MathOp::Log => "log",
+        MathOp::Log2 => "log2",
+        MathOp::Log10 => "log10",
+        MathOp::Log1p => "log1p",
+        MathOp::Exp => "exp",
+        MathOp::Expm1 => "expm1",
+        MathOp::Sin => "sin",
+        MathOp::Cos => "cos",
+        MathOp::Tan => "tan",
+        MathOp::Asin => "asin",
+        MathOp::Acos => "acos",
+        MathOp::Atan => "atan",
+        MathOp::Atan2 => "atan2",
+        MathOp::Sinh => "sinh",
+        MathOp::Cosh => "cosh",
+        MathOp::Tanh => "tanh",
+        MathOp::Asinh => "asinh",
+        MathOp::Acosh => "acosh",
+        MathOp::Atanh => "atanh",
+        MathOp::Random => "random",
+    }
+}
+
+/// An `Array.prototype` method that calls a predicate per index until it
+/// decides the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayFindOp {
+    Find,
+    FindIndex,
+    FindLast,
+    FindLastIndex,
+    Some,
+    Every,
+}
+
+impl ArrayFindOp {
+    /// The method's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Find => "find",
+            Self::FindIndex => "findIndex",
+            Self::FindLast => "findLast",
+            Self::FindLastIndex => "findLastIndex",
+            Self::Some => "some",
+            Self::Every => "every",
         }
     }
 }
@@ -457,6 +606,27 @@ impl ReflectOp {
         }
     }
 }
+/// An `Array.prototype` method that returns a changed copy of its receiver as
+/// a plain array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayCopyOp {
+    With,
+    ToReversed,
+    ToSorted,
+    ToSpliced,
+}
+
+impl ArrayCopyOp {
+    /// The method's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::With => "with",
+            Self::ToReversed => "toReversed",
+            Self::ToSorted => "toSorted",
+            Self::ToSpliced => "toSpliced",
+        }
+    }
+}
 
 /// The promise reactions an async generator registers (see
 /// [`Builtin::AsyncGeneratorReaction`]).
@@ -472,7 +642,8 @@ pub(super) enum AsyncGenReaction {
     ReturnRejected,
 }
 
-/// A `String.prototype` method backed by a host `__method` op.
+/// A generic `String.prototype` method: most are backed by a host `__method`
+/// op ([`StringOp::flag`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StringOp {
     IndexOf,
@@ -480,6 +651,8 @@ pub(super) enum StringOp {
     Slice,
     ToUpperCase,
     ToLowerCase,
+    ToLocaleUpperCase,
+    ToLocaleLowerCase,
     CharAt,
     Trim,
     TrimStart,
@@ -491,6 +664,18 @@ pub(super) enum StringOp {
     PadEnd,
     Substring,
     Split,
+    At,
+    CharCodeAt,
+    CodePointAt,
+    Concat,
+    LastIndexOf,
+    LocaleCompare,
+    Normalize,
+    Search,
+    Match,
+    MatchAll,
+    Replace,
+    ReplaceAll,
 }
 
 impl StringOp {
@@ -502,6 +687,8 @@ impl StringOp {
             Self::Slice => "slice",
             Self::ToUpperCase => "toUpperCase",
             Self::ToLowerCase => "toLowerCase",
+            Self::ToLocaleUpperCase => "toLocaleUpperCase",
+            Self::ToLocaleLowerCase => "toLocaleLowerCase",
             Self::CharAt => "charAt",
             Self::Trim => "trim",
             Self::TrimStart => "trimStart",
@@ -513,6 +700,18 @@ impl StringOp {
             Self::PadEnd => "padEnd",
             Self::Substring => "substring",
             Self::Split => "split",
+            Self::At => "at",
+            Self::CharCodeAt => "charCodeAt",
+            Self::CodePointAt => "codePointAt",
+            Self::Concat => "concat",
+            Self::LastIndexOf => "lastIndexOf",
+            Self::LocaleCompare => "localeCompare",
+            Self::Normalize => "normalize",
+            Self::Search => "search",
+            Self::Match => "match",
+            Self::MatchAll => "matchAll",
+            Self::Replace => "replace",
+            Self::ReplaceAll => "replaceAll",
         }
     }
 
@@ -521,22 +720,25 @@ impl StringOp {
         match self {
             Self::ToUpperCase
             | Self::ToLowerCase
+            | Self::ToLocaleUpperCase
+            | Self::ToLocaleLowerCase
             | Self::Trim
             | Self::TrimStart
-            | Self::TrimEnd => 0,
-            Self::Slice | Self::Substring | Self::Split => 2,
+            | Self::TrimEnd
+            | Self::Normalize => 0,
+            Self::Slice | Self::Substring | Self::Split | Self::Replace | Self::ReplaceAll => 2,
             _ => 1,
         }
     }
 
-    /// The host `__method` op flag.
-    pub(super) fn flag(self) -> i32 {
-        match self {
+    /// The host `__method` op flag (`concat` and `matchAll` have none).
+    pub(super) fn flag(self) -> Option<i32> {
+        Some(match self {
             Self::IndexOf => abi::METHOD_OP_INDEX_OF,
             Self::Includes => abi::METHOD_OP_INCLUDES,
             Self::Slice => abi::METHOD_OP_SLICE,
-            Self::ToUpperCase => abi::METHOD_OP_TO_UPPER,
-            Self::ToLowerCase => abi::METHOD_OP_TO_LOWER,
+            Self::ToUpperCase | Self::ToLocaleUpperCase => abi::METHOD_OP_TO_UPPER,
+            Self::ToLowerCase | Self::ToLocaleLowerCase => abi::METHOD_OP_TO_LOWER,
             Self::CharAt => abi::METHOD_OP_CHAR_AT,
             Self::Trim => abi::METHOD_OP_TRIM,
             Self::TrimStart => abi::METHOD_OP_TRIM_START,
@@ -548,13 +750,23 @@ impl StringOp {
             Self::PadEnd => abi::METHOD_OP_PAD_END,
             Self::Substring => abi::METHOD_OP_SUBSTRING,
             Self::Split => abi::METHOD_OP_SPLIT,
-        }
+            Self::At => abi::METHOD_OP_AT,
+            Self::CharCodeAt => abi::METHOD_OP_CHAR_CODE_AT,
+            Self::CodePointAt => abi::METHOD_OP_CODE_POINT_AT,
+            Self::LastIndexOf => abi::METHOD_OP_LAST_INDEX_OF,
+            Self::LocaleCompare => abi::METHOD_OP_LOCALE_COMPARE,
+            Self::Normalize => abi::METHOD_OP_NORMALIZE,
+            Self::Search | Self::Match => abi::METHOD_OP_SEARCH,
+            Self::Replace => abi::METHOD_OP_REPLACE,
+            Self::ReplaceAll => abi::METHOD_OP_REPLACE_ALL,
+            Self::Concat | Self::MatchAll => return None,
+        })
     }
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 151] = [
+    pub(super) const ALL: [Builtin; 231] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -583,6 +795,32 @@ impl Builtin {
         Self::Math(MathOp::Min),
         Self::Math(MathOp::Max),
         Self::Math(MathOp::Pow),
+        Self::Math(MathOp::Sign),
+        Self::Math(MathOp::Hypot),
+        Self::Math(MathOp::Clz32),
+        Self::Math(MathOp::Fround),
+        Self::Math(MathOp::Imul),
+        Self::Math(MathOp::Cbrt),
+        Self::Math(MathOp::Log),
+        Self::Math(MathOp::Log2),
+        Self::Math(MathOp::Log10),
+        Self::Math(MathOp::Log1p),
+        Self::Math(MathOp::Exp),
+        Self::Math(MathOp::Expm1),
+        Self::Math(MathOp::Sin),
+        Self::Math(MathOp::Cos),
+        Self::Math(MathOp::Tan),
+        Self::Math(MathOp::Asin),
+        Self::Math(MathOp::Acos),
+        Self::Math(MathOp::Atan),
+        Self::Math(MathOp::Atan2),
+        Self::Math(MathOp::Sinh),
+        Self::Math(MathOp::Cosh),
+        Self::Math(MathOp::Tanh),
+        Self::Math(MathOp::Asinh),
+        Self::Math(MathOp::Acosh),
+        Self::Math(MathOp::Atanh),
+        Self::Math(MathOp::Random),
         Self::JsonStringify,
         Self::JsonParse,
         Self::ConsoleLog,
@@ -599,6 +837,7 @@ impl Builtin {
         Self::Ctor(BuiltinCtor::Error(ErrorKind::SyntaxError)),
         Self::Ctor(BuiltinCtor::Error(ErrorKind::EvalError)),
         Self::Ctor(BuiltinCtor::Error(ErrorKind::UriError)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::AggregateError)),
         Self::Ctor(BuiltinCtor::Map),
         Self::Ctor(BuiltinCtor::Set),
         Self::Ctor(BuiltinCtor::Promise),
@@ -625,6 +864,8 @@ impl Builtin {
         Self::ObjectReflect(ReflectOp::ALL[16]),
         Self::ObjectReflect(ReflectOp::ALL[17]),
         Self::IsArray,
+        Self::ArrayOf,
+        Self::ArrayFrom,
         Self::PromiseResolve,
         Self::PromiseReject,
         Self::DateNow,
@@ -639,11 +880,37 @@ impl Builtin {
         Self::ArrayJoin,
         Self::ArraySlice,
         Self::ArrayToString,
+        Self::ArrayToLocaleString,
+        Self::ArrayAt,
+        Self::ArrayFind(ArrayFindOp::Find),
+        Self::ArrayFind(ArrayFindOp::FindIndex),
+        Self::ArrayFind(ArrayFindOp::FindLast),
+        Self::ArrayFind(ArrayFindOp::FindLastIndex),
+        Self::ArrayFind(ArrayFindOp::Some),
+        Self::ArrayFind(ArrayFindOp::Every),
+        Self::ArrayReduceRight,
+        Self::ArrayLastIndexOf,
+        Self::ArrayConcat,
+        Self::ArrayFlat { map: false },
+        Self::ArrayFlat { map: true },
+        Self::ArraySplice,
+        Self::ArraySort,
+        Self::ArrayReverse,
+        Self::ArrayShift,
+        Self::ArrayUnshift,
+        Self::ArrayFill,
+        Self::ArrayCopyWithin,
+        Self::ArrayCopy(ArrayCopyOp::With),
+        Self::ArrayCopy(ArrayCopyOp::ToReversed),
+        Self::ArrayCopy(ArrayCopyOp::ToSorted),
+        Self::ArrayCopy(ArrayCopyOp::ToSpliced),
         Self::StringMethod(StringOp::IndexOf),
         Self::StringMethod(StringOp::Includes),
         Self::StringMethod(StringOp::Slice),
         Self::StringMethod(StringOp::ToUpperCase),
         Self::StringMethod(StringOp::ToLowerCase),
+        Self::StringMethod(StringOp::ToLocaleUpperCase),
+        Self::StringMethod(StringOp::ToLocaleLowerCase),
         Self::StringMethod(StringOp::CharAt),
         Self::StringMethod(StringOp::Trim),
         Self::StringMethod(StringOp::TrimStart),
@@ -655,10 +922,33 @@ impl Builtin {
         Self::StringMethod(StringOp::PadEnd),
         Self::StringMethod(StringOp::Substring),
         Self::StringMethod(StringOp::Split),
+        Self::StringMethod(StringOp::At),
+        Self::StringMethod(StringOp::CharCodeAt),
+        Self::StringMethod(StringOp::CodePointAt),
+        Self::StringMethod(StringOp::Concat),
+        Self::StringMethod(StringOp::LastIndexOf),
+        Self::StringMethod(StringOp::LocaleCompare),
+        Self::StringMethod(StringOp::Normalize),
+        Self::StringMethod(StringOp::Search),
+        Self::StringMethod(StringOp::Match),
+        Self::StringMethod(StringOp::MatchAll),
+        Self::StringMethod(StringOp::Replace),
+        Self::StringMethod(StringOp::ReplaceAll),
         Self::StringToString,
         Self::StringValueOf,
+        Self::StringFromCharCode,
+        Self::StringFromCodePoint,
+        Self::StringRaw,
         Self::NumberToString,
         Self::NumberValueOf,
+        Self::NumberToFixed,
+        Self::NumberToExponential,
+        Self::NumberToPrecision,
+        Self::NumberToLocaleString,
+        Self::NumberIs(NumberTest::Integer),
+        Self::NumberIs(NumberTest::SafeInteger),
+        Self::NumberIs(NumberTest::Finite),
+        Self::NumberIs(NumberTest::NaN),
         Self::BooleanToString,
         Self::BooleanValueOf,
         Self::DateMethod(DateOp::ToString),
@@ -733,6 +1023,8 @@ impl Builtin {
         Self::IterSource,
         Self::IsNaN,
         Self::IsFinite,
+        Self::ParseFloat,
+        Self::ParseInt,
     ];
 
     /// The function's `name`.
@@ -778,20 +1070,20 @@ impl Builtin {
             Self::GeneratorThrow => "throw",
             Self::AsyncGeneratorMethod(request) => request.name(),
             Self::StringMethod(op) => op.name(),
+            Self::StringFromCharCode => "fromCharCode",
+            Self::StringFromCodePoint => "fromCodePoint",
+            Self::StringRaw => "raw",
             Self::Call => "call",
             Self::Apply => "apply",
             Self::Bind => "bind",
-            Self::Math(op) => match op {
-                MathOp::Floor => "floor",
-                MathOp::Ceil => "ceil",
-                MathOp::Round => "round",
-                MathOp::Trunc => "trunc",
-                MathOp::Abs => "abs",
-                MathOp::Sqrt => "sqrt",
-                MathOp::Min => "min",
-                MathOp::Max => "max",
-                MathOp::Pow => "pow",
-            },
+            Self::Math(op) => math_name(op),
+            Self::NumberToFixed => "toFixed",
+            Self::NumberToExponential => "toExponential",
+            Self::NumberToPrecision => "toPrecision",
+            Self::NumberToLocaleString | Self::ArrayToLocaleString => "toLocaleString",
+            Self::NumberIs(test) => test.name(),
+            Self::ParseFloat => "parseFloat",
+            Self::ParseInt => "parseInt",
             Self::JsonStringify => "stringify",
             Self::JsonParse => "parse",
             Self::ConsoleLog => "log",
@@ -801,6 +1093,8 @@ impl Builtin {
             Self::ObjectStatic(ObjectBuiltinOp::Entries) => "entries",
             Self::ObjectReflect(op) => op.name(),
             Self::IsArray => "isArray",
+            Self::ArrayOf => "of",
+            Self::ArrayFrom => "from",
             Self::PromiseResolve => "resolve",
             Self::PromiseReject => "reject",
             Self::DateNow => "now",
@@ -814,6 +1108,21 @@ impl Builtin {
             Self::ArrayIncludes => "includes",
             Self::ArrayJoin => "join",
             Self::ArraySlice => "slice",
+            Self::ArrayAt => "at",
+            Self::ArrayFind(op) => op.name(),
+            Self::ArrayReduceRight => "reduceRight",
+            Self::ArrayLastIndexOf => "lastIndexOf",
+            Self::ArrayConcat => "concat",
+            Self::ArrayFlat { map: false } => "flat",
+            Self::ArrayFlat { map: true } => "flatMap",
+            Self::ArraySplice => "splice",
+            Self::ArraySort => "sort",
+            Self::ArrayReverse => "reverse",
+            Self::ArrayShift => "shift",
+            Self::ArrayUnshift => "unshift",
+            Self::ArrayFill => "fill",
+            Self::ArrayCopyWithin => "copyWithin",
+            Self::ArrayCopy(op) => op.name(),
             Self::IsNaN => "isNaN",
             Self::IsFinite => "isFinite",
         }
@@ -833,6 +1142,8 @@ impl Builtin {
             | Self::StringToString
             | Self::StringValueOf
             | Self::NumberValueOf
+            | Self::NumberToLocaleString
+            | Self::Math(MathOp::Random)
             | Self::BooleanToString
             | Self::BooleanValueOf
             | Self::ObjectToString
@@ -840,6 +1151,7 @@ impl Builtin {
             | Self::ToLocaleString
             | Self::ErrorToString
             | Self::ArrayToString
+            | Self::ArrayToLocaleString
             | Self::DateMethod(_)
             | Self::CollectionSize { .. }
             | Self::ProtoGet
@@ -849,12 +1161,29 @@ impl Builtin {
             | Self::ConsoleLog
             | Self::DateNow
             | Self::ArrayPop
+            | Self::ArrayOf
+            | Self::ArrayFlat { map: false }
+            | Self::ArrayReverse
+            | Self::ArrayShift
+            | Self::ArrayCopy(ArrayCopyOp::ToReversed)
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
-            Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow)
+            Self::Math(
+                MathOp::Min
+                | MathOp::Max
+                | MathOp::Pow
+                | MathOp::Hypot
+                | MathOp::Atan2
+                | MathOp::Imul,
+            )
+            | Self::Ctor(BuiltinCtor::Error(ErrorKind::AggregateError))
+            | Self::ParseInt
             | Self::Apply
             | Self::JsonParse
             | Self::ArraySlice
+            | Self::ArraySplice
+            | Self::ArrayCopyWithin
+            | Self::ArrayCopy(ArrayCopyOp::With | ArrayCopyOp::ToSpliced)
             | Self::CollectionOp { op: MapOp::Set, .. }
             | Self::PromiseThen
             | Self::DefineAccessor { .. } => 2,
@@ -876,7 +1205,23 @@ impl Builtin {
             | Self::ArrayIndexOf
             | Self::ArrayIncludes
             | Self::ArrayJoin
+            | Self::ArrayFrom
+            | Self::ArrayAt
+            | Self::ArrayFind(_)
+            | Self::ArrayReduceRight
+            | Self::ArrayLastIndexOf
+            | Self::ArrayConcat
+            | Self::ArrayFlat { map: true }
+            | Self::ArraySort
+            | Self::ArrayUnshift
+            | Self::ArrayFill
+            | Self::ArrayCopy(ArrayCopyOp::ToSorted)
             | Self::NumberToString
+            | Self::NumberToFixed
+            | Self::NumberToExponential
+            | Self::NumberToPrecision
+            | Self::NumberIs(_)
+            | Self::ParseFloat
             | Self::IsNaN
             | Self::IsFinite
             | Self::DateToJson
@@ -888,7 +1233,10 @@ impl Builtin {
             | Self::GeneratorReturn
             | Self::GeneratorThrow
             | Self::AsyncGeneratorMethod(_)
-            | Self::AsyncGeneratorReaction(_) => 1,
+            | Self::AsyncGeneratorReaction(_)
+            | Self::StringFromCharCode
+            | Self::StringFromCodePoint
+            | Self::StringRaw => 1,
             Self::StringMethod(op) => op.length(),
             Self::ObjectReflect(op) => op.length(),
             Self::JsonStringify => 3,
@@ -906,11 +1254,31 @@ impl Builtin {
             | Self::ArrayIncludes
             | Self::ArrayJoin
             | Self::ArraySlice
-            | Self::ArrayToString => Some(BuiltinCtor::Array),
+            | Self::ArrayToString
+            | Self::ArrayToLocaleString
+            | Self::ArrayAt
+            | Self::ArrayFind(_)
+            | Self::ArrayReduceRight
+            | Self::ArrayLastIndexOf
+            | Self::ArrayConcat
+            | Self::ArrayFlat { .. }
+            | Self::ArraySplice
+            | Self::ArraySort
+            | Self::ArrayReverse
+            | Self::ArrayShift
+            | Self::ArrayUnshift
+            | Self::ArrayFill
+            | Self::ArrayCopyWithin
+            | Self::ArrayCopy(_) => Some(BuiltinCtor::Array),
             Self::StringMethod(_) | Self::StringToString | Self::StringValueOf => {
                 Some(BuiltinCtor::String)
             }
-            Self::NumberToString | Self::NumberValueOf => Some(BuiltinCtor::Number),
+            Self::NumberToString
+            | Self::NumberValueOf
+            | Self::NumberToFixed
+            | Self::NumberToExponential
+            | Self::NumberToPrecision
+            | Self::NumberToLocaleString => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
             Self::DateMethod(_) | Self::DateToJson => Some(BuiltinCtor::Date),
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
@@ -1020,9 +1388,21 @@ const MATH_CONSTANTS: [(&str, f64); 8] = [
     ("SQRT2", std::f64::consts::SQRT_2),
 ];
 
+/// The `Number` value properties.
+const NUMBER_CONSTANTS: [(&str, f64); 8] = [
+    ("EPSILON", f64::EPSILON),
+    ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0),
+    ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+    ("MAX_VALUE", f64::MAX),
+    ("MIN_VALUE", 5e-324),
+    ("NaN", f64::NAN),
+    ("POSITIVE_INFINITY", f64::INFINITY),
+    ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+];
+
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 26] = [
+const GLOBALS: [(&str, u32, Value); 29] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -1106,6 +1486,13 @@ const GLOBALS: [(&str, u32, Value); 26] = [
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::UriError))),
     ),
     (
+        "AggregateError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(
+            ErrorKind::AggregateError,
+        ))),
+    ),
+    (
         "Map",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Map)),
@@ -1127,6 +1514,12 @@ const GLOBALS: [(&str, u32, Value); 26] = [
     ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
+    (
+        "parseFloat",
+        METHOD_ATTRS,
+        Value::Method(Builtin::ParseFloat),
+    ),
+    ("parseInt", METHOD_ATTRS, Value::Method(Builtin::ParseInt)),
 ];
 
 /// The `%Object.prototype%` methods, in slot order.
@@ -1256,14 +1649,32 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         ));
         let statics: &[Builtin] = match ctor {
             BuiltinCtor::Object => &OBJECT_STATICS,
-            BuiltinCtor::Array => &[Builtin::IsArray],
+            BuiltinCtor::Array => &[Builtin::IsArray, Builtin::ArrayOf, Builtin::ArrayFrom],
+            BuiltinCtor::String => &[
+                Builtin::StringFromCharCode,
+                Builtin::StringFromCodePoint,
+                Builtin::StringRaw,
+            ],
             BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
             BuiltinCtor::Date => &[Builtin::DateNow],
+            BuiltinCtor::Number => &[
+                Builtin::NumberIs(NumberTest::Integer),
+                Builtin::NumberIs(NumberTest::SafeInteger),
+                Builtin::NumberIs(NumberTest::Finite),
+                Builtin::NumberIs(NumberTest::NaN),
+                Builtin::ParseFloat,
+                Builtin::ParseInt,
+            ],
             _ => &[],
         };
         for &builtin in statics {
             let method = Value::Method(builtin);
             entries.push(entry(intrinsic, builtin.name(), METHOD_ATTRS, method));
+        }
+        if ctor == BuiltinCtor::Number {
+            for (key, value) in NUMBER_CONSTANTS {
+                entries.push(entry(intrinsic, key, CONST_ATTRS, Value::Num(value)));
+            }
         }
         let ctor = Value::Intrinsic(intrinsic);
         entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
