@@ -26,6 +26,14 @@ impl LowerCtx<'_> {
             // reads through its boxed cell.
             Expr::Ident(ident) => self.lower_ident(ident.sym.as_ref(), ident.span),
             Expr::Paren(p) => self.lower_expr(&p.expr),
+            // `a, b, c`: every operand runs left to right; the value is the
+            // last one (a plain value, so `(0, o.m)()` has no receiver).
+            Expr::Seq(seq) => Ok(IrNode::Seq(
+                seq.exprs
+                    .iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect::<anyhow::Result<_>>()?,
+            )),
             // An arrow function lifts to a top-level function value.
             Expr::Arrow(arrow) => self.lower_arrow(arrow, ""),
             // A function expression `function (..) { .. }` lifts the same way as
@@ -247,6 +255,9 @@ impl LowerCtx<'_> {
                 }
                 if let Some(fi) = self.derived_frame() {
                     return Ok(self.derived_this(fi));
+                }
+                if let Some(this) = self.generator_this() {
+                    return Ok(this);
                 }
                 // Only the top-level `main` frame binds no `this`: there it is
                 // the global object.
@@ -517,28 +528,48 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a function expression to a constructor function value named by
-    /// its own identifier, else by `name` (its optional identifier is not
-    /// bound inside the body).
+    /// Lower a function expression to a function value named by its own
+    /// identifier, else by `name`. A generator/async expression's identifier is
+    /// bound, read-only, inside its own body (for self-reference): a cell in a
+    /// scope of its own, created before the value and set to it, which the body
+    /// captures. An ordinary function expression's identifier is not bound.
     fn lower_fn_expr(
         &mut self,
         fn_expr: &swc_ecma_ast::FnExpr,
         name: &str,
     ) -> anyhow::Result<IrNode> {
-        let block = fn_expr
-            .function
-            .body
-            .as_ref()
-            .ok_or_else(|| anyhow!("function expression requires a body"))?;
-        reject_unsupported_function(&fn_expr.function)?;
-        let param_pats: Vec<&Pat> = fn_expr.function.params.iter().map(|p| &p.pat).collect();
-        let name = fn_expr.ident.as_ref().map_or(name, |id| id.sym.as_ref());
-        self.lower_lifted_function(
-            &param_pats,
-            BodyKind::Block(&block.stmts),
-            name,
-            FnKind::Constructor,
-        )
+        let function = &fn_expr.function;
+        let Some(ident) = &fn_expr.ident else {
+            return self.lower_function_value(function, name);
+        };
+        let name = ident.sym.as_ref();
+        let id = ident.span.lo.0;
+        if !(function.is_generator || function.is_async) || !self.shared.captured.contains(&id) {
+            return self.lower_function_value(function, name);
+        }
+        self.push_scope();
+        let local = self.declare(name, false, id);
+        let env_slot = self.env_slot_for_local(local);
+        let value = self.lower_function_value(function, name);
+        self.pop_scope();
+        let value = value?;
+        // In a generator frame the cell is a pre-created frame cell.
+        if let Some(slot) = env_slot {
+            return Ok(IrNode::CellSet {
+                cell: Box::new(IrNode::EnvLoad(slot)),
+                value: Box::new(value),
+            });
+        }
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local,
+                value: Box::new(IrNode::CellNew(Box::new(IrNode::Undefined))),
+            },
+            IrNode::CellSet {
+                cell: Box::new(IrNode::Local(local)),
+                value: Box::new(value),
+            },
+        ]))
     }
 
     /// Lower `super(args)` inside a derived class constructor (DESIGN.md §7.6):
@@ -634,6 +665,16 @@ impl LowerCtx<'_> {
     fn super_this(&mut self, node: IrNode, span: Span) -> anyhow::Result<(IrNode, u32)> {
         if let Some(fi) = self.derived_frame() {
             let this = self.derived_this(fi);
+            let local = self.fresh();
+            let read = IrNode::Assign {
+                local,
+                value: Box::new(this),
+            };
+            return Ok((IrNode::Seq(vec![read, node]), local));
+        }
+        // A generator/async method's `this` lives in its frame cell: snapshot
+        // it into a local for the call.
+        if let Some(this) = self.generator_this() {
             let local = self.fresh();
             let read = IrNode::Assign {
                 local,
@@ -1569,22 +1610,8 @@ impl LowerCtx<'_> {
                 // A method / shorthand method `{m(){..}}` lifts to a first-class
                 // function value (like an arrow) that carries `this`.
                 Prop::Method(method) => {
-                    reject_unsupported_function(&method.function)?;
                     let key = self.lower_prop_key(&method.key)?;
-                    let block = method
-                        .function
-                        .body
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("object method requires a body"))?;
-                    let param_pats: Vec<&Pat> =
-                        method.function.params.iter().map(|p| &p.pat).collect();
-                    let name = static_key_name(&key);
-                    let value = self.lower_lifted_function(
-                        &param_pats,
-                        BodyKind::Block(&block.stmts),
-                        name,
-                        FnKind::Plain,
-                    )?;
+                    let value = self.lower_method(&method.function, static_key_name(&key))?;
                     entries.push((key, value));
                 }
                 Prop::Getter(getter) => {
@@ -2050,7 +2077,6 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
         Expr::Yield(_) => "yield expressions are not supported",
-        Expr::Seq(_) => "comma (sequence) expressions are not supported",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",

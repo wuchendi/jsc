@@ -17,6 +17,7 @@ impl Frame {
             next_label: 0,
             allows_this: false,
             this_local: None,
+            gen_this: None,
             arrow: false,
             new_target_local: None,
             ctor: FnKind::Plain,
@@ -401,10 +402,24 @@ impl<'a> LowerCtx<'a> {
         self.frame().env_backed = true;
     }
 
-    /// The number of environment slots the current frame has allocated (its
-    /// generator frame size).
-    pub(super) fn env_len(&self) -> usize {
-        self.frames.last().map_or(0, |f| f.env.len())
+    /// `this` in a generator/async (`env_backed`) body: the frame's `this`
+    /// cell (allocated on first use), which the generator constructor seeds
+    /// with its call's receiver so it survives every suspend. `None` in an
+    /// ordinary frame.
+    pub(super) fn generator_this(&mut self) -> Option<IrNode> {
+        let frame = self.frame();
+        if !frame.env_backed {
+            return None;
+        }
+        let slot = if let Some(slot) = frame.gen_this {
+            slot
+        } else {
+            let slot = u32::try_from(frame.env.len()).unwrap_or(u32::MAX);
+            frame.env.push(u32::MAX);
+            frame.gen_this = Some(slot);
+            slot
+        };
+        Some(IrNode::CellGet(Box::new(IrNode::EnvLoad(slot))))
     }
 
     /// Find the binding a name resolves to: the frame index it lives in and its
