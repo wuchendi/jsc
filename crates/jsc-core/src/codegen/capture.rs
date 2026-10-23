@@ -146,25 +146,87 @@ impl CaptureResolver {
         }
     }
 
-    /// Declare a function/arrow parameter binding for capture analysis: a plain
-    /// `Pat::Ident`, a defaulted ident (`a = d`, whose default is analyzed first in
-    /// the function's frame, so an outer binding it reads is captured), or the
-    /// inner ident of a trailing rest parameter (`...rest`), so a nested closure
-    /// referencing the rest binding marks it captured.
-    fn declare_param(&mut self, pat: &Pat) {
-        match pat {
-            Pat::Ident(ident) => self.declare(ident.id.sym.as_ref(), binding_id(ident)),
-            Pat::Assign(assign) => {
-                self.expr(&assign.right);
-                self.declare_param(&assign.left);
+    /// Analyze a function's parameters and body in the current (fresh)
+    /// function frame, mirroring [`LowerCtx::declare_params`] /
+    /// [`LowerCtx::bind_params`]: every parameter name is declared first (a
+    /// default may reference a later parameter, in its TDZ, or a closure may
+    /// capture one), then the parameter expressions are analyzed. With
+    /// parameter expressions, a body `var` redeclaring a parameter is a
+    /// separate binding declared on entry (see [`LowerCtx::bind_var_copies`]).
+    fn params_and_body(&mut self, params: &[&Pat], body: AnalyzeBody<'_>) {
+        let mut names = Vec::new();
+        for pat in params {
+            pat_bindings(pat, &mut names);
+        }
+        for (name, id) in &names {
+            self.declare(name, *id);
+            self.var_ids.insert(*id);
+        }
+        for pat in params {
+            self.pat_exprs(pat);
+        }
+        match body {
+            AnalyzeBody::Block(stmts) => {
+                if has_param_expressions(params) {
+                    for (name, id) in var_copies(&names, stmts) {
+                        self.declare(&name, id);
+                        self.var_ids.insert(id);
+                    }
+                }
+                self.stmts(stmts);
             }
-            Pat::Rest(rest) => {
-                if let Pat::Ident(ident) = rest.arg.as_ref() {
-                    self.declare(ident.id.sym.as_ref(), binding_id(ident));
+            AnalyzeBody::Expr(e) => self.expr(e),
+        }
+    }
+
+    /// Analyze the expressions of a parameter pattern (its defaults).
+    fn pat_exprs(&mut self, pat: &Pat) {
+        match pat {
+            Pat::Array(arr) => {
+                for elem in arr.elems.iter().flatten() {
+                    self.pat_exprs(elem);
                 }
             }
-            _ => {}
+            Pat::Object(obj) => {
+                for prop in &obj.props {
+                    match prop {
+                        ObjectPatProp::KeyValue(kv) => {
+                            if let PropName::Computed(key) = &kv.key {
+                                self.expr(&key.expr);
+                            }
+                            self.pat_exprs(&kv.value);
+                        }
+                        ObjectPatProp::Assign(assign) => {
+                            if let Some(default) = &assign.value {
+                                self.expr(default);
+                            }
+                        }
+                        ObjectPatProp::Rest(rest) => self.pat_exprs(&rest.arg),
+                    }
+                }
+            }
+            Pat::Rest(rest) => self.pat_exprs(&rest.arg),
+            Pat::Assign(assign) => {
+                self.pat_exprs(&assign.left);
+                self.expr(&assign.right);
+            }
+            Pat::Ident(_) | Pat::Expr(_) | Pat::Invalid(_) => {}
         }
+    }
+
+    /// Declare a `var` binding `name`: a redeclaration of a var-scoped binding
+    /// of the current function reuses it (see [`LowerCtx::var_redeclaration`]);
+    /// `main`'s top-level `var`s are module cells and always declare.
+    fn declare_var(&mut self, name: &str, id: u32) {
+        if self.frames.len() > 1
+            && let Some(frame) = self.frames.last()
+            && let Some(existing) = frame.iter().rev().find_map(|scope| scope.get(name))
+            && self.var_ids.contains(existing)
+        {
+            return;
+        }
+        self.declare(name, id);
+        self.var_ids.insert(id);
     }
 
     /// Declare every binding introduced by a (possibly destructuring) pattern,
@@ -173,34 +235,49 @@ impl CaptureResolver {
     /// is analyzed in place (it may reference outer bindings). Holes and rest
     /// targets recurse; unsupported pattern kinds simply bind nothing (lowering
     /// rejects them with a span).
-    fn declare_pat(&mut self, pat: &Pat) {
+    fn declare_pat(&mut self, pat: &Pat, var: bool) {
         match pat {
-            Pat::Ident(ident) => self.declare(ident.id.sym.as_ref(), binding_id(ident)),
+            Pat::Ident(ident) => {
+                self.declare_binding(ident.id.sym.as_ref(), binding_id(ident), var);
+            }
             Pat::Array(arr) => {
                 for elem in arr.elems.iter().flatten() {
-                    self.declare_pat(elem);
+                    self.declare_pat(elem, var);
                 }
             }
             Pat::Object(obj) => {
                 for prop in &obj.props {
                     match prop {
-                        ObjectPatProp::KeyValue(kv) => self.declare_pat(&kv.value),
+                        ObjectPatProp::KeyValue(kv) => self.declare_pat(&kv.value, var),
                         ObjectPatProp::Assign(assign) => {
                             if let Some(default) = &assign.value {
                                 self.expr(default);
                             }
-                            self.declare(assign.key.id.sym.as_ref(), binding_id(&assign.key));
+                            self.declare_binding(
+                                assign.key.id.sym.as_ref(),
+                                binding_id(&assign.key),
+                                var,
+                            );
                         }
-                        ObjectPatProp::Rest(rest) => self.declare_pat(&rest.arg),
+                        ObjectPatProp::Rest(rest) => self.declare_pat(&rest.arg, var),
                     }
                 }
             }
-            Pat::Rest(rest) => self.declare_pat(&rest.arg),
+            Pat::Rest(rest) => self.declare_pat(&rest.arg, var),
             Pat::Assign(assign) => {
                 self.expr(&assign.right);
-                self.declare_pat(&assign.left);
+                self.declare_pat(&assign.left, var);
             }
             _ => {}
+        }
+    }
+
+    /// Declare `name` as a `var` ([`Self::declare_var`]) or a lexical binding.
+    fn declare_binding(&mut self, name: &str, id: u32, var: bool) {
+        if var {
+            self.declare_var(name, id);
+        } else {
+            self.declare(name, id);
         }
     }
 
@@ -304,7 +381,7 @@ impl CaptureResolver {
                     if let Some(init) = &d.init {
                         self.expr(init);
                     }
-                    self.declare_pat(&d.name);
+                    self.declare_pat(&d.name, v.kind == VarDeclKind::Var);
                 }
             }
             Stmt::Decl(Decl::Fn(f)) => {
@@ -316,6 +393,7 @@ impl CaptureResolver {
                     f.function.body.as_ref().map(|b| &b.stmts),
                 );
                 self.declare(f.ident.sym.as_ref(), f.ident.span.lo.0);
+                self.var_ids.insert(f.ident.span.lo.0);
             }
             Stmt::Decl(Decl::Class(c)) => self.class_decl(c),
             Stmt::Block(b) => self.analyze_scoped(&b.stmts),
@@ -344,7 +422,11 @@ impl CaptureResolver {
                             self.expr(init);
                         }
                         if let Pat::Ident(ident) = &d.name {
-                            self.declare(ident.id.sym.as_ref(), binding_id(ident));
+                            self.declare_binding(
+                                ident.id.sym.as_ref(),
+                                binding_id(ident),
+                                v.kind == VarDeclKind::Var,
+                            );
                         }
                     }
                 } else if let Some(VarDeclOrExpr::Expr(e)) = &f.init {
@@ -423,15 +505,17 @@ impl CaptureResolver {
         for member in &class.body {
             match member {
                 ClassMember::Constructor(ctor) => {
+                    let params: Vec<&Pat> = ctor
+                        .params
+                        .iter()
+                        .filter_map(|param| match param {
+                            ParamOrTsParamProp::Param(p) => Some(&p.pat),
+                            ParamOrTsParamProp::TsParamProp(_) => None,
+                        })
+                        .collect();
                     self.enter_function();
-                    for param in &ctor.params {
-                        if let ParamOrTsParamProp::Param(p) = param {
-                            self.declare_param(&p.pat);
-                        }
-                    }
-                    if let Some(body) = &ctor.body {
-                        self.stmts(&body.stmts);
-                    }
+                    let stmts = ctor.body.as_ref().map_or(&[][..], |b| &b.stmts);
+                    self.params_and_body(&params, AnalyzeBody::Block(stmts));
                     self.exit_function();
                 }
                 ClassMember::Method(m) => {
@@ -463,7 +547,7 @@ impl CaptureResolver {
         if let ForHead::VarDecl(v) = left
             && let [declarator] = v.decls.as_slice()
         {
-            self.declare_pat(&declarator.name);
+            self.declare_pat(&declarator.name, false);
         } else if let ForHead::Pat(pat) = left {
             self.mark_pat(pat);
         }
@@ -494,6 +578,7 @@ impl CaptureResolver {
             .collect();
         for f in &fns {
             self.declare(f.ident.sym.as_ref(), f.ident.span.lo.0);
+            self.var_ids.insert(f.ident.span.lo.0);
         }
         for s in stmts {
             if !matches!(s, Stmt::Decl(Decl::Fn(_))) {
@@ -685,29 +770,143 @@ impl CaptureResolver {
 
     /// Analyze an arrow (expression- or block-bodied) in a fresh function frame.
     fn arrow_or_fn(&mut self, params: &[Pat], body: AnalyzeBody<'_>) {
+        let params: Vec<&Pat> = params.iter().collect();
         self.enter_function();
-        for param in params {
-            self.declare_param(param);
-        }
-        match body {
-            AnalyzeBody::Block(stmts) => self.stmts(stmts),
-            AnalyzeBody::Expr(e) => self.expr(e),
-        }
+        self.params_and_body(&params, body);
         self.exit_function();
     }
 
     /// Analyze a `function`-keyword function (declaration or expression) in a
     /// fresh function frame.
     fn function(&mut self, params: &[swc_ecma_ast::Param], body: Option<&Vec<Stmt>>) {
+        let pats: Vec<&Pat> = params.iter().map(|p| &p.pat).collect();
         self.enter_function();
-        for param in params {
-            self.declare_param(&param.pat);
-        }
-        if let Some(stmts) = body {
-            self.stmts(stmts);
-        }
+        let stmts = body.map_or(&[][..], Vec::as_slice);
+        self.params_and_body(&pats, AnalyzeBody::Block(stmts));
         self.exit_function();
     }
+}
+
+/// Collect the name and [`binding_id`] of every identifier a (possibly
+/// destructuring) binding pattern binds, in source order.
+pub(super) fn pat_bindings(pat: &Pat, out: &mut Vec<(String, u32)>) {
+    match pat {
+        Pat::Ident(ident) => out.push((ident.id.sym.as_ref().to_owned(), binding_id(ident))),
+        Pat::Array(arr) => {
+            for elem in arr.elems.iter().flatten() {
+                pat_bindings(elem, out);
+            }
+        }
+        Pat::Object(obj) => {
+            for prop in &obj.props {
+                match prop {
+                    ObjectPatProp::KeyValue(kv) => pat_bindings(&kv.value, out),
+                    ObjectPatProp::Assign(assign) => out.push((
+                        assign.key.id.sym.as_ref().to_owned(),
+                        binding_id(&assign.key),
+                    )),
+                    ObjectPatProp::Rest(rest) => pat_bindings(&rest.arg, out),
+                }
+            }
+        }
+        Pat::Rest(rest) => pat_bindings(&rest.arg, out),
+        Pat::Assign(assign) => pat_bindings(&assign.left, out),
+        Pat::Expr(_) | Pat::Invalid(_) => {}
+    }
+}
+
+/// Whether a parameter list has parameter expressions (a default or a
+/// computed key anywhere): only then can parameter code observe a TDZ, and a
+/// body `var` redeclaring a parameter is a separate binding.
+pub(super) fn has_param_expressions(params: &[&Pat]) -> bool {
+    fn pat(p: &Pat) -> bool {
+        match p {
+            Pat::Assign(_) => true,
+            Pat::Array(arr) => arr.elems.iter().flatten().any(pat),
+            Pat::Object(obj) => obj.props.iter().any(|prop| match prop {
+                ObjectPatProp::KeyValue(kv) => {
+                    matches!(kv.key, PropName::Computed(_)) || pat(&kv.value)
+                }
+                ObjectPatProp::Assign(assign) => assign.value.is_some(),
+                ObjectPatProp::Rest(rest) => pat(&rest.arg),
+            }),
+            Pat::Rest(rest) => pat(&rest.arg),
+            Pat::Ident(_) | Pat::Expr(_) | Pat::Invalid(_) => false,
+        }
+    }
+    params.iter().any(|p| pat(p))
+}
+
+/// The body `var`s of a function with parameter expressions that redeclare
+/// one of its `params`: each name once, with the [`binding_id`] of its first
+/// declaration, which identifies the body's separate copy of the parameter.
+pub(super) fn var_copies(params: &[(String, u32)], stmts: &[Stmt]) -> Vec<(String, u32)> {
+    fn var_decl(v: &swc_ecma_ast::VarDecl, out: &mut Vec<(String, u32)>) {
+        if v.kind == VarDeclKind::Var {
+            for d in &v.decls {
+                pat_bindings(&d.name, out);
+            }
+        }
+    }
+    fn stmt(s: &Stmt, out: &mut Vec<(String, u32)>) {
+        match s {
+            Stmt::Decl(Decl::Var(v)) => var_decl(v, out),
+            Stmt::Block(b) => b.stmts.iter().for_each(|s| stmt(s, out)),
+            Stmt::If(i) => {
+                stmt(&i.cons, out);
+                if let Some(alt) = &i.alt {
+                    stmt(alt, out);
+                }
+            }
+            Stmt::While(w) => stmt(&w.body, out),
+            Stmt::DoWhile(w) => stmt(&w.body, out),
+            Stmt::Labeled(l) => stmt(&l.body, out),
+            Stmt::For(f) => {
+                if let Some(VarDeclOrExpr::VarDecl(v)) = &f.init {
+                    var_decl(v, out);
+                }
+                stmt(&f.body, out);
+            }
+            Stmt::ForIn(f) => {
+                if let ForHead::VarDecl(v) = &f.left {
+                    var_decl(v, out);
+                }
+                stmt(&f.body, out);
+            }
+            Stmt::ForOf(f) => {
+                if let ForHead::VarDecl(v) = &f.left {
+                    var_decl(v, out);
+                }
+                stmt(&f.body, out);
+            }
+            Stmt::Switch(sw) => sw
+                .cases
+                .iter()
+                .flat_map(|c| &c.cons)
+                .for_each(|s| stmt(s, out)),
+            Stmt::Try(t) => {
+                t.block.stmts.iter().for_each(|s| stmt(s, out));
+                if let Some(handler) = &t.handler {
+                    handler.body.stmts.iter().for_each(|s| stmt(s, out));
+                }
+                if let Some(finalizer) = &t.finalizer {
+                    finalizer.stmts.iter().for_each(|s| stmt(s, out));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut vars = Vec::new();
+    for s in stmts {
+        stmt(s, &mut vars);
+    }
+    let mut copies: Vec<(String, u32)> = Vec::new();
+    for (name, id) in vars {
+        if params.iter().any(|(p, _)| *p == name) && !copies.iter().any(|(n, _)| *n == name) {
+            copies.push((name, id));
+        }
+    }
+    copies
 }
 
 /// Strip redundant parentheses from an expression.

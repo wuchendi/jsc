@@ -25,6 +25,9 @@ impl Frame {
             arguments_local: None,
             spread_args_local: None,
             machine: None,
+            var_ids: std::collections::HashSet::new(),
+            params: Vec::new(),
+            binding: None,
         }
     }
 }
@@ -41,6 +44,7 @@ impl<'a> LowerCtx<'a> {
             current_super: None,
             class_fields: Vec::new(),
             static_init: None,
+            binding_var: false,
         }
     }
 
@@ -379,23 +383,29 @@ impl<'a> LowerCtx<'a> {
         }
         let slot = *self.shared.module_slots.get(name)?;
         let mutable = *self.shared.module_mutable.get(name)?;
-        let message = format!("Cannot access '{name}' before initialization");
-        let error = IrNode::error_object(
-            ErrorKind::ReferenceError,
-            Some(IrNode::Str(message.clone())),
-            IrNode::Str(format!("ReferenceError: {message}")),
-        );
-        let guarded = IrNode::Ternary {
-            cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
-                IrNode::ModuleCell(slot),
-            ))))),
-            then_branch: Box::new(IrNode::Throw(Box::new(error))),
-            else_branch: Box::new(IrNode::ModuleCell(slot)),
-        };
         Some(Resolved {
-            kind: AccessKind::Cell(guarded),
+            kind: AccessKind::Cell(tdz_guard(IrNode::ModuleCell(slot), name)),
             mutable,
         })
+    }
+
+    /// The binding a `var` declaration of `name` redeclares: an existing
+    /// var-scoped binding (parameter, `var` or function declaration) of the
+    /// current function — for a generator body, including its constructor's
+    /// parameters — which the declaration then reuses. `None` in `main`, whose
+    /// top-level `var`s are module cells.
+    pub(super) fn var_redeclaration(&mut self, name: &str) -> Option<Resolved> {
+        let top = self.top();
+        if self.main_ctx && top == 0 {
+            return None;
+        }
+        let (fi, binding) = self.find_binding(name)?;
+        let own = fi == top || (fi + 1 == top && self.frames[top].env_backed);
+        if own && self.frames[fi].var_ids.contains(&binding.id) {
+            self.resolve(name)
+        } else {
+            None
+        }
     }
 
     /// Mark the current frame `env_backed`: every binding it declares becomes an
@@ -513,6 +523,21 @@ impl<'a> LowerCtx<'a> {
         let Some((fi, binding)) = self.find_binding(name) else {
             return self.resolve_module(name);
         };
+        // A parameter still in its TDZ (DESIGN.md §7.4): a reference from its
+        // own frame runs before the binding, so it throws outright; a closure
+        // may run later, so it checks the cell for the hole.
+        let pending = self.frames[fi]
+            .binding
+            .as_ref()
+            .is_some_and(|b| b.pending.contains(&binding.id));
+        if pending && fi == self.top() {
+            return Some(Resolved {
+                kind: AccessKind::Cell(IrNode::Throw(Box::new(reference_error(&format!(
+                    "Cannot access '{name}' before initialization"
+                ))))),
+                mutable: binding.mutable,
+            });
+        }
         let kind = if let Some(slot) = binding.module {
             // `main` (or an arrow/method nested in it) reads its module binding
             // directly: `main` code only runs after the declaration.
@@ -530,7 +555,12 @@ impl<'a> LowerCtx<'a> {
         } else {
             // Captured from an enclosing frame: reached through this frame's env.
             let slot = self.route_env(fi, binding.id);
-            AccessKind::Cell(IrNode::EnvLoad(slot))
+            let ptr = IrNode::EnvLoad(slot);
+            if pending {
+                AccessKind::Cell(tdz_guard(ptr, name))
+            } else {
+                AccessKind::Cell(ptr)
+            }
         };
         Some(Resolved {
             kind,
@@ -640,6 +670,20 @@ impl<'a> LowerCtx<'a> {
             None => self.frames[top].env_index.get(&id).copied().unwrap_or(0),
         };
         IrNode::EnvLoad(slot)
+    }
+}
+
+/// The cell pointer `ptr` of binding `name` guarded against the TDZ hole:
+/// while the cell holds it, any read or write throws a `ReferenceError`.
+fn tdz_guard(ptr: IrNode, name: &str) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
+            ptr.clone(),
+        ))))),
+        then_branch: Box::new(IrNode::Throw(Box::new(reference_error(&format!(
+            "Cannot access '{name}' before initialization"
+        ))))),
+        else_branch: Box::new(ptr),
     }
 }
 

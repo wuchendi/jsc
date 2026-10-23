@@ -818,8 +818,9 @@ unresolvable name throws `ReferenceError` (strict).
 **Global facts** (`codegen/globals.rs`, one whole-program syntactic scan):
 
 - **`sealed(N)`** — `N` names an unshadowed global, is never assigned, and the
-  program contains no `globalThis`, top-level `this`, or `delete` of an
-  identifier. A namespace (`Math`, `JSON`, `console`, `Object`, `Promise`,
+  program contains no escaping `globalThis` (anything but a static
+  `globalThis.k` read or call — a member write escapes), top-level `this`, or
+  `delete` of an identifier. A namespace (`Math`, `JSON`, `console`, `Object`, `Promise`,
   `Date`) is additionally **inline** when it never escapes (only `N.k` reads
   and `N.m(..)` calls); then its members compile to inline code.
 - **intrinsics-sealed** — none of `prototype`, `constructor`, `__proto__`,
@@ -845,6 +846,8 @@ path, never semantics:
 | site | fast path | taken when | otherwise |
 |---|---|---|---|
 | `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
+| `String/Number/Boolean(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property |
+| `parseInt/parseFloat(..)` | inline conversion | `sealed(N)`, or else the global object has no such property (they are not global values, so only a program-stored one) | a call of the stored global property |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0`, `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
@@ -1101,9 +1104,21 @@ those of `switch` and loops are not tracked.
 - **Parameters.** Default values (evaluated per call in a prologue, may reference
   earlier parameters and captured bindings), trailing rest parameters
   (collected from the positional slots and `$__spread_args`), and array/object
-  destructuring patterns (composable with defaults), in every function form
-  (a generator binds them when called, §7.8). A duplicate parameter name is an
+  destructuring patterns (composable with defaults). Every parameter name is
+  declared up front and the parameters bind left to right. With parameter
+  expressions (a default anywhere), a parameter is in its TDZ until it binds:
+  a reference from the parameter code itself compiles to a `ReferenceError`
+  throw, and a captured parameter's cell holds the hole until then, so a
+  closure created by a default checks it (`f(a = b, b)`, `f(a = a)` throw).
+  This holds in every function form; a generator, async or async generator
+  function binds them when called (§7.8). A duplicate parameter name is an
   early `SyntaxError` (all code is strict).
+- **`var` redeclaring a parameter.** A `var` naming a var-scoped binding of
+  the same function (a parameter, a `var`, a function declaration) reuses it:
+  without an initializer it keeps its value, with one it assigns. With
+  parameter expressions, a body `var` redeclaring a parameter is instead a
+  separate binding created on entry from the parameter's value, so closures
+  in the parameter list keep the parameter.
 - **`arguments`.** A function that references `arguments` builds an unmapped
   `CLASS_ARGUMENTS` object from `argc`, the positional slots, and
   `$__spread_args`.
@@ -1190,6 +1205,10 @@ those of `switch` and loops are not tracked.
   `new.target.prototype` (one of the static `%…Error.prototype%` blocks unless
   subclassed) with own non-enumerable `message` (only when one was given) and
   `stack` (`"Name: message"`, a single line, no frames); `name` is inherited.
+  `InstallErrorCause`: when the second argument is an object with a `cause`
+  property (own or inherited, even `undefined`), the instance gets an own
+  non-enumerable `cause` = `options.cause`, read after the message's
+  `ToString`; otherwise it has no `cause`.
   `Error.prototype.toString` formats `Name: message`.
 - `throw` accepts any value.
 - **Engine-raised errors** are real error objects linked to the same static
@@ -1302,7 +1321,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 
 | area | supported |
 |---|---|
-| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
+| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls (while sealed, §6.4) |
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
@@ -1554,9 +1573,14 @@ Each item below is current behaviour of this tree.
   no `import()`.
 - Strict-mode semantics only: sloppy-mode constructs (`with`, implicit globals)
   are rejected or throw, and the test262 runner skips `noStrict` tests.
-- TDZ is enforced only for module cells; reading a block-scoped binding before
-  its declaration inside the same function resolves to the enclosing binding
-  (or the global object) instead of throwing.
+- TDZ is enforced only for module cells and parameters; reading a
+  block-scoped binding before its declaration inside the same function
+  resolves to the enclosing binding (or the global object) instead of
+  throwing.
+- A function-body `var` is not hoisted: it binds at its declaration, scoped
+  to its block (only a redeclaration of a var-scoped binding of the same
+  function reuses it, §7.4), and a `for-in`/`for-of` `var` head is a loop
+  binding.
 - Top-level `var` and function declarations are module cells, not properties
   of the global object (`var v = 1; globalThis.v` is `undefined`).
 - An assignment to an unresolvable name evaluates its right-hand side before
@@ -1579,7 +1603,9 @@ Each item below is current behaviour of this tree.
   `assign`), no `Array.from`, `sort`, `find`,
   `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
-- `parseInt` and `parseFloat` exist only as direct calls, not as global values.
+- `parseInt` and `parseFloat` exist only as direct calls, not as global values
+  (`parseInt = f` throws `ReferenceError`; `globalThis.parseInt = f` is
+  honoured by later calls, §6.4).
 
 **Object model**
 
@@ -1607,6 +1633,8 @@ Each item below is current behaviour of this tree.
 
 - No `for await` and no `Symbol.asyncIterator`; `yield*` is rejected in an
   async generator.
+- A `yield`/`await` that would carry a per-node compiler temporary across the
+  suspend is a compile error (`super.m(yield x)`, `o[yield k]?.(yield v)`).
 - `yield*` is supported only as a statement; it does not thread sent values or
   the delegate's return value.
 - `return()` at a suspended `yield` in a body with a `finally` or a `yield*`,

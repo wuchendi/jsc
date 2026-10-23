@@ -851,16 +851,36 @@ impl LowerCtx<'_> {
             // `Error(m)` without `new` constructs too (DESIGN.md §7.7).
             Ok(self.lower_error_construct(kind, args))
         } else if let Some(op) = convert_builtin_op(name)
-            && (!matches!(name, "String" | "Number" | "Boolean")
-                || self.shared.globals.sealed(name))
+            && self.shared.globals.sealed(name)
         {
             // A conversion built-in `String/Number/Boolean/parseInt/parseFloat`.
             // Reached only when the name is NOT a binding or a user
             // function (checked above), so a user `let String = ..` / `function
-            // String(){}` shadows it.
+            // String(){}` shadows it, and only while sealed, so a reassigned
+            // global is called instead.
             let empty = args.is_empty();
             let (seq, args) = self.fit_inline_args(Some(convert_arity(op)), args);
             Ok(seq_then(seq, convert_call(op, empty, args)))
+        } else if let Some(op) = convert_builtin_op(name)
+            && is_parse(op)
+        {
+            // An unsealed `parseInt`/`parseFloat`: the global object has no
+            // such property unless the program stored one, which is called;
+            // otherwise the builtin conversion runs.
+            let empty = args.is_empty();
+            let (mut seq, has, callee) = self.user_global(name);
+            let args: Vec<IrNode> = args
+                .into_iter()
+                .map(|arg| self.spill(&mut seq, arg))
+                .collect();
+            let user = IrNode::CallIndirect {
+                callee: Box::new(IrNode::Local(callee)),
+                args: args.clone(),
+                not_callable: CalleeError::not_a_function(name),
+            };
+            let (fit, args) = self.fit_inline_args(Some(convert_arity(op)), args);
+            let builtin = seq_then(fit, convert_call(op, empty, args));
+            Ok(seq_then(seq, ternary(IrNode::Local(has), user, builtin)))
         } else {
             // A global-object property, read (or thrown on) at run time.
             Ok(IrNode::CallIndirect {
@@ -1073,26 +1093,9 @@ impl LowerCtx<'_> {
                 args,
             })
         } else if let Some(op) = convert_builtin_op(name)
-            && matches!(op, ConvertOp::ParseInt | ConvertOp::ParseFloat)
+            && is_parse(op)
         {
-            // `parseInt`/`parseFloat` read their arguments from the array.
-            let array = self.fresh();
-            let arg = |i: f64| IrNode::Index {
-                obj: Box::new(IrNode::Local(array)),
-                index: Box::new(IrNode::Num(i)),
-            };
-            let read = [0.0, 1.0]
-                .into_iter()
-                .take(convert_arity(op))
-                .map(arg)
-                .collect();
-            Ok(seq_then(
-                vec![IrNode::Assign {
-                    local: array,
-                    value: args,
-                }],
-                convert_call(op, false, read),
-            ))
+            Ok(self.lower_spread_parse(name, op, args))
         } else {
             Ok(IrNode::CallSpread {
                 target: SpreadCallee::Indirect(
@@ -1102,6 +1105,52 @@ impl LowerCtx<'_> {
                 args,
             })
         }
+    }
+
+    /// Lower a spread `parseInt(...a)` / `parseFloat(...a)` call over the
+    /// argument array `args`.
+    fn lower_spread_parse(&mut self, name: &str, op: ConvertOp, args: Box<IrNode>) -> IrNode {
+        // `parseInt`/`parseFloat` read their arguments from the array;
+        // unsealed, a user value stored on the global object is called
+        // instead (see [`Self::user_global`]).
+        let (mut seq, guard) = if self.shared.globals.sealed(name) {
+            (Vec::new(), None)
+        } else {
+            let (seq, has, callee) = self.user_global(name);
+            (seq, Some((has, callee)))
+        };
+        let array = self.fresh();
+        let arg = |i: f64| IrNode::Index {
+            obj: Box::new(IrNode::Local(array)),
+            index: Box::new(IrNode::Num(i)),
+        };
+        let read = [0.0, 1.0]
+            .into_iter()
+            .take(convert_arity(op))
+            .map(arg)
+            .collect();
+        seq.push(IrNode::Assign {
+            local: array,
+            value: args,
+        });
+        let builtin = convert_call(op, false, read);
+        seq_then(
+            seq,
+            match guard {
+                Some((has, callee)) => ternary(
+                    IrNode::Local(has),
+                    IrNode::CallSpread {
+                        target: SpreadCallee::Indirect(
+                            Box::new(IrNode::Local(callee)),
+                            CalleeError::not_a_function(name),
+                        ),
+                        args: Box::new(IrNode::Local(array)),
+                    },
+                    builtin,
+                ),
+                None => builtin,
+            },
+        )
     }
 
     /// Lower a spread method call `obj.m(...args)` / `obj[k](...args)` (the
@@ -1862,30 +1911,79 @@ impl LowerCtx<'_> {
     }
 
     /// Build the Error instance `<kind>(args)` / `new <kind>(args)` constructs:
-    /// the first argument is the message (see [`Self::lower_error_object`]);
-    /// surplus arguments are evaluated after it, left to right, for their side
-    /// effects only.
+    /// the first argument is the message (see [`Self::lower_error_object`]),
+    /// the second the options whose `cause` the instance installs (see
+    /// [`IrNode::install_error_cause`]); surplus arguments are evaluated after
+    /// them, left to right, for their side effects only.
     fn lower_error_construct(&mut self, kind: ErrorKind, args: Vec<IrNode>) -> IrNode {
         let mut args = args.into_iter();
         let mut message = args.next();
+        let options = args.next();
         let extra: Vec<IrNode> = args.collect();
-        if extra.is_empty() {
+        if options.is_none() {
             return self.lower_error_object(kind, message);
         }
-        // A non-literal message is evaluated into a temp before the surplus
-        // arguments run.
-        let head = message
-            .take_if(|message| !matches!(message, IrNode::Str(_) | IrNode::Undefined))
-            .map(|value| {
-                let local = self.fresh();
-                message = Some(IrNode::Local(local));
-                IrNode::Assign {
-                    local,
-                    value: Box::new(value),
-                }
-            });
+        // A non-literal message or options value is evaluated into a temp
+        // before the arguments after it run; a literal options value is a
+        // primitive, so it installs no cause.
+        let mut head = Vec::new();
+        if let Some(value) = message.take_if(|message| !is_literal(message)) {
+            message = Some(self.spill(&mut head, value));
+        }
+        let options = options
+            .filter(|options| !is_literal(options))
+            .map(|value| self.spill(&mut head, value));
+        head.extend(extra);
         let error = self.lower_error_object(kind, message);
-        IrNode::Seq(head.into_iter().chain(extra).chain([error]).collect())
+        let error = match options {
+            Some(options) => {
+                let (obj, scratch) = (self.fresh(), self.fresh());
+                IrNode::install_error_cause(error, options, obj, scratch)
+            }
+            None => error,
+        };
+        if head.is_empty() {
+            return error;
+        }
+        IrNode::Seq(head.into_iter().chain([error]).collect())
+    }
+
+    /// The callee reference of an unsealed `parseInt`/`parseFloat` call,
+    /// resolved before its arguments run: the statements setting local `has`
+    /// to whether the global object has the property `name` (only a value
+    /// the program stored: these builtins are not global properties) and
+    /// local `callee` to that value.
+    fn user_global(&mut self, name: &str) -> (Vec<IrNode>, u32, u32) {
+        let (has, callee) = (self.fresh(), self.fresh());
+        let seq = vec![
+            IrNode::Assign {
+                local: has,
+                value: Box::new(IrNode::ObjectHas {
+                    key: Box::new(IrNode::Str(name.to_owned())),
+                    obj: Box::new(IrNode::Intrinsic(GlobalIntrinsic::Global)),
+                }),
+            },
+            IrNode::Assign {
+                local: callee,
+                value: Box::new(ternary(
+                    IrNode::Local(has),
+                    self.global_read(name),
+                    IrNode::Undefined,
+                )),
+            },
+        ];
+        (seq, has, callee)
+    }
+
+    /// Append the evaluation of `value` into a fresh temp to `head`; yields
+    /// the temp's read.
+    fn spill(&mut self, head: &mut Vec<IrNode>, value: IrNode) -> IrNode {
+        let local = self.fresh();
+        head.push(IrNode::Assign {
+            local,
+            value: Box::new(value),
+        });
+        IrNode::Local(local)
     }
 
     /// Build the Error instance `new <kind>(message)` / `<kind>(message)`
@@ -2101,6 +2199,29 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
     }
+}
+
+/// `cond ? then_branch : else_branch`.
+fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(cond),
+        then_branch: Box::new(then_branch),
+        else_branch: Box::new(else_branch),
+    }
+}
+
+/// Whether `op` is `parseInt` / `parseFloat` (not global values, so never
+/// reachable through the global object unless the program stores one).
+fn is_parse(op: ConvertOp) -> bool {
+    matches!(op, ConvertOp::ParseInt | ConvertOp::ParseFloat)
+}
+
+/// Whether `node` is a literal primitive (no side effects, no object).
+fn is_literal(node: &IrNode) -> bool {
+    matches!(
+        node,
+        IrNode::Num(_) | IrNode::Str(_) | IrNode::Bool(_) | IrNode::Null | IrNode::Undefined
+    )
 }
 
 /// `seq` (evaluated for its effects) then `last`, the value.

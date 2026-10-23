@@ -298,6 +298,9 @@ struct CaptureResolver {
     /// (`false` for `const`). Collected before the walk so a forward reference
     /// from a closure resolves to a module binding.
     top_bindings: HashMap<String, bool>,
+    /// The ids of function-scoped var bindings (parameters, `var`s, function
+    /// declarations), mirroring [`Frame::var_ids`].
+    var_ids: std::collections::HashSet<u32>,
 }
 
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
@@ -461,6 +464,27 @@ struct Frame {
     /// The kind of the generator/async body this (`env_backed`) frame lowers,
     /// `None` for every other frame.
     machine: Option<Machine>,
+    /// The ids of this function's var-scoped bindings (parameters, `var`s and
+    /// function declarations): a `var` redeclaring one reuses it rather than
+    /// declaring a fresh binding (DESIGN.md §7.4).
+    var_ids: std::collections::HashSet<u32>,
+    /// The parameter names and ids of this function when its list has
+    /// parameter expressions, else empty (see [`LowerCtx::bind_var_copies`]).
+    params: Vec<(String, u32)>,
+    /// While this frame's parameters are being bound: the ids still in their
+    /// TDZ (empty for a list without parameter expressions, which cannot
+    /// observe it), and whether a destructured or rest name binds its
+    /// pre-declared local (see [`LowerCtx::bind_params`]).
+    binding: Option<ParamBinding>,
+}
+
+/// The in-progress parameter binding of a [`Frame`].
+struct ParamBinding {
+    /// Whether the list has parameter expressions: a captured parameter's
+    /// cell then holds the TDZ hole until its binding initializes it.
+    tdz: bool,
+    /// The parameter ids not yet initialized.
+    pending: std::collections::HashSet<u32>,
 }
 
 /// A derived constructor's `super(..)` bookkeeping (see [`Frame::ctor`]).
@@ -543,6 +567,9 @@ struct LowerCtx<'a> {
     /// While lowering `static` field initializers: the class frame and the
     /// hidden id of the class value, which `this` resolves to there.
     static_init: Option<(usize, u32)>,
+    /// Whether a `var` declaration's pattern is being bound (see
+    /// [`LowerCtx::var_redeclaration`]).
+    binding_var: bool,
 }
 
 mod arity;
