@@ -215,6 +215,7 @@ pub(super) fn emit_builtin(
         | Builtin::ArrayJoin
         | Builtin::ArraySlice
         | Builtin::ArrayToString
+        | Builtin::ArrayToLocaleString
         | Builtin::ArrayOf
         | Builtin::ArrayFrom
         | Builtin::ArrayAt
@@ -311,6 +312,7 @@ fn emit_array_family(
         Builtin::ArrayJoin => array::emit_join(f, frame, strings, helpers),
         Builtin::ArraySlice => array::emit_slice(f, frame, strings, helpers),
         Builtin::ArrayToString => array::emit_to_string(f, frame, strings, helpers),
+        Builtin::ArrayToLocaleString => array::emit_to_locale_string(f, frame, strings, helpers),
         Builtin::ArrayOf => array::emit_of(f, frame, strings, helpers),
         Builtin::ArrayFrom => array::emit_from(f, frame, strings, helpers),
         Builtin::ArrayAt => array::emit_at(f, frame, strings, helpers),

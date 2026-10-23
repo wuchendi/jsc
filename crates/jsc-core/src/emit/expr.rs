@@ -1093,6 +1093,18 @@ pub(super) fn emit_proto_guard(
     }
     for (kind, path) in fast {
         emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
+        if matches!(path, IrNode::ArrayPush { .. }) {
+            // An array already `2^32 - 1` long takes the builtin, which sets
+            // the non-index key and throws the RangeError on `length`.
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            function.instruction(&Instruction::LocalGet(scratch + 3));
+            function.instruction(&Instruction::I32Load(array_len_slot()));
+            function.instruction(&Instruction::I32Const(-1));
+            function.instruction(&Instruction::I32Ne);
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::End);
+        }
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
         emit_node(path, function, scratch, strings, helpers);

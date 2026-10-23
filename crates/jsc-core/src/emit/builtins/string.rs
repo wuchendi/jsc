@@ -45,6 +45,8 @@ fn coercions(op: StringOp) -> [Coerce; 2] {
         }
         StringOp::ToUpperCase
         | StringOp::ToLowerCase
+        | StringOp::ToLocaleUpperCase
+        | StringOp::ToLocaleLowerCase
         | StringOp::Trim
         | StringOp::TrimStart
         | StringOp::TrimEnd
@@ -71,6 +73,8 @@ fn may_refuse(op: StringOp, args: &[IrNode]) -> bool {
     match op {
         StringOp::ToUpperCase
         | StringOp::ToLowerCase
+        | StringOp::ToLocaleUpperCase
+        | StringOp::ToLocaleLowerCase
         | StringOp::Trim
         | StringOp::TrimStart
         | StringOp::TrimEnd
@@ -177,6 +181,8 @@ fn texts(op: StringOp) -> Texts {
         StringOp::Slice => texts!("slice"),
         StringOp::ToUpperCase => texts!("toUpperCase"),
         StringOp::ToLowerCase => texts!("toLowerCase"),
+        StringOp::ToLocaleUpperCase => texts!("toLocaleUpperCase"),
+        StringOp::ToLocaleLowerCase => texts!("toLocaleLowerCase"),
         StringOp::CharAt => texts!("charAt"),
         StringOp::Trim => texts!("trim"),
         StringOp::TrimStart => texts!("trimStart"),
@@ -204,12 +210,14 @@ fn texts(op: StringOp) -> Texts {
 }
 
 /// Every op of this family.
-const OPS: [StringOp; 28] = [
+const OPS: [StringOp; 30] = [
     StringOp::IndexOf,
     StringOp::Includes,
     StringOp::Slice,
     StringOp::ToUpperCase,
     StringOp::ToLowerCase,
+    StringOp::ToLocaleUpperCase,
+    StringOp::ToLocaleLowerCase,
     StringOp::CharAt,
     StringOp::Trim,
     StringOp::TrimStart,
