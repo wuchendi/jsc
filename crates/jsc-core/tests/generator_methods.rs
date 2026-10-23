@@ -214,3 +214,22 @@ fn computed_generator_class_methods_stay_rejected() {
         "computed class method names are not supported",
     );
 }
+
+#[test]
+fn a_line_terminator_after_async_in_a_method_is_a_syntax_error() {
+    for src in [
+        "({ async\n foo(){} });",
+        "({ async /* c */\r *foo(){} });",
+        "({ async /*\u{2028}*/ foo(){} });",
+    ] {
+        assert_compile_error(src, "line terminator");
+    }
+    // A line break before `async`, or none at all, is fine; in a class body
+    // `async` followed by a line break is a field named `async`.
+    assert_output(
+        "class C { static\n async foo(){ return 1; } } const o = { async\tbar(){ return 2; } };
+         class D { async\n baz(){ return 3; } }
+         C.foo().then(v => o.bar().then(w => console.log(v, w, 'async' in new D(), new D().baz())));",
+        "1 2 true 3\n",
+    );
+}
