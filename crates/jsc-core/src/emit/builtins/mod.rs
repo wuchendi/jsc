@@ -83,6 +83,9 @@ impl Frame {
             (2, ValType::I32),
             (1, ValType::F64),
             (1, ValType::I64),
+            (6, ValType::I64),
+            (4, ValType::I32),
+            (2, ValType::F64),
         ])
     }
 
@@ -140,6 +143,21 @@ impl Frame {
     fn f64(self, n: u32) -> u32 {
         self.scratch() + 34 + n
     }
+
+    /// Further i64 temp `n` (`0..6`), past the [`Self::arg`] temp.
+    fn y64(self, n: u32) -> u32 {
+        self.scratch() + 36 + n
+    }
+
+    /// Further i32 temp `n` (`0..4`).
+    fn y32(self, n: u32) -> u32 {
+        self.scratch() + 42 + n
+    }
+
+    /// Further f64 temp `n` (`0..2`).
+    fn yf64(self, n: u32) -> u32 {
+        self.scratch() + 46 + n
+    }
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -190,6 +208,14 @@ pub(super) fn emit_builtin(
         Builtin::ArrayJoin => array::emit_join(&mut f, frame, strings, helpers),
         Builtin::ArraySlice => array::emit_slice(&mut f, frame, strings, helpers),
         Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),
+        Builtin::ArrayOf => array::emit_of(&mut f, frame, strings, helpers),
+        Builtin::ArrayFrom => array::emit_from(&mut f, frame, strings, helpers),
+        Builtin::ArrayAt => array::emit_at(&mut f, frame, strings, helpers),
+        Builtin::ArrayFind(op) => array::emit_find(op, &mut f, frame, strings, helpers),
+        Builtin::ArrayReduceRight => array::emit_reduce_right(&mut f, frame, strings, helpers),
+        Builtin::ArrayLastIndexOf => array::emit_last_index_of(&mut f, frame, strings, helpers),
+        Builtin::ArrayConcat => array::emit_concat(&mut f, frame, strings, helpers),
+        Builtin::ArrayFlat { map } => array::emit_flat(map, &mut f, frame, strings, helpers),
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
