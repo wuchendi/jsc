@@ -175,6 +175,11 @@ pub(super) fn emit_builtin(
         Builtin::HasOwnProperty => object::emit_has_own_property(&mut f, frame, strings, helpers),
         Builtin::ObjectToString => object::emit_to_string(&mut f, frame, strings),
         Builtin::ValueOf => object::emit_value_of(&mut f, frame, strings, helpers),
+        Builtin::IsPrototypeOf => object::emit_is_prototype_of(&mut f, frame, strings, helpers),
+        Builtin::PropertyIsEnumerable => {
+            object::emit_property_is_enumerable(&mut f, frame, strings, helpers);
+        }
+        Builtin::ToLocaleString => object::emit_to_locale_string(&mut f, frame, strings, helpers),
         Builtin::ObjectReflect(op) => object_static::emit(op, &mut f, frame, strings, helpers),
         Builtin::Call => function::emit_call(&mut f, frame, strings, helpers),
         Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),

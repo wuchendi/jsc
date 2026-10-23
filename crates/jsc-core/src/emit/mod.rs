@@ -497,7 +497,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 16] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 20] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -561,6 +561,22 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 16] = [
         PROP_THROW_ARRAY_INTEGRITY,
         "Cannot ",
         " an array: array integrity levels are unsupported",
+    ),
+    (
+        PROP_THROW_PROTO_TYPE,
+        "Object prototype may only be an Object or null: ",
+        "",
+    ),
+    (
+        PROP_THROW_PROTO_NOT_EXTENSIBLE,
+        "#<Object> is not extensible",
+        "",
+    ),
+    (PROP_THROW_PROTO_CYCLE, "Cyclic __proto__ value", ""),
+    (
+        PROP_THROW_PROTO_IMMUTABLE,
+        "Immutable prototype object 'Object.prototype' cannot have their prototype set",
+        "",
     ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
@@ -628,6 +644,18 @@ const PROP_THROW_ARRAY_DEFINE: i32 = 17;
 /// `__prop_throw`'s `mode` argument: `preventExtensions` / `seal` / `freeze`
 /// (the `key`) of an array, which cannot take an integrity level yet.
 const PROP_THROW_ARRAY_INTEGRITY: i32 = 18;
+/// `__prop_throw`'s `mode` argument: a prototype (the `key`) that is neither
+/// an object nor `null`.
+const PROP_THROW_PROTO_TYPE: i32 = 19;
+/// `__prop_throw`'s `mode` argument: `[[SetPrototypeOf]]` of a non-extensible
+/// object (the `key` is the empty string).
+const PROP_THROW_PROTO_NOT_EXTENSIBLE: i32 = 20;
+/// `__prop_throw`'s `mode` argument: `[[SetPrototypeOf]]` that would close a
+/// prototype cycle (the `key` is the empty string).
+const PROP_THROW_PROTO_CYCLE: i32 = 21;
+/// `__prop_throw`'s `mode` argument: `[[SetPrototypeOf]]` of the immutable
+/// `%Object.prototype%` (the `key` is the empty string).
+const PROP_THROW_PROTO_IMMUTABLE: i32 = 22;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
@@ -1089,6 +1117,16 @@ impl Helpers<'_> {
         self.to_primitive() + 13
     }
 
+    /// `__own_enum(obj, key) -> i32` (see [`props::emit_own_enum`]).
+    fn own_enum(self) -> u32 {
+        self.to_primitive() + 14
+    }
+
+    /// `__set_proto(o, proto) -> i32` (see [`props::emit_set_proto`]).
+    fn set_proto(self) -> u32 {
+        self.to_primitive() + 15
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1530,6 +1568,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_own_desc(&offsets, helpers));
     code.function(&emit_set_integrity(&offsets, helpers));
     code.function(&emit_test_integrity());
+    code.function(&emit_own_enum(&offsets, helpers));
+    code.function(&emit_set_proto(helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

@@ -11,7 +11,9 @@
 //! - `__own_desc` (`FromPropertyDescriptor` of `[[GetOwnProperty]]`) builds
 //!   the descriptor object of an own property;
 //! - `__set_integrity` / `__test_integrity` back `preventExtensions` / `seal`
-//!   / `freeze` and `isExtensible` / `isSealed` / `isFrozen`.
+//!   / `freeze` and `isExtensible` / `isSealed` / `isFrozen`;
+//! - `__own_enum` tests for an own enumerable property (`Object.assign`,
+//!   `propertyIsEnumerable`), and `__set_proto` is `[[SetPrototypeOf]]`.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -99,7 +101,12 @@ fn emit_flag(function: &mut Function, local: u32, mask: i32) {
 /// Push `SameValue` of the jsvals in i64 locals `a` and `b` as an i32: two
 /// numbers by bits (so `+0` and `-0` differ) or both `NaN`; anything else
 /// by `__same_value_zero` (strings by content, the rest by identity).
-fn emit_same_value(function: &mut Function, a: u32, b: u32, helpers: Helpers<'_>) {
+pub(in crate::emit) fn emit_same_value(
+    function: &mut Function,
+    a: u32,
+    b: u32,
+    helpers: Helpers<'_>,
+) {
     emit_is_number(function, a);
     emit_is_number(function, b);
     wasm!(function;
@@ -667,5 +674,80 @@ pub(in crate::emit) fn emit_test_integrity() -> Function {
         );
     });
     wasm!(f; End, I32Const(1), End);
+    f
+}
+
+/// `__own_enum(obj: i64, key: i32) -> i32`: whether the object `obj` has an
+/// own enumerable property `key` (an interned key, `0` = absent): an array's
+/// `length` is not enumerable and its present elements (holes are absent)
+/// are; any other key is its table entry's `E` (a `LAZY` function is
+/// materialized by the lookup).
+pub(in crate::emit) fn emit_own_enum(
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) -> Function {
+    let mut f = Function::new(vec![(2, ValType::I32)]);
+    let (obj, key, o, i) = (0, 1, 2, 3);
+    wasm!(f;
+        LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(key), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
+        If(BlockType::Empty),
+        LocalGet(key), Call(helpers.index_value), LocalTee(i),
+        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
+        If(BlockType::Empty), I32Const(0), Return, End,
+    );
+    emit_elem_load(&mut f, o, i, helpers.sparse_get());
+    wasm!(f;
+        I64Const(HOLE_BITS), I64Ne, Return,
+        End,
+        End,
+        LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(i),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(i), I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And, I32Const(0), I32Ne,
+        Else, I32Const(0), End,
+        End,
+    );
+    f
+}
+
+/// `__set_proto(o: i32, proto: i64) -> i32`: `OrdinarySetPrototypeOf`
+/// (ECMA-262 10.1.2.1) of the object-family block `o` to `proto` (an object
+/// or `null`). Returns `0` when the prototype is set (or already is
+/// `proto`), else the `__prop_throw` mode of the rejection (nothing changed):
+/// [`PROP_THROW_PROTO_IMMUTABLE`] for `%Object.prototype%` (an immutable
+/// prototype exotic object), [`PROP_THROW_PROTO_NOT_EXTENSIBLE`] for a
+/// non-extensible object, [`PROP_THROW_PROTO_CYCLE`] when `o` is on
+/// `proto`'s chain. A watched intrinsic sets its dirty bit.
+pub(in crate::emit) fn emit_set_proto(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
+    let (o, proto, p, t) = (0, 1, 2, 3);
+    let object_prototype = intrinsic_bits(Intrinsic::ObjectPrototype, helpers);
+    wasm!(f;
+        LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalGet(proto), I64Eq,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(o), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, I64Const(object_prototype), I64Eq,
+        If(BlockType::Empty), I32Const(PROP_THROW_PROTO_IMMUTABLE), Return, End,
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+        If(BlockType::Empty), I32Const(PROP_THROW_PROTO_NOT_EXTENSIBLE), Return, End,
+        LocalGet(proto), LocalSet(p),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(p), I64Const(NULL_BITS), I64Eq, BrIf(1),
+        LocalGet(p), I32WrapI64, LocalGet(o), I32Eq,
+        If(BlockType::Empty), I32Const(PROP_THROW_PROTO_CYCLE), Return, End,
+        LocalGet(p), I32WrapI64, I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(p),
+        Br(0),
+        End, End,
+        LocalGet(o), LocalGet(proto), I64Store(m64(OBJ_PROTO_OFFSET)),
+    );
+    if helpers.dirty_tracking {
+        wasm!(f; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(t), If(BlockType::Empty));
+        emit_mark_dirty(&mut f, t);
+        wasm!(f; End);
+    }
+    wasm!(f; I32Const(0), End);
     f
 }

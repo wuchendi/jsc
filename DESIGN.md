@@ -771,6 +771,14 @@ tables. Keys are interned `u32`s.
   materialized first, and an array throws (`Cannot freeze an array: …`).
   `__test_integrity(obj, level)` is `IsExtensible` (level `0`) or
   `TestIntegrityLevel`.
+- **Prototypes.** `__set_proto(o, proto)` is `OrdinarySetPrototypeOf`: the
+  same `proto` succeeds; `%Object.prototype%` (an immutable prototype exotic
+  object), a non-extensible object, and a `proto` whose chain reaches `o`
+  are rejected (it returns the `__prop_throw` mode; the caller throws); a
+  watched intrinsic sets its dirty bit. `__own_enum(obj, key)` tests for an
+  own enumerable property (an array's `length` is not enumerable, its
+  present elements are), backing `Object.assign` and
+  `propertyIsEnumerable`.
 - **Own-key order** (`__own_keys(obj, mode)`, behind `Object.keys/values/entries`,
   `JSON.stringify`, object rest, and the renderers): integer keys ascending
   (array elements skipping holes, then table keys flagged `ARRAY_INDEX` sorted
@@ -839,7 +847,8 @@ unresolvable name throws `ReferenceError` (strict).
   called through its value; then `K` covers the widest call (§4.2).
 
 **Dirty bits.** `$__intrinsics_dirty` has one bit per watched intrinsic, set by
-`__set` / `__define` / `__delete` / `__define_own` / `__set_integrity` on a
+`__set` / `__define` / `__delete` / `__define_own` / `__set_integrity` /
+`__set_proto` on a
 table flagged `WATCHED` (the table's
 byte 3 holds the bit index) when the program tests any bit; bits are never
 cleared. Bits: `0` `%Object.prototype%`, `1` `%Array.prototype%`, `2`
@@ -1235,7 +1244,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 |---|---|
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
 | `console` | `log` |
-| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`); `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
+| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over what `for-of` iterates); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf` |
 | `Function` | `Function.prototype.call`, `apply`; `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`; `push` / `pop` (variadic, generic over array-likes), `map`, `filter`, `forEach`, `reduce` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `indexOf`, `includes`, `join`, `slice`, `toString` |
 | `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
@@ -1493,8 +1502,10 @@ Each item below is current behaviour of this tree.
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
-- The builtin library is exactly §7.9: no prototype reflection
-  (`getPrototypeOf`, `create`, `assign`), no `Function.prototype.bind`, no `Array.from`, `sort`, `find`,
+- The builtin library is exactly §7.9: no `Object.prototype.__proto__`
+  accessor (`o.__proto__` reads and writes an ordinary property; its setter
+  would need `K >= 1` in programs without calls), no
+  `Function.prototype.bind`, no `Array.from`, `sort`, `find`,
   `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
 - `parseInt` and `parseFloat` exist only as direct calls, not as global values.
@@ -1516,8 +1527,10 @@ Each item below is current behaviour of this tree.
   new index without all of `writable`/`enumerable`/`configurable` true), and
   `preventExtensions` / `seal` / `freeze` of any array throw a `TypeError`.
   So a `JSON.parse` reviver cannot meet a non-configurable array element.
-- `Object.defineProperties` reads the enumerable own keys of its
-  `Properties` argument once, before reading any descriptor.
+- `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
+  enumerable own keys of its `Properties` argument once, before reading any
+  descriptor. `Object.fromEntries` collects its iterable eagerly, like the
+  `Map`/`Set` constructors.
 - `.stack` on errors is `"Name: message"` with no frames.
 
 **Functions & classes**
