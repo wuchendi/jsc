@@ -451,6 +451,9 @@ struct Frame {
     /// class's instance fields ([`LowerCtx::class_fields`]) on entry;
     /// [`FnKind::DerivedClass`] for a derived one, whose `this` starts in the
     /// TDZ and is bound by `super(..)` (which also runs the instance fields).
+    /// [`FnKind::Generator`] for a generator or async function's constructor,
+    /// which binds the parameters: every binding it declares is a boxed cell,
+    /// so the body (a nested `env_backed` frame) shares it by reference.
     /// [`FnKind::Plain`] otherwise.
     ctor: FnKind,
     /// A derived constructor's `super(..)` bookkeeping.

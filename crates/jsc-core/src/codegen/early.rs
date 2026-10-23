@@ -7,7 +7,7 @@
 //!   the script's) top level it is var-scoped;
 //! - a parameter redeclared lexically in its function's body, a catch
 //!   parameter redeclared lexically in its block, and a duplicate parameter
-//!   of a generator, async function, or async arrow;
+//!   name of any function (every function is strict);
 //! - an `async function` declaration in statement position (`if (x) async
 //!   function f(){}`);
 //! - `await` (escaped or not) as an identifier inside an async body.
@@ -93,13 +93,12 @@ impl Checker {
     }
 
     /// Check and visit a function-like with parameter patterns `params` and
-    /// block `body`; `strict_params` rejects duplicate parameters.
+    /// block `body`, rejecting duplicate parameters.
     fn function<'a>(
         &mut self,
         params: impl Iterator<Item = &'a Pat>,
         body: Option<&FunctionBody>,
         is_async: bool,
-        strict_params: bool,
     ) {
         let outer_async = std::mem::replace(&mut self.in_async, is_async);
         let mut names = Vec::new();
@@ -107,12 +106,10 @@ impl Checker {
             pat.visit_with(self);
             pat_names(pat, &mut names);
         }
-        if strict_params {
-            let mut seen = std::collections::HashSet::new();
-            for (name, span) in &names {
-                if !seen.insert(name) {
-                    self.fail(*span, format!("duplicate parameter name `{name}`"));
-                }
+        let mut seen = std::collections::HashSet::new();
+        for (name, span) in &names {
+            if !seen.insert(name) {
+                self.fail(*span, format!("duplicate parameter name `{name}`"));
             }
         }
         if let Some(body) = body {
@@ -136,13 +133,7 @@ impl Checker {
 
 impl Visit for Checker {
     fn visit_function(&mut self, f: &Function) {
-        let strict = f.is_async || f.is_generator;
-        self.function(
-            f.params.iter().map(|p| &p.pat),
-            f.body.as_ref(),
-            f.is_async,
-            strict,
-        );
+        self.function(f.params.iter().map(|p| &p.pat), f.body.as_ref(), f.is_async);
     }
 
     fn visit_fn_expr(&mut self, f: &FnExpr) {
@@ -158,10 +149,10 @@ impl Visit for Checker {
     fn visit_arrow_expr(&mut self, a: &ArrowExpr) {
         match a.body.as_ref() {
             ArrowFunctionBody::FunctionBody(block) => {
-                self.function(a.params.iter(), Some(block), a.is_async, a.is_async);
+                self.function(a.params.iter(), Some(block), a.is_async);
             }
             ArrowFunctionBody::Expr(expr) => {
-                self.function(a.params.iter(), None, a.is_async, a.is_async);
+                self.function(a.params.iter(), None, a.is_async);
                 let outer_async = std::mem::replace(&mut self.in_async, a.is_async);
                 expr.visit_with(self);
                 self.in_async = outer_async;
@@ -174,7 +165,7 @@ impl Visit for Checker {
             ParamOrTsParamProp::Param(p) => Some(&p.pat),
             ParamOrTsParamProp::TsParamProp(_) => None,
         });
-        self.function(params, c.body.as_ref(), false, false);
+        self.function(params, c.body.as_ref(), false);
     }
 
     fn visit_block_stmt(&mut self, b: &BlockStmt) {

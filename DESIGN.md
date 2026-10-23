@@ -1194,11 +1194,14 @@ functions: a **constructor** that allocates a `TYPE_GENERATOR` handle and its
 frame without running the body, and a **state machine** `SM(sent, gen, …)` that
 resumes at `gen.state`. Every generator local lives in a frame cell, so locals
 survive suspension. The constructor is an ordinary lifted function value (not a
-constructor, so `new` throws a `TypeError`): it seeds the parameters' cells
-from its argument slots and a `this` cell from its call's receiver, and a
+constructor, so `new` throws a `TypeError`): it binds the parameters when
+called — defaults, destructuring and rest, exactly like an ordinary function,
+so a binding error throws from the call before any `next()` — into cells the
+body shares by reference, and seeds a `this` cell from its call's receiver. A
 binding the body captures from an enclosing function is a frame slot holding
 that function's own cell (read through the constructor's environment), so the
-capture is by reference and outlives the creating call. A named generator
+capture is by reference and outlives the creating call. `arguments` in the body
+is the constructor's (unmapped) arguments object, built at the call. A named generator
 expression binds its name, read-only, inside its body. The body is lowered to a control-flow
 graph of basic blocks (`codegen/generator.rs`); control flow crossing a suspend
 point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
@@ -1221,7 +1224,8 @@ control flow. A `yield` may appear inside a larger expression
 **`async`/`await`.** An `async function` (in every position a `function*` may
 take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
 function value is a wrapper that builds the generator and hands it to the host
-async driver (§6.7), returning the result promise. An `async` arrow keeps arrow
+async driver (§6.7), returning the result promise; a parameter binding error
+rejects that promise instead of throwing. An `async` arrow keeps arrow
 semantics: no `prototype`, not a constructor, and `arguments` / `new.target`
 are the enclosing function's. All generator control-flow support applies to `await`; a rejected
 awaited promise throws into the body at the `await`, so `try`/`catch` around
@@ -1544,9 +1548,7 @@ Each item below is current behaviour of this tree.
 
 **Generators & async**
 
-- No `async function*` (nor `async *m(){}` methods). Generator and async
-  parameters must be simple
-  identifiers, and their bodies cannot reference `arguments`.
+- No `async function*` (nor `async *m(){}` methods).
 - `yield*` is supported only as a statement; it does not thread sent values or
   the delegate's return value.
 - `return()` at a suspended `yield` in a body with a `finally` or a `yield*`,
