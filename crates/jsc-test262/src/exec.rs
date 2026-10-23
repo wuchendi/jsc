@@ -2,9 +2,8 @@
 //! batch of work out over a std-only worker pool.
 //!
 //! Each program is written to its own file under a scratch directory; jsc's
-//! stdout is discarded and its stderr goes to a sibling file (not a pipe, so a
-//! chatty child can never deadlock the runner). Both files are removed after
-//! the run.
+//! stdout and stderr go to sibling files (not pipes, so a chatty child can
+//! never deadlock the runner). All three files are removed after the run.
 
 use std::fs::{self, File};
 use std::io;
@@ -19,30 +18,54 @@ use crate::outcome::Status;
 /// Upper bound of the `try_wait` polling interval.
 const MAX_POLL: Duration = Duration::from_millis(20);
 
+/// How one run ended and what it printed (both streams lossily decoded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    /// Exit status.
+    pub status: Status,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+}
+
 /// Runs `jsc <dir>/<name>.js` on `program` and returns how it ended plus its
-/// stderr (lossily decoded). The child is killed and reaped after `timeout`.
+/// output. The child is killed and reaped after `timeout`.
 pub fn run(
     jsc: &Path,
     dir: &Path,
     name: &str,
     program: &str,
     timeout: Duration,
-) -> io::Result<(Status, String)> {
+) -> io::Result<Output> {
     let src = dir.join(format!("{name}.js"));
+    let out = dir.join(format!("{name}.stdout"));
     let err = dir.join(format!("{name}.stderr"));
     fs::write(&src, program)?;
-    let result = spawn_and_wait(jsc, &src, &err, timeout);
-    let stderr = fs::read(&err).map(|b| String::from_utf8_lossy(&b).into_owned());
-    let _ = fs::remove_file(&src);
-    let _ = fs::remove_file(&err);
-    Ok((result?, stderr?))
+    let result = spawn_and_wait(jsc, &src, &out, &err, timeout);
+    let read = |p: &Path| fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned());
+    let (stdout, stderr) = (read(&out), read(&err));
+    for p in [&src, &out, &err] {
+        let _ = fs::remove_file(p);
+    }
+    Ok(Output {
+        status: result?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
 }
 
-fn spawn_and_wait(jsc: &Path, src: &Path, err: &Path, timeout: Duration) -> io::Result<Status> {
+fn spawn_and_wait(
+    jsc: &Path,
+    src: &Path,
+    out: &Path,
+    err: &Path,
+    timeout: Duration,
+) -> io::Result<Status> {
     let mut child = Command::new(jsc)
         .arg(src)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(File::create(out)?)
         .stderr(File::create(err)?)
         .spawn()?;
     let start = Instant::now();
@@ -106,18 +129,32 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_and_stderr() -> io::Result<()> {
+    fn exit_codes_and_output() -> io::Result<()> {
         let dir = scratch("codes")?;
         let sh = Path::new("/bin/sh");
         let long = Duration::from_secs(10);
         let ok = run(sh, &dir, "a", "exit 0", long)?;
-        let fail = run(sh, &dir, "b", "echo 'Error: Uncaught x' >&2; exit 3", long)?;
+        let fail = run(
+            sh,
+            &dir,
+            "b",
+            "echo out; echo 'Error: Uncaught x' >&2; exit 3",
+            long,
+        )?;
         let sig = run(sh, &dir, "c", "kill -9 $$", long)?;
         let left = fs::read_dir(&dir)?.count();
         fs::remove_dir_all(&dir)?;
-        assert_eq!(ok, (Status::Exited(0), String::new()));
-        assert_eq!(fail, (Status::Exited(3), "Error: Uncaught x\n".to_owned()));
-        assert_eq!(sig.0, Status::Signaled);
+        let output = |status, stdout: &str, stderr: &str| Output {
+            status,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        };
+        assert_eq!(ok, output(Status::Exited(0), "", ""));
+        assert_eq!(
+            fail,
+            output(Status::Exited(3), "out\n", "Error: Uncaught x\n")
+        );
+        assert_eq!(sig.status, Status::Signaled);
         assert_eq!(left, 0, "scratch files must be removed");
         Ok(())
     }
@@ -134,7 +171,7 @@ mod tests {
             Duration::from_millis(100),
         );
         fs::remove_dir_all(&dir)?;
-        assert_eq!(r?.0, Status::TimedOut);
+        assert_eq!(r?.status, Status::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(4));
         Ok(())
     }
