@@ -258,6 +258,20 @@ pub(super) enum Builtin {
         /// `flatMap`: map each top-level element first.
         map: bool,
     },
+    /// `Array.prototype.splice`.
+    ArraySplice,
+    /// `Array.prototype.sort`.
+    ArraySort,
+    /// `Array.prototype.reverse`.
+    ArrayReverse,
+    /// `Array.prototype.shift`.
+    ArrayShift,
+    /// `Array.prototype.unshift`.
+    ArrayUnshift,
+    /// `Array.prototype.fill`.
+    ArrayFill,
+    /// `Array.prototype.copyWithin`.
+    ArrayCopyWithin,
     /// A `String.prototype` method backed by a host `__method` op.
     StringMethod(StringOp),
     /// `String.prototype.toString`.
@@ -432,7 +446,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 129] = [
+    pub(super) const ALL: [Builtin; 136] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -504,6 +518,13 @@ impl Builtin {
         Self::ArrayConcat,
         Self::ArrayFlat { map: false },
         Self::ArrayFlat { map: true },
+        Self::ArraySplice,
+        Self::ArraySort,
+        Self::ArrayReverse,
+        Self::ArrayShift,
+        Self::ArrayUnshift,
+        Self::ArrayFill,
+        Self::ArrayCopyWithin,
         Self::StringMethod(StringOp::IndexOf),
         Self::StringMethod(StringOp::Includes),
         Self::StringMethod(StringOp::Slice),
@@ -665,6 +686,13 @@ impl Builtin {
             Self::ArrayConcat => "concat",
             Self::ArrayFlat { map: false } => "flat",
             Self::ArrayFlat { map: true } => "flatMap",
+            Self::ArraySplice => "splice",
+            Self::ArraySort => "sort",
+            Self::ArrayReverse => "reverse",
+            Self::ArrayShift => "shift",
+            Self::ArrayUnshift => "unshift",
+            Self::ArrayFill => "fill",
+            Self::ArrayCopyWithin => "copyWithin",
             Self::IsNaN => "isNaN",
             Self::IsFinite => "isFinite",
         }
@@ -698,12 +726,16 @@ impl Builtin {
             | Self::ArrayPop
             | Self::ArrayOf
             | Self::ArrayFlat { map: false }
+            | Self::ArrayReverse
+            | Self::ArrayShift
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow)
             | Self::Apply
             | Self::JsonParse
             | Self::ArraySlice
+            | Self::ArraySplice
+            | Self::ArrayCopyWithin
             | Self::CollectionOp { op: MapOp::Set, .. }
             | Self::PromiseThen => 2,
             Self::HasOwnProperty
@@ -727,6 +759,9 @@ impl Builtin {
             | Self::ArrayLastIndexOf
             | Self::ArrayConcat
             | Self::ArrayFlat { map: true }
+            | Self::ArraySort
+            | Self::ArrayUnshift
+            | Self::ArrayFill
             | Self::NumberToString
             | Self::IsNaN
             | Self::IsFinite
@@ -760,7 +795,14 @@ impl Builtin {
             | Self::ArrayReduceRight
             | Self::ArrayLastIndexOf
             | Self::ArrayConcat
-            | Self::ArrayFlat { .. } => Some(BuiltinCtor::Array),
+            | Self::ArrayFlat { .. }
+            | Self::ArraySplice
+            | Self::ArraySort
+            | Self::ArrayReverse
+            | Self::ArrayShift
+            | Self::ArrayUnshift
+            | Self::ArrayFill
+            | Self::ArrayCopyWithin => Some(BuiltinCtor::Array),
             Self::StringMethod(_) | Self::StringToString | Self::StringValueOf => {
                 Some(BuiltinCtor::String)
             }

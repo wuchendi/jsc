@@ -1220,7 +1220,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
-| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString` — every method generic over array-likes; `map` / `filter` / `slice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
+| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin` — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
 | `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.prototype.toString(radix)`, `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `min`, `max` (variadic), `pow`; `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
@@ -1478,8 +1478,7 @@ Each item below is current behaviour of this tree.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9: no property-descriptor or prototype
   reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Array.prototype.sort`,
-  `splice`, `keys`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
+  `assign`), no `Array.prototype.keys` / `values` / `entries`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
 - `parseInt` and `parseFloat` exist only as direct calls, not as global values.
 
@@ -1498,7 +1497,11 @@ Each item below is current behaviour of this tree.
   that is neither an array-like source nor a runtime iterable as an array-like
   (user `@@iterator` waits for `Symbol`).
 - Array-like lengths are clamped to `2^32 - 1` by the generic `Array.prototype`
-  loops (`at` and `push` use the full `ToLength` range).
+  loops (`at`, `push` and the mutating `splice`, `sort`, `reverse`, `shift`,
+  `unshift`, `fill`, `copyWithin` use the full `ToLength` range).
+- `sort` without a comparator orders by the byte order of the UTF-8
+  `ToString` keys (code-point order), which differs from the specified UTF-16
+  code-unit order only between astral characters and `U+E000`..`U+FFFF`.
 - Generator functions have no `prototype` property; generator objects inherit
   `%GeneratorPrototype%` directly.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;

@@ -86,6 +86,7 @@ impl Frame {
             (6, ValType::I64),
             (4, ValType::I32),
             (2, ValType::F64),
+            (6, ValType::F64),
         ])
     }
 
@@ -158,6 +159,11 @@ impl Frame {
     fn yf64(self, n: u32) -> u32 {
         self.scratch() + 46 + n
     }
+
+    /// Further f64 temp `n` (`0..6`).
+    fn zf64(self, n: u32) -> u32 {
+        self.scratch() + 48 + n
+    }
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -216,6 +222,13 @@ pub(super) fn emit_builtin(
         Builtin::ArrayLastIndexOf => array::emit_last_index_of(&mut f, frame, strings, helpers),
         Builtin::ArrayConcat => array::emit_concat(&mut f, frame, strings, helpers),
         Builtin::ArrayFlat { map } => array::emit_flat(map, &mut f, frame, strings, helpers),
+        Builtin::ArraySplice => array::emit_splice(&mut f, frame, strings, helpers),
+        Builtin::ArraySort => array::emit_sort(&mut f, frame, strings, helpers),
+        Builtin::ArrayReverse => array::emit_reverse(&mut f, frame, strings, helpers),
+        Builtin::ArrayShift => array::emit_shift(&mut f, frame, strings, helpers),
+        Builtin::ArrayUnshift => array::emit_unshift(&mut f, frame, strings, helpers),
+        Builtin::ArrayFill => array::emit_fill(&mut f, frame, strings, helpers),
+        Builtin::ArrayCopyWithin => array::emit_copy_within(&mut f, frame, strings, helpers),
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
