@@ -36,9 +36,11 @@ mod object;
 mod promise;
 mod string;
 
+use crate::emit::realm::ArrayCopyOp;
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
-pub(super) use string::host_ready_args;
+use number::NumberFormat;
+pub(super) use string::{emit_is_method_refusal, inline_host_op};
 
 /// The IR fragments the hand-written bodies emit with `K = k`, for the
 /// static-string scan.
@@ -83,6 +85,10 @@ impl Frame {
             (2, ValType::I32),
             (1, ValType::F64),
             (1, ValType::I64),
+            (6, ValType::I64),
+            (4, ValType::I32),
+            (2, ValType::F64),
+            (6, ValType::F64),
         ])
     }
 
@@ -140,6 +146,26 @@ impl Frame {
     fn f64(self, n: u32) -> u32 {
         self.scratch() + 34 + n
     }
+
+    /// Further i64 temp `n` (`0..6`), past the [`Self::arg`] temp.
+    fn y64(self, n: u32) -> u32 {
+        self.scratch() + 36 + n
+    }
+
+    /// Further i32 temp `n` (`0..4`).
+    fn y32(self, n: u32) -> u32 {
+        self.scratch() + 42 + n
+    }
+
+    /// Further f64 temp `n` (`0..2`).
+    fn yf64(self, n: u32) -> u32 {
+        self.scratch() + 46 + n
+    }
+
+    /// Further f64 temp `n` (`0..6`).
+    fn zf64(self, n: u32) -> u32 {
+        self.scratch() + 48 + n
+    }
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -165,9 +191,8 @@ pub(super) fn emit_builtin(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) -> Function {
-    let frame = Frame {
-        k: helpers.max_args,
-    };
+    let k = helpers.max_args;
+    let frame = Frame { k };
     let mut f = Frame::function();
     helpers.unwind.borrow_mut().reset();
     match builtin {
@@ -182,21 +207,49 @@ pub(super) fn emit_builtin(
         Builtin::BoundCall => function::emit_bound_call(&mut f, frame, strings, helpers),
         Builtin::ThrowTypeError => function::emit_throw_type_error(&mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::ArrayPush => array::emit_push(&mut f, frame, strings, helpers),
-        Builtin::ArrayPop => array::emit_pop(&mut f, frame, strings, helpers),
-        Builtin::ArrayHof(op) => array::emit_hof(op, &mut f, frame, strings, helpers),
-        Builtin::ArrayIndexOf => array::emit_search(false, &mut f, frame, strings, helpers),
-        Builtin::ArrayIncludes => array::emit_search(true, &mut f, frame, strings, helpers),
-        Builtin::ArrayJoin => array::emit_join(&mut f, frame, strings, helpers),
-        Builtin::ArraySlice => array::emit_slice(&mut f, frame, strings, helpers),
-        Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),
+        Builtin::ArrayPush
+        | Builtin::ArrayPop
+        | Builtin::ArrayHof(_)
+        | Builtin::ArrayIndexOf
+        | Builtin::ArrayIncludes
+        | Builtin::ArrayJoin
+        | Builtin::ArraySlice
+        | Builtin::ArrayToString
+        | Builtin::ArrayOf
+        | Builtin::ArrayFrom
+        | Builtin::ArrayAt
+        | Builtin::ArrayFind(_)
+        | Builtin::ArrayReduceRight
+        | Builtin::ArrayLastIndexOf
+        | Builtin::ArrayConcat
+        | Builtin::ArrayFlat { .. }
+        | Builtin::ArraySplice
+        | Builtin::ArraySort
+        | Builtin::ArrayReverse
+        | Builtin::ArrayShift
+        | Builtin::ArrayUnshift
+        | Builtin::ArrayFill
+        | Builtin::ArrayCopyWithin
+        | Builtin::ArrayCopy(_) => emit_array_family(builtin, &mut f, frame, strings, helpers),
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
-        Builtin::NumberToString => number::emit_number_to_string(&mut f, frame, strings, helpers),
-        Builtin::NumberValueOf => number::emit_number_value_of(&mut f, frame, strings, helpers),
-        Builtin::BooleanToString => number::emit_boolean(false, &mut f, frame, strings, helpers),
-        Builtin::BooleanValueOf => number::emit_boolean(true, &mut f, frame, strings, helpers),
+        Builtin::StringFromCharCode | Builtin::StringFromCodePoint => {
+            let code_point = builtin == Builtin::StringFromCodePoint;
+            string::emit_from_char_code(code_point, &mut f, frame, strings, helpers);
+        }
+        Builtin::StringRaw => string::emit_raw(&mut f, frame, strings, helpers),
+        Builtin::NumberToString
+        | Builtin::NumberValueOf
+        | Builtin::NumberToFixed
+        | Builtin::NumberToExponential
+        | Builtin::NumberToPrecision
+        | Builtin::NumberToLocaleString
+        | Builtin::NumberIs(_)
+        | Builtin::ParseFloat
+        | Builtin::ParseInt
+        | Builtin::BooleanToString
+        | Builtin::BooleanValueOf => emit_number_family(builtin, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::IterSource => iter::emit_iter_source(&mut f, frame, strings, helpers),
         Builtin::DateMethod(op) => date::emit_method(op, &mut f, frame, strings, helpers),
@@ -240,6 +293,91 @@ pub(super) fn emit_builtin(
     f
 }
 
+/// Emit the body of an `Array` static or `%Array.prototype%` method into `f`
+/// (the variants [`emit_builtin`] routes here).
+fn emit_array_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::ArrayPush => array::emit_push(f, frame, strings, helpers),
+        Builtin::ArrayPop => array::emit_pop(f, frame, strings, helpers),
+        Builtin::ArrayHof(op) => array::emit_hof(op, f, frame, strings, helpers),
+        Builtin::ArrayIndexOf => array::emit_search(false, f, frame, strings, helpers),
+        Builtin::ArrayIncludes => array::emit_search(true, f, frame, strings, helpers),
+        Builtin::ArrayJoin => array::emit_join(f, frame, strings, helpers),
+        Builtin::ArraySlice => array::emit_slice(f, frame, strings, helpers),
+        Builtin::ArrayToString => array::emit_to_string(f, frame, strings, helpers),
+        Builtin::ArrayOf => array::emit_of(f, frame, strings, helpers),
+        Builtin::ArrayFrom => array::emit_from(f, frame, strings, helpers),
+        Builtin::ArrayAt => array::emit_at(f, frame, strings, helpers),
+        Builtin::ArrayFind(op) => array::emit_find(op, f, frame, strings, helpers),
+        Builtin::ArrayReduceRight => array::emit_reduce_right(f, frame, strings, helpers),
+        Builtin::ArrayLastIndexOf => array::emit_last_index_of(f, frame, strings, helpers),
+        Builtin::ArrayConcat => array::emit_concat(f, frame, strings, helpers),
+        Builtin::ArrayFlat { map } => array::emit_flat(map, f, frame, strings, helpers),
+        Builtin::ArraySplice => array::emit_splice(f, frame, strings, helpers),
+        Builtin::ArraySort => array::emit_sort(false, f, frame, strings, helpers),
+        Builtin::ArrayReverse => array::emit_reverse(f, frame, strings, helpers),
+        Builtin::ArrayShift => array::emit_shift(f, frame, strings, helpers),
+        Builtin::ArrayUnshift => array::emit_unshift(f, frame, strings, helpers),
+        Builtin::ArrayFill => array::emit_fill(f, frame, strings, helpers),
+        Builtin::ArrayCopyWithin => array::emit_copy_within(f, frame, strings, helpers),
+        Builtin::ArrayCopy(ArrayCopyOp::With) => array::emit_with(f, frame, strings, helpers),
+        Builtin::ArrayCopy(ArrayCopyOp::ToReversed) => {
+            array::emit_to_reversed(f, frame, strings, helpers);
+        }
+        Builtin::ArrayCopy(ArrayCopyOp::ToSorted) => {
+            array::emit_sort(true, f, frame, strings, helpers);
+        }
+        Builtin::ArrayCopy(ArrayCopyOp::ToSpliced) => {
+            array::emit_to_spliced(f, frame, strings, helpers);
+        }
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
+}
+
+/// Emit the body of a `Number` / `Boolean` prototype method, a `Number`
+/// static or a global number function into `f` (the variants
+/// [`emit_builtin`] routes here).
+fn emit_number_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::NumberToString => number::emit_number_to_string(f, frame, strings, helpers),
+        Builtin::NumberValueOf => number::emit_number_value_of(f, frame, strings, helpers),
+        Builtin::NumberToFixed => {
+            number::emit_number_format(NumberFormat::Fixed, f, frame, strings, helpers);
+        }
+        Builtin::NumberToExponential => {
+            let format = NumberFormat::Exponential;
+            number::emit_number_format(format, f, frame, strings, helpers);
+        }
+        Builtin::NumberToPrecision => {
+            let format = NumberFormat::Precision;
+            number::emit_number_format(format, f, frame, strings, helpers);
+        }
+        Builtin::NumberToLocaleString => {
+            number::emit_number_to_locale_string(f, frame, strings, helpers);
+        }
+        Builtin::NumberIs(test) => global::emit_number_is(test, f, frame),
+        Builtin::ParseFloat => global::emit_parse(false, f, frame, strings, helpers),
+        Builtin::ParseInt => global::emit_parse(true, f, frame, strings, helpers),
+        Builtin::BooleanToString => number::emit_boolean(false, f, frame, strings, helpers),
+        Builtin::BooleanValueOf => number::emit_boolean(true, f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
+}
+
 /// Throw a `TypeError` with `text` (`[message, stack]`) and return.
 fn throw_type_error(
     function: &mut Function,
@@ -265,8 +403,8 @@ pub(super) fn emit_is_wrapper(function: &mut Function, local: u32, class: u8) {
 }
 
 /// `this<Type>Value(this)` into i64 `out`: the primitive itself (`is_prim`),
-/// the `[[PrimitiveValue]]` of a wrapper object of `class`, else throw
-/// `text`.
+/// the `[[PrimitiveValue]]` of a wrapper object of `class` (`+0` for
+/// `%Number.prototype%`, itself a Number object), else throw `text`.
 #[allow(clippy::too_many_arguments)]
 fn this_primitive(
     function: &mut Function,
@@ -281,6 +419,14 @@ fn this_primitive(
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(out));
     is_prim(function, out);
     wasm!(function; I32Eqz, If(BlockType::Empty));
+    let number_proto = class == abi::CLASS_NUMBER;
+    if number_proto {
+        let proto = intrinsic_bits(realm::prototype_of(BuiltinCtor::Number), helpers);
+        wasm!(function;
+            LocalGet(out), I64Const(proto), I64Eq,
+            If(BlockType::Empty), I64Const(0), LocalSet(out), Else,
+        );
+    }
     emit_is_wrapper(function, out, class);
     wasm!(function;
         If(BlockType::Empty),
@@ -291,6 +437,9 @@ fn this_primitive(
     );
     throw_type_error(function, frame, text, strings, helpers);
     wasm!(function; End, End);
+    if number_proto {
+        wasm!(function; End);
+    }
 }
 
 /// `__to_object(v: i64) -> i64`: `ToObject` of a non-nullish jsval: a
@@ -397,6 +546,53 @@ fn return_if_pending(function: &mut Function) {
         GlobalGet(EXC_PENDING_GLOBAL),
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
     );
+}
+
+/// Push the argument count (`argc`, a number jsval) as an i32.
+fn push_argc(function: &mut Function, frame: Frame) {
+    wasm!(function; LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U);
+}
+
+/// `while i < n { body; i += 1 }` over i32 locals.
+fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Function)) {
+    wasm!(function;
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
+    );
+    body(function);
+    wasm!(function;
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+    );
+}
+
+/// Argument `i` (an i32 local) into i64 `out`: from the spread argument
+/// array when the call passed more than `K` arguments, else from slot `i`
+/// (`undefined` past the slots); a spread hole reads `undefined`.
+fn arg_at(function: &mut Function, frame: Frame, i: u32, out: u32) {
+    let k = frame.k;
+    push_argc(function, frame);
+    wasm!(function;
+        I32Const(k.cast_signed()), I32GtU,
+        If(BlockType::Result(ValType::I64)),
+        GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64,
+    );
+    emit_array_elems(function);
+    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), Else);
+    for j in 0..k {
+        wasm!(function;
+            LocalGet(i), I32Const(j.cast_signed()), I32Eq,
+            If(BlockType::Result(ValType::I64)), LocalGet(j), Else,
+        );
+    }
+    wasm!(function; I64Const(UNDEFINED_BITS));
+    for _ in 0..k {
+        wasm!(function; End);
+    }
+    wasm!(function; End, LocalSet(out));
+    emit_elem_read(function, out);
+    wasm!(function; LocalSet(out));
 }
 
 /// Push the heap jsval of the static string `text`.

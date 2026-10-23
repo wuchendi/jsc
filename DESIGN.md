@@ -584,7 +584,8 @@ in the data segment (§4.2), so it has one identity for the whole run.
 ### 5.6 `__alloc` and memory growth
 
 `__alloc(size: i32) -> i32` is a bump allocator over the `$__heap_ptr` global,
-which starts at the first free offset after the static region:
+which starts at the first free offset after the static region (the module
+declares enough initial pages to hold that region):
 
 1. Round `size` up to 8; `old = __heap_ptr`; `end = u64(old) + u64(size)`
    (computed in `i64`, so it cannot wrap).
@@ -658,7 +659,7 @@ Every module imports exactly seven functions from the `"env"` namespace
 |---|---|---|---|
 | 0 | `print` | `(bits: i64, flag: i32) -> ()` | `console.log` |
 | 1 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
-| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search/slice, string methods, `Number.prototype.toString` |
+| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search/slice, string methods, `Number.prototype` digit formatting, host `Math` functions |
 | 3 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn |
 | 4 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
 | 5 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
@@ -681,8 +682,29 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   `9` `trimEnd`, `10` `repeat`, `11` `startsWith`, `12` `endsWith`,
   `13` `padStart`, `14` `padEnd`, `15` `substring`, `16` `split`,
   `17` `Number.prototype.toString(radix)` (a number receiver and an integral
-  radix in `2..=36`). The host dispatches on the receiver's type byte for the
-  names shared by arrays and strings. The calling string builtin coerces the
+  radix in `2..=36`), `18` `at`, `19` `charCodeAt`, `20` `codePointAt`,
+  `21` `lastIndexOf`, `22` `localeCompare` (code-unit order), `23`
+  `normalize`, `24` the index of a RegExp-free `search` / `match` pattern,
+  `25` `replace` / `26` `replaceAll` with a string pattern and a replacement
+  template (`GetSubstitution` without captures) or the array of a function
+  replacer's results, `27` `String.fromCharCode` /
+  `28` `String.fromCodePoint` (an array receiver of the guest-coerced
+  numbers), `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
+  finite number receiver and an integral digit count already range-checked
+  in the guest; `undefined` for a `toExponential` without digits; rendered
+  from the exact decimal expansion, ties away from zero), `43` a `Math`
+  function (`arg1` the `MATH_FN_*` code: `cbrt`, `log`, `log2`, `log10`,
+  `log1p`, `exp`, `expm1`, the trigonometric and hyperbolic functions and
+  their inverses, `atan2` with `x` in `arg0`, and `random`; the Rust host
+  uses the platform libm and a `xorshift64*` generator, the JS shim its own
+  `Math`). The host dispatches on the receiver's type byte for the
+  names shared by arrays and strings. A string op that cannot produce a
+  correct result returns a refusal sentinel the calling builtin throws:
+  `METHOD_UNSUPPORTED` (`HOLE`; a byte offset crossing a non-ASCII byte, a
+  lone surrogate, §13) as a named `TypeError`,
+  `METHOD_RANGE_ERROR` (`undefined | 2`, an unknown `normalize` form) as a
+  `RangeError`, `METHOD_NEEDS_REGEXP` (`undefined | 3`, a `search` / `match`
+  pattern with RegExp syntax) as a `TypeError`. The calling string builtin coerces the
   receiver (`ToString`) and its arguments (`ToString` or `ToNumber`, keeping
   `undefined` where it selects the host default) in the guest first, so user
   `toString`/`valueOf` run in the guest and the host only sees primitives.
@@ -1154,12 +1176,18 @@ those of `switch` and loops are not tracked.
 ### 7.7 Errors
 
 - `Error`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`,
-  `EvalError`, `URIError` are `SELF_ALLOC` constructors (callable with or
-  without `new`). An error object is a `CLASS_ERROR` object whose `proto` is
+  `EvalError`, `URIError`, `AggregateError` are `SELF_ALLOC` constructors
+  (callable with or without `new`). An error object is a `CLASS_ERROR` object whose `proto` is
   `new.target.prototype` (one of the static `%…Error.prototype%` blocks unless
   subclassed) with own non-enumerable `message` (only when one was given) and
   `stack` (`"Name: message"`, a single line, no frames); `name` is inherited.
   `Error.prototype.toString` formats `Name: message`.
+- `AggregateError(errors, message, options)` takes the message second, adds
+  an own non-enumerable `cause` when `options` is an object with a `cause`
+  property, then an own non-enumerable `errors` array of the values iterating
+  `errors` yields (`TypeError` when it is not iterable). It always runs its
+  constructor body; the other kinds lower `Error(m)` / `new Error(m)`
+  syntactically and ignore `options` (no `cause`).
 - `throw` accepts any value.
 - **Engine-raised errors** are real error objects linked to the same static
   prototypes, catchable with `try`/`catch` and recognised by `instanceof`:
@@ -1216,14 +1244,14 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 
 | area | supported |
 |---|---|
-| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
+| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` |
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
-| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`; `push` / `pop` (variadic, generic over array-likes), `map`, `filter`, `forEach`, `reduce` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `indexOf`, `includes`, `join`, `slice`, `toString` |
-| `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
-| `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.prototype.toString(radix)`, `valueOf`; `Boolean.prototype.toString`, `valueOf` |
-| `Math` | `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `min`, `max` (variadic), `pow`; `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
+| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
+| `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
+| `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
+| `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`; Set `add`/`has`/`delete`/`clear`/`forEach`/`size` |
 | `Promise` | §6.7, §7.8 |
@@ -1482,8 +1510,29 @@ Each item below is current behaviour of this tree.
 **Values & operators**
 
 - Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
-  `slice`, `charAt`, `split("")`, string spread, and `for-of` over a string all
-  work per byte (`"é".length` is `2`). Case mapping and trimming are ASCII-only.
+  string spread, and `for-of` over a string work per byte (`"é".length` is
+  `2`). The `String.prototype` methods are exact for ASCII strings. The
+  search methods work in exact UTF-16 offsets for any text: `indexOf`,
+  `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `search`, the
+  `match` index and the positions a `replace` / `replaceAll` function
+  replacer receives (so they disagree with the byte `.length`). The methods
+  that build text from positions or lengths keep byte offsets and throw a
+  `TypeError` (`String.prototype.X does not support non-ASCII strings yet`)
+  when an offset would cross a non-ASCII byte: `at`, `charAt`,
+  `charCodeAt`, `codePointAt` (an index past a non-ASCII byte; `at` with a
+  negative index on any non-ASCII string), `slice` / `substring` (an
+  endpoint past a non-ASCII byte; a negative `slice` endpoint on any
+  non-ASCII string), `padStart` / `padEnd` (a non-ASCII receiver or fill),
+  `split("")` (a non-ASCII receiver), and `normalize` (any non-ASCII
+  receiver). Content-only results stay exact for any text: `concat`,
+  `repeat`, `split` on a non-empty separator, `replace` / `replaceAll`
+  (an empty pattern over text with astral characters throws: it would split
+  a surrogate pair), `toUpperCase` / `toLowerCase` (full Unicode mappings),
+  `trim*` (JS whitespace), `localeCompare`. `String.fromCharCode` /
+  `fromCodePoint` throw a `TypeError` for a lone surrogate. `search` /
+  `match` / `matchAll` interpret a string pattern as RegExp source: a
+  pattern with RegExp syntax throws a `TypeError`, and `matchAll` (a RegExp
+  string iterator) always throws one.
 - No comma/sequence expressions, no `void`.
 - Not available: `RegExp` (literals and constructor), `Symbol` (so no
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
@@ -1491,18 +1540,51 @@ Each item below is current behaviour of this tree.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9: no property-descriptor or prototype
   reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Array.from`, `sort`, `find`,
-  `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
+  `assign`), no `Array.prototype.keys` / `values` / `entries`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
-- `parseInt` and `parseFloat` exist only as direct calls, not as global values.
+- A direct `parseInt(..)` / `parseFloat(..)` call always runs the builtin
+  conversion, even after the global binding is reassigned.
+- The `Math` transcendental functions follow the host libm (Rust) or the JS
+  engine (shim), which may differ in the last ulp.
 
 **Object model**
 
 - Property tables are linear-scanned; there are no inline caches.
 - No object spread (`{...o}`); object patterns accept only identifier and
   string keys; `catch` parameters must be identifiers.
-- No `ArraySpeciesCreate`: `map`/`filter` on an `Array` subclass instance return a plain
-  array.
+- `ArraySpeciesCreate` reads `constructor` only (there is no `Symbol`, so no
+  `@@species`): `undefined` creates a plain array, a non-object throws, and an
+  object `C` stands in for `C[@@species]` as the builtin `@@species` getters
+  would answer: `C` itself when its prototype chain reaches `%Array%`,
+  `%Map%`, `%Set%` or `%Promise%` (so an `Array` subclass gets instances of
+  itself, `%Array%` a plain array), else a plain array. `concat` spreads by
+  `IsArray` only (no `@@isConcatSpreadable`), and `Array.from` treats an object
+  that is neither an array-like source nor a runtime iterable as an array-like
+  (user `@@iterator` waits for `Symbol`).
+- Array-like lengths are clamped to `2^32 - 1` by the generic loops of `map`,
+  `filter`, `forEach`, `reduce`, `join`, `concat` and `flat` (`map` sizes its
+  `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the
+  `RangeError` first); every other `Array.prototype` method uses the full
+  `ToLength` range.
+- An array element hole does not read through the prototype chain
+  (`Array.prototype[1] = 1; [0, , 2][1]` is `undefined`), and an object whose
+  prototype is an array does not inherit its elements; about 35
+  built-ins/Array test262 tests (`*-7-c-i-8`, `S15.4.4.*_A4_T*`,
+  `holes-not-preserved`, `reduce` / `reduceRight` `10-6`/`10-7`) wait on this
+  property-lookup change.
+- A call-site `arr.push(..)` on an array of length `2^32 - 1` stores the
+  element without throwing the `RangeError` (the inline fast path; the
+  `Array.prototype.push` builtin throws).
+- The remaining built-ins/Array test262 failures (after phase 3 F-T2c) belong to
+  other workstreams: `Object.defineProperty` / `freeze` /
+  `getOwnPropertyDescriptor` / `getPrototypeOf` / `isPrototypeOf` (~630,
+  property descriptors), async test bodies (78, compile errors), `RegExp`
+  (26), `Symbol` / `@@toStringTag` / iterator methods `keys` / `values` /
+  `entries` (~16), `eval` (6), `Proxy` (4), `void` (5); `toLocaleString` is
+  not implemented (5).
+- `sort` without a comparator orders by the byte order of the UTF-8
+  `ToString` keys (code-point order), which differs from the specified UTF-16
+  code-unit order only between astral characters and `U+E000`..`U+FFFF`.
 - Generator functions have no `prototype` property; generator objects inherit
   `%GeneratorPrototype%` directly.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
@@ -1600,7 +1682,6 @@ installed on the realm's prototypes, and phase 3 extends that set.
   `String`, `Number`, and `Math`; `Date` parsing and local time.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
-- `AggregateError`.
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
   and surrogate pairs.
 
