@@ -1039,6 +1039,9 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 - **Conditional** `c ? a : b`, optional chaining `a?.b`, `a?.[k]`, `a?.()`,
   `a?.m()` (a nullish base short-circuits the rest of the chain to
   `undefined`).
+- **Comma** `a, b, c` evaluates every operand left to right and yields the last
+  (a plain value: `(0, o.m)()` calls without a receiver); `yield`/`await`
+  operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
   (`__delete`).
 - **Member access on `null`/`undefined`** throws a `TypeError`
@@ -1070,8 +1073,9 @@ those of `switch` and loops are not tracked.
 
 ### 7.4 Functions
 
-- **Forms.** Function declarations and expressions, arrows (expression- or
-  block-bodied), object-literal methods, getters and setters, class
+- **Forms.** Function declarations and expressions (including generator and
+  `async` ones, §7.8), arrows (expression- or block-bodied, optionally
+  `async`), object-literal methods, getters and setters, class
   constructors/methods/accessors (instance and static), class expressions. All
   are lifted to top-level wasm functions with the uniform ABI (§4.2); a function
   value is a `TYPE_FUNCTION` block (§5.5) and carries properties like any
@@ -1178,11 +1182,18 @@ those of `switch` and loops are not tracked.
 
 ### 7.8 Iteration, generators & async
 
-**Generators.** A top-level `function*` declaration compiles to two
-uniform-ABI functions: a **constructor** that allocates a `TYPE_GENERATOR`
-handle and its frame without running the body, and a **state machine**
-`SM(sent, gen, …)` that resumes at `gen.state`. Every generator local lives in a
-frame cell, so locals survive suspension. The body is lowered to a control-flow
+**Generators.** A `function*` — declaration (top-level or nested, hoisted like
+any nested function declaration) or expression — compiles to two uniform-ABI
+functions: a **constructor** that allocates a `TYPE_GENERATOR` handle and its
+frame without running the body, and a **state machine** `SM(sent, gen, …)` that
+resumes at `gen.state`. Every generator local lives in a frame cell, so locals
+survive suspension. The constructor is an ordinary lifted function value (not a
+constructor, so `new` throws a `TypeError`): it seeds the parameters' cells
+from its argument slots and a `this` cell from its call's receiver, and a
+binding the body captures from an enclosing function is a frame slot holding
+that function's own cell (read through the constructor's environment), so the
+capture is by reference and outlives the creating call. A named generator
+expression binds its name, read-only, inside its body. The body is lowered to a control-flow
 graph of basic blocks (`codegen/generator.rs`); control flow crossing a suspend
 point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
 `break`/`continue`/`return` — becomes block jumps dispatched by a
@@ -1197,10 +1208,12 @@ control flow. A `yield` may appear inside a larger expression
   object's own `next` is called like any method.
 - `yield* g` as a statement delegates to any iterable source (§7.3).
 
-**`async`/`await`.** A top-level `async function` declaration is a generator whose
-`await e` is a `yield e`; the declared name binds to a wrapper that builds the
-generator and hands it to the host async driver (§6.7), returning the result
-promise. All generator control-flow support applies to `await`; a rejected
+**`async`/`await`.** An `async function` (in every position a `function*` may
+take) or `async` arrow is a generator whose `await e` is a `yield e`; its
+function value is a wrapper that builds the generator and hands it to the host
+async driver (§6.7), returning the result promise. An `async` arrow keeps arrow
+semantics: no `prototype`, not a constructor, and `arguments` / `new.target`
+are the enclosing function's. All generator control-flow support applies to `await`; a rejected
 awaited promise throws into the body at the `await`, so `try`/`catch` around
 `await` works. Top-level `await` is supported in `main`.
 
@@ -1257,10 +1270,9 @@ is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`, `comma (sequence) expressions
-are not supported`, `private class fields are not supported`, `class static
-blocks are not supported`, `computed class method names are not supported`,
-`generator functions are unsupported`, `a label may only be applied to a loop`,
+supported`, `with statements are not supported`, `private class fields are not
+supported`, `class static blocks are not supported`, `computed class method names are not supported`,
+`async generator functions are unsupported`, `a label may only be applied to a loop`,
 `destructuring assignment is only supported as an expression statement`.
 
 **Run-time errors** carry no source span:
@@ -1484,7 +1496,7 @@ Each item below is current behaviour of this tree.
 - Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
   `slice`, `charAt`, `split("")`, string spread, and `for-of` over a string all
   work per byte (`"é".length` is `2`). Case mapping and trimming are ASCII-only.
-- No comma/sequence expressions, no `void`.
+- No `void`.
 - Not available: `RegExp` (literals and constructor), `Symbol` (so no
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
@@ -1527,9 +1539,9 @@ Each item below is current behaviour of this tree.
 
 **Generators & async**
 
-- Generators and async functions must be top-level declarations: no nested
-  declarations, expressions, arrows, or methods, and no `async function*`.
-  Generator parameters must be simple identifiers.
+- No generator or `async` methods (object-literal or class) and no
+  `async function*`. Generator and async parameters must be simple
+  identifiers, and their bodies cannot reference `arguments`.
 - `yield*` is supported only as a statement; it does not thread sent values or
   the delegate's return value.
 - `return()` at a suspended `yield` in a body with a `finally` or a `yield*`,

@@ -103,14 +103,13 @@ fn undeclared_identifier_throws_reference_error_at_run_time() {
     );
 }
 
-/// A codegen-rejected *unsupported construct* (an `async` ARROW — a top-level
-/// `async function` declaration is supported, but the arrow form is not)
+/// A codegen-rejected *unsupported construct* (an async generator)
 /// carries the offending node's span: the diagnostic points a caret at
 /// the construct.
 #[test]
 fn unsupported_construct_renders_caret_diagnostic() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", "let f = async () => 1;"])
+        .args(["-e", "let f = async function* () {};"])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(output.status.code() == Some(2), "must exit 2");

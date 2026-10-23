@@ -24,8 +24,8 @@ use crate::ir::{GenSegment, GenTerm};
 
 /// Emit `IrNode::MakeGenerator`: build a generator handle and its frame, leaving
 /// the handle jsval on the stack. Allocates a `TYPE_ENV` frame of `total` boxed
-/// cells (the first `slots.len()` initialized from the constructor's argument
-/// expressions, the rest to `undefined`), then the [`abi::TYPE_GENERATOR`] block
+/// cells (the first `slots.len()` from the constructor's cell expressions, the
+/// rest fresh cells holding `undefined`), then the [`abi::TYPE_GENERATOR`] block
 /// pointing at it with `sm_idx`/`state = 0`/`done = 0`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_make_generator(
@@ -63,13 +63,14 @@ pub(super) fn emit_make_generator(
         memory_index: 0,
     }));
 
-    // 2. Each frame cell: a fresh boxed cell holding the parameter argument (for
-    // the leading slots) or `undefined` (for the body locals). `emit_cell_new`
-    // uses the `+3` dst scratch, disjoint from `env_base` (`+21`).
+    // 2. Each frame cell: the slot's cell-pointer expression (a fresh cell, or a
+    // captured enclosing cell), else a fresh boxed cell holding `undefined` (the
+    // trailing body locals). `emit_cell_new` uses the `+3` dst scratch, disjoint
+    // from `env_base` (`+21`).
     for i in 0..total {
         function.instruction(&Instruction::LocalGet(env_base));
         match slots.get(i as usize) {
-            Some(value) => emit_cell_new(value, function, scratch, strings, helpers),
+            Some(cell) => emit_node(cell, function, scratch, strings, helpers),
             None => emit_cell_new(&IrNode::Undefined, function, scratch, strings, helpers),
         }
         function.instruction(&Instruction::I64Store(MemArg {
