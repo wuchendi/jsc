@@ -1492,9 +1492,6 @@ Each item below is current behaviour of this tree.
   (usually `undefined`, also at top level).
 - Not supported: private `#` members, static blocks, computed class member
   names, generator or async methods.
-- The `K` scan does not count object-literal setter parameters: a setter
-  defined only in an object literal receives `undefined` unless something else
-  in the program widens `K` to at least 1.
 
 **Generators & async**
 
