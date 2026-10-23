@@ -862,7 +862,7 @@ export function valueToNumber(value: Value): number {
 
 /** Parse a whole string as JS `Number(str)` (mirrors `host.rs::str_to_number`). */
 function strToNumber(s: string): number {
-  const trimmed = s.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
+  const trimmed = s.replace(/^\s+|\s+$/g, '')
   if (trimmed.length === 0) return 0
   // `Number("bad")` is already `NaN`, matching Rust's `parse::<f64>().unwrap_or(NaN)`.
   return Number(trimmed)
@@ -915,7 +915,7 @@ function digitValue(code: number): number {
 /** Parse a leading decimal float (the `parseFloat` subset from `host.rs::parse_float_str`). */
 export function parseFloatStr(s: string): number {
   let i = 0
-  while (i < s.length && isAsciiWhitespace(s[i]!)) i++
+  while (i < s.length && /\s/.test(s[i]!)) i++
   const from = i
   if (i < s.length && (s[i] === '+' || s[i] === '-')) i++
   let seenDigit = false
@@ -941,17 +941,6 @@ export function parseFloatStr(s: string): number {
   }
   // `Number("bad")` is already `NaN`, matching Rust's `parse::<f64>().unwrap_or(NaN)`.
   return Number(s.slice(from, i))
-}
-
-function isAsciiWhitespace(c: string): boolean {
-  return (
-    c === ' ' ||
-    c === '\t' ||
-    c === '\n' ||
-    c === '\r' ||
-    c === '\f' ||
-    c === '\v'
-  )
 }
 
 function isAsciiDigit(c: string): boolean {
