@@ -53,8 +53,9 @@ fn syntactic_new(callee: &str, args: usize) -> bool {
 /// What the whole-program scan found (see the module docs).
 #[derive(Default)]
 pub(super) struct GlobalFacts {
-    /// The program contains `globalThis`, a top-level `this` or a `delete`
-    /// of an identifier: the global object can change under any name.
+    /// The program contains an escaping `globalThis` (anything but a static
+    /// `globalThis.k` read or call), a top-level `this` or a `delete` of an
+    /// identifier: the global object can change under any name.
     open: bool,
     /// Names written as identifiers anywhere (assignment, update,
     /// destructuring or loop-head target).
@@ -134,9 +135,13 @@ struct Scan {
 
 impl Scan {
     /// Record a read of `name`; `escapes` when not a static member read or
-    /// call.
+    /// call. An escaping `globalThis` (a bare use, a member write) opens the
+    /// global object.
     fn read(&mut self, name: &str, escapes: bool) {
         self.name(name);
+        if escapes && name == "globalThis" {
+            self.facts.open = true;
+        }
         self.facts.referenced.insert(name.to_owned());
         if escapes {
             self.facts.escaped.insert(name.to_owned());
@@ -178,13 +183,7 @@ impl Scan {
 impl Visit for Scan {
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Ident(id) => {
-                let name = id.sym.as_ref();
-                if name == "globalThis" {
-                    self.facts.open = true;
-                }
-                self.read(name, true);
-            }
+            Expr::Ident(id) => self.read(id.sym.as_ref(), true),
             Expr::This(_) if self.fn_depth == 0 => self.facts.open = true,
             Expr::Member(member) => match Self::static_member_obj(member) {
                 Some(name) if self.target => self.read(name, true),
