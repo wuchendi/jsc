@@ -1022,6 +1022,16 @@ const GLOBALS: [(&str, u32, Value); 26] = [
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
 ];
 
+/// The `%Object.prototype%` methods, in slot order.
+const OBJECT_PROTOTYPE_METHODS: [Builtin; 6] = [
+    Builtin::HasOwnProperty,
+    Builtin::ObjectToString,
+    Builtin::ValueOf,
+    Builtin::IsPrototypeOf,
+    Builtin::PropertyIsEnumerable,
+    Builtin::ToLocaleString,
+];
+
 /// The registry: every own property of every intrinsic, in slot order per
 /// intrinsic.
 pub(super) fn registry() -> Vec<Entry> {
@@ -1032,43 +1042,11 @@ pub(super) fn registry() -> Vec<Entry> {
         attrs,
         value,
     };
-    let mut entries = vec![
-        entry(
-            ObjectPrototype,
-            "hasOwnProperty",
-            METHOD_ATTRS,
-            Value::Method(Builtin::HasOwnProperty),
-        ),
-        entry(
-            ObjectPrototype,
-            "toString",
-            METHOD_ATTRS,
-            Value::Method(Builtin::ObjectToString),
-        ),
-        entry(
-            ObjectPrototype,
-            "valueOf",
-            METHOD_ATTRS,
-            Value::Method(Builtin::ValueOf),
-        ),
-        entry(
-            ObjectPrototype,
-            "isPrototypeOf",
-            METHOD_ATTRS,
-            Value::Method(Builtin::IsPrototypeOf),
-        ),
-        entry(
-            ObjectPrototype,
-            "propertyIsEnumerable",
-            METHOD_ATTRS,
-            Value::Method(Builtin::PropertyIsEnumerable),
-        ),
-        entry(
-            ObjectPrototype,
-            "toLocaleString",
-            METHOD_ATTRS,
-            Value::Method(Builtin::ToLocaleString),
-        ),
+    let mut entries: Vec<Entry> = OBJECT_PROTOTYPE_METHODS
+        .into_iter()
+        .map(|b| entry(ObjectPrototype, b.name(), METHOD_ATTRS, Value::Method(b)))
+        .collect();
+    entries.extend([
         entry(FunctionPrototype, "length", FN_FACT_ATTRS, Value::Num(0.0)),
         entry(FunctionPrototype, "name", FN_FACT_ATTRS, Value::Str("")),
         entry(
@@ -1097,7 +1075,7 @@ pub(super) fn registry() -> Vec<Entry> {
         ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
-    ];
+    ]);
     for kind in ErrorKind::ALL {
         let proto = Intrinsic::ErrorPrototype(kind);
         entries.push(entry(proto, "name", METHOD_ATTRS, Value::Str(kind.name())));
