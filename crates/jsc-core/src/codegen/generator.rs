@@ -46,9 +46,12 @@
 //! resume the `return`/jump, through any outer `finally` first). A throw no
 //! handler catches leaves the state machine and completes the generator.
 //!
+//! The parameters bind in the CONSTRUCTOR (its frame boxes every parameter
+//! binding), so defaults and destructuring run when the function is called;
+//! the body captures them by reference like any enclosing binding.
+//!
 //! Still rejected (deferred): a `yield` whose continuation would read a per-node
-//! scratch local set before the suspend; generator expressions/arrows/methods;
-//! and non-simple parameters.
+//! scratch local set before the suspend; and async generators.
 //!
 //! A closure nested in the body captures the frame's env cells by reference
 //! (see [`LowerCtx::capture_source`]), so it shares them with the body across
@@ -59,18 +62,14 @@ use super::*;
 
 use std::collections::HashSet;
 
-use swc_common::Spanned;
-
 use crate::error::CompileError;
 use crate::ir::{GenSegment, GenTerm};
-
-use super::capture::binding_id;
 
 /// The resume `limits` bits of a generator body (see
 /// [`crate::abi::GEN_LIMIT_RETURN`]): a `return()` at a suspended `yield` must
 /// run the enclosing `finally` blocks and a `throw()` / `return()` must
 /// forward to a `yield*` delegate, which the state machine cannot do.
-fn resume_limits(body: &swc_ecma_ast::FunctionBody) -> u32 {
+fn resume_limits(body: BodyKind<'_>) -> u32 {
     use swc_ecma_visit::{Visit, VisitWith};
 
     /// Finds `finally` and `yield*` outside nested functions and classes.
@@ -93,7 +92,10 @@ fn resume_limits(body: &swc_ecma_ast::FunctionBody) -> u32 {
         }
     }
     let mut scan = Scan::default();
-    body.visit_with(&mut scan);
+    match body {
+        BodyKind::Block(stmts) => stmts.iter().for_each(|s| s.visit_with(&mut scan)),
+        BodyKind::Expr(expr) => expr.visit_with(&mut scan),
+    }
     let mut limits = 0;
     if scan.finally || scan.delegate {
         limits |= crate::abi::GEN_LIMIT_RETURN;
@@ -105,31 +107,56 @@ fn resume_limits(body: &swc_ecma_ast::FunctionBody) -> u32 {
 }
 
 impl LowerCtx<'_> {
-    /// Lower a top-level `function*` declaration into its CONSTRUCTOR
-    /// [`IrFunction`], registering the state-machine function in the arrow
-    /// accumulator. Called from [`lower_function`] for a generator.
+    /// Lower a generator (or, when `is_async`, an async function or arrow)
+    /// with parameters `param_pats` and body `body_kind` into its CONSTRUCTOR
+    /// [`IrFunction`] in the current frame, registering the state-machine
+    /// function in the arrow accumulator. Returns the constructor and its
+    /// environment layout (the bindings the body captures from enclosing
+    /// frames, in env-slot order), like `build_function_body`. `span` is the
+    /// function's, for the CFG diagnostics.
     ///
-    /// Also lowers a top-level `async function`, keyed on
-    /// `fn_decl.function.is_async`: the body is compiled to the SAME generator
-    /// state machine (`await e` lowers to `yield e`; see
-    /// [`LowerCtx::lower_generator_body`]), but the function the name binds to is a
-    /// WRAPPER that builds the generator and spawns it as a promise
-    /// ([`IrNode::AsyncSpawn`]) rather than returning the raw generator handle.
-    pub(super) fn lower_generator(&mut self, fn_decl: &FnDecl) -> anyhow::Result<IrFunction> {
-        let function = &fn_decl.function;
-        let block = function
-            .body
-            .as_ref()
-            .ok_or_else(|| anyhow!("generator declaration requires a body"))?;
-
-        // The uniform ABI arity `K`: forced to >= 2 when generators exist (below),
-        // so `(sent, gen)` fit the first two positional slots. `K + 2` = the full
-        // uniform param count (`K` args + env + argc).
+    /// The constructor binds the parameters first (like an ordinary
+    /// function's prologue, every binding a cell), so a binding error throws
+    /// from the call — or, for an async function, rejects its promise. The
+    /// body is lowered in a nested `env_backed` frame. The constructor then
+    /// builds the generator's frame of cells ([`IrNode::MakeGenerator`]): the
+    /// `this` cell holds the call's receiver, and a binding the body captures
+    /// from an enclosing frame (a parameter included) SHARES that frame's
+    /// cell, so the capture is by reference and outlives the creating call.
+    /// An async body compiles to the SAME state machine
+    /// (`await e` lowers to `yield e`; see [`LowerCtx::lower_generator_body`]),
+    /// but the constructor spawns it as a promise ([`IrNode::AsyncSpawn`])
+    /// rather than returning the raw generator handle. Neither is a
+    /// constructor.
+    ///
+    /// `callee` (a generator's) reads the generator function object itself:
+    /// the handle's `[[Prototype]]` is its `prototype` at call time when that
+    /// is an object, else `%GeneratorPrototype%`.
+    pub(super) fn build_generator_ctor(
+        &mut self,
+        param_pats: &[&Pat],
+        body_kind: BodyKind<'_>,
+        is_async: bool,
+        span: swc_common::Span,
+        callee: Option<IrNode>,
+    ) -> anyhow::Result<(IrFunction, Vec<u32>)> {
+        // The uniform ABI arity `K`: forced to >= 2 when generators exist (see
+        // `has_state_machine`), so `(sent, gen)` fit the first two positional
+        // slots. `K + 2` = the full uniform param count (`K` args + env + argc).
         let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
         let uniform_params = k + 2;
 
+        // The parameters bind in the constructor, when the function is called:
+        // every parameter binding is a cell the body shares by reference.
+        self.frame().ctor = FnKind::Generator;
+        let (params, mut prologue) = self.declare_params(param_pats)?;
+        self.frame().next = self.frame().next.max(uniform_params);
+        let boxing = prologue.len();
+        self.bind_params(params, &mut prologue)?;
+        let binds = prologue.len() > boxing;
+
         // Reserve the state machine's funcref-table slot before lowering its body
-        // (mirrors `lower_lifted_function`).
+        // (mirrors `lower_lifted`).
         let sm_pos = {
             let mut arrows = self.shared.arrows.borrow_mut();
             let pos = arrows.len();
@@ -147,24 +174,34 @@ impl LowerCtx<'_> {
         // Lower the body in a fresh, `env_backed` frame: every local becomes a
         // frame cell reached via `EnvLoad`. Body temporaries (from `fresh`) start
         // ABOVE the uniform ABI slots so they cannot collide with `sent`/`gen`/env.
-        // The frame's env size (`total`) and local count are read before popping.
+        // An arrow's frame reads its enclosing function's `arguments` and
+        // `new.target` (both the constructor's and the body's frame are arrows).
+        let arrow = self.frame().arrow;
         self.push_frame();
-        let lowered = self.lower_generator_body(function, block, uniform_params);
-        let (body, nparams, mut total, sm_locals) = match lowered {
-            Ok((body, nparams)) => {
-                let total = u32::try_from(self.env_len()).unwrap_or(u32::MAX);
-                let sm_locals = self.frame().next;
-                (body, nparams, total, sm_locals)
-            }
+        self.frame().arrow = arrow;
+        let body = match self.lower_generator_body(body_kind, is_async, uniform_params) {
+            Ok(body) => body,
             Err(e) => {
                 self.pop_frame();
                 return Err(e);
             }
         };
+        let frame = self.frame();
+        let sm_locals = frame.next;
+        let this_slot = frame.gen_this;
+        // Each frame slot's binding id, and whether the body declares it (an
+        // own cell) or captures it from an enclosing frame (the constructor's
+        // parameters included).
+        let layout: Vec<(u32, bool)> = frame
+            .env
+            .iter()
+            .map(|id| (*id, frame.by_id.contains_key(id)))
+            .collect();
         self.pop_frame();
+        let mut total = u32::try_from(layout.len()).unwrap_or(u32::MAX);
 
         // Spill cells for values live across a nested suspend extend the frame.
-        let segments = build_segments(&body, fn_decl, &mut total)?;
+        let segments = build_segments(&body, span, &mut total)?;
         self.shared.arrows.borrow_mut()[sm_pos] = IrFunction {
             params: uniform_params,
             locals: sm_locals,
@@ -173,30 +210,90 @@ impl LowerCtx<'_> {
             info: FnInfo::default(),
         };
 
-        // The constructor: `return MakeGenerator(...)`, reading each parameter from
-        // its uniform-ABI argument slot to seed the frame's leading cells. An
-        // `async function` wraps the handle in `AsyncSpawn` so the wrapper returns
-        // the spawned result promise instead of the raw generator.
-        let slots: Vec<IrNode> = (0..nparams).map(IrNode::Local).collect();
+        // The constructor: bind the parameters, then `return MakeGenerator(...)`,
+        // seeding the frame's cells. The `this` cell holds the receiver
+        // snapshotted on entry (a default may have called out since).
+        let this = this_slot.and_then(|_| self.ensure_this_local());
+        let mut slots: Vec<IrNode> = layout
+            .iter()
+            .zip(0u32..)
+            .map(|(&(id, own), slot)| {
+                if Some(slot) == this_slot {
+                    IrNode::CellNew(Box::new(this.map_or(IrNode::ThisGlobal, IrNode::Local)))
+                } else if own {
+                    IrNode::CellNew(Box::new(IrNode::Undefined))
+                } else {
+                    self.capture_source(id)
+                }
+            })
+            .collect();
+        while matches!(slots.last(), Some(IrNode::CellNew(v)) if matches!(**v, IrNode::Undefined)) {
+            slots.pop();
+        }
         let make = IrNode::MakeGenerator {
             sm_table_index,
             slots,
             total,
-            limits: resume_limits(block),
+            limits: resume_limits(body_kind),
         };
-        let returned = if function.is_async {
-            IrNode::AsyncSpawn(Box::new(make))
-        } else {
-            make
-        };
-        let ctor_body = vec![IrStmt::Return(Some(returned))];
-        Ok(IrFunction {
-            params: uniform_params,
-            locals: uniform_params,
-            body: ctor_body,
-            machine: None,
-            info: FnInfo::default(),
-        })
+        let ctor_body = self.generator_ctor_body(make, is_async, callee);
+        // An async function's parameter binding error rejects its promise
+        // rather than throwing from the call.
+        let mut body = prologue;
+        if is_async && binds {
+            let binding = body.split_off(boxing);
+            body.push(IrStmt::Try {
+                body: binding,
+                catch_body: Some(vec![IrStmt::Return(Some(IrNode::PromiseReject(Box::new(
+                    IrNode::ExcValue,
+                ))))]),
+                finally_body: None,
+            });
+        }
+        body.extend(ctor_body);
+        Ok(self.finish_function(body))
+    }
+
+    /// The generator constructor's body around its `make` node: an async
+    /// function spawns it as a promise; a generator with a `callee` sets the
+    /// handle's `[[Prototype]]` to `callee.prototype` when that is an object
+    /// (`MakeGenerator` starts it at `%GeneratorPrototype%`).
+    fn generator_ctor_body(
+        &mut self,
+        make: IrNode,
+        is_async: bool,
+        callee: Option<IrNode>,
+    ) -> Vec<IrStmt> {
+        match callee {
+            _ if is_async => vec![IrStmt::Return(Some(IrNode::AsyncSpawn(Box::new(make))))],
+            None => vec![IrStmt::Return(Some(make))],
+            Some(callee) => {
+                let proto = self.fresh();
+                let handle = self.fresh();
+                vec![
+                    IrStmt::Decl {
+                        local: proto,
+                        init: IrNode::Index {
+                            obj: Box::new(callee),
+                            index: Box::new(IrNode::Str("prototype".to_owned())),
+                        },
+                    },
+                    IrStmt::Decl {
+                        local: handle,
+                        init: make,
+                    },
+                    IrStmt::If {
+                        cond: IrNode::IsObject(Box::new(IrNode::Local(proto))),
+                        then_body: vec![IrStmt::Expr(IrNode::SetProto {
+                            obj: Box::new(IrNode::Local(handle)),
+                            proto: Box::new(IrNode::Local(proto)),
+                        })],
+                        else_body: Vec::new(),
+                    },
+                    IrStmt::Return(Some(IrNode::Local(handle))),
+                ]
+            }
+        }
     }
 
     /// Desugar a `yield* iterable;` statement over the same iterables `for-of`
@@ -332,48 +429,42 @@ impl LowerCtx<'_> {
         resolved.kind
     }
 
-    /// Lower the parameters and body of a generator into the current (already
-    /// pushed, `env_backed`) frame, returning the lowered statements and the
-    /// parameter count. Rejects the unsupported forms with spans.
+    /// Lower the body of a generator into the current (already pushed,
+    /// `env_backed`) frame, returning the lowered statements. Its parameters
+    /// are bound by the constructor, in the enclosing frame.
     fn lower_generator_body(
         &mut self,
-        function: &swc_ecma_ast::Function,
-        block: &swc_ecma_ast::FunctionBody,
+        body_kind: BodyKind<'_>,
+        is_async: bool,
         uniform_params: u32,
-    ) -> anyhow::Result<(Vec<IrStmt>, u32)> {
+    ) -> anyhow::Result<Vec<IrStmt>> {
         self.set_env_backed();
         // Body temporaries live above the uniform ABI slots (`sent`/`gen`/…/env/
         // argc), so a `fresh` temp never aliases `sent` (local 0) or the env slot.
         self.frame().next = uniform_params;
 
-        // An `async function` body lowers `await e` to a generator `yield e`;
+        // An async body lowers `await e` to a generator `yield e`;
         // a plain `function*` keeps `await` a parse error, so the flag
         // stays off. Restored before returning on the success path (a compile
         // error aborts the whole function, so the leak on the error path is inert).
         let prev_async = self.async_body;
-        self.async_body = function.is_async;
-
-        // Only simple-identifier parameters are supported.
-        let mut nparams = 0u32;
-        for param in &function.params {
-            let Pat::Ident(ident) = &param.pat else {
-                return Err(CompileError::spanned(
-                    param.pat.span(),
-                    "generator parameters must be simple identifiers",
-                )
-                .into());
-            };
-            self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
-            nparams += 1;
-        }
+        self.async_body = is_async;
 
         let mut body = Vec::new();
-        for stmt in &block.stmts {
-            self.lower_stmt(stmt, &mut body)?;
+        match body_kind {
+            BodyKind::Block(stmts) => {
+                for stmt in stmts {
+                    self.lower_stmt(stmt, &mut body)?;
+                }
+            }
+            BodyKind::Expr(expr) => {
+                let node = self.lower_expr(expr)?;
+                body.push(IrStmt::Return(Some(node)));
+            }
         }
 
         self.async_body = prev_async;
-        Ok((body, nparams))
+        Ok(body)
     }
 }
 
@@ -388,14 +479,14 @@ impl LowerCtx<'_> {
 /// still rejected (see [`CfgBuilder::track`]).
 fn build_segments(
     stmts: &[IrStmt],
-    fn_decl: &FnDecl,
+    span: swc_common::Span,
     total: &mut u32,
 ) -> anyhow::Result<Vec<GenSegment>> {
     let mut next_slot = *total;
     let stmts = promote_raw_locals(stmts, &mut next_slot)
-        .map_err(|msg| CfgBuilder::unsupported_in(fn_decl, msg))?;
+        .map_err(|msg| CfgBuilder::unsupported_in(span, msg))?;
     let mut cfg = CfgBuilder {
-        fn_decl,
+        span,
         blocks: vec![PendingBlock::default()],
         cur: 0,
         loops: Vec::new(),
@@ -470,8 +561,9 @@ struct FinallyCtx {
     exits: Vec<(u32, usize)>,
 }
 
-struct CfgBuilder<'a> {
-    fn_decl: &'a FnDecl,
+struct CfgBuilder {
+    /// The generator function's span, for the diagnostics.
+    span: swc_common::Span,
     blocks: Vec<PendingBlock>,
     /// The block currently being filled.
     cur: usize,
@@ -490,7 +582,7 @@ struct CfgBuilder<'a> {
     live: HashSet<u32>,
 }
 
-impl CfgBuilder<'_> {
+impl CfgBuilder {
     fn new_block(&mut self) -> u32 {
         let id = u32::try_from(self.blocks.len()).unwrap_or(u32::MAX);
         self.blocks.push(PendingBlock {
@@ -513,11 +605,11 @@ impl CfgBuilder<'_> {
     }
 
     fn unsupported(&self, msg: &str) -> anyhow::Error {
-        Self::unsupported_in(self.fn_decl, msg)
+        Self::unsupported_in(self.span, msg)
     }
 
-    fn unsupported_in(fn_decl: &FnDecl, msg: &str) -> anyhow::Error {
-        CompileError::spanned(fn_decl.function.span(), msg.to_owned()).into()
+    fn unsupported_in(span: swc_common::Span, msg: &str) -> anyhow::Error {
+        CompileError::spanned(span, msg.to_owned()).into()
     }
 
     fn lower_stmts(&mut self, stmts: &[IrStmt]) -> anyhow::Result<()> {
@@ -922,21 +1014,33 @@ impl CfgBuilder<'_> {
             | IrNode::ArrayPop { local, .. } => Some(*local),
             _ => None,
         };
-        if let Some(local) = read
-            && self.suspended
-            && !self.live.contains(&local)
-        {
-            return Err(self.unsupported(
-                "a `yield` here would lose a compiler temporary across the suspend; \
-                 move the `yield` into its own statement",
-            ));
+        if let Some(local) = read {
+            self.check_live(local)?;
         }
         let mut result = Ok(());
         node.any_child(|child| {
             result = self.track(child);
             result.is_err()
         });
-        result
+        result?;
+        // A `super.m(..)` receiver snapshot is set by its callee (a child) and
+        // read at the call itself, after the arguments.
+        if let IrNode::ThisCall { this_local, .. } = node {
+            self.check_live(*this_local)?;
+        }
+        Ok(())
+    }
+
+    /// Reject reading raw local `local` after a suspend earlier in the
+    /// statement that it was not re-set since (see [`Self::track`]).
+    fn check_live(&self, local: u32) -> anyhow::Result<()> {
+        if self.suspended && !self.live.contains(&local) {
+            return Err(self.unsupported(
+                "a `yield` here would lose a compiler temporary across the suspend; \
+                 move the `yield` into its own statement",
+            ));
+        }
+        Ok(())
     }
 
     /// Suspend with `value`: end the current block with a `Yield` and continue in
@@ -1177,14 +1281,24 @@ fn is_inline(stmt: &IrStmt) -> bool {
 /// frame cell (numbered from `next_slot`), and EVERY read and write of it in the
 /// whole body is rewritten to that cell, so the inline statements that
 /// initialize it write the cell too. Per-node scratch locals (`obj_local`, ...)
-/// are never `Decl`/`Assign` targets and stay raw.
+/// are never `Decl`/`Assign` targets and stay raw, as does a `super.m(..)`
+/// receiver snapshot ([`IrNode::ThisCall`]'s `this_local`), assigned and
+/// consumed within the call's callee evaluation.
 fn promote_raw_locals(stmts: &[IrStmt], next_slot: &mut u32) -> Result<Vec<IrStmt>, &'static str> {
     let mut written = HashSet::new();
     let mut crossing = HashSet::new();
     for stmt in stmts {
         collect_locals(stmt, &mut written, &mut crossing, false);
     }
-    let mut promoted: Vec<u32> = written.intersection(&crossing).copied().collect();
+    let mut pinned = HashSet::new();
+    for stmt in stmts {
+        collect_this_call_locals(stmt, &mut pinned);
+    }
+    let mut promoted: Vec<u32> = written
+        .intersection(&crossing)
+        .filter(|local| !pinned.contains(*local))
+        .copied()
+        .collect();
     promoted.sort_unstable();
     let map: HashMap<u32, u32> = promoted
         .into_iter()
@@ -1250,6 +1364,27 @@ fn collect_node_locals(
     }
     node.any_child(|child| {
         collect_node_locals(child, written, crossing, in_cfg);
+        false
+    });
+}
+
+/// Record every [`IrNode::ThisCall`] `this_local` in `stmt` (recursively).
+fn collect_this_call_locals(stmt: &IrStmt, pinned: &mut HashSet<u32>) {
+    fn walk(node: &IrNode, pinned: &mut HashSet<u32>) {
+        if let IrNode::ThisCall { this_local, .. } = node {
+            pinned.insert(*this_local);
+        }
+        node.any_child(|child| {
+            walk(child, pinned);
+            false
+        });
+    }
+    stmt.any_node(|node| {
+        walk(node, pinned);
+        false
+    });
+    stmt.any_stmt(|inner| {
+        collect_this_call_locals(inner, pinned);
         false
     });
 }

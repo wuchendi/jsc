@@ -21,25 +21,28 @@ pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::R
     let mut ctx = LowerCtx::new(shared);
     let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
     let name = fn_decl.ident.sym.as_ref();
-    // A top-level `function*` lowers to a generator constructor + state machine,
-    // not an ordinary function body. A top-level `async function` compiles its
-    // body to a generator state machine (`await` == `yield`) with a wrapper that
-    // spawns it as a promise; `lower_generator` handles both, keyed on
-    // `function.is_async`. (An `async function*` — an async generator — stays
-    // out of scope and is rejected by `reject_unsupported_function` below.)
-    // Neither is a constructor.
-    if fn_decl.function.is_generator != fn_decl.function.is_async {
-        let mut func = ctx.lower_generator(fn_decl)?;
-        func.info = fn_info(name, &param_pats, FnKind::Plain);
-        return Ok(func);
-    }
     let block = fn_decl
         .function
         .body
         .as_ref()
         .ok_or_else(|| anyhow!("function declaration requires a body"))?;
-    reject_unsupported_function(&fn_decl.function)?;
-    let (mut func, _env) = ctx.build_function_body(&param_pats, BodyKind::Block(&block.stmts))?;
+    let body = BodyKind::Block(&block.stmts);
+    // A top-level `function*` / `async function` lowers to a generator
+    // constructor + state machine, not an ordinary function body; neither is a
+    // constructor. A generator reads its own `prototype` through its static
+    // function object.
+    if let Some(is_async) = state_machine(&fn_decl.function)? {
+        let callee = shared
+            .funcs
+            .get(name)
+            .filter(|_| !is_async)
+            .map(|sig| IrNode::DeclFunc(sig.index - 1));
+        let (mut func, _env) =
+            ctx.build_generator_ctor(&param_pats, body, is_async, fn_decl.function.span, callee)?;
+        func.info = fn_info(name, &param_pats, machine_kind(is_async));
+        return Ok(func);
+    }
+    let (mut func, _env) = ctx.build_function_body(&param_pats, body)?;
     func.info = fn_info(name, &param_pats, FnKind::Constructor);
     Ok(func)
 }
@@ -58,24 +61,45 @@ pub(super) fn fn_info(name: &str, param_pats: &[&Pat], kind: FnKind) -> FnInfo {
     }
 }
 
-/// Reject the out-of-scope function forms — `async function` and generator
-/// (`function*`) — that the function-value lowering would otherwise compile
-/// as an *ordinary* function and run to a **wrong result** (an `async` body
-/// yields a `Promise`, a `function*` yields a generator object; neither is
-/// modeled). A clear compile error is emitted instead of silently
-/// mis-handling them. See DESIGN.md.
-pub(super) fn reject_unsupported_function(function: &swc_ecma_ast::Function) -> anyhow::Result<()> {
-    if function.is_async {
-        return Err(
-            CompileError::spanned(function.span(), "async functions are unsupported").into(),
-        );
+/// Whether `function` compiles to a generator state machine: `Some(is_async)`
+/// for a `function*` (`false`) or an `async function` (`true`), `None` for an
+/// ordinary function. An async generator (`async function*`) is out of scope
+/// and rejected with a span.
+pub(super) fn state_machine(function: &swc_ecma_ast::Function) -> anyhow::Result<Option<bool>> {
+    match (function.is_generator, function.is_async) {
+        (true, true) => Err(CompileError::spanned(
+            function.span(),
+            "async generator functions are unsupported",
+        )
+        .into()),
+        (false, false) => Ok(None),
+        (_, is_async) => Ok(Some(is_async)),
     }
-    if function.is_generator {
-        return Err(
-            CompileError::spanned(function.span(), "generator functions are unsupported").into(),
-        );
+}
+
+/// The [`FnKind`] of a generator (`false`) or async (`true`) function's
+/// constructor: a generator owns a `prototype`, an async function does not.
+fn machine_kind(is_async: bool) -> FnKind {
+    if is_async {
+        FnKind::Plain
+    } else {
+        FnKind::Generator
     }
-    Ok(())
+}
+
+/// A function's declared parameters still to bind in its prologue (see
+/// [`LowerCtx::declare_params`]).
+pub(super) struct Params<'p> {
+    /// Each defaulted identifier parameter's local and default expression.
+    defaults: Vec<(u32, &'p Expr)>,
+    /// A trailing rest parameter: its binding ident and its start position
+    /// `p` (the number of preceding positional parameters). It binds a
+    /// synthesized array rather than a single positional slot.
+    rest: Option<(&'p swc_ecma_ast::BindingIdent, u32)>,
+    /// Destructuring parameters: the temp positional slot the incoming
+    /// argument lands in, the pattern, and an optional parameter-level default
+    /// (`f([a,b] = [1,2])`).
+    destructure: Vec<(u32, &'p Pat, Option<&'p Expr>)>,
 }
 
 impl LowerCtx<'_> {
@@ -84,113 +108,12 @@ impl LowerCtx<'_> {
     /// this frame's environment layout (the captured binding ids it references,
     /// in env-slot order). Operates on the current top frame (the caller pushes
     /// one for a nested function; a top-level function uses the initial frame).
-    #[allow(clippy::too_many_lines)]
     fn build_function_body(
         &mut self,
         param_pats: &[&Pat],
         body_kind: BodyKind<'_>,
     ) -> anyhow::Result<(IrFunction, Vec<u32>)> {
-        // Parameters bind to locals `0..`; a captured parameter is a boxed cell.
-        // A `Pat::Assign` (`a = default`) binds its `Pat::Ident` like a plain
-        // parameter and records the default expression for the prologue guard.
-        let mut boxed_params = Vec::new();
-        let mut defaults: Vec<(u32, &Expr)> = Vec::new();
-        // A trailing rest parameter: its binding ident and its start
-        // position `p` (the number of preceding positional parameters). It binds a
-        // synthesized array rather than a single positional slot, so it is built
-        // after the slots are laid out (below), not declared inline here.
-        let mut rest: Option<(&swc_ecma_ast::BindingIdent, u32)> = None;
-        // Destructuring parameters: each holds the temp positional slot the
-        // incoming argument lands in, the pattern to destructure it with, and an
-        // optional parameter-level default (`f([a,b] = [1,2])`). Destructured in
-        // the prologue (below) by reusing `lower_binding_pattern`.
-        let mut destructure: Vec<(u32, &Pat, Option<&Expr>)> = Vec::new();
-        for (i, pat) in param_pats.iter().enumerate() {
-            let (ident, default) = match pat {
-                Pat::Ident(ident) => (ident, None),
-                Pat::Assign(assign) => match assign.left.as_ref() {
-                    Pat::Ident(ident) => (ident, Some(assign.right.as_ref())),
-                    // A destructuring pattern with a parameter-level default binds
-                    // the argument to a fresh temp slot (guarded by the default),
-                    // then destructures it in the prologue.
-                    left @ (Pat::Array(_) | Pat::Object(_)) => {
-                        let temp = self.fresh();
-                        destructure.push((temp, left, Some(assign.right.as_ref())));
-                        continue;
-                    }
-                    _ => {
-                        return Err(CompileError::spanned(
-                            assign.left.span(),
-                            "unsupported parameter pattern",
-                        )
-                        .into());
-                    }
-                },
-                // A destructuring parameter (`f([a,b])`, `g({x,y})`): bind the
-                // incoming argument to a fresh temp positional slot, destructured
-                // into the named locals in the prologue.
-                Pat::Array(_) | Pat::Object(_) => {
-                    let temp = self.fresh();
-                    destructure.push((temp, *pat, None));
-                    continue;
-                }
-                Pat::Rest(rest_pat) => {
-                    // A rest parameter must be the final parameter.
-                    if i + 1 != param_pats.len() {
-                        return Err(CompileError::spanned(
-                            rest_pat.span(),
-                            "rest parameter must be last",
-                        )
-                        .into());
-                    }
-                    let Pat::Ident(ident) = rest_pat.arg.as_ref() else {
-                        return Err(CompileError::spanned(
-                            rest_pat.arg.span(),
-                            "unsupported rest parameter pattern",
-                        )
-                        .into());
-                    };
-                    rest = Some((ident, u32::try_from(i).unwrap_or(u32::MAX)));
-                    continue;
-                }
-                _ => {
-                    return Err(
-                        CompileError::spanned(pat.span(), "unsupported parameter pattern").into(),
-                    );
-                }
-            };
-            let local = self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
-            if self.is_cell(local) {
-                boxed_params.push(local);
-            }
-            if let Some(default) = default {
-                defaults.push((local, default));
-            }
-        }
-        // Pad the surplus argument slots to `K = max_arity`, then reserve the two
-        // trailing ABI slots: the env slot (local `K`) and the argument-count slot
-        // (local `K + 1`).
-        let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
-        while self.frame().next < k {
-            self.fresh();
-        }
-        self.fresh();
-        self.fresh();
-        let params = self.frame().next;
-
-        // Mark this frame as a function scope so a body `this` binds here;
-        // the `this` slot itself is allocated lazily, only if the body reads it.
-        self.frame().allows_this = true;
-
-        // Prologue: move each captured parameter's incoming value into a fresh
-        // cell, so reads/writes (and the closure) share it by reference.
-        let mut body = Vec::new();
-        for local in boxed_params {
-            body.push(IrStmt::Expr(IrNode::Assign {
-                local,
-                value: Box::new(IrNode::CellNew(Box::new(IrNode::Local(local)))),
-            }));
-        }
+        let (params, mut body) = self.declare_params(param_pats)?;
 
         // A base class constructor defines the instance fields first (design
         // 4.5: right after allocation, before the parameters are bound).
@@ -201,38 +124,7 @@ impl LowerCtx<'_> {
             body.push(IrStmt::Expr(fields));
         }
 
-        // Default-parameter guards, IN PARAMETER ORDER (after capture-boxing so a
-        // defaulted cell param reads/writes its boxed cell).
-        self.lower_default_guards(defaults, &mut body)?;
-
-        // Trailing rest parameter: gather the surplus arguments into a
-        // real array bound to the rest name (after the fixed params / defaults).
-        if let Some((rest_ident, p)) = rest {
-            self.lower_rest_param(rest_ident, p, k, &mut body);
-        }
-
-        // Destructuring parameters: each temp slot holds the incoming
-        // argument; apply an optional parameter-level default, then destructure it
-        // into the named locals by reusing the `lower_binding_pattern`
-        // helper (which handles nested patterns, holes, defaults, and rest).
-        for (temp, pat, default) in destructure {
-            if let Some(default) = default {
-                let default_value = self.lower_expr(default)?;
-                body.push(IrStmt::If {
-                    cond: IrNode::Binary {
-                        op: BinOp::Eq,
-                        lhs: Box::new(IrNode::Local(temp)),
-                        rhs: Box::new(IrNode::Undefined),
-                    },
-                    then_body: vec![IrStmt::Expr(IrNode::Assign {
-                        local: temp,
-                        value: Box::new(default_value),
-                    })],
-                    else_body: Vec::new(),
-                });
-            }
-            self.lower_binding_pattern(pat, IrNode::Local(temp), true, &mut body)?;
-        }
+        self.bind_params(params, &mut body)?;
 
         if self.frame().derived()
             && let BodyKind::Block(stmts) = body_kind
@@ -257,13 +149,167 @@ impl LowerCtx<'_> {
 
         // A derived constructor falling off its end returns `this`, which must
         // have been bound by `super(..)`.
-        let derived = self.frame().derived();
-        if derived {
+        if self.frame().derived() {
             let fi = self.top();
             let this = self.derived_this(fi);
             body.push(IrStmt::Return(Some(this)));
         }
+        Ok(self.finish_function(body))
+    }
 
+    /// Declare the parameters `param_pats` in the current frame and lay out
+    /// its uniform-ABI slots: parameters bind to locals `0..`, padded to
+    /// `K = max_arity`, then the env slot (local `K`) and the argument-count
+    /// slot (local `K + 1`). Returns the [`Params`] still to bind (see
+    /// [`Self::bind_params`]) and the prologue moving each captured
+    /// parameter's incoming value into a fresh cell, so reads/writes (and the
+    /// closure) share it by reference.
+    pub(super) fn declare_params<'p>(
+        &mut self,
+        param_pats: &[&'p Pat],
+    ) -> anyhow::Result<(Params<'p>, Vec<IrStmt>)> {
+        let mut params = Params {
+            defaults: Vec::new(),
+            rest: None,
+            destructure: Vec::new(),
+        };
+        let mut boxed_params = Vec::new();
+        for (i, pat) in param_pats.iter().enumerate() {
+            let (ident, default) = match pat {
+                Pat::Ident(ident) => (ident, None),
+                Pat::Assign(assign) => match assign.left.as_ref() {
+                    Pat::Ident(ident) => (ident, Some(assign.right.as_ref())),
+                    // A destructuring pattern with a parameter-level default binds
+                    // the argument to a fresh temp slot (guarded by the default),
+                    // then destructures it in the prologue.
+                    left @ (Pat::Array(_) | Pat::Object(_)) => {
+                        let temp = self.fresh();
+                        params
+                            .destructure
+                            .push((temp, left, Some(assign.right.as_ref())));
+                        continue;
+                    }
+                    _ => {
+                        return Err(CompileError::spanned(
+                            assign.left.span(),
+                            "unsupported parameter pattern",
+                        )
+                        .into());
+                    }
+                },
+                // A destructuring parameter (`f([a,b])`, `g({x,y})`): bind the
+                // incoming argument to a fresh temp positional slot, destructured
+                // into the named locals in the prologue.
+                Pat::Array(_) | Pat::Object(_) => {
+                    let temp = self.fresh();
+                    params.destructure.push((temp, *pat, None));
+                    continue;
+                }
+                Pat::Rest(rest_pat) => {
+                    // A rest parameter must be the final parameter.
+                    if i + 1 != param_pats.len() {
+                        return Err(CompileError::spanned(
+                            rest_pat.span(),
+                            "rest parameter must be last",
+                        )
+                        .into());
+                    }
+                    let Pat::Ident(ident) = rest_pat.arg.as_ref() else {
+                        return Err(CompileError::spanned(
+                            rest_pat.arg.span(),
+                            "unsupported rest parameter pattern",
+                        )
+                        .into());
+                    };
+                    params.rest = Some((ident, u32::try_from(i).unwrap_or(u32::MAX)));
+                    continue;
+                }
+                _ => {
+                    return Err(
+                        CompileError::spanned(pat.span(), "unsupported parameter pattern").into(),
+                    );
+                }
+            };
+            let local = self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
+            if self.is_cell(local) {
+                boxed_params.push(local);
+            }
+            if let Some(default) = default {
+                params.defaults.push((local, default));
+            }
+        }
+        let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
+        while self.frame().next < k {
+            self.fresh();
+        }
+        self.fresh();
+        self.fresh();
+
+        // Mark this frame as a function scope so a body `this` binds here;
+        // the `this` slot itself is allocated lazily, only if the body reads it.
+        self.frame().allows_this = true;
+
+        let prologue = boxed_params
+            .into_iter()
+            .map(|local| {
+                IrStmt::Expr(IrNode::Assign {
+                    local,
+                    value: Box::new(IrNode::CellNew(Box::new(IrNode::Local(local)))),
+                })
+            })
+            .collect();
+        Ok((params, prologue))
+    }
+
+    /// Bind the declared parameters `params` into `body`: the default guards
+    /// (after capture-boxing, so a defaulted cell param reads/writes its boxed
+    /// cell), the trailing rest array, then the destructuring parameters.
+    pub(super) fn bind_params(
+        &mut self,
+        params: Params<'_>,
+        body: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
+        self.lower_default_guards(params.defaults, body)?;
+
+        // Trailing rest parameter: gather the surplus arguments into a
+        // real array bound to the rest name (after the fixed params / defaults).
+        if let Some((rest_ident, p)) = params.rest {
+            self.lower_rest_param(rest_ident, p, k, body);
+        }
+
+        // Destructuring parameters: each temp slot holds the incoming
+        // argument; apply an optional parameter-level default, then destructure it
+        // into the named locals by reusing the `lower_binding_pattern`
+        // helper (which handles nested patterns, holes, defaults, and rest).
+        for (temp, pat, default) in params.destructure {
+            if let Some(default) = default {
+                let default_value = self.lower_expr(default)?;
+                body.push(IrStmt::If {
+                    cond: IrNode::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(IrNode::Local(temp)),
+                        rhs: Box::new(IrNode::Undefined),
+                    },
+                    then_body: vec![IrStmt::Expr(IrNode::Assign {
+                        local: temp,
+                        value: Box::new(default_value),
+                    })],
+                    else_body: Vec::new(),
+                });
+            }
+            self.lower_binding_pattern(pat, IrNode::Local(temp), true, body)?;
+        }
+        Ok(())
+    }
+
+    /// Finish the current frame's function around its lowered `body`: prepend
+    /// the entry snapshots the body allocated (`this`, `new.target`,
+    /// `arguments`, `__spread_args`) and return the [`IrFunction`] with this
+    /// frame's environment layout.
+    pub(super) fn finish_function(&mut self, mut body: Vec<IrStmt>) -> (IrFunction, Vec<u32>) {
+        let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
+        let derived = self.frame().derived();
         // If the body read `this`, prepend the prologue snapshot as the VERY FIRST
         // statement: `this_slot = __this`, so a nested `this.other()` that
         // re-sets the global cannot disturb this frame's own receiver. A function
@@ -300,9 +346,9 @@ impl LowerCtx<'_> {
             );
         }
 
-        // `arguments` (referenced here or by a nested arrow): built from the
-        // incoming slots before any parameter is boxed, defaulted or assigned
-        // (unmapped semantics).
+        // `arguments` (referenced here, by a nested arrow, or by a generator
+        // body): built from the incoming slots before any parameter is boxed,
+        // defaulted or assigned (unmapped semantics).
         if let Some(local) = self.frame().arguments_local {
             let init = self.lower_arguments_object(local, k);
             body.splice(0..0, init);
@@ -319,18 +365,17 @@ impl LowerCtx<'_> {
             );
         }
 
-        let locals = self.frame().next;
         let env_layout = self.frame().env.clone();
-        Ok((
+        (
             IrFunction {
-                params,
-                locals,
+                params: k + 2,
+                locals: self.frame().next,
                 body,
                 machine: None,
                 info: FnInfo::default(),
             },
             env_layout,
-        ))
+        )
     }
 
     /// Emit the default-parameter guards in parameter order: each emits
@@ -545,11 +590,16 @@ impl LowerCtx<'_> {
         name: &str,
         kind: FnKind,
     ) -> anyhow::Result<IrNode> {
-        self.lower_lifted(param_pats, body_kind, name, kind, false)
+        self.lower_lifted(param_pats, body_kind, name, kind, false, None)
     }
 
     /// [`Self::lower_lifted_function`], for an arrow body when `arrow` is set
-    /// (it reads its enclosing function's `new.target`).
+    /// (it reads its enclosing function's `new.target` and `arguments`), and
+    /// for a generator (`machine = Some((false, span))`) or async
+    /// (`Some((true, span))`) body, whose lifted function is the generator
+    /// constructor ([`Self::build_generator_ctor`]). A generator constructor
+    /// reads its own function object (for its `prototype`) from a hidden
+    /// cell of the enclosing frame, filled right after the value is built.
     fn lower_lifted(
         &mut self,
         param_pats: &[&Pat],
@@ -557,6 +607,7 @@ impl LowerCtx<'_> {
         name: &str,
         kind: FnKind,
         arrow: bool,
+        machine: Option<(bool, swc_common::Span)>,
     ) -> anyhow::Result<IrNode> {
         // Reserve this function's table slot before lowering its body, so any
         // function nested in the body takes a later slot.
@@ -573,13 +624,22 @@ impl LowerCtx<'_> {
             pos
         };
         let table_index = self.shared.arrow_base - 1 + u32::try_from(pos).unwrap_or(u32::MAX);
+        let self_cell =
+            matches!(machine, Some((false, _))).then(|| (self.top(), self.hidden_local()));
 
         self.push_frame();
         self.frame().arrow = arrow;
         if matches!(kind, FnKind::Class | FnKind::DerivedClass) {
             self.frame().ctor = kind;
         }
-        let built = self.build_function_body(param_pats, body_kind);
+        let callee =
+            self_cell.map(|(fi, (_, id))| IrNode::CellGet(Box::new(self.read_hidden(fi, id))));
+        let built = match machine {
+            Some((is_async, span)) => {
+                self.build_generator_ctor(param_pats, body_kind, is_async, span, callee)
+            }
+            None => self.build_function_body(param_pats, body_kind),
+        };
         let (mut func, env_layout) = match built {
             Ok(pair) => pair,
             Err(e) => {
@@ -601,11 +661,29 @@ impl LowerCtx<'_> {
             .iter()
             .map(|&id| self.capture_source(id))
             .collect();
-        Ok(IrNode::FuncValue {
+        let value = IrNode::FuncValue {
             table_index,
             captures,
             kind,
-        })
+        };
+        let Some((_, (cell, _))) = self_cell else {
+            return Ok(value);
+        };
+        let func = self.fresh();
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: cell,
+                value: Box::new(IrNode::CellNew(Box::new(IrNode::Undefined))),
+            },
+            IrNode::Assign {
+                local: func,
+                value: Box::new(value),
+            },
+            IrNode::CellSet {
+                cell: Box::new(IrNode::Local(cell)),
+                value: Box::new(IrNode::Local(func)),
+            },
+        ]))
     }
 
     /// Lower a nested `function foo(){ .. }` declaration in place (outside a
@@ -637,19 +715,59 @@ impl LowerCtx<'_> {
     /// (registered in the funcref table, may capture enclosing bindings like an
     /// arrow) and return the [`IrNode::FuncValue`] building its value.
     pub(super) fn lower_nested_fn_value(&mut self, fn_decl: &FnDecl) -> anyhow::Result<IrNode> {
-        let block = fn_decl
-            .function
+        self.lower_function_value(&fn_decl.function, fn_decl.ident.sym.as_ref())
+    }
+
+    /// Lift a `function`-keyword function (a nested declaration or an
+    /// expression) named `name` to a top-level function and return the
+    /// [`IrNode::FuncValue`] building its value: a constructor for an ordinary
+    /// function, a generator constructor (not a constructor itself) for a
+    /// `function*` / `async function`.
+    pub(super) fn lower_function_value(
+        &mut self,
+        function: &swc_ecma_ast::Function,
+        name: &str,
+    ) -> anyhow::Result<IrNode> {
+        self.lower_callable(function, name, FnKind::Constructor)
+    }
+
+    /// Lift an object-literal or class method (or accessor) `function` named
+    /// `name`: an ordinary method, or the generator constructor of a
+    /// generator / async method. Methods are not constructors.
+    pub(super) fn lower_method(
+        &mut self,
+        function: &swc_ecma_ast::Function,
+        name: &str,
+    ) -> anyhow::Result<IrNode> {
+        self.lower_callable(function, name, FnKind::Plain)
+    }
+
+    /// [`Self::lower_function_value`] / [`Self::lower_method`]: an ordinary
+    /// `function` lifts with `kind`, a generator / async one to its generator
+    /// constructor.
+    fn lower_callable(
+        &mut self,
+        function: &swc_ecma_ast::Function,
+        name: &str,
+        kind: FnKind,
+    ) -> anyhow::Result<IrNode> {
+        let block = function
             .body
             .as_ref()
-            .ok_or_else(|| anyhow!("function declaration requires a body"))?;
-        reject_unsupported_function(&fn_decl.function)?;
-        let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
-        self.lower_lifted_function(
-            &param_pats,
-            BodyKind::Block(&block.stmts),
-            fn_decl.ident.sym.as_ref(),
-            FnKind::Constructor,
-        )
+            .ok_or_else(|| anyhow!("function requires a body"))?;
+        let param_pats: Vec<&Pat> = function.params.iter().map(|p| &p.pat).collect();
+        let body = BodyKind::Block(&block.stmts);
+        match state_machine(function)? {
+            Some(is_async) => self.lower_lifted(
+                &param_pats,
+                body,
+                name,
+                machine_kind(is_async),
+                false,
+                Some((is_async, function.span)),
+            ),
+            None => self.lower_lifted_function(&param_pats, body, name, kind),
+        }
     }
 
     /// Lower an arrow function `(a, b) => a + b` / `x => x * x` / `(n) => { .. }`
@@ -663,24 +781,15 @@ impl LowerCtx<'_> {
     /// `new.target`/`arguments`, and are not constructors. `name` is the
     /// inferred `name` (`""` when anonymous).
     pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr, name: &str) -> anyhow::Result<IrNode> {
-        // `async`/generator arrows are out of scope: reject rather than
-        // silently compile the body as a plain arrow (wrong result).
-        if arrow.is_async {
-            return Err(
-                CompileError::spanned(arrow.span(), "async functions are unsupported").into(),
-            );
-        }
-        if arrow.is_generator {
-            return Err(
-                CompileError::spanned(arrow.span(), "generator functions are unsupported").into(),
-            );
-        }
         let param_pats: Vec<&Pat> = arrow.params.iter().collect();
         let body_kind = match arrow.body.as_ref() {
             ArrowFunctionBody::FunctionBody(block) => BodyKind::Block(&block.stmts),
             ArrowFunctionBody::Expr(expr) => BodyKind::Expr(expr),
         };
-        self.lower_lifted(&param_pats, body_kind, name, FnKind::Plain, true)
+        // An `async` arrow's body is an async body (a generator state machine
+        // spawned as a promise).
+        let machine = arrow.is_async.then_some((true, arrow.span));
+        self.lower_lifted(&param_pats, body_kind, name, FnKind::Plain, true, machine)
     }
 }
 

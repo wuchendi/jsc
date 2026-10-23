@@ -17,6 +17,7 @@ impl Frame {
             next_label: 0,
             allows_this: false,
             this_local: None,
+            gen_this: None,
             arrow: false,
             new_target_local: None,
             ctor: FnKind::Plain,
@@ -175,9 +176,13 @@ impl<'a> LowerCtx<'a> {
             None
         };
         // An `env_backed` (generator) frame boxes EVERY binding into an env cell so
-        // it survives across a `yield`; an ordinary frame boxes only the bindings
-        // capture analysis flagged.
-        let cell = module.is_none() && (env_backed || self.shared.captured.contains(&id));
+        // it survives across a `yield`, and a generator constructor's frame boxes
+        // every parameter binding for its body; an ordinary frame boxes only the
+        // bindings capture analysis flagged.
+        let cell = module.is_none()
+            && (env_backed
+                || self.frame().ctor == FnKind::Generator
+                || self.shared.captured.contains(&id));
         // In an `env_backed` frame the cell lives at a fresh env slot (reached via
         // `EnvLoad`), not in a wasm local; the constructor pre-creates it.
         let env_slot = if env_backed {
@@ -290,19 +295,17 @@ impl<'a> LowerCtx<'a> {
     /// Resolve `arguments`: the nearest non-arrow function's `arguments`
     /// object, built in its prologue (allocated on first reference) and captured
     /// BY VALUE through each nested arrow's environment (the binding is never
-    /// reassigned). `Err` with the diagnostic at top level and in a
-    /// generator/async body.
+    /// reassigned). A generator/async body reads its constructor's (the frame
+    /// enclosing it), built when it is called, so it survives every suspend.
+    /// `Err` with the diagnostic at top level.
     pub(super) fn resolve_arguments(&mut self) -> Result<IrNode, &'static str> {
         let fi = self
             .frames
             .iter()
-            .rposition(|frame| !frame.arrow)
+            .rposition(|frame| !frame.arrow && !frame.env_backed)
             .unwrap_or(0);
         if fi == 0 && self.main_ctx {
             return Err("`arguments` is only valid inside a function");
-        }
-        if self.frames[fi].env_backed {
-            return Err("`arguments` in a generator or async function is unsupported");
         }
         let local = if let Some(local) = self.frames[fi].arguments_local {
             local
@@ -401,10 +404,24 @@ impl<'a> LowerCtx<'a> {
         self.frame().env_backed = true;
     }
 
-    /// The number of environment slots the current frame has allocated (its
-    /// generator frame size).
-    pub(super) fn env_len(&self) -> usize {
-        self.frames.last().map_or(0, |f| f.env.len())
+    /// `this` in a generator/async (`env_backed`) body: the frame's `this`
+    /// cell (allocated on first use), which the generator constructor seeds
+    /// with its call's receiver so it survives every suspend. `None` in an
+    /// ordinary frame.
+    pub(super) fn generator_this(&mut self) -> Option<IrNode> {
+        let frame = self.frame();
+        if !frame.env_backed {
+            return None;
+        }
+        let slot = if let Some(slot) = frame.gen_this {
+            slot
+        } else {
+            let slot = u32::try_from(frame.env.len()).unwrap_or(u32::MAX);
+            frame.env.push(u32::MAX);
+            frame.gen_this = Some(slot);
+            slot
+        };
+        Some(IrNode::CellGet(Box::new(IrNode::EnvLoad(slot))))
     }
 
     /// Find the binding a name resolves to: the frame index it lives in and its
