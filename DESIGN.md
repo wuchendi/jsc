@@ -1294,23 +1294,33 @@ Errors are printed to stderr.
   idempotent.
 - **Harness.** At startup the runner reads every `.tmp/test262/harness/*.js`,
   checks that `sta.js` + `assert.js` compile and run (a setup error otherwise),
-  drops `doneprintHandle.js` (needs a host `print` and an async runner) and
-  `propertyHelper.js` (needs descriptor reflection), and probes each remaining
-  include together with `sta.js` + `assert.js`; only the includes that compile
-  are usable, and it prints their list.
+  drops `propertyHelper.js` (needs descriptor reflection), and probes each
+  remaining include together with `sta.js` + `assert.js` (`doneprintHandle.js`
+  after the host `print` prelude, as async tests use it); only the includes
+  that compile are usable, and it prints their list.
 - **Eligibility** (`filter.rs`). A test is skipped when it has a `module`,
-  `async`, `CanBlockIsFalse`, or `CanBlockIsTrue` flag (or a `resolution`-phase
+  `CanBlockIsFalse`, or `CanBlockIsTrue` flag (or a `resolution`-phase
   negative), is `noStrict`-only, uses a feature listed in
   `tests/test262/unsupported-features.txt` (exact names or `prefix*`), or needs a
-  harness include that is not usable.
+  harness include that is not usable (`async` tests implicitly need
+  `doneprintHandle.js`). A test flagged both `raw` and `async` is skipped as
+  `flag:async`: a raw source leaves no place to prepend `$DONE`.
 - **Assembly** (`assemble.rs`). `raw` tests run byte-for-byte; all others are
   `"use strict";` + `sta.js` + `assert.js` + the listed includes + the test
-  source, all unmodified.
+  source, all unmodified. `async` tests additionally get the runner-owned host
+  prelude `function print(message) { console.log(message); }` right after the
+  directive (test262 `INTERPRETING.md` makes `print` host-defined) and
+  `doneprintHandle.js` as the first include (once, even if listed).
 - **Outcome** (`outcome.rs`). Each test runs as `jsc FILE` with a timeout
-  (default 10 s); exit codes map to pass / fail / compile-error / timeout, with
-  negative tests matched on parse versus runtime phase and the uncaught error
-  name (builtin errors render as `Uncaught TypeError: …`, a failed assertion as
-  `Uncaught Test262Error { … }`).
+  (default 10 s), stdout and stderr captured to files; exit codes map to pass /
+  fail / compile-error / timeout, with negative tests matched on parse versus
+  runtime phase and the uncaught error name (builtin errors render as
+  `Uncaught TypeError: …`, a failed assertion as `Uncaught Test262Error { … }`).
+  A non-negative `async` test that exits 0 passes only if stdout has a line
+  exactly `Test262:AsyncTestComplete` and none starting
+  `Test262:AsyncTestFailure`; otherwise it fails with that failure line (or
+  `missing Test262:AsyncTestComplete`) as the detail in
+  `.tmp/test262-results.tsv`. Negative async tests follow the negative rules.
 - **Baseline.** `tests/test262/baseline.txt` lists every passing test path.
   `--check` fails if any baseline test no longer passes; `--update-baseline`
   merges the current passes into it.
@@ -1320,9 +1330,12 @@ Errors are printed to stderr.
   | commit | pass | eligible | total |
   |---|---|---|---|
   | `319208e` | 10185 | 23208 | 47665 |
+  | `d0f5e6a` | 10269 | 26388 | 47665 |
 
-  i.e. **10185 / 23208 eligible tests pass (≈ 43.9 %)**, out of 47665 tests in
-  the pinned checkout; `baseline.txt` holds the same 10185 paths.
+  i.e. **10269 / 26388 eligible tests pass (≈ 38.9 %)**, out of 47665 tests in
+  the pinned checkout; `baseline.txt` holds the same 10269 paths. The drop in
+  rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); the
+  previously eligible 23208 still pass 10185.
 
 **Running it** (from the repository root):
 
