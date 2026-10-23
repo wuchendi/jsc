@@ -270,6 +270,12 @@ pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
 /// allocation.
 pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
 
+/// [`TYPE_FUNCTION`] header `flags` bit: a bound function exotic object
+/// (`Function.prototype.bind`). Its `func_idx` is the bound-call trampoline
+/// and its `env` an array `[target, boundThis, ...boundArgs]`; its own
+/// `length` and `name` are defined at creation (it is never `LAZY`).
+pub(crate) const FUNC_FLAG_BOUND: u8 = 64;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *

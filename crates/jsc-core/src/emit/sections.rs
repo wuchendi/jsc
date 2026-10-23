@@ -227,8 +227,10 @@ pub(super) fn build_type_and_function_sections<'a>(
     // property-descriptor helpers `__define_own(o: i32, key: i32, desc: i32,
     // value: i64, get: i64, set: i64) -> i32`, `__to_desc(attrs: i64, list:
     // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
-    // i64, level: i32)` and `__test_integrity(obj: i64, level: i32) -> i32`.
-    let conversions: [(&[ValType], &[ValType]); 14] = [
+    // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
+    // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
+    // i64) -> i32`.
+    let conversions: [(&[ValType], &[ValType]); 16] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -263,6 +265,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64, ValType::I32], &[]),
         (&[ValType::I64, ValType::I32], &[ValType::I32]),
+        (&[ValType::I64, ValType::I32], &[ValType::I32]),
+        (&[ValType::I32, ValType::I64], &[ValType::I32]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
@@ -1274,7 +1278,7 @@ fn collect_entries<'a>(
 
 /// Whether any function of `program` (or `main`) builds an accessor
 /// ([`IrNode::MakeAccessor`]), can define one (it names `defineProperty` /
-/// `defineProperties`), or can reach the realm's accessors (the
+/// `defineProperties` / `create`), or can reach the realm's accessors (the
 /// `%Function.prototype%` `caller` / `arguments` poison pair, the `Map`/`Set`
 /// `size` getters): it names them, or reads or writes a
 /// member under a key computed at run time. Then `__get` / `__set` must
@@ -1286,7 +1290,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
         IrNode::MakeAccessor { .. } | IrNode::SizeRead { .. } => true,
         IrNode::Str(s) => matches!(
             s.as_str(),
-            "caller" | "arguments" | "size" | "defineProperty" | "defineProperties"
+            "caller" | "arguments" | "size" | "defineProperty" | "defineProperties" | "create"
         ),
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }

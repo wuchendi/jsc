@@ -188,10 +188,24 @@ pub(super) enum Builtin {
     ObjectToString,
     /// `Object.prototype.valueOf`.
     ValueOf,
+    /// `Object.prototype.isPrototypeOf`.
+    IsPrototypeOf,
+    /// `Object.prototype.propertyIsEnumerable`.
+    PropertyIsEnumerable,
+    /// `Object.prototype.toLocaleString`.
+    ToLocaleString,
     /// `Function.prototype.call`.
     Call,
     /// `Function.prototype.apply`.
     Apply,
+    /// `Function.prototype.bind`.
+    Bind,
+    /// `Function.prototype.toString`.
+    FunctionToString,
+    /// The call/construct trampoline of every bound function (DESIGN.md
+    /// §5.5): `env` is the `[target, boundThis, ...boundArgs]` array. Not
+    /// installed on any intrinsic.
+    BoundCall,
     /// `Error.prototype.toString`.
     ErrorToString,
     /// A `Math` method (`Math.floor`, `Math.max`, ..).
@@ -298,8 +312,8 @@ pub(super) enum Builtin {
     IsFinite,
 }
 
-/// An `Object` static over property descriptors and integrity levels
-/// (DESIGN.md §6.3).
+/// An `Object` static over property descriptors, integrity levels,
+/// prototypes and own keys (DESIGN.md §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReflectOp {
     DefineProperty,
@@ -312,11 +326,19 @@ pub(super) enum ReflectOp {
     Freeze,
     IsSealed,
     IsFrozen,
+    Create,
+    GetPrototypeOf,
+    SetPrototypeOf,
+    GetOwnPropertyNames,
+    Assign,
+    HasOwn,
+    Is,
+    FromEntries,
 }
 
 impl ReflectOp {
     /// Every op, in [`Builtin::ALL`] order.
-    const ALL: [ReflectOp; 10] = [
+    const ALL: [ReflectOp; 18] = [
         Self::DefineProperty,
         Self::DefineProperties,
         Self::GetOwnPropertyDescriptor,
@@ -327,6 +349,14 @@ impl ReflectOp {
         Self::Freeze,
         Self::IsSealed,
         Self::IsFrozen,
+        Self::Create,
+        Self::GetPrototypeOf,
+        Self::SetPrototypeOf,
+        Self::GetOwnPropertyNames,
+        Self::Assign,
+        Self::HasOwn,
+        Self::Is,
+        Self::FromEntries,
     ];
 
     /// The static's name.
@@ -342,6 +372,14 @@ impl ReflectOp {
             Self::Freeze => "freeze",
             Self::IsSealed => "isSealed",
             Self::IsFrozen => "isFrozen",
+            Self::Create => "create",
+            Self::GetPrototypeOf => "getPrototypeOf",
+            Self::SetPrototypeOf => "setPrototypeOf",
+            Self::GetOwnPropertyNames => "getOwnPropertyNames",
+            Self::Assign => "assign",
+            Self::HasOwn => "hasOwn",
+            Self::Is => "is",
+            Self::FromEntries => "fromEntries",
         }
     }
 
@@ -349,7 +387,13 @@ impl ReflectOp {
     fn length(self) -> u32 {
         match self {
             Self::DefineProperty => 3,
-            Self::DefineProperties | Self::GetOwnPropertyDescriptor => 2,
+            Self::DefineProperties
+            | Self::GetOwnPropertyDescriptor
+            | Self::Create
+            | Self::SetPrototypeOf
+            | Self::Assign
+            | Self::HasOwn
+            | Self::Is => 2,
             _ => 1,
         }
     }
@@ -437,13 +481,19 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 122] = [
+    pub(super) const ALL: [Builtin; 136] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
         Self::ValueOf,
+        Self::IsPrototypeOf,
+        Self::PropertyIsEnumerable,
+        Self::ToLocaleString,
         Self::Call,
         Self::Apply,
+        Self::Bind,
+        Self::FunctionToString,
+        Self::BoundCall,
         Self::ErrorToString,
         Self::Math(MathOp::Floor),
         Self::Math(MathOp::Ceil),
@@ -487,6 +537,14 @@ impl Builtin {
         Self::ObjectReflect(ReflectOp::ALL[7]),
         Self::ObjectReflect(ReflectOp::ALL[8]),
         Self::ObjectReflect(ReflectOp::ALL[9]),
+        Self::ObjectReflect(ReflectOp::ALL[10]),
+        Self::ObjectReflect(ReflectOp::ALL[11]),
+        Self::ObjectReflect(ReflectOp::ALL[12]),
+        Self::ObjectReflect(ReflectOp::ALL[13]),
+        Self::ObjectReflect(ReflectOp::ALL[14]),
+        Self::ObjectReflect(ReflectOp::ALL[15]),
+        Self::ObjectReflect(ReflectOp::ALL[16]),
+        Self::ObjectReflect(ReflectOp::ALL[17]),
         Self::IsArray,
         Self::PromiseResolve,
         Self::PromiseReject,
@@ -595,14 +653,19 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ThrowTypeError
             | Self::MethodCall
+            | Self::BoundCall
             | Self::IterSource => "",
             Self::HasOwnProperty => "hasOwnProperty",
+            Self::IsPrototypeOf => "isPrototypeOf",
+            Self::PropertyIsEnumerable => "propertyIsEnumerable",
+            Self::ToLocaleString => "toLocaleString",
             Self::ObjectToString
             | Self::ErrorToString
             | Self::ArrayToString
             | Self::StringToString
             | Self::NumberToString
-            | Self::BooleanToString => "toString",
+            | Self::BooleanToString
+            | Self::FunctionToString => "toString",
             Self::ValueOf | Self::StringValueOf | Self::NumberValueOf | Self::BooleanValueOf => {
                 "valueOf"
             }
@@ -619,6 +682,7 @@ impl Builtin {
             Self::StringMethod(op) => op.name(),
             Self::Call => "call",
             Self::Apply => "apply",
+            Self::Bind => "bind",
             Self::Math(op) => match op {
                 MathOp::Floor => "floor",
                 MathOp::Ceil => "ceil",
@@ -663,7 +727,9 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ThrowTypeError
             | Self::MethodCall
+            | Self::BoundCall
             | Self::IterSource
+            | Self::FunctionToString
             | Self::StringToString
             | Self::StringValueOf
             | Self::NumberValueOf
@@ -671,6 +737,7 @@ impl Builtin {
             | Self::BooleanValueOf
             | Self::ObjectToString
             | Self::ValueOf
+            | Self::ToLocaleString
             | Self::ErrorToString
             | Self::ArrayToString
             | Self::DateMethod(_)
@@ -690,7 +757,10 @@ impl Builtin {
             | Self::CollectionOp { op: MapOp::Set, .. }
             | Self::PromiseThen => 2,
             Self::HasOwnProperty
+            | Self::IsPrototypeOf
+            | Self::PropertyIsEnumerable
             | Self::Call
+            | Self::Bind
             | Self::Math(_)
             | Self::Ctor(_)
             | Self::ObjectStatic(_)
@@ -952,6 +1022,16 @@ const GLOBALS: [(&str, u32, Value); 26] = [
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
 ];
 
+/// The `%Object.prototype%` methods, in slot order.
+const OBJECT_PROTOTYPE_METHODS: [Builtin; 6] = [
+    Builtin::HasOwnProperty,
+    Builtin::ObjectToString,
+    Builtin::ValueOf,
+    Builtin::IsPrototypeOf,
+    Builtin::PropertyIsEnumerable,
+    Builtin::ToLocaleString,
+];
+
 /// The registry: every own property of every intrinsic, in slot order per
 /// intrinsic.
 pub(super) fn registry() -> Vec<Entry> {
@@ -962,25 +1042,11 @@ pub(super) fn registry() -> Vec<Entry> {
         attrs,
         value,
     };
-    let mut entries = vec![
-        entry(
-            ObjectPrototype,
-            "hasOwnProperty",
-            METHOD_ATTRS,
-            Value::Method(Builtin::HasOwnProperty),
-        ),
-        entry(
-            ObjectPrototype,
-            "toString",
-            METHOD_ATTRS,
-            Value::Method(Builtin::ObjectToString),
-        ),
-        entry(
-            ObjectPrototype,
-            "valueOf",
-            METHOD_ATTRS,
-            Value::Method(Builtin::ValueOf),
-        ),
+    let mut entries: Vec<Entry> = OBJECT_PROTOTYPE_METHODS
+        .into_iter()
+        .map(|b| entry(ObjectPrototype, b.name(), METHOD_ATTRS, Value::Method(b)))
+        .collect();
+    entries.extend([
         entry(FunctionPrototype, "length", FN_FACT_ATTRS, Value::Num(0.0)),
         entry(FunctionPrototype, "name", FN_FACT_ATTRS, Value::Str("")),
         entry(
@@ -995,9 +1061,21 @@ pub(super) fn registry() -> Vec<Entry> {
             METHOD_ATTRS,
             Value::Method(Builtin::Apply),
         ),
+        entry(
+            FunctionPrototype,
+            "bind",
+            METHOD_ATTRS,
+            Value::Method(Builtin::Bind),
+        ),
+        entry(
+            FunctionPrototype,
+            "toString",
+            METHOD_ATTRS,
+            Value::Method(Builtin::FunctionToString),
+        ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
-    ];
+    ]);
     for kind in ErrorKind::ALL {
         let proto = Intrinsic::ErrorPrototype(kind);
         entries.push(entry(proto, "name", METHOD_ATTRS, Value::Str(kind.name())));
@@ -1091,7 +1169,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
 }
 
 /// The statics of `Object`, in slot order.
-const OBJECT_STATICS: [Builtin; 13] = [
+const OBJECT_STATICS: [Builtin; 21] = [
     Builtin::ObjectStatic(ObjectBuiltinOp::Keys),
     Builtin::ObjectStatic(ObjectBuiltinOp::Values),
     Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
@@ -1105,6 +1183,14 @@ const OBJECT_STATICS: [Builtin; 13] = [
     Builtin::ObjectReflect(ReflectOp::ALL[7]),
     Builtin::ObjectReflect(ReflectOp::ALL[8]),
     Builtin::ObjectReflect(ReflectOp::ALL[9]),
+    Builtin::ObjectReflect(ReflectOp::ALL[10]),
+    Builtin::ObjectReflect(ReflectOp::ALL[11]),
+    Builtin::ObjectReflect(ReflectOp::ALL[12]),
+    Builtin::ObjectReflect(ReflectOp::ALL[13]),
+    Builtin::ObjectReflect(ReflectOp::ALL[14]),
+    Builtin::ObjectReflect(ReflectOp::ALL[15]),
+    Builtin::ObjectReflect(ReflectOp::ALL[16]),
+    Builtin::ObjectReflect(ReflectOp::ALL[17]),
 ];
 
 /// The builtin method `intrinsic.key` of the registry, if any.

@@ -26,10 +26,18 @@ const TAG_PROMISE: &str = "[object Promise]";
 const TAG_GENERATOR: &str = "[object Generator]";
 const TAG_OBJECT: &str = "[object Object]";
 
+/// The `TypeError` of `toLocaleString` when `this.toString` is not callable.
+const TO_STRING_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "toString is not a function",
+    "TypeError: toString is not a function",
+];
+
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 17] = [
+pub(super) const STRINGS: [&str; 19] = [
     NULLISH_TO_OBJECT[0],
     NULLISH_TO_OBJECT[1],
+    TO_STRING_NOT_CALLABLE[0],
+    TO_STRING_NOT_CALLABLE[1],
     TAG_UNDEFINED,
     TAG_NULL,
     TAG_BOOLEAN,
@@ -156,4 +164,86 @@ pub(super) fn emit_value_of(
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     require_object_coercible(function, frame, this, strings, helpers);
     wasm!(function; LocalGet(this), Call(helpers.to_object()));
+}
+
+/// `Object.prototype.isPrototypeOf(V)`: `false` for a non-object `V`; else
+/// `ToObject(this)` and whether it is on `V`'s `proto` chain.
+pub(super) fn emit_is_prototype_of(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (v, this) = (frame.i64(0), frame.i64(1));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(v));
+    emit_is_object(function, v);
+    wasm!(function;
+        I32Eqz, If(BlockType::Empty), I64Const(FALSE_BITS), Return, End,
+        GlobalGet(THIS_GLOBAL), LocalSet(this),
+    );
+    require_object_coercible(function, frame, this, strings, helpers);
+    let proto = MemArg {
+        offset: OBJ_PROTO_OFFSET,
+        align: 3,
+        memory_index: 0,
+    };
+    wasm!(function;
+        LocalGet(this), Call(helpers.to_object()), LocalSet(this),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(v), I32WrapI64, I64Load(proto), LocalTee(v), I64Const(NULL_BITS), I64Eq, BrIf(1),
+        LocalGet(v), LocalGet(this), I64Eq,
+        If(BlockType::Empty), I64Const(TRUE_BITS), Return, End,
+        Br(0),
+        End, End,
+        I64Const(FALSE_BITS),
+    );
+}
+
+/// `Object.prototype.propertyIsEnumerable(V)`: `ToPropertyKey(V)`, then
+/// `ToObject(this)`, then whether it has an own enumerable property `V`
+/// (`__own_enum`).
+pub(super) fn emit_property_is_enumerable(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (this, key) = (frame.i64(0), frame.i32(0));
+    frame.arg(function, 0);
+    wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
+    return_if_pending(function);
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
+    require_object_coercible(function, frame, this, strings, helpers);
+    wasm!(function;
+        LocalGet(this), Call(helpers.to_object()), LocalGet(key), Call(helpers.own_enum()),
+        If(BlockType::Result(ValType::I64)), I64Const(TRUE_BITS), Else, I64Const(FALSE_BITS), End,
+    );
+}
+
+/// `Object.prototype.toLocaleString()`: `Invoke(this, "toString")` (a
+/// nullish `this` throws; a primitive's `toString` is looked up on its realm
+/// prototype and called with the primitive itself).
+pub(super) fn emit_to_locale_string(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (this, method) = (frame.i64(0), frame.i64(1));
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
+    require_object_coercible(function, frame, this, strings, helpers);
+    wasm!(function;
+        LocalGet(this), I32Const(static_key(strings, "toString")), Call(helpers.get), LocalSet(method),
+    );
+    return_if_pending(function);
+    emit_is_function(function, method);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    throw_type_error(function, frame, TO_STRING_NOT_CALLABLE, strings, helpers);
+    wasm!(function; End);
+    for _ in 0..frame.k {
+        wasm!(function; I64Const(UNDEFINED_BITS));
+    }
+    wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
+    invoke(function, method, |function| emit_argc(0, function), helpers);
 }
