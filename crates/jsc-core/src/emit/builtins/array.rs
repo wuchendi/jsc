@@ -286,20 +286,6 @@ fn to_integer(function: &mut Function, r: u32, helpers: Helpers<'_>) {
     );
 }
 
-/// Push the index the relative position in f64 `r` designates in a length
-/// `len` (i32): `max(len + r, 0)` when `r < 0`, else `min(r, len)` (NaN is 0).
-fn relative_index(function: &mut Function, r: u32, len: u32) {
-    wasm!(function;
-        LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
-        If(BlockType::Result(ValType::F64)),
-        LocalGet(len), F64ConvertI32U, LocalGet(r), F64Add, F64Const(Ieee64::from(0.0)), F64Max,
-        Else,
-        LocalGet(r), LocalGet(len), F64ConvertI32U, F64Min,
-        End,
-        I32TruncSatF64U,
-    );
-}
-
 /// `Array.prototype.push(...items)`: an array appends in place
 /// (`__array_push`); any other object gets `Set(O, len + i, item)` per item
 /// and then `Set(O, "length", len + n)`. Returns the new length.
@@ -314,8 +300,16 @@ pub(super) fn emit_push(
     this_object(function, frame, o, PUSH.nullish, strings, helpers);
     argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
+    // An array grows in place unless it would pass `2^32 - 1` elements: the
+    // generic path then sets the non-index key and throws on `length`.
     is_array(function, o);
-    wasm!(function; If(BlockType::Empty));
+    wasm!(function; If(BlockType::Result(ValType::I32)));
+    wasm!(function;
+        LocalGet(o), I32WrapI64, I32Load(array_len_slot()), I64ExtendI32U,
+        LocalGet(n), I64ExtendI32U, I64Add, I64Const(0xffff_ffff), I64LeU,
+        Else, I32Const(0), End,
+        If(BlockType::Empty),
+    );
     count_loop(function, i, n, |function| {
         wasm!(function; LocalGet(o), I32WrapI64);
         arg_at(function, frame, i, v);
@@ -372,7 +366,7 @@ pub(super) fn emit_pop(
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let len = frame.i32(0);
+    let len = frame.yf64(0);
     let length = || IrNode::Str(INDEX_LENGTH_KEY.to_owned());
     this_object(function, frame, o, POP.nullish, strings, helpers);
     is_array(function, o);
@@ -385,16 +379,16 @@ pub(super) fn emit_pop(
         helpers,
     );
     wasm!(function; Return, End);
-    length_of(function, o, len, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
     wasm!(function;
-        LocalGet(len), I32Eqz,
+        LocalGet(len), F64Const(Ieee64::from(0.0)), F64Eq,
         If(BlockType::Empty),
         I64Const(0.0f64.to_bits().cast_signed()), LocalSet(kv),
     );
     emit_drop(function, frame, &set(o, length(), kv), strings, helpers);
     wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
     wasm!(function;
-        LocalGet(len), I32Const(1), I32Sub, F64ConvertI32U, I64ReinterpretF64, LocalSet(kv),
+        LocalGet(len), F64Const(Ieee64::from(1.0)), F64Sub, I64ReinterpretF64, LocalSet(kv),
     );
     let read = IrNode::Index {
         obj: Box::new(IrNode::Local(o)),
@@ -431,6 +425,7 @@ pub(super) fn emit_hof(
     let (c, kv, target) = (frame.y64(0), frame.y64(1), frame.y64(4));
     let (len, k, to, seeded) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
     let key = frame.x32(0);
+    let flen = frame.yf64(0);
     let reduce = op == ArrayHofOp::Reduce;
     let species = matches!(op, ArrayHofOp::Map | ArrayHofOp::Filter);
     this_object(function, frame, o, texts.nullish, strings, helpers);
@@ -462,7 +457,10 @@ pub(super) fn emit_hof(
         wasm!(function; If(BlockType::Empty));
         fast(function);
     }
-    length_of(function, o, len, strings, helpers);
+    // The full `ToLength` value sizes `map`'s `ArraySpeciesCreate` (past
+    // `2^32 - 1` a `RangeError`); the loop runs over its u32 clamp.
+    length_of_f64(function, o, flen, strings, helpers);
+    wasm!(function; LocalGet(flen), I32TruncSatF64U, LocalSet(len));
     frame.arg(function, 0);
     wasm!(function; LocalSet(callback));
     require_callable(
@@ -482,7 +480,7 @@ pub(super) fn emit_hof(
         );
         fast(function);
         if op == ArrayHofOp::Map {
-            index_value(function, len);
+            num(function, flen);
         } else {
             wasm!(function; I64Const(0.0f64.to_bits().cast_signed()));
         }
@@ -581,8 +579,9 @@ pub(super) fn emit_search(
 ) {
     let texts = if includes { &INCLUDES } else { &INDEX_OF };
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (len, k, key) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let key = frame.i32(2);
     let r = frame.f64(0);
+    let (len, k) = (frame.yf64(0), frame.yf64(1));
     let (op, not_found) = if includes {
         (abi::METHOD_OP_INCLUDES, FALSE_BITS)
     } else {
@@ -603,42 +602,47 @@ pub(super) fn emit_search(
         Call(helpers.method), Return,
         End,
     );
-    length_of(function, o, len, strings, helpers);
-    wasm!(function; LocalGet(len), I32Eqz, If(BlockType::Empty), I64Const(not_found), Return, End);
+    length_of_f64(function, o, len, strings, helpers);
+    wasm!(function;
+        LocalGet(len), F64Const(Ieee64::from(0.0)), F64Eq,
+        If(BlockType::Empty), I64Const(not_found), Return, End,
+    );
     frame.arg(function, 1);
     to_integer(function, r, helpers);
     wasm!(function;
-        LocalGet(r), LocalGet(len), F64ConvertI32U, F64Ge,
+        LocalGet(r), LocalGet(len), F64Ge,
         If(BlockType::Empty), I64Const(not_found), Return, End,
     );
-    relative_index(function, r, len);
+    relative_f64(function, r, len);
     wasm!(function; LocalSet(k));
-    count_loop(function, k, len, |function| {
-        if includes {
-            get_index(function, o, k, key, v, helpers);
-            wasm!(function;
-                LocalGet(v), LocalGet(search), Call(helpers.same_value_zero),
-                If(BlockType::Empty), I64Const(TRUE_BITS), Return, End,
-            );
-        } else {
-            has_index(function, o, k, key, helpers);
-            wasm!(function;
-                If(BlockType::Empty),
-                LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(v),
-            );
-            return_if_pending(function);
-            emit_node(
-                &strict_eq(v, search),
-                function,
-                frame.scratch(),
-                strings,
-                helpers,
-            );
-            wasm!(function; I64Const(TRUE_BITS), I64Eq, If(BlockType::Empty));
-            index_value(function, k);
-            wasm!(function; Return, End, End);
-        }
-    });
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+        |function| {
+            if includes {
+                get_at(function, o, k, key, v, helpers);
+                wasm!(function;
+                    LocalGet(v), LocalGet(search), Call(helpers.same_value_zero),
+                    If(BlockType::Empty), I64Const(TRUE_BITS), Return, End,
+                );
+            } else {
+                has_at(function, o, k, key, helpers);
+                wasm!(function; If(BlockType::Empty));
+                get_key(function, o, key, v, helpers);
+                emit_node(
+                    &strict_eq(v, search),
+                    function,
+                    frame.scratch(),
+                    strings,
+                    helpers,
+                );
+                wasm!(function; I64Const(TRUE_BITS), I64Eq, If(BlockType::Empty));
+                num(function, k);
+                wasm!(function; Return, End, End);
+            }
+            bump(function, k, 1.0);
+        },
+    );
     wasm!(function; I64Const(not_found));
 }
 
@@ -705,28 +709,20 @@ pub(super) fn emit_slice(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let (o, value, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
+    let (o, value, kv, end_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (c, count, target) = (frame.y64(0), frame.y64(1), frame.y64(4));
-    let (len, k, fin, to) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
     let key = frame.x32(1);
     let rel = frame.f64(0);
-    this_object(function, frame, o, SLICE.nullish, strings, helpers);
-    length_of(function, o, len, strings, helpers);
+    let (len, k) = (frame.yf64(0), frame.yf64(1));
+    let (fin, to) = (frame.zf64(0), frame.zf64(1));
     frame.arg(function, 0);
-    to_integer(function, rel, helpers);
-    relative_index(function, rel, len);
-    wasm!(function; LocalSet(k));
+    wasm!(function; LocalSet(value));
     frame.arg(function, 1);
-    wasm!(function;
-        LocalTee(value), I64Const(UNDEFINED_BITS), I64Eq,
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(len),
-        Else,
-        LocalGet(value),
-    );
-    to_integer(function, rel, helpers);
-    relative_index(function, rel, len);
-    wasm!(function; End, LocalSet(fin));
+    wasm!(function; LocalSet(end_v));
+    this_object(function, frame, o, SLICE.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    relative_arg(function, value, false, rel, len, k, helpers);
+    relative_arg(function, end_v, true, rel, len, fin, helpers);
     species_ctor(function, frame, o, c, strings, helpers);
     is_array(function, o);
     wasm!(function;
@@ -734,30 +730,34 @@ pub(super) fn emit_slice(
         If(BlockType::Empty),
         LocalGet(o), I32Const(abi::METHOD_OP_SLICE),
     );
-    index_value(function, k);
-    index_value(function, fin);
+    num(function, k);
+    num(function, fin);
     wasm!(function;
         Call(helpers.method), Return,
         End,
         // count = max(final - k, 0)
-        LocalGet(fin), LocalGet(k), I32Sub, I32Const(0), LocalGet(fin), LocalGet(k), I32GtU, Select,
-        F64ConvertI32U, I64ReinterpretF64, LocalSet(count),
+        LocalGet(fin), LocalGet(k), F64Sub, F64Const(Ieee64::from(0.0)), F64Max,
+        I64ReinterpretF64, LocalSet(count),
     );
     species_from(function, frame, c, count, target, strings, helpers);
-    wasm!(function; I32Const(0), LocalSet(to));
-    count_loop(function, k, fin, |function| {
-        has_index(function, o, k, key, helpers);
-        wasm!(function;
-            If(BlockType::Empty),
-            LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(value),
-        );
-        return_if_pending(function);
-        index_value(function, to);
-        wasm!(function; LocalSet(kv));
-        create_data_property(function, frame, target, kv, value, strings, helpers);
-        wasm!(function; End, LocalGet(to), I32Const(1), I32Add, LocalSet(to));
-    });
-    index_value(function, to);
+    return_if_pending(function);
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(to));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(fin), F64Lt),
+        |function| {
+            has_at(function, o, k, key, helpers);
+            wasm!(function; If(BlockType::Empty));
+            get_key(function, o, key, value, helpers);
+            num(function, to);
+            wasm!(function; LocalSet(kv));
+            create_data_property(function, frame, target, kv, value, strings, helpers);
+            wasm!(function; End);
+            bump(function, k, 1.0);
+            bump(function, to, 1.0);
+        },
+    );
+    num(function, to);
     wasm!(function; LocalSet(kv));
     set_length(function, frame, target, kv, strings, helpers);
     wasm!(function; LocalGet(target));
@@ -1209,15 +1209,16 @@ fn set_length(
     emit_drop(function, frame, &set(a, length, len), strings, helpers);
 }
 
-/// `while i > 0 { i -= 1; body }` over the i32 local `i`.
-fn down_loop(function: &mut Function, i: u32, body: impl FnOnce(&mut Function)) {
-    wasm!(function;
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i), I32Eqz, BrIf(1),
-        LocalGet(i), I32Const(1), I32Sub, LocalSet(i),
+/// `while k > 0 { k -= 1; body }` over the f64 local `k`.
+fn down_loop_f64(function: &mut Function, k: u32, body: impl FnOnce(&mut Function)) {
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), F64Const(Ieee64::from(0.0)), F64Gt),
+        |function| {
+            bump(function, k, -1.0);
+            body(function);
+        },
     );
-    body(function);
-    wasm!(function; Br(0), End, End);
 }
 
 /// Copy the published spread argument array saved in i64 `saved` back into
@@ -1480,11 +1481,12 @@ pub(super) fn emit_find(
 ) {
     let texts = find_texts(op);
     let (o, pred, this_arg, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let r = frame.x64(0);
-    let (len, k, key) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (r, kv) = (frame.x64(0), frame.x64(1));
+    let key = frame.i32(2);
+    let (len, k) = (frame.yf64(0), frame.yf64(1));
     let present_only = matches!(op, ArrayFindOp::Some | ArrayFindOp::Every);
     this_object(function, frame, o, texts.nullish, strings, helpers);
-    length_of(function, o, len, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(pred));
     require_callable(function, frame, pred, texts.not_callable, strings, helpers);
@@ -1492,16 +1494,15 @@ pub(super) fn emit_find(
     wasm!(function; LocalSet(this_arg));
     let body = |function: &mut Function| {
         if present_only {
-            has_index(function, o, k, key, helpers);
-            wasm!(function;
-                If(BlockType::Empty),
-                LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(v),
-            );
-            return_if_pending(function);
+            has_at(function, o, k, key, helpers);
+            wasm!(function; If(BlockType::Empty));
+            get_key(function, o, key, v, helpers);
         } else {
-            get_index(function, o, k, key, v, helpers);
+            get_at(function, o, k, key, v, helpers);
         }
-        let args = [CallArg::Val(v), CallArg::Index(k), CallArg::Val(o)];
+        num(function, k);
+        wasm!(function; LocalSet(kv));
+        let args = [CallArg::Val(v), CallArg::Val(kv), CallArg::Val(o)];
         call_fn(function, frame, pred, this_arg, &args, r, helpers);
         emit_cond(
             &IrNode::Local(r),
@@ -1516,7 +1517,7 @@ pub(super) fn emit_find(
         wasm!(function; If(BlockType::Empty));
         match op {
             ArrayFindOp::Find | ArrayFindOp::FindLast => wasm!(function; LocalGet(v)),
-            ArrayFindOp::FindIndex | ArrayFindOp::FindLastIndex => index_value(function, k),
+            ArrayFindOp::FindIndex | ArrayFindOp::FindLastIndex => num(function, k),
             ArrayFindOp::Some => wasm!(function; I64Const(TRUE_BITS)),
             ArrayFindOp::Every => wasm!(function; I64Const(FALSE_BITS)),
         }
@@ -1527,10 +1528,17 @@ pub(super) fn emit_find(
     };
     if matches!(op, ArrayFindOp::FindLast | ArrayFindOp::FindLastIndex) {
         wasm!(function; LocalGet(len), LocalSet(k));
-        down_loop(function, k, body);
+        down_loop_f64(function, k, body);
     } else {
-        wasm!(function; I32Const(0), LocalSet(k));
-        count_loop(function, k, len, body);
+        wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k));
+        while_loop(
+            function,
+            |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+            |function| {
+                body(function);
+                bump(function, k, 1.0);
+            },
+        );
     }
     match op {
         ArrayFindOp::Find | ArrayFindOp::FindLast => wasm!(function; I64Const(UNDEFINED_BITS)),
@@ -1552,10 +1560,11 @@ pub(super) fn emit_reduce_right(
     helpers: Helpers<'_>,
 ) {
     let (o, callback, this_arg, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let acc = frame.x64(0);
-    let (len, k, key, seeded) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (acc, kv) = (frame.x64(0), frame.x64(1));
+    let (key, seeded) = (frame.i32(2), frame.i32(3));
+    let k = frame.yf64(1);
     this_object(function, frame, o, REDUCE_RIGHT.nullish, strings, helpers);
-    length_of(function, o, len, strings, helpers);
+    length_of_f64(function, o, k, strings, helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(callback));
     require_callable(
@@ -1572,19 +1581,18 @@ pub(super) fn emit_reduce_right(
         LocalTee(seeded), If(BlockType::Empty),
     );
     frame.arg(function, 1);
-    wasm!(function; LocalSet(acc), End, LocalGet(len), LocalSet(k));
-    down_loop(function, k, |function| {
-        has_index(function, o, k, key, helpers);
-        wasm!(function;
-            If(BlockType::Empty),
-            LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(value),
-        );
-        return_if_pending(function);
+    wasm!(function; LocalSet(acc), End);
+    down_loop_f64(function, k, |function| {
+        has_at(function, o, k, key, helpers);
+        wasm!(function; If(BlockType::Empty));
+        get_key(function, o, key, value, helpers);
         wasm!(function; LocalGet(seeded), If(BlockType::Empty));
+        num(function, k);
+        wasm!(function; LocalSet(kv));
         let args = [
             CallArg::Val(acc),
             CallArg::Val(value),
-            CallArg::Index(k),
+            CallArg::Val(kv),
             CallArg::Val(o),
         ];
         call_fn(function, frame, callback, this_arg, &args, acc, helpers);
@@ -1611,15 +1619,17 @@ pub(super) fn emit_last_index_of(
     helpers: Helpers<'_>,
 ) {
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (len, k, key) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let key = frame.i32(2);
     let r = frame.f64(0);
+    let (len, k) = (frame.yf64(0), frame.yf64(1));
     let not_found = (-1.0f64).to_bits().cast_signed();
     this_object(function, frame, o, LAST_INDEX_OF.nullish, strings, helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(search));
-    length_of(function, o, len, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
     wasm!(function;
-        LocalGet(len), I32Eqz, If(BlockType::Empty), I64Const(not_found), Return, End,
+        LocalGet(len), F64Const(Ieee64::from(0.0)), F64Eq,
+        If(BlockType::Empty), I64Const(not_found), Return, End,
         LocalGet(frame.argc()), F64ReinterpretI64, F64Const(Ieee64::from(2.0)), F64Ge,
         If(BlockType::Empty),
     );
@@ -1632,21 +1642,18 @@ pub(super) fn emit_last_index_of(
         // k = r >= 0 ? min(r, len - 1) : len + r; none when k < 0.
         LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
         If(BlockType::Result(ValType::F64)),
-        LocalGet(len), F64ConvertI32U, LocalGet(r), F64Add,
+        LocalGet(len), LocalGet(r), F64Add,
         Else,
-        LocalGet(r), LocalGet(len), I32Const(1), I32Sub, F64ConvertI32U, F64Min,
+        LocalGet(r), LocalGet(len), F64Const(Ieee64::from(1.0)), F64Sub, F64Min,
         End,
         LocalTee(r), F64Const(Ieee64::from(0.0)), F64Lt,
         If(BlockType::Empty), I64Const(not_found), Return, End,
-        LocalGet(r), I32TruncSatF64U, I32Const(1), I32Add, LocalSet(k),
+        LocalGet(r), F64Const(Ieee64::from(1.0)), F64Add, LocalSet(k),
     );
-    down_loop(function, k, |function| {
-        has_index(function, o, k, key, helpers);
-        wasm!(function;
-            If(BlockType::Empty),
-            LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(v),
-        );
-        return_if_pending(function);
+    down_loop_f64(function, k, |function| {
+        has_at(function, o, k, key, helpers);
+        wasm!(function; If(BlockType::Empty));
+        get_key(function, o, key, v, helpers);
         emit_node(
             &strict_eq(v, search),
             function,
@@ -1655,7 +1662,7 @@ pub(super) fn emit_last_index_of(
             helpers,
         );
         wasm!(function; I64Const(TRUE_BITS), I64Eq, If(BlockType::Empty));
-        index_value(function, k);
+        num(function, k);
         wasm!(function; Return, End, End);
     });
     wasm!(function; I64Const(not_found));
@@ -2744,7 +2751,7 @@ pub(super) fn emit_with(
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, index_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (a, v) = (frame.x64(0), frame.x64(1));
+    let (copy, elem) = (frame.x64(0), frame.x64(1));
     let key = frame.i32(0);
     let r = frame.f64(0);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
@@ -2770,7 +2777,7 @@ pub(super) fn emit_with(
     );
     emit_throw_error(&error, function, frame.scratch(), strings, helpers);
     wasm!(function; End);
-    array_create_f64(function, frame, (len, kv, a), strings, helpers);
+    array_create_f64(function, frame, (len, kv, copy), strings, helpers);
     wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k));
     while_loop(
         function,
@@ -2778,15 +2785,15 @@ pub(super) fn emit_with(
         |function| {
             wasm!(function;
                 LocalGet(k), LocalGet(r), F64Eq,
-                If(BlockType::Empty), LocalGet(value), LocalSet(v), Else,
+                If(BlockType::Empty), LocalGet(value), LocalSet(elem), Else,
             );
-            get_at(function, o, k, key, v, helpers);
+            get_at(function, o, k, key, elem, helpers);
             wasm!(function; End);
-            put_at(function, frame, (a, k, v, kv), strings, helpers);
+            put_at(function, frame, (copy, k, elem, kv), strings, helpers);
             bump(function, k, 1.0);
         },
     );
-    wasm!(function; LocalGet(a));
+    wasm!(function; LocalGet(copy));
 }
 
 /// `Array.prototype.toReversed()`: `A = ArrayCreate(len)` gets `Get(O, len -
@@ -2832,8 +2839,8 @@ pub(super) fn emit_to_spliced(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let (o, v, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (sc_v, saved, a) = (frame.x64(0), frame.x64(1), frame.y64(0));
+    let (o, elem, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (sc_v, saved, copy) = (frame.x64(0), frame.x64(1), frame.y64(0));
     let (key, arg_i, argn) = (frame.i32(0), frame.i32(1), frame.i32(2));
     let r = frame.f64(0);
     let (len, start) = (frame.yf64(0), frame.yf64(1));
@@ -2879,21 +2886,21 @@ pub(super) fn emit_to_spliced(
     wasm!(function;
         LocalGet(len), LocalGet(items), F64Add, LocalGet(sc), F64Sub, LocalSet(new_len),
     );
-    array_create_f64(function, frame, (new_len, kv, a), strings, helpers);
+    array_create_f64(function, frame, (new_len, kv, copy), strings, helpers);
     wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(i));
     while_loop(
         function,
         |function| wasm!(function; LocalGet(i), LocalGet(start), F64Lt),
         |function| {
-            get_at(function, o, i, key, v, helpers);
-            put_at(function, frame, (a, i, v, kv), strings, helpers);
+            get_at(function, o, i, key, elem, helpers);
+            put_at(function, frame, (copy, i, elem, kv), strings, helpers);
             bump(function, i, 1.0);
         },
     );
     wasm!(function; I32Const(2), LocalSet(arg_i));
     count_loop(function, arg_i, argn, |function| {
-        saved_arg_at(function, frame, saved, arg_i, v);
-        put_at(function, frame, (a, i, v, kv), strings, helpers);
+        saved_arg_at(function, frame, saved, arg_i, elem);
+        put_at(function, frame, (copy, i, elem, kv), strings, helpers);
         bump(function, i, 1.0);
     });
     wasm!(function;
@@ -2903,11 +2910,11 @@ pub(super) fn emit_to_spliced(
         function,
         |function| wasm!(function; LocalGet(i), LocalGet(new_len), F64Lt),
         |function| {
-            get_at(function, o, from, key, v, helpers);
-            put_at(function, frame, (a, i, v, kv), strings, helpers);
+            get_at(function, o, from, key, elem, helpers);
+            put_at(function, frame, (copy, i, elem, kv), strings, helpers);
             bump(function, i, 1.0);
             bump(function, from, 1.0);
         },
     );
-    wasm!(function; LocalGet(a));
+    wasm!(function; LocalGet(copy));
 }

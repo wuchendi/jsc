@@ -36,6 +36,7 @@ mod object;
 mod promise;
 mod string;
 
+use crate::emit::realm::ArrayCopyOp;
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 use number::NumberFormat;
@@ -190,9 +191,8 @@ pub(super) fn emit_builtin(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) -> Function {
-    let frame = Frame {
-        k: helpers.max_args,
-    };
+    let k = helpers.max_args;
+    let frame = Frame { k };
     let mut f = Frame::function();
     helpers.unwind.borrow_mut().reset();
     match builtin {
@@ -230,10 +230,7 @@ pub(super) fn emit_builtin(
         | Builtin::ArrayUnshift
         | Builtin::ArrayFill
         | Builtin::ArrayCopyWithin
-        | Builtin::ArrayWith
-        | Builtin::ArrayToReversed
-        | Builtin::ArrayToSorted
-        | Builtin::ArrayToSpliced => emit_array_family(builtin, &mut f, frame, strings, helpers),
+        | Builtin::ArrayCopy(_) => emit_array_family(builtin, &mut f, frame, strings, helpers),
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
@@ -329,10 +326,16 @@ fn emit_array_family(
         Builtin::ArrayUnshift => array::emit_unshift(f, frame, strings, helpers),
         Builtin::ArrayFill => array::emit_fill(f, frame, strings, helpers),
         Builtin::ArrayCopyWithin => array::emit_copy_within(f, frame, strings, helpers),
-        Builtin::ArrayWith => array::emit_with(f, frame, strings, helpers),
-        Builtin::ArrayToReversed => array::emit_to_reversed(f, frame, strings, helpers),
-        Builtin::ArrayToSorted => array::emit_sort(true, f, frame, strings, helpers),
-        Builtin::ArrayToSpliced => array::emit_to_spliced(f, frame, strings, helpers),
+        Builtin::ArrayCopy(ArrayCopyOp::With) => array::emit_with(f, frame, strings, helpers),
+        Builtin::ArrayCopy(ArrayCopyOp::ToReversed) => {
+            array::emit_to_reversed(f, frame, strings, helpers);
+        }
+        Builtin::ArrayCopy(ArrayCopyOp::ToSorted) => {
+            array::emit_sort(true, f, frame, strings, helpers);
+        }
+        Builtin::ArrayCopy(ArrayCopyOp::ToSpliced) => {
+            array::emit_to_spliced(f, frame, strings, helpers);
+        }
         // Only the variants `emit_builtin` routes here reach this match.
         _ => {}
     }

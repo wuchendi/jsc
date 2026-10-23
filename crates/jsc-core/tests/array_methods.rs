@@ -982,3 +982,63 @@ fn to_spliced_splices_a_copy() {
     throws_range_error("Array.prototype.toSorted.call({ length: 2 ** 32 })");
     throws_range_error("Array.prototype.with.call({ length: 2 ** 32 }, 0, 0)");
 }
+
+#[test]
+fn generic_methods_use_the_full_length_range() {
+    const BIG: &str = "const n = 2 ** 53 - 1; ";
+    both_string(
+        &format!(
+            "{BIG}const o = {{ length: Infinity }}; o[n - 1] = 'x'; Array.prototype.pop.call(o) + ':' + (o.length === n - 1)"
+        ),
+        "x:true",
+    );
+    both_bool(
+        &format!("{BIG}const o = {{ length: n }}; o[n - 2] = 'c'; [].includes.call(o, 'c', n - 2)"),
+        true,
+    );
+    both_bool(
+        &format!(
+            "{BIG}const o = {{ length: n }}; o[n - 2] = 'c'; [].indexOf.call(o, 'c', n - 3) === n - 2"
+        ),
+        true,
+    );
+    both_bool(
+        &format!(
+            "{BIG}const o = {{ length: n }}; o[n - 3] = 'c'; [].lastIndexOf.call(o, 'c', n - 2) === n - 3"
+        ),
+        true,
+    );
+    both_bool(
+        &format!(
+            "{BIG}let seen = -1; [].findLast.call({{ length: Infinity }}, (v, i) => {{ seen = i; return true; }}); seen === n - 1"
+        ),
+        true,
+    );
+    both_bool(
+        &format!("{BIG}[].findLastIndex.call({{ length: Infinity }}, () => true) === n - 1"),
+        true,
+    );
+    both_string(
+        &format!(
+            "{BIG}const o = {{ length: n }}; o[n - 1] = 1; o[n - 3] = 3; const r = []; try {{ [].reduceRight.call(o, (acc, v) => {{ r.push(v); if (v === 3) throw 0; return acc; }}, 0); }} catch (e) {{}} r.join()"
+        ),
+        "3",
+    );
+    both_string(
+        &format!(
+            "{BIG}const o = {{ length: n, [n - 2]: 'a', [n - 3]: 'b' }}; [].slice.call(o, n - 3, n - 1).join()"
+        ),
+        "b,a",
+    );
+    throws_range_error("[].slice.call({ length: 2 ** 32 + 1 }, 0)");
+    throws_range_error("[].map.call({ length: 2 ** 32 }, () => 0)");
+}
+
+#[test]
+fn push_past_the_array_length_limit_throws() {
+    throws_range_error("const y = []; y.length = 2 ** 32 - 1; Array.prototype.push.call(y, 'x')");
+    both_string(
+        "const y = []; y.length = 2 ** 32 - 1; try { Array.prototype.push.call(y, 'x'); } catch (e) {} y[2 ** 32 - 1] + ':' + (y.length === 2 ** 32 - 1)",
+        "x:true",
+    );
+}
