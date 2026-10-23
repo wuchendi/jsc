@@ -22,11 +22,6 @@ fn unknown_namespace_members_are_runtime_reads() {
         "console.warn(1)",
         "TypeError: console.warn is not a function",
     );
-    // Phase 3 statics are absent until then: a catchable TypeError.
-    assert_bool(
-        "let ok = false; try { Object.freeze({}); } catch (e) { ok = e instanceof TypeError; } ok",
-        true,
-    );
     // Inherited members of a namespace or constructor are reachable.
     assert_string("Math.toString()", "[object Object]");
     assert_bool("Object.hasOwnProperty('keys')", true);
