@@ -1041,4 +1041,44 @@ fn push_past_the_array_length_limit_throws() {
         "const y = []; y.length = 2 ** 32 - 1; try { Array.prototype.push.call(y, 'x'); } catch (e) {} y[2 ** 32 - 1] + ':' + (y.length === 2 ** 32 - 1)",
         "x:true",
     );
+    // The `arr.push(x)` call-site fast path throws the same RangeError.
+    throws_range_error("const y = []; y.length = 2 ** 32 - 1; y.push('x')");
+    both_string(
+        "const y = []; y.length = 2 ** 32 - 1; try { y.push('x'); } catch (e) {} y[2 ** 32 - 1] + ':' + (y.length === 2 ** 32 - 1) + ':' + y.push()",
+        "x:true:4294967295",
+    );
+}
+
+#[test]
+fn to_locale_string_invokes_each_element() {
+    both_string(
+        "const p = Array.prototype.toLocaleString; p.name + ':' + p.length",
+        "toLocaleString:0",
+    );
+    both_string(
+        "[1, null, undefined, 2.5, , 3].toLocaleString()",
+        "1,,,2.5,,3",
+    );
+    both_string("[].toLocaleString()", "");
+    // Each element's own `toLocaleString`, called with it as `this`.
+    both_string(
+        "const e = { toLocaleString() { return 'E' + (this === e); } }; [e, 1, e].toLocaleString()",
+        "Etrue,1,Etrue",
+    );
+    // Generic over array-likes; the result is ToString'd.
+    both_string(
+        "const o = { length: 2, 0: { toLocaleString: () => 7 }, 1: 4 }; Array.prototype.toLocaleString.call(o)",
+        "7,4",
+    );
+    both_string(
+        "class A extends Array {} const a = new A(); a.push(1, 2); a.toLocaleString()",
+        "1,2",
+    );
+    throws_type_error("Array.prototype.toLocaleString.call(null)");
+    throws_type_error("[{ toLocaleString: 1 }].toLocaleString()");
+    // A throwing element stops the walk.
+    both_string(
+        "let n = 0; const t = { toLocaleString() { n++; throw 'x'; } }; try { [t, t].toLocaleString(); } catch (e) {} '' + n",
+        "1",
+    );
 }

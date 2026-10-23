@@ -242,6 +242,8 @@ pub(super) enum Builtin {
     ArraySlice,
     /// `Array.prototype.toString`.
     ArrayToString,
+    /// `Array.prototype.toLocaleString`.
+    ArrayToLocaleString,
     /// `Array.prototype.at`.
     ArrayAt,
     /// `Array.prototype.find` / `findIndex` / `findLast` / `findLastIndex` /
@@ -483,6 +485,8 @@ pub(super) enum StringOp {
     Slice,
     ToUpperCase,
     ToLowerCase,
+    ToLocaleUpperCase,
+    ToLocaleLowerCase,
     CharAt,
     Trim,
     TrimStart,
@@ -517,6 +521,8 @@ impl StringOp {
             Self::Slice => "slice",
             Self::ToUpperCase => "toUpperCase",
             Self::ToLowerCase => "toLowerCase",
+            Self::ToLocaleUpperCase => "toLocaleUpperCase",
+            Self::ToLocaleLowerCase => "toLocaleLowerCase",
             Self::CharAt => "charAt",
             Self::Trim => "trim",
             Self::TrimStart => "trimStart",
@@ -548,6 +554,8 @@ impl StringOp {
         match self {
             Self::ToUpperCase
             | Self::ToLowerCase
+            | Self::ToLocaleUpperCase
+            | Self::ToLocaleLowerCase
             | Self::Trim
             | Self::TrimStart
             | Self::TrimEnd
@@ -563,8 +571,8 @@ impl StringOp {
             Self::IndexOf => abi::METHOD_OP_INDEX_OF,
             Self::Includes => abi::METHOD_OP_INCLUDES,
             Self::Slice => abi::METHOD_OP_SLICE,
-            Self::ToUpperCase => abi::METHOD_OP_TO_UPPER,
-            Self::ToLowerCase => abi::METHOD_OP_TO_LOWER,
+            Self::ToUpperCase | Self::ToLocaleUpperCase => abi::METHOD_OP_TO_UPPER,
+            Self::ToLowerCase | Self::ToLocaleLowerCase => abi::METHOD_OP_TO_LOWER,
             Self::CharAt => abi::METHOD_OP_CHAR_AT,
             Self::Trim => abi::METHOD_OP_TRIM,
             Self::TrimStart => abi::METHOD_OP_TRIM_START,
@@ -592,7 +600,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 192] = [
+    pub(super) const ALL: [Builtin; 195] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -679,6 +687,7 @@ impl Builtin {
         Self::ArrayJoin,
         Self::ArraySlice,
         Self::ArrayToString,
+        Self::ArrayToLocaleString,
         Self::ArrayAt,
         Self::ArrayFind(ArrayFindOp::Find),
         Self::ArrayFind(ArrayFindOp::FindIndex),
@@ -707,6 +716,8 @@ impl Builtin {
         Self::StringMethod(StringOp::Slice),
         Self::StringMethod(StringOp::ToUpperCase),
         Self::StringMethod(StringOp::ToLowerCase),
+        Self::StringMethod(StringOp::ToLocaleUpperCase),
+        Self::StringMethod(StringOp::ToLocaleLowerCase),
         Self::StringMethod(StringOp::CharAt),
         Self::StringMethod(StringOp::Trim),
         Self::StringMethod(StringOp::TrimStart),
@@ -854,7 +865,7 @@ impl Builtin {
             Self::NumberToFixed => "toFixed",
             Self::NumberToExponential => "toExponential",
             Self::NumberToPrecision => "toPrecision",
-            Self::NumberToLocaleString => "toLocaleString",
+            Self::NumberToLocaleString | Self::ArrayToLocaleString => "toLocaleString",
             Self::NumberIs(test) => test.name(),
             Self::ParseFloat => "parseFloat",
             Self::ParseInt => "parseInt",
@@ -921,6 +932,7 @@ impl Builtin {
             | Self::ValueOf
             | Self::ErrorToString
             | Self::ArrayToString
+            | Self::ArrayToLocaleString
             | Self::DateMethod(_)
             | Self::CollectionSize { .. }
             | Self::CollectionOp {
@@ -1015,6 +1027,7 @@ impl Builtin {
             | Self::ArrayJoin
             | Self::ArraySlice
             | Self::ArrayToString
+            | Self::ArrayToLocaleString
             | Self::ArrayAt
             | Self::ArrayFind(_)
             | Self::ArrayReduceRight

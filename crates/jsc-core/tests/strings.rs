@@ -12,6 +12,26 @@ fn string_case_fold() {
     assert_string("\"Hi There\".toLowerCase()", "hi there");
 }
 
+/// `toLocaleUpperCase`/`toLocaleLowerCase` (no locale data) fold like
+/// `toUpperCase`/`toLowerCase`, generic over a coercible `this`.
+#[test]
+fn string_locale_case_fold() {
+    assert_string("\"Hi There\".toLocaleUpperCase()", "HI THERE");
+    assert_string("\"Hi There\".toLocaleLowerCase()", "hi there");
+    assert_string(
+        "const u = String.prototype.toLocaleUpperCase; u.name + u.length + String.prototype.toLocaleLowerCase.name",
+        "toLocaleUpperCase0toLocaleLowerCase",
+    );
+    assert_string(
+        "String.prototype.toLocaleUpperCase.call({ toString() { return 'ab'; } })",
+        "AB",
+    );
+    assert_bool(
+        "let ok = false; try { String.prototype.toLocaleLowerCase.call(null); } catch (e) { ok = e instanceof TypeError; } ok",
+        true,
+    );
+}
+
 /// String `indexOf(sub)` is the first BYTE index of `sub` (empty `sub` => `0`),
 /// or `-1` when absent.
 #[test]

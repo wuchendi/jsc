@@ -1281,14 +1281,14 @@ pub(super) fn value_to_number(value: &Value) -> f64 {
     }
 }
 
-/// Parse a whole string as a JS `Number(str)`: leading/trailing ASCII
-/// whitespace is trimmed, an empty/whitespace-only string is `0`, and anything the
+/// Parse a whole string as a JS `Number(str)`: leading/trailing JS
+/// whitespace ([`is_js_whitespace`]) is trimmed, an empty/whitespace-only string is `0`, and anything the
 /// remaining text does not parse as a full number is `NaN`. The grammar is JS
 /// `StringToNumber`: an unsigned `0x`/`0o`/`0b` integer literal, a signed
 /// `Infinity`, or a signed decimal literal (Rust's `inf`/`nan` spellings are not
 /// JS and yield `NaN`).
 fn str_to_number(s: &str) -> f64 {
-    let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    let trimmed = s.trim_matches(is_js_whitespace);
     if trimmed.is_empty() {
         return 0.0;
     }
@@ -1406,11 +1406,11 @@ fn to_uint16(n: f64) -> u16 {
 }
 
 /// Parse a leading decimal float from `s` (the `parseFloat` subset): skip
-/// leading ASCII whitespace, then take the longest prefix matching an optional
+/// leading JS whitespace ([`is_js_whitespace`]), then take the longest prefix matching an optional
 /// sign, integer/fraction digits (at least one digit overall), and an optional
 /// `e`/`E` exponent. Yields `NaN` when no such prefix exists.
 pub(super) fn parse_float_str(s: &str) -> f64 {
-    let s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let s = s.trim_start_matches(is_js_whitespace);
     let bytes = s.as_bytes();
     let mut i = 0;
     if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {

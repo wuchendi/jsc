@@ -48,6 +48,13 @@ const INDEX_OF: Texts = texts!("indexOf");
 const INCLUDES: Texts = texts!("includes");
 const JOIN_TEXTS: Texts = texts!("join");
 const SLICE: Texts = texts!("slice");
+const TO_LOCALE_STRING: Texts = Texts {
+    not_callable: [
+        "Array.prototype.toLocaleString: element toLocaleString is not a function",
+        "TypeError: Array.prototype.toLocaleString: element toLocaleString is not a function",
+    ],
+    ..texts!("toLocaleString")
+};
 
 /// `2^53 - 1`, the largest array-like length.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -63,6 +70,9 @@ const JOIN: &str = "join";
 
 /// The default `join` separator.
 const COMMA: &str = ",";
+
+/// The method `Array.prototype.toLocaleString` invokes on each element.
+const TO_LOCALE_STRING_KEY: &str = "toLocaleString";
 
 /// The [`Texts`] of the callback method `op`.
 fn hof_texts(op: ArrayHofOp) -> &'static Texts {
@@ -86,7 +96,9 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(callbacks)
         .chain(REDUCE_EMPTY)
         .chain(PUSH_TOO_LONG)
-        .chain([JOIN, COMMA, ""])
+        .chain(TO_LOCALE_STRING.nullish)
+        .chain(TO_LOCALE_STRING.not_callable)
+        .chain([JOIN, COMMA, TO_LOCALE_STRING_KEY, ""])
         .chain(more_strings())
 }
 
@@ -202,11 +214,6 @@ fn length_of(
     wasm!(function; F64ReinterpretI64, I32TruncSatF64U, LocalSet(len));
 }
 
-/// Push the argument count (`argc`, a number jsval) as an i32.
-fn argc(function: &mut Function, frame: Frame) {
-    wasm!(function; LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U);
-}
-
 /// Push the i32 index in local `i` as a number jsval.
 fn index_value(function: &mut Function, i: u32) {
     wasm!(function; LocalGet(i), F64ConvertI32U, I64ReinterpretF64);
@@ -233,48 +240,6 @@ fn get_index(function: &mut Function, o: u32, i: u32, key: u32, v: u32, helpers:
     return_if_pending(function);
 }
 
-/// `while i < n { body; i += 1 }` over i32 locals.
-fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Function)) {
-    wasm!(function;
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
-    );
-    body(function);
-    wasm!(function;
-        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Br(0),
-        End, End,
-    );
-}
-
-/// Argument `i` (an i32 local) into i64 `out`: from the spread argument
-/// array when the call passed more than `K` arguments, else from slot `i`
-/// (`undefined` past the slots); a spread hole reads `undefined`.
-fn arg_at(function: &mut Function, frame: Frame, i: u32, out: u32) {
-    let k = frame.k;
-    argc(function, frame);
-    wasm!(function;
-        I32Const(k.cast_signed()), I32GtU,
-        If(BlockType::Result(ValType::I64)),
-        GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64,
-    );
-    emit_array_elems(function);
-    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), Else);
-    for j in 0..k {
-        wasm!(function;
-            LocalGet(i), I32Const(j.cast_signed()), I32Eq,
-            If(BlockType::Result(ValType::I64)), LocalGet(j), Else,
-        );
-    }
-    wasm!(function; I64Const(UNDEFINED_BITS));
-    for _ in 0..k {
-        wasm!(function; End);
-    }
-    wasm!(function; End, LocalSet(out));
-    emit_elem_read(function, out);
-    wasm!(function; LocalSet(out));
-}
-
 /// `ToIntegerOrInfinity` of the jsval on the stack into f64 `r` (NaN is 0; a
 /// throwing `valueOf` returns).
 fn to_integer(function: &mut Function, r: u32, helpers: Helpers<'_>) {
@@ -298,7 +263,7 @@ pub(super) fn emit_push(
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
     let (n, i) = (frame.i32(0), frame.i32(1));
     this_object(function, frame, o, PUSH.nullish, strings, helpers);
-    argc(function, frame);
+    push_argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
     // An array grows in place unless it would pass `2^32 - 1` elements: the
     // generic path then sets the non-index key and throws on `length`.
@@ -691,6 +656,65 @@ pub(super) fn emit_join(
             If(BlockType::Empty),
             LocalGet(acc), LocalGet(v), Call(helpers.to_str()), Call(helpers.concat), LocalSet(acc),
         );
+        return_if_pending(function);
+        wasm!(function; End);
+    });
+    wasm!(function; LocalGet(acc), I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
+}
+
+/// `Array.prototype.toLocaleString()`: joins with `","` the result of
+/// `ToString(Invoke(O[k], "toLocaleString"))` for `k < len`
+/// (`undefined`/`null` and absent indices are empty); a non-callable
+/// `toLocaleString` throws.
+pub(super) fn emit_to_locale_string(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, v, f) = (frame.i64(0), frame.i64(1), frame.i64(2));
+    let (len, k, acc, base) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let key = frame.x32(0);
+    this_object(
+        function,
+        frame,
+        o,
+        TO_LOCALE_STRING.nullish,
+        strings,
+        helpers,
+    );
+    length_of(function, o, len, strings, helpers);
+    wasm!(function; I32Const(static_key(strings, "")), LocalSet(acc), I32Const(0), LocalSet(k));
+    count_loop(function, k, len, |function| {
+        wasm!(function;
+            LocalGet(k),
+            If(BlockType::Empty),
+            LocalGet(acc), I32Const(static_key(strings, COMMA)), Call(helpers.concat), LocalSet(acc),
+            End,
+        );
+        get_index(function, o, k, key, v, helpers);
+        emit_is_nullish(function, v);
+        wasm!(function;
+            I32Eqz,
+            If(BlockType::Empty),
+            LocalGet(v), I32Const(static_key(strings, TO_LOCALE_STRING_KEY)), Call(helpers.get),
+            LocalSet(f),
+        );
+        return_if_pending(function);
+        emit_is_function(function, f);
+        wasm!(function; I32Eqz, If(BlockType::Empty));
+        throw_type_error(
+            function,
+            frame,
+            TO_LOCALE_STRING.not_callable,
+            strings,
+            helpers,
+        );
+        wasm!(function; End);
+        emit_accessor_call(function, f, v, None, base, helpers);
+        wasm!(function; LocalSet(v));
+        return_if_pending(function);
+        wasm!(function; LocalGet(acc), LocalGet(v), Call(helpers.to_str()), Call(helpers.concat), LocalSet(acc));
         return_if_pending(function);
         wasm!(function; End);
     });
@@ -1243,7 +1267,7 @@ pub(super) fn emit_of(
     let (saved, len) = (frame.x64(0), frame.y64(1));
     let (n, i) = (frame.i32(0), frame.i32(1));
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
-    argc(function, frame);
+    push_argc(function, frame);
     wasm!(function; LocalSet(n));
     index_value(function, n);
     wasm!(function; LocalSet(len), GlobalGet(THIS_GLOBAL), LocalSet(c));
@@ -1692,7 +1716,7 @@ pub(super) fn emit_concat(
     this_object(function, frame, o, CONCAT.nullish, strings, helpers);
     wasm!(function; I64Const(0.0f64.to_bits().cast_signed()), LocalSet(zero));
     species_create(function, frame, o, zero, target, strings, helpers);
-    argc(function, frame);
+    push_argc(function, frame);
     wasm!(function;
         LocalSet(argn),
         F64Const(Ieee64::from(0.0)), LocalSet(count),
@@ -2113,7 +2137,7 @@ pub(super) fn emit_splice(
     wasm!(function; LocalSet(start_v));
     frame.arg(function, 1);
     wasm!(function; LocalSet(dc_v));
-    argc(function, frame);
+    push_argc(function, frame);
     wasm!(function; LocalSet(argn));
     this_object(function, frame, o, SPLICE.nullish, strings, helpers);
     length_of_f64(function, o, len, strings, helpers);
@@ -2331,7 +2355,7 @@ pub(super) fn emit_unshift(
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     let (from, to, items) = (frame.zf64(0), frame.zf64(1), frame.zf64(2));
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
-    argc(function, frame);
+    push_argc(function, frame);
     wasm!(function; LocalTee(argn), F64ConvertI32U, LocalSet(items));
     this_object(function, frame, o, UNSHIFT.nullish, strings, helpers);
     length_of_f64(function, o, len, strings, helpers);
@@ -2851,7 +2875,7 @@ pub(super) fn emit_to_spliced(
     wasm!(function; LocalSet(start_v));
     frame.arg(function, 1);
     wasm!(function; LocalSet(sc_v));
-    argc(function, frame);
+    push_argc(function, frame);
     wasm!(function; LocalSet(argn));
     this_object(function, frame, o, TO_SPLICED.nullish, strings, helpers);
     length_of_f64(function, o, len, strings, helpers);
