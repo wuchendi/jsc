@@ -1577,7 +1577,7 @@ Each item below is current behaviour of this tree.
   `Array.prototype.push` builtin throws).
 - The remaining built-ins/Array test262 failures (after phase 3 F-T2c) belong to
   other workstreams: `Object.defineProperty` / `freeze` /
-  `getOwnPropertyDescriptor` / `getPrototypeOf` / `isPrototypeOf` (~625,
+  `getOwnPropertyDescriptor` / `getPrototypeOf` / `isPrototypeOf` (~630,
   property descriptors), async test bodies (78, compile errors), `RegExp`
   (26), `Symbol` / `@@toStringTag` / iterator methods `keys` / `values` /
   `entries` (~16), `eval` (6), `Proxy` (4), `void` (5); `toLocaleString` is
