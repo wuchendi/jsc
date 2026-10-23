@@ -858,7 +858,7 @@ path, never semantics:
 | `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
-| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0`, `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
+| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0`, `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear; `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
@@ -1244,12 +1244,12 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 
 | area | supported |
 |---|---|
-| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` |
+| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` (both, like `Number(s)`, skip JS whitespace: Unicode `WhiteSpace`, `LineTerminator`, U+FEFF) |
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
-| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
-| `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
+| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
+| `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
@@ -1527,7 +1527,8 @@ Each item below is current behaviour of this tree.
   receiver). Content-only results stay exact for any text: `concat`,
   `repeat`, `split` on a non-empty separator, `replace` / `replaceAll`
   (an empty pattern over text with astral characters throws: it would split
-  a surrogate pair), `toUpperCase` / `toLowerCase` (full Unicode mappings),
+  a surrogate pair), `toUpperCase` / `toLowerCase` and their `toLocale*`
+  forms (full Unicode mappings, no locale data),
   `trim*` (JS whitespace), `localeCompare`. `String.fromCharCode` /
   `fromCodePoint` throw a `TypeError` for a lone surrogate. `search` /
   `match` / `matchAll` interpret a string pattern as RegExp source: a
@@ -1540,7 +1541,9 @@ Each item below is current behaviour of this tree.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9: no property-descriptor or prototype
   reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Array.prototype.keys` / `values` / `entries`, …, no
+  `assign`), no `Array.prototype.keys` / `values` / `entries`, no
+  `String.prototype.isWellFormed` / `toWellFormed` (they wait for UTF-16
+  strings), no `Math.sumPrecise` (it waits for the iterator protocol), …, no
   `Promise.all` / `race` / `allSettled` / `any`.
 - A direct `parseInt(..)` / `parseFloat(..)` call always runs the builtin
   conversion, even after the global binding is reassigned.
@@ -1568,20 +1571,25 @@ Each item below is current behaviour of this tree.
   `ToLength` range.
 - An array element hole does not read through the prototype chain
   (`Array.prototype[1] = 1; [0, , 2][1]` is `undefined`), and an object whose
-  prototype is an array does not inherit its elements; about 35
+  prototype is an array does not inherit its elements; about 55
   built-ins/Array test262 tests (`*-7-c-i-8`, `S15.4.4.*_A4_T*`,
-  `holes-not-preserved`, `reduce` / `reduceRight` `10-6`/`10-7`) wait on this
-  property-lookup change.
-- A call-site `arr.push(..)` on an array of length `2^32 - 1` stores the
-  element without throwing the `RangeError` (the inline fast path; the
-  `Array.prototype.push` builtin throws).
-- The remaining built-ins/Array test262 failures (after phase 3 F-T2c) belong to
+  `holes-not-preserved`, `reduce` / `reduceRight` `10-*` / `9-c-ii-*`) wait on
+  this property-lookup change.
+- `Array.prototype`, `String.prototype` and `Number.prototype` are ordinary
+  objects, not an array / `String` / `Number` exotic object:
+  `Array.isArray(Array.prototype)` is `false`, `Array.prototype.length` is
+  `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
+  `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
+- The remaining built-ins/Array test262 failures (after phase 3 F-T5) belong to
   other workstreams: `Object.defineProperty` / `freeze` /
   `getOwnPropertyDescriptor` / `getPrototypeOf` / `isPrototypeOf` (~630,
   property descriptors), async test bodies (78, compile errors), `RegExp`
-  (26), `Symbol` / `@@toStringTag` / iterator methods `keys` / `values` /
-  `entries` (~16), `eval` (6), `Proxy` (4), `void` (5); `toLocaleString` is
-  not implemented (5).
+  (26), `Symbol` / `@@toStringTag` (so `Math` / `JSON` array-like receivers
+  tag as `[object Object]`) / iterator methods `keys` / `values` / `entries`
+  (~23), `eval` (6), `Proxy` (4), `void` (5), and
+  `Object.prototype.toLocaleString`, which `Array.prototype.toLocaleString`
+  needs for a non-number element (2: a string, boolean or plain-object element
+  throws `TypeError: ... element toLocaleString is not a function`).
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16
   code-unit order only between astral characters and `U+E000`..`U+FFFF`.
@@ -1677,9 +1685,8 @@ installed on the realm's prototypes, and phase 3 extends that set.
 ### Phase 3 — Built-in library and strings
 
 - The remaining built-ins on the realm's prototypes: `Object` property
-  descriptors (`defineProperty`, `create`, `freeze`, `assign`),
-  the rest of `Array` (`from`, `sort`, species),
-  `String`, `Number`, and `Math`; `Date` parsing and local time.
+  descriptors (`defineProperty`, `create`, `freeze`, `assign`); `Date`
+  parsing and local time.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
