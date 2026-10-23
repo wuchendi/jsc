@@ -1045,15 +1045,28 @@ pub(super) fn emit_proto_guard(
     // Arguments already of the types the builtin coerces to: on a string
     // receiver the builtin is exactly its host op, inline.
     let inline_string = match string {
-        Some(Builtin::StringMethod(op)) if builtins::host_ready_args(op, args) => Some(op),
+        Some(Builtin::StringMethod(op)) => builtins::inline_host_op(op, args),
         _ => None,
     };
-    if let Some(op) = inline_string {
+    if let Some((flag, may_fail)) = inline_string {
+        // A host op that may refuse its input (DESIGN.md §13) runs inside a
+        // block: its result leaves the block unless it is the
+        // `METHOD_UNSUPPORTED`-family sentinel, which falls through to the
+        // builtin call below (the builtin throws).
+        if may_fail {
+            function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+            enter_frame(helpers);
+        }
         string_guard(function);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        let block = if may_fail {
+            BlockType::Empty
+        } else {
+            BlockType::Result(ValType::I64)
+        };
+        function.instruction(&Instruction::If(block));
         enter_frame(helpers);
         function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32Const(op.flag()));
+        function.instruction(&Instruction::I32Const(flag));
         for slot in 0..2 {
             match args.get(slot) {
                 Some(arg) => emit_node(arg, function, scratch, strings, helpers),
@@ -1063,7 +1076,19 @@ pub(super) fn emit_proto_guard(
             }
         }
         function.instruction(&Instruction::Call(helpers.method));
-        function.instruction(&Instruction::Else);
+        if may_fail {
+            let result = scratch + 1;
+            function.instruction(&Instruction::LocalTee(result));
+            function.instruction(&Instruction::LocalGet(result));
+            builtins::emit_is_method_refusal(function);
+            function.instruction(&Instruction::I32Eqz);
+            function.instruction(&Instruction::BrIf(1));
+            function.instruction(&Instruction::Drop);
+            leave_frame(helpers);
+            function.instruction(&Instruction::End);
+        } else {
+            function.instruction(&Instruction::Else);
+        }
         opened += 1;
     }
     for (kind, path) in fast {
@@ -1325,7 +1350,7 @@ pub(super) fn emit_is_object(function: &mut Function, local: u32) {
 
 /// Push nonzero if the jsval in `local` is a constructor: a function value
 /// whose header carries `FUNC_FLAG_CONSTRUCTOR`, else `0`.
-fn emit_is_constructor(function: &mut Function, local: u32) {
+pub(super) fn emit_is_constructor(function: &mut Function, local: u32) {
     emit_is_function(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(local));

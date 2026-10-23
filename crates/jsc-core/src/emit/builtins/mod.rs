@@ -39,7 +39,7 @@ mod string;
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 use number::NumberFormat;
-pub(super) use string::host_ready_args;
+pub(super) use string::{emit_is_method_refusal, inline_host_op};
 
 /// The IR fragments the hand-written bodies emit with `K = k`, for the
 /// static-string scan.
@@ -84,6 +84,9 @@ impl Frame {
             (2, ValType::I32),
             (1, ValType::F64),
             (1, ValType::I64),
+            (6, ValType::I64),
+            (4, ValType::I32),
+            (2, ValType::F64),
         ])
     }
 
@@ -141,6 +144,21 @@ impl Frame {
     fn f64(self, n: u32) -> u32 {
         self.scratch() + 34 + n
     }
+
+    /// Further i64 temp `n` (`0..6`), past the [`Self::arg`] temp.
+    fn y64(self, n: u32) -> u32 {
+        self.scratch() + 36 + n
+    }
+
+    /// Further i32 temp `n` (`0..4`).
+    fn y32(self, n: u32) -> u32 {
+        self.scratch() + 42 + n
+    }
+
+    /// Further f64 temp `n` (`0..2`).
+    fn yf64(self, n: u32) -> u32 {
+        self.scratch() + 46 + n
+    }
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -191,9 +209,24 @@ pub(super) fn emit_builtin(
         Builtin::ArrayJoin => array::emit_join(&mut f, frame, strings, helpers),
         Builtin::ArraySlice => array::emit_slice(&mut f, frame, strings, helpers),
         Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),
+        Builtin::ArrayOf => array::emit_of(&mut f, frame, strings, helpers),
+        Builtin::ArrayFrom => array::emit_from(&mut f, frame, strings, helpers),
+        Builtin::ArrayAt => array::emit_at(&mut f, frame, strings, helpers),
+        Builtin::ArrayFind(op) => array::emit_find(op, &mut f, frame, strings, helpers),
+        Builtin::ArrayReduceRight => array::emit_reduce_right(&mut f, frame, strings, helpers),
+        Builtin::ArrayLastIndexOf => array::emit_last_index_of(&mut f, frame, strings, helpers),
+        Builtin::ArrayConcat => array::emit_concat(&mut f, frame, strings, helpers),
+        Builtin::ArrayFlat { map } => array::emit_flat(map, &mut f, frame, strings, helpers),
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
+        Builtin::StringFromCharCode => {
+            string::emit_from_char_code(false, &mut f, frame, strings, helpers);
+        }
+        Builtin::StringFromCodePoint => {
+            string::emit_from_char_code(true, &mut f, frame, strings, helpers);
+        }
+        Builtin::StringRaw => string::emit_raw(&mut f, frame, strings, helpers),
         Builtin::NumberToString => number::emit_number_to_string(&mut f, frame, strings, helpers),
         Builtin::NumberValueOf => number::emit_number_value_of(&mut f, frame, strings, helpers),
         Builtin::NumberToFixed => {
@@ -426,6 +459,53 @@ fn return_if_pending(function: &mut Function) {
         GlobalGet(EXC_PENDING_GLOBAL),
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
     );
+}
+
+/// Push the argument count (`argc`, a number jsval) as an i32.
+fn push_argc(function: &mut Function, frame: Frame) {
+    wasm!(function; LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U);
+}
+
+/// `while i < n { body; i += 1 }` over i32 locals.
+fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Function)) {
+    wasm!(function;
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
+    );
+    body(function);
+    wasm!(function;
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+    );
+}
+
+/// Argument `i` (an i32 local) into i64 `out`: from the spread argument
+/// array when the call passed more than `K` arguments, else from slot `i`
+/// (`undefined` past the slots); a spread hole reads `undefined`.
+fn arg_at(function: &mut Function, frame: Frame, i: u32, out: u32) {
+    let k = frame.k;
+    push_argc(function, frame);
+    wasm!(function;
+        I32Const(k.cast_signed()), I32GtU,
+        If(BlockType::Result(ValType::I64)),
+        GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64,
+    );
+    emit_array_elems(function);
+    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), Else);
+    for j in 0..k {
+        wasm!(function;
+            LocalGet(i), I32Const(j.cast_signed()), I32Eq,
+            If(BlockType::Result(ValType::I64)), LocalGet(j), Else,
+        );
+    }
+    wasm!(function; I64Const(UNDEFINED_BITS));
+    for _ in 0..k {
+        wasm!(function; End);
+    }
+    wasm!(function; End, LocalSet(out));
+    emit_elem_read(function, out);
+    wasm!(function; LocalSet(out));
 }
 
 /// Push the heap jsval of the static string `text`.

@@ -34,6 +34,23 @@ const METHOD_OP_NUMBER_TO_FIXED: i32 = abi::METHOD_OP_NUMBER_TO_FIXED;
 const METHOD_OP_NUMBER_TO_EXPONENTIAL: i32 = abi::METHOD_OP_NUMBER_TO_EXPONENTIAL;
 const METHOD_OP_NUMBER_TO_PRECISION: i32 = abi::METHOD_OP_NUMBER_TO_PRECISION;
 const METHOD_OP_MATH: i32 = abi::METHOD_OP_MATH;
+const METHOD_OP_AT: i32 = abi::METHOD_OP_AT;
+const METHOD_OP_CHAR_CODE_AT: i32 = abi::METHOD_OP_CHAR_CODE_AT;
+const METHOD_OP_CODE_POINT_AT: i32 = abi::METHOD_OP_CODE_POINT_AT;
+const METHOD_OP_LAST_INDEX_OF: i32 = abi::METHOD_OP_LAST_INDEX_OF;
+const METHOD_OP_LOCALE_COMPARE: i32 = abi::METHOD_OP_LOCALE_COMPARE;
+const METHOD_OP_NORMALIZE: i32 = abi::METHOD_OP_NORMALIZE;
+const METHOD_OP_SEARCH: i32 = abi::METHOD_OP_SEARCH;
+const METHOD_OP_REPLACE: i32 = abi::METHOD_OP_REPLACE;
+const METHOD_OP_REPLACE_ALL: i32 = abi::METHOD_OP_REPLACE_ALL;
+const METHOD_OP_FROM_CHAR_CODE: i32 = abi::METHOD_OP_FROM_CHAR_CODE;
+const METHOD_OP_FROM_CODE_POINT: i32 = abi::METHOD_OP_FROM_CODE_POINT;
+
+/// The `__method` results the calling builtin turns into a throw; see
+/// [`abi::METHOD_UNSUPPORTED`] and its siblings.
+const UNSUPPORTED: u64 = abi::METHOD_UNSUPPORTED;
+const RANGE_ERROR: u64 = abi::METHOD_RANGE_ERROR;
+const NEEDS_REGEXP: u64 = abi::METHOD_NEEDS_REGEXP;
 
 /// The NaN-boxed `true`/`false` jsval bits; see [`abi::TRUE`] / [`abi::FALSE`].
 const TRUE_BITS: u64 = abi::TRUE;
@@ -120,9 +137,10 @@ pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bo
 /// BYTE (array element vs string byte semantics); `NumberToString` takes a
 /// number receiver; the other ops accept a string receiver. The string ops get
 /// their arguments already coerced by the guest builtins (a search string, a
-/// number or `undefined` for a position/count/limit). String byte offsets are
-/// used throughout (the ASCII subset), so multibyte UTF-8 receivers are a
-/// documented limitation.
+/// number or `undefined` for a position/count/limit). Positions and lengths are
+/// byte offsets, exact for ASCII strings only: an op whose result depends on
+/// a position or length of a non-ASCII string (or would need a lone surrogate)
+/// returns [`UNSUPPORTED`] instead, which the builtin throws as a `TypeError`.
 #[allow(clippy::too_many_lines)] // one flat dispatch over the op flags
 pub(super) fn method_dispatch<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
@@ -147,9 +165,10 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         METHOD_OP_INDEX_OF => match type_byte {
             Some(TYPE_ARRAY) => Some(array_index_of(&mem, ptr?, arg0.cast_unsigned())),
             Some(TYPE_STRING) => {
-                let hay = string_bytes(&mem, ptr?)?;
-                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
-                Some(string_index_of(&hay, &arg_bytes(arg0, &mem), from))
+                let hay = string_text(&mem, ptr?)?;
+                let needle = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, utf16_len(&hay));
+                Some(index_result(text_index_of(&hay, &needle, from)))
             }
             _ => None,
         },
@@ -157,10 +176,10 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             Some(TYPE_ARRAY) => Some(bool_bits(array_includes(&mem, ptr?, arg0.cast_unsigned()))),
             // `str.includes(sub, from)` — substring containment from `from`.
             Some(TYPE_STRING) => {
-                let hay = string_bytes(&mem, ptr?)?;
-                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
-                let found = string_index_of(&hay, &arg_bytes(arg0, &mem), from);
-                Some(bool_bits(found != not_found_bits()))
+                let hay = string_text(&mem, ptr?)?;
+                let needle = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, utf16_len(&hay));
+                Some(bool_bits(text_index_of(&hay, &needle, from).is_some()))
             }
             _ => None,
         },
@@ -205,19 +224,14 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         },
         METHOD_OP_TO_UPPER | METHOD_OP_TO_LOWER => match type_byte {
             Some(TYPE_STRING) => {
-                let bytes = string_bytes(&mem, ptr?)?;
-                let mapped: Vec<u8> = bytes
-                    .iter()
-                    .map(|b| {
-                        if op == METHOD_OP_TO_UPPER {
-                            b.to_ascii_uppercase()
-                        } else {
-                            b.to_ascii_lowercase()
-                        }
-                    })
-                    .collect();
-                let text = String::from_utf8_lossy(&mapped);
-                alloc_string(caller, &text).map(|base| HEAP | base)
+                let text = String::from_utf8_lossy(&string_bytes(&mem, ptr?)?).into_owned();
+                // The full Unicode default case mappings (`ß` -> `SS`, final sigma).
+                let mapped = if op == METHOD_OP_TO_UPPER {
+                    text.to_uppercase()
+                } else {
+                    text.to_lowercase()
+                };
+                alloc_string(caller, &mapped).map(|base| HEAP | base)
             }
             _ => None,
         },
@@ -225,6 +239,9 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             Some(TYPE_STRING) => {
                 let bytes = string_bytes(&mem, ptr?)?;
                 let i = trunc_to_int(value_to_number(&decode(arg0.cast_unsigned(), &mem)));
+                if !index_exact(&bytes, i) {
+                    return Some(UNSUPPORTED);
+                }
                 // Out-of-range (a negative index fails `try_from`) => "".
                 let text = match usize::try_from(i).ok().filter(|&u| u < bytes.len()) {
                     Some(u) => String::from_utf8_lossy(&bytes[u..=u]).into_owned(),
@@ -262,6 +279,113 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                 arg0.cast_unsigned(),
                 arg1.cast_unsigned(),
             ),
+            _ => None,
+        },
+        METHOD_OP_AT | METHOD_OP_CHAR_CODE_AT | METHOD_OP_CODE_POINT_AT => match type_byte {
+            Some(TYPE_STRING) => string_code_at(caller, &mem, ptr?, arg0, op),
+            _ => None,
+        },
+        METHOD_OP_LAST_INDEX_OF => match type_byte {
+            Some(TYPE_STRING) => {
+                let hay = string_text(&mem, ptr?)?;
+                let needle = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                let pos = value_to_number(&decode(arg1.cast_unsigned(), &mem));
+                Some(index_result(text_last_index_of(&hay, &needle, pos)))
+            }
+            _ => None,
+        },
+        METHOD_OP_LOCALE_COMPARE => match type_byte {
+            Some(TYPE_STRING) => {
+                let this = String::from_utf8_lossy(&string_bytes(&mem, ptr?)?).into_owned();
+                let that = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                // Code-unit order.
+                let order = this.encode_utf16().cmp(that.encode_utf16());
+                Some(f64::from(order as i8).to_bits())
+            }
+            _ => None,
+        },
+        METHOD_OP_NORMALIZE => match type_byte {
+            Some(TYPE_STRING) => {
+                let form = match decode(arg0.cast_unsigned(), &mem) {
+                    Value::Undefined => "NFC".to_owned(),
+                    other => to_js_string(&other),
+                };
+                if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+                    return Some(RANGE_ERROR);
+                }
+                // Every form maps an ASCII string to itself; Unicode
+                // normalization is not available yet.
+                let ascii = string_bytes(&mem, ptr?)?.is_ascii();
+                Some(if ascii { recv } else { UNSUPPORTED })
+            }
+            _ => None,
+        },
+        METHOD_OP_SEARCH => match type_byte {
+            Some(TYPE_STRING) => {
+                let hay = string_text(&mem, ptr?)?;
+                let pattern = match decode(arg0.cast_unsigned(), &mem) {
+                    Value::Undefined => String::new(),
+                    other => to_js_string(&other),
+                };
+                if pattern.contains(is_regexp_syntax) {
+                    return Some(NEEDS_REGEXP);
+                }
+                Some(index_result(text_index_of(&hay, &pattern, 0)))
+            }
+            _ => None,
+        },
+        METHOD_OP_REPLACE | METHOD_OP_REPLACE_ALL => match type_byte {
+            Some(TYPE_STRING) => {
+                let text = String::from_utf8_lossy(&string_bytes(&mem, ptr?)?).into_owned();
+                let search = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                let all = op == METHOD_OP_REPLACE_ALL;
+                // A replacer function's results (an array, in match order), or
+                // a template.
+                let replacement = decode(arg1.cast_unsigned(), &mem);
+                let out = if let Value::Array(items, _) = replacement {
+                    let pieces: Vec<String> = items.iter().map(to_js_string).collect();
+                    replace_str(&text, &search, all, |out, _, i| {
+                        out.push_str(pieces.get(i).map_or("", String::as_str));
+                    })
+                } else {
+                    let template = to_js_string(&replacement);
+                    replace_str(&text, &search, all, |out, at, _| {
+                        substitute(out, &text, at, search.len(), &template);
+                    })
+                };
+                let Some(out) = out else {
+                    return Some(UNSUPPORTED);
+                };
+                alloc_string(caller, &out).map(|base| HEAP | base)
+            }
+            _ => None,
+        },
+        METHOD_OP_FROM_CHAR_CODE | METHOD_OP_FROM_CODE_POINT => match type_byte {
+            Some(TYPE_ARRAY) => {
+                let (_, present) = array_elements(&mem, ptr?)?;
+                let numbers = present
+                    .into_iter()
+                    .map(|(_, bits)| value_to_number(&decode(bits, &mem)));
+                // The UTF-16 code units: `ToUint16` of each, or each
+                // (guest-validated) code point's encoding.
+                let mut units: Vec<u16> = Vec::new();
+                for n in numbers {
+                    if op == METHOD_OP_FROM_CHAR_CODE {
+                        units.push(to_uint16(n));
+                        continue;
+                    }
+                    let point = to_uint32(n);
+                    match char::from_u32(point) {
+                        Some(c) => units.extend(c.encode_utf16(&mut [0; 2]).iter()),
+                        None => units.push(u16::try_from(point).unwrap_or(0)),
+                    }
+                }
+                // A lone surrogate has no UTF-8 form.
+                let Ok(text) = String::from_utf16(&units) else {
+                    return Some(UNSUPPORTED);
+                };
+                alloc_string(caller, &text).map(|base| HEAP | base)
+            }
             _ => None,
         },
         _ => None,
@@ -349,17 +473,6 @@ fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
                     (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
                 )
         })
-}
-
-/// `string.indexOf(sub, from)`: the number bits of the first BYTE index at or
-/// after `from` where `sub` occurs (an empty `sub` matches at `from`), or `-1`.
-fn string_index_of(hay: &[u8], needle: &[u8], from: usize) -> u64 {
-    if needle.is_empty() {
-        return index_bits(from);
-    }
-    hay.get(from..)
-        .and_then(|rest| rest.windows(needle.len()).position(|w| w == needle))
-        .map_or_else(not_found_bits, |i| index_bits(from + i))
 }
 
 /// The radix `Number.prototype.toString` validated (an integral `2..=36`).
@@ -699,6 +812,9 @@ fn string_slice<W: Send + 'static>(
     b: i64,
 ) -> Option<u64> {
     let bytes = string_bytes(mem, ptr)?;
+    if !endpoint_exact(&bytes, a, mem, true) || !endpoint_exact(&bytes, b, mem, true) {
+        return Some(UNSUPPORTED);
+    }
     let len = bytes.len();
     let start = slice_index(a.cast_unsigned(), mem, 0, len);
     let end = slice_index(b.cast_unsigned(), mem, len, len).max(start);
@@ -707,19 +823,23 @@ fn string_slice<W: Send + 'static>(
 }
 
 /// `string.trim()` / `trimStart()` / `trimEnd()`: a NEW heap string with leading
-/// and/or trailing ASCII whitespace removed (selected by `op`). Returns the
-/// result's heap jsval bits.
+/// and/or trailing JS whitespace and line terminators removed (selected by
+/// `op`). Returns the result's heap jsval bits.
 fn string_trim<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     mem: &[u8],
     ptr: usize,
     op: i32,
 ) -> Option<u64> {
-    let bytes = string_bytes(mem, ptr)?;
-    let trim_start = op != METHOD_OP_TRIM_END;
-    let trim_end = op != METHOD_OP_TRIM_START;
-    let text = String::from_utf8_lossy(trim_bytes(&bytes, trim_start, trim_end));
-    alloc_string(caller, &text).map(|base| HEAP | base)
+    let text = String::from_utf8_lossy(&string_bytes(mem, ptr)?).into_owned();
+    let mut trimmed = text.as_str();
+    if op != METHOD_OP_TRIM_END {
+        trimmed = trimmed.trim_start_matches(is_js_whitespace);
+    }
+    if op != METHOD_OP_TRIM_START {
+        trimmed = trimmed.trim_end_matches(is_js_whitespace);
+    }
+    alloc_string(caller, trimmed).map(|base| HEAP | base)
 }
 
 /// `string.repeat(n)`: a NEW heap string of the receiver repeated `n` times. A
@@ -744,17 +864,24 @@ fn string_repeat<W: Send + 'static>(
 }
 
 /// `string.startsWith(sub, from)` / `endsWith(sub, end)`: a boolean prefix
-/// test at `from` (default `0`) / suffix test of the first `end` bytes
-/// (default the length). Returns the boolean jsval bits.
+/// test at UTF-16 offset `from` (default `0`) / suffix test of the first
+/// `end` code units (default the length). Returns the boolean jsval bits.
 fn string_starts_ends(mem: &[u8], ptr: usize, arg0: i64, arg1: i64, op: i32) -> Option<u64> {
-    let hay = string_bytes(mem, ptr)?;
-    let needle = arg_bytes(arg0, mem);
+    let hay = string_text(mem, ptr)?;
+    let needle = to_js_string(&decode(arg0.cast_unsigned(), mem));
+    let len = utf16_len(&hay);
+    // A position inside a surrogate pair holds a lone surrogate, which no
+    // non-empty needle starts or ends with.
     let hit = if op == METHOD_OP_STARTS_WITH {
-        let from = substring_index(arg1.cast_unsigned(), mem, 0, hay.len());
-        hay[from..].starts_with(&needle)
+        match byte_offset(&hay, substring_index(arg1.cast_unsigned(), mem, 0, len)) {
+            Ok(from) => hay[from..].starts_with(&needle),
+            Err(_) => needle.is_empty(),
+        }
     } else {
-        let end = substring_index(arg1.cast_unsigned(), mem, hay.len(), hay.len());
-        hay[..end].ends_with(&needle)
+        match byte_offset(&hay, substring_index(arg1.cast_unsigned(), mem, len, len)) {
+            Ok(end) => hay[..end].ends_with(&needle),
+            Err(_) => needle.is_empty(),
+        }
     };
     Some(bool_bits(hit))
 }
@@ -777,6 +904,9 @@ fn string_pad<W: Send + 'static>(
         Value::Undefined => " ".to_owned(),
         other => to_js_string(&other),
     };
+    if !bytes.is_ascii() || !pad.is_ascii() {
+        return Some(UNSUPPORTED);
+    }
     let text = pad_bytes(&bytes, target, pad.as_bytes(), op == METHOD_OP_PAD_START);
     alloc_string(caller, &text).map(|base| HEAP | base)
 }
@@ -792,6 +922,9 @@ fn string_substring<W: Send + 'static>(
     arg1: i64,
 ) -> Option<u64> {
     let bytes = string_bytes(mem, ptr)?;
+    if !endpoint_exact(&bytes, arg0, mem, false) || !endpoint_exact(&bytes, arg1, mem, false) {
+        return Some(UNSUPPORTED);
+    }
     let len = bytes.len();
     let a = substring_index(arg0.cast_unsigned(), mem, 0, len);
     let b = substring_index(arg1.cast_unsigned(), mem, len, len);
@@ -803,32 +936,6 @@ fn string_substring<W: Send + 'static>(
 /// The NaN-boxed jsval bits of a boolean (`abi::TRUE` / `abi::FALSE`).
 fn bool_bits(b: bool) -> u64 {
     if b { TRUE_BITS } else { FALSE_BITS }
-}
-
-/// Coerce a method argument's raw jsval bits to its JS string form as bytes: a
-/// string yields its payload, everything else its JS `ToString` text (so
-/// `"5".startsWith(5)` matches on `"5"`). Used by the string search/split methods.
-fn arg_bytes(bits: i64, mem: &[u8]) -> Vec<u8> {
-    to_js_string(&decode(bits.cast_unsigned(), mem)).into_bytes()
-}
-
-/// Slice `bytes` with leading and/or trailing ASCII whitespace removed. `is_ascii_whitespace`
-/// matches the same subset as the existing numeric parsers (space/`\t`/`\n`/`\r`/`\x0C`);
-/// non-ASCII whitespace is out of scope (a documented limitation).
-fn trim_bytes(bytes: &[u8], trim_start: bool, trim_end: bool) -> &[u8] {
-    let mut start = 0;
-    let mut end = bytes.len();
-    if trim_start {
-        while start < end && bytes[start].is_ascii_whitespace() {
-            start += 1;
-        }
-    }
-    if trim_end {
-        while end > start && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-    }
-    &bytes[start..end]
 }
 
 /// Pad `bytes` to BYTE length `target` with `pad` repeated (and truncated to fit),
@@ -851,6 +958,225 @@ fn pad_bytes(bytes: &[u8], target: i64, pad: &[u8], at_start: bool) -> String {
         out.extend_from_slice(&filler);
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether the first `n` bytes of `bytes` are ASCII, so that a byte offset up
+/// to `n` is also the UTF-16 offset.
+fn ascii_prefix(bytes: &[u8], n: usize) -> bool {
+    bytes[..n.min(bytes.len())].is_ascii()
+}
+
+/// Whether a position argument (`undefined` or a number) addresses the same
+/// place in `bytes` as in its UTF-16 code units: `undefined` (the default),
+/// `NaN`, a non-negative offset over an ASCII prefix, or a negative one —
+/// which clamps to 0, or counts from the end (`from_end`, exact only for an
+/// ASCII string).
+fn endpoint_exact(bytes: &[u8], position: i64, mem: &[u8], from_end: bool) -> bool {
+    let decoded = decode(position.cast_unsigned(), mem);
+    if matches!(decoded, Value::Undefined) {
+        return true;
+    }
+    let n = trunc_to_int(value_to_number(&decoded));
+    match usize::try_from(n) {
+        Ok(n) => ascii_prefix(bytes, n),
+        Err(_) => !from_end || bytes.is_ascii(),
+    }
+}
+
+/// Whether the character index `i` reads the same code unit in `bytes` as
+/// in UTF-16: out of range (`i < 0` or past the bytes), or over an ASCII
+/// prefix through `i`.
+fn index_exact(bytes: &[u8], i: i64) -> bool {
+    usize::try_from(i).map_or(true, |i| i >= bytes.len() || ascii_prefix(bytes, i + 1))
+}
+
+/// `at(index)` / `charCodeAt(pos)` / `codePointAt(pos)` over an ASCII prefix
+/// (one code unit per byte): the one-character string / code unit at the
+/// position (`at` counts a negative index from the end), or `undefined`
+/// (`at`, `codePointAt`) / `NaN` (`charCodeAt`) out of range.
+fn string_code_at<W: Send + 'static>(
+    caller: &mut Caller<'_, W>,
+    mem: &[u8],
+    ptr: usize,
+    arg0: i64,
+    op: i32,
+) -> Option<u64> {
+    let bytes = string_bytes(mem, ptr)?;
+    let mut i = trunc_to_int(value_to_number(&decode(arg0.cast_unsigned(), mem)));
+    if op == METHOD_OP_AT && i < 0 {
+        // Relative to the length, exact only for an ASCII string.
+        if !bytes.is_ascii() {
+            return Some(UNSUPPORTED);
+        }
+        i += i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+    }
+    if !index_exact(&bytes, i) {
+        return Some(UNSUPPORTED);
+    }
+    let Some(&byte) = usize::try_from(i).ok().and_then(|u| bytes.get(u)) else {
+        return Some(if op == METHOD_OP_CHAR_CODE_AT {
+            f64::NAN.to_bits()
+        } else {
+            abi::UNDEFINED
+        });
+    };
+    if op == METHOD_OP_AT {
+        let text = char::from(byte).to_string();
+        return alloc_string(caller, &text).map(|base| HEAP | base);
+    }
+    Some(f64::from(byte).to_bits())
+}
+
+/// The text of a heap STRING block.
+fn string_text(mem: &[u8], ptr: usize) -> Option<String> {
+    Some(String::from_utf8_lossy(&string_bytes(mem, ptr)?).into_owned())
+}
+
+/// The number of UTF-16 code units of `text`.
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// The byte offset of UTF-16 offset `n` in `text` (its end past the last
+/// unit): `Ok` at a character boundary, `Err` with the boundary after it
+/// inside a surrogate pair.
+fn byte_offset(text: &str, n: usize) -> Result<usize, usize> {
+    let mut units = 0;
+    for (at, c) in text.char_indices() {
+        if units >= n {
+            return if units == n { Ok(at) } else { Err(at) };
+        }
+        units += c.len_utf16();
+    }
+    if units > n {
+        Err(text.len())
+    } else {
+        Ok(text.len())
+    }
+}
+
+/// The UTF-16 offset of the character boundary at byte `at` of `text`.
+fn utf16_offset(text: &str, at: usize) -> usize {
+    utf16_len(&text[..at])
+}
+
+/// The number bits of a UTF-16 search result, `-1` when absent.
+fn index_result(found: Option<usize>) -> u64 {
+    found.map_or_else(not_found_bits, index_bits)
+}
+
+/// `StringIndexOf(text, needle, from)` in UTF-16 offsets (`from` already
+/// clamped to the length): a match starts at a character boundary, so a
+/// `from` inside a surrogate pair searches from the next one.
+fn text_index_of(text: &str, needle: &str, from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from);
+    }
+    let start = byte_offset(text, from).unwrap_or_else(|after| after);
+    find_from(text, needle, start).map(|at| utf16_offset(text, at))
+}
+
+/// `lastIndexOf(needle, pos)` in UTF-16 offsets: the last match starting at
+/// or before `pos` (`NaN`: the end), whose character boundary rounds down
+/// inside a surrogate pair.
+fn text_last_index_of(text: &str, needle: &str, pos: f64) -> Option<usize> {
+    let len = utf16_len(text);
+    let start = if pos.is_nan() {
+        len
+    } else {
+        usize::try_from(trunc_to_int(pos).max(0)).map_or(len, |n| n.min(len))
+    };
+    if needle.is_empty() {
+        return Some(start);
+    }
+    // The pair's high surrogate starts four bytes before the next boundary.
+    let bound = byte_offset(text, start).unwrap_or_else(|after| after - 4);
+    text.match_indices(needle)
+        .map(|(at, _)| at)
+        .take_while(|&at| at <= bound)
+        .last()
+        .map(|at| utf16_offset(text, at))
+}
+
+/// Whether `c` is `RegExp` pattern syntax: a string pattern of `search` /
+/// `match` holding one would need the absent `RegExp`; one without matches
+/// exactly its own text.
+fn is_regexp_syntax(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '^' | '$' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+    )
+}
+
+/// `StringIndexOf(text, search, from)` over byte offsets: `None` past the end.
+fn find_from(text: &str, search: &str, from: usize) -> Option<usize> {
+    if search.is_empty() {
+        return (from <= text.len()).then_some(from);
+    }
+    text.get(from..)?.find(search).map(|i| from + i)
+}
+
+/// `replace` / `replaceAll` of the string pattern `search` in `text`, each
+/// match (at byte `at`, the `i`th) replaced by what `piece(out, at, i)`
+/// appends. `None` when an empty pattern would split a surrogate pair.
+fn replace_str(
+    text: &str,
+    search: &str,
+    all: bool,
+    mut piece: impl FnMut(&mut String, usize, usize),
+) -> Option<String> {
+    let mut positions = Vec::new();
+    if search.is_empty() {
+        // Every code-unit boundary: each char boundary, for BMP text.
+        if text.chars().any(|c| c.len_utf16() > 1) {
+            return None;
+        }
+        positions.extend(text.char_indices().map(|(i, _)| i));
+        positions.push(text.len());
+    } else {
+        let mut from = 0;
+        while let Some(at) = find_from(text, search, from) {
+            positions.push(at);
+            from = at + search.len();
+        }
+    }
+    if !all {
+        positions.truncate(1);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut end = 0;
+    for (i, at) in positions.into_iter().enumerate() {
+        out.push_str(&text[end..at]);
+        piece(&mut out, at, i);
+        end = at + search.len();
+    }
+    out.push_str(&text[end..]);
+    Some(out)
+}
+
+/// Append `GetSubstitution(matched, text, at, [], undefined, template)` to
+/// `out`: `$$`, `` $& ``, `` $` `` and `$'` expand; every other `$` (a capture
+/// reference, with none captured, or `$<`) stays literal.
+fn substitute(out: &mut String, text: &str, at: usize, matched: usize, template: &str) {
+    let mut rest = template;
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        let after = &rest[dollar + 1..];
+        let expansion = match after.as_bytes().first() {
+            Some(b'$') => "$",
+            Some(b'&') => &text[at..at + matched],
+            Some(b'`') => &text[..at],
+            Some(b'\'') => &text[at + matched..],
+            _ => {
+                out.push('$');
+                rest = after;
+                continue;
+            }
+        };
+        out.push_str(expansion);
+        rest = &after[1..];
+    }
+    out.push_str(rest);
 }
 
 /// Resolve one `substring` endpoint (or a search position) against a BYTE
@@ -891,6 +1217,9 @@ fn string_split<W: Send + 'static>(
         other => {
             let sep = to_js_string(&other).into_bytes();
             if sep.is_empty() {
+                if limit > 0 && !bytes.is_ascii() {
+                    return Some(UNSUPPORTED);
+                }
                 // An empty separator splits into one element per byte.
                 bytes.iter().map(|b| vec![*b]).collect()
             } else {
@@ -1064,6 +1393,16 @@ fn to_uint32(n: f64) -> u32 {
         return 0;
     }
     n.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+/// `ToUint16`: non-finite values map to 0, otherwise the truncated value wraps
+/// modulo 2^16.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn to_uint16(n: f64) -> u16 {
+    if !n.is_finite() {
+        return 0;
+    }
+    n.trunc().rem_euclid(65_536.0) as u16
 }
 
 /// Parse a leading decimal float from `s` (the `parseFloat` subset): skip

@@ -3,8 +3,6 @@
 //! backtrace).
 #![allow(clippy::expect_used)]
 
-use std::fmt::Write as _;
-
 use jsc_core::run::compile_and_run;
 mod common;
 use common::{assert_number, assert_str, assert_uncaught};
@@ -23,18 +21,16 @@ fn many_small_strings_grow_memory() {
     );
 }
 
-/// Static data (string literals, the realm image) past the first 64 KiB page
-/// fits the initial memory: the module starts with enough pages for it.
+/// Static data (string literals, the realm image, the intern table) past the
+/// first 64 KiB page is covered by the initial memory, so instantiation does
+/// not trap.
 #[test]
-fn static_data_past_the_first_page() {
-    let literals = (0..1500).fold(String::new(), |mut out, i| {
-        let _ = write!(
-            out,
-            "s += '{i}: a static string literal long enough'.length;"
-        );
-        out
-    });
-    assert_number(&format!("let s = 0; {literals} s > 0 ? 1 : 0"), 1.0);
+fn static_data_beyond_one_page() {
+    let src: String = (0..3000)
+        .map(|i| format!("let s{i} = 'literal number {i} of a long program'; "))
+        .chain(["s2999.length".to_owned()])
+        .collect();
+    assert_number(&src, 37.0);
 }
 
 /// A million small string allocations complete.
