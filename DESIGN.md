@@ -975,7 +975,7 @@ it):
 - wrappers as `[Number: 1]` / `[String: 'ab']` / `[Boolean: true]`;
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
-  non-finite payload);
+  `NaN` time value);
 - cycles as `<ref *1> { self: [Circular *1] }`.
 
 ---
@@ -1542,8 +1542,6 @@ Each item below is current behaviour of this tree.
 
 - UTC only: no local time zone, no string parsing (`new Date("…")` is
   `Invalid Date`), and the calendar-field constructor throws a `TypeError`.
-- No TimeClip: a finite millisecond value outside ±8.64e15 is kept rather than
-  becoming `Invalid Date`.
 
 **Runtime**
 

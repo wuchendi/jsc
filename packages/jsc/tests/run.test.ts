@@ -240,6 +240,16 @@ it('backs Date.now() with the host clock', async () => {
   expect((await run('new Date(0)')).result).toBe('1970-01-01T00:00:00.000Z')
 })
 
+it('renders clipped and expanded-year dates like toISOString', async () => {
+  expect((await run('new Date(1e20)')).result).toBe('Invalid Date')
+  expect((await run('new Date(8.64e15)')).result).toBe(
+    '+275760-09-13T00:00:00.000Z',
+  )
+  expect((await run('new Date(-8.64e15)')).result).toBe(
+    '-271821-04-20T00:00:00.000Z',
+  )
+})
+
 it('rejects run() on an unhandled promise rejection', async () => {
   await expect(run('Promise.reject("x"); 0')).rejects.toThrow(
     /^Uncaught \(in promise\) x$/,
