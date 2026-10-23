@@ -44,9 +44,6 @@ pub(in crate::emit) const DESC_DATA_DEFAULT: i32 = DESC_HAS_WRITABLE
 pub(in crate::emit) const DEFINE_OK: i32 = 1;
 /// `__define_own` result: a non-configurable property rejected the update.
 pub(in crate::emit) const DEFINE_REJECT: i32 = 0;
-/// `__define_own` result: an array cannot take the descriptor yet (its
-/// `length`, or non-default attributes on an index).
-pub(in crate::emit) const DEFINE_UNSUPPORTED: i32 = 2;
 /// `__define_own` result: a new property on a non-extensible object.
 pub(in crate::emit) const DEFINE_NOT_EXTENSIBLE: i32 = 3;
 
@@ -71,9 +68,6 @@ const FIELDS: [(&str, i32, i32); 6] = [
 /// How a non-callable `get` / `set` renders in its `TypeError`.
 const OBJECT_TAG: &str = "#<Object>";
 
-/// The integrity-level names an array's `TypeError` reports.
-const INTEGRITY_NAMES: [&str; 3] = ["preventExtensions", "seal", "freeze"];
-
 /// The static strings the descriptor helpers reference, plus every
 /// `__prop_throw` fragment (these helpers and `__define` throw through it in
 /// any program).
@@ -82,7 +76,6 @@ pub(in crate::emit) fn descriptor_strings() -> impl Iterator<Item = &'static str
         .map(|(key, ..)| key)
         .into_iter()
         .chain([OBJECT_TAG, ""])
-        .chain(INTEGRITY_NAMES)
         .chain(PROP_ERROR_STRS)
         .chain(
             PROP_KEYED_MSGS
@@ -139,11 +132,20 @@ fn emit_accessor_block(
 /// `__define_own(o: i32, key: i32, desc: i32, value: i64, get: i64, set: i64)
 /// -> i32`: `ValidateAndApplyPropertyDescriptor` (ECMA-262 10.1.6.3) of the
 /// descriptor record `(desc, value, get, set)` on the own property `key` (an
-/// interned key) of the object-family block `o`. Never throws; returns
-/// [`DEFINE_OK`], [`DEFINE_REJECT`], [`DEFINE_NOT_EXTENSIBLE`], or
-/// [`DEFINE_UNSUPPORTED`] for an array's `length` or an array index whose
-/// resulting attributes are not the default ones (an index with default
-/// attributes is stored through `__array_set`).
+/// interned key) of the object-family block `o`. Returns [`DEFINE_OK`],
+/// [`DEFINE_REJECT`], or [`DEFINE_NOT_EXTENSIBLE`]; only an array's `length`
+/// may leave an exception pending (its `ToNumber` / `RangeError`, or the
+/// `TypeError` of a shrink stopped by a non-configurable element).
+///
+/// An array's `length` is `ArraySetLength` (10.4.2.4): `configurable` /
+/// `enumerable` `true` and accessor fields reject; a read-only `length`
+/// rejects `writable: true` and any other value; a value goes through
+/// `__array_set_length`; `writable: false` then makes it read-only (after
+/// putting the array in dictionary mode). An array index whose resulting
+/// attributes are the default ones on a non-`SPARSE` array is an element store
+/// (`__array_set`); any other index puts the array in dictionary mode, where
+/// it is an ordinary table property (a new index at or past `length` rejects
+/// on a read-only `length` and raises `length` otherwise).
 ///
 /// A new property takes its absent fields as `false` / `undefined`. An
 /// existing one keeps its absent fields; a kind change (data <-> accessor)
@@ -164,29 +166,81 @@ pub(in crate::emit) fn emit_define_own(
     let undefined = |f: &mut Function| wasm!(f; I64Const(UNDEFINED_BITS));
     let accessor_desc = DESC_HAS_GET | DESC_HAS_SET;
     let data_desc = DESC_HAS_VALUE | DESC_HAS_WRITABLE;
+    // Push 1 when the boolean field `bit` is present and true.
+    let present_true = |f: &mut Function, bit: i32| {
+        let both = (bit << DESC_HAS_SHIFT) | bit;
+        wasm!(f; LocalGet(desc), I32Const(both), I32And, I32Const(both), I32Eq);
+    };
+    let flag = |f: &mut Function, bit: i32| {
+        wasm!(f; LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(bit), I32And);
+    };
 
-    // An array: `length` and accessor indices are unsupported; an index with
-    // default resulting attributes is an element store.
     wasm!(f;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
-        LocalGet(key), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And, LocalSet(i),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
+        If(BlockType::Empty),
     );
+    // `length`: accessor fields, configurable or enumerable `true` reject.
+    emit_flag(&mut f, desc, accessor_desc);
+    present_true(&mut f, ATTR_CONFIGURABLE);
+    wasm!(f; I32Or);
+    present_true(&mut f, ATTR_ENUMERABLE);
+    wasm!(f; I32Or, If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End);
+    flag(&mut f, ARRAY_LENGTH_READONLY);
+    wasm!(f; If(BlockType::Empty));
+    // Read-only: no `writable: true`, and a value must equal the length.
+    present_true(&mut f, ATTR_WRITABLE);
+    wasm!(f;
+        If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+        LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And,
+        If(BlockType::Empty),
+    );
+    emit_is_number(&mut f, value);
+    wasm!(f;
+        If(BlockType::Result(ValType::I64)), LocalGet(value), Else, LocalGet(value), Call(helpers.to_number), End,
+        F64ReinterpretI64, LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), F64ConvertI32U, F64Ne,
+        GlobalGet(EXC_PENDING_GLOBAL), I32Or,
+        If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+        End,
+        I32Const(DEFINE_OK), Return,
+        End,
+        LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(value), Call(helpers.array_set_length()),
+        End,
+        // `writable: false` applies even after a shrink stopped early.
+        LocalGet(desc), I32Const(DESC_HAS_WRITABLE | ATTR_WRITABLE), I32And, I32Const(DESC_HAS_WRITABLE), I32Eq,
+        If(BlockType::Empty),
+    );
+    emit_dictionize(&mut f, o, t, m, p, helpers);
+    wasm!(f;
+        LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32Or,
+        I32Store8(m8(FLAGS)),
+        End,
+        I32Const(DEFINE_REJECT), I32Const(DEFINE_OK), GlobalGet(EXC_PENDING_GLOBAL), Select, Return,
+        End,
+        LocalGet(key), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
+        If(BlockType::Empty),
+        LocalGet(key), Call(helpers.index_value), LocalSet(i),
+    );
+    flag(&mut f, ARRAY_SPARSE);
+    wasm!(f;
+        I32Eqz,
+        If(BlockType::Empty),
+        Block(BlockType::Empty),
+    );
+    // A dense array takes a default-attribute index as an element store.
     emit_flag(&mut f, desc, accessor_desc);
     wasm!(f;
-        LocalGet(i), I32Const(0), I32Ne, I32And, I32Or,
-        If(BlockType::Empty), I32Const(DEFINE_UNSUPPORTED), Return, End,
-        LocalGet(i),
-        If(BlockType::Empty),
+        BrIf(0),
         // b = the element exists.
-        LocalGet(key), Call(helpers.index_value), LocalTee(i),
-        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32LtU,
+        LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32LtU,
         If(BlockType::Result(ValType::I32)),
     );
-    emit_elem_load(&mut f, o, i, helpers.sparse_get());
+    emit_elem_addr(&mut f, o, i);
     wasm!(f;
-        I64Const(HOLE_BITS), I64Ne,
+        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Ne,
         Else, I32Const(0), End,
         LocalSet(b),
         // Every present W/E/C field must be true, and a new element needs all
@@ -195,7 +249,7 @@ pub(in crate::emit) fn emit_define_own(
         LocalGet(desc), I32And, LocalGet(m), I32Ne,
         LocalGet(m), I32Const(7), I32Ne, LocalGet(b), I32Eqz, I32And,
         I32Or,
-        If(BlockType::Empty), I32Const(DEFINE_UNSUPPORTED), Return, End,
+        BrIf(0),
         LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And, LocalGet(b), I32Eqz, I32Or,
         If(BlockType::Empty),
         LocalGet(o),
@@ -207,6 +261,23 @@ pub(in crate::emit) fn emit_define_own(
         LocalGet(value), Call(helpers.array_set()),
         End,
         I32Const(DEFINE_OK), Return,
+        End,
+        End,
+    );
+    // Any other index: dictionary mode, then an ordinary property; a new one
+    // past the length needs a writable `length` and an extensible array.
+    emit_dictionize(&mut f, o, t, m, p, helpers);
+    wasm!(f;
+        LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
+        If(BlockType::Empty),
+    );
+    flag(&mut f, ARRAY_LENGTH_READONLY);
+    wasm!(f; If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End);
+    flag(&mut f, NOT_EXTENSIBLE);
+    wasm!(f;
+        If(BlockType::Empty), I32Const(DEFINE_NOT_EXTENSIBLE), Return, End,
+        LocalGet(o), LocalGet(i), I32Const(1), I32Add, I32Store(m32(ARRAY_LEN_OFFSET)),
+        End,
         End,
         End,
     );
@@ -462,9 +533,10 @@ pub(in crate::emit) fn emit_to_desc(
 /// own property `key` (an interned key, `0` = absent) of the object `obj`:
 /// a fresh ordinary object with own enumerable `value`, `writable` or `get`,
 /// `set`, then `enumerable`, `configurable`; `undefined` when absent. An
-/// array's `length` is writable, non-enumerable, non-configurable, and its
-/// elements (holes are absent) have the default attributes; a `LAZY`
-/// function is materialized by the lookup.
+/// array's `length` is non-enumerable, non-configurable, and writable unless
+/// `LENGTH_READONLY`; its store elements (holes are absent) have the default
+/// attributes and its table elements their own; a `LAZY` function is
+/// materialized by the lookup.
 pub(in crate::emit) fn emit_own_desc(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
@@ -482,7 +554,9 @@ pub(in crate::emit) fn emit_own_desc(
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
         If(BlockType::Empty),
         LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), F64ConvertI32U, I64ReinterpretF64, LocalSet(v),
-        I32Const(ATTR_WRITABLE), LocalSet(a),
+        I32Const(0), I32Const(ATTR_WRITABLE),
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And,
+        Select, LocalSet(a),
         Br(2),
         End,
         LocalGet(key), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
@@ -491,12 +565,17 @@ pub(in crate::emit) fn emit_own_desc(
         LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
     );
-    emit_elem_load(&mut f, o, i, helpers.sparse_get());
+    // A store element; a table one falls through to the table lookup.
+    emit_in_store(&mut f, o, i, a);
+    wasm!(f; If(BlockType::Empty));
+    emit_elem_addr(&mut f, o, i);
     wasm!(f;
+        I64Load(m64(ELEMS_DATA_OFFSET)),
         LocalTee(v), I64Const(HOLE_BITS), I64Eq,
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
         I32Const(ATTRS_DEFAULT), LocalSet(a),
-        Br(2),
+        Br(3),
+        End,
         End,
         End,
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
@@ -585,28 +664,19 @@ fn emit_live_entries(
 /// ([`INTEGRITY_SEALED`]) and every own data property also non-writable
 /// ([`INTEGRITY_FROZEN`]), then the object becomes `NOT_EXTENSIBLE`
 /// ([`INTEGRITY_NON_EXTENSIBLE`] does only that). A `LAZY` function is
-/// materialized first; a watched table sets its dirty bit. An array throws a
-/// `TypeError` (left pending, nothing changed): its exotic `length` and
-/// elements cannot take an integrity level yet.
-pub(in crate::emit) fn emit_set_integrity(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
-    let mut f = Function::new(vec![(5, ValType::I32)]);
+/// materialized first; a watched table sets its dirty bit. An array is put in
+/// dictionary mode first, so its elements are table entries the level
+/// reaches, and a frozen array's `length` becomes read-only.
+pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(6, ValType::I32)]);
     let (obj, level) = (0, 1);
-    let (o, p, e, end, a) = (2, 3, 4, 5, 6);
-    let name = |i: usize| {
-        Instruction::I64Const(HEAP_BITS | i64::from(static_key(strings, INTEGRITY_NAMES[i])))
-    };
+    let (o, p, e, end, a, t) = (2, 3, 4, 5, 6, 7);
     wasm!(f;
-        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq, LocalTee(t),
         If(BlockType::Empty),
-        LocalGet(obj),
-        name(2), name(1), LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq, Select,
-        name(0), LocalGet(level), Select,
-        I32Const(PROP_THROW_ARRAY_INTEGRITY), Call(helpers.prop_throw), Return,
-        End,
     );
+    emit_dictionize(&mut f, o, e, end, a, helpers);
+    wasm!(f; End);
     emit_materialize(&mut f, o, helpers);
     wasm!(f;
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p),
@@ -634,6 +704,9 @@ pub(in crate::emit) fn emit_set_integrity(
     wasm!(f;
         End,
         LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32Or,
+        I32Const(ARRAY_LENGTH_READONLY), I32Const(0),
+        LocalGet(t), LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq, I32And, Select,
+        I32Or,
         I32Store8(m8(FLAGS)),
         End,
     );
@@ -644,7 +717,7 @@ pub(in crate::emit) fn emit_set_integrity(
 /// [`INTEGRITY_NON_EXTENSIBLE`], `IsExtensible(obj)`; otherwise
 /// `TestIntegrityLevel` — the object is not extensible and every own property
 /// is non-configurable (and, [`INTEGRITY_FROZEN`], every own data property
-/// non-writable).
+/// non-writable, an array's `length` included).
 pub(in crate::emit) fn emit_test_integrity() -> Function {
     let mut f = Function::new(vec![(5, ValType::I32)]);
     let (obj, level) = (0, 1);
@@ -654,6 +727,10 @@ pub(in crate::emit) fn emit_test_integrity() -> Function {
         I32Eqz,
         If(BlockType::Empty), LocalGet(level), I32Eqz, Return, End,
         LocalGet(level), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq,
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq, I32And,
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And, I32Eqz, I32And,
+        If(BlockType::Empty), I32Const(0), Return, End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p),
         If(BlockType::Empty),
     );

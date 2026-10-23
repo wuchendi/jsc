@@ -295,6 +295,11 @@ const ARRAY_ELEMS_OFFSET: u64 = abi::ARRAY_ELEMS_OFFSET as u64;
 const ARRAY_BLOCK_SIZE: i32 = abi::ARRAY_BLOCK_SIZE.cast_signed();
 /// Array header `flags` bit: the array is sparse (see [`abi::ARRAY_FLAG_SPARSE`]).
 const ARRAY_SPARSE: i32 = abi::ARRAY_FLAG_SPARSE as i32;
+/// Array header `flags` bit: `length` is read-only (see
+/// [`abi::ARRAY_FLAG_LENGTH_READONLY`]).
+const ARRAY_LENGTH_READONLY: i32 = abi::ARRAY_FLAG_LENGTH_READONLY as i32;
+/// Array header `flags` bit: dictionary mode (see [`abi::ARRAY_FLAG_DICTIONARY`]).
+const ARRAY_DICTIONARY: i32 = abi::ARRAY_FLAG_DICTIONARY as i32;
 
 /// Type byte and field offsets of an array element store (internal): `cap`,
 /// then element `i` at `ELEMS_DATA_OFFSET + 8 * i`. See [`abi::TYPE_ELEMS`].
@@ -497,7 +502,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 16] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 14] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -551,16 +556,6 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 16] = [
         PROP_THROW_DESC_MIXED,
         "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
         "",
-    ),
-    (
-        PROP_THROW_ARRAY_DEFINE,
-        "Cannot define property ",
-        " on an array: array length and non-default element attributes are unsupported",
-    ),
-    (
-        PROP_THROW_ARRAY_INTEGRITY,
-        "Cannot ",
-        " an array: array integrity levels are unsupported",
     ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
@@ -622,12 +617,6 @@ const PROP_THROW_SETTER: i32 = 15;
 /// `__prop_throw`'s `mode` argument: a descriptor with both accessor and
 /// data fields (the `key` is the empty string).
 const PROP_THROW_DESC_MIXED: i32 = 16;
-/// `__prop_throw`'s `mode` argument: a descriptor an array cannot take yet
-/// (its `length`, or non-default attributes on an index).
-const PROP_THROW_ARRAY_DEFINE: i32 = 17;
-/// `__prop_throw`'s `mode` argument: `preventExtensions` / `seal` / `freeze`
-/// (the `key`) of an array, which cannot take an integrity level yet.
-const PROP_THROW_ARRAY_INTEGRITY: i32 = 18;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
@@ -1528,7 +1517,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_define_own(&offsets, helpers));
     code.function(&emit_to_desc(&offsets, helpers));
     code.function(&emit_own_desc(&offsets, helpers));
-    code.function(&emit_set_integrity(&offsets, helpers));
+    code.function(&emit_set_integrity(helpers));
     code.function(&emit_test_integrity());
     module.section(&code);
 

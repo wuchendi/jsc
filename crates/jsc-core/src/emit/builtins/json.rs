@@ -678,18 +678,10 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>) -> Function {
         End,
         If(BlockType::Empty), LocalGet(val), LocalGet(k), Call(helpers.delete), End,
         Else,
-        LocalGet(array),
-        If(BlockType::Empty),
-        LocalGet(val), LocalGet(k),
-    );
-    box_heap(&mut f);
-    wasm!(f;
-        LocalGet(result), Call(helpers.array_set()),
-        Else,
-        // `CreateDataProperty`: a rejection is ignored.
+        // `CreateDataProperty` (an array index included): a rejection is
+        // ignored.
         LocalGet(val), I32WrapI64, LocalGet(k), I32Const(DESC_DATA_DEFAULT), LocalGet(result),
         I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS), Call(helpers.define_own()), Drop,
-        End,
         End,
     );
     return_if_pending(&mut f);
