@@ -512,9 +512,9 @@ it('runs the number formatting and Math host ops like the Rust host', async () =
   expect((await run('(123456).toExponential(2)')).result).toBe('1.23e+5')
   expect((await run('(123456).toExponential()')).result).toBe('1.23456e+5')
   expect((await run('(0.000123).toPrecision(2)')).result).toBe('0.00012')
-  expect((await run('Math.log(1) + Math.cos(0) + Math.atan2(0, 1)')).result).toBe(
-    '1',
-  )
+  expect(
+    (await run('Math.log(1) + Math.cos(0) + Math.atan2(0, 1)')).result,
+  ).toBe('1')
   expect((await run('Math.cbrt(27) + Math.log2(8)')).result).toBe('6')
   expect((await run('1 / Math.sin(-0)')).result).toBe('-Infinity')
   expect((await run('Math.acosh(0.5)')).result).toBe('NaN')

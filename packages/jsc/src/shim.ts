@@ -38,9 +38,9 @@ import {
   MATH_FN_EXP,
   MATH_FN_EXPM1,
   MATH_FN_LOG,
-  MATH_FN_LOG10,
   MATH_FN_LOG1P,
   MATH_FN_LOG2,
+  MATH_FN_LOG10,
   MATH_FN_RANDOM,
   MATH_FN_SIN,
   MATH_FN_SINH,
@@ -725,8 +725,10 @@ export function createShim(): Shim {
         const value = decode(recv, mem)
         if (value.kind !== 'number') return null
         const digits = decode(arg0, mem)
-        const d = digits.kind === 'number' ? Math.trunc(digits.value) : undefined
-        if (d === undefined && op !== METHOD_OP_NUMBER_TO_EXPONENTIAL) return null
+        const d =
+          digits.kind === 'number' ? Math.trunc(digits.value) : undefined
+        if (d === undefined && op !== METHOD_OP_NUMBER_TO_EXPONENTIAL)
+          return null
         const text =
           op === METHOD_OP_NUMBER_TO_FIXED
             ? value.value.toFixed(d)
