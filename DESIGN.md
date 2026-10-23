@@ -405,8 +405,9 @@ a 16-byte prefix (`OBJ_PREFIX_SIZE = 16`):
 bit `2` `ARRAY_INDEX` (content is a canonical array index: `"0"` or a nonzero
 digit then digits, value `< 2^32 - 1`). Object family: bit `1`
 `NOT_EXTENSIBLE`. Functions additionally: `4` `LAZY`, `8` `CONSTRUCTOR`, `16`
-`CLASS_CTOR`, `32` `SELF_ALLOC` (§5.5). Arrays additionally: `4` `SPARSE`,
-`8` `JOINING` (set while `join` runs, so a cyclic element joins as `""`).
+`CLASS_CTOR`, `32` `SELF_ALLOC`, `64` `BOUND` (§5.5). Arrays additionally:
+`4` `SPARSE`, `8` `JOINING` (set while `join` runs, so a cyclic element joins
+as `""`).
 
 ### 5.2 Block layouts
 
@@ -566,6 +567,19 @@ in the data segment (§4.2), so it has one identity for the whole run.
   Error family, Map, Set, Promise, Date).
 - **No own `caller` / `arguments`.** Every function is strict; both names
   resolve to the `%ThrowTypeError%` accessors on `%Function.prototype%`.
+- **Bound functions.** `Function.prototype.bind` allocates a `BOUND`
+  `TYPE_FUNCTION` block (never `LAZY`) whose `func_idx` is the shared
+  `BoundCall` builtin trampoline and whose `env` is an internal array
+  `[target, boundThis, ...boundArgs]`; its `proto` is the target's. It is
+  `CONSTRUCTOR | SELF_ALLOC` iff the target is a constructor, and owns only
+  `length` (`max(0, ToIntegerOrInfinity(target.length) - boundArgs)` when the
+  target has an own number `length`, else `0`) and `name` (`"bound " +
+  target.name`, `"bound "` for a non-string), both configurable only. The
+  trampoline prepends the bound arguments to the call's (into one fresh array,
+  called like a spread call); a call runs the target with `this = boundThis`,
+  a construct constructs the target with `new.target` = the target when it was
+  the bound function itself (recognised by its `env`), else the incoming
+  `new.target`.
 
 ### 5.6 `__alloc` and memory growth
 
@@ -660,8 +674,7 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   `format_value` used for the CLI's `-p` output (§6.9).
 - **`__convert` ops.** `0` ToString, `1` ToNumber (StringToNumber rules),
   `3` parseFloat. The guest runs `ToPrimitive` first (§6.5), so the host sees
-  primitives, plus a `Date` (its `toString` text) and a function without a
-  user `toString`. A string argument to op `0` is returned unchanged; any
+  primitives, plus a `Date` (its `toString` text). A string argument to op `0` is returned unchanged; any
   other result string is allocated through `__new_string`.
 - **`__method` ops.** `0` `indexOf`, `1` `includes`, `3` `slice`,
   `4` `toUpperCase`, `5` `toLowerCase`, `6` `charAt`, `7` `trim`, `8` `trimStart`,
@@ -1073,7 +1086,7 @@ those of `switch` and loops are not tracked.
 - **Spread.** In calls, `new`, and array literals; sources follow the `for-of`
   rules (§7.3). Generators are drained to an array (`__gen_to_array`).
 - **`this`.** Bound by method calls (`obj.m()`), by `new`, by
-  `Function.prototype.call` / `apply`, and for getters/setters. A plain call
+  `Function.prototype.call` / `apply` / `bind`, and for getters/setters. A plain call
   sees `this === undefined`; top-level `this` is the global object.
 - **Arity.** `length` is the count of parameters before the first default or
   rest; arity is never checked, at compile time or at run time.
@@ -1131,9 +1144,12 @@ those of `switch` and loops are not tracked.
 - **`new.target`** reads `$__new_target` under the construct marker, else
   `undefined`.
 - **`instanceof`** is `OrdinaryHasInstance` for any right-hand side: a
-  non-callable right-hand side throws a `TypeError`; otherwise the left
-  operand's `proto` chain is walked against `Get(C, "prototype")`; primitives
-  yield `false`.
+  non-callable right-hand side throws a `TypeError`; a bound right-hand side
+  is replaced by its target (repeatedly); otherwise the left operand's
+  `proto` chain is walked against `Get(C, "prototype")`; primitives yield
+  `false`.
+- **Bound functions** (§5.5) under `new` construct their target; a bound
+  non-constructor is not a constructor (`TypeError: B is not a constructor`).
 
 ### 7.7 Errors
 
@@ -1203,8 +1219,8 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
-| `Function` | `Function.prototype.call`, `apply`; `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
-| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`; `push` / `pop` (variadic, generic over array-likes), `map`, `filter`, `forEach`, `reduce` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `indexOf`, `includes`, `join`, `slice`, `toString` |
+| `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
+| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString` — every method generic over array-likes; `map` / `filter` / `slice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
 | `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.prototype.toString(radix)`, `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `min`, `max` (variadic), `pow`; `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
@@ -1462,8 +1478,8 @@ Each item below is current behaviour of this tree.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9: no property-descriptor or prototype
   reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Function.prototype.bind`, no `Array.from`, `sort`, `find`,
-  `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
+  `assign`), no `Array.prototype.sort`,
+  `splice`, `keys`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
 - `parseInt` and `parseFloat` exist only as direct calls, not as global values.
 
@@ -1472,8 +1488,17 @@ Each item below is current behaviour of this tree.
 - Property tables are linear-scanned; there are no inline caches.
 - No object spread (`{...o}`); object patterns accept only identifier and
   string keys; `catch` parameters must be identifiers.
-- No `ArraySpeciesCreate`: `map`/`filter` on an `Array` subclass instance return a plain
-  array.
+- `ArraySpeciesCreate` reads `constructor` only (there is no `Symbol`, so no
+  `@@species`): `undefined` creates a plain array, a non-object throws, and an
+  object `C` stands in for `C[@@species]` as the builtin `@@species` getters
+  would answer: `C` itself when its prototype chain reaches `%Array%`,
+  `%Map%`, `%Set%` or `%Promise%` (so an `Array` subclass gets instances of
+  itself, `%Array%` a plain array), else a plain array. `concat` spreads by
+  `IsArray` only (no `@@isConcatSpreadable`), and `Array.from` treats an object
+  that is neither an array-like source nor a runtime iterable as an array-like
+  (user `@@iterator` waits for `Symbol`).
+- Array-like lengths are clamped to `2^32 - 1` by the generic `Array.prototype`
+  loops (`at` and `push` use the full `ToLength` range).
 - Generator functions have no `prototype` property; generator objects inherit
   `%GeneratorPrototype%` directly.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
@@ -1572,7 +1597,7 @@ installed on the realm's prototypes, and phase 3 extends that set.
 
 - The remaining built-ins on the realm's prototypes: `Object` property
   descriptors (`defineProperty`, `create`, `freeze`, `assign`),
-  `Function.prototype.bind`, the rest of `Array` (`from`, `sort`, species),
+  the rest of `Array` (`from`, `sort`, species),
   `String`, `Number`, and `Math`; `Date` parsing and local time.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
