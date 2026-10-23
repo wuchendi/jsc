@@ -379,13 +379,12 @@ const ACCESSOR_SET_OFFSET: u64 = abi::ACCESSOR_SET_OFFSET as u64;
 /// [`abi::ACCESSOR_BLOCK_SIZE`].
 const ACCESSOR_BLOCK_SIZE: i32 = abi::ACCESSOR_BLOCK_SIZE.cast_signed();
 
-/// The fixed byte length of a `toISOString()` result (`YYYY-MM-DDTHH:MM:SS.mmmZ`)
-/// — always 24 for a 4-digit year, the in-scope range.
+/// The byte length of a `toISOString()` result with a four-digit year
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`); an expanded `±YYYYYY` year adds three.
 const ISO_STRING_LEN: i32 = 24;
 
-/// The string a `Date` field method yields for a non-finite (`NaN`/`Infinity`)
-/// timestamp: `toISOString()` returns this instead of an ISO string (interned as a
-/// data-segment literal, like the `typeof` words).
+/// The `toString()` of an invalid (`NaN`) Date (interned as a data-segment
+/// literal, like the `typeof` words).
 const INVALID_DATE: &str = "Invalid Date";
 
 /// The NaN-boxed `undefined` jsval as an `i64` carrier (see [`abi::UNDEFINED`]).
