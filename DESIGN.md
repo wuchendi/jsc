@@ -1086,7 +1086,19 @@ those of `switch` and loops are not tracked.
 - **Parameters.** Default values (evaluated per call in a prologue, may reference
   earlier parameters and captured bindings), trailing rest parameters
   (collected from the positional slots and `$__spread_args`), and array/object
-  destructuring patterns (composable with defaults).
+  destructuring patterns (composable with defaults). Every parameter name is
+  declared up front and the parameters bind left to right. With parameter
+  expressions (a default anywhere), a parameter is in its TDZ until it binds:
+  a reference from the parameter code itself compiles to a `ReferenceError`
+  throw, and a captured parameter's cell holds the hole until then, so a
+  closure created by a default checks it (`f(a = b, b)`, `f(a = a)` throw). A
+  generator/async function binds them when called (§7.8).
+- **`var` redeclaring a parameter.** A `var` naming a var-scoped binding of
+  the same function (a parameter, a `var`, a function declaration) reuses it:
+  without an initializer it keeps its value, with one it assigns. With
+  parameter expressions, a body `var` redeclaring a parameter is instead a
+  separate binding created on entry from the parameter's value, so closures
+  in the parameter list keep the parameter.
 - **`arguments`.** A function that references `arguments` builds an unmapped
   `CLASS_ARGUMENTS` object from `argc`, the positional slots, and
   `$__spread_args`.
@@ -1495,9 +1507,14 @@ Each item below is current behaviour of this tree.
   no `import()`.
 - Strict-mode semantics only: sloppy-mode constructs (`with`, implicit globals)
   are rejected or throw, and the test262 runner skips `noStrict` tests.
-- TDZ is enforced only for module cells; reading a block-scoped binding before
-  its declaration inside the same function resolves to the enclosing binding
-  (or the global object) instead of throwing.
+- TDZ is enforced only for module cells and parameters; reading a
+  block-scoped binding before its declaration inside the same function
+  resolves to the enclosing binding (or the global object) instead of
+  throwing.
+- A function-body `var` is not hoisted: it binds at its declaration, scoped
+  to its block (only a redeclaration of a var-scoped binding of the same
+  function reuses it, §7.4), and a `for-in`/`for-of` `var` head is a loop
+  binding.
 - Top-level `var` and function declarations are module cells, not properties
   of the global object (`var v = 1; globalThis.v` is `undefined`).
 - An assignment to an unresolvable name evaluates its right-hand side before
