@@ -161,15 +161,10 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         METHOD_OP_INDEX_OF => match type_byte {
             Some(TYPE_ARRAY) => Some(array_index_of(&mem, ptr?, arg0.cast_unsigned())),
             Some(TYPE_STRING) => {
-                let hay = string_bytes(&mem, ptr?)?;
-                if !endpoint_exact(&hay, arg1, &mem, false) {
-                    return Some(UNSUPPORTED);
-                }
-                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
-                Some(exact_found(
-                    &hay,
-                    string_index_of(&hay, &arg_bytes(arg0, &mem), from),
-                ))
+                let hay = string_text(&mem, ptr?)?;
+                let needle = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, utf16_len(&hay));
+                Some(index_result(text_index_of(&hay, &needle, from)))
             }
             _ => None,
         },
@@ -177,13 +172,10 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             Some(TYPE_ARRAY) => Some(bool_bits(array_includes(&mem, ptr?, arg0.cast_unsigned()))),
             // `str.includes(sub, from)` — substring containment from `from`.
             Some(TYPE_STRING) => {
-                let hay = string_bytes(&mem, ptr?)?;
-                if !endpoint_exact(&hay, arg1, &mem, false) {
-                    return Some(UNSUPPORTED);
-                }
-                let from = substring_index(arg1.cast_unsigned(), &mem, 0, hay.len());
-                let found = string_index_of(&hay, &arg_bytes(arg0, &mem), from);
-                Some(bool_bits(found != not_found_bits()))
+                let hay = string_text(&mem, ptr?)?;
+                let needle = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                let from = substring_index(arg1.cast_unsigned(), &mem, 0, utf16_len(&hay));
+                Some(bool_bits(text_index_of(&hay, &needle, from).is_some()))
             }
             _ => None,
         },
@@ -265,13 +257,10 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         },
         METHOD_OP_LAST_INDEX_OF => match type_byte {
             Some(TYPE_STRING) => {
-                let hay = string_bytes(&mem, ptr?)?;
-                Some(string_last_index_of(
-                    &hay,
-                    &arg_bytes(arg0, &mem),
-                    arg1,
-                    &mem,
-                ))
+                let hay = string_text(&mem, ptr?)?;
+                let needle = to_js_string(&decode(arg0.cast_unsigned(), &mem));
+                let pos = value_to_number(&decode(arg1.cast_unsigned(), &mem));
+                Some(index_result(text_last_index_of(&hay, &needle, pos)))
             }
             _ => None,
         },
@@ -303,7 +292,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         },
         METHOD_OP_SEARCH => match type_byte {
             Some(TYPE_STRING) => {
-                let hay = string_bytes(&mem, ptr?)?;
+                let hay = string_text(&mem, ptr?)?;
                 let pattern = match decode(arg0.cast_unsigned(), &mem) {
                     Value::Undefined => String::new(),
                     other => to_js_string(&other),
@@ -311,10 +300,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                 if pattern.contains(is_regexp_syntax) {
                     return Some(NEEDS_REGEXP);
                 }
-                Some(exact_found(
-                    &hay,
-                    string_index_of(&hay, pattern.as_bytes(), 0),
-                ))
+                Some(index_result(text_index_of(&hay, &pattern, 0)))
             }
             _ => None,
         },
@@ -322,9 +308,22 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             Some(TYPE_STRING) => {
                 let text = String::from_utf8_lossy(&string_bytes(&mem, ptr?)?).into_owned();
                 let search = to_js_string(&decode(arg0.cast_unsigned(), &mem));
-                let template = to_js_string(&decode(arg1.cast_unsigned(), &mem));
                 let all = op == METHOD_OP_REPLACE_ALL;
-                let Some(out) = replace_str(&text, &search, &template, all) else {
+                // A replacer function's results (an array, in match order), or
+                // a template.
+                let replacement = decode(arg1.cast_unsigned(), &mem);
+                let out = if let Value::Array(items, _) = replacement {
+                    let pieces: Vec<String> = items.iter().map(to_js_string).collect();
+                    replace_str(&text, &search, all, |out, _, i| {
+                        out.push_str(pieces.get(i).map_or("", String::as_str));
+                    })
+                } else {
+                    let template = to_js_string(&replacement);
+                    replace_str(&text, &search, all, |out, at, _| {
+                        substitute(out, &text, at, search.len(), &template);
+                    })
+                };
+                let Some(out) = out else {
                     return Some(UNSUPPORTED);
                 };
                 alloc_string(caller, &out).map(|base| HEAP | base)
@@ -444,17 +443,6 @@ fn array_includes(mem: &[u8], ptr: usize, needle: u64) -> bool {
                     (Value::Number(x), Value::Number(y)) if x.is_nan() && y.is_nan()
                 )
         })
-}
-
-/// `string.indexOf(sub, from)`: the number bits of the first BYTE index at or
-/// after `from` where `sub` occurs (an empty `sub` matches at `from`), or `-1`.
-fn string_index_of(hay: &[u8], needle: &[u8], from: usize) -> u64 {
-    if needle.is_empty() {
-        return index_bits(from);
-    }
-    hay.get(from..)
-        .and_then(|rest| rest.windows(needle.len()).position(|w| w == needle))
-        .map_or_else(not_found_bits, |i| index_bits(from + i))
 }
 
 /// The radix `Number.prototype.toString` validated (an integral `2..=36`).
@@ -647,20 +635,24 @@ fn string_repeat<W: Send + 'static>(
 }
 
 /// `string.startsWith(sub, from)` / `endsWith(sub, end)`: a boolean prefix
-/// test at `from` (default `0`) / suffix test of the first `end` bytes
-/// (default the length). Returns the boolean jsval bits.
+/// test at UTF-16 offset `from` (default `0`) / suffix test of the first
+/// `end` code units (default the length). Returns the boolean jsval bits.
 fn string_starts_ends(mem: &[u8], ptr: usize, arg0: i64, arg1: i64, op: i32) -> Option<u64> {
-    let hay = string_bytes(mem, ptr)?;
-    if !endpoint_exact(&hay, arg1, mem, false) {
-        return Some(UNSUPPORTED);
-    }
-    let needle = arg_bytes(arg0, mem);
+    let hay = string_text(mem, ptr)?;
+    let needle = to_js_string(&decode(arg0.cast_unsigned(), mem));
+    let len = utf16_len(&hay);
+    // A position inside a surrogate pair holds a lone surrogate, which no
+    // non-empty needle starts or ends with.
     let hit = if op == METHOD_OP_STARTS_WITH {
-        let from = substring_index(arg1.cast_unsigned(), mem, 0, hay.len());
-        hay[from..].starts_with(&needle)
+        match byte_offset(&hay, substring_index(arg1.cast_unsigned(), mem, 0, len)) {
+            Ok(from) => hay[from..].starts_with(&needle),
+            Err(_) => needle.is_empty(),
+        }
     } else {
-        let end = substring_index(arg1.cast_unsigned(), mem, hay.len(), hay.len());
-        hay[..end].ends_with(&needle)
+        match byte_offset(&hay, substring_index(arg1.cast_unsigned(), mem, len, len)) {
+            Ok(end) => hay[..end].ends_with(&needle),
+            Err(_) => needle.is_empty(),
+        }
     };
     Some(bool_bits(hit))
 }
@@ -717,13 +709,6 @@ fn bool_bits(b: bool) -> u64 {
     if b { TRUE_BITS } else { FALSE_BITS }
 }
 
-/// Coerce a method argument's raw jsval bits to its JS string form as bytes: a
-/// string yields its payload, everything else its JS `ToString` text (so
-/// `"5".startsWith(5)` matches on `"5"`). Used by the string search/split methods.
-fn arg_bytes(bits: i64, mem: &[u8]) -> Vec<u8> {
-    to_js_string(&decode(bits.cast_unsigned(), mem)).into_bytes()
-}
-
 /// Pad `bytes` to BYTE length `target` with `pad` repeated (and truncated to fit),
 /// on the start (`at_start`) or the end. The receiver is returned unchanged when it
 /// is already at least `target` bytes or `pad` is empty (JS `padStart`/`padEnd`).
@@ -776,18 +761,6 @@ fn index_exact(bytes: &[u8], i: i64) -> bool {
     usize::try_from(i).map_or(true, |i| i >= bytes.len() || ascii_prefix(bytes, i + 1))
 }
 
-/// A search result (number bits, `-1` or a byte index) when it is the UTF-16
-/// index too, else [`UNSUPPORTED`].
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn exact_found(hay: &[u8], bits: u64) -> u64 {
-    let at = f64::from_bits(bits);
-    if at < 0.0 || ascii_prefix(hay, at as usize) {
-        bits
-    } else {
-        UNSUPPORTED
-    }
-}
-
 /// `at(index)` / `charCodeAt(pos)` / `codePointAt(pos)` over an ASCII prefix
 /// (one code unit per byte): the one-character string / code unit at the
 /// position (`at` counts a negative index from the end), or `undefined`
@@ -825,30 +798,75 @@ fn string_code_at<W: Send + 'static>(
     Some(f64::from(byte).to_bits())
 }
 
-/// `string.lastIndexOf(sub, pos)`: the number bits of the last BYTE index at
-/// or before `pos` (`undefined`/`NaN`: the end) where `sub` occurs, or `-1`;
-/// [`UNSUPPORTED`] when `pos` or the hit lies past a non-ASCII byte.
-fn string_last_index_of(hay: &[u8], needle: &[u8], pos_bits: i64, mem: &[u8]) -> u64 {
-    let pos = value_to_number(&decode(pos_bits.cast_unsigned(), mem));
-    let len = hay.len();
+/// The text of a heap STRING block.
+fn string_text(mem: &[u8], ptr: usize) -> Option<String> {
+    Some(String::from_utf8_lossy(&string_bytes(mem, ptr)?).into_owned())
+}
+
+/// The number of UTF-16 code units of `text`.
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// The byte offset of UTF-16 offset `n` in `text` (its end past the last
+/// unit): `Ok` at a character boundary, `Err` with the boundary after it
+/// inside a surrogate pair.
+fn byte_offset(text: &str, n: usize) -> Result<usize, usize> {
+    let mut units = 0;
+    for (at, c) in text.char_indices() {
+        if units >= n {
+            return if units == n { Ok(at) } else { Err(at) };
+        }
+        units += c.len_utf16();
+    }
+    if units > n {
+        Err(text.len())
+    } else {
+        Ok(text.len())
+    }
+}
+
+/// The UTF-16 offset of the character boundary at byte `at` of `text`.
+fn utf16_offset(text: &str, at: usize) -> usize {
+    utf16_len(&text[..at])
+}
+
+/// The number bits of a UTF-16 search result, `-1` when absent.
+fn index_result(found: Option<usize>) -> u64 {
+    found.map_or_else(not_found_bits, index_bits)
+}
+
+/// `StringIndexOf(text, needle, from)` in UTF-16 offsets (`from` already
+/// clamped to the length): a match starts at a character boundary, so a
+/// `from` inside a surrogate pair searches from the next one.
+fn text_index_of(text: &str, needle: &str, from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from);
+    }
+    let start = byte_offset(text, from).unwrap_or_else(|after| after);
+    find_from(text, needle, start).map(|at| utf16_offset(text, at))
+}
+
+/// `lastIndexOf(needle, pos)` in UTF-16 offsets: the last match starting at
+/// or before `pos` (`NaN`: the end), whose character boundary rounds down
+/// inside a surrogate pair.
+fn text_last_index_of(text: &str, needle: &str, pos: f64) -> Option<usize> {
+    let len = utf16_len(text);
     let start = if pos.is_nan() {
         len
     } else {
-        let len_i = i64::try_from(len).unwrap_or(i64::MAX);
-        let start = usize::try_from(trunc_to_int(pos).clamp(0, len_i)).unwrap_or(0);
-        if !ascii_prefix(hay, start) {
-            return UNSUPPORTED;
-        }
-        start
+        usize::try_from(trunc_to_int(pos).max(0)).map_or(len, |n| n.min(len))
     };
-    let Some(last) = len.checked_sub(needle.len()) else {
-        return not_found_bits();
-    };
-    let found = (0..=start.min(last))
-        .rev()
-        .find(|&i| hay[i..].starts_with(needle))
-        .map_or_else(not_found_bits, index_bits);
-    exact_found(hay, found)
+    if needle.is_empty() {
+        return Some(start);
+    }
+    // The pair's high surrogate starts four bytes before the next boundary.
+    let bound = byte_offset(text, start).unwrap_or_else(|after| after - 4);
+    text.match_indices(needle)
+        .map(|(at, _)| at)
+        .take_while(|&at| at <= bound)
+        .last()
+        .map(|at| utf16_offset(text, at))
 }
 
 /// Whether `c` is `RegExp` pattern syntax: a string pattern of `search` /
@@ -869,10 +887,15 @@ fn find_from(text: &str, search: &str, from: usize) -> Option<usize> {
     text.get(from..)?.find(search).map(|i| from + i)
 }
 
-/// `replace` / `replaceAll` of the string pattern `search` in `text` by the
-/// replacement template `template` (`GetSubstitution` with no captures).
-/// `None` when an empty pattern would split a surrogate pair.
-fn replace_str(text: &str, search: &str, template: &str, all: bool) -> Option<String> {
+/// `replace` / `replaceAll` of the string pattern `search` in `text`, each
+/// match (at byte `at`, the `i`th) replaced by what `piece(out, at, i)`
+/// appends. `None` when an empty pattern would split a surrogate pair.
+fn replace_str(
+    text: &str,
+    search: &str,
+    all: bool,
+    mut piece: impl FnMut(&mut String, usize, usize),
+) -> Option<String> {
     let mut positions = Vec::new();
     if search.is_empty() {
         // Every code-unit boundary: each char boundary, for BMP text.
@@ -893,9 +916,9 @@ fn replace_str(text: &str, search: &str, template: &str, all: bool) -> Option<St
     }
     let mut out = String::with_capacity(text.len());
     let mut end = 0;
-    for at in positions {
+    for (i, at) in positions.into_iter().enumerate() {
         out.push_str(&text[end..at]);
-        substitute(&mut out, text, at, search.len(), template);
+        piece(&mut out, at, i);
         end = at + search.len();
     }
     out.push_str(&text[end..]);

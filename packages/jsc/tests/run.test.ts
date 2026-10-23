@@ -529,9 +529,11 @@ it('runs the String statics and remaining string methods like the host', async (
     ["'straße'.toUpperCase()", 'STRASSE'],
     ["' a　'.trim()", 'a'],
     [
-      "try { 'éa'.indexOf('a') } catch (e) { e.message }",
-      'String.prototype.indexOf does not support non-ASCII strings yet',
+      "try { 'éa'.slice(1) } catch (e) { e.message }",
+      'String.prototype.slice does not support non-ASCII strings yet',
     ],
+    ["'éaèa'.indexOf('a', 2) + ',' + 'éaèa'.lastIndexOf('a', 2)", '3,1'],
+    ["'éa'.replace('a', (m, p) => p) + 'éa'.startsWith('a', 1)", 'é1true'],
     ["try { 'a'.normalize('x') } catch (e) { e.name }", 'RangeError'],
     ["try { 'a.b'.search('.') } catch (e) { e.name }", 'TypeError'],
     ['try { String.fromCharCode(0xd800) } catch (e) { e.name }', 'TypeError'],

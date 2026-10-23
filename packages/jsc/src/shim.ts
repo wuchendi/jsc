@@ -90,7 +90,6 @@ import {
   arrayElements,
   arrayLayout,
   asU64,
-  bitsToF64,
   decode,
   f64ToBits,
   formatValue,
@@ -471,11 +470,10 @@ export function createShim(): Shim {
         if (ptr !== null && typeByte === TYPE_ARRAY)
           return arrayIndexOf(mem, ptr, arg0)
         if (ptr !== null && typeByte === TYPE_STRING) {
-          const hay = stringBytes(mem, ptr)
+          const hay = stringText(mem, ptr)
           if (hay === null) return null
-          if (!endpointExact(hay, arg1, mem, false)) return METHOD_UNSUPPORTED
           const from = substringIndex(arg1, mem, 0, hay.length)
-          return exactFound(hay, stringIndexOf(hay, argBytes(arg0, mem), from))
+          return f64ToBits(hay.indexOf(toJsString(decode(arg0, mem)), from))
         }
         return null
       case METHOD_OP_INCLUDES:
@@ -483,11 +481,10 @@ export function createShim(): Shim {
           return arrayIncludes(mem, ptr, arg0) ? TRUE : FALSE
         // `str.includes(sub, from)` — substring containment from `from`.
         if (ptr !== null && typeByte === TYPE_STRING) {
-          const hay = stringBytes(mem, ptr)
+          const hay = stringText(mem, ptr)
           if (hay === null) return null
-          if (!endpointExact(hay, arg1, mem, false)) return METHOD_UNSUPPORTED
           const from = substringIndex(arg1, mem, 0, hay.length)
-          return stringIndexOf(hay, argBytes(arg0, mem), from) !== f64ToBits(-1)
+          return hay.includes(toJsString(decode(arg0, mem)), from)
             ? TRUE
             : FALSE
         }
@@ -533,22 +530,15 @@ export function createShim(): Shim {
       case METHOD_OP_STARTS_WITH:
       case METHOD_OP_ENDS_WITH: {
         if (ptr === null || typeByte !== TYPE_STRING) return null
-        const hay = stringBytes(mem, ptr)
+        const hay = stringText(mem, ptr)
         if (hay === null) return null
-        if (!endpointExact(hay, arg1, mem, false)) return METHOD_UNSUPPORTED
-        const needle = argBytes(arg0, mem)
+        const needle = toJsString(decode(arg0, mem))
         const hit =
           op === METHOD_OP_STARTS_WITH
-            ? startsWithBytes(
-                hay.subarray(substringIndex(arg1, mem, 0, hay.length)),
+            ? hay.startsWith(needle, substringIndex(arg1, mem, 0, hay.length))
+            : hay.endsWith(
                 needle,
-              )
-            : endsWithBytes(
-                hay.subarray(
-                  0,
-                  substringIndex(arg1, mem, hay.length, hay.length),
-                ),
-                needle,
+                substringIndex(arg1, mem, hay.length, hay.length),
               )
         return hit ? TRUE : FALSE
       }
@@ -569,9 +559,12 @@ export function createShim(): Shim {
         return stringCodeAt(mem, ptr, arg0, op)
       case METHOD_OP_LAST_INDEX_OF: {
         if (ptr === null || typeByte !== TYPE_STRING) return null
-        const hay = stringBytes(mem, ptr)
+        const hay = stringText(mem, ptr)
         if (hay === null) return null
-        return stringLastIndexOf(hay, argBytes(arg0, mem), arg1, mem)
+        const needle = toJsString(decode(arg0, mem))
+        return f64ToBits(
+          hay.lastIndexOf(needle, valueToNumber(decode(arg1, mem))),
+        )
       }
       case METHOD_OP_LOCALE_COMPARE: {
         if (ptr === null || typeByte !== TYPE_STRING) return null
@@ -597,27 +590,35 @@ export function createShim(): Shim {
       }
       case METHOD_OP_SEARCH: {
         if (ptr === null || typeByte !== TYPE_STRING) return null
-        const hay = stringBytes(mem, ptr)
+        const hay = stringText(mem, ptr)
         if (hay === null) return null
         const patternValue = decode(arg0, mem)
         const pattern =
           patternValue.kind === 'undefined' ? '' : toJsString(patternValue)
         if (/[\\^$.*+?()[\]{}|]/.test(pattern)) return METHOD_NEEDS_REGEXP
-        return exactFound(
-          hay,
-          stringIndexOf(hay, utf8Encode.encode(pattern), 0),
-        )
+        return f64ToBits(hay.indexOf(pattern))
       }
       case METHOD_OP_REPLACE:
       case METHOD_OP_REPLACE_ALL: {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const bytes = stringBytes(mem, ptr)
         if (bytes === null) return null
+        const text = utf8Decode(bytes)
+        const search = toJsString(decode(arg0, mem))
+        // A replacer function's results (an array, in match order), or a
+        // template.
+        const replacement = decode(arg1, mem)
         const out = replaceStr(
-          utf8Decode(bytes),
-          toJsString(decode(arg0, mem)),
-          toJsString(decode(arg1, mem)),
+          text,
+          search,
           op === METHOD_OP_REPLACE_ALL,
+          replacement.kind === 'array'
+            ? (_, i) => {
+                const item = replacement.items[i]
+                return item === undefined ? '' : toJsString(item)
+              }
+            : (at) =>
+                substitute(text, at, search.length, toJsString(replacement)),
         )
         if (out === null) return METHOD_UNSUPPORTED
         const base = allocString(out)
@@ -1083,6 +1084,12 @@ function stringBytes(mem: Uint8Array, ptr: number): Uint8Array | null {
   return mem.subarray(start, start + len)
 }
 
+/** The text of a heap STRING block (mirrors `host.rs::string_text`). */
+function stringText(mem: Uint8Array, ptr: number): string | null {
+  const bytes = stringBytes(mem, ptr)
+  return bytes === null ? null : utf8Decode(bytes)
+}
+
 /** Truncate a JS number toward zero to an integer (matches `host.rs::trunc_to_int`). */
 function truncToInt(n: number): number {
   return Math.trunc(n)
@@ -1139,29 +1146,6 @@ function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
 }
 
 /**
- * `string.indexOf(sub, from)` (mirrors `host.rs::string_index_of`): the first
- * BYTE index at or after `from` where `sub` occurs (empty => `from`), or `-1`.
- */
-function stringIndexOf(
-  hay: Uint8Array,
-  needle: Uint8Array,
-  from: number,
-): bigint {
-  if (needle.length === 0) return indexBits(from)
-  for (let i = from; i + needle.length <= hay.length; i++) {
-    let match = true
-    for (let k = 0; k < needle.length; k++) {
-      if (hay[i + k] !== needle[k]) {
-        match = false
-        break
-      }
-    }
-    if (match) return indexBits(i)
-  }
-  return f64ToBits(-1)
-}
-
-/**
  * Resolve one JS slice endpoint against a sequence `len` (mirrors
  * `host.rs::slice_index`): `undefined` uses `fallback`, otherwise the argument is
  * truncated, offset from the end when negative, and clamped to `0..=len`.
@@ -1177,31 +1161,6 @@ function sliceIndex(
   const n = truncToInt(valueToNumber(decoded))
   const idx = n < 0 ? Math.max(len + n, 0) : Math.min(n, len)
   return Math.max(idx, 0)
-}
-
-/**
- * Coerce a method argument's raw bits to its JS string form as bytes (mirrors
- * `host.rs::arg_bytes`): a string yields its payload, everything else its
- * JS `ToString` text.
- */
-function argBytes(bits: bigint, mem: Uint8Array): Uint8Array {
-  return utf8Encode.encode(toJsString(decode(bits, mem)))
-}
-
-/** Whether `hay` begins with `needle`. */
-function startsWithBytes(hay: Uint8Array, needle: Uint8Array): boolean {
-  if (needle.length > hay.length) return false
-  for (let i = 0; i < needle.length; i++) if (hay[i] !== needle[i]) return false
-  return true
-}
-
-/** Whether `hay` ends with `needle`. */
-function endsWithBytes(hay: Uint8Array, needle: Uint8Array): boolean {
-  if (needle.length > hay.length) return false
-  const off = hay.length - needle.length
-  for (let i = 0; i < needle.length; i++)
-    if (hay[off + i] !== needle[i]) return false
-  return true
 }
 
 /**
@@ -1314,50 +1273,16 @@ function indexExact(bytes: Uint8Array, i: number): boolean {
 }
 
 /**
- * A search result when it is the UTF-16 index too, else `METHOD_UNSUPPORTED`
- * (mirrors `host.rs::exact_found`).
- */
-function exactFound(hay: Uint8Array, bits: bigint): bigint {
-  const at = bitsToF64(bits)
-  return at < 0 || asciiPrefix(hay, at) ? bits : METHOD_UNSUPPORTED
-}
-
-/**
- * `string.lastIndexOf(sub, pos)` (mirrors `host.rs::string_last_index_of`):
- * the last BYTE index at or before `pos` (`undefined`/`NaN`: the end) where
- * `sub` occurs, or `-1`; `METHOD_UNSUPPORTED` past a non-ASCII byte.
- */
-function stringLastIndexOf(
-  hay: Uint8Array,
-  needle: Uint8Array,
-  posBits: bigint,
-  mem: Uint8Array,
-): bigint {
-  const pos = valueToNumber(decode(posBits, mem))
-  const len = hay.length
-  const start = Number.isNaN(pos)
-    ? len
-    : Math.min(Math.max(truncToInt(pos), 0), len)
-  if (!Number.isNaN(pos) && !asciiPrefix(hay, start)) return METHOD_UNSUPPORTED
-  const last = len - needle.length
-  if (last < 0) return f64ToBits(-1)
-  for (let i = Math.min(start, last); i >= 0; i--) {
-    if (startsWithBytes(hay.subarray(i), needle))
-      return exactFound(hay, indexBits(i))
-  }
-  return f64ToBits(-1)
-}
-
-/**
- * `replace` / `replaceAll` of the string pattern `search` in `text` by the
- * template (mirrors `host.rs::replace_str`); `null` when an empty pattern
- * would split a surrogate pair.
+ * `replace` / `replaceAll` of the string pattern `search` in `text`, each
+ * match (at `at`, the `i`th) replaced by `piece(at, i)` (mirrors
+ * `host.rs::replace_str`); `null` when an empty pattern would split a
+ * surrogate pair.
  */
 function replaceStr(
   text: string,
   search: string,
-  template: string,
   all: boolean,
+  piece: (at: number, i: number) => string,
 ): string | null {
   const positions: number[] = []
   if (search.length === 0) {
@@ -1373,9 +1298,9 @@ function replaceStr(
   if (!all) positions.length = Math.min(positions.length, 1)
   let out = ''
   let end = 0
-  for (const at of positions) {
+  for (const [i, at] of positions.entries()) {
     out += text.slice(end, at)
-    out += substitute(text, at, search.length, template)
+    out += piece(at, i)
     end = at + search.length
   }
   return out + text.slice(end)

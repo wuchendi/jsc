@@ -588,8 +588,8 @@ fn emit_concat(function: &mut Function, frame: Frame, s: u32, helpers: Helpers<'
 /// `replace` / `replaceAll(searchValue, replaceValue)` over the string in
 /// i64 temp 0 with a string pattern (`ToString(searchValue)`): a callable
 /// `replaceValue` is called with `(match, position, string)` for each match
-/// (positions by the host `indexOf`, so a non-ASCII string throws), the
-/// result `ToString`ed; any other is `ToString`ed and expanded by the host
+/// (UTF-16 positions by the host `indexOf`), its `ToString`ed results
+/// spliced in by the host; any other is `ToString`ed and expanded by the host
 /// (`GetSubstitution`).
 #[allow(clippy::too_many_lines)]
 fn emit_replace(
@@ -600,8 +600,8 @@ fn emit_replace(
     helpers: Helpers<'_>,
 ) {
     let (s, search, replacer, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (acc, v) = (frame.x64(0), frame.x64(1));
-    let (end, len, pos) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (list, v) = (frame.x64(0), frame.x64(1));
+    let (len, next) = (frame.i32(0), frame.i32(1));
     let all = op == StringOp::ReplaceAll;
     let non_ascii = texts(op).non_ascii;
     frame.arg(function, 0);
@@ -609,50 +609,39 @@ fn emit_replace(
     to_string(function, search, helpers);
     frame.arg(function, 1);
     wasm!(function; LocalSet(replacer));
-    emit_is_function(function, replacer);
-    wasm!(function; I32Eqz, If(BlockType::Empty));
-    to_string(function, replacer, helpers);
     let flag = if all {
         abi::METHOD_OP_REPLACE_ALL
     } else {
         abi::METHOD_OP_REPLACE
     };
-    host_call(function, s, flag, search, replacer, helpers);
-    wasm!(function; LocalTee(r), I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Eq);
-    wasm!(function; If(BlockType::Empty));
-    throw_type_error(function, frame, non_ascii, strings, helpers);
-    wasm!(function; End, LocalGet(r), Return, End);
-    // The match positions: `indexOf(search, from)` from 0, each next one
-    // `max(1, len)` past the last.
+    // The host splices the template, or the replacer's results (an array).
+    let splice = |function: &mut Function| {
+        host_call(function, s, flag, search, replacer, helpers);
+        wasm!(function; LocalTee(r), I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Eq);
+        wasm!(function; If(BlockType::Empty));
+        throw_type_error(function, frame, non_ascii, strings, helpers);
+        wasm!(function; End, LocalGet(r));
+    };
+    emit_is_function(function, replacer);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    to_string(function, replacer, helpers);
+    splice(function);
+    wasm!(function; Return, End);
+    // The match positions (UTF-16 offsets): `indexOf(search, from)` from 0,
+    // each next one `max(1, len)` past the last; a result before `from` is
+    // the clamped end.
     let index_of = |function: &mut Function, from: &dyn Fn(&mut Function)| {
         wasm!(function; LocalGet(s), I32Const(abi::METHOD_OP_INDEX_OF), LocalGet(search));
         from(function);
-        wasm!(function; Call(helpers.method), LocalTee(r));
-        wasm!(function; I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Eq);
-        wasm!(function; If(BlockType::Empty));
-        throw_type_error(function, frame, non_ascii, strings, helpers);
-        wasm!(function; End);
-    };
-    let slice = |function: &mut Function, to: Option<u32>| {
-        wasm!(function;
-            LocalGet(s), I32Const(abi::METHOD_OP_SLICE),
-            LocalGet(end), F64ConvertI32U, I64ReinterpretF64,
-        );
-        if let Some(to) = to {
-            wasm!(function; LocalGet(to), F64ConvertI32U, I64ReinterpretF64);
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-        wasm!(function; Call(helpers.method), LocalSet(v));
-        append(function, acc, v, helpers);
+        wasm!(function; Call(helpers.method), LocalSet(r));
     };
     wasm!(function; LocalGet(search), I32WrapI64);
     wasm!(function;
         I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
-        LocalSet(len), I32Const(0), LocalSet(end),
+        LocalSet(len),
+        I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        LocalSet(list),
     );
-    push_str(function, strings, "");
-    wasm!(function; LocalSet(acc));
     index_of(
         function,
         &|function| wasm!(function; I64Const(0.0f64.to_bits().cast_signed())),
@@ -660,9 +649,9 @@ fn emit_replace(
     wasm!(function;
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(r), I64Const((-1.0f64).to_bits().cast_signed()), I64Eq, BrIf(1),
-        LocalGet(r), F64ReinterpretI64, I32TruncSatF64U, LocalSet(pos),
     );
-    // The replacer over `(match, position, string)` with `this = undefined`.
+    // The replacer over `(match, position, string)` with `this = undefined`;
+    // its `ToString` result joins the list.
     let args = [search, r, s];
     for slot in 0..frame.k {
         if let Some(&local) = args.get(slot as usize) {
@@ -682,29 +671,25 @@ fn emit_replace(
     wasm!(function; LocalSet(v));
     return_if_pending(function);
     to_string(function, v, helpers);
-    wasm!(function; LocalGet(v), LocalSet(frame.i64(3)));
-    // `acc += string[end, pos) + replacement`; the replacement waits in `r`.
-    slice(function, Some(pos));
-    wasm!(function; LocalGet(r), LocalSet(v));
-    append(function, acc, v, helpers);
-    wasm!(function; LocalGet(pos), LocalGet(len), I32Add, LocalSet(end));
+    wasm!(function;
+        LocalGet(list), I32WrapI64, LocalGet(v), Call(helpers.array_push), Drop,
+    );
     if all {
-        // The next search starts `max(1, len)` past this match, if in range.
         wasm!(function;
-            LocalGet(pos), LocalGet(len), I32Const(1), LocalGet(len), I32Const(1), I32GtU, Select,
-            I32Add, LocalTee(pos),
-            LocalGet(s), I32WrapI64,
-            I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
-            I32GtU, BrIf(1),
+            LocalGet(r), F64ReinterpretI64, I32TruncSatF64U,
+            LocalGet(len), I32Const(1), LocalGet(len), I32Const(1), I32GtU, Select,
+            I32Add, LocalSet(next),
         );
         index_of(function, &|function| {
-            wasm!(function; LocalGet(pos), F64ConvertI32U, I64ReinterpretF64);
+            wasm!(function; LocalGet(next), F64ConvertI32U, I64ReinterpretF64);
         });
-        wasm!(function; Br(0));
+        wasm!(function;
+            LocalGet(r), F64ReinterpretI64, LocalGet(next), F64ConvertI32U, F64Lt, BrIf(1),
+            Br(0),
+        );
     }
-    wasm!(function; End, End);
-    slice(function, None);
-    wasm!(function; LocalGet(acc));
+    wasm!(function; End, End, LocalGet(list), LocalSet(replacer));
+    splice(function);
 }
 
 /// `String.fromCharCode(...codeUnits)` / `String.fromCodePoint(...codePoints)`:

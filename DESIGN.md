@@ -684,14 +684,15 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   radix in `2..=36`), `18` `at`, `19` `charCodeAt`, `20` `codePointAt`,
   `21` `lastIndexOf`, `22` `localeCompare` (code-unit order), `23`
   `normalize`, `24` the index of a RegExp-free `search` / `match` pattern,
-  `25` `replace` / `26` `replaceAll` with a string pattern and replacement
-  template (`GetSubstitution` without captures), `27` `String.fromCharCode` /
+  `25` `replace` / `26` `replaceAll` with a string pattern and a replacement
+  template (`GetSubstitution` without captures) or the array of a function
+  replacer's results, `27` `String.fromCharCode` /
   `28` `String.fromCodePoint` (an array receiver of the guest-coerced
   numbers). The host dispatches on the receiver's type byte for the
   names shared by arrays and strings. A string op that cannot produce a
   correct result returns a refusal sentinel the calling builtin throws:
-  `METHOD_UNSUPPORTED` (`HOLE`; a byte position or length over a non-ASCII
-  string, a lone surrogate, §13) as a named `TypeError`,
+  `METHOD_UNSUPPORTED` (`HOLE`; a byte offset crossing a non-ASCII byte, a
+  lone surrogate, §13) as a named `TypeError`,
   `METHOD_RANGE_ERROR` (`undefined | 2`, an unknown `normalize` form) as a
   `RangeError`, `METHOD_NEEDS_REGEXP` (`undefined | 3`, a `search` / `match`
   pattern with RegExp syntax) as a `TypeError`. The calling string builtin coerces the
@@ -1482,23 +1483,28 @@ Each item below is current behaviour of this tree.
 
 - Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
   string spread, and `for-of` over a string work per byte (`"é".length` is
-  `2`). The `String.prototype` methods are exact for ASCII strings; where a
-  byte position or length would make a non-ASCII result wrong they throw a
+  `2`). The `String.prototype` methods are exact for ASCII strings. The
+  search methods work in exact UTF-16 offsets for any text: `indexOf`,
+  `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `search`, the
+  `match` index and the positions a `replace` / `replaceAll` function
+  replacer receives (so they disagree with the byte `.length`). The methods
+  that build text from positions or lengths keep byte offsets and throw a
   `TypeError` (`String.prototype.X does not support non-ASCII strings yet`)
-  instead: on a non-ASCII receiver `at`, `charAt`, `charCodeAt`,
-  `codePointAt`, `indexOf`, `lastIndexOf`, `search`, `match`, `slice`,
-  `substring`, `padStart` / `padEnd` (also for a non-ASCII fill string),
-  `split("")`, `normalize`, a function replacer of `replace` /
-  `replaceAll`, and `includes` / `startsWith` / `endsWith` with a position
-  argument. Content-only results stay exact for any text: `concat`,
-  `repeat`, `includes` / `startsWith` / `endsWith` without a position,
-  `split` on a non-empty separator, `replace` / `replaceAll` with a string
-  replacement (an empty pattern over text with astral characters throws),
-  `toUpperCase` / `toLowerCase`, `trim*`, `localeCompare`.
-  `String.fromCharCode` / `fromCodePoint` throw a `TypeError` for a lone
-  surrogate. `search` / `match` / `matchAll` interpret a string pattern as
-  RegExp source: a pattern with RegExp syntax throws a `TypeError`, and
-  `matchAll` (a RegExp string iterator) always throws one.
+  when an offset would cross a non-ASCII byte: `at`, `charAt`,
+  `charCodeAt`, `codePointAt` (an index past a non-ASCII byte; `at` with a
+  negative index on any non-ASCII string), `slice` / `substring` (an
+  endpoint past a non-ASCII byte; a negative `slice` endpoint on any
+  non-ASCII string), `padStart` / `padEnd` (a non-ASCII receiver or fill),
+  `split("")` (a non-ASCII receiver), and `normalize` (any non-ASCII
+  receiver). Content-only results stay exact for any text: `concat`,
+  `repeat`, `split` on a non-empty separator, `replace` / `replaceAll`
+  (an empty pattern over text with astral characters throws: it would split
+  a surrogate pair), `toUpperCase` / `toLowerCase` (full Unicode mappings),
+  `trim*` (JS whitespace), `localeCompare`. `String.fromCharCode` /
+  `fromCodePoint` throw a `TypeError` for a lone surrogate. `search` /
+  `match` / `matchAll` interpret a string pattern as RegExp source: a
+  pattern with RegExp syntax throws a `TypeError`, and `matchAll` (a RegExp
+  string iterator) always throws one.
 - No comma/sequence expressions, no `void`.
 - Not available: `RegExp` (literals and constructor), `Symbol` (so no
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,

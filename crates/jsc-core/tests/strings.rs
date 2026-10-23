@@ -461,7 +461,12 @@ fn replace_with_string_patterns() {
         &caught("\"a\".replace(\"a\", function () { throw new RangeError(\"r\") })"),
         "RangeError|r",
     );
-    assert_type_error_with("\"\u{e9}a\".replace(\"a\", (m, p) => p)", "non-ASCII");
+    assert_string("\"\u{e9}a\".replace(\"a\", (m, p) => p)", "\u{e9}1");
+    assert_string(
+        "\"\u{e9}a\u{e8}a\".replaceAll(\"a\", (m, p, s) => \"(\" + p + s + \")\")",
+        "\u{e9}(1\u{e9}a\u{e8}a)\u{e8}(3\u{e9}a\u{e8}a)",
+    );
+    assert_type_error_with("\"\u{1F600}\".replaceAll(\"\", (m) => m)", "non-ASCII");
     assert_string("\"\u{e9}a\".replace(\"a\", \"b\")", "\u{e9}b");
 }
 
@@ -505,21 +510,27 @@ fn unicode_case_and_trim() {
 #[test]
 fn byte_positions_throw_on_non_ascii() {
     for call in [
-        "\"\u{e9}a\".indexOf(\"a\")",
-        "\"\u{e9}a\".lastIndexOf(\"a\")",
         "\"\u{e9}a\".slice(1)",
         "\"\u{e9}a\".substring(1)",
         "\"\u{e9}a\".charAt(1)",
         "\"\u{e9}a\".padStart(5)",
         "\"a\".padEnd(5, \"\u{e9}\")",
         "\"\u{e9}a\".split(\"\")",
-        "\"\u{e9}a\".includes(\"a\", 1)",
-        "\"\u{e9}a\".startsWith(\"a\", 1)",
-        "\"\u{e9}a\".endsWith(\"a\", 1)",
-        "\"\u{e9}a\".search(\"a\")",
     ] {
         assert_type_error_with(call, "non-ASCII");
     }
+    // Search positions are exact UTF-16 offsets for any text.
+    assert_number("\"\u{e9}a\".indexOf(\"a\")", 1.0);
+    assert_number("\"\u{e9}a\u{e9}a\".indexOf(\"a\", 2)", 3.0);
+    assert_number("\"\u{e9}a\u{e9}a\".lastIndexOf(\"a\", 2)", 1.0);
+    assert_number("\"\u{1F600}a\".indexOf(\"a\", 1)", 2.0);
+    assert_number("\"\u{1F600}a\".lastIndexOf(\"\u{1F600}\", 1)", 0.0);
+    assert_number("\"\u{e9}a\".search(\"a\")", 1.0);
+    assert_bool("\"\u{e9}a\".includes(\"a\", 1)", true);
+    assert_bool("\"\u{e9}a\".startsWith(\"a\", 1)", true);
+    assert_bool("\"\u{e9}a\".endsWith(\"\u{e9}\", 1)", true);
+    assert_bool("\"\u{1F600}a\".startsWith(\"a\", 1)", false);
+    assert_number("\"\u{ab}0\u{bb}\".match(\"0\").index", 1.0);
     // Positions over an ASCII prefix stay exact.
     assert_number("\"a\u{ab}b\u{bb}\".indexOf(\"a\")", 0.0);
     assert_number("\"\u{ab}x\".indexOf(\"z\")", -1.0);
