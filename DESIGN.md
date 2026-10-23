@@ -289,10 +289,10 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | `8 … 7+n` | the `n` user functions |
 | then | runtime helpers in a fixed order (§6.2): `__alloc` … `__to_number` |
 | then | `__invoke1`, `__async_step`, the two `new Promise` settlers, `__new_string`, `__new_array`, `__new_promise`, `__has_own` |
-| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 112 entries) |
+| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
 | last | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive` |
 
-**Table.** A funcref table of exactly `n + 2 + 112` entries (min = max), filled
+**Table.** A funcref table of exactly `n + 2 + 142` entries (min = max), filled
 by one active element segment: slots `0 … n-1` are the user functions, slots
 `n` and `n + 1` the two settlers, then the builtin bodies in `Builtin::ALL`
 order. A function value's `func_idx` is a slot in this table. Every module has
@@ -404,10 +404,14 @@ a 16-byte prefix (`OBJ_PREFIX_SIZE = 16`):
 **Flags.** Strings: bit `1` `INTERNED` (the canonical block for its content),
 bit `2` `ARRAY_INDEX` (content is a canonical array index: `"0"` or a nonzero
 digit then digits, value `< 2^32 - 1`). Object family: bit `1`
-`NOT_EXTENSIBLE`. Functions additionally: `4` `LAZY`, `8` `CONSTRUCTOR`, `16`
-`CLASS_CTOR`, `32` `SELF_ALLOC`, `64` `BOUND` (§5.5). Arrays additionally:
-`4` `SPARSE`, `8` `JOINING` (set while `join` runs, so a cyclic element joins
-as `""`).
+`NOT_EXTENSIBLE` (set by `preventExtensions` / `seal` / `freeze`, never
+cleared; only on a `DICTIONARY` array). Functions additionally: `2` `ASYNC`,
+`4` `LAZY`, `8` `CONSTRUCTOR`, `16` `CLASS_CTOR`, `32` `SELF_ALLOC`, `64`
+`BOUND`, `128` `GENERATOR` (§5.5).
+Arrays additionally: `4` `SPARSE`, `8` `JOINING` (set while `join` runs, so a
+cyclic element joins as `""`), `16` `LENGTH_READONLY` (`length` is
+non-writable; only on a `DICTIONARY` array), `32` `DICTIONARY` (§5.4). None of
+the array bits is ever cleared (except `JOINING`).
 
 ### 5.2 Block layouts
 
@@ -422,7 +426,7 @@ as `""`).
 | `6` `TYPE_MAP` | `Map` | prefix, `size: u32 @16`, pad, `entries: i64 @24` → backing array | 32 | `object` |
 | `7` `TYPE_SET` | `Set` | same as `TYPE_MAP` | 32 | `object` |
 | `8` `TYPE_PROMISE` | promise | prefix, `state: i32 @16`, pad, `value: i64 @24` | 32 | `object` |
-| `9` `TYPE_GENERATOR` | generator | prefix, `sm_idx: u32 @16`, `state: i32 @20`, `done: i32 @24`, `limits: u32 @28`, `env: i64 @32` | 40 | `object` |
+| `9` `TYPE_GENERATOR` | generator / async generator | prefix, `sm_idx: u32 @16`, `state: i32 @20`, `done: i32 @24`, `limits: u32 @28`, `env: i64 @32`, `queue: u32 @40`, `queue_tail: u32 @44` | 48 | `object` |
 | `10` `TYPE_DATE` | `Date` | prefix, `ms: f64 @16` | 24 | `object` |
 | `11` `TYPE_ACCESSOR` | accessor pair (internal) | header, pad, `getter: i64 @8`, `setter: i64 @16` | 24 | — |
 | `12` `TYPE_PROPS` | own-property table (internal) | §5.3 | `16 + 16·cap` | — |
@@ -453,17 +457,21 @@ Notes per kind:
   the `done` flag, the guest-only `limits` bits (`1` the body has a `finally`
   or `yield*`, so `return()` at a suspended `yield` is unsupported; `2` the body
   has a `yield*`, so `throw()` is unsupported; `4` the state machine is
-  running, so re-entering it throws), and the frame (a `TYPE_ENV` of cells
-  holding every generator local).
+  running, so re-entering it throws; `8` an async generator; `16` its last
+  suspend was an `await`; `32` it is executing or awaiting, so queued requests
+  wait), the frame (a `TYPE_ENV` of cells holding every generator local), and
+  an async generator's request queue (§7.8): a linked list of internal
+  `TYPE_ENV` records `[value, promise, kind, next]`.
 - **Accessor** blocks are the value of an `ACCESSOR` property-table entry; they
   are consumed by `__get`/`__set` and never observed as values (the renderers
   print `[Getter]`, `[Setter]`, `[Getter/Setter]`).
 
 **Initial prototypes.** Ordinary objects are created with
 `%Object.prototype%`, functions with `%Function.prototype%`, arrays, Map, Set,
-promises and dates with their realm prototype, generators with
-`%GeneratorPrototype%`, class instances with `C.prototype`, wrappers with
-`%Boolean/Number/String.prototype%`.
+promises and dates with their realm prototype, generator and async generator
+objects with their function's `prototype` (`%GeneratorPrototype%` /
+`%AsyncGeneratorPrototype%` when that is not an object), class instances with
+`C.prototype`, wrappers with `%Boolean/Number/String.prototype%`.
 
 ### 5.3 Property tables and interning
 
@@ -484,7 +492,8 @@ An object-family block's own named properties live in a `TYPE_PROPS` table:
 `attrs`: `1` `WRITABLE`, `2` `ENUMERABLE`, `4` `CONFIGURABLE`, `8` `ACCESSOR`
 (for which `WRITABLE` is ignored). Properties created by assignment or
 literals are `0b0111` (`ATTRS_DEFAULT`). This is the state space of a spec
-property descriptor, so descriptor reflection needs no relayout.
+property descriptor: descriptor reflection (§6.3) reads and rewrites `attrs`
+and `value` in place.
 
 - **Keys** are interned: two keys are equal iff their `u32` pointers are
   equal, so a lookup is one load and compare per entry (linear scan).
@@ -534,12 +543,38 @@ aliases, captured bindings, and member receivers all observe `push`.
   array-index key in the handle's own property table. `length` may then exceed
   the store; every element operation on a sparse array goes through
   `__sparse_get` / `__sparse_set`.
-- **`length`** is an own, non-enumerable, non-configurable exotic property.
-  Writes go through `__array_set_length` (`ArraySetLength`): `ToUint32(v)` must
-  equal `ToNumber(v)`, else `RangeError: Invalid array length`; shrinking turns
-  `n..len` into holes (keeping the store) and drops a sparse array's index keys
-  `≥ n`; growing fills holes densely within the dense bound, else makes the
-  array sparse without allocating the gap.
+- **Dictionary mode.** Before an element takes non-default attributes
+  (`defineProperty` with `writable`/`enumerable`/`configurable` false or an
+  accessor), before the array becomes non-extensible (`preventExtensions` /
+  `seal` / `freeze`), and before `length` becomes read-only, the whole array
+  turns `SPARSE | DICTIONARY`: every present store element moves into the own
+  table under its index key with the default attributes and the store is
+  dropped (`elems = 0`). Every element is then a table entry carrying its own
+  attributes, reached through the sparse paths: `__sparse_get` calls an
+  accessor's getter, `__sparse_set` is `__set` of the index key (read-only,
+  setter, and non-extensible rules) and throws `Cannot add property i, object
+  is not extensible` when it would grow a read-only `length`; `__delete`
+  honours `configurable`. The builtin fast paths (the `ProtoGuard` receiver
+  test, the `Array.prototype` bodies' array branches, the host search/slice)
+  skip a dictionary array, which takes the generic per-index path. The mode is
+  never left.
+- **`length`** is an own, non-enumerable, non-configurable exotic property,
+  writable unless `LENGTH_READONLY`. Writes go through `__array_set_length`
+  (`ArraySetLength`): a read-only `length` throws `Cannot assign to read only
+  property 'length'`; `ToUint32(v)` must equal `ToNumber(v)`, else
+  `RangeError: Invalid array length`; shrinking turns `n..len` into holes
+  (keeping the store) and drops a sparse array's index keys `≥ n`, stopping at
+  the highest non-configurable element `k ≥ n` (then `length = k + 1` and
+  `Cannot delete property 'k'` is thrown); growing fills holes densely within
+  the dense bound, else makes the array sparse without allocating the gap.
+  `defineProperty(a, "length", d)` first converts a `value` (`ToUint32` and
+  `ToNumber`, two conversions; an abrupt one propagates and a mismatch is the
+  `RangeError`, even on a read-only `length`), then rejects
+  `configurable`/`enumerable` `true` and accessor fields; on a read-only
+  `length` it rejects `writable: true` and
+  any value but the current one; otherwise a value is written as above and
+  `writable: false` then sets `LENGTH_READONLY` (even when the shrink stopped
+  early).
 - **Keys.** Number keys and canonical index strings take the element path;
   every other key (`a.foo`, `a["-1"]`) is an ordinary named property in the
   handle's table.
@@ -558,12 +593,15 @@ in the data segment (§4.2), so it has one identity for the whole run.
   `func_idx` is `[name key][length]`) and, for a plain `CONSTRUCTOR` (not a
   class), `prototype` (writable only) = a fresh object whose non-enumerable
   `constructor` is the function; for a `GENERATOR`, `prototype` (writable
-  only) = a fresh object inheriting `%GeneratorPrototype%`, with no
-  `constructor`.
+  only) = a fresh object inheriting `%GeneratorPrototype%`
+  (`%AsyncGeneratorPrototype%` when also `ASYNC`), with no `constructor`.
 - **Kinds.** `CONSTRUCTOR` is set for `function` declarations and expressions
   and classes; arrows, methods, accessors, generator and async functions are
-  not constructors. `GENERATOR` marks a generator function or method (it gets
-  the generator `prototype` above); the others get no `prototype`. `CLASS_CTOR` marks a class constructor
+  not constructors. `GENERATOR` marks a generator function or method, with
+  `ASYNC` an async generator one (they get the `prototype` above); the others
+  get no `prototype`. A generator function's own `[[Prototype]]` is
+  `%Function.prototype%`: `%GeneratorFunction.prototype%` and
+  `%AsyncGeneratorFunction.prototype%` are not modeled. `CLASS_CTOR` marks a class constructor
   (callable only with the construct marker; its `prototype` is installed by
   the class definition). `SELF_ALLOC` marks a derived class and the builtin
   constructors that allocate their own object from `new.target` (Array, the
@@ -717,6 +755,7 @@ function-index order:
 | realm | `__has_own(key, obj)`, then the builtin bodies (§6.4) |
 | conversions (§6.5) | `__to_primitive(v, hint)`, `__to_string(v)`, `__add(a, b)`, `__compare(a, b, op)`, `__array_join(recv, sep)`, `__to_object(v)` |
 | JSON (§7.9) | `__json_rep(holder, key, value, replacer, list, stack)` — `SerializeJSONProperty` (`toJSON`, replacer function with `this = holder`, property list, wrapper unwrapping, cycle `TypeError` via the `stack` array); `__json_indent(s, gap)` — re-indent compact text for `space`; `__json_revive(holder, key, reviver)` — `InternalizeJSONProperty` |
+| descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already
@@ -726,8 +765,9 @@ wrapper object (§5.2) and returns any object unchanged.
 ### 6.3 Property algorithms
 
 `__get`, `__set`, `__has`, `__delete`, `__define`, `__own_keys`,
-`__for_in_keys`, and `__rest` (`emit/props.rs`) are the only code that reads or
-writes property tables. Keys are interned `u32`s.
+`__for_in_keys`, `__rest`, and the descriptor helpers (`emit/props.rs`,
+`emit/props/descriptor.rs`) are the only code that reads or writes property
+tables. Keys are interned `u32`s.
 
 - **`__get(recv, key)`** — `OrdinaryGet`. A string or array resolves its exotic
   own keys first (`length`, in-range indices; a hole reads `undefined`, a
@@ -739,7 +779,9 @@ writes property tables. Keys are interned `u32`s.
   `TypeError` before calling it).
 - **`__set(recv, key, v)`** — strict `OrdinarySet`. The first own-or-inherited
   hit decides: an accessor calls its setter with `this = recv` (a getter-only
-  accessor throws `Cannot set property k of object which has only a getter`),
+  accessor throws `Cannot set property k of object which has only a getter`;
+  with `K = 0` the value is passed in a one-element spread argument array, so
+  a builtin setter such as `__proto__`'s still receives it),
   a non-writable data property throws, an own writable one is overwritten;
   otherwise a `0b0111` own data property is added (a non-extensible object
   throws). Member stores on a primitive throw (`Cannot create property 'k' on
@@ -752,15 +794,67 @@ writes property tables. Keys are interned `u32`s.
 - **`__delete(obj, key)`** — tombstones an own entry; a non-configurable
   property throws. On an array an in-range index becomes a hole and `length`
   throws.
-- **`__define(o, key, v, attrs)`** — `CreateDataProperty` / accessor install:
-  overwrite in place or append. Used by literals, class definitions, field
-  initializers, and builtins.
+- **`__define(o, key, v, attrs)`** — `CreateDataProperty` /
+  `DefinePropertyOrThrow` of a complete descriptor: overwrite in place or
+  append. Redefining a non-configurable property throws `Cannot redefine
+  property: k`; adding to a non-extensible object throws `Cannot define
+  property k, object is not extensible`. Used by literals, class definitions,
+  field initializers (a class field propagates the throw), and builtins.
+- **Descriptors.** A descriptor record is four jsvals `[desc, value, get,
+  set]`: `desc` packs the `W`/`E`/`C` values in their `attrs` bits plus
+  presence bits (`0x100` writable, `0x200` enumerable, `0x400` configurable,
+  `0x800` value, `0x1000` get, `0x2000` set); an absent `value`/`get`/`set` is
+  `undefined`. `__to_desc(attrs, list)` is `ToPropertyDescriptor` (a
+  non-object throws; fields are read in spec order through `__has` + `__get`,
+  so inherited fields and getters count; `get`/`set` must be callable or
+  `undefined`; mixing accessor and data fields throws) and appends the record
+  to the array `list`. `__define_own(o, key, desc, value, get, set)` is
+  `ValidateAndApplyPropertyDescriptor`: it returns ok, rejected
+  (non-configurable rules), or not extensible, and the caller raises the
+  `TypeError`; only an array's `length` (`ArraySetLength`, §5.4) may leave an
+  exception pending instead. On a non-`SPARSE` array an index whose resulting
+  attributes are the default ones is an element store; any other index puts
+  the array in dictionary mode (§5.4) and is an ordinary table property (a new
+  one at or past `length` rejects on a read-only `length` and raises `length`
+  otherwise). A kind change on a configurable property
+  keeps `E`/`C` and resets the rest; an accessor update allocates a fresh
+  `TYPE_ACCESSOR` block. `__own_desc(obj, key)` is `FromPropertyDescriptor`
+  of `[[GetOwnProperty]]` (a fresh object with `value, writable` or `get,
+  set`, then `enumerable, configurable`; an array's `length` is
+  non-enumerable, non-configurable, and writable unless `LENGTH_READONLY`;
+  store elements have the default attributes, table elements their own).
+- **Integrity levels.** `__set_integrity(obj, level)` (`0` not extensible,
+  `1` sealed, `2` frozen) clears `C` on every own property (and `W` on data
+  properties when frozen), then sets `NOT_EXTENSIBLE`; a `LAZY` function is
+  materialized first, and an array is put in dictionary mode first (so the
+  level reaches its elements; freezing also sets `LENGTH_READONLY`).
+  `__test_integrity(obj, level)` is `IsExtensible` (level `0`) or
+  `TestIntegrityLevel` (a frozen array also needs a read-only `length`).
+- **Prototypes.** `__set_proto(o, proto)` is `OrdinarySetPrototypeOf`: the
+  same `proto` succeeds; `%Object.prototype%` (an immutable prototype exotic
+  object), a non-extensible object, and a `proto` whose chain reaches `o`
+  are rejected (it returns the `__prop_throw` mode; the caller throws); a
+  watched intrinsic sets its dirty bit. `__own_enum(obj, key)` tests for an
+  own enumerable property (an array's `length` is not enumerable; a
+  dense array's present elements are, a dictionary-mode element has its
+  own attributes), backing `Object.assign` and
+  `propertyIsEnumerable`. `Object.prototype.__proto__` is an accessor pair
+  over the same helpers: the getter reads the `proto` of `ToObject(this)`;
+  the setter (`RequireObjectCoercible(this)`; a primitive `this` or a value
+  that is neither an object nor `null` is ignored) calls `__set_proto` and
+  throws on a rejection.
 - **Own-key order** (`__own_keys(obj, mode)`, behind `Object.keys/values/entries`,
   `JSON.stringify`, object rest, and the renderers): integer keys ascending
   (array elements skipping holes, then table keys flagged `ARRAY_INDEX` sorted
   numerically when the table has `HAS_INDEX_KEYS`), then the other string keys
   in insertion order. `mode` selects enumerable keys, values, entries, or all
-  keys.
+  keys. Values and entries follow EnumerableOwnProperties: the key list is
+  taken once, then each key is re-checked as own and enumerable (`__own_enum`)
+  when visited and skipped if a getter deleted it or made it non-enumerable;
+  a key a getter adds is not visited. Only a getter can run between the
+  snapshot and a visit, so the re-check (and the `[[Get]]` of every key) runs
+  only when the own table holds an accessor entry; otherwise array elements
+  load from the store directly.
 - **`for-in`** (`__for_in_keys`): a snapshot taken at loop entry — own
   enumerable string keys, then each prototype's enumerable keys not already
   seen (a key seen at a nearer level, enumerable or not, shadows it).
@@ -824,7 +918,9 @@ unresolvable name throws `ReferenceError` (strict).
   called through its value; then `K` covers the widest call (§4.2).
 
 **Dirty bits.** `$__intrinsics_dirty` has one bit per watched intrinsic, set by
-`__set` / `__define` / `__delete` on a table flagged `WATCHED` (the table's
+`__set` / `__define` / `__delete` / `__define_own` / `__set_integrity` /
+`__set_proto` on a
+table flagged `WATCHED` (the table's
 byte 3 holds the bit index) when the program tests any bit; bits are never
 cleared. Bits: `0` `%Object.prototype%`, `1` `%Array.prototype%`, `2`
 `%String.prototype%`, `3` `%Number.prototype%`, `4` `%Boolean.prototype%`,
@@ -842,7 +938,7 @@ path, never semantics:
 | `parseInt/parseFloat(..)` | inline conversion | `sealed(N)`, or else the global object has no such property (they are not global values, so only a program-stored one) | a call of the stored global property |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
-| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0`, `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
+| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
@@ -939,6 +1035,10 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
   exported `__async_step(gen, sent)` trampoline, fulfills on completion, rejects
   on a throw, and on each `await` registers a continuation on the awaited value
   that resumes the generator from the microtask queue.
+- **Async generators** (§7.8) need no host support: their request queue and
+  driver are guest builtins that allocate (op `4`) and settle (ops `5`/`6`)
+  each request's promise and register their `await` continuations with
+  `__then`.
 - **Unhandled rejections.** After the final drain, the first promise that was
   rejected and never got a handler fails the run with
   `Uncaught (in promise) <value>` (exit 1); a late `catch` still counts as a
@@ -1046,7 +1146,8 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   `a?.m()` (a nullish base short-circuits the rest of the chain to
   `undefined`).
 - **Comma** `a, b, c` evaluates every operand left to right and yields the last
-  (a plain value: `(0, o.m)()` calls without a receiver); `yield`/`await`
+  (a plain value: `(0, o.m)()` calls without a receiver, while parentheses
+  alone keep the reference: `(o.m)()` calls with `this = o`); `yield`/`await`
   operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
   (`__delete`).
@@ -1063,8 +1164,9 @@ catch binding).
 - **`for-of`** iterates arrays (a hole reads `undefined`),
   strings (per byte), `String` wrappers, generators (stepped lazily),
   `arguments` objects, and live `Map` (`[key, value]` entries) / `Set` walks
-  that visit entries added during the loop. Any other value throws
-  `TypeError: x is not iterable`. The loop head declares its binding with
+  that visit entries added during the loop. Any other value (an async
+  generator included) throws `TypeError: x is not iterable`; `for await` is
+  rejected at compile time. The loop head declares its binding with
   `const`/`let` (identifier or pattern) or assigns a pattern
   (`for ([a] of xs)`).
 - **`for-in`** iterates the key snapshot of §6.3; strings and arrays list their
@@ -1079,9 +1181,10 @@ those of `switch` and loops are not tracked.
 
 ### 7.4 Functions
 
-- **Forms.** Function declarations and expressions (including generator and
-  `async` ones, §7.8), arrows (expression- or block-bodied, optionally
-  `async`), object-literal methods, getters and setters, class
+- **Forms.** Function declarations and expressions (including generator,
+  `async` and async generator ones, §7.8), arrows (expression- or
+  block-bodied, optionally `async`), object-literal methods (also generator,
+  `async` and async generator methods), getters and setters, class
   constructors/methods/accessors (instance and static), class expressions. All
   are lifted to top-level wasm functions with the uniform ABI (§4.2); a function
   value is a `TYPE_FUNCTION` block (§5.5) and carries properties like any
@@ -1094,8 +1197,10 @@ those of `switch` and loops are not tracked.
   expressions (a default anywhere), a parameter is in its TDZ until it binds:
   a reference from the parameter code itself compiles to a `ReferenceError`
   throw, and a captured parameter's cell holds the hole until then, so a
-  closure created by a default checks it (`f(a = b, b)`, `f(a = a)` throw). A
-  generator/async function binds them when called (§7.8).
+  closure created by a default checks it (`f(a = b, b)`, `f(a = a)` throw).
+  This holds in every function form; a generator, async or async generator
+  function binds them when called (§7.8). A duplicate parameter name is an
+  early `SyntaxError` (all code is strict).
 - **`var` redeclaring a parameter.** A `var` naming a var-scoped binding of
   the same function (a parameter, a `var`, a function declaration) reuses it:
   without an initializer it keeps its value, with one it assigns. With
@@ -1107,9 +1212,14 @@ those of `switch` and loops are not tracked.
   `$__spread_args`.
 - **Spread.** In calls, `new`, and array literals; sources follow the `for-of`
   rules (§7.3). Generators are drained to an array (`__gen_to_array`).
-- **`this`.** Bound by method calls (`obj.m()`), by `new`, by
+- **`this`.** Bound by method calls (`obj.m()`, also `(obj.m)()`), by `new`, by
   `Function.prototype.call` / `apply` / `bind`, and for getters/setters. A plain call
-  sees `this === undefined`; top-level `this` is the global object.
+  sees `this === undefined`; top-level `this` is the global object. An arrow
+  (`async` ones included) has no `this` of its own: it reads the `this` of the
+  nearest enclosing non-arrow function (the global object at top level),
+  whatever receiver or `thisArg` it is called with. An ordinary function's
+  `this` snapshot is captured by value through each arrow's environment; a
+  generator/async body's `this` cell by reference, so it survives suspension.
 - **Arity.** `length` is the count of parameters before the first default or
   rest; arity is never checked, at compile time or at run time.
 
@@ -1139,8 +1249,8 @@ those of `switch` and loops are not tracked.
   constructor gets a synthesized one. `C.prototype` is a non-writable object
   whose non-enumerable `constructor` is `C`; methods and accessors are defined
   on it; static methods, accessors, and fields are own properties of `C`.
-  Methods may be generator or `async` methods (§7.8); `this` and `super.x`
-  work in their bodies across suspensions.
+  Methods may be generator, `async` or async generator methods (§7.8); `this`
+  and `super.x` work in their bodies across suspensions.
   Calling `C` without `new` throws `TypeError: Class constructor C cannot be
   invoked without 'new'`.
 - **Fields.** Instance fields (`f = init`, or `f;` for `undefined`) are
@@ -1237,8 +1347,15 @@ control flow. A `yield` may appear inside a larger expression
   `it.next(v)` sends `v` and returns a fresh `{ value, done }` object;
   `return(v)` and `throw(e)` complete or throw at the suspended `yield`
   (`throw` reaches an enclosing `catch`). These are ordinary methods: a user
-  object's own `next` is called like any method.
-- `yield* g` as a statement delegates to any iterable source (§7.3).
+  object's own `next` is called like any method. An `it.next(v)` call site
+  runs the resume inline while `it` is a generator without own properties
+  whose `proto` is `%GeneratorPrototype%`, or an object without own
+  properties inheriting it (its function's untouched `prototype`), and
+  `%GeneratorPrototype%` is clean (§6.4); otherwise it is a method call.
+  `%GeneratorFunction.prototype%` is not modeled: a generator function
+  inherits `%Function.prototype%`.
+- `yield* g` as a statement delegates to any iterable source (§7.3); in
+  expression position it is a compile error.
 
 **`async`/`await`.** An `async function` (in every position a `function*` may
 take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
@@ -1246,9 +1363,39 @@ function value is a wrapper that builds the generator and hands it to the host
 async driver (§6.7), returning the result promise; a parameter binding error
 rejects that promise instead of throwing. An `async` arrow keeps arrow
 semantics: no `prototype`, not a constructor, and `arguments` / `new.target`
-are the enclosing function's. All generator control-flow support applies to `await`; a rejected
+are the enclosing function's, and so is `this` (§7.4). All generator control-flow support applies to `await`; a rejected
 awaited promise throws into the body at the `await`, so `try`/`catch` around
 `await` works. Top-level `await` is supported in `main`.
+
+**Async generators.** An `async function*` (in every position a `function*`
+may take, including `async *m(){}` methods) compiles like a generator whose
+`await e` is a `yield` of `e` flagged `GEN_AWAIT` on the handle, `yield e` is
+`yield (await e)`, and `return e` is `return (await e)`. Its function owns a
+`prototype` inheriting `%AsyncGeneratorPrototype%`, which async generator
+objects inherit as generator objects do theirs; the handle carries `GEN_ASYNC`,
+so it is neither a sync iterable nor a valid receiver of the
+`%GeneratorPrototype%` methods. `%AsyncGeneratorPrototype%`'s `next(v)`,
+`throw(e)` and `return(v)` (guest builtins, no host support) append a request
+`{ kind, value, promise }` to the handle's queue and return its fresh promise
+(a bad receiver gets a rejected one); the queue is then served in order unless
+the body is busy:
+
+- `next(v)` / `throw(e)` resume the body (sending `v`, or throwing `e` at the
+  suspended `yield`). A `yield` fulfills the front request with
+  `{ value, done: false }`, completion with `{ value, done: true }`, and a
+  throw out of the body rejects it; the next request is then served.
+- An `await` (flagged suspend) leaves the body busy and registers promise
+  reactions on the operand (`Promise.resolve` semantics); its settlement
+  resumes the body (a rejection throws at the `await`) and continues serving
+  the queue from the microtask queue. Requests made meanwhile, from outside or
+  from the body itself, wait in the queue.
+- An abrupt request before the body started completes it. On a completed
+  generator `next` fulfills `{ undefined, done: true }`, `throw(e)` rejects
+  with `e`, and `return(v)` awaits `v` and fulfills `{ v, done: true }` (or
+  rejects). `return(v)` at a suspended `yield` completes the generator the
+  same way, except that a body with a `finally` rejects it with a
+  `TypeError` (as for generators).
+- `yield*` in an async generator is a compile error.
 
 **Promises.** `new Promise(executor)`, `Promise.resolve`, `Promise.reject`,
 `Promise.prototype.then` / `catch` / `finally` (§6.7).
@@ -1264,7 +1411,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 |---|---|
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls (while sealed, §6.4) |
 | `console` | `log` |
-| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
+| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over what `for-of` iterates); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`; `push` / `pop` (variadic, generic over array-likes), `map`, `filter`, `forEach`, `reduce` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `indexOf`, `includes`, `join`, `slice`, `toString` |
 | `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
@@ -1355,8 +1502,7 @@ Errors are printed to stderr.
   idempotent.
 - **Harness.** At startup the runner reads every `.tmp/test262/harness/*.js`,
   checks that `sta.js` + `assert.js` compile and run (a setup error otherwise),
-  drops `propertyHelper.js` (needs descriptor reflection), and probes each
-  remaining include together with `sta.js` + `assert.js` (`doneprintHandle.js`
+  and probes every other include together with `sta.js` + `assert.js` (`doneprintHandle.js`
   after the host `print` prelude, as async tests use it); only the includes
   that compile are usable, and it prints their list.
 - **Eligibility** (`filter.rs`). A test is skipped when it has a `module`,
@@ -1392,11 +1538,13 @@ Errors are printed to stderr.
   |---|---|---|---|
   | `319208e` | 10185 | 23208 | 47665 |
   | `d0f5e6a` | 10269 | 26388 | 47665 |
+  | `15be3e0` | 14301 | 30008 | 47665 |
 
-  i.e. **10269 / 26388 eligible tests pass (≈ 38.9 %)**, out of 47665 tests in
-  the pinned checkout; `baseline.txt` holds the same 10269 paths. The drop in
-  rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); the
-  previously eligible 23208 still pass 10185.
+  i.e. **14301 / 30008 eligible tests pass (≈ 47.7 %)**, out of 47665 tests in
+  the pinned checkout; `baseline.txt` holds the same 14301 paths. The drop in
+  rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
+  `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
+  (1413 pass).
 
 **Running it** (from the repository root):
 
@@ -1539,9 +1687,8 @@ Each item below is current behaviour of this tree.
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
-- The builtin library is exactly §7.9: no property-descriptor or prototype
-  reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Array.from`, `sort`, `find`,
+- The builtin library is exactly §7.9: no `Array.from`, `sort`,
+  `find`,
   `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
 - `parseInt` and `parseFloat` exist only as direct calls, not as global values
@@ -1558,8 +1705,16 @@ Each item below is current behaviour of this tree.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
   the constructors collect their iterable argument eagerly, with no
   `IteratorClose`.
-- `JSON.parse` revivers cannot meet non-configurable properties correctly
-  (4 test262 tests) until property descriptors exist.
+- An array in dictionary mode (§5.4) keeps every element in its linear-scan
+  property table, so element access on a large frozen or attributed array is
+  `O(n)`; the renderers print an accessor element as `undefined` and omit a
+  non-enumerable one.
+- An object literal's `__proto__: v` defines an own data property named
+  `__proto__` instead of setting the prototype.
+- `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
+  enumerable own keys of its `Properties` argument once, before reading any
+  descriptor. `Object.fromEntries` collects its iterable eagerly, like the
+  `Map`/`Set` constructors.
 - `.stack` on errors is `"Name: message"` with no frames.
 
 **Functions & classes**
@@ -1567,18 +1722,23 @@ Each item below is current behaviour of this tree.
 - Destructuring assignment works only as an expression statement; it is
   rejected in expression position (`x = [a] = b`), and a `for-of` head must
   declare its binding or be a pattern (`for (a of xs)` is rejected).
-- Arrows do not capture lexical `this`; an arrow sees the `this` of its own call
-  (usually `undefined`, also at top level).
 - Not supported: private `#` members, static blocks, computed class member
   names.
 
 **Generators & async**
 
-- No `async function*` (nor `async *m(){}` methods).
+- No `for await` and no `Symbol.asyncIterator`; `yield*` is rejected in an
+  async generator.
+- A `yield`/`await` that would carry a per-node compiler temporary across the
+  suspend is a compile error (`super.m(yield x)`, `o[yield k]?.(yield v)`).
 - `yield*` is supported only as a statement; it does not thread sent values or
   the delegate's return value.
 - `return()` at a suspended `yield` in a body with a `finally` or a `yield*`,
-  and `throw()` in a body with a `yield*`, throw a `TypeError`.
+  and `throw()` in a body with a `yield*`, throw a `TypeError` (an async
+  generator's `return()` rejects with it).
+- An async generator object renders as `Object [Generator]` and
+  `Object.prototype.toString` reports `[object Generator]` for it; functions
+  render as `[Function: f]` whatever their kind.
 - Spread and array destructuring drain a generator completely (no
   `IteratorClose`; an infinite generator runs out of memory); `for-of` steps
   lazily.
@@ -1642,10 +1802,12 @@ installed on the realm's prototypes, and phase 3 extends that set.
 
 ### Phase 3 — Built-in library and strings
 
-- The remaining built-ins on the realm's prototypes: `Object` property
-  descriptors (`defineProperty`, `create`, `freeze`, `assign`),
-  the rest of `Array` (`from`, `sort`, species),
-  `String`, `Number`, and `Math`; `Date` parsing and local time.
+- The remaining built-ins on the realm's prototypes: the rest of `Array`
+  (`from`, `sort`, species), `String`, `Number`, and `Math`; `Date` parsing
+  and local time. `Object` reflection is done: property descriptors,
+  integrity levels, array dictionary mode, every `Object` static and
+  `Object.prototype` method of §7.9 (with `__proto__` and the legacy
+  accessor methods); the test262 runner includes `propertyHelper.js` tests.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
 - `AggregateError`.
@@ -1663,8 +1825,8 @@ installed on the realm's prototypes, and phase 3 extends that set.
 ### Phase 5 — Language completeness
 
 - Private fields and methods, static blocks, computed class member names,
-  object spread, generator and async methods.
-- Async generators and `for await`, labeled statements, all remaining early
+  object spread.
+- `for await` and async `yield*`, labeled statements, all remaining early
   errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.

@@ -740,11 +740,11 @@ fn declaration_without_initializer_binds_undefined() {
 }
 
 #[test]
-fn lowers_generator_and_async_functions_but_rejects_async_generators() {
-    // Generator and async functions compile in every function position; an
-    // `async` generator remains out of scope.
-    let msg = |src: &str| format!("{:#}", lower_src(src).unwrap_err());
-    assert!(msg("async function* g(){ yield 1 }").contains("async generator"));
+fn lowers_generator_async_and_async_generator_functions() {
+    // Generator, async and async generator functions compile in every
+    // function position.
+    assert!(lower_src("async function* g(){ yield 1 } g().next();").is_ok());
+    assert!(lower_src("const o = { async *m(){ yield await 1 } };").is_ok());
     assert!(lower_src("function* g(){ yield 1 } g().next();").is_ok());
     assert!(lower_src("async function f(){ return 1 } f();").is_ok());
     assert!(lower_src("let g = function*(){ return 1 };").is_ok());

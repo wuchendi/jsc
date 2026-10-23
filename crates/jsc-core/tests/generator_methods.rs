@@ -196,18 +196,6 @@ fn async_functions_and_methods_have_no_prototype() {
 }
 
 #[test]
-fn async_generator_methods_stay_a_compile_error() {
-    assert_compile_error(
-        "const o = { async *m(){ yield 1; } };",
-        "async generator functions are unsupported",
-    );
-    assert_compile_error(
-        "class C { async *m(){ yield 1; } }",
-        "async generator functions are unsupported",
-    );
-}
-
-#[test]
 fn computed_generator_class_methods_stay_rejected() {
     assert_compile_error(
         "const k = 'g'; class C { *[k](){ yield 1; } }",

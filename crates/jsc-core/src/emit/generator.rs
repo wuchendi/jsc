@@ -26,8 +26,10 @@ use crate::ir::{GenSegment, GenTerm};
 /// the handle jsval on the stack. Allocates a `TYPE_ENV` frame of `total` boxed
 /// cells (the first `slots.len()` from the constructor's cell expressions, the
 /// rest fresh cells holding `undefined`), then the [`abi::TYPE_GENERATOR`] block
-/// pointing at it with `sm_idx`/`state = 0`/`done = 0`.
-#[allow(clippy::too_many_arguments)]
+/// pointing at it with `sm_idx`/`state = 0`/`done = 0` and an empty request
+/// queue, inheriting `%AsyncGeneratorPrototype%` when `limits` has
+/// [`abi::GEN_ASYNC`] and `%GeneratorPrototype%` otherwise.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn emit_make_generator(
     sm_table_index: u32,
     slots: &[IrNode],
@@ -85,11 +87,16 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
     function.instruction(&Instruction::Call(helpers.alloc));
     function.instruction(&Instruction::LocalTee(gen_dst));
+    let prototype = if limits & abi::GEN_ASYNC == 0 {
+        Intrinsic::GeneratorPrototype
+    } else {
+        Intrinsic::AsyncGeneratorPrototype
+    };
     emit_object_prefix(
         function,
         gen_dst,
         TYPE_GENERATOR,
-        intrinsic_bits(Intrinsic::GeneratorPrototype, helpers),
+        intrinsic_bits(prototype, helpers),
     );
     // sm_idx (u32).
     function.instruction(&Instruction::LocalTee(gen_dst));
@@ -125,6 +132,15 @@ pub(super) fn emit_make_generator(
     function.instruction(&Instruction::I32Store(MemArg {
         offset: u64::from(abi::GEN_LIMITS_OFFSET),
         align: 2,
+        memory_index: 0,
+    }));
+    // An empty async-generator request queue (head and tail).
+    function.instruction(&Instruction::LocalTee(gen_dst));
+    function.instruction(&Instruction::LocalGet(gen_dst));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::I64Store(MemArg {
+        offset: u64::from(abi::GEN_QUEUE_OFFSET),
+        align: 3,
         memory_index: 0,
     }));
     // env = the frame block, reboxed as a heap jsval.
@@ -334,6 +350,7 @@ pub(super) fn emit_generator_sm(
         (7, ValType::I64),
         (1, ValType::I32),
         (2, ValType::I64),
+        (6, ValType::I64),
     ]);
     let scratch = func.locals;
     helpers.unwind.borrow_mut().reset();
@@ -680,4 +697,23 @@ fn store_gen_i32(function: &mut Function, gen_local: u32, offset: u64, value: i3
         align: 2,
         memory_index: 0,
     }));
+}
+
+/// Emit the flag store of [`IrNode::AwaitMark`] (its operand already on the
+/// stack, left there): set [`abi::GEN_AWAIT`] on the running state machine's
+/// generator (local 1).
+pub(super) fn emit_await_mark(function: &mut Function) {
+    let limits = MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    };
+    function.instruction(&Instruction::LocalGet(1));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalGet(1));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(limits));
+    function.instruction(&Instruction::I32Const(abi::GEN_AWAIT.cast_signed()));
+    function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::I32Store(limits));
 }

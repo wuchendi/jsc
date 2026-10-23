@@ -213,6 +213,20 @@ pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
 /// cyclic element joins as the empty string; cleared on every exit.
 pub(crate) const ARRAY_FLAG_JOINING: u8 = 8;
 
+/// [`TYPE_ARRAY`] header `flags` bit: the array's `length` is non-writable
+/// (`defineProperty(a, "length", {writable: false})`, `freeze`), so every
+/// `length` write and every store that would grow the array throws. Only set
+/// on an [`ARRAY_FLAG_DICTIONARY`] array; never cleared.
+pub(crate) const ARRAY_FLAG_LENGTH_READONLY: u8 = 16;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is in dictionary mode — it is
+/// [`ARRAY_FLAG_SPARSE`] with no store (`elems = 0`), so every element is an
+/// array-index key of its `props` table carrying its own attributes. Set before
+/// an element takes non-default attributes, before the array becomes
+/// non-extensible, and before its `length` becomes read-only; never cleared.
+/// The builtin fast paths skip such an array.
+pub(crate) const ARRAY_FLAG_DICTIONARY: u8 = 32;
+
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
 /// [`TYPE_PROPS`] table at `props`, its prototype in `proto`. Maps to `typeof`
@@ -267,6 +281,11 @@ pub(crate) const FUNC_FLAG_BOUND: u8 = 64;
 /// `prototype` object inheriting `%GeneratorPrototype%` with no
 /// `constructor`.
 pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
+
+/// [`TYPE_FUNCTION`] header `flags` bit, with [`FUNC_FLAG_GENERATOR`]: an
+/// async generator function, whose `prototype` inherits
+/// `%AsyncGeneratorPrototype%` instead.
+pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
 
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
@@ -392,12 +411,30 @@ pub(crate) const GEN_LIMIT_THROW: u32 = 2;
 /// resume), so a `next()` / `return()` / `throw()` from its own body throws.
 pub(crate) const GEN_RUNNING: u32 = 4;
 
+/// Generator `limits` bit: an async generator (`async function*`), driven
+/// by `%AsyncGeneratorPrototype%` through its request queue; never a sync
+/// iterable.
+pub(crate) const GEN_ASYNC: u32 = 8;
+
+/// Async generator `limits` bit: the state machine's last suspend was an
+/// `await` (the driver clears it before each step), not a `yield`.
+pub(crate) const GEN_AWAIT: u32 = 16;
+
+/// Async generator `limits` bit: the body is executing or awaiting (an
+/// `await` or a `return()` value), so a queued request waits.
+pub(crate) const GEN_BUSY: u32 = 32;
+
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
 /// jsval, 8-byte aligned past the `limits` word.
 pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
 
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of an async
+/// generator's u32 request-queue head (`0` when empty), guest-only; the
+/// tail follows at `+ 4`.
+pub(crate) const GEN_QUEUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 24;
+
 /// The byte size of a [`TYPE_GENERATOR`] block.
-pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 32;
 
 /// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the

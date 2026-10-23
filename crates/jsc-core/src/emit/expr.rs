@@ -257,6 +257,10 @@ pub(super) fn emit_node(
         IrNode::Yield(_) => {
             unreachable!("a `yield` survived to emit — codegen must reject it first")
         }
+        IrNode::AwaitMark(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            generator::emit_await_mark(function);
+        }
         IrNode::TypeOf(operand) => {
             emit_typeof_node(operand, function, scratch, strings, helpers);
         }
@@ -913,7 +917,8 @@ fn proto_kind_cases(kind: ProtoKind) -> &'static [(i32, Intrinsic)] {
 /// Push i32 `1` when the jsval in `local` is a receiver of `kind` whose
 /// builtin methods are provably the realm's (DESIGN.md §6.4): a heap block of the
 /// kind byte with no own properties (`props == 0`, one i64 load of the header
-/// and `props` words) whose `proto` is the family's prototype and, unless
+/// and `props` words; an array also not in dictionary mode) whose `proto` is
+/// the family's prototype and, unless
 /// `sealed`, whose dirty bit is clear. `tmp` is a free i32 local.
 pub(super) fn emit_proto_kind_test(
     function: &mut Function,
@@ -923,6 +928,10 @@ pub(super) fn emit_proto_kind_test(
     tmp: u32,
     helpers: Helpers<'_>,
 ) {
+    if kind == ProtoKind::Generator {
+        emit_generator_kind_test(function, local, sealed, tmp, helpers);
+        return;
+    }
     let cases = proto_kind_cases(kind);
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
@@ -939,7 +948,11 @@ pub(super) fn emit_proto_kind_test(
             align: 3,
             memory_index: 0,
         }));
-        function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
+        function.instruction(&Instruction::I64Const(if type_byte == TYPE_ARRAY {
+            ARRAY_KIND_AND_PROPS_MASK
+        } else {
+            KIND_AND_PROPS_MASK
+        }));
         function.instruction(&Instruction::I64And);
         function.instruction(&Instruction::I64Const(i64::from(type_byte)));
         function.instruction(&Instruction::I64Eq);
@@ -963,6 +976,87 @@ pub(super) fn emit_proto_kind_test(
     if !sealed && bits != 0 {
         function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
         function.instruction(&Instruction::I32Const(bits));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// [`emit_proto_kind_test`] for [`ProtoKind::Generator`]: a
+/// `TYPE_GENERATOR` without own properties whose `proto` is
+/// `%GeneratorPrototype%`, or an object without own properties (its
+/// function's `prototype`) whose `proto` is `%GeneratorPrototype%`, so
+/// `next` resolves to the builtin either way.
+fn emit_generator_kind_test(
+    function: &mut Function,
+    local: u32,
+    sealed: bool,
+    tmp: u32,
+    helpers: Helpers<'_>,
+) {
+    let prototype = Intrinsic::GeneratorPrototype;
+    let proto_load = Instruction::I64Load(MemArg {
+        offset: OBJ_PROTO_OFFSET,
+        align: 3,
+        memory_index: 0,
+    });
+    let header_load = Instruction::I64Load(MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    });
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalTee(tmp));
+    function.instruction(&header_load);
+    function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Const(i64::from(TYPE_GENERATOR)));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I64Const(intrinsic_bits(prototype, helpers)));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::Else);
+    // One hop: the generator function's `prototype` (a heap object).
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I64Const(48));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Const(HEAP_BITS >> 48));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalTee(tmp));
+    function.instruction(&header_load);
+    function.instruction(&Instruction::I64Const(PROPS_MASK));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Eqz);
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I64Const(intrinsic_bits(prototype, helpers)));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    if !sealed && let Some(bit) = prototype.watch_bit() {
+        function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+        function.instruction(&Instruction::I32Const(1 << bit));
         function.instruction(&Instruction::I32And);
         function.instruction(&Instruction::I32Eqz);
         function.instruction(&Instruction::I32And);
@@ -1112,6 +1206,15 @@ pub(super) fn emit_proto_guard(
 /// The bits of an object's first eight bytes holding its kind byte and its
 /// `props` word.
 const KIND_AND_PROPS_MASK: i64 = 0xffff_ffff_0000_00ff_u64.cast_signed();
+
+/// The bits of an object's first eight bytes holding its `props` word.
+const PROPS_MASK: i64 = 0xffff_ffff_0000_0000_u64.cast_signed();
+
+/// [`KIND_AND_PROPS_MASK`] plus an array's `DICTIONARY` flag bit (header byte
+/// 2, bit `32`): a dictionary array's elements may carry any attributes, so it
+/// takes the generic call.
+const ARRAY_KIND_AND_PROPS_MASK: i64 = KIND_AND_PROPS_MASK | 0x0020_0000;
+const _: () = assert!(abi::ARRAY_FLAG_DICTIONARY == 0x20);
 
 /// Emit `new callee(args)` ([`IrNode::Construct`], DESIGN.md §7.6), leaving the
 /// constructed object on the stack. JS order: the callee is evaluated into
@@ -1845,7 +1948,7 @@ pub(super) fn emit_promise_ctor(
 /// slot `table_index` and whose ENV slot holds the bound promise (read from
 /// `p_local`) rather than a closure environment. Mirrors [`emit_func_value`] but
 /// stores `p_local` in the env slot directly.
-fn emit_settler_value(
+pub(super) fn emit_settler_value(
     table_index: u32,
     p_local: u32,
     function: &mut Function,

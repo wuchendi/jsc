@@ -215,8 +215,8 @@ mod tests {
         );
         assert_eq!(run(&meta(&[], &["Proxy.revocable"], &[])), Ok(Mode::Strict));
         assert_eq!(
-            run(&meta(&[], &[], &["compareArray.js", "propertyHelper.js"])).map_err(|r| r.label()),
-            Err("include:propertyHelper.js".into())
+            run(&meta(&[], &[], &["compareArray.js", "nonCompiling.js"])).map_err(|r| r.label()),
+            Err("include:nonCompiling.js".into())
         );
     }
 }

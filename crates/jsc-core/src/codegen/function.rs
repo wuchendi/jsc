@@ -31,15 +31,15 @@ pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::R
     // constructor + state machine, not an ordinary function body; neither is a
     // constructor. A generator reads its own `prototype` through its static
     // function object.
-    if let Some(is_async) = state_machine(&fn_decl.function)? {
+    if let Some(machine) = state_machine(&fn_decl.function) {
         let callee = shared
             .funcs
             .get(name)
-            .filter(|_| !is_async)
+            .filter(|_| machine.has_prototype())
             .map(|sig| IrNode::DeclFunc(sig.index - 1));
         let (mut func, _env) =
-            ctx.build_generator_ctor(&param_pats, body, is_async, fn_decl.function.span, callee)?;
-        func.info = fn_info(name, &param_pats, machine_kind(is_async));
+            ctx.build_generator_ctor(&param_pats, body, machine, fn_decl.function.span, callee)?;
+        func.info = fn_info(name, &param_pats, machine.fn_kind());
         return Ok(func);
     }
     let (mut func, _env) = ctx.build_function_body(&param_pats, body)?;
@@ -61,29 +61,50 @@ pub(super) fn fn_info(name: &str, param_pats: &[&Pat], kind: FnKind) -> FnInfo {
     }
 }
 
-/// Whether `function` compiles to a generator state machine: `Some(is_async)`
-/// for a `function*` (`false`) or an `async function` (`true`), `None` for an
-/// ordinary function. An async generator (`async function*`) is out of scope
-/// and rejected with a span.
-pub(super) fn state_machine(function: &swc_ecma_ast::Function) -> anyhow::Result<Option<bool>> {
-    match (function.is_generator, function.is_async) {
-        (true, true) => Err(CompileError::spanned(
-            function.span(),
-            "async generator functions are unsupported",
-        )
-        .into()),
-        (false, false) => Ok(None),
-        (_, is_async) => Ok(Some(is_async)),
+/// What a function compiles to when its body is a generator state machine
+/// (DESIGN.md §7.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Machine {
+    /// A `function*`: the constructor returns the generator.
+    Generator,
+    /// An `async function` or arrow: the constructor spawns the body as a
+    /// promise; `await e` suspends like `yield e`.
+    Async,
+    /// An `async function*`: the constructor returns the async generator,
+    /// driven by `%AsyncGeneratorPrototype%`; both `await` and `yield`
+    /// suspend.
+    AsyncGenerator,
+}
+
+impl Machine {
+    /// Whether `await` suspends the body.
+    pub(super) fn awaits(self) -> bool {
+        self != Self::Generator
+    }
+
+    /// Whether the function owns a `prototype` its objects inherit.
+    pub(super) fn has_prototype(self) -> bool {
+        self != Self::Async
+    }
+
+    /// The [`FnKind`] of the function's constructor.
+    pub(super) fn fn_kind(self) -> FnKind {
+        match self {
+            Self::Generator => FnKind::Generator,
+            Self::Async => FnKind::Plain,
+            Self::AsyncGenerator => FnKind::AsyncGenerator,
+        }
     }
 }
 
-/// The [`FnKind`] of a generator (`false`) or async (`true`) function's
-/// constructor: a generator owns a `prototype`, an async function does not.
-fn machine_kind(is_async: bool) -> FnKind {
-    if is_async {
-        FnKind::Plain
-    } else {
-        FnKind::Generator
+/// Whether `function` compiles to a generator state machine, and which
+/// kind; `None` for an ordinary function.
+pub(super) fn state_machine(function: &swc_ecma_ast::Function) -> Option<Machine> {
+    match (function.is_generator, function.is_async) {
+        (true, true) => Some(Machine::AsyncGenerator),
+        (true, false) => Some(Machine::Generator),
+        (false, true) => Some(Machine::Async),
+        (false, false) => None,
     }
 }
 
@@ -774,7 +795,7 @@ impl LowerCtx<'_> {
         name: &str,
         kind: FnKind,
         arrow: bool,
-        machine: Option<(bool, swc_common::Span)>,
+        machine: Option<(Machine, swc_common::Span)>,
     ) -> anyhow::Result<IrNode> {
         // Reserve this function's table slot before lowering its body, so any
         // function nested in the body takes a later slot.
@@ -791,8 +812,9 @@ impl LowerCtx<'_> {
             pos
         };
         let table_index = self.shared.arrow_base - 1 + u32::try_from(pos).unwrap_or(u32::MAX);
-        let self_cell =
-            matches!(machine, Some((false, _))).then(|| (self.top(), self.hidden_local()));
+        let self_cell = machine
+            .is_some_and(|(machine, _)| machine.has_prototype())
+            .then(|| (self.top(), self.hidden_local()));
 
         self.push_frame();
         self.frame().arrow = arrow;
@@ -802,8 +824,8 @@ impl LowerCtx<'_> {
         let callee =
             self_cell.map(|(fi, (_, id))| IrNode::CellGet(Box::new(self.read_hidden(fi, id))));
         let built = match machine {
-            Some((is_async, span)) => {
-                self.build_generator_ctor(param_pats, body_kind, is_async, span, callee)
+            Some((machine, span)) => {
+                self.build_generator_ctor(param_pats, body_kind, machine, span, callee)
             }
             None => self.build_function_body(param_pats, body_kind),
         };
@@ -925,14 +947,14 @@ impl LowerCtx<'_> {
             .ok_or_else(|| anyhow!("function requires a body"))?;
         let param_pats: Vec<&Pat> = function.params.iter().map(|p| &p.pat).collect();
         let body = BodyKind::Block(&block.stmts);
-        match state_machine(function)? {
-            Some(is_async) => self.lower_lifted(
+        match state_machine(function) {
+            Some(machine) => self.lower_lifted(
                 &param_pats,
                 body,
                 name,
-                machine_kind(is_async),
+                machine.fn_kind(),
                 false,
-                Some((is_async, function.span)),
+                Some((machine, function.span)),
             ),
             None => self.lower_lifted_function(&param_pats, body, name, kind),
         }
@@ -956,7 +978,7 @@ impl LowerCtx<'_> {
         };
         // An `async` arrow's body is an async body (a generator state machine
         // spawned as a promise).
-        let machine = arrow.is_async.then_some((true, arrow.span));
+        let machine = arrow.is_async.then_some((Machine::Async, arrow.span));
         self.lower_lifted(&param_pats, body_kind, name, FnKind::Plain, true, machine)
     }
 }

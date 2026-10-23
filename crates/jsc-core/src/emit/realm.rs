@@ -44,6 +44,9 @@ pub(super) enum Intrinsic {
     /// `%GeneratorPrototype%`: `next`, `return`, `throw`; every generator
     /// object's `proto`.
     GeneratorPrototype,
+    /// `%AsyncGeneratorPrototype%`: the promise-returning `next`, `return`,
+    /// `throw` of every async generator object.
+    AsyncGeneratorPrototype,
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
@@ -92,7 +95,8 @@ impl Intrinsic {
             | Self::Json
             | Self::Console
             | Self::Prototype(_)
-            | Self::GeneratorPrototype => Some(Self::ObjectPrototype),
+            | Self::GeneratorPrototype
+            | Self::AsyncGeneratorPrototype => Some(Self::ObjectPrototype),
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
             // The native error constructors inherit from `Error`.
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
@@ -174,7 +178,10 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
         ])
         .chain(BuiltinCtor::ALL.map(Intrinsic::Ctor))
         .chain(PLAIN_PROTOTYPES.map(Intrinsic::Prototype))
-        .chain([Intrinsic::GeneratorPrototype])
+        .chain([
+            Intrinsic::GeneratorPrototype,
+            Intrinsic::AsyncGeneratorPrototype,
+        ])
 }
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
@@ -188,6 +195,26 @@ pub(super) enum Builtin {
     ObjectToString,
     /// `Object.prototype.valueOf`.
     ValueOf,
+    /// `Object.prototype.isPrototypeOf`.
+    IsPrototypeOf,
+    /// `Object.prototype.propertyIsEnumerable`.
+    PropertyIsEnumerable,
+    /// `Object.prototype.toLocaleString`.
+    ToLocaleString,
+    /// `Object.prototype.__defineGetter__` / `__defineSetter__`.
+    DefineAccessor {
+        /// `__defineSetter__` rather than `__defineGetter__`.
+        set: bool,
+    },
+    /// `Object.prototype.__lookupGetter__` / `__lookupSetter__`.
+    LookupAccessor {
+        /// `__lookupSetter__` rather than `__lookupGetter__`.
+        set: bool,
+    },
+    /// The getter of `Object.prototype.__proto__`.
+    ProtoGet,
+    /// The setter of `Object.prototype.__proto__`.
+    ProtoSet,
     /// `Function.prototype.call`.
     Call,
     /// `Function.prototype.apply`.
@@ -214,6 +241,8 @@ pub(super) enum Builtin {
     Ctor(BuiltinCtor),
     /// `Object.keys` / `Object.values` / `Object.entries`.
     ObjectStatic(ObjectBuiltinOp),
+    /// An `Object` static over property descriptors and integrity levels.
+    ObjectReflect(ReflectOp),
     /// `Array.isArray`.
     IsArray,
     /// `Promise.resolve`.
@@ -286,6 +315,22 @@ pub(super) enum Builtin {
     GeneratorReturn,
     /// `%GeneratorPrototype%.throw`.
     GeneratorThrow,
+    /// `%AsyncGeneratorPrototype%.next` / `return` / `throw`: queue the
+    /// request and return its promise.
+    AsyncGeneratorMethod(AsyncGenRequest),
+    /// Serve an async generator's queued requests (argument 0 is the
+    /// generator) until it suspends on an `await` or the queue empties. Not
+    /// installed on any intrinsic.
+    AsyncGeneratorDrain,
+    /// Resume an async generator's body once (argument 0 is the generator,
+    /// argument 1 the sent value, thrown at the suspend when `env` is
+    /// `true`) and settle the front request from the outcome. Not installed
+    /// on any intrinsic.
+    AsyncGeneratorStep,
+    /// A promise reaction of an async generator (`env` is the generator):
+    /// the settlement of an `await`, or of a `return()` value. Not installed
+    /// on any intrinsic.
+    AsyncGeneratorReaction(AsyncGenReaction),
     /// `%ThrowTypeError%`: the poison getter/setter of the strict `caller` /
     /// `arguments` properties (one identity for every installation).
     ThrowTypeError,
@@ -302,6 +347,129 @@ pub(super) enum Builtin {
     IsNaN,
     /// The global `isFinite`.
     IsFinite,
+}
+
+/// An async generator request (`%AsyncGeneratorPrototype%` method).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AsyncGenRequest {
+    /// `next(v)`.
+    Next,
+    /// `throw(e)`.
+    Throw,
+    /// `return(v)`.
+    Return,
+}
+
+impl AsyncGenRequest {
+    /// The method's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Throw => "throw",
+            Self::Return => "return",
+        }
+    }
+}
+
+/// An `Object` static over property descriptors, integrity levels,
+/// prototypes and own keys (DESIGN.md §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReflectOp {
+    DefineProperty,
+    DefineProperties,
+    GetOwnPropertyDescriptor,
+    GetOwnPropertyDescriptors,
+    PreventExtensions,
+    IsExtensible,
+    Seal,
+    Freeze,
+    IsSealed,
+    IsFrozen,
+    Create,
+    GetPrototypeOf,
+    SetPrototypeOf,
+    GetOwnPropertyNames,
+    Assign,
+    HasOwn,
+    Is,
+    FromEntries,
+}
+
+impl ReflectOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [ReflectOp; 18] = [
+        Self::DefineProperty,
+        Self::DefineProperties,
+        Self::GetOwnPropertyDescriptor,
+        Self::GetOwnPropertyDescriptors,
+        Self::PreventExtensions,
+        Self::IsExtensible,
+        Self::Seal,
+        Self::Freeze,
+        Self::IsSealed,
+        Self::IsFrozen,
+        Self::Create,
+        Self::GetPrototypeOf,
+        Self::SetPrototypeOf,
+        Self::GetOwnPropertyNames,
+        Self::Assign,
+        Self::HasOwn,
+        Self::Is,
+        Self::FromEntries,
+    ];
+
+    /// The static's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::DefineProperty => "defineProperty",
+            Self::DefineProperties => "defineProperties",
+            Self::GetOwnPropertyDescriptor => "getOwnPropertyDescriptor",
+            Self::GetOwnPropertyDescriptors => "getOwnPropertyDescriptors",
+            Self::PreventExtensions => "preventExtensions",
+            Self::IsExtensible => "isExtensible",
+            Self::Seal => "seal",
+            Self::Freeze => "freeze",
+            Self::IsSealed => "isSealed",
+            Self::IsFrozen => "isFrozen",
+            Self::Create => "create",
+            Self::GetPrototypeOf => "getPrototypeOf",
+            Self::SetPrototypeOf => "setPrototypeOf",
+            Self::GetOwnPropertyNames => "getOwnPropertyNames",
+            Self::Assign => "assign",
+            Self::HasOwn => "hasOwn",
+            Self::Is => "is",
+            Self::FromEntries => "fromEntries",
+        }
+    }
+
+    /// The static's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::DefineProperty => 3,
+            Self::DefineProperties
+            | Self::GetOwnPropertyDescriptor
+            | Self::Create
+            | Self::SetPrototypeOf
+            | Self::Assign
+            | Self::HasOwn
+            | Self::Is => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// The promise reactions an async generator registers (see
+/// [`Builtin::AsyncGeneratorReaction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AsyncGenReaction {
+    /// An awaited value fulfilled: resume the body with it.
+    AwaitFulfilled,
+    /// An awaited value rejected: throw the reason at the `await`.
+    AwaitRejected,
+    /// A `return(v)` value fulfilled: the request completes `{ v, done }`.
+    ReturnFulfilled,
+    /// A `return(v)` value rejected: the request rejects.
+    ReturnRejected,
 }
 
 /// A `String.prototype` method backed by a host `__method` op.
@@ -386,11 +554,20 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 115] = [
+    pub(super) const ALL: [Builtin; 151] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
         Self::ValueOf,
+        Self::IsPrototypeOf,
+        Self::PropertyIsEnumerable,
+        Self::ToLocaleString,
+        Self::DefineAccessor { set: false },
+        Self::DefineAccessor { set: true },
+        Self::LookupAccessor { set: false },
+        Self::LookupAccessor { set: true },
+        Self::ProtoGet,
+        Self::ProtoSet,
         Self::Call,
         Self::Apply,
         Self::Bind,
@@ -429,6 +606,24 @@ impl Builtin {
         Self::ObjectStatic(ObjectBuiltinOp::Keys),
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
+        Self::ObjectReflect(ReflectOp::ALL[0]),
+        Self::ObjectReflect(ReflectOp::ALL[1]),
+        Self::ObjectReflect(ReflectOp::ALL[2]),
+        Self::ObjectReflect(ReflectOp::ALL[3]),
+        Self::ObjectReflect(ReflectOp::ALL[4]),
+        Self::ObjectReflect(ReflectOp::ALL[5]),
+        Self::ObjectReflect(ReflectOp::ALL[6]),
+        Self::ObjectReflect(ReflectOp::ALL[7]),
+        Self::ObjectReflect(ReflectOp::ALL[8]),
+        Self::ObjectReflect(ReflectOp::ALL[9]),
+        Self::ObjectReflect(ReflectOp::ALL[10]),
+        Self::ObjectReflect(ReflectOp::ALL[11]),
+        Self::ObjectReflect(ReflectOp::ALL[12]),
+        Self::ObjectReflect(ReflectOp::ALL[13]),
+        Self::ObjectReflect(ReflectOp::ALL[14]),
+        Self::ObjectReflect(ReflectOp::ALL[15]),
+        Self::ObjectReflect(ReflectOp::ALL[16]),
+        Self::ObjectReflect(ReflectOp::ALL[17]),
         Self::IsArray,
         Self::PromiseResolve,
         Self::PromiseReject,
@@ -524,6 +719,15 @@ impl Builtin {
         Self::GeneratorNext,
         Self::GeneratorReturn,
         Self::GeneratorThrow,
+        Self::AsyncGeneratorMethod(AsyncGenRequest::Next),
+        Self::AsyncGeneratorMethod(AsyncGenRequest::Return),
+        Self::AsyncGeneratorMethod(AsyncGenRequest::Throw),
+        Self::AsyncGeneratorDrain,
+        Self::AsyncGeneratorStep,
+        Self::AsyncGeneratorReaction(AsyncGenReaction::AwaitFulfilled),
+        Self::AsyncGeneratorReaction(AsyncGenReaction::AwaitRejected),
+        Self::AsyncGeneratorReaction(AsyncGenReaction::ReturnFulfilled),
+        Self::AsyncGeneratorReaction(AsyncGenReaction::ReturnRejected),
         Self::ThrowTypeError,
         Self::MethodCall,
         Self::IterSource,
@@ -538,8 +742,20 @@ impl Builtin {
             | Self::ThrowTypeError
             | Self::MethodCall
             | Self::BoundCall
-            | Self::IterSource => "",
+            | Self::IterSource
+            | Self::AsyncGeneratorDrain
+            | Self::AsyncGeneratorStep
+            | Self::AsyncGeneratorReaction(_) => "",
             Self::HasOwnProperty => "hasOwnProperty",
+            Self::IsPrototypeOf => "isPrototypeOf",
+            Self::PropertyIsEnumerable => "propertyIsEnumerable",
+            Self::ToLocaleString => "toLocaleString",
+            Self::DefineAccessor { set: false } => "__defineGetter__",
+            Self::DefineAccessor { set: true } => "__defineSetter__",
+            Self::LookupAccessor { set: false } => "__lookupGetter__",
+            Self::LookupAccessor { set: true } => "__lookupSetter__",
+            Self::ProtoGet => "get __proto__",
+            Self::ProtoSet => "set __proto__",
             Self::ObjectToString
             | Self::ErrorToString
             | Self::ArrayToString
@@ -560,6 +776,7 @@ impl Builtin {
             Self::GeneratorNext => "next",
             Self::GeneratorReturn => "return",
             Self::GeneratorThrow => "throw",
+            Self::AsyncGeneratorMethod(request) => request.name(),
             Self::StringMethod(op) => op.name(),
             Self::Call => "call",
             Self::Apply => "apply",
@@ -582,6 +799,7 @@ impl Builtin {
             Self::ObjectStatic(ObjectBuiltinOp::Keys | ObjectBuiltinOp::ForInKeys) => "keys",
             Self::ObjectStatic(ObjectBuiltinOp::Values) => "values",
             Self::ObjectStatic(ObjectBuiltinOp::Entries) => "entries",
+            Self::ObjectReflect(op) => op.name(),
             Self::IsArray => "isArray",
             Self::PromiseResolve => "resolve",
             Self::PromiseReject => "reject",
@@ -609,6 +827,8 @@ impl Builtin {
             | Self::MethodCall
             | Self::BoundCall
             | Self::IterSource
+            | Self::AsyncGeneratorDrain
+            | Self::AsyncGeneratorStep
             | Self::FunctionToString
             | Self::StringToString
             | Self::StringValueOf
@@ -617,10 +837,12 @@ impl Builtin {
             | Self::BooleanValueOf
             | Self::ObjectToString
             | Self::ValueOf
+            | Self::ToLocaleString
             | Self::ErrorToString
             | Self::ArrayToString
             | Self::DateMethod(_)
             | Self::CollectionSize { .. }
+            | Self::ProtoGet
             | Self::CollectionOp {
                 op: MapOp::Clear, ..
             }
@@ -634,8 +856,13 @@ impl Builtin {
             | Self::JsonParse
             | Self::ArraySlice
             | Self::CollectionOp { op: MapOp::Set, .. }
-            | Self::PromiseThen => 2,
+            | Self::PromiseThen
+            | Self::DefineAccessor { .. } => 2,
             Self::HasOwnProperty
+            | Self::IsPrototypeOf
+            | Self::PropertyIsEnumerable
+            | Self::LookupAccessor { .. }
+            | Self::ProtoSet
             | Self::Call
             | Self::Bind
             | Self::Math(_)
@@ -659,8 +886,11 @@ impl Builtin {
             | Self::PromiseFinally
             | Self::GeneratorNext
             | Self::GeneratorReturn
-            | Self::GeneratorThrow => 1,
+            | Self::GeneratorThrow
+            | Self::AsyncGeneratorMethod(_)
+            | Self::AsyncGeneratorReaction(_) => 1,
             Self::StringMethod(op) => op.length(),
+            Self::ObjectReflect(op) => op.length(),
             Self::JsonStringify => 3,
         }
     }
@@ -692,6 +922,7 @@ impl Builtin {
             Self::GeneratorNext | Self::GeneratorReturn | Self::GeneratorThrow => {
                 return Some(Intrinsic::GeneratorPrototype);
             }
+            Self::AsyncGeneratorMethod(_) => return Some(Intrinsic::AsyncGeneratorPrototype),
             _ => None,
         };
         ctor.map(Intrinsic::Prototype)
@@ -898,6 +1129,20 @@ const GLOBALS: [(&str, u32, Value); 26] = [
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
 ];
 
+/// The `%Object.prototype%` methods, in slot order.
+const OBJECT_PROTOTYPE_METHODS: [Builtin; 10] = [
+    Builtin::HasOwnProperty,
+    Builtin::ObjectToString,
+    Builtin::ValueOf,
+    Builtin::IsPrototypeOf,
+    Builtin::PropertyIsEnumerable,
+    Builtin::ToLocaleString,
+    Builtin::DefineAccessor { set: false },
+    Builtin::DefineAccessor { set: true },
+    Builtin::LookupAccessor { set: false },
+    Builtin::LookupAccessor { set: true },
+];
+
 /// The registry: every own property of every intrinsic, in slot order per
 /// intrinsic.
 pub(super) fn registry() -> Vec<Entry> {
@@ -908,25 +1153,16 @@ pub(super) fn registry() -> Vec<Entry> {
         attrs,
         value,
     };
-    let mut entries = vec![
-        entry(
-            ObjectPrototype,
-            "hasOwnProperty",
-            METHOD_ATTRS,
-            Value::Method(Builtin::HasOwnProperty),
-        ),
-        entry(
-            ObjectPrototype,
-            "toString",
-            METHOD_ATTRS,
-            Value::Method(Builtin::ObjectToString),
-        ),
-        entry(
-            ObjectPrototype,
-            "valueOf",
-            METHOD_ATTRS,
-            Value::Method(Builtin::ValueOf),
-        ),
+    let mut entries: Vec<Entry> = OBJECT_PROTOTYPE_METHODS
+        .into_iter()
+        .map(|b| entry(ObjectPrototype, b.name(), METHOD_ATTRS, Value::Method(b)))
+        .collect();
+    let proto = Value::Accessor {
+        get: Builtin::ProtoGet,
+        set: Some(Builtin::ProtoSet),
+    };
+    entries.push(entry(ObjectPrototype, "__proto__", ACCESSOR_ATTRS, proto));
+    entries.extend([
         entry(FunctionPrototype, "length", FN_FACT_ATTRS, Value::Num(0.0)),
         entry(FunctionPrototype, "name", FN_FACT_ATTRS, Value::Str("")),
         entry(
@@ -955,7 +1191,7 @@ pub(super) fn registry() -> Vec<Entry> {
         ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
-    ];
+    ]);
     for kind in ErrorKind::ALL {
         let proto = Intrinsic::ErrorPrototype(kind);
         entries.push(entry(proto, "name", METHOD_ATTRS, Value::Str(kind.name())));
@@ -1019,11 +1255,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
             Value::Intrinsic(prototype),
         ));
         let statics: &[Builtin] = match ctor {
-            BuiltinCtor::Object => &[
-                Builtin::ObjectStatic(ObjectBuiltinOp::Keys),
-                Builtin::ObjectStatic(ObjectBuiltinOp::Values),
-                Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
-            ],
+            BuiltinCtor::Object => &OBJECT_STATICS,
             BuiltinCtor::Array => &[Builtin::IsArray],
             BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
             BuiltinCtor::Date => &[Builtin::DateNow],
@@ -1051,6 +1283,31 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         entries.push(entry(prototype, "size", ACCESSOR_ATTRS, size));
     }
 }
+
+/// The statics of `Object`, in slot order.
+const OBJECT_STATICS: [Builtin; 21] = [
+    Builtin::ObjectStatic(ObjectBuiltinOp::Keys),
+    Builtin::ObjectStatic(ObjectBuiltinOp::Values),
+    Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
+    Builtin::ObjectReflect(ReflectOp::ALL[0]),
+    Builtin::ObjectReflect(ReflectOp::ALL[1]),
+    Builtin::ObjectReflect(ReflectOp::ALL[2]),
+    Builtin::ObjectReflect(ReflectOp::ALL[3]),
+    Builtin::ObjectReflect(ReflectOp::ALL[4]),
+    Builtin::ObjectReflect(ReflectOp::ALL[5]),
+    Builtin::ObjectReflect(ReflectOp::ALL[6]),
+    Builtin::ObjectReflect(ReflectOp::ALL[7]),
+    Builtin::ObjectReflect(ReflectOp::ALL[8]),
+    Builtin::ObjectReflect(ReflectOp::ALL[9]),
+    Builtin::ObjectReflect(ReflectOp::ALL[10]),
+    Builtin::ObjectReflect(ReflectOp::ALL[11]),
+    Builtin::ObjectReflect(ReflectOp::ALL[12]),
+    Builtin::ObjectReflect(ReflectOp::ALL[13]),
+    Builtin::ObjectReflect(ReflectOp::ALL[14]),
+    Builtin::ObjectReflect(ReflectOp::ALL[15]),
+    Builtin::ObjectReflect(ReflectOp::ALL[16]),
+    Builtin::ObjectReflect(ReflectOp::ALL[17]),
+];
 
 /// The builtin method `intrinsic.key` of the registry, if any.
 pub(super) fn method_of(intrinsic: Intrinsic, key: &str) -> Option<Builtin> {

@@ -458,12 +458,6 @@ fn async_result_then_chain() {
     );
 }
 
-/// An async generator remains out of scope.
-#[test]
-fn async_generators_rejected() {
-    assert_rejected("async function* f() { yield 1 } f().next()");
-}
-
 /// A C-style `for (let ...)` loop with an `await` in its body inside an async
 /// function still runs each iteration in order.
 #[test]

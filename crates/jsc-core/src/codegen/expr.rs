@@ -47,9 +47,13 @@ impl LowerCtx<'_> {
             // an `async function` body, the body is compiled as a
             // generator state machine, so `await e` becomes a `yield e` — the host
             // async engine resumes the machine with the awaited settled value.
+            // In an async generator, an `await` suspend is marked so its driver
+            // awaits the value instead of yielding it.
             Expr::Await(await_expr) => {
                 let arg = self.lower_expr(&await_expr.arg)?;
-                if self.async_body {
+                if self.frame().machine == Some(Machine::AsyncGenerator) {
+                    Ok(generator::await_suspend(arg))
+                } else if self.async_body {
                     Ok(IrNode::Yield(Box::new(arg)))
                 } else {
                     Ok(IrNode::Await(Box::new(arg)))
@@ -59,10 +63,16 @@ impl LowerCtx<'_> {
             // generator segmentation pass consumes every `Yield`; one that reaches
             // the backend means an unsupported yield position (rejected there).
             // `yield*` (delegate) is a statement, lowered by `lower_yield_delegate`.
+            // In an async generator `yield e` first awaits `e`.
             Expr::Yield(yield_expr) if !yield_expr.delegate => {
                 let arg = match &yield_expr.arg {
                     Some(arg) => self.lower_expr(arg)?,
                     None => IrNode::Undefined,
+                };
+                let arg = if self.frame().machine == Some(Machine::AsyncGenerator) {
+                    generator::await_suspend(arg)
+                } else {
+                    arg
                 };
                 Ok(IrNode::Yield(Box::new(arg)))
             }
@@ -255,6 +265,9 @@ impl LowerCtx<'_> {
                 }
                 if let Some(fi) = self.derived_frame() {
                     return Ok(self.derived_this(fi));
+                }
+                if let Some(this) = self.lexical_this() {
+                    return Ok(this);
                 }
                 if let Some(this) = self.generator_this() {
                     return Ok(this);
@@ -672,9 +685,10 @@ impl LowerCtx<'_> {
             };
             return Ok((IrNode::Seq(vec![read, node]), local));
         }
-        // A generator/async method's `this` lives in its frame cell: snapshot
-        // it into a local for the call.
-        if let Some(this) = self.generator_this() {
+        // An arrow's `this` is its enclosing function's, and a generator/async
+        // method's lives in its frame cell: snapshot it into a local for the
+        // call.
+        if let Some(this) = self.lexical_this().or_else(|| self.generator_this()) {
             let local = self.fresh();
             let read = IrNode::Assign {
                 local,
@@ -753,6 +767,12 @@ impl LowerCtx<'_> {
         let Callee::Expr(callee_expr) = &call.callee else {
             return Err(CompileError::spanned(call.span(), "unsupported call target").into());
         };
+        // Parentheses keep the Reference: `(o.m)()` calls with `this = o`
+        // (only a non-reference such as `(0, o.m)` drops it).
+        let mut callee_expr = callee_expr;
+        while let Expr::Paren(p) = callee_expr.as_ref() {
+            callee_expr = &p.expr;
+        }
         // `super.m(..)` — a parent prototype method call inside a derived class.
         if let Expr::SuperProp(super_prop) = callee_expr.as_ref() {
             return self.lower_super_method_call(call, super_prop);
@@ -2174,7 +2194,7 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
-        Expr::Yield(_) => "yield expressions are not supported",
+        Expr::Yield(_) => "`yield*` is only supported as a statement",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",

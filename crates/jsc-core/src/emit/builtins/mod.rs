@@ -33,12 +33,42 @@ mod map_set;
 mod namespace;
 mod number;
 mod object;
+mod object_static;
 mod promise;
 mod string;
 
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 pub(super) use string::host_ready_args;
+
+/// Argument `i` (an i32 local) into i64 `out`: element `i` of the spread
+/// argument array captured in i32 `spread` when the call passed more than
+/// `K` arguments, else slot `i` (`undefined` past the slots); a spread hole
+/// reads `undefined`.
+fn arg_at(function: &mut Function, frame: Frame, i: u32, spread: u32, out: u32) {
+    let k = frame.k;
+    wasm!(function;
+        LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U,
+        I32Const(k.cast_signed()), I32GtU,
+        If(BlockType::Result(ValType::I64)),
+        LocalGet(spread),
+    );
+    emit_array_elems(function);
+    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), Else);
+    for j in 0..k {
+        wasm!(function;
+            LocalGet(i), I32Const(j.cast_signed()), I32Eq,
+            If(BlockType::Result(ValType::I64)), LocalGet(j), Else,
+        );
+    }
+    wasm!(function; I64Const(UNDEFINED_BITS));
+    for _ in 0..k {
+        wasm!(function; End);
+    }
+    wasm!(function; End, LocalSet(out));
+    emit_elem_read(function, out);
+    wasm!(function; LocalSet(out));
+}
 
 /// The IR fragments the hand-written bodies emit with `K = k`, for the
 /// static-string scan.
@@ -48,6 +78,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(map_set::fragments(k));
     nodes.extend(promise::fragments(k));
     nodes.extend(generator::fragments(k));
+    nodes.extend(generator::async_fragments(k));
     nodes.extend(date::fragments(k));
     nodes.extend(json::fragments());
     nodes
@@ -146,6 +177,7 @@ impl Frame {
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
     object::STRINGS
         .into_iter()
+        .chain(object_static::strings())
         .chain(function::STRINGS)
         .chain(error::STRINGS)
         .chain(array::strings())
@@ -155,6 +187,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(map_set::strings())
         .chain(promise::strings())
         .chain(generator::strings())
+        .chain(generator::async_strings())
         .chain(json::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
@@ -175,6 +208,20 @@ pub(super) fn emit_builtin(
         Builtin::HasOwnProperty => object::emit_has_own_property(&mut f, frame, strings, helpers),
         Builtin::ObjectToString => object::emit_to_string(&mut f, frame, strings),
         Builtin::ValueOf => object::emit_value_of(&mut f, frame, strings, helpers),
+        Builtin::IsPrototypeOf => object::emit_is_prototype_of(&mut f, frame, strings, helpers),
+        Builtin::PropertyIsEnumerable => {
+            object::emit_property_is_enumerable(&mut f, frame, strings, helpers);
+        }
+        Builtin::ToLocaleString => object::emit_to_locale_string(&mut f, frame, strings, helpers),
+        Builtin::DefineAccessor { set } => {
+            object::emit_define_accessor(set, &mut f, frame, strings, helpers);
+        }
+        Builtin::LookupAccessor { set } => {
+            object::emit_lookup_accessor(set, &mut f, frame, strings, helpers);
+        }
+        Builtin::ProtoGet => object::emit_proto_get(&mut f, frame, strings, helpers),
+        Builtin::ProtoSet => object::emit_proto_set(&mut f, frame, strings, helpers),
+        Builtin::ObjectReflect(op) => object_static::emit(op, &mut f, frame, strings, helpers),
         Builtin::Call => function::emit_call(&mut f, frame, strings, helpers),
         Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),
         Builtin::Bind => function::emit_bind(&mut f, frame, strings, helpers),
@@ -220,6 +267,16 @@ pub(super) fn emit_builtin(
         Builtin::GeneratorNext => generator::emit_next(&mut f, frame, strings, helpers),
         Builtin::GeneratorReturn => generator::emit_return(&mut f, frame, strings, helpers),
         Builtin::GeneratorThrow => generator::emit_throw(&mut f, frame, strings, helpers),
+        Builtin::AsyncGeneratorMethod(request) => {
+            generator::emit_async_method(request, &mut f, frame, strings, helpers);
+        }
+        Builtin::AsyncGeneratorDrain => {
+            generator::emit_async_drain(&mut f, frame, strings, helpers);
+        }
+        Builtin::AsyncGeneratorStep => generator::emit_async_step(&mut f, frame, strings, helpers),
+        Builtin::AsyncGeneratorReaction(reaction) => {
+            generator::emit_async_reaction(reaction, &mut f, frame, strings, helpers);
+        }
         Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),

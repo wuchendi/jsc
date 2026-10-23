@@ -461,6 +461,9 @@ struct Frame {
     ctor: FnKind,
     /// A derived constructor's `super(..)` bookkeeping.
     supers: SuperCalls,
+    /// The kind of the generator/async body this (`env_backed`) frame lowers,
+    /// `None` for every other frame.
+    machine: Option<Machine>,
     /// The ids of this function's var-scoped bindings (parameters, `var`s and
     /// function declarations): a `var` redeclaring one reuses it rather than
     /// declaring a fresh binding (DESIGN.md §7.4).

@@ -47,7 +47,8 @@ pub(super) fn emit_iter_source(
         Return,
         End,
     );
-    kind(function, TYPE_GENERATOR);
+    // A (sync) generator is drained; an async generator is not iterable.
+    emit_is_generator(function, value);
     wasm!(function; If(BlockType::Empty), LocalGet(value), Call(helpers.gen_to_array), Return, End);
     kind(function, TYPE_MAP);
     kind(function, TYPE_SET);

@@ -118,6 +118,12 @@ impl LowerCtx<'_> {
                     Some(expr) => Some(self.lower_expr(expr)?),
                     None => None,
                 };
+                // `return e` in an async generator awaits `e`.
+                let value = if self.frame().machine == Some(Machine::AsyncGenerator) {
+                    value.map(generator::await_suspend)
+                } else {
+                    value
+                };
                 let value = if self.frame().derived() {
                     Some(self.derived_return(value))
                 } else {
