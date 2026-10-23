@@ -186,12 +186,15 @@ fn emit_to_int32(function: &mut Function, local: u32) {
 /// Every argument is converted with `ToNumber` (a user `valueOf`/`toString`
 /// runs, and may throw); the conversion is emitted behind one `is_number` test
 /// and skipped for an argument that always yields a number. The unary ops then
-/// unbox their single argument to `f64`, apply a native wasm op, and rebox.
-/// `Round` uses JS semantics `floor(x + 0.5)`. `Min`/`Max` fold the native
-/// `f64.min`/`f64.max` (which propagate NaN and order `-0`/`+0` like JS) over the
-/// arguments starting from the identity (`+Infinity` for min, `-Infinity` for
-/// max), so the empty-args case yields the correct infinity. `Pow` delegates to
-/// [`emit_pow`].
+/// unbox their single argument to `f64`, apply a native wasm op (or the host
+/// `__method` [`abi::METHOD_OP_MATH`] function for the transcendentals), and
+/// rebox. `Min`/`Max` fold the native `f64.min`/`f64.max` (which propagate NaN
+/// and order `-0`/`+0` like JS) over the arguments starting from the identity
+/// (`+Infinity` for min, `-Infinity` for max), so the empty-args case yields
+/// the correct infinity; `Hypot` folds its scaled sum of squares the same way
+/// ([`emit_math_spread`]). `Pow` delegates to [`emit_pow`]; the binary
+/// `Atan2` / `Imul` evaluate both arguments before converting either.
+#[allow(clippy::too_many_lines)] // one flat dispatch over the methods
 pub(super) fn emit_math_call(
     op: MathOp,
     args: &[IrNode],
@@ -200,41 +203,159 @@ pub(super) fn emit_math_call(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    let x = |function: &mut Function, local: u32| {
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::F64ReinterpretI64);
+    };
     match op {
-        // Unary native-op methods: ToNumber → unbox → op → rebox.
-        MathOp::Floor
-        | MathOp::Ceil
-        | MathOp::Trunc
-        | MathOp::Abs
-        | MathOp::Sqrt
-        | MathOp::Round => {
+        MathOp::Min | MathOp::Max => emit_min_max(op, args, function, scratch, strings, helpers),
+        MathOp::Pow => emit_pow(&args[0], &args[1], function, scratch, strings, helpers),
+        MathOp::Hypot => {
+            let items = args.iter().cloned().map(SpreadElem::Item).collect();
+            let spread = IrNode::ArraySpread(items);
+            emit_math_spread(op, &spread, function, scratch, strings, helpers);
+        }
+        MathOp::Random => {
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+            emit_host_math(abi::MATH_FN_RANDOM, None, function, helpers);
+        }
+        MathOp::Atan2 | MathOp::Imul => {
+            let (s0, s1) = (scratch, scratch + 1);
             emit_node(&args[0], function, scratch, strings, helpers);
-            if !yields_number(&args[0]) {
+            emit_node(&args[1], function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalSet(s1));
+            function.instruction(&Instruction::LocalSet(s0));
+            emit_coerce_number(function, s0, helpers);
+            emit_coerce_number(function, s1, helpers);
+            if op == MathOp::Atan2 {
+                function.instruction(&Instruction::LocalGet(s0));
+                emit_host_math(abi::MATH_FN_ATAN2, Some(s1), function, helpers);
+            } else {
+                emit_to_int32(function, s0);
+                emit_to_int32(function, s1);
+                function.instruction(&Instruction::I32Mul);
+                function.instruction(&Instruction::F64ConvertI32S);
+                // An int32 is never NaN, so it reinterprets directly.
+                function.instruction(&Instruction::I64ReinterpretF64);
+            }
+        }
+        // Unary methods: ToNumber → unbox → op → rebox.
+        _ => {
+            let native = match op {
+                MathOp::Floor => Some(Instruction::F64Floor),
+                MathOp::Ceil => Some(Instruction::F64Ceil),
+                MathOp::Trunc => Some(Instruction::F64Trunc),
+                MathOp::Abs => Some(Instruction::F64Abs),
+                MathOp::Sqrt => Some(Instruction::F64Sqrt),
+                _ => None,
+            };
+            emit_node(&args[0], function, scratch, strings, helpers);
+            // A single-use number operand stays on the stack.
+            let stashed = !(yields_number(&args[0]) && (native.is_some() || op == MathOp::Fround));
+            if stashed {
                 function.instruction(&Instruction::LocalSet(scratch));
-                emit_coerce_number(function, scratch, helpers);
+                if !yields_number(&args[0]) {
+                    emit_coerce_number(function, scratch, helpers);
+                }
+            }
+            if let Some(code) = host_math_code(op) {
+                function.instruction(&Instruction::LocalGet(scratch));
+                emit_host_math(code, None, function, helpers);
+                return;
+            }
+            if op == MathOp::Clz32 {
+                emit_to_int32(function, scratch);
+                function.instruction(&Instruction::I32Clz);
+                function.instruction(&Instruction::F64ConvertI32U);
+                function.instruction(&Instruction::I64ReinterpretF64);
+                return;
+            }
+            if stashed {
                 function.instruction(&Instruction::LocalGet(scratch));
             }
             function.instruction(&Instruction::F64ReinterpretI64);
-            match op {
-                MathOp::Floor => function.instruction(&Instruction::F64Floor),
-                MathOp::Ceil => function.instruction(&Instruction::F64Ceil),
-                MathOp::Trunc => function.instruction(&Instruction::F64Trunc),
-                MathOp::Abs => function.instruction(&Instruction::F64Abs),
-                MathOp::Sqrt => function.instruction(&Instruction::F64Sqrt),
-                // JS `round(x)` = `floor(x + 0.5)`, differing from wasm's
-                // banker's `f64.nearest` (e.g. `round(2.5) == 3`, not `2`).
-                MathOp::Round => {
-                    function.instruction(&Instruction::F64Const(Ieee64::from(0.5)));
-                    function.instruction(&Instruction::F64Add);
-                    function.instruction(&Instruction::F64Floor)
-                }
-                _ => unreachable!("outer match restricts op to the unary methods"),
-            };
+            if let Some(native) = native {
+                function.instruction(&native);
+            } else if op == MathOp::Fround {
+                function.instruction(&Instruction::F32DemoteF64);
+                function.instruction(&Instruction::F64PromoteF32);
+            } else if op == MathOp::Round {
+                // JS `round(x)`: `r = floor(x)`, plus one when `x - r >= 0.5`
+                // (exact, unlike `floor(x + 0.5)`), with the sign of `x` so
+                // `[-0.5, -0]` rounds to `-0`; differs from wasm's banker's
+                // `f64.nearest` (e.g. `round(2.5) == 3`, not `2`).
+                function.instruction(&Instruction::F64Floor);
+                x(function, scratch);
+                function.instruction(&Instruction::F64Floor);
+                function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
+                function.instruction(&Instruction::F64Add);
+                x(function, scratch);
+                x(function, scratch);
+                function.instruction(&Instruction::F64Floor);
+                function.instruction(&Instruction::F64Sub);
+                function.instruction(&Instruction::F64Const(Ieee64::from(0.5)));
+                function.instruction(&Instruction::F64Lt);
+                // `select(floor, floor + 1, frac < 0.5)`.
+                function.instruction(&Instruction::Select);
+                x(function, scratch);
+                function.instruction(&Instruction::F64Copysign);
+            } else {
+                // `Sign`: `select(x, copysign(1, x), x == 0 || x != x)`
+                // (keeps `±0` and NaN).
+                function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
+                x(function, scratch);
+                function.instruction(&Instruction::F64Copysign);
+                x(function, scratch);
+                function.instruction(&Instruction::F64Const(Ieee64::from(0.0)));
+                function.instruction(&Instruction::F64Eq);
+                x(function, scratch);
+                x(function, scratch);
+                function.instruction(&Instruction::F64Ne);
+                function.instruction(&Instruction::I32Or);
+                function.instruction(&Instruction::Select);
+            }
             emit_box_f64(function, helpers);
         }
-        MathOp::Min | MathOp::Max => emit_min_max(op, args, function, scratch, strings, helpers),
-        MathOp::Pow => emit_pow(&args[0], &args[1], function, scratch, strings, helpers),
     }
+}
+
+/// The host [`abi::METHOD_OP_MATH`] function code of a unary `Math` method
+/// without an exact wasm instruction, or `None`.
+fn host_math_code(op: MathOp) -> Option<i64> {
+    Some(match op {
+        MathOp::Cbrt => abi::MATH_FN_CBRT,
+        MathOp::Log => abi::MATH_FN_LOG,
+        MathOp::Log2 => abi::MATH_FN_LOG2,
+        MathOp::Log10 => abi::MATH_FN_LOG10,
+        MathOp::Log1p => abi::MATH_FN_LOG1P,
+        MathOp::Exp => abi::MATH_FN_EXP,
+        MathOp::Expm1 => abi::MATH_FN_EXPM1,
+        MathOp::Sin => abi::MATH_FN_SIN,
+        MathOp::Cos => abi::MATH_FN_COS,
+        MathOp::Tan => abi::MATH_FN_TAN,
+        MathOp::Asin => abi::MATH_FN_ASIN,
+        MathOp::Acos => abi::MATH_FN_ACOS,
+        MathOp::Atan => abi::MATH_FN_ATAN,
+        MathOp::Sinh => abi::MATH_FN_SINH,
+        MathOp::Cosh => abi::MATH_FN_COSH,
+        MathOp::Tanh => abi::MATH_FN_TANH,
+        MathOp::Asinh => abi::MATH_FN_ASINH,
+        MathOp::Acosh => abi::MATH_FN_ACOSH,
+        MathOp::Atanh => abi::MATH_FN_ATANH,
+        _ => return None,
+    })
+}
+
+/// Call the host `Math` function `code` on the number jsval on the stack
+/// (and the one in i64 local `second`), leaving its number jsval.
+fn emit_host_math(code: i64, second: Option<u32>, function: &mut Function, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::I32Const(abi::METHOD_OP_MATH));
+    match second {
+        Some(local) => function.instruction(&Instruction::LocalGet(local)),
+        None => function.instruction(&Instruction::I64Const(UNDEFINED_BITS)),
+    };
+    function.instruction(&Instruction::I64Const(code));
+    function.instruction(&Instruction::Call(helpers.method));
 }
 
 /// The first of the i64 slots variadic `Math.min`/`Math.max` stash evaluated
@@ -357,13 +478,20 @@ fn yields_number(node: &IrNode) -> bool {
     }
 }
 
-/// Emit `Math.max(...)` / `Math.min(...)` with a spread argument, leaving
-/// a number jsval on the stack. The `args` node (an [`IrNode::ArraySpread`]) is
-/// materialized into a heap array; a counted loop then folds `f64.max`/`f64.min`
-/// over its elements' `ToNumber` from the identity infinity — matching the
-/// fixed-arity variadic path in [`emit_math_call`], but over a runtime-length
-/// array. Folding has no side effect, so converting each element as it is
-/// folded runs the conversions in argument order, after every argument.
+/// Emit `Math.max(...)` / `Math.min(...)` / `Math.hypot(...)` with a spread
+/// argument, leaving a number jsval on the stack. The `args` node (an
+/// [`IrNode::ArraySpread`]) is materialized into a heap array; a counted loop
+/// then folds `f64.max`/`f64.min` over its elements' `ToNumber` from the
+/// identity infinity — matching the fixed-arity variadic path in
+/// [`emit_math_call`], but over a runtime-length array. Folding has no side
+/// effect, so converting each element as it is folded runs the conversions in
+/// argument order, after every argument.
+///
+/// `hypot` folds a scaled sum of squares instead (`scale` the largest
+/// magnitude so far in the accumulator, `ssq` the sum of `(|x| / scale)²`, so
+/// no square overflows or underflows), noting an infinite and a NaN element
+/// in flag bits; after the loop an infinity wins, then NaN, else the result is
+/// `scale * sqrt(ssq)`.
 pub(super) fn emit_math_spread(
     op: MathOp,
     args: &IrNode,
@@ -379,7 +507,11 @@ pub(super) fn emit_math_spread(
     let len = scratch + 9;
     let idx = scratch + 10;
     let acc = scratch + 13;
+    // The hypot `ssq` (f64 bits) and its infinity / NaN flags: the `Date`
+    // field-method slots, idle while the fold runs.
+    let (ssq, flags) = (scratch + 24, scratch + 25);
     let is_min = matches!(op, MathOp::Min);
+    let is_hypot = matches!(op, MathOp::Hypot);
 
     // Materialize the (fresh, private) argument array; its length -> `len`, its
     // element store -> `base`, idx = 0.
@@ -395,7 +527,9 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::LocalSet(idx));
 
     // acc = identity infinity (as f64 bits): +Infinity for min, -Infinity for max.
-    let identity = if is_min {
+    let identity = if is_hypot {
+        0.0
+    } else if is_min {
         f64::INFINITY
     } else {
         f64::NEG_INFINITY
@@ -403,6 +537,12 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::F64Const(Ieee64::from(identity)));
     function.instruction(&Instruction::I64ReinterpretF64);
     function.instruction(&Instruction::LocalSet(acc));
+    if is_hypot {
+        function.instruction(&Instruction::I64Const(0));
+        function.instruction(&Instruction::LocalSet(ssq));
+        function.instruction(&Instruction::I64Const(0));
+        function.instruction(&Instruction::LocalSet(flags));
+    }
 
     // Counted loop: `while (idx < len) { acc = op(acc, array[idx]); idx++ }`.
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -423,17 +563,21 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::LocalSet(scratch));
     emit_coerce_number(function, scratch, helpers);
-    function.instruction(&Instruction::LocalGet(acc));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    function.instruction(&Instruction::LocalGet(scratch));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    if is_min {
-        function.instruction(&Instruction::F64Min);
+    if is_hypot {
+        emit_hypot_step(function, scratch, acc, ssq, flags);
     } else {
-        function.instruction(&Instruction::F64Max);
+        function.instruction(&Instruction::LocalGet(acc));
+        function.instruction(&Instruction::F64ReinterpretI64);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::F64ReinterpretI64);
+        if is_min {
+            function.instruction(&Instruction::F64Min);
+        } else {
+            function.instruction(&Instruction::F64Max);
+        }
+        function.instruction(&Instruction::I64ReinterpretF64);
+        function.instruction(&Instruction::LocalSet(acc));
     }
-    function.instruction(&Instruction::I64ReinterpretF64);
-    function.instruction(&Instruction::LocalSet(acc));
     // idx++ and continue.
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::I32Const(1));
@@ -448,7 +592,97 @@ pub(super) fn emit_math_spread(
     // The accumulator holds the folded result's f64 bits; rebox it as a number.
     function.instruction(&Instruction::LocalGet(acc));
     function.instruction(&Instruction::F64ReinterpretI64);
+    if is_hypot {
+        // `flags & 1 ? Infinity : flags & 2 ? NaN : scale * sqrt(ssq)`.
+        function.instruction(&Instruction::LocalGet(ssq));
+        function.instruction(&Instruction::F64ReinterpretI64);
+        function.instruction(&Instruction::F64Sqrt);
+        function.instruction(&Instruction::F64Mul);
+        function.instruction(&Instruction::F64Const(Ieee64::from(f64::NAN)));
+        function.instruction(&Instruction::LocalGet(flags));
+        function.instruction(&Instruction::I64Const(2));
+        function.instruction(&Instruction::I64And);
+        function.instruction(&Instruction::I64Eqz);
+        function.instruction(&Instruction::Select);
+        function.instruction(&Instruction::F64Const(Ieee64::from(f64::INFINITY)));
+        function.instruction(&Instruction::LocalGet(flags));
+        function.instruction(&Instruction::I64Const(1));
+        function.instruction(&Instruction::I64And);
+        function.instruction(&Instruction::I64Eqz);
+        function.instruction(&Instruction::Select);
+    }
     emit_box_f64(function, helpers);
+}
+
+/// One `Math.hypot` fold step over the number jsval in `x` (see
+/// [`emit_math_spread`]): an infinite or NaN `|x|` sets flag bit 1 / 2; a
+/// new largest `|x|` rescales `ssq` to `1 + ssq * (scale / |x|)²` and becomes
+/// `scale`; any other nonzero `|x|` adds `(|x| / scale)²`.
+fn emit_hypot_step(function: &mut Function, x: u32, scale: u32, ssq: u32, flags: u32) {
+    let get = |function: &mut Function, local: u32| {
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::F64ReinterpretI64);
+    };
+    let set_flag = |function: &mut Function, bit: i64| {
+        function.instruction(&Instruction::LocalGet(flags));
+        function.instruction(&Instruction::I64Const(bit));
+        function.instruction(&Instruction::I64Or);
+        function.instruction(&Instruction::LocalSet(flags));
+    };
+    // `x = |x|`.
+    get(function, x);
+    function.instruction(&Instruction::F64Abs);
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::LocalSet(x));
+    get(function, x);
+    function.instruction(&Instruction::F64Const(Ieee64::from(f64::INFINITY)));
+    function.instruction(&Instruction::F64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    set_flag(function, 1);
+    function.instruction(&Instruction::Else);
+    get(function, x);
+    get(function, x);
+    function.instruction(&Instruction::F64Ne);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    set_flag(function, 2);
+    function.instruction(&Instruction::Else);
+    get(function, x);
+    get(function, scale);
+    function.instruction(&Instruction::F64Gt);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    // ssq = 1 + ssq * (scale / x)²; scale = x.
+    let ratio_squared = |function: &mut Function, num: u32, den: u32| {
+        for _ in 0..2 {
+            get(function, num);
+            get(function, den);
+            function.instruction(&Instruction::F64Div);
+        }
+        function.instruction(&Instruction::F64Mul);
+    };
+    function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
+    get(function, ssq);
+    ratio_squared(function, scale, x);
+    function.instruction(&Instruction::F64Mul);
+    function.instruction(&Instruction::F64Add);
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::LocalSet(ssq));
+    function.instruction(&Instruction::LocalGet(x));
+    function.instruction(&Instruction::LocalSet(scale));
+    function.instruction(&Instruction::Else);
+    // `0 < x <= scale`: ssq += (x / scale)².
+    get(function, x);
+    function.instruction(&Instruction::F64Const(Ieee64::from(0.0)));
+    function.instruction(&Instruction::F64Gt);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    get(function, ssq);
+    ratio_squared(function, x, scale);
+    function.instruction(&Instruction::F64Add);
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::LocalSet(ssq));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
 }
 
 /// Emit `Math.pow(base, exp)` (and `base ** exp`), leaving a number jsval on the

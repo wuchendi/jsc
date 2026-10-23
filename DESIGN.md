@@ -584,7 +584,8 @@ in the data segment (§4.2), so it has one identity for the whole run.
 ### 5.6 `__alloc` and memory growth
 
 `__alloc(size: i32) -> i32` is a bump allocator over the `$__heap_ptr` global,
-which starts at the first free offset after the static region:
+which starts at the first free offset after the static region (the module
+declares enough initial pages to hold that region):
 
 1. Round `size` up to 8; `old = __heap_ptr`; `end = u64(old) + u64(size)`
    (computed in `i64`, so it cannot wrap).
@@ -658,7 +659,7 @@ Every module imports exactly seven functions from the `"env"` namespace
 |---|---|---|---|
 | 0 | `print` | `(bits: i64, flag: i32) -> ()` | `console.log` |
 | 1 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
-| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search/slice, string methods, `Number.prototype.toString` |
+| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search/slice, string methods, `Number.prototype` digit formatting, host `Math` functions |
 | 3 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn |
 | 4 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
 | 5 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
@@ -681,8 +682,29 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   `9` `trimEnd`, `10` `repeat`, `11` `startsWith`, `12` `endsWith`,
   `13` `padStart`, `14` `padEnd`, `15` `substring`, `16` `split`,
   `17` `Number.prototype.toString(radix)` (a number receiver and an integral
-  radix in `2..=36`). The host dispatches on the receiver's type byte for the
-  names shared by arrays and strings. The calling string builtin coerces the
+  radix in `2..=36`), `18` `at`, `19` `charCodeAt`, `20` `codePointAt`,
+  `21` `lastIndexOf`, `22` `localeCompare` (code-unit order), `23`
+  `normalize`, `24` the index of a RegExp-free `search` / `match` pattern,
+  `25` `replace` / `26` `replaceAll` with a string pattern and a replacement
+  template (`GetSubstitution` without captures) or the array of a function
+  replacer's results, `27` `String.fromCharCode` /
+  `28` `String.fromCodePoint` (an array receiver of the guest-coerced
+  numbers), `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
+  finite number receiver and an integral digit count already range-checked
+  in the guest; `undefined` for a `toExponential` without digits; rendered
+  from the exact decimal expansion, ties away from zero), `43` a `Math`
+  function (`arg1` the `MATH_FN_*` code: `cbrt`, `log`, `log2`, `log10`,
+  `log1p`, `exp`, `expm1`, the trigonometric and hyperbolic functions and
+  their inverses, `atan2` with `x` in `arg0`, and `random`; the Rust host
+  uses the platform libm and a `xorshift64*` generator, the JS shim its own
+  `Math`). The host dispatches on the receiver's type byte for the
+  names shared by arrays and strings. A string op that cannot produce a
+  correct result returns a refusal sentinel the calling builtin throws:
+  `METHOD_UNSUPPORTED` (`HOLE`; a byte offset crossing a non-ASCII byte, a
+  lone surrogate, §13) as a named `TypeError`,
+  `METHOD_RANGE_ERROR` (`undefined | 2`, an unknown `normalize` form) as a
+  `RangeError`, `METHOD_NEEDS_REGEXP` (`undefined | 3`, a `search` / `match`
+  pattern with RegExp syntax) as a `TypeError`. The calling string builtin coerces the
   receiver (`ToString`) and its arguments (`ToString` or `ToNumber`, keeping
   `undefined` where it selects the host default) in the guest first, so user
   `toString`/`valueOf` run in the guest and the host only sees primitives.
@@ -1154,12 +1176,18 @@ those of `switch` and loops are not tracked.
 ### 7.7 Errors
 
 - `Error`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`,
-  `EvalError`, `URIError` are `SELF_ALLOC` constructors (callable with or
-  without `new`). An error object is a `CLASS_ERROR` object whose `proto` is
+  `EvalError`, `URIError`, `AggregateError` are `SELF_ALLOC` constructors
+  (callable with or without `new`). An error object is a `CLASS_ERROR` object whose `proto` is
   `new.target.prototype` (one of the static `%…Error.prototype%` blocks unless
   subclassed) with own non-enumerable `message` (only when one was given) and
   `stack` (`"Name: message"`, a single line, no frames); `name` is inherited.
   `Error.prototype.toString` formats `Name: message`.
+- `AggregateError(errors, message, options)` takes the message second, adds
+  an own non-enumerable `cause` when `options` is an object with a `cause`
+  property, then an own non-enumerable `errors` array of the values iterating
+  `errors` yields (`TypeError` when it is not iterable). It always runs its
+  constructor body; the other kinds lower `Error(m)` / `new Error(m)`
+  syntactically and ignore `options` (no `cause`).
 - `throw` accepts any value.
 - **Engine-raised errors** are real error objects linked to the same static
   prototypes, catchable with `try`/`catch` and recognised by `instanceof`:
@@ -1216,14 +1244,14 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 
 | area | supported |
 |---|---|
-| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`; `parseInt(s, radix)`, `parseFloat(s)` as direct calls |
+| global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` |
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin` — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
-| `String` | `String(v)`, `new String(v)` (wrapper); `indexOf`, `includes`, `slice`, `substring`, `charAt`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`, `repeat`, `startsWith`, `endsWith`, `padStart`, `padEnd`, `split`, `toString`, `valueOf`; `.length`, indexing |
-| `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.prototype.toString(radix)`, `valueOf`; `Boolean.prototype.toString`, `valueOf` |
-| `Math` | `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `min`, `max` (variadic), `pow`; `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
+| `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
+| `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
+| `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`; Set `add`/`has`/`delete`/`clear`/`forEach`/`size` |
 | `Promise` | §6.7, §7.8 |
@@ -1310,23 +1338,33 @@ Errors are printed to stderr.
   idempotent.
 - **Harness.** At startup the runner reads every `.tmp/test262/harness/*.js`,
   checks that `sta.js` + `assert.js` compile and run (a setup error otherwise),
-  drops `doneprintHandle.js` (needs a host `print` and an async runner) and
-  `propertyHelper.js` (needs descriptor reflection), and probes each remaining
-  include together with `sta.js` + `assert.js`; only the includes that compile
-  are usable, and it prints their list.
+  drops `propertyHelper.js` (needs descriptor reflection), and probes each
+  remaining include together with `sta.js` + `assert.js` (`doneprintHandle.js`
+  after the host `print` prelude, as async tests use it); only the includes
+  that compile are usable, and it prints their list.
 - **Eligibility** (`filter.rs`). A test is skipped when it has a `module`,
-  `async`, `CanBlockIsFalse`, or `CanBlockIsTrue` flag (or a `resolution`-phase
+  `CanBlockIsFalse`, or `CanBlockIsTrue` flag (or a `resolution`-phase
   negative), is `noStrict`-only, uses a feature listed in
   `tests/test262/unsupported-features.txt` (exact names or `prefix*`), or needs a
-  harness include that is not usable.
+  harness include that is not usable (`async` tests implicitly need
+  `doneprintHandle.js`). A test flagged both `raw` and `async` is skipped as
+  `flag:async`: a raw source leaves no place to prepend `$DONE`.
 - **Assembly** (`assemble.rs`). `raw` tests run byte-for-byte; all others are
   `"use strict";` + `sta.js` + `assert.js` + the listed includes + the test
-  source, all unmodified.
+  source, all unmodified. `async` tests additionally get the runner-owned host
+  prelude `function print(message) { console.log(message); }` right after the
+  directive (test262 `INTERPRETING.md` makes `print` host-defined) and
+  `doneprintHandle.js` as the first include (once, even if listed).
 - **Outcome** (`outcome.rs`). Each test runs as `jsc FILE` with a timeout
-  (default 10 s); exit codes map to pass / fail / compile-error / timeout, with
-  negative tests matched on parse versus runtime phase and the uncaught error
-  name (builtin errors render as `Uncaught TypeError: …`, a failed assertion as
-  `Uncaught Test262Error { … }`).
+  (default 10 s), stdout and stderr captured to files; exit codes map to pass /
+  fail / compile-error / timeout, with negative tests matched on parse versus
+  runtime phase and the uncaught error name (builtin errors render as
+  `Uncaught TypeError: …`, a failed assertion as `Uncaught Test262Error { … }`).
+  A non-negative `async` test that exits 0 passes only if stdout has a line
+  exactly `Test262:AsyncTestComplete` and none starting
+  `Test262:AsyncTestFailure`; otherwise it fails with that failure line (or
+  `missing Test262:AsyncTestComplete`) as the detail in
+  `.tmp/test262-results.tsv`. Negative async tests follow the negative rules.
 - **Baseline.** `tests/test262/baseline.txt` lists every passing test path.
   `--check` fails if any baseline test no longer passes; `--update-baseline`
   merges the current passes into it.
@@ -1336,9 +1374,12 @@ Errors are printed to stderr.
   | commit | pass | eligible | total |
   |---|---|---|---|
   | `319208e` | 10185 | 23208 | 47665 |
+  | `d0f5e6a` | 10269 | 26388 | 47665 |
 
-  i.e. **10185 / 23208 eligible tests pass (≈ 43.9 %)**, out of 47665 tests in
-  the pinned checkout; `baseline.txt` holds the same 10185 paths.
+  i.e. **10269 / 26388 eligible tests pass (≈ 38.9 %)**, out of 47665 tests in
+  the pinned checkout; `baseline.txt` holds the same 10269 paths. The drop in
+  rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); the
+  previously eligible 23208 still pass 10185.
 
 **Running it** (from the repository root):
 
@@ -1469,8 +1510,29 @@ Each item below is current behaviour of this tree.
 **Values & operators**
 
 - Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
-  `slice`, `charAt`, `split("")`, string spread, and `for-of` over a string all
-  work per byte (`"é".length` is `2`). Case mapping and trimming are ASCII-only.
+  string spread, and `for-of` over a string work per byte (`"é".length` is
+  `2`). The `String.prototype` methods are exact for ASCII strings. The
+  search methods work in exact UTF-16 offsets for any text: `indexOf`,
+  `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `search`, the
+  `match` index and the positions a `replace` / `replaceAll` function
+  replacer receives (so they disagree with the byte `.length`). The methods
+  that build text from positions or lengths keep byte offsets and throw a
+  `TypeError` (`String.prototype.X does not support non-ASCII strings yet`)
+  when an offset would cross a non-ASCII byte: `at`, `charAt`,
+  `charCodeAt`, `codePointAt` (an index past a non-ASCII byte; `at` with a
+  negative index on any non-ASCII string), `slice` / `substring` (an
+  endpoint past a non-ASCII byte; a negative `slice` endpoint on any
+  non-ASCII string), `padStart` / `padEnd` (a non-ASCII receiver or fill),
+  `split("")` (a non-ASCII receiver), and `normalize` (any non-ASCII
+  receiver). Content-only results stay exact for any text: `concat`,
+  `repeat`, `split` on a non-empty separator, `replace` / `replaceAll`
+  (an empty pattern over text with astral characters throws: it would split
+  a surrogate pair), `toUpperCase` / `toLowerCase` (full Unicode mappings),
+  `trim*` (JS whitespace), `localeCompare`. `String.fromCharCode` /
+  `fromCodePoint` throw a `TypeError` for a lone surrogate. `search` /
+  `match` / `matchAll` interpret a string pattern as RegExp source: a
+  pattern with RegExp syntax throws a `TypeError`, and `matchAll` (a RegExp
+  string iterator) always throws one.
 - No comma/sequence expressions, no `void`.
 - Not available: `RegExp` (literals and constructor), `Symbol` (so no
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
@@ -1478,9 +1540,12 @@ Each item below is current behaviour of this tree.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9: no property-descriptor or prototype
   reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Array.prototype.keys` / `values` / `entries`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
+  `assign`), no `Array.prototype.keys` / `values` / `entries`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
-- `parseInt` and `parseFloat` exist only as direct calls, not as global values.
+- A direct `parseInt(..)` / `parseFloat(..)` call always runs the builtin
+  conversion, even after the global binding is reassigned.
+- The `Math` transcendental functions follow the host libm (Rust) or the JS
+  engine (shim), which may differ in the last ulp.
 
 **Object model**
 
@@ -1604,7 +1669,6 @@ installed on the realm's prototypes, and phase 3 extends that set.
   `String`, `Number`, and `Math`; `Date` parsing and local time.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
-- `AggregateError`.
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
   and surrogate pairs.
 

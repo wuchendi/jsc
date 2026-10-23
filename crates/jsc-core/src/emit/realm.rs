@@ -278,10 +278,26 @@ pub(super) enum Builtin {
     StringToString,
     /// `String.prototype.valueOf`.
     StringValueOf,
+    /// `String.fromCharCode`.
+    StringFromCharCode,
+    /// `String.fromCodePoint`.
+    StringFromCodePoint,
+    /// `String.raw`.
+    StringRaw,
     /// `Number.prototype.toString`.
     NumberToString,
     /// `Number.prototype.valueOf`.
     NumberValueOf,
+    /// `Number.prototype.toFixed`.
+    NumberToFixed,
+    /// `Number.prototype.toExponential`.
+    NumberToExponential,
+    /// `Number.prototype.toPrecision`.
+    NumberToPrecision,
+    /// `Number.prototype.toLocaleString`: `toString()` (no locale data).
+    NumberToLocaleString,
+    /// A `Number` predicate static (`Number.isInteger`, ..): no coercion.
+    NumberIs(NumberTest),
     /// `Boolean.prototype.toString`.
     BooleanToString,
     /// `Boolean.prototype.valueOf`.
@@ -336,6 +352,76 @@ pub(super) enum Builtin {
     IsNaN,
     /// The global `isFinite`.
     IsFinite,
+    /// The global `parseFloat` (also `Number.parseFloat`).
+    ParseFloat,
+    /// The global `parseInt` (also `Number.parseInt`).
+    ParseInt,
+}
+
+/// A `Number` predicate static.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NumberTest {
+    /// `Number.isInteger`.
+    Integer,
+    /// `Number.isSafeInteger`.
+    SafeInteger,
+    /// `Number.isFinite`.
+    Finite,
+    /// `Number.isNaN`.
+    NaN,
+}
+
+impl NumberTest {
+    /// The static's name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Integer => "isInteger",
+            Self::SafeInteger => "isSafeInteger",
+            Self::Finite => "isFinite",
+            Self::NaN => "isNaN",
+        }
+    }
+}
+
+/// The name of a `Math` method.
+fn math_name(op: MathOp) -> &'static str {
+    match op {
+        MathOp::Floor => "floor",
+        MathOp::Ceil => "ceil",
+        MathOp::Round => "round",
+        MathOp::Trunc => "trunc",
+        MathOp::Abs => "abs",
+        MathOp::Sqrt => "sqrt",
+        MathOp::Min => "min",
+        MathOp::Max => "max",
+        MathOp::Pow => "pow",
+        MathOp::Sign => "sign",
+        MathOp::Hypot => "hypot",
+        MathOp::Clz32 => "clz32",
+        MathOp::Fround => "fround",
+        MathOp::Imul => "imul",
+        MathOp::Cbrt => "cbrt",
+        MathOp::Log => "log",
+        MathOp::Log2 => "log2",
+        MathOp::Log10 => "log10",
+        MathOp::Log1p => "log1p",
+        MathOp::Exp => "exp",
+        MathOp::Expm1 => "expm1",
+        MathOp::Sin => "sin",
+        MathOp::Cos => "cos",
+        MathOp::Tan => "tan",
+        MathOp::Asin => "asin",
+        MathOp::Acos => "acos",
+        MathOp::Atan => "atan",
+        MathOp::Atan2 => "atan2",
+        MathOp::Sinh => "sinh",
+        MathOp::Cosh => "cosh",
+        MathOp::Tanh => "tanh",
+        MathOp::Asinh => "asinh",
+        MathOp::Acosh => "acosh",
+        MathOp::Atanh => "atanh",
+        MathOp::Random => "random",
+    }
 }
 
 /// An `Array.prototype` method that calls a predicate per index until it
@@ -364,7 +450,8 @@ impl ArrayFindOp {
     }
 }
 
-/// A `String.prototype` method backed by a host `__method` op.
+/// A generic `String.prototype` method: most are backed by a host `__method`
+/// op ([`StringOp::flag`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StringOp {
     IndexOf,
@@ -383,6 +470,18 @@ pub(super) enum StringOp {
     PadEnd,
     Substring,
     Split,
+    At,
+    CharCodeAt,
+    CodePointAt,
+    Concat,
+    LastIndexOf,
+    LocaleCompare,
+    Normalize,
+    Search,
+    Match,
+    MatchAll,
+    Replace,
+    ReplaceAll,
 }
 
 impl StringOp {
@@ -405,6 +504,18 @@ impl StringOp {
             Self::PadEnd => "padEnd",
             Self::Substring => "substring",
             Self::Split => "split",
+            Self::At => "at",
+            Self::CharCodeAt => "charCodeAt",
+            Self::CodePointAt => "codePointAt",
+            Self::Concat => "concat",
+            Self::LastIndexOf => "lastIndexOf",
+            Self::LocaleCompare => "localeCompare",
+            Self::Normalize => "normalize",
+            Self::Search => "search",
+            Self::Match => "match",
+            Self::MatchAll => "matchAll",
+            Self::Replace => "replace",
+            Self::ReplaceAll => "replaceAll",
         }
     }
 
@@ -415,15 +526,16 @@ impl StringOp {
             | Self::ToLowerCase
             | Self::Trim
             | Self::TrimStart
-            | Self::TrimEnd => 0,
-            Self::Slice | Self::Substring | Self::Split => 2,
+            | Self::TrimEnd
+            | Self::Normalize => 0,
+            Self::Slice | Self::Substring | Self::Split | Self::Replace | Self::ReplaceAll => 2,
             _ => 1,
         }
     }
 
-    /// The host `__method` op flag.
-    pub(super) fn flag(self) -> i32 {
-        match self {
+    /// The host `__method` op flag (`concat` and `matchAll` have none).
+    pub(super) fn flag(self) -> Option<i32> {
+        Some(match self {
             Self::IndexOf => abi::METHOD_OP_INDEX_OF,
             Self::Includes => abi::METHOD_OP_INCLUDES,
             Self::Slice => abi::METHOD_OP_SLICE,
@@ -440,13 +552,23 @@ impl StringOp {
             Self::PadEnd => abi::METHOD_OP_PAD_END,
             Self::Substring => abi::METHOD_OP_SUBSTRING,
             Self::Split => abi::METHOD_OP_SPLIT,
-        }
+            Self::At => abi::METHOD_OP_AT,
+            Self::CharCodeAt => abi::METHOD_OP_CHAR_CODE_AT,
+            Self::CodePointAt => abi::METHOD_OP_CODE_POINT_AT,
+            Self::LastIndexOf => abi::METHOD_OP_LAST_INDEX_OF,
+            Self::LocaleCompare => abi::METHOD_OP_LOCALE_COMPARE,
+            Self::Normalize => abi::METHOD_OP_NORMALIZE,
+            Self::Search | Self::Match => abi::METHOD_OP_SEARCH,
+            Self::Replace => abi::METHOD_OP_REPLACE,
+            Self::ReplaceAll => abi::METHOD_OP_REPLACE_ALL,
+            Self::Concat | Self::MatchAll => return None,
+        })
     }
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 136] = [
+    pub(super) const ALL: [Builtin; 188] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -466,6 +588,32 @@ impl Builtin {
         Self::Math(MathOp::Min),
         Self::Math(MathOp::Max),
         Self::Math(MathOp::Pow),
+        Self::Math(MathOp::Sign),
+        Self::Math(MathOp::Hypot),
+        Self::Math(MathOp::Clz32),
+        Self::Math(MathOp::Fround),
+        Self::Math(MathOp::Imul),
+        Self::Math(MathOp::Cbrt),
+        Self::Math(MathOp::Log),
+        Self::Math(MathOp::Log2),
+        Self::Math(MathOp::Log10),
+        Self::Math(MathOp::Log1p),
+        Self::Math(MathOp::Exp),
+        Self::Math(MathOp::Expm1),
+        Self::Math(MathOp::Sin),
+        Self::Math(MathOp::Cos),
+        Self::Math(MathOp::Tan),
+        Self::Math(MathOp::Asin),
+        Self::Math(MathOp::Acos),
+        Self::Math(MathOp::Atan),
+        Self::Math(MathOp::Atan2),
+        Self::Math(MathOp::Sinh),
+        Self::Math(MathOp::Cosh),
+        Self::Math(MathOp::Tanh),
+        Self::Math(MathOp::Asinh),
+        Self::Math(MathOp::Acosh),
+        Self::Math(MathOp::Atanh),
+        Self::Math(MathOp::Random),
         Self::JsonStringify,
         Self::JsonParse,
         Self::ConsoleLog,
@@ -482,6 +630,7 @@ impl Builtin {
         Self::Ctor(BuiltinCtor::Error(ErrorKind::SyntaxError)),
         Self::Ctor(BuiltinCtor::Error(ErrorKind::EvalError)),
         Self::Ctor(BuiltinCtor::Error(ErrorKind::UriError)),
+        Self::Ctor(BuiltinCtor::Error(ErrorKind::AggregateError)),
         Self::Ctor(BuiltinCtor::Map),
         Self::Ctor(BuiltinCtor::Set),
         Self::Ctor(BuiltinCtor::Promise),
@@ -541,10 +690,33 @@ impl Builtin {
         Self::StringMethod(StringOp::PadEnd),
         Self::StringMethod(StringOp::Substring),
         Self::StringMethod(StringOp::Split),
+        Self::StringMethod(StringOp::At),
+        Self::StringMethod(StringOp::CharCodeAt),
+        Self::StringMethod(StringOp::CodePointAt),
+        Self::StringMethod(StringOp::Concat),
+        Self::StringMethod(StringOp::LastIndexOf),
+        Self::StringMethod(StringOp::LocaleCompare),
+        Self::StringMethod(StringOp::Normalize),
+        Self::StringMethod(StringOp::Search),
+        Self::StringMethod(StringOp::Match),
+        Self::StringMethod(StringOp::MatchAll),
+        Self::StringMethod(StringOp::Replace),
+        Self::StringMethod(StringOp::ReplaceAll),
         Self::StringToString,
         Self::StringValueOf,
+        Self::StringFromCharCode,
+        Self::StringFromCodePoint,
+        Self::StringRaw,
         Self::NumberToString,
         Self::NumberValueOf,
+        Self::NumberToFixed,
+        Self::NumberToExponential,
+        Self::NumberToPrecision,
+        Self::NumberToLocaleString,
+        Self::NumberIs(NumberTest::Integer),
+        Self::NumberIs(NumberTest::SafeInteger),
+        Self::NumberIs(NumberTest::Finite),
+        Self::NumberIs(NumberTest::NaN),
         Self::BooleanToString,
         Self::BooleanValueOf,
         Self::DateMethod(DateOp::ToString),
@@ -610,6 +782,8 @@ impl Builtin {
         Self::IterSource,
         Self::IsNaN,
         Self::IsFinite,
+        Self::ParseFloat,
+        Self::ParseInt,
     ];
 
     /// The function's `name`.
@@ -642,20 +816,20 @@ impl Builtin {
             Self::GeneratorReturn => "return",
             Self::GeneratorThrow => "throw",
             Self::StringMethod(op) => op.name(),
+            Self::StringFromCharCode => "fromCharCode",
+            Self::StringFromCodePoint => "fromCodePoint",
+            Self::StringRaw => "raw",
             Self::Call => "call",
             Self::Apply => "apply",
             Self::Bind => "bind",
-            Self::Math(op) => match op {
-                MathOp::Floor => "floor",
-                MathOp::Ceil => "ceil",
-                MathOp::Round => "round",
-                MathOp::Trunc => "trunc",
-                MathOp::Abs => "abs",
-                MathOp::Sqrt => "sqrt",
-                MathOp::Min => "min",
-                MathOp::Max => "max",
-                MathOp::Pow => "pow",
-            },
+            Self::Math(op) => math_name(op),
+            Self::NumberToFixed => "toFixed",
+            Self::NumberToExponential => "toExponential",
+            Self::NumberToPrecision => "toPrecision",
+            Self::NumberToLocaleString => "toLocaleString",
+            Self::NumberIs(test) => test.name(),
+            Self::ParseFloat => "parseFloat",
+            Self::ParseInt => "parseInt",
             Self::JsonStringify => "stringify",
             Self::JsonParse => "parse",
             Self::ConsoleLog => "log",
@@ -710,6 +884,8 @@ impl Builtin {
             | Self::StringToString
             | Self::StringValueOf
             | Self::NumberValueOf
+            | Self::NumberToLocaleString
+            | Self::Math(MathOp::Random)
             | Self::BooleanToString
             | Self::BooleanValueOf
             | Self::ObjectToString
@@ -730,7 +906,16 @@ impl Builtin {
             | Self::ArrayShift
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
-            Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow)
+            Self::Math(
+                MathOp::Min
+                | MathOp::Max
+                | MathOp::Pow
+                | MathOp::Hypot
+                | MathOp::Atan2
+                | MathOp::Imul,
+            )
+            | Self::Ctor(BuiltinCtor::Error(ErrorKind::AggregateError))
+            | Self::ParseInt
             | Self::Apply
             | Self::JsonParse
             | Self::ArraySlice
@@ -763,6 +948,11 @@ impl Builtin {
             | Self::ArrayUnshift
             | Self::ArrayFill
             | Self::NumberToString
+            | Self::NumberToFixed
+            | Self::NumberToExponential
+            | Self::NumberToPrecision
+            | Self::NumberIs(_)
+            | Self::ParseFloat
             | Self::IsNaN
             | Self::IsFinite
             | Self::DateToJson
@@ -772,7 +962,10 @@ impl Builtin {
             | Self::PromiseFinally
             | Self::GeneratorNext
             | Self::GeneratorReturn
-            | Self::GeneratorThrow => 1,
+            | Self::GeneratorThrow
+            | Self::StringFromCharCode
+            | Self::StringFromCodePoint
+            | Self::StringRaw => 1,
             Self::StringMethod(op) => op.length(),
             Self::JsonStringify => 3,
         }
@@ -806,7 +999,12 @@ impl Builtin {
             Self::StringMethod(_) | Self::StringToString | Self::StringValueOf => {
                 Some(BuiltinCtor::String)
             }
-            Self::NumberToString | Self::NumberValueOf => Some(BuiltinCtor::Number),
+            Self::NumberToString
+            | Self::NumberValueOf
+            | Self::NumberToFixed
+            | Self::NumberToExponential
+            | Self::NumberToPrecision
+            | Self::NumberToLocaleString => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
             Self::DateMethod(_) | Self::DateToJson => Some(BuiltinCtor::Date),
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
@@ -915,9 +1113,21 @@ const MATH_CONSTANTS: [(&str, f64); 8] = [
     ("SQRT2", std::f64::consts::SQRT_2),
 ];
 
+/// The `Number` value properties.
+const NUMBER_CONSTANTS: [(&str, f64); 8] = [
+    ("EPSILON", f64::EPSILON),
+    ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0),
+    ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+    ("MAX_VALUE", f64::MAX),
+    ("MIN_VALUE", 5e-324),
+    ("NaN", f64::NAN),
+    ("POSITIVE_INFINITY", f64::INFINITY),
+    ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+];
+
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 26] = [
+const GLOBALS: [(&str, u32, Value); 29] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -1001,6 +1211,13 @@ const GLOBALS: [(&str, u32, Value); 26] = [
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(ErrorKind::UriError))),
     ),
     (
+        "AggregateError",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Error(
+            ErrorKind::AggregateError,
+        ))),
+    ),
+    (
         "Map",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Map)),
@@ -1022,6 +1239,12 @@ const GLOBALS: [(&str, u32, Value); 26] = [
     ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
+    (
+        "parseFloat",
+        METHOD_ATTRS,
+        Value::Method(Builtin::ParseFloat),
+    ),
+    ("parseInt", METHOD_ATTRS, Value::Method(Builtin::ParseInt)),
 ];
 
 /// The registry: every own property of every intrinsic, in slot order per
@@ -1151,13 +1374,31 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
             ],
             BuiltinCtor::Array => &[Builtin::IsArray, Builtin::ArrayOf, Builtin::ArrayFrom],
+            BuiltinCtor::String => &[
+                Builtin::StringFromCharCode,
+                Builtin::StringFromCodePoint,
+                Builtin::StringRaw,
+            ],
             BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
             BuiltinCtor::Date => &[Builtin::DateNow],
+            BuiltinCtor::Number => &[
+                Builtin::NumberIs(NumberTest::Integer),
+                Builtin::NumberIs(NumberTest::SafeInteger),
+                Builtin::NumberIs(NumberTest::Finite),
+                Builtin::NumberIs(NumberTest::NaN),
+                Builtin::ParseFloat,
+                Builtin::ParseInt,
+            ],
             _ => &[],
         };
         for &builtin in statics {
             let method = Value::Method(builtin);
             entries.push(entry(intrinsic, builtin.name(), METHOD_ATTRS, method));
+        }
+        if ctor == BuiltinCtor::Number {
+            for (key, value) in NUMBER_CONSTANTS {
+                entries.push(entry(intrinsic, key, CONST_ATTRS, Value::Num(value)));
+            }
         }
         let ctor = Value::Intrinsic(intrinsic);
         entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
