@@ -43,18 +43,25 @@ pub enum Mode {
     Strict,
     /// Source run unmodified (`raw` flag).
     Raw,
+    /// `async` flag: like [`Mode::Strict`] plus a host `print` prelude and
+    /// `doneprintHandle.js`; judged by the `$DONE` completion line on stdout.
+    Async,
 }
+
+/// Harness file defining `$DONE`, prepended to every [`Mode::Async`] test.
+pub const DONE_PRINT: &str = "doneprintHandle.js";
 
 /// Why a test was not run.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkipReason {
-    /// Unsupported flag (`module`, `async`, `CanBlockIs*`).
+    /// Unsupported flag (`module`, `CanBlockIs*`, or `async` together with
+    /// `raw`, which leaves no place to prepend `doneprintHandle.js`).
     Flag(String),
     /// Sloppy-mode-only test.
     NoStrict,
     /// Denied feature.
     Feature(String),
-    /// Harness include that does not compile with jsc, or is kept out of M1.
+    /// Harness include that does not compile with jsc or is excluded.
     Include(String),
 }
 
@@ -72,17 +79,22 @@ impl SkipReason {
 
 /// Classifies a test by its metadata. `compiling` holds the harness include
 /// names that compile with jsc (`assert.js` / `sta.js` are implicit and never
-/// listed).
+/// listed); async tests also need [`DONE_PRINT`] in it.
 pub fn classify(
     meta: &Meta,
     deny: &Denylist,
     compiling: &BTreeSet<String>,
 ) -> Result<Mode, SkipReason> {
     let has = |flag: &str| meta.flags.iter().any(|f| f == flag);
-    for flag in ["module", "async", "CanBlockIsFalse", "CanBlockIsTrue"] {
+    for flag in ["module", "CanBlockIsFalse", "CanBlockIsTrue"] {
         if has(flag) {
             return Err(SkipReason::Flag(flag.to_owned()));
         }
+    }
+    let raw = has("raw");
+    let is_async = has("async");
+    if raw && is_async {
+        return Err(SkipReason::Flag("async".to_owned()));
     }
     if meta
         .negative
@@ -91,7 +103,6 @@ pub fn classify(
     {
         return Err(SkipReason::Flag("module".to_owned()));
     }
-    let raw = has("raw");
     if !raw && has("noStrict") {
         return Err(SkipReason::NoStrict);
     }
@@ -101,14 +112,15 @@ pub fn classify(
     if raw {
         return Ok(Mode::Raw);
     }
-    if let Some(i) = meta
-        .includes
-        .iter()
-        .find(|i| !compiling.contains(i.as_str()))
+    let implicit = is_async.then_some(DONE_PRINT);
+    if let Some(i) = implicit
+        .into_iter()
+        .chain(meta.includes.iter().map(String::as_str))
+        .find(|i| !compiling.contains(*i))
     {
-        return Err(SkipReason::Include(i.clone()));
+        return Err(SkipReason::Include(i.to_owned()));
     }
-    Ok(Mode::Strict)
+    Ok(if is_async { Mode::Async } else { Mode::Strict })
 }
 
 #[cfg(test)]
@@ -128,13 +140,13 @@ mod tests {
 
     fn run(m: &Meta) -> Result<Mode, SkipReason> {
         let deny = Denylist::parse("# unsupported\nSymbol*\n\nProxy  # exact\n");
-        let compiling = BTreeSet::from(["compareArray.js".to_owned()]);
+        let compiling = BTreeSet::from(["compareArray.js".to_owned(), DONE_PRINT.to_owned()]);
         classify(m, &deny, &compiling)
     }
 
     #[test]
     fn flag_rules() {
-        for f in ["module", "async", "CanBlockIsFalse", "CanBlockIsTrue"] {
+        for f in ["module", "CanBlockIsFalse", "CanBlockIsTrue"] {
             assert_eq!(run(&meta(&[f], &[], &[])), Err(SkipReason::Flag(f.into())));
         }
         let mut m = meta(&[], &[], &[]);
@@ -157,6 +169,37 @@ mod tests {
         assert_eq!(
             run(&meta(&["raw"], &["Symbol"], &[])),
             Err(SkipReason::Feature("Symbol".into()))
+        );
+    }
+
+    #[test]
+    fn async_tests() {
+        assert_eq!(run(&meta(&["async"], &[], &[])), Ok(Mode::Async));
+        assert_eq!(
+            run(&meta(&["async"], &[], &["compareArray.js", DONE_PRINT])),
+            Ok(Mode::Async)
+        );
+        assert_eq!(
+            run(&meta(&["async", "raw"], &[], &[])),
+            Err(SkipReason::Flag("async".into()))
+        );
+        assert_eq!(
+            run(&meta(&["async", "module"], &[], &[])),
+            Err(SkipReason::Flag("module".into()))
+        );
+        assert_eq!(
+            run(&meta(&["async"], &[], &["asyncHelpers.js"])).map_err(|r| r.label()),
+            Err("include:asyncHelpers.js".into())
+        );
+        let deny = Denylist::default();
+        let no_done = BTreeSet::from(["compareArray.js".to_owned()]);
+        assert_eq!(
+            classify(&meta(&["async"], &[], &[]), &deny, &no_done).map_err(|r| r.label()),
+            Err("include:doneprintHandle.js".into())
+        );
+        assert_eq!(
+            classify(&meta(&[], &[], &[]), &deny, &no_done),
+            Ok(Mode::Strict)
         );
     }
 

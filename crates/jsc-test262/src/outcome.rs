@@ -14,6 +14,12 @@
 //! `Test262Error.thrower`, which renders as `Uncaught Test262Error { message:
 //! x }` and so reports the name `Test262Error`. `$DONOTEVALUATE()` throws a
 //! string (`Uncaught Test262: This statement ...`), which never matches.
+//!
+//! # Async tests
+//!
+//! A non-negative `flag:async` test that exits 0 is judged by the `$DONE`
+//! report on stdout ([`classify_async`]); every other async result follows
+//! the rules above.
 
 use crate::frontmatter::Negative;
 
@@ -104,6 +110,37 @@ pub fn classify(status: Status, stderr: &str, negative: Option<&Negative>) -> Ou
             Verdict::CompileError => Outcome::Pass,
             _ => Outcome::Fail,
         },
+    }
+}
+
+/// Line `$DONE()` prints on success.
+pub const ASYNC_COMPLETE: &str = "Test262:AsyncTestComplete";
+/// Prefix of the line `$DONE(error)` prints.
+pub const ASYNC_FAILURE: &str = "Test262:AsyncTestFailure";
+/// Failure detail when an async test exits 0 without reporting completion.
+pub const MISSING_COMPLETE: &str = "missing Test262:AsyncTestComplete";
+
+/// Classifies an async test. A non-negative test that exits 0 passes iff
+/// stdout has a line exactly [`ASYNC_COMPLETE`] and none starting with
+/// [`ASYNC_FAILURE`]; otherwise it fails with the failure line (or
+/// [`MISSING_COMPLETE`]) as the detail. Other cases defer to [`classify`]
+/// with no detail.
+pub fn classify_async(
+    status: Status,
+    stdout: &str,
+    stderr: &str,
+    negative: Option<&Negative>,
+) -> (Outcome, Option<String>) {
+    if negative.is_some() || status != Status::Exited(0) {
+        return (classify(status, stderr, negative), None);
+    }
+    if let Some(line) = stdout.lines().find(|l| l.starts_with(ASYNC_FAILURE)) {
+        return (Outcome::Fail, Some(line.to_owned()));
+    }
+    if stdout.lines().any(|l| l == ASYNC_COMPLETE) {
+        (Outcome::Pass, None)
+    } else {
+        (Outcome::Fail, Some(MISSING_COMPLETE.to_owned()))
     }
 }
 
@@ -214,6 +251,73 @@ mod tests {
         assert_eq!(
             classify(Status::Exited(1), not_evaluated, Some(&t262)),
             Outcome::Fail
+        );
+    }
+
+    #[test]
+    fn async_positive() {
+        let done = "Test262:AsyncTestComplete\n";
+        let failure = "Test262:AsyncTestFailure:Test262Error: boom";
+        let ok = Status::Exited(0);
+        assert_eq!(classify_async(ok, done, "", None), (Outcome::Pass, None));
+        assert_eq!(
+            classify_async(ok, &format!("log\n{done}more\n"), "", None),
+            (Outcome::Pass, None)
+        );
+        assert_eq!(
+            classify_async(ok, &format!("{failure}\n"), "", None),
+            (Outcome::Fail, Some(failure.to_owned()))
+        );
+        assert_eq!(
+            classify_async(ok, &format!("{done}{failure}\n"), "", None),
+            (Outcome::Fail, Some(failure.to_owned()))
+        );
+        for stdout in [
+            "",
+            "x\n",
+            " Test262:AsyncTestComplete\n",
+            "Test262:AsyncTestComplete!\n",
+        ] {
+            assert_eq!(
+                classify_async(ok, stdout, "", None),
+                (Outcome::Fail, Some(MISSING_COMPLETE.to_owned())),
+                "{stdout:?}"
+            );
+        }
+        assert_eq!(
+            classify_async(Status::Exited(2), done, "error: x", None),
+            (Outcome::CompileError, None)
+        );
+        assert_eq!(
+            classify_async(Status::TimedOut, done, "", None),
+            (Outcome::Timeout, None)
+        );
+        assert_eq!(
+            classify_async(Status::Exited(1), done, UNCAUGHT, None),
+            (Outcome::Fail, None)
+        );
+    }
+
+    #[test]
+    fn async_negative_follows_negative_rules() {
+        let parse = neg("parse", "SyntaxError");
+        assert_eq!(
+            classify_async(Status::Exited(2), "", "error: x", Some(&parse)),
+            (Outcome::Pass, None)
+        );
+        let done = "Test262:AsyncTestComplete\n";
+        assert_eq!(
+            classify_async(Status::Exited(0), done, "", Some(&parse)),
+            (Outcome::Fail, None)
+        );
+        let runtime = neg("runtime", "TypeError");
+        assert_eq!(
+            classify_async(Status::Exited(1), "", UNCAUGHT, Some(&runtime)),
+            (Outcome::Pass, None)
+        );
+        assert_eq!(
+            classify_async(Status::Exited(0), done, "", Some(&runtime)),
+            (Outcome::Fail, None)
         );
     }
 }
