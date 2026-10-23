@@ -186,6 +186,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 }
 
 /// Emit the body of `builtin`.
+#[allow(clippy::too_many_lines)]
 pub(super) fn emit_builtin(
     builtin: Builtin,
     strings: &HashMap<String, i32>,

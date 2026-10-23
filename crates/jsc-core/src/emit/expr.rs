@@ -1094,16 +1094,7 @@ pub(super) fn emit_proto_guard(
     for (kind, path) in fast {
         emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
         if matches!(path, IrNode::ArrayPush { .. }) {
-            // An array already `2^32 - 1` long takes the builtin, which sets
-            // the non-index key and throws the RangeError on `length`.
-            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-            function.instruction(&Instruction::LocalGet(scratch + 3));
-            function.instruction(&Instruction::I32Load(array_len_slot()));
-            function.instruction(&Instruction::I32Const(-1));
-            function.instruction(&Instruction::I32Ne);
-            function.instruction(&Instruction::Else);
-            function.instruction(&Instruction::I32Const(0));
-            function.instruction(&Instruction::End);
+            emit_push_room_test(function, scratch + 3);
         }
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
@@ -1144,6 +1135,21 @@ pub(super) fn emit_proto_guard(
         leave_frame(helpers);
         function.instruction(&Instruction::End);
     }
+}
+
+/// AND the passed array kind test on the stack with `length != 2^32 - 1` of
+/// the array base in i32 local `base`: an array that long takes the builtin
+/// `push`, which sets the non-index key and throws the `RangeError` on
+/// `length`.
+fn emit_push_room_test(function: &mut Function, base: u32) {
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
+    function.instruction(&Instruction::I32Const(-1));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
 }
 
 /// The bits of an object's first eight bytes holding its kind byte and its
