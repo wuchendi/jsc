@@ -51,6 +51,7 @@ use crate::ir::{
 /// outside the supported numeric subset.
 #[allow(clippy::too_many_lines)]
 pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
+    early::check(program)?;
     let body: Vec<&Stmt> = match program {
         Program::Script(script) => script.body.iter().collect(),
         Program::Module(module) => module
@@ -540,6 +541,7 @@ struct LowerCtx<'a> {
 
 mod arity;
 mod capture;
+mod early;
 mod expr;
 mod function;
 mod generator;
