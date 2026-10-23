@@ -1428,11 +1428,13 @@ Errors are printed to stderr.
   |---|---|---|---|
   | `319208e` | 10185 | 23208 | 47665 |
   | `d0f5e6a` | 10269 | 26388 | 47665 |
+  | `15be3e0` | 14301 | 30008 | 47665 |
 
-  i.e. **10269 / 26388 eligible tests pass (≈ 38.9 %)**, out of 47665 tests in
-  the pinned checkout; `baseline.txt` holds the same 10269 paths. The drop in
-  rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); the
-  previously eligible 23208 still pass 10185.
+  i.e. **14301 / 30008 eligible tests pass (≈ 47.7 %)**, out of 47665 tests in
+  the pinned checkout; `baseline.txt` holds the same 14301 paths. The drop in
+  rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
+  `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
+  (1413 pass).
 
 **Running it** (from the repository root):
 
