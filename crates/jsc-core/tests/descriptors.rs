@@ -303,6 +303,36 @@ fn array_set_length_descriptor() {
     ]);
 }
 
+/// `ArraySetLength` steps 3-5 run before any rejection: `ToUint32` and
+/// `ToNumber` each convert the value (two `valueOf` calls), an abrupt
+/// conversion propagates, and an invalid length is a `RangeError` even on a
+/// read-only `length` or with `configurable: true`. `a.length = v` on a
+/// read-only `length` throws before converting.
+#[test]
+fn array_set_length_conversion_order() {
+    check(&[
+        (
+            "let n = 0; let v = {valueOf: function () { n++; return 2 }}; let a = [1, 2, 3]; \
+             Object.defineProperty(a, 'length', {value: v}); console.log(a.length, n); \
+             Object.defineProperty(a, 'length', {writable: false}); \
+             console.log(tn(function () { Object.defineProperty(a, 'length', {value: -1}) }), \
+             tn(function () { Object.defineProperty(a, 'length', {value: 1.5, configurable: true}) }), \
+             tn(function () { Object.defineProperty(a, 'length', {value: 3}) }), \
+             tn(function () { Object.defineProperty(a, 'length', {value: v}) }), n, \
+             tn(function () { a.length = v }), n, a.length)",
+            "2 2\nRangeError RangeError TypeError ok 4 TypeError 4 2\n",
+        ),
+        (
+            "let calls = []; let bad = {valueOf: function () { calls.push('v'); return {} }, toString: function () { calls.push('s'); return {} }}; \
+             console.log(tn(function () { Object.defineProperty([], 'length', {value: bad}) }), calls.join()); \
+             console.log(tn(function () { [].length = bad }), calls.join()); \
+             let k = 0; let flip = {valueOf: function () { k++; return k === 1 ? 4294967297 : 1 }}; let b = [1, 2]; \
+             Object.defineProperty(b, 'length', {value: flip}); console.log(b.length, k)",
+            "TypeError v,s\nTypeError v,s,v,s\n1 2\n",
+        ),
+    ]);
+}
+
 /// A non-writable `length` makes every growth and every `length` write
 /// throw; in-range element writes and named keys still work.
 #[test]

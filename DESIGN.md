@@ -1383,8 +1383,7 @@ Errors are printed to stderr.
   idempotent.
 - **Harness.** At startup the runner reads every `.tmp/test262/harness/*.js`,
   checks that `sta.js` + `assert.js` compile and run (a setup error otherwise),
-  drops `propertyHelper.js` (needs descriptor reflection), and probes each
-  remaining include together with `sta.js` + `assert.js` (`doneprintHandle.js`
+  and probes every other include together with `sta.js` + `assert.js` (`doneprintHandle.js`
   after the host `print` prelude, as async tests use it); only the includes
   that compile are usable, and it prints their list.
 - **Eligibility** (`filter.rs`). A test is skipped when it has a `module`,

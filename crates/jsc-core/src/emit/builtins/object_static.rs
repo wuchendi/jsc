@@ -140,12 +140,37 @@ fn emit_apply(
     r: u32,
     helpers: Helpers<'_>,
 ) {
+    define_or_throw(
+        function,
+        o,
+        key,
+        r,
+        |function| {
+            emit_element(function, list, j, 0);
+            wasm!(function; F64ReinterpretI64, I32TruncSatF64U);
+            for slot in 1..4 {
+                emit_element(function, list, j, slot);
+            }
+        },
+        helpers,
+    );
+}
+
+/// `DefinePropertyOrThrow(o, key, record)`: `__define_own` of the descriptor
+/// record `record` pushes (`desc: i32, value, get, set: i64`) on the own
+/// property `key` (an interned i32 local) of the object in i64 `o`; a
+/// rejection returns from the body with its `TypeError` pending, as does an
+/// exception an array `length` left pending (`r` is i32 scratch).
+pub(super) fn define_or_throw(
+    function: &mut Function,
+    o: u32,
+    key: u32,
+    r: u32,
+    record: impl FnOnce(&mut Function),
+    helpers: Helpers<'_>,
+) {
     wasm!(function; LocalGet(o), I32WrapI64, LocalGet(key));
-    emit_element(function, list, j, 0);
-    wasm!(function; F64ReinterpretI64, I32TruncSatF64U);
-    for slot in 1..4 {
-        emit_element(function, list, j, slot);
-    }
+    record(function);
     wasm!(function;
         Call(helpers.define_own()), LocalTee(r), I32Const(DEFINE_OK), I32Ne,
         GlobalGet(EXC_PENDING_GLOBAL), I32Or,
@@ -413,7 +438,7 @@ fn emit_test_level(level: i32, function: &mut Function, frame: Frame, helpers: H
 
 /// Raise the keyed `__prop_throw` `TypeError` of the mode pushed by `mode`
 /// over the key jsval pushed by `key`, and return from the body.
-fn prop_throw(
+pub(super) fn prop_throw(
     function: &mut Function,
     key: impl FnOnce(&mut Function),
     mode: impl FnOnce(&mut Function),
@@ -569,35 +594,6 @@ fn emit_get_own_property_names(
         End,
         LocalGet(res), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
     );
-}
-
-/// Argument `i` (an i32 local) into i64 `out`: element `i` of the spread
-/// argument array captured in i32 `spread` when the call passed more than
-/// `K` arguments, else slot `i` (`undefined` past the slots); a spread hole
-/// reads `undefined`.
-fn arg_at(function: &mut Function, frame: Frame, i: u32, spread: u32, out: u32) {
-    let k = frame.k;
-    wasm!(function;
-        LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U,
-        I32Const(k.cast_signed()), I32GtU,
-        If(BlockType::Result(ValType::I64)),
-        LocalGet(spread),
-    );
-    emit_array_elems(function);
-    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), Else);
-    for j in 0..k {
-        wasm!(function;
-            LocalGet(i), I32Const(j.cast_signed()), I32Eq,
-            If(BlockType::Result(ValType::I64)), LocalGet(j), Else,
-        );
-    }
-    wasm!(function; I64Const(UNDEFINED_BITS));
-    for _ in 0..k {
-        wasm!(function; End);
-    }
-    wasm!(function; End, LocalSet(out));
-    emit_elem_read(function, out);
-    wasm!(function; LocalSet(out));
 }
 
 /// `Object.assign(target, ...sources)`: `ToObject(target)`; each non-nullish
