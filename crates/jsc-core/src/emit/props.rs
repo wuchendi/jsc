@@ -1607,7 +1607,7 @@ pub(super) fn emit_array_set_length(
 /// keys (a `SPARSE` array's elements past the store sort first as integer
 /// keys); a primitive has no own keys.
 ///
-/// Values / entries follow EnumerableOwnProperties (ECMA-262 7.3.23): the
+/// Values / entries follow `EnumerableOwnProperties` (ECMA-262 7.3.23): the
 /// key list is taken once, then each key is re-checked as own and enumerable
 /// (`__own_enum`) when visited, so a getter that deletes a later key or makes
 /// it non-enumerable drops it. Only a getter can change the object between
