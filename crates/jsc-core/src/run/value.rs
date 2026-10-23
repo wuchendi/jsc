@@ -542,8 +542,17 @@ fn decode_function(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
                     .is_some_and(|f| f & abi::FUNC_FLAG_CONSTRUCTOR != 0)
         })
         .and_then(|parent| function_name(abi::HEAP | parent as u64, memory));
+    // A bound function's name is its own `name` property (`bound f`).
+    let name = if flags & abi::FUNC_FLAG_BOUND == 0 {
+        function_name(abi::HEAP | ptr as u64, memory)
+    } else {
+        own_data(ptr, "name", memory).and_then(|bits| match decode(bits, memory) {
+            Value::Str(name) => Some(name),
+            _ => None,
+        })
+    };
     Value::Function {
-        name: function_name(abi::HEAP | ptr as u64, memory).unwrap_or_default(),
+        name: name.unwrap_or_default(),
         class,
         extends,
         props: decode_props(ptr, memory, guard),
