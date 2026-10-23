@@ -165,6 +165,25 @@ fn replaced_parse_functions_are_honoured() {
     assert_number("function parseFloat() { return 8 } parseFloat('1')", 8.0);
 }
 
+/// An unsealed program (a `globalThis` write of an unrelated name) still
+/// calls the builtin conversions and error constructors.
+#[test]
+fn unsealed_programs_keep_the_builtins() {
+    assert_string(
+        "globalThis.x = 1; \
+         [parseInt('12px'), parseFloat('1.5'), parseInt(...['7', 8]), parseFloat(...['2.5']), \
+          String(1), Number('2'), Boolean(0), new RangeError('m', { cause: 3 }).cause, \
+          TypeError('t').message].join()",
+        "12,1.5,7,2.5,1,2,false,3,t",
+    );
+    // A failed assignment (strict, no global `parseInt` property) leaves the
+    // builtin in place.
+    assert_number(
+        "try { parseInt = function () { return 1 } } catch (e) {} parseInt('5')",
+        5.0,
+    );
+}
+
 /// Reassigned `String` / `Number` / `Boolean` / error constructors are
 /// called, not lowered syntactically.
 #[test]

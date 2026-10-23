@@ -838,7 +838,8 @@ path, never semantics:
 | site | fast path | taken when | otherwise |
 |---|---|---|---|
 | `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
-| `String/Number/Boolean/parseInt/parseFloat(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property |
+| `String/Number/Boolean(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property |
+| `parseInt/parseFloat(..)` | inline conversion | `sealed(N)`, or else the global object has no such property (they are not global values, so only a program-stored one) | a call of the stored global property |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0`, `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
@@ -1522,9 +1523,9 @@ Each item below is current behaviour of this tree.
   `assign`), no `Array.from`, `sort`, `find`,
   `at`, `flat`, …, no `charCodeAt`, `toFixed`, `Number.isInteger`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
-- `parseInt` and `parseFloat` exist only as direct calls, not as global values:
-  in a program where they are not sealed (§6.4) a call reads the global
-  property, which throws `ReferenceError` unless the program installed one.
+- `parseInt` and `parseFloat` exist only as direct calls, not as global values
+  (`parseInt = f` throws `ReferenceError`; `globalThis.parseInt = f` is
+  honoured by later calls, §6.4).
 
 **Object model**
 
