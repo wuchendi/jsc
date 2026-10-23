@@ -113,7 +113,10 @@ fn inherited_defaults_match_spec() {
     assert_nan("+{}");
     assert_string("String(new Map())", "[object Map]");
     assert_string("String(Promise.resolve(1))", "[object Promise]");
-    assert_string("String(function f(a) { return a; })", "[Function: f]");
+    assert_string(
+        "String(function f(a) { return a; })",
+        "function f() { [native code] }",
+    );
     assert_string("Array.prototype.toString.call({})", "[object Object]");
     assert_string("const a = [3, 4]; a.toString()", "3,4");
     // A user toString on a class prototype is inherited.

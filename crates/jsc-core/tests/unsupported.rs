@@ -56,12 +56,6 @@ fn rejects_unsupported_for_of_and_for_in() {
     assert_rejected("for (const k in 5) { k }");
 }
 
-#[test]
-fn rejects_function_prototype_bind() {
-    // `bind` is phase 3: it throws rather than mis-dispatching.
-    assert_rejected("function f(a) { return a } let g = f.bind(null); g(1)");
-}
-
 // ---------------------------------------------------------------------------
 // An unknown / not-yet-implemented method is a run-time `TypeError` from the
 // prototype lookup — never a compile error, and never invalid wasm.
@@ -234,8 +228,8 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "TypeError: o.zzz is not a function",
     );
     // An array literal reads its methods from `%Array.prototype%` at run time.
-    assert_uncaught("[1, 2].flat()", "TypeError: expression is not a function");
-    assert_uncaught("[].concat([1])", "TypeError: expression is not a function");
+    assert_uncaught("[1, 2].group()", "TypeError: expression is not a function");
+    assert_uncaught("[].groupBy([1])", "TypeError: expression is not a function");
     // A builtin-named method's user-method fallback throws too.
     assert_uncaught("let o = {}; o.get(1)", "TypeError: o.get is not a function");
     assert_uncaught(

@@ -1350,7 +1350,7 @@ pub(super) fn emit_is_object(function: &mut Function, local: u32) {
 
 /// Push nonzero if the jsval in `local` is a constructor: a function value
 /// whose header carries `FUNC_FLAG_CONSTRUCTOR`, else `0`.
-fn emit_is_constructor(function: &mut Function, local: u32) {
+pub(super) fn emit_is_constructor(function: &mut Function, local: u32) {
     emit_is_function(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(local));

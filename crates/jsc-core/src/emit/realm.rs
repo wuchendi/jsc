@@ -192,6 +192,14 @@ pub(super) enum Builtin {
     Call,
     /// `Function.prototype.apply`.
     Apply,
+    /// `Function.prototype.bind`.
+    Bind,
+    /// `Function.prototype.toString`.
+    FunctionToString,
+    /// The call/construct trampoline of every bound function (DESIGN.md
+    /// §5.5): `env` is the `[target, boundThis, ...boundArgs]` array. Not
+    /// installed on any intrinsic.
+    BoundCall,
     /// `Error.prototype.toString`.
     ErrorToString,
     /// A `Math` method (`Math.floor`, `Math.max`, ..).
@@ -208,6 +216,10 @@ pub(super) enum Builtin {
     ObjectStatic(ObjectBuiltinOp),
     /// `Array.isArray`.
     IsArray,
+    /// `Array.of`.
+    ArrayOf,
+    /// `Array.from`.
+    ArrayFrom,
     /// `Promise.resolve`.
     PromiseResolve,
     /// `Promise.reject`.
@@ -230,6 +242,22 @@ pub(super) enum Builtin {
     ArraySlice,
     /// `Array.prototype.toString`.
     ArrayToString,
+    /// `Array.prototype.at`.
+    ArrayAt,
+    /// `Array.prototype.find` / `findIndex` / `findLast` / `findLastIndex` /
+    /// `some` / `every`.
+    ArrayFind(ArrayFindOp),
+    /// `Array.prototype.reduceRight`.
+    ArrayReduceRight,
+    /// `Array.prototype.lastIndexOf`.
+    ArrayLastIndexOf,
+    /// `Array.prototype.concat`.
+    ArrayConcat,
+    /// `Array.prototype.flat` (`map == false`) / `flatMap`.
+    ArrayFlat {
+        /// `flatMap`: map each top-level element first.
+        map: bool,
+    },
     /// A `String.prototype` method backed by a host `__method` op.
     StringMethod(StringOp),
     /// `String.prototype.toString`.
@@ -300,6 +328,32 @@ pub(super) enum Builtin {
     IsNaN,
     /// The global `isFinite`.
     IsFinite,
+}
+
+/// An `Array.prototype` method that calls a predicate per index until it
+/// decides the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayFindOp {
+    Find,
+    FindIndex,
+    FindLast,
+    FindLastIndex,
+    Some,
+    Every,
+}
+
+impl ArrayFindOp {
+    /// The method's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Find => "find",
+            Self::FindIndex => "findIndex",
+            Self::FindLast => "findLast",
+            Self::FindLastIndex => "findLastIndex",
+            Self::Some => "some",
+            Self::Every => "every",
+        }
+    }
 }
 
 /// A generic `String.prototype` method: most are backed by a host `__method`
@@ -420,13 +474,16 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 127] = [
+    pub(super) const ALL: [Builtin; 144] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
         Self::ValueOf,
         Self::Call,
         Self::Apply,
+        Self::Bind,
+        Self::FunctionToString,
+        Self::BoundCall,
         Self::ErrorToString,
         Self::Math(MathOp::Floor),
         Self::Math(MathOp::Ceil),
@@ -461,6 +518,8 @@ impl Builtin {
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
         Self::IsArray,
+        Self::ArrayOf,
+        Self::ArrayFrom,
         Self::PromiseResolve,
         Self::PromiseReject,
         Self::DateNow,
@@ -475,6 +534,18 @@ impl Builtin {
         Self::ArrayJoin,
         Self::ArraySlice,
         Self::ArrayToString,
+        Self::ArrayAt,
+        Self::ArrayFind(ArrayFindOp::Find),
+        Self::ArrayFind(ArrayFindOp::FindIndex),
+        Self::ArrayFind(ArrayFindOp::FindLast),
+        Self::ArrayFind(ArrayFindOp::FindLastIndex),
+        Self::ArrayFind(ArrayFindOp::Some),
+        Self::ArrayFind(ArrayFindOp::Every),
+        Self::ArrayReduceRight,
+        Self::ArrayLastIndexOf,
+        Self::ArrayConcat,
+        Self::ArrayFlat { map: false },
+        Self::ArrayFlat { map: true },
         Self::StringMethod(StringOp::IndexOf),
         Self::StringMethod(StringOp::Includes),
         Self::StringMethod(StringOp::Slice),
@@ -583,6 +654,7 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ThrowTypeError
             | Self::MethodCall
+            | Self::BoundCall
             | Self::IterSource => "",
             Self::HasOwnProperty => "hasOwnProperty",
             Self::ObjectToString
@@ -590,7 +662,8 @@ impl Builtin {
             | Self::ArrayToString
             | Self::StringToString
             | Self::NumberToString
-            | Self::BooleanToString => "toString",
+            | Self::BooleanToString
+            | Self::FunctionToString => "toString",
             Self::ValueOf | Self::StringValueOf | Self::NumberValueOf | Self::BooleanValueOf => {
                 "valueOf"
             }
@@ -610,6 +683,7 @@ impl Builtin {
             Self::StringRaw => "raw",
             Self::Call => "call",
             Self::Apply => "apply",
+            Self::Bind => "bind",
             Self::Math(op) => match op {
                 MathOp::Floor => "floor",
                 MathOp::Ceil => "ceil",
@@ -629,6 +703,8 @@ impl Builtin {
             Self::ObjectStatic(ObjectBuiltinOp::Values) => "values",
             Self::ObjectStatic(ObjectBuiltinOp::Entries) => "entries",
             Self::IsArray => "isArray",
+            Self::ArrayOf => "of",
+            Self::ArrayFrom => "from",
             Self::PromiseResolve => "resolve",
             Self::PromiseReject => "reject",
             Self::DateNow => "now",
@@ -642,6 +718,13 @@ impl Builtin {
             Self::ArrayIncludes => "includes",
             Self::ArrayJoin => "join",
             Self::ArraySlice => "slice",
+            Self::ArrayAt => "at",
+            Self::ArrayFind(op) => op.name(),
+            Self::ArrayReduceRight => "reduceRight",
+            Self::ArrayLastIndexOf => "lastIndexOf",
+            Self::ArrayConcat => "concat",
+            Self::ArrayFlat { map: false } => "flat",
+            Self::ArrayFlat { map: true } => "flatMap",
             Self::IsNaN => "isNaN",
             Self::IsFinite => "isFinite",
         }
@@ -653,7 +736,9 @@ impl Builtin {
             Self::FunctionPrototype
             | Self::ThrowTypeError
             | Self::MethodCall
+            | Self::BoundCall
             | Self::IterSource
+            | Self::FunctionToString
             | Self::StringToString
             | Self::StringValueOf
             | Self::NumberValueOf
@@ -671,6 +756,8 @@ impl Builtin {
             | Self::ConsoleLog
             | Self::DateNow
             | Self::ArrayPop
+            | Self::ArrayOf
+            | Self::ArrayFlat { map: false }
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(MathOp::Min | MathOp::Max | MathOp::Pow)
@@ -681,6 +768,7 @@ impl Builtin {
             | Self::PromiseThen => 2,
             Self::HasOwnProperty
             | Self::Call
+            | Self::Bind
             | Self::Math(_)
             | Self::Ctor(_)
             | Self::ObjectStatic(_)
@@ -692,6 +780,13 @@ impl Builtin {
             | Self::ArrayIndexOf
             | Self::ArrayIncludes
             | Self::ArrayJoin
+            | Self::ArrayFrom
+            | Self::ArrayAt
+            | Self::ArrayFind(_)
+            | Self::ArrayReduceRight
+            | Self::ArrayLastIndexOf
+            | Self::ArrayConcat
+            | Self::ArrayFlat { map: true }
             | Self::NumberToString
             | Self::IsNaN
             | Self::IsFinite
@@ -722,7 +817,13 @@ impl Builtin {
             | Self::ArrayIncludes
             | Self::ArrayJoin
             | Self::ArraySlice
-            | Self::ArrayToString => Some(BuiltinCtor::Array),
+            | Self::ArrayToString
+            | Self::ArrayAt
+            | Self::ArrayFind(_)
+            | Self::ArrayReduceRight
+            | Self::ArrayLastIndexOf
+            | Self::ArrayConcat
+            | Self::ArrayFlat { .. } => Some(BuiltinCtor::Array),
             Self::StringMethod(_) | Self::StringToString | Self::StringValueOf => {
                 Some(BuiltinCtor::String)
             }
@@ -987,6 +1088,18 @@ pub(super) fn registry() -> Vec<Entry> {
             METHOD_ATTRS,
             Value::Method(Builtin::Apply),
         ),
+        entry(
+            FunctionPrototype,
+            "bind",
+            METHOD_ATTRS,
+            Value::Method(Builtin::Bind),
+        ),
+        entry(
+            FunctionPrototype,
+            "toString",
+            METHOD_ATTRS,
+            Value::Method(Builtin::FunctionToString),
+        ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
     ];
@@ -1058,7 +1171,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 Builtin::ObjectStatic(ObjectBuiltinOp::Values),
                 Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
             ],
-            BuiltinCtor::Array => &[Builtin::IsArray],
+            BuiltinCtor::Array => &[Builtin::IsArray, Builtin::ArrayOf, Builtin::ArrayFrom],
             BuiltinCtor::String => &[
                 Builtin::StringFromCharCode,
                 Builtin::StringFromCodePoint,
