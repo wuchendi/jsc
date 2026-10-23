@@ -120,6 +120,8 @@ fn date_now_reads_host_clock() {
     assert_eq!(jsc(&["-p", "typeof Date.now()"]), "number");
     // A clock well past 2023-11 (1_700_000_000_000 ms) confirms a real timestamp.
     assert_eq!(jsc(&["-p", "Date.now() > 1700000000000"]), "true");
+    // A time value is integral.
+    assert_eq!(jsc(&["-p", "Date.now() % 1 === 0"]), "true");
     assert_eq!(jsc(&["-p", "typeof new Date()"]), "object");
     assert_eq!(jsc(&["-p", "new Date() instanceof Date"]), "true");
     // `new Date()` and `Date.now()` share the same clock, in order.
@@ -181,9 +183,15 @@ fn date_field_methods() {
         jsc(&["-p", r#""[" + new Date(0).toISOString() + "]""#]),
         "[1970-01-01T00:00:00.000Z]",
     );
-    // A non-finite timestamp: numeric fields are NaN, toISOString is "Invalid Date".
+    // An invalid date: numeric fields are NaN, toISOString throws a RangeError.
     assert_eq!(jsc(&["-p", "new Date(NaN).getFullYear()"]), "NaN");
-    assert_eq!(jsc(&["-p", "new Date(NaN).toISOString()"]), "Invalid Date");
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "try { new Date(NaN).toISOString() } catch (e) { e instanceof RangeError && e.name }",
+        ]),
+        "RangeError"
+    );
 }
 
 /// The `Date` field-method names work as ordinary user object

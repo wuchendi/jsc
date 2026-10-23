@@ -1902,22 +1902,15 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower `new Date()` / `new Date(ms)` (at most one non-spread argument)
-    /// into an [`IrNode::DateNew`]. The no-argument form seeds the payload from
-    /// the host clock (`ms: None`); a single argument is coerced to a number
-    /// (`Number(arg)`) so any operand stores its numeric value.
+    /// Lower `new Date()` / `new Date(value)` (at most one non-spread
+    /// argument) into an [`IrNode::DateNew`]. The no-argument form seeds the
+    /// payload from the host clock (`arg: None`).
     fn lower_new_date(&mut self, args: &[ExprOrSpread]) -> anyhow::Result<IrNode> {
-        let Some(arg) = args.first() else {
-            return Ok(IrNode::DateNew { ms: None });
+        let arg = match args.first() {
+            Some(arg) => Some(Box::new(self.lower_expr(&arg.expr)?)),
+            None => None,
         };
-        let ms = IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
-            arg: Box::new(self.lower_expr(&arg.expr)?),
-            radix: None,
-        };
-        Ok(IrNode::DateNew {
-            ms: Some(Box::new(ms)),
-        })
+        Ok(IrNode::DateNew { arg })
     }
 }
 
