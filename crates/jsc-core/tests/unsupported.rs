@@ -9,23 +9,6 @@ use common::{assert_rejected, assert_uncaught};
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rejects_async_functions() {
-    // Top-level `async function` DECLARATIONS are supported (see the
-    // promises suite); an async FUNCTION EXPRESSION, an async ARROW, and an async
-    // GENERATOR remain out of scope.
-    assert_rejected("let f = async function () { return 1 }; f()");
-    assert_rejected("let f = async () => 1; f()");
-    assert_rejected("async function* f() { yield 1 } f().next()");
-}
-
-#[test]
-fn rejects_generator_functions() {
-    // Top-level `function*` DECLARATIONS are supported (see the
-    // generators suite); a generator EXPRESSION remains rejected.
-    assert_rejected("let g = function* () { return 1 }; g()");
-}
-
-#[test]
 fn rejects_spread() {
     // Call-argument and array-literal spread are supported; only
     // object spread remains out of scope.
@@ -36,6 +19,7 @@ fn rejects_spread() {
 fn rejects_async_methods() {
     // Async/generator methods stay out of scope.
     assert_rejected("let o = { async m() { return 1 } }; o.m()");
+    assert_rejected("let o = { *m() { yield 1 } }; o.m().next()");
 }
 
 #[test]
