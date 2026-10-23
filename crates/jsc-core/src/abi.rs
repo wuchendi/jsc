@@ -262,6 +262,12 @@ pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
 /// `length` and `name` are defined at creation (it is never `LAZY`).
 pub(crate) const FUNC_FLAG_BOUND: u8 = 64;
 
+/// [`TYPE_FUNCTION`] header `flags` bit: a generator function (`function*`
+/// or a generator method). Not a constructor; materialization gives it a
+/// `prototype` object inheriting `%GeneratorPrototype%` with no
+/// `constructor`.
+pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *

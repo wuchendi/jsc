@@ -10,9 +10,7 @@
 
 mod common;
 
-use common::{
-    assert_bool, assert_eval, assert_number, assert_output, assert_rejected, assert_uncaught,
-};
+use common::{assert_bool, assert_eval, assert_number, assert_output, assert_uncaught};
 
 #[test]
 fn yields_a_sequence_then_done() {
@@ -931,12 +929,6 @@ fn a_closure_escaping_a_generator_outlives_it() {
          console.log(f(), f());",
         "true\n41 42\n",
     );
-}
-
-#[test]
-fn rejects_a_generator_expression() {
-    // Only top-level `function*` DECLARATIONS are supported.
-    assert_rejected("let g = function*(){ yield 1 }; g().next();");
 }
 
 #[test]
