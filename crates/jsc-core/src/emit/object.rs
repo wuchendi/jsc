@@ -758,10 +758,14 @@ fn emit_time_clip(function: &mut Function, out: u32) {
     function.instruction(&Instruction::LocalSet(out));
 }
 
-/// Emit `Date.now()`: call the host `__now` clock (an f64 ms count) and
-/// reinterpret it to a number jsval (a number's raw i64 IS its f64 bit pattern).
-pub(super) fn emit_date_now_node(function: &mut Function, helpers: Helpers<'_>) {
+/// Emit `Date.now()`: the host `__now` clock (an f64 ms count) through
+/// [`emit_time_clip`] (a time value is integral), boxed as a number jsval.
+pub(super) fn emit_date_now_node(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
+    let time = scratch + 24;
     function.instruction(&Instruction::Call(helpers.now));
+    emit_time_clip(function, time);
+    function.instruction(&Instruction::LocalGet(time));
+    function.instruction(&Instruction::F64ReinterpretI64);
     emit_box_f64(function, helpers);
 }
 
@@ -1162,34 +1166,7 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
         memory_index: 0,
     }));
 
-    // The year: four digits, or a sign and six digits of |year|.
-    function.instruction(&Instruction::LocalGet(at));
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(bptr));
-    function.instruction(&Instruction::I32Const(i32::from(b'+')));
-    function.instruction(&Instruction::I32Const(i32::from(b'-')));
-    function.instruction(&Instruction::LocalGet(year));
-    function.instruction(&Instruction::I64Const(0));
-    function.instruction(&Instruction::I64GeS);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: (HEADER_SIZE as u64) + 4,
-        align: 0,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::I64Const(0));
-    function.instruction(&Instruction::LocalGet(year));
-    function.instruction(&Instruction::I64Sub);
-    function.instruction(&Instruction::LocalGet(year));
-    function.instruction(&Instruction::LocalGet(year));
-    function.instruction(&Instruction::I64Const(0));
-    function.instruction(&Instruction::I64LtS);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::LocalSet(abs_year));
-    emit_iso_digits(function, bptr, 1, abs_year, 6);
-    function.instruction(&Instruction::Else);
-    emit_iso_digits(function, bptr, 0, year, 4);
-    function.instruction(&Instruction::End);
+    emit_iso_year(function, bptr, at, year, abs_year);
     function.instruction(&Instruction::LocalGet(bptr));
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::I32Add);
@@ -1232,6 +1209,39 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
+}
+
+/// Write the `toISOString()` year field of the i64 `year` at the start of the
+/// string block in `bptr`: four digits, or (when the shift in i32 `at` is
+/// nonzero) a sign and six digits of `|year|`, kept in i64 `abs_year`.
+fn emit_iso_year(function: &mut Function, bptr: u32, at: u32, year: u32, abs_year: u32) {
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(bptr));
+    function.instruction(&Instruction::I32Const(i32::from(b'+')));
+    function.instruction(&Instruction::I32Const(i32::from(b'-')));
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::I64GeS);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::I32Store8(MemArg {
+        offset: (HEADER_SIZE as u64) + 4,
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::I64Sub);
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::LocalGet(year));
+    function.instruction(&Instruction::I64Const(0));
+    function.instruction(&Instruction::I64LtS);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::LocalSet(abs_year));
+    emit_iso_digits(function, bptr, 1, abs_year, 6);
+    function.instruction(&Instruction::Else);
+    emit_iso_digits(function, bptr, 0, year, 4);
+    function.instruction(&Instruction::End);
 }
 
 /// The three-letter weekday names, Sunday first (`Date.prototype.toString`).

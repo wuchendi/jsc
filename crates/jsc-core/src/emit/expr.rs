@@ -521,7 +521,7 @@ pub(super) fn emit_node(
         IrNode::DateNew { arg } => {
             emit_date_new_node(arg.as_deref(), function, scratch, strings, helpers);
         }
-        IrNode::DateNow => emit_date_now_node(function, helpers),
+        IrNode::DateNow => emit_date_now_node(function, scratch, helpers),
         IrNode::DateField { op, recv } => {
             emit_date_field(*op, *recv, function, scratch, strings, helpers);
         }
