@@ -320,18 +320,13 @@ fn conversion(body: &Body, ctor: BuiltinCtor, op: ConvertOp, empty: IrNode) -> I
 /// `new Date()` / `new Date(ms)`; called, `Date()` is the current time as
 /// `Date.prototype.toString` renders it. The calendar-field form is not supported.
 fn date(body: &Body) -> IrNode {
-    let ms = IrNode::ConvertCall {
-        op: ConvertOp::ToNumber,
-        arg: Box::new(body.arg(0)),
-        radix: None,
-    };
     let alloc = ternary(
         body.argc_is(0),
-        IrNode::DateNew { ms: None },
+        IrNode::DateNew { arg: None },
         ternary(
             body.argc_is(1),
             IrNode::DateNew {
-                ms: Some(Box::new(ms)),
+                arg: Some(Box::new(body.arg(0))),
             },
             throw_type_error("the Date calendar-field constructor is not supported"),
         ),
@@ -343,7 +338,7 @@ fn date(body: &Body) -> IrNode {
         IrNode::Seq(vec![
             IrNode::Assign {
                 local: now,
-                value: Box::new(IrNode::DateNew { ms: None }),
+                value: Box::new(IrNode::DateNew { arg: None }),
             },
             IrNode::DateField {
                 op: DateOp::ToString,

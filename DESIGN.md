@@ -997,7 +997,7 @@ it):
 - wrappers as `[Number: 1]` / `[String: 'ab']` / `[Boolean: true]`;
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
-  non-finite payload);
+  `NaN` time value);
 - cycles as `<ref *1> { self: [Circular *1] }`.
 
 ---
@@ -1248,7 +1248,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`; `Object.prototype.hasOwnProperty`, `toString` (`[object Tag]`), `valueOf` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
-| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString` — every method generic over array-likes; `map` / `filter` / `slice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
+| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin` — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
 | `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
@@ -1540,8 +1540,7 @@ Each item below is current behaviour of this tree.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9: no property-descriptor or prototype
   reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`,
-  `assign`), no `Array.prototype.sort`,
-  `splice`, `keys`, …, no
+  `assign`), no `Array.prototype.keys` / `values` / `entries`, …, no
   `Promise.all` / `race` / `allSettled` / `any`.
 - A direct `parseInt(..)` / `parseFloat(..)` call always runs the builtin
   conversion, even after the global binding is reassigned.
@@ -1563,7 +1562,11 @@ Each item below is current behaviour of this tree.
   that is neither an array-like source nor a runtime iterable as an array-like
   (user `@@iterator` waits for `Symbol`).
 - Array-like lengths are clamped to `2^32 - 1` by the generic `Array.prototype`
-  loops (`at` and `push` use the full `ToLength` range).
+  loops (`at`, `push` and the mutating `splice`, `sort`, `reverse`, `shift`,
+  `unshift`, `fill`, `copyWithin` use the full `ToLength` range).
+- `sort` without a comparator orders by the byte order of the UTF-8
+  `ToString` keys (code-point order), which differs from the specified UTF-16
+  code-unit order only between astral characters and `U+E000`..`U+FFFF`.
 - Generator functions have no `prototype` property; generator objects inherit
   `%GeneratorPrototype%` directly.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
@@ -1582,9 +1585,6 @@ Each item below is current behaviour of this tree.
   (usually `undefined`, also at top level).
 - Not supported: private `#` members, static blocks, computed class member
   names, generator or async methods.
-- The `K` scan does not count object-literal setter parameters: a setter
-  defined only in an object literal receives `undefined` unless something else
-  in the program widens `K` to at least 1.
 
 **Generators & async**
 
@@ -1606,8 +1606,6 @@ Each item below is current behaviour of this tree.
 
 - UTC only: no local time zone, no string parsing (`new Date("…")` is
   `Invalid Date`), and the calendar-field constructor throws a `TypeError`.
-- No TimeClip: a finite millisecond value outside ±8.64e15 is kept rather than
-  becoming `Invalid Date`.
 
 **Runtime**
 

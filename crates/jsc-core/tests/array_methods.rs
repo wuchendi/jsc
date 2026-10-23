@@ -1,8 +1,9 @@
 //! Integration tests: `Array.of` / `Array.from`, the non-mutating
 //! `%Array.prototype%` methods (`at`, `find*`, `some`, `every`,
-//! `reduceRight`, `lastIndexOf`, `concat`, `flat`, `flatMap`) and
-//! `ArraySpeciesCreate` by `constructor` (DESIGN.md §6.4, §13): generic over
-//! array-likes, holes, subclass receivers.
+//! `reduceRight`, `lastIndexOf`, `concat`, `flat`, `flatMap`), the mutating
+//! ones (`splice`, `sort`, `reverse`, `shift`, `unshift`, `fill`,
+//! `copyWithin`) and `ArraySpeciesCreate` by `constructor` (DESIGN.md §6.4,
+//! §13): generic over array-likes, holes, subclass receivers.
 
 mod common;
 use common::{assert_bool, assert_number, assert_string};
@@ -478,4 +479,361 @@ fn existing_methods_on_array_likes_and_holes() {
         "const a = [1, 2]; a.map((x) => { a.push(x); return x; }).length",
         2.0,
     );
+}
+
+// --- mutating methods: splice / sort / reverse / shift / unshift / fill / copyWithin ---
+
+#[test]
+fn mutating_methods_have_name_and_length() {
+    for (name, length) in [
+        ("splice", 2.0),
+        ("sort", 1.0),
+        ("reverse", 0.0),
+        ("shift", 0.0),
+        ("unshift", 1.0),
+        ("fill", 1.0),
+        ("copyWithin", 2.0),
+    ] {
+        both_string(&format!("typeof [].{name}"), "function");
+        both_string(&format!("Array.prototype.{name}.name"), name);
+        both_number(&format!("Array.prototype.{name}.length"), length);
+        both_bool(
+            &format!("Object.keys(Array.prototype).indexOf('{name}') === -1"),
+            true,
+        );
+        throws_type_error(&format!("Array.prototype.{name}.call(null)"));
+        throws_type_error(&format!("Array.prototype.{name}.call(undefined)"));
+    }
+}
+
+#[test]
+fn splice_removes_and_inserts() {
+    both_string(
+        "const a = [1, 2, 3, 4, 5]; const r = a.splice(1, 2); a.join() + '|' + r.join()",
+        "1,4,5|2,3",
+    );
+    both_string(
+        "const a = [1, 2, 3]; const r = a.splice(1, 0, 'x', 'y'); a.join() + '|' + r.length",
+        "1,x,y,2,3|0",
+    );
+    both_string(
+        "const a = [1, 2, 3, 4]; const r = a.splice(-2, 1, 'x', 'y', 'z'); a.join() + '|' + r.join()",
+        "1,2,x,y,z,4|3",
+    );
+    // deleteCount omitted removes to the end; undefined removes none.
+    both_string(
+        "const a = [1, 2, 3]; const r = a.splice(1); a.join() + '|' + r.join()",
+        "1|2,3",
+    );
+    both_string(
+        "const a = [1, 2, 3]; const r = a.splice(1, undefined); a.join() + '|' + r.length",
+        "1,2,3|0",
+    );
+    both_string(
+        "const a = [1, 2, 3]; const r = a.splice(); a.join() + '|' + r.length",
+        "1,2,3|0",
+    );
+    both_string(
+        "const a = [1, 2, 3]; a.splice(10, 5, 'z'); a.join()",
+        "1,2,3,z",
+    );
+    both_string("const a = [1, 2, 3]; a.splice(-10, 1.9); a.join()", "2,3");
+    both_string(
+        "const a = [1, 2, 3, 4, 5, 6, 7]; a.splice(1, 2, ...[8, 9, 10, 11, 12, 13]); a.join()",
+        "1,8,9,10,11,12,13,4,5,6,7",
+    );
+}
+
+#[test]
+fn splice_on_array_likes_and_holes() {
+    both_string(
+        &format!(
+            "{LIKE}const r = Array.prototype.splice.call(o, 1, 2, 'x'); o.length + ':' + o[0] + o[1] + o[2] + ('3' in o) + '|' + r.length + ('1' in r)"
+        ),
+        "3:axdfalse|2false",
+    );
+    // Holes move as holes.
+    both_string(
+        "const a = [1, , 3, , 5]; a.splice(0, 1); a.length + ':' + (0 in a) + (1 in a) + (2 in a) + (3 in a)",
+        "4:falsetruefalsetrue",
+    );
+    both_string(
+        "const a = [1, , 3]; a.splice(0, 0, 'x'); a.length + ':' + (2 in a) + a[3]",
+        "4:false3",
+    );
+    // The result length is set even past the deleted elements.
+    both_number(
+        "Array.prototype.splice.call({ length: 2 }, 0, 2).length",
+        2.0,
+    );
+    both_number(
+        "const o = { length: 2 }; Array.prototype.splice.call(o, 0, 0, 'a'); o.length",
+        3.0,
+    );
+    // Past 2^53 - 1 the new length throws before any change.
+    throws_type_error("Array.prototype.splice.call({ length: 2 ** 53 - 1 }, 0, 0, 'a')");
+    both_string(
+        "const o = { length: 2 ** 53 - 1 }; try { Array.prototype.splice.call(o, 0, 0, 'a'); } catch (e) {} o.length + ':' + ('0' in o)",
+        "9007199254740991:false",
+    );
+}
+
+#[test]
+fn splice_uses_species_constructor() {
+    both_bool(
+        &format!("{SUB}A.from([1, 2, 3]).splice(0, 1) instanceof A"),
+        true,
+    );
+    both_string(
+        "let seen = ''; class B extends Array { constructor(...args) { seen += args.join('/') + ';'; super(...args); } } const b = B.from([1, 2, 3]); seen = ''; b.splice(1, 2); b.splice(0, 0); seen",
+        "2;0;",
+    );
+    both_bool(
+        "const a = [1, 2]; a.constructor = undefined; Array.isArray(a.splice(0, 1))",
+        true,
+    );
+    throws_type_error("const a = [1, 2]; a.constructor = 1; a.splice(0, 1)");
+}
+
+#[test]
+fn sort_default_order() {
+    both_string("[3, 1, 2].sort().join()", "1,2,3");
+    // Code-unit order of ToString, not numeric order.
+    both_string("[10, 9, 1, 100].sort().join()", "1,10,100,9");
+    both_string("['b', 'a', 'B', 'aa'].sort().join()", "B,a,aa,b");
+    both_bool("const a = [2, 1]; a.sort() === a", true);
+    // undefined sorts last, holes after it.
+    both_string(
+        "const a = [undefined, 'c', , 'b', undefined, , 'a']; a.sort(); a.length + ':' + a.slice(0, 3).join() + ':' + a[3] + a[4] + ':' + (5 in a) + (6 in a) + (4 in a)",
+        "7:a,b,c:undefinedundefined:falsefalsetrue",
+    );
+    both_string(
+        "const a = [3, , 1]; a.sort(); a.length + ':' + a[0] + a[1] + (2 in a)",
+        "3:13false",
+    );
+    both_string(
+        "const a = [undefined, 2, 1]; a.sort((x, y) => { if (x === undefined || y === undefined) throw 0; return x - y; }); a[0] + ',' + a[1] + ',' + a[2]",
+        "1,2,undefined",
+    );
+}
+
+#[test]
+fn sort_with_comparator() {
+    both_string("[10, 9, 1, 100].sort((a, b) => a - b).join()", "1,9,10,100");
+    both_string("[1, 2, 3].sort((a, b) => b - a).join()", "3,2,1");
+    // The result is ToNumber'd.
+    both_string(
+        "[1, 2, 3].sort((a, b) => ({ valueOf() { return b - a; } })).join()",
+        "3,2,1",
+    );
+    both_string("[1, 2, 3].sort((a, b) => String(b - a)).join()", "3,2,1");
+    both_string("[3, 1, 2].sort(() => NaN).join()", "3,1,2");
+    both_string("[3, 1, 2].sort(undefined).join()", "1,2,3");
+    // The comparator gets (x, y) with this = undefined.
+    both_string(
+        "let s = ''; [1, 2].sort(function (x, y) { 'use strict'; s += typeof this + arguments.length; return 0; }); s",
+        "undefined2",
+    );
+}
+
+#[test]
+fn sort_is_stable() {
+    both_string(
+        "const a = []; for (let i = 0; i < 40; i++) a.push({ k: i % 3, i }); a.sort((x, y) => x.k - y.k); a.map((x) => x.i).join()",
+        "0,3,6,9,12,15,18,21,24,27,30,33,36,39,1,4,7,10,13,16,19,22,25,28,31,34,37,2,5,8,11,14,17,20,23,26,29,32,35,38",
+    );
+    both_string(
+        "const a = ['b1', 'a1', 'b2', 'a2', 'b3']; a.sort((x, y) => x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0); a.join()",
+        "a1,a2,b1,b2,b3",
+    );
+}
+
+#[test]
+fn sort_large_array_is_not_quadratic() {
+    both_number(
+        "const a = []; for (let i = 0; i < 20000; i++) a.push((i * 7919) % 20000); a.sort((x, y) => x - y); let ok = 1; for (let i = 0; i < 20000; i++) if (a[i] !== i) ok = 0; ok",
+        1.0,
+    );
+    both_number(
+        "const a = []; for (let i = 0; i < 5000; i++) a.push(5000 - i); let n = 0; a.sort((x, y) => { n++; return x - y; }); n < 5000 * 14 ? a[0] : -1",
+        1.0,
+    );
+}
+
+#[test]
+fn sort_comparator_errors() {
+    for bad in ["1", "'x'", "{}", "null", "true"] {
+        throws_type_error(&format!("[2, 1].sort({bad})"));
+    }
+    // The comparator check precedes ToObject and any read.
+    both_string(
+        "let s = ''; try { Array.prototype.sort.call({ get length() { s += 'len'; return 2; } }, 1); } catch (e) { s += e.constructor.name; } s",
+        "TypeError",
+    );
+    throws_type_error("Array.prototype.sort.call(null, 1)");
+    // A throwing comparator propagates.
+    both_string(
+        "let r = ''; try { [1, 2, 3].sort(() => { throw new RangeError('cmp'); }); } catch (e) { r = e.name + ':' + e.message; } r",
+        "RangeError:cmp",
+    );
+    both_string(
+        "let r = ''; try { [{ toString() { throw new Error('ts'); } }, 1].sort(); } catch (e) { r = e.message; } r",
+        "ts",
+    );
+}
+
+#[test]
+fn sort_on_array_likes_and_subclasses() {
+    both_string(
+        "const o = { length: 4, 0: 'c', 1: 'a', 3: 'b' }; Array.prototype.sort.call(o); o[0] + o[1] + o[2] + ('3' in o) + o.length",
+        "abcfalse4",
+    );
+    both_string(
+        "const o = { length: 3, 0: undefined, 2: 1 }; Array.prototype.sort.call(o); o[0] + ',' + o[1] + ',' + ('2' in o) + ',' + o.hasOwnProperty(1)",
+        "1,undefined,false,true",
+    );
+    both_string(
+        &format!("{SUB}const a = A.from([3, 1, 2]); a.sort(); (a instanceof A) + a.join()"),
+        "true1,2,3",
+    );
+    both_string("Array.prototype.sort.call('').length + ''", "0");
+}
+
+#[test]
+fn reverse_in_place() {
+    both_string(
+        "const a = [1, 2, 3]; a.reverse() === a && a.join()",
+        "3,2,1",
+    );
+    both_string("[1, 2, 3, 4].reverse().join()", "4,3,2,1");
+    both_string("[].reverse().length + ''", "0");
+    both_string(
+        "const a = [1, , 3, , ]; a.reverse(); a.length + ':' + (0 in a) + (1 in a) + (2 in a) + (3 in a) + a[1] + a[3]",
+        "4:falsetruefalsetrue31",
+    );
+    both_string(
+        &format!(
+            "{LIKE}Array.prototype.reverse.call(o); o[0] + ('1' in o) + o[2] + o[3] + o.length"
+        ),
+        "dfalseba4",
+    );
+    both_string(
+        &format!("{LIKE}Array.prototype.reverse.call(o); ('1' in o) + o[0]"),
+        "falsed",
+    );
+    both_string(
+        &format!("{SUB}const a = A.from([1, 2]); a.reverse(); (a instanceof A) + a.join()"),
+        "true2,1",
+    );
+}
+
+#[test]
+fn shift_and_unshift() {
+    both_string(
+        "const a = [1, 2, 3]; const x = a.shift(); x + '|' + a.join() + '|' + a.length",
+        "1|2,3|2",
+    );
+    both_bool("[].shift() === undefined", true);
+    both_string(
+        "const a = [1, , 3]; a.shift(); a.length + ':' + (0 in a) + a[1]",
+        "2:false3",
+    );
+    both_string(
+        &format!(
+            "{LIKE}const x = Array.prototype.shift.call(o); x + o[0] + ('1' in o) + o[2] + ('3' in o) + o.length"
+        ),
+        "abfalsedfalse3",
+    );
+    both_number(
+        "const o = { length: 0 }; Array.prototype.shift.call(o); o.length",
+        0.0,
+    );
+    both_number("const o = {}; Array.prototype.shift.call(o); o.length", 0.0);
+    both_string(
+        "const a = [3, 4]; const n = a.unshift(1, 2); n + '|' + a.join()",
+        "4|1,2,3,4",
+    );
+    both_number("[1].unshift()", 1.0);
+    both_string(
+        "const a = [1, , 3]; a.unshift('x'); a.length + ':' + a[0] + a[1] + (2 in a) + a[3]",
+        "4:x1false3",
+    );
+    both_string(
+        &format!(
+            "{LIKE}const n = Array.prototype.unshift.call(o, 'z'); n + o[0] + o[1] + o[2] + ('3' in o) + o[4]"
+        ),
+        "5zabfalsed",
+    );
+    both_number(
+        "const a = []; for (let i = 0; i < 9; i++) a.unshift(i); a.shift() + a.length",
+        16.0,
+    );
+    throws_type_error("Array.prototype.unshift.call({ length: 2 ** 53 - 1 }, 1)");
+    both_number(
+        "Array.prototype.unshift.call({ length: 2 ** 53 - 1 })",
+        9_007_199_254_740_991.0,
+    );
+    both_string(
+        &format!(
+            "{SUB}const a = A.from([2]); a.unshift(1); a.shift(); (a instanceof A) + a.join()"
+        ),
+        "true2",
+    );
+}
+
+#[test]
+fn fill_with_relative_bounds() {
+    both_string("[1, 2, 3, 4].fill(0).join()", "0,0,0,0");
+    both_string("[1, 2, 3, 4].fill(0, 1, 3).join()", "1,0,0,4");
+    both_string("[1, 2, 3, 4].fill(0, -2).join()", "1,2,0,0");
+    both_string("[1, 2, 3, 4].fill(0, -10, -3).join()", "0,2,3,4");
+    both_string("[1, 2, 3, 4].fill(0, 2, undefined).join()", "1,2,0,0");
+    both_string("[1, 2, 3, 4].fill(0, NaN, 2.5).join()", "0,0,3,4");
+    both_bool("const a = [1]; a.fill(2) === a", true);
+    both_string(
+        "const a = [, , ]; a.fill(7); a.length + ':' + (0 in a) + a[1]",
+        "2:true7",
+    );
+    both_string(
+        "const o = { length: 3 }; Array.prototype.fill.call(o, 'x', 1); ('0' in o) + o[1] + o[2]",
+        "falsexx",
+    );
+    both_string(
+        &format!("{SUB}const a = A.from([1, 2]); (a.fill(9) instanceof A) + a.join()"),
+        "true9,9",
+    );
+}
+
+#[test]
+fn copy_within_moves_ranges() {
+    both_string("[1, 2, 3, 4, 5].copyWithin(0, 3).join()", "4,5,3,4,5");
+    both_string("[1, 2, 3, 4, 5].copyWithin(1, 0).join()", "1,1,2,3,4");
+    both_string("[1, 2, 3, 4, 5].copyWithin(0, 3, 4).join()", "4,2,3,4,5");
+    both_string("[1, 2, 3, 4, 5].copyWithin(-2, -3, -1).join()", "1,2,3,3,4");
+    both_string(
+        "[1, 2, 3, 4, 5].copyWithin(2, 0, undefined).join()",
+        "1,2,1,2,3",
+    );
+    both_bool("const a = [1]; a.copyWithin(0, 0) === a", true);
+    // Holes copy as deletions.
+    both_string(
+        "const a = [1, , 3, 4]; a.copyWithin(2, 0, 2); a.length + ':' + a[2] + (3 in a)",
+        "4:1false",
+    );
+    both_string(
+        &format!("{LIKE}Array.prototype.copyWithin.call(o, 0, 2); ('0' in o) + o[1] + o[2] + o[3]"),
+        "falsedundefinedd",
+    );
+    both_string(
+        &format!("{SUB}const a = A.from([1, 2, 3]); (a.copyWithin(0, 1) instanceof A) + a.join()"),
+        "true2,3,3",
+    );
+}
+
+#[test]
+fn mutating_methods_on_primitive_receivers() {
+    both_string("typeof Array.prototype.reverse.call(1)", "object");
+    both_string("typeof Array.prototype.fill.call(true, 0)", "object");
+    both_bool("Array.prototype.shift.call(5) === undefined", true);
+    throws_type_error("Array.prototype.reverse.call('ab')");
 }

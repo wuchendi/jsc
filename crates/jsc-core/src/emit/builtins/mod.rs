@@ -87,6 +87,7 @@ impl Frame {
             (6, ValType::I64),
             (4, ValType::I32),
             (2, ValType::F64),
+            (6, ValType::F64),
         ])
     }
 
@@ -159,6 +160,11 @@ impl Frame {
     fn yf64(self, n: u32) -> u32 {
         self.scratch() + 46 + n
     }
+
+    /// Further f64 temp `n` (`0..6`).
+    fn zf64(self, n: u32) -> u32 {
+        self.scratch() + 48 + n
+    }
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -201,30 +207,35 @@ pub(super) fn emit_builtin(
         Builtin::BoundCall => function::emit_bound_call(&mut f, frame, strings, helpers),
         Builtin::ThrowTypeError => function::emit_throw_type_error(&mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::ArrayPush => array::emit_push(&mut f, frame, strings, helpers),
-        Builtin::ArrayPop => array::emit_pop(&mut f, frame, strings, helpers),
-        Builtin::ArrayHof(op) => array::emit_hof(op, &mut f, frame, strings, helpers),
-        Builtin::ArrayIndexOf => array::emit_search(false, &mut f, frame, strings, helpers),
-        Builtin::ArrayIncludes => array::emit_search(true, &mut f, frame, strings, helpers),
-        Builtin::ArrayJoin => array::emit_join(&mut f, frame, strings, helpers),
-        Builtin::ArraySlice => array::emit_slice(&mut f, frame, strings, helpers),
-        Builtin::ArrayToString => array::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::ArrayOf => array::emit_of(&mut f, frame, strings, helpers),
-        Builtin::ArrayFrom => array::emit_from(&mut f, frame, strings, helpers),
-        Builtin::ArrayAt => array::emit_at(&mut f, frame, strings, helpers),
-        Builtin::ArrayFind(op) => array::emit_find(op, &mut f, frame, strings, helpers),
-        Builtin::ArrayReduceRight => array::emit_reduce_right(&mut f, frame, strings, helpers),
-        Builtin::ArrayLastIndexOf => array::emit_last_index_of(&mut f, frame, strings, helpers),
-        Builtin::ArrayConcat => array::emit_concat(&mut f, frame, strings, helpers),
-        Builtin::ArrayFlat { map } => array::emit_flat(map, &mut f, frame, strings, helpers),
+        Builtin::ArrayPush
+        | Builtin::ArrayPop
+        | Builtin::ArrayHof(_)
+        | Builtin::ArrayIndexOf
+        | Builtin::ArrayIncludes
+        | Builtin::ArrayJoin
+        | Builtin::ArraySlice
+        | Builtin::ArrayToString
+        | Builtin::ArrayOf
+        | Builtin::ArrayFrom
+        | Builtin::ArrayAt
+        | Builtin::ArrayFind(_)
+        | Builtin::ArrayReduceRight
+        | Builtin::ArrayLastIndexOf
+        | Builtin::ArrayConcat
+        | Builtin::ArrayFlat { .. }
+        | Builtin::ArraySplice
+        | Builtin::ArraySort
+        | Builtin::ArrayReverse
+        | Builtin::ArrayShift
+        | Builtin::ArrayUnshift
+        | Builtin::ArrayFill
+        | Builtin::ArrayCopyWithin => emit_array_family(builtin, &mut f, frame, strings, helpers),
         Builtin::StringMethod(op) => string::emit_method(op, &mut f, frame, strings, helpers),
         Builtin::StringToString => string::emit_this_value(false, &mut f, frame, strings, helpers),
         Builtin::StringValueOf => string::emit_this_value(true, &mut f, frame, strings, helpers),
-        Builtin::StringFromCharCode => {
-            string::emit_from_char_code(false, &mut f, frame, strings, helpers);
-        }
-        Builtin::StringFromCodePoint => {
-            string::emit_from_char_code(true, &mut f, frame, strings, helpers);
+        Builtin::StringFromCharCode | Builtin::StringFromCodePoint => {
+            let code_point = builtin == Builtin::StringFromCodePoint;
+            string::emit_from_char_code(code_point, &mut f, frame, strings, helpers);
         }
         Builtin::StringRaw => string::emit_raw(&mut f, frame, strings, helpers),
         Builtin::NumberToString
@@ -279,6 +290,44 @@ pub(super) fn emit_builtin(
     }
     wasm!(f; End);
     f
+}
+
+/// Emit the body of an `Array` static or `%Array.prototype%` method into `f`
+/// (the variants [`emit_builtin`] routes here).
+fn emit_array_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::ArrayPush => array::emit_push(f, frame, strings, helpers),
+        Builtin::ArrayPop => array::emit_pop(f, frame, strings, helpers),
+        Builtin::ArrayHof(op) => array::emit_hof(op, f, frame, strings, helpers),
+        Builtin::ArrayIndexOf => array::emit_search(false, f, frame, strings, helpers),
+        Builtin::ArrayIncludes => array::emit_search(true, f, frame, strings, helpers),
+        Builtin::ArrayJoin => array::emit_join(f, frame, strings, helpers),
+        Builtin::ArraySlice => array::emit_slice(f, frame, strings, helpers),
+        Builtin::ArrayToString => array::emit_to_string(f, frame, strings, helpers),
+        Builtin::ArrayOf => array::emit_of(f, frame, strings, helpers),
+        Builtin::ArrayFrom => array::emit_from(f, frame, strings, helpers),
+        Builtin::ArrayAt => array::emit_at(f, frame, strings, helpers),
+        Builtin::ArrayFind(op) => array::emit_find(op, f, frame, strings, helpers),
+        Builtin::ArrayReduceRight => array::emit_reduce_right(f, frame, strings, helpers),
+        Builtin::ArrayLastIndexOf => array::emit_last_index_of(f, frame, strings, helpers),
+        Builtin::ArrayConcat => array::emit_concat(f, frame, strings, helpers),
+        Builtin::ArrayFlat { map } => array::emit_flat(map, f, frame, strings, helpers),
+        Builtin::ArraySplice => array::emit_splice(f, frame, strings, helpers),
+        Builtin::ArraySort => array::emit_sort(f, frame, strings, helpers),
+        Builtin::ArrayReverse => array::emit_reverse(f, frame, strings, helpers),
+        Builtin::ArrayShift => array::emit_shift(f, frame, strings, helpers),
+        Builtin::ArrayUnshift => array::emit_unshift(f, frame, strings, helpers),
+        Builtin::ArrayFill => array::emit_fill(f, frame, strings, helpers),
+        Builtin::ArrayCopyWithin => array::emit_copy_within(f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
 }
 
 /// Emit the body of a `Number` / `Boolean` prototype method, a `Number`

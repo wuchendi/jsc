@@ -10,10 +10,12 @@ const NOT_DATE: CalleeErrorText<'static> = [
 ];
 
 /// The static strings of this family (the method texts included).
-pub(super) const STRINGS: [&str; 6] = [
+pub(super) const STRINGS: [&str; 8] = [
     NOT_DATE[0],
     NOT_DATE[1],
     INVALID_DATE,
+    INVALID_TIME_VALUE[0],
+    INVALID_TIME_VALUE[1],
     DATE_WEEKDAYS,
     DATE_MONTHS,
     DATE_TAIL,

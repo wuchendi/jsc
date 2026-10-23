@@ -878,6 +878,7 @@ fn more_strings() -> impl Iterator<Item = &'static str> {
         .chain(CTOR_NOT_OBJECT)
         .chain(CANNOT_DEFINE)
         .chain([CONSTRUCTOR, "done", "value"])
+        .chain(mutating_strings())
 }
 
 /// The IR fragments of the statics and the non-mutating methods, over the
@@ -1851,4 +1852,802 @@ pub(super) fn emit_flat(
         End, End,
         LocalGet(a),
     );
+}
+
+// --- splice / sort / reverse / shift / unshift / fill / copyWithin --------------------
+
+const SPLICE: Texts = texts!("splice");
+const SORT: Texts = texts!("sort");
+const REVERSE: Texts = texts!("reverse");
+const SHIFT: Texts = texts!("shift");
+const UNSHIFT: Texts = texts!("unshift");
+const FILL: Texts = texts!("fill");
+const COPY_WITHIN: Texts = texts!("copyWithin");
+
+/// The `TypeError` of `sort` with a comparator neither callable nor
+/// `undefined`.
+const SORT_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "The comparison function must be either a function or undefined",
+    "TypeError: The comparison function must be either a function or undefined",
+];
+
+/// The `TypeError` of a `splice` / `unshift` whose new length passes
+/// [`MAX_SAFE_INTEGER`].
+const TOO_LONG: CalleeErrorText<'static> = [
+    "The new length exceeds the maximum array-like length",
+    "TypeError: The new length exceeds the maximum array-like length",
+];
+
+/// The static strings of the mutating methods.
+fn mutating_strings() -> impl Iterator<Item = &'static str> {
+    [
+        &SPLICE,
+        &SORT,
+        &REVERSE,
+        &SHIFT,
+        &UNSHIFT,
+        &FILL,
+        &COPY_WITHIN,
+    ]
+    .into_iter()
+    .flat_map(|t| t.nullish)
+    .chain(SORT_NOT_CALLABLE)
+    .chain(TOO_LONG)
+}
+
+/// Push the f64 index in local `f` as a number jsval.
+fn num(function: &mut Function, f: u32) {
+    wasm!(function; LocalGet(f), I64ReinterpretF64);
+}
+
+/// `f += delta` over an f64 local.
+fn bump(function: &mut Function, f: u32, delta: f64) {
+    wasm!(function; LocalGet(f), F64Const(Ieee64::from(delta)), F64Add, LocalSet(f));
+}
+
+/// `while cond { body }`: `cond` pushes an i32, nonzero to run `body` again.
+fn while_loop(
+    function: &mut Function,
+    cond: impl FnOnce(&mut Function),
+    body: impl FnOnce(&mut Function),
+) {
+    wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
+    cond(function);
+    wasm!(function; I32Eqz, BrIf(1));
+    body(function);
+    wasm!(function; Br(0), End, End);
+}
+
+/// Push the index the relative position in f64 `r` designates in the f64
+/// length `len`: `max(len + r, 0)` when `r < 0`, else `min(r, len)` (`-0`
+/// is `+0`).
+fn relative_f64(function: &mut Function, r: u32, len: u32) {
+    wasm!(function;
+        LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
+        If(BlockType::Result(ValType::F64)),
+        LocalGet(len), LocalGet(r), F64Add, F64Const(Ieee64::from(0.0)), F64Max,
+        Else,
+        LocalGet(r), LocalGet(len), F64Min,
+        End,
+        F64Const(Ieee64::from(0.0)), F64Add,
+    );
+}
+
+/// `ToIntegerOrInfinity` of the jsval in i64 `v` relative to the f64 length
+/// `len` (or `len` itself when `v` is `undefined` and `undefined_is_len`),
+/// into f64 `out` (`r` an f64 temp).
+fn relative_arg(
+    function: &mut Function,
+    v: u32,
+    undefined_is_len: bool,
+    r: u32,
+    len: u32,
+    out: u32,
+    helpers: Helpers<'_>,
+) {
+    if undefined_is_len {
+        wasm!(function;
+            LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq,
+            If(BlockType::Empty), LocalGet(len), LocalSet(out), Else,
+        );
+    }
+    wasm!(function; LocalGet(v));
+    to_integer(function, r, helpers);
+    relative_f64(function, r, len);
+    wasm!(function; LocalSet(out));
+    if undefined_is_len {
+        wasm!(function; End);
+    }
+}
+
+/// Push `HasProperty(o, f)` (i32) for the f64 index in local `f`, leaving its
+/// interned key in i32 `key`.
+fn has_at(function: &mut Function, o: u32, f: u32, key: u32, helpers: Helpers<'_>) {
+    num(function, f);
+    wasm!(function;
+        I32Const(1), Call(helpers.to_key), LocalTee(key),
+        LocalGet(o), Call(helpers.has),
+    );
+}
+
+/// `Get(o, key)` into i64 `v` for the interned key in i32 `key`; a throwing
+/// getter returns.
+fn get_key(function: &mut Function, o: u32, key: u32, v: u32, helpers: Helpers<'_>) {
+    wasm!(function; LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(v));
+    return_if_pending(function);
+}
+
+/// `Set(o, f, v, true)` for the f64 index in local `f` (`kv` an i64 temp).
+fn set_at(
+    function: &mut Function,
+    frame: Frame,
+    (o, f, v, kv): (u32, u32, u32, u32),
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    num(function, f);
+    wasm!(function; LocalSet(kv));
+    emit_drop(
+        function,
+        frame,
+        &set(o, IrNode::Local(kv), v),
+        strings,
+        helpers,
+    );
+}
+
+/// `DeletePropertyOrThrow(o, f)` for the f64 index in local `f` (`kv` an i64
+/// temp).
+fn delete_at(
+    function: &mut Function,
+    frame: Frame,
+    (o, f, kv): (u32, u32, u32),
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    num(function, f);
+    wasm!(function; LocalSet(kv));
+    emit_drop(function, frame, &delete(o, kv), strings, helpers);
+}
+
+/// The element move of `splice` / `shift` / `unshift` / `copyWithin`: when
+/// `HasProperty(o, from)`, `Set(o, to, Get(o, from), true)`, else
+/// `DeletePropertyOrThrow(o, to)` (f64 indices; `key`, `v`, `kv` temps).
+fn move_or_delete(
+    function: &mut Function,
+    frame: Frame,
+    (o, from, to): (u32, u32, u32),
+    (key, v, kv): (u32, u32, u32),
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    has_at(function, o, from, key, helpers);
+    wasm!(function; If(BlockType::Empty));
+    get_key(function, o, key, v, helpers);
+    set_at(function, frame, (o, to, v, kv), strings, helpers);
+    wasm!(function; Else);
+    delete_at(function, frame, (o, to, kv), strings, helpers);
+    wasm!(function; End);
+}
+
+/// `Set(o, "length", f, true)` for the f64 length in local `f` (`kv` an i64
+/// temp).
+fn set_length_f64(
+    function: &mut Function,
+    frame: Frame,
+    (o, f, kv): (u32, u32, u32),
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    num(function, f);
+    wasm!(function; LocalSet(kv));
+    set_length(function, frame, o, kv, strings, helpers);
+}
+
+/// Throw [`TOO_LONG`] when `len + delta` (f64 locals; `delta` a small
+/// integer, so the sum rounds past [`MAX_SAFE_INTEGER`] only when it is past
+/// it) exceeds [`MAX_SAFE_INTEGER`].
+fn check_new_length(
+    function: &mut Function,
+    frame: Frame,
+    len: u32,
+    delta: impl FnOnce(&mut Function),
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    wasm!(function; LocalGet(len));
+    delta(function);
+    wasm!(function;
+        F64Add, F64Const(Ieee64::from(MAX_SAFE_INTEGER)), F64Gt,
+        If(BlockType::Empty),
+    );
+    throw_type_error(function, frame, TOO_LONG, strings, helpers);
+    wasm!(function; End);
+}
+
+/// `Array.prototype.splice(start, deleteCount, ...items)`: `actualStart`
+/// relative to `len`; `actualDeleteCount` 0 without arguments, `len -
+/// actualStart` without a `deleteCount`, else clamped to `[0, len -
+/// actualStart]`; a new length past `2^53 - 1` throws; `A =
+/// ArraySpeciesCreate(O, actualDeleteCount)` receives the deleted present
+/// elements and its `length`; the tail moves down (then the vacated top is
+/// deleted) or up to fit the items, which are `Set` from `actualStart`; then
+/// `Set(O, "length", len - actualDeleteCount + itemCount)`.
+#[allow(clippy::too_many_lines)]
+pub(super) fn emit_splice(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, v, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (dc_v, saved) = (frame.x64(0), frame.x64(1));
+    let (count, target) = (frame.y64(1), frame.y64(4));
+    let (key, arg_i, argn) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let r = frame.f64(0);
+    let (len, start) = (frame.yf64(0), frame.yf64(1));
+    let (dc, items, k) = (frame.zf64(0), frame.zf64(1), frame.zf64(2));
+    let (from, to, bound) = (frame.zf64(3), frame.zf64(4), frame.zf64(5));
+    let temps = (key, v, kv);
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(start_v));
+    frame.arg(function, 1);
+    wasm!(function; LocalSet(dc_v));
+    argc(function, frame);
+    wasm!(function; LocalSet(argn));
+    this_object(function, frame, o, SPLICE.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    relative_arg(function, start_v, false, r, len, start, helpers);
+    wasm!(function;
+        // itemCount = max(argc - 2, 0)
+        LocalGet(argn), I32Const(2), I32Sub, I32Const(0), LocalGet(argn), I32Const(2), I32GtU, Select,
+        F64ConvertI32U, LocalSet(items),
+        LocalGet(argn), I32Eqz,
+        If(BlockType::Empty),
+        F64Const(Ieee64::from(0.0)), LocalSet(dc),
+        Else,
+        LocalGet(len), LocalGet(start), F64Sub, LocalSet(dc),
+        LocalGet(argn), I32Const(1), I32GtU,
+        If(BlockType::Empty),
+        LocalGet(dc_v),
+    );
+    to_integer(function, r, helpers);
+    wasm!(function;
+        LocalGet(r), F64Const(Ieee64::from(0.0)), F64Max, LocalGet(dc), F64Min, LocalSet(dc),
+        End,
+        End,
+    );
+    check_new_length(
+        function,
+        frame,
+        len,
+        |function| wasm!(function; LocalGet(items), LocalGet(dc), F64Sub),
+        strings,
+        helpers,
+    );
+    num(function, dc);
+    wasm!(function; LocalSet(count));
+    species_create(function, frame, o, count, target, strings, helpers);
+    // The deleted elements into `A`.
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(dc), F64Lt),
+        |function| {
+            wasm!(function; LocalGet(start), LocalGet(k), F64Add, LocalSet(from));
+            has_at(function, o, from, key, helpers);
+            wasm!(function; If(BlockType::Empty));
+            get_key(function, o, key, v, helpers);
+            num(function, k);
+            wasm!(function; LocalSet(kv));
+            create_data_property(function, frame, target, kv, v, strings, helpers);
+            wasm!(function; End);
+            bump(function, k, 1.0);
+        },
+    );
+    set_length_f64(function, frame, (target, dc, kv), strings, helpers);
+    // Shift the tail to fit the items.
+    wasm!(function; LocalGet(items), LocalGet(dc), F64Lt, If(BlockType::Empty));
+    wasm!(function;
+        LocalGet(start), LocalSet(k),
+        LocalGet(len), LocalGet(dc), F64Sub, LocalSet(bound),
+    );
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(bound), F64Lt),
+        |function| {
+            wasm!(function;
+                LocalGet(k), LocalGet(dc), F64Add, LocalSet(from),
+                LocalGet(k), LocalGet(items), F64Add, LocalSet(to),
+            );
+            move_or_delete(function, frame, (o, from, to), temps, strings, helpers);
+            bump(function, k, 1.0);
+        },
+    );
+    wasm!(function;
+        LocalGet(len), LocalSet(k),
+        LocalGet(len), LocalGet(dc), F64Sub, LocalGet(items), F64Add, LocalSet(bound),
+    );
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(bound), F64Gt),
+        |function| {
+            bump(function, k, -1.0);
+            delete_at(function, frame, (o, k, kv), strings, helpers);
+        },
+    );
+    wasm!(function; Else, LocalGet(items), LocalGet(dc), F64Gt, If(BlockType::Empty));
+    wasm!(function; LocalGet(len), LocalGet(dc), F64Sub, LocalSet(k));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(start), F64Gt),
+        |function| {
+            wasm!(function;
+                LocalGet(k), LocalGet(dc), F64Add, F64Const(Ieee64::from(1.0)), F64Sub, LocalSet(from),
+                LocalGet(k), LocalGet(items), F64Add, F64Const(Ieee64::from(1.0)), F64Sub, LocalSet(to),
+            );
+            move_or_delete(function, frame, (o, from, to), temps, strings, helpers);
+            bump(function, k, -1.0);
+        },
+    );
+    wasm!(function; End, End);
+    // The items from `actualStart`.
+    wasm!(function; LocalGet(start), LocalSet(k), I32Const(2), LocalSet(arg_i));
+    count_loop(function, arg_i, argn, |function| {
+        saved_arg_at(function, frame, saved, arg_i, v);
+        set_at(function, frame, (o, k, v, kv), strings, helpers);
+        bump(function, k, 1.0);
+    });
+    wasm!(function;
+        LocalGet(len), LocalGet(dc), F64Sub, LocalGet(items), F64Add, LocalSet(bound),
+    );
+    set_length_f64(function, frame, (o, bound, kv), strings, helpers);
+    wasm!(function; LocalGet(target));
+}
+
+/// `Array.prototype.reverse()`: swap `lower` and `len - 1 - lower` for each
+/// `lower < floor(len / 2)`, by `HasProperty` / `Get` of both, then `Set` of
+/// the present ones and `DeletePropertyOrThrow` of the absent ones.
+pub(super) fn emit_reverse(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, lv, uv, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (key, lower_present, upper_present) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (len, lower) = (frame.yf64(0), frame.yf64(1));
+    let (upper, middle) = (frame.zf64(0), frame.zf64(1));
+    this_object(function, frame, o, REVERSE.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    wasm!(function;
+        LocalGet(len), F64Const(Ieee64::from(2.0)), F64Div, F64Floor, LocalSet(middle),
+        F64Const(Ieee64::from(0.0)), LocalSet(lower),
+    );
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(lower), LocalGet(middle), F64Lt),
+        |function| {
+            wasm!(function;
+                LocalGet(len), LocalGet(lower), F64Sub, F64Const(Ieee64::from(1.0)), F64Sub,
+                LocalSet(upper),
+            );
+            has_at(function, o, lower, key, helpers);
+            wasm!(function; LocalTee(lower_present), If(BlockType::Empty));
+            get_key(function, o, key, lv, helpers);
+            wasm!(function; End);
+            has_at(function, o, upper, key, helpers);
+            wasm!(function; LocalTee(upper_present), If(BlockType::Empty));
+            get_key(function, o, key, uv, helpers);
+            wasm!(function; End, LocalGet(upper_present), If(BlockType::Empty));
+            set_at(function, frame, (o, lower, uv, kv), strings, helpers);
+            wasm!(function; LocalGet(lower_present), If(BlockType::Empty));
+            set_at(function, frame, (o, upper, lv, kv), strings, helpers);
+            wasm!(function; Else);
+            delete_at(function, frame, (o, upper, kv), strings, helpers);
+            wasm!(function; End, Else, LocalGet(lower_present), If(BlockType::Empty));
+            delete_at(function, frame, (o, lower, kv), strings, helpers);
+            set_at(function, frame, (o, upper, lv, kv), strings, helpers);
+            wasm!(function; End, End);
+            bump(function, lower, 1.0);
+        },
+    );
+    wasm!(function; LocalGet(o));
+}
+
+/// `Array.prototype.shift()`: an empty receiver gets `length` 0 and returns
+/// `undefined`; else `first = Get(O, "0")`, each index `1..len` moves down
+/// one, the last index is deleted and `length` becomes `len - 1`.
+pub(super) fn emit_shift(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, first, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let key = frame.i32(0);
+    let (len, k) = (frame.yf64(0), frame.yf64(1));
+    let to = frame.zf64(0);
+    this_object(function, frame, o, SHIFT.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    wasm!(function; LocalGet(len), F64Const(Ieee64::from(0.0)), F64Eq, If(BlockType::Empty));
+    set_length_f64(function, frame, (o, len, kv), strings, helpers);
+    wasm!(function;
+        I64Const(UNDEFINED_BITS), Return,
+        End,
+        F64Const(Ieee64::from(0.0)), LocalSet(k),
+    );
+    num(function, k);
+    wasm!(function; I32Const(1), Call(helpers.to_key), LocalSet(key));
+    get_key(function, o, key, first, helpers);
+    wasm!(function; F64Const(Ieee64::from(1.0)), LocalSet(k));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+        |function| {
+            wasm!(function; LocalGet(k), F64Const(Ieee64::from(1.0)), F64Sub, LocalSet(to));
+            move_or_delete(function, frame, (o, k, to), (key, v, kv), strings, helpers);
+            bump(function, k, 1.0);
+        },
+    );
+    wasm!(function; LocalGet(len), F64Const(Ieee64::from(1.0)), F64Sub, LocalSet(to));
+    delete_at(function, frame, (o, to, kv), strings, helpers);
+    set_length_f64(function, frame, (o, to, kv), strings, helpers);
+    wasm!(function; LocalGet(first));
+}
+
+/// `Array.prototype.unshift(...items)`: with items, a new length past
+/// `2^53 - 1` throws, each index `len - 1..0` moves up by the item count and
+/// the items are `Set` from 0; `length` becomes (and the call returns)
+/// `len + argCount`.
+pub(super) fn emit_unshift(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, v, kv, saved) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
+    let (key, arg_i, argn) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (len, k) = (frame.yf64(0), frame.yf64(1));
+    let (from, to, items) = (frame.zf64(0), frame.zf64(1), frame.zf64(2));
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
+    argc(function, frame);
+    wasm!(function; LocalTee(argn), F64ConvertI32U, LocalSet(items));
+    this_object(function, frame, o, UNSHIFT.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    wasm!(function; LocalGet(argn), If(BlockType::Empty));
+    check_new_length(
+        function,
+        frame,
+        len,
+        |function| wasm!(function; LocalGet(items)),
+        strings,
+        helpers,
+    );
+    wasm!(function; LocalGet(len), LocalSet(k));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), F64Const(Ieee64::from(0.0)), F64Gt),
+        |function| {
+            wasm!(function;
+                LocalGet(k), F64Const(Ieee64::from(1.0)), F64Sub, LocalSet(from),
+                LocalGet(from), LocalGet(items), F64Add, LocalSet(to),
+            );
+            move_or_delete(
+                function,
+                frame,
+                (o, from, to),
+                (key, v, kv),
+                strings,
+                helpers,
+            );
+            bump(function, k, -1.0);
+        },
+    );
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k), I32Const(0), LocalSet(arg_i));
+    count_loop(function, arg_i, argn, |function| {
+        saved_arg_at(function, frame, saved, arg_i, v);
+        set_at(function, frame, (o, k, v, kv), strings, helpers);
+        bump(function, k, 1.0);
+    });
+    wasm!(function; End, LocalGet(len), LocalGet(items), F64Add, LocalSet(to));
+    set_length_f64(function, frame, (o, to, kv), strings, helpers);
+    wasm!(function; LocalGet(kv));
+}
+
+/// `Array.prototype.fill(value, start, end)`: `Set(O, k, value, true)` for
+/// each `k` in `[relative start, relative end)` (`end` is `len` when
+/// `undefined`).
+pub(super) fn emit_fill(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, value, kv, end_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let start_v = frame.x64(0);
+    let r = frame.f64(0);
+    let (len, k, fin) = (frame.yf64(0), frame.yf64(1), frame.zf64(0));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(value));
+    frame.arg(function, 1);
+    wasm!(function; LocalSet(start_v));
+    frame.arg(function, 2);
+    wasm!(function; LocalSet(end_v));
+    this_object(function, frame, o, FILL.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    relative_arg(function, start_v, false, r, len, k, helpers);
+    relative_arg(function, end_v, true, r, len, fin, helpers);
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(fin), F64Lt),
+        |function| {
+            set_at(function, frame, (o, k, value, kv), strings, helpers);
+            bump(function, k, 1.0);
+        },
+    );
+    wasm!(function; LocalGet(o));
+}
+
+/// `Array.prototype.copyWithin(target, start, end)`: `to`, `from` and
+/// `final` relative to `len` (`final` is `len` when `end` is `undefined`),
+/// `count = min(final - from, len - to)`; the move runs downwards when the
+/// ranges overlap with `from < to`, and each step moves or deletes one index.
+pub(super) fn emit_copy_within(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, v, kv, target_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (start_v, end_v) = (frame.x64(0), frame.x64(1));
+    let key = frame.i32(0);
+    let r = frame.f64(0);
+    let (len, to) = (frame.yf64(0), frame.yf64(1));
+    let (from, fin, count, dir) = (frame.zf64(0), frame.zf64(1), frame.zf64(2), frame.zf64(3));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(target_v));
+    frame.arg(function, 1);
+    wasm!(function; LocalSet(start_v));
+    frame.arg(function, 2);
+    wasm!(function; LocalSet(end_v));
+    this_object(function, frame, o, COPY_WITHIN.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    relative_arg(function, target_v, false, r, len, to, helpers);
+    relative_arg(function, start_v, false, r, len, from, helpers);
+    relative_arg(function, end_v, true, r, len, fin, helpers);
+    wasm!(function;
+        LocalGet(fin), LocalGet(from), F64Sub, LocalGet(len), LocalGet(to), F64Sub, F64Min,
+        LocalSet(count),
+        F64Const(Ieee64::from(1.0)), LocalSet(dir),
+        LocalGet(from), LocalGet(to), F64Lt,
+        LocalGet(to), LocalGet(from), LocalGet(count), F64Add, F64Lt, I32And,
+        If(BlockType::Empty),
+        F64Const(Ieee64::from(-1.0)), LocalSet(dir),
+        LocalGet(from), LocalGet(count), F64Add, F64Const(Ieee64::from(1.0)), F64Sub, LocalSet(from),
+        LocalGet(to), LocalGet(count), F64Add, F64Const(Ieee64::from(1.0)), F64Sub, LocalSet(to),
+        End,
+    );
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(count), F64Const(Ieee64::from(0.0)), F64Gt),
+        |function| {
+            move_or_delete(
+                function,
+                frame,
+                (o, from, to),
+                (key, v, kv),
+                strings,
+                helpers,
+            );
+            wasm!(function;
+                LocalGet(from), LocalGet(dir), F64Add, LocalSet(from),
+                LocalGet(to), LocalGet(dir), F64Add, LocalSet(to),
+            );
+            bump(function, count, -1.0);
+        },
+    );
+    wasm!(function; LocalGet(o));
+}
+
+/// Push the address of pair `p` (an i32 local) of the sort buffer whose array
+/// handle base is in i32 `buf`: its sort key at [`elem_slot`] 0, its value at
+/// slot 1.
+fn pair_at(function: &mut Function, buf: u32, p: u32) {
+    wasm!(function; LocalGet(buf));
+    emit_array_elems(function);
+    wasm!(function; LocalGet(p), I32Const(4), I32Shl, I32Add);
+}
+
+/// `Array.prototype.sort(comparefn)`: a comparator neither `undefined` nor
+/// callable throws before `ToObject`. The present indices `k < len` are read
+/// (`HasProperty` / `Get`) into a private buffer of `(key, value)` pairs —
+/// the key is `ToString(value)` without a comparator — counting the
+/// `undefined` values apart; a bottom-up merge sort (stable, `O(n log n)`
+/// comparisons) orders the pairs by `comparefn(x, y) < 0` (its result
+/// `ToNumber`'d) or by code-unit order of the keys; then the sorted values,
+/// the `undefined`s and (by `DeletePropertyOrThrow` up to `len`) the holes
+/// are written back. A throw from a getter, `ToString` or the comparator
+/// leaves `O` unchanged.
+#[allow(clippy::too_many_lines)]
+pub(super) fn emit_sort(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, cmp, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (lhs, rhs, result, this_arg) = (frame.x64(0), frame.x64(1), frame.y64(1), frame.y64(4));
+    let (src, dst, pairs, width) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (lo, mid) = (frame.x32(0), frame.x32(1));
+    let (hi, left, right, out) = (frame.y32(0), frame.y32(1), frame.y32(2), frame.y32(3));
+    // The key temp of the read and write-back loops (the merge is done or
+    // not yet started there).
+    let key = lo;
+    let (len, k, undefs) = (frame.yf64(0), frame.yf64(1), frame.zf64(0));
+    frame.arg(function, 0);
+    wasm!(function;
+        LocalTee(cmp), I64Const(UNDEFINED_BITS), I64Ne,
+        If(BlockType::Empty),
+    );
+    require_callable(function, frame, cmp, SORT_NOT_CALLABLE, strings, helpers);
+    wasm!(function; End);
+    this_object(function, frame, o, SORT.nullish, strings, helpers);
+    length_of_f64(function, o, len, strings, helpers);
+    let default_order = |function: &mut Function| {
+        wasm!(function; LocalGet(cmp), I64Const(UNDEFINED_BITS), I64Eq);
+    };
+    // Collect.
+    wasm!(function;
+        I32Const(0), Call(helpers.new_array()), LocalSet(src),
+        F64Const(Ieee64::from(0.0)), LocalSet(k),
+        F64Const(Ieee64::from(0.0)), LocalSet(undefs),
+    );
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+        |function| {
+            has_at(function, o, k, key, helpers);
+            wasm!(function; If(BlockType::Empty));
+            get_key(function, o, key, v, helpers);
+            wasm!(function; LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
+            bump(function, undefs, 1.0);
+            wasm!(function; Else, LocalGet(v), LocalSet(lhs));
+            default_order(function);
+            wasm!(function;
+                If(BlockType::Empty),
+                LocalGet(v), Call(helpers.to_str()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+                LocalSet(lhs),
+            );
+            return_if_pending(function);
+            wasm!(function;
+                End,
+                LocalGet(src), LocalGet(lhs), Call(helpers.array_push), Drop,
+                LocalGet(src), LocalGet(v), Call(helpers.array_push), Drop,
+                End,
+                End,
+            );
+            bump(function, k, 1.0);
+        },
+    );
+    wasm!(function;
+        LocalGet(src), I32Load(array_len_slot()), LocalTee(pairs), Call(helpers.new_array()),
+        LocalSet(dst),
+        LocalGet(pairs), I32Const(1), I32ShrU, LocalSet(pairs),
+        I64Const(UNDEFINED_BITS), LocalSet(this_arg),
+    );
+    // Push i32 `1` when pair `right` sorts strictly before pair `left`.
+    let less = |function: &mut Function| {
+        pair_at(function, src, right);
+        wasm!(function; I64Load(elem_slot(0)), LocalSet(lhs));
+        pair_at(function, src, left);
+        wasm!(function; I64Load(elem_slot(0)), LocalSet(rhs));
+        default_order(function);
+        wasm!(function;
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(lhs), I32WrapI64, LocalGet(rhs), I32WrapI64, Call(helpers.str_cmp),
+            I32Const(0), I32LtS,
+            Else,
+        );
+        let args = [CallArg::Val(lhs), CallArg::Val(rhs)];
+        call_fn(function, frame, cmp, this_arg, &args, result, helpers);
+        wasm!(function; LocalGet(result), Call(helpers.to_number), LocalSet(result));
+        return_if_pending(function);
+        wasm!(function;
+            LocalGet(result), F64ReinterpretI64, F64Const(Ieee64::from(0.0)), F64Lt,
+            End,
+        );
+    };
+    // dst[out] = src[pair], then pair += 1 and out += 1.
+    let take = |function: &mut Function, pair: u32| {
+        for slot in 0..2 {
+            pair_at(function, dst, out);
+            pair_at(function, src, pair);
+            wasm!(function; I64Load(elem_slot(slot)), I64Store(elem_slot(slot)));
+        }
+        wasm!(function;
+            LocalGet(pair), I32Const(1), I32Add, LocalSet(pair),
+            LocalGet(out), I32Const(1), I32Add, LocalSet(out),
+        );
+    };
+    // Merge runs of `width` pairs from `src` into `dst`, then swap them.
+    wasm!(function; I32Const(1), LocalSet(width));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(width), LocalGet(pairs), I32LtU),
+        |function| {
+            wasm!(function; I32Const(0), LocalSet(lo));
+            while_loop(
+                function,
+                |function| wasm!(function; LocalGet(lo), LocalGet(pairs), I32LtU),
+                |function| {
+                    wasm!(function;
+                        LocalGet(lo), LocalGet(width), I32Add, LocalTee(mid),
+                        LocalGet(pairs), LocalGet(mid), LocalGet(pairs), I32LtU, Select, LocalSet(mid),
+                        LocalGet(mid), LocalGet(width), I32Add, LocalTee(hi),
+                        LocalGet(pairs), LocalGet(hi), LocalGet(pairs), I32LtU, Select, LocalSet(hi),
+                        LocalGet(lo), LocalTee(left), LocalSet(out),
+                        LocalGet(mid), LocalSet(right),
+                    );
+                    while_loop(
+                        function,
+                        |function| wasm!(function; LocalGet(out), LocalGet(hi), I32LtU),
+                        |function| {
+                            // Take from the right run when the left is
+                            // exhausted or the right pair is strictly less.
+                            wasm!(function;
+                                LocalGet(left), LocalGet(mid), I32GeU,
+                                If(BlockType::Result(ValType::I32)),
+                                I32Const(1),
+                                Else,
+                                LocalGet(right), LocalGet(hi), I32GeU,
+                                If(BlockType::Result(ValType::I32)),
+                                I32Const(0),
+                                Else,
+                            );
+                            less(function);
+                            wasm!(function; End, End, If(BlockType::Empty));
+                            take(function, right);
+                            wasm!(function; Else);
+                            take(function, left);
+                            wasm!(function; End);
+                        },
+                    );
+                    wasm!(function; LocalGet(hi), LocalSet(lo));
+                },
+            );
+            wasm!(function;
+                LocalGet(src), LocalGet(dst), LocalSet(src), LocalSet(dst),
+                LocalGet(width), I32Const(1), I32Shl, LocalSet(width),
+            );
+        },
+    );
+    // Write back the values, the `undefined`s, then delete up to `len`.
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k), I32Const(0), LocalSet(left));
+    count_loop(function, left, pairs, |function| {
+        pair_at(function, src, left);
+        wasm!(function; I64Load(elem_slot(1)), LocalSet(v));
+        set_at(function, frame, (o, k, v, kv), strings, helpers);
+        bump(function, k, 1.0);
+    });
+    wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(v));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(undefs), F64Const(Ieee64::from(0.0)), F64Gt),
+        |function| {
+            set_at(function, frame, (o, k, v, kv), strings, helpers);
+            bump(function, k, 1.0);
+            bump(function, undefs, -1.0);
+        },
+    );
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+        |function| {
+            delete_at(function, frame, (o, k, kv), strings, helpers);
+            bump(function, k, 1.0);
+        },
+    );
+    wasm!(function; LocalGet(o));
 }
