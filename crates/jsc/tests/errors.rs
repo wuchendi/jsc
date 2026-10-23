@@ -103,7 +103,7 @@ fn undeclared_identifier_throws_reference_error_at_run_time() {
     );
 }
 
-/// A codegen-rejected *unsupported construct* (a RegExp literal)
+/// A codegen-rejected *unsupported construct* (a `RegExp` literal)
 /// carries the offending node's span: the diagnostic points a caret at
 /// the construct.
 #[test]

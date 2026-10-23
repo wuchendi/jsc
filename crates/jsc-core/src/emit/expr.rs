@@ -917,7 +917,8 @@ fn proto_kind_cases(kind: ProtoKind) -> &'static [(i32, Intrinsic)] {
 /// Push i32 `1` when the jsval in `local` is a receiver of `kind` whose
 /// builtin methods are provably the realm's (DESIGN.md §6.4): a heap block of the
 /// kind byte with no own properties (`props == 0`, one i64 load of the header
-/// and `props` words) whose `proto` is the family's prototype and, unless
+/// and `props` words; an array also not in dictionary mode) whose `proto` is
+/// the family's prototype and, unless
 /// `sealed`, whose dirty bit is clear. `tmp` is a free i32 local.
 pub(super) fn emit_proto_kind_test(
     function: &mut Function,
@@ -947,7 +948,11 @@ pub(super) fn emit_proto_kind_test(
             align: 3,
             memory_index: 0,
         }));
-        function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
+        function.instruction(&Instruction::I64Const(if type_byte == TYPE_ARRAY {
+            ARRAY_KIND_AND_PROPS_MASK
+        } else {
+            KIND_AND_PROPS_MASK
+        }));
         function.instruction(&Instruction::I64And);
         function.instruction(&Instruction::I64Const(i64::from(type_byte)));
         function.instruction(&Instruction::I64Eq);
@@ -1204,6 +1209,12 @@ const KIND_AND_PROPS_MASK: i64 = 0xffff_ffff_0000_00ff_u64.cast_signed();
 
 /// The bits of an object's first eight bytes holding its `props` word.
 const PROPS_MASK: i64 = 0xffff_ffff_0000_0000_u64.cast_signed();
+
+/// [`KIND_AND_PROPS_MASK`] plus an array's `DICTIONARY` flag bit (header byte
+/// 2, bit `32`): a dictionary array's elements may carry any attributes, so it
+/// takes the generic call.
+const ARRAY_KIND_AND_PROPS_MASK: i64 = KIND_AND_PROPS_MASK | 0x0020_0000;
+const _: () = assert!(abi::ARRAY_FLAG_DICTIONARY == 0x20);
 
 /// Emit `new callee(args)` ([`IrNode::Construct`], DESIGN.md §7.6), leaving the
 /// constructed object on the stack. JS order: the callee is evaluated into

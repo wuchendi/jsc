@@ -34,6 +34,9 @@ macro_rules! wasm {
     }};
 }
 
+mod descriptor;
+pub(super) use descriptor::*;
+
 /// Kind byte of an own-property table (see [`abi::TYPE_PROPS`]).
 const TYPE_PROPS: i32 = abi::TYPE_PROPS as i32;
 /// Object-family `props` slot offset (see [`abi::OBJ_PROPS_OFFSET`]).
@@ -91,7 +94,7 @@ pub(super) const OWN_VALUES: i32 = 1;
 /// `__own_keys` mode: `[key, value]` pairs of the enumerable string keys.
 pub(super) const OWN_ENTRIES: i32 = 2;
 /// `__own_keys` mode: every string key, enumerable or not.
-const OWN_ALL: i32 = 3;
+pub(super) const OWN_ALL: i32 = 3;
 
 fn m8(offset: u64) -> MemArg {
     MemArg {
@@ -240,6 +243,80 @@ fn emit_elem_addr(function: &mut Function, arr: u32, i: u32) {
     );
 }
 
+/// Push `1` when element `i` (i32 local) of the array whose base is in i32
+/// local `o` lives in its store — the array is not `SPARSE`, or it is and
+/// `i < cap` — else `0` (the element, if any, is a table entry). `a` is i32
+/// scratch.
+fn emit_in_store(function: &mut Function, o: u32, i: u32, a: u32) {
+    emit_is_sparse(function, o);
+    wasm!(function;
+        I32Eqz,
+        If(BlockType::Result(ValType::I32)),
+        I32Const(1),
+        Else,
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(i), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), I32LtU,
+        Else, I32Const(0),
+        End,
+        End,
+    );
+}
+
+/// Put the array whose base is in i32 local `o` in dictionary mode (DESIGN.md
+/// §5.4) unless it already is: every present store element (`i < min(len,
+/// cap)`) becomes an own data property of its index key with the default
+/// attributes, the store is dropped (`elems = 0`), and the array is flagged
+/// `SPARSE | DICTIONARY`. Every element then lives in the table, where it can
+/// carry any attributes. `i`, `n`, `a` are i32 scratch.
+pub(super) fn emit_dictionize(
+    function: &mut Function,
+    o: u32,
+    i: u32,
+    n: u32,
+    a: u32,
+    helpers: Helpers<'_>,
+) {
+    let elem = |function: &mut Function| {
+        wasm!(function;
+            LocalGet(a), LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(m64(ELEMS_DATA_OFFSET)),
+        );
+    };
+    wasm!(function;
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_DICTIONARY), I32And, I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
+        If(BlockType::Empty),
+        // n = min(len, cap)
+        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalTee(n),
+        LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), LocalTee(i),
+        LocalGet(n), LocalGet(i), I32LtU, Select, LocalSet(n),
+        I32Const(0), LocalSet(i),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
+    );
+    elem(function);
+    wasm!(function;
+        I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(i), Call(helpers.index_string), Call(helpers.intern),
+    );
+    elem(function);
+    wasm!(function;
+        I32Const(ATTRS_DEFAULT), Call(helpers.define),
+        End,
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+        LocalGet(o), I32Const(0), I32Store(m32(ARRAY_ELEMS_OFFSET)),
+        End,
+        LocalGet(o),
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_SPARSE | ARRAY_DICTIONARY), I32Or,
+        I32Store8(m8(FLAGS)),
+        End,
+    );
+}
+
 /// Push the u32 length of the string or array whose base is in i32 local `o`.
 fn emit_exotic_len(function: &mut Function, o: u32) {
     wasm!(function;
@@ -255,7 +332,10 @@ fn emit_exotic_len(function: &mut Function, o: u32) {
 /// Invoke the accessor function value in i64 local `callee` with `this` = the
 /// i64 local `this`, passing `arg` (an i64 local) as its only argument when
 /// given; the result stays on the stack. Only emitted when the program has
-/// accessors (so the funcref table exists).
+/// accessors (so the funcref table exists). With `K = 0` (no setter declares
+/// a parameter; the callee may be a builtin setter such as `__proto__`'s) the
+/// argument goes in a fresh one-element spread argument array, as for any
+/// call passing more than `K` arguments.
 pub(super) fn emit_accessor_call(
     function: &mut Function,
     callee: u32,
@@ -265,11 +345,16 @@ pub(super) fn emit_accessor_call(
     helpers: Helpers<'_>,
 ) {
     let mut pushed = 0;
-    if let Some(arg) = arg
-        && helpers.max_args >= 1
-    {
-        wasm!(function; LocalGet(arg));
-        pushed = 1;
+    if let Some(arg) = arg {
+        if helpers.max_args >= 1 {
+            wasm!(function; LocalGet(arg));
+            pushed = 1;
+        } else {
+            wasm!(function; I32Const(1), Call(helpers.new_array()), LocalTee(base));
+            emit_array_elems(function);
+            wasm!(function; LocalGet(arg), I64Store(elem_slot(0)));
+            emit_publish_spread_args(base, function);
+        }
     }
     for _ in pushed..helpers.max_args {
         wasm!(function; I64Const(UNDEFINED_BITS));
@@ -552,19 +637,38 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>) -> Function {
 }
 
 /// `__define(o: i32, key: i32, v: i64, attrs: i32)`: define the own property
-/// `key` of the object-family block `o` (overwrite in place when present, else
-/// append; `CreateDataProperty` / accessor install). A missing table starts at
-/// capacity 4; a full one is rebuilt with capacity `max(4, 2 * live)` (the same
-/// capacity when tombstones free half), keeping the live entries in order
-/// (and the table's watch flag and bit), and `o`'s `props` slot is rewritten.
-/// A watched table sets its dirty bit when the program tracks them.
+/// `key` of the object-family block `o` with the complete descriptor
+/// `(v, attrs)` (`CreateDataProperty` / `DefinePropertyOrThrow` / accessor
+/// install): overwrite in place when present, else append. Redefining a
+/// non-configurable property throws `Cannot redefine property: k`, and adding
+/// to a `NOT_EXTENSIBLE` object throws `Cannot define property k, object is
+/// not extensible` (both left pending, nothing changed). A missing table
+/// starts at capacity 4; a full one is rebuilt with capacity `max(4, 2 *
+/// live)` (the same capacity when tombstones free half), keeping the live
+/// entries in order (and the table's watch flag and bit), and `o`'s `props`
+/// slot is rewritten. A watched table sets its dirty bit when the program
+/// tracks them.
 pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(7, ValType::I32)]);
     let (o, key, v, attrs) = (0, 1, 2, 3);
     let (e, p, q, n, src, end, cap) = (4, 5, 6, 7, 8, 9, 10);
+    // Throw the keyed `__prop_throw` TypeError of `mode` for `o` / `key`.
+    let throw = |f: &mut Function, mode: i32| {
+        wasm!(f; LocalGet(o));
+        emit_box_heap(f);
+        wasm!(f; LocalGet(key));
+        emit_box_heap(f);
+        wasm!(f; I32Const(mode), Call(helpers.prop_throw), Return);
+    };
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
         If(BlockType::Empty),
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+        If(BlockType::Empty),
+    );
+    throw(&mut f, PROP_THROW_DEFINE_NOT_EXTENSIBLE);
+    wasm!(f;
+        End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p), I32Eqz,
         If(BlockType::Empty),
         // A fresh table: kind 12, count 0, cap 4, live 0.
@@ -614,6 +718,13 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
         If(BlockType::Empty),
         LocalGet(p), LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_INDEX_KEYS), I32Or,
         I32Store8(m8(P_TFLAGS)),
+        End,
+        Else,
+        LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_CONFIGURABLE), I32And, I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw(&mut f, PROP_THROW_REDEFINE);
+    wasm!(f;
         End,
         End,
         LocalGet(e), LocalGet(attrs), I32Store(m32(E_ATTRS)),
@@ -712,6 +823,16 @@ pub(super) fn emit_fn_materialize(
     define(&mut f, ATTR_WRITABLE);
     wasm!(f; End, End);
     f
+}
+
+/// Materialize the `LAZY` function whose block base is in i32 local `o` (a
+/// no-op for any other block), so its own `length` / `name` / `prototype`
+/// exist before a whole-table walk or an integrity change.
+pub(super) fn emit_materialize(function: &mut Function, o: u32, helpers: Helpers<'_>) {
+    wasm!(function;
+        LocalGet(o), I32Load(m32(0)), I32Const(LAZY_FN_MASK), I32And, I32Const(LAZY_FN_WORD), I32Eq,
+        If(BlockType::Empty), LocalGet(o), Call(helpers.define + 1), End,
+    );
 }
 
 /// Emit the string/array exotic own lookup of the interned `key` (i32 local)
@@ -926,9 +1047,9 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
 
 /// `__has(key: i32, obj: i64) -> i32`: `HasProperty` of the interned `key`
 /// (`0` = a key never interned, absent everywhere): a string/array's exotic
-/// own keys (`length`, an in-range index that is not an array hole, read
-/// through `__sparse_get` on a `SPARSE` array), else the
-/// own table (an array's named keys) and then each `proto`. A primitive
+/// own keys (`length`, an in-range index whose store slot is not a hole),
+/// else the own table (an array's named keys, and a `SPARSE` array's
+/// elements past its store) and then each `proto`. A primitive
 /// `obj` throws the `in` `TypeError` (left pending, result `0`).
 pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     emit_has_lookup(strings, helpers, false)
@@ -942,8 +1063,8 @@ pub(super) fn emit_has_own(strings: &HashMap<String, i32>, helpers: Helpers<'_>)
 
 /// The body of [`emit_has`] (`own` = `false`) and [`emit_has_own`].
 fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bool) -> Function {
-    let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::I64)]);
-    let (key, obj, o, t, i, p) = (0, 1, 2, 3, 4, 5);
+    let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
+    let (key, obj, o, t, i, a, p) = (0, 1, 2, 3, 4, 5, 6);
     if !own {
         // `key in primitive` is a TypeError.
         emit_is_object(&mut f, obj);
@@ -973,15 +1094,14 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
         I32LtU,
         If(BlockType::Empty),
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
-        If(BlockType::Result(ValType::I32)),
-        I32Const(1),
-        Else,
+        If(BlockType::Empty), I32Const(1), Return, End,
     );
-    emit_elem_load(&mut f, o, i, helpers.sparse_get());
+    emit_in_store(&mut f, o, i, a);
+    wasm!(f; If(BlockType::Empty));
+    emit_elem_addr(&mut f, o, i);
     wasm!(f;
-        I64Const(HOLE_BITS), I64Ne,
+        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Ne, Return,
         End,
-        Return,
         End,
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Empty), I32Const(0), Return, End,
@@ -1199,10 +1319,12 @@ fn emit_sparsify(function: &mut Function, o: u32, j: u32, a: u32) {
 
 /// `__sparse_get(o: i32, i: i32) -> i64`: element `i` of the `SPARSE` array
 /// `o`, or [`HOLE_BITS`] when absent — its store slot when `i < cap`, else the
-/// value of its own table's array-index key whose value is `i`.
+/// value of its own table's array-index key whose value is `i` (an accessor
+/// element calls its getter with `this = o`, `undefined` without one).
 pub(super) fn emit_sparse_get(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(4, ValType::I32)]);
+    let mut f = Function::new(vec![(4, ValType::I32), (2, ValType::I64)]);
     let (o, i, a, e, end, k) = (0, 1, 2, 3, 4, 5);
+    let (g, this) = (6, 7);
     wasm!(f;
         LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
         If(BlockType::Empty),
@@ -1226,7 +1348,25 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>) -> Function {
         LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
         If(BlockType::Empty),
         LocalGet(k), Call(helpers.index_value), LocalGet(i), I32Eq,
-        If(BlockType::Empty), LocalGet(e), I64Load(m64(E_VALUE)), Return, End,
+        If(BlockType::Empty),
+    );
+    if helpers.has_accessors {
+        wasm!(f;
+            LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_ACCESSOR), I32And,
+            If(BlockType::Empty),
+            LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_GET_OFFSET)),
+            LocalSet(g),
+        );
+        emit_is_function(&mut f, g);
+        wasm!(f; I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End, LocalGet(o));
+        emit_box_heap(&mut f);
+        wasm!(f; LocalSet(this));
+        emit_accessor_call(&mut f, g, this, None, k, helpers);
+        wasm!(f; Return, End);
+    }
+    wasm!(f;
+        LocalGet(e), I64Load(m64(E_VALUE)), Return,
+        End,
         End,
         End,
         LocalGet(e), I32Const(ENTRY), I32Add, LocalSet(e),
@@ -1238,14 +1378,17 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>) -> Function {
     f
 }
 
-/// `__sparse_set(o: i32, i: i32, v: i64)`: store element `i` of the `SPARSE`
-/// array `o` — in its store when `i < cap`, else as the own data property of
-/// the interned index key `i` — and raise `length` to `i + 1` when `i` is at
-/// or past it (a push at the maximum length `2^32 - 1` leaves it, since
-/// `i + 1` does not fit).
+/// `__sparse_set(o: i32, i: i32, v: i64)`: the strict `[[Set]]` of element
+/// `i` of the `SPARSE` array `o` — a store slot when `i < cap`, else `__set`
+/// of the interned index key `i` (so a read-only or accessor element and a
+/// non-extensible array behave as on any object) — then raise `length` to
+/// `i + 1` when `i` is at or past it (a push at the maximum length `2^32 - 1`
+/// leaves it, since `i + 1` does not fit). Growing an array whose `length`
+/// is read-only throws `Cannot add property i, object is not extensible`. A
+/// throw leaves the exception pending and changes nothing.
 pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(1, ValType::I32)]);
-    let (o, i, v, a) = (0, 1, 2, 3);
+    let mut f = Function::new(vec![(2, ValType::I32)]);
+    let (o, i, v, a, k) = (0, 1, 2, 3, 4);
     wasm!(f;
         LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
         If(BlockType::Result(ValType::I32)),
@@ -1258,8 +1401,25 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)),
         Else,
-        LocalGet(o), LocalGet(i), Call(helpers.index_string), Call(helpers.intern),
-        LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
+        LocalGet(i), Call(helpers.index_string), Call(helpers.intern), LocalSet(k),
+        LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And, I32Const(0), I32Ne,
+        I32And,
+        If(BlockType::Empty),
+        LocalGet(o),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f; LocalGet(k));
+    emit_box_heap(&mut f);
+    wasm!(f;
+        I32Const(PROP_THROW_NOT_EXTENSIBLE), Call(helpers.prop_throw), Return,
+        End,
+        LocalGet(o),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f;
+        LocalGet(k), LocalGet(v), Call(helpers.set),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         End,
         LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
         LocalGet(i), I32Const(-1), I32Ne, I32And,
@@ -1272,13 +1432,18 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
 }
 
 /// `__array_set_length(o: i32, v: i64)`: the `length` write `o.length = v` on
-/// the array `o` (`ArraySetLength`). `n = ToUint32(v)`; when `ToNumber(v) != n`
-/// it raises the `RangeError` "Invalid array length" (left pending) and
-/// changes nothing. A shrink (`n < len`) turns the slots `n..len` into holes
-/// and keeps the store (so a regrowth and a GC walk see no stale element); a
-/// `SPARSE` array also drops its index keys `>= n`. A growth past the length
-/// fills holes densely while `n - 1 < max(2 * cap, len + 1024)` and otherwise
-/// makes the array `SPARSE` without allocating the gap. Then `len = n`.
+/// the array `o` (`ArraySetLength`). A read-only `length` throws `Cannot
+/// assign to read only property 'length'` before any conversion. `n =
+/// ToUint32(v)`; an abrupt `ToNumber(v)` propagates, and when `ToNumber(v) !=
+/// n` it raises the `RangeError` "Invalid array length" (left pending); both
+/// change nothing. A shrink (`n < len`)
+/// turns the slots `n..len` into holes and keeps the store (so a regrowth and
+/// a GC walk see no stale element); a `SPARSE` array also drops its index
+/// keys `>= n`, except that a non-configurable element `k >= n` stops the
+/// deletion: the length becomes `k + 1` (the highest such `k`) and `Cannot
+/// delete property 'k'` is left pending. A growth past the length fills holes
+/// densely while `n - 1 < max(2 * cap, len + 1024)` and otherwise makes the
+/// array `SPARSE` without allocating the gap. Then `len = n`.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
 pub(super) fn emit_array_set_length(
     strings: &HashMap<String, i32>,
@@ -1290,7 +1455,7 @@ pub(super) fn emit_array_set_length(
     let scratch = 2;
     let mut locals = type_error_helper_locals();
     let base = scratch + locals.iter().map(|(count, _)| count).sum::<u32>();
-    locals.extend([(7, ValType::I32), (1, ValType::F64)]);
+    locals.extend([(9, ValType::I32), (1, ValType::F64)]);
     let mut f = Function::new(locals);
     let (n, len, a, cap, j, e, end) = (
         base,
@@ -1301,8 +1466,45 @@ pub(super) fn emit_array_set_length(
         base + 5,
         base + 6,
     );
-    let d = base + 7;
+    let (m, stopped) = (base + 7, base + 8);
+    let d = base + 9;
     let k = j;
+    let length_key = static_key(strings, INDEX_LENGTH_KEY);
+    // Walk the live array-index entries of the table in `a` (nonzero): `body`
+    // runs with the entry address in `e` and its key in `k`.
+    let index_entries = |f: &mut Function, body: &dyn Fn(&mut Function)| {
+        wasm!(f;
+            LocalGet(a), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(a), I32Add,
+            I32Const(P_HEADER), I32Add, LocalSet(end),
+            LocalGet(a), I32Const(P_HEADER), I32Add, LocalSet(e),
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(e), LocalGet(end), I32GeU, BrIf(1),
+            LocalGet(e), I32Load(m32(E_KEY)), LocalTee(k),
+            If(BlockType::Empty),
+            LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
+            If(BlockType::Empty),
+        );
+        body(f);
+        wasm!(f;
+            End,
+            End,
+            LocalGet(e), I32Const(ENTRY), I32Add, LocalSet(e),
+            Br(0),
+            End, End,
+        );
+    };
+    // A read-only `length` rejects any write.
+    wasm!(f;
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And,
+        If(BlockType::Empty),
+        LocalGet(o),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f;
+        I64Const(HEAP_BITS | i64::from(length_key)),
+        I32Const(PROP_THROW_READ_ONLY), Call(helpers.prop_throw), Return,
+        End,
+    );
     // d = ToNumber(v); a value that is not an integer in 0..2^32 is invalid.
     emit_is_number(&mut f, v);
     wasm!(f;
@@ -1310,6 +1512,7 @@ pub(super) fn emit_array_set_length(
         LocalGet(v),
         Else,
         LocalGet(v), Call(helpers.to_number),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         End,
         F64ReinterpretI64, LocalTee(d), F64Const(0.0.into()), F64Ge,
         LocalGet(d), F64Const(4_294_967_296.0.into()), F64Lt, I32And,
@@ -1335,13 +1538,29 @@ pub(super) fn emit_array_set_length(
         If(BlockType::Result(ValType::I32)), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), Else, I32Const(0), End,
         LocalSet(cap),
     );
-    // SPARSE: a shrink holes the store slots n..min(len, cap) and drops the
-    // index keys >= n; the length is set either way.
+    // SPARSE: a shrink first raises n past the highest non-configurable
+    // element at or above it, then holes the store slots n..min(len, cap) and
+    // drops the index keys >= n; the length is set either way.
     emit_is_sparse(&mut f, o);
     wasm!(f;
         If(BlockType::Empty),
         LocalGet(n), LocalGet(len), I32LtU,
         If(BlockType::Empty),
+        LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(a),
+        If(BlockType::Empty),
+        LocalGet(n), LocalSet(stopped),
+    );
+    index_entries(&mut f, &|f| {
+        wasm!(f;
+            LocalGet(k), Call(helpers.index_value), LocalTee(m), LocalGet(n), I32GeU,
+            LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_CONFIGURABLE), I32And, I32Eqz,
+            I32And,
+            If(BlockType::Empty), LocalGet(m), I32Const(1), I32Add, LocalSet(n), End,
+        );
+    });
+    wasm!(f;
+        LocalGet(n), LocalGet(stopped), I32Ne, LocalSet(stopped),
+        End,
         LocalGet(n), LocalSet(j),
         LocalGet(len), LocalGet(cap), LocalGet(len), LocalGet(cap), I32LtU, Select, LocalSet(end),
     );
@@ -1349,29 +1568,32 @@ pub(super) fn emit_array_set_length(
     wasm!(f;
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(a),
         If(BlockType::Empty),
-        LocalGet(a), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(a), I32Add,
-        I32Const(P_HEADER), I32Add, LocalSet(end),
-        LocalGet(a), I32Const(P_HEADER), I32Add, LocalSet(e),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(e), LocalGet(end), I32GeU, BrIf(1),
-        LocalGet(e), I32Load(m32(E_KEY)), LocalTee(k),
+    );
+    index_entries(&mut f, &|f| {
+        wasm!(f;
+            LocalGet(k), Call(helpers.index_value), LocalGet(n), I32GeU,
+            If(BlockType::Empty),
+            LocalGet(e), I64Const(0), I64Store(m64(0)),
+            LocalGet(e), I64Const(UNDEFINED_BITS), I64Store(m64(E_VALUE)),
+            LocalGet(a), LocalGet(a), I32Load(m32(P_LIVE)), I32Const(1), I32Sub, I32Store(m32(P_LIVE)),
+            End,
+        );
+    });
+    wasm!(f;
+        End,
+        End,
+        LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)),
+        LocalGet(stopped),
         If(BlockType::Empty),
-        LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
-        If(BlockType::Empty),
-        LocalGet(k), Call(helpers.index_value), LocalGet(n), I32GeU,
-        If(BlockType::Empty),
-        LocalGet(e), I64Const(0), I64Store(m64(0)),
-        LocalGet(e), I64Const(UNDEFINED_BITS), I64Store(m64(E_VALUE)),
-        LocalGet(a), LocalGet(a), I32Load(m32(P_LIVE)), I32Const(1), I32Sub, I32Store(m32(P_LIVE)),
+        LocalGet(o),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f; LocalGet(n), I32Const(1), I32Sub, Call(helpers.index_string), Call(helpers.intern));
+    emit_box_heap(&mut f);
+    wasm!(f;
+        I32Const(PROP_THROW_DELETE), Call(helpers.prop_throw),
         End,
-        End,
-        End,
-        LocalGet(e), I32Const(ENTRY), I32Add, LocalSet(e),
-        Br(0),
-        End, End,
-        End,
-        End,
-        LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)), Return,
+        Return,
         End,
         // Dense shrink (or no change): hole the slots n..len.
         LocalGet(n), LocalGet(len), I32LeU,
@@ -1411,12 +1633,26 @@ pub(super) fn emit_array_set_length(
 /// its indices; an array its present (non-hole) store indices, then its table
 /// keys (a `SPARSE` array's elements past the store sort first as integer
 /// keys); a primitive has no own keys.
+///
+/// Values / entries follow `EnumerableOwnProperties` (ECMA-262 7.3.23): the
+/// key list is taken once, then each key is re-checked as own and enumerable
+/// (`__own_enum`) when visited, so a getter that deletes a later key or makes
+/// it non-enumerable drops it. Only a getter can change the object between
+/// the snapshot and a visit, so the re-check runs only when the own table
+/// holds an accessor entry (a string, a store element and a data property
+/// run no code).
 #[allow(clippy::too_many_lines)] // one straight-line helper body
 pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(11, ValType::I32), (2, ValType::I64)]);
+    let mut f = Function::new(vec![
+        (11, ValType::I32),
+        (2, ValType::I64),
+        (2, ValType::I32),
+    ]);
     let (obj, mode) = (0, 1);
     let (o, t, n, out, j, p, e, end, k, i, x) = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
     let (kv, val) = (13, 14);
+    // `w`: the values/entries write index; `recheck`: the table has an accessor.
+    let (w, recheck) = (15, 16);
     let new_array = helpers.new_string + 1;
     // include(e) = key != 0 && (mode == ALL || attrs & ENUMERABLE)
     let include = |f: &mut Function| {
@@ -1590,27 +1826,57 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         End,
         LocalGet(out), LocalGet(j), I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
-        // Values / entries: map each key in place.
+        // Values / entries: map each key in place, compacting out the keys
+        // the visit-time re-check drops.
         LocalGet(mode), I32Const(OWN_VALUES), I32Eq,
         LocalGet(mode), I32Const(OWN_ENTRIES), I32Eq, I32Or,
         If(BlockType::Empty),
+        // recheck = the own table (a string has none: p == 0) has a live
+        // accessor entry.
+        LocalGet(p),
+        If(BlockType::Empty),
+    );
+    entry_loop_head(&mut f);
+    wasm!(f;
+        LocalGet(e), I32Load(m32(E_KEY)), I32Const(0), I32Ne,
+        LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_ACCESSOR), I32And, I32Const(0), I32Ne,
+        I32And,
+        If(BlockType::Empty), I32Const(1), LocalSet(recheck), Br(2), End,
+    );
+    entry_loop_tail(&mut f);
+    wasm!(f;
+        End,
         I32Const(0), LocalSet(i),
+        I32Const(0), LocalSet(w),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(j), I32GeU, BrIf(1),
     );
     emit_elem_addr(&mut f, out, i);
     wasm!(f;
         I64Load(m64(ELEMS_DATA_OFFSET)), LocalSet(kv),
+        // Re-check: kv = the interned key; not own and enumerable now -> skip.
+        LocalGet(recheck),
+        If(BlockType::Empty),
+        LocalGet(kv), I32Const(1), Call(helpers.to_key),
+        I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(kv),
+        LocalGet(obj), LocalGet(kv), I32WrapI64, Call(helpers.own_enum()),
+        I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(2),
+        End,
+        End,
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Result(ValType::I64)),
         LocalGet(o), LocalGet(i), Call(helpers.str_index),
     );
     emit_box_heap(&mut f);
     // An array's element key (a fresh, uninterned index string) loads the
-    // element; a table key goes through `__get`.
+    // element; a table key (and, under the re-check, every key) goes through
+    // `__get`.
     wasm!(f;
         Else,
-        LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(t), I32Const(TYPE_ARRAY), I32Eq, LocalGet(recheck), I32Eqz, I32And,
         If(BlockType::Result(ValType::I32)),
         LocalGet(kv), I32WrapI64, Call(helpers.index_value), LocalTee(n), I32Const(-1), I32Ne,
         Else, I32Const(0),
@@ -1634,12 +1900,14 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalSet(val), End);
-    emit_elem_addr(&mut f, out, i);
+    emit_elem_addr(&mut f, out, w);
     wasm!(f;
         LocalGet(val), I64Store(m64(ELEMS_DATA_OFFSET)),
+        LocalGet(w), I32Const(1), I32Add, LocalSet(w),
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
+        LocalGet(out), LocalGet(w), I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
         LocalGet(out),
     );
