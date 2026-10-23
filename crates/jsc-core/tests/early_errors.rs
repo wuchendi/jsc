@@ -120,6 +120,26 @@ fn duplicate_parameters_and_body_names_are_rejected() {
     assert_early_error("async (a, a) => {}", "duplicate parameter name `a`");
     assert_early_error("function* g(a, a) {}", "duplicate parameter name `a`");
     assert_early_error("async function f(a, a) {}", "duplicate parameter name `a`");
+    for src in [
+        "(a, a) => 1",
+        "(a, a) => {}",
+        "function f(a, a) {}",
+        "(function (a, a) {});",
+        "function f(a, a = 1) {}",
+        "function f(a, [a]) {}",
+        "function f(a, ...a) {}",
+        "({ m(a, a) {} });",
+        "({ m(a, a = 1) {} });",
+        "({ *m(a, a) {} });",
+        "class C { m(a, a) {} }",
+        "class C { static m(a, a = 1) {} }",
+        "class C { constructor(a, a) {} }",
+        "(class { m(a, a) {} });",
+        "({ set s([a, a]) {} });",
+        "({ [function (a, a) {}]: 1 });",
+    ] {
+        assert_early_error(src, "duplicate parameter name `a`");
+    }
     assert_early_error(
         "async (bar) => { let bar; }",
         "`bar` has already been declared",

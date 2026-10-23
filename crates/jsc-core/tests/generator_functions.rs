@@ -199,15 +199,3 @@ fn async_generators_stay_a_compile_error() {
         "async generator functions are unsupported",
     );
 }
-
-#[test]
-fn generator_expression_limits_keep_their_diagnostics() {
-    assert_compile_error(
-        "const g = function*([a]){ yield a };",
-        "generator parameters must be simple identifiers",
-    );
-    assert_compile_error(
-        "const g = function*(){ yield arguments.length };",
-        "`arguments` in a generator or async function is unsupported",
-    );
-}

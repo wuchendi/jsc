@@ -46,9 +46,12 @@
 //! resume the `return`/jump, through any outer `finally` first). A throw no
 //! handler catches leaves the state machine and completes the generator.
 //!
+//! The parameters bind in the CONSTRUCTOR (its frame boxes every parameter
+//! binding), so defaults and destructuring run when the function is called;
+//! the body captures them by reference like any enclosing binding.
+//!
 //! Still rejected (deferred): a `yield` whose continuation would read a per-node
-//! scratch local set before the suspend; async generators; and non-simple
-//! parameters.
+//! scratch local set before the suspend; and async generators.
 //!
 //! A closure nested in the body captures the frame's env cells by reference
 //! (see [`LowerCtx::capture_source`]), so it shares them with the body across
@@ -59,12 +62,8 @@ use super::*;
 
 use std::collections::HashSet;
 
-use swc_common::Spanned;
-
 use crate::error::CompileError;
 use crate::ir::{GenSegment, GenTerm};
-
-use super::capture::binding_id;
 
 /// The resume `limits` bits of a generator body (see
 /// [`crate::abi::GEN_LIMIT_RETURN`]): a `return()` at a suspended `yield` must
@@ -116,13 +115,15 @@ impl LowerCtx<'_> {
     /// frames, in env-slot order), like `build_function_body`. `span` is the
     /// function's, for the CFG diagnostics.
     ///
-    /// The body is lowered in a nested `env_backed` frame. The constructor
-    /// builds the generator's frame of cells ([`IrNode::MakeGenerator`]): a
-    /// parameter's cell holds its argument slot, the `this` cell the call's
-    /// receiver, and a binding the body captures from an enclosing frame
-    /// SHARES that frame's cell (read through the constructor's own
-    /// environment), so the capture is by reference and outlives the
-    /// creating call. An async body compiles to the SAME state machine
+    /// The constructor binds the parameters first (like an ordinary
+    /// function's prologue, every binding a cell), so a binding error throws
+    /// from the call — or, for an async function, rejects its promise. The
+    /// body is lowered in a nested `env_backed` frame. The constructor then
+    /// builds the generator's frame of cells ([`IrNode::MakeGenerator`]): the
+    /// `this` cell holds the call's receiver, and a binding the body captures
+    /// from an enclosing frame (a parameter included) SHARES that frame's
+    /// cell, so the capture is by reference and outlives the creating call.
+    /// An async body compiles to the SAME state machine
     /// (`await e` lowers to `yield e`; see [`LowerCtx::lower_generator_body`]),
     /// but the constructor spawns it as a promise ([`IrNode::AsyncSpawn`])
     /// rather than returning the raw generator handle. Neither is a
@@ -144,7 +145,15 @@ impl LowerCtx<'_> {
         // slots. `K + 2` = the full uniform param count (`K` args + env + argc).
         let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
         let uniform_params = k + 2;
+
+        // The parameters bind in the constructor, when the function is called:
+        // every parameter binding is a cell the body shares by reference.
+        self.frame().ctor = FnKind::Generator;
+        let (params, mut prologue) = self.declare_params(param_pats)?;
         self.frame().next = self.frame().next.max(uniform_params);
+        let boxing = prologue.len();
+        self.bind_params(params, &mut prologue)?;
+        let binds = prologue.len() > boxing;
 
         // Reserve the state machine's funcref-table slot before lowering its body
         // (mirrors `lower_lifted`).
@@ -170,9 +179,8 @@ impl LowerCtx<'_> {
         let arrow = self.frame().arrow;
         self.push_frame();
         self.frame().arrow = arrow;
-        let lowered = self.lower_generator_body(param_pats, body_kind, is_async, uniform_params);
-        let (body, nparams) = match lowered {
-            Ok(pair) => pair,
+        let body = match self.lower_generator_body(body_kind, is_async, uniform_params) {
+            Ok(body) => body,
             Err(e) => {
                 self.pop_frame();
                 return Err(e);
@@ -182,7 +190,8 @@ impl LowerCtx<'_> {
         let sm_locals = frame.next;
         let this_slot = frame.gen_this;
         // Each frame slot's binding id, and whether the body declares it (an
-        // own cell) or captures it from an enclosing frame.
+        // own cell) or captures it from an enclosing frame (the constructor's
+        // parameters included).
         let layout: Vec<(u32, bool)> = frame
             .env
             .iter()
@@ -201,16 +210,16 @@ impl LowerCtx<'_> {
             info: FnInfo::default(),
         };
 
-        // The constructor: `return MakeGenerator(...)`, seeding the frame's cells
-        // (the parameters lead, reading their uniform-ABI argument slots).
+        // The constructor: bind the parameters, then `return MakeGenerator(...)`,
+        // seeding the frame's cells. The `this` cell holds the receiver
+        // snapshotted on entry (a default may have called out since).
+        let this = this_slot.and_then(|_| self.ensure_this_local());
         let mut slots: Vec<IrNode> = layout
             .iter()
             .zip(0u32..)
             .map(|(&(id, own), slot)| {
-                if slot < nparams {
-                    IrNode::CellNew(Box::new(IrNode::Local(slot)))
-                } else if Some(slot) == this_slot {
-                    IrNode::CellNew(Box::new(IrNode::ThisGlobal))
+                if Some(slot) == this_slot {
+                    IrNode::CellNew(Box::new(this.map_or(IrNode::ThisGlobal, IrNode::Local)))
                 } else if own {
                     IrNode::CellNew(Box::new(IrNode::Undefined))
                 } else {
@@ -227,18 +236,22 @@ impl LowerCtx<'_> {
             total,
             limits: resume_limits(body_kind),
         };
-        let body = self.generator_ctor_body(make, is_async, callee);
-        let env_layout = self.frame().env.clone();
-        Ok((
-            IrFunction {
-                params: uniform_params,
-                locals: self.frame().next,
-                body,
-                machine: None,
-                info: FnInfo::default(),
-            },
-            env_layout,
-        ))
+        let ctor_body = self.generator_ctor_body(make, is_async, callee);
+        // An async function's parameter binding error rejects its promise
+        // rather than throwing from the call.
+        let mut body = prologue;
+        if is_async && binds {
+            let binding = body.split_off(boxing);
+            body.push(IrStmt::Try {
+                body: binding,
+                catch_body: Some(vec![IrStmt::Return(Some(IrNode::PromiseReject(Box::new(
+                    IrNode::ExcValue,
+                ))))]),
+                finally_body: None,
+            });
+        }
+        body.extend(ctor_body);
+        Ok(self.finish_function(body))
     }
 
     /// The generator constructor's body around its `make` node: an async
@@ -416,16 +429,15 @@ impl LowerCtx<'_> {
         resolved.kind
     }
 
-    /// Lower the parameters and body of a generator into the current (already
-    /// pushed, `env_backed`) frame, returning the lowered statements and the
-    /// parameter count. Rejects the unsupported forms with spans.
+    /// Lower the body of a generator into the current (already pushed,
+    /// `env_backed`) frame, returning the lowered statements. Its parameters
+    /// are bound by the constructor, in the enclosing frame.
     fn lower_generator_body(
         &mut self,
-        param_pats: &[&Pat],
         body_kind: BodyKind<'_>,
         is_async: bool,
         uniform_params: u32,
-    ) -> anyhow::Result<(Vec<IrStmt>, u32)> {
+    ) -> anyhow::Result<Vec<IrStmt>> {
         self.set_env_backed();
         // Body temporaries live above the uniform ABI slots (`sent`/`gen`/…/env/
         // argc), so a `fresh` temp never aliases `sent` (local 0) or the env slot.
@@ -437,20 +449,6 @@ impl LowerCtx<'_> {
         // error aborts the whole function, so the leak on the error path is inert).
         let prev_async = self.async_body;
         self.async_body = is_async;
-
-        // Only simple-identifier parameters are supported.
-        let mut nparams = 0u32;
-        for pat in param_pats {
-            let Pat::Ident(ident) = pat else {
-                return Err(CompileError::spanned(
-                    pat.span(),
-                    "generator parameters must be simple identifiers",
-                )
-                .into());
-            };
-            self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
-            nparams += 1;
-        }
 
         let mut body = Vec::new();
         match body_kind {
@@ -466,7 +464,7 @@ impl LowerCtx<'_> {
         }
 
         self.async_body = prev_async;
-        Ok((body, nparams))
+        Ok(body)
     }
 }
 
