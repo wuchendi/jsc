@@ -1022,7 +1022,7 @@ fn generic_methods_use_the_full_length_range() {
         &format!(
             "{BIG}const o = {{ length: n }}; o[n - 1] = 1; o[n - 3] = 3; const r = []; try {{ [].reduceRight.call(o, (acc, v) => {{ r.push(v); if (v === 3) throw 0; return acc; }}, 0); }} catch (e) {{}} r.join()"
         ),
-        "3",
+        "1,3",
     );
     both_string(
         &format!(
