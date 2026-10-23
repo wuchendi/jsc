@@ -1717,10 +1717,13 @@ pub struct FnInfo {
 /// Whether a function is a constructor (DESIGN.md §5.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FnKind {
-    /// Not a constructor: arrows, methods, accessors, generators, async
-    /// functions, and internal functions. No `prototype`.
+    /// Not a constructor: arrows, methods, accessors, async functions, and
+    /// internal functions. No `prototype`.
     #[default]
     Plain,
+    /// A generator function or method: not a constructor, but materializes a
+    /// `prototype` inheriting `%GeneratorPrototype%` (no `constructor`).
+    Generator,
     /// A `function` declaration or expression: materializes a `prototype`.
     Constructor,
     /// A class constructor: its `prototype` is defined by the class.

@@ -16,10 +16,10 @@ fn rejects_spread() {
 }
 
 #[test]
-fn rejects_async_methods() {
-    // Async/generator methods stay out of scope.
-    assert_rejected("let o = { async m() { return 1 } }; o.m()");
-    assert_rejected("let o = { *m() { yield 1 } }; o.m().next()");
+fn rejects_async_generator_methods() {
+    // Async generator methods stay out of scope.
+    assert_rejected("let o = { async *m() { yield 1 } }; o.m()");
+    assert_rejected("class A { async *m() { yield 1 } } new A().m()");
 }
 
 #[test]

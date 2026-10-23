@@ -47,8 +47,8 @@
 //! handler catches leaves the state machine and completes the generator.
 //!
 //! Still rejected (deferred): a `yield` whose continuation would read a per-node
-//! scratch local set before the suspend; generator expressions/arrows/methods;
-//! and non-simple parameters.
+//! scratch local set before the suspend; async generators; and non-simple
+//! parameters.
 //!
 //! A closure nested in the body captures the frame's env cells by reference
 //! (see [`LowerCtx::capture_source`]), so it shares them with the body across
@@ -127,12 +127,17 @@ impl LowerCtx<'_> {
     /// but the constructor spawns it as a promise ([`IrNode::AsyncSpawn`])
     /// rather than returning the raw generator handle. Neither is a
     /// constructor.
+    ///
+    /// `callee` (a generator's) reads the generator function object itself:
+    /// the handle's `[[Prototype]]` is its `prototype` at call time when that
+    /// is an object, else `%GeneratorPrototype%`.
     pub(super) fn build_generator_ctor(
         &mut self,
         param_pats: &[&Pat],
         body_kind: BodyKind<'_>,
         is_async: bool,
         span: swc_common::Span,
+        callee: Option<IrNode>,
     ) -> anyhow::Result<(IrFunction, Vec<u32>)> {
         // The uniform ABI arity `K`: forced to >= 2 when generators exist (see
         // `has_state_machine`), so `(sent, gen)` fit the first two positional
@@ -222,22 +227,60 @@ impl LowerCtx<'_> {
             total,
             limits: resume_limits(body_kind),
         };
-        let returned = if is_async {
-            IrNode::AsyncSpawn(Box::new(make))
-        } else {
-            make
-        };
+        let body = self.generator_ctor_body(make, is_async, callee);
         let env_layout = self.frame().env.clone();
         Ok((
             IrFunction {
                 params: uniform_params,
                 locals: self.frame().next,
-                body: vec![IrStmt::Return(Some(returned))],
+                body,
                 machine: None,
                 info: FnInfo::default(),
             },
             env_layout,
         ))
+    }
+
+    /// The generator constructor's body around its `make` node: an async
+    /// function spawns it as a promise; a generator with a `callee` sets the
+    /// handle's `[[Prototype]]` to `callee.prototype` when that is an object
+    /// (`MakeGenerator` starts it at `%GeneratorPrototype%`).
+    fn generator_ctor_body(
+        &mut self,
+        make: IrNode,
+        is_async: bool,
+        callee: Option<IrNode>,
+    ) -> Vec<IrStmt> {
+        match callee {
+            _ if is_async => vec![IrStmt::Return(Some(IrNode::AsyncSpawn(Box::new(make))))],
+            None => vec![IrStmt::Return(Some(make))],
+            Some(callee) => {
+                let proto = self.fresh();
+                let handle = self.fresh();
+                vec![
+                    IrStmt::Decl {
+                        local: proto,
+                        init: IrNode::Index {
+                            obj: Box::new(callee),
+                            index: Box::new(IrNode::Str("prototype".to_owned())),
+                        },
+                    },
+                    IrStmt::Decl {
+                        local: handle,
+                        init: make,
+                    },
+                    IrStmt::If {
+                        cond: IrNode::IsObject(Box::new(IrNode::Local(proto))),
+                        then_body: vec![IrStmt::Expr(IrNode::SetProto {
+                            obj: Box::new(IrNode::Local(handle)),
+                            proto: Box::new(IrNode::Local(proto)),
+                        })],
+                        else_body: Vec::new(),
+                    },
+                    IrStmt::Return(Some(IrNode::Local(handle))),
+                ]
+            }
+        }
     }
 
     /// Desugar a `yield* iterable;` statement over the same iterables `for-of`
@@ -973,21 +1016,33 @@ impl CfgBuilder {
             | IrNode::ArrayPop { local, .. } => Some(*local),
             _ => None,
         };
-        if let Some(local) = read
-            && self.suspended
-            && !self.live.contains(&local)
-        {
-            return Err(self.unsupported(
-                "a `yield` here would lose a compiler temporary across the suspend; \
-                 move the `yield` into its own statement",
-            ));
+        if let Some(local) = read {
+            self.check_live(local)?;
         }
         let mut result = Ok(());
         node.any_child(|child| {
             result = self.track(child);
             result.is_err()
         });
-        result
+        result?;
+        // A `super.m(..)` receiver snapshot is set by its callee (a child) and
+        // read at the call itself, after the arguments.
+        if let IrNode::ThisCall { this_local, .. } = node {
+            self.check_live(*this_local)?;
+        }
+        Ok(())
+    }
+
+    /// Reject reading raw local `local` after a suspend earlier in the
+    /// statement that it was not re-set since (see [`Self::track`]).
+    fn check_live(&self, local: u32) -> anyhow::Result<()> {
+        if self.suspended && !self.live.contains(&local) {
+            return Err(self.unsupported(
+                "a `yield` here would lose a compiler temporary across the suspend; \
+                 move the `yield` into its own statement",
+            ));
+        }
+        Ok(())
     }
 
     /// Suspend with `value`: end the current block with a `Yield` and continue in
@@ -1228,14 +1283,24 @@ fn is_inline(stmt: &IrStmt) -> bool {
 /// frame cell (numbered from `next_slot`), and EVERY read and write of it in the
 /// whole body is rewritten to that cell, so the inline statements that
 /// initialize it write the cell too. Per-node scratch locals (`obj_local`, ...)
-/// are never `Decl`/`Assign` targets and stay raw.
+/// are never `Decl`/`Assign` targets and stay raw, as does a `super.m(..)`
+/// receiver snapshot ([`IrNode::ThisCall`]'s `this_local`), assigned and
+/// consumed within the call's callee evaluation.
 fn promote_raw_locals(stmts: &[IrStmt], next_slot: &mut u32) -> Result<Vec<IrStmt>, &'static str> {
     let mut written = HashSet::new();
     let mut crossing = HashSet::new();
     for stmt in stmts {
         collect_locals(stmt, &mut written, &mut crossing, false);
     }
-    let mut promoted: Vec<u32> = written.intersection(&crossing).copied().collect();
+    let mut pinned = HashSet::new();
+    for stmt in stmts {
+        collect_this_call_locals(stmt, &mut pinned);
+    }
+    let mut promoted: Vec<u32> = written
+        .intersection(&crossing)
+        .filter(|local| !pinned.contains(*local))
+        .copied()
+        .collect();
     promoted.sort_unstable();
     let map: HashMap<u32, u32> = promoted
         .into_iter()
@@ -1301,6 +1366,27 @@ fn collect_node_locals(
     }
     node.any_child(|child| {
         collect_node_locals(child, written, crossing, in_cfg);
+        false
+    });
+}
+
+/// Record every [`IrNode::ThisCall`] `this_local` in `stmt` (recursively).
+fn collect_this_call_locals(stmt: &IrStmt, pinned: &mut HashSet<u32>) {
+    fn walk(node: &IrNode, pinned: &mut HashSet<u32>) {
+        if let IrNode::ThisCall { this_local, .. } = node {
+            pinned.insert(*this_local);
+        }
+        node.any_child(|child| {
+            walk(child, pinned);
+            false
+        });
+    }
+    stmt.any_node(|node| {
+        walk(node, pinned);
+        false
+    });
+    stmt.any_stmt(|inner| {
+        collect_this_call_locals(inner, pinned);
         false
     });
 }

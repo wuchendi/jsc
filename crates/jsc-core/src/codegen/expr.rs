@@ -672,6 +672,16 @@ impl LowerCtx<'_> {
             };
             return Ok((IrNode::Seq(vec![read, node]), local));
         }
+        // A generator/async method's `this` lives in its frame cell: snapshot
+        // it into a local for the call.
+        if let Some(this) = self.generator_this() {
+            let local = self.fresh();
+            let read = IrNode::Assign {
+                local,
+                value: Box::new(this),
+            };
+            return Ok((IrNode::Seq(vec![read, node]), local));
+        }
         let Some(this_local) = self.ensure_this_local() else {
             return Err(CompileError::spanned(span, "`super` is not available here").into());
         };
@@ -1600,22 +1610,8 @@ impl LowerCtx<'_> {
                 // A method / shorthand method `{m(){..}}` lifts to a first-class
                 // function value (like an arrow) that carries `this`.
                 Prop::Method(method) => {
-                    reject_machine_method(&method.function)?;
                     let key = self.lower_prop_key(&method.key)?;
-                    let block = method
-                        .function
-                        .body
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("object method requires a body"))?;
-                    let param_pats: Vec<&Pat> =
-                        method.function.params.iter().map(|p| &p.pat).collect();
-                    let name = static_key_name(&key);
-                    let value = self.lower_lifted_function(
-                        &param_pats,
-                        BodyKind::Block(&block.stmts),
-                        name,
-                        FnKind::Plain,
-                    )?;
+                    let value = self.lower_method(&method.function, static_key_name(&key))?;
                     entries.push((key, value));
                 }
                 Prop::Getter(getter) => {

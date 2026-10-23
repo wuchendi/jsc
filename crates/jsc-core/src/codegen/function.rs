@@ -29,11 +29,17 @@ pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::R
     let body = BodyKind::Block(&block.stmts);
     // A top-level `function*` / `async function` lowers to a generator
     // constructor + state machine, not an ordinary function body; neither is a
-    // constructor.
+    // constructor. A generator reads its own `prototype` through its static
+    // function object.
     if let Some(is_async) = state_machine(&fn_decl.function)? {
+        let callee = shared
+            .funcs
+            .get(name)
+            .filter(|_| !is_async)
+            .map(|sig| IrNode::DeclFunc(sig.index - 1));
         let (mut func, _env) =
-            ctx.build_generator_ctor(&param_pats, body, is_async, fn_decl.function.span)?;
-        func.info = fn_info(name, &param_pats, FnKind::Plain);
+            ctx.build_generator_ctor(&param_pats, body, is_async, fn_decl.function.span, callee)?;
+        func.info = fn_info(name, &param_pats, machine_kind(is_async));
         return Ok(func);
     }
     let (mut func, _env) = ctx.build_function_body(&param_pats, body)?;
@@ -71,19 +77,14 @@ pub(super) fn state_machine(function: &swc_ecma_ast::Function) -> anyhow::Result
     }
 }
 
-/// Reject the out-of-scope object-literal method forms — `async` and
-/// generator (`*m(){}`) methods — that the method lowering would otherwise
-/// compile as an *ordinary* function and run to a **wrong result**. A clear
-/// compile error is emitted instead. See DESIGN.md.
-pub(super) fn reject_machine_method(function: &swc_ecma_ast::Function) -> anyhow::Result<()> {
-    let msg = if function.is_async {
-        "async object methods are not supported"
-    } else if function.is_generator {
-        "generator object methods are not supported"
+/// The [`FnKind`] of a generator (`false`) or async (`true`) function's
+/// constructor: a generator owns a `prototype`, an async function does not.
+fn machine_kind(is_async: bool) -> FnKind {
+    if is_async {
+        FnKind::Plain
     } else {
-        return Ok(());
-    };
-    Err(CompileError::spanned(function.span(), msg).into())
+        FnKind::Generator
+    }
 }
 
 impl LowerCtx<'_> {
@@ -560,7 +561,9 @@ impl LowerCtx<'_> {
     /// (it reads its enclosing function's `new.target` and `arguments`), and
     /// for a generator (`machine = Some((false, span))`) or async
     /// (`Some((true, span))`) body, whose lifted function is the generator
-    /// constructor ([`Self::build_generator_ctor`]).
+    /// constructor ([`Self::build_generator_ctor`]). A generator constructor
+    /// reads its own function object (for its `prototype`) from a hidden
+    /// cell of the enclosing frame, filled right after the value is built.
     fn lower_lifted(
         &mut self,
         param_pats: &[&Pat],
@@ -585,15 +588,19 @@ impl LowerCtx<'_> {
             pos
         };
         let table_index = self.shared.arrow_base - 1 + u32::try_from(pos).unwrap_or(u32::MAX);
+        let self_cell =
+            matches!(machine, Some((false, _))).then(|| (self.top(), self.hidden_local()));
 
         self.push_frame();
         self.frame().arrow = arrow;
         if matches!(kind, FnKind::Class | FnKind::DerivedClass) {
             self.frame().ctor = kind;
         }
+        let callee =
+            self_cell.map(|(fi, (_, id))| IrNode::CellGet(Box::new(self.read_hidden(fi, id))));
         let built = match machine {
             Some((is_async, span)) => {
-                self.build_generator_ctor(param_pats, body_kind, is_async, span)
+                self.build_generator_ctor(param_pats, body_kind, is_async, span, callee)
             }
             None => self.build_function_body(param_pats, body_kind),
         };
@@ -618,11 +625,29 @@ impl LowerCtx<'_> {
             .iter()
             .map(|&id| self.capture_source(id))
             .collect();
-        Ok(IrNode::FuncValue {
+        let value = IrNode::FuncValue {
             table_index,
             captures,
             kind,
-        })
+        };
+        let Some((_, (cell, _))) = self_cell else {
+            return Ok(value);
+        };
+        let func = self.fresh();
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: cell,
+                value: Box::new(IrNode::CellNew(Box::new(IrNode::Undefined))),
+            },
+            IrNode::Assign {
+                local: func,
+                value: Box::new(value),
+            },
+            IrNode::CellSet {
+                cell: Box::new(IrNode::Local(cell)),
+                value: Box::new(IrNode::Local(func)),
+            },
+        ]))
     }
 
     /// Lower a nested `function foo(){ .. }` declaration in place (outside a
@@ -667,6 +692,29 @@ impl LowerCtx<'_> {
         function: &swc_ecma_ast::Function,
         name: &str,
     ) -> anyhow::Result<IrNode> {
+        self.lower_callable(function, name, FnKind::Constructor)
+    }
+
+    /// Lift an object-literal or class method (or accessor) `function` named
+    /// `name`: an ordinary method, or the generator constructor of a
+    /// generator / async method. Methods are not constructors.
+    pub(super) fn lower_method(
+        &mut self,
+        function: &swc_ecma_ast::Function,
+        name: &str,
+    ) -> anyhow::Result<IrNode> {
+        self.lower_callable(function, name, FnKind::Plain)
+    }
+
+    /// [`Self::lower_function_value`] / [`Self::lower_method`]: an ordinary
+    /// `function` lifts with `kind`, a generator / async one to its generator
+    /// constructor.
+    fn lower_callable(
+        &mut self,
+        function: &swc_ecma_ast::Function,
+        name: &str,
+        kind: FnKind,
+    ) -> anyhow::Result<IrNode> {
         let block = function
             .body
             .as_ref()
@@ -678,11 +726,11 @@ impl LowerCtx<'_> {
                 &param_pats,
                 body,
                 name,
-                FnKind::Plain,
+                machine_kind(is_async),
                 false,
                 Some((is_async, function.span)),
             ),
-            None => self.lower_lifted_function(&param_pats, body, name, FnKind::Constructor),
+            None => self.lower_lifted_function(&param_pats, body, name, kind),
         }
     }
 
