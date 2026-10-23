@@ -182,7 +182,10 @@ impl LowerCtx<'_> {
         let mut prefix = Vec::new();
         let fn_locals: Vec<u32> = fns
             .iter()
-            .map(|f| self.declare(f.ident.sym.as_ref(), true, f.ident.span.lo.0))
+            .map(|f| {
+                self.frame().var_ids.insert(f.ident.span.lo.0);
+                self.declare(f.ident.sym.as_ref(), true, f.ident.span.lo.0)
+            })
             .collect();
         for &local in &fn_locals {
             if self.is_cell(local) {
@@ -272,17 +275,19 @@ impl LowerCtx<'_> {
                 (Some(init), _) => self.lower_expr(init)?,
                 (None, _) => IrNode::Undefined,
             };
-            match &declarator.name {
-                // The `Pat::Ident` fast path: bind one local directly (a captured
-                // binding is boxed so its cell holds the value).
-                Pat::Ident(ident) => {
-                    let local = self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident));
-                    self.push_binding(local, init, out);
-                }
-                // A destructuring pattern (`let [a, b] = ..`) desugars to indexed
-                // reads off a hidden temp holding the initializer.
-                other => self.lower_binding_pattern(other, init, mutable, out)?,
+            // A `var` redeclaring a var-scoped binding of the function reuses
+            // it: without an initializer it keeps its value (DESIGN.md §7.4).
+            if var_decl.kind == VarDeclKind::Var
+                && declarator.init.is_none()
+                && let Pat::Ident(ident) = &declarator.name
+                && self.var_redeclaration(ident.id.sym.as_ref()).is_some()
+            {
+                continue;
             }
+            self.binding_var = var_decl.kind == VarDeclKind::Var;
+            let result = self.lower_binding_pattern(&declarator.name, init, mutable, out);
+            self.binding_var = false;
+            result?;
         }
         Ok(())
     }
@@ -758,14 +763,34 @@ impl LowerCtx<'_> {
     /// a cell (the `Pat::Ident` fast path shared by [`Self::lower_var_decl`] and the
     /// destructuring desugars). `mutable` is the binding mutability (`false` for
     /// `const`).
-    fn bind_ident(
+    pub(super) fn bind_ident(
         &mut self,
         ident: &swc_ecma_ast::BindingIdent,
         value: IrNode,
         mutable: bool,
         out: &mut Vec<IrStmt>,
     ) {
-        let local = self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident));
+        let name = ident.id.sym.as_ref();
+        let id = binding_id(ident);
+        if let Some((local, cell)) = self.bind_declared_param(name, id) {
+            if cell {
+                out.push(IrStmt::Expr(IrNode::CellSet {
+                    cell: Box::new(IrNode::Local(local)),
+                    value: Box::new(value),
+                }));
+            } else {
+                self.push_binding(local, value, out);
+            }
+            return;
+        }
+        if self.binding_var {
+            if let Some(existing) = self.var_redeclaration(name) {
+                out.push(IrStmt::Expr(Self::write_of(existing.kind, value)));
+                return;
+            }
+            self.frame().var_ids.insert(id);
+        }
+        let local = self.declare(name, mutable, id);
         self.push_binding(local, value, out);
     }
 

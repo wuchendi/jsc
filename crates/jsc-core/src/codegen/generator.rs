@@ -453,6 +453,7 @@ impl LowerCtx<'_> {
         let mut body = Vec::new();
         match body_kind {
             BodyKind::Block(stmts) => {
+                self.bind_var_copies(stmts, &mut body)?;
                 for stmt in stmts {
                     self.lower_stmt(stmt, &mut body)?;
                 }
