@@ -51,6 +51,7 @@ use crate::ir::{
 /// outside the supported numeric subset.
 #[allow(clippy::too_many_lines)]
 pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
+    early::check(program)?;
     let body: Vec<&Stmt> = match program {
         Program::Script(script) => script.body.iter().collect(),
         Program::Module(module) => module
@@ -120,13 +121,11 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     // sharing the same signature. Scanning the whole program up front fixes `K`
     // before any body is lowered, so a single `call_indirect` type serves them
     // all and no arrow's params can overflow the fixed argument slots.
-    // A generator's — and an `async function`'s — state machine is
+    // A generator's — and an `async` function's or arrow's — state machine is
     // driven with two positional arguments (`sent`, the handle), so `K` must be at
     // least 2 for the second slot to exist, regardless of the widest
     // source arity.
-    let has_state_machine = fn_decls
-        .iter()
-        .any(|f| f.function.is_generator || f.function.is_async);
+    let has_state_machine = has_state_machine(program);
     // A builtin reached through its function value reads its arguments from
     // the same `K` slots, so `K` then also covers the widest call.
     let globals = GlobalFacts::scan(program);
@@ -429,6 +428,10 @@ struct Frame {
     /// and for a function that never reads `this`). An `Expr::This` in this frame
     /// reads this local.
     this_local: Option<u32>,
+    /// The environment slot of an `env_backed` (generator) frame's `this` cell,
+    /// seeded by the generator constructor with its call's receiver; allocated
+    /// on the first `this` in the body (`None` until then).
+    gen_this: Option<u32>,
     /// Whether this frame is an arrow body, which has no `new.target` of its
     /// own: it reads the enclosing function's.
     arrow: bool,
@@ -538,6 +541,7 @@ struct LowerCtx<'a> {
 
 mod arity;
 mod capture;
+mod early;
 mod expr;
 mod function;
 mod generator;
@@ -557,3 +561,26 @@ use op::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `program` contains any generator or async function or arrow (a
+/// body compiled to a state machine).
+fn has_state_machine(program: &Program) -> bool {
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    /// Finds a `function*` / `async` function or arrow anywhere.
+    #[derive(Default)]
+    struct Scan(bool);
+    impl Visit for Scan {
+        fn visit_function(&mut self, node: &swc_ecma_ast::Function) {
+            self.0 |= node.is_generator || node.is_async;
+            node.visit_children_with(self);
+        }
+        fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
+            self.0 |= node.is_async;
+            node.visit_children_with(self);
+        }
+    }
+    let mut scan = Scan::default();
+    program.visit_with(&mut scan);
+    scan.0
+}

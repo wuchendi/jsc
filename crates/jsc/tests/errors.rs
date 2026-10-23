@@ -103,14 +103,13 @@ fn undeclared_identifier_throws_reference_error_at_run_time() {
     );
 }
 
-/// A codegen-rejected *unsupported construct* (an `async` ARROW — a top-level
-/// `async function` declaration is supported, but the arrow form is not)
+/// A codegen-rejected *unsupported construct* (an async generator)
 /// carries the offending node's span: the diagnostic points a caret at
 /// the construct.
 #[test]
 fn unsupported_construct_renders_caret_diagnostic() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", "let f = async () => 1;"])
+        .args(["-e", "let f = async function* () {};"])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(output.status.code() == Some(2), "must exit 2");
@@ -374,14 +373,11 @@ fn property_write_error_unwinds_through_finally_and_calls() {
     );
 }
 
-/// Out-of-scope object method forms (async/generator methods) are rejected at compile time with exit code 2 and
-/// an explanatory message.
+/// Out-of-scope object method forms (async generator methods) are rejected at
+/// compile time with exit code 2 and an explanatory message.
 #[test]
 fn unsupported_object_methods_error() {
-    let cases = [
-        ("let o={async m(){return 1}}; 1", "async"),
-        ("let o={*m(){return 1}}; 1", "generator"),
-    ];
+    let cases = [("let o={async *m(){yield 1}}; 1", "async generator")];
     for (src, needle) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
             .args(["-e", src])
@@ -401,9 +397,9 @@ fn unsupported_object_methods_error() {
 
 /// Out-of-scope class forms are rejected at compile time with a
 /// non-zero exit and an explanatory, spanned message. Constructors, methods,
-/// accessors (instance and static), fields, `extends`, and class expressions
-/// are supported (see the classes suites); computed, private, async, and
-/// generator members stay out of scope.
+/// accessors (instance and static), generator and async methods, fields,
+/// `extends`, and class expressions are supported (see the classes suites);
+/// computed, private, and async generator members stay out of scope.
 #[test]
 fn unsupported_class_forms_error() {
     let cases = [
@@ -412,8 +408,7 @@ fn unsupported_class_forms_error() {
         ("class A{ get [k](){return 1} } 1", "computed"),
         ("class A{ #p = 1 } 1", "private"),
         ("class A{ [k](){} } 1", "computed"),
-        ("class A{ async m(){return 1} } 1", "async"),
-        ("class A{ *m(){return 1} } 1", "generator"),
+        ("class A{ async *m(){yield 1} } 1", "async generator"),
     ];
     for (src, needle) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_jsc"))

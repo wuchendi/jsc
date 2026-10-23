@@ -557,10 +557,13 @@ in the data segment (§4.2), so it has one identity for the whole run.
   function's info entry (the `u32` at `FN_INFO_ADDR` locates the table; entry
   `func_idx` is `[name key][length]`) and, for a plain `CONSTRUCTOR` (not a
   class), `prototype` (writable only) = a fresh object whose non-enumerable
-  `constructor` is the function.
+  `constructor` is the function; for a `GENERATOR`, `prototype` (writable
+  only) = a fresh object inheriting `%GeneratorPrototype%`, with no
+  `constructor`.
 - **Kinds.** `CONSTRUCTOR` is set for `function` declarations and expressions
-  and classes; arrows, methods, accessors, and generator functions are not
-  constructors and get no `prototype`. `CLASS_CTOR` marks a class constructor
+  and classes; arrows, methods, accessors, generator and async functions are
+  not constructors. `GENERATOR` marks a generator function or method (it gets
+  the generator `prototype` above); the others get no `prototype`. `CLASS_CTOR` marks a class constructor
   (callable only with the construct marker; its `prototype` is installed by
   the class definition). `SELF_ALLOC` marks a derived class and the builtin
   constructors that allocate their own object from `new.target` (Array, the
@@ -1039,6 +1042,9 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 - **Conditional** `c ? a : b`, optional chaining `a?.b`, `a?.[k]`, `a?.()`,
   `a?.m()` (a nullish base short-circuits the rest of the chain to
   `undefined`).
+- **Comma** `a, b, c` evaluates every operand left to right and yields the last
+  (a plain value: `(0, o.m)()` calls without a receiver); `yield`/`await`
+  operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
   (`__delete`).
 - **Member access on `null`/`undefined`** throws a `TypeError`
@@ -1070,8 +1076,9 @@ those of `switch` and loops are not tracked.
 
 ### 7.4 Functions
 
-- **Forms.** Function declarations and expressions, arrows (expression- or
-  block-bodied), object-literal methods, getters and setters, class
+- **Forms.** Function declarations and expressions (including generator and
+  `async` ones, §7.8), arrows (expression- or block-bodied, optionally
+  `async`), object-literal methods, getters and setters, class
   constructors/methods/accessors (instance and static), class expressions. All
   are lifted to top-level wasm functions with the uniform ABI (§4.2); a function
   value is a `TYPE_FUNCTION` block (§5.5) and carries properties like any
@@ -1117,6 +1124,8 @@ those of `switch` and loops are not tracked.
   constructor gets a synthesized one. `C.prototype` is a non-writable object
   whose non-enumerable `constructor` is `C`; methods and accessors are defined
   on it; static methods, accessors, and fields are own properties of `C`.
+  Methods may be generator or `async` methods (§7.8); `this` and `super.x`
+  work in their bodies across suspensions.
   Calling `C` without `new` throws `TypeError: Class constructor C cannot be
   invoked without 'new'`.
 - **Fields.** Instance fields (`f = init`, or `f;` for `undefined`) are
@@ -1178,11 +1187,19 @@ those of `switch` and loops are not tracked.
 
 ### 7.8 Iteration, generators & async
 
-**Generators.** A top-level `function*` declaration compiles to two
-uniform-ABI functions: a **constructor** that allocates a `TYPE_GENERATOR`
-handle and its frame without running the body, and a **state machine**
-`SM(sent, gen, …)` that resumes at `gen.state`. Every generator local lives in a
-frame cell, so locals survive suspension. The body is lowered to a control-flow
+**Generators.** A `function*` — declaration (top-level or nested, hoisted like
+any nested function declaration), expression, or object-literal / class
+generator method (`*m(){}`, instance or static) — compiles to two uniform-ABI
+functions: a **constructor** that allocates a `TYPE_GENERATOR` handle and its
+frame without running the body, and a **state machine** `SM(sent, gen, …)` that
+resumes at `gen.state`. Every generator local lives in a frame cell, so locals
+survive suspension. The constructor is an ordinary lifted function value (not a
+constructor, so `new` throws a `TypeError`): it seeds the parameters' cells
+from its argument slots and a `this` cell from its call's receiver, and a
+binding the body captures from an enclosing function is a frame slot holding
+that function's own cell (read through the constructor's environment), so the
+capture is by reference and outlives the creating call. A named generator
+expression binds its name, read-only, inside its body. The body is lowered to a control-flow
 graph of basic blocks (`codegen/generator.rs`); control flow crossing a suspend
 point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
 `break`/`continue`/`return` — becomes block jumps dispatched by a
@@ -1190,17 +1207,23 @@ point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
 control flow. A `yield` may appear inside a larger expression
 (`1 + (yield 2)`, a loop condition); the expression is linearized around it.
 
-- Generator objects inherit `%GeneratorPrototype%` (`next`, `return`, `throw`).
+- Each generator function owns a `prototype` (writable, non-enumerable,
+  non-configurable): a fresh object inheriting `%GeneratorPrototype%`
+  (`next`, `return`, `throw`), with no own `constructor`. A generator object
+  inherits its function's `prototype` read at call time, or
+  `%GeneratorPrototype%` when that is not an object; so `g() instanceof g`.
   `it.next(v)` sends `v` and returns a fresh `{ value, done }` object;
   `return(v)` and `throw(e)` complete or throw at the suspended `yield`
   (`throw` reaches an enclosing `catch`). These are ordinary methods: a user
   object's own `next` is called like any method.
 - `yield* g` as a statement delegates to any iterable source (§7.3).
 
-**`async`/`await`.** A top-level `async function` declaration is a generator whose
-`await e` is a `yield e`; the declared name binds to a wrapper that builds the
-generator and hands it to the host async driver (§6.7), returning the result
-promise. All generator control-flow support applies to `await`; a rejected
+**`async`/`await`.** An `async function` (in every position a `function*` may
+take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
+function value is a wrapper that builds the generator and hands it to the host
+async driver (§6.7), returning the result promise. An `async` arrow keeps arrow
+semantics: no `prototype`, not a constructor, and `arguments` / `new.target`
+are the enclosing function's. All generator control-flow support applies to `await`; a rejected
 awaited promise throws into the body at the `await`, so `try`/`catch` around
 `await` works. Top-level `await` is supported in `main`.
 
@@ -1257,10 +1280,9 @@ is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`, `comma (sequence) expressions
-are not supported`, `private class fields are not supported`, `class static
-blocks are not supported`, `computed class method names are not supported`,
-`generator functions are unsupported`, `a label may only be applied to a loop`,
+supported`, `with statements are not supported`, `private class fields are not
+supported`, `class static blocks are not supported`, `computed class method names are not supported`,
+`async generator functions are unsupported`, `a label may only be applied to a loop`,
 `destructuring assignment is only supported as an expression statement`.
 
 **Run-time errors** carry no source span:
@@ -1484,7 +1506,7 @@ Each item below is current behaviour of this tree.
 - Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
   `slice`, `charAt`, `split("")`, string spread, and `for-of` over a string all
   work per byte (`"é".length` is `2`). Case mapping and trimming are ASCII-only.
-- No comma/sequence expressions, no `void`.
+- No `void`.
 - Not available: `RegExp` (literals and constructor), `Symbol` (so no
   user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
@@ -1503,8 +1525,6 @@ Each item below is current behaviour of this tree.
   string keys; `catch` parameters must be identifiers.
 - No `ArraySpeciesCreate`: `map`/`filter` on an `Array` subclass instance return a plain
   array.
-- Generator functions have no `prototype` property; generator objects inherit
-  `%GeneratorPrototype%` directly.
 - `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
   the constructors collect their iterable argument eagerly, with no
   `IteratorClose`.
@@ -1520,13 +1540,13 @@ Each item below is current behaviour of this tree.
 - Arrows do not capture lexical `this`; an arrow sees the `this` of its own call
   (usually `undefined`, also at top level).
 - Not supported: private `#` members, static blocks, computed class member
-  names, generator or async methods.
+  names.
 
 **Generators & async**
 
-- Generators and async functions must be top-level declarations: no nested
-  declarations, expressions, arrows, or methods, and no `async function*`.
-  Generator parameters must be simple identifiers.
+- No `async function*` (nor `async *m(){}` methods). Generator and async
+  parameters must be simple
+  identifiers, and their bodies cannot reference `arguments`.
 - `yield*` is supported only as a statement; it does not thread sent values or
   the delegate's return value.
 - `return()` at a suspended `yield` in a body with a `finally` or a `yield*`,
