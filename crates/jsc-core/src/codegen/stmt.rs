@@ -318,7 +318,7 @@ impl LowerCtx<'_> {
     /// defined after the class value exists, with `this` = the class.
     ///
     /// Out-of-scope forms are rejected WITH SPANS: decorators, computed
-    /// member names, async/generator methods, private members, static blocks.
+    /// member names, private members, static blocks.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_class(
         &mut self,
@@ -553,12 +553,6 @@ impl LowerCtx<'_> {
         m: &ClassMethod,
         entries: &mut Vec<(PropKey, IrNode)>,
     ) -> anyhow::Result<()> {
-        let f = m.function.as_ref();
-        let body = f
-            .body
-            .as_ref()
-            .ok_or_else(|| anyhow!("class method requires a body"))?;
-        let param_pats: Vec<&Pat> = f.params.iter().map(|p| &p.pat).collect();
         let key = prop_key_name(&m.key)?;
         let accessor = match m.kind {
             MethodKind::Getter => Some(true),
@@ -570,12 +564,7 @@ impl LowerCtx<'_> {
             Some(false) => format!("set {key}"),
             None => key.clone(),
         };
-        let value = self.lower_lifted_function(
-            &param_pats,
-            BodyKind::Block(&body.stmts),
-            &fn_name,
-            FnKind::Plain,
-        )?;
+        let value = self.lower_method(&m.function, &fn_name)?;
         match accessor {
             Some(getter) => push_accessor_half(entries, PropKey::Hidden(key), value, getter),
             None => entries.push((PropKey::Hidden(key), value)),
@@ -2023,22 +2012,16 @@ fn index_num(i: usize) -> IrNode {
     IrNode::Num(f64::from(u32::try_from(i).unwrap_or(u32::MAX)))
 }
 
-/// Reject an out-of-scope class method form WITH a span: computed names and
-/// async/generator methods (static or not). Returns `Ok(())` for a supported
-/// method or accessor.
+/// Reject an out-of-scope class method form WITH a span: computed names
+/// (static or not). Returns `Ok(())` for a supported method or accessor.
 fn reject_out_of_scope_method(m: &ClassMethod) -> anyhow::Result<()> {
-    let msg = if matches!(m.key, PropName::Computed(_)) {
-        if matches!(m.kind, MethodKind::Method) {
-            "computed class method names are not supported"
-        } else {
-            "computed class accessor names are not supported"
-        }
-    } else if m.function.is_async {
-        "async class methods are not supported"
-    } else if m.function.is_generator {
-        "generator class methods are not supported"
-    } else {
+    if !matches!(m.key, PropName::Computed(_)) {
         return Ok(());
+    }
+    let msg = if matches!(m.kind, MethodKind::Method) {
+        "computed class method names are not supported"
+    } else {
+        "computed class accessor names are not supported"
     };
     Err(CompileError::spanned(m.span(), msg).into())
 }

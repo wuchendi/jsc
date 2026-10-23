@@ -567,11 +567,13 @@ fn emit_fn_data(
 }
 
 /// The header `flags` a fresh function object of `kind` is created with:
-/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR` / `SELF_ALLOC`) per its kind.
+/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR` / `SELF_ALLOC`) or
+/// `GENERATOR` per its kind.
 pub(super) fn fn_flags(kind: FnKind) -> u8 {
     abi::FUNC_FLAG_LAZY
         | match kind {
             FnKind::Plain => 0,
+            FnKind::Generator => abi::FUNC_FLAG_GENERATOR,
             FnKind::Constructor => abi::FUNC_FLAG_CONSTRUCTOR,
             FnKind::Class => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR,
             FnKind::DerivedClass => {
