@@ -32,12 +32,27 @@ const TO_STRING_NOT_CALLABLE: CalleeErrorText<'static> = [
     "TypeError: toString is not a function",
 ];
 
+/// The `TypeError`s of `__defineGetter__` / `__defineSetter__` with a
+/// non-callable accessor.
+const GETTER_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Object.prototype.__defineGetter__: Expecting function",
+    "TypeError: Object.prototype.__defineGetter__: Expecting function",
+];
+const SETTER_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Object.prototype.__defineSetter__: Expecting function",
+    "TypeError: Object.prototype.__defineSetter__: Expecting function",
+];
+
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 19] = [
+pub(super) const STRINGS: [&str; 23] = [
     NULLISH_TO_OBJECT[0],
     NULLISH_TO_OBJECT[1],
     TO_STRING_NOT_CALLABLE[0],
     TO_STRING_NOT_CALLABLE[1],
+    GETTER_NOT_CALLABLE[0],
+    GETTER_NOT_CALLABLE[1],
+    SETTER_NOT_CALLABLE[0],
+    SETTER_NOT_CALLABLE[1],
     TAG_UNDEFINED,
     TAG_NULL,
     TAG_BOOLEAN,
@@ -246,4 +261,151 @@ pub(super) fn emit_to_locale_string(
     }
     wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
     invoke(function, method, |function| emit_argc(0, function), helpers);
+}
+
+/// `Object.prototype.__defineGetter__(P, getter)` / `__defineSetter__(P,
+/// setter)` (Annex B.2.2.2-3): `ToObject(this)`, the accessor must be
+/// callable, `ToPropertyKey(P)`, then `DefinePropertyOrThrow` of `{[[Get]] |
+/// [[Set]]: accessor, enumerable: true, configurable: true}`.
+pub(super) fn emit_define_accessor(
+    set: bool,
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, accessor) = (frame.i64(0), frame.i64(1));
+    let (key, r) = (frame.i32(0), frame.i32(1));
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(o));
+    require_object_coercible(function, frame, o, strings, helpers);
+    wasm!(function; LocalGet(o), Call(helpers.to_object()), LocalSet(o));
+    frame.arg(function, 1);
+    wasm!(function; LocalSet(accessor));
+    emit_is_function(function, accessor);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    let text = if set {
+        SETTER_NOT_CALLABLE
+    } else {
+        GETTER_NOT_CALLABLE
+    };
+    throw_type_error(function, frame, text, strings, helpers);
+    wasm!(function; End);
+    frame.arg(function, 0);
+    wasm!(function; I32Const(1), Call(helpers.to_key), LocalSet(key));
+    return_if_pending(function);
+    let half = if set { DESC_HAS_SET } else { DESC_HAS_GET };
+    let desc = half
+        | DESC_HAS_ENUMERABLE
+        | DESC_HAS_CONFIGURABLE
+        | abi::ATTR_ENUMERABLE.cast_signed()
+        | abi::ATTR_CONFIGURABLE.cast_signed();
+    object_static::define_or_throw(
+        function,
+        o,
+        key,
+        r,
+        |function| {
+            wasm!(function; I32Const(desc), I64Const(UNDEFINED_BITS));
+            for present in [!set, set] {
+                if present {
+                    wasm!(function; LocalGet(accessor));
+                } else {
+                    wasm!(function; I64Const(UNDEFINED_BITS));
+                }
+            }
+        },
+        helpers,
+    );
+    wasm!(function; I64Const(UNDEFINED_BITS));
+}
+
+/// `Object.prototype.__lookupGetter__(P)` / `__lookupSetter__(P)` (Annex
+/// B.2.2.4-5): `ToObject(this)`, `ToPropertyKey(P)`, then the first own
+/// property `P` up the `proto` chain decides: an accessor's `get` / `set`,
+/// else (a data property or none) `undefined`.
+pub(super) fn emit_lookup_accessor(
+    set: bool,
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (o, desc) = (frame.i64(0), frame.i64(1));
+    let key = frame.i32(0);
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(o));
+    require_object_coercible(function, frame, o, strings, helpers);
+    wasm!(function; LocalGet(o), Call(helpers.to_object()), LocalSet(o));
+    frame.arg(function, 0);
+    wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
+    return_if_pending(function);
+    let half = static_key(strings, if set { "set" } else { "get" });
+    wasm!(function;
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(o), LocalGet(key), Call(helpers.own_desc()), LocalTee(desc),
+        I64Const(UNDEFINED_BITS), I64Ne,
+        // A data descriptor has no own `get` / `set` (one inherited from
+        // `%Object.prototype%` must not be read).
+        If(BlockType::Empty),
+        I32Const(half), LocalGet(desc), Call(helpers.has_own()),
+        If(BlockType::Result(ValType::I64)),
+        LocalGet(desc), I32Const(half), Call(helpers.get),
+        Else, I64Const(UNDEFINED_BITS), End,
+        Return,
+        End,
+        LocalGet(o), I32WrapI64, I64Load(MemArg { offset: OBJ_PROTO_OFFSET, align: 3, memory_index: 0 }),
+        LocalTee(o), I64Const(NULL_BITS), I64Eq, BrIf(1),
+        Br(0),
+        End, End,
+        I64Const(UNDEFINED_BITS),
+    );
+}
+
+/// The getter of `Object.prototype.__proto__`: the `proto` of
+/// `ToObject(this)`.
+pub(super) fn emit_proto_get(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let this = frame.i64(0);
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
+    require_object_coercible(function, frame, this, strings, helpers);
+    wasm!(function;
+        LocalGet(this), Call(helpers.to_object()), I32WrapI64,
+        I64Load(MemArg { offset: OBJ_PROTO_OFFSET, align: 3, memory_index: 0 }),
+    );
+}
+
+/// The setter of `Object.prototype.__proto__`: `RequireObjectCoercible(this)`;
+/// a value that is neither an object nor `null`, or a primitive `this`, does
+/// nothing; else `[[SetPrototypeOf]]` (`__set_proto`; a rejection throws).
+/// Returns `undefined`.
+pub(super) fn emit_proto_set(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (this, proto, r) = (frame.i64(0), frame.i64(1), frame.i32(0));
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
+    require_object_coercible(function, frame, this, strings, helpers);
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(proto));
+    emit_is_object(function, proto);
+    wasm!(function; LocalGet(proto), I64Const(NULL_BITS), I64Eq, I32Or);
+    emit_is_object(function, this);
+    wasm!(function;
+        I32And,
+        If(BlockType::Empty),
+        LocalGet(this), I32WrapI64, LocalGet(proto), Call(helpers.set_proto()), LocalTee(r),
+        If(BlockType::Empty),
+    );
+    object_static::prop_throw(
+        function,
+        |function| push_str(function, strings, ""),
+        |function| wasm!(function; LocalGet(r)),
+        helpers,
+    );
+    wasm!(function; End, End, I64Const(UNDEFINED_BITS));
 }

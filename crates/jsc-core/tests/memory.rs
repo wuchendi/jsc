@@ -21,6 +21,17 @@ fn many_small_strings_grow_memory() {
     );
 }
 
+/// Static data (string literals and the intern table) past the first page
+/// still fits the initial memory.
+#[test]
+fn static_data_beyond_one_page() {
+    let literals: Vec<String> = (0..3000)
+        .map(|i| format!("'literal number {i:05}'"))
+        .collect();
+    let src = format!("let a = [{}]; a.length", literals.join(", "));
+    assert_number(&src, 3000.0);
+}
+
 /// A million small string allocations complete.
 #[test]
 fn million_small_strings() {

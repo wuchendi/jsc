@@ -251,34 +251,6 @@ fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Fu
     );
 }
 
-/// Argument `i` (an i32 local) into i64 `out`: from the spread argument
-/// array when the call passed more than `K` arguments, else from slot `i`
-/// (`undefined` past the slots); a spread hole reads `undefined`.
-fn arg_at(function: &mut Function, frame: Frame, i: u32, out: u32) {
-    let k = frame.k;
-    argc(function, frame);
-    wasm!(function;
-        I32Const(k.cast_signed()), I32GtU,
-        If(BlockType::Result(ValType::I64)),
-        GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64,
-    );
-    emit_array_elems(function);
-    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), Else);
-    for j in 0..k {
-        wasm!(function;
-            LocalGet(i), I32Const(j.cast_signed()), I32Eq,
-            If(BlockType::Result(ValType::I64)), LocalGet(j), Else,
-        );
-    }
-    wasm!(function; I64Const(UNDEFINED_BITS));
-    for _ in 0..k {
-        wasm!(function; End);
-    }
-    wasm!(function; End, LocalSet(out));
-    emit_elem_read(function, out);
-    wasm!(function; LocalSet(out));
-}
-
 /// `ToIntegerOrInfinity` of the jsval on the stack into f64 `r` (a throwing
 /// `valueOf` returns).
 fn to_integer(function: &mut Function, r: u32, helpers: Helpers<'_>) {
@@ -311,7 +283,9 @@ pub(super) fn emit_push(
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (n, i) = (frame.i32(0), frame.i32(1));
+    let (n, i, spread) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    // The spread argument array, before a setter's spread call republishes it.
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64, LocalSet(spread));
     this_object(function, frame, o, PUSH.nullish, strings, helpers);
     argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
@@ -319,7 +293,7 @@ pub(super) fn emit_push(
     wasm!(function; If(BlockType::Empty));
     count_loop(function, i, n, |function| {
         wasm!(function; LocalGet(o), I32WrapI64);
-        arg_at(function, frame, i, v);
+        arg_at(function, frame, i, spread, v);
         wasm!(function; LocalGet(v), Call(helpers.array_push), Drop);
     });
     wasm!(function; LocalGet(o), I32WrapI64, I32Load(array_len_slot()));
@@ -345,7 +319,7 @@ pub(super) fn emit_push(
     count_loop(function, i, n, |function| {
         wasm!(function; LocalGet(flen), LocalGet(i), F64ConvertI32U, F64Add);
         wasm!(function; I64ReinterpretF64, LocalSet(kv));
-        arg_at(function, frame, i, v);
+        arg_at(function, frame, i, spread, v);
         emit_drop(
             function,
             frame,

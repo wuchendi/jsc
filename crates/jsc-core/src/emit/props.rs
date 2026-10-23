@@ -330,7 +330,10 @@ fn emit_exotic_len(function: &mut Function, o: u32) {
 /// Invoke the accessor function value in i64 local `callee` with `this` = the
 /// i64 local `this`, passing `arg` (an i64 local) as its only argument when
 /// given; the result stays on the stack. Only emitted when the program has
-/// accessors (so the funcref table exists).
+/// accessors (so the funcref table exists). With `K = 0` (no setter declares
+/// a parameter; the callee may be a builtin setter such as `__proto__`'s) the
+/// argument goes in a fresh one-element spread argument array, as for any
+/// call passing more than `K` arguments.
 pub(super) fn emit_accessor_call(
     function: &mut Function,
     callee: u32,
@@ -340,11 +343,16 @@ pub(super) fn emit_accessor_call(
     helpers: Helpers<'_>,
 ) {
     let mut pushed = 0;
-    if let Some(arg) = arg
-        && helpers.max_args >= 1
-    {
-        wasm!(function; LocalGet(arg));
-        pushed = 1;
+    if let Some(arg) = arg {
+        if helpers.max_args >= 1 {
+            wasm!(function; LocalGet(arg));
+            pushed = 1;
+        } else {
+            wasm!(function; I32Const(1), Call(helpers.new_array()), LocalTee(base));
+            emit_array_elems(function);
+            wasm!(function; LocalGet(arg), I64Store(elem_slot(0)));
+            emit_publish_spread_args(base, function);
+        }
     }
     for _ in pushed..helpers.max_args {
         wasm!(function; I64Const(UNDEFINED_BITS));
@@ -1399,8 +1407,9 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
 /// `__array_set_length(o: i32, v: i64)`: the `length` write `o.length = v` on
 /// the array `o` (`ArraySetLength`). A read-only `length` throws `Cannot
 /// assign to read only property 'length'` before any conversion. `n =
-/// ToUint32(v)`; when `ToNumber(v) != n` it raises the `RangeError` "Invalid
-/// array length" (left pending) and changes nothing. A shrink (`n < len`)
+/// ToUint32(v)`; an abrupt `ToNumber(v)` propagates, and when `ToNumber(v) !=
+/// n` it raises the `RangeError` "Invalid array length" (left pending); both
+/// change nothing. A shrink (`n < len`)
 /// turns the slots `n..len` into holes and keeps the store (so a regrowth and
 /// a GC walk see no stale element); a `SPARSE` array also drops its index
 /// keys `>= n`, except that a non-configurable element `k >= n` stops the
@@ -1476,6 +1485,7 @@ pub(super) fn emit_array_set_length(
         LocalGet(v),
         Else,
         LocalGet(v), Call(helpers.to_number),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         End,
         F64ReinterpretI64, LocalTee(d), F64Const(0.0.into()), F64Ge,
         LocalGet(d), F64Const(4_294_967_296.0.into()), F64Lt, I32And,

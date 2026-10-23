@@ -532,8 +532,9 @@ pub enum DateOp {
     GetMinutes,
     /// `d.getSeconds()` — the UTC second of the minute (`0`..`59`).
     GetSeconds,
-    /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`,
-    /// built GUEST-side as a fresh heap string.
+    /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`
+    /// (an expanded `±YYYYYY` year outside `0..=9999`), built GUEST-side as a
+    /// fresh heap string.
     ToIsoString,
     /// `d.toString()` — `Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated
     /// Universal Time)`, built GUEST-side as a fresh heap string.
@@ -1518,16 +1519,16 @@ pub enum IrNode {
     /// promise. Emitted as the whole body of the wrapper function the `async`
     /// name binds to (`return AsyncSpawn(MakeGenerator{..})`).
     AsyncSpawn(Box<IrNode>),
-    /// `new Date()` / `new Date(ms)`. Allocates a fresh `TYPE_DATE`
-    /// block whose f64 payload is the timestamp in milliseconds since the Unix
-    /// epoch, and yields the handle heap jsval. `ms` is `None` for the no-argument
-    /// form (the payload is the host clock, the `__now` import); otherwise it is
-    /// the single constructor argument already wrapped in a `Number(..)` coercion
-    /// (an [`IrNode::ConvertCall`] with [`ConvertOp::ToNumber`]), so any operand
-    /// stores its numeric value (`new Date("2020")` is `NaN`, like `Number`).
+    /// `new Date()` / `new Date(value)`. Allocates a fresh `TYPE_DATE`
+    /// block whose f64 payload is `TimeClip` of the timestamp in milliseconds
+    /// since the Unix epoch, and yields the handle heap jsval. `arg` is `None`
+    /// for the no-argument form (the host clock, the `__now` import); otherwise
+    /// it is the single constructor argument: a Date's time value is taken
+    /// directly, anything else goes through `ToNumber` (`new Date("2020")` is
+    /// `NaN`, like `Number`).
     DateNew {
-        /// The millisecond timestamp expression, or `None` for the host clock.
-        ms: Option<Box<IrNode>>,
+        /// The constructor argument, or `None` for the host clock.
+        arg: Option<Box<IrNode>>,
     },
     /// `Date.now()`: the host wall-clock time in milliseconds since the
     /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
@@ -1544,8 +1545,9 @@ pub enum IrNode {
         obj: Box<IrNode>,
     },
     /// The field `op` of the `TYPE_DATE` block in `recv` (already checked),
-    /// computed GUEST-side from its stored f64 epoch-ms. A non-finite
-    /// timestamp yields `NaN` (or `"Invalid Date"` for `toISOString`).
+    /// computed GUEST-side from its stored f64 epoch-ms. An invalid (`NaN`)
+    /// time value yields `NaN`, `"Invalid Date"` for `toString`, and throws a
+    /// `RangeError` for `toISOString`.
     DateField {
         /// Which field is computed.
         op: DateOp,
@@ -2001,7 +2003,7 @@ impl IrNode {
                     || this_arg.as_deref().is_some_and(f)
             }
             IrNode::ConvertCall { arg, radix, .. } => f(arg) || radix.as_deref().is_some_and(f),
-            IrNode::DateNew { ms } => ms.as_deref().is_some_and(f),
+            IrNode::DateNew { arg } => arg.as_deref().is_some_and(f),
             IrNode::Call { args, .. }
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }
@@ -2188,7 +2190,7 @@ impl IrNode {
                 out.extend(radix.as_deref_mut());
                 out
             }
-            IrNode::DateNew { ms } => ms.as_deref_mut().into_iter().collect(),
+            IrNode::DateNew { arg } => arg.as_deref_mut().into_iter().collect(),
             IrNode::Call { args, .. }
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }

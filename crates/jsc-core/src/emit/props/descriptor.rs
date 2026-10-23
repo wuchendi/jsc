@@ -144,11 +144,13 @@ fn emit_accessor_block(
 /// may leave an exception pending (its `ToNumber` / `RangeError`, or the
 /// `TypeError` of a shrink stopped by a non-configurable element).
 ///
-/// An array's `length` is `ArraySetLength` (10.4.2.4): `configurable` /
-/// `enumerable` `true` and accessor fields reject; a read-only `length`
-/// rejects `writable: true` and any other value; a value goes through
-/// `__array_set_length`; `writable: false` then makes it read-only (after
-/// putting the array in dictionary mode). An array index whose resulting
+/// An array's `length` is `ArraySetLength` (10.4.2.4): a value is first
+/// converted by `ToUint32` and `ToNumber` (two conversions), and a mismatch is
+/// the `RangeError` of `__array_set_length` (raised with the read-only flag
+/// briefly cleared); then `configurable` / `enumerable` `true` and accessor
+/// fields reject; a read-only `length` rejects `writable: true` and any other
+/// value; a value goes through `__array_set_length`; `writable: false` then
+/// makes it read-only (after putting the array in dictionary mode). An array index whose resulting
 /// attributes are the default ones on a non-`SPARSE` array is an element store
 /// (`__array_set`); any other index puts the array in dictionary mode, where
 /// it is an ordinary table property (a new index at or past `length` rejects
@@ -166,10 +168,10 @@ pub(in crate::emit) fn emit_define_own(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) -> Function {
-    let mut f = Function::new(vec![(7, ValType::I32), (1, ValType::I64)]);
+    let mut f = Function::new(vec![(7, ValType::I32), (2, ValType::I64)]);
     let (o, key, desc, value, get, set) = (0, 1, 2, 3, 4, 5);
     let (e, a, m, t, i, b, p) = (6, 7, 8, 9, 10, 11, 12);
-    let x = 13;
+    let (x, y) = (13, 14);
     let undefined = |f: &mut Function| wasm!(f; I64Const(UNDEFINED_BITS));
     let accessor_desc = DESC_HAS_GET | DESC_HAS_SET;
     let data_desc = DESC_HAS_VALUE | DESC_HAS_WRITABLE;
@@ -187,6 +189,40 @@ pub(in crate::emit) fn emit_define_own(
         If(BlockType::Empty),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
         If(BlockType::Empty),
+        LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And,
+        If(BlockType::Empty),
+    );
+    // `length` value: x = ToNumber(value) (for `ToUint32`), y = ToNumber(value);
+    // `value` becomes the number `ToUint32(x)`, which must equal `y`.
+    emit_is_number(&mut f, value);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(value), LocalSet(x), LocalGet(value), LocalSet(y),
+        Else,
+        LocalGet(value), Call(helpers.to_number), LocalSet(x),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+        LocalGet(value), Call(helpers.to_number), LocalSet(y),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+        End,
+    );
+    // ToUint32(x) = t - 2^32 * floor(t / 2^32), t = trunc(x) (NaN / infinities
+    // saturate to 0).
+    wasm!(f;
+        LocalGet(x), F64ReinterpretI64, F64Trunc,
+        LocalGet(x), F64ReinterpretI64, F64Trunc, F64Const(Ieee64::from(1.0 / 4_294_967_296.0)), F64Mul,
+        F64Floor, F64Const(Ieee64::from(4_294_967_296.0)), F64Mul, F64Sub,
+        I32TruncSatF64U, F64ConvertI32U, I64ReinterpretF64, LocalTee(value),
+        F64ReinterpretI64, LocalGet(y), F64ReinterpretI64, F64Ne,
+        If(BlockType::Empty),
+        // NaN is always an invalid length: `__array_set_length` raises the
+        // `RangeError` and changes nothing.
+        LocalGet(o), I32Load8U(m8(FLAGS)), LocalSet(t),
+        LocalGet(o), LocalGet(t), I32Const(!ARRAY_LENGTH_READONLY), I32And, I32Store8(m8(FLAGS)),
+        LocalGet(o), I64Const(QNAN_BITS), Call(helpers.array_set_length()),
+        LocalGet(o), LocalGet(t), I32Store8(m8(FLAGS)),
+        I32Const(DEFINE_REJECT), Return,
+        End,
+        End,
     );
     // `length`: accessor fields, configurable or enumerable `true` reject.
     emit_flag(&mut f, desc, accessor_desc);
@@ -203,11 +239,8 @@ pub(in crate::emit) fn emit_define_own(
         LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And,
         If(BlockType::Empty),
     );
-    emit_is_number(&mut f, value);
     wasm!(f;
-        If(BlockType::Result(ValType::I64)), LocalGet(value), Else, LocalGet(value), Call(helpers.to_number), End,
-        F64ReinterpretI64, LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), F64ConvertI32U, F64Ne,
-        GlobalGet(EXC_PENDING_GLOBAL), I32Or,
+        LocalGet(value), F64ReinterpretI64, LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), F64ConvertI32U, F64Ne,
         If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
         End,
         I32Const(DEFINE_OK), Return,

@@ -516,12 +516,12 @@ pub(super) fn emit_node(
             );
         }
         // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
-        // millisecond payload. `DateNew`/`DateNow` seed from `ms` or the host clock;
+        // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the host clock;
         // `DateField` computes a field from a Date receiver's payload.
-        IrNode::DateNew { ms } => {
-            emit_date_new_node(ms.as_deref(), function, scratch, strings, helpers);
+        IrNode::DateNew { arg } => {
+            emit_date_new_node(arg.as_deref(), function, scratch, strings, helpers);
         }
-        IrNode::DateNow => emit_date_now_node(function, helpers),
+        IrNode::DateNow => emit_date_now_node(function, scratch, helpers),
         IrNode::DateField { op, recv } => {
             emit_date_field(*op, *recv, function, scratch, strings, helpers);
         }

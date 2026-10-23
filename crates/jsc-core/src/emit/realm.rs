@@ -194,6 +194,20 @@ pub(super) enum Builtin {
     PropertyIsEnumerable,
     /// `Object.prototype.toLocaleString`.
     ToLocaleString,
+    /// `Object.prototype.__defineGetter__` / `__defineSetter__`.
+    DefineAccessor {
+        /// `__defineSetter__` rather than `__defineGetter__`.
+        set: bool,
+    },
+    /// `Object.prototype.__lookupGetter__` / `__lookupSetter__`.
+    LookupAccessor {
+        /// `__lookupSetter__` rather than `__lookupGetter__`.
+        set: bool,
+    },
+    /// The getter of `Object.prototype.__proto__`.
+    ProtoGet,
+    /// The setter of `Object.prototype.__proto__`.
+    ProtoSet,
     /// `Function.prototype.call`.
     Call,
     /// `Function.prototype.apply`.
@@ -481,7 +495,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 136] = [
+    pub(super) const ALL: [Builtin; 142] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -489,6 +503,12 @@ impl Builtin {
         Self::IsPrototypeOf,
         Self::PropertyIsEnumerable,
         Self::ToLocaleString,
+        Self::DefineAccessor { set: false },
+        Self::DefineAccessor { set: true },
+        Self::LookupAccessor { set: false },
+        Self::LookupAccessor { set: true },
+        Self::ProtoGet,
+        Self::ProtoSet,
         Self::Call,
         Self::Apply,
         Self::Bind,
@@ -659,6 +679,12 @@ impl Builtin {
             Self::IsPrototypeOf => "isPrototypeOf",
             Self::PropertyIsEnumerable => "propertyIsEnumerable",
             Self::ToLocaleString => "toLocaleString",
+            Self::DefineAccessor { set: false } => "__defineGetter__",
+            Self::DefineAccessor { set: true } => "__defineSetter__",
+            Self::LookupAccessor { set: false } => "__lookupGetter__",
+            Self::LookupAccessor { set: true } => "__lookupSetter__",
+            Self::ProtoGet => "get __proto__",
+            Self::ProtoSet => "set __proto__",
             Self::ObjectToString
             | Self::ErrorToString
             | Self::ArrayToString
@@ -742,6 +768,7 @@ impl Builtin {
             | Self::ArrayToString
             | Self::DateMethod(_)
             | Self::CollectionSize { .. }
+            | Self::ProtoGet
             | Self::CollectionOp {
                 op: MapOp::Clear, ..
             }
@@ -755,10 +782,13 @@ impl Builtin {
             | Self::JsonParse
             | Self::ArraySlice
             | Self::CollectionOp { op: MapOp::Set, .. }
-            | Self::PromiseThen => 2,
+            | Self::PromiseThen
+            | Self::DefineAccessor { .. } => 2,
             Self::HasOwnProperty
             | Self::IsPrototypeOf
             | Self::PropertyIsEnumerable
+            | Self::LookupAccessor { .. }
+            | Self::ProtoSet
             | Self::Call
             | Self::Bind
             | Self::Math(_)
@@ -1023,13 +1053,17 @@ const GLOBALS: [(&str, u32, Value); 26] = [
 ];
 
 /// The `%Object.prototype%` methods, in slot order.
-const OBJECT_PROTOTYPE_METHODS: [Builtin; 6] = [
+const OBJECT_PROTOTYPE_METHODS: [Builtin; 10] = [
     Builtin::HasOwnProperty,
     Builtin::ObjectToString,
     Builtin::ValueOf,
     Builtin::IsPrototypeOf,
     Builtin::PropertyIsEnumerable,
     Builtin::ToLocaleString,
+    Builtin::DefineAccessor { set: false },
+    Builtin::DefineAccessor { set: true },
+    Builtin::LookupAccessor { set: false },
+    Builtin::LookupAccessor { set: true },
 ];
 
 /// The registry: every own property of every intrinsic, in slot order per
@@ -1046,6 +1080,11 @@ pub(super) fn registry() -> Vec<Entry> {
         .into_iter()
         .map(|b| entry(ObjectPrototype, b.name(), METHOD_ATTRS, Value::Method(b)))
         .collect();
+    let proto = Value::Accessor {
+        get: Builtin::ProtoGet,
+        set: Some(Builtin::ProtoSet),
+    };
+    entries.push(entry(ObjectPrototype, "__proto__", ACCESSOR_ATTRS, proto));
     entries.extend([
         entry(FunctionPrototype, "length", FN_FACT_ATTRS, Value::Num(0.0)),
         entry(FunctionPrototype, "name", FN_FACT_ATTRS, Value::Str("")),

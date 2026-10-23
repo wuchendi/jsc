@@ -401,3 +401,59 @@ fn dictionary_arrays() {
         ),
     ]);
 }
+
+/// `Object.prototype.__proto__`: the getter is `ToObject(this)` then its
+/// prototype; the setter requires an object-coercible `this`, ignores a
+/// non-object non-null value and a primitive `this`, and throws when
+/// `[[SetPrototypeOf]]` rejects. It is reached by member writes, computed
+/// keys, `Object.assign`, and in programs without any call argument.
+#[test]
+fn proto_accessor() {
+    check(&[
+        (
+            r"let p = {x: 1}; let o = {}; o.__proto__ = p; console.log(o.x, o.__proto__ === p, Object.getPrototypeOf(o) === p, Object.keys(o).length, o.hasOwnProperty('__proto__')); o.__proto__ = 5; console.log(o.__proto__ === p); o.__proto__ = null; console.log(o.x, Object.getPrototypeOf(o), o.__proto__)",
+            "1 true true 0 false\ntrue\nundefined null undefined\n",
+        ),
+        (
+            r"console.log((1).__proto__ === Number.prototype, 's'.__proto__ === String.prototype, [].__proto__ === Array.prototype, (function () {}).__proto__ === Function.prototype); let d = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__'); console.log(typeof d.get, typeof d.set, d.enumerable, d.configurable, d.get.name, d.get.length, d.set.name, d.set.length); console.log(t(function () { d.get.call(undefined) }), t(function () { d.set.call(null, {}) }), d.set.call(1, {}), d.set.call({}), d.get.call(true) === Boolean.prototype)",
+            "true true true true\nfunction function false true get __proto__ 0 set __proto__ 1\nTypeError: Cannot convert undefined or null to object TypeError: Cannot convert undefined or null to object undefined undefined true\n",
+        ),
+        (
+            r"let a = {}; let b = Object.create(a); console.log(t(function () { a.__proto__ = b }), t(function () { Object.prototype.__proto__ = {} }), t(function () { Object.preventExtensions({}).__proto__ = {} })); let o = Object.preventExtensions({}); o.__proto__ = Object.prototype; console.log(Object.prototype.__proto__)",
+            "TypeError: Cyclic __proto__ value TypeError: Immutable prototype object 'Object.prototype' cannot have their prototype set TypeError: #<Object> is not extensible\nnull\n",
+        ),
+        (
+            r#"let k = '__pro' + 'to__'; let p = {y: 2}; let o = {}; o[k] = p; console.log(o.y); let q = Object.assign({}, JSON.parse('{"__proto__": {"z": 3}}')); console.log(q.z, Object.keys(q).length)"#,
+            "2\n3 0\n",
+        ),
+    ]);
+    // No call passes an argument: the setter still receives its value.
+    common::assert_output(
+        "let p = {v: 9}; let o = {}; o['__pro' + 'to__'] = p; console.log(o.v)",
+        "9\n",
+    );
+}
+
+/// The legacy accessor methods `__defineGetter__` / `__defineSetter__` /
+/// `__lookupGetter__` / `__lookupSetter__` (Annex B.2.2.2-5).
+#[test]
+fn legacy_accessor_methods() {
+    check(&[
+        (
+            r"let o = {}; let g = function () { return 7 }; let log = []; let s = function (v) { log.push(v) }; console.log(o.__defineGetter__('x', g), o.x); o.__defineSetter__('x', s); o.x = 3; let d = Object.getOwnPropertyDescriptor(o, 'x'); console.log(log.join(), d.get === g, d.set === s, d.enumerable, d.configurable); console.log(o.__lookupGetter__('x') === g, o.__lookupSetter__('x') === s, Object.create(o).__lookupGetter__('x') === g, o.__lookupGetter__('y'), ({y: 1}).__lookupGetter__('y'))",
+            "undefined 7\n3 true true true true\ntrue true true undefined undefined\n",
+        ),
+        (
+            r"let o = Object.defineProperty({}, 'x', {value: 1}); console.log(t(function () { o.__defineGetter__('x', function () {}) }), t(function () { ({}).__defineGetter__('x', 1) }), t(function () { Object.prototype.__defineSetter__.call(undefined, 'x', function () {}) }), t(function () { Object.prototype.__lookupGetter__.call(null, 'x') }), tn(function () { Object.preventExtensions({}).__defineGetter__('x', function () {}) }))",
+            "TypeError: Cannot redefine property: x TypeError: Object.prototype.__defineGetter__: Expecting function TypeError: Cannot convert undefined or null to object TypeError: Cannot convert undefined or null to object TypeError\n",
+        ),
+        (
+            r"let p = Object.prototype; console.log(p.__defineGetter__.length, p.__defineGetter__.name, p.__defineSetter__.length, p.__lookupGetter__.length, p.__lookupSetter__.name, (1).__lookupGetter__('x'), [1].__lookupGetter__(0))",
+            "2 __defineGetter__ 2 1 __lookupSetter__ undefined undefined\n",
+        ),
+        (
+            r"Object.prototype.get = 'g'; Object.prototype.set = 's'; let o = {d: 1}; console.log(o.__lookupGetter__('d'), o.__lookupSetter__('d'), Object.create(o).__lookupGetter__('d'))",
+            "undefined undefined undefined\n",
+        ),
+    ]);
+}
