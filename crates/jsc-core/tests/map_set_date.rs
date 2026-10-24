@@ -514,3 +514,64 @@ fn date_iso_string_extended_years() {
         "+275760-09-13T00:00:00.000Z -271821-04-20T00:00:00.000Z\n",
     );
 }
+
+// --- the calendar-field constructor ----------------------------------------------
+
+/// `new Date(year, month[, date, hours, minutes, seconds, ms])` builds the
+/// UTC time value (`MakeDay` / `MakeTime`, two-digit years in the 1900s,
+/// month overflow carried into the year, `TimeClip`).
+#[test]
+fn date_calendar_fields_build_the_utc_time_value() {
+    both_number(
+        "new Date(2020, 0, 2, 3, 4, 5, 6).getTime()",
+        1_577_934_245_006.0,
+    );
+    both_number("new Date(2020, 1).getTime()", 1_580_515_200_000.0);
+    both_number("new Date(2019, 13, 1).getTime()", 1_580_515_200_000.0);
+    both_number("new Date(2020, -1, 1).getTime()", 1_575_158_400_000.0);
+    both_number("new Date(99, 0).getFullYear()", 1999.0);
+    both_number("new Date(-1, 0).getTime()", -62_198_755_200_000.0);
+    both_number("new Date(1970, 0, 1, 0, 0, 0, -1).getTime()", -1.0);
+    both_number("new Date(2020.7, 0.9, 1.5).getTime()", 1_577_836_800_000.0);
+    both_number("new Date(275760, 8, 13).getTime()", 8.64e15);
+    both_bool("isNaN(new Date(275760, 8, 13, 0, 0, 0, 1).getTime())", true);
+    both_bool("isNaN(new Date(2020, NaN).getTime())", true);
+    both_bool("isNaN(new Date(Infinity, 0).getTime())", true);
+    both_number("new Date('2020', '1').getTime()", 1_580_515_200_000.0);
+    // Every argument is converted, in order, even after a NaN.
+    assert_string(
+        "let log = ''; const f = (v) => ({ valueOf() { log += v; return v } }); \
+         new Date(f(1), f(NaN), f(3), f(4), f(5), f(6), f(7)); log",
+        "1NaN34567",
+    );
+    // A subclass gets its own prototype.
+    assert_bool(
+        "class D extends Date {} const d = new D(2020, 0); d instanceof D && d.getTime() === 1577836800000",
+        true,
+    );
+}
+
+/// A spread construct passing more arguments than the `K` slots (these
+/// programs keep `K = 1`) hands `Date` every calendar field, read before a
+/// field's `valueOf` can publish another spread argument array.
+#[test]
+fn date_reads_spread_arguments_past_the_slots() {
+    assert_number(
+        "new Date(...[2020, 0, 2, 3, 4, 5, 6]).getTime() % 1000",
+        6.0,
+    );
+    assert_number(
+        "new Date(...[2020, 0, 2, 3, 4, 5, 6]).getTime()",
+        1_577_934_245_006.0,
+    );
+    assert_number(
+        "const y = { valueOf() { return Number(...[2020]) } }; \
+         new Date(...[y, 0, 2, 3, 4, 5, 6]).getTime()",
+        1_577_934_245_006.0,
+    );
+    assert_number(
+        "class D extends Date { constructor(...a) { super(...a) } } \
+         new D(...[2020, 0, 2, 3, 4, 5, 6]).getTime()",
+        1_577_934_245_006.0,
+    );
+}

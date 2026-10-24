@@ -510,17 +510,6 @@ fn instanceof_any_rhs() {
     assert_bool("class X {} let Object = X; ({}) instanceof Object", false);
 }
 
-/// The calendar-field `Date` constructor is a run-time `TypeError`; a spread
-/// argument constructs through the builtin constructor.
-#[test]
-fn date_calendar_field_form_throws_at_run_time() {
-    assert_uncaught(
-        "new Date(2024, 0, 1)",
-        "TypeError: the Date calendar-field constructor is not supported",
-    );
-    assert_number("new Date(...[7]).getTime()", 7.0);
-}
-
 /// `new Promise` / `new Error` with any arity or a spread argument construct
 /// through the builtin constructor (no compile-time arity diagnostics).
 #[test]
