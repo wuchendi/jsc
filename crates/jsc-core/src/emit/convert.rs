@@ -256,7 +256,8 @@ pub(super) fn emit_compare(helpers: Helpers<'_>) -> Function {
 /// `__array_join(recv: i64, sep: i64) -> i64`: `Array.prototype.join` on an
 /// array receiver (`undefined` for any other receiver): `ToString(sep)`
 /// (`","` when `undefined`), then each element's `ToString` (`null`,
-/// `undefined` and holes are empty) joined by it. An array already being
+/// `undefined` and absent elements are empty; a hole reads through the
+/// prototype chain) joined by it. An array already being
 /// joined (a cycle) joins as the empty string.
 pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let (recv, sep_v, arr, len, i, acc, sep, e) = (0, 1, 2, 3, 4, 5, 6, 7);
@@ -297,25 +298,38 @@ pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'
         LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
         LocalGet(i),
         If(BlockType::Empty), LocalGet(acc), LocalGet(sep), Call(helpers.concat), LocalSet(acc), End,
-        // An element past a length shrunk by an earlier element's conversion
-        // reads `undefined`.
+        // A hole, or an element past a length shrunk by an earlier element's
+        // conversion, reads through the prototype chain.
         LocalGet(i), LocalGet(arr),
         I32Load(MemArg { offset: ARRAY_LEN_OFFSET, align: 2, memory_index: 0 }),
         I32LtU,
         If(BlockType::Result(ValType::I64)),
     );
     emit_elem_load(&mut f, arr, i, helpers.sparse_get());
-    wasm!(f; Else, I64Const(UNDEFINED_BITS), End, LocalTee(e), I64Const(HOLE_BITS), I64Eq);
+    wasm!(f;
+        Else, I64Const(HOLE_BITS), End, LocalTee(e), I64Const(HOLE_BITS), I64Eq,
+        If(BlockType::Empty),
+        LocalGet(arr), LocalGet(i), Call(helpers.proto_elem()), LocalSet(e),
+    );
+    let unwind = |f: &mut Function| {
+        wasm!(f;
+            GlobalGet(EXC_PENDING_GLOBAL),
+            If(BlockType::Empty),
+            LocalGet(arr), LocalGet(arr), I32Load8U(flags), I32Const(!joining), I32And, I32Store8(flags),
+            I64Const(UNDEFINED_BITS), Return,
+            End,
+        );
+    };
+    unwind(&mut f);
+    wasm!(f; End, LocalGet(e), I64Const(HOLE_BITS), I64Eq);
     emit_is_nullish(&mut f, e);
     wasm!(f;
         I32Or, I32Eqz,
         If(BlockType::Empty),
         LocalGet(acc), LocalGet(e), Call(helpers.to_str()), Call(helpers.concat), LocalSet(acc),
-        GlobalGet(EXC_PENDING_GLOBAL),
-        If(BlockType::Empty),
-        LocalGet(arr), LocalGet(arr), I32Load8U(flags), I32Const(!joining), I32And, I32Store8(flags),
-        I64Const(UNDEFINED_BITS), Return,
-        End,
+    );
+    unwind(&mut f);
+    wasm!(f;
         End,
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),

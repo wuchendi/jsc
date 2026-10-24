@@ -87,6 +87,13 @@ const PAYLOAD_I32: i32 = HEADER_SIZE + 4;
 const FNV_OFFSET: u32 = 0x811C_9DC5;
 const FNV_PRIME: u32 = 0x0100_0193;
 
+/// The dense bound of an array store (DESIGN.md §5.4): an element store at
+/// `i >= len + DENSE_GAP`, or a `length` growth past it, makes the array
+/// `SPARSE` instead of allocating the gap. The bound is a gap, not a multiple
+/// of the capacity, so each store can add at most this many hole slots and
+/// stores that keep doubling the index stay small.
+const DENSE_GAP: i32 = 1024;
+
 /// `__own_keys` mode: the enumerable string keys.
 pub(super) const OWN_KEYS: i32 = 0;
 /// `__own_keys` mode: the values of the enumerable string keys.
@@ -835,13 +842,14 @@ pub(super) fn emit_materialize(function: &mut Function, o: u32, helpers: Helpers
     );
 }
 
-/// Emit the string/array exotic own lookup of the interned `key` (i32 local)
-/// on the block base in i32 local `o` whose kind byte is in i32 local `t`:
-/// `length` and an in-range canonical index return their value (an array hole
-/// reads `undefined`, a `SPARSE` array's element comes from `__sparse_get`);
-/// any other key falls through (an array's named keys live in its own table,
-/// a string's inherited ones on `%String.prototype%`). A key of `0` (never
-/// interned) returns `undefined`. `p` is i64 scratch.
+/// Emit the string/array exotic own lookup of the interned `key` (i32 local,
+/// nonzero) on the block base in i32 local `o` whose kind byte is in i32 local
+/// `t`: `length` and a present in-range index (a string's character, an array
+/// store element that is not a hole) return their value; anything else falls
+/// through to the table and the `proto` chain (an array's named keys and a
+/// `SPARSE` array's elements past its store live in its own table, a hole or
+/// an index at or past the length is inherited). `a` is i32 and `p` i64
+/// scratch.
 #[allow(clippy::too_many_arguments)]
 fn emit_exotic_get(
     function: &mut Function,
@@ -849,12 +857,12 @@ fn emit_exotic_get(
     t: u32,
     key: u32,
     i: u32,
+    a: u32,
     p: u32,
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
-        LocalGet(key), I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
         If(BlockType::Empty),
     );
@@ -869,17 +877,18 @@ fn emit_exotic_get(
         I32LtU,
         If(BlockType::Empty),
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
-        If(BlockType::Result(ValType::I64)),
+        If(BlockType::Empty),
         LocalGet(o), LocalGet(i), Call(helpers.str_index),
     );
     emit_box_heap(function);
-    wasm!(function; Else);
-    emit_elem_load(function, o, i, helpers.sparse_get());
-    wasm!(function; LocalSet(p));
-    emit_elem_read(function, p);
+    wasm!(function; Return, End);
+    emit_in_store(function, o, i, a);
+    wasm!(function; If(BlockType::Empty));
+    emit_elem_addr(function, o, i);
     wasm!(function;
+        I64Load(m64(ELEMS_DATA_OFFSET)), LocalTee(p), I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty), LocalGet(p), Return, End,
         End,
-        Return,
         End,
     );
 }
@@ -897,12 +906,13 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 }
 
 /// `__get(recv: i64, key: i32) -> i64`: `OrdinaryGet` of the interned `key` on
-/// any jsval. A string or array resolves its exotic own keys (`length`,
-/// indices); an object-family block (an array for its named keys) scans its
-/// own table and then each `proto`, calling an accessor's getter with
-/// `this = recv` (`undefined` when it has none). A string, number or boolean
-/// continues at its realm prototype without allocating a wrapper;
-/// `null`/`undefined` read `undefined`.
+/// any jsval. Each object on the way — `recv`, then each `proto` — answers
+/// first from its exotic own keys when it is a string or an array (`length`,
+/// a present index; a hole or an index past the length is not own, so it
+/// reads through the chain), then from its own table, calling an accessor's
+/// getter with `this = recv` (`undefined` when it has none). A string, number
+/// or boolean continues at its realm prototype without allocating a wrapper;
+/// `null`/`undefined` and a key of `0` (never interned) read `undefined`.
 pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
     let (recv, key, o, e, t, i, p) = (0, 1, 2, 3, 4, 5, 6);
@@ -911,18 +921,11 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
         let bits = intrinsic_bits(realm::prototype_of(ctor), helpers);
         Instruction::I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed())
     };
+    wasm!(f; LocalGet(key), I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
     emit_is_pointer(&mut f, recv);
     wasm!(f;
         If(BlockType::Empty),
-        LocalGet(recv), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalSet(t),
-    );
-    emit_is_string_or_array_kind(&mut f, t);
-    wasm!(f; If(BlockType::Empty));
-    emit_exotic_get(&mut f, o, t, key, i, p, strings, helpers);
-    wasm!(f;
-        LocalGet(t), I32Const(TYPE_STRING), I32Eq,
-        If(BlockType::Empty), proto_base(BuiltinCtor::String), LocalSet(o), End,
-        End,
+        LocalGet(recv), I32WrapI64, LocalSet(o),
         Else,
     );
     emit_is_number(&mut f, recv);
@@ -934,10 +937,17 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
         I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
         proto_base(BuiltinCtor::Boolean), LocalSet(o),
         End,
-    );
-    wasm!(f;
         End,
         Loop(BlockType::Empty),
+        LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
+    );
+    emit_is_string_or_array_kind(&mut f, t);
+    wasm!(f; If(BlockType::Empty));
+    emit_exotic_get(&mut f, o, t, key, i, e, p, strings, helpers);
+    wasm!(f;
+        LocalGet(t), I32Const(TYPE_STRING), I32Eq,
+        If(BlockType::Empty), proto_base(BuiltinCtor::String), LocalSet(o), End,
+        End,
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e),
         If(BlockType::Empty),
     );
@@ -1046,11 +1056,12 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
 }
 
 /// `__has(key: i32, obj: i64) -> i32`: `HasProperty` of the interned `key`
-/// (`0` = a key never interned, absent everywhere): a string/array's exotic
-/// own keys (`length`, an in-range index whose store slot is not a hole),
-/// else the own table (an array's named keys, and a `SPARSE` array's
-/// elements past its store) and then each `proto`. A primitive
-/// `obj` throws the `in` `TypeError` (left pending, result `0`).
+/// (`0` = a key never interned, absent everywhere): each object on the way —
+/// `obj`, then each `proto` — has it when it is a string or an array owning
+/// it exotically (`length`, an in-range index whose store slot is not a
+/// hole), or when its own table has it (an array's named keys, and a `SPARSE`
+/// array's elements past its store). A primitive `obj` throws the `in`
+/// `TypeError` (left pending, result `0`).
 pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     emit_has_lookup(strings, helpers, false)
 }
@@ -1080,7 +1091,9 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
     emit_is_pointer(&mut f, obj);
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
-        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalSet(t),
+        LocalGet(obj), I32WrapI64, LocalSet(o),
+        Loop(BlockType::Empty),
+        LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
     );
     emit_is_string_or_array_kind(&mut f, t);
     wasm!(f;
@@ -1100,13 +1113,13 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
     wasm!(f; If(BlockType::Empty));
     emit_elem_addr(&mut f, o, i);
     wasm!(f;
-        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Ne, Return,
+        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty), I32Const(1), Return, End,
         End,
         End,
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Empty), I32Const(0), Return, End,
         End,
-        Loop(BlockType::Empty),
         LocalGet(o), LocalGet(key), Call(helpers.prop_find),
         If(BlockType::Empty), I32Const(1), Return, End,
     );
@@ -1201,7 +1214,7 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
 /// array index — a number key or a canonical index string (DF9) — takes the
 /// element path; `length` is `__array_set_length`; every other key is an
 /// ordinary property set (`__set`). An index at or past the length grows the
-/// array densely when `i < max(2 * cap, len + 1024)` (store capacity
+/// array densely when `i < len + DENSE_GAP` (store capacity
 /// `max(4, 2 * cap, i + 1)`, the gap `len..i` filled with holes, `len = i + 1`);
 /// a larger gap makes the array `SPARSE`, and every element store on a
 /// `SPARSE` array is `__sparse_set`. A throw leaves the exception pending.
@@ -1247,16 +1260,8 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
     wasm!(f;
         LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)), Return,
         End,
-        // Past the length: dense only below max(2 * cap, len + 1024).
-        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), I32Const(1), I32Shl,
-        Else, I32Const(0),
-        End,
-        LocalTee(a),
-        LocalGet(len), I32Const(1024), I32Add, LocalTee(k),
-        LocalGet(a), LocalGet(k), I32GtU, Select,
-        LocalGet(i), I32LeU,
+        // Past the length: dense only below len + DENSE_GAP.
+        LocalGet(i), LocalGet(len), I32Const(DENSE_GAP), I32Add, I32GeU,
         If(BlockType::Empty),
     );
     // Too far: the array turns SPARSE and stores the element there.
@@ -1431,6 +1436,63 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
     f
 }
 
+/// `__protos_indexless(o: i32) -> i32`: `1` when nothing on the `proto`
+/// chain of the object-family block `o` can hold an integer-index property —
+/// no prototype is an array and none has a table flagged `HAS_INDEX_KEYS` —
+/// so every index `o` does not own is absent; else `0`. The builtins' array
+/// fast paths that read a hole as absent run only under it.
+pub(super) fn emit_protos_indexless() -> Function {
+    let mut f = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
+    let (o, p, t) = (0, 1, 2);
+    wasm!(f;
+        LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(p),
+        Loop(BlockType::Empty),
+    );
+    emit_is_pointer(&mut f, p);
+    wasm!(f;
+        I32Eqz, If(BlockType::Empty), I32Const(1), Return, End,
+        LocalGet(p), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(t),
+        If(BlockType::Empty),
+        LocalGet(t), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_INDEX_KEYS), I32And,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        End,
+        LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(p),
+        Br(0),
+        End,
+        Unreachable,
+        End,
+    );
+    f
+}
+
+/// `__proto_elem(o: i32, i: i32) -> i64`: element `i` of the object-family
+/// block `o` that `o` does not own (an array hole, or an index at or past its
+/// length), read through the `proto` chain: [`HOLE_BITS`] when
+/// `HasProperty(o, i)` is false (at once under `__protos_indexless`), else
+/// `Get(o, i)` (an inherited getter runs with `this = o`; its throw is left
+/// pending). Every element read that meets a hole goes through here.
+pub(super) fn emit_proto_elem(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, i, k) = (0, 1, 2);
+    wasm!(f;
+        LocalGet(o), Call(helpers.protos_indexless()),
+        If(BlockType::Empty), I64Const(HOLE_BITS), Return, End,
+        LocalGet(i), Call(helpers.index_string), Call(helpers.intern), LocalTee(k),
+        LocalGet(o),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f;
+        Call(helpers.has), I32Eqz,
+        If(BlockType::Empty), I64Const(HOLE_BITS), Return, End,
+        LocalGet(o),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f; LocalGet(k), Call(helpers.get), End);
+    f
+}
+
 /// `__array_set_length(o: i32, v: i64)`: the `length` write `o.length = v` on
 /// the array `o` (`ArraySetLength`). A read-only `length` throws `Cannot
 /// assign to read only property 'length'` before any conversion. `n =
@@ -1442,7 +1504,7 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
 /// keys `>= n`, except that a non-configurable element `k >= n` stops the
 /// deletion: the length becomes `k + 1` (the highest such `k`) and `Cannot
 /// delete property 'k'` is left pending. A growth past the length fills holes
-/// densely while `n - 1 < max(2 * cap, len + 1024)` and otherwise makes the
+/// densely while `n - 1 < len + DENSE_GAP` and otherwise makes the
 /// array `SPARSE` without allocating the gap. Then `len = n`.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
 pub(super) fn emit_array_set_length(
@@ -1604,11 +1666,9 @@ pub(super) fn emit_array_set_length(
     wasm!(f;
         LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)), Return,
         End,
-        // Dense growth below max(2 * cap, len + 1024), else SPARSE.
+        // Dense growth below len + DENSE_GAP, else SPARSE.
         LocalGet(n), I32Const(1), I32Sub,
-        LocalGet(cap), I32Const(1), I32Shl, LocalTee(j),
-        LocalGet(len), I32Const(1024), I32Add, LocalTee(end),
-        LocalGet(j), LocalGet(end), I32GtU, Select,
+        LocalGet(len), I32Const(DENSE_GAP), I32Add,
         I32LtU,
         If(BlockType::Empty),
         LocalGet(o), LocalGet(n), Call(helpers.array_reserve()),

@@ -776,16 +776,29 @@ pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32) -> Function {
 }
 
 /// Emit the `__array_concat(dst: i32, src: i32) -> i32` in-place joiner:
-/// `__array_reserve(dst, dlen + slen)`, append `src`'s `slen` elements after
-/// `dst`'s (a spread reads each through the iterator, so a hole is appended as
-/// `undefined`), write the combined length, and return `dst`. A `SPARSE`
-/// `src` is read element by element through `__sparse_get` (function
-/// `sparse_get`) and appended by `__array_push`. The two params occupy locals
-/// 0/1; extra `i32` locals hold `dlen`, `slen`, and the two element cursors,
-/// an `i64` local the element.
-pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32) -> Function {
-    let mut function = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
-    let (dst, src, dlen, slen, to, from, elem) = (0, 1, 2, 3, 4, 5, 6);
+/// append `src`'s `slen` elements after `dst`'s (a spread reads each with
+/// `Get`, so a hole is appended as the element inherited through the
+/// prototype chain, `undefined` when there is none), write the combined
+/// length, and return `dst`. A dense `src` is copied slot by slot into
+/// `__array_reserve(dst, dlen + slen)` until its first hole; from there (and
+/// for a `SPARSE` `src` from the start) each element is read by index —
+/// `__sparse_get` (function `sparse_get`), a hole through `__proto_elem`
+/// (function `proto_elem`), so a getter that changes `src` is seen — and
+/// appended by `__array_push`. A throwing getter returns `dst` with the
+/// exception pending. The two params occupy locals 0/1; extra `i32` locals
+/// hold `dlen`, `slen`, the two element cursors and the index `k`, an `i64`
+/// local the element.
+pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32, proto_elem: u32) -> Function {
+    let mut function = Function::new(vec![
+        (4, ValType::I32),
+        (1, ValType::I64),
+        (1, ValType::I32),
+    ]);
+    let (dst, src, dlen, slen, to, from, elem, k) = (0, 1, 2, 3, 4, 5, 6, 7);
+    let ret_dst = |function: &mut Function| {
+        function.instruction(&Instruction::LocalGet(dst));
+        function.instruction(&Instruction::Return);
+    };
 
     // dlen = dst.len; slen = src.len; an empty `src` leaves `dst` as is.
     function.instruction(&Instruction::LocalGet(dst));
@@ -794,43 +807,22 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32) -> Function
     function.instruction(&Instruction::LocalGet(src));
     function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalTee(slen));
+    function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // A SPARSE `src`: for (from = 0; from < slen; from++)
-    // __array_push(dst, read(__sparse_get(src, from))); return dst.
-    emit_is_sparse(&mut function, src);
-    function.instruction(&Instruction::If(BlockType::Empty));
+    ret_dst(&mut function);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(from));
-    function.instruction(&Instruction::LocalGet(slen));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(src));
-    function.instruction(&Instruction::LocalGet(from));
-    function.instruction(&Instruction::Call(sparse_get));
-    function.instruction(&Instruction::LocalSet(elem));
-    emit_elem_read(&mut function, elem);
-    function.instruction(&Instruction::Call(reserve_index + 1));
-    function.instruction(&Instruction::Drop);
-    function.instruction(&Instruction::LocalGet(from));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(from));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
+    // A SPARSE `src` is read by index from k = 0.
+    emit_is_sparse(&mut function, src);
+    function.instruction(&Instruction::BrIf(0));
     // __array_reserve(dst, dlen + slen).
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(dlen));
     function.instruction(&Instruction::LocalGet(slen));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(reserve_index));
-    // to = dst.elems + 8 * dlen; from = src.elems; then `slen` element copies
-    // (the slot MemArg adds ELEMS_DATA_OFFSET).
+    // to = dst.elems + 8 * dlen; from = src.elems; then the slot copies (the
+    // slot MemArg adds ELEMS_DATA_OFFSET).
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalGet(dlen));
@@ -841,18 +833,29 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32) -> Function
     function.instruction(&Instruction::LocalGet(src));
     function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalSet(from));
-    // dst.len = dlen + slen (slen counts down below).
+    // dst.len = dlen + slen.
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(dlen));
     function.instruction(&Instruction::LocalGet(slen));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(to));
     function.instruction(&Instruction::LocalGet(from));
     function.instruction(&Instruction::I64Load(mem64(ELEMS_DATA_OFFSET)));
-    function.instruction(&Instruction::LocalSet(elem));
-    emit_elem_read(&mut function, elem);
+    function.instruction(&Instruction::LocalTee(elem));
+    // The first hole: dst.len = dlen + k, then the by-index loop from k.
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::LocalGet(dlen));
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::Br(2));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(to));
+    function.instruction(&Instruction::LocalGet(elem));
     function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
     function.instruction(&Instruction::LocalGet(to));
     function.instruction(&Instruction::I32Const(8));
@@ -862,16 +865,83 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32) -> Function
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(from));
-    function.instruction(&Instruction::LocalGet(slen));
+    function.instruction(&Instruction::LocalGet(k));
     function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::LocalTee(slen));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalTee(k));
+    function.instruction(&Instruction::LocalGet(slen));
+    function.instruction(&Instruction::I32LtU);
     function.instruction(&Instruction::BrIf(0));
     function.instruction(&Instruction::End);
+    ret_dst(&mut function);
     function.instruction(&Instruction::End);
+    emit_concat_by_index(
+        &mut function,
+        (dst, src, slen, elem, k),
+        reserve_index + 1,
+        sparse_get,
+        proto_elem,
+    );
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::End);
     function
+}
+
+/// The by-index half of [`emit_array_concat`] over its locals `(dst, src,
+/// slen, elem, k)`: for `k < slen`, `__array_push(dst, Get(src, k))` — the
+/// element via `__sparse_get`, a hole (or an index past a length a getter
+/// shrank) through `__proto_elem`; a throwing getter returns `dst`.
+fn emit_concat_by_index(
+    function: &mut Function,
+    (dst, src, slen, elem, k): (u32, u32, u32, u32, u32),
+    array_push: u32,
+    sparse_get: u32,
+    proto_elem: u32,
+) {
+    // By index: for (; k < slen; k++) __array_push(dst, Get(src, k)).
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::LocalGet(slen));
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+    // An index past a length a getter shrank is absent from `src` itself.
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::LocalGet(src));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    function.instruction(&Instruction::LocalGet(src));
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::Call(sparse_get));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalTee(elem));
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(src));
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::Call(proto_elem));
+    function.instruction(&Instruction::LocalSet(elem));
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(dst));
+    emit_elem_read(function, elem);
+    function.instruction(&Instruction::Call(array_push));
+    function.instruction(&Instruction::Drop);
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(k));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
 }
 
 /// A one-byte store [`MemArg`] (`offset 0`, `align 0`) for the JSON string builder.
