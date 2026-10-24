@@ -169,7 +169,7 @@ it('runs a Promise chain through the microtask queue', async () => {
 
 it('rejects a promise resolved with itself with a TypeError', async () => {
   const executor = await run(
-    'let res; const p = new Promise(r => res = r); res(p); p.then(() => console.log("ful"), e => console.log(e instanceof TypeError, e.message))',
+    'let res; const p = new Promise(r => res = r); res(p); p.then(() => console.log("fulfilled"), e => console.log(e instanceof TypeError, e.message))',
   )
   expect(executor.stdout).toBe(
     'true Chaining cycle detected for promise #<Promise>\n',

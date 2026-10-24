@@ -800,7 +800,7 @@ fn executor_resolve_with_self_rejects_with_type_error() {
     assert_output(
         "let res; const p = new Promise(r => res = r); \
          console.log(res(p) === undefined); \
-         p.then(() => console.log(\"ful\"), e => console.log(e instanceof TypeError, e.message));",
+         p.then(() => console.log(\"fulfilled\"), e => console.log(e instanceof TypeError, e.message));",
         "true\ntrue Chaining cycle detected for promise #<Promise>\n",
     );
 }
@@ -820,7 +820,7 @@ fn sync_executor_resolve_with_self_rejects() {
 fn then_callback_returning_own_promise_rejects() {
     assert_output(
         "let p2 = Promise.resolve(1).then(() => p2); \
-         p2.then(() => console.log(\"ful\"), e => console.log(e instanceof TypeError));",
+         p2.then(() => console.log(\"fulfilled\"), e => console.log(e instanceof TypeError));",
         "true\n",
     );
 }
