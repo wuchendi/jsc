@@ -91,11 +91,13 @@ pub enum LogicalOp {
     Nullish,
 }
 
-/// A `Math.*` built-in method. `Math` is not a real binding — these are
+/// A `Math.*` built-in method. The methods through [`MathOp::Pow`] are also
 /// recognized syntactically from a `Math.<name>(..)` member callee at codegen and
-/// lowered to native wasm `f64` ops (or an inline loop, for [`MathOp::Pow`]). The
-/// `Math.PI` / `Math.E` constants are property READS and lower directly to
-/// [`IrNode::Num`], so they need no variant here.
+/// lowered inline to native wasm `f64` ops (or an inline loop, for
+/// [`MathOp::Pow`]); the rest are reached through the `Math` object's function
+/// values only. Every method converts each argument with `ToNumber`, in order,
+/// before computing. The `Math.PI` / `Math.E` constants are property READS and
+/// lower directly to [`IrNode::Num`], so they need no variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MathOp {
     /// `Math.floor(x)` — largest integer ≤ x (wasm `f64.floor`).
@@ -123,6 +125,60 @@ pub enum MathOp {
     /// `f64.sqrt` roots of `base`. A negative exponent reciprocates the result; a
     /// negative base with a fractional exponent yields `NaN`.
     Pow,
+    /// `Math.sign(x)` — `-1`, `1`, or `x` itself for `±0` / `NaN`.
+    Sign,
+    /// `Math.hypot(..)` — variadic; `+Infinity` when any argument is infinite,
+    /// else `NaN` when any is `NaN`, else the scaled square root of the sum
+    /// of squares (`+0` for no arguments).
+    Hypot,
+    /// `Math.clz32(x)` — leading zero bits of `ToUint32(x)` (wasm `i32.clz`).
+    Clz32,
+    /// `Math.fround(x)` — nearest `f32` (wasm `f32.demote_f64`).
+    Fround,
+    /// `Math.imul(a, b)` — the int32 product of `ToInt32(a)` and `ToInt32(b)`.
+    Imul,
+    /// `Math.cbrt(x)` (host).
+    Cbrt,
+    /// `Math.log(x)` (host).
+    Log,
+    /// `Math.log2(x)` (host).
+    Log2,
+    /// `Math.log10(x)` (host).
+    Log10,
+    /// `Math.log1p(x)` (host).
+    Log1p,
+    /// `Math.exp(x)` (host).
+    Exp,
+    /// `Math.expm1(x)` (host).
+    Expm1,
+    /// `Math.sin(x)` (host).
+    Sin,
+    /// `Math.cos(x)` (host).
+    Cos,
+    /// `Math.tan(x)` (host).
+    Tan,
+    /// `Math.asin(x)` (host).
+    Asin,
+    /// `Math.acos(x)` (host).
+    Acos,
+    /// `Math.atan(x)` (host).
+    Atan,
+    /// `Math.atan2(y, x)` (host).
+    Atan2,
+    /// `Math.sinh(x)` (host).
+    Sinh,
+    /// `Math.cosh(x)` (host).
+    Cosh,
+    /// `Math.tanh(x)` (host).
+    Tanh,
+    /// `Math.asinh(x)` (host).
+    Asinh,
+    /// `Math.acosh(x)` (host).
+    Acosh,
+    /// `Math.atanh(x)` (host).
+    Atanh,
+    /// `Math.random()` — a host pseudo-random number in `[0, 1)`.
+    Random,
 }
 
 /// An array higher-order method: `map`/`filter`/`reduce`/`forEach` (see
@@ -275,11 +331,14 @@ pub enum ErrorKind {
     EvalError,
     /// `URIError`.
     UriError,
+    /// `AggregateError` (`errors` first, then `message`): only ever built by
+    /// its constructor body, never by the syntactic `Error(m)` lowering.
+    AggregateError,
 }
 
 impl ErrorKind {
     /// Every kind, in realm-image order.
-    pub(crate) const ALL: [ErrorKind; 7] = [
+    pub(crate) const ALL: [ErrorKind; 8] = [
         Self::Error,
         Self::TypeError,
         Self::RangeError,
@@ -287,11 +346,16 @@ impl ErrorKind {
         Self::SyntaxError,
         Self::EvalError,
         Self::UriError,
+        Self::AggregateError,
     ];
 
-    /// The kind named by the constructor identifier `name`.
+    /// The kind named by the constructor identifier `name` whose calls and
+    /// `new`s lower syntactically (`message` first): every kind but
+    /// `AggregateError`, which always runs its constructor body.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.name() == name)
+        Self::ALL
+            .into_iter()
+            .find(|kind| *kind != Self::AggregateError && kind.name() == name)
     }
 
     /// The constructor name, which is also the prototype's `name` value.
@@ -304,6 +368,7 @@ impl ErrorKind {
             Self::SyntaxError => "SyntaxError",
             Self::EvalError => "EvalError",
             Self::UriError => "URIError",
+            Self::AggregateError => "AggregateError",
         }
     }
 }
@@ -370,7 +435,7 @@ pub enum BuiltinCtor {
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 17] = [
+    pub(crate) const ALL: [BuiltinCtor; 18] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -384,6 +449,7 @@ impl BuiltinCtor {
         Self::Error(ErrorKind::SyntaxError),
         Self::Error(ErrorKind::EvalError),
         Self::Error(ErrorKind::UriError),
+        Self::Error(ErrorKind::AggregateError),
         Self::Map,
         Self::Set,
         Self::Promise,

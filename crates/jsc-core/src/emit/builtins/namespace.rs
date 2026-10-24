@@ -19,7 +19,7 @@ pub(in crate::emit) fn fragment(builtin: Builtin, k: u32) -> Option<IrNode> {
         }
     };
     Some(match builtin {
-        Builtin::Math(op @ (MathOp::Min | MathOp::Max)) => variadic(
+        Builtin::Math(op @ (MathOp::Min | MathOp::Max | MathOp::Hypot)) => variadic(
             k,
             IrNode::MathSpread {
                 op,
@@ -27,9 +27,13 @@ pub(in crate::emit) fn fragment(builtin: Builtin, k: u32) -> Option<IrNode> {
             },
             |args| IrNode::MathCall { op, args },
         ),
-        Builtin::Math(op @ MathOp::Pow) => IrNode::MathCall {
+        Builtin::Math(op @ (MathOp::Pow | MathOp::Atan2 | MathOp::Imul)) => IrNode::MathCall {
             op,
             args: vec![arg(0), arg(1)],
+        },
+        Builtin::Math(op @ MathOp::Random) => IrNode::MathCall {
+            op,
+            args: Vec::new(),
         },
         Builtin::Math(op) => IrNode::MathCall {
             op,

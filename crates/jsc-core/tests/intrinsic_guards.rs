@@ -31,7 +31,7 @@ fn unknown_namespace_members_are_runtime_reads() {
 fn array_literal_receivers_dispatch_at_runtime() {
     assert_string("[1].toString()", "1");
     assert_string("[1, 2].toString()", "1,2");
-    assert_uncaught("[1, 2].flat()", "TypeError: expression is not a function");
+    assert_uncaught("[1, 2].group()", "TypeError: expression is not a function");
 }
 
 #[test]

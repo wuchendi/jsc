@@ -861,26 +861,6 @@ impl LowerCtx<'_> {
             let empty = args.is_empty();
             let (seq, args) = self.fit_inline_args(Some(convert_arity(op)), args);
             Ok(seq_then(seq, convert_call(op, empty, args)))
-        } else if let Some(op) = convert_builtin_op(name)
-            && is_parse(op)
-        {
-            // An unsealed `parseInt`/`parseFloat`: the global object has no
-            // such property unless the program stored one, which is called;
-            // otherwise the builtin conversion runs.
-            let empty = args.is_empty();
-            let (mut seq, has, callee) = self.user_global(name);
-            let args: Vec<IrNode> = args
-                .into_iter()
-                .map(|arg| self.spill(&mut seq, arg))
-                .collect();
-            let user = IrNode::CallIndirect {
-                callee: Box::new(IrNode::Local(callee)),
-                args: args.clone(),
-                not_callable: CalleeError::not_a_function(name),
-            };
-            let (fit, args) = self.fit_inline_args(Some(convert_arity(op)), args);
-            let builtin = seq_then(fit, convert_call(op, empty, args));
-            Ok(seq_then(seq, ternary(IrNode::Local(has), user, builtin)))
         } else {
             // A global-object property, read (or thrown on) at run time.
             Ok(IrNode::CallIndirect {
@@ -1094,8 +1074,9 @@ impl LowerCtx<'_> {
             })
         } else if let Some(op) = convert_builtin_op(name)
             && is_parse(op)
+            && self.shared.globals.sealed(name)
         {
-            Ok(self.lower_spread_parse(name, op, args))
+            Ok(self.lower_spread_parse(op, args))
         } else {
             Ok(IrNode::CallSpread {
                 target: SpreadCallee::Indirect(
@@ -1107,18 +1088,10 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Lower a spread `parseInt(...a)` / `parseFloat(...a)` call over the
-    /// argument array `args`.
-    fn lower_spread_parse(&mut self, name: &str, op: ConvertOp, args: Box<IrNode>) -> IrNode {
-        // `parseInt`/`parseFloat` read their arguments from the array;
-        // unsealed, a user value stored on the global object is called
-        // instead (see [`Self::user_global`]).
-        let (mut seq, guard) = if self.shared.globals.sealed(name) {
-            (Vec::new(), None)
-        } else {
-            let (seq, has, callee) = self.user_global(name);
-            (seq, Some((has, callee)))
-        };
+    /// Lower a sealed spread `parseInt(...a)` / `parseFloat(...a)` call over
+    /// the argument array `args`: the builtin conversion of its first
+    /// elements.
+    fn lower_spread_parse(&mut self, op: ConvertOp, args: Box<IrNode>) -> IrNode {
         let array = self.fresh();
         let arg = |i: f64| IrNode::Index {
             obj: Box::new(IrNode::Local(array)),
@@ -1129,27 +1102,12 @@ impl LowerCtx<'_> {
             .take(convert_arity(op))
             .map(arg)
             .collect();
-        seq.push(IrNode::Assign {
-            local: array,
-            value: args,
-        });
-        let builtin = convert_call(op, false, read);
         seq_then(
-            seq,
-            match guard {
-                Some((has, callee)) => ternary(
-                    IrNode::Local(has),
-                    IrNode::CallSpread {
-                        target: SpreadCallee::Indirect(
-                            Box::new(IrNode::Local(callee)),
-                            CalleeError::not_a_function(name),
-                        ),
-                        args: Box::new(IrNode::Local(array)),
-                    },
-                    builtin,
-                ),
-                None => builtin,
-            },
+            vec![IrNode::Assign {
+                local: array,
+                value: args,
+            }],
+            convert_call(op, false, read),
         )
     }
 
@@ -1948,33 +1906,6 @@ impl LowerCtx<'_> {
         IrNode::Seq(head.into_iter().chain([error]).collect())
     }
 
-    /// The callee reference of an unsealed `parseInt`/`parseFloat` call,
-    /// resolved before its arguments run: the statements setting local `has`
-    /// to whether the global object has the property `name` (only a value
-    /// the program stored: these builtins are not global properties) and
-    /// local `callee` to that value.
-    fn user_global(&mut self, name: &str) -> (Vec<IrNode>, u32, u32) {
-        let (has, callee) = (self.fresh(), self.fresh());
-        let seq = vec![
-            IrNode::Assign {
-                local: has,
-                value: Box::new(IrNode::ObjectHas {
-                    key: Box::new(IrNode::Str(name.to_owned())),
-                    obj: Box::new(IrNode::Intrinsic(GlobalIntrinsic::Global)),
-                }),
-            },
-            IrNode::Assign {
-                local: callee,
-                value: Box::new(ternary(
-                    IrNode::Local(has),
-                    self.global_read(name),
-                    IrNode::Undefined,
-                )),
-            },
-        ];
-        (seq, has, callee)
-    }
-
     /// Append the evaluation of `value` into a fresh temp to `head`; yields
     /// the temp's read.
     fn spill(&mut self, head: &mut Vec<IrNode>, value: IrNode) -> IrNode {
@@ -2198,15 +2129,6 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
-    }
-}
-
-/// `cond ? then_branch : else_branch`.
-fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) -> IrNode {
-    IrNode::Ternary {
-        cond: Box::new(cond),
-        then_branch: Box::new(then_branch),
-        else_branch: Box::new(else_branch),
     }
 }
 
