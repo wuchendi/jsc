@@ -169,7 +169,7 @@ impl LowerCtx<'_> {
 
         self.bind_params(params, &mut body)?;
         if let BodyKind::Block(stmts) = body_kind {
-            self.bind_var_copies(stmts, &mut body)?;
+            self.bind_vars(stmts, &mut body)?;
         }
 
         if self.frame().derived()
@@ -475,12 +475,15 @@ impl LowerCtx<'_> {
         Some((local, tdz && self.is_cell(local)))
     }
 
-    /// With parameter expressions, each body `var` redeclaring a parameter
-    /// is a separate binding initialized from the parameter's value (the
-    /// parameter code's closures keep the parameter): declare it on entry
-    /// to the body `stmts`, in the current frame. The function's parameters
-    /// live in this frame, or in its constructor's for a generator body.
-    pub(super) fn bind_var_copies(
+    /// Hoist the body `stmts`' `var`s into the current frame (DESIGN.md
+    /// §7.1): each name binds once, to `undefined`, before any statement. A
+    /// `var` redeclaring a parameter or a top-level function declaration of
+    /// the body reuses it — except that with parameter expressions one
+    /// redeclaring a parameter is a separate binding initialized from the
+    /// parameter's value (the parameter code's closures keep the parameter).
+    /// The function's parameters live in this frame, or in its constructor's
+    /// for a generator body.
+    pub(super) fn bind_vars(
         &mut self,
         stmts: &[Stmt],
         out: &mut Vec<IrStmt>,
@@ -491,11 +494,21 @@ impl LowerCtx<'_> {
         } else {
             top
         };
-        for (name, id) in var_copies(&self.frames[fi].params, stmts) {
-            let Some(param) = self.resolve(&name) else {
-                return Err(anyhow!("parameter `{name}` is unbound"));
+        let fns = fn_decl_names(stmts);
+        for (name, id) in hoisted_vars(stmts) {
+            if fns.contains(name.as_str()) {
+                continue;
+            }
+            let value = if self.frames[fi].params.iter().any(|(p, _)| *p == name) {
+                let Some(param) = self.resolve(&name) else {
+                    return Err(anyhow!("parameter `{name}` is unbound"));
+                };
+                Self::read_of(param.kind)
+            } else if self.own_var_binding(&name) {
+                continue;
+            } else {
+                IrNode::Undefined
             };
-            let value = Self::read_of(param.kind);
             let local = self.declare(&name, true, id);
             self.frame().var_ids.insert(id);
             self.push_binding(local, value, out);
