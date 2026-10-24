@@ -1183,6 +1183,13 @@ pub(super) fn collect_node<'a>(
                 seed_strs_ref(&[&global.message, &global.stack], order, seen);
             }
         }
+        IrNode::GlobalDeclare { name, value } => {
+            seed_strs_ref(&[name], order, seen);
+            if let Some(value) = value {
+                seed_prop_strs(order, seen);
+                collect_node(value, order, seen);
+            }
+        }
         IrNode::GlobalSet { global, value } => {
             seed_strs_ref(&[&global.name, &global.message, &global.stack], order, seen);
             seed_prop_strs(order, seen);

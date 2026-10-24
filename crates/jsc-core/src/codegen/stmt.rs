@@ -281,13 +281,9 @@ impl LowerCtx<'_> {
                 (Some(init), _) => self.lower_expr(init)?,
                 (None, _) => IrNode::Undefined,
             };
-            // A `var` redeclaring a var-scoped binding of the function reuses
-            // it: without an initializer it keeps its value (DESIGN.md §7.4).
-            if var_decl.kind == VarDeclKind::Var
-                && declarator.init.is_none()
-                && let Pat::Ident(ident) = &declarator.name
-                && self.var_redeclaration(ident.id.sym.as_ref()).is_some()
-            {
+            // A `var` is hoisted (DESIGN.md §7.1): without an initializer it
+            // does nothing, with one it assigns the hoisted binding.
+            if var_decl.kind == VarDeclKind::Var && declarator.init.is_none() {
                 continue;
             }
             self.binding_var = var_decl.kind == VarDeclKind::Var;
@@ -790,11 +786,15 @@ impl LowerCtx<'_> {
             return;
         }
         if self.binding_var {
-            if let Some(existing) = self.var_redeclaration(name) {
-                out.push(IrStmt::Expr(Self::write_of(existing.kind, value)));
-                return;
-            }
-            self.frame().var_ids.insert(id);
+            // Bound as a `Decl` of a scratch local so the assignment never
+            // becomes `main`'s completion value (a `var` statement has none).
+            let target = self.var_target(name);
+            let local = self.fresh();
+            out.push(IrStmt::Decl {
+                local,
+                init: Self::write_of(target.kind, value),
+            });
+            return;
         }
         let local = self.declare(name, mutable, id);
         self.push_binding(local, value, out);
@@ -1606,6 +1606,8 @@ impl LowerCtx<'_> {
                 };
                 let mutable = var_decl.kind != VarDeclKind::Const;
                 match &declarator.name {
+                    // A `var` head assigns the hoisted binding(s).
+                    pat if var_decl.kind == VarDeclKind::Var => ForOfHead::Var(pat),
                     Pat::Ident(ident) => ForOfHead::Decl(ident, mutable),
                     pat @ (Pat::Array(_) | Pat::Object(_)) => {
                         let mut names = Vec::new();
@@ -1795,6 +1797,7 @@ impl LowerCtx<'_> {
                 ForOfTarget::Local(self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident)))
             }
             ForOfHead::Pattern(pat, mutable) => ForOfTarget::Pattern(pat, mutable),
+            ForOfHead::Var(pat) => ForOfTarget::Var(pat),
             ForOfHead::Assign(pat) => ForOfTarget::Assign(pat),
         }
     }
@@ -1814,6 +1817,12 @@ impl LowerCtx<'_> {
             }
             ForOfTarget::Pattern(pat, mutable) => {
                 self.lower_binding_pattern(pat, elem, mutable, body)
+            }
+            ForOfTarget::Var(pat) => {
+                self.binding_var = true;
+                let result = self.lower_binding_pattern(pat, elem, true, body);
+                self.binding_var = false;
+                result
             }
             ForOfTarget::Assign(pat) => self.assign_to_target(pat, elem, body),
         }
@@ -1844,7 +1853,7 @@ impl LowerCtx<'_> {
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
         // The head must declare a single `const`/`let`/`var` identifier binding.
-        let (ident, mutable) = match &for_in.left {
+        let (ident, pat, kind) = match &for_in.left {
             ForHead::VarDecl(var_decl) => {
                 let [declarator] = var_decl.decls.as_slice() else {
                     return Err(CompileError::spanned(
@@ -1860,7 +1869,7 @@ impl LowerCtx<'_> {
                     )
                     .into());
                 };
-                (ident, var_decl.kind != VarDeclKind::Const)
+                (ident, &declarator.name, var_decl.kind)
             }
             other => {
                 return Err(CompileError::spanned(
@@ -1913,8 +1922,17 @@ impl LowerCtx<'_> {
             };
 
             // The loop binding: a fresh block-scoped local, rebound each iteration
-            // to the key at index `i` as the first statement of the body.
-            let local = self.declare(ident.id.sym.as_ref(), mutable, binding_id(ident));
+            // to the key at index `i` as the first statement of the body; a
+            // `var` head assigns the hoisted binding instead.
+            let target = if kind == VarDeclKind::Var {
+                ForOfTarget::Var(pat)
+            } else {
+                ForOfTarget::Local(self.declare(
+                    ident.id.sym.as_ref(),
+                    kind != VarDeclKind::Const,
+                    binding_id(ident),
+                ))
+            };
             self.breakable_inc();
             self.loopable_inc();
             let mut body = Vec::new();
@@ -1922,7 +1940,7 @@ impl LowerCtx<'_> {
                 obj: Box::new(IrNode::Local(iter_local)),
                 index: Box::new(IrNode::Local(idx_local)),
             };
-            self.push_binding(local, key, &mut body);
+            self.bind_for_of_target(target, key, &mut body)?;
             self.lower_stmt(&for_in.body, &mut body)?;
             self.loopable_dec();
             self.breakable_dec();
@@ -2018,6 +2036,7 @@ enum AssignRef {
 enum ForOfHead<'a> {
     Decl(&'a swc_ecma_ast::BindingIdent, bool),
     Pattern(&'a Pat, bool),
+    Var(&'a Pat),
     Assign(&'a Pat),
 }
 
@@ -2027,6 +2046,7 @@ enum ForOfHead<'a> {
 enum ForOfTarget<'a> {
     Local(u32),
     Pattern(&'a Pat, bool),
+    Var(&'a Pat),
     Assign(&'a Pat),
 }
 

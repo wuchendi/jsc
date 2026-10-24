@@ -927,8 +927,28 @@ enumerable.
 **Global object.** Own properties: `globalThis`, `Infinity`, `NaN`,
 `undefined` (non-writable, non-enumerable, non-configurable), `Math`, `JSON`,
 `console`, every constructor above, `isNaN`, `isFinite`. Top-level `this` is
-the global object. Top-level declarations are module cells (§7.1), not
-global-object properties.
+the global object.
+
+**Global declarations.** Top-level `var`s and function declarations are
+global-object properties. A program that never observes the global object —
+no `globalThis` in any form and no top-level `this` — cannot tell, so they
+stay `main` bindings and module cells (§7.1) at no cost. Otherwise
+(also when a top-level `var` and function share a name) `main`'s prologue
+runs GlobalDeclarationInstantiation before any statement
+(`IrNode::GlobalDeclare`): each function declaration defines
+`{value: f, writable, enumerable, non-configurable}` (CreateGlobalFunctionBinding;
+a non-configurable existing property such as `NaN` throws
+`TypeError: Cannot redefine property: NaN`), then each `var` not already an
+own property defines `{undefined, writable, enumerable, non-configurable}`
+(CreateGlobalVarBinding). The property is then the only storage: a `var`
+is not a binding at all, so every reference — from `main` or any function
+— resolves to the global object like an unresolved name (`GlobalGet` /
+`GlobalSet`), and `var q = 1; globalThis.q = 2; q` is `2`. These names count
+as assigned for `sealed` (so `var parseInt = ..` takes the generic global
+path). A function declaration keeps its static identity (direct `call`,
+static function object) while its name is `sealed`; once the global object
+is open or the name is assigned (`f = ..`), reads and calls go through the
+property. Top-level `let` / `const` / `class` are never global properties.
 
 **Global name resolution.** Lexical scopes → top-level declarations (module
 cells) → the global object. A read of a `sealed` global compiles to the
@@ -969,7 +989,7 @@ path, never semantics:
 
 | site | fast path | taken when | otherwise |
 |---|---|---|---|
-| `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
+| `f(..)` on a top-level declaration | direct `call` | declarations are `main` bindings (not assignable), or `sealed(f)` | an ordinary call of the global property |
 | `String/Number/Boolean/parseInt/parseFloat(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance (a spread `parseInt(...a)` / `parseFloat(...a)` converts the array's first elements) | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property (a `ReferenceError` once it is deleted) |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
@@ -1136,6 +1156,17 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 - **Declarations.** `let`, `const`, `var`, function declarations (hoisted, also
   nested ones), class declarations. An identifier that resolves to no
   declaration is a global-object lookup (§6.4).
+- **`var` hoisting.** A `var` belongs to its function's (or the script's) var
+  scope, wherever it appears: the names are collected up front and bound once
+  each, to `undefined`, on entry — before any statement, so a read before the
+  declaration yields `undefined`. A `var` statement is an assignment to that
+  binding (a declarator without an initializer does nothing), and a
+  `for (var ..)` / `for-in` / `for-of` `var` head assigns it each iteration
+  (closures share one binding, no per-iteration copy). Block-scoped `let` /
+  `const` still shadow it. Inside `catch (e)`, `var e = v` assigns the catch
+  parameter (Annex B); the function-level `e` exists and stays `undefined`.
+  Top-level `var`s are the script's var scope: `main` bindings (module cells
+  when a function references them), or global-object properties (§6.4).
 - **Block scoping.** Name resolution walks a compile-time scope stack: every
   `{}` block, loop body, `for` head, and `catch` clause pushes a frame. Each
   `let`/`const` gets a fresh wasm local; inner declarations shadow outer ones.
@@ -1240,8 +1271,12 @@ those of `switch` and loops are not tracked.
   This holds in every function form; a generator, async or async generator
   function binds them when called (§7.8). A duplicate parameter name is an
   early `SyntaxError` (all code is strict).
-- **`var` redeclaring a parameter.** A `var` naming a var-scoped binding of
-  the same function (a parameter, a `var`, a function declaration) reuses it:
+- **`var` scope.** Every `var` of a function body (in nested blocks, loop
+  heads, `try` / `catch` / `finally`, `switch` cases and labelled statements
+  too, not in nested functions) is hoisted (§7.1): one binding per name,
+  `undefined` on entry before any statement, in every function form (a
+  generator or async body binds it in its persistent frame). A `var` naming
+  a parameter or a top-level function declaration of the body reuses it:
   without an initializer it keeps its value, with one it assigns. With
   parameter expressions, a body `var` redeclaring a parameter is instead a
   separate binding created on entry from the parameter's value, so closures
@@ -1704,8 +1739,6 @@ Each item below is current behaviour of this tree.
 **Input & semantics model**
 
 - TypeScript is type-stripped, never type-checked; `.tsx`/JSX is rejected.
-  `enum` and `namespace` strip to `var`-based code whose binding is not
-  resolved, so using one throws `ReferenceError` at run time.
 - A single script is compiled; there are no ES modules (`import`/`export`) and
   no `import()`.
 - Strict-mode semantics only: sloppy-mode constructs (`with`, implicit globals)
@@ -1714,12 +1747,9 @@ Each item below is current behaviour of this tree.
   block-scoped binding before its declaration inside the same function
   resolves to the enclosing binding (or the global object) instead of
   throwing.
-- A function-body `var` is not hoisted: it binds at its declaration, scoped
-  to its block (only a redeclaration of a var-scoped binding of the same
-  function reuses it, §7.4), and a `for-in`/`for-of` `var` head is a loop
-  binding.
-- Top-level `var` and function declarations are module cells, not properties
-  of the global object (`var v = 1; globalThis.v` is `undefined`).
+- A top-level function declaration is not assignable (`f = ..` is a compile
+  error) in a program whose top-level declarations stay `main` bindings
+  (§6.4).
 - An assignment to an unresolvable name evaluates its right-hand side before
   the `HasProperty` check throws the `ReferenceError`.
 - `-p` completion values come from expression statements and `try`
@@ -1794,9 +1824,10 @@ Each item below is current behaviour of this tree.
   `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
   `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
 - The remaining test262 failures of the phase-3 built-in families (after
-  element reads through the prototype chain, L2-V T3: 538 of
-  built-ins/{Array 181, String 207, Function 135, Math 10, Number 5};
-  NativeErrors and AggregateError have none), by cause and owner:
+  element reads through the prototype chain, L2-V T3, and `var` hoisting /
+  global declarations, L2-V T1: 538 of built-ins/{Array 181, String 207,
+  Function 135, Math 10, Number 5}; NativeErrors and AggregateError have
+  none), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number |
   |---|---|---|---|---|---|---|
@@ -1807,12 +1838,10 @@ Each item below is current behaviour of this tree.
   | `asyncTest` used by a test without the `async` flag | L2-R (runner) | 67 | | | | |
   | `nativeFunctionMatcher.js` harness | L2-R (runner) | | | 1 | | |
   | `void` | L2-L | 5 | 36 | 7 | | 1 |
-  | top-level `var` used before its declaration or declared in a block (`ReferenceError`) | L2-L | 5 | 17 | 1 | 1 | |
   | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
   | `Symbol` / `@@toStringTag` (`Math` / `JSON` receivers tag as `[object Object]`) | D3 | 24 | 7 | 1 | | |
   | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
   | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | D3 | | 29 | | | |
-  | a top-level `var` / function is not a global-object property | realm | 4 | 1 | | | |
   | an element write does not reach an inherited index setter (below) | object model | 3 | | | | |
   | a higher-order builtin's callback receives at most `K` arguments (`arguments[3]` of a three-parameter `reduce` callback) | — | 4 | | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |

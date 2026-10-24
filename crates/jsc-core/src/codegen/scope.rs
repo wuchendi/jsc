@@ -389,23 +389,39 @@ impl<'a> LowerCtx<'a> {
         })
     }
 
-    /// The binding a `var` declaration of `name` redeclares: an existing
-    /// var-scoped binding (parameter, `var` or function declaration) of the
-    /// current function — for a generator body, including its constructor's
-    /// parameters — which the declaration then reuses. `None` in `main`, whose
-    /// top-level `var`s are module cells.
-    pub(super) fn var_redeclaration(&mut self, name: &str) -> Option<Resolved> {
+    /// The binding a `var` declaration of `name` assigns (DESIGN.md §7.1):
+    /// the one hoisted on entry to the function or script, or an enclosing
+    /// catch parameter of that name (Annex B), which shadows it; a top-level
+    /// `var` that is a global-object property assigns that property.
+    pub(super) fn var_target(&mut self, name: &str) -> Resolved {
+        self.resolve(name).unwrap_or_else(|| Resolved {
+            kind: AccessKind::Global(GlobalRef::new(name)),
+            mutable: true,
+        })
+    }
+
+    /// Whether `name` is already a var-scoped binding (a parameter or
+    /// function declaration) of the current function — for a generator body,
+    /// including its constructor's parameters — so a body `var` of that name
+    /// reuses it.
+    pub(super) fn own_var_binding(&self, name: &str) -> bool {
         let top = self.top();
-        if self.main_ctx && top == 0 {
-            return None;
-        }
-        let (fi, binding) = self.find_binding(name)?;
+        let Some((fi, binding)) = self.find_binding(name) else {
+            return false;
+        };
         let own = fi == top || (fi + 1 == top && self.frames[top].env_backed);
-        if own && self.frames[fi].var_ids.contains(&binding.id) {
-            self.resolve(name)
-        } else {
-            None
-        }
+        own && self.frames[fi].var_ids.contains(&binding.id)
+    }
+
+    /// The top-level function declaration `name` refers to by its static
+    /// identity (a direct call, its static function object): always, unless
+    /// declarations are global-object properties and that property may
+    /// change (`name` is not `sealed`).
+    pub(super) fn decl_func(&self, name: &str) -> Option<&FnSig> {
+        self.shared
+            .funcs
+            .get(name)
+            .filter(|_| !self.shared.global_decls || self.shared.globals.sealed(name))
     }
 
     /// Mark the current frame `env_backed`: every binding it declares becomes an
@@ -587,7 +603,7 @@ impl<'a> LowerCtx<'a> {
         if let Some(resolved) = self.resolve(name) {
             return Ok(resolved);
         }
-        if self.shared.funcs.contains_key(name) {
+        if self.decl_func(name).is_some() {
             return Err(CompileError::spanned(
                 span,
                 format!("cannot assign to function declaration: {name}"),
@@ -614,7 +630,7 @@ impl<'a> LowerCtx<'a> {
     /// is the unshadowed global, sealed and never escaping.
     pub(super) fn inline_namespace(&mut self, name: &str) -> bool {
         self.resolve(name).is_none()
-            && !self.shared.funcs.contains_key(name)
+            && self.decl_func(name).is_none()
             && self.shared.globals.inline(name)
     }
 
