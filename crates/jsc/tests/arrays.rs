@@ -50,7 +50,7 @@ fn caught_range(body: &str) -> String {
 }
 
 /// `a[i] = v` past the length grows the array densely (within
-/// `max(2 * cap, len + 1024)`), filling the gap with holes; compound and
+/// `len + 1024`), filling the gap with holes; compound and
 /// update forms read `undefined` first. A gap beyond the dense bound makes
 /// the array sparse (see `sparse_arrays`).
 #[test]
@@ -258,7 +258,7 @@ fn array_length_writes() {
     );
 }
 
-/// A store far past the dense bound (`i >= max(2 * cap, len + 1024)`) makes
+/// A store far past the dense bound (`i >= len + 1024`) makes
 /// the array sparse: the element lives in the array's own property table, the
 /// length jumps without allocating the gap, and every element operation
 /// (reads, `in`, `delete`, keys, iteration, the higher-order and host
@@ -785,5 +785,232 @@ fn push_pop_on_non_array_receiver_throws() {
     assert_eq!(
         caught("const o={xs:null}; o.xs.push(1)"),
         "true|Cannot read properties of null (reading 'push')"
+    );
+}
+
+/// `[[Get]]` and `HasProperty` of an integer index that an array does not own
+/// (a hole, or an index at or past its length) continue along the prototype
+/// chain — `Array.prototype`, `Object.prototype`, a user prototype, an array
+/// used as a prototype — in member reads, `in`, destructuring, spread,
+/// `for-of`, `JSON.stringify`, and every `Array.prototype` method that reads
+/// through `HasProperty` / `Get` (an inherited getter runs with the array as
+/// `this`, and its throw propagates).
+#[test]
+fn holes_read_through_the_prototype_chain() {
+    let cases: &[(&str, &str)] = &[
+        ("Array.prototype[1] = 5; var a = [0,,2]; a[1]", "5"),
+        ("Object.prototype[1] = \"x\"; [0,,2].join()", "0,x,2"),
+        ("Array.prototype[1] = 5; var a = [0,,2]; 1 in a", "true"),
+        ("Array.prototype[1] = 5; [0,,2].hasOwnProperty(1)", "false"),
+        ("Array.prototype[5] = \"p\"; var a = [0]; a[5]", "p"),
+        (
+            "var p = [1,2,3]; var o = Object.create(p); o[1] + \"|\" + (1 in o) + \"|\" + o.length",
+            "2|true|3",
+        ),
+        (
+            "var a = [0,,2]; Object.setPrototypeOf(a, Object.setPrototypeOf({1: 7}, Array.prototype)); a[1] + \"|\" + (1 in a) + \"|\" + a.join()",
+            "7|true|0,7,2",
+        ),
+        (
+            "class P extends Array {}; P.prototype[1] = 9; var a = new P(3); a[0] = 0; a[1] + \"|\" + a.join()",
+            "9|0,9,",
+        ),
+        (
+            "Array.prototype[1] = 5; var r = []; [0,,2].forEach(function (v, i) { r.push(i + \":\" + v) }); r.join()",
+            "0:0,1:5,2:2",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].map(function (v) { return v * 2 }).join()",
+            "0,10,4",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].filter(function (v) { return v > 0 }).join()",
+            "5,2",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].every(function (v) { return v !== 5 })",
+            "false",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].some(function (v) { return v === 5 })",
+            "true",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].reduce(function (a, v) { return a + v }, \"\")",
+            "052",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].reduceRight(function (a, v) { return a + v }, \"\")",
+            "250",
+        ),
+        ("Array.prototype[1] = 5; [0,,2].indexOf(5)", "1"),
+        ("Array.prototype[1] = 5; [0,,2].lastIndexOf(5)", "1"),
+        ("Array.prototype[1] = 5; [0,,2].includes(5)", "true"),
+        (
+            "Array.prototype[1] = 5; [0,,2].find(function (v) { return v === 5 })",
+            "5",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].findIndex(function (v) { return v === 5 })",
+            "1",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].findLast(function (v) { return v === 5 })",
+            "5",
+        ),
+        ("Array.prototype[1] = 5; [0,,2].toString()", "0,5,2"),
+        (
+            "Array.prototype[1] = 5; [0,,2].concat([3]).hasOwnProperty(1)",
+            "true",
+        ),
+        (
+            "Array.prototype[1] = 5; [0,,2].slice(0).hasOwnProperty(1)",
+            "true",
+        ),
+        (
+            "Array.prototype[1] = 5; var a = [0,,2]; a.reverse(); a.hasOwnProperty(1) + \"|\" + a.join()",
+            "false|2,5,0",
+        ),
+        (
+            "Array.prototype[1] = 5; var a = [0,,2]; a.shift(); a.hasOwnProperty(0) + \"|\" + a.join()",
+            "true|5,2",
+        ),
+        (
+            "Array.prototype[1] = 5; var a = [0,,2]; a.unshift(9); a.hasOwnProperty(2) + \"|\" + a.join()",
+            "true|9,0,5,2",
+        ),
+        (
+            "Array.prototype[1] = 5; var a = [0,,2]; a.splice(0, 2).hasOwnProperty(1)",
+            "true",
+        ),
+        (
+            "Array.prototype[1] = 5; var a = [3,,1]; a.sort(); a.join() + \"|\" + a.hasOwnProperty(2)",
+            "1,3,5|true",
+        ),
+        (
+            "Array.prototype[1] = 5; var a = [0,,2,3]; a.copyWithin(2, 0); a.hasOwnProperty(3) + \"|\" + a.join()",
+            "true|0,5,0,5",
+        ),
+        ("Array.prototype[1] = 5; [[0,,2]].flat().join()", "0,5,2"),
+        (
+            "Array.prototype[1] = 5; [0,,2].flatMap(function (v) { return [v] }).join()",
+            "0,5,2",
+        ),
+        ("Array.prototype[1] = 5; [...[0,,2]].join()", "0,5,2"),
+        ("Array.prototype[1] = 5; Array.from([0,,2]).join()", "0,5,2"),
+        (
+            "Array.prototype[1] = 5; Array.from({length: 3, 0: 0, 2: 2}).join()",
+            "0,,2",
+        ),
+        ("Array.prototype[1] = 5; var [x, y, z] = [0,,2]; y", "5"),
+        ("Array.prototype[1] = 5; JSON.stringify([0,,2])", "[0,5,2]"),
+        ("Array.prototype[1] = 5; Math.max(...[0,,2])", "5"),
+        (
+            "Array.prototype[1] = 5; var a = [0,,2]; a.pop(); a.pop()",
+            "5",
+        ),
+        (
+            "Array.prototype[1] = 5; var r = []; for (var v of [0,,2]) r.push(v); r.join()",
+            "0,5,2",
+        ),
+        ("Object.prototype[1] = \"x\"; var a = [0,,2]; a[1]", "x"),
+        (
+            "Object.prototype[1] = \"x\"; [0,,2].map(function (v) { return v }).join()",
+            "0,x,2",
+        ),
+        ("Object.prototype[1] = \"x\"; [0,,2].indexOf(\"x\")", "1"),
+        (
+            "Object.defineProperty(Array.prototype, \"1\", { get: function () { return this.length }, configurable: true }); [0,,2][1]",
+            "3",
+        ),
+        (
+            "Object.defineProperty(Array.prototype, \"1\", { get: function () { throw new RangeError(\"g\") }, configurable: true }); try { [0,,2].forEach(function () {}); \"no\" } catch (e) { e.message }",
+            "g",
+        ),
+        (
+            "var a = [0,,2]; var n = 0; a.forEach(function (v, i) { if (i === 0) Array.prototype[1] = 7; n += v }); n",
+            "9",
+        ),
+        (
+            "var o = {length: 3, 0: \"a\", 2: \"c\"}; Object.setPrototypeOf(o, {1: \"b\"}); Array.prototype.join.call(o)",
+            "a,b,c",
+        ),
+        ("var a = [0,,2]; a[1]", "undefined"),
+        ("[0,,2].join()", "0,,2"),
+        (
+            "Object.prototype[1] = \"x\"; var arr = []; arr.length = 3; Array.prototype.slice.call(arr).hasOwnProperty(1)",
+            "true",
+        ),
+        (
+            "Array.prototype[3] = \"z\"; var a = [0]; a[2000] = 1; a[3] + \"|\" + (3 in a)",
+            "z|true",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(jsc(&["-p", src]), *want, "{src}");
+    }
+}
+
+/// A store far past the end (`i >= len + 1024`, DESIGN.md §5.4) makes the
+/// array sparse instead of allocating the gap, even when each store lands
+/// just past twice the previous one (test262 `S15.4_A1.1_T10`); the largest
+/// index `2^32 - 2` sets `length` to `2^32 - 1`, and `2^32 - 1` is an
+/// ordinary property that leaves `length` alone.
+#[test]
+fn far_index_writes_go_sparse() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var x = []; var k = 1; for (var i = 0; i < 32; i++) { k = k * 2; x[k - 2] = k } \
+             k = 1; var ok = true; for (i = 0; i < 32; i++) { k = k * 2; ok = ok && x[k - 2] === k } \
+             ok + \"|\" + x.length + \"|\" + Object.keys(x).length + \"|\" + (5 in x)"
+        ]),
+        "true|4294967295|32|false"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var x = []; x[4294967294] = 1; x.length + \"|\" + x[4294967294]"
+        ]),
+        "4294967295|1"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var x = [1]; x[4294967295] = 2; x.length + \"|\" + x[4294967295] + \"|\" + Object.keys(x)"
+        ]),
+        "1|2|0,4294967295"
+    );
+    // The bound: a gap of 1023 holes stays dense, 1024 goes sparse; either way
+    // the array reads the same.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var a = [1, 2]; a[1025] = 3; a.length + \"|\" + a[1025] + \"|\" + (1024 in a) + \"|\" + a.indexOf(3)"
+        ]),
+        "1026|3|false|1025"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var a = [1, 2]; a[1026] = 3; a.length + \"|\" + a[1026] + \"|\" + (1025 in a) + \"|\" + a.indexOf(3)"
+        ]),
+        "1027|3|false|1026"
+    );
+    // A sparse array keeps working: builtins, iteration order, holes through
+    // the prototype chain.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var a = [0]; a[5000] = 2; a[3000] = 1; var r = []; a.forEach(function (v, i) { r.push(i + \":\" + v) }); r.join() + \"|\" + Object.keys(a).join() + \"|\" + a.lastIndexOf(1)"
+        ]),
+        "0:0,3000:1,5000:2|0,3000,5000|3000"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "Array.prototype[4000] = 9; var a = [0]; a[5000] = 2; a[4000] + \"|\" + (4000 in a) + \"|\" + a.indexOf(9) + \"|\" + a.filter(function () { return true }).join()"
+        ]),
+        "9|true|4000|0,9,2"
     );
 }
