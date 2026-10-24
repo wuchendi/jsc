@@ -99,6 +99,7 @@ import {
   PROMISE_OP_SETTLE_FULFILL,
   PROMISE_OP_SETTLE_REJECT,
   PROMISE_PENDING,
+  PROMISE_SELF_ERROR_EXPORT_NAME,
   PROMISE_REJECTED,
   PROMISE_STATE_OFFSET,
   PROMISE_VALUE_OFFSET,
@@ -821,14 +822,30 @@ export function createShim(): Shim {
   }
 
   /**
-   * Settle promise `base` once; fulfilling with a promise ADOPTS it. On a real
-   * settlement its reactions move into the queue (mirrors `promise.rs::settle`).
+   * Settle promise `base` once; fulfilling with another promise ADOPTS it, and
+   * fulfilling with itself rejects with the guest's `__promise_self_error`
+   * `TypeError`. On a real settlement its reactions move into the queue
+   * (mirrors `promise.rs::settle`).
    */
   function settle(base: number, state: number, value: bigint): void {
     if (readState(memView(), base) !== PROMISE_PENDING) return
-    if (state === PROMISE_FULFILLED && asPromise(memView(), value) !== null) {
-      registerSource(value, UNDEFINED, UNDEFINED, base, false, null)
-      return
+    if (state === PROMISE_FULFILLED) {
+      const inner = asPromise(memView(), value)
+      if (inner === base) {
+        const selfError = instance?.exports[PROMISE_SELF_ERROR_EXPORT_NAME] as
+          | (() => bigint)
+          | undefined
+        if (!selfError) return
+        try {
+          value = asU64(selfError())
+        } catch {
+          return // an out-of-memory trap: the run stage reports it.
+        }
+        state = PROMISE_REJECTED
+      } else if (inner !== null) {
+        registerSource(value, UNDEFINED, UNDEFINED, base, false, null)
+        return
+      }
     }
     writeSettlement(base, state, value)
     if (state === PROMISE_REJECTED) rejected.add(base)

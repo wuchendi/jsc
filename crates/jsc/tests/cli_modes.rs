@@ -252,3 +252,25 @@ fn file_run_unhandled_rejection_exits_one() {
         "got: {stderr}"
     );
 }
+
+/// A diagnostic whose span starts inside a multi-byte character never panics:
+/// U+180E (MONGOLIAN VOWEL SEPARATOR, 3 UTF-8 bytes) is not whitespace, so
+/// `var a\u{180e}= 1;` is a syntax error rendered with a caret under the
+/// offending character, and the CLI exits 2.
+#[test]
+fn syntax_error_at_multibyte_char_renders_without_panic() {
+    let path = temp_source("mongolian-vowel-separator.js", "var a\u{180e}= 1;\n");
+    let output = jsc_output(&[path.to_str().expect("utf-8 path")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("error: Unexpected character '\\u{180e}'"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mongolian-vowel-separator.js:1:6"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.ends_with("|      ^\n"), "stderr: {stderr:?}");
+}
