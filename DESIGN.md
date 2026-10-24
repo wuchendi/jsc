@@ -1805,9 +1805,9 @@ Each item below is current behaviour of this tree.
   `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
   `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
 - The remaining test262 failures of the phase-3 built-in families (after the
-  L2-F T6 merge with L2-O and L2-L: 636 of built-ins/{Array 279, String 207,
-  Function 135, Math 10, Number 5}; NativeErrors and AggregateError have
-  none), by cause and owner:
+  L2-F T6 merge with L2-O and L2-L and the L2-V `var` / global-declaration
+  fix: 613 of built-ins/{Array 273, String 191, Function 135, Math 9,
+  Number 5}; NativeErrors and AggregateError have none), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number |
   |---|---|---|---|---|---|---|
