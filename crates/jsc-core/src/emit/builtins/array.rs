@@ -205,6 +205,19 @@ fn is_array(function: &mut Function, o: u32) {
     );
 }
 
+/// Push i32 `1` when [`is_array`] holds for the jsval in `o` and no
+/// prototype of it can hold an integer index (`__protos_indexless`), so a
+/// host fast path that treats a hole as absent reads what `HasProperty` /
+/// `Get` would.
+fn indexless_array(function: &mut Function, o: u32, helpers: Helpers<'_>) {
+    is_array(function, o);
+    wasm!(function;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(o), I32WrapI64, Call(helpers.protos_indexless()),
+        Else, I32Const(0), End,
+    );
+}
+
 /// `LengthOfArrayLike(o)` into i32 `len`: `ToLength(Get(o, "length"))` (NaN
 /// and negatives are 0; the u32 range bounds the rest).
 fn length_of(
@@ -540,7 +553,8 @@ pub(super) fn emit_hof(
 }
 
 /// `Array.prototype.indexOf(search, fromIndex)` (`includes`: `includes`).
-/// An array without a `fromIndex` runs the call sites' host search. Any
+/// An array without a `fromIndex` (and no prototype holding an index) runs
+/// the call sites' host search. Any
 /// other receiver scans `k` from `fromIndex` (relative to `len`): `indexOf`
 /// over the present indices with `===`, `includes` over every index with
 /// `SameValueZero` (an absent index reads `undefined`).
@@ -564,7 +578,7 @@ pub(super) fn emit_search(
     this_object(function, frame, o, texts.nullish, strings, helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(search));
-    is_array(function, o);
+    indexless_array(function, o, helpers);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     wasm!(function; LocalGet(frame.argc()), F64ReinterpretI64, F64Const(Ieee64::from(2.0)), F64Lt);
     frame.arg(function, 1);
@@ -757,7 +771,7 @@ pub(super) fn emit_slice(
     relative_arg(function, value, false, rel, len, k, helpers);
     relative_arg(function, end_v, true, rel, len, fin, helpers);
     species_ctor(function, frame, o, c, strings, helpers);
-    is_array(function, o);
+    indexless_array(function, o, helpers);
     wasm!(function;
         LocalGet(c), I64Const(UNDEFINED_BITS), I64Eq, I32And,
         If(BlockType::Empty),
@@ -2823,7 +2837,7 @@ pub(super) fn emit_with(
 }
 
 /// `Array.prototype.toReversed()`: `A = ArrayCreate(len)` gets `Get(O, len -
-/// 1 - k)` at each `k` (holes read `undefined`).
+/// 1 - k)` at each `k` (a hole reads through the prototype chain).
 pub(super) fn emit_to_reversed(
     function: &mut Function,
     frame: Frame,
