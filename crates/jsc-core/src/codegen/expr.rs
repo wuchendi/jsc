@@ -512,7 +512,7 @@ impl LowerCtx<'_> {
     pub(super) fn lower_ident(&mut self, name: &str, span: Span) -> anyhow::Result<IrNode> {
         if let Some(resolved) = self.resolve(name) {
             Ok(Self::read_of(resolved.kind))
-        } else if let Some(sig) = self.shared.funcs.get(name) {
+        } else if let Some(sig) = self.decl_func(name) {
             Ok(IrNode::DeclFunc(sig.index - 1))
         } else {
             match name {
@@ -837,7 +837,7 @@ impl LowerCtx<'_> {
                 args,
                 not_callable: CalleeError::not_a_function(name),
             })
-        } else if let Some(sig) = self.shared.funcs.get(name) {
+        } else if let Some(sig) = self.decl_func(name) {
             // JS arity semantics: the uniform ABI pads missing arguments with
             // `undefined` (so defaults apply), and surplus arguments are evaluated
             // for their side effects and ignored (or gathered by a rest parameter).
@@ -883,7 +883,7 @@ impl LowerCtx<'_> {
         let namespace = obj.sym.as_ref();
         (globals::NAMESPACES.contains(&namespace)
             && self.resolve(namespace).is_none()
-            && !self.shared.funcs.contains_key(namespace))
+            && self.decl_func(namespace).is_none())
         .then_some((namespace, key.sym.as_ref()))
     }
 
@@ -1064,7 +1064,7 @@ impl LowerCtx<'_> {
                 ),
                 args,
             })
-        } else if let Some(sig) = self.shared.funcs.get(name) {
+        } else if let Some(sig) = self.decl_func(name) {
             // A known declaration: a direct spread call. The runtime argument
             // count is unchecked — the uniform ABI pads/truncates to `K` and
             // passes the real count as `argc`.
@@ -1746,7 +1746,7 @@ impl LowerCtx<'_> {
         if let Expr::Ident(id) = right {
             let name = id.sym.as_ref();
             if self.resolve(name).is_none()
-                && !self.shared.funcs.contains_key(name)
+                && self.decl_func(name).is_none()
                 && self.shared.globals.sealed(name)
             {
                 if let Some(kind) = ErrorKind::from_name(name) {
@@ -1770,7 +1770,7 @@ impl LowerCtx<'_> {
         // a reassigned global, constructs through the general path below.
         if let Expr::Ident(callee) = new_expr.callee.as_ref()
             && self.resolve(callee.sym.as_ref()).is_none()
-            && !self.shared.funcs.contains_key(callee.sym.as_ref())
+            && self.decl_func(callee.sym.as_ref()).is_none()
             && self.shared.globals.sealed(callee.sym.as_ref())
         {
             let name = callee.sym.as_ref();

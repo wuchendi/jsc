@@ -813,6 +813,20 @@ pub enum IrNode {
         /// The assigned value.
         value: Box<IrNode>,
     },
+    /// Create the global-object property of a top-level declaration
+    /// `name` before any statement runs (DESIGN.md §6.4): a function
+    /// declaration (`value` = its function object) defines it as
+    /// `{value, writable, enumerable, non-configurable}`
+    /// (`CreateGlobalFunctionBinding`; redefining a non-configurable property
+    /// throws a `TypeError`); a `var` (`value` = `None`) defines
+    /// `{undefined, writable, enumerable, non-configurable}` unless the
+    /// property already exists (`CreateGlobalVarBinding`). Yields `undefined`.
+    GlobalDeclare {
+        /// The declared name, also the property key.
+        name: String,
+        /// A function declaration's function object.
+        value: Option<Box<IrNode>>,
+    },
     /// The function object of a top-level function declaration (funcref-table
     /// index `.0`). A top-level declaration never captures, so its one object
     /// is a static block in the data segment: every reference yields the same
@@ -2129,7 +2143,9 @@ impl IrNode {
                     || this_arg.as_deref().is_some_and(f)
             }
             IrNode::ConvertCall { arg, radix, .. } => f(arg) || radix.as_deref().is_some_and(f),
-            IrNode::DateNew { arg } => arg.as_deref().is_some_and(f),
+            IrNode::DateNew { arg } | IrNode::GlobalDeclare { value: arg, .. } => {
+                arg.as_deref().is_some_and(f)
+            }
             IrNode::Call { args, .. }
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }
@@ -2317,7 +2333,9 @@ impl IrNode {
                 out.extend(radix.as_deref_mut());
                 out
             }
-            IrNode::DateNew { arg } => arg.as_deref_mut().into_iter().collect(),
+            IrNode::DateNew { arg } | IrNode::GlobalDeclare { value: arg, .. } => {
+                arg.as_deref_mut().into_iter().collect()
+            }
             IrNode::Call { args, .. }
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }

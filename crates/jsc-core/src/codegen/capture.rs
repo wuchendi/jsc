@@ -22,13 +22,17 @@ pub(super) fn binding_id(ident: &swc_ecma_ast::BindingIdent) -> u32 {
 /// every function. Top-level function NAMES are not entered as bindings, so a
 /// call to a sibling top-level function is a static reference, not a capture.
 /// Nested arrows and function expressions/declarations push a further scope.
-pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> CaptureAnalysis {
+pub(super) fn analyze_captures(
+    top_stmts: &[&Stmt],
+    fn_decls: &[&FnDecl],
+    top_vars: &[(String, u32)],
+) -> CaptureAnalysis {
     let mut resolver = CaptureResolver::default();
     // `main`'s outermost-scope bindings and their mutability, known up front so a
     // closure referencing one declared LATER in the program resolves to it.
     for stmt in top_stmts {
         match stmt {
-            Stmt::Decl(Decl::Var(v)) => {
+            Stmt::Decl(Decl::Var(v)) if v.kind != VarDeclKind::Var => {
                 let mut names = std::collections::HashSet::new();
                 for d in &v.decls {
                     pat_names(&d.name, &mut names);
@@ -48,6 +52,13 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         }
     }
     resolver.enter_function();
+    // The hoisted top-level `var`s bind before any statement (none when they
+    // are global-object properties).
+    for (name, id) in top_vars {
+        resolver.top_bindings.insert(name.clone(), true);
+        resolver.declare(name, *id);
+        resolver.var_ids.insert(*id);
+    }
     for stmt in top_stmts {
         resolver.stmt(stmt);
     }
@@ -63,18 +74,6 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         );
     }
     resolver.exit_function();
-    // The `var`-declared module bindings (hoisted, initialized to `undefined`).
-    let mut module_vars = std::collections::HashSet::new();
-    for stmt in top_stmts {
-        if let Stmt::Decl(Decl::Var(v)) = stmt
-            && v.kind == VarDeclKind::Var
-        {
-            for d in &v.decls {
-                pat_names(&d.name, &mut module_vars);
-            }
-        }
-    }
-    module_vars.retain(|name| resolver.module_names.contains(name));
     let module_mutable = resolver
         .module_names
         .iter()
@@ -85,7 +84,6 @@ pub(super) fn analyze_captures(top_stmts: &[&Stmt], fn_decls: &[&FnDecl]) -> Cap
         .collect();
     CaptureAnalysis {
         captured: resolver.captured,
-        module_vars,
         module_mutable,
         module_names: resolver.module_names,
     }
@@ -167,11 +165,15 @@ impl CaptureResolver {
         }
         match body {
             AnalyzeBody::Block(stmts) => {
-                if has_param_expressions(params) {
-                    for (name, id) in var_copies(&names, stmts) {
-                        self.declare(&name, id);
-                        self.var_ids.insert(id);
+                let copies = has_param_expressions(params);
+                let fns = fn_decl_names(stmts);
+                for (name, id) in hoisted_vars(stmts) {
+                    let param = names.iter().any(|(p, _)| *p == name);
+                    if fns.contains(name.as_str()) || (param && !copies) {
+                        continue;
                     }
+                    self.declare(&name, id);
+                    self.var_ids.insert(id);
                 }
                 self.stmts(stmts);
             }
@@ -214,19 +216,11 @@ impl CaptureResolver {
         }
     }
 
-    /// Declare a `var` binding `name`: a redeclaration of a var-scoped binding
-    /// of the current function reuses it (see [`LowerCtx::var_redeclaration`]);
-    /// `main`'s top-level `var`s are module cells and always declare.
-    fn declare_var(&mut self, name: &str, id: u32) {
-        if self.frames.len() > 1
-            && let Some(frame) = self.frames.last()
-            && let Some(existing) = frame.iter().rev().find_map(|scope| scope.get(name))
-            && self.var_ids.contains(existing)
-        {
-            return;
-        }
-        self.declare(name, id);
-        self.var_ids.insert(id);
+    /// A `var` declaration of `name` assigns the binding hoisted on entry to
+    /// the function or script (or an enclosing catch parameter of that name,
+    /// see [`LowerCtx::var_target`]); it declares nothing.
+    fn declare_var(&mut self, name: &str) {
+        self.reference(name);
     }
 
     /// Declare every binding introduced by a (possibly destructuring) pattern,
@@ -275,7 +269,7 @@ impl CaptureResolver {
     /// Declare `name` as a `var` ([`Self::declare_var`]) or a lexical binding.
     fn declare_binding(&mut self, name: &str, id: u32, var: bool) {
         if var {
-            self.declare_var(name, id);
+            self.declare_var(name);
         } else {
             self.declare(name, id);
         }
@@ -547,7 +541,7 @@ impl CaptureResolver {
         if let ForHead::VarDecl(v) = left
             && let [declarator] = v.decls.as_slice()
         {
-            self.declare_pat(&declarator.name, false);
+            self.declare_pat(&declarator.name, v.kind == VarDeclKind::Var);
         } else if let ForHead::Pat(pat) = left {
             self.mark_pat(pat);
         }
@@ -837,76 +831,34 @@ pub(super) fn has_param_expressions(params: &[&Pat]) -> bool {
     params.iter().any(|p| pat(p))
 }
 
-/// The body `var`s of a function with parameter expressions that redeclare
-/// one of its `params`: each name once, with the [`binding_id`] of its first
-/// declaration, which identifies the body's separate copy of the parameter.
-pub(super) fn var_copies(params: &[(String, u32)], stmts: &[Stmt]) -> Vec<(String, u32)> {
-    fn var_decl(v: &swc_ecma_ast::VarDecl, out: &mut Vec<(String, u32)>) {
-        if v.kind == VarDeclKind::Var {
-            for d in &v.decls {
-                pat_bindings(&d.name, out);
-            }
-        }
-    }
-    fn stmt(s: &Stmt, out: &mut Vec<(String, u32)>) {
-        match s {
-            Stmt::Decl(Decl::Var(v)) => var_decl(v, out),
-            Stmt::Block(b) => b.stmts.iter().for_each(|s| stmt(s, out)),
-            Stmt::If(i) => {
-                stmt(&i.cons, out);
-                if let Some(alt) = &i.alt {
-                    stmt(alt, out);
-                }
-            }
-            Stmt::While(w) => stmt(&w.body, out),
-            Stmt::DoWhile(w) => stmt(&w.body, out),
-            Stmt::Labeled(l) => stmt(&l.body, out),
-            Stmt::For(f) => {
-                if let Some(VarDeclOrExpr::VarDecl(v)) = &f.init {
-                    var_decl(v, out);
-                }
-                stmt(&f.body, out);
-            }
-            Stmt::ForIn(f) => {
-                if let ForHead::VarDecl(v) = &f.left {
-                    var_decl(v, out);
-                }
-                stmt(&f.body, out);
-            }
-            Stmt::ForOf(f) => {
-                if let ForHead::VarDecl(v) = &f.left {
-                    var_decl(v, out);
-                }
-                stmt(&f.body, out);
-            }
-            Stmt::Switch(sw) => sw
-                .cases
-                .iter()
-                .flat_map(|c| &c.cons)
-                .for_each(|s| stmt(s, out)),
-            Stmt::Try(t) => {
-                t.block.stmts.iter().for_each(|s| stmt(s, out));
-                if let Some(handler) = &t.handler {
-                    handler.body.stmts.iter().for_each(|s| stmt(s, out));
-                }
-                if let Some(finalizer) = &t.finalizer {
-                    finalizer.stmts.iter().for_each(|s| stmt(s, out));
-                }
-            }
-            _ => {}
-        }
-    }
+/// The names a function body or script hoists into its var scope (DESIGN.md
+/// §7.1): every `var` declared in `stmts`, in nested statements too but not in
+/// nested functions, each name once with the [`binding_id`] of its first
+/// declaration, in source order.
+pub(super) fn hoisted_vars<'s>(stmts: impl IntoIterator<Item = &'s Stmt>) -> Vec<(String, u32)> {
     let mut vars = Vec::new();
     for s in stmts {
-        stmt(s, &mut vars);
+        super::early::var_names(s, &mut vars);
     }
-    let mut copies: Vec<(String, u32)> = Vec::new();
-    for (name, id) in vars {
-        if params.iter().any(|(p, _)| *p == name) && !copies.iter().any(|(n, _)| *n == name) {
-            copies.push((name, id));
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for (name, span) in vars {
+        if !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, span.lo.0));
         }
     }
-    copies
+    out
+}
+
+/// The names of the function declarations directly in `stmts` (var-scoped at
+/// a function's top level, so a `var` of the same name reuses them).
+pub(super) fn fn_decl_names(stmts: &[Stmt]) -> std::collections::HashSet<&str> {
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Decl(Decl::Fn(f)) => Some(f.ident.sym.as_ref()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Strip redundant parentheses from an expression.
