@@ -812,8 +812,8 @@ fn far_index_writes_go_sparse() {
     assert_eq!(
         jsc(&[
             "-p",
-            "var x = []; var k = 1; for (var i = 0; i < 32; i++) { k = k * 2; x[k - 2] = k } \
-             k = 1; var ok = true; for (i = 0; i < 32; i++) { k = k * 2; ok = ok && x[k - 2] === k } \
+            "var x = []; var k = 1; for (let i = 0; i < 32; i++) { k = k * 2; x[k - 2] = k } \
+             k = 1; var ok = true; for (let i = 0; i < 32; i++) { k = k * 2; ok = ok && x[k - 2] === k } \
              ok + \"|\" + x.length + \"|\" + Object.keys(x).length + \"|\" + (5 in x)"
         ]),
         "true|4294967295|32|false"
