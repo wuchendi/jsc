@@ -1816,8 +1816,8 @@ Each item below is current behaviour of this tree.
   `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
 - The remaining test262 failures of the phase-3 built-in families (after
   element reads through the prototype chain, L2-V T3, and `var` hoisting /
-  global declarations, L2-V T1: 538 of built-ins/{Array 181, String 207,
-  Function 135, Math 10, Number 5}; NativeErrors and AggregateError have
+  global declarations, L2-V T1: 514 of built-ins/{Array 174, String 191,
+  Function 135, Math 9, Number 5}; NativeErrors and AggregateError have
   none), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number |
