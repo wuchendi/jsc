@@ -1290,12 +1290,28 @@ those of `switch` and loops are not tracked.
   generator/async body's `this` cell by reference, so it survives suspension.
 - **Arity.** `length` is the count of parameters before the first default or
   rest; arity is never checked, at compile time or at run time.
+- **Call evaluation order.** A call evaluates its callee first — for a
+  member callee the base, then the key, then the `[[Get]]` (a getter runs
+  here) — then the arguments left to right, then `IsCallable` and the call;
+  `new` evaluates the constructor, then the arguments, then
+  `IsConstructor`. The wasm call pushes the arguments before the callee, so a
+  callee expression is first evaluated into a temp unless every argument is
+  side-effect free; a method read lands in a temp before the arguments run.
+  A builtin-named method call with side-effecting arguments (§6.4) resolves
+  the method first — the builtin as a constant when the receiver passes its
+  fast-path test, else `__get` — and its fast path then also requires the
+  method read to be that builtin; any other receiver calls the read method.
 
 ### 7.5 Objects & arrays
 
 - **Object literals** with identifier, string, numeric, and computed keys,
   shorthand properties, methods, and getters/setters; keys are defined in
-  source order with `__define`, `proto = %Object.prototype%`.
+  source order with `__define`, `proto = %Object.prototype%`. A `__proto__: v`
+  entry (identifier or string key; not computed, shorthand, method or
+  accessor) defines no property: `v` is evaluated in source order and becomes
+  the `[[Prototype]]` when it is an object or `null`, else it is ignored
+  (ECMA-262 B.3.1). Two such entries in one literal are an early
+  `SyntaxError` (a destructuring assignment pattern may repeat it).
 - **Property access** `o.k`, `o["k"]`, `o[expr]` (§6.3): own keys, then the
   prototype chain; a missing key reads `undefined`. Writes add properties
   dynamically; `delete` removes them.
@@ -1847,8 +1863,6 @@ Each item below is current behaviour of this tree.
   property table, so element access on a large frozen or attributed array is
   `O(n)`; the renderers print an accessor element as `undefined` and omit a
   non-enumerable one.
-- An object literal's `__proto__: v` defines an own data property named
-  `__proto__` instead of setting the prototype.
 - `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
   enumerable own keys of its `Properties` argument once, before reading any
   descriptor. `Object.fromEntries` collects its iterable eagerly, like the

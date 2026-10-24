@@ -1318,8 +1318,9 @@ pub enum IrNode {
     /// value at member `key` of `obj` (an ordinary member read through `__get`);
     /// the `__this` global is set to `obj` immediately before the
     /// `call_indirect`, so the callee's prologue snapshots it into its own `this`
-    /// slot. Missing arguments become `undefined`; extra arguments are ignored, as
-    /// with any indirect call.
+    /// slot. The member is read into `callee_local` BEFORE the arguments run
+    /// (ECMA-262 13.3.6.1). Missing arguments become `undefined`; extra
+    /// arguments are ignored, as with any indirect call.
     MethodCallUser {
         /// The receiver expression (evaluated once into `obj_local`).
         obj: Box<IrNode>,
@@ -1331,17 +1332,22 @@ pub enum IrNode {
         /// Fresh temp local holding the evaluated receiver across argument
         /// evaluation and the `__this` set.
         obj_local: u32,
+        /// Fresh temp local holding the method read from the receiver, which
+        /// runs before the arguments (ECMA-262 13.3.6.1).
+        callee_local: u32,
         /// The `TypeError` thrown when the member is not callable (`o.m is not
         /// a function`).
         not_callable: CalleeError,
     },
     /// `N.key(args)` on a builtin namespace `N` whose value is not the sealed,
     /// non-escaping intrinsic (DESIGN.md §6.4). `obj` (the value of `N`) is
-    /// evaluated into `obj_local` and `args` into `arg_locals`; `fast` (the
-    /// inline code over `arg_locals`) runs while `obj_local.key` is still the
-    /// builtin method, else `slow` (the generic method call on `obj_local`).
-    /// For a watched namespace (`Math`, `JSON`, `console`) the test is
-    /// `obj_local === %N%` with its dirty bit clear, reading no member.
+    /// evaluated into `obj_local`, then tested — `obj_local.key` read into
+    /// `member_local` and compared with the builtin method — before `args`
+    /// run into `arg_locals` (JS reads the callee first); `fast` (the inline
+    /// code over `arg_locals`) runs when the test passed, else `slow` (the
+    /// call of `member_local` with `this = obj_local`). For a watched
+    /// namespace (`Math`, `JSON`, `console`) the test is `obj_local === %N%`
+    /// with its dirty bit clear, reading no member.
     NamespaceGuard {
         /// The namespace whose builtin `key` the fast path implements.
         namespace: GlobalIntrinsic,
@@ -1351,13 +1357,15 @@ pub enum IrNode {
         obj: Box<IrNode>,
         /// Scratch local holding `obj`.
         obj_local: u32,
+        /// Scratch local holding the member `obj_local.key` once read.
+        member_local: u32,
         /// The argument expressions, in source order.
         args: Vec<IrNode>,
         /// Scratch locals holding `args`.
         arg_locals: Vec<u32>,
         /// The inline code over `arg_locals`.
         fast: Box<IrNode>,
-        /// The generic method call on `obj_local` over `arg_locals`.
+        /// The call of `member_local` on `obj_local` over `arg_locals`.
         slow: Box<IrNode>,
     },
     /// A call `recv.key(args)` of a builtin prototype method name (design
@@ -1384,8 +1392,28 @@ pub enum IrNode {
         args: Vec<IrNode>,
         /// The inline fast paths, by receiver family, tested in order.
         fast: Vec<(ProtoKind, IrNode)>,
+        /// With arguments that have side effects, the read of the
+        /// [`IrNode::ProtoMethod`] made before they ran (JS reads the callee
+        /// first): a fast path then also requires it to be that family's
+        /// builtin, and every other receiver calls it.
+        callee: Option<Box<IrNode>>,
         /// The `TypeError` thrown when `recv.key` is not callable.
         not_callable: CalleeError,
+    },
+    /// The method `recv.key` of an [`IrNode::ProtoGuard`] call, read before
+    /// its arguments run: the builtin of the first family in `kinds` (or of
+    /// `String.prototype`, for a string receiver) whose fast-path test
+    /// `recv` passes — a constant, no lookup — else the generic `[[Get]]`.
+    ProtoMethod {
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
+        /// The receiver read (a local, evaluated and nullish-checked before
+        /// this node).
+        recv: Box<IrNode>,
+        /// The method name.
+        key: String,
+        /// The receiver families of the call's fast paths.
+        kinds: Vec<ProtoKind>,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
@@ -1413,6 +1441,8 @@ pub enum IrNode {
         /// `super(..)`: pass the construct marker (`argc = -(n + 1)`), so the
         /// parent class constructor accepts the call.
         construct: bool,
+        /// The `TypeError` thrown when `callee` is not callable.
+        not_callable: CalleeError,
     },
     /// `new callee(args)` (DESIGN.md §7.6): evaluate `callee` into `callee_local` and
     /// the arguments, then `IsConstructor(callee)` (a function with
@@ -2081,6 +2111,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => f(inner),
             IrNode::InstanceOf { value, kind } => {
@@ -2170,8 +2201,17 @@ impl IrNode {
                 ..
             } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
             IrNode::ProtoGuard {
-                recv, args, fast, ..
-            } => f(recv) || args.iter().any(&mut f) || fast.iter().any(|(_, node)| f(node)),
+                recv,
+                args,
+                fast,
+                callee,
+                ..
+            } => {
+                f(recv)
+                    || args.iter().any(&mut f)
+                    || fast.iter().any(|(_, node)| f(node))
+                    || callee.as_deref().is_some_and(f)
+            }
             IrNode::Construct {
                 callee,
                 args,
@@ -2269,6 +2309,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
             IrNode::InstanceOf { value, kind } => match kind {
@@ -2368,10 +2409,15 @@ impl IrNode {
                 .chain([&mut **fast, &mut **slow])
                 .collect(),
             IrNode::ProtoGuard {
-                recv, args, fast, ..
+                recv,
+                args,
+                fast,
+                callee,
+                ..
             } => std::iter::once(&mut **recv)
                 .chain(args.iter_mut())
                 .chain(fast.iter_mut().map(|(_, node)| node))
+                .chain(callee.as_deref_mut())
                 .collect(),
             IrNode::Construct {
                 callee,

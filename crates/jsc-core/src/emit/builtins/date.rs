@@ -79,6 +79,7 @@ fn to_iso_string_call(frame: Frame) -> IrNode {
         key: Box::new(IrNode::Str("toISOString".to_owned())),
         args: vec![],
         obj_local: frame.i64(2),
+        callee_local: frame.x64(0),
         not_callable: CalleeError::not_a_function("toISOString"),
     }
 }

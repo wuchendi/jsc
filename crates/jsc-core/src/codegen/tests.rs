@@ -621,7 +621,8 @@ fn unsealed_namespaces_guard_the_inline_code() {
             ..
         }
     ));
-    assert!(matches!(**slow, IrNode::MethodCallUser { .. }));
+    // The slow path calls the member read before the arguments.
+    assert!(matches!(**slow, IrNode::ThisCall { .. }));
     // An escaping namespace stays sealed (constant) but guards the inline call.
     let program = lower_src("typeof JSON; JSON.stringify(1)").expect("lower");
     let IrStmt::Expr(IrNode::NamespaceGuard { obj, fast, .. }) = &program.stmts[1] else {
