@@ -190,12 +190,19 @@ fn this_object(
     wasm!(function; End, LocalGet(o), Call(helpers.to_object()), LocalSet(o));
 }
 
-/// Push i32 `1` when the jsval in `o` is an array handle.
+/// Push i32 `1` when the jsval in `o` is an array handle that is not in
+/// dictionary mode (whose elements may carry any attributes, so it takes the
+/// generic per-index path).
 fn is_array(function: &mut Function, o: u32) {
     emit_is_pointer(function, o);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, o);
-    wasm!(function; I32Const(TYPE_ARRAY), I32Eq, Else, I32Const(0), End);
+    wasm!(function;
+        I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(o), I32WrapI64, I32Load8U(MemArg { offset: u64::from(abi::HEADER_FLAGS_OFFSET), align: 0, memory_index: 0 }),
+        I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
+        Else, I32Const(0), End,
+    );
 }
 
 /// `LengthOfArrayLike(o)` into i32 `len`: `ToLength(Get(o, "length"))` (NaN
@@ -261,7 +268,9 @@ pub(super) fn emit_push(
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (n, i) = (frame.i32(0), frame.i32(1));
+    let (n, i, spread) = (frame.i32(0), frame.i32(1), frame.x64(0));
+    // The spread argument array, before a setter's spread call republishes it.
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
     this_object(function, frame, o, PUSH.nullish, strings, helpers);
     push_argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
@@ -277,7 +286,7 @@ pub(super) fn emit_push(
     );
     count_loop(function, i, n, |function| {
         wasm!(function; LocalGet(o), I32WrapI64);
-        arg_at(function, frame, i, v);
+        arg_at(function, frame, i, spread, v);
         wasm!(function; LocalGet(v), Call(helpers.array_push), Drop);
     });
     wasm!(function; LocalGet(o), I32WrapI64, I32Load(array_len_slot()));
@@ -303,7 +312,7 @@ pub(super) fn emit_push(
     count_loop(function, i, n, |function| {
         wasm!(function; LocalGet(flen), LocalGet(i), F64ConvertI32U, F64Add);
         wasm!(function; I64ReinterpretF64, LocalSet(kv));
-        arg_at(function, frame, i, v);
+        arg_at(function, frame, i, spread, v);
         emit_drop(
             function,
             frame,
@@ -1245,13 +1254,6 @@ fn down_loop_f64(function: &mut Function, k: u32, body: impl FnOnce(&mut Functio
     );
 }
 
-/// Copy the published spread argument array saved in i64 `saved` back into
-/// its global (a call made since may have replaced it), then [`arg_at`].
-fn saved_arg_at(function: &mut Function, frame: Frame, saved: u32, i: u32, out: u32) {
-    wasm!(function; LocalGet(saved), GlobalSet(SPREAD_ARGS_GLOBAL));
-    arg_at(function, frame, i, out);
-}
-
 // --- Array.of / Array.from ------------------------------------------------------------
 
 /// `Array.of(...items)`: `A = IsConstructor(this) ? Construct(this, [n]) :
@@ -1274,7 +1276,7 @@ pub(super) fn emit_of(
     construct_or_create(function, frame, c, Some(len), target, strings, helpers);
     wasm!(function; I32Const(0), LocalSet(i));
     count_loop(function, i, n, |function| {
-        saved_arg_at(function, frame, saved, i, item);
+        arg_at(function, frame, i, saved, item);
         index_value(function, i);
         wasm!(function; LocalSet(kv));
         create_data_property(function, frame, target, kv, item, strings, helpers);
@@ -1747,7 +1749,7 @@ pub(super) fn emit_concat(
         End,
         LocalGet(j), LocalGet(argn), I32GeU, BrIf(1),
     );
-    saved_arg_at(function, frame, saved, j, item);
+    arg_at(function, frame, j, saved, item);
     wasm!(function;
         LocalGet(j), I32Const(1), I32Add, LocalSet(j),
         Br(0),
@@ -2238,7 +2240,7 @@ pub(super) fn emit_splice(
     // The items from `actualStart`.
     wasm!(function; LocalGet(start), LocalSet(k), I32Const(2), LocalSet(arg_i));
     count_loop(function, arg_i, argn, |function| {
-        saved_arg_at(function, frame, saved, arg_i, v);
+        arg_at(function, frame, arg_i, saved, v);
         set_at(function, frame, (o, k, v, kv), strings, helpers);
         bump(function, k, 1.0);
     });
@@ -2390,7 +2392,7 @@ pub(super) fn emit_unshift(
     );
     wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k), I32Const(0), LocalSet(arg_i));
     count_loop(function, arg_i, argn, |function| {
-        saved_arg_at(function, frame, saved, arg_i, v);
+        arg_at(function, frame, arg_i, saved, v);
         set_at(function, frame, (o, k, v, kv), strings, helpers);
         bump(function, k, 1.0);
     });
@@ -2923,7 +2925,7 @@ pub(super) fn emit_to_spliced(
     );
     wasm!(function; I32Const(2), LocalSet(arg_i));
     count_loop(function, arg_i, argn, |function| {
-        saved_arg_at(function, frame, saved, arg_i, elem);
+        arg_at(function, frame, arg_i, saved, elem);
         put_at(function, frame, (copy, i, elem, kv), strings, helpers);
         bump(function, i, 1.0);
     });

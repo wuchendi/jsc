@@ -630,3 +630,27 @@ fn object_literal_accessors() {
         "10 10"
     );
 }
+
+/// The prototype and own-key `Object` statics run end to end through the
+/// built binary.
+#[test]
+fn object_prototype_statics_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let p={g:1}; let o=Object.create(p, {h:{value:2}}); Object.getPrototypeOf(o)===p && o.g+o.h"
+        ]),
+        "3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "let o=Object.assign({}, Object.fromEntries([[\"a\",1]]), {b:2}); Object.getOwnPropertyNames(o).join()"
+        ]),
+        "a,b"
+    );
+    assert_eq!(
+        caught("let a={}; Object.setPrototypeOf(a, Object.create(a))"),
+        "true|TypeError|Cyclic __proto__ value"
+    );
+}

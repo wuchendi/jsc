@@ -375,6 +375,10 @@ pub(super) fn emit_method(
     let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let count = frame.f64(0);
     let texts = texts(op);
+    if op == StringOp::Concat {
+        // The spread argument array, before `ToString(this)` can republish it.
+        wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(frame.x64(0)));
+    }
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(s));
     is_string(function, s);
     wasm!(function; I32Eqz, If(BlockType::Empty));
@@ -579,14 +583,14 @@ fn append(function: &mut Function, acc: u32, v: u32, helpers: Helpers<'_>) {
 }
 
 /// `concat(...args)` over the string in `s`: append `ToString` of each
-/// argument in order.
+/// argument in order (the spread argument array is captured in `x64(0)`).
 fn emit_concat(function: &mut Function, frame: Frame, s: u32, helpers: Helpers<'_>) {
-    let v = frame.i64(1);
+    let (v, spread) = (frame.i64(1), frame.x64(0));
     let (n, i) = (frame.i32(0), frame.i32(1));
     push_argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
     count_loop(function, i, n, |function| {
-        arg_at(function, frame, i, v);
+        arg_at(function, frame, i, spread, v);
         to_string(function, v, helpers);
         append(function, s, v, helpers);
     });
@@ -712,17 +716,19 @@ pub(super) fn emit_from_char_code(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let (v, result, list) = (frame.i64(0), frame.i64(1), frame.i64(2));
+    let (v, result, list, spread) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
     let (n, i) = (frame.i32(0), frame.i32(1));
     let point = frame.f64(0);
+    // The spread argument array, before a `valueOf` can republish it.
     wasm!(function;
+        GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread),
         I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         LocalSet(list),
     );
     push_argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
     count_loop(function, i, n, |function| {
-        arg_at(function, frame, i, v);
+        arg_at(function, frame, i, spread, v);
         emit_is_number(function, v);
         wasm!(function;
             I32Eqz, If(BlockType::Empty),
@@ -775,8 +781,10 @@ pub(super) fn emit_raw(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let (raw, v, acc) = (frame.i64(0), frame.i64(1), frame.i64(2));
+    let (raw, v, acc, spread) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
     let (len, i, key, n) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    // The spread argument array, before a getter or `toString` can republish it.
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
     let to_object = |function: &mut Function| {
         emit_is_nullish(function, raw);
         wasm!(function; If(BlockType::Empty));
@@ -817,7 +825,7 @@ pub(super) fn emit_raw(
             LocalGet(len), I32LtU, LocalGet(key), LocalGet(n), I32LtU, I32And,
             If(BlockType::Empty),
         );
-        arg_at(function, frame, key, v);
+        arg_at(function, frame, key, spread, v);
         to_string(function, v, helpers);
         append(function, acc, v, helpers);
         wasm!(function; End);

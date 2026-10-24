@@ -23,6 +23,28 @@ impl Body {
         }
     }
 
+    /// Argument `i`, past the `K` slots the element of the argument array a
+    /// spread call or construct with more arguments published (`undefined`
+    /// past the argument count). Read it before any user code runs: a nested
+    /// spread call replaces that array.
+    fn spread_arg(&self, i: u32) -> IrNode {
+        if i < self.k {
+            return IrNode::Local(i);
+        }
+        ternary(
+            IrNode::Binary {
+                op: BinOp::Gt,
+                lhs: Box::new(IrNode::ArgCount(self.k + 1)),
+                rhs: Box::new(IrNode::Num(f64::from(i))),
+            },
+            IrNode::Index {
+                obj: Box::new(IrNode::SpreadArgsGlobal),
+                index: Box::new(IrNode::Num(f64::from(i))),
+            },
+            IrNode::Undefined,
+        )
+    }
+
     /// Temp local `n` (`0..4`).
     fn temp(&self, n: u32) -> u32 {
         self.k + 2 + n
@@ -137,19 +159,24 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         BuiltinCtor::Boolean => conversion(&body, ctor, ConvertOp::ToBoolean, IrNode::Bool(false)),
         BuiltinCtor::Error(ErrorKind::AggregateError) => aggregate_error(&body),
         BuiltinCtor::Error(kind) => {
-            let proto = body.temp(1);
+            let (proto, options) = (body.temp(1), body.temp(3));
+            let error = IrNode::error_from_argument(
+                kind,
+                IrNode::Local(proto),
+                body.arg(0),
+                body.temp(0),
+                body.temp(2),
+            );
             IrNode::Seq(vec![
+                IrNode::Assign {
+                    local: options,
+                    value: Box::new(body.spread_arg(1)),
+                },
                 IrNode::Assign {
                     local: proto,
                     value: Box::new(body.proto(ctor)),
                 },
-                IrNode::error_from_argument(
-                    kind,
-                    IrNode::Local(proto),
-                    body.arg(0),
-                    body.temp(2),
-                    body.temp(3),
-                ),
+                IrNode::install_error_cause(error, IrNode::Local(options), proto, body.temp(0)),
             ])
         }
         // The allocation only: `map_set::emit_ctor` adds the iterable's values.
@@ -174,50 +201,44 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
 }
 
 /// `AggregateError(errors, message, options)` (called or constructed): the
-/// Error instance of `message` over `GetPrototypeFromConstructor`, an own
-/// non-enumerable `cause` when `options` is an object with a `cause`
-/// property (`InstallErrorCause`), then an own non-enumerable `errors` array
-/// of the values iterating `errors` yields (a `TypeError` for a
+/// arguments captured first (a spread call's past the `K` slots too), then
+/// the Error instance of `message` over `GetPrototypeFromConstructor`,
+/// `InstallErrorCause` from `options`, then an own non-enumerable `errors`
+/// array of the values iterating `errors` yields (a `TypeError` for a
 /// non-iterable).
 fn aggregate_error(body: &Body) -> IrNode {
     let ctor = BuiltinCtor::Error(ErrorKind::AggregateError);
     let (obj, proto) = (body.temp(0), body.temp(1));
-    let options = body.arg(2);
-    let has_cause = IrNode::Logical {
-        op: LogicalOp::And,
-        lhs: Box::new(IrNode::IsObject(Box::new(options.clone()))),
-        rhs: Box::new(IrNode::ObjectHas {
-            key: Box::new(IrNode::Str("cause".to_owned())),
-            obj: Box::new(options.clone()),
-        }),
+    let frame = Frame { k: body.k };
+    let (errors, message, options) = (frame.y64(0), frame.y64(1), frame.y64(2));
+    let capture = |local: u32, i: u32| IrNode::Assign {
+        local,
+        value: Box::new(body.spread_arg(i)),
     };
-    let define = |key: &str, value: IrNode| IrNode::DefineProps {
-        obj: Box::new(IrNode::Local(obj)),
-        local: proto,
-        entries: vec![(PropKey::Hidden(key.to_owned()), value)],
-    };
-    let cause = IrNode::Index {
-        obj: Box::new(options),
-        index: Box::new(IrNode::Str("cause".to_owned())),
-    };
-    let errors = IrNode::ArraySpread(vec![SpreadElem::Spread(body.arg(0))]);
+    let error = IrNode::error_from_argument(
+        ErrorKind::AggregateError,
+        IrNode::Local(proto),
+        IrNode::Local(message),
+        body.temp(2),
+        body.temp(3),
+    );
     IrNode::Seq(vec![
+        capture(errors, 0),
+        capture(message, 1),
+        capture(options, 2),
         IrNode::Assign {
             local: proto,
             value: Box::new(body.proto(ctor)),
         },
-        IrNode::Assign {
-            local: obj,
-            value: Box::new(IrNode::error_from_argument(
-                ErrorKind::AggregateError,
-                IrNode::Local(proto),
-                body.arg(1),
-                body.temp(2),
-                body.temp(3),
-            )),
+        IrNode::install_error_cause(error, IrNode::Local(options), obj, proto),
+        IrNode::DefineProps {
+            obj: Box::new(IrNode::Local(obj)),
+            local: proto,
+            entries: vec![(
+                PropKey::Hidden("errors".to_owned()),
+                IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::Local(errors))]),
+            )],
         },
-        ternary(has_cause, define("cause", cause), IrNode::Undefined),
-        define("errors", errors),
     ])
 }
 
@@ -317,8 +338,8 @@ fn conversion(body: &Body, ctor: BuiltinCtor, op: ConvertOp, empty: IrNode) -> I
     ternary(body.constructing(), wrapper, value)
 }
 
-/// `new Date()` / `new Date(ms)`; called, `Date()` is the current time as
-/// `Date.prototype.toString` renders it. The calendar-field form is not supported.
+/// `new Date()` / `new Date(ms)` / `new Date(year, month, ..)`; called,
+/// `Date()` is the current time as `Date.prototype.toString` renders it.
 fn date(body: &Body) -> IrNode {
     let alloc = ternary(
         body.argc_is(0),
@@ -328,7 +349,7 @@ fn date(body: &Body) -> IrNode {
             IrNode::DateNew {
                 arg: Some(Box::new(body.arg(0))),
             },
-            throw_type_error("the Date calendar-field constructor is not supported"),
+            date_fields(body),
         ),
     );
     let now = body.temp(3);
@@ -346,4 +367,179 @@ fn date(body: &Body) -> IrNode {
             },
         ]),
     )
+}
+
+/// The calendar-field form over at least two arguments (UTC: there is no
+/// local time zone): every field captured first (a spread call's past the
+/// `K` slots too) and converted with `ToNumber` in order (absent `date` is
+/// `1`, absent time fields `0`), then `MakeDate(MakeDay(MakeFullYear(year),
+/// month, date), MakeTime(h, min, s, ms))` into a fresh Date, whose
+/// `TimeClip` turns a non-finite or out-of-range value into an invalid date.
+/// Uses temp 3.
+fn date_fields(body: &Body) -> IrNode {
+    let frame = Frame { k: body.k };
+    let f: [u32; 7] = [
+        frame.y64(0),
+        frame.y64(1),
+        frame.y64(2),
+        frame.y64(3),
+        frame.y64(4),
+        frame.y64(5),
+        frame.x64(0),
+    ];
+    let t = body.temp(3);
+    let mut seq: Vec<IrNode> = (0..7u32)
+        .zip(f)
+        .map(|(i, l)| {
+            let default = if i == 2 { 1.0 } else { 0.0 };
+            let present = bin(BinOp::Gt, IrNode::ArgCount(body.k + 1), num(f64::from(i)));
+            assign(l, ternary(present, body.spread_arg(i), num(default)))
+        })
+        .collect();
+    seq.extend(f.map(|l| {
+        let arg = Box::new(IrNode::Local(l));
+        assign(
+            l,
+            IrNode::ConvertCall {
+                op: ConvertOp::ToNumber,
+                arg,
+                radix: None,
+            },
+        )
+    }));
+    seq.extend(make_day(f[0], f[1], f[2], t));
+    // MakeDate(day, MakeTime(h, min, s, ms)).
+    seq.push(assign(
+        t,
+        sum([
+            bin(BinOp::Mul, IrNode::Local(t), num(86_400_000.0)),
+            bin(BinOp::Mul, trunc(f[3]), num(3_600_000.0)),
+            bin(BinOp::Mul, trunc(f[4]), num(60_000.0)),
+            bin(BinOp::Mul, trunc(f[5]), num(1000.0)),
+            trunc(f[6]),
+        ]),
+    ));
+    seq.push(IrNode::DateNew {
+        arg: Some(Box::new(IrNode::Local(t))),
+    });
+    IrNode::Seq(seq)
+}
+
+/// `MakeDay(MakeFullYear(year), month, date)` over the number locals into
+/// local `t` (clobbering `year` and `month`): the month index carries into
+/// the year, then `days_from_civil` of the month's first day over a
+/// March-based year (`year` becomes the year of era, `month` the March-based
+/// month, `t` the era), plus `date - 1`. NaN and infinities propagate.
+fn make_day(year: u32, month: u32, date: u32, t: u32) -> [IrNode; 8] {
+    let local = IrNode::Local;
+    let two_digit = IrNode::Logical {
+        op: LogicalOp::And,
+        lhs: Box::new(bin(BinOp::Ge, trunc(year), num(0.0))),
+        rhs: Box::new(bin(BinOp::Le, trunc(year), num(99.0))),
+    };
+    let before_march = || bin(BinOp::Lt, local(month), num(2.0));
+    let full_year = ternary(
+        two_digit,
+        bin(BinOp::Add, num(1900.0), trunc(year)),
+        trunc(year),
+    );
+    let carry = bin(BinOp::Mul, num(12.0), floor_div(trunc(month), 12.0));
+    [
+        assign(year, full_year),
+        assign(
+            year,
+            bin(BinOp::Add, local(year), floor_div(trunc(month), 12.0)),
+        ),
+        assign(month, bin(BinOp::Sub, trunc(month), carry)),
+        assign(
+            year,
+            ternary(
+                before_march(),
+                bin(BinOp::Sub, local(year), num(1.0)),
+                local(year),
+            ),
+        ),
+        assign(
+            month,
+            ternary(
+                before_march(),
+                bin(BinOp::Add, local(month), num(10.0)),
+                bin(BinOp::Sub, local(month), num(2.0)),
+            ),
+        ),
+        assign(t, floor_div(local(year), 400.0)),
+        assign(
+            year,
+            bin(
+                BinOp::Sub,
+                local(year),
+                bin(BinOp::Mul, local(t), num(400.0)),
+            ),
+        ),
+        assign(
+            t,
+            sum([
+                bin(BinOp::Mul, local(t), num(146_097.0)),
+                bin(BinOp::Mul, local(year), num(365.0)),
+                floor_div(local(year), 4.0),
+                bin(BinOp::Sub, num(0.0), floor_div(local(year), 100.0)),
+                floor_div(
+                    bin(
+                        BinOp::Add,
+                        bin(BinOp::Mul, num(153.0), local(month)),
+                        num(2.0),
+                    ),
+                    5.0,
+                ),
+                num(-719_469.0),
+                trunc(date),
+            ]),
+        ),
+    ]
+}
+
+/// The number literal `n`.
+fn num(n: f64) -> IrNode {
+    IrNode::Num(n)
+}
+
+/// `lhs op rhs`.
+fn bin(op: BinOp, lhs: IrNode, rhs: IrNode) -> IrNode {
+    IrNode::Binary {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
+}
+
+/// `Math.trunc` of the number in local `l`.
+fn trunc(l: u32) -> IrNode {
+    IrNode::MathCall {
+        op: MathOp::Trunc,
+        args: vec![IrNode::Local(l)],
+    }
+}
+
+/// `Math.floor(n / d)`.
+fn floor_div(n: IrNode, d: f64) -> IrNode {
+    IrNode::MathCall {
+        op: MathOp::Floor,
+        args: vec![bin(BinOp::Div, n, num(d))],
+    }
+}
+
+/// `l = value`.
+fn assign(l: u32, value: IrNode) -> IrNode {
+    IrNode::Assign {
+        local: l,
+        value: Box::new(value),
+    }
+}
+
+/// The left-to-right sum of `terms`.
+fn sum<const N: usize>(terms: [IrNode; N]) -> IrNode {
+    terms
+        .into_iter()
+        .reduce(|acc, term| bin(BinOp::Add, acc, term))
+        .unwrap_or(IrNode::Num(0.0))
 }

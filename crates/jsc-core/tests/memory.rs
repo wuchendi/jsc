@@ -21,11 +21,22 @@ fn many_small_strings_grow_memory() {
     );
 }
 
+/// Static data (string literals and the intern table) past the first page
+/// still fits the initial memory.
+#[test]
+fn static_data_beyond_one_page() {
+    let literals: Vec<String> = (0..3000)
+        .map(|i| format!("'literal number {i:05}'"))
+        .collect();
+    let src = format!("let a = [{}]; a.length", literals.join(", "));
+    assert_number(&src, 3000.0);
+}
+
 /// Static data (string literals, the realm image, the intern table) past the
 /// first 64 KiB page is covered by the initial memory, so instantiation does
 /// not trap.
 #[test]
-fn static_data_beyond_one_page() {
+fn static_bindings_beyond_one_page() {
     let src: String = (0..3000)
         .map(|i| format!("let s{i} = 'literal number {i} of a long program'; "))
         .chain(["s2999.length".to_owned()])

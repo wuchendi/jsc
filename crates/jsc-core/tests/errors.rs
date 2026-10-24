@@ -510,17 +510,6 @@ fn instanceof_any_rhs() {
     assert_bool("class X {} let Object = X; ({}) instanceof Object", false);
 }
 
-/// The calendar-field `Date` constructor is a run-time `TypeError`; a spread
-/// argument constructs through the builtin constructor.
-#[test]
-fn date_calendar_field_form_throws_at_run_time() {
-    assert_uncaught(
-        "new Date(2024, 0, 1)",
-        "TypeError: the Date calendar-field constructor is not supported",
-    );
-    assert_number("new Date(...[7]).getTime()", 7.0);
-}
-
 /// `new Promise` / `new Error` with any arity or a spread argument construct
 /// through the builtin constructor (no compile-time arity diagnostics).
 #[test]
@@ -1363,6 +1352,36 @@ fn aggregate_error_shape() {
         (
             "class E extends AggregateError {} const e = new E([1], 'x'); (e instanceof E) + e.message + e.errors.length",
             "truex1",
+        ),
+    ] {
+        assert_str(src, expected);
+    }
+}
+
+/// A spread call or construct passing more arguments than the `K` slots
+/// still hands `AggregateError` its message and options (the programs keep
+/// `K = 1`), read before the message's `toString` can publish another spread
+/// argument array.
+#[test]
+fn aggregate_error_reads_spread_arguments_past_the_slots() {
+    for (src, expected) in [
+        (
+            "const e = new AggregateError(...[[1, 2], 'm', { cause: 3 }]); e.message + e.cause + e.errors.length",
+            "m32",
+        ),
+        (
+            "const e = AggregateError(...[[1], 'c']); e.message + e.hasOwnProperty('cause')",
+            "cfalse",
+        ),
+        (
+            "class E extends AggregateError { constructor(...a) { super(...a) } } \
+             const e = new E(...[[1], 'x', { cause: 'y' }]); (e instanceof E) + e.message + e.cause",
+            "truexy",
+        ),
+        (
+            "const m = { toString() { return String(...['q']) } }; \
+             const e = new AggregateError(...[[1], m, { cause: 4 }]); e.message + e.cause",
+            "q4",
         ),
     ] {
         assert_str(src, expected);

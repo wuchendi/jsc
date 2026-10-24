@@ -458,15 +458,6 @@ fn async_result_then_chain() {
     );
 }
 
-/// An async function expression, an async arrow, and an async generator remain
-/// out of scope (only top-level `async function` DECLARATIONS are supported).
-#[test]
-fn async_non_declaration_forms_rejected() {
-    assert_rejected("let f = async function () { return 1 }; f()");
-    assert_rejected("let f = async () => 1; f()");
-    assert_rejected("async function* f() { yield 1 } f().next()");
-}
-
 /// A C-style `for (let ...)` loop with an `await` in its body inside an async
 /// function still runs each iteration in order.
 #[test]

@@ -17,12 +17,17 @@ impl Frame {
             next_label: 0,
             allows_this: false,
             this_local: None,
+            gen_this: None,
             arrow: false,
             new_target_local: None,
             ctor: FnKind::Plain,
             supers: SuperCalls::default(),
             arguments_local: None,
             spread_args_local: None,
+            machine: None,
+            var_ids: std::collections::HashSet::new(),
+            params: Vec::new(),
+            binding: None,
         }
     }
 }
@@ -39,6 +44,7 @@ impl<'a> LowerCtx<'a> {
             current_super: None,
             class_fields: Vec::new(),
             static_init: None,
+            binding_var: false,
         }
     }
 
@@ -175,9 +181,13 @@ impl<'a> LowerCtx<'a> {
             None
         };
         // An `env_backed` (generator) frame boxes EVERY binding into an env cell so
-        // it survives across a `yield`; an ordinary frame boxes only the bindings
-        // capture analysis flagged.
-        let cell = module.is_none() && (env_backed || self.shared.captured.contains(&id));
+        // it survives across a `yield`, and a generator constructor's frame boxes
+        // every parameter binding for its body; an ordinary frame boxes only the
+        // bindings capture analysis flagged.
+        let cell = module.is_none()
+            && (env_backed
+                || self.frame().ctor == FnKind::Generator
+                || self.shared.captured.contains(&id));
         // In an `env_backed` frame the cell lives at a fresh env slot (reached via
         // `EnvLoad`), not in a wasm local; the constructor pre-creates it.
         let env_slot = if env_backed {
@@ -290,19 +300,17 @@ impl<'a> LowerCtx<'a> {
     /// Resolve `arguments`: the nearest non-arrow function's `arguments`
     /// object, built in its prologue (allocated on first reference) and captured
     /// BY VALUE through each nested arrow's environment (the binding is never
-    /// reassigned). `Err` with the diagnostic at top level and in a
-    /// generator/async body.
+    /// reassigned). A generator/async body reads its constructor's (the frame
+    /// enclosing it), built when it is called, so it survives every suspend.
+    /// `Err` with the diagnostic at top level.
     pub(super) fn resolve_arguments(&mut self) -> Result<IrNode, &'static str> {
         let fi = self
             .frames
             .iter()
-            .rposition(|frame| !frame.arrow)
+            .rposition(|frame| !frame.arrow && !frame.env_backed)
             .unwrap_or(0);
         if fi == 0 && self.main_ctx {
             return Err("`arguments` is only valid inside a function");
-        }
-        if self.frames[fi].env_backed {
-            return Err("`arguments` in a generator or async function is unsupported");
         }
         let local = if let Some(local) = self.frames[fi].arguments_local {
             local
@@ -375,23 +383,29 @@ impl<'a> LowerCtx<'a> {
         }
         let slot = *self.shared.module_slots.get(name)?;
         let mutable = *self.shared.module_mutable.get(name)?;
-        let message = format!("Cannot access '{name}' before initialization");
-        let error = IrNode::error_object(
-            ErrorKind::ReferenceError,
-            Some(IrNode::Str(message.clone())),
-            IrNode::Str(format!("ReferenceError: {message}")),
-        );
-        let guarded = IrNode::Ternary {
-            cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
-                IrNode::ModuleCell(slot),
-            ))))),
-            then_branch: Box::new(IrNode::Throw(Box::new(error))),
-            else_branch: Box::new(IrNode::ModuleCell(slot)),
-        };
         Some(Resolved {
-            kind: AccessKind::Cell(guarded),
+            kind: AccessKind::Cell(tdz_guard(IrNode::ModuleCell(slot), name)),
             mutable,
         })
+    }
+
+    /// The binding a `var` declaration of `name` redeclares: an existing
+    /// var-scoped binding (parameter, `var` or function declaration) of the
+    /// current function — for a generator body, including its constructor's
+    /// parameters — which the declaration then reuses. `None` in `main`, whose
+    /// top-level `var`s are module cells.
+    pub(super) fn var_redeclaration(&mut self, name: &str) -> Option<Resolved> {
+        let top = self.top();
+        if self.main_ctx && top == 0 {
+            return None;
+        }
+        let (fi, binding) = self.find_binding(name)?;
+        let own = fi == top || (fi + 1 == top && self.frames[top].env_backed);
+        if own && self.frames[fi].var_ids.contains(&binding.id) {
+            self.resolve(name)
+        } else {
+            None
+        }
     }
 
     /// Mark the current frame `env_backed`: every binding it declares becomes an
@@ -401,10 +415,73 @@ impl<'a> LowerCtx<'a> {
         self.frame().env_backed = true;
     }
 
-    /// The number of environment slots the current frame has allocated (its
-    /// generator frame size).
-    pub(super) fn env_len(&self) -> usize {
-        self.frames.last().map_or(0, |f| f.env.len())
+    /// `this` in a generator/async (`env_backed`) body: the frame's `this`
+    /// cell (allocated on first use), which the generator constructor seeds
+    /// with its call's receiver so it survives every suspend. `None` in an
+    /// ordinary frame.
+    pub(super) fn generator_this(&mut self) -> Option<IrNode> {
+        let frame = self.frame();
+        if !frame.env_backed {
+            return None;
+        }
+        let slot = if let Some(slot) = frame.gen_this {
+            slot
+        } else {
+            let slot = u32::try_from(frame.env.len()).unwrap_or(u32::MAX);
+            frame.env.push(u32::MAX);
+            frame.gen_this = Some(slot);
+            slot
+        };
+        Some(IrNode::CellGet(Box::new(IrNode::EnvLoad(slot))))
+    }
+
+    /// `this` inside an arrow (DESIGN.md §7.4): the `this` of the nearest
+    /// enclosing non-arrow function, never the arrow's own receiver. An
+    /// ordinary function's snapshot is captured BY VALUE (it is never
+    /// reassigned); a generator/async body's `this` cell is captured by
+    /// reference. At top level it is the global object. `None` outside an
+    /// arrow (the current frame binds its own `this`).
+    pub(super) fn lexical_this(&mut self) -> Option<IrNode> {
+        let top = self.top();
+        let fi = self.frames.iter().rposition(|frame| !frame.arrow)?;
+        if fi == top {
+            return None;
+        }
+        if fi == 0 && self.main_ctx {
+            return Some(IrNode::Intrinsic(GlobalIntrinsic::Global));
+        }
+        let id = this_id(fi);
+        if self.frames[fi].env_backed {
+            let frame = &mut self.frames[fi];
+            let slot = if let Some(slot) = frame.gen_this {
+                slot
+            } else {
+                let slot = u32::try_from(frame.env.len()).unwrap_or(u32::MAX);
+                frame.env.push(u32::MAX);
+                frame.gen_this = Some(slot);
+                slot
+            };
+            if !frame.env_index.contains_key(&id) {
+                let local = frame.next;
+                frame.next += 1;
+                frame.env_index.insert(id, slot);
+                frame.by_id.insert(id, local);
+            }
+            return Some(IrNode::CellGet(Box::new(IrNode::EnvLoad(
+                self.route_env(fi, id),
+            ))));
+        }
+        let frame = &mut self.frames[fi];
+        let local = if let Some(local) = frame.this_local {
+            local
+        } else {
+            let local = frame.next;
+            frame.next += 1;
+            frame.this_local = Some(local);
+            local
+        };
+        frame.by_id.insert(id, local);
+        Some(IrNode::EnvLoad(self.route_env(fi, id)))
     }
 
     /// Find the binding a name resolves to: the frame index it lives in and its
@@ -446,6 +523,21 @@ impl<'a> LowerCtx<'a> {
         let Some((fi, binding)) = self.find_binding(name) else {
             return self.resolve_module(name);
         };
+        // A parameter still in its TDZ (DESIGN.md §7.4): a reference from its
+        // own frame runs before the binding, so it throws outright; a closure
+        // may run later, so it checks the cell for the hole.
+        let pending = self.frames[fi]
+            .binding
+            .as_ref()
+            .is_some_and(|b| b.pending.contains(&binding.id));
+        if pending && fi == self.top() {
+            return Some(Resolved {
+                kind: AccessKind::Cell(IrNode::Throw(Box::new(reference_error(&format!(
+                    "Cannot access '{name}' before initialization"
+                ))))),
+                mutable: binding.mutable,
+            });
+        }
         let kind = if let Some(slot) = binding.module {
             // `main` (or an arrow/method nested in it) reads its module binding
             // directly: `main` code only runs after the declaration.
@@ -463,7 +555,12 @@ impl<'a> LowerCtx<'a> {
         } else {
             // Captured from an enclosing frame: reached through this frame's env.
             let slot = self.route_env(fi, binding.id);
-            AccessKind::Cell(IrNode::EnvLoad(slot))
+            let ptr = IrNode::EnvLoad(slot);
+            if pending {
+                AccessKind::Cell(tdz_guard(ptr, name))
+            } else {
+                AccessKind::Cell(ptr)
+            }
         };
         Some(Resolved {
             kind,
@@ -576,11 +673,31 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
+/// The cell pointer `ptr` of binding `name` guarded against the TDZ hole:
+/// while the cell holds it, any read or write throws a `ReferenceError`.
+fn tdz_guard(ptr: IrNode, name: &str) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
+            ptr.clone(),
+        ))))),
+        then_branch: Box::new(IrNode::Throw(Box::new(reference_error(&format!(
+            "Cannot access '{name}' before initialization"
+        ))))),
+        else_branch: Box::new(ptr),
+    }
+}
+
 /// The synthetic binding id of the `new.target` snapshot of the function at
 /// frame depth `frame`: above every source offset (a [`binding_id`]), unique
 /// among the frames enclosing a capture.
 fn new_target_id(frame: usize) -> u32 {
     0x8000_0000 | u32::try_from(frame).unwrap_or(0)
+}
+
+/// The synthetic binding id of the `this` of the function at frame depth
+/// `frame`, distinct from every [`new_target_id`] and [`arguments_id`].
+fn this_id(frame: usize) -> u32 {
+    0xA000_0000 | u32::try_from(frame).unwrap_or(0)
 }
 
 /// The synthetic binding id of the `arguments` object of the function at frame
