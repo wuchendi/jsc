@@ -697,6 +697,12 @@ pub(crate) const NEW_ARRAY_EXPORT_NAME: &str = "__new_array";
 /// allocate every promise through it.
 pub(crate) const NEW_PROMISE_EXPORT_NAME: &str = "__new_promise";
 
+/// The name under which the module exports the `__promise_self_error() -> i64`
+/// constructor: a fresh `TypeError` ("Chaining cycle detected for promise
+/// #<Promise>"). The host promise engines reject a promise resolved with
+/// itself (Promise Resolve Functions step 7) with it.
+pub(crate) const PROMISE_SELF_ERROR_EXPORT_NAME: &str = "__promise_self_error";
+
 /// The name under which the module exports its linear memory; [`crate::run`]
 /// reads it back to resolve heap pointers.
 pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";

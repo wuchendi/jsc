@@ -230,8 +230,8 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
-    // i64) -> i32`.
-    let conversions: [(&[ValType], &[ValType]); 16] = [
+    // i64) -> i32`; then the exported `__promise_self_error() -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 17] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -268,6 +268,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I32, ValType::I64], &[ValType::I32]),
+        (&[], &[ValType::I64]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
