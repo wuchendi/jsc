@@ -1170,6 +1170,21 @@ impl Helpers<'_> {
     fn sparse_set(self) -> u32 {
         self.array_concat + 4
     }
+
+    /// `__protos_indexless(o) -> i32`: whether no prototype of `o` can hold an
+    /// integer-index property (see [`props::emit_protos_indexless`]). It is
+    /// the helper right after `__sparse_set`.
+    fn protos_indexless(self) -> u32 {
+        self.array_concat + 5
+    }
+
+    /// `__proto_elem(o, i) -> i64`: element `i` that `o` does not own, read
+    /// through its prototype chain ([`HOLE_BITS`] when absent; see
+    /// [`props::emit_proto_elem`]). It is the helper right after
+    /// `__protos_indexless`.
+    fn proto_elem(self) -> u32 {
+        self.array_concat + 6
+    }
 }
 
 /// The address of the static function block of top-level declaration
@@ -1499,11 +1514,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_array_concat(
         helpers.array_reserve(),
         helpers.sparse_get(),
+        helpers.proto_elem(),
     ));
     code.function(&emit_array_set(&offsets, helpers));
     code.function(&emit_array_set_length(&offsets, helpers));
     code.function(&emit_sparse_get(helpers));
     code.function(&emit_sparse_set(helpers));
+    code.function(&emit_protos_indexless());
+    code.function(&emit_proto_elem(helpers));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.convert,

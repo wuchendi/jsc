@@ -530,16 +530,27 @@ aliases, captured bindings, and member receivers all observe `push`.
   `elems + ELEMS_DATA_OFFSET + 8·i` (`ELEMS_DATA_OFFSET = 8`); slots past
   `len` are unused.
 - **Holes.** A hole slot holds `HOLE`. Literal elisions, `delete a[i]`, gaps
-  left by growth, and truncation produce holes. Reads map a hole to
-  `undefined`; `in`, `hasOwnProperty`, own-key enumeration, and the array
-  builtins' callbacks skip it; the renderers print `<N empty items>`.
+  left by growth, and truncation produce holes. A hole is not an own
+  property: `hasOwnProperty` and own-key enumeration skip it and the
+  renderers print `<N empty items>`, while `[[Get]]` and `HasProperty` (and
+  so `in`, member reads, spread, destructuring, `for-of`, `JSON.stringify`,
+  and every `Array.prototype` method) continue along the prototype chain
+  exactly as for an index at or past `length`. Every element read that meets
+  a hole calls `__proto_elem(o, i)`: `HOLE` at once when
+  `__protos_indexless(o)` (no prototype is an array or has a table flagged
+  `HAS_INDEX_KEYS`), else `HasProperty` then `Get` of the index key with
+  `this = o`. A dense read pays nothing; a hole read pays one call.
 - **Growth.** `__array_reserve(base, need)` (behind `push` and every bulk
   append) grows the store to `max(need, 4, 2·cap)` slots and copies the `len`
   live ones. A store
-  `a[i] = v` with `i ≥ len` stays dense while `i < max(2·cap, len + 1024)`
-  (store capacity `max(4, 2·cap, i + 1)`, gap filled with holes,
-  `len = i + 1`).
-- **Sparse arrays.** A larger gap sets `SPARSE` (never cleared): the store is
+  `a[i] = v` with `i ≥ len` stays dense while `i < len + 1024` (`DENSE_GAP`;
+  store capacity `max(4, 2·cap, i + 1)`, gap filled with holes,
+  `len = i + 1`). The bound is a gap, not a multiple of the capacity: each
+  store adds at most 1023 hole slots, so stores that keep doubling the index
+  (`x[2^k - 2]`) go sparse instead of doubling the store until memory runs
+  out.
+- **Sparse arrays.** A larger gap (a store or a `length` growth to
+  `i ≥ len + 1024`) sets `SPARSE` (never cleared): the store is
   kept for indices `< cap`, and every element at or past `cap` is an
   array-index key in the handle's own property table. `length` may then exceed
   the store; every element operation on a sparse array goes through
@@ -793,11 +804,12 @@ wrapper object (§5.2) and returns any object unchanged.
 `emit/props/descriptor.rs`) are the only code that reads or writes property
 tables. Keys are interned `u32`s.
 
-- **`__get(recv, key)`** — `OrdinaryGet`. A string or array resolves its exotic
-  own keys first (`length`, in-range indices; a hole reads `undefined`, a
-  sparse element comes from `__sparse_get`). An object-family block scans its
-  own table, then each `proto`; an accessor calls its getter with
-  `this = recv` (`undefined` without a getter). A string, number, or boolean
+- **`__get(recv, key)`** — `OrdinaryGet`. Each object on the chain (`recv`,
+  then each `proto`) answers from its exotic own keys first when it is a
+  string or an array (`length`, a present in-range index; a hole or an index
+  past `length` is not own and reads on through the chain), then from its own
+  table (a sparse element past the store is a table entry); an accessor
+  calls its getter with `this = recv` (`undefined` without a getter). A string, number, or boolean
   continues at its realm prototype without allocating a wrapper;
   `null`/`undefined` read `undefined` (member-access sites throw the nullish
   `TypeError` before calling it).
@@ -811,8 +823,8 @@ tables. Keys are interned `u32`s.
   throws). Member stores on a primitive throw (`Cannot create property 'k' on
   string 'abc'`); on `null`/`undefined` they throw `Cannot set properties of
   undefined (setting 'k')`.
-- **`__has(key, obj)`** — `HasProperty` (backs `in`): exotic own keys (a hole is
-  absent), the own table, then the `proto` chain. A primitive right-hand side
+- **`__has(key, obj)`** — `HasProperty` (backs `in`): at each object of the
+  chain its exotic own keys (a hole is not own), then its own table. A primitive right-hand side
   throws a `TypeError`. `__has_own` is the same without the chain
   (`hasOwnProperty`).
 - **`__delete(obj, key)`** — tombstones an own entry; a non-configurable
@@ -961,7 +973,7 @@ path, never semantics:
 | `String/Number/Boolean/parseInt/parseFloat(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance (a spread `parseInt(...a)` / `parseFloat(...a)` converts the array's first elements) | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property (a `ReferenceError` once it is deleted) |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
-| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear; `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
+| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear (an array also needs `%Object.prototype%`'s, since its fast paths read a hole as absent); `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
@@ -1771,40 +1783,38 @@ Each item below is current behaviour of this tree.
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the
   `RangeError` first); every other `Array.prototype` method uses the full
   `ToLength` range.
-- An array element hole does not read through the prototype chain
-  (`Array.prototype[1] = 1; [0, , 2][1]` is `undefined`), and an object whose
-  prototype is an array does not inherit its elements (nor does an element
-  write reach an `Array.prototype` index accessor); 107 built-ins/Array
-  test262 tests (`*-7-c-i-8`, `S15.4.4.*_A4_T*`, `holes-not-preserved`,
-  `reduce` / `reduceRight` `10-*` / `9-c-ii-*`, `set-length-array-is-frozen`,
-  `sort/precise-prototype-*`) wait on this property-lookup change.
+- An element write (`a[i] = v`, `push`, the mutating `Array.prototype`
+  methods) to an index the array does not own defines an own element without
+  consulting the prototype chain: an inherited index setter is not called and
+  an inherited read-only index does not reject the write (reads and
+  `HasProperty` do see inherited indices, §5.4).
 - `Array.prototype`, `String.prototype` and `Number.prototype` are ordinary
   objects, not an array / `String` / `Number` exotic object:
   `Array.isArray(Array.prototype)` is `false`, `Array.prototype.length` is
   `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
   `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
-- The remaining test262 failures of the phase-3 built-in families (after the
-  L2-F T6 merge with L2-O and L2-L: 636 of built-ins/{Array 279, String 207,
-  Function 135, Math 10, Number 5}; NativeErrors and AggregateError have
-  none), by cause and owner:
+- The remaining test262 failures of the phase-3 built-in families (after
+  element reads through the prototype chain, L2-V T3: 538 of
+  built-ins/{Array 181, String 207, Function 135, Math 10, Number 5};
+  NativeErrors and AggregateError have none), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number |
   |---|---|---|---|---|---|---|
   | `RegExp` | never in phase 3 | 26 | 95 | 3 | | |
   | `Function` constructor | never in phase 3 | | 3 | 117 | | |
   | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 16 | 12 | 3 | 1 | |
-  | element lookup through the prototype chain (above) | object model | 107 | | | | |
   | builtin prototypes are not exotic (above) | object model | 4 | 3 | | | 4 |
   | `asyncTest` used by a test without the `async` flag | L2-R (runner) | 67 | | | | |
   | `nativeFunctionMatcher.js` harness | L2-R (runner) | | | 1 | | |
   | `void` | L2-L | 5 | 36 | 7 | | 1 |
-  | top-level `var` used before its declaration or declared in a block (`ReferenceError`) | L2-L | 4 | 17 | 1 | 1 | |
+  | top-level `var` used before its declaration or declared in a block (`ReferenceError`) | L2-L | 5 | 17 | 1 | 1 | |
   | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
   | `Symbol` / `@@toStringTag` (`Math` / `JSON` receivers tag as `[object Object]`) | D3 | 24 | 7 | 1 | | |
   | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
   | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | D3 | | 29 | | | |
-  | a top-level `var` / function is not a global-object property | realm | 2 | 1 | | | |
-  | a sparse write at index `2^32 - 2` allocates densely (`RangeError: out of memory`) | L2-O | 1 | | | | |
+  | a top-level `var` / function is not a global-object property | realm | 4 | 1 | | | |
+  | an element write does not reach an inherited index setter (below) | object model | 3 | | | | |
+  | a higher-order builtin's callback receives at most `K` arguments (`arguments[3]` of a three-parameter `reduce` callback) | — | 4 | | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16
