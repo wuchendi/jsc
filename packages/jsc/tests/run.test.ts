@@ -167,6 +167,23 @@ it('runs a Promise chain through the microtask queue', async () => {
   expect(fin.result).toBe('Promise { 1 }')
 })
 
+it('rejects a promise resolved with itself with a TypeError', async () => {
+  const executor = await run(
+    'let res; const p = new Promise(r => res = r); res(p); p.then(() => console.log("fulfilled"), e => console.log(e instanceof TypeError, e.message))',
+  )
+  expect(executor.stdout).toBe(
+    'true Chaining cycle detected for promise #<Promise>\n',
+  )
+  const chained = await run(
+    'let p2 = Promise.resolve(1).then(() => p2); p2.catch(e => console.log(e instanceof TypeError))',
+  )
+  expect(chained.stdout).toBe('true\n')
+  const asyncSelf = await run(
+    'let p; async function f() { await null; return p } p = f(); p.catch(e => console.log(e.constructor === TypeError))',
+  )
+  expect(asyncSelf.stdout).toBe('true\n')
+})
+
 it('renders promises by settlement', async () => {
   expect((await run('Promise.resolve(42)')).result).toBe('Promise { 42 }')
   expect(

@@ -241,7 +241,7 @@ fn lexical_names<'a>(stmts: impl Iterator<Item = &'a Stmt>, block: bool) -> Vec<
 
 /// Collect the `var`-declared names of `stmt`, descending into nested
 /// statements but not into functions.
-fn var_names(stmt: &Stmt, out: &mut Vec<(String, Span)>) {
+pub(super) fn var_names(stmt: &Stmt, out: &mut Vec<(String, Span)>) {
     let var_decl = |v: &swc_ecma_ast::VarDecl, out: &mut Vec<(String, Span)>| {
         if v.kind == VarDeclKind::Var {
             for d in &v.decls {

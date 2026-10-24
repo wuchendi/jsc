@@ -81,9 +81,10 @@ impl std::error::Error for CompileError {}
 /// Locate a byte `offset` within `src`, returning the 1-based line number, the
 /// 1-based column (counted in characters, not bytes), and the byte range
 /// `line_start..line_end` of the containing source line (excluding the trailing
-/// newline). `offset` is clamped to `src.len()`.
+/// `\n` or `\r\n`). `offset` is clamped to `src.len()` and snapped back to the
+/// start of the character it falls inside, so any byte offset is accepted.
 fn locate(src: &str, offset: usize) -> (usize, usize, usize, usize) {
-    let offset = offset.min(src.len());
+    let offset = src.floor_char_boundary(offset);
     let mut line = 1usize;
     let mut line_start = 0usize;
     for (i, b) in src.bytes().enumerate() {
@@ -98,6 +99,11 @@ fn locate(src: &str, offset: usize) -> (usize, usize, usize, usize) {
     let line_end = src[line_start..]
         .find('\n')
         .map_or(src.len(), |n| line_start + n);
+    let line_end = if src[..line_end].ends_with('\r') {
+        line_end - 1
+    } else {
+        line_end
+    };
     let col = src[line_start..offset].chars().count() + 1;
     (line, col, line_start, line_end)
 }
@@ -115,13 +121,16 @@ fn locate(src: &str, offset: usize) -> (usize, usize, usize, usize) {
 /// `lo`/`hi` are 0-based byte offsets into `src` (`hi` exclusive) delimiting the
 /// offending span. The caret sits under the span's start column; a span wider
 /// than one column underlines its full width (`^^^`, at least one caret). The
-/// line-number gutter is right-aligned and the `|` bars line up.
+/// line-number gutter is right-aligned and the `|` bars line up. Any offsets
+/// are accepted: they are clamped to `src` and snapped outward to character
+/// boundaries, so a span inside a multi-byte character never panics.
 pub fn render(src: &str, label: &str, msg: &str, lo: usize, hi: usize) -> String {
+    let lo = src.floor_char_boundary(lo);
     let (line, col, line_start, line_end) = locate(src, lo);
     let line_text = &src[line_start..line_end];
 
     // Caret width: characters spanned on this line, at least one.
-    let hi = hi.max(lo + 1).min(line_end);
+    let hi = src.ceil_char_boundary(hi.max(lo + 1)).min(line_end).max(lo);
     let width = src[lo..hi].chars().count().max(1);
 
     let num = line.to_string();
@@ -225,6 +234,42 @@ mod tests {
         assert!(block.contains('^'), "got: {block}");
         // A span-less error has nothing to point at.
         assert!(CompileError::msg("boom").render(src, "<eval>").is_none());
+    }
+
+    #[test]
+    fn render_never_panics_at_any_byte_offset_of_non_ascii_source() {
+        // 2-byte (é), 3-byte (U+180E, 中), 4-byte (😀) chars, CRLF and LF line
+        // endings, and an empty last line. Every `lo` and every `lo..hi` pair —
+        // including offsets inside a multi-byte char and past the end — must
+        // render without panicking.
+        let src = "var a\u{180e}= 1;\r\nlet é = '中';\n// 😀x\r\n\n";
+        let len = src.len();
+        for lo in 0..=len + 2 {
+            let (_, col, start, end) = locate(src, lo);
+            assert!(col >= 1 && start <= end && end <= len);
+            for hi in 0..=len + 2 {
+                let block = render(src, "f.js", "boom", lo, hi);
+                assert!(block.starts_with("error: boom\n"), "lo={lo} hi={hi}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_inside_multibyte_char_points_at_that_char() {
+        // Offset 6 is the middle byte of U+180E (bytes 5..8): the caret snaps
+        // back to the char's start column (6) and underlines one char.
+        let src = "var a\u{180e}= 1;";
+        let block = render(src, "f.js", "boom", 6, 7);
+        assert!(block.contains("--> f.js:1:6"), "got: {block}");
+        assert!(block.ends_with("     ^"), "got: {block}");
+    }
+
+    #[test]
+    fn render_strips_carriage_return_from_crlf_line() {
+        let src = "let a;\r\nlet b;\r\n";
+        let lo = src.find('b').expect("has b");
+        let block = render(src, "f.js", "boom", lo, lo + 1);
+        assert!(block.contains("\n 2 | let b;\n"), "got: {block:?}");
     }
 
     #[test]
