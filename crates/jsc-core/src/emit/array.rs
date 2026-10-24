@@ -536,18 +536,20 @@ fn emit_hof_index(function: &mut Function, idx: u32) {
 /// Emit the trailing half of a higher-order callback invocation: pad the
 /// remaining positional slots to the shared funcref arity with `undefined`, set
 /// `this` (from i64 local `this`, else `undefined`), push the callback's own
-/// environment (at `+FUNC_ENV_OFFSET`) as the env-last argument and its
-/// funcref-table index (at `+FUNC_INDEX_OFFSET`), and `call_indirect`. The
-/// real positional args (already pushed by the caller) number at most
-/// `helpers.max_args`. Leaves the callback's boxed jsval result.
+/// environment (at `+FUNC_ENV_OFFSET`) as the env-last argument, the argument
+/// count `argc`, and its funcref-table index (at `+FUNC_INDEX_OFFSET`), and
+/// `call_indirect`. The real positional args (already pushed by the caller)
+/// number `pushed`, at most `helpers.max_args`. Leaves the callback's boxed
+/// jsval result.
 fn emit_hof_invoke(
     function: &mut Function,
     helpers: Helpers<'_>,
     cb: u32,
     this: Option<u32>,
-    real_args: u32,
+    pushed: u32,
+    argc: HofArgc,
 ) {
-    for _ in real_args..helpers.max_args {
+    for _ in pushed..helpers.max_args {
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
     // The real positional args are already on the stack, so setting the
@@ -565,9 +567,19 @@ fn emit_hof_invoke(
         align: 3,
         memory_index: 0,
     }));
-    // Argument count (env-last ABI): the real positional args the callback
-    // receives, so a rest-parameter callback collects exactly those.
-    emit_argc(real_args as usize, function);
+    // Argument count (env-last ABI): the arguments the callback receives, so
+    // a rest-parameter callback collects exactly those.
+    match argc {
+        HofArgc::Fixed(n) => emit_argc(n as usize, function),
+        HofArgc::Spilled { all, pushed, spill } => {
+            emit_argc(all as usize, function);
+            emit_argc(pushed as usize, function);
+            function.instruction(&Instruction::LocalGet(spill));
+            function.instruction(&Instruction::I64Const(0));
+            function.instruction(&Instruction::I64Ne);
+            function.instruction(&Instruction::Select);
+        }
+    }
     function.instruction(&Instruction::LocalGet(cb));
     function.instruction(&Instruction::I32Load(MemArg {
         offset: FUNC_INDEX_OFFSET,
@@ -584,6 +596,61 @@ fn emit_hof_invoke(
     emit_propagate_if_pending(function, helpers);
 }
 
+/// The argument count [`emit_hof_invoke`] passes.
+#[derive(Clone, Copy)]
+enum HofArgc {
+    /// Always `n`.
+    Fixed(u32),
+    /// `all` when the i64 local `spill` holds the published spread argument
+    /// array (nonzero), else the `pushed` positional ones.
+    Spilled { all: u32, pushed: u32, spill: u32 },
+}
+
+/// Seed the i64 local `spill` before an [`emit_array_hof`] loop whose
+/// callback (base in i32 local `cb`) is passed `all > K` arguments: a fresh
+/// `all`-element array that every invocation refills and publishes as the
+/// spread argument array, so the arguments past the `K` positional slots
+/// reach a callback gathering them (a rest parameter, `arguments`, a variadic
+/// or bound builtin; each copies them out on entry, so one array serves the
+/// whole loop). When no user function gathers its arguments only a builtin
+/// callee (a funcref slot past the user functions and the settlers) can, so
+/// any other callback keeps `spill = 0` and receives the `K` positional
+/// arguments alone, as if passed directly.
+fn emit_hof_spill_seed(
+    function: &mut Function,
+    helpers: Helpers<'_>,
+    cb: u32,
+    spill: u32,
+    all: u32,
+) {
+    let alloc = |function: &mut Function| {
+        function.instruction(&Instruction::I32Const(all.cast_signed()));
+        function.instruction(&Instruction::Call(helpers.new_array()));
+        function.instruction(&Instruction::I64ExtendI32U);
+        function.instruction(&Instruction::I64Const(HEAP_BITS));
+        function.instruction(&Instruction::I64Or);
+    };
+    if helpers.gathers_arguments {
+        alloc(function);
+    } else {
+        let first_builtin = helpers.builtin_slot(Builtin::ALL[0]);
+        function.instruction(&Instruction::LocalGet(cb));
+        function.instruction(&Instruction::I32Load(MemArg {
+            offset: FUNC_INDEX_OFFSET,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(first_builtin.cast_signed()));
+        function.instruction(&Instruction::I32GeU);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        alloc(function);
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::I64Const(0));
+        function.instruction(&Instruction::End);
+    }
+    function.instruction(&Instruction::LocalSet(spill));
+}
+
 /// The `TypeError` of `reduce` over no element without an initial value.
 pub(super) const REDUCE_EMPTY: CalleeErrorText<'static> = [
     "Reduce of empty array with no initial value",
@@ -597,8 +664,10 @@ pub(super) const REDUCE_EMPTY: CalleeErrorText<'static> = [
 /// `this_arg` into `this`; a counted loop over `0..len` then invokes the
 /// callback per element still present (below the current length, not a hole)
 /// through the uniform `call_indirect` ABI via [`emit_hof_invoke`], passing
-/// `(element, index, array)` (`reduce`: `(acc, element, index, array)`)
-/// truncated to `K`:
+/// `(element, index, array)` (`reduce`: `(acc, element, index, array)`): the
+/// first `K` in the positional slots, all of them through the spread argument
+/// array when there are more than `K` and the callback may gather them
+/// ([`emit_hof_spill_seed`]):
 ///
 /// - `Map` fills a fresh same-length array `res[i] = fn(..)`, a skipped index
 ///   staying a hole.
@@ -635,6 +704,10 @@ pub(super) fn emit_array_hof(
     let this = scratch + 14;
     // The visited element: the store slot, or (for a hole) the inherited one.
     let elem = scratch + 16;
+    // The spread argument array of a callback passed more than `K` arguments.
+    let spill = scratch + 15;
+    let all = if op == ArrayHofOp::Reduce { 4 } else { 3 };
+    let spilled = all > helpers.max_args;
 
     // Prologue: receiver base -> `arr`, its length -> `len`, then the
     // callback (IsCallable, DF4: a non-function throws before any iteration,
@@ -666,6 +739,9 @@ pub(super) fn emit_array_hof(
         function.instruction(&Instruction::LocalSet(this));
     }
     let this = this_arg.map(|_| this);
+    if spilled {
+        emit_hof_spill_seed(function, helpers, cb, spill, all);
+    }
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(idx));
 
@@ -709,12 +785,48 @@ pub(super) fn emit_array_hof(
             function.instruction(&Instruction::I64Or);
         }
     };
+    // Push the positional arguments (`reduce`'s accumulator is pushed by the
+    // caller), refill and publish the spread argument array when spilled,
+    // and invoke.
     let call = |function: &mut Function, before: u32| {
-        let n = (before + 3).min(helpers.max_args);
+        let n = all.min(helpers.max_args);
         for j in before..n {
             callback_arg(function, j - before);
         }
-        emit_hof_invoke(function, helpers, cb, this, n);
+        if !spilled {
+            emit_hof_invoke(function, helpers, cb, this, n, HofArgc::Fixed(n));
+            return;
+        }
+        if !helpers.gathers_arguments {
+            function.instruction(&Instruction::LocalGet(spill));
+            function.instruction(&Instruction::I64Const(0));
+            function.instruction(&Instruction::I64Ne);
+            function.instruction(&Instruction::If(BlockType::Empty));
+        }
+        for j in 0..all {
+            function.instruction(&Instruction::LocalGet(spill));
+            function.instruction(&Instruction::I32WrapI64);
+            emit_array_elems(function);
+            if j < before {
+                function.instruction(&Instruction::LocalGet(acc));
+            } else {
+                callback_arg(function, j - before);
+            }
+            function.instruction(&Instruction::I64Store(elem_slot(u64::from(j))));
+        }
+        function.instruction(&Instruction::LocalGet(spill));
+        function.instruction(&Instruction::GlobalSet(SPREAD_ARGS_GLOBAL));
+        let argc = if helpers.gathers_arguments {
+            HofArgc::Fixed(all)
+        } else {
+            function.instruction(&Instruction::End);
+            HofArgc::Spilled {
+                all,
+                pushed: n,
+                spill,
+            }
+        };
+        emit_hof_invoke(function, helpers, cb, this, n, argc);
     };
 
     // Counted loop: `while (idx < len) { <body>; idx++ }`.

@@ -2145,12 +2145,13 @@ fn emit_set_call(
 }
 
 /// Emit the array arm of [`emit_index_set_node`] for the array in `s0`: an
-/// integer key `0 <= k < length` of a dense array stores the element at
-/// `elems + 8 + 8*k` inline (the compares run on `f64`, so a non-number key
-/// fails them without reading memory); any other key (or a `SPARSE` array)
-/// goes to `__array_set` (growth by index, sparse elements, canonical index
-/// strings, `length`, named properties), followed by the pending-exception
-/// check. The caller tracks the enclosing dispatch frame.
+/// integer key `0 <= k < length` of a dense array whose slot is not a hole
+/// stores the element at `elems + 8 + 8*k` inline (the compares run on `f64`,
+/// so a non-number key fails them without reading memory); any other key (a
+/// hole, or a `SPARSE` array) goes to `__array_set` (the prototype chain for
+/// an element the array does not own, growth by index, sparse elements,
+/// canonical index strings, `length`, named properties), followed by the
+/// pending-exception check. The caller tracks the enclosing dispatch frame.
 fn emit_index_set_array(
     function: &mut Function,
     s0: u32,
@@ -2158,20 +2159,33 @@ fn emit_index_set_array(
     sval: u32,
     helpers: Helpers<'_>,
 ) {
+    // The address of element `i` (elems + 8*i; the slot MemArg adds the
+    // data offset).
+    let elem_addr = |function: &mut Function| {
+        function.instruction(&Instruction::LocalGet(s0));
+        function.instruction(&Instruction::I32WrapI64);
+        emit_array_elems(function);
+        function.instruction(&Instruction::LocalGet(s1));
+        function.instruction(&Instruction::F64ReinterpretI64);
+        function.instruction(&Instruction::I32TruncSatF64U);
+        function.instruction(&Instruction::I32Const(8));
+        function.instruction(&Instruction::I32Mul);
+        function.instruction(&Instruction::I32Add);
+    };
     emit_dense_index_in_bounds(function, s0, s1);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    elem_addr(function);
+    function.instruction(&Instruction::I64Load(elem_slot(0)));
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    // In bounds: store the element jsval at elems + 8 + 8*i. Mirrors
-    // `emit_index_node`'s array arm.
-    function.instruction(&Instruction::LocalGet(s0));
-    function.instruction(&Instruction::I32WrapI64);
-    emit_array_elems(function);
-    function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    function.instruction(&Instruction::I32TruncSatF64U);
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
+    // An own element in bounds: store the element jsval at elems + 8 + 8*i.
+    // Mirrors `emit_index_node`'s array arm.
+    elem_addr(function);
     function.instruction(&Instruction::LocalGet(sval));
     function.instruction(&Instruction::I64Store(elem_slot(0)));
     function.instruction(&Instruction::Else);

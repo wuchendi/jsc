@@ -287,9 +287,10 @@ pub(super) fn emit_push(
     this_object(function, frame, o, PUSH.nullish, strings, helpers);
     push_argc(function, frame);
     wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
-    // An array grows in place unless it would pass `2^32 - 1` elements: the
-    // generic path then sets the non-index key and throws on `length`.
-    is_array(function, o);
+    // An array grows in place unless it would pass `2^32 - 1` elements (the
+    // generic path then sets the non-index key and throws on `length`) or a
+    // prototype may hold an index (each `Set` then consults the chain).
+    indexless_array(function, o, helpers);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     wasm!(function;
         LocalGet(o), I32WrapI64, I32Load(array_len_slot()), I64ExtendI32U,
@@ -976,8 +977,10 @@ enum CallArg {
     Index(u32),
 }
 
-/// Call the function in i64 `callee` with `this` = i64 `this` over `args`
-/// (the first `K` of them), leaving its result (or a pending throw).
+/// Call the function in i64 `callee` with `this` = i64 `this` over `args`,
+/// leaving its result (or a pending throw): the first `K` in the positional
+/// slots and, when there are more, all of them in a fresh spread argument
+/// array published for the callee (built in the [`Frame::arg`] temp).
 fn push_call(
     function: &mut Function,
     frame: Frame,
@@ -986,15 +989,28 @@ fn push_call(
     args: &[CallArg],
     helpers: Helpers<'_>,
 ) {
+    let push = |function: &mut Function, arg: Option<&CallArg>| match arg {
+        Some(CallArg::Val(local)) => wasm!(function; LocalGet(*local)),
+        Some(CallArg::Index(local)) => index_value(function, *local),
+        None => wasm!(function; I64Const(UNDEFINED_BITS)),
+    };
     for slot in 0..frame.k {
-        match args.get(slot as usize) {
-            Some(CallArg::Val(local)) => wasm!(function; LocalGet(*local)),
-            Some(CallArg::Index(local)) => index_value(function, *local),
-            None => wasm!(function; I64Const(UNDEFINED_BITS)),
+        push(function, args.get(slot as usize));
+    }
+    if args.len() > frame.k as usize {
+        let spread = frame.scratch() + 35;
+        let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
+        wasm!(function; I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(spread));
+        for (j, arg) in (0u64..).zip(args) {
+            wasm!(function; LocalGet(spread), I32WrapI64);
+            emit_array_elems(function);
+            push(function, Some(arg));
+            wasm!(function; I64Store(elem_slot(j)));
         }
+        wasm!(function; LocalGet(spread), GlobalSet(SPREAD_ARGS_GLOBAL));
     }
     wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(frame.k as usize);
+    let count = args.len();
     invoke(
         function,
         callee,

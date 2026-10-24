@@ -1213,7 +1213,9 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
 /// on the array `recv` (the inline path stores an in-range number index). An
 /// array index — a number key or a canonical index string (DF9) — takes the
 /// element path; `length` is `__array_set_length`; every other key is an
-/// ordinary property set (`__set`). An index at or past the length grows the
+/// ordinary property set (`__set`). A store to a hole or at or past the
+/// length first consults the prototype chain (`__proto_set`: an inherited
+/// setter or read-only index consumes it). An index at or past the length grows the
 /// array densely when `i < len + DENSE_GAP` (store capacity
 /// `max(4, 2 * cap, i + 1)`, the gap `len..i` filled with holes, `len = i + 1`);
 /// a larger gap makes the array `SPARSE`, and every element store on a
@@ -1252,8 +1254,22 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
         If(BlockType::Empty),
         LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.sparse_set()), Return,
         End,
-        // In range -> store.
+        // An own element in range -> store.
         LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalTee(len), I32LtU,
+        If(BlockType::Empty),
+    );
+    emit_elem_addr(&mut f, o, i);
+    wasm!(f; I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Ne, If(BlockType::Empty));
+    emit_elem_addr(&mut f, o, i);
+    wasm!(f;
+        LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)), Return,
+        End,
+        End,
+        // A hole or past the length: an inherited setter or read-only index
+        // consumes the write, else the own element is created.
+        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.proto_set()),
+        If(BlockType::Empty), Return, End,
+        LocalGet(i), LocalGet(len), I32LtU,
         If(BlockType::Empty),
     );
     emit_elem_addr(&mut f, o, i);
@@ -1384,7 +1400,8 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>) -> Function {
 }
 
 /// `__sparse_set(o: i32, i: i32, v: i64)`: the strict `[[Set]]` of element
-/// `i` of the `SPARSE` array `o` — a store slot when `i < cap`, else `__set`
+/// `i` of the `SPARSE` array `o` — a store slot when `i < cap` (a hole slot
+/// after `__proto_set` leaves it to the array), else `__set`
 /// of the interned index key `i` (so a read-only or accessor element and a
 /// non-extensible array behave as on any object) — then raise `length` to
 /// `i + 1` when `i` is at or past it (a push at the maximum length `2^32 - 1`
@@ -1401,6 +1418,16 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
         Else, I32Const(0),
         End,
         If(BlockType::Empty),
+    );
+    // A store slot holding a hole is not own: the prototype chain may
+    // consume the write.
+    emit_elem_addr(&mut f, o, i);
+    wasm!(f;
+        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Eq,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.proto_set()),
+        If(BlockType::Empty), Return, End,
+        End,
     );
     emit_elem_addr(&mut f, o, i);
     wasm!(f;
@@ -1490,6 +1517,86 @@ pub(super) fn emit_proto_elem(helpers: Helpers<'_>) -> Function {
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalGet(k), Call(helpers.get), End);
+    f
+}
+
+/// `__proto_set(o: i32, i: i32, v: i64) -> i32`: the inherited half of the
+/// strict `OrdinarySet` of element `i` that the array `o` does not own (a
+/// hole, or an index at or past its length). The first prototype owning `i`
+/// (an array's present store element, else a table entry) decides: an
+/// accessor calls its setter with `this = o` (a getter-only one throws), a
+/// read-only data property throws, and the result is `1` — the write is
+/// consumed (a throw left pending). A writable data property, no owner at
+/// all, or `__protos_indexless(o)` (checked first) yield `0`: the caller
+/// creates the own element.
+pub(super) fn emit_proto_set(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(3, ValType::I32), (2, ValType::I64)]);
+    let (o, i, v) = (0, 1, 2);
+    let (k, q, e, p, recv) = (3, 4, 5, 6, 7);
+    wasm!(f;
+        LocalGet(o), Call(helpers.protos_indexless()),
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(i), Call(helpers.index_string), Call(helpers.intern), LocalSet(k),
+        LocalGet(o),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f;
+        LocalSet(recv),
+        LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(p),
+        Loop(BlockType::Empty),
+    );
+    emit_is_pointer(&mut f, p);
+    wasm!(f;
+        I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+        // A present store element of an array prototype is a writable data
+        // property (an attributed one lives in a dictionary array's table).
+        LocalGet(p), I32WrapI64, LocalTee(q), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(i), LocalGet(q), I32Load(m32(ARRAY_LEN_OFFSET)), I32LtU,
+        LocalGet(q), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(e), I32Const(0), I32Ne, I32And,
+        If(BlockType::Empty),
+        LocalGet(i), LocalGet(e), I32Load(m32(ELEMS_CAP_OFFSET)), I32LtU,
+        If(BlockType::Empty),
+    );
+    emit_elem_addr(&mut f, q, i);
+    wasm!(f;
+        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        End,
+        End,
+        End,
+        LocalGet(q), LocalGet(k), Call(helpers.prop_find), LocalTee(e),
+        If(BlockType::Empty),
+    );
+    if helpers.has_accessors {
+        wasm!(f;
+            LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_ACCESSOR), I32And,
+            If(BlockType::Empty),
+            LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_SET_OFFSET)),
+            LocalSet(p),
+        );
+        emit_is_function(&mut f, p);
+        wasm!(f; If(BlockType::Empty));
+        emit_accessor_call(&mut f, p, recv, Some(v), q, helpers);
+        wasm!(f; Drop, I32Const(1), Return, End, I32Const(1));
+        emit_prop_throw_return(&mut f, recv, k, PROP_THROW_GETTER_ONLY, helpers);
+        wasm!(f; End);
+    }
+    wasm!(f;
+        LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_WRITABLE), I32And, I32Eqz,
+        If(BlockType::Empty), I32Const(1),
+    );
+    emit_prop_throw_return(&mut f, recv, k, PROP_THROW_READ_ONLY, helpers);
+    wasm!(f;
+        End,
+        I32Const(0), Return,
+        End,
+        LocalGet(q), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(p),
+        Br(0),
+        End,
+        Unreachable,
+        End,
+    );
     f
 }
 

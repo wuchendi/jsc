@@ -100,11 +100,11 @@ pub(super) fn build_type_and_function_sections<'a>(
             index()
         },
         // `__array_set`, `__array_set_length`, `__sparse_get`,
-        // `__sparse_set`, `__protos_indexless`, and `__proto_elem` take the
-        // indices right after `__array_concat`.
+        // `__sparse_set`, `__protos_indexless`, `__proto_elem`, and
+        // `__proto_set` take the indices right after `__array_concat`.
         array_concat: {
             let array_concat = index();
-            for _ in 0..6 {
+            for _ in 0..7 {
                 index();
             }
             array_concat
@@ -145,6 +145,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         new_string: index() + 2,
         fn_type,
         max_args,
+        gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
         has_accessors: program_has_accessors(program),
         dirty_tracking: program_tests_dirty_bits(program),
         fn_info: layout.info,
@@ -351,6 +352,8 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32], &[I32]),
         // `__proto_elem(o, i) -> v`.
         (&[I32, I32], &[I64]),
+        // `__proto_set(o, i, v) -> i32`.
+        (&[I32, I32, I64], &[I32]),
         // `__json_escape(str) -> str` and `__json_str(v) -> str`.
         (&[I32], &[I32]),
         (&[I64], &[I32]),

@@ -1017,3 +1017,113 @@ const HOLE_CASES: &[(&str, &str)] = &[
         "z|true",
     ),
 ];
+
+/// A store to an index an array does not own (a hole, or at or past its
+/// length) is `OrdinarySet` through the prototype chain, for `a[i] = v`,
+/// compound assignment, and every `Array.prototype` method that writes by
+/// `Set` (`push`, `unshift`, `splice`, `fill`, `copyWithin`, `reverse`, the
+/// `sort` write-back): an inherited setter runs with the array as `this` and
+/// no own element is created, an inherited read-only or getter-only index
+/// throws `TypeError` (all code is strict), and an inherited writable data
+/// property is shadowed by a new own element. Dense, `SPARSE` (store and
+/// table elements), ordinary-object and array prototypes all apply.
+#[test]
+fn element_writes_set_through_the_prototype_chain() {
+    for (src, want) in WRITE_CASES {
+        assert_eq!(jsc(&["-p", src]), *want, "{src}");
+    }
+}
+
+/// `(program, completion value)` pairs of
+/// [`element_writes_set_through_the_prototype_chain`] (each checked against
+/// Node in strict mode).
+const WRITE_CASES: &[(&str, &str)] = &[
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"1\", {set: function (v) { log.push(this.length + \":\" + v) }, configurable: true}); var a=[0,,2]; a[1]=7; log.join() + \"|\" + a.hasOwnProperty(1) + \"|\" + a.length",
+        "3:7|false|3",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"3\", {set: function (v) { this.seen = v }, configurable: true}); var a=[0]; a[3]=9; a.seen + \"|\" + a.length + \"|\" + a.hasOwnProperty(3)",
+        "9|1|false",
+    ),
+    (
+        "Object.defineProperty(Object.prototype, \"0\", {set: function (v) { this.x = v }, configurable: true}); var a=[]; a[0]=1; a.x + \"|\" + a.length",
+        "1|0",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", {value: 5, writable: false, configurable: true}); var a=[0,,2]; var r; try { a[1]=7; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a[1] + \"|\" + a.hasOwnProperty(1) } r",
+        "true|5|false",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"2\", {get: function () { return 1 }, configurable: true}); var a=[0]; var r; try { a[2]=7; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.length } r",
+        "true|1",
+    ),
+    (
+        "Array.prototype[1]=5; var a=[0,,2]; a[1]=7; a[1] + \"|\" + a.hasOwnProperty(1) + \"|\" + Array.prototype[1]",
+        "7|true|5",
+    ),
+    (
+        "Array.prototype[1]=5; var a=[0,,2]; a[1]=7; a.join()",
+        "0,7,2",
+    ),
+    (
+        "var n=0; Object.defineProperty(Array.prototype, \"1\", {set: function (v) { n = v }, get: function () { return 10 }, configurable: true}); var a=[0,,2]; a[1] += 5; n + \"|\" + a.hasOwnProperty(1)",
+        "15|false",
+    ),
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log.push(v) }, configurable: true}); var a=[0,1]; a.push(9); log.join() + \"|\" + a.length + \"|\" + a.hasOwnProperty(2)",
+        "9|3|false",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", {value: 0, writable: false, configurable: true}); var a=[0]; var r; try { a.push(1); r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.length } r",
+        "true|1",
+    ),
+    (
+        "var log=\"\"; Object.defineProperty(Array.prototype, \"0\", {set: function (v) { log += v }, get: function () { return \"g\" }, configurable: true}); var a=[]; a.unshift(5); log + \"|\" + a.length + \"|\" + a.hasOwnProperty(0)",
+        "5|1|false",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", {value: 0, writable: false, configurable: true}); var a=[1,,3]; var r; try { a.fill(9); r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.join() } r",
+        "true|9,0,3",
+    ),
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log.push(v) }, configurable: true}); var a=[0,1]; a.splice(2, 0, 8); log.join() + \"|\" + a.length + \"|\" + a.hasOwnProperty(2)",
+        "8|3|false",
+    ),
+    (
+        "var log=\"\"; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log += v }, get: function () { return 9 }, configurable: true}); var a=[0,1,,3]; a.reverse(); log + \"|\" + a.hasOwnProperty(2) + \"|\" + a[1]",
+        "1|false|9",
+    ),
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"1\", {set: function (v) { log.push(v) }, configurable: true}); var a=[0,,2,3]; a.copyWithin(1, 3); log.join() + \"|\" + a.hasOwnProperty(1)",
+        "3|false",
+    ),
+    (
+        "var log=\"\"; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log += v }, get: function () { return 0 }, configurable: true}); var a=[3,1]; a.length = 3; a.sort(); log + \"|\" + a.hasOwnProperty(2) + \"|\" + a.join()",
+        "3|false|0,1,0",
+    ),
+    (
+        "var a=[0]; a[5000]=1; Object.defineProperty(Array.prototype, \"3\", {set: function (v) { this.s = v }, configurable: true}); a[3]=2; a.s + \"|\" + a.hasOwnProperty(3)",
+        "2|false",
+    ),
+    (
+        "var a=[0]; a[5000]=1; Object.defineProperty(Array.prototype, \"4000\", {set: function (v) { this.s = v }, configurable: true}); a[4000]=2; a.s + \"|\" + a.hasOwnProperty(4000)",
+        "2|false",
+    ),
+    (
+        "var p = { set 1(v) { this.y = v } }; var a=[0]; Object.setPrototypeOf(a, p); a[1]=3; a.y + \"|\" + a.length",
+        "3|1",
+    ),
+    (
+        "var p = Object.freeze([1, 2]); var a=[]; Object.setPrototypeOf(a, p); var r; try { a[0]=5; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.length } r",
+        "true|0",
+    ),
+    (
+        "var o = Object.create(Object.freeze([1])); var r; try { o[0]=2; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + o.hasOwnProperty(0) } r",
+        "true|false",
+    ),
+    (
+        "var p = [1, 2]; var a=[]; Object.setPrototypeOf(a, p); a[0]=5; a[0] + \"|\" + a.hasOwnProperty(0) + \"|\" + p[0]",
+        "5|true|1",
+    ),
+];
