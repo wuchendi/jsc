@@ -875,6 +875,29 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32, proto_elem:
     function.instruction(&Instruction::End);
     ret_dst(&mut function);
     function.instruction(&Instruction::End);
+    emit_concat_by_index(
+        &mut function,
+        (dst, src, slen, elem, k),
+        reserve_index + 1,
+        sparse_get,
+        proto_elem,
+    );
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::End);
+    function
+}
+
+/// The by-index half of [`emit_array_concat`] over its locals `(dst, src,
+/// slen, elem, k)`: for `k < slen`, `__array_push(dst, Get(src, k))` — the
+/// element via `__sparse_get`, a hole (or an index past a length a getter
+/// shrank) through `__proto_elem`; a throwing getter returns `dst`.
+fn emit_concat_by_index(
+    function: &mut Function,
+    (dst, src, slen, elem, k): (u32, u32, u32, u32, u32),
+    array_push: u32,
+    sparse_get: u32,
+    proto_elem: u32,
+) {
     // By index: for (; k < slen; k++) __array_push(dst, Get(src, k)).
     function.instruction(&Instruction::Block(BlockType::Empty));
     function.instruction(&Instruction::Loop(BlockType::Empty));
@@ -904,12 +927,13 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32, proto_elem:
     function.instruction(&Instruction::LocalSet(elem));
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::If(BlockType::Empty));
-    ret_dst(&mut function);
+    function.instruction(&Instruction::LocalGet(dst));
+    function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalGet(dst));
-    emit_elem_read(&mut function, elem);
-    function.instruction(&Instruction::Call(reserve_index + 1));
+    emit_elem_read(function, elem);
+    function.instruction(&Instruction::Call(array_push));
     function.instruction(&Instruction::Drop);
     function.instruction(&Instruction::LocalGet(k));
     function.instruction(&Instruction::I32Const(1));
@@ -918,9 +942,6 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32, proto_elem:
     function.instruction(&Instruction::Br(0));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
-    function
 }
 
 /// A one-byte store [`MemArg`] (`offset 0`, `align 0`) for the JSON string builder.
