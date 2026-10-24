@@ -555,6 +555,11 @@ aliases, captured bindings, and member receivers all observe `push`.
   `reverse`, the `sort` write-back) sees inherited setters and read-only
   indices. The in-place appends of `push` (its guarded fast path and the
   builtin's array branch) run only while no prototype can hold an index.
+  `CreateDataPropertyOrThrow` never consults the chain: the result arrays of
+  `map`, `filter`, `concat`, `slice`, `splice`, `flat`, `flatMap`,
+  `Array.of` / `from` and the change-by-copy methods, and `defineProperty` of
+  a default-attribute element, store through `__array_define` /
+  `__sparse_define` (the same element paths without `__proto_set`).
 - **Growth.** `__array_reserve(base, need)` (behind `push` and every bulk
   append) grows the store to `max(need, 4, 2·cap)` slots and copies the `len`
   live ones. A store
@@ -794,7 +799,7 @@ function-index order:
 | allocation, strings | `__alloc`, `__concat`, `__str_eq`, `__str_cmp`, `__str_index` |
 | interning (§5.3) | `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`, `__index_value`, `__index_string`, `__to_key` |
 | property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__rest(src, excl)` |
-| arrays (§5.4) | `__array_reserve(base, need)`, `__array_push(base, v)`, `__array_concat(dst, src)`, `__array_set(recv, key, v)`, `__array_set_length(arr, v)`, `__sparse_get(arr, i)`, `__sparse_set(arr, i, v)`, `__protos_indexless(o)`, `__proto_elem(o, i)`, `__proto_set(o, i, v)` |
+| arrays (§5.4) | `__array_reserve(base, need)`, `__array_push(base, v)`, `__array_concat(dst, src)`, `__array_set(recv, key, v)`, `__array_set_length(arr, v)`, `__sparse_get(arr, i)`, `__sparse_set(arr, i, v)`, `__protos_indexless(o)`, `__proto_elem(o, i)`, `__proto_set(o, i, v)`, `__array_define(recv, key, v)`, `__sparse_define(arr, i, v)` |
 | JSON (stringify) | `__json_escape(str)`, `__json_str(v)` — the primitive serializer: finite numbers via `__convert` ToString, `NaN`/`±Infinity`/`undefined` as `null`, keywords, escaped strings, any heap kind `null` |
 | Map/Set, equality | `__same_value_zero`, `__map_find`, `__map_set`, `__map_get`, `__map_has`, `__map_delete`, `__loose_eq`, `__str_to_array` |
 | JSON (parse) | `__json_ws`, `__json_throw`, `__json_string`, `__json_number`, `__json_value`, `__json_array`, `__json_object`, `__json_parse` |

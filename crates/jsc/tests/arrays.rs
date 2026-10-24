@@ -1127,3 +1127,71 @@ const WRITE_CASES: &[(&str, &str)] = &[
         "5|true|1",
     ),
 ];
+
+/// The algorithms that build a result by `CreateDataPropertyOrThrow` (and
+/// `defineProperty` of a default element) define own elements without
+/// consulting the prototype chain: an inherited `Array.prototype` index setter
+/// is never called by `map`, `filter`, `concat`, `slice`, `Array.of`,
+/// `Array.from`, `splice`'s removed array, `flat`, `flatMap`, `toReversed`,
+/// `with`, while a plain store to an own element skips it too and a store
+/// past the length calls it.
+#[test]
+fn result_arrays_define_without_the_prototype_chain() {
+    let setter = "var n=0; Object.defineProperty(Array.prototype, \"0\", {set: function () { n++ }, configurable: true}); ";
+    let cases: &[(&str, &str)] = &[
+        (
+            "var r = [5].map(function (v) { return v }); n + \"|\" + r.hasOwnProperty(0) + \"|\" + r[0]",
+            "0|true|5",
+        ),
+        (
+            "var r = [5].filter(function () { return true }); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].concat([6]); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5, 6].slice(0); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = Array.of(5); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = Array.from([5]); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var a = [5, 6]; var r = a.splice(0, 1); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [[5]].flat(); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].flatMap(function (v) { return [v] }); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].toReversed(); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].with(0, 6); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5, 6]; Object.defineProperty(r, \"0\", {value: 7}); n + \"|\" + r[0]",
+            "0|7",
+        ),
+        ("var r = [5]; r[0] = 6; n + \"|\" + r[0]", "0|6"),
+        ("var r = []; r[0] = 6; n + \"|\" + r.length", "1|0"),
+    ];
+    for (src, want) in cases {
+        let src = format!("{setter}{src}");
+        assert_eq!(jsc(&["-p", &src]), *want, "{src}");
+    }
+}

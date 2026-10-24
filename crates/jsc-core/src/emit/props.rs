@@ -1220,7 +1220,21 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
 /// `max(4, 2 * cap, i + 1)`, the gap `len..i` filled with holes, `len = i + 1`);
 /// a larger gap makes the array `SPARSE`, and every element store on a
 /// `SPARSE` array is `__sparse_set`. A throw leaves the exception pending.
-pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+///
+/// With `define` this is `__array_define(recv, key, v)`, the array arm of
+/// `CreateDataPropertyOrThrow` (result arrays, `defineProperty` of a default
+/// element): the prototype chain is never consulted, a `SPARSE` array stores
+/// through `__sparse_define`, and a named key is an own `__define`.
+pub(super) fn emit_array_set(
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+    define: bool,
+) -> Function {
+    let sparse_store = if define {
+        helpers.sparse_define()
+    } else {
+        helpers.sparse_set()
+    };
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::F64)]);
     let (recv, key, v) = (0, 1, 2);
     let (o, i, k, len, a, d) = (3, 4, 5, 6, 7, 8);
@@ -1245,14 +1259,21 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
         If(BlockType::Empty),
         LocalGet(o), LocalGet(v), Call(helpers.array_set_length()), Return,
         End,
-        LocalGet(recv), LocalGet(k), LocalGet(v), Call(helpers.set), Return,
-        End,
     );
+    if define {
+        wasm!(f;
+            LocalGet(o), LocalGet(k), LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
+            Return,
+        );
+    } else {
+        wasm!(f; LocalGet(recv), LocalGet(k), LocalGet(v), Call(helpers.set), Return);
+    }
+    wasm!(f; End);
     // Element `i`: a SPARSE array stores through `__sparse_set`.
     emit_is_sparse(&mut f, o);
     wasm!(f;
         If(BlockType::Empty),
-        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.sparse_set()), Return,
+        LocalGet(o), LocalGet(i), LocalGet(v), Call(sparse_store), Return,
         End,
         // An own element in range -> store.
         LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalTee(len), I32LtU,
@@ -1265,10 +1286,16 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
         LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)), Return,
         End,
         End,
+    );
+    if !define {
         // A hole or past the length: an inherited setter or read-only index
         // consumes the write, else the own element is created.
-        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.proto_set()),
-        If(BlockType::Empty), Return, End,
+        wasm!(f;
+            LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.proto_set()),
+            If(BlockType::Empty), Return, End,
+        );
+    }
+    wasm!(f;
         LocalGet(i), LocalGet(len), I32LtU,
         If(BlockType::Empty),
     );
@@ -1283,7 +1310,7 @@ pub(super) fn emit_array_set(strings: &HashMap<String, i32>, helpers: Helpers<'_
     // Too far: the array turns SPARSE and stores the element there.
     emit_sparsify(&mut f, o, k, a);
     wasm!(f;
-        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.sparse_set()), Return,
+        LocalGet(o), LocalGet(i), LocalGet(v), Call(sparse_store), Return,
         End,
         LocalGet(o), LocalGet(i), I32Const(1), I32Add, Call(helpers.array_reserve()),
         // Fill len..i with holes, then store element i.
@@ -1408,7 +1435,11 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>) -> Function {
 /// leaves it, since `i + 1` does not fit). Growing an array whose `length`
 /// is read-only throws `Cannot add property i, object is not extensible`. A
 /// throw leaves the exception pending and changes nothing.
-pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
+///
+/// With `define` this is `__sparse_define(o, i, v)`, the `SPARSE` arm of
+/// `__array_define`: no prototype check, and a table element is an own
+/// `__define` of the default attributes.
+pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool) -> Function {
     let mut f = Function::new(vec![(2, ValType::I32)]);
     let (o, i, v, a, k) = (0, 1, 2, 3, 4);
     wasm!(f;
@@ -1419,16 +1450,18 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
         End,
         If(BlockType::Empty),
     );
-    // A store slot holding a hole is not own: the prototype chain may
-    // consume the write.
-    emit_elem_addr(&mut f, o, i);
-    wasm!(f;
-        I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Eq,
-        If(BlockType::Empty),
-        LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.proto_set()),
-        If(BlockType::Empty), Return, End,
-        End,
-    );
+    if !define {
+        // A store slot holding a hole is not own: the prototype chain may
+        // consume the write.
+        emit_elem_addr(&mut f, o, i);
+        wasm!(f;
+            I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Eq,
+            If(BlockType::Empty),
+            LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.proto_set()),
+            If(BlockType::Empty), Return, End,
+            End,
+        );
+    }
     emit_elem_addr(&mut f, o, i);
     wasm!(f;
         LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)),
@@ -1446,11 +1479,15 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         I32Const(PROP_THROW_NOT_EXTENSIBLE), Call(helpers.prop_throw), Return,
         End,
-        LocalGet(o),
     );
-    emit_box_heap(&mut f);
+    if define {
+        wasm!(f; LocalGet(o), LocalGet(k), LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define));
+    } else {
+        wasm!(f; LocalGet(o));
+        emit_box_heap(&mut f);
+        wasm!(f; LocalGet(k), LocalGet(v), Call(helpers.set));
+    }
     wasm!(f;
-        LocalGet(k), LocalGet(v), Call(helpers.set),
         GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         End,
         LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,

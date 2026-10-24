@@ -1198,6 +1198,19 @@ impl Helpers<'_> {
     fn proto_set(self) -> u32 {
         self.array_concat + 7
     }
+
+    /// `__array_define(recv, key, v)`: `__array_set` without the prototype
+    /// chain, for `CreateDataPropertyOrThrow` (see [`props::emit_array_set`]).
+    /// It is the helper right after `__proto_set`.
+    fn array_define(self) -> u32 {
+        self.array_concat + 8
+    }
+
+    /// `__sparse_define(o, i, v)`: the `SPARSE` arm of `__array_define` (see
+    /// [`props::emit_sparse_set`]), right after `__array_define`.
+    fn sparse_define(self) -> u32 {
+        self.array_concat + 9
+    }
 }
 
 /// The address of the static function block of top-level declaration
@@ -1522,20 +1535,22 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_array_reserve(helpers.alloc));
     code.function(&emit_array_push(
         helpers.array_reserve(),
-        helpers.sparse_set(),
+        helpers.sparse_define(),
     ));
     code.function(&emit_array_concat(
         helpers.array_reserve(),
         helpers.sparse_get(),
         helpers.proto_elem(),
     ));
-    code.function(&emit_array_set(&offsets, helpers));
+    code.function(&emit_array_set(&offsets, helpers, false));
     code.function(&emit_array_set_length(&offsets, helpers));
     code.function(&emit_sparse_get(helpers));
-    code.function(&emit_sparse_set(helpers));
+    code.function(&emit_sparse_set(helpers, false));
     code.function(&emit_protos_indexless());
     code.function(&emit_proto_elem(helpers));
     code.function(&emit_proto_set(helpers));
+    code.function(&emit_array_set(&offsets, helpers, true));
+    code.function(&emit_sparse_set(helpers, true));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.convert,

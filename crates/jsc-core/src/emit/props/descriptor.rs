@@ -298,7 +298,7 @@ pub(in crate::emit) fn emit_define_own(
     wasm!(f; LocalGet(key));
     emit_box_heap(&mut f);
     wasm!(f;
-        LocalGet(value), Call(helpers.array_set()),
+        LocalGet(value), Call(helpers.array_define()),
         End,
         I32Const(DEFINE_OK), Return,
         End,

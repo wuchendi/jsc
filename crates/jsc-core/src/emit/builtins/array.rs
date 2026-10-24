@@ -1227,14 +1227,11 @@ fn create_data_property(
 ) {
     let (k, entry) = (frame.y32(2), frame.y32(3));
     is_array(function, a);
-    wasm!(function; If(BlockType::Empty));
-    emit_drop(
-        function,
-        frame,
-        &set(a, IrNode::Local(key), v),
-        strings,
-        helpers,
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(a), LocalGet(key), LocalGet(v), Call(helpers.array_define()),
     );
+    return_if_pending(function);
     wasm!(function;
         Else,
         LocalGet(key), I32Const(1), Call(helpers.to_key), LocalSet(k),
