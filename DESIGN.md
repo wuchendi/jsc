@@ -1764,25 +1764,40 @@ Each item below is current behaviour of this tree.
   `ToLength` range.
 - An array element hole does not read through the prototype chain
   (`Array.prototype[1] = 1; [0, , 2][1]` is `undefined`), and an object whose
-  prototype is an array does not inherit its elements; about 55
-  built-ins/Array test262 tests (`*-7-c-i-8`, `S15.4.4.*_A4_T*`,
-  `holes-not-preserved`, `reduce` / `reduceRight` `10-*` / `9-c-ii-*`) wait on
-  this property-lookup change.
+  prototype is an array does not inherit its elements (nor does an element
+  write reach an `Array.prototype` index accessor); 107 built-ins/Array
+  test262 tests (`*-7-c-i-8`, `S15.4.4.*_A4_T*`, `holes-not-preserved`,
+  `reduce` / `reduceRight` `10-*` / `9-c-ii-*`, `set-length-array-is-frozen`,
+  `sort/precise-prototype-*`) wait on this property-lookup change.
 - `Array.prototype`, `String.prototype` and `Number.prototype` are ordinary
   objects, not an array / `String` / `Number` exotic object:
   `Array.isArray(Array.prototype)` is `false`, `Array.prototype.length` is
   `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
   `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
-- The remaining built-ins/Array test262 failures (after phase 3 F-T5) belong to
-  other workstreams: `Object.defineProperty` / `freeze` /
-  `getOwnPropertyDescriptor` / `getPrototypeOf` / `isPrototypeOf` (~630,
-  property descriptors), async test bodies (78, compile errors), `RegExp`
-  (26), `Symbol` / `@@toStringTag` (so `Math` / `JSON` array-like receivers
-  tag as `[object Object]`) / iterator methods `keys` / `values` / `entries`
-  (~23), `eval` (6), `Proxy` (4), `void` (5), and
-  `Object.prototype.toLocaleString`, which `Array.prototype.toLocaleString`
-  needs for a non-number element (2: a string, boolean or plain-object element
-  throws `TypeError: ... element toLocaleString is not a function`).
+- The remaining test262 failures of the phase-3 built-in families (after the
+  L2-F T6 merge with L2-O and L2-L: 636 of built-ins/{Array 279, String 207,
+  Function 135, Math 10, Number 5}; NativeErrors and AggregateError have
+  none), by cause and owner:
+
+  | cause | owner | Array | String | Function | Math | Number |
+  |---|---|---|---|---|---|---|
+  | `RegExp` | never in phase 3 | 26 | 95 | 3 | | |
+  | `Function` constructor | never in phase 3 | | 3 | 115 | | |
+  | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 16 | 12 | 3 | 1 | |
+  | element lookup through the prototype chain (above) | object model | 107 | | | | |
+  | builtin prototypes are not exotic (above) | object model | 4 | 3 | | | 4 |
+  | `asyncTest` used by a test without the `async` flag | L2-R (runner) | 67 | | | | |
+  | `nativeFunctionMatcher.js` harness | L2-R (runner) | | | 1 | | |
+  | `void` | L2-L | 5 | 36 | 7 | | 1 |
+  | top-level `var` used before its declaration or declared in a block (`ReferenceError`) | L2-L | 4 | 17 | 1 | 1 | |
+  | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
+  | `Symbol` / `@@toStringTag` (`Math` / `JSON` receivers tag as `[object Object]`) | D3 | 24 | 7 | 1 | | |
+  | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
+  | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | D3 | | 29 | | | |
+  | a top-level `var` / function is not a global-object property | realm | 2 | 1 | | | |
+  | a sparse write at index `2^32 - 2` allocates densely (`RangeError: out of memory`) | L2-O | 1 | | | | |
+  | `new Function.prototype.call` / `apply` does not throw `TypeError` | L2-F | | | 2 | | |
+  | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16
   code-unit order only between astral characters and `U+E000`..`U+FFFF`.
