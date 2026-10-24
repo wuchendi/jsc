@@ -732,8 +732,8 @@ fn emit_from_entries(
         LocalGet(list),
     );
     emit_array_elems(function);
-    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), LocalSet(item));
-    emit_elem_read(function, item);
+    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)));
+    emit_elem_get(function, item, list, i, helpers);
     wasm!(function; LocalSet(item));
     emit_is_object(function, item);
     wasm!(function; I32Eqz, If(BlockType::Empty));

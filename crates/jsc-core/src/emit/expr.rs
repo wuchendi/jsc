@@ -972,9 +972,17 @@ pub(super) fn emit_proto_kind_test(
             function.instruction(&Instruction::I32Or);
         }
     }
+    // An array fast path reads a hole as absent, which holds while neither
+    // `%Array.prototype%` nor `%Object.prototype%` has changed (DESIGN.md
+    // §6.4).
     let bits = cases
         .iter()
-        .filter_map(|(_, prototype)| prototype.watch_bit())
+        .flat_map(|&(type_byte, prototype)| {
+            let object = (type_byte == TYPE_ARRAY).then_some(Intrinsic::ObjectPrototype);
+            [Some(prototype), object]
+        })
+        .flatten()
+        .filter_map(Intrinsic::watch_bit)
         .fold(0, |bits, bit| bits | (1 << bit));
     if !sealed && bits != 0 {
         function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
