@@ -1824,7 +1824,7 @@ fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Help
 /// string key goes straight to `__get` with its interned key constant
 /// (`__get` resolves a string's or array's `length`/index keys itself, and a
 /// primitive receiver's inherited ones through its prototype). A computed in-range integer key on an array loads the element (a hole
-/// reads `undefined`); a computed `"length"` or canonical numeric index on a
+/// falls through to `__get`, which reads it through the prototype chain); a computed `"length"` or canonical numeric index on a
 /// string reads it inline. Any other computed read converts the key with
 /// `ToPropertyKey` (a lookup, so a never-interned key reads `undefined`) and
 /// calls `__get` (which routes an array's canonical index strings to its
@@ -1957,8 +1957,9 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
     // ARRAY: an in-range integer key loads the i64 element jsval at
-    // elems + 8 + 8*i (`__sparse_get` on a SPARSE array; stashed in `s1`, the
-    // key being dead) and reads a hole as `undefined`.
+    // elems + 8 + 8*i (`__sparse_get` on a SPARSE array) into `scratch`; a
+    // hole is not own, so it falls through to the `__get` that reads it
+    // through the prototype chain.
     emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
     function.instruction(&Instruction::If(BlockType::Empty));
     emit_sparse_test(function, s0);
@@ -1981,9 +1982,13 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::End);
-    function.instruction(&Instruction::LocalSet(s1));
-    emit_elem_read(function, s1);
-    function.instruction(&Instruction::Br(3));
+    function.instruction(&Instruction::LocalTee(scratch));
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::Br(4));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     emit_load_type_byte(function, s0);
