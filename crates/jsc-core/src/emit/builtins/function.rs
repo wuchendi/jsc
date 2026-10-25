@@ -187,7 +187,7 @@ pub(super) fn emit_call(
 
 /// `Function.prototype.apply(thisArg, argList)`: call `this` with `thisArg`
 /// and `CreateListFromArrayLike(argList)` (no arguments for `undefined` /
-/// `null`): an array's elements (holes read `undefined`), else
+/// `null`): an array's elements (a hole read through the prototype chain), else
 /// `ToLength(argList.length)` indexed reads; a non-object throws.
 pub(super) fn emit_apply(
     function: &mut Function,
@@ -224,6 +224,9 @@ pub(super) fn emit_apply(
         I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         I32Const(0), Call(helpers.new_array()), LocalGet(src), Call(helpers.array_concat), LocalSet(dst),
+    );
+    return_if_pending(function);
+    wasm!(function;
         Else,
         LocalGet(list), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get),
     );

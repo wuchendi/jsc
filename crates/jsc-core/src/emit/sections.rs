@@ -99,11 +99,12 @@ pub(super) fn build_type_and_function_sections<'a>(
             index();
             index()
         },
-        // `__array_set`, `__array_set_length`, `__sparse_get`, and
-        // `__sparse_set` take the indices right after `__array_concat`.
+        // `__array_set`, `__array_set_length`, `__sparse_get`,
+        // `__sparse_set`, `__protos_indexless`, and `__proto_elem` take the
+        // indices right after `__array_concat`.
         array_concat: {
             let array_concat = index();
-            for _ in 0..4 {
+            for _ in 0..6 {
                 index();
             }
             array_concat
@@ -229,8 +230,8 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
-    // i64) -> i32`.
-    let conversions: [(&[ValType], &[ValType]); 16] = [
+    // i64) -> i32`; then the exported `__promise_self_error() -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 17] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -267,6 +268,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I32, ValType::I64], &[ValType::I32]),
+        (&[], &[ValType::I64]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
@@ -346,6 +348,10 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32, I32], &[I64]),
         // `__sparse_set(arr, i, v)`.
         (&[I32, I32, I64], &[]),
+        // `__protos_indexless(o) -> i32`.
+        (&[I32], &[I32]),
+        // `__proto_elem(o, i) -> v`.
+        (&[I32, I32], &[I64]),
         // `__json_escape(str) -> str` and `__json_str(v) -> str`.
         (&[I32], &[I32]),
         (&[I64], &[I32]),
@@ -1175,6 +1181,13 @@ pub(super) fn collect_node<'a>(
             seed_strs_ref(&[&global.name], order, seen);
             if !typeof_operand {
                 seed_strs_ref(&[&global.message, &global.stack], order, seen);
+            }
+        }
+        IrNode::GlobalDeclare { name, value } => {
+            seed_strs_ref(&[name], order, seen);
+            if let Some(value) = value {
+                seed_prop_strs(order, seen);
+                collect_node(value, order, seen);
             }
         }
         IrNode::GlobalSet { global, value } => {

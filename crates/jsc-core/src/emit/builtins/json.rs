@@ -110,14 +110,22 @@ fn unwrap_primitive(function: &mut Function, local: u32) {
 }
 
 /// Push array element `i` (i32 local) of the array handle in i32 local `arr`
-/// as JS reads it: `undefined` at or past the current length or for a hole.
+/// as `Get` reads it: an element at or past the current length or a hole
+/// reads through the prototype chain (`undefined` when absent; a throwing
+/// getter returns).
 fn elem_or_undefined(function: &mut Function, arr: u32, i: u32, out: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(i), LocalGet(arr), I32Load(ARR_LEN), I32LtU,
         If(BlockType::Result(ValType::I64)),
     );
     emit_elem_load(function, arr, i, helpers.sparse_get());
-    wasm!(function; Else, I64Const(UNDEFINED_BITS), End, LocalSet(out));
+    wasm!(function;
+        Else, I64Const(HOLE_BITS), End, LocalTee(out), I64Const(HOLE_BITS), I64Eq,
+        If(BlockType::Empty),
+        LocalGet(arr), LocalGet(i), Call(helpers.proto_elem()), LocalSet(out),
+    );
+    return_if_pending(function);
+    wasm!(function; End);
     emit_elem_read(function, out);
 }
 

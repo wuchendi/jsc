@@ -159,6 +159,11 @@ export const NEW_STRING_EXPORT_NAME = '__new_string'
 export const NEW_ARRAY_EXPORT_NAME = '__new_array'
 /** Export name of the `__new_promise() -> base` guest pending-promise constructor. */
 export const NEW_PROMISE_EXPORT_NAME = '__new_promise'
+/**
+ * Export name of the `__promise_self_error() -> jsval` guest constructor of the
+ * `TypeError` a promise resolved with itself is rejected with.
+ */
+export const PROMISE_SELF_ERROR_EXPORT_NAME = '__promise_self_error'
 /** Export name of the pending-exception flag global (`i32`). */
 export const EXC_PENDING_EXPORT_NAME = '__exc_pending'
 /** Export name of the in-flight exception value global (`i64`). */

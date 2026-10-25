@@ -113,6 +113,7 @@ const ALLOC_EXPORT_NAME: &str = abi::ALLOC_EXPORT_NAME;
 const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
 const NEW_ARRAY_EXPORT_NAME: &str = abi::NEW_ARRAY_EXPORT_NAME;
 const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
+const PROMISE_SELF_ERROR_EXPORT_NAME: &str = abi::PROMISE_SELF_ERROR_EXPORT_NAME;
 
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
@@ -1115,6 +1116,12 @@ impl Helpers<'_> {
         self.to_primitive() + 15
     }
 
+    /// `__promise_self_error() -> i64` (see [`builtins::emit_promise_self_error`]),
+    /// exported under [`PROMISE_SELF_ERROR_EXPORT_NAME`].
+    fn promise_self_error(self) -> u32 {
+        self.to_primitive() + 16
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1162,6 +1169,21 @@ impl Helpers<'_> {
     /// helper right after `__sparse_get`.
     fn sparse_set(self) -> u32 {
         self.array_concat + 4
+    }
+
+    /// `__protos_indexless(o) -> i32`: whether no prototype of `o` can hold an
+    /// integer-index property (see [`props::emit_protos_indexless`]). It is
+    /// the helper right after `__sparse_set`.
+    fn protos_indexless(self) -> u32 {
+        self.array_concat + 5
+    }
+
+    /// `__proto_elem(o, i) -> i64`: element `i` that `o` does not own, read
+    /// through its prototype chain ([`HOLE_BITS`] when absent; see
+    /// [`props::emit_proto_elem`]). It is the helper right after
+    /// `__protos_indexless`.
+    fn proto_elem(self) -> u32 {
+        self.array_concat + 6
     }
 }
 
@@ -1419,6 +1441,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         ExportKind::Func,
         helpers.new_string + 2,
     );
+    // The self-resolution `TypeError` the hosts reject `resolve(p)`-with-`p` with.
+    exports.export(
+        PROMISE_SELF_ERROR_EXPORT_NAME,
+        ExportKind::Func,
+        helpers.promise_self_error(),
+    );
     module.section(&exports);
 
     // Element section: an active segment filling the funcref table at offset
@@ -1486,11 +1514,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_array_concat(
         helpers.array_reserve(),
         helpers.sparse_get(),
+        helpers.proto_elem(),
     ));
     code.function(&emit_array_set(&offsets, helpers));
     code.function(&emit_array_set_length(&offsets, helpers));
     code.function(&emit_sparse_get(helpers));
     code.function(&emit_sparse_set(helpers));
+    code.function(&emit_protos_indexless());
+    code.function(&emit_proto_elem(helpers));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.convert,
@@ -1561,6 +1592,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_test_integrity());
     code.function(&emit_own_enum(&offsets, helpers));
     code.function(&emit_set_proto(helpers));
+    code.function(&builtins::emit_promise_self_error(&offsets, helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

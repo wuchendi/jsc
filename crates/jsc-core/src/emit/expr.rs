@@ -126,6 +126,9 @@ pub(super) fn emit_node(
         IrNode::GlobalSet { global, value } => {
             emit_global_set(global, value, function, scratch, strings, helpers);
         }
+        IrNode::GlobalDeclare { name, value } => {
+            emit_global_declare(name, value.as_deref(), function, scratch, strings, helpers);
+        }
         IrNode::DeclFunc(table_index) => {
             let base = decl_func_base(*table_index, helpers);
             function.instruction(&Instruction::I64Const(
@@ -969,9 +972,17 @@ pub(super) fn emit_proto_kind_test(
             function.instruction(&Instruction::I32Or);
         }
     }
+    // An array fast path reads a hole as absent, which holds while neither
+    // `%Array.prototype%` nor `%Object.prototype%` has changed (DESIGN.md
+    // §6.4).
     let bits = cases
         .iter()
-        .filter_map(|(_, prototype)| prototype.watch_bit())
+        .flat_map(|&(type_byte, prototype)| {
+            let object = (type_byte == TYPE_ARRAY).then_some(Intrinsic::ObjectPrototype);
+            [Some(prototype), object]
+        })
+        .flatten()
+        .filter_map(Intrinsic::watch_bit)
         .fold(0, |bits, bit| bits | (1 << bit));
     if !sealed && bits != 0 {
         function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
@@ -2228,6 +2239,48 @@ fn emit_global_set(
     function.instruction(&Instruction::Call(helpers.set));
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::LocalGet(scratch));
+}
+
+/// Emit a [`IrNode::GlobalDeclare`]: `__define` the global-object property
+/// `name` as writable, enumerable and non-configurable — a function
+/// declaration's unconditionally (a rejected redefinition propagates), a
+/// `var`'s with `undefined` only when it is not already an own property;
+/// yields `undefined`.
+fn emit_global_declare(
+    name: &str,
+    value: Option<&IrNode>,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let global = intrinsic_bits(Intrinsic::Global, helpers);
+    let key = static_key(strings, name);
+    let attrs = (abi::ATTR_WRITABLE | abi::ATTR_ENUMERABLE).cast_signed();
+    let define = |function: &mut Function| {
+        function.instruction(&Instruction::I64Const(global));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Const(key));
+    };
+    if let Some(value) = value {
+        define(function);
+        emit_node(value, function, scratch, strings, helpers);
+        function.instruction(&Instruction::I32Const(attrs));
+        function.instruction(&Instruction::Call(helpers.define));
+        emit_propagate_if_pending(function, helpers);
+    } else {
+        function.instruction(&Instruction::I32Const(key));
+        function.instruction(&Instruction::I64Const(global));
+        function.instruction(&Instruction::Call(helpers.has_own()));
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        define(function);
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        function.instruction(&Instruction::I32Const(attrs));
+        function.instruction(&Instruction::Call(helpers.define));
+        function.instruction(&Instruction::End);
+    }
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
 /// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in

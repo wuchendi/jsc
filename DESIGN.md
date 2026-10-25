@@ -322,7 +322,8 @@ the table, including one without user functions.
 `__invoke1(fn: i64, arg: i64) -> i64`, `__async_step(gen: i64, sent: i64) -> i64`,
 and the allocator and guest constructors `__alloc(size: i32) -> i32`,
 `__new_string(len: i32) -> i32`, `__new_array(len: i32) -> i32`,
-`__new_promise() -> i32` (§6.8).
+`__new_promise() -> i32` (§6.8), and `__promise_self_error() -> i64` (the
+self-resolution `TypeError`, §6.7; the last defined function).
 
 **Static region (data segments).** Everything below the initial heap pointer is
 laid out by the compiler, in this order:
@@ -529,16 +530,27 @@ aliases, captured bindings, and member receivers all observe `push`.
   `elems + ELEMS_DATA_OFFSET + 8·i` (`ELEMS_DATA_OFFSET = 8`); slots past
   `len` are unused.
 - **Holes.** A hole slot holds `HOLE`. Literal elisions, `delete a[i]`, gaps
-  left by growth, and truncation produce holes. Reads map a hole to
-  `undefined`; `in`, `hasOwnProperty`, own-key enumeration, and the array
-  builtins' callbacks skip it; the renderers print `<N empty items>`.
+  left by growth, and truncation produce holes. A hole is not an own
+  property: `hasOwnProperty` and own-key enumeration skip it and the
+  renderers print `<N empty items>`, while `[[Get]]` and `HasProperty` (and
+  so `in`, member reads, spread, destructuring, `for-of`, `JSON.stringify`,
+  and every `Array.prototype` method) continue along the prototype chain
+  exactly as for an index at or past `length`. Every element read that meets
+  a hole calls `__proto_elem(o, i)`: `HOLE` at once when
+  `__protos_indexless(o)` (no prototype is an array or has a table flagged
+  `HAS_INDEX_KEYS`), else `HasProperty` then `Get` of the index key with
+  `this = o`. A dense read pays nothing; a hole read pays one call.
 - **Growth.** `__array_reserve(base, need)` (behind `push` and every bulk
   append) grows the store to `max(need, 4, 2·cap)` slots and copies the `len`
   live ones. A store
-  `a[i] = v` with `i ≥ len` stays dense while `i < max(2·cap, len + 1024)`
-  (store capacity `max(4, 2·cap, i + 1)`, gap filled with holes,
-  `len = i + 1`).
-- **Sparse arrays.** A larger gap sets `SPARSE` (never cleared): the store is
+  `a[i] = v` with `i ≥ len` stays dense while `i < len + 1024` (`DENSE_GAP`;
+  store capacity `max(4, 2·cap, i + 1)`, gap filled with holes,
+  `len = i + 1`). The bound is a gap, not a multiple of the capacity: each
+  store adds at most 1023 hole slots, so stores that keep doubling the index
+  (`x[2^k - 2]`) go sparse instead of doubling the store until memory runs
+  out.
+- **Sparse arrays.** A larger gap (a store or a `length` growth to
+  `i ≥ len + 1024`) sets `SPARSE` (never cleared): the store is
   kept for indices `< cap`, and every element at or past `cap` is an
   array-index key in the handle's own property table. `length` may then exceed
   the store; every element operation on a sparse array goes through
@@ -778,6 +790,7 @@ function-index order:
 | conversions (§6.5) | `__to_primitive(v, hint)`, `__to_string(v)`, `__add(a, b)`, `__compare(a, b, op)`, `__array_join(recv, sep)`, `__to_object(v)` |
 | JSON (§7.9) | `__json_rep(holder, key, value, replacer, list, stack)` — `SerializeJSONProperty` (`toJSON`, replacer function with `this = holder`, property list, wrapper unwrapping, cycle `TypeError` via the `stack` array); `__json_indent(s, gap)` — re-indent compact text for `space`; `__json_revive(holder, key, reviver)` — `InternalizeJSONProperty` |
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
+| promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already
@@ -791,11 +804,12 @@ wrapper object (§5.2) and returns any object unchanged.
 `emit/props/descriptor.rs`) are the only code that reads or writes property
 tables. Keys are interned `u32`s.
 
-- **`__get(recv, key)`** — `OrdinaryGet`. A string or array resolves its exotic
-  own keys first (`length`, in-range indices; a hole reads `undefined`, a
-  sparse element comes from `__sparse_get`). An object-family block scans its
-  own table, then each `proto`; an accessor calls its getter with
-  `this = recv` (`undefined` without a getter). A string, number, or boolean
+- **`__get(recv, key)`** — `OrdinaryGet`. Each object on the chain (`recv`,
+  then each `proto`) answers from its exotic own keys first when it is a
+  string or an array (`length`, a present in-range index; a hole or an index
+  past `length` is not own and reads on through the chain), then from its own
+  table (a sparse element past the store is a table entry); an accessor
+  calls its getter with `this = recv` (`undefined` without a getter). A string, number, or boolean
   continues at its realm prototype without allocating a wrapper;
   `null`/`undefined` read `undefined` (member-access sites throw the nullish
   `TypeError` before calling it).
@@ -809,8 +823,8 @@ tables. Keys are interned `u32`s.
   throws). Member stores on a primitive throw (`Cannot create property 'k' on
   string 'abc'`); on `null`/`undefined` they throw `Cannot set properties of
   undefined (setting 'k')`.
-- **`__has(key, obj)`** — `HasProperty` (backs `in`): exotic own keys (a hole is
-  absent), the own table, then the `proto` chain. A primitive right-hand side
+- **`__has(key, obj)`** — `HasProperty` (backs `in`): at each object of the
+  chain its exotic own keys (a hole is not own), then its own table. A primitive right-hand side
   throws a `TypeError`. `__has_own` is the same without the chain
   (`hasOwnProperty`).
 - **`__delete(obj, key)`** — tombstones an own entry; a non-configurable
@@ -913,8 +927,28 @@ enumerable.
 **Global object.** Own properties: `globalThis`, `Infinity`, `NaN`,
 `undefined` (non-writable, non-enumerable, non-configurable), `Math`, `JSON`,
 `console`, every constructor above, `isNaN`, `isFinite`. Top-level `this` is
-the global object. Top-level declarations are module cells (§7.1), not
-global-object properties.
+the global object.
+
+**Global declarations.** Top-level `var`s and function declarations are
+global-object properties. A program that never observes the global object —
+no `globalThis` in any form and no top-level `this` — cannot tell, so they
+stay `main` bindings and module cells (§7.1) at no cost. Otherwise
+(also when a top-level `var` and function share a name) `main`'s prologue
+runs GlobalDeclarationInstantiation before any statement
+(`IrNode::GlobalDeclare`): each function declaration defines
+`{value: f, writable, enumerable, non-configurable}` (CreateGlobalFunctionBinding;
+a non-configurable existing property such as `NaN` throws
+`TypeError: Cannot redefine property: NaN`), then each `var` not already an
+own property defines `{undefined, writable, enumerable, non-configurable}`
+(CreateGlobalVarBinding). The property is then the only storage: a `var`
+is not a binding at all, so every reference — from `main` or any function
+— resolves to the global object like an unresolved name (`GlobalGet` /
+`GlobalSet`), and `var q = 1; globalThis.q = 2; q` is `2`. These names count
+as assigned for `sealed` (so `var parseInt = ..` takes the generic global
+path). A function declaration keeps its static identity (direct `call`,
+static function object) while its name is `sealed`; once the global object
+is open or the name is assigned (`f = ..`), reads and calls go through the
+property. Top-level `let` / `const` / `class` are never global properties.
 
 **Global name resolution.** Lexical scopes → top-level declarations (module
 cells) → the global object. A read of a `sealed` global compiles to the
@@ -955,11 +989,11 @@ path, never semantics:
 
 | site | fast path | taken when | otherwise |
 |---|---|---|---|
-| `f(..)` on a top-level declaration | direct `call` | always (declarations are not assignable) | — |
+| `f(..)` on a top-level declaration | direct `call` | declarations are `main` bindings (not assignable), or `sealed(f)` | an ordinary call of the global property |
 | `String/Number/Boolean/parseInt/parseFloat(..)`, `Error(..)` / `new Error(..)` (each native error) | inline conversion / Error instance (a spread `parseInt(...a)` / `parseFloat(...a)` converts the array's first elements) | `sealed(N)` (compile time, no run-time cost) | an ordinary call / construct of the global property (a `ReferenceError` once it is deleted) |
 | `N.m(..)` / `N.k` on an inline namespace | inline code (`MathCall`, `ConsoleLog`, JSON, `Object.keys`, ...) | always | — |
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
-| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear; `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
+| `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear (an array also needs `%Object.prototype%`'s, since its fast paths read a hole as absent); `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
@@ -1034,7 +1068,11 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
   builtins and top-level `await` call `__promise`; `then` and `catch` call
   `__then`, which returns the chained promise. Missing handlers pass the
   settlement through. Resolving with a promise adopts it; other thenables are
-  not assimilated (§13). `then`/`catch`/`finally` on a receiver that is not a
+  not assimilated (§13). Resolving a promise with itself — through an executor
+  `resolve`, a reaction returning its chained promise, or an `async` body
+  returning its own result — rejects it with a fresh `TypeError` ("Chaining
+  cycle detected for promise #<Promise>"), built by the exported
+  `__promise_self_error()` guest constructor; both hosts check it in `settle`. `then`/`catch`/`finally` on a receiver that is not a
   promise throw a `TypeError`. An awaited non-promise is treated as already
   fulfilled (`await 5` → `5`).
 - **Re-entry.** Reactions are guest closures; the engine runs them by calling the
@@ -1118,6 +1156,17 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 - **Declarations.** `let`, `const`, `var`, function declarations (hoisted, also
   nested ones), class declarations. An identifier that resolves to no
   declaration is a global-object lookup (§6.4).
+- **`var` hoisting.** A `var` belongs to its function's (or the script's) var
+  scope, wherever it appears: the names are collected up front and bound once
+  each, to `undefined`, on entry — before any statement, so a read before the
+  declaration yields `undefined`. A `var` statement is an assignment to that
+  binding (a declarator without an initializer does nothing), and a
+  `for (var ..)` / `for-in` / `for-of` `var` head assigns it each iteration
+  (closures share one binding, no per-iteration copy). Block-scoped `let` /
+  `const` still shadow it. Inside `catch (e)`, `var e = v` assigns the catch
+  parameter (Annex B); the function-level `e` exists and stays `undefined`.
+  Top-level `var`s are the script's var scope: `main` bindings (module cells
+  when a function references them), or global-object properties (§6.4).
 - **Block scoping.** Name resolution walks a compile-time scope stack: every
   `{}` block, loop body, `for` head, and `catch` clause pushes a frame. Each
   `let`/`const` gets a fresh wasm local; inner declarations shadow outer ones.
@@ -1222,8 +1271,12 @@ those of `switch` and loops are not tracked.
   This holds in every function form; a generator, async or async generator
   function binds them when called (§7.8). A duplicate parameter name is an
   early `SyntaxError` (all code is strict).
-- **`var` redeclaring a parameter.** A `var` naming a var-scoped binding of
-  the same function (a parameter, a `var`, a function declaration) reuses it:
+- **`var` scope.** Every `var` of a function body (in nested blocks, loop
+  heads, `try` / `catch` / `finally`, `switch` cases and labelled statements
+  too, not in nested functions) is hoisted (§7.1): one binding per name,
+  `undefined` on entry before any statement, in every function form (a
+  generator or async body binds it in its persistent frame). A `var` naming
+  a parameter or a top-level function declaration of the body reuses it:
   without an initializer it keeps its value, with one it assigns. With
   parameter expressions, a body `var` redeclaring a parameter is instead a
   separate binding created on entry from the parameter's value, so closures
@@ -1471,7 +1524,10 @@ error: cannot assign to constant binding: c
 
 The label is `<eval>` for `-e`/`-p` input and the file path otherwise
 (`jsc-wasm` uses `<source>`). Columns count characters; a multi-column span
-underlines its full width. A span-less error prints its bare message. Because
+underlines its full width. Rendering never panics: span offsets are clamped to
+the source and snapped outward to character boundaries (a span starting inside
+a multi-byte character points at that character), and a CRLF line is printed
+without its `\r`. A span-less error prints its bare message. Because
 `CompileError` implements `std::error::Error`, it travels through `anyhow` and
 is recovered with `downcast_ref`.
 
@@ -1683,8 +1739,6 @@ Each item below is current behaviour of this tree.
 **Input & semantics model**
 
 - TypeScript is type-stripped, never type-checked; `.tsx`/JSX is rejected.
-  `enum` and `namespace` strip to `var`-based code whose binding is not
-  resolved, so using one throws `ReferenceError` at run time.
 - A single script is compiled; there are no ES modules (`import`/`export`) and
   no `import()`.
 - Strict-mode semantics only: sloppy-mode constructs (`with`, implicit globals)
@@ -1693,12 +1747,9 @@ Each item below is current behaviour of this tree.
   block-scoped binding before its declaration inside the same function
   resolves to the enclosing binding (or the global object) instead of
   throwing.
-- A function-body `var` is not hoisted: it binds at its declaration, scoped
-  to its block (only a redeclaration of a var-scoped binding of the same
-  function reuses it, §7.4), and a `for-in`/`for-of` `var` head is a loop
-  binding.
-- Top-level `var` and function declarations are module cells, not properties
-  of the global object (`var v = 1; globalThis.v` is `undefined`).
+- A top-level function declaration is not assignable (`f = ..` is a compile
+  error) in a program whose top-level declarations stay `main` bindings
+  (§6.4).
 - An assignment to an unresolvable name evaluates its right-hand side before
   the `HasProperty` check throws the `ReferenceError`.
 - `-p` completion values come from expression statements and `try`
@@ -1762,41 +1813,37 @@ Each item below is current behaviour of this tree.
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the
   `RangeError` first); every other `Array.prototype` method uses the full
   `ToLength` range.
-- An array element hole does not read through the prototype chain
-  (`Array.prototype[1] = 1; [0, , 2][1]` is `undefined`), and an object whose
-  prototype is an array does not inherit its elements (nor does an element
-  write reach an `Array.prototype` index accessor); 107 built-ins/Array
-  test262 tests (`*-7-c-i-8`, `S15.4.4.*_A4_T*`, `holes-not-preserved`,
-  `reduce` / `reduceRight` `10-*` / `9-c-ii-*`, `set-length-array-is-frozen`,
-  `sort/precise-prototype-*`) wait on this property-lookup change.
+- An element write (`a[i] = v`, `push`, the mutating `Array.prototype`
+  methods) to an index the array does not own defines an own element without
+  consulting the prototype chain: an inherited index setter is not called and
+  an inherited read-only index does not reject the write (reads and
+  `HasProperty` do see inherited indices, §5.4).
 - `Array.prototype`, `String.prototype` and `Number.prototype` are ordinary
   objects, not an array / `String` / `Number` exotic object:
   `Array.isArray(Array.prototype)` is `false`, `Array.prototype.length` is
   `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
   `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
-- The remaining test262 failures of the phase-3 built-in families (after the
-  L2-F T6 merge with L2-O and L2-L: 636 of built-ins/{Array 279, String 207,
-  Function 135, Math 10, Number 5}; NativeErrors and AggregateError have
+- The remaining test262 failures of the phase-3 built-in families (after
+  element reads through the prototype chain, L2-V T3, and `var` hoisting /
+  global declarations, L2-V T1: 514 of built-ins/{Array 174, String 191,
+  Function 135, Math 9, Number 5}; NativeErrors and AggregateError have
   none), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number |
   |---|---|---|---|---|---|---|
   | `RegExp` | never in phase 3 | 26 | 95 | 3 | | |
-  | `Function` constructor | never in phase 3 | | 3 | 115 | | |
+  | `Function` constructor | never in phase 3 | | 3 | 117 | | |
   | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 16 | 12 | 3 | 1 | |
-  | element lookup through the prototype chain (above) | object model | 107 | | | | |
   | builtin prototypes are not exotic (above) | object model | 4 | 3 | | | 4 |
   | `asyncTest` used by a test without the `async` flag | L2-R (runner) | 67 | | | | |
   | `nativeFunctionMatcher.js` harness | L2-R (runner) | | | 1 | | |
   | `void` | L2-L | 5 | 36 | 7 | | 1 |
-  | top-level `var` used before its declaration or declared in a block (`ReferenceError`) | L2-L | 4 | 17 | 1 | 1 | |
   | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
   | `Symbol` / `@@toStringTag` (`Math` / `JSON` receivers tag as `[object Object]`) | D3 | 24 | 7 | 1 | | |
   | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
   | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | D3 | | 29 | | | |
-  | a top-level `var` / function is not a global-object property | realm | 2 | 1 | | | |
-  | a sparse write at index `2^32 - 2` allocates densely (`RangeError: out of memory`) | L2-O | 1 | | | | |
-  | `new Function.prototype.call` / `apply` does not throw `TypeError` | L2-F | | | 2 | | |
+  | an element write does not reach an inherited index setter (below) | object model | 3 | | | | |
+  | a higher-order builtin's callback receives at most `K` arguments (`arguments[3]` of a three-parameter `reduce` callback) | — | 4 | | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16
