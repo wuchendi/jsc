@@ -45,6 +45,7 @@ built-ins/Array/S15.4.5.2_A2_T1.js
 built-ins/Array/S15.4.5.2_A3_T1.js
 built-ins/Array/S15.4.5.2_A3_T2.js
 built-ins/Array/S15.4.5.2_A3_T3.js
+built-ins/Array/S15.4_A1.1_T10.js
 built-ins/Array/S15.4_A1.1_T4.js
 built-ins/Array/S15.4_A1.1_T5.js
 built-ins/Array/S15.4_A1.1_T6.js
@@ -7011,15 +7012,19 @@ built-ins/Promise/prototype/then/reject-settled-fulfilled.js
 built-ins/Promise/prototype/then/reject-settled-rejected.js
 built-ins/Promise/prototype/then/resolve-pending-fulfilled-non-obj.js
 built-ins/Promise/prototype/then/resolve-pending-fulfilled-non-thenable.js
+built-ins/Promise/prototype/then/resolve-pending-fulfilled-self.js
 built-ins/Promise/prototype/then/resolve-pending-fulfilled-thenable.js
 built-ins/Promise/prototype/then/resolve-pending-rejected-non-obj.js
 built-ins/Promise/prototype/then/resolve-pending-rejected-non-thenable.js
+built-ins/Promise/prototype/then/resolve-pending-rejected-self.js
 built-ins/Promise/prototype/then/resolve-pending-rejected-thenable.js
 built-ins/Promise/prototype/then/resolve-settled-fulfilled-non-obj.js
 built-ins/Promise/prototype/then/resolve-settled-fulfilled-non-thenable.js
+built-ins/Promise/prototype/then/resolve-settled-fulfilled-self.js
 built-ins/Promise/prototype/then/resolve-settled-fulfilled-thenable.js
 built-ins/Promise/prototype/then/resolve-settled-rejected-non-obj.js
 built-ins/Promise/prototype/then/resolve-settled-rejected-non-thenable.js
+built-ins/Promise/prototype/then/resolve-settled-rejected-self.js
 built-ins/Promise/prototype/then/resolve-settled-rejected-thenable.js
 built-ins/Promise/prototype/then/rxn-handler-fulfilled-invoke-strict.js
 built-ins/Promise/prototype/then/rxn-handler-fulfilled-next.js
@@ -7066,12 +7071,14 @@ built-ins/Promise/resolve-non-obj-deferred.js
 built-ins/Promise/resolve-non-obj-immed.js
 built-ins/Promise/resolve-non-thenable-deferred.js
 built-ins/Promise/resolve-non-thenable-immed.js
+built-ins/Promise/resolve-self.js
 built-ins/Promise/resolve-thenable-deferred.js
 built-ins/Promise/resolve-thenable-immed.js
 built-ins/Promise/resolve/S25.4.4.5_A1.1_T1.js
 built-ins/Promise/resolve/S25.4.4.5_A2.1_T1.js
 built-ins/Promise/resolve/S25.4.4.5_A2.2_T1.js
 built-ins/Promise/resolve/S25.4.4.5_A2.3_T1.js
+built-ins/Promise/resolve/S25.4.4.5_A4.1_T1.js
 built-ins/Promise/resolve/arg-non-thenable.js
 built-ins/Promise/resolve/length.js
 built-ins/Promise/resolve/name.js
@@ -14685,7 +14692,9 @@ language/identifiers/vals-rus-alpha-upper-via-escape-hex.js
 language/identifiers/vals-rus-alpha-upper-via-escape-hex4.js
 language/identifiers/vals-rus-alpha-upper.js
 language/identifiers/vertical-tilde-continue-escaped.js
+language/identifiers/vertical-tilde-continue.js
 language/identifiers/vertical-tilde-start-escaped.js
+language/identifiers/vertical-tilde-start.js
 language/keywords/ident-ref-break.js
 language/keywords/ident-ref-case.js
 language/keywords/ident-ref-catch.js
@@ -19352,3 +19361,4 @@ language/white-space/between-horizontal-tab.js
 language/white-space/between-nbsp.js
 language/white-space/between-space.js
 language/white-space/between-vertical-tab.js
+language/white-space/mongolian-vowel-separator.js

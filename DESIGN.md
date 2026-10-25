@@ -322,7 +322,8 @@ the table, including one without user functions.
 `__invoke1(fn: i64, arg: i64) -> i64`, `__async_step(gen: i64, sent: i64) -> i64`,
 and the allocator and guest constructors `__alloc(size: i32) -> i32`,
 `__new_string(len: i32) -> i32`, `__new_array(len: i32) -> i32`,
-`__new_promise() -> i32` (§6.8).
+`__new_promise() -> i32` (§6.8), and `__promise_self_error() -> i64` (the
+self-resolution `TypeError`, §6.7; the last defined function).
 
 **Static region (data segments).** Everything below the initial heap pointer is
 laid out by the compiler, in this order:
@@ -789,6 +790,7 @@ function-index order:
 | conversions (§6.5) | `__to_primitive(v, hint)`, `__to_string(v)`, `__add(a, b)`, `__compare(a, b, op)`, `__array_join(recv, sep)`, `__to_object(v)` |
 | JSON (§7.9) | `__json_rep(holder, key, value, replacer, list, stack)` — `SerializeJSONProperty` (`toJSON`, replacer function with `this = holder`, property list, wrapper unwrapping, cycle `TypeError` via the `stack` array); `__json_indent(s, gap)` — re-indent compact text for `space`; `__json_revive(holder, key, reviver)` — `InternalizeJSONProperty` |
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
+| promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already
@@ -1066,7 +1068,11 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
   builtins and top-level `await` call `__promise`; `then` and `catch` call
   `__then`, which returns the chained promise. Missing handlers pass the
   settlement through. Resolving with a promise adopts it; other thenables are
-  not assimilated (§13). `then`/`catch`/`finally` on a receiver that is not a
+  not assimilated (§13). Resolving a promise with itself — through an executor
+  `resolve`, a reaction returning its chained promise, or an `async` body
+  returning its own result — rejects it with a fresh `TypeError` ("Chaining
+  cycle detected for promise #<Promise>"), built by the exported
+  `__promise_self_error()` guest constructor; both hosts check it in `settle`. `then`/`catch`/`finally` on a receiver that is not a
   promise throw a `TypeError`. An awaited non-promise is treated as already
   fulfilled (`await 5` → `5`).
 - **Re-entry.** Reactions are guest closures; the engine runs them by calling the
@@ -1534,7 +1540,10 @@ error: cannot assign to constant binding: c
 
 The label is `<eval>` for `-e`/`-p` input and the file path otherwise
 (`jsc-wasm` uses `<source>`). Columns count characters; a multi-column span
-underlines its full width. A span-less error prints its bare message. Because
+underlines its full width. Rendering never panics: span offsets are clamped to
+the source and snapped outward to character boundaries (a span starting inside
+a multi-byte character points at that character), and a CRLF line is printed
+without its `\r`. A span-less error prints its bare message. Because
 `CompileError` implements `std::error::Error`, it travels through `anyhow` and
 is recovered with `downcast_ref`.
 
@@ -1832,14 +1841,14 @@ Each item below is current behaviour of this tree.
   `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
 - The remaining test262 failures of the phase-3 built-in families (after
   element reads through the prototype chain, L2-V T3, and `var` hoisting /
-  global declarations, L2-V T1: 538 of built-ins/{Array 181, String 207,
-  Function 135, Math 10, Number 5}; NativeErrors and AggregateError have
+  global declarations, L2-V T1: 514 of built-ins/{Array 174, String 191,
+  Function 135, Math 9, Number 5}; NativeErrors and AggregateError have
   none), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number |
   |---|---|---|---|---|---|---|
   | `RegExp` | never in phase 3 | 26 | 95 | 3 | | |
-  | `Function` constructor | never in phase 3 | | 3 | 115 | | |
+  | `Function` constructor | never in phase 3 | | 3 | 117 | | |
   | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 16 | 12 | 3 | 1 | |
   | builtin prototypes are not exotic (above) | object model | 4 | 3 | | | 4 |
   | `asyncTest` used by a test without the `async` flag | L2-R (runner) | 67 | | | | |
@@ -1851,7 +1860,6 @@ Each item below is current behaviour of this tree.
   | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | D3 | | 29 | | | |
   | an element write does not reach an inherited index setter (below) | object model | 3 | | | | |
   | a higher-order builtin's callback receives at most `K` arguments (`arguments[3]` of a three-parameter `reduce` callback) | — | 4 | | | | |
-  | `new Function.prototype.call` / `apply` does not throw `TypeError` | L2-F | | | 2 | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16

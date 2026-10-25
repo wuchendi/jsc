@@ -117,6 +117,9 @@ struct Handles {
     /// The `__new_promise() -> base` guest constructor every promise block is
     /// allocated through.
     new_promise: Func,
+    /// The `__promise_self_error() -> jsval` guest constructor of the
+    /// `TypeError` a promise resolved with itself is rejected with.
+    self_error: Func,
     exc_pending: Global,
     exc_value: Global,
     /// The `__invoke1` callback trampoline. `None` when the program declares no
@@ -135,6 +138,9 @@ impl Handles {
             memory: caller.get_export("memory")?.into_memory()?,
             new_promise: caller
                 .get_export(abi::NEW_PROMISE_EXPORT_NAME)?
+                .into_func()?,
+            self_error: caller
+                .get_export(abi::PROMISE_SELF_ERROR_EXPORT_NAME)?
                 .into_func()?,
             exc_pending: caller
                 .get_export(abi::EXC_PENDING_EXPORT_NAME)?
@@ -157,6 +163,7 @@ impl Handles {
         Some(Self {
             memory: instance.get_memory(&mut *store, "memory")?,
             new_promise: instance.get_func(&mut *store, abi::NEW_PROMISE_EXPORT_NAME)?,
+            self_error: instance.get_func(&mut *store, abi::PROMISE_SELF_ERROR_EXPORT_NAME)?,
             exc_pending: instance.get_global(&mut *store, abi::EXC_PENDING_EXPORT_NAME)?,
             exc_value: instance.get_global(&mut *store, abi::EXC_VALUE_EXPORT_NAME)?,
             invoke1: instance.get_func(&mut *store, abi::INVOKE_EXPORT_NAME),
@@ -517,22 +524,44 @@ fn run_job<W: Write + Send + 'static>(
 
 /// Settle promise `base` with `(state, value)`, once. Fulfilling with a value
 /// that is itself a promise ADOPTS it (the promise stays pending and re-settles
-/// when the inner one does). On a real settlement, its registered reactions are
-/// moved into the microtask queue.
+/// when the inner one does); fulfilling a promise with ITSELF rejects it with a
+/// fresh `TypeError` instead (Promise Resolve Functions step 7). On a real
+/// settlement, its registered reactions are moved into the microtask queue.
 fn settle<W: Write + Send + 'static>(
     mut ctx: StoreContextMut<'_, Host<W>>,
     handles: &Handles,
     base: u32,
-    state: i32,
-    value: u64,
+    mut state: i32,
+    mut value: u64,
 ) {
     if read_state(handles.memory.data(&ctx), base) != PROMISE_PENDING {
         return; // settle-once.
     }
-    // Resolving with a promise: adopt it instead of storing a promise-as-value.
-    if state == PROMISE_FULFILLED && as_promise(handles.memory.data(&ctx), value).is_some() {
-        register_source(ctx, handles, value, UNDEFINED, UNDEFINED, base, false, None);
-        return;
+    if state == PROMISE_FULFILLED {
+        match as_promise(handles.memory.data(&ctx), value) {
+            Some(inner) if inner == base => {
+                let mut results = [Val::I64(0)];
+                if handles
+                    .self_error
+                    .call(&mut ctx, &[], &mut results)
+                    .is_err()
+                {
+                    return; // an out-of-memory trap: the run stage reports it.
+                }
+                state = PROMISE_REJECTED;
+                value = match results[0] {
+                    Val::I64(v) => v.cast_unsigned(),
+                    _ => UNDEFINED,
+                };
+            }
+            // Resolving with another promise: adopt it instead of storing a
+            // promise-as-value.
+            Some(_) => {
+                register_source(ctx, handles, value, UNDEFINED, UNDEFINED, base, false, None);
+                return;
+            }
+            None => {}
+        }
     }
     write_settlement(ctx.as_context_mut(), handles, base, state, value);
     if state == PROMISE_REJECTED {
