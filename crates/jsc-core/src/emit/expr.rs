@@ -1154,19 +1154,13 @@ pub(super) fn emit_proto_guard(
     let string_guard = |function: &mut Function| {
         emit_string_receiver_test(function, local, *sealed);
     };
-    // With an early callee read, AND the test on the stack with `callee ===
-    // builtin` (else a fast path would run a method the read did not find).
-    let callee_is = |function: &mut Function, builtin: Option<Builtin>| {
+    // With an early callee read: whether it found the fast path `slot`'s
+    // builtin (its marker, see [`early_marker`]).
+    let found = |function: &mut Function, slot: usize| {
         if let Some(callee) = callee {
             emit_node(callee, function, scratch, strings, helpers);
-            if let Some(builtin) = builtin {
-                function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
-                function.instruction(&Instruction::I64Eq);
-            } else {
-                function.instruction(&Instruction::Drop);
-                function.instruction(&Instruction::I32Const(0));
-            }
-            function.instruction(&Instruction::I32And);
+            function.instruction(&Instruction::I64Const(early_marker(slot)));
+            function.instruction(&Instruction::I64Eq);
         }
     };
     let string = realm::method_of(realm::prototype_of(BuiltinCtor::String), key);
@@ -1186,8 +1180,12 @@ pub(super) fn emit_proto_guard(
             function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
             enter_frame(helpers);
         }
-        string_guard(function);
-        callee_is(function, string);
+        // A primitive keeps its kind: the early read decides.
+        if callee.is_some() {
+            found(function, STRING_SLOT);
+        } else {
+            string_guard(function);
+        }
         let block = if may_fail {
             BlockType::Empty
         } else {
@@ -1221,13 +1219,18 @@ pub(super) fn emit_proto_guard(
         }
         opened += 1;
     }
-    for (kind, path) in fast {
-        for (i, &base) in base_kinds(*kind).iter().enumerate() {
-            emit_proto_kind_test(function, local, base, *sealed, scratch + 3, helpers);
-            callee_is(function, kind_method(base, key));
-            if i > 0 {
-                function.instruction(&Instruction::I32Or);
+    for (slot, (kind, path)) in fast.iter().enumerate() {
+        // An object keeps its kind byte through the arguments, so the early
+        // read decides; only a path reading own properties (an array's
+        // elements, a promise's `constructor`) tests the receiver again.
+        if callee.is_none() || props_sensitive(*kind) {
+            emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
+            if callee.is_some() {
+                found(function, slot);
+                function.instruction(&Instruction::I32And);
             }
+        } else {
+            found(function, slot);
         }
         if matches!(path, IrNode::ArrayPush { .. }) {
             emit_push_room_test(function, scratch + 3);
@@ -1238,16 +1241,31 @@ pub(super) fn emit_proto_guard(
         function.instruction(&Instruction::Else);
         opened += 1;
     }
-    // With an early callee read, every other receiver calls it.
+    // With an early callee read, every other receiver calls it (a marker
+    // that reaches here names its builtin).
     if let Some(callee) = callee {
         emit_call_args(args, function, scratch, strings, helpers);
-        let callee_val = if let IrNode::Local(l) = **callee {
-            l
-        } else {
-            emit_node(callee, function, scratch, strings, helpers);
-            function.instruction(&Instruction::LocalSet(scratch + 1));
-            scratch + 1
-        };
+        let callee_val = scratch + 1;
+        emit_node(callee, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(callee_val));
+        let mut markers: Vec<(usize, Builtin)> =
+            string.map(|b| (STRING_SLOT, b)).into_iter().collect();
+        for (slot, (kind, _)) in fast.iter().enumerate() {
+            if props_sensitive(*kind)
+                && let Some(builtin) = kind_method(*kind, key)
+            {
+                markers.push((slot, builtin));
+            }
+        }
+        for (slot, builtin) in markers {
+            function.instruction(&Instruction::LocalGet(callee_val));
+            function.instruction(&Instruction::I64Const(early_marker(slot)));
+            function.instruction(&Instruction::I64Eq);
+            function.instruction(&Instruction::If(BlockType::Empty));
+            function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
+            function.instruction(&Instruction::LocalSet(callee_val));
+            function.instruction(&Instruction::End);
+        }
         emit_bound_call(
             (callee_val, local),
             args.len(),
@@ -1329,20 +1347,26 @@ fn emit_string_receiver_test(function: &mut Function, local: u32, sealed: bool) 
     function.instruction(&Instruction::End);
 }
 
-/// The single-prototype families a [`ProtoKind`] test covers.
-fn base_kinds(kind: ProtoKind) -> &'static [ProtoKind] {
-    match kind {
-        ProtoKind::Collection => &[ProtoKind::Map, ProtoKind::Set],
-        ProtoKind::Array => &[ProtoKind::Array],
-        ProtoKind::Map => &[ProtoKind::Map],
-        ProtoKind::Set => &[ProtoKind::Set],
-        ProtoKind::Promise => &[ProtoKind::Promise],
-        ProtoKind::Date => &[ProtoKind::Date],
-        ProtoKind::Generator => &[ProtoKind::Generator],
-    }
+/// The [`early_marker`] slot of a string receiver.
+const STRING_SLOT: usize = 6;
+
+/// The value an [`IrNode::ProtoMethod`] leaves for a receiver that passed the
+/// test of fast path `slot` ([`STRING_SLOT`]: a string receiver): a heap tag
+/// over an address no block has (blocks are 8-aligned), so no `[[Get]]`
+/// result equals it. A slot past [`STRING_SLOT`] has no marker (the read
+/// then always takes `[[Get]]`).
+fn early_marker(slot: usize) -> i64 {
+    HEAP_BITS | i64::try_from(slot + 1).unwrap_or(0)
 }
 
-/// The builtin `key` of the prototype of the single-prototype family `kind`.
+/// Whether the fast paths of `kind` read the receiver's own properties, so
+/// arguments that run after the early read can invalidate them.
+fn props_sensitive(kind: ProtoKind) -> bool {
+    matches!(kind, ProtoKind::Array | ProtoKind::Promise)
+}
+
+/// The builtin `key` of the prototype of the family `kind` (the first one of
+/// [`ProtoKind::Collection`]).
 fn kind_method(kind: ProtoKind, key: &str) -> Option<Builtin> {
     proto_kind_cases(kind)
         .first()
@@ -1350,8 +1374,9 @@ fn kind_method(kind: ProtoKind, key: &str) -> Option<Builtin> {
 }
 
 /// Emit an [`IrNode::ProtoMethod`], leaving the method on the stack: the
-/// builtin of the first family (a string receiver first) whose fast-path
-/// test the receiver passes, else the generic `[[Get]]` of `key`.
+/// [`early_marker`] of a string receiver or of the first fast path whose test
+/// the receiver passes (its builtin, with no lookup), else the generic
+/// `[[Get]]` of `key`.
 pub(super) fn emit_proto_method(
     node: &IrNode,
     function: &mut Function,
@@ -1375,26 +1400,21 @@ pub(super) fn emit_proto_method(
         function.instruction(&Instruction::LocalSet(scratch));
         scratch
     };
-    let string = realm::method_of(realm::prototype_of(BuiltinCtor::String), key);
     let mut opened = 0;
-    if let Some(builtin) = string {
+    let mut open = |function: &mut Function, slot: usize| {
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        enter_frame(helpers);
+        function.instruction(&Instruction::I64Const(early_marker(slot)));
+        function.instruction(&Instruction::Else);
+        opened += 1;
+    };
+    if realm::method_of(realm::prototype_of(BuiltinCtor::String), key).is_some() {
         emit_string_receiver_test(function, local, *sealed);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-        enter_frame(helpers);
-        function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
-        function.instruction(&Instruction::Else);
-        opened += 1;
+        open(function, STRING_SLOT);
     }
-    for &kind in kinds.iter().flat_map(|&kind| base_kinds(kind)) {
-        let Some(builtin) = kind_method(kind, key) else {
-            continue;
-        };
+    for (slot, &kind) in kinds.iter().enumerate().take(STRING_SLOT) {
         emit_proto_kind_test(function, local, kind, *sealed, scratch + 3, helpers);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-        enter_frame(helpers);
-        function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
-        function.instruction(&Instruction::Else);
-        opened += 1;
+        open(function, slot);
     }
     emit_index_node(
         &IrNode::Local(local),

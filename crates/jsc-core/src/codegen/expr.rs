@@ -1292,12 +1292,7 @@ impl LowerCtx<'_> {
         // order), so the read happens before them.
         let callee = (!pure).then(|| {
             let local = self.fresh();
-            let mut kinds: Vec<ProtoKind> = Vec::new();
-            for (kind, _) in &fast {
-                if !kinds.contains(kind) {
-                    kinds.push(*kind);
-                }
-            }
+            let kinds = fast.iter().map(|(kind, _)| *kind).collect();
             seq.push(IrNode::Assign {
                 local,
                 value: Box::new(IrNode::ProtoMethod {

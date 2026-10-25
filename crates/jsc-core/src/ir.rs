@@ -1394,16 +1394,17 @@ pub enum IrNode {
         fast: Vec<(ProtoKind, IrNode)>,
         /// With arguments that have side effects, the read of the
         /// [`IrNode::ProtoMethod`] made before they ran (JS reads the callee
-        /// first): a fast path then also requires it to be that family's
-        /// builtin, and every other receiver calls it.
+        /// first): a fast path then runs only when that read found it (an
+        /// array or promise path also tests the receiver again), and every
+        /// other receiver calls the read method.
         callee: Option<Box<IrNode>>,
         /// The `TypeError` thrown when `recv.key` is not callable.
         not_callable: CalleeError,
     },
     /// The method `recv.key` of an [`IrNode::ProtoGuard`] call, read before
-    /// its arguments run: the builtin of the first family in `kinds` (or of
-    /// `String.prototype`, for a string receiver) whose fast-path test
-    /// `recv` passes — a constant, no lookup — else the generic `[[Get]]`.
+    /// its arguments run: for a string receiver, or one passing the test of
+    /// a fast path, a constant marker naming that path (whose builtin the
+    /// method is — no lookup); else the generic `[[Get]]`.
     ProtoMethod {
         /// Whether the program is intrinsics-sealed (no dirty-bit test).
         sealed: bool,
@@ -1412,7 +1413,7 @@ pub enum IrNode {
         recv: Box<IrNode>,
         /// The method name.
         key: String,
-        /// The receiver families of the call's fast paths.
+        /// The receiver families of the call's fast paths, in their order.
         kinds: Vec<ProtoKind>,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
