@@ -1163,6 +1163,46 @@ impl CfgBuilder {
                     }),
                 })
             }
+            // A method call reads its method before the arguments run, so with
+            // a suspend in an argument the receiver and the method are spilled
+            // up front and the call binds the spilled receiver.
+            IrNode::MethodCallUser {
+                obj,
+                key,
+                args,
+                obj_local,
+                not_callable,
+                ..
+            } if args.iter().any(node_contains_yield) => {
+                let obj = self.linearize(*obj)?;
+                let obj = self.spill(obj)?;
+                let key = self.linearize(*key)?;
+                let key = self.spill(key)?;
+                let callee = self.spill(IrNode::Index {
+                    obj: Box::new(obj.clone()),
+                    index: Box::new(key),
+                })?;
+                self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
+            }
+            IrNode::NamespaceGuard {
+                obj,
+                key,
+                obj_local,
+                args,
+                slow,
+                ..
+            } if args.iter().any(node_contains_yield) => {
+                let IrNode::ThisCall { not_callable, .. } = *slow else {
+                    return Err(self.unsupported("unexpected namespace call shape"));
+                };
+                let obj = self.linearize(*obj)?;
+                let obj = self.spill(obj)?;
+                let callee = self.spill(IrNode::Index {
+                    obj: Box::new(obj.clone()),
+                    index: Box::new(IrNode::Str(key)),
+                })?;
+                self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
+            }
             mut node => {
                 let mut children = node.children_mut();
                 let last = children
@@ -1177,6 +1217,38 @@ impl CfgBuilder {
                 Ok(node)
             }
         }
+    }
+
+    /// Linearize the arguments of a call of the already spilled `callee` with
+    /// `this` = the spilled `obj`, rebound through the raw `this_local` once
+    /// every suspend has run.
+    fn linearize_bound_call(
+        &mut self,
+        obj: IrNode,
+        callee: IrNode,
+        args: Vec<IrNode>,
+        this_local: u32,
+        not_callable: CalleeError,
+    ) -> anyhow::Result<IrNode> {
+        let last = args.iter().rposition(node_contains_yield).unwrap_or(0);
+        let mut lowered = Vec::with_capacity(args.len());
+        for (i, arg) in args.into_iter().enumerate() {
+            let value = self.linearize(arg)?;
+            lowered.push(if i < last { self.spill(value)? } else { value });
+        }
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: this_local,
+                value: Box::new(obj),
+            },
+            IrNode::ThisCall {
+                callee: Box::new(callee),
+                args: lowered,
+                this_local,
+                construct: false,
+                not_callable,
+            },
+        ]))
     }
 
     /// Linearize `cond ? then_branch : else_branch` with a suspend in a branch:

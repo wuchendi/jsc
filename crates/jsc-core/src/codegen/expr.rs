@@ -434,6 +434,7 @@ impl LowerCtx<'_> {
                 args,
                 this_local,
                 construct: false,
+                not_callable: not_a_function(None),
             };
             let tail = self.build_chain(call, after)?;
             return Ok(nullish_short_circuit(callee, method, tail));
@@ -453,6 +454,7 @@ impl LowerCtx<'_> {
             key: Box::new(key),
             args,
             obj_local,
+            callee_local: self.fresh(),
             not_callable: not_a_function(None),
         };
         self.build_chain(call, after)
@@ -493,11 +495,10 @@ impl LowerCtx<'_> {
                     Err(CompileError::spanned(*span, "private fields are not supported").into())
                 }
             },
-            ChainLink::Call { args, .. } => Ok(IrNode::CallIndirect {
-                callee: Box::new(obj),
-                args: self.lower_chain_args(args)?,
-                not_callable: not_a_function(None),
-            }),
+            ChainLink::Call { args, .. } => {
+                let args = self.lower_chain_args(args)?;
+                Ok(self.call_indirect(obj, args, not_a_function(None)))
+            }
         }
     }
 
@@ -744,12 +745,18 @@ impl LowerCtx<'_> {
             }
             args.push(self.lower_expr(&arg.expr)?);
         }
-        Ok(IrNode::ThisCall {
-            callee: Box::new(callee),
-            args,
-            this_local,
-            construct: false,
-        })
+        // The method is read before the arguments run (ECMA-262 13.3.7.1).
+        let (seq, callee) = self.callee_first(callee, &args);
+        Ok(seq_then(
+            seq,
+            IrNode::ThisCall {
+                callee: Box::new(callee),
+                args,
+                this_local,
+                construct: false,
+                not_callable: not_a_function(None),
+            },
+        ))
     }
 
     /// Lower a call expression `callee(args)`. A call to a bare **function name**
@@ -821,22 +828,23 @@ impl LowerCtx<'_> {
         let Expr::Ident(ident) = callee_expr.as_ref() else {
             // A computed callee (e.g. a returned function value) is always an
             // indirect call through the funcref table.
-            return Ok(IrNode::CallIndirect {
-                callee: Box::new(self.lower_expr(callee_expr)?),
+            let callee = self.lower_expr(callee_expr)?;
+            return Ok(self.call_indirect(
+                callee,
                 args,
-                not_callable: not_a_function(source_name(callee_expr).as_deref()),
-            });
+                not_a_function(source_name(callee_expr).as_deref()),
+            ));
         };
         let name = ident.sym.as_ref();
         // A variable/parameter/captured binding holding a function value is called
         // indirectly (its callee is not statically known); a bare function name
         // keeps the direct `call` optimization.
         if let Some(resolved) = self.resolve(name) {
-            Ok(IrNode::CallIndirect {
-                callee: Box::new(Self::read_of(resolved.kind)),
+            Ok(self.call_indirect(
+                Self::read_of(resolved.kind),
                 args,
-                not_callable: CalleeError::not_a_function(name),
-            })
+                CalleeError::not_a_function(name),
+            ))
         } else if let Some(sig) = self.decl_func(name) {
             // JS arity semantics: the uniform ABI pads missing arguments with
             // `undefined` (so defaults apply), and surplus arguments are evaluated
@@ -863,12 +871,49 @@ impl LowerCtx<'_> {
             Ok(seq_then(seq, convert_call(op, empty, args)))
         } else {
             // A global-object property, read (or thrown on) at run time.
-            Ok(IrNode::CallIndirect {
-                callee: Box::new(self.global_read(name)),
-                args,
-                not_callable: CalleeError::not_a_function(name),
-            })
+            let callee = self.global_read(name);
+            Ok(self.call_indirect(callee, args, CalleeError::not_a_function(name)))
         }
+    }
+
+    /// An [`IrNode::CallIndirect`] of `callee` with `args`. JS evaluates the
+    /// callee before the arguments (ECMA-262 13.3.6.1) while the call pushes
+    /// the arguments first, so a callee is evaluated into a temp first unless
+    /// every argument is side-effect free (nothing an argument does can then
+    /// observe or change the callee) or the callee is a function literal.
+    fn call_indirect(
+        &mut self,
+        callee: IrNode,
+        args: Vec<IrNode>,
+        not_callable: CalleeError,
+    ) -> IrNode {
+        let (seq, callee) = self.callee_first(callee, &args);
+        seq_then(
+            seq,
+            IrNode::CallIndirect {
+                callee: Box::new(callee),
+                args,
+                not_callable,
+            },
+        )
+    }
+
+    /// The statements evaluating `callee` before `args` and the callee read
+    /// to call (see [`Self::call_indirect`]).
+    fn callee_first(&mut self, callee: IrNode, args: &[IrNode]) -> (Vec<IrNode>, IrNode) {
+        if args.iter().all(pure_arg)
+            || matches!(callee, IrNode::FuncValue { .. } | IrNode::DeclFunc(_))
+        {
+            return (Vec::new(), callee);
+        }
+        let local = self.fresh();
+        (
+            vec![IrNode::Assign {
+                local,
+                value: Box::new(callee),
+            }],
+            IrNode::Local(local),
+        )
     }
 
     /// The `(namespace, key)` of a static member `N.key` on an unshadowed
@@ -924,11 +969,12 @@ impl LowerCtx<'_> {
             return Err(anyhow!("{namespace}.{key} has no inline code"));
         };
         let obj_local = self.fresh();
-        let slow = IrNode::MethodCallUser {
-            obj: Box::new(IrNode::Local(obj_local)),
-            key: Box::new(IrNode::Str(key.to_owned())),
+        let member_local = self.fresh();
+        let slow = IrNode::ThisCall {
+            callee: Box::new(IrNode::Local(member_local)),
             args: locals,
-            obj_local,
+            this_local: obj_local,
+            construct: false,
             not_callable: not_a_function(member_source_name(member).as_deref()),
         };
         Ok(IrNode::NamespaceGuard {
@@ -936,6 +982,7 @@ impl LowerCtx<'_> {
             key: key.to_owned(),
             obj: Box::new(self.global_read(namespace)),
             obj_local,
+            member_local,
             args,
             arg_locals,
             fast: Box::new(fast),
@@ -1191,6 +1238,7 @@ impl LowerCtx<'_> {
                 value: Box::new(recv),
             });
         }
+        let mut arg_seq = Vec::new();
         let args: Vec<IrNode> = args
             .into_iter()
             .map(|arg| {
@@ -1198,7 +1246,7 @@ impl LowerCtx<'_> {
                     return arg;
                 }
                 let local = self.fresh();
-                seq.push(IrNode::Assign {
+                arg_seq.push(IrNode::Assign {
                     local,
                     value: Box::new(arg),
                 });
@@ -1239,12 +1287,31 @@ impl LowerCtx<'_> {
             .into_iter()
             .collect();
         fast.extend(receiver_fast_paths(name, recv_local, &args));
+        let sealed = self.shared.globals.intrinsics_sealed();
+        // Arguments with side effects run after the method is read (JS
+        // order), so the read happens before them.
+        let callee = (!pure).then(|| {
+            let local = self.fresh();
+            let kinds = fast.iter().map(|(kind, _)| *kind).collect();
+            seq.push(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::ProtoMethod {
+                    sealed,
+                    recv: recv(),
+                    key: name.to_owned(),
+                    kinds,
+                }),
+            });
+            Box::new(IrNode::Local(local))
+        });
+        seq.extend(arg_seq);
         seq.push(IrNode::ProtoGuard {
-            sealed: self.shared.globals.intrinsics_sealed(),
+            sealed,
             recv: recv(),
             key: name.to_owned(),
             args,
             fast,
+            callee,
             not_callable: method_not_a_function(&member.obj, name),
         });
         Ok(IrNode::Seq(seq))
@@ -1278,6 +1345,7 @@ impl LowerCtx<'_> {
             key: Box::new(key),
             args,
             obj_local,
+            callee_local: self.fresh(),
             not_callable: not_a_function(member_source_name(member).as_deref()),
         })
     }
@@ -1608,6 +1676,8 @@ impl LowerCtx<'_> {
     /// expression is outside the supported subset.
     fn lower_object(&mut self, obj: &ObjectLit) -> anyhow::Result<IrNode> {
         let mut entries = Vec::with_capacity(obj.props.len());
+        // The `__proto__: v` entry: the entry count before it and `v`.
+        let mut proto = None;
         for prop in &obj.props {
             let prop = match prop {
                 PropOrSpread::Prop(prop) => prop,
@@ -1620,6 +1690,9 @@ impl LowerCtx<'_> {
                 }
             };
             match prop.as_ref() {
+                Prop::KeyValue(kv) if is_proto_key(&kv.key) => {
+                    proto = Some((entries.len(), self.lower_expr(&kv.value)?));
+                }
                 Prop::KeyValue(kv) => {
                     let key = self.lower_prop_key(&kv.key)?;
                     let value = match &key {
@@ -1684,12 +1757,64 @@ impl LowerCtx<'_> {
                 }
             }
         }
-        Ok(IrNode::Object {
-            entries,
-            proto: None,
-            class: crate::abi::CLASS_ORDINARY,
-            reserve: 0,
-        })
+        let Some((at, value)) = proto else {
+            return Ok(literal_object(entries));
+        };
+        Ok(self.with_proto_entry(entries, at, value))
+    }
+
+    /// The object literal `entries` with a `__proto__: value` entry after the
+    /// first `at` of them: `value` sets the new object's [[Prototype]] when it
+    /// is an object or `null` and defines no property (ECMA-262 B.3.1); the
+    /// entries after it are defined once `value` has been evaluated.
+    fn with_proto_entry(
+        &mut self,
+        mut entries: Vec<(PropKey, IrNode)>,
+        at: usize,
+        value: IrNode,
+    ) -> IrNode {
+        let after = entries.split_off(at);
+        let (obj_local, proto_local) = (self.fresh(), self.fresh());
+        let set_proto = IrNode::Ternary {
+            cond: Box::new(IrNode::Logical {
+                op: LogicalOp::Or,
+                lhs: Box::new(IrNode::IsObject(Box::new(IrNode::Local(proto_local)))),
+                rhs: Box::new(IrNode::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(IrNode::Local(proto_local)),
+                    rhs: Box::new(IrNode::Null),
+                }),
+            }),
+            then_branch: Box::new(IrNode::SetProto {
+                obj: Box::new(IrNode::Local(obj_local)),
+                proto: Box::new(IrNode::Local(proto_local)),
+            }),
+            else_branch: Box::new(IrNode::Local(obj_local)),
+        };
+        let assign = |local, value| IrNode::Assign {
+            local,
+            value: Box::new(value),
+        };
+        if at == 0 {
+            return IrNode::Seq(vec![
+                assign(proto_local, value),
+                assign(obj_local, literal_object(after)),
+                set_proto,
+            ]);
+        }
+        let mut seq = vec![
+            assign(obj_local, literal_object(entries)),
+            assign(proto_local, value),
+            set_proto,
+        ];
+        if !after.is_empty() {
+            seq.push(IrNode::DefineProps {
+                obj: Box::new(IrNode::Local(obj_local)),
+                local: self.fresh(),
+                entries: after,
+            });
+        }
+        IrNode::Seq(seq)
     }
 
     /// Lower an object-literal property name: an identifier or string key is
@@ -2030,6 +2155,26 @@ fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
         cond: Box::new(is_nullish),
         then_branch: Box::new(IrNode::Undefined),
         else_branch: Box::new(tail),
+    }
+}
+
+/// An ordinary object literal of `entries`.
+fn literal_object(entries: Vec<(PropKey, IrNode)>) -> IrNode {
+    IrNode::Object {
+        entries,
+        proto: None,
+        class: crate::abi::CLASS_ORDINARY,
+        reserve: 0,
+    }
+}
+
+/// Whether an object-literal `key: value` entry is a `__proto__` entry: a
+/// non-computed `__proto__` / `"__proto__"` key (ECMA-262 B.3.1).
+pub(super) fn is_proto_key(key: &PropName) -> bool {
+    match key {
+        PropName::Ident(id) => id.sym.as_ref() == "__proto__",
+        PropName::Str(s) => s.value.to_string_lossy() == "__proto__",
+        _ => false,
     }
 }
 

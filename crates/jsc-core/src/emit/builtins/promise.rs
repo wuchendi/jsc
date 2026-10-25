@@ -79,6 +79,7 @@ fn catch_call(frame: Frame) -> IrNode {
         key: Box::new(IrNode::Str("then".to_owned())),
         args: vec![IrNode::Undefined, IrNode::Local(frame.i64(1))],
         obj_local: frame.i64(3),
+        callee_local: frame.x64(0),
         not_callable: CalleeError::not_a_function("then"),
     }
 }

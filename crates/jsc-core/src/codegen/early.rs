@@ -10,15 +10,17 @@
 //!   name of any function (every function is strict);
 //! - an `async function` declaration in statement position (`if (x) async
 //!   function f(){}`);
-//! - `await` (escaped or not) as an identifier inside an async body.
+//! - `await` (escaped or not) as an identifier inside an async body;
+//! - two `__proto__: v` entries in one object literal (a destructuring
+//!   assignment pattern is an `ObjectPat`, not visited here).
 
 use std::collections::HashMap;
 
-use swc_common::Span;
+use swc_common::{Span, Spanned};
 use swc_ecma_ast::{
     ArrowExpr, ArrowFunctionBody, BlockStmt, CatchClause, Constructor, Decl, FnExpr, ForHead,
-    Function, FunctionBody, Ident, ObjectPatProp, ParamOrTsParamProp, Pat, Program, Stmt,
-    SwitchStmt, VarDeclKind, VarDeclOrExpr,
+    Function, FunctionBody, Ident, ObjectLit, ObjectPatProp, ParamOrTsParamProp, Pat, Program,
+    Prop, PropOrSpread, Stmt, SwitchStmt, VarDeclKind, VarDeclOrExpr,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -204,6 +206,25 @@ impl Visit for Checker {
             _ => {}
         }
         stmt.visit_children_with(self);
+    }
+
+    fn visit_object_lit(&mut self, o: &ObjectLit) {
+        let mut seen = false;
+        for prop in &o.props {
+            if let PropOrSpread::Prop(prop) = prop
+                && let Prop::KeyValue(kv) = prop.as_ref()
+                && super::expr::is_proto_key(&kv.key)
+            {
+                if seen {
+                    self.fail(
+                        kv.key.span(),
+                        "duplicate __proto__ fields are not allowed in object literals".to_owned(),
+                    );
+                }
+                seen = true;
+            }
+        }
+        o.visit_children_with(self);
     }
 
     fn visit_ident(&mut self, ident: &Ident) {

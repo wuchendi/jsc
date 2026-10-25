@@ -794,15 +794,14 @@ pub(super) fn collect_node<'a>(
             callee,
             args,
             not_callable,
+        }
+        | IrNode::ThisCall {
+            callee,
+            args,
+            not_callable,
+            ..
         } => {
             seed_callee_error(callee_error_text(not_callable), order, seen);
-            collect_node(callee, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
-        IrNode::ThisCall { callee, args, .. } => {
-            seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
             collect_node(callee, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
@@ -972,6 +971,7 @@ pub(super) fn collect_node<'a>(
             key,
             args,
             fast,
+            callee,
             not_callable,
             ..
         } => {
@@ -986,6 +986,16 @@ pub(super) fn collect_node<'a>(
             for (_, path) in fast {
                 collect_node(path, order, seen);
             }
+            if let Some(callee) = callee {
+                // Every other receiver calls the early read, guarded.
+                seed_callee_error(callee_error_text(not_callable), order, seen);
+                collect_node(callee, order, seen);
+            }
+        }
+        // The generic `[[Get]]` reads the interned key.
+        IrNode::ProtoMethod { recv, key, .. } => {
+            seed_strs_ref(&[key], order, seen);
+            collect_node(recv, order, seen);
         }
         // The slow path is a `size` member read.
         IrNode::SizeRead { obj, .. } => {
@@ -1337,7 +1347,9 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 /// `__define` / `__delete` must set the bits (DESIGN.md §6.4).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        IrNode::ProtoGuard { sealed, .. } | IrNode::SizeRead { sealed, .. } => !sealed,
+        IrNode::ProtoGuard { sealed, .. }
+        | IrNode::ProtoMethod { sealed, .. }
+        | IrNode::SizeRead { sealed, .. } => !sealed,
         IrNode::NamespaceGuard { namespace, .. } => {
             realm::Intrinsic::from(*namespace).watch_bit().is_some()
         }

@@ -158,3 +158,21 @@ fn duplicate_parameters_and_body_names_are_rejected() {
     );
     assert_runs("function* g(x) { var x; yield x; } g(1).next();");
 }
+
+#[test]
+fn a_duplicate_proto_entry_in_an_object_literal_is_an_early_error() {
+    assert_early_error(
+        "var o = {__proto__: null, \"__proto__\": null}",
+        "duplicate __proto__",
+    );
+    assert_early_error(
+        "if (false) { var o = {__proto__: {}, a: 1, __proto__: {}} }",
+        "duplicate __proto__",
+    );
+    // Shorthand, computed, method and accessor keys do not count.
+    assert_runs("var __proto__ = 1; var o = {__proto__: null, __proto__}");
+    assert_runs("var o = {__proto__: null, [\"__proto__\"]: 1}");
+    assert_runs("var o = {__proto__: null, __proto__() {}}");
+    // A destructuring assignment pattern may repeat it.
+    assert_runs("var a, b; ({__proto__: a, __proto__: b} = {})");
+}
