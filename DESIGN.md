@@ -1304,9 +1304,11 @@ those of `switch` and loops are not tracked.
   callee expression is first evaluated into a temp unless every argument is
   side-effect free; a method read lands in a temp before the arguments run.
   A builtin-named method call with side-effecting arguments (§6.4) resolves
-  the method first — the builtin as a constant when the receiver passes its
-  fast-path test, else `__get` — and its fast path then also requires the
-  method read to be that builtin; any other receiver calls the read method.
+  the method first — a constant marker naming the fast path whose test the
+  receiver passes (no lookup), else `__get` — and after the arguments a fast
+  path runs on its marker (an array or promise path also re-tests the
+  receiver, whose own properties the arguments may have changed); any other
+  receiver calls the method read first.
 
 ### 7.5 Objects & arrays
 
