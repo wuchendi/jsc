@@ -998,6 +998,12 @@ struct Helpers<'a> {
     /// argument slots every call site pushes (padding with `undefined` or
     /// truncating extras).
     max_args: u32,
+    /// Whether some user function gathers its arguments past the `K`
+    /// positional slots (a rest parameter or `arguments`, which snapshot
+    /// [`IrNode::SpreadArgsGlobal`]). When `false`, only a builtin callee can
+    /// observe more than `K` arguments, so a call passing more of them
+    /// publishes the spread argument array only for a builtin callee.
+    gathers_arguments: bool,
     /// Whether the program builds any accessor ([`IrNode::MakeAccessor`]).
     /// When `false`, `__get` / `__set` omit the getter/setter invocation and
     /// member accesses skip the post-call exception check.
@@ -1184,6 +1190,26 @@ impl Helpers<'_> {
     /// `__protos_indexless`.
     fn proto_elem(self) -> u32 {
         self.array_concat + 6
+    }
+
+    /// `__proto_set(o, i, v) -> i32`: the inherited half of a store to an
+    /// element `o` does not own (see [`props::emit_proto_set`]). It is the
+    /// helper right after `__proto_elem`.
+    fn proto_set(self) -> u32 {
+        self.array_concat + 7
+    }
+
+    /// `__array_define(recv, key, v)`: `__array_set` without the prototype
+    /// chain, for `CreateDataPropertyOrThrow` (see [`props::emit_array_set`]).
+    /// It is the helper right after `__proto_set`.
+    fn array_define(self) -> u32 {
+        self.array_concat + 8
+    }
+
+    /// `__sparse_define(o, i, v)`: the `SPARSE` arm of `__array_define` (see
+    /// [`props::emit_sparse_set`]), right after `__array_define`.
+    fn sparse_define(self) -> u32 {
+        self.array_concat + 9
     }
 }
 
@@ -1509,19 +1535,22 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_array_reserve(helpers.alloc));
     code.function(&emit_array_push(
         helpers.array_reserve(),
-        helpers.sparse_set(),
+        helpers.sparse_define(),
     ));
     code.function(&emit_array_concat(
         helpers.array_reserve(),
         helpers.sparse_get(),
         helpers.proto_elem(),
     ));
-    code.function(&emit_array_set(&offsets, helpers));
+    code.function(&emit_array_set(&offsets, helpers, false));
     code.function(&emit_array_set_length(&offsets, helpers));
     code.function(&emit_sparse_get(helpers));
-    code.function(&emit_sparse_set(helpers));
+    code.function(&emit_sparse_set(helpers, false));
     code.function(&emit_protos_indexless());
     code.function(&emit_proto_elem(helpers));
+    code.function(&emit_proto_set(helpers));
+    code.function(&emit_array_set(&offsets, helpers, true));
+    code.function(&emit_sparse_set(helpers, true));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.convert,
