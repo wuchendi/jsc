@@ -1652,7 +1652,8 @@ Errors are printed to stderr.
   `.tmp/test262-results.tsv`. Negative async tests follow the negative rules.
 - **Baseline.** `tests/test262/baseline.txt` lists every passing test path.
   `--check` fails if any baseline test no longer passes; `--update-baseline`
-  merges the current passes into it.
+  rewrites it to the current passes (with PATH_PREFIX filters, only the entries
+  under those prefixes are replaced).
 - **History.** `--history` appends `commit pass eligible total` for a full run to
   `tests/test262/history.tsv`. The current metric is its last row:
 
@@ -1661,9 +1662,11 @@ Errors are printed to stderr.
   | `319208e` | 10185 | 23208 | 47665 |
   | `d0f5e6a` | 10269 | 26388 | 47665 |
   | `15be3e0` | 14301 | 30008 | 47665 |
+  | `968dd97` | 19243 | 30014 | 47665 |
+  | `eee36ef` | 19378 | 30014 | 47665 |
 
-  i.e. **14301 / 30008 eligible tests pass (≈ 47.7 %)**, out of 47665 tests in
-  the pinned checkout; `baseline.txt` holds the same 14301 paths. The drop in
+  i.e. **19378 / 30014 eligible tests pass (≈ 64.6 %)**, out of 47665 tests in
+  the pinned checkout; `baseline.txt` holds the same 19378 paths. The drop in
   rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
   `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
   (1413 pass).
@@ -1976,6 +1979,15 @@ installed on the realm's prototypes, and phase 3 extends that set.
 - The GC design is decided here; implementation lands in phase 4.
 
 ### Phase 3 — Built-in library and strings
+
+**Status: wave 3a complete** (M3 reached: 64.6 % of eligible tests pass).
+3a delivered property descriptors and `Object` reflection, `bind`, the ES2025
+`Array` / `String` / `Number` / `Math` methods, `AggregateError`, Date TimeClip,
+the async test262 runner, and language completions pulled forward from phase 5
+(comma, generator and async expressions / methods, async generators,
+non-simple parameters, early errors, `var` hoisting and global bindings).
+Wave 3c (`Symbol`, the iteration protocol, Latin-1 / UTF-16 strings) is designed
+and awaits approval.
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,

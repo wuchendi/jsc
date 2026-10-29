@@ -75,10 +75,10 @@ test262 is the primary metric. `crates/jsc-test262` runs the official suite at a
 
 - `scripts/test262-fetch.sh` checks out tc39/test262 into `.tmp/test262`.
 - Tests run against the official harness files in that checkout, unmodified: `"use strict";` + `sta.js` + `assert.js` + the test's includes + the test source, compiled and run as `jsc FILE`. Includes that do not compile make their tests ineligible.
-- `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module`, `async`, or `noStrict` are ineligible as well.
+- `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Symbol, Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module` or `noStrict` (and `raw` tests flagged `async`) are ineligible as well; other `async` tests run with the official `doneprintHandle.js` and pass on `Test262:AsyncTestComplete`.
 - `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records `pass` / `eligible` / `total` per commit from a full run (`--history`).
 
-Current result (last row of `tests/test262/history.tsv`): **10185 pass / 23208 eligible (43.9%) / 47665 total**.
+Current result (last row of `tests/test262/history.tsv`): **19378 pass / 30014 eligible (64.6%) / 47665 total**.
 
 ```bash
 bash scripts/test262-fetch.sh
@@ -86,13 +86,13 @@ cargo build --release -p jsc
 cargo run --release -p jsc-test262                      # full run with a per-directory report
 cargo run --release -p jsc-test262 -- built-ins/Array   # only tests under a path prefix
 cargo run --release -p jsc-test262 -- --check           # fail if any baseline test regressed
-cargo run --release -p jsc-test262 -- --update-baseline # rewrite baseline.txt
+cargo run --release -p jsc-test262 -- --update-baseline # rewrite baseline.txt (only the filtered prefixes, if any)
 cargo run --release -p jsc-test262 -- --history         # append a row to history.tsv
 ```
 
 CI (`.github/workflows/`):
 
-- `ci.yml` — on push to `main` and on pull requests that touch Rust paths (`crates/**`, Cargo manifests and lockfile, toolchain/lint configs, `tests/test262/**`, `scripts/test262-fetch.sh`): `cargo fmt --check`, `typos`, `cargo clippy` (warnings denied), `cargo nextest`, doctests, `cargo shear`, `cargo deny`; plus a test262 job that fetches test262, runs the M1 harness tests (`crates/jsc/tests/test262_harness.rs`: the official `sta.js` + `assert.js` compile and run), and runs `jsc-test262 --check` against the baseline.
+- `ci.yml` — manual only (`workflow_dispatch`: the Actions tab or `gh workflow run ci.yml --ref <branch>`): `cargo fmt --check`, `typos`, `cargo clippy` (warnings denied), `cargo nextest`, doctests, `cargo shear`, `cargo deny`; plus a test262 job that fetches test262, runs the M1 harness tests (`crates/jsc/tests/test262_harness.rs`: the official `sta.js` + `assert.js` compile and run), and runs `jsc-test262 --check` against the baseline.
 - `web.yml` — on push to `main` and pull requests that touch `crates/**`, `packages/**`, `apps/**`, `scripts/**`, Cargo or bun manifests (and manual dispatch): builds `@cdlab/jsc`, runs `biome` lint, builds the playground, and runs the package tests.
 - `release.yml` — on `v*` tags (and manual dispatch): builds the static musl binary and publishes the release.
 
@@ -101,15 +101,15 @@ CI (`.github/workflows/`):
 | Area | What works |
 | ---- | ---------- |
 | **Values** | `number`, `boolean`, `undefined`, `null`, `string`, arrays, objects, functions, `Map`, `Set`, `Promise`, `Date`, generators |
-| **Operators** | arithmetic, bitwise and shift, comparison, `==`/`===` and negations, logical and `??`, `typeof`, `instanceof`, `in`, `delete`, compound assignment, `++`/`--`, optional chaining `?.`; `ToPrimitive` / `ToNumber` / `ToString` call user `valueOf` / `toString` |
-| **Bindings** | block-scoped `let`/`const` (assigning a `const` is a compile error); array/object destructuring with defaults and rest; spread in array literals and calls |
-| **Objects** | dynamic properties with a prototype chain; object literals with computed keys, methods and getters/setters; arrays with holes, growth by index and `length` writes |
+| **Operators** | comma, arithmetic, bitwise and shift, comparison, `==`/`===` and negations, logical and `??`, `typeof`, `instanceof`, `in`, `delete`, compound assignment, `++`/`--`, optional chaining `?.`; `ToPrimitive` / `ToNumber` / `ToString` call user `valueOf` / `toString` |
+| **Bindings** | `var` hoisted to function scope (top-level `var` and function declarations are global-object properties), block-scoped `let`/`const` (assigning a `const` is a compile error); array/object destructuring with defaults and rest; spread in array literals and calls |
+| **Objects** | dynamic properties with a prototype chain and property descriptors (writable / enumerable / configurable, accessors), extensibility, `seal` / `freeze`; object literals with computed keys, methods, getters/setters and `__proto__`; arrays with holes (read through the prototype chain), growth by index, sparse storage and `length` writes |
 | **Control flow** | `if`, `for`, `while`, `do`/`while`, `for-of`, `for-in`, `switch`, labels, ternary |
-| **Functions** | declarations, expressions, arrows, closures (capture by reference), default and rest parameters, `arguments`; functions are objects; `call`/`apply`; missing arguments are `undefined`, extra arguments are ignored; `function*` generators; `async` functions and top-level `await` |
+| **Functions** | declarations, expressions, arrows, closures (capture by reference), default and rest parameters, `arguments`; functions are objects; `call`/`apply`; missing arguments are `undefined`, extra arguments are ignored; generator and `async` functions, expressions, methods and async generators, top-level `await`; `bind`; parameter TDZ |
 | **Classes** | class declarations and expressions, fields, methods, constructors, `extends` any constructor (including builtins)/`super`, `new.target`, static methods and fields, getters/setters |
-| **Built-ins** | function objects on real prototypes, usable as values: `console.log`, `Math`, `Object`, `String`/`Number`/`Boolean` (and wrapper objects), `parseInt`/`parseFloat`, `isNaN`/`isFinite`, `globalThis`, common array and string methods, `Map`/`Set`, `JSON.parse`/`stringify` (reviver, replacer, `space`), `Date` |
+| **Built-ins** | function objects on real prototypes, usable as values: `console.log`, `Math`, `Object`, `String`/`Number`/`Boolean` (and wrapper objects), `parseInt`/`parseFloat`, `isNaN`/`isFinite`, `globalThis`, `Object` reflection (`defineProperty(ies)`, `getOwnPropertyDescriptor(s)`, `create`, `getPrototypeOf` / `setPrototypeOf`, `assign`, `keys` / `values` / `entries`, …), the ES2025 `Array`, `String`, `Number` and `Math` methods, `Map`/`Set`, `JSON.parse`/`stringify` (reviver, replacer, `space`), `Date` |
 | **Async** | `Promise` (`new Promise`, `resolve`/`reject`, `.then`/`.catch`) with a microtask queue |
-| **Errors** | `throw`, `try`/`catch`/`finally`; `Error` and the six native error types with `.name`, `.message`, `.stack` and `instanceof`; engine errors (`null` member access, calling a non-function, unresolved names, …) are catchable error objects; running out of memory ends the run with `RangeError` |
+| **Errors** | `throw`, `try`/`catch`/`finally`; `Error` and the six native error types with `AggregateError`, with `.name`, `.message`, `cause`, `.stack` and `instanceof`; engine errors (`null` member access, calling a non-function, unresolved names, …) are catchable error objects; running out of memory ends the run with `RangeError` |
 
 Unsupported syntax is rejected at compile time with a source-span diagnostic; calling a missing method throws `TypeError` at run time.
 
@@ -129,12 +129,11 @@ Details are in [DESIGN.md](DESIGN.md).
 ## Current limitations
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
-- **Object model gaps.** No object spread, property-descriptor or prototype reflection (`Object.defineProperty`, `getPrototypeOf`, `create`, `freeze`, `assign`), private `#` members, static blocks, or computed class member names.
+- **Language gaps.** No object spread, private `#` members, static blocks, computed class member names, `for await`, or `yield*` in async generators.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
 - **Not self-contained.** The module imports seven host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
-- **Byte strings.** Strings are byte sequences, not UTF-16: `"é".length` is `2`.
-- **Missing built-ins.** No `RegExp` (regex literals are rejected), `Symbol`, `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval`, or `Function.prototype.bind`; no ES modules.
-- **Restricted forms.** Generators and async functions must be top-level declarations: generator and async expressions, arrows, methods and nested declarations, and async generators are rejected.
+- **Byte strings.** Strings are byte sequences, not UTF-16: `"é".length` is `2`; string methods throw `TypeError` where a non-ASCII position would otherwise be wrong.
+- **Missing built-ins.** No `RegExp` (regex literals are rejected), `Symbol`, `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval` or the `Function` constructor; no generic iteration protocol (`Symbol.iterator`); no ES modules.
 
 ## Roadmap
 
