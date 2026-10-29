@@ -9,33 +9,10 @@ use common::{assert_rejected, assert_uncaught};
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rejects_async_functions() {
-    // Top-level `async function` DECLARATIONS are supported (see the
-    // promises suite); an async FUNCTION EXPRESSION, an async ARROW, and an async
-    // GENERATOR remain out of scope.
-    assert_rejected("let f = async function () { return 1 }; f()");
-    assert_rejected("let f = async () => 1; f()");
-    assert_rejected("async function* f() { yield 1 } f().next()");
-}
-
-#[test]
-fn rejects_generator_functions() {
-    // Top-level `function*` DECLARATIONS are supported (see the
-    // generators suite); a generator EXPRESSION remains rejected.
-    assert_rejected("let g = function* () { return 1 }; g()");
-}
-
-#[test]
 fn rejects_spread() {
     // Call-argument and array-literal spread are supported; only
     // object spread remains out of scope.
     assert_rejected("let o = { a: 1 }; let p = { ...o }; p.a");
-}
-
-#[test]
-fn rejects_async_methods() {
-    // Async/generator methods stay out of scope.
-    assert_rejected("let o = { async m() { return 1 } }; o.m()");
 }
 
 #[test]
@@ -56,12 +33,6 @@ fn rejects_unsupported_for_of_and_for_in() {
     assert_rejected("for (const k in 5) { k }");
 }
 
-#[test]
-fn rejects_function_prototype_bind() {
-    // `bind` is phase 3: it throws rather than mis-dispatching.
-    assert_rejected("function f(a) { return a } let g = f.bind(null); g(1)");
-}
-
 // ---------------------------------------------------------------------------
 // An unknown / not-yet-implemented method is a run-time `TypeError` from the
 // prototype lookup — never a compile error, and never invalid wasm.
@@ -71,7 +42,7 @@ fn rejects_function_prototype_bind() {
 fn unknown_string_method_throws_typeerror() {
     // A primitive receiver reads its methods from its prototype at run time:
     // an unknown name is `undefined`, and calling it throws.
-    for src in ["`t`.zzz()", "`hi`.charCodeAt(0)"] {
+    for src in ["`t`.zzz()", "`hi`.toWellFormed()"] {
         assert_uncaught(src, "TypeError: expression is not a function");
     }
     for (src, name) in [
@@ -234,8 +205,8 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "TypeError: o.zzz is not a function",
     );
     // An array literal reads its methods from `%Array.prototype%` at run time.
-    assert_uncaught("[1, 2].flat()", "TypeError: expression is not a function");
-    assert_uncaught("[].concat([1])", "TypeError: expression is not a function");
+    assert_uncaught("[1, 2].group()", "TypeError: expression is not a function");
+    assert_uncaught("[].groupBy([1])", "TypeError: expression is not a function");
     // A builtin-named method's user-method fallback throws too.
     assert_uncaught("let o = {}; o.get(1)", "TypeError: o.get is not a function");
     assert_uncaught(

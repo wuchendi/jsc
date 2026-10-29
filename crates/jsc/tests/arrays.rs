@@ -50,7 +50,7 @@ fn caught_range(body: &str) -> String {
 }
 
 /// `a[i] = v` past the length grows the array densely (within
-/// `max(2 * cap, len + 1024)`), filling the gap with holes; compound and
+/// `len + 1024`), filling the gap with holes; compound and
 /// update forms read `undefined` first. A gap beyond the dense bound makes
 /// the array sparse (see `sparse_arrays`).
 #[test]
@@ -258,7 +258,7 @@ fn array_length_writes() {
     );
 }
 
-/// A store far past the dense bound (`i >= max(2 * cap, len + 1024)`) makes
+/// A store far past the dense bound (`i >= len + 1024`) makes
 /// the array sparse: the element lives in the array's own property table, the
 /// length jumps without allocating the gap, and every element operation
 /// (reads, `in`, `delete`, keys, iteration, the higher-order and host
@@ -786,4 +786,412 @@ fn push_pop_on_non_array_receiver_throws() {
         caught("const o={xs:null}; o.xs.push(1)"),
         "true|Cannot read properties of null (reading 'push')"
     );
+}
+
+/// `[[Get]]` and `HasProperty` of an integer index that an array does not own
+/// (a hole, or an index at or past its length) continue along the prototype
+/// chain — `Array.prototype`, `Object.prototype`, a user prototype, an array
+/// used as a prototype — in member reads, `in`, destructuring, spread,
+/// `for-of`, `JSON.stringify`, and every `Array.prototype` method that reads
+/// through `HasProperty` / `Get` (an inherited getter runs with the array as
+/// `this`, and its throw propagates).
+#[test]
+fn holes_read_through_the_prototype_chain() {
+    for (src, want) in HOLE_CASES {
+        assert_eq!(jsc(&["-p", src]), *want, "{src}");
+    }
+}
+
+/// A store far past the end (`i >= len + 1024`, DESIGN.md §5.4) makes the
+/// array sparse instead of allocating the gap, even when each store lands
+/// just past twice the previous one (test262 `S15.4_A1.1_T10`); the largest
+/// index `2^32 - 2` sets `length` to `2^32 - 1`, and `2^32 - 1` is an
+/// ordinary property that leaves `length` alone.
+#[test]
+fn far_index_writes_go_sparse() {
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var x = []; var k = 1; for (let i = 0; i < 32; i++) { k = k * 2; x[k - 2] = k } \
+             k = 1; var ok = true; for (let i = 0; i < 32; i++) { k = k * 2; ok = ok && x[k - 2] === k } \
+             ok + \"|\" + x.length + \"|\" + Object.keys(x).length + \"|\" + (5 in x)"
+        ]),
+        "true|4294967295|32|false"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var x = []; x[4294967294] = 1; x.length + \"|\" + x[4294967294]"
+        ]),
+        "4294967295|1"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var x = [1]; x[4294967295] = 2; x.length + \"|\" + x[4294967295] + \"|\" + Object.keys(x)"
+        ]),
+        "1|2|0,4294967295"
+    );
+    // The bound: a gap of 1023 holes stays dense, 1024 goes sparse; either way
+    // the array reads the same.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var a = [1, 2]; a[1025] = 3; a.length + \"|\" + a[1025] + \"|\" + (1024 in a) + \"|\" + a.indexOf(3)"
+        ]),
+        "1026|3|false|1025"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var a = [1, 2]; a[1026] = 3; a.length + \"|\" + a[1026] + \"|\" + (1025 in a) + \"|\" + a.indexOf(3)"
+        ]),
+        "1027|3|false|1026"
+    );
+    // A sparse array keeps working: builtins, iteration order, holes through
+    // the prototype chain.
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "var a = [0]; a[5000] = 2; a[3000] = 1; var r = []; a.forEach(function (v, i) { r.push(i + \":\" + v) }); r.join() + \"|\" + Object.keys(a).join() + \"|\" + a.lastIndexOf(1)"
+        ]),
+        "0:0,3000:1,5000:2|0,3000,5000|3000"
+    );
+    assert_eq!(
+        jsc(&[
+            "-p",
+            "Array.prototype[4000] = 9; var a = [0]; a[5000] = 2; a[4000] + \"|\" + (4000 in a) + \"|\" + a.indexOf(9) + \"|\" + a.filter(function () { return true }).join()"
+        ]),
+        "9|true|4000|0,9,2"
+    );
+}
+
+/// `(program, completion value)` pairs of
+/// [`holes_read_through_the_prototype_chain`] (each checked against Node).
+const HOLE_CASES: &[(&str, &str)] = &[
+    ("Array.prototype[1] = 5; var a = [0,,2]; a[1]", "5"),
+    ("Object.prototype[1] = \"x\"; [0,,2].join()", "0,x,2"),
+    ("Array.prototype[1] = 5; var a = [0,,2]; 1 in a", "true"),
+    ("Array.prototype[1] = 5; [0,,2].hasOwnProperty(1)", "false"),
+    ("Array.prototype[5] = \"p\"; var a = [0]; a[5]", "p"),
+    (
+        "var p = [1,2,3]; var o = Object.create(p); o[1] + \"|\" + (1 in o) + \"|\" + o.length",
+        "2|true|3",
+    ),
+    (
+        "var a = [0,,2]; Object.setPrototypeOf(a, Object.setPrototypeOf({1: 7}, Array.prototype)); a[1] + \"|\" + (1 in a) + \"|\" + a.join()",
+        "7|true|0,7,2",
+    ),
+    (
+        "class P extends Array {}; P.prototype[1] = 9; var a = new P(3); a[0] = 0; a[1] + \"|\" + a.join()",
+        "9|0,9,",
+    ),
+    (
+        "Array.prototype[1] = 5; var r = []; [0,,2].forEach(function (v, i) { r.push(i + \":\" + v) }); r.join()",
+        "0:0,1:5,2:2",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].map(function (v) { return v * 2 }).join()",
+        "0,10,4",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].filter(function (v) { return v > 0 }).join()",
+        "5,2",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].every(function (v) { return v !== 5 })",
+        "false",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].some(function (v) { return v === 5 })",
+        "true",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].reduce(function (a, v) { return a + v }, \"\")",
+        "052",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].reduceRight(function (a, v) { return a + v }, \"\")",
+        "250",
+    ),
+    ("Array.prototype[1] = 5; [0,,2].indexOf(5)", "1"),
+    ("Array.prototype[1] = 5; [0,,2].lastIndexOf(5)", "1"),
+    ("Array.prototype[1] = 5; [0,,2].includes(5)", "true"),
+    (
+        "Array.prototype[1] = 5; [0,,2].find(function (v) { return v === 5 })",
+        "5",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].findIndex(function (v) { return v === 5 })",
+        "1",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].findLast(function (v) { return v === 5 })",
+        "5",
+    ),
+    ("Array.prototype[1] = 5; [0,,2].toString()", "0,5,2"),
+    (
+        "Array.prototype[1] = 5; [0,,2].concat([3]).hasOwnProperty(1)",
+        "true",
+    ),
+    (
+        "Array.prototype[1] = 5; [0,,2].slice(0).hasOwnProperty(1)",
+        "true",
+    ),
+    (
+        "Array.prototype[1] = 5; var a = [0,,2]; a.reverse(); a.hasOwnProperty(1) + \"|\" + a.join()",
+        "false|2,5,0",
+    ),
+    (
+        "Array.prototype[1] = 5; var a = [0,,2]; a.shift(); a.hasOwnProperty(0) + \"|\" + a.join()",
+        "true|5,2",
+    ),
+    (
+        "Array.prototype[1] = 5; var a = [0,,2]; a.unshift(9); a.hasOwnProperty(2) + \"|\" + a.join()",
+        "true|9,0,5,2",
+    ),
+    (
+        "Array.prototype[1] = 5; var a = [0,,2]; a.splice(0, 2).hasOwnProperty(1)",
+        "true",
+    ),
+    (
+        "Array.prototype[1] = 5; var a = [3,,1]; a.sort(); a.join() + \"|\" + a.hasOwnProperty(2)",
+        "1,3,5|true",
+    ),
+    (
+        "Array.prototype[1] = 5; var a = [0,,2,3]; a.copyWithin(2, 0); a.hasOwnProperty(3) + \"|\" + a.join()",
+        "true|0,5,0,5",
+    ),
+    ("Array.prototype[1] = 5; [[0,,2]].flat().join()", "0,5,2"),
+    (
+        "Array.prototype[1] = 5; [0,,2].flatMap(function (v) { return [v] }).join()",
+        "0,5,2",
+    ),
+    ("Array.prototype[1] = 5; [...[0,,2]].join()", "0,5,2"),
+    ("Array.prototype[1] = 5; Array.from([0,,2]).join()", "0,5,2"),
+    (
+        "Array.prototype[1] = 5; Array.from({length: 3, 0: 0, 2: 2}).join()",
+        "0,,2",
+    ),
+    ("Array.prototype[1] = 5; var [x, y, z] = [0,,2]; y", "5"),
+    ("Array.prototype[1] = 5; JSON.stringify([0,,2])", "[0,5,2]"),
+    ("Array.prototype[1] = 5; Math.max(...[0,,2])", "5"),
+    (
+        "Array.prototype[1] = 5; var a = [0,,2]; a.pop(); a.pop()",
+        "5",
+    ),
+    (
+        "Array.prototype[1] = 5; var r = []; for (var v of [0,,2]) r.push(v); r.join()",
+        "0,5,2",
+    ),
+    ("Object.prototype[1] = \"x\"; var a = [0,,2]; a[1]", "x"),
+    (
+        "Object.prototype[1] = \"x\"; [0,,2].map(function (v) { return v }).join()",
+        "0,x,2",
+    ),
+    ("Object.prototype[1] = \"x\"; [0,,2].indexOf(\"x\")", "1"),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", { get: function () { return this.length }, configurable: true }); [0,,2][1]",
+        "3",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", { get: function () { throw new RangeError(\"g\") }, configurable: true }); try { [0,,2].forEach(function () {}); \"no\" } catch (e) { e.message }",
+        "g",
+    ),
+    (
+        "var a = [0,,2]; var n = 0; a.forEach(function (v, i) { if (i === 0) Array.prototype[1] = 7; n += v }); n",
+        "9",
+    ),
+    (
+        "var o = {length: 3, 0: \"a\", 2: \"c\"}; Object.setPrototypeOf(o, {1: \"b\"}); Array.prototype.join.call(o)",
+        "a,b,c",
+    ),
+    ("var a = [0,,2]; a[1]", "undefined"),
+    ("[0,,2].join()", "0,,2"),
+    (
+        "Object.prototype[1] = \"x\"; var arr = []; arr.length = 3; Array.prototype.slice.call(arr).hasOwnProperty(1)",
+        "true",
+    ),
+    (
+        "Array.prototype[3] = \"z\"; var a = [0]; a[2000] = 1; a[3] + \"|\" + (3 in a)",
+        "z|true",
+    ),
+];
+
+/// A store to an index an array does not own (a hole, or at or past its
+/// length) is `OrdinarySet` through the prototype chain, for `a[i] = v`,
+/// compound assignment, and every `Array.prototype` method that writes by
+/// `Set` (`push`, `unshift`, `splice`, `fill`, `copyWithin`, `reverse`, the
+/// `sort` write-back): an inherited setter runs with the array as `this` and
+/// no own element is created, an inherited read-only or getter-only index
+/// throws `TypeError` (all code is strict), and an inherited writable data
+/// property is shadowed by a new own element. Dense, `SPARSE` (store and
+/// table elements), ordinary-object and array prototypes all apply.
+#[test]
+fn element_writes_set_through_the_prototype_chain() {
+    for (src, want) in WRITE_CASES {
+        assert_eq!(jsc(&["-p", src]), *want, "{src}");
+    }
+}
+
+/// `(program, completion value)` pairs of
+/// [`element_writes_set_through_the_prototype_chain`] (each checked against
+/// Node in strict mode).
+const WRITE_CASES: &[(&str, &str)] = &[
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"1\", {set: function (v) { log.push(this.length + \":\" + v) }, configurable: true}); var a=[0,,2]; a[1]=7; log.join() + \"|\" + a.hasOwnProperty(1) + \"|\" + a.length",
+        "3:7|false|3",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"3\", {set: function (v) { this.seen = v }, configurable: true}); var a=[0]; a[3]=9; a.seen + \"|\" + a.length + \"|\" + a.hasOwnProperty(3)",
+        "9|1|false",
+    ),
+    (
+        "Object.defineProperty(Object.prototype, \"0\", {set: function (v) { this.x = v }, configurable: true}); var a=[]; a[0]=1; a.x + \"|\" + a.length",
+        "1|0",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", {value: 5, writable: false, configurable: true}); var a=[0,,2]; var r; try { a[1]=7; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a[1] + \"|\" + a.hasOwnProperty(1) } r",
+        "true|5|false",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"2\", {get: function () { return 1 }, configurable: true}); var a=[0]; var r; try { a[2]=7; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.length } r",
+        "true|1",
+    ),
+    (
+        "Array.prototype[1]=5; var a=[0,,2]; a[1]=7; a[1] + \"|\" + a.hasOwnProperty(1) + \"|\" + Array.prototype[1]",
+        "7|true|5",
+    ),
+    (
+        "Array.prototype[1]=5; var a=[0,,2]; a[1]=7; a.join()",
+        "0,7,2",
+    ),
+    (
+        "var n=0; Object.defineProperty(Array.prototype, \"1\", {set: function (v) { n = v }, get: function () { return 10 }, configurable: true}); var a=[0,,2]; a[1] += 5; n + \"|\" + a.hasOwnProperty(1)",
+        "15|false",
+    ),
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log.push(v) }, configurable: true}); var a=[0,1]; a.push(9); log.join() + \"|\" + a.length + \"|\" + a.hasOwnProperty(2)",
+        "9|3|false",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", {value: 0, writable: false, configurable: true}); var a=[0]; var r; try { a.push(1); r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.length } r",
+        "true|1",
+    ),
+    (
+        "var log=\"\"; Object.defineProperty(Array.prototype, \"0\", {set: function (v) { log += v }, get: function () { return \"g\" }, configurable: true}); var a=[]; a.unshift(5); log + \"|\" + a.length + \"|\" + a.hasOwnProperty(0)",
+        "5|1|false",
+    ),
+    (
+        "Object.defineProperty(Array.prototype, \"1\", {value: 0, writable: false, configurable: true}); var a=[1,,3]; var r; try { a.fill(9); r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.join() } r",
+        "true|9,0,3",
+    ),
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log.push(v) }, configurable: true}); var a=[0,1]; a.splice(2, 0, 8); log.join() + \"|\" + a.length + \"|\" + a.hasOwnProperty(2)",
+        "8|3|false",
+    ),
+    (
+        "var log=\"\"; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log += v }, get: function () { return 9 }, configurable: true}); var a=[0,1,,3]; a.reverse(); log + \"|\" + a.hasOwnProperty(2) + \"|\" + a[1]",
+        "1|false|9",
+    ),
+    (
+        "var log=[]; Object.defineProperty(Array.prototype, \"1\", {set: function (v) { log.push(v) }, configurable: true}); var a=[0,,2,3]; a.copyWithin(1, 3); log.join() + \"|\" + a.hasOwnProperty(1)",
+        "3|false",
+    ),
+    (
+        "var log=\"\"; Object.defineProperty(Array.prototype, \"2\", {set: function (v) { log += v }, get: function () { return 0 }, configurable: true}); var a=[3,1]; a.length = 3; a.sort(); log + \"|\" + a.hasOwnProperty(2) + \"|\" + a.join()",
+        "3|false|0,1,0",
+    ),
+    (
+        "var a=[0]; a[5000]=1; Object.defineProperty(Array.prototype, \"3\", {set: function (v) { this.s = v }, configurable: true}); a[3]=2; a.s + \"|\" + a.hasOwnProperty(3)",
+        "2|false",
+    ),
+    (
+        "var a=[0]; a[5000]=1; Object.defineProperty(Array.prototype, \"4000\", {set: function (v) { this.s = v }, configurable: true}); a[4000]=2; a.s + \"|\" + a.hasOwnProperty(4000)",
+        "2|false",
+    ),
+    (
+        "var p = { set 1(v) { this.y = v } }; var a=[0]; Object.setPrototypeOf(a, p); a[1]=3; a.y + \"|\" + a.length",
+        "3|1",
+    ),
+    (
+        "var p = Object.freeze([1, 2]); var a=[]; Object.setPrototypeOf(a, p); var r; try { a[0]=5; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + a.length } r",
+        "true|0",
+    ),
+    (
+        "var o = Object.create(Object.freeze([1])); var r; try { o[0]=2; r=\"no\" } catch (e) { r = (e instanceof TypeError) + \"|\" + o.hasOwnProperty(0) } r",
+        "true|false",
+    ),
+    (
+        "var p = [1, 2]; var a=[]; Object.setPrototypeOf(a, p); a[0]=5; a[0] + \"|\" + a.hasOwnProperty(0) + \"|\" + p[0]",
+        "5|true|1",
+    ),
+];
+
+/// The algorithms that build a result by `CreateDataPropertyOrThrow` (and
+/// `defineProperty` of a default element) define own elements without
+/// consulting the prototype chain: an inherited `Array.prototype` index setter
+/// is never called by `map`, `filter`, `concat`, `slice`, `Array.of`,
+/// `Array.from`, `splice`'s removed array, `flat`, `flatMap`, `toReversed`,
+/// `with`, while a plain store to an own element skips it too and a store
+/// past the length calls it.
+#[test]
+fn result_arrays_define_without_the_prototype_chain() {
+    let setter = "var n=0; Object.defineProperty(Array.prototype, \"0\", {set: function () { n++ }, configurable: true}); ";
+    let cases: &[(&str, &str)] = &[
+        (
+            "var r = [5].map(function (v) { return v }); n + \"|\" + r.hasOwnProperty(0) + \"|\" + r[0]",
+            "0|true|5",
+        ),
+        (
+            "var r = [5].filter(function () { return true }); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].concat([6]); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5, 6].slice(0); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = Array.of(5); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = Array.from([5]); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var a = [5, 6]; var r = a.splice(0, 1); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [[5]].flat(); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].flatMap(function (v) { return [v] }); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].toReversed(); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5].with(0, 6); n + \"|\" + r.hasOwnProperty(0)",
+            "0|true",
+        ),
+        (
+            "var r = [5, 6]; Object.defineProperty(r, \"0\", {value: 7}); n + \"|\" + r[0]",
+            "0|7",
+        ),
+        ("var r = [5]; r[0] = 6; n + \"|\" + r[0]", "0|6"),
+        ("var r = []; r[0] = 6; n + \"|\" + r.length", "1|0"),
+    ];
+    for (src, want) in cases {
+        let src = format!("{setter}{src}");
+        assert_eq!(jsc(&["-p", &src]), *want, "{src}");
+    }
 }

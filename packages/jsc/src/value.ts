@@ -23,6 +23,7 @@ import {
   FN_INFO_ADDR,
   FN_INFO_ENTRY_SIZE,
   FN_INFO_NAME_OFFSET,
+  FUNC_FLAG_BOUND,
   FUNC_FLAG_CLASS_CTOR,
   FUNC_FLAG_CONSTRUCTOR,
   FUNC_INDEX_OFFSET,
@@ -498,9 +499,18 @@ function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
     )
       parent = functionName(HEAP | BigInt(linkPtr), mem)
   }
+  // A bound function's name is its own `name` property (`bound f`).
+  let name: string | undefined
+  if (((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_BOUND) === 0) {
+    name = functionName(HEAP | BigInt(ptr), mem)
+  } else {
+    const bits = ownData(ptr, 'name', mem)
+    const own = bits === undefined ? undefined : decode(bits, mem)
+    name = own?.kind === 'string' ? own.value : undefined
+  }
   return {
     kind: 'function',
-    name: functionName(HEAP | BigInt(ptr), mem) ?? '',
+    name: name ?? '',
     isClass,
     extends: parent,
     props: decodeProps(ptr, mem, guard),
@@ -785,8 +795,7 @@ function formatEntries(entries: [string, Value][]): string {
  * Render a millisecond epoch timestamp as `YYYY-MM-DDTHH:MM:SS.mmmZ` (mirrors
  * `value.rs::format_date_iso`, Howard Hinnant's `civil_from_days`); a
  * non-finite timestamp renders as `Invalid Date`. Ported rather than delegated
- * to `Date.prototype.toISOString`, which uses extended `±YYYYYY` years and
- * throws out of range.
+ * to `Date.prototype.toISOString`, which throws for an invalid time value.
  */
 function formatDateIso(ms: number): string {
   if (!Number.isFinite(ms)) return 'Invalid Date'
@@ -816,7 +825,7 @@ function formatDateIso(ms: number): string {
   const month = mp < 10 ? mp + 3 : mp - 9
   const year = yoe + era * 400 + (month <= 2 ? 1 : 0)
 
-  return `${padSigned(year, 4)}-${pad2(month)}-${pad2(day)}T${pad2(hours)}:${pad2(mins)}:${pad2(secs)}.${String(millis).padStart(3, '0')}Z`
+  return `${isoYear(year)}-${pad2(month)}-${pad2(day)}T${pad2(hours)}:${pad2(mins)}:${pad2(secs)}.${String(millis).padStart(3, '0')}Z`
 }
 
 /** Zero-pad to two digits (Rust `{:02}` for a non-negative integer). */
@@ -824,10 +833,10 @@ function pad2(n: number): string {
   return String(n).padStart(2, '0')
 }
 
-/** Zero-pad to `width` chars counting the sign (Rust `{:0width}` for a signed integer). */
-function padSigned(n: number, width: number): string {
-  const sign = n < 0 ? '-' : ''
-  return sign + String(Math.abs(n)).padStart(width - sign.length, '0')
+/** Four digits, or an expanded `±YYYYYY` year outside `0..=9999`. */
+function isoYear(year: number): string {
+  if (year >= 0 && year <= 9999) return String(year).padStart(4, '0')
+  return (year < 0 ? '-' : '+') + String(Math.abs(year)).padStart(6, '0')
 }
 
 /**
@@ -853,7 +862,7 @@ export function valueToNumber(value: Value): number {
 
 /** Parse a whole string as JS `Number(str)` (mirrors `host.rs::str_to_number`). */
 function strToNumber(s: string): number {
-  const trimmed = s.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
+  const trimmed = s.replace(/^\s+|\s+$/g, '')
   if (trimmed.length === 0) return 0
   // `Number("bad")` is already `NaN`, matching Rust's `parse::<f64>().unwrap_or(NaN)`.
   return Number(trimmed)
@@ -906,7 +915,7 @@ function digitValue(code: number): number {
 /** Parse a leading decimal float (the `parseFloat` subset from `host.rs::parse_float_str`). */
 export function parseFloatStr(s: string): number {
   let i = 0
-  while (i < s.length && isAsciiWhitespace(s[i]!)) i++
+  while (i < s.length && /\s/.test(s[i]!)) i++
   const from = i
   if (i < s.length && (s[i] === '+' || s[i] === '-')) i++
   let seenDigit = false
@@ -932,17 +941,6 @@ export function parseFloatStr(s: string): number {
   }
   // `Number("bad")` is already `NaN`, matching Rust's `parse::<f64>().unwrap_or(NaN)`.
   return Number(s.slice(from, i))
-}
-
-function isAsciiWhitespace(c: string): boolean {
-  return (
-    c === ' ' ||
-    c === '\t' ||
-    c === '\n' ||
-    c === '\r' ||
-    c === '\f' ||
-    c === '\v'
-  )
 }
 
 function isAsciiDigit(c: string): boolean {

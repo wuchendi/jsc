@@ -4,7 +4,9 @@
 //! the iterable `Map`/`Set` constructors and `Date()`.
 
 mod common;
-use common::{assert_bool, assert_number, assert_output, assert_string, assert_uncaught};
+use common::{
+    assert_bool, assert_eval, assert_number, assert_output, assert_string, assert_uncaught,
+};
 
 /// A prefix that makes a program not intrinsics-sealed without writing any
 /// prototype, so the call-site fast paths run behind their run-time guards.
@@ -397,4 +399,179 @@ fn date_called_as_a_function_is_a_to_string_string() {
     // Arguments are ignored.
     both_bool("Date(0).length === 62", true);
     both_bool("const D = Date; D().length === 62", true);
+}
+
+// --- TimeClip and invalid dates ---------------------------------------------------
+
+/// The constructor path behind `new Date(...)` and an indirect `new D(...)`.
+fn both_ctors(f: impl Fn(&str) -> String, check: impl Fn(&str)) {
+    check(&f("Date"));
+    check(&format!("const D = Date; {}", f("D")));
+}
+
+#[test]
+fn date_time_clip_truncates_and_bounds() {
+    for (arg, expected) in [
+        ("8.64e15", 8.64e15),
+        ("-8.64e15", -8.64e15),
+        ("1.9", 1.0),
+        ("-1.9", -1.0),
+        ("'7'", 7.0),
+    ] {
+        both_ctors(
+            |d| format!("new {d}({arg}).getTime()"),
+            |src| both_number(src, expected),
+        );
+    }
+    for arg in [
+        "8.64e15 + 1",
+        "-8.64e15 - 1",
+        "1e20",
+        "Infinity",
+        "-Infinity",
+        "NaN",
+    ] {
+        both_ctors(
+            |d| format!("isNaN(new {d}({arg}).getTime())"),
+            |src| both_bool(src, true),
+        );
+    }
+    both_ctors(
+        |d| format!("1 / new {d}(-0).getTime() === Infinity"),
+        |src| both_bool(src, true),
+    );
+    both_ctors(
+        |d| format!("1 / new {d}(-0.5).valueOf() === Infinity"),
+        |src| both_bool(src, true),
+    );
+    // The host clock is clipped too: a whole, finite millisecond count.
+    both_bool("const t = new Date().getTime(); t === Math.trunc(t)", true);
+}
+
+#[test]
+fn date_from_a_date_takes_its_time_value() {
+    // Not ToPrimitive: a Date's own `valueOf`/`toString` are not consulted.
+    both_ctors(
+        |d| format!("const a = new Date(5); a.valueOf = () => 9; new {d}(a).getTime()"),
+        |src| both_number(src, 5.0),
+    );
+    both_ctors(
+        |d| format!("new {d}(new Date(1e20)).toString()"),
+        |src| both_string(src, "Invalid Date"),
+    );
+    // An ordinary object still goes through `valueOf`.
+    both_number("new Date({ valueOf() { return 4.5 } }).getTime()", 4.0);
+}
+
+#[test]
+fn invalid_date_behavior() {
+    for getter in [
+        "getTime",
+        "valueOf",
+        "getFullYear",
+        "getMonth",
+        "getDate",
+        "getDay",
+        "getHours",
+        "getMinutes",
+        "getSeconds",
+    ] {
+        both_bool(&format!("isNaN(new Date(1e20).{getter}())"), true);
+    }
+    both_string("new Date(1e20).toString()", "Invalid Date");
+    both_string("String(new Date(8.64e15 + 1))", "Invalid Date");
+    both_string("JSON.stringify(new Date(NaN))", "null");
+    both_string("JSON.stringify({ d: new Date(1e20) })", "{\"d\":null}");
+    both_bool("new Date(NaN).toJSON() === null", true);
+    both_string(
+        "try { new Date(1e20).toISOString(); 'none' } catch (e) { `${e instanceof RangeError} ${e.name}: ${e.message}` }",
+        "true RangeError: Invalid time value",
+    );
+    assert_uncaught(
+        "new Date(NaN).toISOString()",
+        "RangeError: Invalid time value",
+    );
+    assert_output("console.log(new Date(1e20))", "Invalid Date\n");
+    assert_eval("new Date(1e20)", "Invalid Date");
+}
+
+#[test]
+fn date_iso_string_extended_years() {
+    for (ms, iso) in [
+        ("-8.64e15", "-271821-04-20T00:00:00.000Z"),
+        ("8.64e15", "+275760-09-13T00:00:00.000Z"),
+        ("-62198755200000", "-000001-01-01T00:00:00.000Z"),
+        ("-62167219200000", "0000-01-01T00:00:00.000Z"),
+        ("253402300799999", "9999-12-31T23:59:59.999Z"),
+        ("253402300800000", "+010000-01-01T00:00:00.000Z"),
+        ("-1", "1969-12-31T23:59:59.999Z"),
+    ] {
+        both_string(&format!("new Date({ms}).toISOString()"), iso);
+        both_string(&format!("new Date({ms}).toJSON()"), iso);
+    }
+    assert_output(
+        "console.log(new Date(8.64e15), new Date(-8.64e15))",
+        "+275760-09-13T00:00:00.000Z -271821-04-20T00:00:00.000Z\n",
+    );
+}
+
+// --- the calendar-field constructor ----------------------------------------------
+
+/// `new Date(year, month[, date, hours, minutes, seconds, ms])` builds the
+/// UTC time value (`MakeDay` / `MakeTime`, two-digit years in the 1900s,
+/// month overflow carried into the year, `TimeClip`).
+#[test]
+fn date_calendar_fields_build_the_utc_time_value() {
+    both_number(
+        "new Date(2020, 0, 2, 3, 4, 5, 6).getTime()",
+        1_577_934_245_006.0,
+    );
+    both_number("new Date(2020, 1).getTime()", 1_580_515_200_000.0);
+    both_number("new Date(2019, 13, 1).getTime()", 1_580_515_200_000.0);
+    both_number("new Date(2020, -1, 1).getTime()", 1_575_158_400_000.0);
+    both_number("new Date(99, 0).getFullYear()", 1999.0);
+    both_number("new Date(-1, 0).getTime()", -62_198_755_200_000.0);
+    both_number("new Date(1970, 0, 1, 0, 0, 0, -1).getTime()", -1.0);
+    both_number("new Date(2020.7, 0.9, 1.5).getTime()", 1_577_836_800_000.0);
+    both_number("new Date(275760, 8, 13).getTime()", 8.64e15);
+    both_bool("isNaN(new Date(275760, 8, 13, 0, 0, 0, 1).getTime())", true);
+    both_bool("isNaN(new Date(2020, NaN).getTime())", true);
+    both_bool("isNaN(new Date(Infinity, 0).getTime())", true);
+    both_number("new Date('2020', '1').getTime()", 1_580_515_200_000.0);
+    // Every argument is converted, in order, even after a NaN.
+    assert_string(
+        "let log = ''; const f = (v) => ({ valueOf() { log += v; return v } }); \
+         new Date(f(1), f(NaN), f(3), f(4), f(5), f(6), f(7)); log",
+        "1NaN34567",
+    );
+    // A subclass gets its own prototype.
+    assert_bool(
+        "class D extends Date {} const d = new D(2020, 0); d instanceof D && d.getTime() === 1577836800000",
+        true,
+    );
+}
+
+/// A spread construct passing more arguments than the `K` slots (these
+/// programs keep `K = 1`) hands `Date` every calendar field, read before a
+/// field's `valueOf` can publish another spread argument array.
+#[test]
+fn date_reads_spread_arguments_past_the_slots() {
+    assert_number(
+        "new Date(...[2020, 0, 2, 3, 4, 5, 6]).getTime() % 1000",
+        6.0,
+    );
+    assert_number(
+        "new Date(...[2020, 0, 2, 3, 4, 5, 6]).getTime()",
+        1_577_934_245_006.0,
+    );
+    assert_number(
+        "const y = { valueOf() { return Number(...[2020]) } }; \
+         new Date(...[y, 0, 2, 3, 4, 5, 6]).getTime()",
+        1_577_934_245_006.0,
+    );
+    assert_number(
+        "class D extends Date { constructor(...a) { super(...a) } } \
+         new D(...[2020, 0, 2, 3, 4, 5, 6]).getTime()",
+        1_577_934_245_006.0,
+    );
 }

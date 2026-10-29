@@ -7,7 +7,8 @@
 
 mod common;
 use common::{
-    assert_bool, assert_nan, assert_number, assert_output, assert_string, assert_uncaught,
+    assert_bool, assert_eval, assert_nan, assert_number, assert_output, assert_string,
+    assert_uncaught,
 };
 
 /// `(source, expected string completion)` pairs written against `JSON`;
@@ -468,5 +469,82 @@ fn math_converts_after_evaluating_every_argument() {
         "let r = ''; for (let i = 0; i < 2; i++) { try { Math.min(...[v('a'), { valueOf() { throw new RangeError('x') } }]) } catch (e) { r += e.name } } r + s",
     ) {
         assert_string(&format!("{prelude} {program}"), "RangeErrorRangeErroraa");
+    }
+}
+
+#[test]
+fn number_statics_do_not_coerce() {
+    for (src, expected) in [
+        ("Number.isInteger(5)", "true"),
+        ("Number.isInteger(5.5)", "false"),
+        ("Number.isInteger(-0)", "true"),
+        ("Number.isInteger(Infinity)", "false"),
+        ("Number.isInteger('5')", "false"),
+        ("Number.isInteger(new Number(5))", "false"),
+        ("Number.isInteger(2 ** 60)", "true"),
+        ("Number.isSafeInteger(2 ** 53 - 1)", "true"),
+        ("Number.isSafeInteger(2 ** 53)", "false"),
+        ("Number.isSafeInteger(-(2 ** 53 - 1))", "true"),
+        ("Number.isSafeInteger(1.5)", "false"),
+        ("Number.isSafeInteger(NaN)", "false"),
+        ("Number.isFinite(1)", "true"),
+        ("Number.isFinite('1')", "false"),
+        ("Number.isFinite(Infinity)", "false"),
+        ("Number.isNaN(NaN)", "true"),
+        ("Number.isNaN('NaN')", "false"),
+        ("Number.isNaN(undefined)", "false"),
+        ("Number.isNaN()", "false"),
+        ("Number.isInteger.length + Number.isNaN.length", "2"),
+        ("Number.isSafeInteger.name", "isSafeInteger"),
+        ("const f = Number.isFinite; f(3)", "true"),
+    ] {
+        assert_eval(src, expected);
+    }
+}
+
+#[test]
+fn number_parse_functions_are_the_globals() {
+    for (src, expected) in [
+        ("Number.parseFloat === parseFloat", "true"),
+        ("Number.parseInt === parseInt", "true"),
+        ("typeof globalThis.parseFloat", "function"),
+        ("parseFloat.name + parseFloat.length", "parseFloat1"),
+        ("parseInt.name + parseInt.length", "parseInt2"),
+        ("Number.parseFloat('3.5abc')", "3.5"),
+        ("Number.parseInt('ff', 16)", "255"),
+        ("const p = parseInt; p('12px')", "12"),
+        (
+            "Number.parseFloat({ toString() { return '-1e3' } })",
+            "-1000",
+        ),
+        ("Number.parseInt(' 0x1A ')", "26"),
+    ] {
+        assert_eval(src, expected);
+    }
+}
+
+#[test]
+fn number_constants() {
+    for (src, expected) in [
+        ("Number.EPSILON === 2 ** -52", "true"),
+        ("Number.MAX_SAFE_INTEGER", "9007199254740991"),
+        ("Number.MIN_SAFE_INTEGER", "-9007199254740991"),
+        ("Number.MAX_VALUE", "1.7976931348623157e+308"),
+        ("Number.MIN_VALUE", "5e-324"),
+        ("Number.NaN", "NaN"),
+        ("Number.POSITIVE_INFINITY", "Infinity"),
+        ("Number.NEGATIVE_INFINITY", "-Infinity"),
+        (
+            "try { Number.MAX_VALUE = 1 } catch (e) {} Number.MAX_VALUE",
+            "1.7976931348623157e+308",
+        ),
+        (
+            "try { delete Number.EPSILON } catch (e) {} Number.EPSILON > 0",
+            "true",
+        ),
+        ("Object.keys(Number).length", "0"),
+        ("try { Math.PI = 3 } catch (e) {} Math.PI === 3", "false"),
+    ] {
+        assert_eval(src, expected);
     }
 }

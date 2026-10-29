@@ -50,12 +50,26 @@ fn syntactic_new(callee: &str, args: usize) -> bool {
         || ErrorKind::from_name(callee).is_some()
 }
 
+/// How a program reaches the global object, in increasing order.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GlobalUse {
+    /// Never: no `globalThis`, no top-level `this`, no `delete` of an
+    /// identifier.
+    #[default]
+    None,
+    /// Only by static `globalThis.k` reads and calls: it can be observed.
+    Observed,
+    /// By an escaping `globalThis` (anything but a static `globalThis.k`
+    /// read or call), a top-level `this` or a `delete` of an identifier: it
+    /// is observed and can change under any name.
+    Open,
+}
+
 /// What the whole-program scan found (see the module docs).
 #[derive(Default)]
 pub(super) struct GlobalFacts {
-    /// The program contains `globalThis`, a top-level `this` or a `delete`
-    /// of an identifier: the global object can change under any name.
-    open: bool,
+    /// How the program reaches the global object.
+    global: GlobalUse,
     /// Names written as identifiers anywhere (assignment, update,
     /// destructuring or loop-head target).
     assigned: HashSet<String>,
@@ -86,7 +100,20 @@ impl GlobalFacts {
 
     /// `sealed(name)` for an unshadowed global `name`.
     pub(super) fn sealed(&self, name: &str) -> bool {
-        !self.open && !self.assigned.contains(name)
+        self.global != GlobalUse::Open && !self.assigned.contains(name)
+    }
+
+    /// Whether the program can observe the global object, so the top-level
+    /// `var`s and function declarations must be its properties.
+    pub(super) fn observes_global(&self) -> bool {
+        self.global >= GlobalUse::Observed
+    }
+
+    /// Record the top-level `var`s `names` as written: they are
+    /// global-object properties, so a global of the same name is not
+    /// `sealed`.
+    pub(super) fn declare_vars<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        self.assigned.extend(names.into_iter().map(str::to_owned));
     }
 
     /// Whether `name.m(..)` / `name.k` keep the inline namespace code.
@@ -107,7 +134,7 @@ impl GlobalFacts {
     /// positional slots, so `K` must then cover the widest call
     /// ([`Self::call_arity`]).
     pub(super) fn reaches_builtins(&self) -> bool {
-        self.open
+        self.global == GlobalUse::Open
             || self.member_value
             || NAMESPACES
                 .iter()
@@ -134,9 +161,18 @@ struct Scan {
 
 impl Scan {
     /// Record a read of `name`; `escapes` when not a static member read or
-    /// call.
+    /// call. An escaping `globalThis` (a bare use, a member write) opens the
+    /// global object.
     fn read(&mut self, name: &str, escapes: bool) {
         self.name(name);
+        if name == "globalThis" {
+            let used = if escapes {
+                GlobalUse::Open
+            } else {
+                GlobalUse::Observed
+            };
+            self.facts.global = self.facts.global.max(used);
+        }
         self.facts.referenced.insert(name.to_owned());
         if escapes {
             self.facts.escaped.insert(name.to_owned());
@@ -178,14 +214,8 @@ impl Scan {
 impl Visit for Scan {
     fn visit_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Ident(id) => {
-                let name = id.sym.as_ref();
-                if name == "globalThis" {
-                    self.facts.open = true;
-                }
-                self.read(name, true);
-            }
-            Expr::This(_) if self.fn_depth == 0 => self.facts.open = true,
+            Expr::Ident(id) => self.read(id.sym.as_ref(), true),
+            Expr::This(_) if self.fn_depth == 0 => self.facts.global = GlobalUse::Open,
             Expr::Member(member) => match Self::static_member_obj(member) {
                 Some(name) if self.target => self.read(name, true),
                 Some(name) => {
@@ -284,7 +314,7 @@ impl Visit for Scan {
 
     fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
         match (unary.op, unary.arg.as_ref()) {
-            (UnaryOp::Delete, Expr::Ident(_)) => self.facts.open = true,
+            (UnaryOp::Delete, Expr::Ident(_)) => self.facts.global = GlobalUse::Open,
             (UnaryOp::Delete, Expr::Member(member)) => self.member_write(member),
             _ => unary.visit_children_with(self),
         }

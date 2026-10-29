@@ -99,11 +99,13 @@ pub(super) fn build_type_and_function_sections<'a>(
             index();
             index()
         },
-        // `__array_set`, `__array_set_length`, `__sparse_get`, and
-        // `__sparse_set` take the indices right after `__array_concat`.
+        // `__array_set`, `__array_set_length`, `__sparse_get`,
+        // `__sparse_set`, `__protos_indexless`, `__proto_elem`, `__proto_set`,
+        // `__array_define`, and `__sparse_define` take the indices right after
+        // `__array_concat`.
         array_concat: {
             let array_concat = index();
-            for _ in 0..4 {
+            for _ in 0..9 {
                 index();
             }
             array_concat
@@ -144,6 +146,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         new_string: index() + 2,
         fn_type,
         max_args,
+        gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
         has_accessors: program_has_accessors(program),
         dirty_tracking: program_tests_dirty_bits(program),
         fn_info: layout.info,
@@ -223,8 +226,14 @@ pub(super) fn build_type_and_function_sections<'a>(
     // `__array_join(recv: i64, sep: i64) -> i64` and `__to_object(v: i64) -> i64`;
     // then the `JSON` helpers `__json_rep(holder, key, value, replacer, list,
     // stack: i32) -> i64`, `__json_indent(s: i32, gap: i32) -> i32` and
-    // `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 9] = [
+    // `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`; then the
+    // property-descriptor helpers `__define_own(o: i32, key: i32, desc: i32,
+    // value: i64, get: i64, set: i64) -> i32`, `__to_desc(attrs: i64, list:
+    // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
+    // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
+    // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
+    // i64) -> i32`; then the exported `__promise_self_error() -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 17] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -244,6 +253,24 @@ pub(super) fn build_type_and_function_sections<'a>(
         ),
         (&[ValType::I32, ValType::I32], &[ValType::I32]),
         (&[ValType::I64, ValType::I32, ValType::I64], &[ValType::I64]),
+        (
+            &[
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I64,
+                ValType::I64,
+                ValType::I64,
+            ],
+            &[ValType::I32],
+        ),
+        (&[ValType::I64, ValType::I32], &[]),
+        (&[ValType::I64, ValType::I32], &[ValType::I64]),
+        (&[ValType::I64, ValType::I32], &[]),
+        (&[ValType::I64, ValType::I32], &[ValType::I32]),
+        (&[ValType::I64, ValType::I32], &[ValType::I32]),
+        (&[ValType::I32, ValType::I64], &[ValType::I32]),
+        (&[], &[ValType::I64]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
@@ -322,6 +349,15 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         // `__sparse_get(arr, i) -> v`.
         (&[I32, I32], &[I64]),
         // `__sparse_set(arr, i, v)`.
+        (&[I32, I32, I64], &[]),
+        // `__protos_indexless(o) -> i32`.
+        (&[I32], &[I32]),
+        // `__proto_elem(o, i) -> v`.
+        (&[I32, I32], &[I64]),
+        // `__proto_set(o, i, v) -> i32`.
+        (&[I32, I32, I64], &[I32]),
+        // `__array_define(recv, key, v)` and `__sparse_define(arr, i, v)`.
+        (&[I64, I64, I64], &[]),
         (&[I32, I32, I64], &[]),
         // `__json_escape(str) -> str` and `__json_str(v) -> str`.
         (&[I32], &[I32]),
@@ -567,11 +603,14 @@ fn emit_fn_data(
 }
 
 /// The header `flags` a fresh function object of `kind` is created with:
-/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR` / `SELF_ALLOC`) per its kind.
+/// `LAZY`, plus `CONSTRUCTOR` (and `CLASS_CTOR` / `SELF_ALLOC`) or
+/// `GENERATOR` per its kind.
 pub(super) fn fn_flags(kind: FnKind) -> u8 {
     abi::FUNC_FLAG_LAZY
         | match kind {
             FnKind::Plain => 0,
+            FnKind::Generator => abi::FUNC_FLAG_GENERATOR,
+            FnKind::AsyncGenerator => abi::FUNC_FLAG_GENERATOR | abi::FUNC_FLAG_ASYNC,
             FnKind::Constructor => abi::FUNC_FLAG_CONSTRUCTOR,
             FnKind::Class => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_CLASS_CTOR,
             FnKind::DerivedClass => {
@@ -762,15 +801,14 @@ pub(super) fn collect_node<'a>(
             callee,
             args,
             not_callable,
+        }
+        | IrNode::ThisCall {
+            callee,
+            args,
+            not_callable,
+            ..
         } => {
             seed_callee_error(callee_error_text(not_callable), order, seen);
-            collect_node(callee, order, seen);
-            for arg in args {
-                collect_node(arg, order, seen);
-            }
-        }
-        IrNode::ThisCall { callee, args, .. } => {
-            seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
             collect_node(callee, order, seen);
             for arg in args {
                 collect_node(arg, order, seen);
@@ -797,6 +835,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::Throw(operand)
         // A generator `yield e` / `IsGenerator` carries only its operand.
         | IrNode::Yield(operand)
+        | IrNode::AwaitMark(operand)
         | IrNode::IsGenerator(operand)
         | IrNode::IterSource { value: operand, .. }
         | IrNode::IterLen(operand)
@@ -939,6 +978,7 @@ pub(super) fn collect_node<'a>(
             key,
             args,
             fast,
+            callee,
             not_callable,
             ..
         } => {
@@ -953,6 +993,16 @@ pub(super) fn collect_node<'a>(
             for (_, path) in fast {
                 collect_node(path, order, seen);
             }
+            if let Some(callee) = callee {
+                // Every other receiver calls the early read, guarded.
+                seed_callee_error(callee_error_text(not_callable), order, seen);
+                collect_node(callee, order, seen);
+            }
+        }
+        // The generic `[[Get]]` reads the interned key.
+        IrNode::ProtoMethod { recv, key, .. } => {
+            seed_strs_ref(&[key], order, seen);
+            collect_node(recv, order, seen);
         }
         // The slow path is a `size` member read.
         IrNode::SizeRead { obj, .. } => {
@@ -960,13 +1010,17 @@ pub(super) fn collect_node<'a>(
             seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
         }
-        // `toISOString()` returns the interned `"Invalid Date"` literal for a
-        // non-finite timestamp.
-        IrNode::DateField { op, .. } => {
-            if matches!(op, DateOp::ToIsoString) && seen.insert(INVALID_DATE) {
-                order.push(INVALID_DATE);
+        // An invalid date's `toString()` is the interned `"Invalid Date"`
+        // literal; its `toISOString()` throws a `RangeError`.
+        IrNode::DateField { op, .. } => match op {
+            DateOp::ToString => {
+                if seen.insert(INVALID_DATE) {
+                    order.push(INVALID_DATE);
+                }
             }
-        }
+            DateOp::ToIsoString => seed_strs(&INVALID_TIME_VALUE, order, seen),
+            _ => {}
+        },
         IrNode::Construct {
             callee,
             args,
@@ -1129,9 +1183,9 @@ pub(super) fn collect_node<'a>(
         }
         // The `Date` builtins carry no string literals; recurse into
         // the timestamp / receiver sub-expressions (`Date.now()` has neither).
-        IrNode::DateNew { ms } => {
-            if let Some(ms) = ms {
-                collect_node(ms, order, seen);
+        IrNode::DateNew { arg } => {
+            if let Some(arg) = arg {
+                collect_node(arg, order, seen);
             }
         }
         // A global reference interns its key and, unless it reads `undefined`
@@ -1144,6 +1198,13 @@ pub(super) fn collect_node<'a>(
             seed_strs_ref(&[&global.name], order, seen);
             if !typeof_operand {
                 seed_strs_ref(&[&global.message, &global.stack], order, seen);
+            }
+        }
+        IrNode::GlobalDeclare { name, value } => {
+            seed_strs_ref(&[name], order, seen);
+            if let Some(value) = value {
+                seed_prop_strs(order, seen);
+                collect_node(value, order, seen);
             }
         }
         IrNode::GlobalSet { global, value } => {
@@ -1254,17 +1315,32 @@ fn collect_entries<'a>(
 }
 
 /// Whether any function of `program` (or `main`) builds an accessor
-/// ([`IrNode::MakeAccessor`]) or can reach the realm's accessors (the
-/// `%Function.prototype%` `caller` / `arguments` poison pair, the `Map`/`Set`
-/// `size` getters): it names them, or reads or writes a
+/// ([`IrNode::MakeAccessor`]), can define one (it names `defineProperty` /
+/// `defineProperties` / `create` / `__defineGetter__` / `__defineSetter__`),
+/// or can reach the realm's accessors (the `%Function.prototype%` `caller` /
+/// `arguments` poison pair, the `Map`/`Set` `size` getters, the
+/// `Object.prototype.__proto__` pair): it names them, or reads or writes a
 /// member under a key computed at run time. Then `__get` / `__set` must
 /// dispatch to getters and setters. (The builtins only read fixed keys:
-/// `length`, indices, `prototype`, `name`, `message`.)
+/// `length`, indices, `prototype`, `name`, `message`; `Object.assign` writes
+/// its sources' keys, which may be `__proto__`, so naming it counts.)
 fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
         IrNode::MakeAccessor { .. } | IrNode::SizeRead { .. } => true,
-        IrNode::Str(s) => s == "caller" || s == "arguments" || s == "size",
+        IrNode::Str(s) => matches!(
+            s.as_str(),
+            "caller"
+                | "arguments"
+                | "size"
+                | "defineProperty"
+                | "defineProperties"
+                | "create"
+                | "assign"
+                | "__proto__"
+                | "__defineGetter__"
+                | "__defineSetter__"
+        ),
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }
         | IrNode::IndexOpSet { index: key, .. }
@@ -1278,7 +1354,9 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 /// `__define` / `__delete` must set the bits (DESIGN.md §6.4).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        IrNode::ProtoGuard { sealed, .. } | IrNode::SizeRead { sealed, .. } => !sealed,
+        IrNode::ProtoGuard { sealed, .. }
+        | IrNode::ProtoMethod { sealed, .. }
+        | IrNode::SizeRead { sealed, .. } => !sealed,
         IrNode::NamespaceGuard { namespace, .. } => {
             realm::Intrinsic::from(*namespace).watch_bit().is_some()
         }

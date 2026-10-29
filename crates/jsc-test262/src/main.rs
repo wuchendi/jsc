@@ -9,17 +9,13 @@ use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use jsc_test262::filter::{self, Denylist, Mode, SkipReason};
+use jsc_test262::filter::{self, DONE_PRINT, Denylist, Mode, SkipReason};
 use jsc_test262::outcome::{self, Outcome};
 use jsc_test262::report::{self, Report};
 use jsc_test262::{assemble, baseline, exec, frontmatter, walk};
 
 const USAGE: &str = "usage: jsc-test262 [--test262 DIR] [--jsc PATH] [--jobs N] \
 [--timeout SECS] [--check] [--update-baseline] [--history] [PATH_PREFIX...]";
-/// Harness includes kept out of M1 (`DESIGN.md` section 10):
-/// `doneprintHandle.js` needs a host `print` and an async runner,
-/// `propertyHelper.js` needs phase-3 reflection.
-const EXCLUDED_INCLUDES: [&str; 2] = ["doneprintHandle.js", "propertyHelper.js"];
 const DENYLIST: &str = "tests/test262/unsupported-features.txt";
 const BASELINE: &str = "tests/test262/baseline.txt";
 const HISTORY: &str = "tests/test262/history.tsv";
@@ -80,7 +76,8 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(args)
 }
 
-/// One test's result plus the first stderr line (for failure clustering).
+/// One test's result plus a failure detail: the async failure report, or the
+/// first stderr line (for failure clustering).
 struct Record {
     result: Result<Outcome, SkipReason>,
     detail: String,
@@ -157,17 +154,22 @@ fn load(args: Args) -> Result<Env, String> {
         deny: Denylist::parse(&read(Path::new(DENYLIST))?),
         args,
     };
-    if let Err(detail) = probe(&env, 0, &[])? {
+    if let Err(detail) = probe(&env, 0, Mode::Strict, &[])? {
         return Err(format!(
             "official sta.js + assert.js do not compile with {}: {detail}",
             env.args.jsc.display()
         ));
     }
-    env.includes
-        .retain(|name, _| !EXCLUDED_INCLUDES.contains(&name.as_str()));
     let names: Vec<&String> = env.includes.keys().collect();
     let probed = exec::pool(&names, env.args.jobs, |i, name| {
-        probe(&env, i + 1, &[env.includes[*name].as_str()])
+        // `doneprintHandle.js` is probed as async tests use it: after the
+        // host `print` prelude.
+        let mode = if name.as_str() == DONE_PRINT {
+            Mode::Async
+        } else {
+            Mode::Strict
+        };
+        probe(&env, i + 1, mode, &[env.includes[*name].as_str()])
     })
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
@@ -181,13 +183,19 @@ fn load(args: Args) -> Result<Env, String> {
     Ok(env)
 }
 
-/// Compiles and runs `sta.js` + `assert.js` + `includes` once. The inner
-/// result is `Err(first stderr line)` when jsc rejects the program at compile
-/// time or it times out; a runtime throw still counts as compiling.
-fn probe(env: &Env, index: usize, includes: &[&str]) -> Result<Result<(), String>, String> {
-    let program = assemble::program(Mode::Strict, "", &env.sta, &env.assert, includes);
+/// Compiles and runs `sta.js` + `assert.js` + `includes` once, assembled for
+/// `mode`. The inner result is `Err(first stderr line)` when jsc rejects the
+/// program at compile time or it times out; a runtime throw still counts as
+/// compiling.
+fn probe(
+    env: &Env,
+    index: usize,
+    mode: Mode,
+    includes: &[&str],
+) -> Result<Result<(), String>, String> {
+    let program = assemble::program(mode, "", &env.sta, &env.assert, includes);
     let name = format!("{}-probe-{index}", std::process::id());
-    let (status, stderr) = exec::run(
+    let out = exec::run(
         &env.args.jsc,
         &env.scratch,
         &name,
@@ -195,23 +203,31 @@ fn probe(env: &Env, index: usize, includes: &[&str]) -> Result<Result<(), String
         env.args.timeout,
     )
     .map_err(|e| format!("cannot run {}: {e}", env.args.jsc.display()))?;
-    Ok(match outcome::classify(status, &stderr, None) {
+    Ok(match outcome::classify(out.status, &out.stderr, None) {
         Outcome::Pass | Outcome::Fail => Ok(()),
-        Outcome::CompileError | Outcome::Timeout => Err(first_line(&stderr)),
+        Outcome::CompileError | Outcome::Timeout => Err(first_line(&out.stderr)),
     })
 }
 
-/// First non-empty stderr line, tab-free and bounded.
+/// First non-empty stderr line, tab-free and bounded, with the OS thread id
+/// dropped from a Rust panic header (`thread 'main' (1234) panicked`) so the
+/// detail is identical across runs.
 fn first_line(stderr: &str) -> String {
-    stderr
+    let line = stderr
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .replace('\t', " ")
-        .chars()
-        .take(MAX_DETAIL)
-        .collect()
+        .unwrap_or("");
+    let line = match line.split_once("' (") {
+        Some((head, rest)) if line.starts_with("thread '") => match rest.split_once(") panicked") {
+            Some((id, tail)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+                format!("{head}' panicked{tail}")
+            }
+            _ => line.to_owned(),
+        },
+        _ => line.to_owned(),
+    };
+    line.replace('\t', " ").chars().take(MAX_DETAIL).collect()
 }
 
 fn run_test(env: &Env, index: usize, path: &str) -> Result<Record, String> {
@@ -228,17 +244,24 @@ fn run_test(env: &Env, index: usize, path: &str) -> Result<Record, String> {
             });
         }
     };
+    // Async tests get `doneprintHandle.js` first, once even if listed.
+    let implicit = (mode == Mode::Async).then_some(DONE_PRINT);
     let includes: Vec<&str> = match mode {
         Mode::Raw => Vec::new(),
-        Mode::Strict => meta
-            .includes
-            .iter()
+        Mode::Strict | Mode::Async => implicit
+            .into_iter()
+            .chain(
+                meta.includes
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|i| Some(*i) != implicit),
+            )
             .filter_map(|i| env.includes.get(i).map(String::as_str))
             .collect(),
     };
     let program = assemble::program(mode, &source, &env.sta, &env.assert, &includes);
     let name = format!("{}-{index}", std::process::id());
-    let (status, stderr) = exec::run(
+    let out = exec::run(
         &env.args.jsc,
         &env.scratch,
         &name,
@@ -246,9 +269,15 @@ fn run_test(env: &Env, index: usize, path: &str) -> Result<Record, String> {
         env.args.timeout,
     )
     .map_err(|e| format!("cannot run {} on {path}: {e}", env.args.jsc.display()))?;
+    let negative = meta.negative.as_ref();
+    let (result, detail) = if mode == Mode::Async {
+        outcome::classify_async(out.status, &out.stdout, &out.stderr, negative)
+    } else {
+        (outcome::classify(out.status, &out.stderr, negative), None)
+    };
     Ok(Record {
-        result: Ok(outcome::classify(status, &stderr, meta.negative.as_ref())),
-        detail: first_line(&stderr),
+        result: Ok(result),
+        detail: first_line(detail.as_deref().unwrap_or(&out.stderr)),
     })
 }
 
@@ -476,5 +505,14 @@ mod tests {
             "Error: Uncaught x"
         );
         assert_eq!(first_line(&"a".repeat(1000)).len(), MAX_DETAIL);
+        assert_eq!(
+            first_line("thread 'main' (2156276) panicked at src/error.rs:125:20:\nx"),
+            "thread 'main' panicked at src/error.rs:125:20:"
+        );
+        assert_eq!(first_line("a (12) panicked"), "a (12) panicked");
+        assert_eq!(
+            first_line("thread 'main' (x) panicked"),
+            "thread 'main' (x) panicked"
+        );
     }
 }

@@ -219,3 +219,79 @@ function $DONOTEVALUATE() {
         "true m Test262Error: m true\ntrue b\ntrue\nTest262Error: t\nTest262: This statement should not be evaluated.\n"
     );
 }
+
+/// Every builtin function that is not a constructor throws a `TypeError` under
+/// `new` — a representative per namespace (globals, `Object`, `Array`,
+/// `String`, `Number`, `Boolean`, `Math`, `JSON`, `Promise`, `Map`/`Set`,
+/// `Date`, `Error`, `Function`), plus bound, arrow, method, accessor,
+/// generator and async non-constructors. Each case prints its name when it
+/// does NOT throw a `TypeError`.
+#[test]
+fn non_constructor_builtins_throw_type_error_under_new() {
+    let cases = [
+        "new Function.prototype.call()",
+        "new Function.prototype.apply()",
+        "new Function.prototype.call",
+        "new Function.prototype.bind()",
+        "new Function.prototype.toString()",
+        "var c = Function.prototype.call; new c()",
+        "new parseInt('1')",
+        "new parseFloat('1')",
+        "new isNaN(1)",
+        "new isFinite(1)",
+        "new Object.keys({})",
+        "new Object.assign({})",
+        "new Object.is(1, 1)",
+        "new Object.prototype.toString()",
+        "new Object.prototype.hasOwnProperty('a')",
+        "new Array.isArray([])",
+        "new Array.from([])",
+        "new Array.prototype.push()",
+        "new [].map(x => x)",
+        "new String.fromCharCode(65)",
+        "new String.prototype.slice()",
+        "new 'a'.charAt(0)",
+        "new Number.isNaN(1)",
+        "new Number.prototype.toString()",
+        "new (1).toFixed(1)",
+        "new Boolean.prototype.valueOf()",
+        "new Math.max()",
+        "new Math.floor(1)",
+        "new JSON.stringify(1)",
+        "new JSON.parse('1')",
+        "new Promise.resolve()",
+        "new Promise.all([])",
+        "new Promise.prototype.then()",
+        "new Promise.resolve(1).then",
+        "new Map.prototype.set()",
+        "new (new Map()).get",
+        "new Set.prototype.add()",
+        "new (new Set()).has(1)",
+        "new Date.now()",
+        "new Date.UTC(1)",
+        "new Date.prototype.getTime()",
+        "new (new Date(0)).toISOString()",
+        "new Error.prototype.toString()",
+        "new Math.max.bind(null)()",
+        "var b = (() => 1).bind(null); new b()",
+        "new (() => 1)()",
+        "var o = { m() {} }; new o.m()",
+        "class A { m() {} static s() {} } new (new A()).m()",
+        "class B { static s() {} } new B.s()",
+        "var g = { get x() { return 1 } }; new (Object.getOwnPropertyDescriptor(g, 'x').get)()",
+        "function* gen() {} new gen()",
+        "async function af() {} new af()",
+        "new (async () => 1)()",
+    ];
+    let src: String = cases
+        .iter()
+        .map(|case| {
+            format!(
+                "try {{ {case}; console.log({case:?}) }} \
+                 catch (e) {{ if (!(e instanceof TypeError)) console.log({case:?}) }}\n"
+            )
+        })
+        .chain(["console.log('done')".to_owned()])
+        .collect();
+    assert_eq!(run(&src), "done\n");
+}

@@ -351,3 +351,88 @@ fn spread_of_array_with_holes() {
         "[ 0, undefined, undefined, 3 ]\n"
     );
 }
+
+/// The array higher-order builtins pass every specified callback argument —
+/// `(value, index, array)`, `reduce` / `reduceRight` `(acc, value, index,
+/// array)`, `sort` comparators `(a, b)` — whatever the callback declares, so
+/// `arguments.length`, `arguments[3]` and rest parameters see them all, on
+/// array and array-like receivers, for bound and builtin callbacks too.
+#[test]
+fn hof_callbacks_receive_every_argument() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "var r=[]; [5].forEach(function (v) { r.push(arguments.length, arguments[2].length) }); r.join()",
+            "3,1",
+        ),
+        (
+            "[5].map(function (...a) { return a.length + \":\" + a[2].length }).join()",
+            "3:1",
+        ),
+        (
+            "[5].filter(function () { return arguments.length === 3 && arguments[2].length === 1 }).length",
+            "1",
+        ),
+        (
+            "[5].some(function () { return arguments.length === 3 })",
+            "true",
+        ),
+        (
+            "[5].every(function () { return arguments.length === 3 })",
+            "true",
+        ),
+        (
+            "[5].find(function () { return arguments.length === 3 })",
+            "5",
+        ),
+        (
+            "[5].findIndex(function () { return arguments.length === 3 })",
+            "0",
+        ),
+        (
+            "[5].findLast(function () { return arguments.length === 3 })",
+            "5",
+        ),
+        (
+            "[5].findLastIndex(function () { return arguments.length === 3 })",
+            "0",
+        ),
+        (
+            "[5].flatMap(function () { return [arguments.length] }).join()",
+            "3",
+        ),
+        (
+            "[1, 2].reduce(function (a, b, c) { return arguments.length + \":\" + arguments[3].length }, 0)",
+            "4:2",
+        ),
+        ("[1, 2].reduce(function (...a) { return a.length })", "4"),
+        (
+            "[1, 2].reduceRight(function (a, b, c) { return arguments.length + \":\" + arguments[3].length }, 0)",
+            "4:2",
+        ),
+        (
+            "var n=[]; [2, 1].sort(function () { n.push(arguments.length); return 0 }); n[0]",
+            "2",
+        ),
+        (
+            "var f = function () { return arguments.length }; [1].map(f).join()",
+            "3",
+        ),
+        (
+            "var r=[]; Array.prototype.forEach.call({length: 1, 0: \"a\"}, function () { r.push(arguments.length) }); r.join()",
+            "3",
+        ),
+        ("var a=[]; [7, 8].forEach(a.push, a); a.length", "6"),
+        (
+            "function g() { return arguments.length } [1].map(g.bind(null, 0)).join()",
+            "4",
+        ),
+        ("[1, 2].reduce((a, b) => a + b)", "3"),
+        (
+            "[[1, 2]].map(function (x, i, arr) { return arr.length }).join()",
+            "1",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(jsc(&["-p", src]), *want, "{src}");
+    }
+}

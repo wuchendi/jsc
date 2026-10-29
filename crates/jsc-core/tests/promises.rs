@@ -458,15 +458,6 @@ fn async_result_then_chain() {
     );
 }
 
-/// An async function expression, an async arrow, and an async generator remain
-/// out of scope (only top-level `async function` DECLARATIONS are supported).
-#[test]
-fn async_non_declaration_forms_rejected() {
-    assert_rejected("let f = async function () { return 1 }; f()");
-    assert_rejected("let f = async () => 1; f()");
-    assert_rejected("async function* f() { yield 1 } f().next()");
-}
-
 /// A C-style `for (let ...)` loop with an `await` in its body inside an async
 /// function still runs each iteration in order.
 #[test]
@@ -797,5 +788,75 @@ fn promise_prototype_override_is_honoured() {
     assert_eval(
         "Promise.prototype.then = function () { return 'mine' }; Promise.resolve(1).then()",
         "mine",
+    );
+}
+
+// --- Self-resolution ----------------------------------------------------------
+
+/// Resolving a promise with itself rejects it with a `TypeError` (Promise
+/// Resolve Functions step 7) instead of leaving it pending forever.
+#[test]
+fn executor_resolve_with_self_rejects_with_type_error() {
+    assert_output(
+        "let res; const p = new Promise(r => res = r); \
+         console.log(res(p) === undefined); \
+         p.then(() => console.log(\"fulfilled\"), e => console.log(e instanceof TypeError, e.message));",
+        "true\ntrue Chaining cycle detected for promise #<Promise>\n",
+    );
+}
+
+/// The executor's `resolve` called synchronously with the promise itself.
+#[test]
+fn sync_executor_resolve_with_self_rejects() {
+    assert_output(
+        "let p = new Promise(r => Promise.resolve().then(() => r(p))); \
+         p.catch(e => console.log(e.constructor === TypeError));",
+        "true\n",
+    );
+}
+
+/// A `then` callback returning the chained promise itself rejects it.
+#[test]
+fn then_callback_returning_own_promise_rejects() {
+    assert_output(
+        "let p2 = Promise.resolve(1).then(() => p2); \
+         p2.then(() => console.log(\"fulfilled\"), e => console.log(e instanceof TypeError));",
+        "true\n",
+    );
+}
+
+/// The rejected-path handler returning the chained promise rejects it too.
+#[test]
+fn catch_callback_returning_own_promise_rejects() {
+    assert_output(
+        "let p2 = Promise.reject(1).then(null, () => p2); \
+         p2.catch(e => console.log(e instanceof TypeError));",
+        "true\n",
+    );
+}
+
+/// An async body returning its own result promise rejects it.
+#[test]
+fn async_return_of_own_promise_rejects() {
+    assert_output(
+        "let p; async function f() { await null; return p; } p = f(); \
+         p.catch(e => console.log(e instanceof TypeError));",
+        "true\n",
+    );
+}
+
+/// Adopting a pending promise keeps the established tick ordering (matches
+/// V8): the adopted settlement reaches the outer chain one tick after the
+/// inner promise's own reactions.
+#[test]
+fn adoption_ordering_is_unchanged() {
+    assert_output(
+        "let r; const inner = new Promise(x => r = x); \
+         const outer = new Promise(x => x(inner)); \
+         outer.then(v => console.log(\"outer\", v)); \
+         inner.then(v => console.log(\"inner\", v)); \
+         Promise.resolve().then(() => console.log(\"a\")).then(() => console.log(\"b\")); \
+         r(1);",
+        "a\ninner 1\nb\nouter 1\n",
     );
 }

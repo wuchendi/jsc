@@ -91,11 +91,13 @@ pub enum LogicalOp {
     Nullish,
 }
 
-/// A `Math.*` built-in method. `Math` is not a real binding — these are
+/// A `Math.*` built-in method. The methods through [`MathOp::Pow`] are also
 /// recognized syntactically from a `Math.<name>(..)` member callee at codegen and
-/// lowered to native wasm `f64` ops (or an inline loop, for [`MathOp::Pow`]). The
-/// `Math.PI` / `Math.E` constants are property READS and lower directly to
-/// [`IrNode::Num`], so they need no variant here.
+/// lowered inline to native wasm `f64` ops (or an inline loop, for
+/// [`MathOp::Pow`]); the rest are reached through the `Math` object's function
+/// values only. Every method converts each argument with `ToNumber`, in order,
+/// before computing. The `Math.PI` / `Math.E` constants are property READS and
+/// lower directly to [`IrNode::Num`], so they need no variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MathOp {
     /// `Math.floor(x)` — largest integer ≤ x (wasm `f64.floor`).
@@ -123,6 +125,60 @@ pub enum MathOp {
     /// `f64.sqrt` roots of `base`. A negative exponent reciprocates the result; a
     /// negative base with a fractional exponent yields `NaN`.
     Pow,
+    /// `Math.sign(x)` — `-1`, `1`, or `x` itself for `±0` / `NaN`.
+    Sign,
+    /// `Math.hypot(..)` — variadic; `+Infinity` when any argument is infinite,
+    /// else `NaN` when any is `NaN`, else the scaled square root of the sum
+    /// of squares (`+0` for no arguments).
+    Hypot,
+    /// `Math.clz32(x)` — leading zero bits of `ToUint32(x)` (wasm `i32.clz`).
+    Clz32,
+    /// `Math.fround(x)` — nearest `f32` (wasm `f32.demote_f64`).
+    Fround,
+    /// `Math.imul(a, b)` — the int32 product of `ToInt32(a)` and `ToInt32(b)`.
+    Imul,
+    /// `Math.cbrt(x)` (host).
+    Cbrt,
+    /// `Math.log(x)` (host).
+    Log,
+    /// `Math.log2(x)` (host).
+    Log2,
+    /// `Math.log10(x)` (host).
+    Log10,
+    /// `Math.log1p(x)` (host).
+    Log1p,
+    /// `Math.exp(x)` (host).
+    Exp,
+    /// `Math.expm1(x)` (host).
+    Expm1,
+    /// `Math.sin(x)` (host).
+    Sin,
+    /// `Math.cos(x)` (host).
+    Cos,
+    /// `Math.tan(x)` (host).
+    Tan,
+    /// `Math.asin(x)` (host).
+    Asin,
+    /// `Math.acos(x)` (host).
+    Acos,
+    /// `Math.atan(x)` (host).
+    Atan,
+    /// `Math.atan2(y, x)` (host).
+    Atan2,
+    /// `Math.sinh(x)` (host).
+    Sinh,
+    /// `Math.cosh(x)` (host).
+    Cosh,
+    /// `Math.tanh(x)` (host).
+    Tanh,
+    /// `Math.asinh(x)` (host).
+    Asinh,
+    /// `Math.acosh(x)` (host).
+    Acosh,
+    /// `Math.atanh(x)` (host).
+    Atanh,
+    /// `Math.random()` — a host pseudo-random number in `[0, 1)`.
+    Random,
 }
 
 /// An array higher-order method: `map`/`filter`/`reduce`/`forEach` (see
@@ -275,11 +331,14 @@ pub enum ErrorKind {
     EvalError,
     /// `URIError`.
     UriError,
+    /// `AggregateError` (`errors` first, then `message`): only ever built by
+    /// its constructor body, never by the syntactic `Error(m)` lowering.
+    AggregateError,
 }
 
 impl ErrorKind {
     /// Every kind, in realm-image order.
-    pub(crate) const ALL: [ErrorKind; 7] = [
+    pub(crate) const ALL: [ErrorKind; 8] = [
         Self::Error,
         Self::TypeError,
         Self::RangeError,
@@ -287,11 +346,16 @@ impl ErrorKind {
         Self::SyntaxError,
         Self::EvalError,
         Self::UriError,
+        Self::AggregateError,
     ];
 
-    /// The kind named by the constructor identifier `name`.
+    /// The kind named by the constructor identifier `name` whose calls and
+    /// `new`s lower syntactically (`message` first): every kind but
+    /// `AggregateError`, which always runs its constructor body.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.name() == name)
+        Self::ALL
+            .into_iter()
+            .find(|kind| *kind != Self::AggregateError && kind.name() == name)
     }
 
     /// The constructor name, which is also the prototype's `name` value.
@@ -304,6 +368,7 @@ impl ErrorKind {
             Self::SyntaxError => "SyntaxError",
             Self::EvalError => "EvalError",
             Self::UriError => "URIError",
+            Self::AggregateError => "AggregateError",
         }
     }
 }
@@ -370,7 +435,7 @@ pub enum BuiltinCtor {
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 17] = [
+    pub(crate) const ALL: [BuiltinCtor; 18] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -384,6 +449,7 @@ impl BuiltinCtor {
         Self::Error(ErrorKind::SyntaxError),
         Self::Error(ErrorKind::EvalError),
         Self::Error(ErrorKind::UriError),
+        Self::Error(ErrorKind::AggregateError),
         Self::Map,
         Self::Set,
         Self::Promise,
@@ -532,8 +598,9 @@ pub enum DateOp {
     GetMinutes,
     /// `d.getSeconds()` — the UTC second of the minute (`0`..`59`).
     GetSeconds,
-    /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`,
-    /// built GUEST-side as a fresh heap string.
+    /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`
+    /// (an expanded `±YYYYYY` year outside `0..=9999`), built GUEST-side as a
+    /// fresh heap string.
     ToIsoString,
     /// `d.toString()` — `Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated
     /// Universal Time)`, built GUEST-side as a fresh heap string.
@@ -746,6 +813,20 @@ pub enum IrNode {
         /// The assigned value.
         value: Box<IrNode>,
     },
+    /// Create the global-object property of a top-level declaration
+    /// `name` before any statement runs (DESIGN.md §6.4): a function
+    /// declaration (`value` = its function object) defines it as
+    /// `{value, writable, enumerable, non-configurable}`
+    /// (`CreateGlobalFunctionBinding`; redefining a non-configurable property
+    /// throws a `TypeError`); a `var` (`value` = `None`) defines
+    /// `{undefined, writable, enumerable, non-configurable}` unless the
+    /// property already exists (`CreateGlobalVarBinding`). Yields `undefined`.
+    GlobalDeclare {
+        /// The declared name, also the property key.
+        name: String,
+        /// A function declaration's function object.
+        value: Option<Box<IrNode>>,
+    },
     /// The function object of a top-level function declaration (funcref-table
     /// index `.0`). A top-level declaration never captures, so its one object
     /// is a static block in the data segment: every reference yields the same
@@ -818,21 +899,29 @@ pub enum IrNode {
     /// into a state-machine suspend point, so a `Yield` that survives to the
     /// backend is an unsupported yield position (rejected by codegen before emit).
     Yield(Box<IrNode>),
+    /// The operand of the suspend an `await` in an async generator body
+    /// lowers to (`Yield(AwaitMark(e))`): evaluate `e`, then flag the running
+    /// generator (`gen` is the state machine's local 1) with
+    /// [`crate::abi::GEN_AWAIT`], so its driver awaits the suspended value
+    /// instead of yielding it.
+    AwaitMark(Box<IrNode>),
     /// Read the value passed to the generator's `.next(v)` for the `yield` that is
     /// resuming: the state machine's first wasm parameter (local `0`,
     /// `sent`). Emitted at the start of a resumed segment to bind `x = yield …`.
     SentValue,
     /// Build a `Generator` handle: allocate the [`abi::TYPE_GENERATOR`]
-    /// block, allocate `total` boxed cells for the frame (the first `slots.len()`
-    /// initialized from the constructor's argument expressions, the rest to
-    /// `undefined`), stash them in a `TYPE_ENV` frame block stored in the handle's
+    /// block, fill the `total` frame cells (the first `slots.len()` from
+    /// `slots`, the rest fresh cells holding `undefined`), stash them in a
+    /// `TYPE_ENV` frame block stored in the handle's
     /// `env` field, set `sm_idx`/`state=0`/`done=0`, and yield the handle jsval.
     /// This is the whole body of a `function*` CONSTRUCTOR.
     MakeGenerator {
         /// The funcref-table index of the state-machine function.
         sm_table_index: u32,
-        /// Initial values for the leading frame cells (the generator parameters),
-        /// in slot order — each a `Local(i)` reading the constructor's argument.
+        /// The leading frame cells, in slot order: each an expression yielding
+        /// the cell pointer — a fresh `CellNew` (a parameter's argument, the
+        /// receiver, `undefined`) or a cell captured from the constructor's
+        /// environment (an `EnvLoad`), shared by reference.
         slots: Vec<IrNode>,
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
@@ -1229,8 +1318,9 @@ pub enum IrNode {
     /// value at member `key` of `obj` (an ordinary member read through `__get`);
     /// the `__this` global is set to `obj` immediately before the
     /// `call_indirect`, so the callee's prologue snapshots it into its own `this`
-    /// slot. Missing arguments become `undefined`; extra arguments are ignored, as
-    /// with any indirect call.
+    /// slot. The member is read into `callee_local` BEFORE the arguments run
+    /// (ECMA-262 13.3.6.1). Missing arguments become `undefined`; extra
+    /// arguments are ignored, as with any indirect call.
     MethodCallUser {
         /// The receiver expression (evaluated once into `obj_local`).
         obj: Box<IrNode>,
@@ -1242,17 +1332,22 @@ pub enum IrNode {
         /// Fresh temp local holding the evaluated receiver across argument
         /// evaluation and the `__this` set.
         obj_local: u32,
+        /// Fresh temp local holding the method read from the receiver, which
+        /// runs before the arguments (ECMA-262 13.3.6.1).
+        callee_local: u32,
         /// The `TypeError` thrown when the member is not callable (`o.m is not
         /// a function`).
         not_callable: CalleeError,
     },
     /// `N.key(args)` on a builtin namespace `N` whose value is not the sealed,
     /// non-escaping intrinsic (DESIGN.md §6.4). `obj` (the value of `N`) is
-    /// evaluated into `obj_local` and `args` into `arg_locals`; `fast` (the
-    /// inline code over `arg_locals`) runs while `obj_local.key` is still the
-    /// builtin method, else `slow` (the generic method call on `obj_local`).
-    /// For a watched namespace (`Math`, `JSON`, `console`) the test is
-    /// `obj_local === %N%` with its dirty bit clear, reading no member.
+    /// evaluated into `obj_local`, then tested — `obj_local.key` read into
+    /// `member_local` and compared with the builtin method — before `args`
+    /// run into `arg_locals` (JS reads the callee first); `fast` (the inline
+    /// code over `arg_locals`) runs when the test passed, else `slow` (the
+    /// call of `member_local` with `this = obj_local`). For a watched
+    /// namespace (`Math`, `JSON`, `console`) the test is `obj_local === %N%`
+    /// with its dirty bit clear, reading no member.
     NamespaceGuard {
         /// The namespace whose builtin `key` the fast path implements.
         namespace: GlobalIntrinsic,
@@ -1262,13 +1357,15 @@ pub enum IrNode {
         obj: Box<IrNode>,
         /// Scratch local holding `obj`.
         obj_local: u32,
+        /// Scratch local holding the member `obj_local.key` once read.
+        member_local: u32,
         /// The argument expressions, in source order.
         args: Vec<IrNode>,
         /// Scratch locals holding `args`.
         arg_locals: Vec<u32>,
         /// The inline code over `arg_locals`.
         fast: Box<IrNode>,
-        /// The generic method call on `obj_local` over `arg_locals`.
+        /// The call of `member_local` on `obj_local` over `arg_locals`.
         slow: Box<IrNode>,
     },
     /// A call `recv.key(args)` of a builtin prototype method name (design
@@ -1295,8 +1392,29 @@ pub enum IrNode {
         args: Vec<IrNode>,
         /// The inline fast paths, by receiver family, tested in order.
         fast: Vec<(ProtoKind, IrNode)>,
+        /// With arguments that have side effects, the read of the
+        /// [`IrNode::ProtoMethod`] made before they ran (JS reads the callee
+        /// first): a fast path then runs only when that read found it (an
+        /// array or promise path also tests the receiver again), and every
+        /// other receiver calls the read method.
+        callee: Option<Box<IrNode>>,
         /// The `TypeError` thrown when `recv.key` is not callable.
         not_callable: CalleeError,
+    },
+    /// The method `recv.key` of an [`IrNode::ProtoGuard`] call, read before
+    /// its arguments run: for a string receiver, or one passing the test of
+    /// a fast path, a constant marker naming that path (whose builtin the
+    /// method is — no lookup); else the generic `[[Get]]`.
+    ProtoMethod {
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
+        /// The receiver read (a local, evaluated and nullish-checked before
+        /// this node).
+        recv: Box<IrNode>,
+        /// The method name.
+        key: String,
+        /// The receiver families of the call's fast paths, in their order.
+        kinds: Vec<ProtoKind>,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
@@ -1324,6 +1442,8 @@ pub enum IrNode {
         /// `super(..)`: pass the construct marker (`argc = -(n + 1)`), so the
         /// parent class constructor accepts the call.
         construct: bool,
+        /// The `TypeError` thrown when `callee` is not callable.
+        not_callable: CalleeError,
     },
     /// `new callee(args)` (DESIGN.md §7.6): evaluate `callee` into `callee_local` and
     /// the arguments, then `IsConstructor(callee)` (a function with
@@ -1366,8 +1486,9 @@ pub enum IrNode {
     /// Read the `__spread_args` wasm global: the argument array of the most
     /// recent spread call or construct, which holds the arguments beyond the
     /// `K` positional slots. Emitted ONLY in the prologue of a function that
-    /// gathers its arguments (a rest parameter or `arguments`), which reads it
-    /// only when its decoded argument count exceeds `K`.
+    /// gathers its arguments (a rest parameter or `arguments`) or of a builtin
+    /// constructor reading an argument past `K`, which reads it only when its
+    /// decoded argument count exceeds `K`.
     SpreadArgsGlobal,
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
@@ -1518,16 +1639,16 @@ pub enum IrNode {
     /// promise. Emitted as the whole body of the wrapper function the `async`
     /// name binds to (`return AsyncSpawn(MakeGenerator{..})`).
     AsyncSpawn(Box<IrNode>),
-    /// `new Date()` / `new Date(ms)`. Allocates a fresh `TYPE_DATE`
-    /// block whose f64 payload is the timestamp in milliseconds since the Unix
-    /// epoch, and yields the handle heap jsval. `ms` is `None` for the no-argument
-    /// form (the payload is the host clock, the `__now` import); otherwise it is
-    /// the single constructor argument already wrapped in a `Number(..)` coercion
-    /// (an [`IrNode::ConvertCall`] with [`ConvertOp::ToNumber`]), so any operand
-    /// stores its numeric value (`new Date("2020")` is `NaN`, like `Number`).
+    /// `new Date()` / `new Date(value)`. Allocates a fresh `TYPE_DATE`
+    /// block whose f64 payload is `TimeClip` of the timestamp in milliseconds
+    /// since the Unix epoch, and yields the handle heap jsval. `arg` is `None`
+    /// for the no-argument form (the host clock, the `__now` import); otherwise
+    /// it is the single constructor argument: a Date's time value is taken
+    /// directly, anything else goes through `ToNumber` (`new Date("2020")` is
+    /// `NaN`, like `Number`).
     DateNew {
-        /// The millisecond timestamp expression, or `None` for the host clock.
-        ms: Option<Box<IrNode>>,
+        /// The constructor argument, or `None` for the host clock.
+        arg: Option<Box<IrNode>>,
     },
     /// `Date.now()`: the host wall-clock time in milliseconds since the
     /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
@@ -1544,8 +1665,9 @@ pub enum IrNode {
         obj: Box<IrNode>,
     },
     /// The field `op` of the `TYPE_DATE` block in `recv` (already checked),
-    /// computed GUEST-side from its stored f64 epoch-ms. A non-finite
-    /// timestamp yields `NaN` (or `"Invalid Date"` for `toISOString`).
+    /// computed GUEST-side from its stored f64 epoch-ms. An invalid (`NaN`)
+    /// time value yields `NaN`, `"Invalid Date"` for `toString`, and throws a
+    /// `RangeError` for `toISOString`.
     DateField {
         /// Which field is computed.
         op: DateOp,
@@ -1715,10 +1837,16 @@ pub struct FnInfo {
 /// Whether a function is a constructor (DESIGN.md §5.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FnKind {
-    /// Not a constructor: arrows, methods, accessors, generators, async
-    /// functions, and internal functions. No `prototype`.
+    /// Not a constructor: arrows, methods, accessors, async functions, and
+    /// internal functions. No `prototype`.
     #[default]
     Plain,
+    /// A generator function or method: not a constructor, but materializes a
+    /// `prototype` inheriting `%GeneratorPrototype%` (no `constructor`).
+    Generator,
+    /// An async generator function or method: like [`Self::Generator`], its
+    /// `prototype` inheriting `%AsyncGeneratorPrototype%`.
+    AsyncGenerator,
     /// A `function` declaration or expression: materializes a `prototype`.
     Constructor,
     /// A class constructor: its `prototype` is defined by the class.
@@ -1878,6 +2006,50 @@ impl IrNode {
         }
     }
 
+    /// `InstallErrorCause` (DESIGN.md §7.7): the Error instance `error` is
+    /// evaluated into local `obj` and, when `options` (side-effect free, read
+    /// repeatedly) is an object with a `cause` property (own or inherited),
+    /// gets an own non-enumerable `cause` = `options.cause` (defined through
+    /// local `scratch`); yields the instance.
+    pub(crate) fn install_error_cause(
+        error: IrNode,
+        options: IrNode,
+        obj: u32,
+        scratch: u32,
+    ) -> Self {
+        let cause = || IrNode::Str("cause".to_owned());
+        let has_cause = IrNode::Logical {
+            op: LogicalOp::And,
+            lhs: Box::new(IrNode::IsObject(Box::new(options.clone()))),
+            rhs: Box::new(IrNode::ObjectHas {
+                key: Box::new(cause()),
+                obj: Box::new(options.clone()),
+            }),
+        };
+        let define = IrNode::DefineProps {
+            obj: Box::new(IrNode::Local(obj)),
+            local: scratch,
+            entries: vec![(
+                PropKey::Hidden("cause".to_owned()),
+                IrNode::Index {
+                    obj: Box::new(options),
+                    index: Box::new(cause()),
+                },
+            )],
+        };
+        IrNode::Seq(vec![
+            IrNode::Assign {
+                local: obj,
+                value: Box::new(error),
+            },
+            IrNode::Ternary {
+                cond: Box::new(has_cause),
+                then_branch: Box::new(define),
+                else_branch: Box::new(IrNode::Local(obj)),
+            },
+        ])
+    }
+
     /// Whether `f` holds for any DIRECT child expression. Exhaustive over every
     /// variant (no wildcard), so a new variant must classify its children before
     /// the tree walkers built on this compile.
@@ -1919,6 +2091,7 @@ impl IrNode {
             | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::AwaitMark(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::IterSource { value: inner, .. }
             | IrNode::IterLen(inner)
@@ -1939,6 +2112,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => f(inner),
             IrNode::InstanceOf { value, kind } => {
@@ -2001,7 +2175,9 @@ impl IrNode {
                     || this_arg.as_deref().is_some_and(f)
             }
             IrNode::ConvertCall { arg, radix, .. } => f(arg) || radix.as_deref().is_some_and(f),
-            IrNode::DateNew { ms } => ms.as_deref().is_some_and(f),
+            IrNode::DateNew { arg } | IrNode::GlobalDeclare { value: arg, .. } => {
+                arg.as_deref().is_some_and(f)
+            }
             IrNode::Call { args, .. }
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }
@@ -2026,8 +2202,17 @@ impl IrNode {
                 ..
             } => f(obj) || args.iter().any(&mut f) || f(fast) || f(slow),
             IrNode::ProtoGuard {
-                recv, args, fast, ..
-            } => f(recv) || args.iter().any(&mut f) || fast.iter().any(|(_, node)| f(node)),
+                recv,
+                args,
+                fast,
+                callee,
+                ..
+            } => {
+                f(recv)
+                    || args.iter().any(&mut f)
+                    || fast.iter().any(|(_, node)| f(node))
+                    || callee.as_deref().is_some_and(f)
+            }
             IrNode::Construct {
                 callee,
                 args,
@@ -2104,6 +2289,7 @@ impl IrNode {
             | IrNode::ToObject(inner)
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::AwaitMark(inner)
             | IrNode::IsGenerator(inner)
             | IrNode::IterSource { value: inner, .. }
             | IrNode::IterLen(inner)
@@ -2124,6 +2310,7 @@ impl IrNode {
             }
             | IrNode::AsyncSpawn(inner)
             | IrNode::SizeRead { obj: inner, .. }
+            | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
             | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
             IrNode::InstanceOf { value, kind } => match kind {
@@ -2188,7 +2375,9 @@ impl IrNode {
                 out.extend(radix.as_deref_mut());
                 out
             }
-            IrNode::DateNew { ms } => ms.as_deref_mut().into_iter().collect(),
+            IrNode::DateNew { arg } | IrNode::GlobalDeclare { value: arg, .. } => {
+                arg.as_deref_mut().into_iter().collect()
+            }
             IrNode::Call { args, .. }
             | IrNode::FuncValue { captures: args, .. }
             | IrNode::MakeGenerator { slots: args, .. }
@@ -2221,10 +2410,15 @@ impl IrNode {
                 .chain([&mut **fast, &mut **slow])
                 .collect(),
             IrNode::ProtoGuard {
-                recv, args, fast, ..
+                recv,
+                args,
+                fast,
+                callee,
+                ..
             } => std::iter::once(&mut **recv)
                 .chain(args.iter_mut())
                 .chain(fast.iter_mut().map(|(_, node)| node))
+                .chain(callee.as_deref_mut())
                 .collect(),
             IrNode::Construct {
                 callee,

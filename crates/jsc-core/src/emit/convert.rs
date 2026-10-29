@@ -64,9 +64,7 @@ fn return_if_pending(function: &mut Function, ret: &Instruction<'_>) {
 /// runs `OrdinaryToPrimitive`: `valueOf` then `toString` (hint string:
 /// `toString` first, and a Date's default hint is string), each looked up
 /// through the `proto` chain, skipped unless callable, its result skipped
-/// unless a primitive; neither -> `TypeError`. A function whose `toString`
-/// is still `%Object.prototype.toString%` keeps the host rendering until
-/// `Function.prototype.toString` lands (S5).
+/// unless a primitive; neither -> `TypeError`.
 pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let (v, hint, method, result, key, second, base) = (0, 1, 2, 3, 4, 5, 6);
     let scratch = 7;
@@ -92,7 +90,6 @@ pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers
         I32Const(value_of), I32Const(to_string),
         LocalGet(hint), I32Const(HINT_STRING), I32Eq, Select, LocalSet(second),
     );
-    let object_to_string = realm::method_bits(Builtin::ObjectToString, helpers);
     for pass in 0..2 {
         if pass == 1 {
             wasm!(f; LocalGet(second), LocalSet(key));
@@ -100,14 +97,7 @@ pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers
         wasm!(f; LocalGet(v), LocalGet(key), Call(helpers.get), LocalSet(method));
         return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
         emit_is_function(&mut f, method);
-        wasm!(f; If(BlockType::Empty), LocalGet(method), I64Const(object_to_string), I64Eq);
-        emit_load_type_byte(&mut f, v);
-        wasm!(f;
-            I32Const(TYPE_FUNCTION), I32Eq, I32And,
-            If(BlockType::Empty),
-            LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), Return,
-            End,
-        );
+        wasm!(f; If(BlockType::Empty));
         emit_accessor_call(&mut f, method, v, None, base, helpers);
         wasm!(f; LocalSet(result));
         return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
@@ -266,7 +256,8 @@ pub(super) fn emit_compare(helpers: Helpers<'_>) -> Function {
 /// `__array_join(recv: i64, sep: i64) -> i64`: `Array.prototype.join` on an
 /// array receiver (`undefined` for any other receiver): `ToString(sep)`
 /// (`","` when `undefined`), then each element's `ToString` (`null`,
-/// `undefined` and holes are empty) joined by it. An array already being
+/// `undefined` and absent elements are empty; a hole reads through the
+/// prototype chain) joined by it. An array already being
 /// joined (a cycle) joins as the empty string.
 pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let (recv, sep_v, arr, len, i, acc, sep, e) = (0, 1, 2, 3, 4, 5, 6, 7);
@@ -307,25 +298,38 @@ pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'
         LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
         LocalGet(i),
         If(BlockType::Empty), LocalGet(acc), LocalGet(sep), Call(helpers.concat), LocalSet(acc), End,
-        // An element past a length shrunk by an earlier element's conversion
-        // reads `undefined`.
+        // A hole, or an element past a length shrunk by an earlier element's
+        // conversion, reads through the prototype chain.
         LocalGet(i), LocalGet(arr),
         I32Load(MemArg { offset: ARRAY_LEN_OFFSET, align: 2, memory_index: 0 }),
         I32LtU,
         If(BlockType::Result(ValType::I64)),
     );
     emit_elem_load(&mut f, arr, i, helpers.sparse_get());
-    wasm!(f; Else, I64Const(UNDEFINED_BITS), End, LocalTee(e), I64Const(HOLE_BITS), I64Eq);
+    wasm!(f;
+        Else, I64Const(HOLE_BITS), End, LocalTee(e), I64Const(HOLE_BITS), I64Eq,
+        If(BlockType::Empty),
+        LocalGet(arr), LocalGet(i), Call(helpers.proto_elem()), LocalSet(e),
+    );
+    let unwind = |f: &mut Function| {
+        wasm!(f;
+            GlobalGet(EXC_PENDING_GLOBAL),
+            If(BlockType::Empty),
+            LocalGet(arr), LocalGet(arr), I32Load8U(flags), I32Const(!joining), I32And, I32Store8(flags),
+            I64Const(UNDEFINED_BITS), Return,
+            End,
+        );
+    };
+    unwind(&mut f);
+    wasm!(f; End, LocalGet(e), I64Const(HOLE_BITS), I64Eq);
     emit_is_nullish(&mut f, e);
     wasm!(f;
         I32Or, I32Eqz,
         If(BlockType::Empty),
         LocalGet(acc), LocalGet(e), Call(helpers.to_str()), Call(helpers.concat), LocalSet(acc),
-        GlobalGet(EXC_PENDING_GLOBAL),
-        If(BlockType::Empty),
-        LocalGet(arr), LocalGet(arr), I32Load8U(flags), I32Const(!joining), I32And, I32Store8(flags),
-        I64Const(UNDEFINED_BITS), Return,
-        End,
+    );
+    unwind(&mut f);
+    wasm!(f;
         End,
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),

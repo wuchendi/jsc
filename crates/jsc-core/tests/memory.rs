@@ -21,6 +21,29 @@ fn many_small_strings_grow_memory() {
     );
 }
 
+/// Static data (string literals and the intern table) past the first page
+/// still fits the initial memory.
+#[test]
+fn static_data_beyond_one_page() {
+    let literals: Vec<String> = (0..3000)
+        .map(|i| format!("'literal number {i:05}'"))
+        .collect();
+    let src = format!("let a = [{}]; a.length", literals.join(", "));
+    assert_number(&src, 3000.0);
+}
+
+/// Static data (string literals, the realm image, the intern table) past the
+/// first 64 KiB page is covered by the initial memory, so instantiation does
+/// not trap.
+#[test]
+fn static_bindings_beyond_one_page() {
+    let src: String = (0..3000)
+        .map(|i| format!("let s{i} = 'literal number {i} of a long program'; "))
+        .chain(["s2999.length".to_owned()])
+        .collect();
+    assert_number(&src, 37.0);
+}
+
 /// A million small string allocations complete.
 #[test]
 fn million_small_strings() {
@@ -135,5 +158,46 @@ fn sparse_store_does_not_allocate_the_gap() {
         memory.len() < 4 * 1024 * 1024,
         "linear memory grew to {} bytes",
         memory.len()
+    );
+}
+
+/// Run `src` and return its number result and final linear-memory size.
+fn run_with_memory(src: &str) -> (f64, usize) {
+    let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js).expect("parses");
+    let ir = jsc_core::codegen::lower(&program).expect("lowers");
+    let wasm = jsc_core::emit::emit(&ir);
+    let (bits, memory) = jsc_core::run::run(&wasm).expect("runs");
+    (f64::from_bits(bits), memory.len())
+}
+
+/// The dense bound is a gap of 1024 holes past the length, whatever the store
+/// capacity: stores that each land 1024 past the end (or roughly double the
+/// index, test262 `S15.4_A1.1_T10`) stay sparse and small, while a gap of
+/// 1023 still grows the store densely.
+#[test]
+fn dense_growth_is_bounded_by_the_gap() {
+    let (len, sparse) = run_with_memory(
+        "const a = []; for (let k = 0; k < 1000; k++) a[a.length + 1024] = k; a.length",
+    );
+    assert_eq!(len, 1_025_000.0);
+    assert!(
+        sparse < 4 * 1024 * 1024,
+        "sparse stores grew memory to {sparse} bytes"
+    );
+    let (len, dense) = run_with_memory(
+        "const a = []; for (let k = 0; k < 1000; k++) a[a.length + 1023] = k; a.length",
+    );
+    assert_eq!(len, 1_024_000.0);
+    assert!(
+        dense > 8 * 1024 * 1024,
+        "dense stores only grew memory to {dense} bytes"
+    );
+    let (len, doubling) = run_with_memory(
+        "const x = []; let k = 1; for (let i = 0; i < 32; i++) { k = k * 2; x[k - 2] = k } x.length",
+    );
+    assert_eq!(len, 4_294_967_295.0);
+    assert!(
+        doubling < 4 * 1024 * 1024,
+        "doubling stores grew memory to {doubling} bytes"
     );
 }

@@ -126,6 +126,9 @@ pub(super) fn emit_node(
         IrNode::GlobalSet { global, value } => {
             emit_global_set(global, value, function, scratch, strings, helpers);
         }
+        IrNode::GlobalDeclare { name, value } => {
+            emit_global_declare(name, value.as_deref(), function, scratch, strings, helpers);
+        }
         IrNode::DeclFunc(table_index) => {
             let base = decl_func_base(*table_index, helpers);
             function.instruction(&Instruction::I64Const(
@@ -257,6 +260,10 @@ pub(super) fn emit_node(
         IrNode::Yield(_) => {
             unreachable!("a `yield` survived to emit — codegen must reject it first")
         }
+        IrNode::AwaitMark(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            generator::emit_await_mark(function);
+        }
         IrNode::TypeOf(operand) => {
             emit_typeof_node(operand, function, scratch, strings, helpers);
         }
@@ -328,6 +335,9 @@ pub(super) fn emit_node(
         }
         node @ IrNode::NamespaceGuard { .. } => {
             emit_namespace_guard(node, function, scratch, strings, helpers);
+        }
+        node @ IrNode::ProtoMethod { .. } => {
+            emit_proto_method(node, function, scratch, strings, helpers);
         }
         node @ IrNode::ProtoGuard { .. } => {
             emit_proto_guard(node, function, scratch, strings, helpers);
@@ -516,12 +526,12 @@ pub(super) fn emit_node(
             );
         }
         // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
-        // millisecond payload. `DateNew`/`DateNow` seed from `ms` or the host clock;
+        // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the host clock;
         // `DateField` computes a field from a Date receiver's payload.
-        IrNode::DateNew { ms } => {
-            emit_date_new_node(ms.as_deref(), function, scratch, strings, helpers);
+        IrNode::DateNew { arg } => {
+            emit_date_new_node(arg.as_deref(), function, scratch, strings, helpers);
         }
-        IrNode::DateNow => emit_date_now_node(function, helpers),
+        IrNode::DateNow => emit_date_now_node(function, scratch, helpers),
         IrNode::DateField { op, recv } => {
             emit_date_field(*op, *recv, function, scratch, strings, helpers);
         }
@@ -618,11 +628,12 @@ pub(super) fn emit_reset_this(function: &mut Function) {
 }
 
 /// Emit a user method call `obj.m(args)` binding `this = obj`, leaving the
-/// callee's boxed jsval result on the stack. The receiver is evaluated once into
-/// the stable frame local `obj_local`; the `K` padded argument slots are pushed
-/// (env-last ABI); the callee — the function value at member `key` of the
-/// receiver — is read via the ordinary object-member path and its block base
-/// stashed; then `__this` is set to the receiver immediately before the
+/// callee's boxed jsval result on the stack. JS order (ECMA-262 13.3.6.1): the
+/// receiver is evaluated once into the stable frame local `obj_local`, the
+/// callee — the function value at member `key` of the receiver — is read via
+/// the ordinary object-member path into the frame local `callee_local`, then
+/// the `K` padded argument slots are pushed (env-last ABI), then `IsCallable`
+/// is checked and `__this` is set to the receiver immediately before the
 /// `call_indirect`, so nothing evaluated afterward can clobber it. The callee's
 /// own environment is the trailing `env` argument, then `argc`, then the funcref
 /// index.
@@ -638,13 +649,13 @@ pub(super) fn emit_method_call_user(
         key,
         args,
         obj_local,
+        callee_local,
         not_callable,
     } = node
     else {
         unreachable!("emit_method_call_user is only called with a MethodCallUser node")
     };
-    let obj_local = *obj_local;
-    let base = scratch + 7;
+    let (obj_local, callee_val) = (*obj_local, *callee_local);
     // Evaluate the receiver ONCE into a stable frame local (survives argument
     // evaluation, the member read, and the `__this` set).
     emit_node(obj, function, scratch, strings, helpers);
@@ -653,13 +664,9 @@ pub(super) fn emit_method_call_user(
     // The key is only evaluated here on the throw path.
     emit_nullish_guard(function, obj_local, key, false, scratch, strings, helpers);
 
-    // K padded argument slots (deepest on the stack). Nested method calls here set
-    // `__this`, but it is overwritten below after all arguments are evaluated.
-    emit_call_args(args, function, scratch, strings, helpers);
-
-    // Evaluate the callee — the function value at `receiver[key]` — via the
-    // ordinary object-member read (already nullish-guarded above), and stash the
-    // full jsval in a scratch i64.
+    // Read the callee — the function value at `receiver[key]` — via the
+    // ordinary object-member read (already nullish-guarded above) before any
+    // argument runs, into its stable frame local.
     emit_index_node(
         &IrNode::Local(obj_local),
         key,
@@ -669,34 +676,56 @@ pub(super) fn emit_method_call_user(
         strings,
         helpers,
     );
-    // The general i64 scratch slot (+0) is free here: the member read has already
-    // left its result on the stack, and nothing below reads +0 before this call.
-    let callee_val = scratch;
     function.instruction(&Instruction::LocalSet(callee_val));
+
+    // K padded argument slots (deepest on the stack). Nested method calls here set
+    // `__this`, but it is overwritten below after all arguments are evaluated.
+    emit_call_args(args, function, scratch, strings, helpers);
 
     // Runtime guard: the resolved member MUST be a function value. For a
     // dynamic-shape receiver — a `new`-instance, a reassigned binding, a computed
     // key, or a call result — the compile-time unknown-method guards
     // cannot prove the method absent, so `receiver[key]` may read `undefined` (or
     // any non-function). Dispatching that as a funcref index is undefined
-    // behaviour; instead throw a clean `TypeError` and unwind to the nearest
-    // handler (or the program boundary), exactly like `throw`.
-    emit_callable_guard(
-        function,
+    // behaviour; instead throw a clean `TypeError` (after the arguments, as
+    // `IsCallable` runs in JS) and unwind to the nearest handler (or the
+    // program boundary), exactly like `throw`.
+    emit_bound_call(
+        (callee_val, obj_local),
+        args.len(),
         callee_error_text(not_callable),
-        callee_val,
+        function,
         scratch,
         strings,
         helpers,
     );
+}
+
+/// With the `K` argument slots of an `argc`-argument call pushed, call the
+/// jsval in local `callee` with `this` = the jsval in local `this`: the
+/// `IsCallable` guard (throwing the `TypeError` `text`), then `__this` set
+/// immediately before the `call_indirect`, the callee's own environment as
+/// the trailing `env` argument, `argc` and the funcref index; unwinds if the
+/// callee left an exception pending.
+fn emit_bound_call(
+    (callee_val, this_local): (u32, u32),
+    argc: usize,
+    text: CalleeErrorText<'_>,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let base = scratch + 7;
+    emit_callable_guard(function, text, callee_val, scratch, strings, helpers);
 
     // Not-thrown path: proceed with the callee's block base (its wrapped pointer).
     function.instruction(&Instruction::LocalGet(callee_val));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
 
-    // Bind `this = receiver` immediately before the call (after every sub-eval).
-    function.instruction(&Instruction::LocalGet(obj_local));
+    // Bind `this` immediately before the call (after every sub-eval).
+    function.instruction(&Instruction::LocalGet(this_local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 
     // Trailing env argument: the callee's own environment (at FUNC_ENV_OFFSET).
@@ -707,7 +736,7 @@ pub(super) fn emit_method_call_user(
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
-    emit_argc(call_argc(args.len(), helpers), function);
+    emit_argc(call_argc(argc, helpers), function);
     // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
@@ -743,6 +772,7 @@ pub(super) fn emit_this_call(
         args,
         this_local,
         construct,
+        not_callable,
     } = node
     else {
         unreachable!("emit_this_call is only called with a ThisCall node")
@@ -763,7 +793,7 @@ pub(super) fn emit_this_call(
     // of dispatching a bogus funcref index. Identical to the method-call guard.
     emit_callable_guard(
         function,
-        EXPRESSION_NOT_A_FUNCTION,
+        callee_error_text(not_callable),
         callee_val,
         scratch,
         strings,
@@ -824,6 +854,7 @@ pub(super) fn emit_namespace_guard(
         key,
         obj,
         obj_local,
+        member_local,
         args,
         arg_locals,
         fast,
@@ -832,19 +863,9 @@ pub(super) fn emit_namespace_guard(
     else {
         unreachable!("emit_namespace_guard is only called with a NamespaceGuard node")
     };
-    emit_node(obj, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(*obj_local));
-    for (arg, &local) in args.iter().zip(arg_locals) {
-        emit_node(arg, function, scratch, strings, helpers);
-        function.instruction(&Instruction::LocalSet(local));
-    }
-    let intrinsic = Intrinsic::from(*namespace);
-    let Some(builtin) = realm::method_of(intrinsic, key) else {
-        emit_node(slow, function, scratch, strings, helpers);
-        return;
-    };
-    // `obj.key === %builtin%`: the member read, compared with the constant.
-    let read_compare = |function: &mut Function| {
+    // `obj.key` into `member_local` (JS reads the callee before the
+    // arguments).
+    let read = |function: &mut Function| {
         emit_index_node(
             &IrNode::Local(*obj_local),
             &IrNode::Str(key.clone()),
@@ -854,6 +875,27 @@ pub(super) fn emit_namespace_guard(
             strings,
             helpers,
         );
+        function.instruction(&Instruction::LocalTee(*member_local));
+    };
+    let emit_args = |function: &mut Function| {
+        for (arg, &local) in args.iter().zip(arg_locals) {
+            emit_node(arg, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalSet(local));
+        }
+    };
+    emit_node(obj, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(*obj_local));
+    let intrinsic = Intrinsic::from(*namespace);
+    let Some(builtin) = realm::method_of(intrinsic, key) else {
+        read(function);
+        function.instruction(&Instruction::Drop);
+        emit_args(function);
+        emit_node(slow, function, scratch, strings, helpers);
+        return;
+    };
+    // `obj.key === %builtin%`: the member read, compared with the constant.
+    let read_compare = |function: &mut Function| {
+        read(function);
         function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
         function.instruction(&Instruction::I64Eq);
     };
@@ -877,6 +919,8 @@ pub(super) fn emit_namespace_guard(
     } else {
         read_compare(function);
     }
+    // The test result waits on the stack while the arguments run.
+    emit_args(function);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
     emit_node(fast, function, scratch, strings, helpers);
@@ -913,7 +957,8 @@ fn proto_kind_cases(kind: ProtoKind) -> &'static [(i32, Intrinsic)] {
 /// Push i32 `1` when the jsval in `local` is a receiver of `kind` whose
 /// builtin methods are provably the realm's (DESIGN.md §6.4): a heap block of the
 /// kind byte with no own properties (`props == 0`, one i64 load of the header
-/// and `props` words) whose `proto` is the family's prototype and, unless
+/// and `props` words; an array also not in dictionary mode) whose `proto` is
+/// the family's prototype and, unless
 /// `sealed`, whose dirty bit is clear. `tmp` is a free i32 local.
 pub(super) fn emit_proto_kind_test(
     function: &mut Function,
@@ -923,6 +968,10 @@ pub(super) fn emit_proto_kind_test(
     tmp: u32,
     helpers: Helpers<'_>,
 ) {
+    if kind == ProtoKind::Generator {
+        emit_generator_kind_test(function, local, sealed, tmp, helpers);
+        return;
+    }
     let cases = proto_kind_cases(kind);
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
@@ -939,7 +988,11 @@ pub(super) fn emit_proto_kind_test(
             align: 3,
             memory_index: 0,
         }));
-        function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
+        function.instruction(&Instruction::I64Const(if type_byte == TYPE_ARRAY {
+            ARRAY_KIND_AND_PROPS_MASK
+        } else {
+            KIND_AND_PROPS_MASK
+        }));
         function.instruction(&Instruction::I64And);
         function.instruction(&Instruction::I64Const(i64::from(type_byte)));
         function.instruction(&Instruction::I64Eq);
@@ -956,13 +1009,102 @@ pub(super) fn emit_proto_kind_test(
             function.instruction(&Instruction::I32Or);
         }
     }
+    // An array fast path reads a hole as absent, which holds while neither
+    // `%Array.prototype%` nor `%Object.prototype%` has changed (DESIGN.md
+    // §6.4).
     let bits = cases
         .iter()
-        .filter_map(|(_, prototype)| prototype.watch_bit())
+        .flat_map(|&(type_byte, prototype)| {
+            let object = (type_byte == TYPE_ARRAY).then_some(Intrinsic::ObjectPrototype);
+            [Some(prototype), object]
+        })
+        .flatten()
+        .filter_map(Intrinsic::watch_bit)
         .fold(0, |bits, bit| bits | (1 << bit));
     if !sealed && bits != 0 {
         function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
         function.instruction(&Instruction::I32Const(bits));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// [`emit_proto_kind_test`] for [`ProtoKind::Generator`]: a
+/// `TYPE_GENERATOR` without own properties whose `proto` is
+/// `%GeneratorPrototype%`, or an object without own properties (its
+/// function's `prototype`) whose `proto` is `%GeneratorPrototype%`, so
+/// `next` resolves to the builtin either way.
+fn emit_generator_kind_test(
+    function: &mut Function,
+    local: u32,
+    sealed: bool,
+    tmp: u32,
+    helpers: Helpers<'_>,
+) {
+    let prototype = Intrinsic::GeneratorPrototype;
+    let proto_load = Instruction::I64Load(MemArg {
+        offset: OBJ_PROTO_OFFSET,
+        align: 3,
+        memory_index: 0,
+    });
+    let header_load = Instruction::I64Load(MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    });
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalTee(tmp));
+    function.instruction(&header_load);
+    function.instruction(&Instruction::I64Const(KIND_AND_PROPS_MASK));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Const(i64::from(TYPE_GENERATOR)));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I64Const(intrinsic_bits(prototype, helpers)));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::Else);
+    // One hop: the generator function's `prototype` (a heap object).
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I64Const(48));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Const(HEAP_BITS >> 48));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalTee(tmp));
+    function.instruction(&header_load);
+    function.instruction(&Instruction::I64Const(PROPS_MASK));
+    function.instruction(&Instruction::I64And);
+    function.instruction(&Instruction::I64Eqz);
+    function.instruction(&Instruction::LocalGet(tmp));
+    function.instruction(&proto_load);
+    function.instruction(&Instruction::I64Const(intrinsic_bits(prototype, helpers)));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    if !sealed && let Some(bit) = prototype.watch_bit() {
+        function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+        function.instruction(&Instruction::I32Const(1 << bit));
         function.instruction(&Instruction::I32And);
         function.instruction(&Instruction::I32Eqz);
         function.instruction(&Instruction::I32And);
@@ -996,6 +1138,7 @@ pub(super) fn emit_proto_guard(
         key,
         args,
         fast,
+        callee,
         not_callable,
     } = node
     else {
@@ -1008,52 +1151,50 @@ pub(super) fn emit_proto_guard(
         function.instruction(&Instruction::LocalSet(scratch));
         scratch
     };
-    let dirty_clear = |function: &mut Function, prototype: Intrinsic| {
-        if !*sealed && let Some(bit) = prototype.watch_bit() {
-            function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
-            function.instruction(&Instruction::I32Const(1 << bit));
-            function.instruction(&Instruction::I32And);
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::I32And);
-        }
-    };
-    // A string receiver while `%String.prototype%` is clean: the heap tag in
-    // the top 16 bits, then the kind byte.
     let string_guard = |function: &mut Function| {
-        function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I64Const(48));
-        function.instruction(&Instruction::I64ShrU);
-        function.instruction(&Instruction::I64Const(HEAP_BITS >> 48));
-        function.instruction(&Instruction::I64Eq);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-        function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32WrapI64);
-        function.instruction(&Instruction::I32Load8U(MemArg {
-            offset: 0,
-            align: 0,
-            memory_index: 0,
-        }));
-        function.instruction(&Instruction::I32Const(TYPE_STRING));
-        function.instruction(&Instruction::I32Eq);
-        dirty_clear(function, realm::prototype_of(BuiltinCtor::String));
-        function.instruction(&Instruction::Else);
-        function.instruction(&Instruction::I32Const(0));
-        function.instruction(&Instruction::End);
+        emit_string_receiver_test(function, local, *sealed);
+    };
+    // With an early callee read: whether it found the fast path `slot`'s
+    // builtin (its marker, see [`early_marker`]).
+    let found = |function: &mut Function, slot: usize| {
+        if let Some(callee) = callee {
+            emit_node(callee, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Const(early_marker(slot)));
+            function.instruction(&Instruction::I64Eq);
+        }
     };
     let string = realm::method_of(realm::prototype_of(BuiltinCtor::String), key);
     let mut opened = 0;
     // Arguments already of the types the builtin coerces to: on a string
     // receiver the builtin is exactly its host op, inline.
     let inline_string = match string {
-        Some(Builtin::StringMethod(op)) if builtins::host_ready_args(op, args) => Some(op),
+        Some(Builtin::StringMethod(op)) => builtins::inline_host_op(op, args),
         _ => None,
     };
-    if let Some(op) = inline_string {
-        string_guard(function);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    if let Some((flag, may_fail)) = inline_string {
+        // A host op that may refuse its input (DESIGN.md §13) runs inside a
+        // block: its result leaves the block unless it is the
+        // `METHOD_UNSUPPORTED`-family sentinel, which falls through to the
+        // builtin call below (the builtin throws).
+        if may_fail {
+            function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+            enter_frame(helpers);
+        }
+        // A primitive keeps its kind: the early read decides.
+        if callee.is_some() {
+            found(function, STRING_SLOT);
+        } else {
+            string_guard(function);
+        }
+        let block = if may_fail {
+            BlockType::Empty
+        } else {
+            BlockType::Result(ValType::I64)
+        };
+        function.instruction(&Instruction::If(block));
         enter_frame(helpers);
         function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32Const(op.flag()));
+        function.instruction(&Instruction::I32Const(flag));
         for slot in 0..2 {
             match args.get(slot) {
                 Some(arg) => emit_node(arg, function, scratch, strings, helpers),
@@ -1063,16 +1204,82 @@ pub(super) fn emit_proto_guard(
             }
         }
         function.instruction(&Instruction::Call(helpers.method));
-        function.instruction(&Instruction::Else);
+        if may_fail {
+            let result = scratch + 1;
+            function.instruction(&Instruction::LocalTee(result));
+            function.instruction(&Instruction::LocalGet(result));
+            builtins::emit_is_method_refusal(function);
+            function.instruction(&Instruction::I32Eqz);
+            function.instruction(&Instruction::BrIf(1));
+            function.instruction(&Instruction::Drop);
+            leave_frame(helpers);
+            function.instruction(&Instruction::End);
+        } else {
+            function.instruction(&Instruction::Else);
+        }
         opened += 1;
     }
-    for (kind, path) in fast {
-        emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
+    for (slot, (kind, path)) in fast.iter().enumerate() {
+        // An object keeps its kind byte through the arguments, so the early
+        // read decides; only a path reading own properties (an array's
+        // elements, a promise's `constructor`) tests the receiver again.
+        if callee.is_none() || props_sensitive(*kind) {
+            emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
+            if callee.is_some() {
+                found(function, slot);
+                function.instruction(&Instruction::I32And);
+            }
+        } else {
+            found(function, slot);
+        }
+        if matches!(path, IrNode::ArrayPush { .. }) {
+            emit_push_room_test(function, scratch + 3);
+        }
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
         emit_node(path, function, scratch, strings, helpers);
         function.instruction(&Instruction::Else);
         opened += 1;
+    }
+    // With an early callee read, every other receiver calls it (a marker
+    // that reaches here names its builtin).
+    if let Some(callee) = callee {
+        emit_call_args(args, function, scratch, strings, helpers);
+        let callee_val = scratch + 1;
+        emit_node(callee, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(callee_val));
+        let mut markers: Vec<(usize, Builtin)> =
+            string.map(|b| (STRING_SLOT, b)).into_iter().collect();
+        for (slot, (kind, _)) in fast.iter().enumerate() {
+            if props_sensitive(*kind)
+                && let Some(builtin) = kind_method(*kind, key)
+            {
+                markers.push((slot, builtin));
+            }
+        }
+        for (slot, builtin) in markers {
+            function.instruction(&Instruction::LocalGet(callee_val));
+            function.instruction(&Instruction::I64Const(early_marker(slot)));
+            function.instruction(&Instruction::I64Eq);
+            function.instruction(&Instruction::If(BlockType::Empty));
+            function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
+            function.instruction(&Instruction::LocalSet(callee_val));
+            function.instruction(&Instruction::End);
+        }
+        emit_bound_call(
+            (callee_val, local),
+            args.len(),
+            callee_error_text(not_callable),
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+        for _ in 0..opened {
+            leave_frame(helpers);
+            function.instruction(&Instruction::End);
+        }
+        return;
     }
     // ONE uniform-ABI call: the argument slots, `this = recv`, the packed
     // `env` and `argc`, into the generic call — or, for a `String.prototype`
@@ -1109,9 +1316,148 @@ pub(super) fn emit_proto_guard(
     }
 }
 
+/// Push `1` when the jsval in `local` is a string while (unless `sealed`)
+/// `%String.prototype%`'s dirty bit is clear: the heap tag in the top 16
+/// bits, then the kind byte.
+fn emit_string_receiver_test(function: &mut Function, local: u32, sealed: bool) {
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I64Const(48));
+    function.instruction(&Instruction::I64ShrU);
+    function.instruction(&Instruction::I64Const(HEAP_BITS >> 48));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(TYPE_STRING));
+    function.instruction(&Instruction::I32Eq);
+    if !sealed && let Some(bit) = realm::prototype_of(BuiltinCtor::String).watch_bit() {
+        function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+        function.instruction(&Instruction::I32Const(1 << bit));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::I32And);
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// The [`early_marker`] slot of a string receiver.
+const STRING_SLOT: usize = 6;
+
+/// The value an [`IrNode::ProtoMethod`] leaves for a receiver that passed the
+/// test of fast path `slot` ([`STRING_SLOT`]: a string receiver): a heap tag
+/// over an address no block has (blocks are 8-aligned), so no `[[Get]]`
+/// result equals it. A slot past [`STRING_SLOT`] has no marker (the read
+/// then always takes `[[Get]]`).
+fn early_marker(slot: usize) -> i64 {
+    HEAP_BITS | i64::try_from(slot + 1).unwrap_or(0)
+}
+
+/// Whether the fast paths of `kind` read the receiver's own properties, so
+/// arguments that run after the early read can invalidate them.
+fn props_sensitive(kind: ProtoKind) -> bool {
+    matches!(kind, ProtoKind::Array | ProtoKind::Promise)
+}
+
+/// The builtin `key` of the prototype of the family `kind` (the first one of
+/// [`ProtoKind::Collection`]).
+fn kind_method(kind: ProtoKind, key: &str) -> Option<Builtin> {
+    proto_kind_cases(kind)
+        .first()
+        .and_then(|&(_, prototype)| realm::method_of(prototype, key))
+}
+
+/// Emit an [`IrNode::ProtoMethod`], leaving the method on the stack: the
+/// [`early_marker`] of a string receiver or of the first fast path whose test
+/// the receiver passes (its builtin, with no lookup), else the generic
+/// `[[Get]]` of `key`.
+pub(super) fn emit_proto_method(
+    node: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let IrNode::ProtoMethod {
+        sealed,
+        recv,
+        key,
+        kinds,
+    } = node
+    else {
+        unreachable!("emit_proto_method is only called with a ProtoMethod node")
+    };
+    let local = if let IrNode::Local(local) = **recv {
+        local
+    } else {
+        emit_node(recv, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(scratch));
+        scratch
+    };
+    let mut opened = 0;
+    let mut open = |function: &mut Function, slot: usize| {
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        enter_frame(helpers);
+        function.instruction(&Instruction::I64Const(early_marker(slot)));
+        function.instruction(&Instruction::Else);
+        opened += 1;
+    };
+    if realm::method_of(realm::prototype_of(BuiltinCtor::String), key).is_some() {
+        emit_string_receiver_test(function, local, *sealed);
+        open(function, STRING_SLOT);
+    }
+    for (slot, &kind) in kinds.iter().enumerate().take(STRING_SLOT) {
+        emit_proto_kind_test(function, local, kind, *sealed, scratch + 3, helpers);
+        open(function, slot);
+    }
+    emit_index_node(
+        &IrNode::Local(local),
+        &IrNode::Str(key.clone()),
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    for _ in 0..opened {
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
+}
+
+/// AND the passed array kind test on the stack with `length != 2^32 - 1` of
+/// the array base in i32 local `base`: an array that long takes the builtin
+/// `push`, which sets the non-index key and throws the `RangeError` on
+/// `length`.
+fn emit_push_room_test(function: &mut Function, base: u32) {
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(array_len_slot()));
+    function.instruction(&Instruction::I32Const(-1));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
 /// The bits of an object's first eight bytes holding its kind byte and its
 /// `props` word.
 const KIND_AND_PROPS_MASK: i64 = 0xffff_ffff_0000_00ff_u64.cast_signed();
+
+/// The bits of an object's first eight bytes holding its `props` word.
+const PROPS_MASK: i64 = 0xffff_ffff_0000_0000_u64.cast_signed();
+
+/// [`KIND_AND_PROPS_MASK`] plus an array's `DICTIONARY` flag bit (header byte
+/// 2, bit `32`): a dictionary array's elements may carry any attributes, so it
+/// takes the generic call.
+const ARRAY_KIND_AND_PROPS_MASK: i64 = KIND_AND_PROPS_MASK | 0x0020_0000;
+const _: () = assert!(abi::ARRAY_FLAG_DICTIONARY == 0x20);
 
 /// Emit `new callee(args)` ([`IrNode::Construct`], DESIGN.md §7.6), leaving the
 /// constructed object on the stack. JS order: the callee is evaluated into
@@ -1325,7 +1671,7 @@ pub(super) fn emit_is_object(function: &mut Function, local: u32) {
 
 /// Push nonzero if the jsval in `local` is a constructor: a function value
 /// whose header carries `FUNC_FLAG_CONSTRUCTOR`, else `0`.
-fn emit_is_constructor(function: &mut Function, local: u32) {
+pub(super) fn emit_is_constructor(function: &mut Function, local: u32) {
     emit_is_function(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(local));
@@ -1845,7 +2191,7 @@ pub(super) fn emit_promise_ctor(
 /// slot `table_index` and whose ENV slot holds the bound promise (read from
 /// `p_local`) rather than a closure environment. Mirrors [`emit_func_value`] but
 /// stores `p_local` in the env slot directly.
-fn emit_settler_value(
+pub(super) fn emit_settler_value(
     table_index: u32,
     p_local: u32,
     function: &mut Function,
@@ -2082,6 +2428,48 @@ fn emit_global_set(
     function.instruction(&Instruction::Call(helpers.set));
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::LocalGet(scratch));
+}
+
+/// Emit a [`IrNode::GlobalDeclare`]: `__define` the global-object property
+/// `name` as writable, enumerable and non-configurable — a function
+/// declaration's unconditionally (a rejected redefinition propagates), a
+/// `var`'s with `undefined` only when it is not already an own property;
+/// yields `undefined`.
+fn emit_global_declare(
+    name: &str,
+    value: Option<&IrNode>,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let global = intrinsic_bits(Intrinsic::Global, helpers);
+    let key = static_key(strings, name);
+    let attrs = (abi::ATTR_WRITABLE | abi::ATTR_ENUMERABLE).cast_signed();
+    let define = |function: &mut Function| {
+        function.instruction(&Instruction::I64Const(global));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Const(key));
+    };
+    if let Some(value) = value {
+        define(function);
+        emit_node(value, function, scratch, strings, helpers);
+        function.instruction(&Instruction::I32Const(attrs));
+        function.instruction(&Instruction::Call(helpers.define));
+        emit_propagate_if_pending(function, helpers);
+    } else {
+        function.instruction(&Instruction::I32Const(key));
+        function.instruction(&Instruction::I64Const(global));
+        function.instruction(&Instruction::Call(helpers.has_own()));
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        define(function);
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        function.instruction(&Instruction::I32Const(attrs));
+        function.instruction(&Instruction::Call(helpers.define));
+        function.instruction(&Instruction::End);
+    }
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
 /// Emit the `IsCallable` check guarding an indirect call (DF4): unless the jsval in

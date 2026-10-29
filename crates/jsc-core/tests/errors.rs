@@ -510,17 +510,6 @@ fn instanceof_any_rhs() {
     assert_bool("class X {} let Object = X; ({}) instanceof Object", false);
 }
 
-/// The calendar-field `Date` constructor is a run-time `TypeError`; a spread
-/// argument constructs through the builtin constructor.
-#[test]
-fn date_calendar_field_form_throws_at_run_time() {
-    assert_uncaught(
-        "new Date(2024, 0, 1)",
-        "TypeError: the Date calendar-field constructor is not supported",
-    );
-    assert_number("new Date(...[7]).getTime()", 7.0);
-}
-
 /// `new Promise` / `new Error` with any arity or a spread argument construct
 /// through the builtin constructor (no compile-time arity diagnostics).
 #[test]
@@ -1300,5 +1289,121 @@ fn error_constructors_evaluate_surplus_arguments() {
         "let log = ''; let f = (v) => { log = log + v; return v }; \
          let e = new Error(f('a'), f('b'), f('c')); console.log(log, e.message)",
         "abc a\n",
+    );
+}
+
+// --- AggregateError ------------------------------------------------------------
+
+#[test]
+fn aggregate_error_shape() {
+    for (src, expected) in [
+        (
+            "const e = new AggregateError([1, 2], 'm'); e.errors.length + e.message",
+            "2m",
+        ),
+        ("new AggregateError([]) instanceof AggregateError", "true"),
+        ("new AggregateError([]) instanceof Error", "true"),
+        ("AggregateError([1]).errors[0]", "1"),
+        ("AggregateError([]) instanceof AggregateError", "true"),
+        ("new AggregateError([]).name", "AggregateError"),
+        (
+            "String(new AggregateError([], 'boom'))",
+            "AggregateError: boom",
+        ),
+        ("AggregateError.prototype instanceof Error", "true"),
+        (
+            "AggregateError.prototype.constructor === AggregateError",
+            "true",
+        ),
+        ("AggregateError.prototype.name", "AggregateError"),
+        ("AggregateError.prototype.message", ""),
+        ("AggregateError.length", "2"),
+        ("AggregateError.name", "AggregateError"),
+        ("new AggregateError([]).hasOwnProperty('message')", "false"),
+        (
+            "new AggregateError([], undefined).hasOwnProperty('message')",
+            "false",
+        ),
+        ("Object.keys(new AggregateError([1], 'm')).length", "0"),
+        ("const a = [1]; new AggregateError(a).errors !== a", "true"),
+        ("new AggregateError('ab').errors.join()", "a,b"),
+        ("new AggregateError(new Set([3, 4])).errors.join()", "3,4"),
+        (
+            "new AggregateError(new Map([[1, 2]])).errors[0].join()",
+            "1,2",
+        ),
+        (
+            "function* g() { yield 'x'; yield 'y' } new AggregateError(g()).errors.join()",
+            "x,y",
+        ),
+        ("new AggregateError([], 'm', { cause: 0 }).cause", "0"),
+        (
+            "new AggregateError([], 'm', { cause: undefined }).hasOwnProperty('cause')",
+            "true",
+        ),
+        (
+            "new AggregateError([], 'm', {}).hasOwnProperty('cause')",
+            "false",
+        ),
+        (
+            "new AggregateError([], 'm', 1).hasOwnProperty('cause')",
+            "false",
+        ),
+        (
+            "class E extends AggregateError {} const e = new E([1], 'x'); (e instanceof E) + e.message + e.errors.length",
+            "truex1",
+        ),
+    ] {
+        assert_str(src, expected);
+    }
+}
+
+/// A spread call or construct passing more arguments than the `K` slots
+/// still hands `AggregateError` its message and options (the programs keep
+/// `K = 1`), read before the message's `toString` can publish another spread
+/// argument array.
+#[test]
+fn aggregate_error_reads_spread_arguments_past_the_slots() {
+    for (src, expected) in [
+        (
+            "const e = new AggregateError(...[[1, 2], 'm', { cause: 3 }]); e.message + e.cause + e.errors.length",
+            "m32",
+        ),
+        (
+            "const e = AggregateError(...[[1], 'c']); e.message + e.hasOwnProperty('cause')",
+            "cfalse",
+        ),
+        (
+            "class E extends AggregateError { constructor(...a) { super(...a) } } \
+             const e = new E(...[[1], 'x', { cause: 'y' }]); (e instanceof E) + e.message + e.cause",
+            "truexy",
+        ),
+        (
+            "const m = { toString() { return String(...['q']) } }; \
+             const e = new AggregateError(...[[1], m, { cause: 4 }]); e.message + e.cause",
+            "q4",
+        ),
+    ] {
+        assert_str(src, expected);
+    }
+}
+
+#[test]
+fn aggregate_error_rejects_non_iterables() {
+    for src in [
+        "new AggregateError()",
+        "new AggregateError(1)",
+        "new AggregateError({})",
+        "AggregateError(null)",
+    ] {
+        assert_str(
+            &format!("let r = 'none'; try {{ {src} }} catch (e) {{ r = e.name }} r"),
+            "TypeError",
+        );
+    }
+    // The message is converted before the errors are iterated.
+    assert_str(
+        "let s = ''; try { new AggregateError(1, { toString() { s += 'm'; return '' } }) } catch (e) { s += e.name } s",
+        "mTypeError",
     );
 }

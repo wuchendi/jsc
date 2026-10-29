@@ -22,13 +22,40 @@ const FINALLY_THENABLE: CalleeErrorText<'static> = [
     "TypeError: Promise.prototype.finally on a non-promise object is not supported",
 ];
 
+/// The `TypeError` a promise resolved with itself is rejected with (Promise
+/// Resolve Functions step 7), built by [`emit_promise_self_error`].
+const SELF_RESOLUTION: CalleeErrorText<'static> = [
+    "Chaining cycle detected for promise #<Promise>",
+    "TypeError: Chaining cycle detected for promise #<Promise>",
+];
+
 /// The static strings of this family.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
     NOT_PROMISE
         .into_iter()
         .flatten()
         .chain(FINALLY_THENABLE)
+        .chain(SELF_RESOLUTION)
         .chain(["then"])
+}
+
+/// `__promise_self_error() -> i64`: a fresh [`SELF_RESOLUTION`] `TypeError`.
+/// Exported for the host promise engines, which settle every promise: a
+/// promise fulfilled with itself is rejected with this error instead.
+pub(in crate::emit) fn emit_promise_self_error(
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) -> Function {
+    let mut function = Function::new(type_error_helper_locals());
+    emit_node(
+        &callee_type_error(SELF_RESOLUTION),
+        &mut function,
+        0,
+        strings,
+        helpers,
+    );
+    wasm!(function; End);
+    function
 }
 
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
@@ -52,6 +79,7 @@ fn catch_call(frame: Frame) -> IrNode {
         key: Box::new(IrNode::Str("then".to_owned())),
         args: vec![IrNode::Undefined, IrNode::Local(frame.i64(1))],
         obj_local: frame.i64(3),
+        callee_local: frame.x64(0),
         not_callable: CalleeError::not_a_function("then"),
     }
 }

@@ -213,6 +213,20 @@ pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
 /// cyclic element joins as the empty string; cleared on every exit.
 pub(crate) const ARRAY_FLAG_JOINING: u8 = 8;
 
+/// [`TYPE_ARRAY`] header `flags` bit: the array's `length` is non-writable
+/// (`defineProperty(a, "length", {writable: false})`, `freeze`), so every
+/// `length` write and every store that would grow the array throws. Only set
+/// on an [`ARRAY_FLAG_DICTIONARY`] array; never cleared.
+pub(crate) const ARRAY_FLAG_LENGTH_READONLY: u8 = 16;
+
+/// [`TYPE_ARRAY`] header `flags` bit: the array is in dictionary mode — it is
+/// [`ARRAY_FLAG_SPARSE`] with no store (`elems = 0`), so every element is an
+/// array-index key of its `props` table carrying its own attributes. Set before
+/// an element takes non-default attributes, before the array becomes
+/// non-extensible, and before its `length` becomes read-only; never cleared.
+/// The builtin fast paths skip such an array.
+pub(crate) const ARRAY_FLAG_DICTIONARY: u8 = 32;
+
 /// TYPE BYTE of an ordinary object block: the object-family prefix alone
 /// ([`OBJ_PREFIX_SIZE`] bytes, `class` byte 0) — its own properties live in the
 /// [`TYPE_PROPS`] table at `props`, its prototype in `proto`. Maps to `typeof`
@@ -255,6 +269,23 @@ pub(crate) const FUNC_FLAG_CLASS_CTOR: u8 = 16;
 /// `this` (a derived class: `super(..)` constructs it), so `new` skips the
 /// allocation.
 pub(crate) const FUNC_FLAG_SELF_ALLOC: u8 = 32;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: a bound function exotic object
+/// (`Function.prototype.bind`). Its `func_idx` is the bound-call trampoline
+/// and its `env` an array `[target, boundThis, ...boundArgs]`; its own
+/// `length` and `name` are defined at creation (it is never `LAZY`).
+pub(crate) const FUNC_FLAG_BOUND: u8 = 64;
+
+/// [`TYPE_FUNCTION`] header `flags` bit: a generator function (`function*`
+/// or a generator method). Not a constructor; materialization gives it a
+/// `prototype` object inheriting `%GeneratorPrototype%` with no
+/// `constructor`.
+pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
+
+/// [`TYPE_FUNCTION`] header `flags` bit, with [`FUNC_FLAG_GENERATOR`]: an
+/// async generator function, whose `prototype` inherits
+/// `%AsyncGeneratorPrototype%` instead.
+pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
 
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
@@ -380,12 +411,30 @@ pub(crate) const GEN_LIMIT_THROW: u32 = 2;
 /// resume), so a `next()` / `return()` / `throw()` from its own body throws.
 pub(crate) const GEN_RUNNING: u32 = 4;
 
+/// Generator `limits` bit: an async generator (`async function*`), driven
+/// by `%AsyncGeneratorPrototype%` through its request queue; never a sync
+/// iterable.
+pub(crate) const GEN_ASYNC: u32 = 8;
+
+/// Async generator `limits` bit: the state machine's last suspend was an
+/// `await` (the driver clears it before each step), not a `yield`.
+pub(crate) const GEN_AWAIT: u32 = 16;
+
+/// Async generator `limits` bit: the body is executing or awaiting (an
+/// `await` or a `return()` value), so a queued request waits.
+pub(crate) const GEN_BUSY: u32 = 32;
+
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
 /// jsval, 8-byte aligned past the `limits` word.
 pub(crate) const GEN_ENV_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
 
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of an async
+/// generator's u32 request-queue head (`0` when empty), guest-only; the
+/// tail follows at `+ 4`.
+pub(crate) const GEN_QUEUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 24;
+
 /// The byte size of a [`TYPE_GENERATOR`] block.
-pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 32;
 
 /// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the
@@ -648,6 +697,12 @@ pub(crate) const NEW_ARRAY_EXPORT_NAME: &str = "__new_array";
 /// allocate every promise through it.
 pub(crate) const NEW_PROMISE_EXPORT_NAME: &str = "__new_promise";
 
+/// The name under which the module exports the `__promise_self_error() -> i64`
+/// constructor: a fresh `TypeError` ("Chaining cycle detected for promise
+/// #<Promise>"). The host promise engines reject a promise resolved with
+/// itself (Promise Resolve Functions step 7) with it.
+pub(crate) const PROMISE_SELF_ERROR_EXPORT_NAME: &str = "__promise_self_error";
+
 /// The name under which the module exports its linear memory; [`crate::run`]
 /// reads it back to resolve heap pointers.
 pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";
@@ -749,6 +804,120 @@ pub(crate) const METHOD_OP_SPLIT: i32 = 16;
 /// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
 /// `arg0` an integral radix in `2..=36`).
 pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
+
+/// `__method` op flag: `String.prototype.at` (string, a number or
+/// `undefined` index).
+pub(crate) const METHOD_OP_AT: i32 = 18;
+
+/// `__method` op flag: `String.prototype.charCodeAt` (string).
+pub(crate) const METHOD_OP_CHAR_CODE_AT: i32 = 19;
+
+/// `__method` op flag: `String.prototype.codePointAt` (string).
+pub(crate) const METHOD_OP_CODE_POINT_AT: i32 = 20;
+
+/// `__method` op flag: `String.prototype.lastIndexOf` (string).
+pub(crate) const METHOD_OP_LAST_INDEX_OF: i32 = 21;
+
+/// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
+/// order).
+pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
+
+/// `__method` op flag: `String.prototype.normalize` (string, a form string or
+/// `undefined`).
+pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
+
+/// `__method` op flag: the index of a string pattern without `RegExp` syntax
+/// (`String.prototype.search` / `match`; `undefined` is the empty pattern).
+pub(crate) const METHOD_OP_SEARCH: i32 = 24;
+
+/// `__method` op flag: `String.prototype.replace` with a string pattern and a
+/// replacement template (`GetSubstitution`).
+pub(crate) const METHOD_OP_REPLACE: i32 = 25;
+
+/// `__method` op flag: `String.prototype.replaceAll` with a string pattern and
+/// a replacement template.
+pub(crate) const METHOD_OP_REPLACE_ALL: i32 = 26;
+
+/// `__method` op flag: `String.fromCharCode` (an array receiver of numbers).
+pub(crate) const METHOD_OP_FROM_CHAR_CODE: i32 = 27;
+
+/// `__method` op flag: `String.fromCodePoint` (an array receiver of
+/// validated code points).
+pub(crate) const METHOD_OP_FROM_CODE_POINT: i32 = 28;
+
+/// `__method` result: the string op cannot produce a correct result for its
+/// input yet (a byte position over a non-ASCII string, a lone surrogate); the
+/// calling builtin throws a `TypeError`. [`HOLE`], which no JS value produces.
+pub(crate) const METHOD_UNSUPPORTED: u64 = HOLE;
+
+/// `__method` result: the argument is out of range (an unknown `normalize`
+/// form); the calling builtin throws a `RangeError`.
+pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
+
+/// `__method` result: the pattern has `RegExp` syntax, which needs the absent
+/// `RegExp`; the calling builtin throws a `TypeError`.
+pub(crate) const METHOD_NEEDS_REGEXP: u64 = UNDEFINED | 3;
+/// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
+/// receiver, `arg0` an integral `f` in `0..=100`).
+pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;
+
+/// `__method` op flag: `Number.prototype.toExponential(f)` (a finite number
+/// receiver, `arg0` an integral `f` in `0..=100`, or `undefined` for the
+/// shortest round-tripping digits).
+pub(crate) const METHOD_OP_NUMBER_TO_EXPONENTIAL: i32 = 41;
+
+/// `__method` op flag: `Number.prototype.toPrecision(p)` (a finite number
+/// receiver, `arg0` an integral `p` in `1..=100`).
+pub(crate) const METHOD_OP_NUMBER_TO_PRECISION: i32 = 42;
+
+/// `__method` op flag: a host `Math` function. The receiver is the first
+/// number operand, `arg0` the second (`Math.atan2`'s `x`; `undefined` for
+/// the unary functions) and `arg1` the raw `MATH_FN_*` code; the result is a
+/// number jsval.
+pub(crate) const METHOD_OP_MATH: i32 = 43;
+
+/// `METHOD_OP_MATH` function code: `Math.cbrt`.
+pub(crate) const MATH_FN_CBRT: i64 = 0;
+/// `METHOD_OP_MATH` function code: `Math.log`.
+pub(crate) const MATH_FN_LOG: i64 = 1;
+/// `METHOD_OP_MATH` function code: `Math.log2`.
+pub(crate) const MATH_FN_LOG2: i64 = 2;
+/// `METHOD_OP_MATH` function code: `Math.log10`.
+pub(crate) const MATH_FN_LOG10: i64 = 3;
+/// `METHOD_OP_MATH` function code: `Math.log1p`.
+pub(crate) const MATH_FN_LOG1P: i64 = 4;
+/// `METHOD_OP_MATH` function code: `Math.exp`.
+pub(crate) const MATH_FN_EXP: i64 = 5;
+/// `METHOD_OP_MATH` function code: `Math.expm1`.
+pub(crate) const MATH_FN_EXPM1: i64 = 6;
+/// `METHOD_OP_MATH` function code: `Math.sin`.
+pub(crate) const MATH_FN_SIN: i64 = 7;
+/// `METHOD_OP_MATH` function code: `Math.cos`.
+pub(crate) const MATH_FN_COS: i64 = 8;
+/// `METHOD_OP_MATH` function code: `Math.tan`.
+pub(crate) const MATH_FN_TAN: i64 = 9;
+/// `METHOD_OP_MATH` function code: `Math.asin`.
+pub(crate) const MATH_FN_ASIN: i64 = 10;
+/// `METHOD_OP_MATH` function code: `Math.acos`.
+pub(crate) const MATH_FN_ACOS: i64 = 11;
+/// `METHOD_OP_MATH` function code: `Math.atan`.
+pub(crate) const MATH_FN_ATAN: i64 = 12;
+/// `METHOD_OP_MATH` function code: `Math.atan2` (`y` the receiver, `x` in `arg0`).
+pub(crate) const MATH_FN_ATAN2: i64 = 13;
+/// `METHOD_OP_MATH` function code: `Math.sinh`.
+pub(crate) const MATH_FN_SINH: i64 = 14;
+/// `METHOD_OP_MATH` function code: `Math.cosh`.
+pub(crate) const MATH_FN_COSH: i64 = 15;
+/// `METHOD_OP_MATH` function code: `Math.tanh`.
+pub(crate) const MATH_FN_TANH: i64 = 16;
+/// `METHOD_OP_MATH` function code: `Math.asinh`.
+pub(crate) const MATH_FN_ASINH: i64 = 17;
+/// `METHOD_OP_MATH` function code: `Math.acosh`.
+pub(crate) const MATH_FN_ACOSH: i64 = 18;
+/// `METHOD_OP_MATH` function code: `Math.atanh`.
+pub(crate) const MATH_FN_ATANH: i64 = 19;
+/// `METHOD_OP_MATH` function code: `Math.random` (operands ignored).
+pub(crate) const MATH_FN_RANDOM: i64 = 20;
 
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]

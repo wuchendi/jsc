@@ -102,39 +102,32 @@ fn js_file_rejects_type_annotations() {
     );
 }
 
-/// Assert that running `src` as a `.ts` file exits 1 with the uncaught
-/// `ReferenceError` of the unresolved `binding`.
-fn assert_ts_reference_error(dir: &str, src: &str, binding: &str) {
+/// Assert that running `src` as a `.ts` file exits 0 printing `expected`.
+fn assert_ts_output(dir: &str, src: &str, expected: &str) {
     let path = write_source(dir, "input.ts", src);
     let output = run_jsc(&[path.to_str().expect("utf-8 path")]);
-    assert_eq!(output.status.code(), Some(1), "must throw at run time");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(&format!("ReferenceError: {binding} is not defined")),
-        "stderr should carry the ReferenceError, got: {stderr}"
-    );
+    assert_eq!(output.status.code(), Some(0), "must run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
 }
 
-/// `strip` lowers an `enum` to `var E = function (E) { .. }(E || {})`; codegen
-/// does not yet resolve a `var` read inside its own initializer, so the read
-/// falls through to the global object and throws at run time.
+/// `strip` lowers an `enum` to `var E = function (E) { .. }(E || {})`: the
+/// hoisted `var` reads `undefined` inside its own initializer.
 #[test]
-fn ts_enum_throws_reference_error() {
-    assert_ts_reference_error(
+fn ts_enum_runs() {
+    assert_ts_output(
         "enum",
-        "enum Color { Red, Green = 5, Blue }\nconsole.log(Color.Red);\n",
-        "Color",
+        "enum Color { Red, Green = 5, Blue }\nconsole.log(Color.Red, Color.Blue, Color[5]);\n",
+        "0 6 Green\n",
     );
 }
 
-/// `strip` lowers a `namespace` to an IIFE followed by a trailing `var NS;`;
-/// codegen does not hoist `var`, so the read falls through to the global
-/// object and throws at run time.
+/// `strip` lowers a `namespace` to an IIFE followed by a trailing `var NS;`,
+/// which is hoisted above the IIFE.
 #[test]
-fn ts_namespace_throws_reference_error() {
-    assert_ts_reference_error(
+fn ts_namespace_runs() {
+    assert_ts_output(
         "namespace",
         "namespace NS { export const v = 7; }\nconsole.log(NS.v);\n",
-        "NS",
+        "7\n",
     );
 }

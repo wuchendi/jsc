@@ -51,6 +51,7 @@ use crate::ir::{
 /// outside the supported numeric subset.
 #[allow(clippy::too_many_lines)]
 pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
+    early::check(program)?;
     let body: Vec<&Stmt> = match program {
         Program::Script(script) => script.body.iter().collect(),
         Program::Module(module) => module
@@ -80,11 +81,33 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         }
     }
 
+    // The script's hoisted `var`s (DESIGN.md §7.1). When the program can
+    // observe the global object (`globalThis`, top-level `this`), or a `var`
+    // shares its name with a top-level function, they and the top-level
+    // functions are global-object properties (DESIGN.md §6.4): every
+    // reference resolves to the global object, as an unresolved name does.
+    // Otherwise they are ordinary `main` bindings.
+    let mut globals = GlobalFacts::scan(program);
+    let top_vars = hoisted_vars(scan_top_stmts.iter().copied());
+    let global_decls = globals.observes_global()
+        || top_vars.iter().any(|(name, _)| {
+            all_fn_decls
+                .iter()
+                .any(|f| f.ident.sym.as_ref() == name.as_str())
+        });
+    if global_decls {
+        globals.declare_vars(top_vars.iter().map(|(name, _)| name.as_str()));
+    }
+
     // Capture analysis: which bindings are boxed into cells, and which
     // top-level bindings are referenced from top-level functions (module
     // bindings). Runs before any body is lowered so a captured binding's
     // declaration knows to allocate its cell up front.
-    let analysis = analyze_captures(&scan_top_stmts, &all_fn_decls);
+    let analysis = analyze_captures(
+        &scan_top_stmts,
+        &all_fn_decls,
+        if global_decls { &[] } else { &top_vars },
+    );
 
     // Pass 1b: register every hoisted top-level function declaration for the
     // direct-call fast path. A declaration referencing top-level bindings reaches
@@ -120,16 +143,13 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     // sharing the same signature. Scanning the whole program up front fixes `K`
     // before any body is lowered, so a single `call_indirect` type serves them
     // all and no arrow's params can overflow the fixed argument slots.
-    // A generator's — and an `async function`'s — state machine is
+    // A generator's — and an `async` function's or arrow's — state machine is
     // driven with two positional arguments (`sent`, the handle), so `K` must be at
     // least 2 for the second slot to exist, regardless of the widest
     // source arity.
-    let has_state_machine = fn_decls
-        .iter()
-        .any(|f| f.function.is_generator || f.function.is_async);
+    let has_state_machine = has_state_machine(program);
     // A builtin reached through its function value reads its arguments from
     // the same `K` slots, so `K` then also covers the widest call.
-    let globals = GlobalFacts::scan(program);
     let max_arity = body
         .iter()
         .map(|s| scan_stmt_arity(s))
@@ -164,6 +184,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         module_mutable: analysis.module_mutable,
         completion: Cell::new(None),
         globals,
+        global_decls,
     };
 
     // Pass 2: the top-level statements become `main`'s body, lowered in a single
@@ -174,18 +195,39 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
     let mut ctx = LowerCtx::new(&shared);
     ctx.main_ctx = true;
     let mut stmts = Vec::new();
-    // A `var` module binding is initialized to `undefined` (hoisted, no TDZ):
-    // clear its module cell's TDZ hole before any user code runs.
-    for (name, slot) in analysis.module_names.iter().zip(0u32..) {
-        if analysis.module_vars.contains(name) {
+    if global_decls {
+        // GlobalDeclarationInstantiation: the functions' properties, then the
+        // `var`s' (an existing property is kept), before any statement.
+        for fn_decl in &fn_decls {
+            let name = fn_decl.ident.sym.as_ref();
+            let index = funcs.get(name).map_or(0, |sig| sig.index - 1);
             let local = ctx.fresh();
             stmts.push(IrStmt::Decl {
                 local,
-                init: IrNode::CellSet {
-                    cell: Box::new(IrNode::ModuleCell(slot)),
-                    value: Box::new(IrNode::Undefined),
+                init: IrNode::GlobalDeclare {
+                    name: name.to_owned(),
+                    value: Some(Box::new(IrNode::DeclFunc(index))),
                 },
             });
+        }
+        for (name, _) in &top_vars {
+            if !funcs.contains_key(name) {
+                let local = ctx.fresh();
+                stmts.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::GlobalDeclare {
+                        name: name.clone(),
+                        value: None,
+                    },
+                });
+            }
+        }
+    } else {
+        // The hoisted `var`s bind `undefined` before any statement.
+        for (name, id) in &top_vars {
+            let local = ctx.declare(name, true, *id);
+            ctx.frame().var_ids.insert(*id);
+            ctx.push_binding(local, IrNode::Undefined, &mut stmts);
         }
     }
     for stmt in top_stmts {
@@ -262,6 +304,11 @@ struct Shared<'a> {
     completion: Cell<Option<u32>>,
     /// The program-level global facts (DESIGN.md §6.4).
     globals: GlobalFacts,
+    /// Whether the top-level `var`s and function declarations are
+    /// global-object properties rather than `main` bindings (DESIGN.md §6.4):
+    /// a `var` then always resolves to the global object, and a function
+    /// declaration keeps its direct-call fast path only while `sealed`.
+    global_decls: bool,
 }
 
 /// The lowered shape of a `class` declaration: the instance field names the
@@ -299,6 +346,9 @@ struct CaptureResolver {
     /// (`false` for `const`). Collected before the walk so a forward reference
     /// from a closure resolves to a module binding.
     top_bindings: HashMap<String, bool>,
+    /// The ids of function-scoped var bindings (parameters, `var`s, function
+    /// declarations), mirroring [`Frame::var_ids`].
+    var_ids: std::collections::HashSet<u32>,
 }
 
 /// The result of [`analyze_captures`]: which bindings are boxed into cells, and
@@ -311,11 +361,6 @@ struct CaptureAnalysis {
     /// module cell (slot = position here) so the hoisted declaration — and
     /// anything it is called from — reaches it without a closure environment.
     module_names: Vec<String>,
-    /// The [`module_names`] declared by a top-level `var` (hoisted and
-    /// initialized to `undefined`, so they carry no TDZ).
-    ///
-    /// [`module_names`]: CaptureAnalysis::module_names
-    module_vars: std::collections::HashSet<String>,
     /// Mutability of each [`module_names`] binding, known from its top-level
     /// declaration kind (`const` is immutable), so a closure lowered before the
     /// declaration (a forward reference) still resolves it.
@@ -429,6 +474,10 @@ struct Frame {
     /// and for a function that never reads `this`). An `Expr::This` in this frame
     /// reads this local.
     this_local: Option<u32>,
+    /// The environment slot of an `env_backed` (generator) frame's `this` cell,
+    /// seeded by the generator constructor with its call's receiver; allocated
+    /// on the first `this` in the body (`None` until then).
+    gen_this: Option<u32>,
     /// Whether this frame is an arrow body, which has no `new.target` of its
     /// own: it reads the enclosing function's.
     arrow: bool,
@@ -448,10 +497,37 @@ struct Frame {
     /// class's instance fields ([`LowerCtx::class_fields`]) on entry;
     /// [`FnKind::DerivedClass`] for a derived one, whose `this` starts in the
     /// TDZ and is bound by `super(..)` (which also runs the instance fields).
+    /// [`FnKind::Generator`] for a generator or async function's constructor,
+    /// which binds the parameters: every binding it declares is a boxed cell,
+    /// so the body (a nested `env_backed` frame) shares it by reference.
     /// [`FnKind::Plain`] otherwise.
     ctor: FnKind,
     /// A derived constructor's `super(..)` bookkeeping.
     supers: SuperCalls,
+    /// The kind of the generator/async body this (`env_backed`) frame lowers,
+    /// `None` for every other frame.
+    machine: Option<Machine>,
+    /// The ids of this function's var-scoped bindings (parameters, `var`s and
+    /// function declarations): a `var` redeclaring one reuses it rather than
+    /// declaring a fresh binding (DESIGN.md §7.4).
+    var_ids: std::collections::HashSet<u32>,
+    /// The parameter names and ids of this function when its list has
+    /// parameter expressions, else empty (see [`LowerCtx::bind_vars`]).
+    params: Vec<(String, u32)>,
+    /// While this frame's parameters are being bound: the ids still in their
+    /// TDZ (empty for a list without parameter expressions, which cannot
+    /// observe it), and whether a destructured or rest name binds its
+    /// pre-declared local (see [`LowerCtx::bind_params`]).
+    binding: Option<ParamBinding>,
+}
+
+/// The in-progress parameter binding of a [`Frame`].
+struct ParamBinding {
+    /// Whether the list has parameter expressions: a captured parameter's
+    /// cell then holds the TDZ hole until its binding initializes it.
+    tdz: bool,
+    /// The parameter ids not yet initialized.
+    pending: std::collections::HashSet<u32>,
 }
 
 /// A derived constructor's `super(..)` bookkeeping (see [`Frame::ctor`]).
@@ -534,10 +610,14 @@ struct LowerCtx<'a> {
     /// While lowering `static` field initializers: the class frame and the
     /// hidden id of the class value, which `this` resolves to there.
     static_init: Option<(usize, u32)>,
+    /// Whether a `var` declaration's pattern is being bound: it assigns the
+    /// hoisted binding (see [`LowerCtx::var_target`]).
+    binding_var: bool,
 }
 
 mod arity;
 mod capture;
+mod early;
 mod expr;
 mod function;
 mod generator;
@@ -557,3 +637,26 @@ use op::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `program` contains any generator or async function or arrow (a
+/// body compiled to a state machine).
+fn has_state_machine(program: &Program) -> bool {
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    /// Finds a `function*` / `async` function or arrow anywhere.
+    #[derive(Default)]
+    struct Scan(bool);
+    impl Visit for Scan {
+        fn visit_function(&mut self, node: &swc_ecma_ast::Function) {
+            self.0 |= node.is_generator || node.is_async;
+            node.visit_children_with(self);
+        }
+        fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
+            self.0 |= node.is_async;
+            node.visit_children_with(self);
+        }
+    }
+    let mut scan = Scan::default();
+    program.visit_with(&mut scan);
+    scan.0
+}

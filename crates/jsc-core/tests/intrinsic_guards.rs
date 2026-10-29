@@ -22,11 +22,6 @@ fn unknown_namespace_members_are_runtime_reads() {
         "console.warn(1)",
         "TypeError: console.warn is not a function",
     );
-    // Phase 3 statics are absent until then: a catchable TypeError.
-    assert_bool(
-        "let ok = false; try { Object.freeze({}); } catch (e) { ok = e instanceof TypeError; } ok",
-        true,
-    );
     // Inherited members of a namespace or constructor are reachable.
     assert_string("Math.toString()", "[object Object]");
     assert_bool("Object.hasOwnProperty('keys')", true);
@@ -36,7 +31,7 @@ fn unknown_namespace_members_are_runtime_reads() {
 fn array_literal_receivers_dispatch_at_runtime() {
     assert_string("[1].toString()", "1");
     assert_string("[1, 2].toString()", "1,2");
-    assert_uncaught("[1, 2].flat()", "TypeError: expression is not a function");
+    assert_uncaught("[1, 2].group()", "TypeError: expression is not a function");
 }
 
 #[test]

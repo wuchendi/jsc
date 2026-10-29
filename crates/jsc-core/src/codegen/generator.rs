@@ -46,9 +46,12 @@
 //! resume the `return`/jump, through any outer `finally` first). A throw no
 //! handler catches leaves the state machine and completes the generator.
 //!
+//! The parameters bind in the CONSTRUCTOR (its frame boxes every parameter
+//! binding), so defaults and destructuring run when the function is called;
+//! the body captures them by reference like any enclosing binding.
+//!
 //! Still rejected (deferred): a `yield` whose continuation would read a per-node
-//! scratch local set before the suspend; generator expressions/arrows/methods;
-//! and non-simple parameters.
+//! scratch local set before the suspend; and async generators.
 //!
 //! A closure nested in the body captures the frame's env cells by reference
 //! (see [`LowerCtx::capture_source`]), so it shares them with the body across
@@ -59,18 +62,14 @@ use super::*;
 
 use std::collections::HashSet;
 
-use swc_common::Spanned;
-
 use crate::error::CompileError;
 use crate::ir::{GenSegment, GenTerm};
-
-use super::capture::binding_id;
 
 /// The resume `limits` bits of a generator body (see
 /// [`crate::abi::GEN_LIMIT_RETURN`]): a `return()` at a suspended `yield` must
 /// run the enclosing `finally` blocks and a `throw()` / `return()` must
 /// forward to a `yield*` delegate, which the state machine cannot do.
-fn resume_limits(body: &swc_ecma_ast::FunctionBody) -> u32 {
+fn resume_limits(body: BodyKind<'_>) -> u32 {
     use swc_ecma_visit::{Visit, VisitWith};
 
     /// Finds `finally` and `yield*` outside nested functions and classes.
@@ -93,7 +92,10 @@ fn resume_limits(body: &swc_ecma_ast::FunctionBody) -> u32 {
         }
     }
     let mut scan = Scan::default();
-    body.visit_with(&mut scan);
+    match body {
+        BodyKind::Block(stmts) => stmts.iter().for_each(|s| s.visit_with(&mut scan)),
+        BodyKind::Expr(expr) => expr.visit_with(&mut scan),
+    }
     let mut limits = 0;
     if scan.finally || scan.delegate {
         limits |= crate::abi::GEN_LIMIT_RETURN;
@@ -105,31 +107,58 @@ fn resume_limits(body: &swc_ecma_ast::FunctionBody) -> u32 {
 }
 
 impl LowerCtx<'_> {
-    /// Lower a top-level `function*` declaration into its CONSTRUCTOR
-    /// [`IrFunction`], registering the state-machine function in the arrow
-    /// accumulator. Called from [`lower_function`] for a generator.
+    /// Lower a generator, async function or arrow, or async generator
+    /// (`machine`) with parameters `param_pats` and body `body_kind` into its CONSTRUCTOR
+    /// [`IrFunction`] in the current frame, registering the state-machine
+    /// function in the arrow accumulator. Returns the constructor and its
+    /// environment layout (the bindings the body captures from enclosing
+    /// frames, in env-slot order), like `build_function_body`. `span` is the
+    /// function's, for the CFG diagnostics.
     ///
-    /// Also lowers a top-level `async function`, keyed on
-    /// `fn_decl.function.is_async`: the body is compiled to the SAME generator
-    /// state machine (`await e` lowers to `yield e`; see
-    /// [`LowerCtx::lower_generator_body`]), but the function the name binds to is a
-    /// WRAPPER that builds the generator and spawns it as a promise
-    /// ([`IrNode::AsyncSpawn`]) rather than returning the raw generator handle.
-    pub(super) fn lower_generator(&mut self, fn_decl: &FnDecl) -> anyhow::Result<IrFunction> {
-        let function = &fn_decl.function;
-        let block = function
-            .body
-            .as_ref()
-            .ok_or_else(|| anyhow!("generator declaration requires a body"))?;
-
-        // The uniform ABI arity `K`: forced to >= 2 when generators exist (below),
-        // so `(sent, gen)` fit the first two positional slots. `K + 2` = the full
-        // uniform param count (`K` args + env + argc).
+    /// The constructor binds the parameters first (like an ordinary
+    /// function's prologue, every binding a cell), so a binding error throws
+    /// from the call — or, for an async function, rejects its promise. The
+    /// body is lowered in a nested `env_backed` frame. The constructor then
+    /// builds the generator's frame of cells ([`IrNode::MakeGenerator`]): the
+    /// `this` cell holds the call's receiver, and a binding the body captures
+    /// from an enclosing frame (a parameter included) SHARES that frame's
+    /// cell, so the capture is by reference and outlives the creating call.
+    /// An async body compiles to the SAME state machine
+    /// (`await e` lowers to `yield e`; see [`LowerCtx::lower_generator_body`]),
+    /// but the constructor spawns it as a promise ([`IrNode::AsyncSpawn`])
+    /// rather than returning the raw generator handle. An async generator's
+    /// handle carries [`crate::abi::GEN_ASYNC`]: `%AsyncGeneratorPrototype%`
+    /// drives it (both `await` and `yield` suspend). None is a constructor.
+    ///
+    /// `callee` (a generator's or async generator's) reads the function
+    /// object itself: the handle's `[[Prototype]]` is its `prototype` at call
+    /// time when that is an object, else `%GeneratorPrototype%` /
+    /// `%AsyncGeneratorPrototype%`.
+    pub(super) fn build_generator_ctor(
+        &mut self,
+        param_pats: &[&Pat],
+        body_kind: BodyKind<'_>,
+        machine: Machine,
+        span: swc_common::Span,
+        callee: Option<IrNode>,
+    ) -> anyhow::Result<(IrFunction, Vec<u32>)> {
+        // The uniform ABI arity `K`: forced to >= 2 when generators exist (see
+        // `has_state_machine`), so `(sent, gen)` fit the first two positional
+        // slots. `K + 2` = the full uniform param count (`K` args + env + argc).
         let k = u32::try_from(self.shared.max_arity).unwrap_or(u32::MAX);
         let uniform_params = k + 2;
 
+        // The parameters bind in the constructor, when the function is called:
+        // every parameter binding is a cell the body shares by reference.
+        self.frame().ctor = FnKind::Generator;
+        let (params, mut prologue) = self.declare_params(param_pats)?;
+        self.frame().next = self.frame().next.max(uniform_params);
+        let boxing = prologue.len();
+        self.bind_params(params, &mut prologue)?;
+        let binds = prologue.len() > boxing;
+
         // Reserve the state machine's funcref-table slot before lowering its body
-        // (mirrors `lower_lifted_function`).
+        // (mirrors `lower_lifted`).
         let sm_pos = {
             let mut arrows = self.shared.arrows.borrow_mut();
             let pos = arrows.len();
@@ -147,24 +176,34 @@ impl LowerCtx<'_> {
         // Lower the body in a fresh, `env_backed` frame: every local becomes a
         // frame cell reached via `EnvLoad`. Body temporaries (from `fresh`) start
         // ABOVE the uniform ABI slots so they cannot collide with `sent`/`gen`/env.
-        // The frame's env size (`total`) and local count are read before popping.
+        // An arrow's frame reads its enclosing function's `arguments` and
+        // `new.target` (both the constructor's and the body's frame are arrows).
+        let arrow = self.frame().arrow;
         self.push_frame();
-        let lowered = self.lower_generator_body(function, block, uniform_params);
-        let (body, nparams, mut total, sm_locals) = match lowered {
-            Ok((body, nparams)) => {
-                let total = u32::try_from(self.env_len()).unwrap_or(u32::MAX);
-                let sm_locals = self.frame().next;
-                (body, nparams, total, sm_locals)
-            }
+        self.frame().arrow = arrow;
+        let body = match self.lower_generator_body(body_kind, machine, uniform_params) {
+            Ok(body) => body,
             Err(e) => {
                 self.pop_frame();
                 return Err(e);
             }
         };
+        let frame = self.frame();
+        let sm_locals = frame.next;
+        let this_slot = frame.gen_this;
+        // Each frame slot's binding id, and whether the body declares it (an
+        // own cell) or captures it from an enclosing frame (the constructor's
+        // parameters included).
+        let layout: Vec<(u32, bool)> = frame
+            .env
+            .iter()
+            .map(|id| (*id, frame.by_id.contains_key(id)))
+            .collect();
         self.pop_frame();
+        let mut total = u32::try_from(layout.len()).unwrap_or(u32::MAX);
 
         // Spill cells for values live across a nested suspend extend the frame.
-        let segments = build_segments(&body, fn_decl, &mut total)?;
+        let segments = build_segments(&body, span, &mut total)?;
         self.shared.arrows.borrow_mut()[sm_pos] = IrFunction {
             params: uniform_params,
             locals: sm_locals,
@@ -173,30 +212,98 @@ impl LowerCtx<'_> {
             info: FnInfo::default(),
         };
 
-        // The constructor: `return MakeGenerator(...)`, reading each parameter from
-        // its uniform-ABI argument slot to seed the frame's leading cells. An
-        // `async function` wraps the handle in `AsyncSpawn` so the wrapper returns
-        // the spawned result promise instead of the raw generator.
-        let slots: Vec<IrNode> = (0..nparams).map(IrNode::Local).collect();
+        // The constructor: bind the parameters, then `return MakeGenerator(...)`,
+        // seeding the frame's cells. The `this` cell holds the receiver
+        // snapshotted on entry (a default may have called out since).
+        let this = this_slot.and_then(|_| self.ensure_this_local());
+        let mut slots: Vec<IrNode> = layout
+            .iter()
+            .zip(0u32..)
+            .map(|(&(id, own), slot)| {
+                if Some(slot) == this_slot {
+                    IrNode::CellNew(Box::new(this.map_or(IrNode::ThisGlobal, IrNode::Local)))
+                } else if own {
+                    IrNode::CellNew(Box::new(IrNode::Undefined))
+                } else {
+                    self.capture_source(id)
+                }
+            })
+            .collect();
+        while matches!(slots.last(), Some(IrNode::CellNew(v)) if matches!(**v, IrNode::Undefined)) {
+            slots.pop();
+        }
+        let async_bit = if machine == Machine::AsyncGenerator {
+            crate::abi::GEN_ASYNC
+        } else {
+            0
+        };
         let make = IrNode::MakeGenerator {
             sm_table_index,
             slots,
             total,
-            limits: resume_limits(block),
+            limits: resume_limits(body_kind) | async_bit,
         };
-        let returned = if function.is_async {
-            IrNode::AsyncSpawn(Box::new(make))
-        } else {
-            make
-        };
-        let ctor_body = vec![IrStmt::Return(Some(returned))];
-        Ok(IrFunction {
-            params: uniform_params,
-            locals: uniform_params,
-            body: ctor_body,
-            machine: None,
-            info: FnInfo::default(),
-        })
+        let ctor_body = self.generator_ctor_body(make, machine, callee);
+        // An async function's parameter binding error rejects its promise
+        // rather than throwing from the call.
+        let mut body = prologue;
+        if machine == Machine::Async && binds {
+            let binding = body.split_off(boxing);
+            body.push(IrStmt::Try {
+                body: binding,
+                catch_body: Some(vec![IrStmt::Return(Some(IrNode::PromiseReject(Box::new(
+                    IrNode::ExcValue,
+                ))))]),
+                finally_body: None,
+            });
+        }
+        body.extend(ctor_body);
+        Ok(self.finish_function(body))
+    }
+
+    /// The generator constructor's body around its `make` node: an async
+    /// function spawns it as a promise; a generator with a `callee` sets the
+    /// handle's `[[Prototype]]` to `callee.prototype` when that is an object
+    /// (`MakeGenerator` starts it at `%GeneratorPrototype%`, or
+    /// `%AsyncGeneratorPrototype%` for an async generator).
+    fn generator_ctor_body(
+        &mut self,
+        make: IrNode,
+        machine: Machine,
+        callee: Option<IrNode>,
+    ) -> Vec<IrStmt> {
+        match callee {
+            _ if machine == Machine::Async => {
+                vec![IrStmt::Return(Some(IrNode::AsyncSpawn(Box::new(make))))]
+            }
+            None => vec![IrStmt::Return(Some(make))],
+            Some(callee) => {
+                let proto = self.fresh();
+                let handle = self.fresh();
+                vec![
+                    IrStmt::Decl {
+                        local: proto,
+                        init: IrNode::Index {
+                            obj: Box::new(callee),
+                            index: Box::new(IrNode::Str("prototype".to_owned())),
+                        },
+                    },
+                    IrStmt::Decl {
+                        local: handle,
+                        init: make,
+                    },
+                    IrStmt::If {
+                        cond: IrNode::IsObject(Box::new(IrNode::Local(proto))),
+                        then_body: vec![IrStmt::Expr(IrNode::SetProto {
+                            obj: Box::new(IrNode::Local(handle)),
+                            proto: Box::new(IrNode::Local(proto)),
+                        })],
+                        else_body: Vec::new(),
+                    },
+                    IrStmt::Return(Some(IrNode::Local(handle))),
+                ]
+            }
+        }
     }
 
     /// Desugar a `yield* iterable;` statement over the same iterables `for-of`
@@ -227,6 +334,13 @@ impl LowerCtx<'_> {
         yield_expr: &swc_ecma_ast::YieldExpr,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
+        if self.frame().machine == Some(Machine::AsyncGenerator) {
+            return Err(CompileError::spanned(
+                yield_expr.span,
+                "`yield*` in an async generator is unsupported",
+            )
+            .into());
+        }
         let Some(arg) = &yield_expr.arg else {
             return Err(
                 CompileError::spanned(yield_expr.span, "`yield*` requires an operand").into(),
@@ -332,49 +446,51 @@ impl LowerCtx<'_> {
         resolved.kind
     }
 
-    /// Lower the parameters and body of a generator into the current (already
-    /// pushed, `env_backed`) frame, returning the lowered statements and the
-    /// parameter count. Rejects the unsupported forms with spans.
+    /// Lower the body of a generator into the current (already pushed,
+    /// `env_backed`) frame, returning the lowered statements. Its parameters
+    /// are bound by the constructor, in the enclosing frame.
     fn lower_generator_body(
         &mut self,
-        function: &swc_ecma_ast::Function,
-        block: &swc_ecma_ast::FunctionBody,
+        body_kind: BodyKind<'_>,
+        machine: Machine,
         uniform_params: u32,
-    ) -> anyhow::Result<(Vec<IrStmt>, u32)> {
+    ) -> anyhow::Result<Vec<IrStmt>> {
         self.set_env_backed();
         // Body temporaries live above the uniform ABI slots (`sent`/`gen`/…/env/
         // argc), so a `fresh` temp never aliases `sent` (local 0) or the env slot.
         self.frame().next = uniform_params;
 
-        // An `async function` body lowers `await e` to a generator `yield e`;
+        // An async body lowers `await e` to a generator `yield e`;
         // a plain `function*` keeps `await` a parse error, so the flag
         // stays off. Restored before returning on the success path (a compile
         // error aborts the whole function, so the leak on the error path is inert).
         let prev_async = self.async_body;
-        self.async_body = function.is_async;
-
-        // Only simple-identifier parameters are supported.
-        let mut nparams = 0u32;
-        for param in &function.params {
-            let Pat::Ident(ident) = &param.pat else {
-                return Err(CompileError::spanned(
-                    param.pat.span(),
-                    "generator parameters must be simple identifiers",
-                )
-                .into());
-            };
-            self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
-            nparams += 1;
-        }
+        self.async_body = machine.awaits();
+        self.frame().machine = Some(machine);
 
         let mut body = Vec::new();
-        for stmt in &block.stmts {
-            self.lower_stmt(stmt, &mut body)?;
+        match body_kind {
+            BodyKind::Block(stmts) => {
+                self.bind_vars(stmts, &mut body)?;
+                for stmt in stmts {
+                    self.lower_stmt(stmt, &mut body)?;
+                }
+            }
+            BodyKind::Expr(expr) => {
+                let node = self.lower_expr(expr)?;
+                body.push(IrStmt::Return(Some(node)));
+            }
         }
 
         self.async_body = prev_async;
-        Ok((body, nparams))
+        Ok(body)
     }
+}
+
+/// The suspend an `await e` lowers to in an async generator body: a
+/// `yield` of `e` marked as an await (see [`IrNode::AwaitMark`]).
+pub(super) fn await_suspend(value: IrNode) -> IrNode {
+    IrNode::Yield(Box::new(IrNode::AwaitMark(Box::new(value))))
 }
 
 /// Build the generator's control-flow graph of basic blocks. A run of
@@ -388,14 +504,13 @@ impl LowerCtx<'_> {
 /// still rejected (see [`CfgBuilder::track`]).
 fn build_segments(
     stmts: &[IrStmt],
-    fn_decl: &FnDecl,
+    span: swc_common::Span,
     total: &mut u32,
 ) -> anyhow::Result<Vec<GenSegment>> {
     let mut next_slot = *total;
-    let stmts = promote_raw_locals(stmts, &mut next_slot)
-        .map_err(|msg| CfgBuilder::unsupported_in(fn_decl, msg))?;
+    let stmts = promote_raw_locals(stmts, &mut next_slot);
     let mut cfg = CfgBuilder {
-        fn_decl,
+        span,
         blocks: vec![PendingBlock::default()],
         cur: 0,
         loops: Vec::new(),
@@ -470,8 +585,9 @@ struct FinallyCtx {
     exits: Vec<(u32, usize)>,
 }
 
-struct CfgBuilder<'a> {
-    fn_decl: &'a FnDecl,
+struct CfgBuilder {
+    /// The generator function's span, for the diagnostics.
+    span: swc_common::Span,
     blocks: Vec<PendingBlock>,
     /// The block currently being filled.
     cur: usize,
@@ -490,7 +606,7 @@ struct CfgBuilder<'a> {
     live: HashSet<u32>,
 }
 
-impl CfgBuilder<'_> {
+impl CfgBuilder {
     fn new_block(&mut self) -> u32 {
         let id = u32::try_from(self.blocks.len()).unwrap_or(u32::MAX);
         self.blocks.push(PendingBlock {
@@ -513,11 +629,7 @@ impl CfgBuilder<'_> {
     }
 
     fn unsupported(&self, msg: &str) -> anyhow::Error {
-        Self::unsupported_in(self.fn_decl, msg)
-    }
-
-    fn unsupported_in(fn_decl: &FnDecl, msg: &str) -> anyhow::Error {
-        CompileError::spanned(fn_decl.function.span(), msg.to_owned()).into()
+        CompileError::spanned(self.span, msg.to_owned()).into()
     }
 
     fn lower_stmts(&mut self, stmts: &[IrStmt]) -> anyhow::Result<()> {
@@ -919,24 +1031,38 @@ impl CfgBuilder<'_> {
             IrNode::Local(local)
             | IrNode::IncDec { local, .. }
             | IrNode::ArrayPush { local, .. }
-            | IrNode::ArrayPop { local, .. } => Some(*local),
+            | IrNode::ArrayPop { local, .. }
+            | IrNode::CollectionOp { handle: local, .. }
+            | IrNode::DateField { recv: local, .. } => Some(*local),
             _ => None,
         };
-        if let Some(local) = read
-            && self.suspended
-            && !self.live.contains(&local)
-        {
-            return Err(self.unsupported(
-                "a `yield` here would lose a compiler temporary across the suspend; \
-                 move the `yield` into its own statement",
-            ));
+        if let Some(local) = read {
+            self.check_live(local)?;
         }
         let mut result = Ok(());
         node.any_child(|child| {
             result = self.track(child);
             result.is_err()
         });
-        result
+        result?;
+        // A `super.m(..)` receiver snapshot is set by its callee (a child) and
+        // read at the call itself, after the arguments.
+        if let IrNode::ThisCall { this_local, .. } = node {
+            self.check_live(*this_local)?;
+        }
+        Ok(())
+    }
+
+    /// Reject reading raw local `local` after a suspend earlier in the
+    /// statement that it was not re-set since (see [`Self::track`]).
+    fn check_live(&self, local: u32) -> anyhow::Result<()> {
+        if self.suspended && !self.live.contains(&local) {
+            return Err(self.unsupported(
+                "a `yield` here would lose a compiler temporary across the suspend; \
+                 move the `yield` into its own statement",
+            ));
+        }
+        Ok(())
     }
 
     /// Suspend with `value`: end the current block with a `Yield` and continue in
@@ -1037,6 +1163,46 @@ impl CfgBuilder<'_> {
                     }),
                 })
             }
+            // A method call reads its method before the arguments run, so with
+            // a suspend in an argument the receiver and the method are spilled
+            // up front and the call binds the spilled receiver.
+            IrNode::MethodCallUser {
+                obj,
+                key,
+                args,
+                obj_local,
+                not_callable,
+                ..
+            } if args.iter().any(node_contains_yield) => {
+                let obj = self.linearize(*obj)?;
+                let obj = self.spill(obj)?;
+                let key = self.linearize(*key)?;
+                let key = self.spill(key)?;
+                let callee = self.spill(IrNode::Index {
+                    obj: Box::new(obj.clone()),
+                    index: Box::new(key),
+                })?;
+                self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
+            }
+            IrNode::NamespaceGuard {
+                obj,
+                key,
+                obj_local,
+                args,
+                slow,
+                ..
+            } if args.iter().any(node_contains_yield) => {
+                let IrNode::ThisCall { not_callable, .. } = *slow else {
+                    return Err(self.unsupported("unexpected namespace call shape"));
+                };
+                let obj = self.linearize(*obj)?;
+                let obj = self.spill(obj)?;
+                let callee = self.spill(IrNode::Index {
+                    obj: Box::new(obj.clone()),
+                    index: Box::new(IrNode::Str(key)),
+                })?;
+                self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
+            }
             mut node => {
                 let mut children = node.children_mut();
                 let last = children
@@ -1051,6 +1217,38 @@ impl CfgBuilder<'_> {
                 Ok(node)
             }
         }
+    }
+
+    /// Linearize the arguments of a call of the already spilled `callee` with
+    /// `this` = the spilled `obj`, rebound through the raw `this_local` once
+    /// every suspend has run.
+    fn linearize_bound_call(
+        &mut self,
+        obj: IrNode,
+        callee: IrNode,
+        args: Vec<IrNode>,
+        this_local: u32,
+        not_callable: CalleeError,
+    ) -> anyhow::Result<IrNode> {
+        let last = args.iter().rposition(node_contains_yield).unwrap_or(0);
+        let mut lowered = Vec::with_capacity(args.len());
+        for (i, arg) in args.into_iter().enumerate() {
+            let value = self.linearize(arg)?;
+            lowered.push(if i < last { self.spill(value)? } else { value });
+        }
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: this_local,
+                value: Box::new(obj),
+            },
+            IrNode::ThisCall {
+                callee: Box::new(callee),
+                args: lowered,
+                this_local,
+                construct: false,
+                not_callable,
+            },
+        ]))
     }
 
     /// Linearize `cond ? then_branch : else_branch` with a suspend in a branch:
@@ -1177,14 +1375,24 @@ fn is_inline(stmt: &IrStmt) -> bool {
 /// frame cell (numbered from `next_slot`), and EVERY read and write of it in the
 /// whole body is rewritten to that cell, so the inline statements that
 /// initialize it write the cell too. Per-node scratch locals (`obj_local`, ...)
-/// are never `Decl`/`Assign` targets and stay raw.
-fn promote_raw_locals(stmts: &[IrStmt], next_slot: &mut u32) -> Result<Vec<IrStmt>, &'static str> {
+/// are never `Decl`/`Assign` targets and stay raw, as does a `super.m(..)`
+/// receiver snapshot ([`IrNode::ThisCall`]'s `this_local`), assigned and
+/// consumed within the call's callee evaluation.
+fn promote_raw_locals(stmts: &[IrStmt], next_slot: &mut u32) -> Vec<IrStmt> {
     let mut written = HashSet::new();
     let mut crossing = HashSet::new();
     for stmt in stmts {
         collect_locals(stmt, &mut written, &mut crossing, false);
     }
-    let mut promoted: Vec<u32> = written.intersection(&crossing).copied().collect();
+    let mut pinned = HashSet::new();
+    for stmt in stmts {
+        collect_this_call_locals(stmt, &mut pinned);
+    }
+    let mut promoted: Vec<u32> = written
+        .intersection(&crossing)
+        .filter(|local| !pinned.contains(*local))
+        .copied()
+        .collect();
     promoted.sort_unstable();
     let map: HashMap<u32, u32> = promoted
         .into_iter()
@@ -1197,10 +1405,10 @@ fn promote_raw_locals(stmts: &[IrStmt], next_slot: &mut u32) -> Result<Vec<IrStm
     let mut stmts = stmts.to_vec();
     if !map.is_empty() {
         for stmt in &mut stmts {
-            remap_stmt(stmt, &map)?;
+            remap_stmt(stmt, &map);
         }
     }
-    Ok(stmts)
+    stmts
 }
 
 /// Record the raw locals `stmt` declares or assigns (into `written`), and every
@@ -1244,7 +1452,9 @@ fn collect_node_locals(
         | IrNode::Assign { local, .. }
         | IrNode::IncDec { local, .. }
         | IrNode::ArrayPush { local, .. }
-        | IrNode::ArrayPop { local, .. } = node
+        | IrNode::ArrayPop { local, .. }
+        | IrNode::CollectionOp { handle: local, .. }
+        | IrNode::DateField { recv: local, .. } = node
     {
         crossing.insert(*local);
     }
@@ -1254,42 +1464,63 @@ fn collect_node_locals(
     });
 }
 
+/// Record every [`IrNode::ThisCall`] `this_local` in `stmt` (recursively).
+fn collect_this_call_locals(stmt: &IrStmt, pinned: &mut HashSet<u32>) {
+    fn walk(node: &IrNode, pinned: &mut HashSet<u32>) {
+        if let IrNode::ThisCall { this_local, .. } = node {
+            pinned.insert(*this_local);
+        }
+        node.any_child(|child| {
+            walk(child, pinned);
+            false
+        });
+    }
+    stmt.any_node(|node| {
+        walk(node, pinned);
+        false
+    });
+    stmt.any_stmt(|inner| {
+        collect_this_call_locals(inner, pinned);
+        false
+    });
+}
+
 /// Rewrite every access of a promoted local in `stmt` (recursively) to its frame
 /// cell (see [`promote_raw_locals`]).
-fn remap_stmt(stmt: &mut IrStmt, map: &HashMap<u32, u32>) -> Result<(), &'static str> {
+fn remap_stmt(stmt: &mut IrStmt, map: &HashMap<u32, u32>) {
     match stmt {
         IrStmt::Decl { local, init } => {
-            remap_node(init, map)?;
+            remap_node(init, map);
             if let Some(&slot) = map.get(local) {
                 let init = std::mem::replace(init, IrNode::Undefined);
                 *stmt = IrStmt::Expr(slot_set(slot, init));
             }
         }
-        IrStmt::Expr(node) | IrStmt::Return(Some(node)) => remap_node(node, map)?,
+        IrStmt::Expr(node) | IrStmt::Return(Some(node)) => remap_node(node, map),
         IrStmt::Return(None) | IrStmt::Break(_) | IrStmt::Continue(_) => {}
         IrStmt::If {
             cond,
             then_body,
             else_body,
         } => {
-            remap_node(cond, map)?;
-            remap_stmts(then_body, map)?;
-            remap_stmts(else_body, map)?;
+            remap_node(cond, map);
+            remap_stmts(then_body, map);
+            remap_stmts(else_body, map);
         }
         IrStmt::While {
             cond, body, update, ..
         } => {
-            remap_node(cond, map)?;
-            remap_stmts(body, map)?;
-            remap_stmts(update, map)?;
+            remap_node(cond, map);
+            remap_stmts(body, map);
+            remap_stmts(update, map);
         }
         IrStmt::Switch { disc, cases, .. } => {
-            remap_node(disc, map)?;
+            remap_node(disc, map);
             for case in cases {
                 if let Some(test) = &mut case.test {
-                    remap_node(test, map)?;
+                    remap_node(test, map);
                 }
-                remap_stmts(&mut case.body, map)?;
+                remap_stmts(&mut case.body, map);
             }
         }
         IrStmt::Try {
@@ -1297,38 +1528,43 @@ fn remap_stmt(stmt: &mut IrStmt, map: &HashMap<u32, u32>) -> Result<(), &'static
             catch_body,
             finally_body,
         } => {
-            remap_stmts(body, map)?;
+            remap_stmts(body, map);
             if let Some(catch_body) = catch_body {
-                remap_stmts(catch_body, map)?;
+                remap_stmts(catch_body, map);
             }
             if let Some(finally_body) = finally_body {
-                remap_stmts(finally_body, map)?;
+                remap_stmts(finally_body, map);
             }
         }
     }
-    Ok(())
 }
 
-fn remap_stmts(stmts: &mut [IrStmt], map: &HashMap<u32, u32>) -> Result<(), &'static str> {
-    stmts.iter_mut().try_for_each(|stmt| remap_stmt(stmt, map))
+fn remap_stmts(stmts: &mut [IrStmt], map: &HashMap<u32, u32>) {
+    for stmt in stmts {
+        remap_stmt(stmt, map);
+    }
 }
 
 /// The expression half of [`remap_stmt`]: `Local` becomes a cell read, `Assign`
-/// a cell write, and `++`/`--` the read-modify-write a captured cell uses.
-fn remap_node(node: &mut IrNode, map: &HashMap<u32, u32>) -> Result<(), &'static str> {
+/// a cell write, `++`/`--` the read-modify-write a captured cell uses, and a
+/// node reading its receiver from a raw local (an array push/pop, a Map/Set
+/// method, a Date field) first reloads that local from the cell.
+fn remap_node(node: &mut IrNode, map: &HashMap<u32, u32>) {
     for child in node.children_mut() {
-        remap_node(child, map)?;
+        remap_node(child, map);
     }
     let slot = match node {
         IrNode::Local(local)
         | IrNode::Assign { local, .. }
         | IrNode::IncDec { local, .. }
         | IrNode::ArrayPush { local, .. }
-        | IrNode::ArrayPop { local, .. } => match map.get(local) {
+        | IrNode::ArrayPop { local, .. }
+        | IrNode::CollectionOp { handle: local, .. }
+        | IrNode::DateField { recv: local, .. } => match map.get(local) {
             Some(&slot) => slot,
-            None => return Ok(()),
+            None => return,
         },
-        _ => return Ok(()),
+        _ => return,
     };
     *node = match std::mem::replace(node, IrNode::Undefined) {
         IrNode::Local(_) => slot_get(slot),
@@ -1357,13 +1593,38 @@ fn remap_node(node: &mut IrNode, map: &HashMap<u32, u32>) -> Result<(), &'static
                 }
             }
         }
-        _ => {
-            return Err(
-                "an in-place array update of a compiler temporary is not supported inside a generator",
-            );
-        }
+        // The handle never moves: reload it from the cell into its raw local
+        // right before the in-place update.
+        IrNode::ArrayPush { local, value } => IrNode::Seq(vec![
+            IrNode::Assign {
+                local,
+                value: Box::new(slot_get(slot)),
+            },
+            IrNode::ArrayPush { local, value },
+        ]),
+        IrNode::ArrayPop { local } => IrNode::Seq(vec![
+            IrNode::Assign {
+                local,
+                value: Box::new(slot_get(slot)),
+            },
+            IrNode::ArrayPop { local },
+        ]),
+        IrNode::CollectionOp { op, handle, args } => IrNode::Seq(vec![
+            IrNode::Assign {
+                local: handle,
+                value: Box::new(slot_get(slot)),
+            },
+            IrNode::CollectionOp { op, handle, args },
+        ]),
+        IrNode::DateField { op, recv } => IrNode::Seq(vec![
+            IrNode::Assign {
+                local: recv,
+                value: Box::new(slot_get(slot)),
+            },
+            IrNode::DateField { op, recv },
+        ]),
+        other => other,
     };
-    Ok(())
 }
 
 /// Whether a statement contains a `break`/`continue` anywhere (recursively).

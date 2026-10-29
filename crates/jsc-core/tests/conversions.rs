@@ -116,6 +116,18 @@ fn parse_float() {
     assert_nan("parseFloat(\"abc\")");
 }
 
+/// `Number(str)` and `parseFloat(str)` skip every `StrWhiteSpaceChar` (the
+/// Unicode `WhiteSpace` and `LineTerminator` code points, U+000B and U+FEFF).
+#[test]
+fn string_to_number_trims_unicode_whitespace() {
+    let ws = "\\u0009\\u000B\\u000C\\u0020\\u00A0\\u000A\\u000D\\u2028\\u2029\\u1680\\u2000\\u200A\\u202F\\u205F\\u3000\\uFEFF";
+    assert_number(&format!("Number(\"{ws}\")"), 0.0);
+    assert_number(&format!("Number(\"{ws}12{ws}\")"), 12.0);
+    assert_number(&format!("+\"{ws}-Infinity{ws}\""), f64::NEG_INFINITY);
+    assert_number(&format!("parseFloat(\"{ws}1.5e1x\")"), 15.0);
+    assert_nan("Number(\"\\u0085 1\")");
+}
+
 /// The conversions are bare global names, not real bindings, so a user binding of
 /// the same name shadows the built-in (mirrors `Math`): the call then resolves to
 /// the user value (here a function value invoked indirectly).

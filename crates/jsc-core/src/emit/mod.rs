@@ -113,6 +113,7 @@ const ALLOC_EXPORT_NAME: &str = abi::ALLOC_EXPORT_NAME;
 const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
 const NEW_ARRAY_EXPORT_NAME: &str = abi::NEW_ARRAY_EXPORT_NAME;
 const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
+const PROMISE_SELF_ERROR_EXPORT_NAME: &str = abi::PROMISE_SELF_ERROR_EXPORT_NAME;
 
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
@@ -295,6 +296,11 @@ const ARRAY_ELEMS_OFFSET: u64 = abi::ARRAY_ELEMS_OFFSET as u64;
 const ARRAY_BLOCK_SIZE: i32 = abi::ARRAY_BLOCK_SIZE.cast_signed();
 /// Array header `flags` bit: the array is sparse (see [`abi::ARRAY_FLAG_SPARSE`]).
 const ARRAY_SPARSE: i32 = abi::ARRAY_FLAG_SPARSE as i32;
+/// Array header `flags` bit: `length` is read-only (see
+/// [`abi::ARRAY_FLAG_LENGTH_READONLY`]).
+const ARRAY_LENGTH_READONLY: i32 = abi::ARRAY_FLAG_LENGTH_READONLY as i32;
+/// Array header `flags` bit: dictionary mode (see [`abi::ARRAY_FLAG_DICTIONARY`]).
+const ARRAY_DICTIONARY: i32 = abi::ARRAY_FLAG_DICTIONARY as i32;
 
 /// Type byte and field offsets of an array element store (internal): `cap`,
 /// then element `i` at `ELEMS_DATA_OFFSET + 8 * i`. See [`abi::TYPE_ELEMS`].
@@ -379,13 +385,12 @@ const ACCESSOR_SET_OFFSET: u64 = abi::ACCESSOR_SET_OFFSET as u64;
 /// [`abi::ACCESSOR_BLOCK_SIZE`].
 const ACCESSOR_BLOCK_SIZE: i32 = abi::ACCESSOR_BLOCK_SIZE.cast_signed();
 
-/// The fixed byte length of a `toISOString()` result (`YYYY-MM-DDTHH:MM:SS.mmmZ`)
-/// — always 24 for a 4-digit year, the in-scope range.
+/// The byte length of a `toISOString()` result with a four-digit year
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`); an expanded `±YYYYYY` year adds three.
 const ISO_STRING_LEN: i32 = 24;
 
-/// The string a `Date` field method yields for a non-finite (`NaN`/`Infinity`)
-/// timestamp: `toISOString()` returns this instead of an ISO string (interned as a
-/// data-segment literal, like the `typeof` words).
+/// The `toString()` of an invalid (`NaN`) Date (interned as a data-segment
+/// literal, like the `typeof` words).
 const INVALID_DATE: &str = "Invalid Date";
 
 /// The NaN-boxed `undefined` jsval as an `i64` carrier (see [`abi::UNDEFINED`]).
@@ -497,7 +502,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 8] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 18] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -532,6 +537,40 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 8] = [
     (
         PROP_THROW_IN,
         "Cannot use 'in' operator to search for a key in ",
+        "",
+    ),
+    (PROP_THROW_REDEFINE, "Cannot redefine property: ", ""),
+    (
+        PROP_THROW_DEFINE_NOT_EXTENSIBLE,
+        "Cannot define property ",
+        ", object is not extensible",
+    ),
+    (
+        PROP_THROW_DESC_NOT_OBJECT,
+        "Property description must be an object: ",
+        "",
+    ),
+    (PROP_THROW_GETTER, "Getter must be a function: ", ""),
+    (PROP_THROW_SETTER, "Setter must be a function: ", ""),
+    (
+        PROP_THROW_DESC_MIXED,
+        "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+        "",
+    ),
+    (
+        PROP_THROW_PROTO_TYPE,
+        "Object prototype may only be an Object or null: ",
+        "",
+    ),
+    (
+        PROP_THROW_PROTO_NOT_EXTENSIBLE,
+        "#<Object> is not extensible",
+        "",
+    ),
+    (PROP_THROW_PROTO_CYCLE, "Cyclic __proto__ value", ""),
+    (
+        PROP_THROW_PROTO_IMMUTABLE,
+        "Immutable prototype object 'Object.prototype' cannot have their prototype set",
         "",
     ),
 ];
@@ -576,6 +615,36 @@ const PROP_THROW_IN: i32 = 9;
 /// `__prop_throw`'s `mode` argument: `ToObject` of `null`/`undefined` (the
 /// `key` is the empty string).
 const PROP_THROW_TO_OBJECT: i32 = 10;
+/// `__prop_throw`'s `mode` argument: a rejected redefinition of a
+/// non-configurable property (`ValidateAndApplyPropertyDescriptor`).
+const PROP_THROW_REDEFINE: i32 = 11;
+/// `__prop_throw`'s `mode` argument: defining a new property on a
+/// non-extensible object.
+const PROP_THROW_DEFINE_NOT_EXTENSIBLE: i32 = 12;
+/// `__prop_throw`'s `mode` argument: `ToPropertyDescriptor` of a non-object
+/// (the `key`).
+const PROP_THROW_DESC_NOT_OBJECT: i32 = 13;
+/// `__prop_throw`'s `mode` argument: a descriptor `get` (the `key`) that is
+/// neither callable nor `undefined`.
+const PROP_THROW_GETTER: i32 = 14;
+/// `__prop_throw`'s `mode` argument: a descriptor `set` (the `key`) that is
+/// neither callable nor `undefined`.
+const PROP_THROW_SETTER: i32 = 15;
+/// `__prop_throw`'s `mode` argument: a descriptor with both accessor and
+/// data fields (the `key` is the empty string).
+const PROP_THROW_DESC_MIXED: i32 = 16;
+/// `__prop_throw`'s `mode` argument: a prototype (the `key`) that is neither
+/// an object nor `null`.
+const PROP_THROW_PROTO_TYPE: i32 = 17;
+/// `__prop_throw`'s `mode` argument: `[[SetPrototypeOf]]` of a non-extensible
+/// object (the `key` is the empty string).
+const PROP_THROW_PROTO_NOT_EXTENSIBLE: i32 = 18;
+/// `__prop_throw`'s `mode` argument: `[[SetPrototypeOf]]` that would close a
+/// prototype cycle (the `key` is the empty string).
+const PROP_THROW_PROTO_CYCLE: i32 = 19;
+/// `__prop_throw`'s `mode` argument: `[[SetPrototypeOf]]` of the immutable
+/// `%Object.prototype%` (the `key` is the empty string).
+const PROP_THROW_PROTO_IMMUTABLE: i32 = 20;
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
@@ -929,6 +998,12 @@ struct Helpers<'a> {
     /// argument slots every call site pushes (padding with `undefined` or
     /// truncating extras).
     max_args: u32,
+    /// Whether some user function gathers its arguments past the `K`
+    /// positional slots (a rest parameter or `arguments`, which snapshot
+    /// [`IrNode::SpreadArgsGlobal`]). When `false`, only a builtin callee can
+    /// observe more than `K` arguments, so a call passing more of them
+    /// publishes the spread argument array only for a builtin callee.
+    gathers_arguments: bool,
     /// Whether the program builds any accessor ([`IrNode::MakeAccessor`]).
     /// When `false`, `__get` / `__set` omit the getter/setter invocation and
     /// member accesses skip the post-call exception check.
@@ -1010,6 +1085,49 @@ impl Helpers<'_> {
         self.to_primitive() + 8
     }
 
+    /// `__define_own(o, key, desc, value, get, set) -> i32` (see
+    /// [`props::emit_define_own`]), right after `__json_revive`.
+    fn define_own(self) -> u32 {
+        self.to_primitive() + 9
+    }
+
+    /// `__to_desc(attrs, list)` (see [`props::emit_to_desc`]).
+    fn to_desc(self) -> u32 {
+        self.to_primitive() + 10
+    }
+
+    /// `__own_desc(obj, key) -> i64` (see [`props::emit_own_desc`]).
+    fn own_desc(self) -> u32 {
+        self.to_primitive() + 11
+    }
+
+    /// `__set_integrity(obj, level)` (see [`props::emit_set_integrity`]).
+    fn set_integrity(self) -> u32 {
+        self.to_primitive() + 12
+    }
+
+    /// `__test_integrity(obj, level) -> i32` (see
+    /// [`props::emit_test_integrity`]).
+    fn test_integrity(self) -> u32 {
+        self.to_primitive() + 13
+    }
+
+    /// `__own_enum(obj, key) -> i32` (see [`props::emit_own_enum`]).
+    fn own_enum(self) -> u32 {
+        self.to_primitive() + 14
+    }
+
+    /// `__set_proto(o, proto) -> i32` (see [`props::emit_set_proto`]).
+    fn set_proto(self) -> u32 {
+        self.to_primitive() + 15
+    }
+
+    /// `__promise_self_error() -> i64` (see [`builtins::emit_promise_self_error`]),
+    /// exported under [`PROMISE_SELF_ERROR_EXPORT_NAME`].
+    fn promise_self_error(self) -> u32 {
+        self.to_primitive() + 16
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1057,6 +1175,41 @@ impl Helpers<'_> {
     /// helper right after `__sparse_get`.
     fn sparse_set(self) -> u32 {
         self.array_concat + 4
+    }
+
+    /// `__protos_indexless(o) -> i32`: whether no prototype of `o` can hold an
+    /// integer-index property (see [`props::emit_protos_indexless`]). It is
+    /// the helper right after `__sparse_set`.
+    fn protos_indexless(self) -> u32 {
+        self.array_concat + 5
+    }
+
+    /// `__proto_elem(o, i) -> i64`: element `i` that `o` does not own, read
+    /// through its prototype chain ([`HOLE_BITS`] when absent; see
+    /// [`props::emit_proto_elem`]). It is the helper right after
+    /// `__protos_indexless`.
+    fn proto_elem(self) -> u32 {
+        self.array_concat + 6
+    }
+
+    /// `__proto_set(o, i, v) -> i32`: the inherited half of a store to an
+    /// element `o` does not own (see [`props::emit_proto_set`]). It is the
+    /// helper right after `__proto_elem`.
+    fn proto_set(self) -> u32 {
+        self.array_concat + 7
+    }
+
+    /// `__array_define(recv, key, v)`: `__array_set` without the prototype
+    /// chain, for `CreateDataPropertyOrThrow` (see [`props::emit_array_set`]).
+    /// It is the helper right after `__proto_set`.
+    fn array_define(self) -> u32 {
+        self.array_concat + 8
+    }
+
+    /// `__sparse_define(o, i, v)`: the `SPARSE` arm of `__array_define` (see
+    /// [`props::emit_sparse_set`]), right after `__array_define`.
+    fn sparse_define(self) -> u32 {
+        self.array_concat + 9
     }
 }
 
@@ -1125,7 +1278,9 @@ use numeric::*;
 use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
-use realm::{Builtin, Intrinsic, StringOp, intrinsic_bits};
+use realm::{
+    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, intrinsic_bits,
+};
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]
@@ -1257,11 +1412,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     });
     module.section(&tables);
 
-    // Memory section: one linear memory (min 1 page, capped at
-    // `abi::MEMORY_MAX_PAGES`; `__alloc` grows it on demand), exported below.
+    // Memory section: one linear memory (min: the pages holding the static
+    // data, at least 1; capped at `abi::MEMORY_MAX_PAGES`; `__alloc` grows it
+    // on demand), exported below.
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
-        minimum: 1,
+        minimum: u64::from(heap_ptr_init.cast_unsigned().div_ceil(65_536)).max(1),
         maximum: Some(abi::MEMORY_MAX_PAGES),
         memory64: false,
         shared: false,
@@ -1310,6 +1466,12 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
         NEW_PROMISE_EXPORT_NAME,
         ExportKind::Func,
         helpers.new_string + 2,
+    );
+    // The self-resolution `TypeError` the hosts reject `resolve(p)`-with-`p` with.
+    exports.export(
+        PROMISE_SELF_ERROR_EXPORT_NAME,
+        ExportKind::Func,
+        helpers.promise_self_error(),
     );
     module.section(&exports);
 
@@ -1373,16 +1535,22 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_array_reserve(helpers.alloc));
     code.function(&emit_array_push(
         helpers.array_reserve(),
-        helpers.sparse_set(),
+        helpers.sparse_define(),
     ));
     code.function(&emit_array_concat(
         helpers.array_reserve(),
         helpers.sparse_get(),
+        helpers.proto_elem(),
     ));
-    code.function(&emit_array_set(&offsets, helpers));
+    code.function(&emit_array_set(&offsets, helpers, false));
     code.function(&emit_array_set_length(&offsets, helpers));
     code.function(&emit_sparse_get(helpers));
-    code.function(&emit_sparse_set(helpers));
+    code.function(&emit_sparse_set(helpers, false));
+    code.function(&emit_protos_indexless());
+    code.function(&emit_proto_elem(helpers));
+    code.function(&emit_proto_set(helpers));
+    code.function(&emit_array_set(&offsets, helpers, true));
+    code.function(&emit_sparse_set(helpers, true));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
         helpers.convert,
@@ -1446,6 +1614,14 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&builtins::emit_json_rep(&offsets, helpers));
     code.function(&builtins::emit_json_indent(helpers));
     code.function(&builtins::emit_json_revive(helpers));
+    code.function(&emit_define_own(&offsets, helpers));
+    code.function(&emit_to_desc(&offsets, helpers));
+    code.function(&emit_own_desc(&offsets, helpers));
+    code.function(&emit_set_integrity(helpers));
+    code.function(&emit_test_integrity());
+    code.function(&emit_own_enum(&offsets, helpers));
+    code.function(&emit_set_proto(helpers));
+    code.function(&builtins::emit_promise_self_error(&offsets, helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

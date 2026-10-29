@@ -1080,8 +1080,9 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     let frame = u64_at(&mem, generator + GEN_ENV_OFFSET);
     assert_eq!((frame >> 48) & 0b111, 0b101, "frame is a heap block");
 
+    // The payload is the TimeClip'd time value (truncated toward zero).
     let (date, mem) = heap("new Date(1234.5)", TYPE_DATE, 0);
-    assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234.5_f64.to_bits());
+    assert_eq!(u64_at(&mem, date + DATE_MS_OFFSET), 1234_f64.to_bits());
 }
 
 /// The number of `global.set` of the dirty-bits global in `bytes`.
@@ -1112,18 +1113,19 @@ fn compile(src: &str) -> Vec<u8> {
 #[test]
 fn dirty_bits_are_set_only_when_tested() {
     // Intrinsics-sealed with inline namespaces: no guard, so `__set`,
-    // `__define` and `__delete` never touch the bits.
+    // `__define`, `__delete`, `__define_own`, `__set_integrity` and
+    // `__set_proto` never touch the bits.
     assert_eq!(
         dirty_bit_sets(&compile("let a = []; a.push(Math.max(1, 2))")),
         0
     );
     // A push guard (not intrinsics-sealed) or a watched-namespace guard (an
-    // escaping `Math`) makes the three helpers set the bits.
+    // escaping `Math`) makes the six helpers set the bits.
     assert_eq!(
         dirty_bit_sets(&compile("Object.prototype.x = 1; let a = []; a.push(1)")),
-        3
+        6
     );
-    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 3);
+    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 6);
     // An unwatched namespace guard compares the member instead.
     assert_eq!(
         dirty_bit_sets(&compile("let o = Object; Object.keys({})")),

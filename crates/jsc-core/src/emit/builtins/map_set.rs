@@ -168,9 +168,9 @@ pub(super) fn not_iterable(local: u32) -> IrNode {
     throw_message(message, local)
 }
 
-/// The `TypeError` for a `Map` constructor entry in `local` that is not an
-/// object.
-fn not_an_entry(local: u32) -> IrNode {
+/// The `TypeError` for a `Map` constructor (or `Object.fromEntries`) entry in
+/// `local` that is not an object.
+pub(super) fn not_an_entry(local: u32) -> IrNode {
     let message = concat(
         concat(
             IrNode::Str("Iterator value ".to_owned()),
