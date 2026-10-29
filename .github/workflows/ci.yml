@@ -3,30 +3,13 @@
 # swc is consumed from crates.io (pinned versions in crates/jsc-core/Cargo.toml),
 # so the workspace compiles on any runner — no local path provisioning needed.
 #
-# This gate only checks the Rust workspace, so it runs only when Rust-relevant
-# files change (paths allowlist below). Changes to the JS/TS monorepo
-# (package.json, apps/**, packages/**, scripts/**) and docs do NOT trigger it,
-# except scripts/test262-fetch.sh, which pins the test262 checkout.
+# Manual only: run it from the Actions tab (or `gh workflow run ci.yml --ref <branch>`).
+# Pushes and pull requests do not trigger it.
 
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths: &rust-paths
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "clippy.toml"
-      - "rustfmt.toml"
-      - "deny.toml"
-      - "_typos.toml"
-      - "tests/test262/**"
-      - "scripts/test262-fetch.sh"
-      - ".github/workflows/ci.yml"
-  pull_request:
-    paths: *rust-paths
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

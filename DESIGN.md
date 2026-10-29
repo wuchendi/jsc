@@ -1693,11 +1693,9 @@ All workflows use Rust toolchain `1.99.1`.
 
 ### `ci.yml` — Rust gate
 
-**Triggers.** `push` to `main` and `pull_request`, both restricted to these
-paths: `crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
-`clippy.toml`, `rustfmt.toml`, `deny.toml`, `_typos.toml`, `tests/test262/**`,
-`scripts/test262-fetch.sh`, `.github/workflows/ci.yml`. Changes elsewhere
-(JS/TS packages, apps, other scripts, docs) do not run it.
+**Triggers.** Manual only (`workflow_dispatch`): run it from the Actions tab
+or with `gh workflow run ci.yml --ref <branch>`. Pushes and pull requests do
+not run it.
 
 **Job `rust`** (fmt + clippy + test + deny + shear + typos):
 
