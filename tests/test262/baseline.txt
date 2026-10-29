@@ -1544,6 +1544,8 @@ built-ins/Array/prototype/push/length-near-integer-limit.js
 built-ins/Array/prototype/push/length.js
 built-ins/Array/prototype/push/name.js
 built-ins/Array/prototype/push/prop-desc.js
+built-ins/Array/prototype/push/set-length-array-is-frozen.js
+built-ins/Array/prototype/push/set-length-array-length-is-non-writable.js
 built-ins/Array/prototype/push/set-length-zero-array-is-frozen.js
 built-ins/Array/prototype/push/set-length-zero-array-length-is-non-writable.js
 built-ins/Array/prototype/push/throws-if-integer-limit-exceeded.js
@@ -1762,7 +1764,9 @@ built-ins/Array/prototype/reduce/15.4.4.21-9-c-i-9.js
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-1.js
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-10.js
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-11.js
+built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-12.js
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-13.js
+built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-14.js
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-16.js
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-17.js
 built-ins/Array/prototype/reduce/15.4.4.21-9-c-ii-18.js
@@ -2007,7 +2011,9 @@ built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-i-9.js
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-1.js
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-10.js
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-11.js
+built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-12.js
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-13.js
+built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-14.js
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-16.js
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-17.js
 built-ins/Array/prototype/reduceRight/15.4.4.22-9-c-ii-18.js
@@ -2359,6 +2365,7 @@ built-ins/Array/prototype/sort/precise-getter-increases-length.js
 built-ins/Array/prototype/sort/precise-getter-pops-elements.js
 built-ins/Array/prototype/sort/precise-getter-sets-predecessor.js
 built-ins/Array/prototype/sort/precise-getter-sets-successor.js
+built-ins/Array/prototype/sort/precise-prototype-accessors.js
 built-ins/Array/prototype/sort/precise-prototype-element.js
 built-ins/Array/prototype/sort/precise-setter-appends-elements.js
 built-ins/Array/prototype/sort/precise-setter-decreases-length.js
@@ -2529,6 +2536,8 @@ built-ins/Array/prototype/unshift/length.js
 built-ins/Array/prototype/unshift/name.js
 built-ins/Array/prototype/unshift/prop-desc.js
 built-ins/Array/prototype/unshift/read-only-property.js
+built-ins/Array/prototype/unshift/set-length-array-is-frozen.js
+built-ins/Array/prototype/unshift/set-length-array-length-is-non-writable.js
 built-ins/Array/prototype/unshift/set-length-zero-array-is-frozen.js
 built-ins/Array/prototype/unshift/set-length-zero-array-length-is-non-writable.js
 built-ins/Array/prototype/unshift/throws-if-integer-limit-exceeded.js
@@ -13179,9 +13188,14 @@ language/expressions/object/S11.1.5_A3.js
 language/expressions/object/S11.1.5_A4.1.js
 language/expressions/object/S11.1.5_A4.2.js
 language/expressions/object/S11.1.5_A4.3.js
+language/expressions/object/__proto__-duplicate-computed.js
+language/expressions/object/__proto__-duplicate.js
 language/expressions/object/__proto__-fn-name.js
 language/expressions/object/__proto__-permitted-dup-shorthand.js
 language/expressions/object/__proto__-permitted-dup.js
+language/expressions/object/__proto__-poisoned-object-prototype.js
+language/expressions/object/__proto__-value-null.js
+language/expressions/object/__proto__-value-obj.js
 language/expressions/object/accessor-name-computed-err-evaluation.js
 language/expressions/object/accessor-name-computed-err-to-prop-key.js
 language/expressions/object/accessor-name-computed-err-unresolvable.js

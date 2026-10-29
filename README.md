@@ -67,7 +67,7 @@ The dialect is chosen by FILE extension:
 - `.tsx` — rejected (exit `2`); JSX is not supported.
 - any other extension, and all `-e` / `-p` input — JavaScript, so type syntax there is a compile error.
 
-`enum` and `namespace` are not supported: the strip pass lowers them to `var`-based JavaScript whose binding is not resolved, so using one throws `ReferenceError` at run time. Invalid input in either dialect — including errors swc recovers from, such as strict-mode early errors — is a compile error (exit `2`). The `@cdlab/jsc` package compiles JavaScript only.
+`enum` and `namespace` are lowered by the strip pass to `var`-based JavaScript and run like any other declaration. Invalid input in either dialect — including errors swc recovers from, such as strict-mode early errors — is a compile error (exit `2`). The `@cdlab/jsc` package compiles JavaScript only.
 
 ## Conformance
 
