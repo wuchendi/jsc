@@ -31,8 +31,8 @@ use super::{
     UNDEFINED,
 };
 use super::{
-    CLASS_SYMBOL, PROPS_HAS_SYMBOL_KEYS, SYMBOL_BLOCK_SIZE, SYMBOL_DESCRIPTION_OFFSET,
-    SYMBOL_FLAG_REGISTERED, TYPE_SYMBOL,
+    CLASS_ITERATOR, CLASS_SYMBOL, PROPS_HAS_SYMBOL_KEYS, SYMBOL_BLOCK_SIZE,
+    SYMBOL_DESCRIPTION_OFFSET, SYMBOL_FLAG_REGISTERED, TYPE_SYMBOL,
 };
 use super::{
     FN_INFO_ADDR, FN_INFO_ENTRY_SIZE, FN_INFO_NAME_OFFSET, FUNC_FLAG_BOUND, FUNC_FLAG_CLASS_CTOR,
@@ -97,6 +97,7 @@ fn expected() -> Vec<(&'static str, Val)> {
         ("CLASS_NUMBER", int(CLASS_NUMBER)),
         ("CLASS_STRING", int(CLASS_STRING)),
         ("CLASS_SYMBOL", int(CLASS_SYMBOL)),
+        ("CLASS_ITERATOR", int(CLASS_ITERATOR)),
         ("WRAPPER_VALUE_OFFSET", int(WRAPPER_VALUE_OFFSET)),
         ("STR_FLAG_ARRAY_INDEX", int(STR_FLAG_ARRAY_INDEX)),
         ("ARRAY_FLAG_SPARSE", int(ARRAY_FLAG_SPARSE)),
@@ -496,5 +497,7 @@ fn symbol_layout_matches_design() {
         0
     );
     assert_eq!(CLASS_SYMBOL, CLASS_GLOBAL + 1);
+    // Section 5.4: the iterator objects' class byte.
+    assert_eq!(CLASS_ITERATOR, CLASS_SYMBOL + 1);
     assert_eq!(TYPEOF_STRINGS[6], "symbol");
 }

@@ -144,6 +144,12 @@ pub(crate) const CLASS_GLOBAL: u8 = 6;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const CLASS_SYMBOL: u8 = 7;
 
+/// [`TYPE_OBJECT`] `class` byte: a builtin iterator object (an Array, String,
+/// Map or Set iterator; design/symbol-strings.md §5.4). Its 32-byte block
+/// holds the iterated value, the next index and the iterator kind past the
+/// object-family prefix; no host reads the payload.
+pub(crate) const CLASS_ITERATOR: u8 = 8;
+
 /// Offset of a wrapper object's `[[PrimitiveValue]]` jsval (an `i64`) from
 /// its base, right after the object-family prefix.
 pub(crate) const WRAPPER_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE;
