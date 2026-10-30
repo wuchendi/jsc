@@ -1,9 +1,9 @@
 //! Integration tests: the Symbol primitive (`design/symbol-strings.md` §2):
-//! `typeof`, Node-style rendering of symbols, symbol-keyed properties and
-//! uncaught symbols.
+//! `typeof`, Node-style rendering of symbols, symbol-keyed properties,
+//! uncaught symbols, and the conversions and object checks of §2.3 / §2.4.
 
 mod common;
-use common::{assert_eval, assert_string, assert_uncaught};
+use common::{assert_bool, assert_eval, assert_number, assert_string, assert_uncaught};
 
 // --- typeof ----------------------------------------------------------------------
 
@@ -46,4 +46,139 @@ fn symbol_keys_render_last() {
 #[test]
 fn uncaught_symbol_renders_its_description() {
     assert_uncaught("throw Symbol(\"a\")", "Symbol(a)");
+}
+
+// --- conversions (§2.4) -----------------------------------------------------------
+
+/// Evaluate `expr` against `let s = Symbol("x")` inside a `try`, yielding
+/// whether it threw a `TypeError`.
+fn throws_type_error(expr: &str) -> String {
+    format!("let s = Symbol(\"x\"); try {{ {expr}; false }} catch (e) {{ e instanceof TypeError }}")
+}
+
+#[test]
+fn to_string_of_a_symbol_throws() {
+    for expr in ["\"\" + s", "`${s}`", "s + \"\"", "new String(s)"] {
+        assert_bool(&throws_type_error(expr), true);
+    }
+    assert_uncaught(
+        "let s = Symbol(\"x\"); \"\" + s",
+        "TypeError: Cannot convert a Symbol value to a string",
+    );
+    assert_uncaught(
+        "let s = Symbol(\"x\"); `${s}`",
+        "TypeError: Cannot convert a Symbol value to a string",
+    );
+}
+
+#[test]
+fn to_number_of_a_symbol_throws() {
+    for expr in [
+        "s + 1",
+        "+s",
+        "s < 1",
+        "1 >= s",
+        "Math.abs(s)",
+        "s * 2",
+        "Number(s)",
+    ] {
+        assert_bool(&throws_type_error(expr), true);
+    }
+    assert_uncaught(
+        "let s = Symbol(\"x\"); +s",
+        "TypeError: Cannot convert a Symbol value to a number",
+    );
+    assert_uncaught(
+        "let s = Symbol(\"x\"); s < 1",
+        "TypeError: Cannot convert a Symbol value to a number",
+    );
+}
+
+#[test]
+fn string_call_describes_a_symbol() {
+    assert_string("String(Symbol(\"x\"))", "Symbol(x)");
+    assert_string("String(Symbol())", "Symbol()");
+    assert_string("String(Symbol(\"\"))", "Symbol()");
+    // The `String` function as a value takes the same path.
+    assert_string("let S = String; S(Symbol(\"x\"))", "Symbol(x)");
+}
+
+#[test]
+fn loose_equality_of_symbols() {
+    assert_bool("let s = Symbol(\"x\"); s == s", true);
+    assert_bool("let s = Symbol(\"x\"); Object(s) == s", true);
+    assert_bool("let s = Symbol(\"x\"); s == Object(s)", true);
+    assert_bool("let s = Symbol(\"x\"); s == \"Symbol(x)\"", false);
+    assert_bool("let s = Symbol(\"x\"); s == 1", false);
+    assert_bool("Symbol(\"x\") == Symbol(\"x\")", false);
+    assert_bool("let s = Symbol(\"x\"); s != s", false);
+}
+
+#[test]
+fn a_symbol_is_truthy() {
+    assert_bool("!!Symbol()", true);
+    assert_bool("let s = Symbol(\"x\"); s ? true : false", true);
+}
+
+#[test]
+fn json_skips_symbols() {
+    assert_string(
+        "let s = Symbol(\"x\"); JSON.stringify({a: s, b: 1})",
+        "{\"b\":1}",
+    );
+    assert_string("let s = Symbol(\"x\"); JSON.stringify([s])", "[null]");
+    assert_bool(
+        "let s = Symbol(\"x\"); JSON.stringify(s) === undefined",
+        true,
+    );
+}
+
+// --- wrappers and object checks (§2.3) ----------------------------------------------
+
+#[test]
+fn to_object_of_a_symbol_is_a_symbol_wrapper() {
+    assert_string("typeof Object(Symbol(\"x\"))", "object");
+    assert_bool("let s = Symbol(\"x\"); Object(s) instanceof Symbol", true);
+    assert_bool("let s = Symbol(\"x\"); Object(s).valueOf() === s", true);
+    assert_bool("let s = Symbol(\"x\"); Object(s) !== s", true);
+    assert_bool("let s = Symbol(\"x\"); Object(s) instanceof Object", true);
+}
+
+#[test]
+fn a_symbol_is_not_an_object() {
+    assert_bool("Symbol(\"x\") instanceof Object", false);
+    assert_bool(&throws_type_error("\"x\" in s"), true);
+    assert_bool(
+        &throws_type_error("Object.defineProperty(s, \"x\", {})"),
+        true,
+    );
+    assert_bool(&throws_type_error("s.x = 1"), true);
+    assert_uncaught(
+        "let s = Symbol(\"x\"); s.x = 1",
+        "TypeError: Cannot create property 'x' on symbol 'Symbol(x)'",
+    );
+    // `for-in` over a symbol does not walk its description.
+    assert_number("let n = 0; for (let k in Symbol(\"ab\")) n++; n", 0.0);
+}
+
+#[test]
+fn symbols_are_keys_and_elements_by_identity() {
+    assert_number("let s = Symbol(\"x\"); new Map([[s, 1]]).get(s)", 1.0);
+    assert_bool("let s = Symbol(\"x\"); [s].includes(s)", true);
+    assert_bool("let s = Symbol(\"x\"); [s].includes(Symbol(\"x\"))", false);
+    assert_bool("let s = Symbol(\"x\"); Object.is(s, s)", true);
+    assert_bool("let s = Symbol(\"x\"); s === s", true);
+    assert_bool("let s = Symbol(\"x\"); new Set([s, s]).size === 1", true);
+}
+
+#[test]
+fn object_to_string_tags_symbols() {
+    assert_string(
+        "Object.prototype.toString.call(Symbol(\"x\"))",
+        "[object Symbol]",
+    );
+    assert_string(
+        "Object.prototype.toString.call(Object(Symbol(\"x\")))",
+        "[object Symbol]",
+    );
 }

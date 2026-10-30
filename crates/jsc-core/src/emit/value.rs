@@ -71,11 +71,16 @@ pub(super) fn emit_coerce_number(function: &mut Function, local: u32, helpers: H
 
 /// Emit the `__to_number(v: i64) -> i64` helper backing [`emit_coerce_number`]
 /// and `Number(x)`: `ToPrimitive` (hint number, in the guest) then the host
-/// `__convert` to-number op on the primitive (`StringToNumber` rules). A throw
-/// from a user `valueOf`/`toString` stays pending and yields `NaN`.
-pub(super) fn emit_to_number_helper(helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![]);
-    let v = 0;
+/// `__convert` to-number op on the primitive (`StringToNumber` rules); a
+/// symbol throws the `TypeError`. A throw from a user `valueOf`/`toString`
+/// stays pending and yields `NaN`.
+pub(super) fn emit_to_number_helper(
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) -> Function {
+    let mut function = Function::new(type_error_helper_locals());
+    let (v, scratch) = (0, 1);
+    helpers.unwind.borrow_mut().reset();
     emit_is_object(&mut function, v);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(v));
@@ -88,6 +93,15 @@ pub(super) fn emit_to_number_helper(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
+    throw_if_symbol(
+        &mut function,
+        v,
+        SYMBOL_TO_NUMBER,
+        &Instruction::I64Const(QNAN_BITS),
+        scratch,
+        strings,
+        helpers,
+    );
     function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
     function.instruction(&Instruction::Call(helpers.convert));
@@ -165,6 +179,19 @@ pub(super) fn emit_is_string(function: &mut Function, local: u32) {
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// Push `1` if the jsval in `local` is a symbol (a [`TYPE_SYMBOL`] heap
+/// block), else `0`. Same shape as [`emit_is_string`].
+pub(super) fn emit_is_symbol(function: &mut Function, local: u32) {
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
