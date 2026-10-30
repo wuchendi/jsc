@@ -374,7 +374,8 @@ pub(super) fn emit_object_has_node(
 /// the target prototype: the static error prototype ([`InstanceOfKind::Proto`])
 /// or, for [`InstanceOfKind::Ctor`] (`OrdinaryHasInstance`), `Get(C,
 /// "prototype")` of the callable-guarded right-hand side `C`, which must be an
-/// object.
+/// object. An object `C` whose chain holds a `@@hasInstance` (`__symbol_get`)
+/// throws the interim `TypeError` first (Y4 honours it).
 #[allow(clippy::too_many_lines)] // straight-line per-kind emit, not branching depth
 pub(super) fn emit_instanceof_node(
     value: &IrNode,
@@ -418,6 +419,24 @@ pub(super) fn emit_instanceof_node(
     function.instruction(&Instruction::LocalSet(tgt));
     function.instruction(&Instruction::LocalSet(cur));
     if ctor {
+        // A `@@hasInstance` on an object `C`'s chain is not honoured before Y4:
+        // the interim `TypeError` (design/symbol-strings.md §9.4).
+        emit_is_object(function, tgt);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        emit_hook_guard(
+            function,
+            tgt,
+            WellKnown::HasInstance,
+            scratch,
+            strings,
+            helpers,
+        );
+        if helpers.has_accessors {
+            emit_propagate_if_pending(function, helpers);
+        }
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
         // `IsCallable(C)`, checked before the receiver (a primitive operand still
         // throws for a non-callable right-hand side).
         emit_callable_guard(
