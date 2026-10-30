@@ -118,19 +118,34 @@ fn yield_star_delegates_to_map_and_set() {
 }
 
 #[test]
-fn map_set_iterator_methods_are_absent() {
-    for (ctor, method) in [
-        ("Map", "entries"),
-        ("Map", "keys"),
-        ("Map", "values"),
-        ("Set", "values"),
-        ("Set", "keys"),
-        ("Set", "entries"),
+fn map_set_iterators_inherit_iterator_helpers() {
+    for (src, expected) in [
+        (
+            "new Map([[1, 2]]).keys().map(x => x * 2).toArray().join()",
+            "2",
+        ),
+        (
+            "new Map([[1, 2]]).values().map(x => x * 2).toArray().join()",
+            "4",
+        ),
+        (
+            "new Map([[1, 2]]).entries().map(([k, v]) => k + v).toArray().join()",
+            "3",
+        ),
+        (
+            "new Set([1, 2]).values().map(x => x * 2).toArray().join()",
+            "2,4",
+        ),
+        (
+            "new Set([1, 2]).keys().filter(x => x > 1).toArray().join()",
+            "2",
+        ),
+        (
+            "new Set([3]).entries().map(([a, b]) => a + b).toArray().join()",
+            "6",
+        ),
     ] {
-        assert_uncaught(
-            &format!("const c = new {ctor}(); c.{method}()"),
-            &format!("TypeError: c.{method} is not a function"),
-        );
+        assert_string(src, expected);
     }
 }
 
