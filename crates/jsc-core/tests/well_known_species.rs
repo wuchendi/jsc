@@ -275,3 +275,46 @@ fn array_prototype_unscopables() {
         true,
     );
 }
+
+// --- Builtin accessors in accessor-free programs ---------------------------------
+//
+// None of these sources builds or names an accessor, so `__get` is compiled
+// without getter dispatch; the builtin `get [@@species]` /
+// `[@@toStringTag]` / `description` getters must still be called.
+
+#[test]
+fn plain_array_species_methods_without_accessors() {
+    assert_string("[1, 2, 3, 4].slice(1, 3).join()", "2,3");
+    assert_string("[1, 2, 3].map((x) => x * 2).join()", "2,4,6");
+    assert_string("[1, 2, 3, 4].filter((x) => x % 2).join()", "1,3");
+    assert_string("[1].concat([2, 3], 4).join()", "1,2,3,4");
+    assert_string(
+        "const a = [1, 2, 3, 4]; a.splice(1, 2).join() + '|' + a.join()",
+        "2,3|1,4",
+    );
+    assert_string("[1, [2, [3]]].flat().length + ''", "3");
+    assert_string("[1, 2].flatMap((x) => [x, x]).join()", "1,1,2,2");
+    assert_bool("Array.isArray([1, 2, 3].slice(1))", true);
+}
+
+#[test]
+fn promise_then_without_accessors() {
+    assert_output("Promise.resolve(1).then((v) => console.log(v + 1));", "2\n");
+    // Resolving with a promise runs its `then` (a `SpeciesConstructor` read)
+    // without the program naming it.
+    assert_output(
+        "const f = async () => Promise.resolve(5); \
+         (async () => console.log(await f()))();",
+        "5\n",
+    );
+}
+
+#[test]
+fn builtin_tags_and_getters_without_accessors() {
+    assert_string(
+        "Object.prototype.toString.call([].values())",
+        "[object Array Iterator]",
+    );
+    assert_string("Symbol(\"d\").description", "d");
+    assert_bool("[].values().constructor === Iterator", true);
+}
