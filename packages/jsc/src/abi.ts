@@ -56,7 +56,7 @@ export const SYMBOL_BLOCK_SIZE = 16
 /** {@link TYPE_SYMBOL} `flags` bit: the symbol is in the `Symbol.for` registry. */
 export const SYMBOL_FLAG_REGISTERED = 4
 
-/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
+/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`, `TWO_BYTE`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
 export const HEADER_FLAGS_OFFSET = 2
 /** Header byte 3: the `TYPE_OBJECT` sub-`class` byte. */
 export const HEADER_CLASS_OFFSET = 3
@@ -76,6 +76,12 @@ export const CLASS_SYMBOL = 7
 export const WRAPPER_VALUE_OFFSET = 16
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
+/** String `flags` bit: the data is UTF-16LE code units (absent: Latin-1 bytes). */
+export const STR_FLAG_TWO_BYTE = 4
+/** Byte offset of a string block's `len:u32`, in UTF-16 code units (header | len @4 | data @8). */
+export const STR_LEN_OFFSET = 4
+/** Byte offset of a string block's data. */
+export const STR_DATA_OFFSET = 8
 
 /** Byte offset of the object-family prefix's `props:u32` slot (the `TYPE_PROPS` table, `0` = none). */
 export const OBJ_PROPS_OFFSET = HEADER_SIZE
@@ -165,7 +171,11 @@ export const HEAP_PTR_EXPORT_NAME = '__heap_ptr'
 export const MEMORY_MAX_PAGES = 8192
 /** The sticky out-of-memory sentinel the guest stores in `__heap_ptr` (`i32`). */
 export const HEAP_PTR_OOM = -1
-/** Export name of the `__new_string(len) -> base` guest string constructor. */
+/**
+ * Export name of the `__new_string(len, twoByte) -> base` guest string constructor:
+ * `len` code units, Latin-1 (`twoByte` 0) or UTF-16LE (`twoByte` 1, sets
+ * `STR_FLAG_TWO_BYTE`); the caller fills the data at `base + STR_DATA_OFFSET`.
+ */
 export const NEW_STRING_EXPORT_NAME = '__new_string'
 /** Export name of the `__new_array(len) -> base` guest array constructor. */
 export const NEW_ARRAY_EXPORT_NAME = '__new_array'
@@ -199,68 +209,24 @@ export const CONVERT_OP_TO_NUMBER = 1
 /** `__convert` op: parse a leading float (`parseFloat(x)`). */
 export const CONVERT_OP_PARSE_FLOAT = 3
 
-/** `__method` op: `indexOf` (overloaded on array/string). */
+/** `__method` op: array `indexOf`. */
 export const METHOD_OP_INDEX_OF = 0
-/** `__method` op: `includes`. */
+/** `__method` op: array `includes`. */
 export const METHOD_OP_INCLUDES = 1
-/** `__method` op: `slice` (overloaded on array/string). */
-export const METHOD_OP_SLICE = 3
 /** `__method` op: `toUpperCase`. */
 export const METHOD_OP_TO_UPPER = 4
 /** `__method` op: `toLowerCase`. */
 export const METHOD_OP_TO_LOWER = 5
-/** `__method` op: `charAt`. */
-export const METHOD_OP_CHAR_AT = 6
-/** `__method` op: `trim` (string). */
-export const METHOD_OP_TRIM = 7
-/** `__method` op: `trimStart` (string). */
-export const METHOD_OP_TRIM_START = 8
-/** `__method` op: `trimEnd` (string). */
-export const METHOD_OP_TRIM_END = 9
-/** `__method` op: `repeat` (string). */
-export const METHOD_OP_REPEAT = 10
-/** `__method` op: `startsWith` (string). */
-export const METHOD_OP_STARTS_WITH = 11
-/** `__method` op: `endsWith` (string). */
-export const METHOD_OP_ENDS_WITH = 12
-/** `__method` op: `padStart` (string). */
-export const METHOD_OP_PAD_START = 13
-/** `__method` op: `padEnd` (string). */
-export const METHOD_OP_PAD_END = 14
-/** `__method` op: `substring` (string). */
-export const METHOD_OP_SUBSTRING = 15
-/** `__method` op: `split` (string, yields an array). */
-export const METHOD_OP_SPLIT = 16
 /** `__method` op: `Number.prototype.toString(radix)` (number receiver). */
 export const METHOD_OP_NUMBER_TO_STRING = 17
-/** `__method` op: `String.prototype.at` (string). */
-export const METHOD_OP_AT = 18
-/** `__method` op: `String.prototype.charCodeAt` (string). */
-export const METHOD_OP_CHAR_CODE_AT = 19
-/** `__method` op: `String.prototype.codePointAt` (string). */
-export const METHOD_OP_CODE_POINT_AT = 20
-/** `__method` op: `String.prototype.lastIndexOf` (string). */
-export const METHOD_OP_LAST_INDEX_OF = 21
 /** `__method` op: `String.prototype.localeCompare` (string, code-unit order). */
 export const METHOD_OP_LOCALE_COMPARE = 22
 /** `__method` op: `String.prototype.normalize` (string). */
 export const METHOD_OP_NORMALIZE = 23
-/** `__method` op: index of a RegExp-free string pattern (`search` / `match`). */
-export const METHOD_OP_SEARCH = 24
-/** `__method` op: `String.prototype.replace` (string pattern, replacement template). */
-export const METHOD_OP_REPLACE = 25
-/** `__method` op: `String.prototype.replaceAll` (string pattern, replacement template). */
-export const METHOD_OP_REPLACE_ALL = 26
-/** `__method` op: `String.fromCharCode` (array receiver of numbers). */
-export const METHOD_OP_FROM_CHAR_CODE = 27
-/** `__method` op: `String.fromCodePoint` (array receiver of code points). */
-export const METHOD_OP_FROM_CODE_POINT = 28
-/** `__method` result: no correct result for the input yet (non-ASCII position, lone surrogate). */
+/** `__method` result: no correct result for the input yet (`normalize` over non-ASCII text). */
 export const METHOD_UNSUPPORTED = 0x7ffb_0000_0000_0001n
 /** `__method` result: an out-of-range argument (unknown `normalize` form). */
 export const METHOD_RANGE_ERROR = 0x7ffb_0000_0000_0002n
-/** `__method` result: the pattern needs the absent `RegExp`. */
-export const METHOD_NEEDS_REGEXP = 0x7ffb_0000_0000_0003n
 /** `__method` op: `Number.prototype.toFixed(f)` (finite number receiver). */
 export const METHOD_OP_NUMBER_TO_FIXED = 40
 /** `__method` op: `Number.prototype.toExponential(f)` (finite number receiver). */

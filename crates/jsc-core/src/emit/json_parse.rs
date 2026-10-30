@@ -10,15 +10,16 @@
 //! # Cursor state
 //!
 //! The parse walks the input via three module globals set once at entry:
-//! [`JSON_DATA_GLOBAL`] (the UTF-8 payload offset), [`JSON_POS_GLOBAL`] (the
-//! current byte offset), and [`JSON_LEN_GLOBAL`] (the byte length). The helpers
+//! [`JSON_DATA_GLOBAL`] (the data offset, its low bit set for a two-byte
+//! input — the offset itself is 8-aligned), [`JSON_POS_GLOBAL`] (the current
+//! code-unit index), and [`JSON_LEN_GLOBAL`] (the code-unit length). The helpers
 //! recurse (`__json_value` → `__json_array`/`__json_object` → `__json_value`),
 //! reading/advancing these globals. A parse runs synchronously to completion, so
 //! nothing re-enters and disturbs them.
 //!
 //! # Errors
 //!
-//! Malformed (or unsupported — a `\u` escape) input calls `__json_throw`, which
+//! Malformed input calls `__json_throw`, which
 //! stashes an `Error` in `$exc_value`, sets `$exc_pending`, and unwinds via
 //! the exception-unwinding mechanism. Each helper checks `$exc_pending` after a recursive call and
 //! propagates; the emit-context [`emit_json_parse_node`] issues the final
@@ -27,10 +28,10 @@
 //!
 //! # v1 cuts (documented)
 //!
-//! String `\u` escapes are unsupported (throw). Multi-byte UTF-8 in string *bodies*
-//! is copied verbatim (byte-for-byte), which is correct. Each parsed string
-//! over-allocates its worst-case decoded length on the bump heap (never
-//! reclaimed, §10). No `ToPrimitive`/reviver.
+//! String bodies and `\uXXXX` escapes (lone surrogates included) decode to
+//! code units; each parsed string over-allocates its worst-case decoded
+//! length as a two-byte block on the bump heap (never reclaimed, §10), then
+//! narrows to one-byte when every unit is `<= 0xFF`. No `ToPrimitive`/reviver.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -44,22 +45,49 @@ fn byte_mem() -> MemArg {
     }
 }
 
-/// The u32 length-header `MemArg` (`+HEADER_SIZE` from a block base).
+/// The u32 length-header `MemArg` (`+STR_LEN_OFFSET` from a string block base).
 fn len_header() -> MemArg {
     MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     }
 }
 
-/// Push the i32 byte at the current cursor (`load8u($__json_data + $__json_pos)`).
-/// The caller must have established the position is in range.
-fn cur_byte(function: &mut Function) {
+/// Push the input's code unit at the index `pos` pushes, read at the input's
+/// width (the low bit of `$__json_data`). The caller must have established
+/// the index is in range.
+fn unit_at(function: &mut Function, pos: impl Fn(&mut Function)) {
     function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
-    function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
+    function.instruction(&Instruction::I32Const(-2));
+    function.instruction(&Instruction::I32And);
+    pos(function);
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I32Load16U(MemArg {
+        offset: 0,
+        align: 1,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
+    pos(function);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I32Load8U(byte_mem()));
+    function.instruction(&Instruction::End);
+}
+
+/// Push the code unit at the cursor. The caller must have established the
+/// position is in range.
+fn cur_unit(function: &mut Function) {
+    unit_at(function, |f| {
+        f.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
+    });
 }
 
 /// Push `1` if the cursor is at/past the end (`$__json_pos >= $__json_len`).
@@ -120,14 +148,13 @@ fn expect_word(function: &mut Function, word: &[u8], result_bits: i64, helpers: 
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(function, helpers);
     function.instruction(&Instruction::End);
-    // Verify each byte.
+    // Verify each unit.
     for (i, byte) in word.iter().enumerate() {
-        function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
-        function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::I32Const(i32::try_from(i).unwrap_or(i32::MAX)));
-        function.instruction(&Instruction::I32Add);
-        function.instruction(&Instruction::I32Load8U(byte_mem()));
+        unit_at(function, |f| {
+            f.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
+            f.instruction(&Instruction::I32Const(i32::try_from(i).unwrap_or(i32::MAX)));
+            f.instruction(&Instruction::I32Add);
+        });
         function.instruction(&Instruction::I32Const(i32::from(*byte)));
         function.instruction(&Instruction::I32Ne);
         function.instruction(&Instruction::If(BlockType::Empty));
@@ -150,7 +177,7 @@ pub(super) fn emit_json_ws() -> Function {
     function.instruction(&Instruction::Loop(BlockType::Empty));
     at_end(&mut function);
     function.instruction(&Instruction::BrIf(1));
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::LocalSet(c));
     // is_ws = c==32 | c==9 | c==10 | c==13.
     function.instruction(&Instruction::LocalGet(c));
@@ -181,7 +208,7 @@ pub(super) fn emit_json_ws() -> Function {
 
 /// `__json_throw() -> i64`: stash a `SyntaxError` in `$exc_value`, set the
 /// pending flag + clear any routed completion, and return a dummy `undefined`.
-pub(super) fn emit_json_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_json_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     // The full `emit_main` scratch-local layout (starting at local 0, since this
     // helper has no params) so `emit_node` can build the error object exactly as
     // it would in `main`.
@@ -215,33 +242,34 @@ pub(super) fn emit_json_throw(strings: &HashMap<String, i32>, helpers: Helpers<'
 }
 
 /// `__json_string() -> i64`: parse a JSON string token (the cursor is at the
-/// opening `"`) into a fresh heap string, handling the simple escapes
-/// `\" \\ \/ \b \f \n \r \t`. A `\u` escape or an unterminated string throws.
+/// opening `"`) into a fresh heap string of code units, handling the simple
+/// escapes `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (any unit, a lone
+/// surrogate included; a pair is two escapes). The units are decoded into a
+/// two-byte block, narrowed to one-byte when every unit is `<= 0xFF`. A
+/// malformed escape or an unterminated string throws.
 pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![(7, ValType::I32)]);
-    let (cap, str_base, wp, c, e, out, len2) = (0, 1, 2, 3, 4, 5, 6);
+    let (cap, str_base, wp, c, e, out, d) = (0, 1, 2, 3, 4, 5, 6);
 
     // Consume the opening quote.
     advance(&mut function);
-    // cap = len - pos (an upper bound on the decoded length); over-allocate.
+    // cap = len - pos (an upper bound on the decoded length); over-allocate a
+    // two-byte block. `wp` (the write index) starts at 0.
     function.instruction(&Instruction::GlobalGet(JSON_LEN_GLOBAL));
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     function.instruction(&Instruction::I32Sub);
     function.instruction(&Instruction::LocalSet(cap));
-    // str_base = __alloc(HEADER_SIZE + 4 + cap); write TYPE_STRING byte.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::LocalGet(cap));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(str_base));
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::I32Const(TYPE_STRING));
-    function.instruction(&Instruction::I32Store8(byte_mem()));
-    // wp = str_base + HEADER_SIZE + 4 (the write cursor).
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(wp));
+    emit_alloc_str(
+        &mut function,
+        alloc_index,
+        |f| {
+            f.instruction(&Instruction::LocalGet(cap));
+        },
+        |f| {
+            f.instruction(&Instruction::I32Const(1));
+        },
+        str_base,
+    );
 
     function.instruction(&Instruction::Block(BlockType::Empty));
     function.instruction(&Instruction::Loop(BlockType::Empty));
@@ -250,8 +278,8 @@ pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
-    // c = cur_byte; pos++.
-    cur_byte(&mut function);
+    // c = cur_unit; pos++.
+    cur_unit(&mut function);
     function.instruction(&Instruction::LocalSet(c));
     advance(&mut function);
     // if c == '"' (34): closing quote consumed -> break.
@@ -259,62 +287,114 @@ pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::I32Const(34));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::BrIf(1));
-    // if c == '\\' (92): decode an escape.
+    // if c == '\\' (92): decode an escape into c.
     function.instruction(&Instruction::LocalGet(c));
     function.instruction(&Instruction::I32Const(92));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // e = cur_byte; pos++ (the escape char). Out-of-range -> throw.
+    // e = cur_unit; pos++ (the escape char). Out-of-range -> throw.
     at_end(&mut function);
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::LocalSet(e));
     advance(&mut function);
-    // out = mapped byte for e, or throw on an unsupported escape (incl. \u).
-    emit_escape_byte(&mut function, e, helpers);
-    function.instruction(&Instruction::LocalSet(out));
-    // store out at wp; wp++.
-    function.instruction(&Instruction::LocalGet(wp));
-    function.instruction(&Instruction::LocalGet(out));
-    function.instruction(&Instruction::I32Store8(byte_mem()));
-    function.instruction(&Instruction::LocalGet(wp));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(wp));
+    // `\u`: four hex digits; any other escape maps to its unit or throws.
+    function.instruction(&Instruction::LocalGet(e));
+    function.instruction(&Instruction::I32Const(i32::from(b'u')));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_hex4(&mut function, out, d, helpers);
     function.instruction(&Instruction::Else);
-    // Ordinary byte: store c at wp; wp++.
+    emit_escape_byte(&mut function, e, helpers);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalSet(c));
+    function.instruction(&Instruction::End);
+    // store16(str_base + DATA + 2*wp, c); wp++.
+    function.instruction(&Instruction::LocalGet(str_base));
     function.instruction(&Instruction::LocalGet(wp));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(c));
-    function.instruction(&Instruction::I32Store8(byte_mem()));
+    function.instruction(&Instruction::I32Store16(MemArg {
+        offset: u64::from(abi::STR_DATA_OFFSET),
+        align: 1,
+        memory_index: 0,
+    }));
     function.instruction(&Instruction::LocalGet(wp));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(wp));
-    function.instruction(&Instruction::End);
     function.instruction(&Instruction::Br(0));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 
-    // len2 = wp - (str_base + HEADER_SIZE + 4); write it as the u32 length header.
+    // Write the decoded unit count as the u32 length header, then narrow.
+    function.instruction(&Instruction::LocalGet(str_base));
     function.instruction(&Instruction::LocalGet(wp));
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::LocalSet(len2));
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::LocalGet(len2));
     function.instruction(&Instruction::I32Store(len_header()));
+    emit_str_narrow(&mut function, str_base, c, d);
     // Box and return.
     box_local(&mut function, str_base);
     function.instruction(&Instruction::End);
     function
 }
 
-/// Map a JSON escape char (in i32 local `e`) to its decoded byte, pushing it as an
-/// i32; throw on an unsupported escape (`\u` and anything else). Leaves one i32.
+/// Decode the four hex digits of a `\uXXXX` escape at the cursor (advancing
+/// past them), pushing the code unit; throw on a missing or non-hex digit.
+/// `out` and `d` are i32 scratch.
+fn emit_hex4(function: &mut Function, out: u32, d: u32, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(out));
+    for _ in 0..4 {
+        at_end(function);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        throw_return(function, helpers);
+        function.instruction(&Instruction::End);
+        cur_unit(function);
+        function.instruction(&Instruction::LocalSet(d));
+        advance(function);
+        // d = d - '0' when a decimal digit, else (d | 0x20) - 'a' + 10 when
+        // `a`-`f` / `A`-`F`, else throw.
+        function.instruction(&Instruction::LocalGet(d));
+        function.instruction(&Instruction::I32Const(i32::from(b'0')));
+        function.instruction(&Instruction::I32Sub);
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::I32LtU);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::LocalGet(d));
+        function.instruction(&Instruction::I32Const(i32::from(b'0')));
+        function.instruction(&Instruction::I32Sub);
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::LocalGet(d));
+        function.instruction(&Instruction::I32Const(0x20));
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::I32Const(i32::from(b'a')));
+        function.instruction(&Instruction::I32Sub);
+        function.instruction(&Instruction::LocalTee(d));
+        function.instruction(&Instruction::I32Const(6));
+        function.instruction(&Instruction::I32GeU);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        throw_return(function, helpers);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(d));
+        function.instruction(&Instruction::I32Const(10));
+        function.instruction(&Instruction::I32Add);
+        function.instruction(&Instruction::End);
+        // out = out << 4 | digit.
+        function.instruction(&Instruction::LocalGet(out));
+        function.instruction(&Instruction::I32Const(4));
+        function.instruction(&Instruction::I32Shl);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::LocalSet(out));
+    }
+    function.instruction(&Instruction::LocalGet(out));
+}
+
+/// Map a simple JSON escape char (in i32 local `e`) to its decoded unit, pushing
+/// it as an i32; throw on any other escape. Leaves one i32.
 fn emit_escape_byte(function: &mut Function, e: u32, helpers: Helpers<'_>) {
     // A chain of `e == <escape> ? <byte> : …`, throwing in the final else.
     let cases: [(i32, i32); 8] = [
@@ -335,8 +415,8 @@ fn emit_escape_byte(function: &mut Function, e: u32, helpers: Helpers<'_>) {
         function.instruction(&Instruction::I32Const(byte));
         function.instruction(&Instruction::Else);
     }
-    // Unsupported escape (including `\u`): throw. After the return this branch is
-    // unreachable, so it satisfies the `i32` result type polymorphically.
+    // Any other escape: throw. After the return this branch is unreachable, so
+    // it satisfies the `i32` result type polymorphically.
     throw_return(function, helpers);
     for _ in cases {
         function.instruction(&Instruction::End);
@@ -361,7 +441,7 @@ pub(super) fn emit_json_number(
     function.instruction(&Instruction::Loop(BlockType::Empty));
     at_end(&mut function);
     function.instruction(&Instruction::BrIf(1));
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::LocalSet(c));
     // in_set = (c>=48 & c<=57) | c==45 | c==43 | c==46 | c==101 | c==69.
     function.instruction(&Instruction::LocalGet(c));
@@ -392,12 +472,13 @@ pub(super) fn emit_json_number(
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
 
-    // len2 = pos - start; str_base = __alloc(HEADER_SIZE+4+len2); copy the token.
+    // len2 = pos - start; str_base = __alloc(STR_DATA_OFFSET+len2); copy the
+    // (ASCII) token units as bytes.
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     function.instruction(&Instruction::LocalGet(start));
     function.instruction(&Instruction::I32Sub);
     function.instruction(&Instruction::LocalSet(len2));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::LocalGet(len2));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(alloc_index));
@@ -408,18 +489,35 @@ pub(super) fn emit_json_number(
     function.instruction(&Instruction::LocalGet(str_base));
     function.instruction(&Instruction::LocalGet(len2));
     function.instruction(&Instruction::I32Store(len_header()));
-    // memory.copy(dst = str_base+HEADER_SIZE+4, src = DATA+start, size = len2).
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
-    function.instruction(&Instruction::LocalGet(start));
-    function.instruction(&Instruction::I32Add);
+    // for c in 0..len2: store8(str_base + STR_DATA_OFFSET + c, unit(start + c)).
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::LocalSet(c));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(c));
     function.instruction(&Instruction::LocalGet(len2));
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(str_base));
+    function.instruction(&Instruction::LocalGet(c));
+    function.instruction(&Instruction::I32Add);
+    unit_at(&mut function, |f| {
+        f.instruction(&Instruction::LocalGet(start));
+        f.instruction(&Instruction::LocalGet(c));
+        f.instruction(&Instruction::I32Add);
     });
+    function.instruction(&Instruction::I32Store8(MemArg {
+        offset: u64::from(abi::STR_DATA_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalGet(c));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(c));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
     // ToNumber(boxed str).
     box_local(&mut function, str_base);
     function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
@@ -439,7 +537,7 @@ pub(super) fn emit_json_value(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::LocalSet(c));
 
     // '{' -> object.
@@ -515,7 +613,7 @@ pub(super) fn emit_json_array(helpers: Helpers<'_>) -> Function {
     at_end(&mut function);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::I32Const(93));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -542,8 +640,8 @@ pub(super) fn emit_json_array(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
-    // c = cur_byte; pos++.
-    cur_byte(&mut function);
+    // c = cur_unit; pos++.
+    cur_unit(&mut function);
     function.instruction(&Instruction::LocalSet(c));
     advance(&mut function);
     // if c == ']' (93): break.
@@ -593,7 +691,7 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     at_end(&mut function);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::I32Const(125));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::Else);
@@ -612,7 +710,7 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
     // Key must be a string: if cur != '"' -> throw.
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::I32Const(34));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -628,7 +726,7 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
-    cur_byte(&mut function);
+    cur_unit(&mut function);
     function.instruction(&Instruction::I32Const(58));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -653,8 +751,8 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
-    // c = cur_byte; pos++.
-    cur_byte(&mut function);
+    // c = cur_unit; pos++.
+    cur_unit(&mut function);
     function.instruction(&Instruction::LocalSet(c));
     advance(&mut function);
     // if c == '}' (125): break.
@@ -689,14 +787,16 @@ pub(super) fn emit_json_parse(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32), (1, ValType::I64)]);
     let (s, base, result) = (0, 1, 2);
 
-    // base = wrap(s); DATA = base + HEADER_SIZE + 4; LEN = load_u32(base+HEADER);
-    // POS = 0.
+    // base = wrap(s); DATA = (base + STR_DATA_OFFSET) | two_byte;
+    // LEN = load_u32(base+STR_LEN_OFFSET); POS = 0.
     function.instruction(&Instruction::LocalGet(s));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
     function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::I32Add);
+    emit_str_two_byte(&mut function, base);
+    function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::GlobalSet(JSON_DATA_GLOBAL));
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(len_header()));
@@ -730,7 +830,7 @@ pub(super) fn emit_json_parse_node(
     arg: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);

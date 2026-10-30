@@ -399,7 +399,7 @@ pub(super) enum Builtin {
     ArrayCopyWithin,
     /// `Array.prototype.with` / `toReversed` / `toSorted` / `toSpliced`.
     ArrayCopy(ArrayCopyOp),
-    /// A `String.prototype` method backed by a host `__method` op.
+    /// A generic `String.prototype` method ([`StringOp`]).
     StringMethod(StringOp),
     /// `String.prototype.toString`.
     StringToString,
@@ -780,8 +780,9 @@ pub(super) enum AsyncGenReaction {
     ReturnRejected,
 }
 
-/// A generic `String.prototype` method: most are backed by a host `__method`
-/// op ([`StringOp::flag`]).
+/// A generic `String.prototype` method: the case mappings, `localeCompare`
+/// and `normalize` are backed by a host `__method` op ([`StringOp::flag`]);
+/// the rest run in the guest on code units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StringOp {
     IndexOf,
@@ -814,6 +815,8 @@ pub(super) enum StringOp {
     MatchAll,
     Replace,
     ReplaceAll,
+    IsWellFormed,
+    ToWellFormed,
 }
 
 impl StringOp {
@@ -850,6 +853,8 @@ impl StringOp {
             Self::MatchAll => "matchAll",
             Self::Replace => "replace",
             Self::ReplaceAll => "replaceAll",
+            Self::IsWellFormed => "isWellFormed",
+            Self::ToWellFormed => "toWellFormed",
         }
     }
 
@@ -863,48 +868,29 @@ impl StringOp {
             | Self::Trim
             | Self::TrimStart
             | Self::TrimEnd
-            | Self::Normalize => 0,
+            | Self::Normalize
+            | Self::IsWellFormed
+            | Self::ToWellFormed => 0,
             Self::Slice | Self::Substring | Self::Split | Self::Replace | Self::ReplaceAll => 2,
             _ => 1,
         }
     }
 
-    /// The host `__method` op flag (`concat` and `matchAll` have none).
+    /// The host `__method` op flag of a host-backed method.
     pub(super) fn flag(self) -> Option<i32> {
         Some(match self {
-            Self::IndexOf => abi::METHOD_OP_INDEX_OF,
-            Self::Includes => abi::METHOD_OP_INCLUDES,
-            Self::Slice => abi::METHOD_OP_SLICE,
             Self::ToUpperCase | Self::ToLocaleUpperCase => abi::METHOD_OP_TO_UPPER,
             Self::ToLowerCase | Self::ToLocaleLowerCase => abi::METHOD_OP_TO_LOWER,
-            Self::CharAt => abi::METHOD_OP_CHAR_AT,
-            Self::Trim => abi::METHOD_OP_TRIM,
-            Self::TrimStart => abi::METHOD_OP_TRIM_START,
-            Self::TrimEnd => abi::METHOD_OP_TRIM_END,
-            Self::Repeat => abi::METHOD_OP_REPEAT,
-            Self::StartsWith => abi::METHOD_OP_STARTS_WITH,
-            Self::EndsWith => abi::METHOD_OP_ENDS_WITH,
-            Self::PadStart => abi::METHOD_OP_PAD_START,
-            Self::PadEnd => abi::METHOD_OP_PAD_END,
-            Self::Substring => abi::METHOD_OP_SUBSTRING,
-            Self::Split => abi::METHOD_OP_SPLIT,
-            Self::At => abi::METHOD_OP_AT,
-            Self::CharCodeAt => abi::METHOD_OP_CHAR_CODE_AT,
-            Self::CodePointAt => abi::METHOD_OP_CODE_POINT_AT,
-            Self::LastIndexOf => abi::METHOD_OP_LAST_INDEX_OF,
             Self::LocaleCompare => abi::METHOD_OP_LOCALE_COMPARE,
             Self::Normalize => abi::METHOD_OP_NORMALIZE,
-            Self::Search | Self::Match => abi::METHOD_OP_SEARCH,
-            Self::Replace => abi::METHOD_OP_REPLACE,
-            Self::ReplaceAll => abi::METHOD_OP_REPLACE_ALL,
-            Self::Concat | Self::MatchAll => return None,
+            _ => return None,
         })
     }
 }
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 239] = [
+    pub(super) const ALL: [Builtin; 241] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1074,6 +1060,8 @@ impl Builtin {
         Self::StringMethod(StringOp::MatchAll),
         Self::StringMethod(StringOp::Replace),
         Self::StringMethod(StringOp::ReplaceAll),
+        Self::StringMethod(StringOp::IsWellFormed),
+        Self::StringMethod(StringOp::ToWellFormed),
         Self::StringToString,
         Self::StringValueOf,
         Self::StringFromCharCode,
@@ -2026,7 +2014,7 @@ pub(super) fn method_bits(builtin: Builtin, helpers: Helpers<'_>) -> i64 {
 
 /// Build the image bytes for `base`: `first_slot` is the funcref-table slot
 /// of [`Builtin::ALL`]'s first entry, `strings` the static-string offsets.
-pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) -> Vec<u8> {
+pub(super) fn image(base: i32, first_slot: u32, strings: &StrOffsets) -> Vec<u8> {
     let registry = registry();
     let at = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE).cast_unsigned();
     let heap = |addr: u32| abi::HEAP | u64::from(addr);
@@ -2135,10 +2123,10 @@ mod tests {
 
     /// Static-string offsets for every realm string, as `collect_strings`
     /// would assign them.
-    fn offsets() -> HashMap<String, i32> {
+    fn offsets() -> StrOffsets {
         (0..)
             .zip(strings())
-            .map(|(i, s)| (s.to_owned(), HEAP_BASE + 16 * i))
+            .map(|(i, s)| (JsStr::from(s), HEAP_BASE + 16 * i))
             .collect()
     }
 

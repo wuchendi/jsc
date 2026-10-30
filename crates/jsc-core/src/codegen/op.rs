@@ -141,7 +141,7 @@ pub(super) fn convert_arity(op: ConvertOp) -> usize {
 /// (not the conversion of `undefined`).
 pub(super) fn convert_call(op: ConvertOp, empty: bool, args: Vec<IrNode>) -> IrNode {
     match op {
-        ConvertOp::String if empty => return IrNode::Str(String::new()),
+        ConvertOp::String if empty => return IrNode::Str("".into()),
         ConvertOp::ToNumber if empty => return IrNode::Num(0.0),
         _ => {}
     }

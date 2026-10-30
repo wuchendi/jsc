@@ -97,7 +97,7 @@ pub(crate) const HEADER_SIZE: u32 = 4;
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
 /// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
-/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`] / [`STR_FLAG_TWO_BYTE`], an object-family block's
 /// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
 /// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`], a symbol's
 /// [`SYMBOL_FLAG_REGISTERED`].
@@ -617,6 +617,22 @@ pub(crate) const STR_FLAG_INTERNED: u8 = 1;
 /// intern time.
 pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
+/// String header `flags` bit: the data is UTF-16LE code units (`2 * len`
+/// bytes); absent, it is Latin-1 bytes (`len` bytes). Canonical: set iff some
+/// unit is above `0xFF`. It shares bit `4` with [`SYMBOL_FLAG_REGISTERED`],
+/// which cannot collide: string paths read it only on a [`TYPE_STRING`]
+/// block, and a symbol key never reaches them (unlike `1` / `2`, which key
+/// paths test on any key block).
+pub(crate) const STR_FLAG_TWO_BYTE: u8 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's `len: u32`, the length in UTF-16
+/// code units (the JS `.length`). String block = header | `len: u32` @4 |
+/// data @8 (Latin-1 bytes, or UTF-16LE units with [`STR_FLAG_TWO_BYTE`]).
+pub(crate) const STR_LEN_OFFSET: u32 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's data (see [`STR_LEN_OFFSET`]).
+pub(crate) const STR_DATA_OFFSET: u32 = 8;
+
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
 /// value `undefined`). A method call `obj.m(args)` sets it to the receiver
 /// immediately before the `call_indirect`; every function/arrow prologue
@@ -723,9 +739,13 @@ pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
 /// stores [`HEAP_PTR_OOM`] and traps.
 pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
 
-/// The name under which the module exports the `__new_string(len: i32) -> base:
-/// i32` constructor: a [`TYPE_STRING`] block with `len` set and a `len`-byte
-/// payload for the caller to fill. The hosts allocate every string through it.
+/// The name under which the module exports the `__new_string(len: i32,
+/// two_byte: i32) -> base: i32` constructor: a [`TYPE_STRING`] block of `len`
+/// code units — `len` Latin-1 bytes, or with `two_byte` (`0`/`1`)
+/// [`STR_FLAG_TWO_BYTE`] set and `2 * len` bytes of UTF-16LE units — with
+/// `len` set and the data at [`STR_DATA_OFFSET`] for the caller to fill. The
+/// hosts allocate every string through it, in canonical form (one-byte iff
+/// every unit is `<= 0xFF`).
 pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
 
 /// The name under which the module exports the `__new_array(len: i32) -> base:
@@ -795,14 +815,11 @@ pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
 /// `__convert` op flag: parse a leading float (`parseFloat(x)`).
 pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;
 
-/// `__method` op flag: `indexOf` (overloaded on array/string).
+/// `__method` op flag: array `indexOf`.
 pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
-/// `__method` op flag: `includes`.
+/// `__method` op flag: array `includes`.
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `slice` (overloaded on array/string).
-pub(crate) const METHOD_OP_SLICE: i32 = 3;
 
 /// `__method` op flag: `toUpperCase`.
 pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
@@ -810,55 +827,9 @@ pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
 /// `__method` op flag: `toLowerCase`.
 pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
 
-/// `__method` op flag: `charAt`.
-pub(crate) const METHOD_OP_CHAR_AT: i32 = 6;
-
-/// `__method` op flag: `trim` (string).
-pub(crate) const METHOD_OP_TRIM: i32 = 7;
-
-/// `__method` op flag: `trimStart` (string).
-pub(crate) const METHOD_OP_TRIM_START: i32 = 8;
-
-/// `__method` op flag: `trimEnd` (string).
-pub(crate) const METHOD_OP_TRIM_END: i32 = 9;
-
-/// `__method` op flag: `repeat` (string).
-pub(crate) const METHOD_OP_REPEAT: i32 = 10;
-
-/// `__method` op flag: `startsWith` (string).
-pub(crate) const METHOD_OP_STARTS_WITH: i32 = 11;
-
-/// `__method` op flag: `endsWith` (string).
-pub(crate) const METHOD_OP_ENDS_WITH: i32 = 12;
-
-/// `__method` op flag: `padStart` (string).
-pub(crate) const METHOD_OP_PAD_START: i32 = 13;
-
-/// `__method` op flag: `padEnd` (string).
-pub(crate) const METHOD_OP_PAD_END: i32 = 14;
-
-/// `__method` op flag: `substring` (string).
-pub(crate) const METHOD_OP_SUBSTRING: i32 = 15;
-
-/// `__method` op flag: `split` (string, yields an array).
-pub(crate) const METHOD_OP_SPLIT: i32 = 16;
-
 /// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
 /// `arg0` an integral radix in `2..=36`).
 pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
-
-/// `__method` op flag: `String.prototype.at` (string, a number or
-/// `undefined` index).
-pub(crate) const METHOD_OP_AT: i32 = 18;
-
-/// `__method` op flag: `String.prototype.charCodeAt` (string).
-pub(crate) const METHOD_OP_CHAR_CODE_AT: i32 = 19;
-
-/// `__method` op flag: `String.prototype.codePointAt` (string).
-pub(crate) const METHOD_OP_CODE_POINT_AT: i32 = 20;
-
-/// `__method` op flag: `String.prototype.lastIndexOf` (string).
-pub(crate) const METHOD_OP_LAST_INDEX_OF: i32 = 21;
 
 /// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
 /// order).
@@ -868,37 +839,15 @@ pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
 /// `undefined`).
 pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
 
-/// `__method` op flag: the index of a string pattern without `RegExp` syntax
-/// (`String.prototype.search` / `match`; `undefined` is the empty pattern).
-pub(crate) const METHOD_OP_SEARCH: i32 = 24;
-
-/// `__method` op flag: `String.prototype.replace` with a string pattern and a
-/// replacement template (`GetSubstitution`).
-pub(crate) const METHOD_OP_REPLACE: i32 = 25;
-
-/// `__method` op flag: `String.prototype.replaceAll` with a string pattern and
-/// a replacement template.
-pub(crate) const METHOD_OP_REPLACE_ALL: i32 = 26;
-
-/// `__method` op flag: `String.fromCharCode` (an array receiver of numbers).
-pub(crate) const METHOD_OP_FROM_CHAR_CODE: i32 = 27;
-
-/// `__method` op flag: `String.fromCodePoint` (an array receiver of
-/// validated code points).
-pub(crate) const METHOD_OP_FROM_CODE_POINT: i32 = 28;
-
 /// `__method` result: the string op cannot produce a correct result for its
-/// input yet (a byte position over a non-ASCII string, a lone surrogate); the
-/// calling builtin throws a `TypeError`. [`HOLE`], which no JS value produces.
+/// input yet (`normalize` over non-ASCII text); the calling builtin throws a
+/// `TypeError`. [`HOLE`], which no JS value produces.
 pub(crate) const METHOD_UNSUPPORTED: u64 = HOLE;
 
 /// `__method` result: the argument is out of range (an unknown `normalize`
 /// form); the calling builtin throws a `RangeError`.
 pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
 
-/// `__method` result: the pattern has `RegExp` syntax, which needs the absent
-/// `RegExp`; the calling builtin throws a `TypeError`.
-pub(crate) const METHOD_NEEDS_REGEXP: u64 = UNDEFINED | 3;
 /// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
 /// receiver, `arg0` an integral `f` in `0..=100`).
 pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;

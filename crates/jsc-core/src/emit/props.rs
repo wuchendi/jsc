@@ -68,6 +68,7 @@ const P_WATCH_BIT: u64 = abi::PROPS_WATCH_BIT_OFFSET as u64;
 /// String `flags` bits.
 const STR_INTERNED: i32 = abi::STR_FLAG_INTERNED as i32;
 const STR_ARRAY_INDEX: i32 = abi::STR_FLAG_ARRAY_INDEX as i32;
+const STR_TWO_BYTE: i32 = abi::STR_FLAG_TWO_BYTE as i32;
 /// Object-family `flags` bit: not extensible.
 const NOT_EXTENSIBLE: i32 = abi::OBJ_FLAG_NOT_EXTENSIBLE as i32;
 /// Function `flags` bits (see [`abi::FUNC_FLAG_LAZY`] ..).
@@ -80,9 +81,6 @@ const FUNC_ASYNC: i32 = abi::FUNC_FLAG_ASYNC as i32;
 /// [`LAZY_FN_MASK`]: kind byte `TYPE_FUNCTION`, `flags` bit `LAZY`.
 const LAZY_FN_WORD: i32 = TYPE_FUNCTION | FUNC_LAZY << 16;
 const LAZY_FN_MASK: i32 = 0xFF | FUNC_LAZY << 16;
-/// Byte offset of a string's u32 length, and of its payload.
-const LEN: u64 = HEADER_SIZE as u64;
-const PAYLOAD_I32: i32 = HEADER_SIZE + 4;
 
 /// The 32-bit FNV-1a offset basis and prime the intern table hashes with.
 const FNV_OFFSET: u32 = 0x811C_9DC5;
@@ -118,6 +116,14 @@ fn m8(offset: u64) -> MemArg {
     }
 }
 
+fn m16(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 1,
+        memory_index: 0,
+    }
+}
+
 fn m32(offset: u64) -> MemArg {
     MemArg {
         offset,
@@ -134,25 +140,31 @@ fn m64(offset: u64) -> MemArg {
     }
 }
 
-/// The 32-bit FNV-1a hash of `bytes` (the compile-time twin of `__str_hash`).
-fn fnv1a(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(FNV_OFFSET, |h, &b| {
-        (h ^ u32::from(b)).wrapping_mul(FNV_PRIME)
+/// The 32-bit FNV-1a hash of a string's code units, one round per unit
+/// (the compile-time twin of `__str_hash`). For ASCII it equals the byte hash.
+pub(super) fn fnv1a(units: impl IntoIterator<Item = u16>) -> u32 {
+    units.into_iter().fold(FNV_OFFSET, |h, unit| {
+        (h ^ u32::from(unit)).wrapping_mul(FNV_PRIME)
     })
 }
 
-/// Whether `text` is a canonical array index: `"0"`, or a nonzero digit
-/// followed by digits, with value `< 2^32 - 1` (the compile-time twin of
-/// `__index_value`).
-pub(super) fn is_array_index(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    if bytes.is_empty() || bytes.len() > 10 || !bytes.iter().all(u8::is_ascii_digit) {
-        return false;
+/// Whether the code units `units` spell a canonical array index: `"0"`, or a
+/// nonzero digit followed by digits, with value `< 2^32 - 1` (the
+/// compile-time twin of `__index_value`).
+pub(super) fn is_array_index(units: &[u16]) -> bool {
+    let mut value = 0u64;
+    let mut len = 0;
+    for &unit in units {
+        let Some(digit) = char::from_u32(u32::from(unit)).and_then(|c| c.to_digit(10)) else {
+            return false;
+        };
+        if (len == 1 && value == 0) || len == 10 {
+            return false;
+        }
+        value = value * 10 + u64::from(digit);
+        len += 1;
     }
-    if bytes[0] == b'0' {
-        return bytes.len() == 1;
-    }
-    text.parse::<u64>().is_ok_and(|v| v < u64::from(u32::MAX))
+    len > 0 && value < u64::from(u32::MAX)
 }
 
 /// The compile-time intern table: a power-of-two array of u32 slots at
@@ -171,13 +183,13 @@ pub(super) struct InternTable {
 
 /// Build the initial intern table holding every static string in `offsets`,
 /// placed at the 8-aligned `base`.
-pub(super) fn intern_table(offsets: &HashMap<String, i32>, base: i32) -> InternTable {
+pub(super) fn intern_table(offsets: &StrOffsets, base: i32) -> InternTable {
     let cap = (offsets.len() * 2).max(8).next_power_of_two();
     let mut slots = vec![0u32; cap];
-    let mut entries: Vec<(&String, i32)> = offsets.iter().map(|(s, o)| (s, *o)).collect();
+    let mut entries: Vec<(&JsStr, i32)> = offsets.iter().collect();
     entries.sort_by_key(|(_, offset)| *offset);
     for (text, offset) in entries {
-        let mut i = fnv1a(text.as_bytes()) as usize & (cap - 1);
+        let mut i = fnv1a(text.as_units().iter().copied()) as usize & (cap - 1);
         while slots[i] != 0 {
             i = (i + 1) & (cap - 1);
         }
@@ -193,8 +205,13 @@ pub(super) fn intern_table(offsets: &HashMap<String, i32>, base: i32) -> InternT
 
 /// The interned key constant a literal-key site passes: the static string's
 /// data-segment offset (every static string is interned at compile time).
-pub(super) fn static_key(strings: &HashMap<String, i32>, key: &str) -> i32 {
+pub(super) fn static_key(strings: &StrOffsets, key: &str) -> i32 {
     strings.get(key).copied().unwrap_or(HEAP_BASE)
+}
+
+/// [`static_key`] of a literal ([`IrNode::Str`] / [`PropKey`]) key.
+pub(super) fn static_str_key(strings: &StrOffsets, key: &JsStr) -> i32 {
+    strings.get_str(key).copied().unwrap_or(HEAP_BASE)
 }
 
 /// Push the interned `u32` key of the property key `index` whose jsval is
@@ -205,11 +222,11 @@ pub(super) fn emit_prop_key(
     index: &IrNode,
     local: u32,
     insert: bool,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if let IrNode::Str(key) = index {
-        wasm!(function; I32Const(static_key(strings, key)));
+        wasm!(function; I32Const(static_str_key(strings, key)));
     } else {
         wasm!(function; LocalGet(local), I32Const(i32::from(insert)), Call(helpers.to_key));
     }
@@ -222,11 +239,11 @@ pub(super) fn emit_key_lookup(
     key: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if let IrNode::Str(name) = key {
-        wasm!(function; I32Const(static_key(strings, name)));
+        wasm!(function; I32Const(static_str_key(strings, name)));
     } else {
         emit_node(key, function, scratch, strings, helpers);
         wasm!(function; I32Const(0), Call(helpers.to_key));
@@ -336,7 +353,7 @@ fn emit_exotic_len(function: &mut Function, o: u32) {
     wasm!(function;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Result(ValType::I32)),
-        LocalGet(o), I32Load(m32(LEN)),
+        LocalGet(o), I32Load(m32(STR_LEN_OFFSET)),
         Else,
         LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)),
         End,
@@ -412,14 +429,30 @@ fn emit_mark_dirty(function: &mut Function, table: u32) {
     );
 }
 
-/// `__str_hash(s: i32) -> i32`: the 32-bit FNV-1a hash of the string's bytes.
+/// `__str_hash(s: i32) -> i32`: the 32-bit FNV-1a hash of the string's code
+/// units, one round per unit: a byte per round for a one-byte string, a
+/// UTF-16 unit per round for a `TWO_BYTE` one ([`fnv1a`]).
 pub(super) fn emit_str_hash() -> Function {
     let mut f = Function::new(vec![(3, ValType::I32)]);
     let (s, h, p, end) = (0, 1, 2, 3);
+    wasm!(f; I32Const(FNV_OFFSET.cast_signed()), LocalSet(h), LocalGet(s));
+    emit_str_data(&mut f);
+    wasm!(f; LocalSet(p), LocalGet(s));
+    emit_load_str_len(&mut f);
     wasm!(f;
-        I32Const(FNV_OFFSET.cast_signed()), LocalSet(h),
-        LocalGet(s), I32Const(PAYLOAD_I32), I32Add, LocalTee(p),
-        LocalGet(s), I32Load(m32(LEN)), I32Add, LocalSet(end),
+        LocalSet(end),
+        LocalGet(s), I32Load8U(m8(FLAGS)), I32Const(STR_TWO_BYTE), I32And,
+        If(BlockType::Empty),
+        LocalGet(p), LocalGet(end), I32Const(1), I32Shl, I32Add, LocalSet(end),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(p), LocalGet(end), I32GeU, BrIf(1),
+        LocalGet(h), LocalGet(p), I32Load16U(m16(0)), I32Xor,
+        I32Const(FNV_PRIME.cast_signed()), I32Mul, LocalSet(h),
+        LocalGet(p), I32Const(2), I32Add, LocalSet(p),
+        Br(0),
+        End, End,
+        Else,
+        LocalGet(p), LocalGet(end), I32Add, LocalSet(end),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(p), LocalGet(end), I32GeU, BrIf(1),
         LocalGet(h), LocalGet(p), I32Load8U(m8(0)), I32Xor,
@@ -427,6 +460,7 @@ pub(super) fn emit_str_hash() -> Function {
         LocalGet(p), I32Const(1), I32Add, LocalSet(p),
         Br(0),
         End, End,
+        End,
         LocalGet(h),
         End,
     );
@@ -511,15 +545,18 @@ pub(super) fn emit_intern(helpers: Helpers<'_>) -> Function {
 
 /// `__index_value(s: i32) -> i32`: the value of the string `s` when it is a
 /// canonical array index (`"0"`, or a nonzero digit then digits, `< 2^32 - 1`),
-/// else `-1` (`2^32 - 1`, never an index).
+/// else `-1` (`2^32 - 1`, never an index). A canonical index is ASCII, so a
+/// `TWO_BYTE` string is never one.
 pub(super) fn emit_index_value() -> Function {
     let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::I64)]);
     let (s, len, p, c, v) = (0, 1, 2, 3, 4);
     wasm!(f;
-        LocalGet(s), I32Load(m32(LEN)), LocalTee(len),
+        LocalGet(s), I32Load8U(m8(FLAGS)), I32Const(STR_TWO_BYTE), I32And,
+        If(BlockType::Empty), I32Const(-1), Return, End,
+        LocalGet(s), I32Load(m32(STR_LEN_OFFSET)), LocalTee(len),
         I32Eqz, LocalGet(len), I32Const(10), I32GtU, I32Or,
         If(BlockType::Empty), I32Const(-1), Return, End,
-        LocalGet(s), I32Const(PAYLOAD_I32), I32Add, LocalTee(p),
+        LocalGet(s), I32Const(STR_DATA_OFFSET), I32Add, LocalTee(p),
         I32Load8U(m8(0)), I32Const(i32::from(b'0')), I32Eq,
         If(BlockType::Empty),
         I32Const(0), I32Const(-1), LocalGet(len), I32Const(1), I32Eq, Select, Return,
@@ -554,8 +591,8 @@ pub(super) fn emit_index_string(helpers: Helpers<'_>) -> Function {
         LocalGet(len), I32Const(1), I32Add, LocalSet(len),
         Br(0),
         End, End,
-        LocalGet(len), Call(helpers.new_string), LocalTee(t),
-        LocalGet(len), I32Add, I32Const(PAYLOAD_I32), I32Add, LocalSet(p),
+        LocalGet(len), I32Const(0), Call(helpers.new_string), LocalTee(t),
+        LocalGet(len), I32Add, I32Const(STR_DATA_OFFSET), I32Add, LocalSet(p),
         Loop(BlockType::Empty),
         LocalGet(p), I32Const(1), I32Sub, LocalTee(p),
         LocalGet(n), I32Const(10), I32RemU, I32Const(i32::from(b'0')), I32Add,
@@ -564,6 +601,72 @@ pub(super) fn emit_index_string(helpers: Helpers<'_>) -> Function {
         BrIf(0),
         End,
         LocalGet(t),
+        End,
+    );
+    f
+}
+
+/// Push `1` when the object-family block in i32 local `o` is a `String`
+/// wrapper (`TYPE_OBJECT` of class `STRING`), else `0`.
+fn emit_is_string_wrapper(function: &mut Function, o: u32) {
+    wasm!(function;
+        LocalGet(o), I32Load(m32(0)), I32Const(0xff00_00ff_u32.cast_signed()), I32And,
+        I32Const(TYPE_OBJECT | (i32::from(abi::CLASS_STRING) << 24)), I32Eq,
+    );
+}
+
+/// Run `body` when the block in i32 local `o` is a `String` wrapper owning
+/// the virtual index the key in i32 local `key` names (`__str_exotic_index`),
+/// with that index in i32 local `i`.
+pub(super) fn emit_if_str_exotic(
+    function: &mut Function,
+    o: u32,
+    key: u32,
+    i: u32,
+    helpers: Helpers<'_>,
+    body: impl FnOnce(&mut Function),
+) {
+    emit_is_string_wrapper(function, o);
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(key), Call(helpers.str_exotic_index()), LocalTee(i), I32Const(-1), I32Ne,
+        If(BlockType::Empty),
+    );
+    body(function);
+    wasm!(function; End, End);
+}
+
+/// Push the boxed one-unit string at code-unit index `i` (i32 local) of the
+/// `String` wrapper in i32 local `o`.
+pub(super) fn emit_str_exotic_value(function: &mut Function, o: u32, i: u32, helpers: Helpers<'_>) {
+    wasm!(function;
+        LocalGet(o), I64Load(m64(u64::from(abi::WRAPPER_VALUE_OFFSET))), I32WrapI64,
+        LocalGet(i), Call(helpers.str_index),
+    );
+    emit_box_heap(function);
+}
+
+/// `__str_exotic_index(o: i32, key: i32) -> i32`: the String exotic own index
+/// `key` names on the object-family block `o` — its value when `o` is a
+/// `String` wrapper and `key` is a canonical array index below the length of
+/// its `[[PrimitiveValue]]`, else `-1`. Such an index is a virtual own data
+/// property `{value: s[i], writable: false, enumerable: true, configurable:
+/// false}` (ECMA-262 10.4.3); the property and descriptor helpers consult it
+/// before the table. `key` need not be interned.
+pub(super) fn emit_str_exotic_index(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, key, i) = (0, 1, 2);
+    wasm!(f; LocalGet(key), I32Eqz);
+    emit_is_string_wrapper(&mut f, o);
+    wasm!(f;
+        I32Eqz, I32Or,
+        If(BlockType::Empty), I32Const(-1), Return, End,
+        LocalGet(key), Call(helpers.index_value), LocalTee(i),
+        I32Const(-1),
+        LocalGet(i),
+        LocalGet(o), I64Load(m64(u64::from(abi::WRAPPER_VALUE_OFFSET))), I32WrapI64,
+        I32Load(m32(STR_LEN_OFFSET)), I32LtU,
+        Select,
         End,
     );
     f
@@ -579,7 +682,7 @@ pub(super) fn emit_index_string(helpers: Helpers<'_>) -> Function {
 /// resulting string is then interned (`insert`) or looked up (`0` on a miss).
 /// A lookup still interns a canonical array index, so an array or string
 /// element is found by an index key that no property ever used.
-pub(super) fn emit_to_key(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_to_key(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(2, ValType::I32), (1, ValType::F64)]);
     let (v, insert, s, r, d) = (0, 1, 2, 3, 4);
     emit_is_string(&mut f, v);
@@ -788,10 +891,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
 /// with no `constructor`.
 /// No own `caller` / `arguments`: every function is strict, so they resolve to
 /// the `%Function.prototype%` `%ThrowTypeError%` accessors.
-pub(super) fn emit_fn_materialize(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(super) fn emit_fn_materialize(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(2, ValType::I32)]);
     let (o, i, p) = (0, 1, 2);
     // Finish a `__define(target, key, value, attrs)` whose first three
@@ -885,7 +985,7 @@ fn emit_exotic_get(
     i: u32,
     a: u32,
     p: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
@@ -935,12 +1035,13 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 /// any jsval. Each object on the way — `recv`, then each `proto` — answers
 /// first from its exotic own keys when it is a string or an array (`length`,
 /// a present index; a hole or an index past the length is not own, so it
-/// reads through the chain), then from its own table, calling an accessor's
+/// reads through the chain) or a `String` wrapper (its indices), then from
+/// its own table, calling an accessor's
 /// getter with `this = recv` (`undefined` when it has none). A string, symbol,
 /// number or boolean continues at its realm prototype without allocating a
 /// wrapper;
 /// `null`/`undefined` and a key of `0` (never interned) read `undefined`.
-pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
     let (recv, key, o, e, t, i, p) = (0, 1, 2, 3, 4, 5, 6);
     let base = t;
@@ -981,6 +1082,12 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Empty), proto_base(BuiltinCtor::String), LocalSet(o), End,
         End,
+    );
+    emit_if_str_exotic(&mut f, o, key, i, helpers, |f| {
+        emit_str_exotic_value(f, o, i, helpers);
+        wasm!(f; Return);
+    });
+    wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e),
         If(BlockType::Empty),
     );
@@ -1074,7 +1181,8 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>) -> Function {
 /// `__set(recv: i64, key: i32, v: i64)`: `OrdinarySet` (strict) of the interned
 /// `key` on the object-family block `recv`. The first own-or-inherited hit
 /// decides: an accessor calls its setter with `this = recv` (a getter-only one
-/// throws), a non-writable data property throws, an own writable one is
+/// throws), a non-writable data property (a `String` wrapper's index
+/// included) throws, an own writable one is
 /// overwritten; otherwise an own `0b0111` data property is added (a
 /// non-extensible object throws). An own overwrite on a watched table sets its
 /// dirty bit when the program tracks them (an add does so in `__define`). A
@@ -1087,6 +1195,12 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
         LocalGet(recv), I32WrapI64, LocalTee(o), LocalSet(q),
         I32Const(1), LocalSet(own),
         Block(BlockType::Empty), Loop(BlockType::Empty),
+    );
+    // A String wrapper's index is a read-only data property.
+    emit_if_str_exotic(&mut f, q, key, a, helpers, |f| {
+        emit_prop_throw_return(f, recv, key, PROP_THROW_READ_ONLY, helpers);
+    });
+    wasm!(f;
         LocalGet(q), LocalGet(key), Call(helpers.prop_find), LocalTee(e), BrIf(1),
         LocalGet(q), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(s),
     );
@@ -1150,21 +1264,22 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
 /// (`0` = a key never interned, absent everywhere): each object on the way —
 /// `obj`, then each `proto` — has it when it is a string or an array owning
 /// it exotically (`length`, an in-range index whose store slot is not a
-/// hole), or when its own table has it (an array's named keys, and a `SPARSE`
-/// array's elements past its store). A primitive `obj` throws the `in`
+/// hole) or a `String` wrapper owning it (an index), or when its own table
+/// has it (an array's named keys, and a `SPARSE` array's elements past its
+/// store). A primitive `obj` throws the `in`
 /// `TypeError` (left pending, result `0`).
-pub(super) fn emit_has(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_has(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     emit_has_lookup(strings, helpers, false)
 }
 
 /// `__has_own(key: i32, obj: i64) -> i32`: [`emit_has`] without the `proto`
 /// walk (`HasOwnProperty`, backing `Object.prototype.hasOwnProperty`).
-pub(super) fn emit_has_own(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_has_own(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     emit_has_lookup(strings, helpers, true)
 }
 
 /// The body of [`emit_has`] (`own` = `false`) and [`emit_has_own`].
-fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bool) -> Function {
+fn emit_has_lookup(strings: &StrOffsets, helpers: Helpers<'_>, own: bool) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
     let (key, obj, o, t, i, a, p) = (0, 1, 2, 3, 4, 5, 6);
     if !own {
@@ -1211,6 +1326,16 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Empty), I32Const(0), Return, End,
         End,
+    );
+    emit_if_str_exotic(
+        &mut f,
+        o,
+        key,
+        i,
+        helpers,
+        |f| wasm!(f; I32Const(1), Return),
+    );
+    wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find),
         If(BlockType::Empty), I32Const(1), Return, End,
     );
@@ -1237,9 +1362,10 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
 /// `live` decremented); a non-configurable property throws. On an array an
 /// in-range index becomes a hole and `length` (non-configurable) throws; its
 /// named keys (and a `SPARSE` array's elements past its store) are table
-/// entries. A primitive (a string or symbol included) is left unchanged. A delete on a watched
+/// entries. A `String` wrapper's index (non-configurable) throws. A primitive
+/// (a string or symbol included) is left unchanged. A delete on a watched
 /// table sets its dirty bit when the program tracks them.
-pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_delete(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32)]);
     let (obj, key, o, e, t, i) = (0, 1, 2, 3, 4, 5);
     emit_is_pointer(&mut f, obj);
@@ -1281,6 +1407,12 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
         End,
         End,
         End,
+    );
+    // A String wrapper's index is non-configurable.
+    emit_if_str_exotic(&mut f, o, key, i, helpers, |f| {
+        emit_prop_throw_return(f, obj, key, PROP_THROW_DELETE, helpers);
+    });
+    wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
         If(BlockType::Empty), Return, End,
         LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_CONFIGURABLE), I32And, I32Eqz,
@@ -1317,11 +1449,7 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
 /// `CreateDataPropertyOrThrow` (result arrays, `defineProperty` of a default
 /// element): the prototype chain is never consulted, a `SPARSE` array stores
 /// through `__sparse_define`, and a named key is an own `__define`.
-pub(super) fn emit_array_set(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-    define: bool,
-) -> Function {
+pub(super) fn emit_array_set(strings: &StrOffsets, helpers: Helpers<'_>, define: bool) -> Function {
     let sparse_store = if define {
         helpers.sparse_define()
     } else {
@@ -1594,8 +1722,9 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool) -> Function {
 
 /// `__protos_indexless(o: i32) -> i32`: `1` when nothing on the `proto`
 /// chain of the object-family block `o` can hold an integer-index property —
-/// no prototype is an array and none has a table flagged `HAS_INDEX_KEYS` —
-/// so every index `o` does not own is absent; else `0`. The builtins' array
+/// no prototype is an array or a `String` wrapper and none has a table
+/// flagged `HAS_INDEX_KEYS` — so every index `o` does not own is absent; else
+/// `0`. The builtins' array
 /// fast paths that read a hole as absent run only under it.
 pub(super) fn emit_protos_indexless() -> Function {
     let mut f = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
@@ -1608,6 +1737,10 @@ pub(super) fn emit_protos_indexless() -> Function {
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I32Const(1), Return, End,
         LocalGet(p), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+    );
+    emit_is_string_wrapper(&mut f, o);
+    wasm!(f;
+        I32Or,
         If(BlockType::Empty), I32Const(0), Return, End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(t),
         If(BlockType::Empty),
@@ -1694,6 +1827,13 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>) -> Function {
         End,
         End,
         End,
+    );
+    // A String wrapper's index is a read-only data property.
+    emit_if_str_exotic(&mut f, q, k, e, helpers, |f| {
+        wasm!(f; I32Const(1));
+        emit_prop_throw_return(f, recv, k, PROP_THROW_READ_ONLY, helpers);
+    });
+    wasm!(f;
         LocalGet(q), LocalGet(k), Call(helpers.prop_find), LocalTee(e),
         If(BlockType::Empty),
     );
@@ -1743,10 +1883,7 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>) -> Function {
 /// densely while `n - 1 < len + DENSE_GAP` and otherwise makes the
 /// array `SPARSE` without allocating the gap. Then `len = n`.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
-pub(super) fn emit_array_set_length(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(super) fn emit_array_set_length(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (o, v) = (0, 1);
     // The error object is built in the shared helper scratch layout after the
     // two params; this helper's own locals follow it.
@@ -1820,8 +1957,8 @@ pub(super) fn emit_array_set_length(
     );
     let error = IrNode::error_object(
         ErrorKind::RangeError,
-        Some(IrNode::Str(ARRAY_LENGTH_MSG.to_owned())),
-        IrNode::Str(ARRAY_LENGTH_STACK.to_owned()),
+        Some(IrNode::Str(ARRAY_LENGTH_MSG.into())),
+        IrNode::Str(ARRAY_LENGTH_STACK.into()),
     );
     emit_node(&error, &mut f, scratch, strings, helpers);
     wasm!(f;
@@ -1929,7 +2066,8 @@ pub(super) fn emit_array_set_length(
 /// ([`OWN_ENTRIES`]). Symbol keys are skipped, except that [`OWN_ALL_KEYS`]
 /// appends them after the string keys and [`OWN_SYMBOLS`] lists only them
 /// (both in slot order, the walk skipped when the table lacks
-/// `HAS_SYMBOL_KEYS`). A string lists its indices; an array its present
+/// `HAS_SYMBOL_KEYS`). A string lists its indices, a `String` wrapper its
+/// indices before its table keys; an array its present
 /// (non-hole) store indices, then its table keys (a `SPARSE` array's elements
 /// past the store sort first as integer keys); a primitive has no own keys.
 ///
@@ -2078,7 +2216,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Empty),
-        LocalGet(o), I32Load(m32(LEN)), LocalTee(n), Call(new_array), LocalSet(out),
+        LocalGet(o), I32Load(m32(STR_LEN_OFFSET)), LocalTee(n), Call(new_array), LocalSet(out),
     );
     index_keys(&mut f, false);
     wasm!(f;
@@ -2105,13 +2243,27 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     index_keys(&mut f, true);
     wasm!(f;
         Else,
-        LocalGet(p), I32Eqz,
+    );
+    // A String wrapper lists its virtual indices `0..n` first.
+    emit_is_string_wrapper(&mut f, o);
+    wasm!(f;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(o), I64Load(m64(u64::from(abi::WRAPPER_VALUE_OFFSET))), I32WrapI64,
+        I32Load(m32(STR_LEN_OFFSET)),
+        Else, I32Const(0), End,
+        LocalTee(n), I32Eqz,
+        LocalGet(p), I32Eqz, I32And,
         If(BlockType::Empty), I32Const(0), Call(new_array),
     );
     emit_box_heap(&mut f);
     wasm!(f;
         Return, End,
-        LocalGet(p), I32Load(m32(P_LIVE)), Call(new_array), LocalSet(out),
+        LocalGet(n),
+        LocalGet(p), I32Load(m32(P_LIVE)), I32Const(0), LocalGet(p), Select, I32Add,
+        Call(new_array), LocalSet(out),
+    );
+    index_keys(&mut f, false);
+    wasm!(f;
         End,
         LocalGet(p),
         If(BlockType::Empty),
@@ -2382,8 +2534,8 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
         I32Eqz,
         If(BlockType::Empty),
         LocalGet(o), LocalGet(k), Call(helpers.array_push), Drop,
-        LocalGet(cur), I32WrapI64, LocalGet(k), I32WrapI64, Call(helpers.prop_find),
-        I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And,
+        // An exotic index key (a fresh string) is interned for the check.
+        LocalGet(cur), LocalGet(k), I32Const(1), Call(helpers.to_key), Call(helpers.own_enum()),
         If(BlockType::Empty),
         LocalGet(out), I32WrapI64, LocalGet(k), Call(helpers.array_push), Drop,
         End,

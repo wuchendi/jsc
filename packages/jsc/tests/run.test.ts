@@ -573,15 +573,49 @@ it('runs the String statics and remaining string methods like the host', async (
     ["'éa'.replace('a', 'b')", 'éb'],
     ["'straße'.toUpperCase()", 'STRASSE'],
     ["' a　'.trim()", 'a'],
-    [
-      "try { 'éa'.slice(1) } catch (e) { e.message }",
-      'String.prototype.slice does not support non-ASCII strings yet',
-    ],
+    ["'éa'.slice(1)", 'a'],
     ["'éaèa'.indexOf('a', 2) + ',' + 'éaèa'.lastIndexOf('a', 2)", '3,1'],
     ["'éa'.replace('a', (m, p) => p) + 'éa'.startsWith('a', 1)", 'é1true'],
     ["try { 'a'.normalize('x') } catch (e) { e.name }", 'RangeError'],
     ["try { 'a.b'.search('.') } catch (e) { e.name }", 'TypeError'],
-    ['try { String.fromCharCode(0xd800) } catch (e) { e.name }', 'TypeError'],
+    ['String.fromCharCode(0xd800).length', '1'],
+  ]
+  for (const [src, expected] of cases) {
+    expect((await run(src)).result, src).toBe(expected)
+  }
+})
+
+it('runs the moved string methods on code units like the Rust host', async () => {
+  const cases: [string, string][] = [
+    ["'aé'.charAt(1)", 'é'],
+    ["'😀'.at(-1) === '\\uDE00'", 'true'],
+    ["'aé😀'.slice(1, 3) === 'é\\uD83D'", 'true'],
+    ["'é'.padStart(3, 'é')", 'ééé'],
+    ["JSON.stringify('aé'.split(''))", '["a","é"]'],
+    [
+      "let p = '😀'.split(''); p.length + ',' + (p[0] === '\\uD83D') + ',' + (p[1] === '\\uDE00')",
+      '2,true,true',
+    ],
+    ["'😀'.replace('', '-')", '-😀'],
+    ['String.fromCharCode(0xD800).length', '1'],
+    ["String.fromCodePoint(0xDC00) === '\\uDC00'", 'true'],
+    ["'\\uD800'.isWellFormed()", 'false'],
+    ["'a😀'.isWellFormed()", 'true'],
+    ["'a\\uD800'.toWellFormed()", 'a\uFFFD'],
+    ["'\u3000a\u3000'.trim()", 'a'],
+    ["'\uFEFFa'.trimStart()", 'a'],
+    ["'😀'.codePointAt(0) + ',' + '😀'.codePointAt(1)", '128512,56832'],
+    ["'é😀é'.lastIndexOf('é')", '3'],
+    ["'aé'.indexOf('é')", '1'],
+    ["'xé'.search('é')", '1'],
+    ["'éé'.replaceAll('é', '$&$&').length", '4'],
+    ["'é'.repeat(3).length", '3'],
+    ["'aé'.startsWith('é', 1)", 'true'],
+    ["'é😀'.endsWith('😀')", 'true'],
+    ["'ab«'.at(-1) + 'ab«'.slice(-1)", '««'],
+    ["'a'.padEnd(2, 'bĀ') === 'ab'", 'true'],
+    ["try { 'é.'.search('.') } catch (e) { e.name }", 'TypeError'],
+    ["try { 'é+'.match('é+') } catch (e) { e.name }", 'TypeError'],
   ]
   for (const [src, expected] of cases) {
     expect((await run(src)).result, src).toBe(expected)
@@ -602,4 +636,24 @@ it('renders symbols like the Rust host', async () => {
   await expect(run('throw Symbol("a")')).rejects.toThrow(
     /^Uncaught Symbol\(a\)$/,
   )
+})
+
+it('decodes and allocates Latin-1 and UTF-16 strings like the Rust host', async () => {
+  expect((await run('"\\u00e9"')).result).toBe('é')
+  expect((await run('"\\u{1F600}"')).result).toBe('😀')
+  // Latin-1 bytes 0x80..0xFF are U+0080..U+00FF, not windows-1252.
+  expect((await run('"\\u0080\\u0099\\u00ff"')).result).toBe('\u0080\u0099ÿ')
+  // A host op round trip: decode, then allocate one-byte / two-byte blocks.
+  expect((await run('"\\u0080\\u0099\\u00ff".toLowerCase()')).result).toBe(
+    '\u0080\u0099ÿ',
+  )
+  expect((await run('"\\u00c9\\u{1F600}".toLowerCase()')).result).toBe('é😀')
+  // A lone surrogate stays a unit; writing it out as UTF-8 yields U+FFFD.
+  const { result, stdout } = await run('console.log("\\uD800"); "a\\uDC00b"')
+  expect(result).toBe('a\uDC00b')
+  const written = (s: string) =>
+    new TextDecoder().decode(new TextEncoder().encode(s))
+  expect(written(result)).toBe('a�b')
+  expect(written(stdout)).toBe('�\n')
+  expect((await run('new String("\\u00e9")')).result).toBe("[String: 'é']")
 })

@@ -323,7 +323,7 @@ fn from_char_code() {
         "let f = String.fromCharCode; f(97, 98, 99, 100, 101, 102)",
         "abcdef",
     );
-    assert_type_error_with("String.fromCharCode(0xD800)", "surrogate");
+    assert_bool("String.fromCharCode(0xD800) === \"\\uD800\"", true);
 }
 
 #[test]
@@ -346,7 +346,11 @@ fn from_code_point() {
             &format!("RangeError|Invalid code point {shown}"),
         );
     }
-    assert_type_error_with("String.fromCodePoint(0xDC00)", "surrogate");
+    assert_bool("String.fromCodePoint(0xDC00) === \"\\uDC00\"", true);
+    assert_bool(
+        "String.fromCodePoint(0xD83D, 0xDE00) === String.fromCodePoint(0x1F600)",
+        true,
+    );
 }
 
 #[test]
@@ -386,9 +390,9 @@ fn at_char_code_at_code_point_at() {
     assert_eval("\"abc\".codePointAt(3)", "undefined");
     assert_number("\"abc\".charCodeAt(\"1\")", 98.0);
     assert_number("\"abc\".charCodeAt(1.9)", 98.0);
-    assert_type_error_with("\"\u{e9}t\u{e9}\".charCodeAt(0)", "non-ASCII");
-    assert_type_error_with("\"\u{e9}\".at(0)", "non-ASCII");
-    assert_type_error_with("\"\u{e9}\".codePointAt(0)", "non-ASCII");
+    assert_number("\"\u{e9}t\u{e9}\".charCodeAt(0)", 233.0);
+    assert_string("\"\u{e9}\".at(0)", "\u{e9}");
+    assert_number("\"\u{e9}\".codePointAt(0)", 233.0);
 }
 
 #[test]
@@ -486,7 +490,7 @@ fn replace_with_string_patterns() {
         "\"\u{e9}a\u{e8}a\".replaceAll(\"a\", (m, p, s) => \"(\" + p + s + \")\")",
         "\u{e9}(1\u{e9}a\u{e8}a)\u{e8}(3\u{e9}a\u{e8}a)",
     );
-    assert_type_error_with("\"\u{1F600}\".replaceAll(\"\", (m) => m)", "non-ASCII");
+    assert_string("\"\u{1F600}\".replaceAll(\"\", (m) => m)", "\u{1F600}");
     assert_string("\"\u{e9}a\".replace(\"a\", \"b\")", "\u{e9}b");
 }
 
@@ -528,18 +532,14 @@ fn unicode_case_and_trim() {
 }
 
 #[test]
-fn byte_positions_throw_on_non_ascii() {
-    for call in [
-        "\"\u{e9}a\".slice(1)",
-        "\"\u{e9}a\".substring(1)",
-        "\"\u{e9}a\".charAt(1)",
-        "\"\u{e9}a\".padStart(5)",
-        "\"a\".padEnd(5, \"\u{e9}\")",
-        "\"\u{e9}a\".split(\"\")",
-    ] {
-        assert_type_error_with(call, "non-ASCII");
-    }
-    // Search positions are exact UTF-16 offsets for any text.
+fn code_unit_positions_over_non_ascii() {
+    assert_string("\"\u{e9}a\".slice(1)", "a");
+    assert_string("\"\u{e9}a\".substring(1)", "a");
+    assert_string("\"\u{e9}a\".charAt(1)", "a");
+    assert_string("\"\u{e9}a\".padStart(5)", "   \u{e9}a");
+    assert_string("\"a\".padEnd(5, \"\u{e9}\")", "a\u{e9}\u{e9}\u{e9}\u{e9}");
+    assert_string("\"\u{e9}a\".split(\"\").join(\"|\")", "\u{e9}|a");
+    // Search positions are code-unit offsets.
     assert_number("\"\u{e9}a\".indexOf(\"a\")", 1.0);
     assert_number("\"\u{e9}a\u{e9}a\".indexOf(\"a\", 2)", 3.0);
     assert_number("\"\u{e9}a\u{e9}a\".lastIndexOf(\"a\", 2)", 1.0);
@@ -561,8 +561,8 @@ fn byte_positions_throw_on_non_ascii() {
     assert_number("\"x\u{ab}\".charCodeAt(0)", 120.0);
     assert_bool("\"ab\u{ab}\".startsWith(\"b\", 1)", true);
     assert_eval("\"x\u{ab}\".at(5)", "undefined");
-    assert_type_error_with("\"ab\u{ab}\".at(-1)", "non-ASCII");
-    assert_type_error_with("\"ab\u{ab}\".slice(-1)", "non-ASCII");
+    assert_string("\"ab\u{ab}\".at(-1)", "\u{ab}");
+    assert_string("\"ab\u{ab}\".slice(-1)", "\u{ab}");
     // Position-free results stay correct.
     assert_bool("\"\u{e9}a\".includes(\"a\")", true);
     assert_bool("\"\u{e9}a\".startsWith(\"\u{e9}\")", true);
@@ -586,6 +586,8 @@ fn generic_receivers() {
         "matchAll",
         "replace",
         "replaceAll",
+        "isWellFormed",
+        "toWellFormed",
     ] {
         assert_string(
             &caught(&format!("String.prototype.{name}.call(undefined)")),
@@ -609,5 +611,76 @@ fn generic_receivers() {
     assert_string(
         "class S extends String {} new S(\"abc\").at(-1) + new S(\"ab\").concat(\"c\")",
         "cabc",
+    );
+}
+
+/// Every former non-ASCII / lone-surrogate refusal returns the spec result:
+/// the methods work on code units at each string's width.
+#[test]
+fn former_refusals_return_spec_results() {
+    assert_string("\"a\u{e9}\".charAt(1)", "\u{e9}");
+    assert_bool("\"\u{1F600}\".at(-1) === \"\\uDE00\"", true);
+    assert_bool(
+        "\"a\u{e9}\u{1F600}\".slice(1, 3) === \"\u{e9}\\uD83D\"",
+        true,
+    );
+    assert_string("\"\u{e9}\".padStart(3, \"\u{e9}\")", "\u{e9}\u{e9}\u{e9}");
+    assert_string(
+        "JSON.stringify(\"a\u{e9}\".split(\"\"))",
+        "[\"a\",\"\u{e9}\"]",
+    );
+    assert_string(
+        "let p = \"\u{1F600}\".split(\"\"); p.length + \",\" + (p[0] === \"\\uD83D\") + \",\" + (p[1] === \"\\uDE00\")",
+        "2,true,true",
+    );
+    assert_string("\"\u{1F600}\".replace(\"\", \"-\")", "-\u{1F600}");
+    assert_number("String.fromCharCode(0xD800).length", 1.0);
+    assert_bool("String.fromCodePoint(0xDC00) === \"\\uDC00\"", true);
+    assert_bool("\"\\uD800\".isWellFormed()", false);
+    assert_bool("\"a\u{1F600}\".isWellFormed()", true);
+    assert_string("\"a\\uD800\".toWellFormed()", "a\u{FFFD}");
+    assert_string("\"\u{3000}a\u{3000}\".trim()", "a");
+    assert_string("\"\u{feff}a\".trimStart()", "a");
+    assert_number("\"\u{1F600}\".codePointAt(0)", 128_512.0);
+    assert_number("\"\u{1F600}\".codePointAt(1)", 56_832.0);
+    assert_number("\"\u{e9}\u{1F600}\u{e9}\".lastIndexOf(\"\u{e9}\")", 3.0);
+    assert_number("\"a\u{e9}\".indexOf(\"\u{e9}\")", 1.0);
+    assert_number("\"x\u{e9}\".search(\"\u{e9}\")", 1.0);
+    assert_number(
+        "\"\u{e9}\u{e9}\".replaceAll(\"\u{e9}\", \"$&$&\").length",
+        4.0,
+    );
+    assert_number("\"\u{e9}\".repeat(3).length", 3.0);
+    assert_bool("\"a\u{e9}\".startsWith(\"\u{e9}\", 1)", true);
+    assert_bool("\"\u{e9}\u{1F600}\".endsWith(\"\u{1F600}\")", true);
+    // A `RegExp`-syntax string pattern still throws (correct-or-throw).
+    assert_type_error_with("\"\u{e9}.\".search(\".\")", "RegExp");
+    assert_type_error_with("\"\u{e9}+\".match(\"\u{e9}+\")", "RegExp");
+}
+
+/// `isWellFormed` / `toWellFormed` over pairs and lone surrogates; results
+/// narrow to one-byte when every unit fits.
+#[test]
+fn well_formed_and_narrowing() {
+    assert_number("String.prototype.isWellFormed.length", 0.0);
+    assert_number("String.prototype.toWellFormed.length", 0.0);
+    assert_bool("\"\\uDC00\\uD800\".isWellFormed()", false);
+    assert_bool("\"\".isWellFormed() && \"abc\".isWellFormed()", true);
+    assert_bool(
+        "\"\\uDC00a\\uD800\".toWellFormed() === \"\\uFFFDa\\uFFFD\"",
+        true,
+    );
+    assert_string("\"a\u{1F600}\".toWellFormed()", "a\u{1F600}");
+    assert_string("\"\u{e9}\".toWellFormed()", "\u{e9}");
+    // A slice of two-byte text that fits Latin-1 equals the one-byte literal.
+    assert_bool("\"\u{e9}\u{1F600}\".slice(0, 1) === \"\u{e9}\"", true);
+    assert_bool("\"a\u{3000}\".trim() === \"a\"", true);
+    assert_bool("\"\u{1F600}ab\".split(\"\u{1F600}\")[1] === \"ab\"", true);
+    assert_bool("String.fromCharCode(0xE9) === \"\u{e9}\"", true);
+    assert_bool("\"a\".padEnd(3, \"b\u{100}\") === \"ab\u{100}\"", true);
+    assert_bool("\"a\".padEnd(2, \"b\u{100}\") === \"ab\"", true);
+    assert_string(
+        "\"\u{e9}a\u{e9}\".replaceAll(\"a\", \"$\\u0060|$'\")",
+        "\u{e9}\u{e9}|\u{e9}\u{e9}",
     );
 }
