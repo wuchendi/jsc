@@ -1121,14 +1121,17 @@ pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
 }
 
 /// `__symbol_get(v: i64, sym: i32) -> i64`: `Get(v, sym)` for the symbol key
-/// `sym`, short-circuited to `undefined` without a lookup unless some table
-/// on `v`'s prototype chain (a primitive's from its realm prototype; `null` /
-/// `undefined` have none) has `HAS_SYMBOL_KEYS`. The consult sites of the
-/// well-known symbols (DESIGN.md §6.4) use it so an object that never held a
-/// symbol key pays one flag test per chain level.
+/// `sym`, looking only in the tables on `v`'s prototype chain (a primitive's
+/// from its realm prototype; `null` / `undefined` have none) that have
+/// `HAS_SYMBOL_KEYS`. The consult sites of the well-known symbols (DESIGN.md
+/// §6.4) use it so an object that never held a symbol key pays one flag test
+/// per chain level. An accessor hit always calls its getter with `this = v`,
+/// even when the program builds no accessor of its own (so `__get` omits the
+/// dispatch): the realm's `get [@@species]` / `%IteratorPrototype%`
+/// `get [@@toStringTag]` are read by builtins alone.
 pub(super) fn emit_symbol_get(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(2, ValType::I32), (1, ValType::I64)]);
-    let (v, sym, o, p, next) = (0, 1, 2, 3, 4);
+    let mut f = Function::new(vec![(4, ValType::I32), (2, ValType::I64)]);
+    let (v, sym, o, p, e, base, next, g) = (0, 1, 2, 3, 4, 5, 6, 7);
     let proto_base = |intrinsic| {
         let bits = intrinsic_bits(intrinsic, helpers);
         Instruction::I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed())
@@ -1162,7 +1165,23 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>) -> Function {
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p),
         If(BlockType::Empty),
         LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_SYMBOL_KEYS), I32And,
-        If(BlockType::Empty), LocalGet(v), LocalGet(sym), Call(helpers.get), Return, End,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(sym), Call(helpers.prop_find), LocalTee(e),
+        If(BlockType::Empty),
+        LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_ACCESSOR), I32And,
+        If(BlockType::Empty),
+        LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_GET_OFFSET)),
+        LocalSet(g),
+    );
+    emit_is_function(&mut f, g);
+    wasm!(f; I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
+    emit_accessor_call(&mut f, g, v, None, base, helpers);
+    wasm!(f;
+        Return,
+        End,
+        LocalGet(e), I64Load(m64(E_VALUE)), Return,
+        End,
+        End,
         End,
         LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(next),
     );
