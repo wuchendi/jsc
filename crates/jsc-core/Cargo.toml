@@ -12,10 +12,12 @@ default = ["native-run"]
 # Native execution stage: pulls in wasmtime to instantiate and run the emitted
 # module. Off by the caller (e.g. wasm32 targets) leaves a frontend+codegen+emit
 # core that produces module bytes without a runtime.
-native-run = ["dep:wasmtime"]
+# The native host also normalizes strings (`String.prototype.normalize`).
+native-run = ["dep:icu_normalizer", "dep:wasmtime"]
 
 [dependencies]
 anyhow                         = "1.0.104"
+icu_normalizer                 = { version = "2.4.0", optional = true }
 swc_common                     = "26"
 swc_ecma_ast                   = "29"
 swc_ecma_parser                = "46"

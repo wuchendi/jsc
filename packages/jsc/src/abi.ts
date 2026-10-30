@@ -225,8 +225,6 @@ export const METHOD_OP_NUMBER_TO_STRING = 17
 export const METHOD_OP_LOCALE_COMPARE = 22
 /** `__method` op: `String.prototype.normalize` (string). */
 export const METHOD_OP_NORMALIZE = 23
-/** `__method` result: no correct result for the input yet (`normalize` over non-ASCII text). */
-export const METHOD_UNSUPPORTED = 0x7ffb_0000_0000_0001n
 /** `__method` result: an out-of-range argument (unknown `normalize` form). */
 export const METHOD_RANGE_ERROR = 0x7ffb_0000_0000_0002n
 /** `__method` op: `Number.prototype.toFixed(f)` (finite number receiver). */
