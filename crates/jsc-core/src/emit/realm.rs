@@ -541,10 +541,9 @@ pub(super) enum Builtin {
     /// key (low half) and the not-a-function message (high half). Not
     /// installed on any intrinsic.
     MethodCall,
-    /// `GetIterator` of an [`IrNode::IterSource`]: `this` is the iterated
-    /// value, `env` is `1` for a live `Map` / `Set` walk. Not installed on
-    /// any intrinsic.
-    IterSource,
+    /// An internal builtin of the iteration protocol
+    /// (design/symbol-strings.md §5.1). Not installed on any intrinsic.
+    Protocol(ProtocolOp),
     /// The global `isNaN`.
     IsNaN,
     /// The global `isFinite`.
@@ -557,6 +556,28 @@ pub(super) enum Builtin {
     Symbol(SymbolOp),
     /// An iteration builtin (design/symbol-strings.md §5.4).
     Iter(IterOp),
+}
+
+/// An internal builtin of the iteration protocol (design/symbol-strings.md
+/// §5.1), called by the record nodes and the consumers with `this` and
+/// `env` as below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProtocolOp {
+    /// The protocol half of `GetIterator`: `this` is the iterated value,
+    /// `env` its `@@iterator` method (`<x> is not iterable` unless
+    /// callable); returns the iterator the call yields (a `TypeError` unless
+    /// an object).
+    Open,
+    /// `IteratorStep`: `this` is the iterator, `env` its cached `next`;
+    /// returns the result object, or the hole once `done`.
+    Step,
+    /// `IteratorClose` of a non-throw completion: `this` is the iterator;
+    /// `GetMethod(this, "return")`, its call and the object check of its
+    /// result.
+    Close,
+    /// `IterableToList`: `this` is the iterated value; returns a fresh array
+    /// of the values its iterator yields.
+    ToList,
 }
 
 /// An iteration builtin: an iterator-creating method, a builtin iterator
@@ -1041,7 +1062,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 254] = [
+    pub(super) const ALL: [Builtin; 257] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1297,7 +1318,10 @@ impl Builtin {
         Self::AsyncGeneratorReaction(AsyncGenReaction::ReturnRejected),
         Self::ThrowTypeError,
         Self::MethodCall,
-        Self::IterSource,
+        Self::Protocol(ProtocolOp::Open),
+        Self::Protocol(ProtocolOp::Step),
+        Self::Protocol(ProtocolOp::Close),
+        Self::Protocol(ProtocolOp::ToList),
         Self::IsNaN,
         Self::IsFinite,
         Self::ParseFloat,
@@ -1332,7 +1356,7 @@ impl Builtin {
             | Self::ThrowTypeError
             | Self::MethodCall
             | Self::BoundCall
-            | Self::IterSource
+            | Self::Protocol(_)
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
             | Self::AsyncGeneratorReaction(_) => "",
@@ -1436,7 +1460,7 @@ impl Builtin {
             | Self::ThrowTypeError
             | Self::MethodCall
             | Self::BoundCall
-            | Self::IterSource
+            | Self::Protocol(_)
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
             | Self::FunctionToString

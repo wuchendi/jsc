@@ -230,30 +230,29 @@ pub(super) fn emit_node(
                 helpers,
             );
         }
-        IrNode::IsGenerator(operand) => {
-            // Evaluate into a stable scratch slot, test the type byte, and box the
-            // i32 result as a boolean jsval. `select` wants (a, b, cond), so stash
-            // the cond in the i32 scratch and push it last.
-            // The for-of / `yield*` dispatch: a user `@@iterator` is not
-            // honoured before Y2 (§9.4), on the generator path either.
-            emit_node(operand, function, scratch, strings, helpers);
-            function.instruction(&Instruction::LocalSet(scratch + 22));
-            emit_iterator_guard(scratch + 22, function, scratch, strings, helpers);
-            emit_is_generator(function, scratch + 22);
-            function.instruction(&Instruction::LocalSet(scratch + 21));
+        IrNode::GetIterator { value, rec, sealed } => {
+            builtins::emit_get_iterator(value, rec, *sealed, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+        IrNode::IteratorStep(rec) => {
+            builtins::emit_iterator_step(rec, function, scratch, strings, helpers);
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
             function.instruction(&Instruction::I64Const(TRUE_BITS));
+            function.instruction(&Instruction::Else);
             function.instruction(&Instruction::I64Const(FALSE_BITS));
-            function.instruction(&Instruction::LocalGet(scratch + 21));
-            function.instruction(&Instruction::Select);
+            function.instruction(&Instruction::End);
         }
-        IrNode::IterSource { value, live } => {
-            array::emit_iter_source(value, *live, function, scratch, strings, helpers);
+        IrNode::IteratorValue(rec) => {
+            builtins::emit_iterator_value(rec, function, scratch, strings, helpers);
         }
-        IrNode::IterLen(operand) => {
-            array::emit_iter_len(operand, function, scratch, strings, helpers);
-        }
-        IrNode::IterItem { iterable, index } => {
-            array::emit_iter_item(iterable, index, function, scratch, strings, helpers);
+        IrNode::IteratorClose { rec, throwing } => {
+            let mode = if *throwing {
+                builtins::CloseMode::Catch
+            } else {
+                builtins::CloseMode::Normal
+            };
+            builtins::emit_iterator_close(rec, mode, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
         IrNode::GenResume { handle, sent } => {
             generator::emit_gen_resume(handle, sent, function, scratch, strings, helpers);

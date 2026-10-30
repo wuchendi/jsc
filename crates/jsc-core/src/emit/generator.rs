@@ -198,6 +198,35 @@ pub(super) fn emit_gen_resume(
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 
+    emit_gen_drive(
+        handle_slot,
+        sent,
+        sm_result,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+
+    // 4. Build the `{ value, done }` result object from the SM's value and the
+    // handle's `done` flag.
+    emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
+}
+
+/// Resume the generator handle in i64 `handle_slot` once with `sent`
+/// (steps 2b-3 of [`emit_gen_resume`]): a running generator throws, else the
+/// state machine runs with the running bit set, its returned value lands in
+/// i64 `sm_result` (the handle's `done` flag tells a yield from the return),
+/// and a throw it left pending unwinds.
+pub(super) fn emit_gen_drive(
+    handle_slot: u32,
+    sent: &IrNode,
+    sm_result: u32,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
     // 2b. A running generator (resumed from its own body) throws; otherwise it
     // is marked running for the resume.
     let limits = MemArg {
@@ -271,10 +300,6 @@ pub(super) fn emit_gen_resume(
     function.instruction(&Instruction::LocalSet(sm_result));
     set_running(function, false);
     emit_propagate_if_pending(function, helpers);
-
-    // 4. Build the `{ value, done }` result object from the SM's value and the
-    // handle's `done` flag.
-    emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
 }
 
 /// Emit the `{ value, done }` iterator result object, leaving its jsval on the

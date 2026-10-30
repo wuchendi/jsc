@@ -836,12 +836,9 @@ pub(super) fn collect_node<'a>(
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
-        // A generator `yield e` / `IsGenerator` carries only its operand.
+        // A generator `yield e` carries only its operand.
         | IrNode::Yield(operand)
         | IrNode::AwaitMark(operand)
-        | IrNode::IsGenerator(operand)
-        | IrNode::IterSource { value: operand, .. }
-        | IrNode::IterLen(operand)
         | IrNode::ObjectBuiltin { arg: operand, .. } => {
             collect_node(operand, order, seen);
         }
@@ -1056,11 +1053,7 @@ pub(super) fn collect_node<'a>(
             collect_node(source, order, seen);
             collect_node(exclude, order, seen);
         }
-        IrNode::Index { obj, index }
-        | IrNode::IterItem {
-            iterable: obj,
-            index,
-        } => {
+        IrNode::Index { obj, index } => {
             seed_nullish_strs(order, seen);
             collect_node(obj, order, seen);
             collect_node(index, order, seen);
@@ -1176,6 +1169,24 @@ pub(super) fn collect_node<'a>(
         IrNode::MakeGenerator { slots, .. } => {
             for slot in slots {
                 collect_node(slot, order, seen);
+            }
+        }
+        // The iterator record nodes read members (`Index`, with its nullish
+        // guard) and resume a generator fast path (a running generator
+        // throws); their own texts are the realm's (`builtins::strings`).
+        IrNode::GetIterator { .. }
+        | IrNode::IteratorStep(_)
+        | IrNode::IteratorValue(_)
+        | IrNode::IteratorClose { .. } => {
+            seed_nullish_strs(order, seen);
+            seed_callee_error(GENERATOR_RUNNING, order, seen);
+            for key in ["value", "done", "next", "return"] {
+                if seen.insert(key) {
+                    order.push(key);
+                }
+            }
+            if let IrNode::GetIterator { value, .. } = node {
+                collect_node(value, order, seen);
             }
         }
         // `gen.next(sent)` builds a `{ value, done }` result object, so both keys'
@@ -1362,14 +1373,25 @@ fn program_has_accessors(program: &IrProgram) -> bool {
     })
 }
 
-/// Whether `program` tests a dirty bit (a [`IrNode::ProtoGuard`] or a
-/// [`IrNode::NamespaceGuard`] on a watched namespace), so `__set` /
-/// `__define` / `__delete` must set the bits (DESIGN.md §6.4).
+/// Whether `program` tests a dirty bit (a [`IrNode::ProtoGuard`], a
+/// [`IrNode::NamespaceGuard`] on a watched namespace, or an iteration fast
+/// path: a [`IrNode::GetIterator`], a spread source, or an `arguments`
+/// object, whose guard is the iterator prototypes' bits 15..=19,
+/// design/symbol-strings.md §5.3), so
+/// `__set` / `__define` / `__delete` must set the bits (DESIGN.md §6.4).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::ProtoGuard { sealed, .. }
         | IrNode::ProtoMethod { sealed, .. }
-        | IrNode::SizeRead { sealed, .. } => !sealed,
+        | IrNode::SizeRead { sealed, .. }
+        | IrNode::GetIterator { sealed, .. } => !sealed,
+        IrNode::ArraySpread(parts) => parts
+            .iter()
+            .any(|part| matches!(part, SpreadElem::Spread(_))),
+        // An `arguments` object is iterated through the fast path only (it
+        // has no own `@@iterator` yet), which a builtin consumer takes only
+        // while the bits are tracked.
+        IrNode::Object { class, .. } => *class == abi::CLASS_ARGUMENTS,
         IrNode::NamespaceGuard { namespace, .. } => {
             realm::Intrinsic::from(*namespace).watch_bit().is_some()
         }
@@ -1409,6 +1431,8 @@ pub(super) fn collect_spread_elem<'a>(
     seen: &mut HashSet<&'a str>,
 ) {
     match part {
-        SpreadElem::Item(node) | SpreadElem::Spread(node) => collect_node(node, order, seen),
+        SpreadElem::Item(node) | SpreadElem::Spread(node) | SpreadElem::List(node) => {
+            collect_node(node, order, seen);
+        }
     }
 }

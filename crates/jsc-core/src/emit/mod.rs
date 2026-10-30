@@ -36,7 +36,7 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
+    IterRecord, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
     SpreadCallee, SpreadElem,
 };
 
@@ -1295,8 +1295,8 @@ use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
 use realm::{
-    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, WellKnown,
-    intrinsic_bits,
+    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ProtocolOp, ReflectOp, StringOp,
+    WellKnown, intrinsic_bits,
 };
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
