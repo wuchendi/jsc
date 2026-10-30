@@ -68,6 +68,9 @@ pub(super) enum Intrinsic {
     /// `%WrapForValidIteratorPrototype%`: the `next` / `return` of the
     /// wrappers `Iterator.from` creates (design/symbol-strings.md §5.7).
     WrapForValidIteratorPrototype,
+    /// `%IteratorHelperPrototype%`: the `next` / `return` of the helper
+    /// objects the lazy `Iterator.prototype` methods create (§5.7).
+    IteratorHelperPrototype,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -242,7 +245,8 @@ impl Intrinsic {
             | Self::AsyncIteratorPrototype => Some(Self::ObjectPrototype),
             Self::IterPrototype(_)
             | Self::GeneratorPrototype
-            | Self::WrapForValidIteratorPrototype => Some(Self::IteratorPrototype),
+            | Self::WrapForValidIteratorPrototype
+            | Self::IteratorHelperPrototype => Some(Self::IteratorPrototype),
             Self::AsyncGeneratorPrototype => Some(Self::AsyncIteratorPrototype),
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
             // The native error constructors inherit from `Error`.
@@ -344,6 +348,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::SymbolRegistry,
             Intrinsic::ArrayUnscopables,
             Intrinsic::WrapForValidIteratorPrototype,
+            Intrinsic::IteratorHelperPrototype,
         ])
 }
 
@@ -581,8 +586,8 @@ pub(super) enum Builtin {
     Iterator(IteratorOp),
 }
 
-/// The `Iterator` builtins of design/symbol-strings.md §5.7 (the helpers
-/// are Y3-T2 / Y3-T3).
+/// The `Iterator` builtins of design/symbol-strings.md §5.7 (the eager
+/// helpers are Y3-T3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IteratorOp {
     /// `Iterator.from`.
@@ -601,11 +606,45 @@ pub(super) enum IteratorOp {
     /// The setter of `Iterator.prototype[@@toStringTag]`
     /// (`SetterThatIgnoresPrototypeProperties`).
     TagSet,
+    /// A lazy `Iterator.prototype` helper: a fresh helper object.
+    Helper(HelperKind),
+    /// `%IteratorHelperPrototype%.next`.
+    HelperNext,
+    /// `%IteratorHelperPrototype%.return`.
+    HelperReturn,
+}
+
+/// The lazy `Iterator.prototype` helpers (design/symbol-strings.md §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HelperKind {
+    /// `map(mapper)`.
+    Map,
+    /// `filter(predicate)`.
+    Filter,
+    /// `take(limit)`.
+    Take,
+    /// `drop(limit)`.
+    Drop,
+    /// `flatMap(mapper)`.
+    FlatMap,
+}
+
+impl HelperKind {
+    /// The method's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::Filter => "filter",
+            Self::Take => "take",
+            Self::Drop => "drop",
+            Self::FlatMap => "flatMap",
+        }
+    }
 }
 
 impl IteratorOp {
     /// Every op, in [`Builtin::ALL`] order.
-    const ALL: [IteratorOp; 7] = [
+    const ALL: [IteratorOp; 14] = [
         Self::From,
         Self::WrapNext,
         Self::WrapReturn,
@@ -613,26 +652,39 @@ impl IteratorOp {
         Self::ConstructorSet,
         Self::TagGet,
         Self::TagSet,
+        Self::Helper(HelperKind::Map),
+        Self::Helper(HelperKind::Filter),
+        Self::Helper(HelperKind::Take),
+        Self::Helper(HelperKind::Drop),
+        Self::Helper(HelperKind::FlatMap),
+        Self::HelperNext,
+        Self::HelperReturn,
     ];
 
     /// The builtin's `name`.
     fn name(self) -> &'static str {
         match self {
             Self::From => "from",
-            Self::WrapNext => "next",
-            Self::WrapReturn => "return",
+            Self::WrapNext | Self::HelperNext => "next",
+            Self::WrapReturn | Self::HelperReturn => "return",
             Self::ConstructorGet => "get constructor",
             Self::ConstructorSet => "set constructor",
             Self::TagGet => "get [Symbol.toStringTag]",
             Self::TagSet => "set [Symbol.toStringTag]",
+            Self::Helper(kind) => kind.name(),
         }
     }
 
     /// The builtin's `length`.
     fn length(self) -> u32 {
         match self {
-            Self::From | Self::ConstructorSet | Self::TagSet => 1,
-            Self::WrapNext | Self::WrapReturn | Self::ConstructorGet | Self::TagGet => 0,
+            Self::From | Self::ConstructorSet | Self::TagSet | Self::Helper(_) => 1,
+            Self::WrapNext
+            | Self::WrapReturn
+            | Self::ConstructorGet
+            | Self::TagGet
+            | Self::HelperNext
+            | Self::HelperReturn => 0,
         }
     }
 
@@ -640,6 +692,8 @@ impl IteratorOp {
     fn prototype(self) -> Option<Intrinsic> {
         match self {
             Self::WrapNext | Self::WrapReturn => Some(Intrinsic::WrapForValidIteratorPrototype),
+            Self::Helper(_) => Some(Intrinsic::IteratorPrototype),
+            Self::HelperNext | Self::HelperReturn => Some(Intrinsic::IteratorHelperPrototype),
             _ => None,
         }
     }
@@ -1232,7 +1286,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 280] = [
+    pub(super) const ALL: [Builtin; 287] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1540,6 +1594,13 @@ impl Builtin {
         Self::Iterator(IteratorOp::ALL[4]),
         Self::Iterator(IteratorOp::ALL[5]),
         Self::Iterator(IteratorOp::ALL[6]),
+        Self::Iterator(IteratorOp::ALL[7]),
+        Self::Iterator(IteratorOp::ALL[8]),
+        Self::Iterator(IteratorOp::ALL[9]),
+        Self::Iterator(IteratorOp::ALL[10]),
+        Self::Iterator(IteratorOp::ALL[11]),
+        Self::Iterator(IteratorOp::ALL[12]),
+        Self::Iterator(IteratorOp::ALL[13]),
     ];
 
     /// The function's `name`.
@@ -2321,6 +2382,7 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
         ),
         (Intrinsic::IterPrototype(IterFamily::Map), "Map Iterator"),
         (Intrinsic::IterPrototype(IterFamily::Set), "Set Iterator"),
+        (Intrinsic::IteratorHelperPrototype, "Iterator Helper"),
     ];
     entries.extend(tags.map(|(intrinsic, tag)| Entry {
         intrinsic,
