@@ -1253,13 +1253,21 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         | IrNode::OpenIterator { .. }
         | IrNode::IteratorStep(_)
         | IrNode::IteratorValue(_)
-        | IrNode::IteratorClose { .. } => {
+        | IrNode::IteratorClose { .. }
+        | IrNode::AsyncIteratorNext(_)
+        | IrNode::AsyncIteratorComplete { .. }
+        | IrNode::AsyncIteratorReturn { .. }
+        | IrNode::IteratorResultCheck(_) => {
             seed_nullish_strs(strs);
             seed_callee_error(GENERATOR_RUNNING, strs);
             for key in ["value", "done", "next", "return"] {
                 strs.add(key);
             }
-            if let IrNode::GetIterator { value, .. } | IrNode::OpenIterator { value, .. } = node {
+            if let IrNode::GetIterator { value, .. }
+            | IrNode::OpenIterator { value, .. }
+            | IrNode::AsyncIteratorComplete { result: value, .. }
+            | IrNode::IteratorResultCheck(value) = node
+            {
                 collect_node(value, strs);
             }
         }

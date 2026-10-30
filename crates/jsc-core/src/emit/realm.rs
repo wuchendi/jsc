@@ -52,6 +52,11 @@ pub(super) enum Intrinsic {
     /// `%AsyncIteratorPrototype%`: `[@@asyncIterator]() { return this }`;
     /// `%AsyncGeneratorPrototype%`'s `proto`.
     AsyncIteratorPrototype,
+    /// `%AsyncFromSyncIteratorPrototype%` (design/symbol-strings.md §5.8):
+    /// the promise-returning `next`, `return`, `throw` of the
+    /// `CreateAsyncFromSyncIterator` objects; not reachable from the global
+    /// object.
+    AsyncFromSyncIteratorPrototype,
     /// `%GeneratorPrototype%`: `next`, `return`, `throw`; every generator
     /// object's `proto`.
     GeneratorPrototype,
@@ -237,7 +242,9 @@ impl Intrinsic {
             | Self::IteratorPrototype
             | Self::AsyncIteratorPrototype => Some(Self::ObjectPrototype),
             Self::IterPrototype(_) | Self::GeneratorPrototype => Some(Self::IteratorPrototype),
-            Self::AsyncGeneratorPrototype => Some(Self::AsyncIteratorPrototype),
+            Self::AsyncGeneratorPrototype | Self::AsyncFromSyncIteratorPrototype => {
+                Some(Self::AsyncIteratorPrototype)
+            }
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
             // The native error constructors inherit from `Error`.
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
@@ -333,6 +340,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
         .chain(IterFamily::ALL.map(Intrinsic::IterPrototype))
         .chain([
             Intrinsic::AsyncIteratorPrototype,
+            Intrinsic::AsyncFromSyncIteratorPrototype,
             Intrinsic::GeneratorPrototype,
             Intrinsic::AsyncGeneratorPrototype,
             Intrinsic::SymbolRegistry,
@@ -564,7 +572,7 @@ pub(super) enum Builtin {
     ParseInt,
     /// A `Symbol` static or `%Symbol.prototype%` builtin.
     Symbol(SymbolOp),
-    /// An iteration builtin (design/symbol-strings.md §5.4).
+    /// An iteration builtin (design/symbol-strings.md §5.4, §5.8).
     Iter(IterOp),
     /// A `@@species` builtin: a `get [Symbol.species]`, or an internal
     /// closure of the promise `SpeciesConstructor` paths.
@@ -638,6 +646,115 @@ impl SpeciesOp {
     }
 }
 
+/// `Array.fromAsync` (design/symbol-strings.md §5.8) and the internal
+/// builtins of its promise-reaction state machine (not installed on any
+/// intrinsic), whose `env` is the loop's state block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FromAsyncOp {
+    /// `Array.fromAsync(items, mapFn, thisArg)`: returns a promise.
+    Entry,
+    /// One step of the loop, resumed at the phase the state block records;
+    /// a throw is left pending for the caller to reject (or close) with.
+    Run,
+    /// The fulfillment reaction of each await: stores the value, then runs.
+    Resume,
+    /// The rejection reaction of each await: rejects the result promise,
+    /// closing the iterator first while a mapped value is in flight.
+    Reject,
+    /// The reaction of the awaited `return()` result of a close: rejects the
+    /// result promise with the stored reason.
+    Rethrow,
+}
+
+impl FromAsyncOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [FromAsyncOp; 5] = [
+        Self::Entry,
+        Self::Run,
+        Self::Resume,
+        Self::Reject,
+        Self::Rethrow,
+    ];
+
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Entry => "fromAsync",
+            _ => "",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::Run => 0,
+            _ => 1,
+        }
+    }
+}
+
+/// An async iteration builtin (design/symbol-strings.md §5.8): the
+/// `%AsyncFromSyncIteratorPrototype%` methods, and the internal builtins
+/// behind the async record nodes and their promise reactions (not installed
+/// on any intrinsic), called with `this` and `env` as below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AsyncIterOp {
+    /// `GetIterator(this, async)`: `this` is the iterated value; returns
+    /// its async iterator (an async-from-sync wrapper over its sync
+    /// iterator when it has no `@@asyncIterator`).
+    Open,
+    /// The call of an async `IteratorStep`: `this` is the iterator, `env`
+    /// its cached `next`; returns the (unawaited) call result.
+    Step,
+    /// The check of an async `IteratorStep`: `this` is the awaited step
+    /// result; a `TypeError` unless an object, else the hole when
+    /// `ToBoolean(this.done)`, else `this`.
+    Complete,
+    /// The call of `AsyncIteratorClose`: `this` is the iterator;
+    /// `GetMethod(this, "return")` (the hole when absent) and its
+    /// (unawaited) call result.
+    Return,
+    /// `%AsyncFromSyncIteratorPrototype%.next` / `return` / `throw`.
+    FromSync(AsyncGenRequest),
+    /// The fulfillment reaction of `AsyncFromSyncIteratorContinuation`
+    /// (`env` is `done`): `v => ({ value: v, done })`.
+    Unwrap,
+    /// The rejection reaction of `AsyncFromSyncIteratorContinuation`
+    /// (`env` is the sync iterator): close it, then rethrow the reason.
+    CloseRejected,
+    /// `Array.fromAsync` and its internal builtins.
+    FromAsync(FromAsyncOp),
+}
+
+impl AsyncIterOp {
+    /// The builtin's `name` (the internal ones are anonymous).
+    fn name(self) -> &'static str {
+        match self {
+            Self::FromSync(request) => request.name(),
+            Self::FromAsync(op) => op.name(),
+            _ => "",
+        }
+    }
+
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [AsyncIterOp; 14] = [
+        Self::Open,
+        Self::Step,
+        Self::Complete,
+        Self::Return,
+        Self::FromSync(AsyncGenRequest::Next),
+        Self::FromSync(AsyncGenRequest::Return),
+        Self::FromSync(AsyncGenRequest::Throw),
+        Self::Unwrap,
+        Self::CloseRejected,
+        Self::FromAsync(FromAsyncOp::ALL[0]),
+        Self::FromAsync(FromAsyncOp::ALL[1]),
+        Self::FromAsync(FromAsyncOp::ALL[2]),
+        Self::FromAsync(FromAsyncOp::ALL[3]),
+        Self::FromAsync(FromAsyncOp::ALL[4]),
+    ];
+}
+
 /// An internal builtin of the iteration protocol (design/symbol-strings.md
 /// §5.1), called by the record nodes and the consumers with `this` and
 /// `env` as below.
@@ -682,10 +799,12 @@ pub(super) enum IterOp {
     StringIterator,
     /// The `next` of a builtin iterator prototype.
     Next(IterFamily),
+    /// An async iteration builtin (design/symbol-strings.md §5.8).
+    Async(AsyncIterOp),
 }
 
 impl IterOp {
-    /// Every op, in [`Builtin::ALL`] order.
+    /// Every op but [`Self::Async`], in [`Builtin::ALL`] order.
     const ALL: [IterOp; 15] = [
         Self::IteratorSelf,
         Self::AsyncIteratorSelf,
@@ -726,6 +845,18 @@ impl IterOp {
             Self::AsyncIteratorSelf => "[Symbol.asyncIterator]",
             Self::ArrayIter(kind) | Self::CollectionIter { kind, .. } => kind.name(),
             Self::Next(_) => "next",
+            Self::Async(op) => op.name(),
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::Async(
+                AsyncIterOp::FromSync(_) | AsyncIterOp::Unwrap | AsyncIterOp::CloseRejected,
+            ) => 1,
+            Self::Async(AsyncIterOp::FromAsync(op)) => op.length(),
+            _ => 0,
         }
     }
 
@@ -736,7 +867,13 @@ impl IterOp {
             Self::ArrayIter(_) => Some(Intrinsic::Prototype(BuiltinCtor::Array)),
             Self::CollectionIter { set, .. } => Some(Intrinsic::Prototype(collection(set))),
             Self::Next(family) => Some(Intrinsic::IterPrototype(family)),
-            Self::IteratorSelf | Self::AsyncIteratorSelf | Self::StringIterator => None,
+            Self::Async(AsyncIterOp::FromSync(_)) => {
+                Some(Intrinsic::AsyncFromSyncIteratorPrototype)
+            }
+            Self::IteratorSelf
+            | Self::AsyncIteratorSelf
+            | Self::StringIterator
+            | Self::Async(_) => None,
         }
     }
 }
@@ -1158,7 +1295,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 272] = [
+    pub(super) const ALL: [Builtin; 286] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1447,6 +1584,20 @@ impl Builtin {
         Self::Iter(IterOp::ALL[12]),
         Self::Iter(IterOp::ALL[13]),
         Self::Iter(IterOp::ALL[14]),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[0])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[1])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[2])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[3])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[4])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[5])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[6])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[7])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[8])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[9])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[10])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[11])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[12])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[13])),
         Self::Species(SpeciesOp::ALL[0]),
         Self::Species(SpeciesOp::ALL[1]),
         Self::Species(SpeciesOp::ALL[2]),
@@ -1612,8 +1763,8 @@ impl Builtin {
             | Self::ArrayReverse
             | Self::ArrayShift
             | Self::ArrayCopy(ArrayCopyOp::ToReversed)
-            | Self::Iter(_)
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol) => 0,
+            Self::Iter(op) => op.length(),
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(
                 MathOp::Min
@@ -2080,7 +2231,12 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         ));
         let statics: &[Builtin] = match ctor {
             BuiltinCtor::Object => &OBJECT_STATICS,
-            BuiltinCtor::Array => &[Builtin::IsArray, Builtin::ArrayOf, Builtin::ArrayFrom],
+            BuiltinCtor::Array => &[
+                Builtin::IsArray,
+                Builtin::ArrayOf,
+                Builtin::ArrayFrom,
+                Builtin::Iter(IterOp::Async(AsyncIterOp::FromAsync(FromAsyncOp::Entry))),
+            ],
             BuiltinCtor::String => &[
                 Builtin::StringFromCharCode,
                 Builtin::StringFromCodePoint,
@@ -2828,6 +2984,31 @@ mod tests {
         assert_eq!(
             AsyncGeneratorPrototype.proto(),
             Some(AsyncIteratorPrototype)
+        );
+        // `%AsyncFromSyncIteratorPrototype%` (§5.8): unreachable from the
+        // global object, holding the promise-returning `next` / `return` /
+        // `throw` of the async-from-sync wrappers.
+        assert_eq!(
+            Intrinsic::AsyncFromSyncIteratorPrototype.proto(),
+            Some(AsyncIteratorPrototype)
+        );
+        assert_eq!(Intrinsic::AsyncFromSyncIteratorPrototype.watch_bit(), None);
+        for request in [
+            AsyncGenRequest::Next,
+            AsyncGenRequest::Return,
+            AsyncGenRequest::Throw,
+        ] {
+            let builtin = Builtin::Iter(IterOp::Async(AsyncIterOp::FromSync(request)));
+            assert_eq!(
+                method_of(Intrinsic::AsyncFromSyncIteratorPrototype, request.name()),
+                Some(builtin)
+            );
+            assert_eq!(builtin.length(), 1);
+        }
+        assert!(
+            registry()
+                .iter()
+                .all(|e| e.value != Value::Intrinsic(Intrinsic::AsyncFromSyncIteratorPrototype))
         );
         for family in IterFamily::ALL {
             assert_eq!(IterPrototype(family).proto(), Some(IteratorPrototype));

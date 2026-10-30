@@ -1381,9 +1381,16 @@ catch binding).
   guarded fast path while its builtin `@@iterator` and iterator `next` are
   provably intact (the dirty bits of §6.4); an `arguments` object is walked
   by index while its own `@@iterator` is still `%Array.prototype.values%`
-  (and the Array Iterator bits are clean). `for await` is rejected
-  at compile time. The loop head declares its binding with `const`/`let`
-  (identifier or pattern) or assigns a pattern (`for ([a] of xs)`).
+  (and the Array Iterator bits are clean). The loop head declares its
+  binding with `const`/`let`/`var` (identifier or pattern) or assigns a
+  pattern (`for ([a] of xs)`).
+- **`for await`** (in async functions, async generators and the top level of
+  `main`) has `for-of`'s shape and head forms over an async record (§7.8):
+  each step awaits `next()`, then checks the result is an object; an abrupt
+  body exit calls `return()` (if any) and awaits it, a normal completion
+  then requiring an object result while a throw completion discards any
+  rejection; a throw from a step does not close. It has no fast path: every
+  step is a microtask turn.
 - **`for-in`** iterates the key snapshot of §6.3; strings and arrays list their
   index keys first.
 
@@ -1659,7 +1666,11 @@ control flow. A `yield` may appear inside a larger expression
   (bit `64`) is iterated through the protocol, never by direct state-machine
   resumes. Each delegated step calls the cached `next` (or the
   `throw` / `return` method read per step); there is no fast path for a
-  clean generator delegate.
+  clean generator delegate. In an async generator the delegate is opened
+  with the async `GetIterator` and every inner result (the `return()` of a
+  closed delegate included) is awaited before its check (ES2025 §15.5.5); a
+  non-object result throws `Iterator result <x> is not an object` in both
+  forms.
 
 **`async`/`await`.** An `async function` (in every position a `function*` may
 take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
@@ -1699,7 +1710,32 @@ the body is busy:
   rejects). `return(v)` at a suspended `yield` resumes the body with a
   return completion there, which awaits `v`, then runs the enclosing
   `finally` blocks like a generator's.
-- `yield*` in an async generator is a compile error.
+- `yield*` in an async generator delegates through the async protocol (see
+  generators above).
+
+**Async iteration.** The async `GetIterator` (`IrNode::OpenIterator` with
+`is_async`, `emit/builtins/async_iter.rs`) calls `@@asyncIterator` (a
+non-object result throws); without one it wraps the sync iterator of
+`@@iterator` in `CreateAsyncFromSyncIterator`, and with neither throws
+`TypeError: <x> is not async iterable`. `%AsyncFromSyncIteratorPrototype%`
+(hidden, `CLASS_ITERATOR` kind `32`, a 48-byte block holding the sync record)
+has guest `next` / `return` / `throw`: each calls the sync method and returns
+a promise for `{ value, done }` after `Promise.resolve(value)`; a rejected
+value closes the sync iterator unless done. A missing `return` fulfills
+`{ value, done: true }`; a missing `throw` closes the sync iterator, then
+rejects with `TypeError: The iterator does not provide a 'throw' method`.
+The consumers (`for await`, async `yield*`) await `next()` through the
+state machine (`AsyncIteratorNext` / `AsyncIteratorComplete` /
+`AsyncIteratorReturn`); the wrapper's builtin bodies need a positional
+slot, so a program with a `for await` has `K` ≥ 1 (§4.2).
+`Array.fromAsync` is a builtin promise-reaction state machine over a state
+block (`emit/builtins/array.rs`): it returns a promise at once (every abrupt
+completion rejects it), takes `@@asyncIterator`, else `@@iterator` through
+the async-from-sync wrapper, else an array-like, and awaits each `next()`
+result, array-like element and mapped value (one microtask turn per step); a
+`mapFn` throw or rejection, or a failed define, closes the iterator
+(`AsyncIteratorClose`, its `return()` result awaited) before rejecting. Its
+reactions read the settled value from slot 0, so they trap when `K` = 0.
 
 **Promises.** `new Promise(executor)`, `Promise.resolve`, `Promise.reject`,
 `Promise.prototype.then` / `catch` / `finally` (§6.7).
@@ -1717,7 +1753,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`: a string `@@toStringTag` on the receiver's chain, else the builtin tag; `Map`, `Set`, `Promise`, `Generator`, `AsyncGenerator`, `Symbol`, `Math`, `JSON` and the Array / String / Map / Set Iterator prototypes own a configurable-only `@@toStringTag`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors, `[@@hasInstance]` (`OrdinaryHasInstance`; non-writable, non-enumerable, non-configurable); `Function(..)` throws `TypeError` |
-| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` (`constructor[@@species]`; `%Array%`, `%Map%`, `%Set%` and `%Promise%` have the builtin `get [Symbol.species]` returning `this`), `concat` spreads the items `IsConcatSpreadable` accepts (`@@isConcatSpreadable`, else `IsArray`), and `Array.prototype[@@unscopables]` is the spec's `null`-prototype list |
+| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor), `Array.fromAsync(items, mapFn, thisArg)` (the same over an async or sync iterable or an array-like, every element and mapped value awaited, §7.8); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` (`constructor[@@species]`; `%Array%`, `%Map%`, `%Set%` and `%Promise%` have the builtin `get [Symbol.species]` returning `this`), `concat` spreads the items `IsConcatSpreadable` accepts (`@@isConcatSpreadable`, else `IsArray`), and `Array.prototype[@@unscopables]` is the spec's `null`-prototype list |
 | `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order, not locale collation), `normalize` (all four forms; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings, lossless; a one-byte receiver maps in the guest), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`, §5.4); `search`, `match`, `matchAll`, `replace`, `replaceAll`, `split` call an object argument's `@@search` / `@@match` / `@@matchAll` / `@@replace` / `@@split` method with `(O, …)` before `ToString(this)` (`matchAll` / `replaceAll` first require an `IsRegExp` argument's `flags` to hold `g`), and `includes` / `startsWith` / `endsWith` throw a `TypeError` for an `IsRegExp` argument (`ToBoolean(arg[@@match])`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all but the host case-mapping path (§6.1), `localeCompare` and `normalize` (host, §6.1) run in the guest on code units (`emit/builtins/string.rs`), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
@@ -2071,8 +2107,6 @@ Each item below is current behaviour of this tree.
 
 **Generators & async**
 
-- No `for await` and no `Symbol.asyncIterator`; `yield*` is rejected in an
-  async generator.
 - A `yield`/`await` that would carry a per-node compiler temporary across the
   suspend is a compile error (`super.m(yield x)`, `o[yield k]?.(yield v)`).
 - `yield*` has no fast path for a clean generator delegate: each delegated
@@ -2161,7 +2195,9 @@ Its stage U1 is done: Latin-1 / UTF-16 strings with code-unit `.length`,
 indexing and comparison, lossless literals, and the `String.prototype`
 methods in the guest. Its stage U2 is done: the code-point string iterator,
 full lossless case mapping, `normalize` in all four forms, and lossless
-code-unit `localeCompare`.
+code-unit `localeCompare`. Its stage Y5 is done: the async `GetIterator`,
+`%AsyncFromSyncIteratorPrototype%`, `for await`, `yield*` in async
+generators (pulled forward from phase 5) and `Array.fromAsync`.
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
@@ -2185,8 +2221,7 @@ code-unit `localeCompare`.
 ### Phase 5 — Language completeness
 
 - Private fields and methods, static blocks, object spread.
-- `for await` and async `yield*`, labeled statements, all remaining early
-  errors.
+- Labeled statements, all remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
 - `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,

@@ -1125,12 +1125,69 @@ pub enum IrNode {
     /// check, `rec.next` read once), leaving `rec.iter` the iterator object
     /// and `rec.next` its `next`, for a consumer that calls them itself
     /// (`yield*`). Yields `undefined`.
+    ///
+    /// With `is_async`, `GetIterator(value, async)` (design/symbol-strings.md
+    /// §5.8): `GetMethod(value, @@asyncIterator)`, else
+    /// `CreateAsyncFromSyncIterator` over `GetIterator(value, sync)` (a
+    /// `%AsyncFromSyncIteratorPrototype%` object), else `<x> is not async
+    /// iterable`; then the call, the object check and `rec.next` read once.
+    /// An async record has no fast path and is driven only by
+    /// [`IrNode::AsyncIteratorNext`] / [`IrNode::AsyncIteratorComplete`] /
+    /// [`IrNode::IteratorValue`] and closed by [`IrNode::AsyncIteratorReturn`]
+    /// (never by [`IrNode::IteratorStep`] / [`IrNode::IteratorClose`]).
     OpenIterator {
         /// The iterated value.
         value: Box<IrNode>,
         /// The record the iterator is opened into.
         rec: Box<IterRecord>,
+        /// `GetIterator(value, async)` rather than `sync`.
+        is_async: bool,
     },
+    /// The call half of an async `IteratorStep` (design/symbol-strings.md
+    /// §5.8): `Call(rec.next, rec.iter)`, yielding its result for the caller
+    /// to `Await` (every step is a microtask turn). The record is marked
+    /// stepping until [`IrNode::AsyncIteratorComplete`], so a throw from the
+    /// call or the await leaves it unclosed.
+    ///
+    /// A `for await` step lowers to
+    /// `AsyncIteratorComplete { rec, result: Await(AsyncIteratorNext(rec)) }`
+    /// (`false` ends the loop), then `IteratorValue(rec)`.
+    AsyncIteratorNext(Box<IterRecord>),
+    /// The check half of an async `IteratorStep`: evaluate `result` (the
+    /// awaited [`IrNode::AsyncIteratorNext`] value); a non-object throws
+    /// `Iterator result <x> is not an object` (the record stays unclosed);
+    /// yields `false` (the record done) when `ToBoolean(result.done)`, else
+    /// `true` with `result` left in `rec.result` for [`IrNode::IteratorValue`]
+    /// and the record open again (closed on an abrupt exit).
+    AsyncIteratorComplete {
+        /// The record being stepped.
+        rec: Box<IterRecord>,
+        /// The awaited step result.
+        result: Box<IrNode>,
+    },
+    /// The call half of `AsyncIteratorClose(rec, completion)`
+    /// (design/symbol-strings.md §5.8) of a record not yet done (a done or
+    /// stepping record yields the hole): `GetMethod(iterator, "return")`
+    /// (the hole when `undefined` / `null`) and its call, yielding the call's
+    /// result for the caller to `Await`. The record is done afterwards. With
+    /// `throwing` (a throw completion, run from a `catch` that rethrows) a
+    /// throw of the `GetMethod` or the call is discarded (the hole).
+    ///
+    /// A close lowers to `r = AsyncIteratorReturn { rec, throwing }`, then
+    /// unless `IsHole(r)`: for a non-throw completion
+    /// `IteratorResultCheck(Await(r))`; for a throw completion `Await(r)`
+    /// inside a `try` whose `catch` discards (the original throw is
+    /// rethrown afterwards either way).
+    AsyncIteratorReturn {
+        /// The record to close.
+        rec: Box<IterRecord>,
+        /// Whether the completion being propagated is a throw.
+        throwing: bool,
+    },
+    /// The result check of a non-throw `AsyncIteratorClose`: evaluate the
+    /// operand (the awaited `return()` result) and throw `Iterator result
+    /// <x> is not an object` unless it is an object; yields `undefined`.
+    IteratorResultCheck(Box<IrNode>),
     /// `yield* iterable` in a generator body (design/symbol-strings.md §5.6):
     /// the CFG builder expands it into the delegation loop, forwarding each
     /// `next(v)` / `throw(e)` / `return(v)` to the delegate; its value is the
@@ -2313,6 +2370,7 @@ impl IrNode {
             | IrNode::YieldDelegate {
                 iterable: inner, ..
             }
+            | IrNode::IteratorResultCheck(inner)
             | IrNode::AwaitMark(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
@@ -2453,12 +2511,16 @@ impl IrNode {
                         || f(value)
                 })
             }
-            IrNode::GetIterator { value, rec, .. } | IrNode::OpenIterator { value, rec } => {
+            IrNode::GetIterator { value, rec, .. }
+            | IrNode::OpenIterator { value, rec, .. }
+            | IrNode::AsyncIteratorComplete { rec, result: value } => {
                 f(value) || rec.places().into_iter().any(&mut f)
             }
             IrNode::IteratorStep(rec)
             | IrNode::IteratorValue(rec)
-            | IrNode::IteratorClose { rec, .. } => rec.places().into_iter().any(&mut f),
+            | IrNode::IteratorClose { rec, .. }
+            | IrNode::AsyncIteratorNext(rec)
+            | IrNode::AsyncIteratorReturn { rec, .. } => rec.places().into_iter().any(&mut f),
             IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
                 SpreadElem::Item(value) | SpreadElem::Spread(value) | SpreadElem::List(value) => {
                     f(value)
@@ -2519,6 +2581,7 @@ impl IrNode {
             | IrNode::YieldDelegate {
                 iterable: inner, ..
             }
+            | IrNode::IteratorResultCheck(inner)
             | IrNode::AwaitMark(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
@@ -2675,14 +2738,18 @@ impl IrNode {
                 }
                 out
             }
-            IrNode::GetIterator { value, rec, .. } | IrNode::OpenIterator { value, rec } => {
+            IrNode::GetIterator { value, rec, .. }
+            | IrNode::OpenIterator { value, rec, .. }
+            | IrNode::AsyncIteratorComplete { rec, result: value } => {
                 let mut out: Vec<&mut IrNode> = vec![&mut **value];
                 out.extend(rec.places_mut());
                 out
             }
             IrNode::IteratorStep(rec)
             | IrNode::IteratorValue(rec)
-            | IrNode::IteratorClose { rec, .. } => rec.places_mut().into_iter().collect(),
+            | IrNode::IteratorClose { rec, .. }
+            | IrNode::AsyncIteratorNext(rec)
+            | IrNode::AsyncIteratorReturn { rec, .. } => rec.places_mut().into_iter().collect(),
             IrNode::ArraySpread(elems) => elems
                 .iter_mut()
                 .map(|elem| match elem {

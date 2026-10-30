@@ -1184,6 +1184,19 @@ Y4 reason drafts (one line per affected row, for the final CI pass):
   `endsWith` (Y4-T4).
 - `fib`, `math`, `push_1e5`, `console_log`: must not change.
 
+Y5 reason drafts (one line per affected row, for the final CI pass):
+
+- every row: no opcount program uses `for await`, an async generator or
+  `yield*`, so no lowering changes; the realm grows by the async-from-sync
+  and async record builtins (`Builtin::ALL` +9, Y5-T1) and their
+  interned message texts, which may shift static slots and intern-table
+  probe fuel by a few.
+- `fib`, `math`, `push_1e5`, `console_log`, `object_reads`, `json`,
+  `for_in`, `map_set`, `for_of`, `spread`, `class_methods`, `array_hofs`,
+  `generators`, `string_methods`: must not change beyond the line above.
+- every row: `Array.fromAsync` adds five builtins (`Builtin::ALL` +5,
+  Y5-T4) and two interned `TypeError` texts; same shift as above.
+
 ---
 
 ## 9. Staged migration

@@ -177,6 +177,9 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         .max()
         .unwrap_or(0)
         .max(if has_state_machine { 2 } else { 0 })
+        // The `%AsyncFromSyncIteratorPrototype%` builtin bodies a `for await`
+        // reaches need a positional slot, also for a top-level loop in `main`.
+        .max(usize::from(has_for_await(program)))
         .max(if globals.reaches_builtins() {
             globals.call_arity()
         } else {
@@ -659,6 +662,23 @@ use op::*;
 
 #[cfg(test)]
 mod tests;
+
+/// Whether the program has a `for await` loop anywhere.
+fn has_for_await(program: &Program) -> bool {
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    #[derive(Default)]
+    struct Scan(bool);
+    impl Visit for Scan {
+        fn visit_for_of_stmt(&mut self, node: &swc_ecma_ast::ForOfStmt) {
+            self.0 |= node.is_await;
+            node.visit_children_with(self);
+        }
+    }
+    let mut scan = Scan::default();
+    program.visit_with(&mut scan);
+    scan.0
+}
 
 /// Whether `program` contains any generator or async function or arrow (a
 /// body compiled to a state machine).
