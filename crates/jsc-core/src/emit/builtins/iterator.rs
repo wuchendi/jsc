@@ -3,7 +3,8 @@
 //! wrappers, the `constructor` / `[@@toStringTag]` accessors of
 //! `%IteratorPrototype%` (`Iterator.prototype`), and the lazy helpers
 //! `map` / `filter` / `take` / `drop` / `flatMap` with their
-//! `%IteratorHelperPrototype%` objects.
+//! `%IteratorHelperPrototype%` objects, and the eager helpers `reduce` /
+//! `toArray` / `forEach` / `some` / `every` / `find`.
 //!
 //! A wrapper is a `CLASS_ITERATOR` object of kind [`WRAP_KIND`] whose
 //! 32-byte head is the one of the builtin iterators (§5.4), followed by the
@@ -20,7 +21,7 @@
 use super::iter::guarded;
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::emit::realm::{HelperKind, IteratorOp};
+use crate::emit::realm::{EagerKind, HelperKind, IteratorOp};
 use crate::ir::ConvertOp;
 
 /// The `kind` byte of a `%WrapForValidIteratorPrototype%` object (the first
@@ -195,8 +196,42 @@ const FLAT_NOT_OBJECT: CalleeErrorText<'static> = [
     "TypeError: Iterator.prototype.flatMap mapper result is not an object",
 ];
 
+/// An eager helper called on a non-object, by [`EagerKind`] order.
+const EAGER_NOT_OBJECT: [CalleeErrorText<'static>; 6] = [
+    [
+        "Iterator.prototype.reduce called on non-object",
+        "TypeError: Iterator.prototype.reduce called on non-object",
+    ],
+    [
+        "Iterator.prototype.toArray called on non-object",
+        "TypeError: Iterator.prototype.toArray called on non-object",
+    ],
+    [
+        "Iterator.prototype.forEach called on non-object",
+        "TypeError: Iterator.prototype.forEach called on non-object",
+    ],
+    [
+        "Iterator.prototype.some called on non-object",
+        "TypeError: Iterator.prototype.some called on non-object",
+    ],
+    [
+        "Iterator.prototype.every called on non-object",
+        "TypeError: Iterator.prototype.every called on non-object",
+    ],
+    [
+        "Iterator.prototype.find called on non-object",
+        "TypeError: Iterator.prototype.find called on non-object",
+    ],
+];
+
+/// `reduce` without an initial value on an empty iterator.
+const REDUCE_EMPTY: CalleeErrorText<'static> = [
+    "Reduce of empty iterator with no initial value",
+    "TypeError: Reduce of empty iterator with no initial value",
+];
+
 /// Every static string the bodies reference.
-pub(super) const STRINGS: [&str; 38] = [
+pub(super) const STRINGS: [&str; 52] = [
     FROM_PRIMITIVE[0],
     FROM_PRIMITIVE[1],
     FROM_NOT_CALLABLE[0],
@@ -235,6 +270,20 @@ pub(super) const STRINGS: [&str; 38] = [
     HELPER_RUNNING[1],
     FLAT_NOT_OBJECT[0],
     FLAT_NOT_OBJECT[1],
+    EAGER_NOT_OBJECT[0][0],
+    EAGER_NOT_OBJECT[0][1],
+    EAGER_NOT_OBJECT[1][0],
+    EAGER_NOT_OBJECT[1][1],
+    EAGER_NOT_OBJECT[2][0],
+    EAGER_NOT_OBJECT[2][1],
+    EAGER_NOT_OBJECT[3][0],
+    EAGER_NOT_OBJECT[3][1],
+    EAGER_NOT_OBJECT[4][0],
+    EAGER_NOT_OBJECT[4][1],
+    EAGER_NOT_OBJECT[5][0],
+    EAGER_NOT_OBJECT[5][1],
+    REDUCE_EMPTY[0],
+    REDUCE_EMPTY[1],
 ];
 
 /// The IR fragments the bodies emit, for the static-string scan.
@@ -297,6 +346,7 @@ pub(super) fn emit(
         IteratorOp::Helper(kind) => emit_helper(kind, function, frame, strings, helpers),
         IteratorOp::HelperNext => emit_helper_next(function, frame, strings, helpers),
         IteratorOp::HelperReturn => emit_helper_return(function, frame, strings, helpers),
+        IteratorOp::Eager(kind) => emit_eager(kind, function, frame, strings, helpers),
     }
 }
 
@@ -1074,6 +1124,235 @@ fn emit_helper_return(
     set_state(function, n, COMPLETED);
     return_if_pending(function);
     emit_node(&done_result(), function, frame.scratch(), strings, helpers);
+}
+
+/// The locals of an eager helper body.
+#[derive(Clone, Copy)]
+struct Eager {
+    /// The iterator, `this` (i64).
+    o: u32,
+    /// The callback (i64).
+    cb: u32,
+    /// Its `next` (i64).
+    next: u32,
+    /// The exception set aside while closing (i64).
+    saved: u32,
+    /// A step result (i64).
+    r: u32,
+    /// A stepped value (i64).
+    v: u32,
+    /// The `reduce` accumulator (i64).
+    acc: u32,
+    /// A callback result (i64).
+    res: u32,
+    /// The counter as a jsval (i64).
+    cv: u32,
+    /// The counter (f64).
+    counter: u32,
+    /// The `toArray` result array (i32).
+    list: u32,
+}
+
+impl Eager {
+    /// The locals of `frame`.
+    fn new(frame: Frame) -> Self {
+        Self {
+            o: frame.i64(0),
+            cb: frame.i64(1),
+            next: frame.i64(2),
+            saved: frame.i64(3),
+            r: frame.y64(0),
+            v: frame.y64(1),
+            acc: frame.y64(2),
+            res: frame.y64(3),
+            cv: frame.y64(4),
+            counter: frame.f64(0),
+            list: frame.i32(0),
+        }
+    }
+}
+
+/// `IteratorStepValue` of the record `e.o` / `e.next` into `e.v`, branching
+/// to label depth `done` once done; a throw propagates (no close).
+fn eager_step(
+    function: &mut Function,
+    e: Eager,
+    done: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    call_protocol(function, ProtocolOp::Step, e.o, Some(e.next), helpers);
+    wasm!(function; LocalSet(e.r));
+    return_if_pending(function);
+    wasm!(function;
+        LocalGet(e.r), I64Const(HOLE_BITS), I64Eq, BrIf(done),
+        LocalGet(e.r), I32Const(static_key(strings, "value")), Call(helpers.get), LocalSet(e.v),
+    );
+    return_if_pending(function);
+}
+
+/// `reduce`'s accumulator: the initial value when one is passed (counter
+/// `0`), else the first value (counter `1`), an empty iterator throwing a
+/// `TypeError`.
+fn eager_reduce_start(
+    function: &mut Function,
+    e: Eager,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    wasm!(function;
+        LocalGet(frame.argc()), F64ReinterpretI64, F64Const(Ieee64::from(2.0)), F64Ge,
+        If(BlockType::Empty),
+    );
+    frame.arg(function, 1);
+    wasm!(function; LocalSet(e.acc), Else, Block(BlockType::Empty));
+    eager_step(function, e, 0, strings, helpers);
+    wasm!(function;
+        LocalGet(e.v), LocalSet(e.acc),
+        F64Const(Ieee64::from(1.0)), LocalSet(e.counter),
+        Br(1),
+        End,
+    );
+    throw_type_error(function, frame, REDUCE_EMPTY, strings, helpers);
+    wasm!(function; End);
+}
+
+/// When `ToBoolean(e.res)` is `select`, close the iterator (normal
+/// completion; a throw from that propagates) and return `found` (the
+/// stepped value) or else `bits`.
+fn eager_early(
+    function: &mut Function,
+    e: Eager,
+    (select, found, bits): (bool, bool, i64),
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let truthy = IrNode::ConvertCall {
+        op: ConvertOp::ToBoolean,
+        arg: Box::new(IrNode::Local(e.res)),
+        radix: None,
+    };
+    emit_node(&truthy, function, frame.scratch(), strings, helpers);
+    wasm!(function; I64Const(TRUE_BITS), I64Eq);
+    if !select {
+        wasm!(function; I32Eqz);
+    }
+    wasm!(function; If(BlockType::Empty));
+    call_protocol(function, ProtocolOp::Close, e.o, None, helpers);
+    wasm!(function; Drop);
+    return_if_pending(function);
+    if found {
+        wasm!(function; LocalGet(e.v));
+    } else {
+        wasm!(function; I64Const(bits));
+    }
+    wasm!(function; Return, End);
+}
+
+/// An eager helper `Iterator.prototype.<kind>(fn[, initialValue])`: `this`
+/// must be an object; the callback must be callable (else a `TypeError`
+/// closing `this`, as for the lazy helpers); then `GetIteratorDirect(this)`
+/// (`next` read once) and the iterator is consumed, the counter passed as
+/// the callback's last argument. A throw from stepping or reading a value
+/// propagates; a throwing callback closes the iterator under its throw;
+/// `some` / `every` / `find` close it (normal completion) on an early
+/// result. `reduce` without an initial value starts from the first value
+/// (counter `1`; an empty iterator is a `TypeError`).
+fn emit_eager(
+    kind: EagerKind,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let e = Eager::new(frame);
+    let index = match kind {
+        EagerKind::Reduce => 0,
+        EagerKind::ToArray => 1,
+        EagerKind::ForEach => 2,
+        EagerKind::Some => 3,
+        EagerKind::Every => 4,
+        EagerKind::Find => 5,
+    };
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(e.o));
+    emit_is_object(function, e.o);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    throw_type_error(function, frame, EAGER_NOT_OBJECT[index], strings, helpers);
+    wasm!(function; End);
+    if kind != EagerKind::ToArray {
+        frame.arg(function, 0);
+        wasm!(function; LocalSet(e.cb));
+        emit_is_function(function, e.cb);
+        wasm!(function; I32Eqz, If(BlockType::Empty));
+        raise_type(function, frame, CALLBACK_NOT_CALLABLE, strings, helpers);
+        close_pending(function, e.o, e.saved, helpers);
+        wasm!(function; End);
+    }
+    wasm!(function;
+        LocalGet(e.o), I32Const(static_key(strings, "next")), Call(helpers.get), LocalSet(e.next),
+    );
+    return_if_pending(function);
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(e.counter));
+    match kind {
+        EagerKind::ToArray => {
+            wasm!(function; I32Const(0), Call(helpers.new_array()), LocalSet(e.list));
+        }
+        EagerKind::Reduce => eager_reduce_start(function, e, frame, strings, helpers),
+        _ => {}
+    }
+    wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
+    eager_step(function, e, 1, strings, helpers);
+    wasm!(function; LocalGet(e.counter), I64ReinterpretF64, LocalSet(e.cv));
+    if kind == EagerKind::ToArray {
+        wasm!(function; LocalGet(e.list), LocalGet(e.v), Call(helpers.array_push), Drop);
+    } else {
+        let args: &[u32] = if kind == EagerKind::Reduce {
+            &[e.acc, e.v, e.cv]
+        } else {
+            &[e.v, e.cv]
+        };
+        call_args(function, frame, e.cb, None, args, helpers);
+        wasm!(function; LocalSet(e.res), GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+        close_pending(function, e.o, e.saved, helpers);
+        wasm!(function; End);
+    }
+    match kind {
+        EagerKind::Reduce => wasm!(function; LocalGet(e.res), LocalSet(e.acc)),
+        EagerKind::Some => eager_early(
+            function,
+            e,
+            (true, false, TRUE_BITS),
+            frame,
+            strings,
+            helpers,
+        ),
+        EagerKind::Every => eager_early(
+            function,
+            e,
+            (false, false, FALSE_BITS),
+            frame,
+            strings,
+            helpers,
+        ),
+        EagerKind::Find => eager_early(function, e, (true, true, 0), frame, strings, helpers),
+        EagerKind::ToArray | EagerKind::ForEach => {}
+    }
+    wasm!(function;
+        LocalGet(e.counter), F64Const(Ieee64::from(1.0)), F64Add, LocalSet(e.counter),
+        Br(0),
+        End, End,
+    );
+    match kind {
+        EagerKind::Reduce => wasm!(function; LocalGet(e.acc)),
+        EagerKind::ToArray => {
+            wasm!(function; LocalGet(e.list), I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
+        }
+        EagerKind::ForEach | EagerKind::Find => wasm!(function; I64Const(UNDEFINED_BITS)),
+        EagerKind::Some => wasm!(function; I64Const(FALSE_BITS)),
+        EagerKind::Every => wasm!(function; I64Const(TRUE_BITS)),
+    }
 }
 
 /// Read `this` into i64 `this`, throwing unless it is a
