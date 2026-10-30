@@ -249,11 +249,11 @@ reinterpret directly. Consequently NaN tests compare bits directly, and a
 computed NaN can never alias a boolean, `null`, `undefined`, or pointer.
 
 **`typeof`.** `typeof` yields an interned heap string: the type index
-(`number`, `boolean`, `undefined`, `object`, `string`, `function` —
-`abi::TYPEOF_STRINGS`) selects the data-segment offset of the matching word, so
-`typeof x === "number"`, concatenation, and `.length` all go through ordinary
-string machinery. `TYPE_FUNCTION` blocks report `"function"`, strings
-`"string"`, every other heap kind `"object"`. `typeof` of an unresolvable
+(`number`, `boolean`, `undefined`, `object`, `string`, `function`, `symbol`
+— `abi::TYPEOF_STRINGS`) selects the data-segment offset of the matching word,
+so `typeof x === "number"`, concatenation, and `.length` all go through
+ordinary string machinery. `TYPE_FUNCTION` blocks report `"function"`, strings
+`"string"`, `TYPE_SYMBOL` blocks `"symbol"`, every other heap kind `"object"`. `typeof` of an unresolvable
 global name is `"undefined"` and never throws.
 
 **Truthiness.** Falsy is exactly `false`, `null`, `undefined`, `±0`, `NaN`, and
@@ -432,6 +432,7 @@ the array bits is ever cleared (except `JOINING`).
 | `11` `TYPE_ACCESSOR` | accessor pair (internal) | header, pad, `getter: i64 @8`, `setter: i64 @16` | 24 | — |
 | `12` `TYPE_PROPS` | own-property table (internal) | §5.3 | `16 + 16·cap` | — |
 | `13` `TYPE_ELEMS` | array element store (internal) | header, `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
+| `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`; bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 
 **`TYPE_OBJECT` classes** (header byte 3): `0` `CLASS_ORDINARY`, `1`
 `CLASS_ERROR` (an Error instance: its kind is its prototype, §7.7), `2`
@@ -440,7 +441,8 @@ non-enumerable `length`), `3` / `4` / `5` `CLASS_BOOLEAN` / `CLASS_NUMBER` /
 `CLASS_STRING` wrappers (24 bytes, `[[PrimitiveValue]]` at
 `WRAPPER_VALUE_OFFSET = 16`; a String wrapper owns its `length` and indices as
 read-only properties), `6` `CLASS_GLOBAL` (the global object, a static realm
-block).
+block), `7` `CLASS_SYMBOL` (a Symbol wrapper, `[[SymbolData]]` at
+`WRAPPER_VALUE_OFFSET`).
 
 Notes per kind:
 
@@ -481,12 +483,12 @@ An object-family block's own named properties live in a `TYPE_PROPS` table:
 | offset | size | field |
 |---|---|---|
 | 0 | 1 | kind `12` |
-| 2 | 1 | `tflags`: `1` `HAS_INDEX_KEYS`, `2` `HAS_NON_ENUM`, `4` `WATCHED` |
+| 2 | 1 | `tflags`: `1` `HAS_INDEX_KEYS`, `2` `HAS_NON_ENUM`, `4` `WATCHED`, `8` `HAS_SYMBOL_KEYS` (some key is a `TYPE_SYMBOL` block) |
 | 3 | 1 | dirty-bit index of a watched intrinsic's table |
 | 4 | 4 | `count: u32` — slots used, tombstones included |
 | 8 | 4 | `cap: u32` |
 | 12 | 4 | `live: u32` — non-tombstone entries |
-| `16 + 16·k` | 4 | `key: u32` → interned string block; `0` = tombstone |
+| `16 + 16·k` | 4 | `key: u32` → interned string block or `TYPE_SYMBOL` block; `0` = tombstone |
 | `20 + 16·k` | 4 | `attrs: u32` |
 | `24 + 16·k` | 8 | `value: i64` — a data value, or a `TYPE_ACCESSOR` pointer when `ACCESSOR` |
 
@@ -1148,17 +1150,19 @@ it):
 
 - numbers by the ECMAScript Number::toString rules (shortest round-trip digits,
   exponential form at `>= 1e21` and `< 1e-6`, `-0` prints `0`); strings
-  unquoted, also inside containers;
+  unquoted, also inside containers; symbols `Symbol(a)` / `Symbol()`;
 - arrays `[ 1, <1 empty item>, 3, foo: 1 ]` (holes as runs, then own named
   properties); objects `{ a: 1, b: 2 }` from their own enumerable properties
-  in own-key order, accessors as `[Getter]` / `[Setter]` / `[Getter/Setter]`;
+  in own-key order (enumerable symbol keys last, as `[Symbol(a)]: 1`),
+  accessors as `[Getter]` / `[Setter]` / `[Getter/Setter]`;
   an object whose prototype chain holds a `constructor` naming a function other
   than `Object` renders as `A { x: 1 }`;
 - functions `[Function: f]` / `[Function (anonymous)]`, classes `[class A]` /
   `[class B extends A]`, names from the function info table;
 - `CLASS_ERROR` objects as `Name: message` (name and message looked up along the
   prototype chain without running getters);
-- wrappers as `[Number: 1]` / `[String: 'ab']` / `[Boolean: true]`;
+- wrappers as `[Number: 1]` / `[String: 'ab']` / `[Boolean: true]` /
+  `[Symbol: Symbol(a)]`;
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
   `NaN` time value);
