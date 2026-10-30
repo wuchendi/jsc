@@ -21,6 +21,7 @@ macro_rules! wasm {
 }
 
 mod array;
+mod async_iter;
 mod ctor;
 mod date;
 mod error;
@@ -39,6 +40,10 @@ mod string;
 mod symbol;
 
 use crate::emit::realm::ArrayCopyOp;
+pub(super) use async_iter::{
+    emit_async_iterator_complete, emit_async_iterator_next, emit_async_iterator_return,
+    emit_iterator_result_check, emit_open_async_iterator,
+};
 pub(super) use iter::{
     CloseMode, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
     emit_iterator_close, emit_iterator_step, emit_iterator_value, emit_open_iterator,
@@ -90,6 +95,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(date::fragments(k));
     nodes.extend(json::fragments());
     nodes.extend(iter::fragments(k));
+    nodes.extend(async_iter::fragments(k));
     nodes
 }
 
@@ -230,6 +236,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(json::strings())
         .chain(symbol::STRINGS)
         .chain(iter::strings())
+        .chain(async_iter::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 

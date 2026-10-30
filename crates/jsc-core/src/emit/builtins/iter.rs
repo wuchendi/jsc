@@ -122,7 +122,7 @@ const CREATE_TEXTS: [(IterFamily, IterKind, CalleeErrorText<'static>); 8] = [
 ];
 
 /// The `TypeError` of an `@@iterator` method returning a non-object.
-const ITERATOR_NOT_OBJECT: CalleeErrorText<'static> = [
+pub(super) const ITERATOR_NOT_OBJECT: CalleeErrorText<'static> = [
     "Result of the Symbol.iterator method is not an object",
     "TypeError: Result of the Symbol.iterator method is not an object",
 ];
@@ -152,7 +152,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
 }
 
 /// `CreateIterResultObject(value, done)`.
-fn iter_result(value: IrNode, done: bool) -> IrNode {
+pub(super) fn iter_result(value: IrNode, done: bool) -> IrNode {
     IrNode::Object {
         entries: vec![
             (PropKey::Static("value".into()), value),
@@ -184,6 +184,7 @@ pub(super) fn emit(
         }
         IterOp::StringIterator => emit_string_iter(function, frame, strings, helpers),
         IterOp::Next(family) => emit_next(family, function, frame, strings, helpers),
+        IterOp::Async(op) => super::async_iter::emit(op, function, frame, strings, helpers),
     }
 }
 
@@ -583,7 +584,7 @@ fn emit_str_iter_next(
 // --- the iteration protocol (design/symbol-strings.md §5.1-§5.3) -------------
 
 /// Record state: done (closing does nothing).
-const ST_DONE: f64 = 0.0;
+pub(super) const ST_DONE: f64 = 0.0;
 /// Record state: a clean array or `arguments` object walked by index
 /// (`next` holds the index).
 pub(in crate::emit) const ST_ARRAY: f64 = 1.0;
@@ -600,11 +601,11 @@ pub(in crate::emit) const ST_GEN: f64 = 5.0;
 /// `%Array.prototype.values%`, walked like an array.
 const ST_ARGS: f64 = 6.0;
 /// Record state: an open protocol record (closing calls `return`).
-const ST_PROTOCOL: f64 = 7.0;
+pub(super) const ST_PROTOCOL: f64 = 7.0;
 /// Record state: a protocol step or its value read in flight, left behind
 /// by a throw from either (closing does nothing: a throw from the iterator
 /// is not closed).
-const ST_STEPPING: f64 = 8.0;
+pub(super) const ST_STEPPING: f64 = 8.0;
 
 /// The jsval of record state `state`.
 fn st(state: f64) -> i64 {
@@ -646,7 +647,7 @@ fn place_set(place: &IrNode, value: IrNode) -> IrNode {
 }
 
 /// Emit `place = value`, discarding the value.
-fn store(
+pub(super) fn store(
     function: &mut Function,
     place: &IrNode,
     value: IrNode,
@@ -665,7 +666,7 @@ fn store(
 }
 
 /// Push the record place `place`.
-fn load(
+pub(super) fn load(
     function: &mut Function,
     place: &IrNode,
     scratch: u32,
@@ -676,7 +677,7 @@ fn load(
 }
 
 /// Push i32 `1` when the record's state is `state`.
-fn state_is(
+pub(super) fn state_is(
     function: &mut Function,
     rec: &IterRecord,
     state: f64,
@@ -705,7 +706,7 @@ fn bits_clear(function: &mut Function, intrinsics: &[Intrinsic], sealed: bool) {
 /// Call the internal protocol builtin `builtin` with `this` = i64 `this`
 /// and `env` = i64 `env` (`0` when `None`), no arguments, leaving its
 /// result (a throw left pending).
-fn call_internal(
+pub(super) fn call_internal(
     function: &mut Function,
     builtin: Builtin,
     this: u32,
@@ -843,6 +844,20 @@ pub(in crate::emit) fn emit_iter_open_with(
     );
     wasm!(function; LocalSet(method));
     emit_propagate_if_pending(function, helpers);
+    emit_record_fill(function, method, rec, scratch, strings, helpers);
+}
+
+/// Fill `rec` (state [`ST_PROTOCOL`]) from the iterator object in i64
+/// `method` (clobbered): `rec.iter`, then `rec.next = Get(iterator,
+/// "next")` read once (a throw propagates, leaving the record done).
+pub(super) fn emit_record_fill(
+    function: &mut Function,
+    method: u32,
+    rec: &IterRecord,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     store(
         function,
         &rec.iter,
@@ -1373,7 +1388,7 @@ pub(super) fn guarded(
 /// `<x> is not a function` for the jsval in `local` (`String(x)` of a
 /// primitive, `typeof x` of an object), thrown as a `TypeError` (`tmp` an
 /// i64 temp).
-fn not_a_function(local: u32, tmp: u32) -> IrNode {
+pub(super) fn not_a_function(local: u32, tmp: u32) -> IrNode {
     let name = IrNode::Ternary {
         cond: Box::new(IrNode::IsObject(Box::new(IrNode::Local(local)))),
         then_branch: Box::new(IrNode::TypeOf(Box::new(IrNode::Local(local)))),
@@ -1384,7 +1399,7 @@ fn not_a_function(local: u32, tmp: u32) -> IrNode {
 
 /// `Iterator result <x> is not an object` for the non-object jsval in
 /// `local`, thrown as a `TypeError` (`tmp` an i64 temp).
-fn result_not_object(local: u32, tmp: u32) -> IrNode {
+pub(super) fn result_not_object(local: u32, tmp: u32) -> IrNode {
     let message = concat(
         concat(IrNode::Str("Iterator result ".into()), describe(local)),
         IrNode::Str(" is not an object".into()),
@@ -1393,7 +1408,7 @@ fn result_not_object(local: u32, tmp: u32) -> IrNode {
 }
 
 /// `String(x)` of the primitive in `local` (a symbol is described).
-fn describe(local: u32) -> IrNode {
+pub(super) fn describe(local: u32) -> IrNode {
     IrNode::ConvertCall {
         op: ConvertOp::String,
         arg: Box::new(IrNode::Local(local)),
@@ -1402,7 +1417,7 @@ fn describe(local: u32) -> IrNode {
 }
 
 /// `a + b`.
-fn concat(a: IrNode, b: IrNode) -> IrNode {
+pub(super) fn concat(a: IrNode, b: IrNode) -> IrNode {
     IrNode::Binary {
         op: BinOp::Add,
         lhs: Box::new(a),
@@ -1411,7 +1426,7 @@ fn concat(a: IrNode, b: IrNode) -> IrNode {
 }
 
 /// Throw a fresh `TypeError` whose message is the string value of `message`.
-fn throw_type(message: IrNode, tmp: u32) -> IrNode {
+pub(super) fn throw_type(message: IrNode, tmp: u32) -> IrNode {
     IrNode::Seq(vec![
         IrNode::Assign {
             local: tmp,
@@ -1426,7 +1441,7 @@ fn throw_type(message: IrNode, tmp: u32) -> IrNode {
 }
 
 /// Throw `node` (an IR throw) from a builtin body and return.
-fn throw_and_return(
+pub(super) fn throw_and_return(
     function: &mut Function,
     frame: Frame,
     node: &IrNode,
@@ -1439,7 +1454,7 @@ fn throw_and_return(
 
 /// Call the function in i64 `callee` with `this` = i64 `this` and no
 /// arguments into i64 `out`, returning on a throw.
-fn call_method(
+pub(super) fn call_method(
     function: &mut Function,
     frame: Frame,
     callee: u32,
@@ -1522,6 +1537,21 @@ fn emit_step_body(
     );
     wasm!(function; End);
     call_method(function, frame, next, it, r, helpers);
+    emit_result_done(function, frame, r, done, tmp, strings, helpers);
+}
+
+/// The tail of an `IteratorStep` over the result in i64 `r`: a `TypeError`
+/// unless an object, then push the hole when `ToBoolean(r.done)`, else `r`
+/// (`done` and `tmp` i64 temps).
+pub(super) fn emit_result_done(
+    function: &mut Function,
+    frame: Frame,
+    r: u32,
+    done: u32,
+    tmp: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     emit_is_object(function, r);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_and_return(
