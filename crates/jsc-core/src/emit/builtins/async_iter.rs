@@ -36,7 +36,7 @@ const SYNC_NEXT_OFFSET: u32 = 40;
 const BLOCK_SIZE: i32 = 48;
 
 /// The `TypeError` of an `@@asyncIterator` method returning a non-object.
-const ASYNC_ITERATOR_NOT_OBJECT: CalleeErrorText<'static> = [
+pub(super) const ASYNC_ITERATOR_NOT_OBJECT: CalleeErrorText<'static> = [
     "Result of the Symbol.asyncIterator method is not an object",
     "TypeError: Result of the Symbol.asyncIterator method is not an object",
 ];
@@ -176,6 +176,9 @@ pub(super) fn emit(
             );
         }
         AsyncIterOp::CloseRejected => emit_close_rejected(function, frame, helpers),
+        AsyncIterOp::FromAsync(op) => {
+            super::array::emit_from_async(op, function, frame, strings, helpers);
+        }
     }
 }
 
@@ -447,7 +450,7 @@ fn emit_open_body(
 /// kind [`KIND_ASYNC_FROM_SYNC`] over `%AsyncFromSyncIteratorPrototype%`
 /// holding the sync iterator in i64 `it` and its `next` in i64 `next`
 /// (`obj` an i32 temp).
-fn create(function: &mut Function, it: u32, next: u32, obj: u32, helpers: Helpers<'_>) {
+pub(super) fn create(function: &mut Function, it: u32, next: u32, obj: u32, helpers: Helpers<'_>) {
     let header = TYPE_OBJECT | (i32::from(abi::CLASS_ITERATOR) << 24);
     let proto = intrinsic_bits(Intrinsic::AsyncFromSyncIteratorPrototype, helpers);
     wasm!(function;

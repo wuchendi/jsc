@@ -129,10 +129,9 @@ Details are in [DESIGN.md](DESIGN.md).
 ## Current limitations
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
-- **Language gaps.** No object spread, private `#` members, static blocks, or computed class member names.
+- **Language gaps.** No object spread, private `#` members, or static blocks.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
 - **Not self-contained.** The module imports seven host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
-- **Byte strings.** Strings are byte sequences, not UTF-16: `"é".length` is `2`; string methods throw `TypeError` where a non-ASCII position would otherwise be wrong.
 - **Missing built-ins.** No `RegExp` (regex literals are rejected), `Symbol`, `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval` or the `Function` constructor; no generic iteration protocol (`Symbol.iterator`); no ES modules.
 
 ## Roadmap

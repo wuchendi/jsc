@@ -310,3 +310,105 @@ fn for_await_inside_an_async_generator_that_yields() {
         "10,20,end\n",
     );
 }
+
+// Array.fromAsync
+
+#[test]
+fn from_async_over_an_async_generator() {
+    assert_output(
+        "async function* g(){ yield 1; yield 2; }
+         Array.fromAsync(g()).then(a => console.log(Array.isArray(a), a.join(',')));",
+        "true 1,2\n",
+    );
+}
+
+#[test]
+fn from_async_awaits_a_sync_iterable_of_promises() {
+    assert_output(
+        "Array.fromAsync([Promise.resolve(1), 2]).then(a => console.log(a.join(',')));",
+        "1,2\n",
+    );
+}
+
+#[test]
+fn from_async_awaits_array_like_elements() {
+    assert_output(
+        "Array.fromAsync({ length: 2, 0: Promise.resolve('a'), 1: 'b' })
+           .then(a => console.log(a.join(','), a.length));",
+        "a,b 2\n",
+    );
+}
+
+#[test]
+fn from_async_awaits_mapped_values_with_the_index() {
+    assert_output(
+        "Array.fromAsync([1, 2, 3], async (x, k) => x * 10 + k)
+           .then(a => console.log(a.join(',')));",
+        "10,21,32\n",
+    );
+}
+
+#[test]
+fn from_async_passes_this_arg_to_map_fn() {
+    assert_output(
+        "Array.fromAsync([2], function (x) { return this.m * x; }, { m: 5 })
+           .then(a => console.log(a[0]));",
+        "10\n",
+    );
+}
+
+#[test]
+fn from_async_rejects_a_non_callable_map_fn_before_reading_items() {
+    assert_output(
+        "let reads = 0;
+         const items = { get [Symbol.iterator]() { reads++; return [][Symbol.iterator]; } };
+         Array.fromAsync(items, 5)
+           .then(() => console.log('fulfilled'), e => console.log(e instanceof TypeError, reads));",
+        "true 0\n",
+    );
+}
+
+#[test]
+fn from_async_returns_a_promise_when_items_throw() {
+    assert_output(
+        "const items = { get [Symbol.asyncIterator]() { throw new Error('boom'); } };
+         const p = Array.fromAsync(items);
+         console.log(p instanceof Promise);
+         p.catch(e => console.log('rejected', e.message));
+         Array.fromAsync(null).catch(e => console.log(e instanceof TypeError));",
+        "true\nrejected boom\ntrue\n",
+    );
+}
+
+#[test]
+fn from_async_closes_the_iterator_when_map_fn_throws() {
+    assert_output(
+        "let returns = 0;
+         const items = { [Symbol.asyncIterator]() {
+           return {
+             next() { return Promise.resolve({ value: 1, done: false }); },
+             return() { returns++; return Promise.resolve({}); },
+           };
+         } };
+         Array.fromAsync(items, () => { throw new Error('map'); })
+           .catch(e => console.log(e.message, returns));",
+        "map 1\n",
+    );
+}
+
+#[test]
+fn from_async_length_and_name() {
+    assert_output(
+        "console.log(Array.fromAsync.length, Array.fromAsync.name);",
+        "1 fromAsync\n",
+    );
+}
+
+#[test]
+fn from_async_constructs_a_subclass() {
+    assert_output(
+        "class A extends Array {}
+         A.fromAsync([1]).then(a => console.log(a instanceof A, a[0], a.length));",
+        "true 1 1\n",
+    );
+}

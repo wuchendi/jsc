@@ -7,9 +7,6 @@
 # Symbols as WeakMap keys need WeakMap
 symbols-as-weakmap-keys
 
-# Array.fromAsync: until Y5-T4
-Array.fromAsync
-
 # Proxy / Reflect (no globals)
 Proxy
 proxy-missing-checks
