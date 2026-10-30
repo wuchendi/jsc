@@ -962,11 +962,17 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        if !inline_member(namespace, key) || (namespace == "JSON" && args.len() > 1) {
+        // `Promise.resolve` / `reject` construct from `this`: only the
+        // inline (never written) `Promise` keeps their `%Promise%` code.
+        let inline = self.shared.globals.inline(namespace);
+        if !inline_member(namespace, key)
+            || (namespace == "JSON" && args.len() > 1)
+            || (namespace == "Promise" && !inline)
+        {
             return self.lower_method_call_user(member, args);
         }
         let arity = inline_arity(namespace, key);
-        if self.shared.globals.inline(namespace) {
+        if inline {
             let (seq, args) = self.fit_inline_args(arity, args);
             let Some(fast) = inline_call(namespace, key, args) else {
                 return Err(anyhow!("{namespace}.{key} has no inline code"));
