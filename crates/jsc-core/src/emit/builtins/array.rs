@@ -747,8 +747,9 @@ pub(super) fn emit_to_locale_string(
 
 /// `Array.prototype.slice(start, end)`: `k` and `final` from the relative
 /// `start` and `end` (`len` when `undefined`), `A = ArraySpeciesCreate(O,
-/// count)`; an array whose species is `ArrayCreate` then runs the call sites'
-/// host slice over `[k, final)`; otherwise each present index of `[k, final)`
+/// count)`; a dense array whose species is `ArrayCreate` then copies its
+/// store slots `[k, final)` (a hole stays a hole) into a fresh array;
+/// otherwise each present index of `[k, final)`
 /// is copied into `A` by `CreateDataPropertyOrThrow` (an absent one stays a
 /// hole) and `A.length` is set.
 pub(super) fn emit_slice(
@@ -773,15 +774,29 @@ pub(super) fn emit_slice(
     relative_arg(function, end_v, true, rel, len, fin, helpers);
     species_ctor(function, frame, o, c, strings, helpers);
     indexless_array(function, o, helpers);
+    let (n, dst) = (frame.i32(0), frame.i32(1));
+    let data = |function: &mut Function| {
+        emit_array_elems(function);
+        wasm!(function; I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()), I32Add);
+    };
     wasm!(function;
         LocalGet(c), I64Const(UNDEFINED_BITS), I64Eq, I32And,
+        LocalGet(o), I32WrapI64,
+        I32Load8U(MemArg { offset: u64::from(abi::HEADER_FLAGS_OFFSET), align: 0, memory_index: 0 }),
+        I32Const(ARRAY_SPARSE), I32And, I32Eqz, I32And,
         If(BlockType::Empty),
-        LocalGet(o), I32Const(abi::METHOD_OP_SLICE),
+        LocalGet(fin), LocalGet(k), F64Sub, I32TruncSatF64U, LocalTee(n),
+        Call(helpers.new_array()), LocalSet(dst),
+        LocalGet(n), If(BlockType::Empty), LocalGet(dst),
     );
-    num(function, k);
-    num(function, fin);
+    data(function);
+    wasm!(function; LocalGet(o), I32WrapI64);
+    data(function);
     wasm!(function;
-        Call(helpers.method), Return,
+        LocalGet(k), I32TruncSatF64U, I32Const(3), I32Shl, I32Add,
+        LocalGet(n), I32Const(3), I32Shl, MemoryCopy { src_mem: 0, dst_mem: 0 },
+        End,
+        LocalGet(dst), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Return,
         End,
         // count = max(final - k, 0)
         LocalGet(fin), LocalGet(k), F64Sub, F64Const(Ieee64::from(0.0)), F64Max,

@@ -815,14 +815,11 @@ pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
 /// `__convert` op flag: parse a leading float (`parseFloat(x)`).
 pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;
 
-/// `__method` op flag: `indexOf` (overloaded on array/string).
+/// `__method` op flag: array `indexOf`.
 pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
-/// `__method` op flag: `includes`.
+/// `__method` op flag: array `includes`.
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `slice` (overloaded on array/string).
-pub(crate) const METHOD_OP_SLICE: i32 = 3;
 
 /// `__method` op flag: `toUpperCase`.
 pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
@@ -830,55 +827,9 @@ pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
 /// `__method` op flag: `toLowerCase`.
 pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
 
-/// `__method` op flag: `charAt`.
-pub(crate) const METHOD_OP_CHAR_AT: i32 = 6;
-
-/// `__method` op flag: `trim` (string).
-pub(crate) const METHOD_OP_TRIM: i32 = 7;
-
-/// `__method` op flag: `trimStart` (string).
-pub(crate) const METHOD_OP_TRIM_START: i32 = 8;
-
-/// `__method` op flag: `trimEnd` (string).
-pub(crate) const METHOD_OP_TRIM_END: i32 = 9;
-
-/// `__method` op flag: `repeat` (string).
-pub(crate) const METHOD_OP_REPEAT: i32 = 10;
-
-/// `__method` op flag: `startsWith` (string).
-pub(crate) const METHOD_OP_STARTS_WITH: i32 = 11;
-
-/// `__method` op flag: `endsWith` (string).
-pub(crate) const METHOD_OP_ENDS_WITH: i32 = 12;
-
-/// `__method` op flag: `padStart` (string).
-pub(crate) const METHOD_OP_PAD_START: i32 = 13;
-
-/// `__method` op flag: `padEnd` (string).
-pub(crate) const METHOD_OP_PAD_END: i32 = 14;
-
-/// `__method` op flag: `substring` (string).
-pub(crate) const METHOD_OP_SUBSTRING: i32 = 15;
-
-/// `__method` op flag: `split` (string, yields an array).
-pub(crate) const METHOD_OP_SPLIT: i32 = 16;
-
 /// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
 /// `arg0` an integral radix in `2..=36`).
 pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
-
-/// `__method` op flag: `String.prototype.at` (string, a number or
-/// `undefined` index).
-pub(crate) const METHOD_OP_AT: i32 = 18;
-
-/// `__method` op flag: `String.prototype.charCodeAt` (string).
-pub(crate) const METHOD_OP_CHAR_CODE_AT: i32 = 19;
-
-/// `__method` op flag: `String.prototype.codePointAt` (string).
-pub(crate) const METHOD_OP_CODE_POINT_AT: i32 = 20;
-
-/// `__method` op flag: `String.prototype.lastIndexOf` (string).
-pub(crate) const METHOD_OP_LAST_INDEX_OF: i32 = 21;
 
 /// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
 /// order).
@@ -888,37 +839,15 @@ pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
 /// `undefined`).
 pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
 
-/// `__method` op flag: the index of a string pattern without `RegExp` syntax
-/// (`String.prototype.search` / `match`; `undefined` is the empty pattern).
-pub(crate) const METHOD_OP_SEARCH: i32 = 24;
-
-/// `__method` op flag: `String.prototype.replace` with a string pattern and a
-/// replacement template (`GetSubstitution`).
-pub(crate) const METHOD_OP_REPLACE: i32 = 25;
-
-/// `__method` op flag: `String.prototype.replaceAll` with a string pattern and
-/// a replacement template.
-pub(crate) const METHOD_OP_REPLACE_ALL: i32 = 26;
-
-/// `__method` op flag: `String.fromCharCode` (an array receiver of numbers).
-pub(crate) const METHOD_OP_FROM_CHAR_CODE: i32 = 27;
-
-/// `__method` op flag: `String.fromCodePoint` (an array receiver of
-/// validated code points).
-pub(crate) const METHOD_OP_FROM_CODE_POINT: i32 = 28;
-
 /// `__method` result: the string op cannot produce a correct result for its
-/// input yet (a byte position over a non-ASCII string, a lone surrogate); the
-/// calling builtin throws a `TypeError`. [`HOLE`], which no JS value produces.
+/// input yet (`normalize` over non-ASCII text); the calling builtin throws a
+/// `TypeError`. [`HOLE`], which no JS value produces.
 pub(crate) const METHOD_UNSUPPORTED: u64 = HOLE;
 
 /// `__method` result: the argument is out of range (an unknown `normalize`
 /// form); the calling builtin throws a `RangeError`.
 pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
 
-/// `__method` result: the pattern has `RegExp` syntax, which needs the absent
-/// `RegExp`; the calling builtin throws a `TypeError`.
-pub(crate) const METHOD_NEEDS_REGEXP: u64 = UNDEFINED | 3;
 /// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
 /// receiver, `arg0` an integral `f` in `0..=100`).
 pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;
