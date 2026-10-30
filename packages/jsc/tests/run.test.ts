@@ -681,3 +681,28 @@ it('decodes and allocates Latin-1 and UTF-16 strings like the Rust host', async 
   expect(written(stdout)).toBe('�\n')
   expect((await run('new String("\\u00e9")')).result).toBe("[String: 'é']")
 })
+
+it('maps case on lossless code units like the Rust host', async () => {
+  const cases: [string, string][] = [
+    ["'ß'.toUpperCase()", 'SS'],
+    ["'ÿ'.toUpperCase() === '\\u0178'", 'true'],
+    ["'µ'.toUpperCase() === '\\u039C'", 'true'],
+    ["'ÀÉ'.toLowerCase()", 'àé'],
+    ["'àé'.toUpperCase()", 'ÀÉ'],
+    ["'×÷'.toUpperCase()", '×÷'],
+    ["'ΑΣ'.toLowerCase()", 'ας'],
+    ["'ΑΣ Α'.toLowerCase()", 'ας α'],
+    ["'\\uD800'.toUpperCase() === '\\uD800'", 'true'],
+    ["'\\uD800'.toUpperCase().length", '1'],
+    ["'a\\uD800b'.toUpperCase() === 'A\\uD800B'", 'true'],
+    ["'İ'.toLowerCase().length", '2'],
+    ["'ﬀ'.toUpperCase()", 'FF'],
+    ["'ß'.toLocaleUpperCase()", 'SS'],
+    ["'ÿ'.toLocaleUpperCase() === '\\u0178'", 'true'],
+    ["'ΑΣ'.toLocaleLowerCase()", 'ας'],
+    ["'a\\uD800b'.toLocaleUpperCase() === 'A\\uD800B'", 'true'],
+  ]
+  for (const [src, expected] of cases) {
+    expect((await run(src)).result, src).toBe(expected)
+  }
+})
