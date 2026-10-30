@@ -427,12 +427,6 @@ const NO_THROW_METHOD: [&str; 2] = [
     "TypeError: The iterator does not provide a 'throw' method",
 ];
 
-/// The `TypeError` of a `yield*` delegate result that is not an object.
-const RESULT_NOT_OBJECT: [&str; 2] = [
-    "Iterator result is not an object",
-    "TypeError: Iterator result is not an object",
-];
-
 /// The resumption modes of a `yield*` loop (its `mode` cell).
 const MODE_NEXT: u32 = crate::abi::GEN_RESUME_MODE_NEXT;
 const MODE_THROW: u32 = crate::abi::GEN_RESUME_MODE_THROW;
@@ -1141,11 +1135,9 @@ impl CfgBuilder {
 
         // check: the result must be an object; `done` ends the delegation.
         self.cur = check as usize;
-        self.push(IrStmt::If {
-            cond: IrNode::Not(Box::new(IrNode::IsObject(Box::new(slot_get(result))))),
-            then_body: vec![IrStmt::Expr(throw_type_error(RESULT_NOT_OBJECT))],
-            else_body: Vec::new(),
-        })?;
+        self.push(IrStmt::Expr(IrNode::IteratorResultCheck(Box::new(
+            slot_get(result),
+        ))))?;
         let (done_b, yield_b) = (self.new_block(), self.new_block());
         self.terminate(GenTerm::Branch {
             cond: member(result, "done"),

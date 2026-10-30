@@ -1700,10 +1700,11 @@ impl LowerCtx<'_> {
     /// ([`Self::async_iterator_close`]). A throw from a step leaves the
     /// record stepping, so neither close calls `return()`.
     ///
-    /// The head is a `const`/`let` single-identifier binding, or a member /
-    /// destructuring assignment target (`o.x`, `[o.a, b]`) written each
-    /// iteration; a bare identifier assignment head, a declared destructuring
-    /// pattern, or a `using` head is a spanned error.
+    /// The head is a `const`/`let` identifier or destructuring binding (a
+    /// duplicate name is a spanned error), a `var` head assigning its hoisted
+    /// binding(s), or a member / destructuring assignment target (`o.x`,
+    /// `[o.a, b]`) written each iteration; a bare identifier assignment head,
+    /// several declarators, or a `using` head is a spanned error.
     fn lower_for_of(
         &mut self,
         for_of: &swc_ecma_ast::ForOfStmt,

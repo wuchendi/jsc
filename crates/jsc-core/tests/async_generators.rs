@@ -391,6 +391,6 @@ fn yield_star_rejects_a_non_object_inner_result() {
          async function* g(){ yield* delegate; }
          g().next().then(() => console.log('fulfilled'),
                          e => console.log(e instanceof TypeError, e.message));",
-        "true Iterator result is not an object\n",
+        "true Iterator result 5 is not an object\n",
     );
 }
