@@ -1251,3 +1251,47 @@ fn closing_a_generator_suspended_in_try_finally_runs_the_finally() {
         "1\nf\n",
     );
 }
+
+#[test]
+fn yield_star_returns_the_delegate_result_object_itself() {
+    // Spec `GeneratorYield(innerResult)`: next / throw / return each hand
+    // back the delegate's own result object while it is not done.
+    assert_output(
+        "let last;
+         const it = { [Symbol.iterator]() { return this },
+                      next() { last = { value: 1, done: false }; return last },
+                      throw(e) { last = { value: e, done: false }; return last },
+                      return(v) { last = { value: v, done: false }; return last } };
+         function* g(){ yield* it }
+         const o = g();
+         console.log(o.next() === last, o.throw(2) === last, o.return(3) === last)",
+        "true true true\n",
+    );
+}
+
+#[test]
+fn yield_star_keeps_extra_properties_of_the_delegate_result() {
+    assert_output(
+        "const it = { [Symbol.iterator]() { return this },
+                      next() { return { value: 1, done: false, extra: 'x' } } };
+         function* g(){ yield* it }
+         const r = g().next(); console.log(r.value, r.done, r.extra, Object.keys(r).join())",
+        "1 false x value,done,extra\n",
+    );
+}
+
+#[test]
+fn yield_star_does_not_read_the_delegate_value_in_a_sync_generator() {
+    // Only `done` is read by `yield*` per step; `value` is read by the outer
+    // consumer (the spread), and once by `yield*` for the completion value.
+    assert_output(
+        "let reads = 0, n = 0;
+         const it = { [Symbol.iterator]() { return this },
+                      next() { n++; return { done: n > 2, get value() { reads++; return n } } } };
+         function* g(){ yield* it }
+         const o = g(); const r = o.next(); console.log(reads);
+         console.log(r.value, reads);
+         const xs = [...g()]; console.log(xs.join(), reads)",
+        "0\n1 1\n2 3\n",
+    );
+}

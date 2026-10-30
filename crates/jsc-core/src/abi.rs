@@ -410,7 +410,7 @@ pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
 pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 `limits`
-/// bits ([`GEN_RUNNING`] .. [`GEN_BUSY`], the [`GEN_RESUME_MODE_MASK`]
+/// bits ([`GEN_RUNNING`] .. [`GEN_DELEGATED_RESULT`], the [`GEN_RESUME_MODE_MASK`]
 /// field), guest-only.
 pub(crate) const GEN_LIMITS_OFFSET: u32 = OBJ_PREFIX_SIZE + 12;
 
@@ -451,6 +451,17 @@ pub(crate) const GEN_AWAIT: u32 = 16;
 /// Async generator `limits` bit: the body is executing or awaiting (an
 /// `await` or a `return()` value), so a queued request waits.
 pub(crate) const GEN_BUSY: u32 = 32;
+
+/// Generator `limits` bit, set at construction: the body has a `yield*`, so
+/// a resume may pass the delegate's result object through
+/// ([`GEN_DELEGATED_RESULT`]); such a handle never takes the direct
+/// state-machine iteration fast path.
+pub(crate) const GEN_DELEGATES: u32 = 64;
+
+/// Generator `limits` bit: the state machine's last suspend was a `yield*`
+/// step returning the delegate's result object itself (not a value to
+/// wrap), which the resumer returns as-is and clears the bit.
+pub(crate) const GEN_DELEGATED_RESULT: u32 = 128;
 
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
 /// jsval, 8-byte aligned past the `limits` word.

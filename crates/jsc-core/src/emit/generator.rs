@@ -208,9 +208,36 @@ pub(super) fn emit_gen_resume(
         helpers,
     );
 
-    // 4. Build the `{ value, done }` result object from the SM's value and the
-    // handle's `done` flag.
+    // 4. A `yield*` step's delegate result object is the result as-is
+    // (clearing [`abi::GEN_DELEGATED_RESULT`]); otherwise build the
+    // `{ value, done }` result object from the SM's value and the handle's
+    // `done` flag.
+    let limits = MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    };
+    let delegated = abi::GEN_DELEGATED_RESULT.cast_signed();
+    function.instruction(&Instruction::LocalGet(handle_slot));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(limits));
+    function.instruction(&Instruction::I32Const(delegated));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    function.instruction(&Instruction::LocalGet(handle_slot));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalGet(handle_slot));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(limits));
+    function.instruction(&Instruction::I32Const(!delegated));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::I32Store(limits));
+    function.instruction(&Instruction::LocalGet(sm_result));
+    function.instruction(&Instruction::Else);
     emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// Resume the generator handle in i64 `handle_slot` once with `sent`
@@ -592,10 +619,30 @@ fn emit_segment_term(
     helpers: Helpers<'_>,
 ) {
     match term {
-        GenTerm::Yield { value, resume, .. } => {
+        GenTerm::Yield {
+            value, resume, raw, ..
+        } => {
             // Evaluate the yielded value (it may throw), then state = resume and
-            // return it (done stays 0).
+            // return it (done stays 0); a `raw` one (a `yield*` delegate's
+            // result object) is flagged for the resumer to return as-is.
             emit_node(value, function, scratch, strings, helpers);
+            if *raw {
+                let limits = MemArg {
+                    offset: u64::from(abi::GEN_LIMITS_OFFSET),
+                    align: 2,
+                    memory_index: 0,
+                };
+                function.instruction(&Instruction::LocalGet(gen_local));
+                function.instruction(&Instruction::I32WrapI64);
+                function.instruction(&Instruction::LocalGet(gen_local));
+                function.instruction(&Instruction::I32WrapI64);
+                function.instruction(&Instruction::I32Load(limits));
+                function.instruction(&Instruction::I32Const(
+                    abi::GEN_DELEGATED_RESULT.cast_signed(),
+                ));
+                function.instruction(&Instruction::I32Or);
+                function.instruction(&Instruction::I32Store(limits));
+            }
             store_gen_i32(function, gen_local, GEN_STATE_OFFSET, resume.cast_signed());
             function.instruction(&Instruction::Return);
         }
