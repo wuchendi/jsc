@@ -79,9 +79,6 @@ const FUNC_ASYNC: i32 = abi::FUNC_FLAG_ASYNC as i32;
 /// [`LAZY_FN_MASK`]: kind byte `TYPE_FUNCTION`, `flags` bit `LAZY`.
 const LAZY_FN_WORD: i32 = TYPE_FUNCTION | FUNC_LAZY << 16;
 const LAZY_FN_MASK: i32 = 0xFF | FUNC_LAZY << 16;
-/// Byte offset of a string's u32 length, and of its payload.
-const LEN: u64 = HEADER_SIZE as u64;
-const PAYLOAD_I32: i32 = HEADER_SIZE + 4;
 
 /// The 32-bit FNV-1a offset basis and prime the intern table hashes with.
 const FNV_OFFSET: u32 = 0x811C_9DC5;
@@ -329,7 +326,7 @@ fn emit_exotic_len(function: &mut Function, o: u32) {
     wasm!(function;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Result(ValType::I32)),
-        LocalGet(o), I32Load(m32(LEN)),
+        LocalGet(o), I32Load(m32(STR_LEN_OFFSET)),
         Else,
         LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)),
         End,
@@ -411,8 +408,8 @@ pub(super) fn emit_str_hash() -> Function {
     let (s, h, p, end) = (0, 1, 2, 3);
     wasm!(f;
         I32Const(FNV_OFFSET.cast_signed()), LocalSet(h),
-        LocalGet(s), I32Const(PAYLOAD_I32), I32Add, LocalTee(p),
-        LocalGet(s), I32Load(m32(LEN)), I32Add, LocalSet(end),
+        LocalGet(s), I32Const(STR_DATA_OFFSET), I32Add, LocalTee(p),
+        LocalGet(s), I32Load(m32(STR_LEN_OFFSET)), I32Add, LocalSet(end),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(p), LocalGet(end), I32GeU, BrIf(1),
         LocalGet(h), LocalGet(p), I32Load8U(m8(0)), I32Xor,
@@ -509,10 +506,10 @@ pub(super) fn emit_index_value() -> Function {
     let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::I64)]);
     let (s, len, p, c, v) = (0, 1, 2, 3, 4);
     wasm!(f;
-        LocalGet(s), I32Load(m32(LEN)), LocalTee(len),
+        LocalGet(s), I32Load(m32(STR_LEN_OFFSET)), LocalTee(len),
         I32Eqz, LocalGet(len), I32Const(10), I32GtU, I32Or,
         If(BlockType::Empty), I32Const(-1), Return, End,
-        LocalGet(s), I32Const(PAYLOAD_I32), I32Add, LocalTee(p),
+        LocalGet(s), I32Const(STR_DATA_OFFSET), I32Add, LocalTee(p),
         I32Load8U(m8(0)), I32Const(i32::from(b'0')), I32Eq,
         If(BlockType::Empty),
         I32Const(0), I32Const(-1), LocalGet(len), I32Const(1), I32Eq, Select, Return,
@@ -548,7 +545,7 @@ pub(super) fn emit_index_string(helpers: Helpers<'_>) -> Function {
         Br(0),
         End, End,
         LocalGet(len), Call(helpers.new_string), LocalTee(t),
-        LocalGet(len), I32Add, I32Const(PAYLOAD_I32), I32Add, LocalSet(p),
+        LocalGet(len), I32Add, I32Const(STR_DATA_OFFSET), I32Add, LocalSet(p),
         Loop(BlockType::Empty),
         LocalGet(p), I32Const(1), I32Sub, LocalTee(p),
         LocalGet(n), I32Const(10), I32RemU, I32Const(i32::from(b'0')), I32Add,
@@ -1930,7 +1927,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         I32Const(0), LocalSet(j),
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Empty),
-        LocalGet(o), I32Load(m32(LEN)), LocalTee(n), Call(new_array), LocalSet(out),
+        LocalGet(o), I32Load(m32(STR_LEN_OFFSET)), LocalTee(n), Call(new_array), LocalSet(out),
     );
     index_keys(&mut f, false);
     wasm!(f;

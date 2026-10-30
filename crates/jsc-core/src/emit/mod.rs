@@ -192,7 +192,7 @@ const THIS_GLOBAL: u32 = abi::THIS_GLOBAL_INDEX;
 
 /// The `JSON.parse` recursive-descent cursor globals (all i32, appended after
 /// [`THIS_GLOBAL`]): `$__json_data` is the byte offset of the input string's UTF-8
-/// payload (`base + HEADER_SIZE + 4`), `$__json_pos` is the current byte offset
+/// payload (`base + STR_DATA_OFFSET`), `$__json_pos` is the current byte offset
 /// into that payload, and `$__json_len` is the input's byte length. Set once at
 /// `__json_parse` entry; the recursive helpers read `$__json_len`/advance
 /// `$__json_pos`. A parse runs synchronously to completion, so no re-entrancy
@@ -286,6 +286,10 @@ const ABI_TRAILING_PARAMS: u32 = abi::ABI_TRAILING_PARAMS;
 /// Type byte for a heap string block: `[type=0][pad×3][len:u32][utf8]` (payload
 /// after the [`HEADER_SIZE`] header). Maps to `typeof` "string".
 const TYPE_STRING: i32 = abi::TYPE_STRING as i32;
+/// String block field offsets: the u32 `len` (a load/store `MemArg` offset) and
+/// the UTF-8 data (an `i32` addend). See [`abi::STR_LEN_OFFSET`].
+const STR_LEN_OFFSET: u64 = abi::STR_LEN_OFFSET as u64;
+const STR_DATA_OFFSET: i32 = abi::STR_DATA_OFFSET.cast_signed();
 
 /// Type byte, field offsets, and size of an array handle (`length` and the
 /// base of its element store). Maps to `typeof` "object". See
