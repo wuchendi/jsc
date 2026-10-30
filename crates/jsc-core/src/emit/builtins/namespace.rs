@@ -50,10 +50,7 @@ pub(in crate::emit) fn fragment(builtin: Builtin, k: u32) -> Option<IrNode> {
             op,
             arg: Box::new(arg(0)),
         },
-        Builtin::IsArray => IrNode::InstanceOf {
-            value: Box::new(arg(0)),
-            kind: InstanceOfKind::Array,
-        },
+        Builtin::IsArray => IrNode::IsArray(Box::new(arg(0))),
         Builtin::DateNow => IrNode::DateNow,
         Builtin::Ctor(ctor) => super::ctor::fragment(ctor, k),
         _ => return None,
