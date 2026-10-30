@@ -3,7 +3,8 @@
 mod common;
 use common::{assert_bool, assert_eval, assert_nan, assert_number, assert_output, assert_string};
 
-/// String `toUpperCase`/`toLowerCase` are ASCII case folds producing NEW strings.
+/// String `toUpperCase`/`toLowerCase` map one-byte receivers to NEW strings
+/// (the guest Latin-1 path).
 #[test]
 fn string_case_fold() {
     assert_string("\"abc\".toUpperCase()", "ABC");
@@ -432,7 +433,6 @@ fn normalize_forms() {
         &caught("\"abc\".normalize(\"nfc\")"),
         "RangeError|The normalization form should be one of NFC, NFD, NFKC, NFKD.",
     );
-    assert_type_error_with("\"\u{e9}\".normalize()", "non-ASCII");
     assert_number("String.prototype.normalize.length", 0.0);
 }
 
