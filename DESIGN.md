@@ -1965,10 +1965,6 @@ Each item below is current behaviour of this tree.
 - Not supported: private `#` members, static blocks.
 - A numeric or BigInt literal class member key (`class { 1() {} }`) is a
   compile error.
-- A later accessor half merges into an earlier accessor of the same literal
-  name across an intervening data method: `get a() {} a() {} set a(v) {}`
-  leaves an accessor with both the getter and the setter, where the spec
-  leaves only the setter (silently wrong).
 
 **Generators & async**
 
