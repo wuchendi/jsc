@@ -1046,20 +1046,37 @@ impl LowerCtx<'_> {
     /// Define the current class's instance fields ([`Self::class_fields`]) on
     /// `this` in source order with `CreateDataProperty` semantics
     /// (`__define`, so an inherited setter is not invoked); `None` when the
-    /// class declares no fields. An uninitialized `f;` defines `undefined`.
+    /// class declares no fields. An uninitialized `f;` defines `undefined`. A
+    /// computed field name reads its key, converted at class definition time.
     pub(super) fn lower_field_inits(&mut self, this: IrNode) -> anyhow::Result<Option<IrNode>> {
         if self.class_fields.is_empty() {
             return Ok(None);
         }
         let fields = std::mem::take(&mut self.class_fields);
         let mut entries = Vec::with_capacity(fields.len());
-        for p in &fields {
-            let key = super::stmt::prop_key_name(&p.key)?;
+        for (p, computed) in &fields {
+            let Some((frame, id)) = *computed else {
+                let key = super::stmt::prop_key_name(&p.key)?;
+                let value = match &p.value {
+                    Some(init) => self.lower_named_expr(init, &key)?,
+                    None => IrNode::Undefined,
+                };
+                entries.push((PropKey::Static(key), value));
+                continue;
+            };
+            let local = self.fresh();
+            let key = IrNode::Seq(vec![
+                IrNode::Assign {
+                    local,
+                    value: Box::new(self.read_hidden(frame, id)),
+                },
+                IrNode::Local(local),
+            ]);
             let value = match &p.value {
-                Some(init) => self.lower_named_expr(init, &key)?,
+                Some(init) => self.lower_computed_named_expr(init, local)?,
                 None => IrNode::Undefined,
             };
-            entries.push((PropKey::Static(key), value));
+            entries.push((PropKey::Computed(key), value));
         }
         self.class_fields = fields;
         let local = self.fresh();

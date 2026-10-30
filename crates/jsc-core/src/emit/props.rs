@@ -63,6 +63,7 @@ const ATTRS_DEFAULT: i32 = abi::ATTRS_DEFAULT.cast_signed();
 const HAS_INDEX_KEYS: i32 = abi::PROPS_HAS_INDEX_KEYS as i32;
 const HAS_NON_ENUM: i32 = abi::PROPS_HAS_NON_ENUM as i32;
 const WATCHED: i32 = abi::PROPS_WATCHED as i32;
+const HAS_SYMBOL_KEYS: i32 = abi::PROPS_HAS_SYMBOL_KEYS as i32;
 const P_WATCH_BIT: u64 = abi::PROPS_WATCH_BIT_OFFSET as u64;
 /// String `flags` bits.
 const STR_INTERNED: i32 = abi::STR_FLAG_INTERNED as i32;
@@ -102,6 +103,12 @@ pub(super) const OWN_VALUES: i32 = 1;
 pub(super) const OWN_ENTRIES: i32 = 2;
 /// `__own_keys` mode: every string key, enumerable or not.
 pub(super) const OWN_ALL: i32 = 3;
+/// `__own_keys` mode: every symbol key, enumerable or not, in creation order.
+pub(super) const OWN_SYMBOLS: i32 = 4;
+/// `__own_keys` mode: every key, enumerable or not — the string keys in
+/// [`OWN_ALL`] order, then the symbol keys in creation order
+/// (`OrdinaryOwnPropertyKeys`).
+pub(super) const OWN_ALL_KEYS: i32 = 5;
 
 fn m8(offset: u64) -> MemArg {
     MemArg {
@@ -563,13 +570,16 @@ pub(super) fn emit_index_string(helpers: Helpers<'_>) -> Function {
 }
 
 /// `__to_key(v: i64, insert: i32) -> i32`: `ToPropertyKey` of `v` as an interned
-/// key. An interned string is its own key; an integer `0 <= v < 2^32 - 1` is
-/// formatted in-guest; anything else goes through `__to_string` (an object's
-/// user `toString` may throw: the exception stays pending and the key is `""`). The
+/// key. An interned string is its own key; a symbol is its own key (its block
+/// address, never interned); an object is first converted with
+/// `ToPrimitive(hint string)` (a `Symbol` wrapper yields its symbol; a user
+/// `toString` / `valueOf` may throw: the exception stays pending and the key
+/// is `""`) and its primitive converted again; an integer `0 <= v < 2^32 - 1`
+/// is formatted in-guest; anything else goes through `__to_string`. The
 /// resulting string is then interned (`insert`) or looked up (`0` on a miss).
 /// A lookup still interns a canonical array index, so an array or string
 /// element is found by an index key that no property ever used.
-pub(super) fn emit_to_key(helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_to_key(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(2, ValType::I32), (1, ValType::F64)]);
     let (v, insert, s, r, d) = (0, 1, 2, 3, 4);
     emit_is_string(&mut f, v);
@@ -578,6 +588,17 @@ pub(super) fn emit_to_key(helpers: Helpers<'_>) -> Function {
         LocalGet(v), I32WrapI64, LocalTee(s), I32Load8U(m8(FLAGS)), I32Const(STR_INTERNED), I32And,
         If(BlockType::Empty), LocalGet(s), Return, End,
         Else,
+    );
+    emit_is_symbol(&mut f, v);
+    wasm!(f; If(BlockType::Empty), LocalGet(v), I32WrapI64, Return, End);
+    emit_is_object(&mut f, v);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(v), I32Const(HINT_STRING), Call(helpers.to_primitive()), LocalSet(v),
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty), I32Const(static_key(strings, "")), Return, End,
+        LocalGet(v), LocalGet(insert), Call(helpers.to_key), Return,
+        End,
     );
     emit_is_number(&mut f, v);
     wasm!(f;
@@ -720,10 +741,15 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
         I32Const(P_HEADER), I32Add, LocalTee(e), LocalGet(key), I32Store(m32(E_KEY)),
         LocalGet(p), LocalGet(n), I32Const(1), I32Add, I32Store(m32(P_COUNT)),
         LocalGet(p), LocalGet(p), I32Load(m32(P_LIVE)), I32Const(1), I32Add, I32Store(m32(P_LIVE)),
-        // An array-index key sets HAS_INDEX_KEYS.
+        // An array-index key sets HAS_INDEX_KEYS, a symbol key HAS_SYMBOL_KEYS.
         LocalGet(key), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
         If(BlockType::Empty),
         LocalGet(p), LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_INDEX_KEYS), I32Or,
+        I32Store8(m8(P_TFLAGS)),
+        End,
+        LocalGet(key), I32Load8U(m8(0)), I32Const(TYPE_SYMBOL), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(p), LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_SYMBOL_KEYS), I32Or,
         I32Store8(m8(P_TFLAGS)),
         End,
         Else,
@@ -910,8 +936,9 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 /// first from its exotic own keys when it is a string or an array (`length`,
 /// a present index; a hole or an index past the length is not own, so it
 /// reads through the chain), then from its own table, calling an accessor's
-/// getter with `this = recv` (`undefined` when it has none). A string, number
-/// or boolean continues at its realm prototype without allocating a wrapper;
+/// getter with `this = recv` (`undefined` when it has none). A string, symbol,
+/// number or boolean continues at its realm prototype without allocating a
+/// wrapper;
 /// `null`/`undefined` and a key of `0` (never interned) read `undefined`.
 pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
@@ -925,7 +952,13 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
     emit_is_pointer(&mut f, recv);
     wasm!(f;
         If(BlockType::Empty),
-        LocalGet(recv), I32WrapI64, LocalSet(o),
+        LocalGet(recv), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_SYMBOL), I32Eq,
+        If(BlockType::Empty),
+    );
+    let bits = intrinsic_bits(SYMBOL_PROTOTYPE, helpers);
+    wasm!(f; I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o));
+    wasm!(f;
+        End,
         Else,
     );
     emit_is_number(&mut f, recv);
@@ -972,6 +1005,64 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(p), I32WrapI64, LocalSet(o),
+        Br(0),
+        End,
+        Unreachable,
+        End,
+    );
+    f
+}
+
+/// `__symbol_get(v: i64, sym: i32) -> i64`: `Get(v, sym)` for the symbol key
+/// `sym`, short-circuited to `undefined` without a lookup unless some table
+/// on `v`'s prototype chain (a primitive's from its realm prototype; `null` /
+/// `undefined` have none) has `HAS_SYMBOL_KEYS`. The consult sites of the
+/// well-known symbols (DESIGN.md §6.4) use it so an object that never held a
+/// symbol key pays one flag test per chain level.
+pub(super) fn emit_symbol_get(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(2, ValType::I32), (1, ValType::I64)]);
+    let (v, sym, o, p, next) = (0, 1, 2, 3, 4);
+    let proto_base = |intrinsic| {
+        let bits = intrinsic_bits(intrinsic, helpers);
+        Instruction::I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed())
+    };
+    emit_is_pointer(&mut f, v);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    wasm!(f;
+        LocalGet(v), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(p),
+        I32Const(TYPE_STRING), I32Eq,
+        If(BlockType::Empty),
+    );
+    f.instruction(&proto_base(realm::prototype_of(BuiltinCtor::String)));
+    wasm!(f; LocalSet(o), End, LocalGet(p), I32Const(TYPE_SYMBOL), I32Eq, If(BlockType::Empty));
+    f.instruction(&proto_base(SYMBOL_PROTOTYPE));
+    wasm!(f; LocalSet(o), End, Else);
+    emit_is_number(&mut f, v);
+    wasm!(f; If(BlockType::Empty));
+    f.instruction(&proto_base(realm::prototype_of(BuiltinCtor::Number)));
+    wasm!(f;
+        LocalSet(o),
+        Else,
+        LocalGet(v), I64Const(TRUE_BITS), I64Eq, LocalGet(v), I64Const(FALSE_BITS), I64Eq, I32Or,
+        I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+    );
+    f.instruction(&proto_base(realm::prototype_of(BuiltinCtor::Boolean)));
+    wasm!(f;
+        LocalSet(o),
+        End,
+        End,
+        Loop(BlockType::Empty),
+        LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p),
+        If(BlockType::Empty),
+        LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_SYMBOL_KEYS), I32And,
+        If(BlockType::Empty), LocalGet(v), LocalGet(sym), Call(helpers.get), Return, End,
+        End,
+        LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(next),
+    );
+    emit_is_pointer(&mut f, next);
+    wasm!(f;
+        I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        LocalGet(next), I32WrapI64, LocalSet(o),
         Br(0),
         End,
         Unreachable,
@@ -1146,7 +1237,7 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
 /// `live` decremented); a non-configurable property throws. On an array an
 /// in-range index becomes a hole and `length` (non-configurable) throws; its
 /// named keys (and a `SPARSE` array's elements past its store) are table
-/// entries. A primitive or string is left unchanged. A delete on a watched
+/// entries. A primitive (a string or symbol included) is left unchanged. A delete on a watched
 /// table sets its dirty bit when the program tracks them.
 pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32)]);
@@ -1156,7 +1247,8 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
         I32Eqz, If(BlockType::Empty), Return, End,
         LocalGet(key), I32Eqz, If(BlockType::Empty), Return, End,
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(t),
-        I32Const(TYPE_STRING), I32Eq, If(BlockType::Empty), Return, End,
+        I32Const(TYPE_STRING), I32Eq, LocalGet(t), I32Const(TYPE_SYMBOL), I32Eq, I32Or,
+        If(BlockType::Empty), Return, End,
         LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
@@ -1832,11 +1924,14 @@ pub(super) fn emit_array_set_length(
 /// `__own_keys(obj: i64, mode: i32) -> i64`: a fresh array of `obj`'s own
 /// string keys in own-key order (2.6) — integer keys ascending (only when the
 /// table has `HAS_INDEX_KEYS`), then the other keys in slot order — filtered
-/// to the enumerable ones unless `mode` is [`OWN_ALL`], and mapped to values
-/// ([`OWN_VALUES`]) or `[key, value]` pairs ([`OWN_ENTRIES`]). A string lists
-/// its indices; an array its present (non-hole) store indices, then its table
-/// keys (a `SPARSE` array's elements past the store sort first as integer
-/// keys); a primitive has no own keys.
+/// to the enumerable ones unless `mode` is [`OWN_ALL`] or [`OWN_ALL_KEYS`],
+/// and mapped to values ([`OWN_VALUES`]) or `[key, value]` pairs
+/// ([`OWN_ENTRIES`]). Symbol keys are skipped, except that [`OWN_ALL_KEYS`]
+/// appends them after the string keys and [`OWN_SYMBOLS`] lists only them
+/// (both in slot order, the walk skipped when the table lacks
+/// `HAS_SYMBOL_KEYS`). A string lists its indices; an array its present
+/// (non-hole) store indices, then its table keys (a `SPARSE` array's elements
+/// past the store sort first as integer keys); a primitive has no own keys.
 ///
 /// Values / entries follow `EnumerableOwnProperties` (ECMA-262 7.3.23): the
 /// key list is taken once, then each key is re-checked as own and enumerable
@@ -1858,11 +1953,11 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     // `w`: the values/entries write index; `recheck`: the table has an accessor.
     let (w, recheck) = (15, 16);
     let new_array = helpers.new_string + 1;
-    // include(e) = key != 0 && (mode == ALL || attrs & ENUMERABLE)
+    // include(e) = key != 0 && (mode is ALL / SYMBOLS / ALL_KEYS || attrs & ENUMERABLE)
     let include = |f: &mut Function| {
         wasm!(f;
             LocalGet(e), I32Load(m32(E_KEY)), LocalTee(k), I32Const(0), I32Ne,
-            LocalGet(mode), I32Const(OWN_ALL), I32Eq,
+            LocalGet(mode), I32Const(OWN_ALL), I32GeS,
             LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And,
             I32Const(0), I32Ne, I32Or,
             I32And,
@@ -1871,6 +1966,14 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     // is_index(k) = (has_index & ARRAY_INDEX flag of k), with has_index in `x`.
     let is_index = |f: &mut Function| {
         wasm!(f; LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And, LocalGet(x), I32And);
+    };
+    // is_symbol(k): the key block's kind byte is TYPE_SYMBOL.
+    let is_symbol = |f: &mut Function| {
+        wasm!(f; LocalGet(k), I32Load8U(m8(0)), I32Const(TYPE_SYMBOL), I32Eq);
+    };
+    // has_symbols(p): the table `p` has HAS_SYMBOL_KEYS.
+    let has_symbols = |f: &mut Function| {
+        wasm!(f; LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_SYMBOL_KEYS), I32And);
     };
     // Walk the entries: e = p + 16 .. end.
     let entry_loop_head = |f: &mut Function| {
@@ -1887,6 +1990,22 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
             End, End,
         );
     };
+    // Append each included symbol key of the table `p` (`end` set) to out[j..].
+    let symbol_pass = |f: &mut Function| {
+        entry_loop_head(f);
+        include(f);
+        is_symbol(f);
+        wasm!(f; I32And, If(BlockType::Empty));
+        emit_elem_addr(f, out, j);
+        wasm!(f; LocalGet(k));
+        emit_box_heap(f);
+        wasm!(f;
+            I64Store(m64(ELEMS_DATA_OFFSET)),
+            LocalGet(j), I32Const(1), I32Add, LocalSet(j),
+            End,
+        );
+        entry_loop_tail(f);
+    };
 
     emit_is_pointer(&mut f, obj);
     wasm!(f;
@@ -1897,6 +2016,36 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         Return, End,
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalSet(t),
+        I32Const(0), LocalSet(j),
+        // OWN_SYMBOLS: only a table with HAS_SYMBOL_KEYS has any.
+        LocalGet(mode), I32Const(OWN_SYMBOLS), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(t), I32Const(TYPE_STRING), I32Ne,
+        If(BlockType::Result(ValType::I32)), LocalGet(o), I32Load(m32(OBJ_PROPS)), Else, I32Const(0), End,
+        LocalTee(p),
+        If(BlockType::Result(ValType::I32)),
+    );
+    has_symbols(&mut f);
+    wasm!(f;
+        Else, I32Const(0), End,
+        I32Eqz,
+        If(BlockType::Empty), I32Const(0), Call(new_array),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f;
+        Return, End,
+        LocalGet(p), I32Load(m32(P_LIVE)), Call(new_array), LocalSet(out),
+        LocalGet(p), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(p), I32Add,
+        I32Const(P_HEADER), I32Add, LocalSet(end),
+    );
+    symbol_pass(&mut f);
+    wasm!(f;
+        LocalGet(out), LocalGet(j), I32Store(m32(ARRAY_LEN_OFFSET)),
+        LocalGet(out),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f;
+        Return, End,
     );
     // The index keys `0..n` (as decimal strings) into `out[j..]`, skipping
     // holes when `skip_holes`.
@@ -1927,7 +2076,6 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         );
     };
     wasm!(f;
-        I32Const(0), LocalSet(j),
         LocalGet(t), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Empty),
         LocalGet(o), I32Load(m32(LEN)), LocalTee(n), Call(new_array), LocalSet(out),
@@ -2009,10 +2157,12 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
     );
     entry_loop_tail(&mut f);
     wasm!(f; End);
-    // Pass 2: the other included keys in slot order.
+    // Pass 2: the other included string keys in slot order.
     entry_loop_head(&mut f);
     include(&mut f);
     is_index(&mut f);
+    wasm!(f; I32Eqz, I32And);
+    is_symbol(&mut f);
     wasm!(f;
         I32Eqz, I32And,
         If(BlockType::Empty),
@@ -2026,7 +2176,13 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
         End,
     );
     entry_loop_tail(&mut f);
+    // Pass 3 (OWN_ALL_KEYS): the symbol keys in slot order.
+    wasm!(f; LocalGet(mode), I32Const(OWN_ALL_KEYS), I32Eq);
+    has_symbols(&mut f);
+    wasm!(f; I32Const(0), I32Ne, I32And, If(BlockType::Empty));
+    symbol_pass(&mut f);
     wasm!(f;
+        End,
         End,
         LocalGet(out), LocalGet(j), I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
@@ -2152,10 +2308,15 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
     let (o, ks, n, i, j, m) = (1, 2, 3, 4, 5, 6);
     let (out, seen, cur, k) = (7, 8, 9, 10);
     let new_array = helpers.new_string + 1;
+    // A primitive (a symbol included) has no enumerable keys of its own or on
+    // its prototype chain.
     emit_is_pointer(&mut f, obj);
     wasm!(f;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(i),
+        I32Const(TYPE_SYMBOL), I32Ne,
+        Else, I32Const(0), End,
         If(BlockType::Empty),
-        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalSet(i),
     );
     emit_is_string_or_array_kind(&mut f, i);
     wasm!(f;
@@ -2243,14 +2404,17 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
     f
 }
 
-/// `__rest(src: i64, excl: i64) -> i64`: the object-rest copy — a fresh
-/// object defining each own enumerable property of `src` (in own-key order)
-/// whose key is not an element of the `excl` array of interned key strings.
+/// `__rest(src: i64, excl: i64) -> i64`: the object-rest copy
+/// (`CopyDataProperties`) — a fresh object defining each own enumerable
+/// property of `src` (string keys in own-key order, then symbol keys) whose
+/// key is not an element of the `excl` array of property keys. An object
+/// source re-checks each key as own and enumerable when visited (a getter may
+/// delete or hide a later key); a string's indices are always enumerable.
 pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(7, ValType::I32), (1, ValType::I64)]);
+    let mut f = Function::new(vec![(8, ValType::I32), (1, ValType::I64)]);
     let (src, excl) = (0, 1);
-    let (dst, ks, n, i, x, j, m) = (2, 3, 4, 5, 6, 7, 8);
-    let k = 9;
+    let (dst, ks, n, i, x, j, m, obj) = (2, 3, 4, 5, 6, 7, 8, 9);
+    let k = 10;
     wasm!(f;
         I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(dst),
     );
@@ -2260,8 +2424,10 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
         TYPE_OBJECT,
         intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
     );
+    emit_is_object(&mut f, src);
     wasm!(f;
-        LocalGet(src), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
+        LocalSet(obj),
+        LocalGet(src), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
         I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         LocalGet(excl), I32WrapI64, LocalSet(x),
         I32Const(0), LocalSet(i),
@@ -2274,9 +2440,16 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalSet(k));
+    // Push whether the key is (still) own and enumerable.
+    wasm!(f;
+        LocalGet(obj),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(src), LocalGet(j), Call(helpers.own_enum()),
+        Else, I32Const(1), End,
+    );
     emit_array_contains(&mut f, x, k, j, m);
     wasm!(f;
-        I32Eqz,
+        I32Eqz, I32And,
         If(BlockType::Empty),
         LocalGet(dst), LocalGet(k), I32WrapI64,
         LocalGet(src), LocalGet(k), I32WrapI64, Call(helpers.get),

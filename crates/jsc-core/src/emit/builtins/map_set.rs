@@ -387,6 +387,15 @@ pub(super) fn emit_ctor(
     wasm!(function; LocalSet(src));
     emit_is_nullish(function, src);
     wasm!(function; If(BlockType::Empty), LocalGet(map), Return, End);
+    emit_hook_guard(
+        function,
+        src,
+        WellKnown::Iterator,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    return_if_pending(function);
     let name = if set { "add" } else { "set" };
     wasm!(function;
         LocalGet(map), I32Const(static_key(strings, name)), Call(helpers.get), LocalSet(adder),

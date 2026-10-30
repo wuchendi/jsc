@@ -205,9 +205,12 @@ pub enum ArrayHofOp {
 /// [`IrNode::ConvertCall`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertOp {
-    /// `String(x)` — `ToString` in the guest (`__to_string`), so an object's
-    /// user `toString`/`valueOf` runs and may throw.
+    /// `ToString(x)` in the guest (`__to_string`), so an object's user
+    /// `toString`/`valueOf` runs and may throw; a symbol throws.
     ToString,
+    /// `String(x)` called (not constructed): [`ConvertOp::ToString`], except
+    /// a symbol yields its `SymbolDescriptiveString` (`"Symbol(desc)"`).
+    String,
     /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
     /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
     ToNumber,
@@ -273,6 +276,9 @@ pub enum PropKey {
     /// A computed key (`{[k]: v}`, or a numeric literal key `{1: v}`), converted
     /// with `ToPropertyKey` and interned at run time.
     Computed(IrNode),
+    /// A computed key of a NON-enumerable (writable, configurable) property:
+    /// a class method or accessor under a computed name (`[k]() {}`).
+    HiddenComputed(IrNode),
 }
 
 /// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
@@ -431,11 +437,13 @@ pub enum BuiltinCtor {
     Promise,
     /// `Date`.
     Date,
+    /// `Symbol`.
+    Symbol,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 18] = [
+    pub(crate) const ALL: [BuiltinCtor; 19] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -454,6 +462,7 @@ impl BuiltinCtor {
         Self::Set,
         Self::Promise,
         Self::Date,
+        Self::Symbol,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -470,6 +479,7 @@ impl BuiltinCtor {
             Self::Set => "Set",
             Self::Promise => "Promise",
             Self::Date => "Date",
+            Self::Symbol => "Symbol",
         }
     }
 
@@ -873,6 +883,26 @@ pub enum IrNode {
     /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
     /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
     ToObject(Box<IrNode>),
+    /// `ToPropertyKey` of the value, as a key jsval: an interned string or a
+    /// symbol. An object's user `toString` / `valueOf` throw propagates.
+    ToPropertyKey(Box<IrNode>),
+    /// `SetFunctionName(func, key, prefix)` at run time for a function value
+    /// defined under a computed key (an object literal or class method,
+    /// accessor, or anonymous function / arrow / class value, a class field
+    /// initializer included): `func` is evaluated into `local`,
+    /// its own `name` is redefined (configurable only) as `prefix` followed by
+    /// the key — a string key itself, a symbol `"[desc]"` (`""` when the
+    /// description is `undefined`) — and `func` is the result.
+    SetFunctionName {
+        /// The function value.
+        func: Box<IrNode>,
+        /// The local holding the [`IrNode::ToPropertyKey`] key jsval.
+        key: u32,
+        /// `""`, `"get "` or `"set "`.
+        prefix: &'static str,
+        /// Fresh temp local holding the evaluated `func`.
+        local: u32,
+    },
     /// A class heritage `extends value` (DESIGN.md §7.6): evaluate `value` into
     /// `parent`; unless it is `null` it must be a constructor, and `proto` gets
     /// `Get(parent, "prototype")`, which must be an object or `null` (`proto` is
@@ -2089,6 +2119,8 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::ToObject(inner)
+            | IrNode::ToPropertyKey(inner)
+            | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::AwaitMark(inner)
@@ -2227,16 +2259,16 @@ impl IrNode {
             }
             IrNode::SetProto { obj, proto } => f(obj) || f(proto),
             IrNode::Object { entries, proto, .. } => {
-                proto.as_deref().is_some_and(&mut f)
-                    || entries.iter().any(|(key, value)| {
-                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
-                    })
+                proto.as_deref().is_some_and(&mut f) || entries.iter().any(|(key, value)| {
+                    matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
+                        || f(value)
+                })
             }
             IrNode::DefineProps { obj, entries, .. } => {
-                f(obj)
-                    || entries.iter().any(|(key, value)| {
-                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
-                    })
+                f(obj) || entries.iter().any(|(key, value)| {
+                    matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
+                        || f(value)
+                })
             }
             IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
                 SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
@@ -2287,6 +2319,8 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::ToObject(inner)
+            | IrNode::ToPropertyKey(inner)
+            | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::AwaitMark(inner)
@@ -2435,7 +2469,7 @@ impl IrNode {
             IrNode::Object { entries, proto, .. } => {
                 let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
                 for (key, value) in entries {
-                    if let PropKey::Computed(key) = key {
+                    if let PropKey::Computed(key) | PropKey::HiddenComputed(key) = key {
                         out.push(key);
                     }
                     out.push(value);
@@ -2445,7 +2479,7 @@ impl IrNode {
             IrNode::DefineProps { obj, entries, .. } => {
                 let mut out: Vec<&mut IrNode> = vec![&mut **obj];
                 for (key, value) in entries {
-                    if let PropKey::Computed(key) = key {
+                    if let PropKey::Computed(key) | PropKey::HiddenComputed(key) = key {
                         out.push(key);
                     }
                     out.push(value);

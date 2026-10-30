@@ -376,6 +376,16 @@ const TYPE_DATE: i32 = abi::TYPE_DATE as i32;
 const DATE_MS_OFFSET: u64 = abi::DATE_MS_OFFSET as u64;
 const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 
+/// The TYPE BYTE of a Symbol primitive block. Maps to `typeof` "symbol". See
+/// [`abi::TYPE_SYMBOL`] for the full layout.
+const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+const SYMBOL_DESCRIPTION_OFFSET: u64 = abi::SYMBOL_DESCRIPTION_OFFSET as u64;
+
+/// `%Symbol.prototype%` (design/symbol-strings.md §2.6): where a property read
+/// on a symbol primitive continues and the prototype of its `ToObject`
+/// wrapper.
+const SYMBOL_PROTOTYPE: Intrinsic = Intrinsic::Prototype(BuiltinCtor::Symbol);
+
 /// The TYPE BYTE of an instance-accessor block. See [`abi::TYPE_ACCESSOR`].
 const TYPE_ACCESSOR: i32 = abi::TYPE_ACCESSOR as i32;
 const ACCESSOR_GET_OFFSET: u64 = abi::ACCESSOR_GET_OFFSET as u64;
@@ -650,7 +660,7 @@ const PROP_THROW_PROTO_IMMUTABLE: i32 = 20;
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
 /// [`collect_node`] at every member store and `delete` site
 /// so their `[len][utf8]` blobs exist when they throw.
-const PROP_ERROR_STRS: [&str; 10] = [
+const PROP_ERROR_STRS: [&str; 11] = [
     ARRAY_LENGTH_MSG,
     ARRAY_LENGTH_STACK,
     TYPE_ERROR_STACK_PREFIX,
@@ -659,6 +669,7 @@ const PROP_ERROR_STRS: [&str; 10] = [
     PRIM_CREATE_QUOTE,
     PRIM_CREATE_SUFFIX,
     "number",
+    "symbol",
     "string",
     "boolean",
 ];
@@ -1128,6 +1139,11 @@ impl Helpers<'_> {
         self.to_primitive() + 16
     }
 
+    /// `__symbol_get(v, sym) -> i64` (see [`props::emit_symbol_get`]).
+    fn symbol_get(self) -> u32 {
+        self.to_primitive() + 17
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1279,7 +1295,8 @@ use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
 use realm::{
-    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, intrinsic_bits,
+    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, WellKnown,
+    intrinsic_bits,
 };
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
@@ -1521,7 +1538,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_intern(helpers));
     code.function(&emit_index_value());
     code.function(&emit_index_string(helpers));
-    code.function(&emit_to_key(helpers));
+    code.function(&emit_to_key(&offsets, helpers));
     code.function(&emit_prop_find(helpers));
     code.function(&emit_define(helpers));
     code.function(&emit_fn_materialize(&offsets, helpers));
@@ -1585,7 +1602,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // every helper index stays stable; the `__async_step` trampoline
     // follows it, then the two `new Promise` settler functions.
     code.function(&emit_box_f64_helper());
-    code.function(&emit_to_number_helper(helpers));
+    code.function(&emit_to_number_helper(&offsets, helpers));
     code.function(&emit_invoke1(helpers));
     code.function(&generator::emit_async_step(helpers));
     code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
@@ -1622,6 +1639,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_own_enum(&offsets, helpers));
     code.function(&emit_set_proto(helpers));
     code.function(&builtins::emit_promise_self_error(&offsets, helpers));
+    code.function(&emit_symbol_get(helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
