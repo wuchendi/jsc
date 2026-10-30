@@ -460,8 +460,9 @@ Notes per kind:
   moves; `delete` tombstones the pair in place (`HOLE` key, `undefined`
   value) and `clear` tombstones every pair, so live iterators and `forEach`
   keep their slot index and see entries appended later (including after a
-  `clear`); a re-added key appends. The backing is never compacted (it
-  keeps its tombstones until a collector exists). `size` is the live entry
+  `clear`); a re-added key appends. The backing is never compacted or
+  shrunk (it keeps its tombstones until a collector exists, §13). `size` is
+  the live entry
   count. Lookup is a linear scan with `__same_value_zero` that skips
   tombstones; the renderers skip them too.
 - **Promise** blocks mirror settlement (`state` ∈ pending `0` / fulfilled `1` /
@@ -471,8 +472,11 @@ Notes per kind:
   the `done` flag, the guest-only `limits` bits (`4` the state machine is
   running, so re-entering it throws; `8` an async generator; `16` its last
   suspend was an `await`; `32` it is executing or awaiting, so queued requests
-  wait; bits `8..=9` the resumption mode — `1` throw, `2` return — of a resume
-  entered with the value pending, written by `throw()` / `return()`), the frame (a `TYPE_ENV` of cells holding every generator local), and
+  wait; `64` the body has a `yield*`, set at construction; `128` the last
+  suspend was a `yield*` step returning the delegate's result object, which
+  the resumer returns as-is and clears; bits `8..=9` the resumption mode —
+  `1` throw, `2` return — of a resume entered with the value pending, written
+  by `throw()` / `return()`), the frame (a `TYPE_ENV` of cells holding every generator local), and
   an async generator's request queue (§7.8): a linked list of internal
   `TYPE_ENV` records `[value, promise, kind, next]`.
 - **Accessor** blocks are the value of an `ACCESSOR` property-table entry; they
@@ -1058,7 +1062,7 @@ path, never semantics:
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear (an array also needs `%Object.prototype%`'s, since its fast paths read a hole as absent and append without consulting the chain); `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
-| `GetIterator` (for-of, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes (`design/symbol-strings.md` §5.3); decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: its own `@@iterator` is still the data property `%Array.prototype.values%`. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
+| `GetIterator` (for-of, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes (`design/symbol-strings.md` §5.3); decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's, and its body has no `yield*`), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: its own `@@iterator` is still the data property `%Array.prototype.values%`. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
 The shared **`MethodCall`** builtin is the generic call for every guarded site:
@@ -1313,7 +1317,8 @@ catch binding).
   non-object `return()` result throws only on a non-throw exit. A clean
   array (a hole reads `undefined`), string (per code point), `Map`
   (`[key, value]` entries) / `Set` (live walks that visit entries added
-  during the loop) or generator (its state machine stepped directly) takes a
+  during the loop) or generator without a `yield*` in its body (its state
+  machine stepped directly) takes a
   guarded fast path while its builtin `@@iterator` and iterator `next` are
   provably intact (the dirty bits of §6.4); an `arguments` object is walked
   by index while its own `@@iterator` is still `%Array.prototype.values%`
@@ -1369,7 +1374,8 @@ those of `switch` and loops are not tracked.
 - **Spread.** In calls, `new`, and array literals; a source is
   `IterableToList` over the `for-of` protocol (never closed). A clean array
   is appended directly, a clean string by character (`__str_to_array`) and
-  a clean generator drained by `__gen_to_array`; a clean `arguments` object
+  a clean generator without a `yield*` drained by `__gen_to_array`; a
+  clean `arguments` object
   is walked by index (`ProtocolOp::ToList`); a derived class's default
   constructor forwards its arguments without the protocol.
 - **`this`.** Bound by method calls (`obj.m()`, also `(obj.m)()`), by `new`, by
@@ -1574,8 +1580,15 @@ control flow. A `yield` may appear inside a larger expression
   delegate's `next(v)` / `throw(e)` / `return(v)` (`GetMethod`); a delegate
   without `throw` is closed, then a `TypeError` is thrown; one without
   `return` completes the outer generator with `return v`; a non-object
-  result throws a `TypeError`. The outer generator yields the result's
-  `value` (a fresh result object, not the delegate's).
+  result throws a `TypeError`. Only `done` is read per step: while not done
+  the outer `next()` / `throw()` / `return()` returns the delegate's result
+  object itself (spec `GeneratorYield(innerResult)`; the state machine
+  flags the handle's `128` bit, §5.2), and its `value` is read once, as the
+  delegate's return value, when done. A generator whose body has a `yield*`
+  (bit `64`) is iterated through the protocol, never by direct state-machine
+  resumes. Each delegated step calls the cached `next` (or the
+  `throw` / `return` method read per step); there is no fast path for a
+  clean generator delegate.
 
 **`async`/`await`.** An `async function` (in every position a `function*` may
 take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
@@ -2008,6 +2021,9 @@ Each item below is current behaviour of this tree.
   rejected in expression position (`x = [a] = b`), and a `for-of` head must
   declare its binding or be a pattern (`for (a of xs)` is rejected).
 - Not supported: private `#` members, static blocks.
+- An `arguments` object has no own `callee` (the strict-mode
+  `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
+  `undefined`.
 - A numeric or BigInt literal class member key (`class { 1() {} }`) is a
   compile error.
 
@@ -2017,9 +2033,8 @@ Each item below is current behaviour of this tree.
   async generator.
 - A `yield`/`await` that would carry a per-node compiler temporary across the
   suspend is a compile error (`super.m(yield x)`, `o[yield k]?.(yield v)`).
-- `yield*` yields a fresh `{ value, done }` object carrying the delegate
-  result's `value` rather than the delegate's result object itself, and
-  calls the delegate's methods without a fast path for a clean generator.
+- `yield*` has no fast path for a clean generator delegate: each delegated
+  step is a call to the cached `next` (or the `throw` / `return` method).
 - An async generator object renders as `Object [Generator]` and
   `Object.prototype.toString` reports `[object Generator]` for it; functions
   render as `[Function: f]` whatever their kind.
@@ -2041,6 +2056,9 @@ Each item below is current behaviour of this tree.
   the Rust host, the TypeScript shim).
 - No garbage collection (§5.7): memory only grows, up to 512 MiB, and
   exhaustion is not catchable. The intern table never shrinks.
+- Map / Set backing arrays never shrink: `delete` and `clear` leave
+  tombstones (§5.2), so set / delete churn grows the backing without bound
+  (phase 4, `design/symbol-strings.md` Risk R6).
 
 ---
 

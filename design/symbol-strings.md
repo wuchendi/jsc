@@ -1092,6 +1092,32 @@ Y1 reason drafts (one line per affected row, for the final CI pass):
   (Y1-T1).
 - `fib`, `math`, `push_1e5`, `console_log`: must not change.
 
+Y2 reason drafts (one line per affected row, for the final CI pass):
+
+- `for_of`: per loop a `GetIterator` classify plus the try/catch/finally
+  landing of the close; per iteration the array path is at most the old
+  index walk, a string similar (`__str_iter_next`), a `Map` at most the old
+  walk (slot walk, `[k, v]` built via `ArraySpread`), and a generator drops
+  sharply (direct state-machine resume, no result object) (Y2-T2); array
+  destructuring now steps a record (Y2-T3); the generator classify also
+  tests the `GEN_DELEGATES` bit (one load, Y2-T6).
+- `spread`: a per-source classify guard; a `Map` spread now runs the
+  protocol (rises; spec-observable) (Y2-T2); an `arguments` spread is the
+  `ToList` index walk (Y2-T5).
+- `generators`: `return(7)` at a suspended `yield` resumes the state machine
+  (completion routing; small fuel rise); `it.next()` is unchanged apart from
+  one `GEN_DELEGATED_RESULT` bit test per resume (Y2-T4, Y2-T6).
+- `map_set`: a `HOLE` compare per scanned slot in `__map_find`; `delete`
+  without `memory.copy`; a tombstone test per entry in `forEach` and the
+  iterators; the constructor goes through the iterator record (Y2-T5).
+- rows with spread, destructuring, unsealed for-of or `arguments`: dirty
+  tracking is now on (a few fuel per watched-table write) (Y2-T2);
+  `arguments` creation defines an own `@@iterator` (Y2-T5).
+- rows with an object `ToPrimitive` on arrays or strings: the Array, String,
+  Map and Set prototypes carry `HAS_SYMBOL_KEYS`, so the well-known-symbol
+  consults do a real lookup (Y2-T1).
+- `fib`, `math`, `push_1e5`, `console_log`: must not change.
+
 ---
 
 ## 9. Staged migration

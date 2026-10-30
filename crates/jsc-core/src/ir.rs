@@ -998,7 +998,8 @@ pub enum IrNode {
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
         /// The initial `limits` bits of the handle ([`crate::abi::GEN_ASYNC`]
-        /// for an async generator, else `0`).
+        /// for an async generator, [`crate::abi::GEN_DELEGATES`] for a body
+        /// with a `yield*`).
         limits: u32,
     },
     /// `GetIterator(value, sync)` (design/symbol-strings.md §5.1): evaluate
@@ -1998,6 +1999,10 @@ pub enum GenTerm {
         /// cleared (a `yield*` forwarding it to its delegate); `None` throws
         /// it at the suspend point instead.
         on_throw: Option<u32>,
+        /// `value` is a `yield*` delegate's result object, which the resumer
+        /// returns as the outer result as-is (the state machine sets
+        /// [`crate::abi::GEN_DELEGATED_RESULT`]) instead of wrapping it.
+        raw: bool,
     },
     /// A `return value` (or falling off the body end): set `gen.done = 1` and
     /// return `value` (`undefined` when `None`).

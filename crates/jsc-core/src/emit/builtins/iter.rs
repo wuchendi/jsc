@@ -758,8 +758,9 @@ fn call_internal(
 /// unless `sealed`. Without dirty tracking (and not `sealed`) the bits prove
 /// nothing, so every value takes the protocol. An `arguments` object takes
 /// the array walk while its own `@@iterator` is still the data property
-/// `%Array.prototype.values%` (read without a getter call). `tmp` is a free
-/// i32 local.
+/// `%Array.prototype.values%` (read without a getter call). A generator
+/// whose body has a `yield*` ([`abi::GEN_DELEGATES`]) takes the protocol.
+/// `tmp` is a free i32 local.
 pub(in crate::emit) fn emit_iter_classify(
     function: &mut Function,
     v: u32,
@@ -792,6 +793,17 @@ pub(in crate::emit) fn emit_iter_classify(
     wasm!(function; I32And, If(BlockType::Result(ValType::I64)), I64Const(st(ST_STRING)), Else);
     for (kind, prototype, state) in arms {
         emit_proto_kind_test(function, v, kind, sealed, tmp, helpers);
+        if kind == ProtoKind::Generator {
+            // A body with a `yield*` passes delegate result objects through,
+            // which only the protocol (`%GeneratorPrototype%.next`) reads.
+            wasm!(function;
+                If(BlockType::Result(ValType::I32)),
+                LocalGet(v), I32WrapI64,
+                I32Load(MemArg { offset: u64::from(abi::GEN_LIMITS_OFFSET), align: 2, memory_index: 0 }),
+                I32Const(abi::GEN_DELEGATES.cast_signed()), I32And, I32Eqz,
+                Else, I32Const(0), End,
+            );
+        }
         bits_clear(function, &[prototype, iterator], sealed);
         wasm!(function; I32And, If(BlockType::Result(ValType::I64)), I64Const(st(state)), Else);
     }

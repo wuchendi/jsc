@@ -169,6 +169,10 @@ impl LowerCtx<'_> {
 
         // Spill cells for values live across a nested suspend extend the frame.
         let segments = build_segments(&body, span, machine, &mut total)?;
+        // A `yield*` step passes the delegate's result object through.
+        let delegates = segments
+            .iter()
+            .any(|segment| matches!(segment.term, GenTerm::Yield { raw: true, .. }));
         self.shared.arrows.borrow_mut()[sm_pos] = IrFunction {
             params: uniform_params,
             locals: sm_locals,
@@ -202,11 +206,16 @@ impl LowerCtx<'_> {
         } else {
             0
         };
+        let delegate_bit = if delegates {
+            crate::abi::GEN_DELEGATES
+        } else {
+            0
+        };
         let make = IrNode::MakeGenerator {
             sm_table_index,
             slots,
             total,
-            limits: async_bit,
+            limits: async_bit | delegate_bit,
         };
         let ctor_body = self.generator_ctor_body(make, machine, callee);
         // An async function's parameter binding error rejects its promise
@@ -1029,6 +1038,7 @@ impl CfgBuilder {
             resume,
             on_return,
             on_throw: None,
+            raw: false,
         });
         self.cur = resume as usize;
         self.suspended = true;
@@ -1070,12 +1080,14 @@ impl CfgBuilder {
     ///           : (m = iter.return) == null ? return received : m.call(iter, received)
     ///         if (!IsObject(r)) throw TypeError
     ///         if (r.done) { if (mode == return) return r.value; goto exit }
-    ///         received = yield r.value  -- mode = how the outer generator resumed
+    ///         received = yield r        -- r itself is the outer result; mode = how it resumed
     ///         goto head
     /// exit:   r.value
     /// ```
     ///
-    /// The `yield` forwards every resumption: a `throw(e)` / `return(v)` of the
+    /// The `yield` passes the delegate's result object through unread (spec
+    /// `GeneratorYield(innerResult)`; a [`GenTerm::Yield`] with `raw`), and
+    /// forwards every resumption: a `throw(e)` / `return(v)` of the
     /// outer generator enters its own block (`on_throw` / `on_return`), which
     /// records the mode and value and loops. Its `this_local` binds the
     /// iterator as `this` of each call.
@@ -1141,10 +1153,11 @@ impl CfgBuilder {
         self.cur = yield_b as usize;
         let (resume, on_throw, on_return) = (self.new_block(), self.new_block(), self.new_block());
         self.terminate(GenTerm::Yield {
-            value: member(result, "value"),
+            value: slot_get(result),
             resume,
             on_return: Some(on_return),
             on_throw: Some(on_throw),
+            raw: true,
         });
         for (block, resumed, value) in [
             (resume, MODE_NEXT, IrNode::SentValue),
