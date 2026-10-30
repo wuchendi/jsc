@@ -15,7 +15,7 @@ use crate::ir::ConvertOp;
 /// once exhausted), right after the object-family prefix.
 const ITER_ITERATED_OFFSET: u32 = abi::OBJ_PREFIX_SIZE;
 /// Offset of an iterator object's `[[NextIndex]]: u32` (an array index, a
-/// string byte index, or a Map/Set backing slot index).
+/// string code-unit index, or a Map/Set backing slot index).
 const ITER_INDEX_OFFSET: u32 = abi::OBJ_PREFIX_SIZE + 8;
 /// Offset of an iterator object's `kind: u8` ([`kind_byte`]).
 const ITER_KIND_OFFSET: u32 = abi::OBJ_PREFIX_SIZE + 12;
@@ -23,7 +23,7 @@ const ITER_KIND_OFFSET: u32 = abi::OBJ_PREFIX_SIZE + 12;
 const ITER_BLOCK_SIZE: i32 = 32;
 
 /// The `kind` byte of an iterator of `family` yielding `kind` (a string
-/// iterator yields code points; a Set's keys are its values).
+/// iterator yields code units; a Set's keys are its values).
 fn kind_byte(family: IterFamily, kind: IterKind) -> i32 {
     match (family, kind) {
         (IterFamily::Array, IterKind::Keys) => 0,
@@ -499,15 +499,13 @@ fn step_array(function: &mut Function, st: Step, strings: &StrOffsets, helpers: 
     wasm!(function; LocalSet(st.value), End, End);
 }
 
-/// A String Iterator step into `value`: the next code point's string.
+/// A String Iterator step into `value`: the next code unit's string.
 fn step_string(function: &mut Function, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
-    wasm!(function;
-        LocalGet(st.target), I32WrapI64, LocalTee(st.at),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
-        LocalSet(st.len),
-    );
+    wasm!(function; LocalGet(st.target), I32WrapI64, LocalTee(st.at));
+    emit_load_str_len(function);
+    wasm!(function; LocalSet(st.len));
     st.end_at_len(function, strings, helpers);
-    emit_str_iter_next(function, st.at, st.i, st.len, st.kind, helpers);
+    emit_str_iter_next(function, st.at, st.i, helpers);
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(st.value));
     st.store_index(function);
 }
@@ -553,41 +551,14 @@ fn step_collection(
     wasm!(function; LocalSet(st.value), End);
 }
 
-/// `__str_iter_next(s, i)` (design/symbol-strings.md §5.4) on the UTF-8
-/// layout: push the fresh string of the code point starting at byte index
-/// `i` of the string at i32 `s` (`len` its byte length, `i < len`) and
-/// advance `i` past it. One UTF-8 sequence is one code point (no lone
-/// surrogate exists before the UTF-16 flip); the sequence length comes from
-/// its lead byte, clamped to the string's end. `k` is an i32 temp.
-fn emit_str_iter_next(
-    function: &mut Function,
-    s: u32,
-    i: u32,
-    len: u32,
-    k: u32,
-    helpers: Helpers<'_>,
-) {
-    let payload = u64::from(abi::HEADER_SIZE) + 4;
-    // k = the sequence length: 1 + (lead >= 0xC0) + (lead >= 0xE0) + (lead >= 0xF0).
+/// `__str_iter_next(s, i)` (design/symbol-strings.md §5.4): push the fresh
+/// one-unit string of code unit `i` of the string at i32 `s` (`i` below its
+/// length) and advance `i` past it. One step is one code unit; combining a
+/// surrogate pair into one code point is U2-T1's.
+fn emit_str_iter_next(function: &mut Function, s: u32, i: u32, helpers: Helpers<'_>) {
     wasm!(function;
-        LocalGet(s), LocalGet(i), I32Add,
-        I32Load8U(MemArg { offset: payload, align: 0, memory_index: 0 }), LocalTee(k),
-        I32Const(0xC0), I32GeU,
-        LocalGet(k), I32Const(0xE0), I32GeU, I32Add,
-        LocalGet(k), I32Const(0xF0), I32GeU, I32Add,
-        I32Const(1), I32Add, LocalSet(k),
-        LocalGet(len), LocalGet(i), I32Sub, LocalGet(k),
-        LocalGet(len), LocalGet(i), I32Sub, LocalGet(k), I32LtU, Select, LocalSet(k),
-        // The first byte, then each continuation byte appended.
         LocalGet(s), LocalGet(i), Call(helpers.str_index),
-        LocalGet(i), LocalGet(k), I32Add, LocalSet(k),
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i), LocalGet(k), I32GeU, BrIf(1),
-        LocalGet(s), LocalGet(i), Call(helpers.str_index), Call(helpers.concat),
-        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Br(0),
-        End, End,
     );
 }
 
@@ -598,8 +569,8 @@ const ST_DONE: f64 = 0.0;
 /// Record state: a clean array or `arguments` object walked by index
 /// (`next` holds the index).
 pub(in crate::emit) const ST_ARRAY: f64 = 1.0;
-/// Record state: a primitive string walked by code point (`next` holds the
-/// byte index).
+/// Record state: a primitive string walked by code unit (`next` holds the
+/// unit index).
 pub(in crate::emit) const ST_STRING: f64 = 2.0;
 /// Record state: a clean `Map` walked live (`next` holds the backing slot).
 const ST_MAP: f64 = 3.0;
@@ -1064,7 +1035,7 @@ fn step_indexed(
     wasm!(function; I64Const(TRUE_BITS), I64Eq);
 }
 
-/// A string step: the next code point's string (`__str_iter_next`).
+/// A string step: the next code unit's string (`__str_iter_next`).
 fn step_code_point(
     rec: &IterRecord,
     function: &mut Function,
@@ -1072,19 +1043,11 @@ fn step_code_point(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (s, i, len, k, out) = (
-        scratch + 8,
-        scratch + 9,
-        scratch + 10,
-        scratch + 11,
-        scratch + 24,
-    );
+    let (s, i, len, out) = (scratch + 8, scratch + 9, scratch + 10, scratch + 24);
     load(function, &rec.iter, scratch, strings, helpers);
-    wasm!(function;
-        I32WrapI64, LocalTee(s),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
-        LocalSet(len),
-    );
+    wasm!(function; I32WrapI64, LocalTee(s));
+    emit_load_str_len(function);
+    wasm!(function; LocalSet(len));
     load(function, &rec.next, scratch, strings, helpers);
     wasm!(function;
         F64ReinterpretI64, I32TruncSatF64U, LocalTee(i), LocalGet(len), I32GeU,
@@ -1092,7 +1055,7 @@ fn step_code_point(
     );
     step_done(rec, function, scratch, strings, helpers);
     wasm!(function; Else);
-    emit_str_iter_next(function, s, i, len, k, helpers);
+    emit_str_iter_next(function, s, i, helpers);
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(out));
     store(
         function,
