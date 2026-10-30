@@ -1476,7 +1476,7 @@ pub(super) fn emit_str_to_array(
 /// `handle` is the base of a `TYPE_MAP`/`TYPE_SET` block; its `entries` slot (at
 /// [`MAP_ENTRIES_OFFSET`]) holds the backing array jsval. Reads the array's
 /// `len` and element store, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
-/// skipping tombstones (a `HOLE` key, design/symbol-strings.md §5.5) and
+/// skipping tombstones (a `HOLE` key, DESIGN.md §5.2) and
 /// returning the byte ADDRESS of the first slot whose value is `__same_value_zero` (at
 /// `svz_index`) to `key`, or `-1` on a miss. The value slot sits 8 bytes past the
 /// returned address. Params occupy locals 0/1; four extra `i32` locals hold the
@@ -1666,7 +1666,7 @@ pub(super) fn emit_map_has(map_find_index: u32) -> Function {
 /// Emit the `__map_delete(handle: i32, key: i64) -> i32` Map/Set remover.
 ///
 /// Looks the key up with `__map_find` (at `map_find_index`); on a miss returns `0`.
-/// On a hit it TOMBSTONES the entry in place (design/symbol-strings.md §5.5):
+/// On a hit it TOMBSTONES the entry in place (DESIGN.md §5.2):
 /// the key slot becomes `HOLE` and the value slot `undefined`, so the backing
 /// keeps every other entry at its index and a live iterator or `forEach`
 /// continues at the next one. The handle's u32 `size` header (the live count)

@@ -1,5 +1,5 @@
 //! Integration tests: the honoured well-known symbol hooks
-//! (`design/symbol-strings.md` §4): `@@toPrimitive` in `ToPrimitive`
+//! (DESIGN.md §6.4): `@@toPrimitive` in `ToPrimitive`
 //! (hint strings, `GetMethod` errors, the `OrdinaryToPrimitive` fallback,
 //! `Date.prototype[@@toPrimitive]`) and `@@toStringTag` in
 //! `Object.prototype.toString` (builtin tags as real properties, user tags);

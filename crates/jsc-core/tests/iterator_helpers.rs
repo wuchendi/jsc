@@ -1,5 +1,5 @@
-//! Integration tests: the `Iterator` global (`design/symbol-strings.md`
-//! §5.7): the abstract constructor, `Iterator.prototype` (=
+//! Integration tests: the `Iterator` global (DESIGN.md
+//! §7.9): the abstract constructor, `Iterator.prototype` (=
 //! `%IteratorPrototype%`) with its `constructor` / `@@toStringTag`
 //! accessors, `Iterator.from` with its `%WrapForValidIteratorPrototype%`
 //! wrappers, the lazy helpers over `%IteratorHelperPrototype%`, and the

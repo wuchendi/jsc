@@ -78,7 +78,7 @@ test262 is the primary metric. `crates/jsc-test262` runs the official suite at a
 - `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module` or `noStrict` (and `raw` tests flagged `async`) are ineligible as well; other `async` tests run with the official `doneprintHandle.js` and pass on `Test262:AsyncTestComplete`.
 - `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records `pass` / `eligible` / `total` per commit from a full run (`--history`).
 
-Current result (last row of `tests/test262/history.tsv`): **19378 pass / 30014 eligible (64.6%) / 47665 total**.
+Current result (last row of `tests/test262/history.tsv`): **23684 pass / 32889 eligible (72.0%)**.
 
 ```bash
 bash scripts/test262-fetch.sh

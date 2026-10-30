@@ -145,7 +145,7 @@ pub(crate) const CLASS_GLOBAL: u8 = 6;
 pub(crate) const CLASS_SYMBOL: u8 = 7;
 
 /// [`TYPE_OBJECT`] `class` byte: a builtin iterator object (an Array, String,
-/// Map or Set iterator; design/symbol-strings.md §5.4). Its 32-byte block
+/// Map or Set iterator; DESIGN.md §5.2). Its 32-byte block
 /// holds the iterated value, the next index and the iterator kind past the
 /// object-family prefix; no host reads the payload.
 pub(crate) const CLASS_ITERATOR: u8 = 8;

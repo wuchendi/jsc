@@ -386,7 +386,7 @@ const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
 const SYMBOL_DESCRIPTION_OFFSET: u64 = abi::SYMBOL_DESCRIPTION_OFFSET as u64;
 
-/// `%Symbol.prototype%` (design/symbol-strings.md §2.6): where a property read
+/// `%Symbol.prototype%` (DESIGN.md §7.9): where a property read
 /// on a symbol primitive continues and the prototype of its `ToObject`
 /// wrapper.
 const SYMBOL_PROTOTYPE: Intrinsic = Intrinsic::Prototype(BuiltinCtor::Symbol);

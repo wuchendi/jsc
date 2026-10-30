@@ -203,8 +203,8 @@ pub(super) fn emit_array_node(
 /// [`Item`] via `__array_push`, a [`Spread`] source's values and a [`List`]'s
 /// elements via `__array_concat`.
 ///
-/// A [`Spread`] source is `IterableToList` (design/symbol-strings.md §5.2):
-/// on its guarded fast path (§5.3, [`builtins::emit_iter_classify`]) a clean
+/// A [`Spread`] source is `IterableToList` (DESIGN.md §7.8):
+/// on its guarded fast path (DESIGN.md §6.4, [`builtins::emit_iter_classify`]) a clean
 /// array is itself, a string its characters (`__str_to_array`) and a
 /// generator its drained values (`__gen_to_array`); every other value
 /// (`arguments` included) goes through [`ProtocolOp::ToList`], which walks

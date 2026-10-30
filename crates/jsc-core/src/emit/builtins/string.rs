@@ -2,7 +2,7 @@
 //! takes `ToString(RequireObjectCoercible(this))` and coerces its arguments in
 //! the guest (a user `toString` / `valueOf` may run, and throw), then works on
 //! the code units at each string's width (one-byte Latin-1 or two-byte
-//! UTF-16, design/symbol-strings.md §6), producing canonical strings; only the
+//! UTF-16, DESIGN.md §5.2), producing canonical strings; only the
 //! case mappings, `localeCompare` and `normalize` run a host `__method` op.
 //! `toString` / `valueOf` are `thisStringValue`.
 
@@ -1241,7 +1241,7 @@ fn emit_last_index_of(
 
 /// Run `lone` at each index `i` (i32 local) of a lone surrogate of the
 /// two-byte string `s` — a lead not followed by a trail, or a trail not
-/// after a lead (the surrogate rule of design/symbol-strings.md §6.6); `c`
+/// after a lead (the surrogate rule of DESIGN.md §5.2); `c`
 /// is i32 scratch.
 fn emit_lone_surrogates(
     function: &mut Function,

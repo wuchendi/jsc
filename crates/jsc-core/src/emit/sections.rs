@@ -1461,7 +1461,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 /// [`IrNode::NamespaceGuard`] on a watched namespace, or an iteration fast
 /// path: a [`IrNode::GetIterator`], a spread source, or an `arguments`
 /// object, whose guard is the iterator prototypes' bits 15..=19,
-/// design/symbol-strings.md §5.3), so
+/// DESIGN.md §6.4), so
 /// `__set` / `__define` / `__delete` must set the bits (DESIGN.md §6.4).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {

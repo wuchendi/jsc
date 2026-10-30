@@ -794,7 +794,7 @@ pub enum SpreadElem {
     /// A plain element/argument `e`, appended as a single value.
     Item(IrNode),
     /// A spread source `...e`: every value its iterator yields is appended in
-    /// order (`IterableToList`, design/symbol-strings.md §5.2).
+    /// order (`IterableToList`, DESIGN.md §7.8).
     Spread(IrNode),
     /// An internal argument-list array (a bound function's or a builtin
     /// constructor's arguments): its elements are appended as they are,
@@ -802,7 +802,7 @@ pub enum SpreadElem {
     List(IrNode),
 }
 
-/// The iterator record of design/symbol-strings.md §5.1, held in four places
+/// The iterator record of DESIGN.md §7.8, held in four places
 /// (each a [`IrNode::Local`], or the frame-cell read a generator promotes it
 /// to) that the record nodes read and write: it never escapes, so it is not
 /// a heap block.
@@ -1111,9 +1111,9 @@ pub enum IrNode {
         /// with a `yield*`).
         limits: u32,
     },
-    /// `GetIterator(value, sync)` (design/symbol-strings.md §5.1): evaluate
+    /// `GetIterator(value, sync)` (DESIGN.md §7.8): evaluate
     /// `value` and open its iterator into the record `rec`. A source passing
-    /// its guarded fast path (§5.3: a clean array or `arguments`, string,
+    /// its guarded fast path (DESIGN.md §6.4: a clean array or `arguments`, string,
     /// `Map`, `Set` or generator) is walked directly (`rec.iter` is the source,
     /// `rec.next` its cursor); any other value runs the protocol:
     /// `GetMethod(value, @@iterator)` (`<x> is not iterable` when absent),
@@ -1133,8 +1133,8 @@ pub enum IrNode {
     /// and `rec.next` its `next`, for a consumer that calls them itself
     /// (`yield*`). Yields `undefined`.
     ///
-    /// With `is_async`, `GetIterator(value, async)` (design/symbol-strings.md
-    /// §5.8): `GetMethod(value, @@asyncIterator)`, else
+    /// With `is_async`, `GetIterator(value, async)` (DESIGN.md
+    /// §7.8): `GetMethod(value, @@asyncIterator)`, else
     /// `CreateAsyncFromSyncIterator` over `GetIterator(value, sync)` (a
     /// `%AsyncFromSyncIteratorPrototype%` object), else `<x> is not async
     /// iterable`; then the call, the object check and `rec.next` read once.
@@ -1150,8 +1150,8 @@ pub enum IrNode {
         /// `GetIterator(value, async)` rather than `sync`.
         is_async: bool,
     },
-    /// The call half of an async `IteratorStep` (design/symbol-strings.md
-    /// §5.8): `Call(rec.next, rec.iter)`, yielding its result for the caller
+    /// The call half of an async `IteratorStep` (DESIGN.md
+    /// §7.8): `Call(rec.next, rec.iter)`, yielding its result for the caller
     /// to `Await` (every step is a microtask turn). The record is marked
     /// stepping until [`IrNode::AsyncIteratorComplete`], so a throw from the
     /// call or the await leaves it unclosed.
@@ -1173,7 +1173,7 @@ pub enum IrNode {
         result: Box<IrNode>,
     },
     /// The call half of `AsyncIteratorClose(rec, completion)`
-    /// (design/symbol-strings.md §5.8) of a record not yet done (a done or
+    /// (DESIGN.md §7.8) of a record not yet done (a done or
     /// stepping record yields the hole): `GetMethod(iterator, "return")`
     /// (the hole when `undefined` / `null`) and its call, yielding the call's
     /// result for the caller to `Await`. The record is done afterwards. With
@@ -1195,7 +1195,7 @@ pub enum IrNode {
     /// operand (the awaited `return()` result) and throw `Iterator result
     /// <x> is not an object` unless it is an object; yields `undefined`.
     IteratorResultCheck(Box<IrNode>),
-    /// `yield* iterable` in a generator body (design/symbol-strings.md §5.6):
+    /// `yield* iterable` in a generator body (DESIGN.md §7.8):
     /// the CFG builder expands it into the delegation loop, forwarding each
     /// `next(v)` / `throw(e)` / `return(v)` to the delegate; its value is the
     /// delegate's return value. Never reaches emit.

@@ -717,7 +717,7 @@ impl Combinator {
 }
 
 /// `Promise.all` / `allSettled` / `any` / `race` (`op`) over `iterable`
-/// with `C = this` (design/symbol-strings.md §5.2, §5.7):
+/// with `C = this` (DESIGN.md §6.7):
 /// `NewPromiseCapability(C)` (a throw propagates), `GetPromiseResolve(C)`
 /// (read once), `GetIterator(iterable)`, then per value
 /// [`combinator_value`]. An abrupt completion closes the iterator unless it

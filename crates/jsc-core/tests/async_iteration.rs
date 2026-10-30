@@ -1,4 +1,4 @@
-//! Async iteration (design/symbol-strings.md §5.8): `GetIterator(async)`,
+//! Async iteration (DESIGN.md §7.8): `GetIterator(async)`,
 //! the `%AsyncFromSyncIteratorPrototype%` wrapper over a sync iterator and
 //! `AsyncIteratorClose`. The wrapper is only reachable through `for await`
 //! (Y5-T2) and async `yield*` (Y5-T3), so these are written as such

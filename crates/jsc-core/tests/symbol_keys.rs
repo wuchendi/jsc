@@ -1,4 +1,4 @@
-//! Integration tests: symbol-keyed properties (`design/symbol-strings.md` §3):
+//! Integration tests: symbol-keyed properties (DESIGN.md §6.3):
 //! `ToPropertyKey(symbol)`, the own-key modes (string walks skip symbols,
 //! `getOwnPropertySymbols`, `OrdinaryOwnPropertyKeys` order), the copying
 //! statics and object rest, descriptors and integrity on a symbol key, and

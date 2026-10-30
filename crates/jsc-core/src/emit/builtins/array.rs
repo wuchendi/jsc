@@ -1305,7 +1305,7 @@ pub(super) fn emit_of(
 
 /// `Array.from(items, mapFn, thisArg)`: a non-callable `mapFn` throws first.
 /// `GetMethod(items, @@iterator)` (through the guarded fast paths of
-/// design/symbol-strings.md §5.3) decides: an iterable fills `A =
+/// DESIGN.md §6.4) decides: an iterable fills `A =
 /// IsConstructor(this) ? Construct(this) : ArrayCreate(0)` by
 /// `CreateDataPropertyOrThrow` from its iterator record, closing the
 /// iterator when `mapFn` or the define throws; any other value is an

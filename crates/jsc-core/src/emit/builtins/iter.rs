@@ -1,8 +1,8 @@
-//! The iteration protocol (design/symbol-strings.md §5.1-§5.3): the
+//! The iteration protocol (DESIGN.md §7.8, §6.4): the
 //! iterator record nodes ([`IrNode::GetIterator`], [`IrNode::IteratorStep`],
 //! [`IrNode::IteratorValue`], [`IrNode::IteratorClose`]) with their guarded
 //! fast paths, the internal protocol builtins behind them, and the builtin
-//! iterator objects (§5.4): the `keys` / `values` / `entries` /
+//! iterator objects (DESIGN.md §5.2): the `keys` / `values` / `entries` /
 //! `[@@iterator]` methods that create them and the `next` of their
 //! prototypes.
 
@@ -552,7 +552,7 @@ fn step_collection(
     wasm!(function; LocalSet(st.value), End);
 }
 
-/// `__str_iter_next(s, i)` (design/symbol-strings.md §5.4): push the fresh
+/// `__str_iter_next(s, i)` (DESIGN.md §5.2): push the fresh
 /// string of the code point at unit `i` of the string at i32 `s` (`len` its
 /// length, `i < len`) and advance `i` past it: a lead surrogate followed by
 /// a trail is one two-unit string, any other unit (a lone surrogate
@@ -581,7 +581,7 @@ fn emit_str_iter_next(
     );
 }
 
-// --- the iteration protocol (design/symbol-strings.md §5.1-§5.3) -------------
+// --- the iteration protocol (DESIGN.md §7.8, §6.4) -------------
 
 /// Record state: done (closing does nothing).
 pub(super) const ST_DONE: f64 = 0.0;
@@ -727,7 +727,7 @@ pub(super) fn call_internal(
 }
 
 /// Push the record state of the fast path the jsval in i64 `v` takes
-/// (design/symbol-strings.md §5.3), or [`ST_PROTOCOL`]: each guard proves
+/// (DESIGN.md §6.4), or [`ST_PROTOCOL`]: each guard proves
 /// the builtin `@@iterator` and the builtin `%XIteratorPrototype%.next` (and
 /// no `return` on `%IteratorPrototype%`) through the watched dirty bits,
 /// unless `sealed`. Without dirty tracking (and not `sealed`) the bits prove
@@ -1298,7 +1298,7 @@ pub(in crate::emit) fn emit_iterator_value(
     wasm!(function; End);
 }
 
-/// Emit `IteratorClose` of `rec` (design/symbol-strings.md §5.1) under
+/// Emit `IteratorClose` of `rec` (DESIGN.md §7.8) under
 /// `mode`: an open protocol record calls [`ProtocolOp::Close`] and a
 /// generator its builtin `return()` (the guard proved `return` is
 /// `%GeneratorPrototype%.return`); a done or stepping record, or one on

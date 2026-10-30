@@ -1,5 +1,5 @@
 //! Integration tests: the honoured `@@species`, `@@isConcatSpreadable` and
-//! `@@unscopables` (`design/symbol-strings.md` §4): `ArraySpeciesCreate` and
+//! `@@unscopables` (DESIGN.md §6.4): `ArraySpeciesCreate` and
 //! `SpeciesConstructor` read `C[@@species]`, the builtin
 //! `get [Symbol.species]` accessors, `concat`'s `IsConcatSpreadable`, and the
 //! `Array.prototype[@@unscopables]` list object.
