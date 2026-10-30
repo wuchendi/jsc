@@ -286,8 +286,8 @@ impl LowerCtx<'_> {
             // A class expression; an anonymous one has the empty name here
             // (`lower_named_expr` names it after its binding).
             Expr::Class(class_expr) => match &class_expr.ident {
-                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true),
-                None => self.lower_class(&class_expr.class, "", false),
+                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true, None),
+                None => self.lower_class(&class_expr.class, "", false, None),
             },
             // `new.target`: the enclosing non-arrow function's snapshot; outside
             // any function it is a SyntaxError.
@@ -536,7 +536,7 @@ impl LowerCtx<'_> {
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
             Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
-                self.lower_class(&class_expr.class, name, false)
+                self.lower_class(&class_expr.class, name, false, None)
             }
             _ => self.lower_expr(expr),
         }
@@ -1695,11 +1695,22 @@ impl LowerCtx<'_> {
                 }
                 Prop::KeyValue(kv) => {
                     let key = self.lower_prop_key(&kv.key)?;
-                    let value = match &key {
-                        PropKey::Static(name) => self.lower_named_expr(&kv.value, name)?,
-                        _ => self.lower_expr(&kv.value)?,
+                    let entry = match key {
+                        PropKey::Static(name) => {
+                            let value = self.lower_named_expr(&kv.value, &name)?;
+                            (PropKey::Static(name), value)
+                        }
+                        key if is_anonymous_definition(&kv.value) => {
+                            let (key, named) = self.computed_name_key(key);
+                            let value = match named {
+                                Some(named) => self.lower_computed_named_expr(&kv.value, named)?,
+                                None => self.lower_expr(&kv.value)?,
+                            };
+                            (key, value)
+                        }
+                        key => (key, self.lower_expr(&kv.value)?),
                     };
-                    entries.push((key, value));
+                    entries.push(entry);
                 }
                 // Shorthand `{n}` ≡ `{n: n}`: the value is the identifier read.
                 Prop::Shorthand(ident) => {
@@ -1711,11 +1722,13 @@ impl LowerCtx<'_> {
                 // function value (like an arrow) that carries `this`.
                 Prop::Method(method) => {
                     let key = self.lower_prop_key(&method.key)?;
+                    let (key, named) = self.computed_name_key(key);
                     let value = self.lower_method(&method.function, static_key_name(&key))?;
-                    entries.push((key, value));
+                    entries.push((key, self.set_computed_name(value, named, "")));
                 }
                 Prop::Getter(getter) => {
                     let key = self.lower_prop_key(&getter.key)?;
+                    let (key, named) = self.computed_name_key(key);
                     let block = getter
                         .function
                         .body
@@ -1730,10 +1743,12 @@ impl LowerCtx<'_> {
                         &name,
                         FnKind::Plain,
                     )?;
+                    let value = self.set_computed_name(value, named, "get ");
                     push_accessor_half(&mut entries, key, value, true);
                 }
                 Prop::Setter(setter) => {
                     let key = self.lower_prop_key(&setter.key)?;
+                    let (key, named) = self.computed_name_key(key);
                     let block = setter
                         .function
                         .body
@@ -1748,6 +1763,7 @@ impl LowerCtx<'_> {
                         &name,
                         FnKind::Plain,
                     )?;
+                    let value = self.set_computed_name(value, named, "set ");
                     push_accessor_half(&mut entries, key, value, false);
                 }
                 Prop::Assign(_) => {
@@ -1761,6 +1777,66 @@ impl LowerCtx<'_> {
             return Ok(literal_object(entries));
         };
         Ok(self.with_proto_entry(entries, at, value))
+    }
+
+    /// A computed object-literal key whose entry is a function value named by
+    /// it: the key is converted once (`ToPropertyKey`, before the value runs)
+    /// into a fresh local, which the entry's [`Self::set_computed_name`]
+    /// reads. Any other key is returned as is, with `None`.
+    pub(super) fn computed_name_key(&mut self, key: PropKey) -> (PropKey, Option<u32>) {
+        let PropKey::Computed(expr) = key else {
+            return (key, None);
+        };
+        let local = self.fresh();
+        let key = IrNode::Seq(vec![
+            IrNode::Assign {
+                local,
+                value: Box::new(IrNode::ToPropertyKey(Box::new(expr))),
+            },
+            IrNode::Local(local),
+        ]);
+        (PropKey::Computed(key), Some(local))
+    }
+
+    /// The function `value` of an entry under the computed key converted into
+    /// `key` (see [`Self::computed_name_key`]), with its `name` set at run
+    /// time from that key and `prefix`; `value` itself without one.
+    pub(super) fn set_computed_name(
+        &mut self,
+        value: IrNode,
+        key: Option<u32>,
+        prefix: &'static str,
+    ) -> IrNode {
+        let Some(key) = key else {
+            return value;
+        };
+        IrNode::SetFunctionName {
+            func: Box::new(value),
+            key,
+            prefix,
+            local: self.fresh(),
+        }
+    }
+
+    /// Lower `expr`, the value of an entry under the computed key converted
+    /// into the local `key` (see [`Self::computed_name_key`]): an anonymous
+    /// function, arrow, or class definition gets its `name` from the key at
+    /// run time (a class before its static members are defined).
+    pub(super) fn lower_computed_named_expr(
+        &mut self,
+        expr: &Expr,
+        key: u32,
+    ) -> anyhow::Result<IrNode> {
+        match expr {
+            Expr::Class(class_expr) if class_expr.ident.is_none() => {
+                self.lower_class(&class_expr.class, "", false, Some(key))
+            }
+            _ if is_anonymous_function(expr) => {
+                let value = self.lower_expr(expr)?;
+                Ok(self.set_computed_name(value, Some(key), ""))
+            }
+            _ => self.lower_expr(expr),
+        }
     }
 
     /// The object literal `entries` with a `__proto__: value` entry after the
@@ -2300,12 +2376,26 @@ fn seq_then(mut seq: Vec<IrNode>, last: IrNode) -> IrNode {
     IrNode::Seq(seq)
 }
 
-/// The compile-time name of a static property key (`""` for a computed key):
-/// the `name` given to a method or accessor defined under it.
+/// Whether `expr` is an anonymous function definition named by the property
+/// it initializes (`IsAnonymousFunctionDefinition`): an arrow or a function
+/// expression without its own name.
+fn is_anonymous_function(expr: &Expr) -> bool {
+    matches!(expr, Expr::Arrow(_)) || matches!(expr, Expr::Fn(f) if f.ident.is_none())
+}
+
+/// Whether `expr` is an anonymous function or class definition
+/// (`IsAnonymousFunctionDefinition`), named by the key it is defined under.
+pub(super) fn is_anonymous_definition(expr: &Expr) -> bool {
+    is_anonymous_function(expr) || matches!(expr, Expr::Class(c) if c.ident.is_none())
+}
+
+/// The compile-time name of a static property key (`""` for a computed key,
+/// whose name is set at run time instead, [`IrNode::SetFunctionName`]): the
+/// `name` given to a method or accessor defined under it.
 fn static_key_name(key: &PropKey) -> &str {
     match key {
         PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => name,
-        PropKey::Computed(_) => "",
+        PropKey::Computed(_) | PropKey::HiddenComputed(_) => "",
     }
 }
 
@@ -2320,7 +2410,7 @@ pub(super) fn push_accessor_half(
 ) {
     let existing = entries.iter_mut().rev().find_map(|(k, v)| match v {
         IrNode::MakeAccessor { getter, setter }
-            if !matches!(k, PropKey::Computed(_)) && *k == key =>
+            if !matches!(k, PropKey::Computed(_) | PropKey::HiddenComputed(_)) && *k == key =>
         {
             Some((getter, setter))
         }

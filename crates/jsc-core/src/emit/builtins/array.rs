@@ -1118,8 +1118,10 @@ fn construct_or_create(
 /// throws, and an object is its own species when its prototype chain reaches
 /// a builtin constructor with a `@@species` getter returning `this`
 /// (`%Array%`, `%Map%`, `%Set%`, `%Promise%`), else (`C[@@species]` is
-/// `undefined`) an array is created; `%Array%` itself creates an array. There
-/// is no `Symbol`, so no other `@@species` exists (DESIGN.md §13).
+/// `undefined`) an array is created; `%Array%` itself creates an array. No
+/// builtin defines `@@species` yet, so a `C` whose chain holds a `@@species`
+/// (a user hook, `__symbol_get`) throws the interim `TypeError` (Y4 honours
+/// it, design/symbol-strings.md §9.4).
 fn species_ctor(
     function: &mut Function,
     frame: Frame,
@@ -1141,8 +1143,17 @@ fn species_ctor(
     emit_is_object(function, c);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, CTOR_NOT_OBJECT, strings, helpers);
+    wasm!(function; End);
+    emit_hook_guard(
+        function,
+        c,
+        WellKnown::Species,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    return_if_pending(function);
     wasm!(function;
-        End,
         LocalGet(c), LocalSet(walk), I32Const(0), LocalSet(found),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
@@ -1342,7 +1353,9 @@ fn close_on_throw(function: &mut Function, frame: Frame, generator: u32, helpers
 /// `arguments`, walked live) fills `A = IsConstructor(this) ?
 /// Construct(this) : ArrayCreate(0)` by `CreateDataPropertyOrThrow`; any
 /// other object is an array-like (`ToObject`, `LengthOfArrayLike`, `A` from
-/// `Construct(this, [len])`, `Get` per index). `A.length` is set last.
+/// `Construct(this, [len])`, `Get` per index). `A.length` is set last. An
+/// `items` whose chain holds a `@@iterator` (a user hook, `__symbol_get`)
+/// throws the interim `TypeError` (design/symbol-strings.md §9.4).
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_from(
     function: &mut Function,
@@ -1370,6 +1383,16 @@ pub(super) fn emit_from(
     wasm!(function; If(BlockType::Empty));
     throw_type_error(function, frame, FROM_NULLISH, strings, helpers);
     wasm!(function; End);
+    // A user `@@iterator` is not honoured before Y2 (§9.4).
+    emit_hook_guard(
+        function,
+        items,
+        WellKnown::Iterator,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    return_if_pending(function);
     // `v = mapFn(v, k)` when mapping, then `A[k] = v`, `k += 1`.
     let store = |function: &mut Function, close: bool| {
         wasm!(function; LocalGet(mapping), If(BlockType::Empty));
@@ -1724,9 +1747,11 @@ pub(super) fn emit_last_index_of(
 // --- concat / flat / flatMap --------------------------------------------------------
 
 /// `Array.prototype.concat(...items)`: `A = ArraySpeciesCreate(O, 0)`; for
-/// each of `O, ...items` an array (`IsArray`; no `@@isConcatSpreadable`)
-/// appends its present indices at `n + k` (`n` advancing over holes too), any
-/// other value is one element; then `Set(A, "length", n)`.
+/// each of `O, ...items` an array (`IsArray`) appends its present indices at
+/// `n + k` (`n` advancing over holes too), any other value is one element;
+/// then `Set(A, "length", n)`. An object item whose chain holds a
+/// `@@isConcatSpreadable` (`__symbol_get`) throws the interim `TypeError`
+/// (Y4 honours it, design/symbol-strings.md §9.4).
 pub(super) fn emit_concat(
     function: &mut Function,
     frame: Frame,
@@ -1753,6 +1778,18 @@ pub(super) fn emit_concat(
         I32Const(0), LocalSet(j),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
+    emit_is_object(function, item);
+    wasm!(function; If(BlockType::Empty));
+    emit_hook_guard(
+        function,
+        item,
+        WellKnown::IsConcatSpreadable,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    wasm!(function; End);
+    return_if_pending(function);
     is_array(function, item);
     wasm!(function; If(BlockType::Empty));
     length_of(function, item, len, strings, helpers);

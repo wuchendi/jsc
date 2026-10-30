@@ -234,8 +234,11 @@ pub(super) fn emit_node(
             // Evaluate into a stable scratch slot, test the type byte, and box the
             // i32 result as a boolean jsval. `select` wants (a, b, cond), so stash
             // the cond in the i32 scratch and push it last.
+            // The for-of / `yield*` dispatch: a user `@@iterator` is not
+            // honoured before Y2 (§9.4), on the generator path either.
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::LocalSet(scratch + 22));
+            emit_iterator_guard(scratch + 22, function, scratch, strings, helpers);
             emit_is_generator(function, scratch + 22);
             function.instruction(&Instruction::LocalSet(scratch + 21));
             function.instruction(&Instruction::I64Const(TRUE_BITS));
@@ -345,6 +348,24 @@ pub(super) fn emit_node(
         IrNode::ToObject(operand) => {
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.to_object()));
+        }
+        IrNode::ToPropertyKey(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::Call(helpers.to_key));
+            emit_propagate_if_pending(function, helpers);
+            function.instruction(&Instruction::I64ExtendI32U);
+            function.instruction(&Instruction::I64Const(HEAP_BITS));
+            function.instruction(&Instruction::I64Or);
+        }
+        IrNode::SetFunctionName {
+            func,
+            key,
+            prefix,
+            local,
+        } => {
+            emit_node(func, function, scratch, strings, helpers);
+            emit_set_function_name(*key, prefix, *local, function, strings, helpers);
         }
         IrNode::ThisGlobal => {
             // Snapshot read of the `this`-binding carrier; emitted only in a
@@ -1648,7 +1669,7 @@ fn emit_class_heritage(
 }
 
 /// Push the jsval in `local` when it is an object-family heap value (any heap
-/// kind but a string), else the i64 pushed by `alt`.
+/// kind but a string or a symbol), else the i64 pushed by `alt`.
 fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(alt);
@@ -1657,13 +1678,17 @@ fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>
 }
 
 /// Push `1` if the jsval in `local` is an object (a heap value other than a
-/// string), else `0`.
+/// string or a symbol), else `0`.
 pub(super) fn emit_is_object(function: &mut Function, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Ne);
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
@@ -2769,15 +2794,15 @@ pub(super) fn emit_console_log_spread(
 /// the INTERNED data-segment offset of the matching word — so a `typeof` result is
 /// an ordinary string with no distinct representation: `===`, `+`, `.length`, and
 /// `console.log` all flow through the existing string machinery (no `typeof`
-/// special-casing anywhere). The six words are interned by `collect_node` whenever
+/// special-casing anywhere). The seven words are interned by `collect_node` whenever
 /// a program uses `typeof`, so this allocates nothing per call.
 ///
 /// The concrete heap kind is a TYPE BYTE, not the NaN-box tag, so
 /// `typeof` splits on whether the value is a heap pointer (single tag `0b101`):
 ///
 /// - **Heap pointer** — read the type byte and map it to the `TYPEOF_STRINGS`
-///   index: `TYPE_STRING` -> 4 ("string"), `TYPE_ARRAY`/`TYPE_OBJECT` -> 3
-///   ("object"), `TYPE_FUNCTION` -> 5 ("function").
+///   index: `TYPE_STRING` -> 4 ("string"), `TYPE_FUNCTION` -> 5 ("function"),
+///   `TYPE_SYMBOL` -> 6 ("symbol"), every other kind -> 3 ("object").
 /// - **Immediate** — the NaN-box tag orders boolean(1), null(2), undefined(3),
 ///   while `TYPEOF_STRINGS` orders boolean(1), undefined(2), object(3); booleans
 ///   line up but null/undefined are swapped, so `boxed index = tag ^ ((tag >> 1)
@@ -2804,8 +2829,9 @@ pub(super) fn emit_typeof_node(
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     // HEAP: map the type byte -> typeof index. Base is 3 ("object", array/object);
-    // override string -> 4 and function -> 5 with layered selects.
+    // override string -> 4, function -> 5 and symbol -> 6 with layered selects.
     function.instruction(&Instruction::I64Const(4)); // val1: "string"
+    function.instruction(&Instruction::I64Const(6)); // val1: "symbol"
     function.instruction(&Instruction::I64Const(5)); // val1: "function"
     function.instruction(&Instruction::I64Const(3)); // val2: base "object"
     emit_load_type_byte(function, scratch);
@@ -2813,9 +2839,13 @@ pub(super) fn emit_typeof_node(
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::Select); // function ? 5 : 3
     emit_load_type_byte(function, scratch);
+    function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Select); // symbol ? 6 : (function ? 5 : 3)
+    emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Select); // string ? 4 : (function ? 5 : 3)
+    function.instruction(&Instruction::Select); // string ? 4 : (symbol ? 6 : ...)
     function.instruction(&Instruction::Else);
     // IMMEDIATE: derived = tag ^ ((tag >> 1) & 1); is_boxed ? derived : 0.
     function.instruction(&Instruction::LocalGet(scratch));
@@ -2843,7 +2873,7 @@ pub(super) fn emit_typeof_node(
     // pointer for that word: stash the index, then a branchless nested-`select` fold
     // picks `HEAP_BITS | <offset>` for the matching entry (each step keeps the
     // accumulator as the deeper operand, testing `index != k`). `collect_node`
-    // interns all six words when the program uses `typeof`; the `HEAP_BASE` fallback
+    // interns all seven words when the program uses `typeof`; the `HEAP_BASE` fallback
     // keeps it valid regardless.
     function.instruction(&Instruction::LocalSet(scratch));
     let word_ptr = |k: usize| {
@@ -2862,4 +2892,64 @@ pub(super) fn emit_typeof_node(
         function.instruction(&Instruction::I32Ne);
         function.instruction(&Instruction::Select);
     }
+}
+
+/// The tail of an [`IrNode::SetFunctionName`], with the function value on the
+/// stack: stash it in `local`, redefine its own `name` (configurable only) as
+/// `prefix` + the key in `key` (a string key itself; a symbol `"[desc]"`, or
+/// `""` when its description is `undefined`), and push the function again.
+fn emit_set_function_name(
+    key: u32,
+    prefix: &str,
+    local: u32,
+    function: &mut Function,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let description = MemArg {
+        offset: u64::from(abi::SYMBOL_DESCRIPTION_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    let text = |function: &mut Function, text: &str| {
+        function.instruction(&Instruction::I32Const(static_key(strings, text)));
+    };
+    function.instruction(&Instruction::LocalTee(local));
+    function.instruction(&Instruction::I32WrapI64);
+    text(function, "name");
+    if !prefix.is_empty() {
+        text(function, prefix);
+    }
+    emit_is_symbol(function, key);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(description));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    text(function, "");
+    function.instruction(&Instruction::Else);
+    text(function, "[");
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(description));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.concat));
+    text(function, "]");
+    function.instruction(&Instruction::Call(helpers.concat));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::End);
+    if !prefix.is_empty() {
+        function.instruction(&Instruction::Call(helpers.concat));
+    }
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::I32Const(abi::ATTR_CONFIGURABLE.cast_signed()));
+    function.instruction(&Instruction::Call(helpers.define));
+    function.instruction(&Instruction::LocalGet(local));
 }

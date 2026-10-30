@@ -79,6 +79,9 @@ pub(super) fn emit(
         ReflectOp::GetOwnPropertyNames => {
             emit_get_own_property_names(function, frame, strings, helpers);
         }
+        ReflectOp::GetOwnPropertySymbols => {
+            emit_get_own_property_symbols(function, frame, strings, helpers);
+        }
         ReflectOp::Assign => emit_assign(function, frame, strings, helpers),
         ReflectOp::HasOwn => emit_has_own(function, frame, strings, helpers),
         ReflectOp::Is => emit_is(function, frame, helpers),
@@ -248,9 +251,11 @@ fn emit_define_properties(
 
 /// `ObjectDefineProperties(O, Properties)` of the object in i64 `o` (not
 /// i64 temps `1` / `2`, nor any i32 temp) and argument 1: every descriptor of
-/// `ToObject(Properties)`'s own enumerable keys is read first (`Get` +
-/// `ToPropertyDescriptor`, in own-key order), then each is applied in order;
-/// a throw returns from the body.
+/// `ToObject(Properties)`'s own keys (strings, then symbols) that is an own
+/// enumerable property when reached is read first (`Get` +
+/// `ToPropertyDescriptor`, in own-key order; the read keys are compacted to
+/// the front of the key list), then each is applied in order; a throw returns
+/// from the body.
 fn object_define_properties(
     function: &mut Function,
     frame: Frame,
@@ -263,7 +268,7 @@ fn object_define_properties(
     let (list, result) = (frame.x32(0), frame.x32(1));
     arg_to_object(function, frame, 1, props, strings, helpers);
     wasm!(function;
-        LocalGet(props), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
+        LocalGet(props), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
         I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), Call(helpers.new_array()), LocalSet(list),
     );
@@ -290,12 +295,27 @@ fn object_define_properties(
             End, End,
         );
     };
+    // `result` counts the read keys until the apply pass reuses it as scratch.
+    wasm!(function; I32Const(0), LocalSet(result));
     each(function, &|function| {
-        wasm!(function; LocalGet(props), LocalGet(key), Call(helpers.get), LocalSet(attrs));
+        wasm!(function;
+            LocalGet(props), LocalGet(key), Call(helpers.own_enum()),
+            If(BlockType::Empty),
+            LocalGet(props), LocalGet(key), Call(helpers.get), LocalSet(attrs),
+        );
         return_if_pending(function);
         wasm!(function; LocalGet(attrs), LocalGet(list), Call(helpers.to_desc()));
         return_if_pending(function);
+        wasm!(function; LocalGet(ks));
+        emit_array_elems(function);
+        wasm!(function;
+            LocalGet(result), I32Const(3), I32Shl, I32Add,
+            LocalGet(key), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, I64Store(elem_slot(0)),
+            LocalGet(result), I32Const(1), I32Add, LocalSet(result),
+            End,
+        );
     });
+    wasm!(function; LocalGet(result), LocalSet(n));
     each(function, &|function| {
         emit_apply(function, o, key, list, i, result, helpers);
     });
@@ -319,8 +339,8 @@ fn emit_get_own_property_descriptor(
 }
 
 /// `Object.getOwnPropertyDescriptors(O)`: a fresh object mapping each own key
-/// of `ToObject(O)` (own-key order; an array's `length` follows its indices)
-/// to its descriptor object.
+/// of `ToObject(O)` (own-key order: string keys, an array's `length` after
+/// its indices, then symbol keys) to its descriptor object.
 fn emit_get_own_property_descriptors(
     function: &mut Function,
     frame: Frame,
@@ -346,7 +366,7 @@ fn emit_get_own_property_descriptors(
     emit_load_type_byte(function, v);
     wasm!(function;
         I32Const(TYPE_ARRAY), I32Eq, LocalSet(length),
-        LocalGet(v), I32Const(OWN_ALL), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
+        LocalGet(v), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
         I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
     );
     // Define res[key] = the descriptor of the interned key pushed by `push`.
@@ -596,8 +616,24 @@ fn emit_get_own_property_names(
     );
 }
 
+/// `Object.getOwnPropertySymbols(O)`: every own symbol key of `ToObject(O)`,
+/// enumerable or not, in creation order.
+fn emit_get_own_property_symbols(
+    function: &mut Function,
+    frame: Frame,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (v, key) = (frame.i64(0), frame.i32(0));
+    arg_to_object(function, frame, 0, v, strings, helpers);
+    wasm!(function; LocalGet(v), I32WrapI64, LocalSet(key));
+    emit_materialize(function, key, helpers);
+    wasm!(function; LocalGet(v), I32Const(OWN_SYMBOLS), Call(helpers.own_keys));
+}
+
 /// `Object.assign(target, ...sources)`: `ToObject(target)`; each non-nullish
-/// source is `ToObject`'d and each of its own keys (own-key order) that is
+/// source is `ToObject`'d and each of its own keys (own-key order: strings,
+/// then symbols) that is
 /// an own enumerable property when reached (`__own_enum`) is read with
 /// `[[Get]]` and written to the target with a strict `[[Set]]` (a throw
 /// returns); returns the target.
@@ -625,7 +661,7 @@ fn emit_assign(
         I32Eqz,
         If(BlockType::Empty),
         LocalGet(from), Call(helpers.to_object()), LocalTee(from),
-        I32Const(OWN_ALL), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
+        I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
         I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(len),
         I32Const(0), LocalSet(at),
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -633,7 +669,7 @@ fn emit_assign(
         LocalGet(ks),
     );
     emit_array_elems(function);
-    // kv = the interned key `ks[at]`, as a string jsval.
+    // kv = the interned key `ks[at]`, as a string or symbol jsval.
     wasm!(function;
         LocalGet(at), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)),
         I32Const(1), Call(helpers.to_key), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(kv),
