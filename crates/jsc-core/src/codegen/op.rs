@@ -121,7 +121,7 @@ pub(super) const STRING_METHODS: [&str; 13] = [
 /// stay shadowable.
 pub(super) fn convert_builtin_op(name: &str) -> Option<ConvertOp> {
     Some(match name {
-        "String" => ConvertOp::ToString,
+        "String" => ConvertOp::String,
         "Number" => ConvertOp::ToNumber,
         "Boolean" => ConvertOp::ToBoolean,
         "parseInt" => ConvertOp::ParseInt,
@@ -141,7 +141,7 @@ pub(super) fn convert_arity(op: ConvertOp) -> usize {
 /// (not the conversion of `undefined`).
 pub(super) fn convert_call(op: ConvertOp, empty: bool, args: Vec<IrNode>) -> IrNode {
     match op {
-        ConvertOp::ToString if empty => return IrNode::Str(String::new()),
+        ConvertOp::String if empty => return IrNode::Str(String::new()),
         ConvertOp::ToNumber if empty => return IrNode::Num(0.0),
         _ => {}
     }

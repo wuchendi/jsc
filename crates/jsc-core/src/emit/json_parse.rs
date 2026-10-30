@@ -721,10 +721,11 @@ pub(super) fn emit_json_parse(helpers: Helpers<'_>) -> Function {
     function
 }
 
-/// Emit a `JSON.parse(arg)` node (the emit-context dispatch): coerce `arg` to a
-/// string via the `__convert` `ToString` import, call `__json_parse`, then a
-/// post-call `emit_propagate_if_pending` so a `try`/`catch` around the call
-/// catches a syntax error.
+/// Emit a `JSON.parse(arg)` node (the emit-context dispatch): coerce `arg` with
+/// `ToString` (`__to_string`: an object's user `toString` / `valueOf` may run,
+/// a symbol throws), call `__json_parse`, then a post-call
+/// `emit_propagate_if_pending` so a `try`/`catch` around the call catches a
+/// conversion or syntax error.
 pub(super) fn emit_json_parse_node(
     arg: &IrNode,
     function: &mut Function,
@@ -733,8 +734,11 @@ pub(super) fn emit_json_parse_node(
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);
-    function.instruction(&Instruction::I32Const(abi::CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::Call(helpers.to_str()));
+    emit_propagate_if_pending(function, helpers);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::Call(helpers.json_parse));
     emit_propagate_if_pending(function, helpers);
 }

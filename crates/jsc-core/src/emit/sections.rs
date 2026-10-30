@@ -232,8 +232,9 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
-    // i64) -> i32`; then the exported `__promise_self_error() -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 17] = [
+    // i64) -> i32`; then the exported `__promise_self_error() -> i64`; then
+    // `__symbol_get(v: i64, sym: i32) -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 18] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -271,6 +272,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I64, ValType::I32], &[ValType::I32]),
         (&[ValType::I32, ValType::I64], &[ValType::I32]),
         (&[], &[ValType::I64]),
+        (&[ValType::I64, ValType::I32], &[ValType::I64]),
     ];
     for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
         types
@@ -642,7 +644,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     // `name`.
     let realm_strs = realm::strings()
         .chain(builtins::strings())
-        .chain(convert::STRINGS)
+        .chain(convert::strings())
         .chain([STACK_KEY])
         .chain(FN_KEYS);
     let names = program.functions.iter().map(|f| f.info.name.as_str());
@@ -814,7 +816,7 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
-        // `typeof` interns the six type-string words so the strict-equality path
+        // `typeof` interns the seven type-string words so the strict-equality path
         // can compare a `typeof` result (a boxed immediate) against a string
         // literal by content — see `emit_typeof_to_string`.
         IrNode::TypeOf(operand) => {
@@ -830,6 +832,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
         | IrNode::ToObject(operand)
+        | IrNode::ToPropertyKey(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
         | IrNode::Throw(operand)
@@ -841,6 +844,14 @@ pub(super) fn collect_node<'a>(
         | IrNode::IterLen(operand)
         | IrNode::ObjectBuiltin { arg: operand, .. } => {
             collect_node(operand, order, seen);
+        }
+        IrNode::SetFunctionName { func, prefix, .. } => {
+            for text in ["name", "", "[", "]", prefix] {
+                if seen.insert(text) {
+                    order.push(text);
+                }
+            }
+            collect_node(func, order, seen);
         }
         IrNode::ConvertCall { arg, radix, .. } => {
             collect_node(arg, order, seen);
@@ -1308,7 +1319,9 @@ fn collect_entries<'a>(
                     order.push(key.as_str());
                 }
             }
-            PropKey::Computed(key) => collect_node(key, order, seen),
+            PropKey::Computed(key) | PropKey::HiddenComputed(key) => {
+                collect_node(key, order, seen);
+            }
         }
         collect_node(value, order, seen);
     }

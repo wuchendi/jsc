@@ -1023,11 +1023,51 @@ pub(super) fn emit_convert_call(
     // argument's `ToString` on the host.
     emit_node(arg, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
+    if matches!(op, ConvertOp::String) {
+        emit_symbol_descriptive_string(function, scratch, strings, helpers);
+    }
     emit_to_string_jsval(function, scratch, helpers);
     if matches!(op, ConvertOp::ParseFloat) {
         function.instruction(&Instruction::I32Const(CONVERT_OP_PARSE_FLOAT));
         function.instruction(&Instruction::Call(helpers.convert));
     }
+}
+
+/// Replace a symbol in i64 local `local` with its `SymbolDescriptiveString`:
+/// `"Symbol(" + description + ")"`, an `undefined` description as `""`. The
+/// i64 local `local + 1` is clobbered.
+fn emit_symbol_descriptive_string(
+    function: &mut Function,
+    local: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let desc = local + 1;
+    emit_is_symbol(function, local);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(static_key(strings, SYMBOL_OPEN)));
+    function.instruction(&Instruction::I32Const(static_key(strings, "")));
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: SYMBOL_DESCRIPTION_OFFSET,
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::LocalTee(desc));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalGet(desc));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::Call(helpers.concat));
+    function.instruction(&Instruction::I32Const(static_key(strings, SYMBOL_CLOSE)));
+    function.instruction(&Instruction::Call(helpers.concat));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(local));
+    function.instruction(&Instruction::End);
 }
 
 /// Push `ToString` of the jsval in `local` as a heap-string jsval (via the
