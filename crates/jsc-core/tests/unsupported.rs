@@ -33,9 +33,7 @@ fn rejects_unsupported_for_of_and_for_in() {
 fn unknown_string_method_throws_typeerror() {
     // A primitive receiver reads its methods from its prototype at run time:
     // an unknown name is `undefined`, and calling it throws.
-    for src in ["`t`.zzz()", "`hi`.toWellFormed()"] {
-        assert_uncaught(src, "TypeError: expression is not a function");
-    }
+    assert_uncaught("`t`.zzz()", "TypeError: expression is not a function");
     for (src, name) in [
         ("\"x\".zzz()", "\"x\".zzz"),
         ("(1).zzz()", "1.zzz"),

@@ -700,7 +700,7 @@ impl LowerCtx<'_> {
                 local,
                 init: IrNode::Object {
                     entries: vec![
-                        (PropKey::Hidden("length".to_owned()), IrNode::Local(n)),
+                        (PropKey::Hidden("length".into()), IrNode::Local(n)),
                         (
                             PropKey::HiddenComputed(IrNode::IteratorSymbol),
                             IrNode::ArrayValues,
@@ -1065,7 +1065,7 @@ impl LowerCtx<'_> {
             let Some((frame, id)) = *computed else {
                 let key = super::stmt::prop_key_name(&p.key)?;
                 let value = match &p.value {
-                    Some(init) => self.lower_named_expr(init, &key)?,
+                    Some(init) => self.lower_key_named_expr(init, &key, p.key.span())?,
                     None => IrNode::Undefined,
                 };
                 entries.push((PropKey::Static(key), value));
@@ -1169,8 +1169,8 @@ pub(super) const DERIVED_THIS_TDZ: &str = "Must call super constructor in derive
 pub(super) fn reference_error(message: &str) -> IrNode {
     IrNode::error_object(
         ErrorKind::ReferenceError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(format!("ReferenceError: {message}")),
+        Some(IrNode::Str(message.into())),
+        IrNode::Str(format!("ReferenceError: {message}").into()),
     )
 }
 
@@ -1178,10 +1178,10 @@ pub(super) fn reference_error(message: &str) -> IrNode {
 /// of a string (evaluated twice, for `message` and `stack`).
 pub(super) fn type_error(message: IrNode) -> IrNode {
     let stack = match &message {
-        IrNode::Str(text) => IrNode::Str(format!("TypeError: {text}")),
+        IrNode::Str(text) => IrNode::Str(format!("TypeError: {text}").into()),
         _ => IrNode::Binary {
             op: BinOp::Add,
-            lhs: Box::new(IrNode::Str("TypeError: ".to_owned())),
+            lhs: Box::new(IrNode::Str("TypeError: ".into())),
             rhs: Box::new(message.clone()),
         },
     };
@@ -1208,8 +1208,8 @@ fn class_call_guard(name: &str, argc: u32) -> IrStmt {
         then_body: Vec::new(),
         else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(IrNode::error_object(
             ErrorKind::TypeError,
-            Some(IrNode::Str(message)),
-            IrNode::Str(stack),
+            Some(IrNode::Str(message.into())),
+            IrNode::Str(stack.into()),
         ))))],
     }
 }

@@ -261,18 +261,112 @@ pub enum ObjectBuiltinOp {
     ForInKeys,
 }
 
+/// A compile-time JS string as UTF-16 code units: the text of a string literal
+/// ([`IrNode::Str`]) or a static property key ([`PropKey`]). Unlike a Rust
+/// `String` it holds a lone surrogate (`"\uD800"`) as its own unit, so a
+/// literal reaches the data section losslessly. Compiler-built text converts
+/// with `From<&str>`.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JsStr(Box<[u16]>);
+
+impl JsStr {
+    /// The UTF-16 code units.
+    pub fn as_units(&self) -> &[u16] {
+        &self.0
+    }
+
+    /// The length in code units (the JS `.length`).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the string is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether every code unit is ASCII.
+    pub fn is_ascii(&self) -> bool {
+        self.0.iter().all(|&unit| unit < 0x80)
+    }
+
+    /// The text as a Rust string, or `None` when it holds a lone surrogate.
+    pub fn to_rust_string(&self) -> Option<String> {
+        String::from_utf16(&self.0).ok()
+    }
+}
+
+impl From<&str> for JsStr {
+    fn from(text: &str) -> Self {
+        Self(text.encode_utf16().collect())
+    }
+}
+
+impl From<String> for JsStr {
+    fn from(text: String) -> Self {
+        Self::from(text.as_str())
+    }
+}
+
+impl FromIterator<u16> for JsStr {
+    fn from_iter<I: IntoIterator<Item = u16>>(units: I) -> Self {
+        Self(units.into_iter().collect())
+    }
+}
+
+impl std::borrow::Borrow<[u16]> for JsStr {
+    fn borrow(&self) -> &[u16] {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for JsStr {
+    fn eq(&self, other: &str) -> bool {
+        self.0.iter().copied().eq(other.encode_utf16())
+    }
+}
+
+impl PartialEq<&str> for JsStr {
+    fn eq(&self, other: &&str) -> bool {
+        *self == **other
+    }
+}
+
+/// Diagnostics only: a lone surrogate renders as U+FFFD.
+impl std::fmt::Display for JsStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        char::decode_utf16(self.0.iter().copied())
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .try_for_each(|c| std::fmt::Write::write_char(f, c))
+    }
+}
+
+/// A quoted string literal; a lone surrogate renders as `\u{d800}`.
+impl std::fmt::Debug for JsStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"")?;
+        for c in char::decode_utf16(self.0.iter().copied()) {
+            match c {
+                Ok(c) => write!(f, "{}", c.escape_debug())?,
+                Err(lone) => write!(f, "\\u{{{:x}}}", lone.unpaired_surrogate())?,
+            }
+        }
+        f.write_str("\"")
+    }
+}
+
 /// The key of one [`IrNode::Object`] entry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropKey {
     /// A compile-time string key of an enumerable data property.
-    Static(String),
+    Static(JsStr),
     /// A compile-time string key of a NON-enumerable (writable, configurable)
     /// property: class prototype methods/accessors, `constructor`, static
     /// methods, and an error's own `message` / `stack`.
-    Hidden(String),
+    Hidden(JsStr),
     /// A compile-time string key of a non-writable, non-enumerable,
     /// non-configurable data property: a class's `prototype`.
-    Fixed(String),
+    Fixed(JsStr),
     /// A computed key (`{[k]: v}`, or a numeric literal key `{1: v}`), converted
     /// with `ToPropertyKey` and interned at run time.
     Computed(IrNode),
@@ -770,9 +864,10 @@ pub enum IrNode {
     /// A string literal. It lowers to a heap-pointer jsval (single heap tag
     /// `0b101`) whose payload is the compile-time byte offset of the literal's
     /// block base in the emitted linear memory's static data. The block is
-    /// `[type=0][pad×3][len:u32][utf8]` — a `HEADER_SIZE`-byte type header
-    /// in front of the `[len][utf8]` payload.
-    Str(String),
+    /// `[type=0][gc][flags][class][len:u32][data]` — a `HEADER_SIZE`-byte
+    /// header, the length in UTF-16 code units, then Latin-1 bytes or (with
+    /// `STR_FLAG_TWO_BYTE`) UTF-16LE units.
+    Str(JsStr),
     /// A boolean literal (`true`/`false`).
     Bool(bool),
     /// The `null` literal.
@@ -2057,8 +2152,8 @@ impl IrNode {
     /// An Error instance like [`Self::error_object`] whose `proto` is the
     /// value of `proto` (a subclass prototype for `new.target`).
     fn error_with_proto(proto: IrNode, message: Option<IrNode>, stack: IrNode) -> Self {
-        let message = message.map(|message| (PropKey::Hidden("message".to_owned()), message));
-        let stack = (PropKey::Hidden("stack".to_owned()), stack);
+        let message = message.map(|message| (PropKey::Hidden("message".into()), message));
+        let stack = (PropKey::Hidden("stack".into()), stack);
         Self::Object {
             entries: message.into_iter().chain([stack]).collect(),
             proto: Some(Box::new(proto)),
@@ -2092,12 +2187,12 @@ impl IrNode {
             cond: Box::new(IrNode::Binary {
                 op: BinOp::Eq,
                 lhs: Box::new(IrNode::Local(msg)),
-                rhs: Box::new(IrNode::Str(String::new())),
+                rhs: Box::new(IrNode::Str("".into())),
             }),
-            then_branch: Box::new(IrNode::Str(name.to_owned())),
+            then_branch: Box::new(IrNode::Str(name.into())),
             else_branch: Box::new(IrNode::Binary {
                 op: BinOp::Add,
-                lhs: Box::new(IrNode::Str(format!("{name}: "))),
+                lhs: Box::new(IrNode::Str(format!("{name}: ").into())),
                 rhs: Box::new(IrNode::Local(msg)),
             }),
         };
@@ -2113,7 +2208,7 @@ impl IrNode {
             then_branch: Box::new(Self::error_with_proto(
                 proto.clone(),
                 None,
-                IrNode::Str(name.to_owned()),
+                IrNode::Str(name.into()),
             )),
             else_branch: Box::new(Self::error_with_proto(proto, Some(text), stack)),
         }
@@ -2130,7 +2225,7 @@ impl IrNode {
         obj: u32,
         scratch: u32,
     ) -> Self {
-        let cause = || IrNode::Str("cause".to_owned());
+        let cause = || IrNode::Str("cause".into());
         let has_cause = IrNode::Logical {
             op: LogicalOp::And,
             lhs: Box::new(IrNode::IsObject(Box::new(options.clone()))),
@@ -2143,7 +2238,7 @@ impl IrNode {
             obj: Box::new(IrNode::Local(obj)),
             local: scratch,
             entries: vec![(
-                PropKey::Hidden("cause".to_owned()),
+                PropKey::Hidden("cause".into()),
                 IrNode::Index {
                     obj: Box::new(options),
                     index: Box::new(cause()),

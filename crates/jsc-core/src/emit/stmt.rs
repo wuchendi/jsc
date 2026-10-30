@@ -11,7 +11,7 @@ pub(super) fn emit_stmt(
     stmt: &IrStmt,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
     break_label: Option<u32>,
     continue_label: Option<u32>,
@@ -180,7 +180,7 @@ fn emit_while(
     label: Option<u32>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -305,7 +305,7 @@ pub(super) fn emit_try(
     finally_body: Option<&[IrStmt]>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
     break_label: Option<u32>,
     continue_label: Option<u32>,
@@ -431,7 +431,7 @@ pub(super) fn emit_catch_unit(
     catch_body: &[IrStmt],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
     break_label: Option<u32>,
     continue_label: Option<u32>,
@@ -512,7 +512,7 @@ pub(super) fn emit_switch(
     cases: &[IrCase],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
     continue_label: Option<u32>,
 ) {
@@ -574,7 +574,7 @@ pub(super) fn emit_stmts(
     stmts: &[IrStmt],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
     break_label: Option<u32>,
     continue_label: Option<u32>,
@@ -606,7 +606,7 @@ pub(super) fn emit_cond(
     cond: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if let IrNode::IsConstructCall(argc) = cond {
@@ -660,14 +660,10 @@ pub(super) fn emit_cond(
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    // STRING: load the u32 length header at base + HEADER_SIZE; truthy iff nonzero.
+    // STRING: load the u32 length at base + STR_LEN_OFFSET; truthy iff nonzero.
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
+    emit_load_str_len(function);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::Else);
@@ -713,7 +709,7 @@ pub(super) fn emit_logical(
     rhs: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // The i64 temp holding the left value across the branch; it sits just past

@@ -259,7 +259,7 @@ impl LowerCtx<'_> {
                         local: proto,
                         init: IrNode::Index {
                             obj: Box::new(callee),
-                            index: Box::new(IrNode::Str("prototype".to_owned())),
+                            index: Box::new(IrNode::Str("prototype".into())),
                         },
                     },
                     IrStmt::Decl {
@@ -494,7 +494,7 @@ impl Delegate {
 fn member(slot: u32, key: &str) -> IrNode {
     IrNode::Index {
         obj: Box::new(slot_get(slot)),
-        index: Box::new(IrNode::Str(key.to_owned())),
+        index: Box::new(IrNode::Str(key.into())),
     }
 }
 
@@ -502,8 +502,8 @@ fn member(slot: u32, key: &str) -> IrNode {
 fn throw_type_error(text: [&str; 2]) -> IrNode {
     IrNode::Throw(Box::new(IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(text[0].to_owned())),
-        IrNode::Str(text[1].to_owned()),
+        Some(IrNode::Str(text[0].into())),
+        IrNode::Str(text[1].into()),
     )))
 }
 
@@ -1208,7 +1208,7 @@ impl CfgBuilder {
                 d.method,
                 IrNode::Index {
                     obj: Box::new(d.rec.iter.clone()),
-                    index: Box::new(IrNode::Str(key.to_owned())),
+                    index: Box::new(IrNode::Str(key.into())),
                 },
             )))?;
             let missing = self.new_block();
@@ -1365,7 +1365,7 @@ impl CfgBuilder {
                 let obj = self.spill(obj)?;
                 let callee = self.spill(IrNode::Index {
                     obj: Box::new(obj.clone()),
-                    index: Box::new(IrNode::Str(key)),
+                    index: Box::new(IrNode::Str(key.into())),
                 })?;
                 self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
             }

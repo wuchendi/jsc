@@ -149,7 +149,7 @@ fn is_boolean(function: &mut Function, local: u32) {
 pub(super) fn emit_number_value_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let x = frame.i64(0);
@@ -174,7 +174,7 @@ pub(super) fn emit_number_value_of(
 pub(super) fn emit_number_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (x, radix_v) = (frame.i64(0), frame.i64(1));
@@ -208,8 +208,8 @@ pub(super) fn emit_number_to_string(
     );
     let error = IrNode::error_object(
         ErrorKind::RangeError,
-        Some(IrNode::Str(BAD_RADIX[0].to_owned())),
-        IrNode::Str(BAD_RADIX[1].to_owned()),
+        Some(IrNode::Str(BAD_RADIX[0].into())),
+        IrNode::Str(BAD_RADIX[1].into()),
     );
     emit_throw_error(&error, function, frame.scratch(), strings, helpers);
     wasm!(function;
@@ -236,7 +236,7 @@ fn return_to_string(function: &mut Function, x: u32, helpers: Helpers<'_>) {
 pub(super) fn emit_number_to_locale_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let x = frame.i64(0);
@@ -264,7 +264,7 @@ pub(super) fn emit_number_format(
     format: NumberFormat,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (x, arg) = (frame.i64(0), frame.i64(1));
@@ -305,8 +305,8 @@ pub(super) fn emit_number_format(
         let [message, stack] = BAD_DIGITS[format.index()];
         let error = IrNode::error_object(
             ErrorKind::RangeError,
-            Some(IrNode::Str(message.to_owned())),
-            IrNode::Str(stack.to_owned()),
+            Some(IrNode::Str(message.into())),
+            IrNode::Str(stack.into()),
         );
         emit_throw_error(&error, function, frame.scratch(), strings, helpers);
         wasm!(function; End);
@@ -342,7 +342,7 @@ pub(super) fn emit_boolean(
     value_of: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let b = frame.i64(0);

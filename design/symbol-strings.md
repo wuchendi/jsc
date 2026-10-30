@@ -999,7 +999,7 @@ Reasons: each host op exists twice (Rust + TS), phase 4 removes both hosts
 | stage | added | deleted |
 |---|---|---|
 | Y1 | `TYPE_SYMBOL = 14`, `SYMBOL_DESCRIPTION_OFFSET = 8`, `SYMBOL_BLOCK_SIZE = 16`, `SYMBOL_FLAG_REGISTERED = 4`, `CLASS_SYMBOL = 7`, `PROPS_HAS_SYMBOL_KEYS = 8`, `TYPEOF_STRINGS` + `"symbol"` | — |
-| Y2 | `CLASS_ITERATOR = 8` (+ payload offsets only if a host renders them), `GEN_RESUME_MODE_MASK = 0x300`, `GEN_RESUME_MODE_SHIFT = 8` (guest-only, Rust only like the other `GEN_*` limits bits) | `GEN_LIMIT_RETURN`, `GEN_LIMIT_THROW` (Rust only; `pkg/abi.ts` never mirrored them) |
+| Y2 | `CLASS_ITERATOR = 8` (+ payload offsets only if a host renders them), `GEN_RESUME_MODE_MASK = 0x300`, `GEN_RESUME_MODE_SHIFT = 8`, `GEN_DELEGATES = 64`, `GEN_DELEGATED_RESULT = 128` (guest-only, Rust only like the other `GEN_*` limits bits; the last two Y2-T6) | `GEN_LIMIT_RETURN`, `GEN_LIMIT_THROW` (Rust only; `pkg/abi.ts` never mirrored them) |
 | U1 | `STR_LEN_OFFSET = 4`, `STR_DATA_OFFSET = 8`, `STR_FLAG_TWO_BYTE = 4`, `__new_string(len, two_byte)` doc | the moved `METHOD_OP_*` of §7.5, `METHOD_NEEDS_REGEXP` |
 | U2 | — | `METHOD_UNSUPPORTED` |
 | Y5 | — (iterator kind `32` is a payload value, not an ABI constant) | — |
@@ -1091,6 +1091,33 @@ Y1 reason drafts (one line per affected row, for the final CI pass):
 - rows with `typeof` sites: +4 static ops per site; `"symbol"` interned word
   (Y1-T1).
 - `fib`, `math`, `push_1e5`, `console_log`: must not change.
+
+U1 reason drafts (one line per affected row, for the final CI pass):
+
+- `string_methods`: `slice`, `charAt`, `indexOf`, `includes`, `split`,
+  `trim`, `startsWith` run in the guest on code units (U1-T4): `host_calls`
+  drop (only `toUpperCase` / `toLowerCase` stay host ops), fuel rises
+  (guest loops are metered, host time is not); `user_ops` changes only where
+  a former inline host op site now calls the builtin; `out + ...` pays the
+  `__concat` width branch (U1-T2).
+- `json`: `__json_escape` gains the per-unit width branch and lone-surrogate
+  test; `__json_string` parses `\u` escapes and narrows its result;
+  `JSON.stringify(again)` pays the same escape path (U1-T2): small fuel rise.
+- `for_in`: `keys + k` pays the `__concat` width branch (an empty `keys`
+  returns `k` without copying); `__str_eq` pointer fast path and 8-byte
+  compare on key lookups (U1-T2): small change either way.
+- `map_set`, `for_of`, `spread`, `class_methods`: `'k' + i` /
+  `name + ':'` concat width branch and `__str_eq` on Map key compares
+  (U1-T2); string for-of / spread walk `__str_to_array` on code units, a
+  one-byte string skipping the surrogate test (U1-T2): small change, the
+  array / Map / generator per-iteration fuel unchanged.
+- `array_hofs`: `indexOf` / `includes` keep their host array arms; no
+  `Array.prototype.slice` or String method: unchanged apart from shared
+  helper bodies.
+- every row: ASCII intern hashes are unchanged (FNV-1a over units, U1-T1b),
+  so the static intern table and literal layout are identical.
+- `fib`, `math`, `push_1e5`, `console_log`, `object_reads`: must not
+  change; `generators` changes only by Y2 (see the Y2 drafts below).
 
 Y2 reason drafts (one line per affected row, for the final CI pass):
 

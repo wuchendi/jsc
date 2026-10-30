@@ -16,7 +16,7 @@ impl LowerCtx<'_> {
     pub(super) fn lower_expr(&mut self, expr: &Expr) -> anyhow::Result<IrNode> {
         match expr {
             Expr::Lit(Lit::Num(n)) => Ok(IrNode::Num(n.value)),
-            Expr::Lit(Lit::Str(s)) => Ok(IrNode::Str(s.value.to_string_lossy().into_owned())),
+            Expr::Lit(Lit::Str(s)) => Ok(IrNode::Str(lit_str(s))),
             Expr::Lit(Lit::Bool(b)) => Ok(IrNode::Bool(b.value)),
             Expr::Lit(Lit::Null(_)) => Ok(IrNode::Null),
             // A declared local shadows a function of the same name and the
@@ -112,7 +112,7 @@ impl LowerCtx<'_> {
                 // the property name lowered to a heap-string key.
                 MemberProp::Ident(id) => Ok(IrNode::Index {
                     obj: Box::new(self.lower_expr(&member.obj)?),
-                    index: Box::new(IrNode::Str(id.sym.as_ref().to_owned())),
+                    index: Box::new(IrNode::Str(id.sym.as_ref().into())),
                 }),
                 MemberProp::Computed(c) => Ok(IrNode::Index {
                     obj: Box::new(self.lower_expr(&member.obj)?),
@@ -223,7 +223,7 @@ impl LowerCtx<'_> {
                     Expr::Member(member) => {
                         let obj = self.lower_expr(&member.obj)?;
                         let key = match &member.prop {
-                            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
                             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
                             MemberProp::PrivateName(_) => {
                                 return Err(CompileError::spanned(
@@ -325,7 +325,7 @@ impl LowerCtx<'_> {
         let cooked = |q: &swc_ecma_ast::TplElement| {
             q.cooked
                 .as_ref()
-                .map_or_else(String::new, |c| c.to_string_lossy().into_owned())
+                .map_or_else(JsStr::default, |c| c.to_ill_formed_utf16().collect())
         };
         let mut acc = IrNode::Str(cooked(&tpl.quasis[0]));
         for (expr, quasi) in tpl.exprs.iter().zip(tpl.quasis.iter().skip(1)) {
@@ -442,7 +442,7 @@ impl LowerCtx<'_> {
             return Ok(nullish_short_circuit(callee, method, tail));
         }
         let key = match prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::PrivateName(_) => {
                 return Err(
@@ -487,7 +487,7 @@ impl LowerCtx<'_> {
                 }
                 MemberProp::Ident(id) => Ok(IrNode::Index {
                     obj: Box::new(obj),
-                    index: Box::new(IrNode::Str(id.sym.as_ref().to_owned())),
+                    index: Box::new(IrNode::Str(id.sym.as_ref().into())),
                 }),
                 MemberProp::Computed(c) => Ok(IrNode::Index {
                     obj: Box::new(obj),
@@ -533,6 +533,21 @@ impl LowerCtx<'_> {
     /// Lower `expr` as the value of a binding or property named `name`: an
     /// anonymous function or arrow gets `name` as its `name` (`NamedEvaluation`);
     /// any other expression lowers as usual.
+    /// [`Self::lower_named_expr`] under the static property key `key` (spanned
+    /// `span`): only an anonymous definition takes the key as its `name`.
+    pub(super) fn lower_key_named_expr(
+        &mut self,
+        expr: &Expr,
+        key: &JsStr,
+        span: Span,
+    ) -> anyhow::Result<IrNode> {
+        if !is_anonymous_definition(expr) {
+            return self.lower_expr(expr);
+        }
+        let name = key_fn_name(key, span)?;
+        self.lower_named_expr(expr, &name)
+    }
+
     pub(super) fn lower_named_expr(&mut self, expr: &Expr, name: &str) -> anyhow::Result<IrNode> {
         match expr {
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
@@ -671,7 +686,7 @@ impl LowerCtx<'_> {
     /// Lower the key of `super.x` / `super[k]`.
     fn lower_super_key(&mut self, super_prop: &SuperPropExpr) -> anyhow::Result<IrNode> {
         Ok(match &super_prop.prop {
-            SuperProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            SuperProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             SuperProp::Computed(c) => self.lower_expr(&c.expr)?,
         })
     }
@@ -1169,7 +1184,7 @@ impl LowerCtx<'_> {
         args: Box<IrNode>,
     ) -> anyhow::Result<IrNode> {
         let key = match &member.prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::PrivateName(_) => {
                 return Err(CompileError::spanned(
@@ -1330,7 +1345,7 @@ impl LowerCtx<'_> {
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
         let key = match &member.prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::PrivateName(_) => {
                 return Err(CompileError::spanned(
@@ -1458,7 +1473,7 @@ impl LowerCtx<'_> {
                 let obj = self.lower_expr(&m.obj)?;
                 let index = match &m.prop {
                     MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
                     MemberProp::PrivateName(_) => {
                         return Err(CompileError::spanned(
                             m.span(),
@@ -1588,7 +1603,7 @@ impl LowerCtx<'_> {
         let obj = self.lower_expr(&member.obj)?;
         let index = match &member.prop {
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::PrivateName(_) => {
                 return Err(CompileError::spanned(
                     member.span(),
@@ -1699,7 +1714,8 @@ impl LowerCtx<'_> {
                     let key = self.lower_prop_key(&kv.key)?;
                     let entry = match key {
                         PropKey::Static(name) => {
-                            let value = self.lower_named_expr(&kv.value, &name)?;
+                            let value =
+                                self.lower_key_named_expr(&kv.value, &name, kv.key.span())?;
                             (PropKey::Static(name), value)
                         }
                         key if is_anonymous_definition(&kv.value) => {
@@ -1716,7 +1732,7 @@ impl LowerCtx<'_> {
                 }
                 // Shorthand `{n}` ≡ `{n: n}`: the value is the identifier read.
                 Prop::Shorthand(ident) => {
-                    let key = PropKey::Static(ident.sym.as_ref().to_owned());
+                    let key = PropKey::Static(ident.sym.as_ref().into());
                     let value = self.lower_ident(ident.sym.as_ref(), ident.span)?;
                     entries.push((key, value));
                 }
@@ -1725,7 +1741,8 @@ impl LowerCtx<'_> {
                 Prop::Method(method) => {
                     let key = self.lower_prop_key(&method.key)?;
                     let (key, named) = self.computed_name_key(key);
-                    let value = self.lower_method(&method.function, static_key_name(&key))?;
+                    let name = static_key_name(&key, method.key.span())?;
+                    let value = self.lower_method(&method.function, &name)?;
                     entries.push((key, self.set_computed_name(value, named, "")));
                 }
                 Prop::Getter(getter) => {
@@ -1738,7 +1755,7 @@ impl LowerCtx<'_> {
                         .ok_or_else(|| anyhow!("getter requires a body"))?;
                     let param_pats: Vec<&Pat> =
                         getter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = format!("get {}", static_key_name(&key));
+                    let name = format!("get {}", static_key_name(&key, getter.key.span())?);
                     let value = self.lower_lifted_function(
                         &param_pats,
                         BodyKind::Block(&block.stmts),
@@ -1758,7 +1775,7 @@ impl LowerCtx<'_> {
                         .ok_or_else(|| anyhow!("setter requires a body"))?;
                     let param_pats: Vec<&Pat> =
                         setter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = format!("set {}", static_key_name(&key));
+                    let name = format!("set {}", static_key_name(&key, setter.key.span())?);
                     let value = self.lower_lifted_function(
                         &param_pats,
                         BodyKind::Block(&block.stmts),
@@ -1900,8 +1917,8 @@ impl LowerCtx<'_> {
     /// converted with `ToPropertyKey` at run time.
     fn lower_prop_key(&mut self, name: &PropName) -> anyhow::Result<PropKey> {
         match name {
-            PropName::Ident(id) => Ok(PropKey::Static(id.sym.as_ref().to_owned())),
-            PropName::Str(s) => Ok(PropKey::Static(s.value.to_string_lossy().into_owned())),
+            PropName::Ident(id) => Ok(PropKey::Static(id.sym.as_ref().into())),
+            PropName::Str(s) => Ok(PropKey::Static(lit_str(s))),
             PropName::Num(n) => Ok(PropKey::Computed(IrNode::Num(n.value))),
             PropName::Computed(c) => Ok(PropKey::Computed(self.lower_expr(&c.expr)?)),
             PropName::BigInt(_) => Err(CompileError::spanned(
@@ -2134,16 +2151,22 @@ impl LowerCtx<'_> {
     /// string literal or `undefined` resolves both at compile time.
     fn lower_error_object(&mut self, kind: ErrorKind, message: Option<IrNode>) -> IrNode {
         let name = kind.name();
-        let stack_of = |text: &str| {
-            IrNode::Str(if text.is_empty() {
+        let stack_of = |text: &JsStr| {
+            let prefix = if text.is_empty() {
                 name.to_owned()
             } else {
-                format!("{name}: {text}")
-            })
+                format!("{name}: ")
+            };
+            IrNode::Str(
+                prefix
+                    .encode_utf16()
+                    .chain(text.as_units().iter().copied())
+                    .collect(),
+            )
         };
         match message {
             None | Some(IrNode::Undefined) => {
-                IrNode::error_object(kind, None, IrNode::Str(name.to_owned()))
+                IrNode::error_object(kind, None, IrNode::Str(name.into()))
             }
             Some(IrNode::Str(text)) => {
                 let stack = stack_of(&text);
@@ -2257,7 +2280,7 @@ fn literal_object(entries: Vec<(PropKey, IrNode)>) -> IrNode {
 pub(super) fn is_proto_key(key: &PropName) -> bool {
     match key {
         PropName::Ident(id) => id.sym.as_ref() == "__proto__",
-        PropName::Str(s) => s.value.to_string_lossy() == "__proto__",
+        PropName::Str(s) => lit_str(s) == "__proto__",
         _ => false,
     }
 }
@@ -2291,12 +2314,13 @@ fn nullish_check(value: IrNode, key: &str) -> IrNode {
 
 /// The statically-known method name of a member callee: `obj.m` and the
 /// string-literal computed form `obj["m"]` both name `m`; a dynamic computed key
-/// `obj[k]` is only known at runtime, so it has no static name.
+/// `obj[k]` is only known at runtime, so it has no static name (nor has a
+/// literal with a lone surrogate, which no Rust `String` spells).
 fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
     match &member.prop {
         MemberProp::Ident(id) => Some(id.sym.as_ref().to_owned()),
         MemberProp::Computed(c) => match c.expr.as_ref() {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+            Expr::Lit(Lit::Str(s)) => lit_str(s).to_rust_string(),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
@@ -2399,10 +2423,12 @@ pub(super) fn is_anonymous_definition(expr: &Expr) -> bool {
 /// The compile-time name of a static property key (`""` for a computed key,
 /// whose name is set at run time instead, [`IrNode::SetFunctionName`]): the
 /// `name` given to a method or accessor defined under it.
-fn static_key_name(key: &PropKey) -> &str {
+fn static_key_name(key: &PropKey, span: Span) -> anyhow::Result<String> {
     match key {
-        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => name,
-        PropKey::Computed(_) | PropKey::HiddenComputed(_) => "",
+        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => {
+            key_fn_name(name, span)
+        }
+        PropKey::Computed(_) | PropKey::HiddenComputed(_) => Ok(String::new()),
     }
 }
 

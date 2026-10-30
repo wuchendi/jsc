@@ -321,7 +321,7 @@ the table, including one without user functions.
 **Exports.** `main`, `memory`, `__heap_ptr`, `__exc_pending`, `__exc_value`,
 `__invoke1(fn: i64, arg: i64) -> i64`, `__async_step(gen: i64, sent: i64) -> i64`,
 and the allocator and guest constructors `__alloc(size: i32) -> i32`,
-`__new_string(len: i32) -> i32`, `__new_array(len: i32) -> i32`,
+`__new_string(len: i32, two_byte: i32) -> i32`, `__new_array(len: i32) -> i32`,
 `__new_promise() -> i32` (§6.8), and `__promise_self_error() -> i64` (the
 self-resolution `TypeError`, §6.7; the last defined function).
 
@@ -404,7 +404,9 @@ a 16-byte prefix (`OBJ_PREFIX_SIZE = 16`):
 
 **Flags.** Strings: bit `1` `INTERNED` (the canonical block for its content),
 bit `2` `ARRAY_INDEX` (content is a canonical array index: `"0"` or a nonzero
-digit then digits, value `< 2^32 - 1`). Object family: bit `1`
+digit then digits, value `< 2^32 - 1`), bit `4` `TWO_BYTE` (the data is
+UTF-16LE code units; same bit value as `SYMBOL_FLAG_REGISTERED`, read only on
+`TYPE_STRING` blocks). Object family: bit `1`
 `NOT_EXTENSIBLE` (set by `preventExtensions` / `seal` / `freeze`, never
 cleared; only on a `DICTIONARY` array). Functions additionally: `2` `ASYNC`,
 `4` `LAZY`, `8` `CONSTRUCTOR`, `16` `CLASS_CTOR`, `32` `SELF_ALLOC`, `64`
@@ -418,7 +420,7 @@ the array bits is ever cleared (except `JOINING`).
 
 | type byte | kind | layout (offsets from the block base) | size | `typeof` |
 |---|---|---|---|---|
-| `0` `TYPE_STRING` | string | header, `len: u32 @4`, UTF-8 bytes `@8` | `8 + len`, rounded | `string` |
+| `0` `TYPE_STRING` | string | header, `len: u32 @4` (`STR_LEN_OFFSET`, UTF-16 code units), data `@8` (`STR_DATA_OFFSET`): Latin-1 bytes, or UTF-16LE units with `TWO_BYTE` | `8 + (len << two_byte)`, rounded | `string` |
 | `1` `TYPE_ARRAY` | array handle | prefix, `len: u32 @16`, `elems: u32 @20` → `TYPE_ELEMS` (`0` while capacity is 0) | 24 | `object` |
 | `2` `TYPE_OBJECT` | object | prefix; wrapper classes add `[[PrimitiveValue]]: i64 @16` (`WRAPPER_VALUE_OFFSET`) | 16 / 24 | `object` |
 | `3` `TYPE_FUNCTION` | function | prefix, `func_idx: u32 @16`, reserved `u32 @20`, `env: i64 @24` | 32 | `function` |
@@ -440,8 +442,8 @@ the array bits is ever cleared (except `JOINING`).
 non-enumerable `length` and a non-enumerable `@@iterator` =
 `%Array.prototype.values%`), `3` / `4` / `5` `CLASS_BOOLEAN` / `CLASS_NUMBER` /
 `CLASS_STRING` wrappers (24 bytes, `[[PrimitiveValue]]` at
-`WRAPPER_VALUE_OFFSET = 16`; a String wrapper owns its `length` and indices as
-read-only properties), `6` `CLASS_GLOBAL` (the global object, a static realm
+`WRAPPER_VALUE_OFFSET = 16`; a String wrapper owns its `length` as a
+read-only property and its indices virtually, §5.3), `6` `CLASS_GLOBAL` (the global object, a static realm
 block), `7` `CLASS_SYMBOL` (a Symbol wrapper, `[[SymbolData]]` at
 `WRAPPER_VALUE_OFFSET`), `8` `CLASS_ITERATOR` (an Array / String / Map / Set
 iterator, 32 bytes: `[[IteratedObject]]` at `16` (`undefined` once
@@ -453,7 +455,12 @@ keys / values / entries, `3` string, `4`..`6` map keys / values / entries,
 Notes per kind:
 
 - **Strings** are primitives with no prefix and no own table; `len` and
-  `.length` are byte counts (§13).
+  `.length` count UTF-16 code units. The form is canonical: a string is
+  one-byte (Latin-1) iff every unit is `<= 0xFF`, so every producer narrows
+  (literals, slices, `JSON.parse`, host results), strings of different width
+  are never equal, a two-byte string is never an array index, and the intern
+  table never holds two forms of one content. Strings are immutable; slices
+  copy (no views, no ropes).
 - **Map / Set** handles point (`entries`) at an ordinary array holding
   `(key, value)` pairs flattened into even/odd slots (a Set's value slot is
   `undefined`). The backing grows in place like any array, so the handle never
@@ -523,8 +530,9 @@ and `value` in place.
   class instances reserve their static key count up front. A static realm
   table that overflows is rebuilt on the heap the same way.
 
-**Interning.** The intern table is open-addressed over `u32` slots (FNV-1a of
-the bytes, linear probing, load ≤ 1/2), located by globals 9–11. The compiler
+**Interning.** The intern table is open-addressed over `u32` slots (FNV-1a
+over the code units — one round per unit, zero-extended, so an ASCII key
+hashes as its bytes — linear probing, load ≤ 1/2), located by globals 9–11. The compiler
 emits the initial table containing every static string. `__intern(s)` returns
 the canonical block for `s`'s content, inserting `s` (and flagging it) on a
 miss and doubling the table into a heap copy once more than half full;
@@ -538,6 +546,15 @@ anything else goes through `__to_string`). `__define` sets the table's
 `HAS_SYMBOL_KEYS` when it appends a symbol key. Lookups use `insert = 0` but still intern a canonical
 array index, so an element is found by an index key no property used. The
 table is never pruned.
+
+**String exotic indices.** A `CLASS_STRING` wrapper has no per-index table
+entries: `__str_exotic_index(o, key)` returns the code-unit index when `o` is
+a String wrapper and `key` a canonical array index below its
+`[[PrimitiveValue]]`'s length, else `-1`. `__get`, `__has`, `__set`,
+`__delete`, `__own_desc`, `__own_enum`, `__define_own` and `__own_keys`
+consult it before the table, treating each index as a virtual own data
+property `{value: s[i], writable: false, enumerable: true, configurable:
+false}`; `__own_keys` lists `0..len` before the table's keys.
 
 ### 5.4 Arrays
 
@@ -751,7 +768,7 @@ Every module imports exactly seven functions from the `"env"` namespace
 |---|---|---|---|
 | 0 | `print` | `(bits: i64, flag: i32) -> ()` | `console.log` |
 | 1 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
-| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search/slice, string methods, `Number.prototype` digit formatting, host `Math` functions |
+| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, string case mapping / `localeCompare` / `normalize`, `Number.prototype` digit formatting, host `Math` functions |
 | 3 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn |
 | 4 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
 | 5 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
@@ -769,19 +786,11 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   `3` parseFloat. The guest runs `ToPrimitive` first (§6.5), so the host sees
   primitives, plus a `Date` (its `toString` text). A string argument to op `0` is returned unchanged; any
   other result string is allocated through `__new_string`.
-- **`__method` ops.** `0` `indexOf`, `1` `includes`, `3` `slice`,
-  `4` `toUpperCase`, `5` `toLowerCase`, `6` `charAt`, `7` `trim`, `8` `trimStart`,
-  `9` `trimEnd`, `10` `repeat`, `11` `startsWith`, `12` `endsWith`,
-  `13` `padStart`, `14` `padEnd`, `15` `substring`, `16` `split`,
+- **`__method` ops.** `0` `indexOf` / `1` `includes` (an array receiver:
+  element search), `4` `toUpperCase`, `5` `toLowerCase`,
   `17` `Number.prototype.toString(radix)` (a number receiver and an integral
-  radix in `2..=36`), `18` `at`, `19` `charCodeAt`, `20` `codePointAt`,
-  `21` `lastIndexOf`, `22` `localeCompare` (code-unit order), `23`
-  `normalize`, `24` the index of a RegExp-free `search` / `match` pattern,
-  `25` `replace` / `26` `replaceAll` with a string pattern and a replacement
-  template (`GetSubstitution` without captures) or the array of a function
-  replacer's results, `27` `String.fromCharCode` /
-  `28` `String.fromCodePoint` (an array receiver of the guest-coerced
-  numbers), `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
+  radix in `2..=36`), `22` `localeCompare` (code-unit order), `23`
+  `normalize`, `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
   finite number receiver and an integral digit count already range-checked
   in the guest; `undefined` for a `toExponential` without digits; rendered
   from the exact decimal expansion, ties away from zero), `43` a `Math`
@@ -789,17 +798,17 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   `log1p`, `exp`, `expm1`, the trigonometric and hyperbolic functions and
   their inverses, `atan2` with `x` in `arg0`, and `random`; the Rust host
   uses the platform libm and a `xorshift64*` generator, the JS shim its own
-  `Math`). The host dispatches on the receiver's type byte for the
-  names shared by arrays and strings. A string op that cannot produce a
-  correct result returns a refusal sentinel the calling builtin throws:
-  `METHOD_UNSUPPORTED` (`HOLE`; a byte offset crossing a non-ASCII byte, a
-  lone surrogate, §13) as a named `TypeError`,
-  `METHOD_RANGE_ERROR` (`undefined | 2`, an unknown `normalize` form) as a
-  `RangeError`, `METHOD_NEEDS_REGEXP` (`undefined | 3`, a `search` / `match`
-  pattern with RegExp syntax) as a `TypeError`. The calling string builtin coerces the
-  receiver (`ToString`) and its arguments (`ToString` or `ToNumber`, keeping
-  `undefined` where it selects the host default) in the guest first, so user
-  `toString`/`valueOf` run in the guest and the host only sees primitives.
+  `Math`). Every other `String.prototype` method and `String.fromCharCode` /
+  `fromCodePoint` run in the guest on code units (§7.9). The native host
+  reads a string receiver as lossy text (a lone surrogate becomes U+FFFD,
+  §13); the shim's are lossless JS strings. An op
+  that cannot produce a correct result returns a refusal sentinel the
+  calling builtin throws: `METHOD_UNSUPPORTED` (`HOLE`; `normalize` of a
+  non-ASCII string, §13) as a named `TypeError`, `METHOD_RANGE_ERROR`
+  (`undefined | 2`, an unknown `normalize` form) as a `RangeError`. The
+  calling string builtin coerces the receiver (`ToString`) and its arguments
+  in the guest first, so user `toString`/`valueOf` run in the guest and the
+  host only sees primitives.
 - **`__promise` ops.** `0` resolve, `1` reject, `2` await, `3` finally,
   `4` new pending promise, `5` settle-fulfill, `6` settle-reject,
   `7` async spawn.
@@ -815,8 +824,8 @@ function-index order:
 
 | group | helpers |
 |---|---|
-| allocation, strings | `__alloc`, `__concat`, `__str_eq`, `__str_cmp`, `__str_index` |
-| interning (§5.3) | `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`, `__index_value`, `__index_string`, `__to_key` |
+| allocation, strings | `__alloc`, `__concat`, `__str_eq`, `__str_cmp`, `__str_index` (all on code units, below) |
+| interning (§5.3) | `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`, `__index_value`, `__index_string`, `__str_exotic_index(o, key)`, `__to_key` |
 | property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__rest(src, excl)` |
 | arrays (§5.4) | `__array_reserve(base, need)`, `__array_push(base, v)`, `__array_concat(dst, src)`, `__array_set(recv, key, v)`, `__array_set_length(arr, v)`, `__sparse_get(arr, i)`, `__sparse_set(arr, i, v)`, `__protos_indexless(o)`, `__proto_elem(o, i)`, `__proto_set(o, i, v)`, `__array_define(recv, key, v)`, `__sparse_define(arr, i, v)` |
 | JSON (stringify) | `__json_escape(str)`, `__json_str(v)` — the primitive serializer: finite numbers via `__convert` ToString, `NaN`/`±Infinity`/`undefined` as `null`, keywords, escaped strings, any heap kind `null` |
@@ -824,13 +833,24 @@ function-index order:
 | JSON (parse) | `__json_ws`, `__json_throw`, `__json_string`, `__json_number`, `__json_value`, `__json_array`, `__json_object`, `__json_parse` |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
 | re-entry | `__invoke1(fn, arg)`, `__async_step(gen, sent)`, the two `new Promise` settlers |
-| constructors | `__new_string(len)`, `__new_array(len)`, `__new_promise()` |
+| constructors | `__new_string(len, two_byte)`, `__new_array(len)`, `__new_promise()` |
 | realm | `__has_own(key, obj)`, then the builtin bodies (§6.4) |
 | conversions (§6.5) | `__to_primitive(v, hint)`, `__to_string(v)`, `__add(a, b)`, `__compare(a, b, op)`, `__array_join(recv, sep)`, `__to_object(v)` |
 | JSON (§7.9) | `__json_rep(holder, key, value, replacer, list, stack)` — `SerializeJSONProperty` (`toJSON`, replacer function with `this = holder`, property list, wrapper unwrapping, cycle `TypeError` via the `stack` array); `__json_indent(s, gap)` — re-indent compact text for `space`; `__json_revive(holder, key, reviver)` — `InternalizeJSONProperty` |
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 | promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, short-circuited to `undefined` unless a table on `v`'s chain has `HAS_SYMBOL_KEYS` (the consult sites of the interim hook guards, §13) |
+
+The string helpers work on code units at either width: `__concat` makes a
+two-byte result iff either operand is two-byte (widening the one-byte side)
+and returns the other operand when one is empty; `__str_eq` is pointer
+equality first, then different widths or lengths are unequal, then an 8-byte
+compare; `__str_cmp` is code-unit order (mixed widths read each side at its
+width); `__str_index` is the fresh one-unit string at an index;
+`__str_to_array` splits by code point (surrogate pairs kept together);
+`__json_escape` writes a lone surrogate as `\udxxx` (lowercase hex). Every
+helper that builds a string narrows a two-byte result whose units are all
+`<= 0xFF` (§5.2).
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already
@@ -847,8 +867,9 @@ tables. Keys are interned `u32`s.
 
 - **`__get(recv, key)`** — `OrdinaryGet`. Each object on the chain (`recv`,
   then each `proto`) answers from its exotic own keys first when it is a
-  string or an array (`length`, a present in-range index; a hole or an index
-  past `length` is not own and reads on through the chain), then from its own
+  string, a String wrapper or an array (`length`, a present in-range index —
+  a string's and a wrapper's by code unit, §5.3; a hole or an index past
+  `length` is not own and reads on through the chain), then from its own
   table (a sparse element past the store is a table entry); an accessor
   calls its getter with `this = recv` (`undefined` without a getter). A string, number, or boolean
   continues at its realm prototype without allocating a wrapper (a symbol at
@@ -1101,7 +1122,8 @@ cell, which records why a change was accepted.
   `ToPrimitive` (hint default), then concatenation if either is a string,
   else numeric addition (a symbol throws in either conversion).
 - **Relational** (`__compare`): two numbers compare inline; otherwise
-  `ToPrimitive` (hint number), then two strings compare by bytes and anything
+  `ToPrimitive` (hint number), then two strings compare in code-unit order
+  (`__str_cmp`) and anything
   else by `ToNumber` (a symbol throws).
 - **`Array.prototype.join` / `toString`** (`__array_join`): `ToString` of each
   element (`null`, `undefined`, and holes are empty); a cyclic element joins
@@ -1180,16 +1202,28 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
 
 The host reads layouts but never builds object-family blocks by hand: every
 string, array, and promise the Rust host or the shim creates is allocated by
-re-entering the exported `__new_string(len)` (header and length written, the
-host fills the bytes), `__new_array(len)` (a handle with a `cap = len` store of
+re-entering the exported `__new_string(len, two_byte)` (header, `TWO_BYTE`
+flag and length in code units written; the host fills `len` Latin-1 bytes or
+UTF-16LE units, choosing the width from the content so the block is
+canonical, §5.2), `__new_array(len)` (a handle with a `cap = len` store of
 `undefined`), or `__new_promise()` (pending, `%Promise.prototype%`). Layout
 knowledge lives in the emitter plus read-only decoders.
 
 Host reads, all through `abi.rs` constants (and `abi.ts`, kept equal by the
-drift test): string `len @4` / bytes `@8`; array `len @16` and the
+drift test): string `len @4` (`STR_LEN_OFFSET`) / data `@8`
+(`STR_DATA_OFFSET`) at the width of `TWO_BYTE`; array `len @16` and the
 `TYPE_ELEMS` store (and a sparse array's index keys); promise `state @16` /
 `value @24`; generator `done @24`; Map/Set `size @16`; Date `ms @16`; property
-tables, the function info table, and `class` bytes for rendering. Host-held
+tables, the function info table, and `class` bytes for rendering. The Rust
+decoder `string_units` is lossless (a Latin-1 byte is its own unit);
+`decode_string` and the host ops (case mapping, `localeCompare`,
+`normalize`, ToNumber, `parseInt`, `parseFloat`) read it as lossy text, a
+lone surrogate becoming U+FFFD (safe for the number parsers: a lone surrogate
+is never whitespace or a digit). `alloc_units` allocates a result through
+`__new_string`, narrowing when every unit is `<= 0xFF`. The shim's
+`stringText` builds the JS string with `String.fromCharCode` over chunked
+`Uint8Array` / `Uint16Array` views (no `TextDecoder`: `latin1` would be
+windows-1252 and `utf-16le` would replace lone surrogates). Host-held
 jsvals (reaction lists, the job queue) stay valid because no block moves.
 
 ### 6.9 Value rendering
@@ -1200,7 +1234,9 @@ it):
 
 - numbers by the ECMAScript Number::toString rules (shortest round-trip digits,
   exponential form at `>= 1e21` and `< 1e-6`, `-0` prints `0`); strings
-  unquoted, also inside containers; symbols `Symbol(a)` / `Symbol()`;
+  unquoted, also inside containers, with a lone surrogate written as U+FFFD
+  on the native output (what Node writes; the shim hands the JS string
+  through); symbols `Symbol(a)` / `Symbol()`;
 - arrays `[ 1, <1 empty item>, 3, foo: 1 ]` (holes as runs, then own named
   properties); objects `{ a: 1, b: 2 }` from their own enumerable properties
   in own-key order (enumerable symbol keys last, as `[Symbol(a)]: 1`),
@@ -1212,7 +1248,8 @@ it):
 - `CLASS_ERROR` objects as `Name: message` (name and message looked up along the
   prototype chain without running getters);
 - wrappers as `[Number: 1]` / `[String: 'ab']` / `[Boolean: true]` /
-  `[Symbol: Symbol(a)]`;
+  `[Symbol: Symbol(a)]`, from their `[[PrimitiveValue]]` (a String wrapper's
+  virtual indices are not listed);
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
   `NaN` time value);
@@ -1647,10 +1684,10 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
-| `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one UTF-8 sequence, i.e. one code point, per `next`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
+| `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`, §5.4); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all but the case mappings, `localeCompare` and `normalize` (host, §6.1) run in the guest on code units (`emit/builtins/string.rs`), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
-| `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
+| `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string (a string's first 10 code units), `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw, a lone surrogate written as `\udxxx`), `JSON.parse(text, reviver)` (in-wasm recursive descent, `\uXXXX` escapes incl. lone surrogates, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`/`keys`/`values`/`entries` (also `[@@iterator]`); Set `add`/`has`/`delete`/`clear`/`forEach`/`size`/`values` (also `keys` and `[@@iterator]`)/`entries`; the iterators walk the live backing entries, so entries appended during iteration are seen |
 | `Promise` | §6.7, §7.8 |
 | `Date` | `new Date()`, `new Date(ms)`, `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`; `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `toISOString`, `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`) — all UTC, computed in wasm |
@@ -1913,31 +1950,19 @@ Each item below is current behaviour of this tree.
 
 **Values & operators**
 
-- Strings are length-prefixed UTF-8 with byte semantics: `.length`, indexing,
-  string spread, and `for-of` over a string work per byte (`"é".length` is
-  `2`). The `String.prototype` methods are exact for ASCII strings. The
-  search methods work in exact UTF-16 offsets for any text: `indexOf`,
-  `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `search`, the
-  `match` index and the positions a `replace` / `replaceAll` function
-  replacer receives (so they disagree with the byte `.length`). The methods
-  that build text from positions or lengths keep byte offsets and throw a
-  `TypeError` (`String.prototype.X does not support non-ASCII strings yet`)
-  when an offset would cross a non-ASCII byte: `at`, `charAt`,
-  `charCodeAt`, `codePointAt` (an index past a non-ASCII byte; `at` with a
-  negative index on any non-ASCII string), `slice` / `substring` (an
-  endpoint past a non-ASCII byte; a negative `slice` endpoint on any
-  non-ASCII string), `padStart` / `padEnd` (a non-ASCII receiver or fill),
-  `split("")` (a non-ASCII receiver), and `normalize` (any non-ASCII
-  receiver). Content-only results stay exact for any text: `concat`,
-  `repeat`, `split` on a non-empty separator, `replace` / `replaceAll`
-  (an empty pattern over text with astral characters throws: it would split
-  a surrogate pair), `toUpperCase` / `toLowerCase` and their `toLocale*`
-  forms (full Unicode mappings, no locale data),
-  `trim*` (JS whitespace), `localeCompare`. `String.fromCharCode` /
-  `fromCodePoint` throw a `TypeError` for a lone surrogate. `search` /
-  `match` / `matchAll` interpret a string pattern as RegExp source: a
-  pattern with RegExp syntax throws a `TypeError`, and `matchAll` (a RegExp
-  string iterator) always throws one.
+- Strings are Latin-1 / UTF-16 code units (§5.2): `.length`, indexing,
+  comparison and every guest `String.prototype` method are exact for any
+  text, lone surrogates included. What remains: `toUpperCase` /
+  `toLowerCase` (and their `toLocale*` forms), `localeCompare` and
+  `normalize` run on the host over lossy text, so a lone surrogate in the
+  receiver becomes U+FFFD in their result, and `normalize` throws a
+  `TypeError` for any non-ASCII receiver (no normalizer yet, wave 3c U2);
+  a key with a lone surrogate cannot name a
+  function (a method, accessor or anonymous function under it is a compile
+  error: function names are host text); there are no ropes, so `s = s + x`
+  in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
+  pattern as RegExp source: a pattern with RegExp syntax throws a
+  `TypeError`, and `matchAll` (a RegExp string iterator) always throws one.
 - No `void`.
 - Symbol-keyed properties work on every object, and `@@iterator` is
   honoured by every iteration consumer, but no other well-known symbol hook
@@ -1955,8 +1980,7 @@ Each item below is current behaviour of this tree.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
-- The builtin library is exactly §7.9: no `String.prototype.isWellFormed` / `toWellFormed` (they wait
-  for UTF-16 strings), no `Math.sumPrecise` (it waits for the iterator
+- The builtin library is exactly §7.9: no `Math.sumPrecise` (it waits for the iterator
   protocol), …, no `Promise.all` / `race` / `allSettled` / `any`.
 - The `Math` transcendental functions follow the host libm (Rust) or the JS
   engine (shim), which may differ in the last ulp.
@@ -2001,11 +2025,8 @@ Each item below is current behaviour of this tree.
   | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
   | `Symbol` / `@@toStringTag` (`Math` / `JSON` receivers tag as `[object Object]`) | D3 | 24 | 7 | 1 | | |
   | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
-  | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | D3 | | 29 | | | |
+  | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | U1 (landed; recount at the next baseline) | | 29 | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
-- `sort` without a comparator orders by the byte order of the UTF-8
-  `ToString` keys (code-point order), which differs from the specified UTF-16
-  code-unit order only between astral characters and `U+E000`..`U+FFFF`.
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
   property table, so element access on a large frozen or attributed array is
   `O(n)`; the renderers print an accessor element as `undefined` and omit a
@@ -2113,6 +2134,10 @@ UTF-16 strings) is in progress; its design is `design/symbol-strings.md`.
 Its stage Y1 is done: `Symbol` (registry, wrappers, the 13 well-known
 symbols), symbol-keyed properties, and computed class member names (pulled
 forward from phase 5); the well-known symbol hooks throw until Y2 / Y4 (§13).
+Its stage U1 is done: Latin-1 / UTF-16 strings with code-unit `.length`,
+indexing and comparison, lossless literals, and the `String.prototype`
+methods in the guest; U2 (string iterator, case mapping, `normalize`)
+remains.
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
@@ -2122,7 +2147,8 @@ forward from phase 5); the well-known symbol hooks throw until Y2 / Y4 (§13).
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
-  and surrogate pairs.
+  and surrogate pairs (done in U1; the string iterator, full case mapping
+  and `normalize` follow in U2).
 
 ### Phase 4 — Runtime independence and memory
 

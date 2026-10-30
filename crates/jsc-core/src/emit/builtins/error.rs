@@ -25,7 +25,7 @@ fn string_field(
     out: u32,
     key: &str,
     fallback: &str,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
@@ -47,13 +47,13 @@ fn string_field(
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, value) = (frame.i64(0), frame.i64(1));
     let (name, message) = (frame.i32(0), frame.i32(1));
     let len = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: u64::from(abi::STR_LEN_OFFSET),
         align: 2,
         memory_index: 0,
     };

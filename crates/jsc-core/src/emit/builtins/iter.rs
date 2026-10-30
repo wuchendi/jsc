@@ -15,7 +15,7 @@ use crate::ir::ConvertOp;
 /// once exhausted), right after the object-family prefix.
 const ITER_ITERATED_OFFSET: u32 = abi::OBJ_PREFIX_SIZE;
 /// Offset of an iterator object's `[[NextIndex]]: u32` (an array index, a
-/// string byte index, or a Map/Set backing slot index).
+/// string code-unit index, or a Map/Set backing slot index).
 const ITER_INDEX_OFFSET: u32 = abi::OBJ_PREFIX_SIZE + 8;
 /// Offset of an iterator object's `kind: u8` ([`kind_byte`]).
 const ITER_KIND_OFFSET: u32 = abi::OBJ_PREFIX_SIZE + 12;
@@ -155,8 +155,8 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
 fn iter_result(value: IrNode, done: bool) -> IrNode {
     IrNode::Object {
         entries: vec![
-            (PropKey::Static("value".to_owned()), value),
-            (PropKey::Static("done".to_owned()), IrNode::Bool(done)),
+            (PropKey::Static("value".into()), value),
+            (PropKey::Static("done".into()), IrNode::Bool(done)),
         ],
         proto: None,
         class: abi::CLASS_ORDINARY,
@@ -169,7 +169,7 @@ pub(super) fn emit(
     op: IterOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match op {
@@ -237,7 +237,7 @@ fn emit_array_iter(
     kind: IterKind,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, obj) = (frame.i64(0), frame.i32(0));
@@ -257,7 +257,7 @@ fn emit_collection_iter(
     kind: IterKind,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, obj) = (frame.i64(0), frame.i32(0));
@@ -285,7 +285,7 @@ fn emit_collection_iter(
 fn emit_string_iter(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s, obj) = (frame.i64(0), frame.i32(0));
@@ -360,7 +360,7 @@ impl Step {
         self,
         function: &mut Function,
         node: &IrNode,
-        strings: &HashMap<String, i32>,
+        strings: &StrOffsets,
         helpers: Helpers<'_>,
     ) {
         emit_node(node, function, self.frame.scratch(), strings, helpers);
@@ -382,7 +382,7 @@ impl Step {
     }
 
     /// Return the done result.
-    fn done(self, function: &mut Function, strings: &HashMap<String, i32>, helpers: Helpers<'_>) {
+    fn done(self, function: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>) {
         self.emit(
             function,
             &iter_result(IrNode::Undefined, true),
@@ -393,12 +393,7 @@ impl Step {
     }
 
     /// `i >= len`: exhaust and return the done result.
-    fn end_at_len(
-        self,
-        function: &mut Function,
-        strings: &HashMap<String, i32>,
-        helpers: Helpers<'_>,
-    ) {
+    fn end_at_len(self, function: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>) {
         wasm!(function; LocalGet(self.i), LocalGet(self.len), I32GeU, If(BlockType::Empty));
         self.exhaust(function);
         self.done(function, strings, helpers);
@@ -430,7 +425,7 @@ fn emit_next(
     family: IterFamily,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let st = Step::new(frame);
@@ -477,12 +472,7 @@ fn emit_next(
 
 /// An Array Iterator step into `value`: `LengthOfArrayLike` re-read per
 /// step, then the index (keys), `Get(target, index)` (values) or both.
-fn step_array(
-    function: &mut Function,
-    st: Step,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
+fn step_array(function: &mut Function, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(st.target), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get),
     );
@@ -510,17 +500,10 @@ fn step_array(
 }
 
 /// A String Iterator step into `value`: the next code point's string.
-fn step_string(
-    function: &mut Function,
-    st: Step,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    wasm!(function;
-        LocalGet(st.target), I32WrapI64, LocalTee(st.at),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
-        LocalSet(st.len),
-    );
+fn step_string(function: &mut Function, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
+    wasm!(function; LocalGet(st.target), I32WrapI64, LocalTee(st.at));
+    emit_load_str_len(function);
+    wasm!(function; LocalSet(st.len));
     st.end_at_len(function, strings, helpers);
     emit_str_iter_next(function, st.at, st.i, st.len, st.kind, helpers);
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(st.value));
@@ -534,7 +517,7 @@ fn step_collection(
     set: bool,
     function: &mut Function,
     st: Step,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     map_set::skip_tombstones(function, st.target, st.i, st.at, st.value, st.item);
@@ -568,41 +551,32 @@ fn step_collection(
     wasm!(function; LocalSet(st.value), End);
 }
 
-/// `__str_iter_next(s, i)` (design/symbol-strings.md §5.4) on the UTF-8
-/// layout: push the fresh string of the code point starting at byte index
-/// `i` of the string at i32 `s` (`len` its byte length, `i < len`) and
-/// advance `i` past it. One UTF-8 sequence is one code point (no lone
-/// surrogate exists before the UTF-16 flip); the sequence length comes from
-/// its lead byte, clamped to the string's end. `k` is an i32 temp.
+/// `__str_iter_next(s, i)` (design/symbol-strings.md §5.4): push the fresh
+/// string of the code point at unit `i` of the string at i32 `s` (`len` its
+/// length, `i < len`) and advance `i` past it: a lead surrogate followed by
+/// a trail is one two-unit string, any other unit (a lone surrogate
+/// included) a one-unit string; a one-byte string has no surrogates. `t` is
+/// an i32 temp.
 fn emit_str_iter_next(
     function: &mut Function,
     s: u32,
     i: u32,
     len: u32,
-    k: u32,
+    t: u32,
     helpers: Helpers<'_>,
 ) {
-    let payload = u64::from(abi::HEADER_SIZE) + 4;
-    // k = the sequence length: 1 + (lead >= 0xC0) + (lead >= 0xE0) + (lead >= 0xF0).
+    emit_str_two_byte(function, s);
+    wasm!(function; If(BlockType::Result(ValType::I32)));
+    emit_surrogate_pair_at(function, s, i, len);
+    wasm!(function; Else, I32Const(0), End, If(BlockType::Result(ValType::I32)));
+    emit_str_pair(function, helpers.alloc, s, i, t);
     wasm!(function;
-        LocalGet(s), LocalGet(i), I32Add,
-        I32Load8U(MemArg { offset: payload, align: 0, memory_index: 0 }), LocalTee(k),
-        I32Const(0xC0), I32GeU,
-        LocalGet(k), I32Const(0xE0), I32GeU, I32Add,
-        LocalGet(k), I32Const(0xF0), I32GeU, I32Add,
-        I32Const(1), I32Add, LocalSet(k),
-        LocalGet(len), LocalGet(i), I32Sub, LocalGet(k),
-        LocalGet(len), LocalGet(i), I32Sub, LocalGet(k), I32LtU, Select, LocalSet(k),
-        // The first byte, then each continuation byte appended.
+        LocalGet(t),
+        LocalGet(i), I32Const(2), I32Add, LocalSet(i),
+        Else,
         LocalGet(s), LocalGet(i), Call(helpers.str_index),
-        LocalGet(i), LocalGet(k), I32Add, LocalSet(k),
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i), LocalGet(k), I32GeU, BrIf(1),
-        LocalGet(s), LocalGet(i), Call(helpers.str_index), Call(helpers.concat),
-        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Br(0),
-        End, End,
+        End,
     );
 }
 
@@ -614,7 +588,7 @@ const ST_DONE: f64 = 0.0;
 /// (`next` holds the index).
 pub(in crate::emit) const ST_ARRAY: f64 = 1.0;
 /// Record state: a primitive string walked by code point (`next` holds the
-/// byte index).
+/// code-unit index).
 pub(in crate::emit) const ST_STRING: f64 = 2.0;
 /// Record state: a clean `Map` walked live (`next` holds the backing slot).
 const ST_MAP: f64 = 3.0;
@@ -677,7 +651,7 @@ fn store(
     place: &IrNode,
     value: IrNode,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(
@@ -695,7 +669,7 @@ fn load(
     function: &mut Function,
     place: &IrNode,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(place, function, scratch, strings, helpers);
@@ -707,7 +681,7 @@ fn state_is(
     rec: &IterRecord,
     state: f64,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     load(function, &rec.state, scratch, strings, helpers);
@@ -838,7 +812,7 @@ pub(in crate::emit) fn emit_iter_open(
     method: u32,
     rec: &IterRecord,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
@@ -857,7 +831,7 @@ pub(in crate::emit) fn emit_iter_open_with(
     method: u32,
     rec: &IterRecord,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     call_internal(
@@ -905,7 +879,7 @@ pub(in crate::emit) fn emit_get_iterator(
     sealed: bool,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, kind, method) = (scratch + 22, scratch + 26, scratch + 24);
@@ -959,7 +933,7 @@ pub(in crate::emit) fn emit_open_iterator(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, method) = (scratch + 22, scratch + 24);
@@ -983,7 +957,7 @@ pub(in crate::emit) fn emit_iterator_step(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; Block(BlockType::Result(ValType::I32)));
@@ -1023,7 +997,7 @@ fn step_done(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     store(
@@ -1043,7 +1017,7 @@ fn step_indexed(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let step = IrNode::Ternary {
@@ -1084,10 +1058,10 @@ fn step_code_point(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (s, i, len, k, out) = (
+    let (s, i, len, t, out) = (
         scratch + 8,
         scratch + 9,
         scratch + 10,
@@ -1095,11 +1069,9 @@ fn step_code_point(
         scratch + 24,
     );
     load(function, &rec.iter, scratch, strings, helpers);
-    wasm!(function;
-        I32WrapI64, LocalTee(s),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
-        LocalSet(len),
-    );
+    wasm!(function; I32WrapI64, LocalTee(s));
+    emit_load_str_len(function);
+    wasm!(function; LocalSet(len));
     load(function, &rec.next, scratch, strings, helpers);
     wasm!(function;
         F64ReinterpretI64, I32TruncSatF64U, LocalTee(i), LocalGet(len), I32GeU,
@@ -1107,7 +1079,7 @@ fn step_code_point(
     );
     step_done(rec, function, scratch, strings, helpers);
     wasm!(function; Else);
-    emit_str_iter_next(function, s, i, len, k, helpers);
+    emit_str_iter_next(function, s, i, len, t, helpers);
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(out));
     store(
         function,
@@ -1136,7 +1108,7 @@ fn step_entry(
     set: bool,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (handle, key, value, i, at) = (
@@ -1190,7 +1162,7 @@ fn step_generator(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (handle, value) = (scratch + 22, scratch + 23);
@@ -1231,7 +1203,7 @@ fn step_protocol(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (iter, next) = (scratch + 22, scratch + 24);
@@ -1286,7 +1258,7 @@ pub(in crate::emit) fn emit_iterator_value(
     rec: &IterRecord,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     state_is(function, rec, ST_PROTOCOL, scratch, strings, helpers);
@@ -1298,7 +1270,7 @@ pub(in crate::emit) fn emit_iterator_value(
             &rec.result,
             IrNode::Index {
                 obj: Box::new(rec.result.clone()),
-                index: Box::new(IrNode::Str("value".to_owned())),
+                index: Box::new(IrNode::Str("value".into())),
             },
         ),
         place_set(&rec.state, IrNode::Num(ST_PROTOCOL)),
@@ -1322,7 +1294,7 @@ pub(in crate::emit) fn emit_iterator_close(
     mode: CloseMode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (iter, saved) = (scratch + 22, scratch + 25);
@@ -1407,18 +1379,15 @@ fn not_a_function(local: u32, tmp: u32) -> IrNode {
         then_branch: Box::new(IrNode::TypeOf(Box::new(IrNode::Local(local)))),
         else_branch: Box::new(describe(local)),
     };
-    throw_type(
-        concat(name, IrNode::Str(" is not a function".to_owned())),
-        tmp,
-    )
+    throw_type(concat(name, IrNode::Str(" is not a function".into())), tmp)
 }
 
 /// `Iterator result <x> is not an object` for the non-object jsval in
 /// `local`, thrown as a `TypeError` (`tmp` an i64 temp).
 fn result_not_object(local: u32, tmp: u32) -> IrNode {
     let message = concat(
-        concat(IrNode::Str("Iterator result ".to_owned()), describe(local)),
-        IrNode::Str(" is not an object".to_owned()),
+        concat(IrNode::Str("Iterator result ".into()), describe(local)),
+        IrNode::Str(" is not an object".into()),
     );
     throw_type(message, tmp)
 }
@@ -1451,7 +1420,7 @@ fn throw_type(message: IrNode, tmp: u32) -> IrNode {
         IrNode::Throw(Box::new(IrNode::error_object(
             ErrorKind::TypeError,
             Some(IrNode::Local(tmp)),
-            concat(IrNode::Str("TypeError: ".to_owned()), IrNode::Local(tmp)),
+            concat(IrNode::Str("TypeError: ".into()), IrNode::Local(tmp)),
         ))),
     ])
 }
@@ -1461,7 +1430,7 @@ fn throw_and_return(
     function: &mut Function,
     frame: Frame,
     node: &IrNode,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_drop(function, frame, node, strings, helpers);
@@ -1492,7 +1461,7 @@ pub(super) fn emit_protocol(
     op: ProtocolOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match op {
@@ -1509,7 +1478,7 @@ pub(super) fn emit_protocol(
 fn emit_open_body(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, it, method) = (frame.i64(0), frame.i64(1), frame.k);
@@ -1531,7 +1500,7 @@ fn emit_open_body(
 fn emit_step_body(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (it, r, done, tmp, next) = (
@@ -1583,7 +1552,7 @@ fn emit_step_body(
 fn emit_close_body(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (it, method, r, tmp) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1624,7 +1593,7 @@ fn emit_close_body(
 fn emit_to_list_body(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, value) = (frame.i64(0), frame.i64(2));

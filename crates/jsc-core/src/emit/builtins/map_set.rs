@@ -119,7 +119,7 @@ fn throw_message(message: IrNode, tmp: u32) -> IrNode {
         IrNode::Throw(Box::new(IrNode::error_object(
             ErrorKind::TypeError,
             Some(IrNode::Local(tmp)),
-            concat(IrNode::Str("TypeError: ".to_owned()), IrNode::Local(tmp)),
+            concat(IrNode::Str("TypeError: ".into()), IrNode::Local(tmp)),
         ))),
     ])
 }
@@ -141,10 +141,10 @@ pub(super) fn not_iterable(local: u32) -> IrNode {
     let kind = IrNode::TypeOf(Box::new(IrNode::Local(local)));
     let primitive = concat(
         concat(
-            concat(kind.clone(), IrNode::Str(" ".to_owned())),
+            concat(kind.clone(), IrNode::Str(" ".into())),
             IrNode::Local(local),
         ),
-        IrNode::Str(" is not iterable".to_owned()),
+        IrNode::Str(" is not iterable".into()),
     );
     let nullish = IrNode::Binary {
         op: BinOp::LooseEq,
@@ -153,12 +153,12 @@ pub(super) fn not_iterable(local: u32) -> IrNode {
     };
     let message = IrNode::Ternary {
         cond: Box::new(IrNode::IsObject(Box::new(IrNode::Local(local)))),
-        then_branch: Box::new(concat(kind, IrNode::Str(" is not iterable".to_owned()))),
+        then_branch: Box::new(concat(kind, IrNode::Str(" is not iterable".into()))),
         else_branch: Box::new(IrNode::Ternary {
             cond: Box::new(nullish),
             then_branch: Box::new(concat(
                 IrNode::Local(local),
-                IrNode::Str(" is not iterable".to_owned()),
+                IrNode::Str(" is not iterable".into()),
             )),
             else_branch: Box::new(primitive),
         }),
@@ -170,11 +170,8 @@ pub(super) fn not_iterable(local: u32) -> IrNode {
 /// `local` that is not an object.
 pub(super) fn not_an_entry(local: u32) -> IrNode {
     let message = concat(
-        concat(
-            IrNode::Str("Iterator value ".to_owned()),
-            IrNode::Local(local),
-        ),
-        IrNode::Str(" is not an entry object".to_owned()),
+        concat(IrNode::Str("Iterator value ".into()), IrNode::Local(local)),
+        IrNode::Str(" is not an entry object".into()),
     );
     throw_message(message, local)
 }
@@ -184,10 +181,11 @@ pub(super) fn not_an_entry(local: u32) -> IrNode {
 fn adder_not_callable(local: u32, set: bool) -> IrNode {
     let (key, object) = if set { ("add", "Set") } else { ("set", "Map") };
     let message = concat(
-        concat(IrNode::Str("'".to_owned()), IrNode::Local(local)),
-        IrNode::Str(format!(
-            "' returned for property '{key}' of object '#<{object}>' is not a function"
-        )),
+        concat(IrNode::Str("'".into()), IrNode::Local(local)),
+        IrNode::Str(
+            format!("' returned for property '{key}' of object '#<{object}>' is not a function")
+                .into(),
+        ),
     );
     throw_message(message, local)
 }
@@ -200,7 +198,7 @@ fn this_collection(
     this: u32,
     builtin: Builtin,
     set: bool,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
@@ -277,7 +275,7 @@ pub(super) fn emit_op(
     op: MapOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, a0, a1) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -300,7 +298,7 @@ pub(super) fn emit_size(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let this = frame.i64(0);
@@ -319,7 +317,7 @@ pub(super) fn emit_for_each(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, callback, this_arg, key) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -433,7 +431,7 @@ pub(super) fn emit_ctor(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (map, src) = (frame.x64(0), frame.x64(1));

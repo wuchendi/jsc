@@ -71,7 +71,7 @@ impl Body {
         let own = IrNode::Intrinsic(GlobalIntrinsic::Ctor(ctor));
         let prototype = |obj: IrNode| IrNode::Index {
             obj: Box::new(obj),
-            index: Box::new(IrNode::Str("prototype".to_owned())),
+            index: Box::new(IrNode::Str("prototype".into())),
         };
         let p = self.temp(0);
         IrNode::Seq(vec![
@@ -131,8 +131,8 @@ fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) -> IrNode {
 fn throw_type_error(message: &str) -> IrNode {
     IrNode::Throw(Box::new(IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(format!("TypeError: {message}")),
+        Some(IrNode::Str(message.into())),
+        IrNode::Str(format!("TypeError: {message}").into()),
     )))
 }
 
@@ -156,7 +156,7 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             &body,
             ctor,
             [ConvertOp::String, ConvertOp::ToString],
-            IrNode::Str(String::new()),
+            IrNode::Str("".into()),
         ),
         BuiltinCtor::Number => conversion(&body, ctor, [ConvertOp::ToNumber; 2], IrNode::Num(0.0)),
         BuiltinCtor::Boolean => {
@@ -242,7 +242,7 @@ fn aggregate_error(body: &Body) -> IrNode {
             obj: Box::new(IrNode::Local(obj)),
             local: proto,
             entries: vec![(
-                PropKey::Hidden("errors".to_owned()),
+                PropKey::Hidden("errors".into()),
                 IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::Local(errors))]),
             )],
         },
@@ -302,7 +302,7 @@ fn array(body: &Body) -> IrNode {
         },
         IrNode::IndexSet {
             obj: Box::new(IrNode::Local(arr)),
-            index: Box::new(IrNode::Str(INDEX_LENGTH_KEY.to_owned())),
+            index: Box::new(IrNode::Str(INDEX_LENGTH_KEY.into())),
             value: Box::new(body.arg(0)),
         },
         IrNode::Local(arr),
@@ -310,7 +310,7 @@ fn array(body: &Body) -> IrNode {
     let is_number = IrNode::Binary {
         op: BinOp::Eq,
         lhs: Box::new(IrNode::TypeOf(Box::new(body.arg(0)))),
-        rhs: Box::new(IrNode::Str("number".to_owned())),
+        rhs: Box::new(IrNode::Str("number".into())),
     };
     let one = ternary(is_number, with_length, IrNode::Array(vec![body.arg(0)]));
     let spread = IrNode::ArraySpread(vec![SpreadElem::List(IrNode::SpreadArgsGlobal)]);
