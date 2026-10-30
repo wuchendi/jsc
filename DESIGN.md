@@ -436,8 +436,9 @@ the array bits is ever cleared (except `JOINING`).
 
 **`TYPE_OBJECT` classes** (header byte 3): `0` `CLASS_ORDINARY`, `1`
 `CLASS_ERROR` (an Error instance: its kind is its prototype, §7.7), `2`
-`CLASS_ARGUMENTS` (an unmapped `arguments` object: own `"0".."n-1"` and a
-non-enumerable `length`), `3` / `4` / `5` `CLASS_BOOLEAN` / `CLASS_NUMBER` /
+`CLASS_ARGUMENTS` (an unmapped `arguments` object: own `"0".."n-1"`, a
+non-enumerable `length` and a non-enumerable `@@iterator` =
+`%Array.prototype.values%`), `3` / `4` / `5` `CLASS_BOOLEAN` / `CLASS_NUMBER` /
 `CLASS_STRING` wrappers (24 bytes, `[[PrimitiveValue]]` at
 `WRAPPER_VALUE_OFFSET = 16`; a String wrapper owns its `length` and indices as
 read-only properties), `6` `CLASS_GLOBAL` (the global object, a static realm
@@ -456,8 +457,13 @@ Notes per kind:
 - **Map / Set** handles point (`entries`) at an ordinary array holding
   `(key, value)` pairs flattened into even/odd slots (a Set's value slot is
   `undefined`). The backing grows in place like any array, so the handle never
-  moves; `delete` compacts the pair out of it (shifting later entries down).
-  `size` is the entry count. Lookup is a linear scan with `__same_value_zero`.
+  moves; `delete` tombstones the pair in place (`HOLE` key, `undefined`
+  value) and `clear` tombstones every pair, so live iterators and `forEach`
+  keep their slot index and see entries appended later (including after a
+  `clear`); a re-added key appends. The backing is never compacted (it
+  keeps its tombstones until a collector exists). `size` is the live entry
+  count. Lookup is a linear scan with `__same_value_zero` that skips
+  tombstones; the renderers skip them too.
 - **Promise** blocks mirror settlement (`state` ∈ pending `0` / fulfilled `1` /
   rejected `2`, plus the settled `value`) so a memory snapshot can render them;
   reactions live in the host engine (§6.7).
@@ -1053,7 +1059,7 @@ path, never semantics:
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear (an array also needs `%Object.prototype%`'s, since its fast paths read a hole as absent and append without consulting the chain); `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
-| `GetIterator` (for-of, `yield*`, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes (`design/symbol-strings.md` §5.3); decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: no `@@iterator` on its chain. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
+| `GetIterator` (for-of, `yield*`, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes (`design/symbol-strings.md` §5.3); decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: its own `@@iterator` is still the data property `%Array.prototype.values%`. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
 The shared **`MethodCall`** builtin is the generic call for every guarded site:
@@ -1311,7 +1317,8 @@ catch binding).
   during the loop) or generator (its state machine stepped directly) takes a
   guarded fast path while its builtin `@@iterator` and iterator `next` are
   provably intact (the dirty bits of §6.4); an `arguments` object is walked
-  by index while no `@@iterator` is on its chain. `for await` is rejected
+  by index while its own `@@iterator` is still `%Array.prototype.values%`
+  (and the Array Iterator bits are clean). `for await` is rejected
   at compile time. The loop head declares its binding with `const`/`let`
   (identifier or pattern) or assigns a pattern (`for ([a] of xs)`).
 - **`for-in`** iterates the key snapshot of §6.3; strings and arrays list their
@@ -1358,11 +1365,13 @@ those of `switch` and loops are not tracked.
   in the parameter list keep the parameter.
 - **`arguments`.** A function that references `arguments` builds an unmapped
   `CLASS_ARGUMENTS` object from `argc`, the positional slots, and
-  `$__spread_args`.
+  `$__spread_args`, with an own non-enumerable `@@iterator` =
+  `%Array.prototype.values%`.
 - **Spread.** In calls, `new`, and array literals; a source is
   `IterableToList` over the `for-of` protocol (never closed). A clean array
   is appended directly, a clean string by character (`__str_to_array`) and
-  a clean generator drained by `__gen_to_array`; a derived class's default
+  a clean generator drained by `__gen_to_array`; a clean `arguments` object
+  is walked by index (`ProtocolOp::ToList`); a derived class's default
   constructor forwards its arguments without the protocol.
 - **`this`.** Bound by method calls (`obj.m()`, also `(obj.m)()`), by `new`, by
   `Function.prototype.call` / `apply` / `bind`, and for getters/setters. A plain call
@@ -1973,18 +1982,13 @@ Each item below is current behaviour of this tree.
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16
   code-unit order only between astral characters and `U+E000`..`U+FFFF`.
-- `Map`/`Set`: deleting the current entry during `forEach` or a Map / Set
-  Iterator walk skips the next one;
-  the constructors collect their iterable argument eagerly, with no
-  `IteratorClose`.
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
   property table, so element access on a large frozen or attributed array is
   `O(n)`; the renderers print an accessor element as `undefined` and omit a
   non-enumerable one.
 - `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
   enumerable own keys of its `Properties` argument once, before reading any
-  descriptor. `Object.fromEntries` collects its iterable eagerly, like the
-  `Map`/`Set` constructors.
+  descriptor.
 - `.stack` on errors is `"Name: message"` with no frames.
 
 **Functions & classes**

@@ -371,6 +371,16 @@ it('renders object-family values like the Rust host', async () => {
   )
 })
 
+it('renders a Map / Set after deletes like the Rust host', async () => {
+  const { stdout, result } = await run(
+    'const m = new Map([[1, 1], [2, 2], [3, 3]]); m.delete(1); m.delete(3); ' +
+      'const s = new Set([1, 2]); s.clear(); s.add(5); s.delete(9); ' +
+      'console.log(m, s, [m]); [m, s]',
+  )
+  expect(stdout).toBe('Map(1) Set(1) [ Map(1) ]\n')
+  expect(result).toBe('[ Map(1), Set(1) ]')
+})
+
 it('renders dictionary objects like the Rust host', async () => {
   const cases: [string, string][] = [
     [

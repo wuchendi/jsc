@@ -59,12 +59,11 @@ fn for_of_skips_entries_deleted_before_they_are_reached() {
 }
 
 #[test]
-fn deleting_the_current_entry_skips_the_next_one() {
-    // Known deviation (like forEach): the backing store compacts on delete,
-    // so deleting the visited entry shifts the next one under the cursor.
+fn deleting_the_current_entry_visits_the_next_one() {
+    // Deletion tombstones the entry in place (design/symbol-strings.md §5.5).
     assert_string(
         &collected("const s = new Set([1, 2, 3]); for (const v of s) { out.push(v); s.delete(v) }"),
-        "[1,3]",
+        "[1,2,3]",
     );
 }
 
