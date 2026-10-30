@@ -75,10 +75,10 @@ const QNAN: u64 = abi::QNAN;
 /// to box a freshly allocated heap string.
 const HEAP: u64 = abi::HEAP;
 
-/// The size in bytes of every heap block's leading header (see
-/// [`abi::HEADER_SIZE`]): the TYPE BYTE at offset 0 plus 3 padding bytes. The
-/// per-type payload begins here.
-const HEADER_SIZE: usize = abi::HEADER_SIZE as usize;
+/// A string block's `len: u32` and UTF-8 data offsets (see
+/// [`abi::STR_LEN_OFFSET`]).
+const STR_LEN_OFFSET: usize = abi::STR_LEN_OFFSET as usize;
+const STR_DATA_OFFSET: usize = abi::STR_DATA_OFFSET as usize;
 
 /// Heap block TYPE BYTE values (offset 0 of the block); see [`abi`].
 const TYPE_STRING: u8 = abi::TYPE_STRING;

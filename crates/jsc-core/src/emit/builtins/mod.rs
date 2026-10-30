@@ -605,7 +605,7 @@ pub(super) fn emit_to_object(strings: &HashMap<String, i32>, helpers: Helpers<'_
         LocalGet(class), I32Const(i32::from(abi::CLASS_STRING)), I32Eq,
         If(BlockType::Empty),
         LocalGet(v), I32WrapI64, LocalTee(string),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }), LocalSet(len),
+        I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }), LocalSet(len),
         I32Const(0), LocalSet(idx),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(idx), LocalGet(len), I32GeU, BrIf(1),
