@@ -1,8 +1,8 @@
 //! `Math` and `console` methods and the constructor statics
-//! (`Object.keys/values/entries`, `Array.isArray`, `Promise.resolve/reject`,
-//! `Date.now`): each wraps the IR node its inline fast path lowers to (design
-//! 3.2), applied to the argument slots, so a call through the function value
-//! computes exactly what the inline code does. The constructors' bodies are
+//! (`Object.keys/values/entries`, `Array.isArray`, `Date.now`): each wraps
+//! the IR node its inline fast path lowers to (design 3.2), applied to the
+//! argument slots, so a call through the function value computes exactly
+//! what the inline code does. The constructors' bodies are
 //! IR fragments too ([`super::ctor`]).
 
 #[allow(clippy::wildcard_imports)]
@@ -54,8 +54,6 @@ pub(in crate::emit) fn fragment(builtin: Builtin, k: u32) -> Option<IrNode> {
             value: Box::new(arg(0)),
             kind: InstanceOfKind::Array,
         },
-        Builtin::PromiseResolve => IrNode::PromiseResolve(Box::new(arg(0))),
-        Builtin::PromiseReject => IrNode::PromiseReject(Box::new(arg(0))),
         Builtin::DateNow => IrNode::DateNow,
         Builtin::Ctor(ctor) => super::ctor::fragment(ctor, k),
         _ => return None,

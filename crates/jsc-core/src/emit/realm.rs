@@ -427,10 +427,10 @@ pub(super) enum Builtin {
     ArrayOf,
     /// `Array.from`.
     ArrayFrom,
-    /// `Promise.resolve`.
-    PromiseResolve,
-    /// `Promise.reject`.
-    PromiseReject,
+    /// A `Promise` static.
+    PromiseStatic(PromiseStaticOp),
+    /// `Math.sumPrecise`.
+    MathSumPrecise,
     /// `Date.now`.
     DateNow,
     /// `Array.prototype.push`.
@@ -747,10 +747,72 @@ impl IteratorOp {
     }
 }
 
+/// The `Promise` statics, in installation order.
+const PROMISE_STATICS: [Builtin; 6] = [
+    Builtin::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::All)),
+    Builtin::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::AllSettled)),
+    Builtin::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::Any)),
+    Builtin::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::Race)),
+    Builtin::PromiseStatic(PromiseStaticOp::Resolve),
+    Builtin::PromiseStatic(PromiseStaticOp::Reject),
+];
+
+/// The `Promise` statics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PromiseStaticOp {
+    /// `Promise.resolve`.
+    Resolve,
+    /// `Promise.reject`.
+    Reject,
+    /// `Promise.all` / `allSettled` / `any` / `race`.
+    Combinator(CombinatorOp),
+}
+
+impl PromiseStaticOp {
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Reject => "reject",
+            Self::Combinator(op) => op.name(),
+        }
+    }
+}
+
+/// The `Promise` combinators over an iterable (design/symbol-strings.md
+/// §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CombinatorOp {
+    /// `Promise.all`.
+    All,
+    /// `Promise.allSettled`.
+    AllSettled,
+    /// `Promise.any`.
+    Any,
+    /// `Promise.race`.
+    Race,
+}
+
+impl CombinatorOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [CombinatorOp; 4] = [Self::All, Self::AllSettled, Self::Any, Self::Race];
+
+    /// The builtin's `name`.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::AllSettled => "allSettled",
+            Self::Any => "any",
+            Self::Race => "race",
+        }
+    }
+}
+
 /// The `@@species` builtins: the `get [Symbol.species]` accessors, and the
 /// internal closures of the `SpeciesConstructor` paths of
-/// `Promise.prototype.then` / `finally` (each a fresh function block whose
-/// `env` holds its captured values; not installed on any intrinsic).
+/// `Promise.prototype.then` / `finally` and of the `Promise` combinators
+/// (each a fresh function block whose `env` holds its captured values; not
+/// installed on any intrinsic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpeciesOp {
     /// The `get [Symbol.species]` of `%Array%` / `%Map%` / `%Set%` /
@@ -778,11 +840,22 @@ pub(super) enum SpeciesOp {
         /// Throw the value rather than return it.
         throw: bool,
     },
+    /// A resolve / reject element function of a `Promise` combinator: `env`
+    /// is `[state, index, alreadyCalled]`, `state` the combinator's shared
+    /// `[values, remainingElements, settle]` (`settle` the capability's
+    /// `resolve`, or its `reject` for `any`).
+    Element {
+        /// The combinator (`all`, `allSettled` or `any`).
+        combinator: CombinatorOp,
+        /// The rejection element (`allSettled`'s `onRejected`, `any`'s
+        /// reject element) rather than the fulfillment one.
+        reject: bool,
+    },
 }
 
 impl SpeciesOp {
     /// Every op, in [`Builtin::ALL`] order.
-    const ALL: [SpeciesOp; 11] = [
+    const ALL: [SpeciesOp; 15] = [
         Self::Getter(BuiltinCtor::Array),
         Self::Getter(BuiltinCtor::Map),
         Self::Getter(BuiltinCtor::Set),
@@ -794,6 +867,22 @@ impl SpeciesOp {
         Self::Finally { reject: true },
         Self::Thunk { throw: false },
         Self::Thunk { throw: true },
+        Self::Element {
+            combinator: CombinatorOp::All,
+            reject: false,
+        },
+        Self::Element {
+            combinator: CombinatorOp::AllSettled,
+            reject: false,
+        },
+        Self::Element {
+            combinator: CombinatorOp::AllSettled,
+            reject: true,
+        },
+        Self::Element {
+            combinator: CombinatorOp::Any,
+            reject: true,
+        },
     ];
 
     /// The builtin's `name`.
@@ -808,7 +897,7 @@ impl SpeciesOp {
     fn length(self) -> u32 {
         match self {
             Self::Executor => 2,
-            Self::Reaction { .. } | Self::Finally { .. } => 1,
+            Self::Reaction { .. } | Self::Finally { .. } | Self::Element { .. } => 1,
             Self::Getter(_) | Self::Thunk { .. } => 0,
         }
     }
@@ -1463,7 +1552,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 307] = [
+    pub(super) const ALL: [Builtin; 316] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1567,8 +1656,8 @@ impl Builtin {
         Self::IsArray,
         Self::ArrayOf,
         Self::ArrayFrom,
-        Self::PromiseResolve,
-        Self::PromiseReject,
+        Self::PromiseStatic(PromiseStaticOp::Resolve),
+        Self::PromiseStatic(PromiseStaticOp::Reject),
         Self::DateNow,
         Self::ArrayPush,
         Self::ArrayPop,
@@ -1798,6 +1887,15 @@ impl Builtin {
         Self::Iterator(IteratorOp::ALL[17]),
         Self::Iterator(IteratorOp::ALL[18]),
         Self::Iterator(IteratorOp::ALL[19]),
+        Self::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::ALL[0])),
+        Self::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::ALL[1])),
+        Self::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::ALL[2])),
+        Self::PromiseStatic(PromiseStaticOp::Combinator(CombinatorOp::ALL[3])),
+        Self::Species(SpeciesOp::ALL[11]),
+        Self::Species(SpeciesOp::ALL[12]),
+        Self::Species(SpeciesOp::ALL[13]),
+        Self::Species(SpeciesOp::ALL[14]),
+        Self::MathSumPrecise,
     ];
 
     /// The function's `name`.
@@ -1880,8 +1978,8 @@ impl Builtin {
             Self::IsArray => "isArray",
             Self::ArrayOf => "of",
             Self::ArrayFrom => "from",
-            Self::PromiseResolve => "resolve",
-            Self::PromiseReject => "reject",
+            Self::PromiseStatic(op) => op.name(),
+            Self::MathSumPrecise => "sumPrecise",
             Self::DateNow => "now",
             Self::ArrayPush => "push",
             Self::ArrayPop => "pop",
@@ -2384,7 +2482,7 @@ pub(super) fn registry() -> Vec<Entry> {
     }
     for builtin in Builtin::ALL {
         let namespace = match builtin {
-            Builtin::Math(_) => Intrinsic::Math,
+            Builtin::Math(_) | Builtin::MathSumPrecise => Intrinsic::Math,
             Builtin::JsonStringify | Builtin::JsonParse => Intrinsic::Json,
             Builtin::ConsoleLog => Intrinsic::Console,
             _ => continue,
@@ -2441,7 +2539,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 Builtin::StringFromCodePoint,
                 Builtin::StringRaw,
             ],
-            BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
+            BuiltinCtor::Promise => &PROMISE_STATICS,
             BuiltinCtor::Date => &[Builtin::DateNow],
             BuiltinCtor::Iterator => &[Builtin::Iterator(IteratorOp::From)],
             BuiltinCtor::Symbol => &[
