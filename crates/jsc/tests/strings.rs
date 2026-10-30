@@ -2,7 +2,7 @@
 
 use std::process::Command;
 mod common;
-use common::jsc;
+use common::{jsc, jsc_raw_stdout};
 
 /// String basics run inline with `-p` through the built binary.
 ///
@@ -92,5 +92,31 @@ fn tagged_template_is_rejected() {
     assert!(
         stderr.contains("tagged template"),
         "stderr should explain the tagged-template rejection, got: {stderr}"
+    );
+}
+
+/// Non-ASCII strings print as UTF-8: a Latin-1 (one-byte) string, an astral
+/// (two-byte, surrogate pair) string, a lone surrogate as U+FFFD (what Node
+/// writes), and a String wrapper rendered from its primitive value.
+#[test]
+fn non_ascii_strings_print_as_utf8() {
+    assert_eq!(jsc(&["-p", r#""é""#]), "é");
+    assert_eq!(jsc(&["-p", r#""\u{1F600}""#]), "😀");
+    assert_eq!(jsc(&["-p", r#""\uD800""#]), "\u{FFFD}");
+    assert_eq!(jsc(&["-p", r#""a\uDC00b""#]), "a\u{FFFD}b");
+    assert_eq!(jsc(&["-p", r#""\u0080\u0099ÿ""#]), "\u{80}\u{99}\u{ff}");
+    // A host op round trip: decode, then allocate one-byte / two-byte blocks.
+    assert_eq!(
+        jsc(&["-p", r#""\x80\x99\xff".toLowerCase()"#]),
+        "\u{80}\u{99}\u{ff}"
+    );
+    assert_eq!(jsc(&["-p", r#""\xc9\u{1F600}".toLowerCase()"#]), "é😀");
+    assert_eq!(
+        jsc_raw_stdout(&["-e", r#"console.log("é", "\u{1F600}", "\uD800")"#]),
+        "é 😀 \u{FFFD}\n"
+    );
+    assert_eq!(
+        jsc_raw_stdout(&["-e", r#"console.log(new String("é"))"#]),
+        "[String: 'é']\n"
     );
 }

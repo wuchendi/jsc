@@ -603,3 +603,23 @@ it('renders symbols like the Rust host', async () => {
     /^Uncaught Symbol\(a\)$/,
   )
 })
+
+it('decodes and allocates Latin-1 and UTF-16 strings like the Rust host', async () => {
+  expect((await run('"\\u00e9"')).result).toBe('é')
+  expect((await run('"\\u{1F600}"')).result).toBe('😀')
+  // Latin-1 bytes 0x80..0xFF are U+0080..U+00FF, not windows-1252.
+  expect((await run('"\\u0080\\u0099\\u00ff"')).result).toBe('\u0080\u0099ÿ')
+  // A host op round trip: decode, then allocate one-byte / two-byte blocks.
+  expect((await run('"\\u0080\\u0099\\u00ff".toLowerCase()')).result).toBe(
+    '\u0080\u0099ÿ',
+  )
+  expect((await run('"\\u00c9\\u{1F600}".toLowerCase()')).result).toBe('é😀')
+  // A lone surrogate stays a unit; writing it out as UTF-8 yields U+FFFD.
+  const { result, stdout } = await run('console.log("\\uD800"); "a\\uDC00b"')
+  expect(result).toBe('a\uDC00b')
+  const written = (s: string) =>
+    new TextDecoder().decode(new TextEncoder().encode(s))
+  expect(written(result)).toBe('a�b')
+  expect(written(stdout)).toBe('�\n')
+  expect((await run('new String("\\u00e9")')).result).toBe("[String: 'é']")
+})

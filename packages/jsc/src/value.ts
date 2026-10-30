@@ -50,6 +50,7 @@ import {
   QNAN,
   STR_DATA_OFFSET,
   STR_FLAG_ARRAY_INDEX,
+  STR_FLAG_TWO_BYTE,
   STR_LEN_OFFSET,
   SYMBOL_DESCRIPTION_OFFSET,
   TYPE_ARRAY,
@@ -149,9 +150,6 @@ function readU64(mem: Uint8Array, off: number): bigint | undefined {
   for (let i = 7; i >= 0; i--) value = (value << 8n) | BigInt(mem[off + i]!)
   return value
 }
-
-const utf8 = new TextDecoder()
-const utf8Encode = new TextEncoder()
 
 /**
  * Decode raw jsval `bits` into a {@link Value} per the NaN-box layout.
@@ -285,16 +283,44 @@ function decodeDate(ptr: number, mem: Uint8Array): Value {
   return { kind: 'date', ms: bits === undefined ? Number.NaN : bitsToF64(bits) }
 }
 
-/** Resolve a heap string block at `ptr`: `len:u32` at `ptr + STR_LEN_OFFSET`, UTF-8 at `ptr + STR_DATA_OFFSET`. */
+/** Resolve a heap string block at `ptr` (see {@link stringText}); a truncated block reads as `''`. */
 function decodeString(ptr: number, mem: Uint8Array): Value {
+  return { kind: 'string', value: stringText(mem, ptr) ?? '' }
+}
+
+/** Code units per `String.fromCharCode` call (keeps the argument list small). */
+const CHAR_CODE_CHUNK = 0x2000
+
+/**
+ * The text of the heap STRING block at `ptr`, or `null` when truncated: `len`
+ * (at `ptr + STR_LEN_OFFSET`) Latin-1 bytes, or with `STR_FLAG_TWO_BYTE` `len`
+ * UTF-16LE units, at `ptr + STR_DATA_OFFSET`. Lossless (a lone surrogate stays
+ * a unit); `TextDecoder` is avoided on purpose — its `latin1` label is
+ * windows-1252 and `utf-16le` replaces lone surrogates (mirrors
+ * `value.rs::string_units`).
+ */
+export function stringText(mem: Uint8Array, ptr: number): string | null {
   const len = readU32(mem, ptr + STR_LEN_OFFSET)
-  if (len === undefined) return { kind: 'string', value: '' }
+  if (len === undefined) return null
+  const twoByte =
+    ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & STR_FLAG_TWO_BYTE) !== 0
   const start = ptr + STR_DATA_OFFSET
-  if (start + len > mem.length) return { kind: 'string', value: '' }
-  return {
-    kind: 'string',
-    value: utf8.decode(mem.subarray(start, start + len)),
+  const size = twoByte ? len * 2 : len
+  if (start + size > mem.length) return null
+  let units: Uint8Array | Uint16Array = mem.subarray(start, start + len)
+  if (twoByte) {
+    // A copy when the view is not 2-aligned (a `Uint16Array` needs it).
+    const bytes =
+      (mem.byteOffset + start) % 2 === 0
+        ? mem.subarray(start, start + size)
+        : mem.slice(start, start + size)
+    units = new Uint16Array(bytes.buffer, bytes.byteOffset, len)
   }
+  let text = ''
+  for (let i = 0; i < len; i += CHAR_CODE_CHUNK) {
+    text += String.fromCharCode(...units.subarray(i, i + CHAR_CODE_CHUNK))
+  }
+  return text
 }
 
 /**
@@ -491,7 +517,7 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
       message: field('message') ?? '',
     }
   }
-  let entries = decodeProps(ptr, mem, guard)
+  const entries = decodeProps(ptr, mem, guard)
   const classByte = mem[ptr + HEADER_CLASS_OFFSET] ?? 0
   if (classByte === CLASS_ARGUMENTS) return { kind: 'arguments', entries }
   if (
@@ -501,13 +527,6 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
     const bits = readU64(mem, ptr + WRAPPER_VALUE_OFFSET)
     const primitive: Value =
       bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard)
-    if (primitive.kind === 'string') {
-      // A String wrapper's own indices are its characters, not properties.
-      const len = utf8Encode.encode(primitive.value).length
-      entries = entries.filter(
-        ([key]) => !(/^\d+$/.test(key) && Number(key) < len),
-      )
-    }
     return { kind: 'wrapper', primitive, entries }
   }
   const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)

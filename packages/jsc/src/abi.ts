@@ -171,7 +171,11 @@ export const HEAP_PTR_EXPORT_NAME = '__heap_ptr'
 export const MEMORY_MAX_PAGES = 8192
 /** The sticky out-of-memory sentinel the guest stores in `__heap_ptr` (`i32`). */
 export const HEAP_PTR_OOM = -1
-/** Export name of the `__new_string(len) -> base` guest string constructor. */
+/**
+ * Export name of the `__new_string(len, twoByte) -> base` guest string constructor:
+ * `len` code units, Latin-1 (`twoByte` 0) or UTF-16LE (`twoByte` 1, sets
+ * `STR_FLAG_TWO_BYTE`); the caller fills the data at `base + STR_DATA_OFFSET`.
+ */
 export const NEW_STRING_EXPORT_NAME = '__new_string'
 /** Export name of the `__new_array(len) -> base` guest array constructor. */
 export const NEW_ARRAY_EXPORT_NAME = '__new_array'
