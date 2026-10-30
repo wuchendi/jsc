@@ -698,7 +698,7 @@ impl LowerCtx<'_> {
             IrStmt::Decl {
                 local,
                 init: IrNode::Object {
-                    entries: vec![(PropKey::Hidden("length".to_owned()), IrNode::Local(n))],
+                    entries: vec![(PropKey::Hidden("length".into()), IrNode::Local(n))],
                     proto: None,
                     class: crate::abi::CLASS_ARGUMENTS,
                     reserve: k + 1,
@@ -1046,20 +1046,37 @@ impl LowerCtx<'_> {
     /// Define the current class's instance fields ([`Self::class_fields`]) on
     /// `this` in source order with `CreateDataProperty` semantics
     /// (`__define`, so an inherited setter is not invoked); `None` when the
-    /// class declares no fields. An uninitialized `f;` defines `undefined`.
+    /// class declares no fields. An uninitialized `f;` defines `undefined`. A
+    /// computed field name reads its key, converted at class definition time.
     pub(super) fn lower_field_inits(&mut self, this: IrNode) -> anyhow::Result<Option<IrNode>> {
         if self.class_fields.is_empty() {
             return Ok(None);
         }
         let fields = std::mem::take(&mut self.class_fields);
         let mut entries = Vec::with_capacity(fields.len());
-        for p in &fields {
-            let key = super::stmt::prop_key_name(&p.key)?;
+        for (p, computed) in &fields {
+            let Some((frame, id)) = *computed else {
+                let key = super::stmt::prop_key_name(&p.key)?;
+                let value = match &p.value {
+                    Some(init) => self.lower_key_named_expr(init, &key, p.key.span())?,
+                    None => IrNode::Undefined,
+                };
+                entries.push((PropKey::Static(key), value));
+                continue;
+            };
+            let local = self.fresh();
+            let key = IrNode::Seq(vec![
+                IrNode::Assign {
+                    local,
+                    value: Box::new(self.read_hidden(frame, id)),
+                },
+                IrNode::Local(local),
+            ]);
             let value = match &p.value {
-                Some(init) => self.lower_named_expr(init, &key)?,
+                Some(init) => self.lower_computed_named_expr(init, local)?,
                 None => IrNode::Undefined,
             };
-            entries.push((PropKey::Static(key), value));
+            entries.push((PropKey::Computed(key), value));
         }
         self.class_fields = fields;
         let local = self.fresh();
@@ -1145,8 +1162,8 @@ pub(super) const DERIVED_THIS_TDZ: &str = "Must call super constructor in derive
 pub(super) fn reference_error(message: &str) -> IrNode {
     IrNode::error_object(
         ErrorKind::ReferenceError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(format!("ReferenceError: {message}")),
+        Some(IrNode::Str(message.into())),
+        IrNode::Str(format!("ReferenceError: {message}").into()),
     )
 }
 
@@ -1154,10 +1171,10 @@ pub(super) fn reference_error(message: &str) -> IrNode {
 /// of a string (evaluated twice, for `message` and `stack`).
 pub(super) fn type_error(message: IrNode) -> IrNode {
     let stack = match &message {
-        IrNode::Str(text) => IrNode::Str(format!("TypeError: {text}")),
+        IrNode::Str(text) => IrNode::Str(format!("TypeError: {text}").into()),
         _ => IrNode::Binary {
             op: BinOp::Add,
-            lhs: Box::new(IrNode::Str("TypeError: ".to_owned())),
+            lhs: Box::new(IrNode::Str("TypeError: ".into())),
             rhs: Box::new(message.clone()),
         },
     };
@@ -1184,8 +1201,8 @@ fn class_call_guard(name: &str, argc: u32) -> IrStmt {
         then_body: Vec::new(),
         else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(IrNode::error_object(
             ErrorKind::TypeError,
-            Some(IrNode::Str(message)),
-            IrNode::Str(stack),
+            Some(IrNode::Str(message.into())),
+            IrNode::Str(stack.into()),
         ))))],
     }
 }

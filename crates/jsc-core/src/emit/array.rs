@@ -138,7 +138,7 @@ pub(super) fn emit_array_node(
     elems: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // The two transient i32 scratch locals: `dst` duplicates the block base
@@ -228,7 +228,7 @@ pub(super) fn emit_array_spread(
     parts: &[SpreadElem],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // base = a fresh empty array, left (i32) on the operand stack.
@@ -254,6 +254,8 @@ pub(super) fn emit_array_spread(
                 // operand stack throughout.
                 emit_node(source, function, scratch, strings, helpers);
                 function.instruction(&Instruction::LocalSet(scratch + 22));
+                // A user `@@iterator` is not honoured before Y2 (§9.4).
+                emit_iterator_guard(scratch + 22, function, scratch, strings, helpers);
                 emit_is_string(function, scratch + 22);
                 function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
                 function.instruction(&Instruction::LocalGet(scratch + 22));
@@ -294,6 +296,30 @@ pub(super) fn emit_array_spread(
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
+}
+
+/// Throw the interim `TypeError` of a `@@iterator` hook on the chain of the
+/// jsval in i64 local `value` (design/symbol-strings.md §9.4), propagating a
+/// throwing getter of the lookup: the iteration paths (index walks, spread,
+/// generator drains) do not honour a user iterator before Y2.
+pub(super) fn emit_iterator_guard(
+    value: u32,
+    function: &mut Function,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    emit_hook_guard(
+        function,
+        value,
+        WellKnown::Iterator,
+        scratch,
+        strings,
+        helpers,
+    );
+    if helpers.has_accessors {
+        emit_propagate_if_pending(function, helpers);
+    }
 }
 
 /// Push i32 `1` when the jsval in i64 local `value` is a `TYPE_ARRAY` handle.
@@ -340,7 +366,7 @@ pub(super) fn emit_iter_source(
     live: bool,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(value, function, scratch, strings, helpers);
@@ -354,7 +380,7 @@ pub(super) fn emit_iter_len(
     operand: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let value = scratch + 22;
@@ -378,7 +404,7 @@ pub(super) fn emit_iter_item(
     index: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, at, slot) = (scratch + 22, scratch + 23, scratch + 21);
@@ -443,7 +469,7 @@ pub(super) fn emit_array_push_node(
     value: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::LocalGet(local));
@@ -690,7 +716,7 @@ pub(super) fn emit_array_hof(
     this_arg: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let arr = scratch + 8;

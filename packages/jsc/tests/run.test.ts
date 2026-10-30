@@ -587,3 +587,19 @@ it('runs the String statics and remaining string methods like the host', async (
     expect((await run(src)).result, src).toBe(expected)
   }
 })
+
+it('renders symbols like the Rust host', async () => {
+  expect((await run('typeof Symbol()')).result).toBe('symbol')
+  expect((await run('Symbol("a")')).result).toBe('Symbol(a)')
+  expect((await run('Symbol()')).result).toBe('Symbol()')
+  expect((await run('[Symbol("a")]')).result).toBe('[ Symbol(a) ]')
+  expect((await run('({ a: 1, [Symbol("b")]: 2 })')).result).toBe(
+    '{ a: 1, [Symbol(b)]: 2 }',
+  )
+  expect((await run('let o = {}; o[Symbol("b")] = 2; o.a = 1; o')).result).toBe(
+    '{ a: 1, [Symbol(b)]: 2 }',
+  )
+  await expect(run('throw Symbol("a")')).rejects.toThrow(
+    /^Uncaught Symbol\(a\)$/,
+  )
+})

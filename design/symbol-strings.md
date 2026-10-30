@@ -1071,6 +1071,27 @@ Must not regress: direct calls, sealed fast paths, the `.length` inline
 path, static-key property access (a constant interned pointer), `ProtoGuard`
 builtin fast paths, the `it.next()` generator fast path.
 
+Y1 reason drafts (one line per affected row, for the final CI pass):
+
+- `for_of`, `spread`: "Y1-T1: new program"; Y1-T4 adds one `__symbol_get`
+  chain test per loop / spread setup (for-of over a non-generator runs it
+  twice); per-iteration fuel unchanged.
+- `class_methods`, `object_reads`, `array_hofs`, `string_methods`:
+  `emit_is_object` gains one type-byte compare (Y1-T2); every object
+  `ToPrimitive` gains one `__symbol_get` chain test (Y1-T4); `__get` gains a
+  type-byte compare on the pointer path (Y1-T2); `array_hofs` also pays the
+  `species_ctor` / `concat` chain tests (Y1-T4).
+- `for_in`, `object_reads`: `__to_key` symbol and object kind tests before the
+  number arm (Y1-T4).
+- concat-heavy rows: the `__add` string arm calls
+  `__to_string` for non-string primitives (Y1-T2).
+- `json`: `JSON.parse` text goes through `__to_string` (Y1-T4).
+- rows with accessor-half class statics or object-literal accessors: defined
+  through `__define_own` (Y1-T5).
+- rows with `typeof` sites: +4 static ops per site; `"symbol"` interned word
+  (Y1-T1).
+- `fib`, `math`, `push_1e5`, `console_log`: must not change.
+
 ---
 
 ## 9. Staged migration

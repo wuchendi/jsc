@@ -303,7 +303,7 @@ impl LowerCtx<'_> {
     ) -> anyhow::Result<()> {
         let name = class_decl.ident.sym.as_ref();
         let local = self.declare(name, true, class_decl.ident.span.lo.0);
-        let value = self.lower_class(&class_decl.class, name, true)?;
+        let value = self.lower_class(&class_decl.class, name, true, None)?;
         self.push_binding(local, value, out);
         Ok(())
     }
@@ -324,14 +324,23 @@ impl LowerCtx<'_> {
     /// fields; a base constructor runs them on entry. Static fields are
     /// defined after the class value exists, with `this` = the class.
     ///
-    /// Out-of-scope forms are rejected WITH SPANS: decorators, computed
-    /// member names, private members, static blocks.
+    /// A computed member name (method, accessor, or field, static or not) is
+    /// evaluated once, in source order, right after the heritage — before any
+    /// field initializer runs — and converted with `ToPropertyKey` into a
+    /// hidden local; a computed static method or accessor named `"prototype"`
+    /// throws a `TypeError` there. `name_key` is the local holding the
+    /// computed key an anonymous class is defined under (`{[k]: class {}}`):
+    /// its `name` is set from it before the static members are defined.
+    ///
+    /// Out-of-scope forms are rejected WITH SPANS: decorators, private
+    /// members, static blocks.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_class(
         &mut self,
         class: &Class,
         name: &str,
         inner_name: bool,
+        name_key: Option<u32>,
     ) -> anyhow::Result<IrNode> {
         if !class.decorators.is_empty() {
             return Err(
@@ -341,13 +350,14 @@ impl LowerCtx<'_> {
 
         // Collect the (at most one) constructor, the methods and accessors
         // (instance or static), and the fields; every other member is out of
-        // scope.
+        // scope. Each member is held with its index in the body, which keys
+        // its computed name (`keys`, below).
         let mut ctor = None;
-        let mut methods: Vec<&ClassMethod> = Vec::new();
-        let mut static_methods: Vec<&ClassMethod> = Vec::new();
-        let mut field_props: Vec<&ClassProp> = Vec::new();
-        let mut static_fields: Vec<&ClassProp> = Vec::new();
-        for member in &class.body {
+        let mut methods: Vec<(usize, &ClassMethod)> = Vec::new();
+        let mut static_methods: Vec<(usize, &ClassMethod)> = Vec::new();
+        let mut field_props: Vec<(usize, &ClassProp)> = Vec::new();
+        let mut static_fields: Vec<(usize, &ClassProp)> = Vec::new();
+        for (i, member) in class.body.iter().enumerate() {
             match member {
                 ClassMember::Constructor(c) => {
                     if ctor.is_some() {
@@ -360,21 +370,19 @@ impl LowerCtx<'_> {
                     ctor = Some(c);
                 }
                 ClassMember::Method(m) => {
-                    reject_out_of_scope_method(m)?;
                     check_member_name(&m.key, m.is_static, false)?;
                     if m.is_static {
-                        static_methods.push(m);
+                        static_methods.push((i, m));
                     } else {
-                        methods.push(m);
+                        methods.push((i, m));
                     }
                 }
                 ClassMember::ClassProp(p) => {
-                    reject_out_of_scope_field(p)?;
                     check_member_name(&p.key, p.is_static, true)?;
                     if p.is_static {
-                        static_fields.push(p);
+                        static_fields.push((i, p));
                     } else {
-                        field_props.push(p);
+                        field_props.push((i, p));
                     }
                 }
                 // A stray `;` in the class body binds nothing — harmless.
@@ -413,6 +421,49 @@ impl LowerCtx<'_> {
             }
         };
 
+        // The computed member names, by member index: each evaluated once, in
+        // source order, into a hidden local (read by the constructor's field
+        // initializers through its id).
+        let mut keys: Vec<Option<(u32, u32)>> = Vec::with_capacity(class.body.len());
+        for member in &class.body {
+            let (key, static_method) = match member {
+                ClassMember::Method(m) => (&m.key, m.is_static),
+                ClassMember::ClassProp(p) => (&p.key, false),
+                _ => {
+                    keys.push(None);
+                    continue;
+                }
+            };
+            let PropName::Computed(computed) = key else {
+                keys.push(None);
+                continue;
+            };
+            let value = self.lower_expr(&computed.expr)?;
+            let (local, id) = self.hidden_local();
+            seq.push(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::ToPropertyKey(Box::new(value))),
+            });
+            // A static method or accessor is defined right here in the
+            // evaluation order, so one named `prototype` throws now. (A static
+            // field named `prototype` throws when it is defined, from
+            // `__define` of the non-configurable `prototype`.)
+            if static_method {
+                seq.push(IrNode::Ternary {
+                    cond: Box::new(IrNode::Binary {
+                        op: BinOp::Eq,
+                        lhs: Box::new(IrNode::Local(local)),
+                        rhs: Box::new(IrNode::Str("prototype".into())),
+                    }),
+                    then_branch: Box::new(IrNode::Throw(Box::new(type_error(IrNode::Str(
+                        "Classes may not have a static property named 'prototype'".into(),
+                    ))))),
+                    else_branch: Box::new(IrNode::Undefined),
+                });
+            }
+            keys.push(Some((local, id)));
+        }
+
         // The instance shape (an optimisation): the field declarations and the
         // constructor's `this.<f> = ..` assignments, after a recorded parent's.
         let ctor_stmts: &[Stmt] = ctor
@@ -430,7 +481,7 @@ impl LowerCtx<'_> {
         };
         let own = field_props
             .iter()
-            .filter_map(|p| prop_key_name(&p.key).ok())
+            .filter_map(|(_, p)| prop_key_name(&p.key).ok())
             .chain(collect_instance_fields(ctor_stmts));
         for f in own {
             if !fields.contains(&f) {
@@ -453,9 +504,13 @@ impl LowerCtx<'_> {
 
         // The constructor function value — the class value itself. A derived
         // class without a constructor gets `constructor(...args) { super(...args) }`.
+        let frame = self.top();
         let prev_fields = std::mem::replace(
             &mut self.class_fields,
-            field_props.iter().map(|p| (*p).clone()).collect(),
+            field_props
+                .iter()
+                .map(|&(i, p)| (p.clone(), keys[i].map(|(_, id)| (frame, id))))
+                .collect(),
         );
         let kind = if heritage.is_some() {
             FnKind::DerivedClass
@@ -492,14 +547,14 @@ impl LowerCtx<'_> {
         // collapses to one accessor property.
         let (class_local, class_id) = self.hidden_local();
         let mut proto_entries = vec![(
-            PropKey::Hidden("constructor".to_owned()),
+            PropKey::Hidden("constructor".into()),
             IrNode::Local(class_local),
         )];
-        for m in methods {
-            self.lower_class_method(m, &mut proto_entries)?;
+        for (i, m) in methods {
+            self.lower_class_method(m, keys[i].map(|k| k.0), &mut proto_entries)?;
         }
         let mut class_entries = vec![(
-            PropKey::Fixed("prototype".to_owned()),
+            PropKey::Fixed("prototype".into()),
             IrNode::Object {
                 entries: proto_entries,
                 proto: heritage.map(|h| Box::new(IrNode::Local(h.2))),
@@ -512,9 +567,18 @@ impl LowerCtx<'_> {
         if let Some(scope) = self.current_super.as_mut() {
             scope.is_static = true;
         }
-        for m in static_methods {
-            self.lower_class_method(m, &mut class_entries)?;
+        for (i, m) in static_methods {
+            self.lower_class_method(m, keys[i].map(|k| k.0), &mut class_entries)?;
         }
+        let ctor_value = match name_key {
+            Some(key) => IrNode::SetFunctionName {
+                func: Box::new(ctor_value),
+                key,
+                prefix: "",
+                local: self.fresh(),
+            },
+            None => ctor_value,
+        };
         seq.push(IrNode::DefineProps {
             obj: Box::new(ctor_value),
             local: class_local,
@@ -533,17 +597,26 @@ impl LowerCtx<'_> {
         // Static fields, in source order, defined (CreateDataProperty) once the
         // class value and its inner binding exist; `this` is the class.
         let prev_static = self.static_init.replace((self.top(), class_id));
-        for p in static_fields {
-            let key = prop_key_name(&p.key)?;
-            let value = match &p.value {
-                Some(init) => self.lower_named_expr(init, &key)?,
-                None => IrNode::Undefined,
+        for (i, p) in static_fields {
+            let entry = if let Some((key, _)) = keys[i] {
+                let value = match &p.value {
+                    Some(init) => self.lower_computed_named_expr(init, key)?,
+                    None => IrNode::Undefined,
+                };
+                (PropKey::Computed(IrNode::Local(key)), value)
+            } else {
+                let key = prop_key_name(&p.key)?;
+                let value = match &p.value {
+                    Some(init) => self.lower_key_named_expr(init, &key, p.key.span())?,
+                    None => IrNode::Undefined,
+                };
+                (PropKey::Static(key), value)
             };
             let local = self.fresh();
             seq.push(IrNode::DefineProps {
                 obj: Box::new(IrNode::Local(class_local)),
                 local,
-                entries: vec![(PropKey::Static(key), value)],
+                entries: vec![entry],
             });
         }
         self.static_init = prev_static;
@@ -555,26 +628,31 @@ impl LowerCtx<'_> {
 
     /// Lower a class method or accessor `m` to a function value appended to
     /// `entries` (a prototype's or the class's) as a non-enumerable property.
+    /// `computed` is the local holding its converted computed name, which
+    /// names the function at run time.
     fn lower_class_method(
         &mut self,
         m: &ClassMethod,
+        computed: Option<u32>,
         entries: &mut Vec<(PropKey, IrNode)>,
     ) -> anyhow::Result<()> {
-        let key = prop_key_name(&m.key)?;
-        let accessor = match m.kind {
-            MethodKind::Getter => Some(true),
-            MethodKind::Setter => Some(false),
-            MethodKind::Method => None,
+        let (key, name) = if let Some(local) = computed {
+            (PropKey::HiddenComputed(IrNode::Local(local)), String::new())
+        } else {
+            let key = prop_key_name(&m.key)?;
+            let name = key_fn_name(&key, m.key.span())?;
+            (PropKey::Hidden(key), name)
         };
-        let fn_name = match accessor {
-            Some(true) => format!("get {key}"),
-            Some(false) => format!("set {key}"),
-            None => key.clone(),
+        let (accessor, prefix) = match m.kind {
+            MethodKind::Getter => (Some(true), "get "),
+            MethodKind::Setter => (Some(false), "set "),
+            MethodKind::Method => (None, ""),
         };
-        let value = self.lower_method(&m.function, &fn_name)?;
+        let value = self.lower_method(&m.function, &format!("{prefix}{name}"))?;
+        let value = self.set_computed_name(value, computed, prefix);
         match accessor {
-            Some(getter) => push_accessor_half(entries, PropKey::Hidden(key), value, getter),
-            None => entries.push((PropKey::Hidden(key), value)),
+            Some(getter) => push_accessor_half(entries, key, value, getter),
+            None => entries.push((key, value)),
         }
         Ok(())
     }
@@ -626,7 +704,7 @@ impl LowerCtx<'_> {
                     }),
                     then_branch: Box::new(self.derived_this(fi)),
                     else_branch: Box::new(IrNode::Throw(Box::new(type_error(IrNode::Str(
-                        "Derived constructors may only return object or undefined".to_owned(),
+                        "Derived constructors may only return object or undefined".into(),
                     ))))),
                 }),
             },
@@ -700,7 +778,7 @@ impl LowerCtx<'_> {
                     }));
                 }
                 // The statically-known destructured keys, excluded from a rest.
-                let mut bound_keys: Vec<String> = Vec::new();
+                let mut bound_keys: Vec<JsStr> = Vec::new();
                 for prop in &obj.props {
                     match prop {
                         // `{key: pat}` (or renamed `{key: name}`): read `temp.key`
@@ -718,7 +796,7 @@ impl LowerCtx<'_> {
                         // Shorthand `{x}` or shorthand-with-default `{z = 7}`: the
                         // key IS the bound name; a default fills an `undefined` read.
                         ObjectPatProp::Assign(assign) => {
-                            let key = assign.key.id.sym.as_ref().to_owned();
+                            let key = JsStr::from(assign.key.id.sym.as_ref());
                             bound_keys.push(key.clone());
                             let read = || IrNode::Index {
                                 obj: Box::new(IrNode::Local(temp)),
@@ -1029,11 +1107,11 @@ impl LowerCtx<'_> {
         temp: u32,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let read = |key: &str| IrNode::Index {
+        let read = |key: &JsStr| IrNode::Index {
             obj: Box::new(IrNode::Local(temp)),
-            index: Box::new(IrNode::Str(key.to_owned())),
+            index: Box::new(IrNode::Str(key.clone())),
         };
-        let mut bound_keys: Vec<String> = Vec::new();
+        let mut bound_keys: Vec<JsStr> = Vec::new();
         for prop in &obj.props {
             match prop {
                 ObjectPatProp::KeyValue(kv) => {
@@ -1044,7 +1122,7 @@ impl LowerCtx<'_> {
                 }
                 // Shorthand `{x}` / `{x = 7}` assigns the binding named by the key.
                 ObjectPatProp::Assign(assign) => {
-                    let key = assign.key.id.sym.as_ref().to_owned();
+                    let key = JsStr::from(assign.key.id.sym.as_ref());
                     let target = self.assignable_binding(&assign.key.id)?;
                     let value = self.apply_default(read(&key), assign.value.as_deref(), out)?;
                     bound_keys.push(key);
@@ -1155,7 +1233,7 @@ impl LowerCtx<'_> {
                         out.push(IrStmt::Decl { local: key, init });
                         IrNode::Local(key)
                     }
-                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
                     MemberProp::PrivateName(_) => {
                         return Err(CompileError::spanned(
                             m.span(),
@@ -1748,7 +1826,7 @@ impl LowerCtx<'_> {
         };
         let member = |r: u32, key: &str| IrNode::Index {
             obj: Box::new(IrNode::Local(r)),
-            index: Box::new(IrNode::Str(key.to_owned())),
+            index: Box::new(IrNode::Str(key.into())),
         };
         let mut out = Vec::new();
         let r_local = self.fresh();
@@ -2005,10 +2083,10 @@ fn non_enumerable_literal(expr: &Expr) -> bool {
 /// identifier and string-literal keys are supported (mirroring the object-literal
 /// keys in [`LowerCtx::lower_object`]); a computed or numeric key is a spanned
 /// error.
-pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<String> {
+pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<JsStr> {
     match key {
-        PropName::Ident(id) => Ok(id.sym.as_ref().to_owned()),
-        PropName::Str(s) => Ok(s.value.to_string_lossy().into_owned()),
+        PropName::Ident(id) => Ok(id.sym.as_ref().into()),
+        PropName::Str(s) => Ok(lit_str(s)),
         _ => Err(CompileError::spanned(
             key.span(),
             "unsupported object-pattern key: only identifier and string keys are supported \
@@ -2063,33 +2141,22 @@ fn index_num(i: usize) -> IrNode {
     IrNode::Num(f64::from(u32::try_from(i).unwrap_or(u32::MAX)))
 }
 
-/// Reject an out-of-scope class method form WITH a span: computed names
-/// (static or not). Returns `Ok(())` for a supported method or accessor.
-fn reject_out_of_scope_method(m: &ClassMethod) -> anyhow::Result<()> {
-    if !matches!(m.key, PropName::Computed(_)) {
-        return Ok(());
-    }
-    let msg = if matches!(m.kind, MethodKind::Method) {
-        "computed class method names are not supported"
-    } else {
-        "computed class accessor names are not supported"
-    };
-    Err(CompileError::spanned(m.span(), msg).into())
-}
-
-/// The class-member name early errors (SyntaxErrors): a static member named
-/// `prototype`, a field named `constructor`, and an identifier starting with
-/// a character that cannot start one (ZWJ / ZWNJ, accepted by the lexer when
-/// escaped).
+/// The class-member name early errors (`SyntaxError`s) of a literal key: a
+/// static member named `prototype`, a field named `constructor`, and an
+/// identifier starting with a character that cannot start one (ZWJ / ZWNJ,
+/// accepted by the lexer when escaped). A computed name is not checked here:
+/// a computed static `"prototype"` is a run-time `TypeError`
+/// ([`LowerCtx::lower_class`]), and a computed `"constructor"` is an ordinary
+/// method or field.
 fn check_member_name(key: &PropName, is_static: bool, field: bool) -> anyhow::Result<()> {
     let name = match key {
         PropName::Ident(id) => {
             if id.sym.starts_with(['\u{200c}', '\u{200d}']) {
                 return Err(CompileError::spanned(key.span(), "invalid identifier start").into());
             }
-            id.sym.as_ref().to_owned()
+            id.sym.as_ref().into()
         }
-        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        PropName::Str(s) => lit_str(s),
         _ => return Ok(()),
     };
     let msg = if is_static && name == "prototype" {
@@ -2114,20 +2181,6 @@ fn reject_class_member(member: &ClassMember) -> anyhow::Error {
         other => (other.span(), "unsupported class member"),
     };
     CompileError::spanned(span, msg).into()
-}
-
-/// Reject an out-of-scope class-field form WITH a span. Plain instance
-/// fields (`f = init` / `f;`) and `static` fields are supported; computed field
-/// names are not (static or not). (Private fields arrive as
-/// [`ClassMember::PrivateProp`] and are rejected by [`reject_class_member`].)
-/// Returns `Ok(())` for a supported field.
-fn reject_out_of_scope_field(p: &ClassProp) -> anyhow::Result<()> {
-    let msg = if matches!(p.key, PropName::Computed(_)) {
-        "computed class field names are not supported"
-    } else {
-        return Ok(());
-    };
-    Err(CompileError::spanned(p.span(), msg).into())
 }
 
 /// The parameter and body of a derived class's default constructor,
@@ -2166,7 +2219,7 @@ fn default_derived_ctor() -> (Pat, Vec<Stmt>) {
 /// statements and expressions but does NOT descend into nested `function`/arrow
 /// bodies: a nested `function` rebinds `this`, and an arrow-captured `this.f = ..`
 /// running later is a documented gap.
-fn collect_instance_fields(stmts: &[Stmt]) -> Vec<String> {
+fn collect_instance_fields(stmts: &[Stmt]) -> Vec<JsStr> {
     let mut fields = Vec::new();
     for stmt in stmts {
         collect_fields_stmt(stmt, &mut fields);
@@ -2175,7 +2228,7 @@ fn collect_instance_fields(stmts: &[Stmt]) -> Vec<String> {
 }
 
 /// Record a `this.<name> = ..` assignment target's field name (deduplicated).
-fn record_this_field(target: &AssignTarget, fields: &mut Vec<String>) {
+fn record_this_field(target: &AssignTarget, fields: &mut Vec<JsStr>) {
     let AssignTarget::Simple(SimpleAssignTarget::Member(m)) = target else {
         return;
     };
@@ -2183,9 +2236,9 @@ fn record_this_field(target: &AssignTarget, fields: &mut Vec<String>) {
         return;
     }
     let name = match &m.prop {
-        MemberProp::Ident(id) => Some(id.sym.as_ref().to_owned()),
+        MemberProp::Ident(id) => Some(JsStr::from(id.sym.as_ref())),
         MemberProp::Computed(c) => match c.expr.as_ref() {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+            Expr::Lit(Lit::Str(s)) => Some(lit_str(s)),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
@@ -2200,7 +2253,7 @@ fn record_this_field(target: &AssignTarget, fields: &mut Vec<String>) {
 /// Walk a statement for `this.<name> = ..` field assignments (see
 /// [`collect_instance_fields`]); recurses through control flow but not into
 /// nested function/arrow bodies.
-fn collect_fields_stmt(stmt: &Stmt, fields: &mut Vec<String>) {
+fn collect_fields_stmt(stmt: &Stmt, fields: &mut Vec<JsStr>) {
     match stmt {
         Stmt::Expr(e) => collect_fields_expr(&e.expr, fields),
         Stmt::Decl(Decl::Var(v)) => {
@@ -2295,7 +2348,7 @@ fn collect_fields_stmt(stmt: &Stmt, fields: &mut Vec<String>) {
 /// Walk an expression for `this.<name> = ..` field assignments (see
 /// [`collect_instance_fields`]); does not descend into nested function/arrow
 /// bodies (those rebind or merely capture `this`).
-fn collect_fields_expr(expr: &Expr, fields: &mut Vec<String>) {
+fn collect_fields_expr(expr: &Expr, fields: &mut Vec<JsStr>) {
     match expr {
         Expr::Assign(a) => {
             record_this_field(&a.left, fields);

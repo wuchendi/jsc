@@ -71,13 +71,14 @@ pub(crate) const HOLE: u64 = UNDEFINED | 1;
 /// `emit_typeof_node` interns and selects between; the decoder reads them back as
 /// ordinary strings. Keeping them a single source shared by the emitter and the
 /// runtime prevents the index/word tables from drifting apart.
-pub(crate) const TYPEOF_STRINGS: [&str; 6] = [
+pub(crate) const TYPEOF_STRINGS: [&str; 7] = [
     "number",
     "boolean",
     "undefined",
     "object",
     "string",
     "function",
+    "symbol",
 ];
 
 /// The NaN-boxed heap-pointer header: [`QNAN`] plus tag `0b101` — the SINGLE tag
@@ -96,9 +97,10 @@ pub(crate) const HEADER_SIZE: u32 = 4;
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
 /// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
-/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`] / [`STR_FLAG_TWO_BYTE`], an object-family block's
 /// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
-/// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`].
+/// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`], a symbol's
+/// [`SYMBOL_FLAG_REGISTERED`].
 pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
 
 /// Header byte 3: the `TYPE_OBJECT` sub-`class` byte ([`CLASS_ORDINARY`],
@@ -135,6 +137,12 @@ pub(crate) const CLASS_STRING: u8 = 5;
 
 /// [`TYPE_OBJECT`] `class` byte: the global object (a static realm block).
 pub(crate) const CLASS_GLOBAL: u8 = 6;
+
+/// [`TYPE_OBJECT`] `class` byte: a Symbol wrapper object (created only by
+/// `ToObject`), its `[[SymbolData]]` (the [`TYPE_SYMBOL`] jsval) at
+/// [`WRAPPER_VALUE_OFFSET`].
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
+pub(crate) const CLASS_SYMBOL: u8 = 7;
 
 /// Offset of a wrapper object's `[[PrimitiveValue]]` jsval (an `i64`) from
 /// its base, right after the object-family prefix.
@@ -530,6 +538,11 @@ pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
 /// dirty-bit index. A rebuilt table keeps both.
 pub(crate) const PROPS_WATCHED: u8 = 4;
 
+/// [`TYPE_PROPS`] `tflags` bit: some key is a [`TYPE_SYMBOL`] block, so string
+/// key enumeration must skip it and symbol enumeration has entries to list.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const PROPS_HAS_SYMBOL_KEYS: u8 = 8;
+
 /// Byte offset (from a [`TYPE_PROPS`] block base) of a watched table's u8
 /// dirty-bit index.
 pub(crate) const PROPS_WATCH_BIT_OFFSET: u32 = 3;
@@ -547,6 +560,35 @@ pub(crate) const ELEMS_CAP_OFFSET: u32 = HEADER_SIZE;
 /// Byte offset (from a [`TYPE_ELEMS`] block base) of element 0; element `i`
 /// is the jsval at `ELEMS_DATA_OFFSET + 8 * i`.
 pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
+
+/// TYPE BYTE of a Symbol primitive: a heap block under the single [`HEAP`]
+/// tag, so its jsval's low 32 bits double as a property key (a `u32` block
+/// pointer, like an interned string's). `typeof` is `"symbol"`. Layout:
+/// `[type=14][gc][flags][class=0][reserved:u32 = 0][description:i64]`, the
+/// description (a string jsval or `undefined`) at
+/// [`SYMBOL_DESCRIPTION_OFFSET`], [`SYMBOL_BLOCK_SIZE`] bytes. The only flag
+/// is [`SYMBOL_FLAG_REGISTERED`]; bits `1` and `2` stay clear so a symbol key
+/// never looks like an interned string ([`STR_FLAG_INTERNED`]) or an array
+/// index ([`STR_FLAG_ARRAY_INDEX`]), and the reserved word at offset 4 reads
+/// as "no own properties" if a symbol is mistaken for an object-family block.
+/// The description is immutable; identity is the block address. Well-known
+/// symbols are static blocks in the realm image.
+pub(crate) const TYPE_SYMBOL: u8 = 14;
+
+/// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
+/// (an `i64`: a string jsval or `undefined`).
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
+pub(crate) const SYMBOL_DESCRIPTION_OFFSET: u32 = 8;
+
+/// Byte size of a [`TYPE_SYMBOL`] block.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const SYMBOL_BLOCK_SIZE: u32 = 16;
+
+/// [`TYPE_SYMBOL`] header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the
+/// symbol is in the `Symbol.for` registry (its description is the registry
+/// key), so `Symbol.keyFor` returns the description.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const SYMBOL_FLAG_REGISTERED: u8 = 4;
 
 /// Property `attrs` bit: a data property's value may be reassigned (ignored
 /// for an accessor).
@@ -575,11 +617,20 @@ pub(crate) const STR_FLAG_INTERNED: u8 = 1;
 /// intern time.
 pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
-/// Byte offset of a [`TYPE_STRING`] block's `len: u32` (the UTF-8 byte count).
-/// String block = header | `len: u32` @4 | data @8.
+/// String header `flags` bit: the data is UTF-16LE code units (`2 * len`
+/// bytes); absent, it is Latin-1 bytes (`len` bytes). Canonical: set iff some
+/// unit is above `0xFF`. It shares bit `4` with [`SYMBOL_FLAG_REGISTERED`],
+/// which cannot collide: string paths read it only on a [`TYPE_STRING`]
+/// block, and a symbol key never reaches them (unlike `1` / `2`, which key
+/// paths test on any key block).
+pub(crate) const STR_FLAG_TWO_BYTE: u8 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's `len: u32`, the length in UTF-16
+/// code units (the JS `.length`). String block = header | `len: u32` @4 |
+/// data @8 (Latin-1 bytes, or UTF-16LE units with [`STR_FLAG_TWO_BYTE`]).
 pub(crate) const STR_LEN_OFFSET: u32 = 4;
 
-/// Byte offset of a [`TYPE_STRING`] block's UTF-8 data (see [`STR_LEN_OFFSET`]).
+/// Byte offset of a [`TYPE_STRING`] block's data (see [`STR_LEN_OFFSET`]).
 pub(crate) const STR_DATA_OFFSET: u32 = 8;
 
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial

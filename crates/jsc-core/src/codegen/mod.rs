@@ -33,9 +33,30 @@ use globals::GlobalFacts;
 
 use crate::ir::{
     ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, GlobalIntrinsic,
-    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, LogicalOp, MapOp,
-    MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind, SpreadCallee, SpreadElem,
+    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, JsStr, LogicalOp,
+    MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind, SpreadCallee,
+    SpreadElem,
 };
+
+/// A string literal's value as UTF-16 code units, losslessly: swc keeps a lone
+/// surrogate in its generalized UTF-8 (WTF-8) form, which decodes back to the
+/// single unit.
+pub(super) fn lit_str(s: &swc_ecma_ast::Str) -> JsStr {
+    s.value.to_ill_formed_utf16().collect()
+}
+
+/// The function `name` a static property key gives the method or anonymous
+/// definition under it. Function names are Rust strings, so a key with a lone
+/// surrogate is a spanned compile error (correct-or-throw).
+pub(super) fn key_fn_name(key: &JsStr, span: swc_common::Span) -> anyhow::Result<String> {
+    key.to_rust_string().ok_or_else(|| {
+        CompileError::spanned(
+            span,
+            "unsupported function name: a key with a lone surrogate cannot name a function",
+        )
+        .into()
+    })
+}
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
 ///
@@ -319,7 +340,7 @@ struct ClassInfo {
     /// Distinct instance field names, in first-assignment order. For a class
     /// extending a recorded class name this already includes the inherited
     /// fields (the parent's flattened list, then this class's own).
-    fields: Vec<String>,
+    fields: Vec<JsStr>,
 }
 
 /// A lexical-scope resolver used only by [`analyze_captures`]. It mirrors the
@@ -605,8 +626,9 @@ struct LowerCtx<'a> {
     current_super: Option<SuperScope>,
     /// The instance field declarations of the class whose constructor is being
     /// lowered: a base constructor defines them on entry, a derived one after
-    /// each `super(..)`.
-    class_fields: Vec<ClassProp>,
+    /// each `super(..)`. A computed field name carries the class frame and the
+    /// hidden id of its key, converted once at class definition time.
+    class_fields: Vec<(ClassProp, Option<(usize, u32)>)>,
     /// While lowering `static` field initializers: the class frame and the
     /// hidden id of the class value, which `this` resolves to there.
     static_init: Option<(usize, u32)>,

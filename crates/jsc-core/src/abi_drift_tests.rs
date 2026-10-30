@@ -9,8 +9,8 @@ use super::{
     CLASS_NUMBER, CLASS_STRING, ELEMS_CAP_OFFSET, ELEMS_DATA_OFFSET, HEADER_CLASS_OFFSET,
     HEADER_FLAGS_OFFSET, METHOD_OP_NUMBER_TO_STRING, OBJ_PROPS_OFFSET, PROP_ATTRS_OFFSET,
     PROP_ENTRY_SIZE, PROP_KEY_OFFSET, PROP_VALUE_OFFSET, PROPS_COUNT_OFFSET, PROPS_HAS_INDEX_KEYS,
-    PROPS_HEADER_SIZE, PROPS_TFLAGS_OFFSET, STR_DATA_OFFSET, STR_FLAG_ARRAY_INDEX, STR_LEN_OFFSET,
-    WRAPPER_VALUE_OFFSET,
+    PROPS_HEADER_SIZE, PROPS_TFLAGS_OFFSET, STR_DATA_OFFSET, STR_FLAG_ARRAY_INDEX,
+    STR_FLAG_TWO_BYTE, STR_LEN_OFFSET, WRAPPER_VALUE_OFFSET,
 };
 use super::{
     ASYNC_STEP_EXPORT_NAME, CONVERT_OP_PARSE_FLOAT, CONVERT_OP_TO_NUMBER, CONVERT_OP_TO_STRING,
@@ -30,6 +30,10 @@ use super::{
     PROMISE_OP_SETTLE_REJECT, PROMISE_PENDING, PROMISE_REJECTED, PROMISE_SELF_ERROR_EXPORT_NAME,
     QNAN, TRUE, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_OBJECT, TYPE_PROMISE, TYPE_STRING,
     UNDEFINED,
+};
+use super::{
+    CLASS_SYMBOL, PROPS_HAS_SYMBOL_KEYS, SYMBOL_BLOCK_SIZE, SYMBOL_DESCRIPTION_OFFSET,
+    SYMBOL_FLAG_REGISTERED, TYPE_SYMBOL,
 };
 use super::{
     FN_INFO_ADDR, FN_INFO_ENTRY_SIZE, FN_INFO_NAME_OFFSET, FUNC_FLAG_BOUND, FUNC_FLAG_CLASS_CTOR,
@@ -82,6 +86,10 @@ fn expected() -> Vec<(&'static str, Val)> {
         ("TYPE_PROMISE", int(TYPE_PROMISE)),
         ("TYPE_GENERATOR", int(TYPE_GENERATOR)),
         ("TYPE_DATE", int(TYPE_DATE)),
+        ("TYPE_SYMBOL", int(TYPE_SYMBOL)),
+        ("SYMBOL_DESCRIPTION_OFFSET", int(SYMBOL_DESCRIPTION_OFFSET)),
+        ("SYMBOL_BLOCK_SIZE", int(SYMBOL_BLOCK_SIZE)),
+        ("SYMBOL_FLAG_REGISTERED", int(SYMBOL_FLAG_REGISTERED)),
         ("HEADER_FLAGS_OFFSET", int(HEADER_FLAGS_OFFSET)),
         ("HEADER_CLASS_OFFSET", int(HEADER_CLASS_OFFSET)),
         ("CLASS_ERROR", int(CLASS_ERROR)),
@@ -89,8 +97,10 @@ fn expected() -> Vec<(&'static str, Val)> {
         ("CLASS_BOOLEAN", int(CLASS_BOOLEAN)),
         ("CLASS_NUMBER", int(CLASS_NUMBER)),
         ("CLASS_STRING", int(CLASS_STRING)),
+        ("CLASS_SYMBOL", int(CLASS_SYMBOL)),
         ("WRAPPER_VALUE_OFFSET", int(WRAPPER_VALUE_OFFSET)),
         ("STR_FLAG_ARRAY_INDEX", int(STR_FLAG_ARRAY_INDEX)),
+        ("STR_FLAG_TWO_BYTE", int(STR_FLAG_TWO_BYTE)),
         ("STR_LEN_OFFSET", int(STR_LEN_OFFSET)),
         ("STR_DATA_OFFSET", int(STR_DATA_OFFSET)),
         ("ARRAY_FLAG_SPARSE", int(ARRAY_FLAG_SPARSE)),
@@ -117,6 +127,7 @@ fn expected() -> Vec<(&'static str, Val)> {
         ("PROP_ATTRS_OFFSET", int(PROP_ATTRS_OFFSET)),
         ("PROP_VALUE_OFFSET", int(PROP_VALUE_OFFSET)),
         ("PROPS_HAS_INDEX_KEYS", int(PROPS_HAS_INDEX_KEYS)),
+        ("PROPS_HAS_SYMBOL_KEYS", int(PROPS_HAS_SYMBOL_KEYS)),
         ("ATTR_ENUMERABLE", int(ATTR_ENUMERABLE)),
         ("ATTR_ACCESSOR", int(ATTR_ACCESSOR)),
         ("ACCESSOR_GET_OFFSET", int(ACCESSOR_GET_OFFSET)),
@@ -451,8 +462,19 @@ fn property_table_layout_matches_design() {
         [1, 2, 4, 8]
     );
     assert_eq!(ATTRS_DEFAULT, 0b0111);
-    assert_eq!([PROPS_HAS_INDEX_KEYS, PROPS_HAS_NON_ENUM], [1, 2]);
-    assert_eq!([STR_FLAG_INTERNED, STR_FLAG_ARRAY_INDEX], [1, 2]);
+    assert_eq!(
+        [
+            PROPS_HAS_INDEX_KEYS,
+            PROPS_HAS_NON_ENUM,
+            super::PROPS_WATCHED,
+            PROPS_HAS_SYMBOL_KEYS
+        ],
+        [1, 2, 4, 8]
+    );
+    assert_eq!(
+        [STR_FLAG_INTERNED, STR_FLAG_ARRAY_INDEX, STR_FLAG_TWO_BYTE],
+        [1, 2, 4]
+    );
     assert_eq!(OBJ_FLAG_NOT_EXTENSIBLE, 1);
     assert_eq!(
         [
@@ -464,4 +486,26 @@ fn property_table_layout_matches_design() {
         [4, 8, 16, 32]
     );
     assert_eq!(HEADER_FLAGS_OFFSET, 2);
+}
+
+/// Pins the `TYPE_SYMBOL` block layout and the `typeof` word table to
+/// `design/symbol-strings.md` sections 2.2 and 2.4.
+#[test]
+fn symbol_layout_matches_design() {
+    use super::{BLOCK_ALIGN, CLASS_GLOBAL, STR_FLAG_INTERNED, TYPE_ELEMS, TYPEOF_STRINGS};
+    assert_eq!(TYPE_SYMBOL, TYPE_ELEMS + 1);
+    assert_eq!([SYMBOL_DESCRIPTION_OFFSET, SYMBOL_BLOCK_SIZE], [8, 16]);
+    assert_eq!(SYMBOL_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    // Bits 1 and 2 (the string INTERNED / ARRAY_INDEX bits, tested on any key
+    // block) stay clear. Bit 4 is shared with STR_FLAG_TWO_BYTE, which only
+    // string paths read, after the TYPE byte says TYPE_STRING.
+    assert_eq!(SYMBOL_FLAG_REGISTERED, 4);
+    assert_eq!(
+        SYMBOL_FLAG_REGISTERED & (STR_FLAG_ARRAY_INDEX | STR_FLAG_INTERNED),
+        0
+    );
+    assert_eq!(SYMBOL_FLAG_REGISTERED, STR_FLAG_TWO_BYTE);
+    assert_ne!(TYPE_SYMBOL, TYPE_STRING);
+    assert_eq!(CLASS_SYMBOL, CLASS_GLOBAL + 1);
+    assert_eq!(TYPEOF_STRINGS[6], "symbol");
 }

@@ -337,7 +337,7 @@ pub(super) fn emit_this_value(
     value_of: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let text = if value_of {
@@ -364,12 +364,15 @@ pub(super) fn emit_this_value(
 /// [`coercions`] in [`coercion_order`], `repeat`'s count check, then the host
 /// op, whose refusal sentinels throw; `match` builds its result array.
 /// `concat`, `matchAll`, `replace` and `replaceAll` continue in their own
-/// bodies after the receiver.
+/// bodies after the receiver. An object first argument whose chain holds the
+/// method's well-known symbol ([`hook_of`], `__symbol_get`) throws the interim
+/// `TypeError` after the receiver (Y4 dispatches to it,
+/// design/symbol-strings.md §9.4).
 pub(super) fn emit_method(
     op: StringOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -388,6 +391,7 @@ pub(super) fn emit_method(
     wasm!(function; End);
     to_string(function, s, helpers);
     wasm!(function; End);
+    arg_hook_guard(op, function, frame, a0, strings, helpers);
     let flag = match (op, op.flag()) {
         (StringOp::Concat, _) => return emit_concat(function, frame, s, helpers),
         (StringOp::MatchAll, _) | (_, None) => {
@@ -472,6 +476,44 @@ pub(super) fn emit_method(
     }
 }
 
+/// Throw the interim `TypeError` when `op`'s first argument (read into i64
+/// `a0`) is an object whose chain holds `op`'s [`hook_of`] symbol.
+fn arg_hook_guard(
+    op: StringOp,
+    function: &mut Function,
+    frame: Frame,
+    a0: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let Some(symbol) = hook_of(op) else {
+        return;
+    };
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(a0));
+    emit_is_object(function, a0);
+    wasm!(function; If(BlockType::Empty));
+    emit_hook_guard(function, a0, symbol, frame.scratch(), strings, helpers);
+    wasm!(function; End);
+    return_if_pending(function);
+}
+
+/// The well-known symbol `op` consults on an object first argument: `@@match`
+/// (`IsRegExp` of `includes` / `startsWith` / `endsWith`, and `match`),
+/// `@@matchAll`, `@@replace`, `@@search`, `@@split`.
+fn hook_of(op: StringOp) -> Option<WellKnown> {
+    match op {
+        StringOp::Includes | StringOp::StartsWith | StringOp::EndsWith | StringOp::Match => {
+            Some(WellKnown::Match)
+        }
+        StringOp::MatchAll => Some(WellKnown::MatchAll),
+        StringOp::Replace | StringOp::ReplaceAll => Some(WellKnown::Replace),
+        StringOp::Search => Some(WellKnown::Search),
+        StringOp::Split => Some(WellKnown::Split),
+        _ => None,
+    }
+}
+
 /// Push the `__method` result of host op `flag` over the jsvals in i64
 /// locals `recv`, `a0` and `a1`.
 fn host_call(
@@ -495,7 +537,7 @@ fn refusal_throws(
     function: &mut Function,
     frame: Frame,
     r: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let when = |function: &mut Function, sentinel: u64| {
@@ -526,16 +568,16 @@ fn throw_range_error(
     frame: Frame,
     text: [&str; 2],
     value: Option<u32>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let part = |prefix: &str| match value {
         Some(local) => IrNode::Binary {
             op: BinOp::Add,
-            lhs: Box::new(IrNode::Str(prefix.to_owned())),
+            lhs: Box::new(IrNode::Str(prefix.into())),
             rhs: Box::new(IrNode::Local(local)),
         },
-        None => IrNode::Str(prefix.to_owned()),
+        None => IrNode::Str(prefix.into()),
     };
     let error = IrNode::error_object(ErrorKind::RangeError, Some(part(text[0])), part(text[1]));
     emit_throw_error(&error, function, frame.scratch(), strings, helpers);
@@ -550,7 +592,7 @@ fn emit_match_result(
     s: u32,
     p: u32,
     r: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let result = frame.x64(0);
@@ -608,7 +650,7 @@ fn emit_replace(
     op: StringOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s, search, replacer, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -713,7 +755,7 @@ pub(super) fn emit_from_char_code(
     code_point: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, result, list, spread) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
@@ -778,7 +820,7 @@ pub(super) fn emit_from_char_code(
 pub(super) fn emit_raw(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (raw, v, acc, spread) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));

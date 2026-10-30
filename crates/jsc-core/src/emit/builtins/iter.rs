@@ -10,11 +10,14 @@ use super::*;
 /// wrapper's string) is itself when live, else its characters; a generator is
 /// drained; a `Map` / `Set` is itself when live, else a fresh array of its
 /// `[key, value]` entries / values; an `arguments` object is copied by
-/// `Array.prototype.slice`; anything else throws `<x> is not iterable`.
+/// `Array.prototype.slice`; anything else throws `<x> is not iterable`. A
+/// value whose chain holds a `@@iterator` (a user hook, `__symbol_get`; no
+/// builtin defines one before Y2) throws the interim `TypeError` first
+/// (design/symbol-strings.md §9.4).
 pub(super) fn emit_iter_source(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, item, key, entry) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
@@ -25,6 +28,15 @@ pub(super) fn emit_iter_source(
         wasm!(function; I32Const(kind), I32Eq);
     };
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(value));
+    emit_hook_guard(
+        function,
+        value,
+        WellKnown::Iterator,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    return_if_pending(function);
     // A `String` wrapper iterates its string.
     emit_is_wrapper(function, value, abi::CLASS_STRING);
     wasm!(function;

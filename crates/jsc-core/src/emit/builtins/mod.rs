@@ -36,6 +36,7 @@ mod object;
 mod object_static;
 mod promise;
 mod string;
+mod symbol;
 
 use crate::emit::realm::ArrayCopyOp;
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
@@ -216,23 +217,23 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(generator::strings())
         .chain(generator::async_strings())
         .chain(json::strings())
+        .chain(symbol::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
 /// Emit the body of `builtin`.
 pub(super) fn emit_builtin(
     builtin: Builtin,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
-    let k = helpers.max_args;
+    let (k, mut f) = (helpers.max_args, Frame::function());
     let frame = Frame { k };
-    let mut f = Frame::function();
     helpers.unwind.borrow_mut().reset();
     match builtin {
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(&mut f, frame, strings, helpers),
-        Builtin::ObjectToString => object::emit_to_string(&mut f, frame, strings),
+        Builtin::ObjectToString => object::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::ValueOf => object::emit_value_of(&mut f, frame, strings, helpers),
         Builtin::IsPrototypeOf => object::emit_is_prototype_of(&mut f, frame, strings, helpers),
         Builtin::ToLocaleString => object::emit_to_locale_string(&mut f, frame, strings, helpers),
@@ -297,7 +298,7 @@ pub(super) fn emit_builtin(
         | Builtin::CollectionOp { .. }
         | Builtin::CollectionForEach { .. }
         | Builtin::CollectionSize { .. }
-        | Builtin::Ctor(BuiltinCtor::Map | BuiltinCtor::Set)
+        | Builtin::Ctor(BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol)
         | Builtin::PromiseThen
         | Builtin::PromiseCatch
         | Builtin::PromiseFinally
@@ -313,6 +314,7 @@ pub(super) fn emit_builtin(
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
         Builtin::IsFinite => global::emit_is_finite(&mut f, frame, helpers),
+        Builtin::Symbol(op) => symbol::emit(op, &mut f, frame, strings, helpers),
         Builtin::Math(_)
         | Builtin::ConsoleLog
         | Builtin::Ctor(_)
@@ -331,7 +333,7 @@ fn emit_fragment(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
@@ -344,7 +346,7 @@ fn emit_string_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -368,7 +370,7 @@ fn emit_object_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -390,6 +392,7 @@ fn emit_object_family(
         Builtin::CollectionSize { set } => map_set::emit_size(set, f, frame, strings, helpers),
         Builtin::Ctor(BuiltinCtor::Map) => map_set::emit_ctor(false, f, frame, strings, helpers),
         Builtin::Ctor(BuiltinCtor::Set) => map_set::emit_ctor(true, f, frame, strings, helpers),
+        Builtin::Ctor(BuiltinCtor::Symbol) => symbol::emit_ctor(f, frame, strings, helpers),
         Builtin::PromiseThen => promise::emit_then(false, f, frame, strings, helpers),
         Builtin::PromiseCatch => promise::emit_then(true, f, frame, strings, helpers),
         Builtin::PromiseFinally => promise::emit_finally(f, frame, strings, helpers),
@@ -415,7 +418,7 @@ fn emit_array_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -465,7 +468,7 @@ fn emit_number_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -500,7 +503,7 @@ fn throw_type_error(
     function: &mut Function,
     frame: Frame,
     text: CalleeErrorText<'_>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_throw_not_a_function(function, text, frame.scratch(), strings, helpers);
@@ -530,7 +533,7 @@ fn this_primitive(
     class: u8,
     is_prim: fn(&mut Function, u32),
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(out));
@@ -560,39 +563,48 @@ fn this_primitive(
 }
 
 /// `__to_object(v: i64) -> i64`: `ToObject` of a non-nullish jsval: a
-/// string, number or boolean becomes a fresh wrapper object (DESIGN.md §5.2) over
-/// its realm prototype; any other value (an object, or `null`/`undefined`,
+/// string, symbol, number or boolean becomes a fresh wrapper object (DESIGN.md
+/// §5.2) over its realm prototype; any other value (an object, or `null`/`undefined`,
 /// which callers reject first) is returned as is. A String wrapper's
 /// `length` and indices are defined as its own read-only, non-configurable
 /// properties (the indices enumerable), so every property operation sees them.
-pub(super) fn emit_to_object(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_to_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![
         (2, ValType::I32),
         (1, ValType::I64),
         (3, ValType::I32),
     ]);
     let (v, obj, class, proto, len, idx, string) = (0, 1, 2, 3, 4, 5, 6);
-    let wrap = |f: &mut Function, c: u8, ctor: BuiltinCtor| {
+    let wrap = |f: &mut Function, c: u8, proto_bits: i64| {
         wasm!(f;
             I32Const(i32::from(c)), LocalSet(class),
-            I64Const(intrinsic_bits(realm::prototype_of(ctor), helpers)), LocalSet(proto),
+            I64Const(proto_bits), LocalSet(proto),
         );
     };
+    let ctor_proto = |ctor| intrinsic_bits(realm::prototype_of(ctor), helpers);
     emit_is_string(&mut f, v);
     wasm!(f; If(BlockType::Empty));
-    wrap(&mut f, abi::CLASS_STRING, BuiltinCtor::String);
+    wrap(&mut f, abi::CLASS_STRING, ctor_proto(BuiltinCtor::String));
+    wasm!(f; Else);
+    emit_is_symbol(&mut f, v);
+    wasm!(f; If(BlockType::Empty));
+    wrap(
+        &mut f,
+        abi::CLASS_SYMBOL,
+        intrinsic_bits(SYMBOL_PROTOTYPE, helpers),
+    );
     wasm!(f; Else);
     emit_is_number(&mut f, v);
     wasm!(f; If(BlockType::Empty));
-    wrap(&mut f, abi::CLASS_NUMBER, BuiltinCtor::Number);
+    wrap(&mut f, abi::CLASS_NUMBER, ctor_proto(BuiltinCtor::Number));
     wasm!(f;
         Else,
         LocalGet(v), I64Const(TRUE_BITS), I64Eq, LocalGet(v), I64Const(FALSE_BITS), I64Eq, I32Or,
         I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End,
     );
-    wrap(&mut f, abi::CLASS_BOOLEAN, BuiltinCtor::Boolean);
+    wrap(&mut f, abi::CLASS_BOOLEAN, ctor_proto(BuiltinCtor::Boolean));
     wasm!(f;
-        End, End,
+        End, End, End,
         I32Const(abi::WRAPPER_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(obj),
         LocalGet(class), I32Const(24), I32Shl, I32Const(TYPE_OBJECT), I32Or,
         I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),
@@ -650,7 +662,7 @@ fn emit_drop(
     function: &mut Function,
     frame: Frame,
     node: &IrNode,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(node, function, frame.scratch(), strings, helpers);
@@ -685,6 +697,6 @@ fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Fu
 }
 
 /// Push the heap jsval of the static string `text`.
-fn push_str(function: &mut Function, strings: &HashMap<String, i32>, text: &str) {
+fn push_str(function: &mut Function, strings: &StrOffsets, text: &str) {
     wasm!(function; I64Const(HEAP_BITS | i64::from(static_key(strings, text))));
 }

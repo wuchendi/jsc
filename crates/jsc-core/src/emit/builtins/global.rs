@@ -88,7 +88,7 @@ pub(super) fn emit_parse(
     int: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s, radix) = (frame.i64(0), frame.i64(1));

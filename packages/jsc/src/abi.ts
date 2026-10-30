@@ -47,8 +47,16 @@ export const TYPE_PROMISE = 8
 export const TYPE_GENERATOR = 9
 /** TYPE BYTE of a `Date` block (prefix, then `ms:f64`). */
 export const TYPE_DATE = 10
+/** TYPE BYTE of a Symbol primitive (`[type=14][gc][flags][class][reserved:u32][description:i64]`). */
+export const TYPE_SYMBOL = 14
+/** Byte offset (from a {@link TYPE_SYMBOL} block base) of the `description` jsval (a string or `undefined`). */
+export const SYMBOL_DESCRIPTION_OFFSET = 8
+/** Byte size of a {@link TYPE_SYMBOL} block. */
+export const SYMBOL_BLOCK_SIZE = 16
+/** {@link TYPE_SYMBOL} `flags` bit: the symbol is in the `Symbol.for` registry. */
+export const SYMBOL_FLAG_REGISTERED = 4
 
-/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
+/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`, `TWO_BYTE`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
 export const HEADER_FLAGS_OFFSET = 2
 /** Header byte 3: the `TYPE_OBJECT` sub-`class` byte. */
 export const HEADER_CLASS_OFFSET = 3
@@ -62,11 +70,15 @@ export const CLASS_BOOLEAN = 3
 export const CLASS_NUMBER = 4
 /** `TYPE_OBJECT` `class` byte of a String wrapper object. */
 export const CLASS_STRING = 5
+/** `TYPE_OBJECT` `class` byte of a Symbol wrapper object. */
+export const CLASS_SYMBOL = 7
 /** Offset of a wrapper object's `[[PrimitiveValue]]` jsval. */
 export const WRAPPER_VALUE_OFFSET = 16
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
-/** Byte offset of a string block's `len:u32` (header | len @4 | data @8). */
+/** String `flags` bit: the data is UTF-16LE code units (absent: Latin-1 bytes). */
+export const STR_FLAG_TWO_BYTE = 4
+/** Byte offset of a string block's `len:u32`, in UTF-16 code units (header | len @4 | data @8). */
 export const STR_LEN_OFFSET = 4
 /** Byte offset of a string block's data. */
 export const STR_DATA_OFFSET = 8
@@ -92,6 +104,8 @@ export const PROP_ATTRS_OFFSET = 4
 export const PROP_VALUE_OFFSET = 8
 /** Property table `tflags` bit: some key is a canonical array index (list integer keys first). */
 export const PROPS_HAS_INDEX_KEYS = 1
+/** Property table `tflags` bit: some key is a {@link TYPE_SYMBOL} block. */
+export const PROPS_HAS_SYMBOL_KEYS = 8
 /** Property `attrs` bit: the key is listed by enumeration and rendering. */
 export const ATTR_ENUMERABLE = 2
 /** Property `attrs` bit: the value is a getter/setter pair. */

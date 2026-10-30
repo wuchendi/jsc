@@ -45,7 +45,7 @@ pub(super) fn fragments() -> Vec<IrNode> {
 /// or reviver walk.
 fn root_holder(value: u32) -> IrNode {
     IrNode::Object {
-        entries: vec![(PropKey::Static(String::new()), IrNode::Local(value))],
+        entries: vec![(PropKey::Static("".into()), IrNode::Local(value))],
         proto: None,
         class: abi::CLASS_ORDINARY,
         reserve: 0,
@@ -153,7 +153,7 @@ fn call_with(function: &mut Function, target: u32, this: u32, args: &[u32], help
 pub(super) fn emit_stringify(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, rep, list, s) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -326,7 +326,7 @@ fn emit_gap(function: &mut Function, frame: Frame, space: u32, gap: u32, helpers
 pub(super) fn emit_parse(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (text, reviver, value) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -356,7 +356,8 @@ pub(super) fn emit_parse(
 
 /// `__json_rep(holder, key, value, replacer, list, stack) -> i64`:
 /// `SerializeJSONProperty` — the JSON text of `value` (the property `key` of
-/// `holder`) as a string jsval, or `undefined` when it is not serializable.
+/// `holder`) as a string jsval, or `undefined` when it is not serializable
+/// (`undefined`, a function, a symbol).
 /// An object's callable `toJSON` maps `value` first, called with `this =
 /// value` and the key; then the replacer function (when not `undefined`),
 /// called with `this = holder`. `key` is a string jsval, or an array index
@@ -367,10 +368,7 @@ pub(super) fn emit_parse(
 /// arrays and objects being serialized: meeting one again throws a
 /// `TypeError`. A throw returns with it pending.
 #[allow(clippy::too_many_lines)]
-pub(in crate::emit) fn emit_json_rep(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(in crate::emit) fn emit_json_rep(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (holder, key, value, rep, list, stack) = (0, 1, 2, 3, 4, 5);
     let (ptr, n, i, first, acc, keys, j, m) = (6, 7, 8, 9, 10, 11, 12, 13);
     let (elem, s, k, to_json) = (14, 15, 16, 17);
@@ -422,6 +420,8 @@ pub(in crate::emit) fn emit_json_rep(
     unwrap_primitive(&mut f, value);
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
     emit_is_function(&mut f, value);
+    wasm!(f; I32Or);
+    emit_is_symbol(&mut f, value);
     wasm!(f; I32Or, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
     emit_is_object(&mut f, value);
     wasm!(f;

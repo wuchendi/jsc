@@ -1295,9 +1295,11 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// number and a string coerce the string via the `__convert` `ToNumber` import
 /// and compare as `f64`; an object against a (non-nullish) primitive is
 /// replaced by its `ToPrimitive` (hint default, `__to_primitive`) and compared
-/// again (a user `valueOf`/`toString` throw leaves it pending and yields `0`);
+/// again (a user `valueOf`/`toString` throw leaves it pending and yields `0`;
+/// a symbol is a primitive here, so `Object(sym) == sym` holds);
 /// anything else compares by raw identity bits (two distinct objects differ;
-/// the same object is equal). The two `i64` params occupy locals 0/1; they are
+/// the same object is equal; a symbol equals only itself, never a number or
+/// string, without coercion). The two `i64` params occupy locals 0/1; they are
 /// mutated in place, so no extra locals are needed.
 pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
     let (str_eq_index, convert_index) = (helpers.str_eq, helpers.convert);

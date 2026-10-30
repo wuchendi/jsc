@@ -180,7 +180,7 @@ fn this_object(
     frame: Frame,
     o: u32,
     nullish: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(o));
@@ -224,7 +224,7 @@ fn length_of(
     function: &mut Function,
     o: u32,
     len: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(o), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get));
@@ -277,7 +277,7 @@ fn to_integer(function: &mut Function, r: u32, helpers: Helpers<'_>) {
 pub(super) fn emit_push(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -339,7 +339,7 @@ pub(super) fn emit_push(
         LocalGet(flen), LocalGet(n), F64ConvertI32U, F64Add,
         I64ReinterpretF64, LocalSet(kv),
     );
-    let length = IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = IrNode::Str(INDEX_LENGTH_KEY.into());
     emit_drop(function, frame, &set(o, length, kv), strings, helpers);
     wasm!(function; LocalGet(kv));
 }
@@ -350,12 +350,12 @@ pub(super) fn emit_push(
 pub(super) fn emit_pop(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
     let len = frame.yf64(0);
-    let length = || IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = || IrNode::Str(INDEX_LENGTH_KEY.into());
     this_object(function, frame, o, POP.nullish, strings, helpers);
     is_array(function, o);
     wasm!(function; If(BlockType::Empty));
@@ -404,7 +404,7 @@ pub(super) fn emit_hof(
     op: ArrayHofOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = hof_texts(op);
@@ -563,7 +563,7 @@ pub(super) fn emit_search(
     includes: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = if includes { &INCLUDES } else { &INDEX_OF };
@@ -642,7 +642,7 @@ pub(super) fn emit_search(
 pub(super) fn emit_join(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, sep_v, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -693,7 +693,7 @@ pub(super) fn emit_join(
 pub(super) fn emit_to_locale_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, f) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -754,7 +754,7 @@ pub(super) fn emit_to_locale_string(
 pub(super) fn emit_slice(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, end_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -817,7 +817,7 @@ pub(super) fn emit_slice(
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, join, base) = (frame.i64(0), frame.i64(1), frame.i32(0));
@@ -1040,7 +1040,7 @@ fn require_callable(
     frame: Frame,
     local: u32,
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_function(function, local);
@@ -1070,14 +1070,14 @@ fn array_create(
     frame: Frame,
     len: u32,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
         I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         LocalSet(out),
     );
-    let length = IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = IrNode::Str(INDEX_LENGTH_KEY.into());
     emit_drop(function, frame, &set(out, length, len), strings, helpers);
 }
 
@@ -1090,7 +1090,7 @@ fn construct_or_create(
     c: u32,
     len: Option<u32>,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
@@ -1118,14 +1118,16 @@ fn construct_or_create(
 /// throws, and an object is its own species when its prototype chain reaches
 /// a builtin constructor with a `@@species` getter returning `this`
 /// (`%Array%`, `%Map%`, `%Set%`, `%Promise%`), else (`C[@@species]` is
-/// `undefined`) an array is created; `%Array%` itself creates an array. There
-/// is no `Symbol`, so no other `@@species` exists (DESIGN.md §13).
+/// `undefined`) an array is created; `%Array%` itself creates an array. No
+/// builtin defines `@@species` yet, so a `C` whose chain holds a `@@species`
+/// (a user hook, `__symbol_get`) throws the interim `TypeError` (Y4 honours
+/// it, design/symbol-strings.md §9.4).
 fn species_ctor(
     function: &mut Function,
     frame: Frame,
     o: u32,
     c: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (walk, found) = (frame.y64(5), frame.y32(0));
@@ -1141,8 +1143,17 @@ fn species_ctor(
     emit_is_object(function, c);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, CTOR_NOT_OBJECT, strings, helpers);
+    wasm!(function; End);
+    emit_hook_guard(
+        function,
+        c,
+        WellKnown::Species,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    return_if_pending(function);
     wasm!(function;
-        End,
         LocalGet(c), LocalSet(walk), I32Const(0), LocalSet(found),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
@@ -1185,7 +1196,7 @@ fn species_from(
     c: u32,
     len: u32,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(c), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
@@ -1204,7 +1215,7 @@ fn species_create(
     o: u32,
     len: u32,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let c = frame.y64(0);
@@ -1222,7 +1233,7 @@ fn create_data_property(
     a: u32,
     key: u32,
     v: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (k, entry) = (frame.y32(2), frame.y32(3));
@@ -1262,10 +1273,10 @@ fn set_length(
     frame: Frame,
     a: u32,
     len: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let length = IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = IrNode::Str(INDEX_LENGTH_KEY.into());
     emit_drop(function, frame, &set(a, length, len), strings, helpers);
 }
 
@@ -1289,7 +1300,7 @@ fn down_loop_f64(function: &mut Function, k: u32, body: impl FnOnce(&mut Functio
 pub(super) fn emit_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (c, target, item, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1342,12 +1353,14 @@ fn close_on_throw(function: &mut Function, frame: Frame, generator: u32, helpers
 /// `arguments`, walked live) fills `A = IsConstructor(this) ?
 /// Construct(this) : ArrayCreate(0)` by `CreateDataPropertyOrThrow`; any
 /// other object is an array-like (`ToObject`, `LengthOfArrayLike`, `A` from
-/// `Construct(this, [len])`, `Get` per index). `A.length` is set last.
+/// `Construct(this, [len])`, `Get` per index). `A.length` is set last. An
+/// `items` whose chain holds a `@@iterator` (a user hook, `__symbol_get`)
+/// throws the interim `TypeError` (design/symbol-strings.md §9.4).
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_from(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (c, items, map_fn, this_arg) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1370,6 +1383,16 @@ pub(super) fn emit_from(
     wasm!(function; If(BlockType::Empty));
     throw_type_error(function, frame, FROM_NULLISH, strings, helpers);
     wasm!(function; End);
+    // A user `@@iterator` is not honoured before Y2 (§9.4).
+    emit_hook_guard(
+        function,
+        items,
+        WellKnown::Iterator,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    return_if_pending(function);
     // `v = mapFn(v, k)` when mapping, then `A[k] = v`, `k += 1`.
     let store = |function: &mut Function, close: bool| {
         wasm!(function; LocalGet(mapping), If(BlockType::Empty));
@@ -1477,7 +1500,7 @@ fn length_of_f64(
     function: &mut Function,
     o: u32,
     len: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(o), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get));
@@ -1498,7 +1521,7 @@ fn length_of_f64(
 pub(super) fn emit_at(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let o = frame.i64(0);
@@ -1529,7 +1552,7 @@ pub(super) fn emit_find(
     op: ArrayFindOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = find_texts(op);
@@ -1609,7 +1632,7 @@ pub(super) fn emit_find(
 pub(super) fn emit_reduce_right(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, callback, this_arg, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1668,7 +1691,7 @@ pub(super) fn emit_reduce_right(
 pub(super) fn emit_last_index_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -1724,13 +1747,15 @@ pub(super) fn emit_last_index_of(
 // --- concat / flat / flatMap --------------------------------------------------------
 
 /// `Array.prototype.concat(...items)`: `A = ArraySpeciesCreate(O, 0)`; for
-/// each of `O, ...items` an array (`IsArray`; no `@@isConcatSpreadable`)
-/// appends its present indices at `n + k` (`n` advancing over holes too), any
-/// other value is one element; then `Set(A, "length", n)`.
+/// each of `O, ...items` an array (`IsArray`) appends its present indices at
+/// `n + k` (`n` advancing over holes too), any other value is one element;
+/// then `Set(A, "length", n)`. An object item whose chain holds a
+/// `@@isConcatSpreadable` (`__symbol_get`) throws the interim `TypeError`
+/// (Y4 honours it, design/symbol-strings.md §9.4).
 pub(super) fn emit_concat(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, item, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1753,6 +1778,18 @@ pub(super) fn emit_concat(
         I32Const(0), LocalSet(j),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
+    emit_is_object(function, item);
+    wasm!(function; If(BlockType::Empty));
+    emit_hook_guard(
+        function,
+        item,
+        WellKnown::IsConcatSpreadable,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    wasm!(function; End);
+    return_if_pending(function);
     is_array(function, item);
     wasm!(function; If(BlockType::Empty));
     length_of(function, item, len, strings, helpers);
@@ -1798,7 +1835,7 @@ pub(super) fn emit_flat(
     map: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = if map { &FLAT_MAP } else { &FLAT };
@@ -2054,7 +2091,7 @@ fn set_at(
     function: &mut Function,
     frame: Frame,
     (o, f, v, kv): (u32, u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2074,7 +2111,7 @@ fn delete_at(
     function: &mut Function,
     frame: Frame,
     (o, f, kv): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2090,7 +2127,7 @@ fn move_or_delete(
     frame: Frame,
     (o, from, to): (u32, u32, u32),
     (key, v, kv): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     has_at(function, o, from, key, helpers);
@@ -2108,7 +2145,7 @@ fn set_length_f64(
     function: &mut Function,
     frame: Frame,
     (o, f, kv): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2124,7 +2161,7 @@ fn check_new_length(
     frame: Frame,
     len: u32,
     delta: impl FnOnce(&mut Function),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(len));
@@ -2149,7 +2186,7 @@ fn check_new_length(
 pub(super) fn emit_splice(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2284,7 +2321,7 @@ pub(super) fn emit_splice(
 pub(super) fn emit_reverse(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, lv, uv, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2334,7 +2371,7 @@ pub(super) fn emit_reverse(
 pub(super) fn emit_shift(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, first, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2376,7 +2413,7 @@ pub(super) fn emit_shift(
 pub(super) fn emit_unshift(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, saved) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
@@ -2434,7 +2471,7 @@ pub(super) fn emit_unshift(
 pub(super) fn emit_fill(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, end_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2469,7 +2506,7 @@ pub(super) fn emit_fill(
 pub(super) fn emit_copy_within(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, target_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2552,7 +2589,7 @@ pub(super) fn emit_sort(
     copy: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, cmp, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2770,7 +2807,7 @@ fn put_at(
     function: &mut Function,
     frame: Frame,
     (a, f, v, kv): (u32, u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2784,7 +2821,7 @@ fn array_create_f64(
     function: &mut Function,
     frame: Frame,
     (len, kv, out): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, len);
@@ -2800,7 +2837,7 @@ fn array_create_f64(
 pub(super) fn emit_with(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, index_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2825,8 +2862,8 @@ pub(super) fn emit_with(
     );
     let error = IrNode::error_object(
         ErrorKind::RangeError,
-        Some(IrNode::Str(WITH_OUT_OF_RANGE[0].to_owned())),
-        IrNode::Str(WITH_OUT_OF_RANGE[1].to_owned()),
+        Some(IrNode::Str(WITH_OUT_OF_RANGE[0].into())),
+        IrNode::Str(WITH_OUT_OF_RANGE[1].into()),
     );
     emit_throw_error(&error, function, frame.scratch(), strings, helpers);
     wasm!(function; End);
@@ -2854,7 +2891,7 @@ pub(super) fn emit_with(
 pub(super) fn emit_to_reversed(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, a, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2889,7 +2926,7 @@ pub(super) fn emit_to_reversed(
 pub(super) fn emit_to_spliced(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, elem, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
