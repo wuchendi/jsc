@@ -127,25 +127,56 @@ fn is_promise(function: &mut Function, local: u32) {
 
 /// `this.then(undefined, onRejected)` over the frame's locals.
 fn catch_call(frame: Frame) -> IrNode {
-    IrNode::MethodCallUser {
-        obj: Box::new(IrNode::Local(frame.i64(0))),
-        key: Box::new(IrNode::Str("then".into())),
-        args: vec![IrNode::Undefined, IrNode::Local(frame.i64(1))],
-        obj_local: frame.i64(3),
-        callee_local: frame.x64(0),
-        not_callable: CalleeError::not_a_function("then"),
-    }
+    let args = vec![IrNode::Undefined, IrNode::Local(frame.i64(1))];
+    method_then(frame, frame.i64(0), args, [frame.i64(3), frame.x64(0)])
 }
 
 /// `this.then(...args)` (`Invoke`) over the frame's locals.
 fn invoke_then(frame: Frame, this: u32, args: Vec<IrNode>) -> IrNode {
-    IrNode::MethodCallUser {
-        obj: Box::new(IrNode::Local(this)),
-        key: Box::new(IrNode::Str("then".into())),
-        args,
-        obj_local: frame.y64(2),
-        callee_local: frame.y64(3),
-        not_callable: CalleeError::not_a_function("then"),
+    method_then(frame, this, args, [frame.y64(2), frame.y64(3)])
+}
+
+/// `Invoke(this, "then", args)` with the receiver kept in `obj_local` (and
+/// the method in `callee_local`). More arguments than the `K` slots (a
+/// two-handler `then` in a program whose widest call takes one) take the
+/// spread call, which passes the full `argc` and publishes the arguments past
+/// `K` for a builtin `then` reached through a subclass.
+fn method_then(
+    frame: Frame,
+    this: u32,
+    args: Vec<IrNode>,
+    [obj_local, callee_local]: [u32; 2],
+) -> IrNode {
+    let not_callable = CalleeError::not_a_function("then");
+    if args.len() <= frame.k as usize {
+        return IrNode::MethodCallUser {
+            obj: Box::new(IrNode::Local(this)),
+            key: Box::new(IrNode::Str("then".into())),
+            args,
+            obj_local,
+            callee_local,
+            not_callable,
+        };
+    }
+    let callee = IrNode::Seq(vec![
+        IrNode::Assign {
+            local: obj_local,
+            value: Box::new(IrNode::Local(this)),
+        },
+        IrNode::Index {
+            obj: Box::new(IrNode::Local(obj_local)),
+            index: Box::new(IrNode::Str("then".into())),
+        },
+    ]);
+    IrNode::CallSpread {
+        target: SpreadCallee::Method {
+            callee: Box::new(callee),
+            this_local: obj_local,
+            not_callable,
+        },
+        args: Box::new(IrNode::ArraySpread(
+            args.into_iter().map(SpreadElem::Item).collect(),
+        )),
     }
 }
 

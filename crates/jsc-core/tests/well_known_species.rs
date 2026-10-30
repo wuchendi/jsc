@@ -295,6 +295,9 @@ fn plain_array_species_methods_without_accessors() {
     assert_string("[1, [2, [3]]].flat().length + ''", "3");
     assert_string("[1, 2].flatMap((x) => [x, x]).join()", "1,1,2,2");
     assert_bool("Array.isArray([1, 2, 3].slice(1))", true);
+    assert_string("[1, 2].concat([3]).join()", "1,2,3");
+    assert_string("[1, 2, 3].splice(0, 1).join()", "1");
+    assert_string("[1, 2, 3].slice().join()", "1,2,3");
 }
 
 #[test]
