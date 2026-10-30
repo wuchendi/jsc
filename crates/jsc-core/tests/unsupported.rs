@@ -203,37 +203,3 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "TypeError: o.getFullYear is not a function",
     );
 }
-
-// ---------------------------------------------------------------------------
-// Interim guards (design/symbol-strings.md §9.4): a user well-known symbol
-// hook a consult site does not honour yet throws a named `TypeError`, never a
-// silently wrong result. Each test is deleted by the stage that honours it.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn user_species_throws_until_y4() {
-    let text = "TypeError: Symbol.species is not supported yet";
-    let setup =
-        "let C = function () {}; C[Symbol.species] = Array; let a = [1]; a.constructor = C;";
-    for method in [
-        "a.map(x => x)",
-        "a.filter(x => x)",
-        "a.slice()",
-        "a.concat()",
-    ] {
-        assert_uncaught(&format!("{setup} {method}"), text);
-    }
-}
-
-#[test]
-fn is_concat_spreadable_throws_until_y4() {
-    let text = "TypeError: Symbol.isConcatSpreadable is not supported yet";
-    assert_uncaught(
-        "let o = { [Symbol.isConcatSpreadable]: true, length: 1, 0: 'x' }; [].concat(o)",
-        text,
-    );
-    assert_uncaught(
-        "let a = [1]; a[Symbol.isConcatSpreadable] = false; a.concat([2])",
-        text,
-    );
-}

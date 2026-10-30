@@ -60,85 +60,6 @@ pub(super) const SYMBOL_TO_NUMBER: CalleeErrorText<'static> = [
     "TypeError: Cannot convert a Symbol value to a number",
 ];
 
-/// The interim `TypeError`s of a well-known symbol hook a consult site finds
-/// before the stage that honours it (design/symbol-strings.md §9.4), in
-/// [`hook_text`] order.
-const HOOK_TEXTS: [CalleeErrorText<'static>; 2] = [
-    [
-        "Symbol.species is not supported yet",
-        "TypeError: Symbol.species is not supported yet",
-    ],
-    [
-        "Symbol.isConcatSpreadable is not supported yet",
-        "TypeError: Symbol.isConcatSpreadable is not supported yet",
-    ],
-];
-
-/// The interim `TypeError` of a `symbol` hook (see [`HOOK_TEXTS`]); `None`
-/// for the symbols without an interim guard (`@@iterator`, honoured by the
-/// iteration protocol; `@@toPrimitive` / `@@toStringTag`, honoured by
-/// `ToPrimitive` / `Object.prototype.toString`; `@@hasInstance`, honoured by
-/// `instanceof`; `@@match` / `@@matchAll` / `@@replace` / `@@search` /
-/// `@@split`, honoured by the String methods; `@@asyncIterator`,
-/// `@@unscopables`, without a consult site).
-pub(super) fn hook_text(symbol: WellKnown) -> Option<CalleeErrorText<'static>> {
-    let at = match symbol {
-        WellKnown::Species => 0,
-        WellKnown::IsConcatSpreadable => 1,
-        WellKnown::Iterator
-        | WellKnown::AsyncIterator
-        | WellKnown::Unscopables
-        | WellKnown::ToPrimitive
-        | WellKnown::ToStringTag
-        | WellKnown::HasInstance
-        | WellKnown::Match
-        | WellKnown::MatchAll
-        | WellKnown::Replace
-        | WellKnown::Search
-        | WellKnown::Split => return None,
-    };
-    Some(HOOK_TEXTS[at])
-}
-
-/// Push i32 `1` when `Get(v, symbol)` of the jsval in i64 `local` is not
-/// `undefined` (`__symbol_get`: no lookup unless the chain holds a symbol
-/// key).
-pub(super) fn emit_has_hook(
-    function: &mut Function,
-    local: u32,
-    symbol: WellKnown,
-    helpers: Helpers<'_>,
-) {
-    wasm!(function;
-        LocalGet(local), I32Const(realm::symbol_addr(symbol, helpers)), Call(helpers.symbol_get()),
-        I64Const(UNDEFINED_BITS), I64Ne,
-    );
-}
-
-/// Throw the interim `TypeError` of `symbol` (design/symbol-strings.md §9.4)
-/// when the jsval in i64 `local` has a `symbol` hook ([`emit_has_hook`]):
-/// the consult site does not honour a user hook before its stage. Usable in
-/// a user function, a builtin body (`scratch` = its frame's scratch) or a
-/// helper.
-pub(super) fn emit_hook_guard(
-    function: &mut Function,
-    local: u32,
-    symbol: WellKnown,
-    scratch: u32,
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-) {
-    let Some(text) = hook_text(symbol) else {
-        return;
-    };
-    emit_has_hook(function, local, symbol, helpers);
-    wasm!(function; If(BlockType::Empty));
-    enter_frame(helpers);
-    emit_throw_not_a_function(function, text, scratch, strings, helpers);
-    leave_frame(helpers);
-    wasm!(function; End);
-}
-
 /// The default `join` separator.
 const COMMA: &str = ",";
 
@@ -150,7 +71,7 @@ pub(super) const SYMBOL_CLOSE: &str = ")";
 
 /// The static strings of this family.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
-    HOOK_TEXTS.into_iter().flatten().chain(STRINGS)
+    STRINGS.into_iter()
 }
 
 /// The fixed static strings of this family (see [`strings`]).

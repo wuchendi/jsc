@@ -104,11 +104,14 @@ struct Frame {
 }
 
 impl Frame {
-    /// The frame of a builtin body under the program's arity `K`.
-    fn of(helpers: Helpers<'_>) -> Self {
-        Self {
+    /// Start a builtin body under the program's arity `K`: its wasm function
+    /// and frame, with the unwind state reset.
+    fn begin(helpers: Helpers<'_>) -> (Function, Self) {
+        helpers.unwind.borrow_mut().reset();
+        let frame = Self {
             k: helpers.max_args,
-        }
+        };
+        (Self::function(), frame)
     }
 
     /// The wasm function with a frame's locals.
@@ -246,8 +249,7 @@ pub(super) fn emit_builtin(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
-    let (mut f, frame) = (Frame::function(), Frame::of(helpers));
-    helpers.unwind.borrow_mut().reset();
+    let (mut f, frame) = Frame::begin(helpers);
     match builtin {
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(&mut f, frame, strings, helpers),
@@ -329,6 +331,7 @@ pub(super) fn emit_builtin(
         | Builtin::AsyncGeneratorDrain
         | Builtin::AsyncGeneratorStep
         | Builtin::AsyncGeneratorReaction(_)
+        | Builtin::Species(_)
         | Builtin::DateGeneric(_) => emit_object_family(builtin, &mut f, frame, strings, helpers),
         Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
@@ -384,8 +387,8 @@ fn emit_string_family(
 }
 
 /// Emit the body of an `Object.prototype` accessor-or-enumerability method,
-/// or of a `Date`, `Map` / `Set`, `Promise` or (async) generator prototype
-/// builtin into `f` (the variants [`emit_builtin`] routes here).
+/// of a `Date`, `Map` / `Set`, `Promise` or (async) generator prototype
+/// builtin, or of a `@@species` builtin into `f` (the variants [`emit_builtin`] routes here).
 fn emit_object_family(
     builtin: Builtin,
     f: &mut Function,
@@ -432,6 +435,7 @@ fn emit_object_family(
         Builtin::AsyncGeneratorReaction(reaction) => {
             generator::emit_async_reaction(reaction, f, frame, strings, helpers);
         }
+        Builtin::Species(op) => promise::emit_species(op, f, frame, strings, helpers),
         // Only the variants `emit_builtin` routes here reach this match.
         _ => {}
     }
