@@ -42,6 +42,16 @@ pub(super) enum Intrinsic {
     /// (`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
     /// `Date`, `Symbol`): `constructor` and the prototype methods.
     Prototype(BuiltinCtor),
+    /// `%IteratorPrototype%`: `[@@iterator]() { return this }`; the `proto`
+    /// of every iterator prototype and of `%GeneratorPrototype%`.
+    IteratorPrototype,
+    /// `%ArrayIteratorPrototype%` / `%StringIteratorPrototype%` /
+    /// `%MapIteratorPrototype%` / `%SetIteratorPrototype%`: the `next` of the
+    /// family's `CLASS_ITERATOR` objects.
+    IterPrototype(IterFamily),
+    /// `%AsyncIteratorPrototype%`: `[@@asyncIterator]() { return this }`;
+    /// `%AsyncGeneratorPrototype%`'s `proto`.
+    AsyncIteratorPrototype,
     /// `%GeneratorPrototype%`: `next`, `return`, `throw`; every generator
     /// object's `proto`.
     GeneratorPrototype,
@@ -52,6 +62,40 @@ pub(super) enum Intrinsic {
     /// the global object): its table maps interned key strings to the
     /// registered symbols.
     SymbolRegistry,
+}
+
+/// A builtin iterator family: the receivers of one iterator prototype's
+/// `next` (design/symbol-strings.md §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IterFamily {
+    Array,
+    String,
+    Map,
+    Set,
+}
+
+impl IterFamily {
+    /// Every family, in image order.
+    pub(super) const ALL: [IterFamily; 4] = [Self::Array, Self::String, Self::Map, Self::Set];
+}
+
+/// What an Array, Map or Set iterator yields per step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IterKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+impl IterKind {
+    /// The creating method's name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Keys => "keys",
+            Self::Values => "values",
+            Self::Entries => "entries",
+        }
+    }
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
@@ -187,8 +231,10 @@ impl Intrinsic {
             | Self::Json
             | Self::Console
             | Self::Prototype(_)
-            | Self::GeneratorPrototype
-            | Self::AsyncGeneratorPrototype => Some(Self::ObjectPrototype),
+            | Self::IteratorPrototype
+            | Self::AsyncIteratorPrototype => Some(Self::ObjectPrototype),
+            Self::IterPrototype(_) | Self::GeneratorPrototype => Some(Self::IteratorPrototype),
+            Self::AsyncGeneratorPrototype => Some(Self::AsyncIteratorPrototype),
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
             // The native error constructors inherit from `Error`.
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
@@ -244,6 +290,11 @@ impl Intrinsic {
             Self::Console => 12,
             Self::GeneratorPrototype => 13,
             Self::Prototype(BuiltinCtor::Symbol) => 14,
+            Self::IteratorPrototype => 15,
+            Self::IterPrototype(IterFamily::Array) => 16,
+            Self::IterPrototype(IterFamily::String) => 17,
+            Self::IterPrototype(IterFamily::Map) => 18,
+            Self::IterPrototype(IterFamily::Set) => 19,
             _ => return None,
         })
     }
@@ -271,7 +322,10 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
         ])
         .chain(BuiltinCtor::ALL.map(Intrinsic::Ctor))
         .chain(PLAIN_PROTOTYPES.map(Intrinsic::Prototype))
+        .chain([Intrinsic::IteratorPrototype])
+        .chain(IterFamily::ALL.map(Intrinsic::IterPrototype))
         .chain([
+            Intrinsic::AsyncIteratorPrototype,
             Intrinsic::GeneratorPrototype,
             Intrinsic::AsyncGeneratorPrototype,
             Intrinsic::SymbolRegistry,
@@ -487,10 +541,9 @@ pub(super) enum Builtin {
     /// key (low half) and the not-a-function message (high half). Not
     /// installed on any intrinsic.
     MethodCall,
-    /// `GetIterator` of an [`IrNode::IterSource`]: `this` is the iterated
-    /// value, `env` is `1` for a live `Map` / `Set` walk. Not installed on
-    /// any intrinsic.
-    IterSource,
+    /// An internal builtin of the iteration protocol
+    /// (design/symbol-strings.md §5.1). Not installed on any intrinsic.
+    Protocol(ProtocolOp),
     /// The global `isNaN`.
     IsNaN,
     /// The global `isFinite`.
@@ -501,6 +554,111 @@ pub(super) enum Builtin {
     ParseInt,
     /// A `Symbol` static or `%Symbol.prototype%` builtin.
     Symbol(SymbolOp),
+    /// An iteration builtin (design/symbol-strings.md §5.4).
+    Iter(IterOp),
+}
+
+/// An internal builtin of the iteration protocol (design/symbol-strings.md
+/// §5.1), called by the record nodes and the consumers with `this` and
+/// `env` as below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProtocolOp {
+    /// The protocol half of `GetIterator`: `this` is the iterated value,
+    /// `env` its `@@iterator` method (`<x> is not iterable` unless
+    /// callable); returns the iterator the call yields (a `TypeError` unless
+    /// an object).
+    Open,
+    /// `IteratorStep`: `this` is the iterator, `env` its cached `next`;
+    /// returns the result object, or the hole once `done`.
+    Step,
+    /// `IteratorClose` of a non-throw completion: `this` is the iterator;
+    /// `GetMethod(this, "return")`, its call and the object check of its
+    /// result.
+    Close,
+    /// `IterableToList`: `this` is the iterated value; returns a fresh array
+    /// of the values its iterator yields.
+    ToList,
+}
+
+/// An iteration builtin: an iterator-creating method, a builtin iterator
+/// prototype's `next`, or a `[@@iterator]` returning `this`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IterOp {
+    /// `%IteratorPrototype%[@@iterator]`: returns `this`.
+    IteratorSelf,
+    /// `%AsyncIteratorPrototype%[@@asyncIterator]`: returns `this`.
+    AsyncIteratorSelf,
+    /// `Array.prototype.keys` / `values` (also `[@@iterator]`) / `entries`.
+    ArrayIter(IterKind),
+    /// `Map.prototype.keys` / `values` / `entries` (also `[@@iterator]`), or
+    /// `Set.prototype.values` (also `keys` and `[@@iterator]`) / `entries`.
+    CollectionIter {
+        /// `%Set.prototype%` rather than `%Map.prototype%`.
+        set: bool,
+        /// What the iterator yields.
+        kind: IterKind,
+    },
+    /// `String.prototype[@@iterator]`.
+    StringIterator,
+    /// The `next` of a builtin iterator prototype.
+    Next(IterFamily),
+}
+
+impl IterOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [IterOp; 15] = [
+        Self::IteratorSelf,
+        Self::AsyncIteratorSelf,
+        Self::ArrayIter(IterKind::Keys),
+        Self::ArrayIter(IterKind::Values),
+        Self::ArrayIter(IterKind::Entries),
+        Self::CollectionIter {
+            set: false,
+            kind: IterKind::Keys,
+        },
+        Self::CollectionIter {
+            set: false,
+            kind: IterKind::Values,
+        },
+        Self::CollectionIter {
+            set: false,
+            kind: IterKind::Entries,
+        },
+        Self::CollectionIter {
+            set: true,
+            kind: IterKind::Values,
+        },
+        Self::CollectionIter {
+            set: true,
+            kind: IterKind::Entries,
+        },
+        Self::StringIterator,
+        Self::Next(IterFamily::Array),
+        Self::Next(IterFamily::String),
+        Self::Next(IterFamily::Map),
+        Self::Next(IterFamily::Set),
+    ];
+
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::IteratorSelf | Self::StringIterator => "[Symbol.iterator]",
+            Self::AsyncIteratorSelf => "[Symbol.asyncIterator]",
+            Self::ArrayIter(kind) | Self::CollectionIter { kind, .. } => kind.name(),
+            Self::Next(_) => "next",
+        }
+    }
+
+    /// The prototype holding this builtin under its string [`Self::name`]
+    /// (the `[@@iterator]` ones are installed by `iterator_entries`).
+    fn prototype(self) -> Option<Intrinsic> {
+        match self {
+            Self::ArrayIter(_) => Some(Intrinsic::Prototype(BuiltinCtor::Array)),
+            Self::CollectionIter { set, .. } => Some(Intrinsic::Prototype(collection(set))),
+            Self::Next(family) => Some(Intrinsic::IterPrototype(family)),
+            Self::IteratorSelf | Self::AsyncIteratorSelf | Self::StringIterator => None,
+        }
+    }
 }
 
 /// A `Symbol` static or `%Symbol.prototype%` builtin.
@@ -904,7 +1062,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 239] = [
+    pub(super) const ALL: [Builtin; 257] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1160,7 +1318,10 @@ impl Builtin {
         Self::AsyncGeneratorReaction(AsyncGenReaction::ReturnRejected),
         Self::ThrowTypeError,
         Self::MethodCall,
-        Self::IterSource,
+        Self::Protocol(ProtocolOp::Open),
+        Self::Protocol(ProtocolOp::Step),
+        Self::Protocol(ProtocolOp::Close),
+        Self::Protocol(ProtocolOp::ToList),
         Self::IsNaN,
         Self::IsFinite,
         Self::ParseFloat,
@@ -1171,6 +1332,21 @@ impl Builtin {
         Self::Symbol(SymbolOp::ValueOf),
         Self::Symbol(SymbolOp::Description),
         Self::Symbol(SymbolOp::ToPrimitive),
+        Self::Iter(IterOp::ALL[0]),
+        Self::Iter(IterOp::ALL[1]),
+        Self::Iter(IterOp::ALL[2]),
+        Self::Iter(IterOp::ALL[3]),
+        Self::Iter(IterOp::ALL[4]),
+        Self::Iter(IterOp::ALL[5]),
+        Self::Iter(IterOp::ALL[6]),
+        Self::Iter(IterOp::ALL[7]),
+        Self::Iter(IterOp::ALL[8]),
+        Self::Iter(IterOp::ALL[9]),
+        Self::Iter(IterOp::ALL[10]),
+        Self::Iter(IterOp::ALL[11]),
+        Self::Iter(IterOp::ALL[12]),
+        Self::Iter(IterOp::ALL[13]),
+        Self::Iter(IterOp::ALL[14]),
     ];
 
     /// The function's `name`.
@@ -1180,7 +1356,7 @@ impl Builtin {
             | Self::ThrowTypeError
             | Self::MethodCall
             | Self::BoundCall
-            | Self::IterSource
+            | Self::Protocol(_)
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
             | Self::AsyncGeneratorReaction(_) => "",
@@ -1273,6 +1449,7 @@ impl Builtin {
             Self::ArrayCopy(op) => op.name(),
             Self::IsNaN => "isNaN",
             Self::IsFinite => "isFinite",
+            Self::Iter(op) => op.name(),
         }
     }
 
@@ -1283,7 +1460,7 @@ impl Builtin {
             | Self::ThrowTypeError
             | Self::MethodCall
             | Self::BoundCall
-            | Self::IterSource
+            | Self::Protocol(_)
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
             | Self::FunctionToString
@@ -1314,6 +1491,7 @@ impl Builtin {
             | Self::ArrayReverse
             | Self::ArrayShift
             | Self::ArrayCopy(ArrayCopyOp::ToReversed)
+            | Self::Iter(_)
             | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(
@@ -1393,6 +1571,7 @@ impl Builtin {
                 return Some(Intrinsic::GeneratorPrototype);
             }
             Self::AsyncGeneratorMethod(_) => return Some(Intrinsic::AsyncGeneratorPrototype),
+            Self::Iter(op) => return op.prototype(),
             _ => None,
         };
         ctor.map(Intrinsic::Prototype)
@@ -1822,6 +2001,67 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         entries.push(entry(prototype, "size", ACCESSOR_ATTRS, size));
     }
     symbol_prototype_entries(entries);
+    iterator_entries(entries);
+}
+
+/// The iteration entries (design/symbol-strings.md §5.4) past the methods
+/// [`Builtin::prototype`] installs: the `[@@iterator]` of `%Array.prototype%`
+/// (`=== values`), `%Map.prototype%` (`=== entries`), `%Set.prototype%`
+/// (`=== values`, as is `keys`) and `%String.prototype%`, and the
+/// `[@@iterator]` / `[@@asyncIterator]` returning `this` of
+/// `%IteratorPrototype%` / `%AsyncIteratorPrototype%`.
+fn iterator_entries(entries: &mut Vec<Entry>) {
+    let symbol = |intrinsic, symbol, builtin| Entry {
+        intrinsic,
+        key: Key::Symbol(symbol),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(builtin),
+    };
+    let set_values = Builtin::Iter(IterOp::CollectionIter {
+        set: true,
+        kind: IterKind::Values,
+    });
+    entries.extend([
+        Entry {
+            intrinsic: Intrinsic::Prototype(BuiltinCtor::Set),
+            key: Key::Str("keys"),
+            attrs: METHOD_ATTRS,
+            value: Value::Method(set_values),
+        },
+        symbol(
+            Intrinsic::Prototype(BuiltinCtor::Array),
+            WellKnown::Iterator,
+            Builtin::Iter(IterOp::ArrayIter(IterKind::Values)),
+        ),
+        symbol(
+            Intrinsic::Prototype(BuiltinCtor::Map),
+            WellKnown::Iterator,
+            Builtin::Iter(IterOp::CollectionIter {
+                set: false,
+                kind: IterKind::Entries,
+            }),
+        ),
+        symbol(
+            Intrinsic::Prototype(BuiltinCtor::Set),
+            WellKnown::Iterator,
+            set_values,
+        ),
+        symbol(
+            Intrinsic::Prototype(BuiltinCtor::String),
+            WellKnown::Iterator,
+            Builtin::Iter(IterOp::StringIterator),
+        ),
+        symbol(
+            Intrinsic::IteratorPrototype,
+            WellKnown::Iterator,
+            Builtin::Iter(IterOp::IteratorSelf),
+        ),
+        symbol(
+            Intrinsic::AsyncIteratorPrototype,
+            WellKnown::AsyncIterator,
+            Builtin::Iter(IterOp::AsyncIteratorSelf),
+        ),
+    ]);
 }
 
 /// The `%Symbol.prototype%` entries past `constructor` / `toString` /
@@ -2311,7 +2551,17 @@ mod tests {
             };
             let table = intrinsic_offset(&registry, intrinsic) + prefix;
             let tflags = image[(table + abi::PROPS_TFLAGS_OFFSET) as usize];
-            let symbol_keys = intrinsic == Intrinsic::Prototype(BuiltinCtor::Symbol);
+            let symbol_keys = matches!(
+                intrinsic,
+                Intrinsic::Prototype(
+                    BuiltinCtor::Symbol
+                        | BuiltinCtor::Array
+                        | BuiltinCtor::String
+                        | BuiltinCtor::Map
+                        | BuiltinCtor::Set
+                ) | Intrinsic::IteratorPrototype
+                    | Intrinsic::AsyncIteratorPrototype
+            );
             assert_eq!(
                 tflags & abi::PROPS_HAS_SYMBOL_KEYS != 0,
                 symbol_keys,
@@ -2323,6 +2573,61 @@ mod tests {
             Some(14)
         );
         assert_eq!(Intrinsic::SymbolRegistry.proto(), None);
+    }
+
+    #[test]
+    fn iterator_prototypes_form_the_spec_chain() {
+        use Intrinsic::{
+            AsyncGeneratorPrototype, AsyncIteratorPrototype, GeneratorPrototype, IterPrototype,
+            IteratorPrototype, ObjectPrototype,
+        };
+        assert_eq!(IteratorPrototype.proto(), Some(ObjectPrototype));
+        assert_eq!(AsyncIteratorPrototype.proto(), Some(ObjectPrototype));
+        assert_eq!(GeneratorPrototype.proto(), Some(IteratorPrototype));
+        assert_eq!(
+            AsyncGeneratorPrototype.proto(),
+            Some(AsyncIteratorPrototype)
+        );
+        for family in IterFamily::ALL {
+            assert_eq!(IterPrototype(family).proto(), Some(IteratorPrototype));
+            assert!(IterPrototype(family).watch_bit().is_some());
+        }
+        // Five new dirty bits (15..=19), all distinct.
+        let mut bits: Vec<u8> = intrinsics().filter_map(Intrinsic::watch_bit).collect();
+        bits.sort_unstable();
+        bits.dedup();
+        assert_eq!(bits, (0..=19).collect::<Vec<u8>>());
+        // The `[@@iterator]` aliases share one method block.
+        let registry = registry();
+        let symbol_method = |intrinsic, symbol| {
+            registry.iter().find_map(|e| {
+                (e.intrinsic == intrinsic && e.key == Key::Symbol(symbol)).then_some(e.value)
+            })
+        };
+        assert_eq!(
+            symbol_method(
+                Intrinsic::Prototype(BuiltinCtor::Array),
+                WellKnown::Iterator
+            ),
+            Some(Value::Method(Builtin::Iter(IterOp::ArrayIter(
+                IterKind::Values
+            ))))
+        );
+        let set_values = Builtin::Iter(IterOp::CollectionIter {
+            set: true,
+            kind: IterKind::Values,
+        });
+        assert_eq!(
+            method_of(Intrinsic::Prototype(BuiltinCtor::Set), "keys"),
+            Some(set_values)
+        );
+        assert_eq!(
+            symbol_method(Intrinsic::Prototype(BuiltinCtor::Map), WellKnown::Iterator),
+            Some(Value::Method(Builtin::Iter(IterOp::CollectionIter {
+                set: false,
+                kind: IterKind::Entries,
+            })))
+        );
     }
 
     #[test]

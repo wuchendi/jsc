@@ -359,10 +359,11 @@ pub(super) fn emit_for_each(
 /// [`super::ctor::fragment`], then, for a non-nullish `iterable`, each value
 /// it yields added through `map.set(k, v)` / `set.add(v)` (looked up on the
 /// new collection, so a user override runs; the builtin itself is called
-/// inline). The iterables are arrays, strings and generators (drained into
-/// an array first) and `Map`/`Set` handles (walked live; a Map yields its
-/// `[key, value]` entries); anything else is a `TypeError`. A `Map` entry
-/// must be an object, read at keys `"0"` and `"1"`.
+/// inline). A `Map`/`Set` on its iteration fast path is walked live (a Map
+/// yields its `[key, value]` entries); any other value is collected first
+/// through the iteration protocol (`IterableToList`; `<x> is not iterable`
+/// without one). A `Map` entry must be an object, read at keys `"0"` and
+/// `"1"`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_ctor(
     set: bool,
@@ -387,15 +388,6 @@ pub(super) fn emit_ctor(
     wasm!(function; LocalSet(src));
     emit_is_nullish(function, src);
     wasm!(function; If(BlockType::Empty), LocalGet(map), Return, End);
-    emit_hook_guard(
-        function,
-        src,
-        WellKnown::Iterator,
-        frame.scratch(),
-        strings,
-        helpers,
-    );
-    return_if_pending(function);
     let name = if set { "add" } else { "set" };
     wasm!(function;
         LocalGet(map), I32Const(static_key(strings, name)), Call(helpers.get), LocalSet(adder),
@@ -462,15 +454,14 @@ pub(super) fn emit_ctor(
         return_if_pending(function);
         wasm!(function; End);
     };
-    // A Map/Set source: its entries, live.
-    emit_is_pointer(function, src);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, src);
-    wasm!(function; I32Const(TYPE_MAP), I32Eq);
-    emit_load_type_byte(function, src);
+    // A Map/Set source on its iteration fast path (design/symbol-strings.md
+    // §5.3): its entries, live.
+    emit_iter_classify(function, src, false, at, helpers);
+    wasm!(function; LocalSet(item));
+    return_if_pending(function);
     wasm!(function;
-        I32Const(TYPE_SET), I32Eq, I32Or,
-        Else, I32Const(0), End,
+        LocalGet(item), I64Const(f64::to_bits(iter::ST_MAP).cast_signed()), I64Eq,
+        LocalGet(item), I64Const(f64::to_bits(iter::ST_SET).cast_signed()), I64Eq, I32Or,
         If(BlockType::Empty),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i),
@@ -491,19 +482,8 @@ pub(super) fn emit_ctor(
         LocalGet(map), Return,
         End,
     );
-    // An array, string or generator: its values, collected first.
-    emit_is_string(function, src);
-    emit_is_generator(function, src);
-    wasm!(function; I32Or);
-    emit_is_pointer(function, src);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, src);
-    wasm!(function;
-        I32Const(TYPE_ARRAY), I32Eq,
-        Else, I32Const(0), End,
-        I32Or,
-        If(BlockType::Empty),
-    );
+    // Any other iterable: its values, collected first (`IterableToList`,
+    // which throws `<x> is not iterable`).
     let values = IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::Local(src))]);
     emit_node(&values, function, frame.scratch(), strings, helpers);
     wasm!(function; LocalSet(src));
@@ -524,14 +504,6 @@ pub(super) fn emit_ctor(
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
-        LocalGet(map), Return,
-        End,
-    );
-    emit_node(
-        &not_iterable(src),
-        function,
-        frame.scratch(),
-        strings,
-        helpers,
+        LocalGet(map),
     );
 }

@@ -957,6 +957,62 @@ fn class_computed_accessors_via_eval() {
     );
 }
 
+/// Each class method replaces the property in order, on the prototype and on
+/// the constructor alike: an accessor half merges with the other half only
+/// when no same-key method sits in between.
+#[test]
+fn class_accessor_halves_across_method_via_eval() {
+    let desc = "let f = (o) => { let d = Object.getOwnPropertyDescriptor(o, 'a'); \
+                return 'value' in d ? 'data:' + typeof d.value : typeof d.get + ',' + typeof d.set }; ";
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ get a() {{ return 1 }} a() {{}} set a(v) {{}} \
+                 static get a() {{ return 1 }} static a() {{}} static set a(v) {{}} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "undefined,function undefined,function"
+    );
+    // Adjacent halves still form one accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ get a() {{ return 1 }} set a(v) {{}} \
+                 static get a() {{ return 1 }} static set a(v) {{}} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "function,function function,function"
+    );
+    // A later method replaces the accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ get a() {{ return 1 }} a() {{}} \
+                 static get a() {{ return 1 }} static a() {{}} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "data:function data:function"
+    );
+    // A later getter replaces the method, without a setter.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ a() {{}} get a() {{ return 3 }} \
+                 static a() {{}} static get a() {{ return 3 }} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "function,undefined function,undefined"
+    );
+}
+
 #[test]
 fn class_computed_generator_and_async_methods_via_eval() {
     assert_eq!(

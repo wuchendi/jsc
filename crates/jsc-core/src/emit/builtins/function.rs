@@ -465,7 +465,7 @@ fn bound_construct(frame: Frame) -> IrNode {
     IrNode::Construct {
         callee: Box::new(IrNode::Local(frame.i64(0))),
         args: Vec::new(),
-        spread: Some(Box::new(IrNode::ArraySpread(vec![SpreadElem::Spread(
+        spread: Some(Box::new(IrNode::ArraySpread(vec![SpreadElem::List(
             IrNode::Local(frame.i64(2)),
         )]))),
         callee_local: frame.x64(0),
