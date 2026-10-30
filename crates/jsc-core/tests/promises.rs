@@ -3,7 +3,8 @@
 //! The covered surface is `Promise.resolve`/`Promise.reject`, `new Promise(executor)`,
 //! `p.then`/`p.catch`/`p.finally`, a FIFO microtask queue drained by top-level
 //! `await` and after `main`, and promise value rendering. `async function` bodies are
-//! covered in the async/await section; `Promise.all`/`race` are out of scope.
+//! covered in the async/await section; the combinators (`Promise.all` / …) in
+//! `promise_combinators.rs`.
 #![allow(clippy::expect_used)]
 
 mod common;
@@ -242,13 +243,13 @@ fn new_promise_wrong_arity_is_rejected() {
 
 // --- Out-of-scope boundary ----------------------------------------------------
 
-/// An absent `Promise.<name>` static (e.g. `Promise.all`) reads `undefined`,
-/// so calling it throws a `TypeError` at run time.
+/// An absent `Promise.<name>` static reads `undefined`, so calling it
+/// throws a `TypeError` at run time.
 #[test]
 fn unknown_promise_static_throws() {
     assert_uncaught(
-        "Promise.all([])",
-        "TypeError: Promise.all is not a function",
+        "Promise.foo([])",
+        "TypeError: Promise.foo is not a function",
     );
 }
 

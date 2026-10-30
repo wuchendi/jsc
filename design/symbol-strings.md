@@ -515,7 +515,7 @@ the stages before it honours a user value (§9.4).
 |---|---|---|---|---|
 | `@@iterator` | `GetIterator`: for-of, spread, array destructuring, `yield*`, `Array.from`, Map/Set ctors, `Object.fromEntries`, `AggregateError`, `Promise.*` combinators, `Iterator.from`, `CreateAsyncFromSyncIterator` | `core/emit/builtins/iter.rs` `emit_iter_source`, `core/emit/array.rs` `emit_array_spread`, `core/codegen/stmt.rs` `lower_for_of` / `iter_snapshot`, `core/codegen/generator.rs` `lower_yield_delegate`, `core/emit/builtins/map_set.rs` `emit_ctor`, `core/emit/builtins/array.rs` `emit_from`, `core/emit/builtins/object_static.rs` `emit_from_entries` | **Y2** (guard Y1) | §5.3 |
 | `@@asyncIterator` | `GetIterator(async)`: `for await`, async `yield*`, `Array.fromAsync`; `%AsyncIteratorPrototype%[@@asyncIterator]` | `lower_for_of` (`for await` rejected), `lower_yield_delegate` (async rejected) | **Y5** (§5.8); defined in Y1; `%AsyncIteratorPrototype%` in Y2-T1 | — (generic protocol only) |
-| `@@hasInstance` | `InstanceofOperator` before `OrdinaryHasInstance`; `%Function.prototype%[@@hasInstance]` | `core/emit/object.rs` `emit_instanceof_node`, `core/codegen/expr.rs` `instanceof_kind` | **Y4** (guard Y1, replaced in Y4) | builtin RHS arms (`Array` / `Function` / `Date` type byte; `Object` and the errors walk the operand's chain for the static prototype) behind a run-time intact test, not `sealed` (`Object.defineProperty(Array, Symbol.hasInstance, ..)` keeps the name sealed): each ctor on the static chain up to `%Function.prototype%` has its realm `proto` and no own `@@hasInstance` (`HAS_SYMBOL_KEYS` clear inline, else a `__prop_find` miss, so `%Array%`'s `@@species` getter keeps the arm); otherwise and for any other RHS: `__symbol_get` of `@@hasInstance`, `%Function.prototype%[@@hasInstance]` recognised by value and run inline |
+| `@@hasInstance` | `InstanceofOperator` before `OrdinaryHasInstance`; `%Function.prototype%[@@hasInstance]` | `core/emit/object.rs` `emit_instanceof_node`, `core/codegen/expr.rs` `instanceof_kind` | **Y4** (guard Y1, replaced in Y4) | builtin RHS arms (`Array` / `Function` / `Date` / `Object` / the errors: walk the operand's `proto` chain for the constructor's static realm prototype, honouring a replaced `proto`, Y4-T5 / Y4-T6) behind a run-time intact test, not `sealed` (`Object.defineProperty(Array, Symbol.hasInstance, ..)` keeps the name sealed): each ctor on the static chain up to `%Function.prototype%` has its realm `proto` and no own `@@hasInstance` (`HAS_SYMBOL_KEYS` clear inline, else a `__prop_find` miss, so `%Array%`'s `@@species` getter keeps the arm); otherwise and for any other RHS: `__symbol_get` of `@@hasInstance`, `%Function.prototype%[@@hasInstance]` recognised by value and run inline |
 | `@@toPrimitive` | `ToPrimitive`; `Date.prototype[@@toPrimitive]`, `Symbol.prototype[@@toPrimitive]` | `core/emit/convert.rs` `emit_to_primitive` (the Date hint special case becomes the real `Date.prototype[@@toPrimitive]`) | **Y4** (guard Y1) | walk the proto chain testing `HAS_SYMBOL_KEYS` per table; do the real `__get` only at the first table that has it |
 | `@@toStringTag` | `Object.prototype.toString`; builtin tags (Map/Set/Promise/Generator/AsyncGenerator/Symbol/Math/JSON/iterator prototypes) | `core/emit/builtins/object.rs` `emit_to_string` (kind table) | **Y4** (guard Y1) | same chain test; fallback is the builtin-tag table; builtin tags installed as real properties and the kind shortcuts for Map/Set/Promise/Generator deleted (an async generator then tags `AsyncGenerator`, fixing the DESIGN §13 item) |
 | `@@species` | `ArraySpeciesCreate` (`map/filter/slice/splice/concat/flat/flatMap`), `SpeciesConstructor` (`Promise.prototype.then/finally`) | `core/emit/builtins/array.rs` `species_ctor` (today walks `C`'s chain for a builtin ctor as a stand-in), `core/emit/builtins/promise.rs` (no `SpeciesConstructor` today) | **Y4** for Array and Promise (guard Y1) | array `ProtoGuard` path proves `proto == %Array.prototype%` with clean bit, hence `constructor === %Array%`; `%Array%[@@species]` / `%Promise%[@@species]` need new ctor dirty bits |
@@ -1182,6 +1182,34 @@ Y4 reason drafts (one line per affected row, for the final CI pass):
 - `string_methods`: a receiver `is_nullish` test and an `is_object` test on
   `arg0` for the six dispatch methods and `includes` / `startsWith` /
   `endsWith` (Y4-T4).
+- `fib`, `math`, `push_1e5`, `console_log`: must not change.
+
+Y5 reason drafts (one line per affected row, for the final CI pass):
+
+- every row: no opcount program uses `for await`, an async generator or
+  `yield*`, so no lowering changes; the realm grows by the async-from-sync
+  and async record builtins (`Builtin::ALL` +9, Y5-T1) and their
+  interned message texts, which may shift static slots and intern-table
+  probe fuel by a few.
+- `fib`, `math`, `push_1e5`, `console_log`, `object_reads`, `json`,
+  `for_in`, `map_set`, `for_of`, `spread`, `class_methods`, `array_hofs`,
+  `generators`, `string_methods`: must not change beyond the line above.
+- every row: `Array.fromAsync` adds five builtins (`Builtin::ALL` +5,
+  Y5-T4) and two interned `TypeError` texts; same shift as above.
+
+Y3 reason drafts (one line per affected row, for the final CI pass):
+
+- every row: no row should change by a lowering. `Iterator`, its helpers,
+  the `Promise` combinators and `Math.sumPrecise` are new builtins only
+  (`Builtin::ALL` +30: `Iterator` statics / wrapper / helper methods
+  Y3-T1..T3, combinators, `PromiseStatic`, `SpeciesOp::Element` and
+  `MathSumPrecise` Y3-T4), two new intrinsics
+  (`%WrapForValidIteratorPrototype%`, `%IteratorHelperPrototype%`) and their
+  interned names / messages: the realm image and funcref table grow, which
+  may shift static slots and intern-table probe fuel by a few.
+- promise rows: an inline `Promise.resolve(x)` gains one `is_promise` test
+  (the non-promise path is unchanged); a promise operand runs the
+  `this`-aware builtin (`Get(x, "constructor")` against `this`) (Y3-T4).
 - `fib`, `math`, `push_1e5`, `console_log`: must not change.
 
 ---

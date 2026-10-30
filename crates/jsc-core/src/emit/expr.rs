@@ -244,9 +244,38 @@ pub(super) fn emit_node(
             builtins::emit_get_iterator(value, rec, *sealed, function, scratch, strings, helpers);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
-        IrNode::OpenIterator { value, rec } => {
-            builtins::emit_open_iterator(value, rec, function, scratch, strings, helpers);
+        IrNode::OpenIterator {
+            value,
+            rec,
+            is_async,
+        } => {
+            if *is_async {
+                builtins::emit_open_async_iterator(value, rec, function, scratch, strings, helpers);
+            } else {
+                builtins::emit_open_iterator(value, rec, function, scratch, strings, helpers);
+            }
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+        IrNode::AsyncIteratorNext(rec) => {
+            builtins::emit_async_iterator_next(rec, function, scratch, strings, helpers);
+        }
+        IrNode::AsyncIteratorComplete { rec, result } => {
+            builtins::emit_async_iterator_complete(
+                rec, result, function, scratch, strings, helpers,
+            );
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            function.instruction(&Instruction::I64Const(TRUE_BITS));
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I64Const(FALSE_BITS));
+            function.instruction(&Instruction::End);
+        }
+        IrNode::AsyncIteratorReturn { rec, throwing } => {
+            builtins::emit_async_iterator_return(
+                rec, *throwing, function, scratch, strings, helpers,
+            );
+        }
+        IrNode::IteratorResultCheck(operand) => {
+            builtins::emit_iterator_result_check(operand, function, scratch, strings, helpers);
         }
         IrNode::IteratorStep(rec) => {
             builtins::emit_iterator_step(rec, function, scratch, strings, helpers);
@@ -477,15 +506,7 @@ pub(super) fn emit_node(
         // the value operand, and an unused `b` slot, then call the host import. It
         // returns the fresh (or, for `resolve` of a promise, adopted) promise jsval.
         IrNode::PromiseResolve(value) => {
-            emit_promise_call(
-                PROMISE_OP_RESOLVE,
-                value,
-                &IrNode::Undefined,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_promise_resolve(value, function, scratch, strings, helpers);
         }
         IrNode::PromiseReject(value) => {
             emit_promise_call(
@@ -2127,6 +2148,68 @@ pub(super) fn emit_promise_call(
     emit_node(a, function, scratch, strings, helpers);
     emit_node(b, function, scratch, strings, helpers);
     function.instruction(&Instruction::Call(helpers.promise));
+}
+
+/// Emit `Promise.resolve(value)` of the inline `%Promise%` namespace: the
+/// host op, except for a promise, whose `constructor` decides the result
+/// (`PromiseResolve(%Promise%, v)`): the `Promise.resolve` builtin with
+/// `this = %Promise%`.
+fn emit_promise_resolve(
+    value: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (v, args) = (scratch, scratch + 3);
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(v));
+    emit_is_pointer(function, v);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, v);
+    function.instruction(&Instruction::I32Const(i32::from(abi::TYPE_PROMISE)));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    for slot in 0..helpers.max_args {
+        if slot == 0 {
+            function.instruction(&Instruction::LocalGet(v));
+        } else {
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+    }
+    if helpers.max_args == 0 {
+        // No positional slot: the argument rides in the spread array.
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Call(helpers.new_array()));
+        function.instruction(&Instruction::LocalTee(args));
+        emit_array_elems(function);
+        function.instruction(&Instruction::LocalGet(v));
+        function.instruction(&Instruction::I64Store(elem_slot(0)));
+        function.instruction(&Instruction::LocalGet(args));
+        function.instruction(&Instruction::I64ExtendI32U);
+        function.instruction(&Instruction::I64Const(HEAP_BITS));
+        function.instruction(&Instruction::I64Or);
+        function.instruction(&Instruction::GlobalSet(SPREAD_ARGS_GLOBAL));
+    }
+    let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
+    function.instruction(&Instruction::I64Const(promise));
+    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+    function.instruction(&Instruction::I64Const(0));
+    emit_argc(1, function);
+    let resolve = Builtin::PromiseStatic(realm::PromiseStaticOp::Resolve);
+    function.instruction(&Instruction::Call(helpers.builtin(resolve)));
+    emit_propagate_if_pending(function, helpers);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(PROMISE_OP_RESOLVE));
+    function.instruction(&Instruction::LocalGet(v));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Call(helpers.promise));
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// Emit `new Promise(executor)`, leaving the fresh promise's jsval on the

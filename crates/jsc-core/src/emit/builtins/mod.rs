@@ -21,6 +21,7 @@ macro_rules! wasm {
 }
 
 mod array;
+mod async_iter;
 mod ctor;
 mod date;
 mod error;
@@ -40,6 +41,10 @@ mod string;
 mod symbol;
 
 use crate::emit::realm::{ArrayCopyOp, DateGenericOp};
+pub(super) use async_iter::{
+    emit_async_iterator_complete, emit_async_iterator_next, emit_async_iterator_return,
+    emit_iterator_result_check, emit_open_async_iterator,
+};
 pub(super) use iter::{
     CloseMode, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
     emit_iterator_close, emit_iterator_step, emit_iterator_value, emit_open_iterator,
@@ -91,6 +96,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(date::fragments(k));
     nodes.extend(json::fragments());
     nodes.extend(iter::fragments(k));
+    nodes.extend(async_iter::fragments(k));
     nodes.extend(iterator::fragments());
     nodes
 }
@@ -235,6 +241,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(date::STRINGS)
         .chain(string::strings())
         .chain(number::STRINGS)
+        .chain(number::SUM_STRINGS)
         .chain(map_set::strings())
         .chain(promise::strings())
         .chain(generator::strings())
@@ -242,6 +249,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(json::strings())
         .chain(symbol::STRINGS)
         .chain(iter::strings())
+        .chain(async_iter::strings())
         .chain(iterator::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
@@ -313,7 +321,8 @@ pub(super) fn emit_builtin(
         | Builtin::ParseFloat
         | Builtin::ParseInt
         | Builtin::BooleanToString
-        | Builtin::BooleanValueOf => emit_number_family(builtin, &mut f, frame, strings, helpers),
+        | Builtin::BooleanValueOf
+        | Builtin::MathSumPrecise => emit_number_family(builtin, &mut f, frame, strings, helpers),
         Builtin::Protocol(op) => iter::emit_protocol(op, &mut f, frame, strings, helpers),
         Builtin::Iter(op) => iter::emit(op, &mut f, frame, strings, helpers),
         Builtin::PropertyIsEnumerable
@@ -328,6 +337,7 @@ pub(super) fn emit_builtin(
         | Builtin::PromiseThen
         | Builtin::PromiseCatch
         | Builtin::PromiseFinally
+        | Builtin::PromiseStatic(_)
         | Builtin::GeneratorNext
         | Builtin::GeneratorReturn
         | Builtin::GeneratorThrow
@@ -346,8 +356,6 @@ pub(super) fn emit_builtin(
         | Builtin::Ctor(_)
         | Builtin::ObjectStatic(_)
         | Builtin::IsArray
-        | Builtin::PromiseResolve
-        | Builtin::PromiseReject
         | Builtin::DateNow => emit_fragment(builtin, &mut f, frame, strings, helpers),
     }
     wasm!(f; End);
@@ -400,8 +408,9 @@ fn emit_string_family(
 
 /// Emit the body of an `Object.prototype` accessor-or-enumerability method,
 /// of a `Date`, `Map` / `Set`, `Promise` or (async) generator prototype
-/// builtin, of a `@@species` builtin, or of `Symbol` and the `Iterator`
-/// builtins into `f` (the variants [`emit_builtin`] routes here).
+/// builtin, of a `Promise` static, of a `@@species` builtin, or of `Symbol`
+/// and the `Iterator` builtins into `f` (the variants [`emit_builtin`]
+/// routes here).
 fn emit_object_family(
     builtin: Builtin,
     f: &mut Function,
@@ -438,6 +447,7 @@ fn emit_object_family(
         Builtin::PromiseThen => promise::emit_then(false, f, frame, strings, helpers),
         Builtin::PromiseCatch => promise::emit_then(true, f, frame, strings, helpers),
         Builtin::PromiseFinally => promise::emit_finally(f, frame, strings, helpers),
+        Builtin::PromiseStatic(op) => promise::emit_static(op, f, frame, strings, helpers),
         Builtin::GeneratorNext => generator::emit_next(f, frame, strings, helpers),
         Builtin::GeneratorReturn => generator::emit_return(f, frame, strings, helpers),
         Builtin::GeneratorThrow => generator::emit_throw(f, frame, strings, helpers),
@@ -528,8 +538,8 @@ fn emit_array_family(
 }
 
 /// Emit the body of a `Number` / `Boolean` prototype method, a `Number`
-/// static or a global number function into `f` (the variants
-/// [`emit_builtin`] routes here).
+/// static, a global number function or `Math.sumPrecise` into `f` (the
+/// variants [`emit_builtin`] routes here).
 fn emit_number_family(
     builtin: Builtin,
     f: &mut Function,
@@ -559,6 +569,7 @@ fn emit_number_family(
         Builtin::ParseInt => global::emit_parse(true, f, frame, strings, helpers),
         Builtin::BooleanToString => number::emit_boolean(false, f, frame, strings, helpers),
         Builtin::BooleanValueOf => number::emit_boolean(true, f, frame, strings, helpers),
+        Builtin::MathSumPrecise => number::emit_sum_precise(f, frame, strings, helpers),
         // Only the variants `emit_builtin` routes here reach this match.
         _ => {}
     }

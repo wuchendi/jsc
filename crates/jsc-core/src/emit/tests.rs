@@ -1252,3 +1252,29 @@ fn two_byte_literals_take_twice_the_data() {
     let narrow = *offsets.get("ééééé").expect("one-byte literal placed");
     assert_eq!(narrow - wide, 24, "8 + 2 * 5 bytes, padded to 8");
 }
+
+#[test]
+fn builtin_bodies_validate() {
+    // Every builtin body is emitted into every module, so an unbalanced
+    // builtin stack makes even the smallest program invalid wasm.
+    validate(&compile("console.log(1)"));
+    validate(&compile(
+        "const s = 'Hello, World';
+        const r = [
+            s.indexOf('o'), s.includes('W'), s.slice(1, 3), s.toUpperCase(), s.toLowerCase(),
+            s.toLocaleUpperCase(), s.toLocaleLowerCase(), s.charAt(1), s.trim(), s.trimStart(),
+            s.trimEnd(), s.repeat(2), s.startsWith('H'), s.endsWith('d'), s.padStart(20, '*'),
+            s.padEnd(20, '*'), s.substring(2, 5), s.split(', '), s.at(-1), s.charCodeAt(0),
+            s.codePointAt(0), s.concat('!'), s.lastIndexOf('o'), s.localeCompare('a'),
+            s.normalize(), s.search('o'), s.match('o'), s.matchAll('o'), s.replace('o', '0'),
+            s.replaceAll('o', '0'), s.isWellFormed(), s.toWellFormed(),
+        ];
+        console.log(r.length)",
+    ));
+    validate(&compile(
+        "const it = Iterator.from([1, 2, 3]).map((x) => x * 2).filter((x) => x > 2);
+        console.log(it.take(1).toArray(), Math.sumPrecise([0.1, 0.2]));
+        Promise.all([Promise.resolve(1), 2]).then((v) => console.log(v));
+        Promise.any([Promise.reject(1)]).catch((e) => console.log(e.errors));",
+    ));
+}

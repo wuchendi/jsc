@@ -1693,78 +1693,42 @@ impl LowerCtx<'_> {
     /// cell per iteration, like a `let`). The `for-of` head opens a lexical
     /// scope, so the binding is not visible after the loop.
     ///
-    /// The head is a `const`/`let` single-identifier binding, or a member /
-    /// destructuring assignment target (`o.x`, `[o.a, b]`) written each
-    /// iteration; a bare identifier assignment head, a declared destructuring
-    /// pattern, `for await`, or a `using` head is a spanned error.
+    /// `for await (const v of ITER) body` (§5.8) has the same shape over an
+    /// async record ([`IrNode::OpenIterator`] with `is_async`): each step
+    /// awaits `next()` ([`IrNode::AsyncIteratorComplete`] over the awaited
+    /// [`IrNode::AsyncIteratorNext`]) and each close awaits `return()`
+    /// ([`Self::async_iterator_close`]). A throw from a step leaves the
+    /// record stepping, so neither close calls `return()`.
+    ///
+    /// The head is a `const`/`let` identifier or destructuring binding (a
+    /// duplicate name is a spanned error), a `var` head assigning its hoisted
+    /// binding(s), or a member / destructuring assignment target (`o.x`,
+    /// `[o.a, b]`) written each iteration; a bare identifier assignment head,
+    /// several declarators, or a `using` head is a spanned error.
     fn lower_for_of(
         &mut self,
         for_of: &swc_ecma_ast::ForOfStmt,
         label: Option<u32>,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        if for_of.is_await {
-            return Err(
-                CompileError::spanned(for_of.span(), "for-await-of is not supported").into(),
-            );
-        }
-        // The head declares a single `const`/`let` identifier binding, or is a
-        // member / destructuring assignment target (`o.x`, `[o.a, o.b]`).
-        let head = match &for_of.left {
-            ForHead::VarDecl(var_decl) => {
-                let [declarator] = var_decl.decls.as_slice() else {
-                    return Err(CompileError::spanned(
-                        var_decl.span(),
-                        "for-of requires a single loop variable",
-                    )
-                    .into());
-                };
-                let mutable = var_decl.kind != VarDeclKind::Const;
-                match &declarator.name {
-                    // A `var` head assigns the hoisted binding(s).
-                    pat if var_decl.kind == VarDeclKind::Var => ForOfHead::Var(pat),
-                    Pat::Ident(ident) => ForOfHead::Decl(ident, mutable),
-                    pat @ (Pat::Array(_) | Pat::Object(_)) => {
-                        let mut names = Vec::new();
-                        super::capture::pat_names(pat, &mut names);
-                        let mut seen = std::collections::HashSet::new();
-                        if let Some(dup) = names.iter().find(|name| !seen.insert(name.as_str())) {
-                            return Err(CompileError::spanned(
-                                pat.span(),
-                                format!("duplicate binding in for-of head: {dup}"),
-                            )
-                            .into());
-                        }
-                        ForOfHead::Pattern(pat, mutable)
-                    }
-                    other => {
-                        return Err(CompileError::spanned(
-                            other.span(),
-                            "unsupported for-of binding pattern",
-                        )
-                        .into());
-                    }
-                }
-            }
-            // A bare identifier head (`for (x of ..)`) stays rejected.
-            ForHead::Pat(pat) if !is_ident_target(pat) => ForOfHead::Assign(pat),
-            other => {
-                return Err(CompileError::spanned(
-                    other.span(),
-                    "for-of requires a `const`/`let` loop variable",
-                )
-                .into());
-            }
-        };
+        let head = for_of_head(&for_of.left)?;
 
         self.push_scope();
         let result = (|| {
             let value = self.lower_expr(&for_of.right)?;
             let rec = self.fresh_iter_record(out);
-            out.push(IrStmt::Expr(IrNode::GetIterator {
-                value: Box::new(value),
-                rec: rec.clone(),
-                sealed: self.shared.globals.intrinsics_sealed(),
+            out.push(IrStmt::Expr(if for_of.is_await {
+                IrNode::OpenIterator {
+                    value: Box::new(value),
+                    rec: rec.clone(),
+                    is_async: true,
+                }
+            } else {
+                IrNode::GetIterator {
+                    value: Box::new(value),
+                    rec: rec.clone(),
+                    sealed: self.shared.globals.intrinsics_sealed(),
+                }
             }));
             let target = self.declare_for_of_head(head);
             self.breakable_inc();
@@ -1776,34 +1740,77 @@ impl LowerCtx<'_> {
             self.loopable_dec();
             self.breakable_dec();
             bound?;
+            let (cond, throw_close, normal_close) = if for_of.is_await {
+                let step = self.lower_await(IrNode::AsyncIteratorNext(rec.clone()));
+                let cond = IrNode::AsyncIteratorComplete {
+                    rec: rec.clone(),
+                    result: Box::new(step),
+                };
+                let throw_close = self.async_iterator_close(&rec, true);
+                (cond, throw_close, self.async_iterator_close(&rec, false))
+            } else {
+                let close = |throwing| {
+                    vec![IrStmt::Expr(IrNode::IteratorClose {
+                        rec: rec.clone(),
+                        throwing,
+                    })]
+                };
+                (IrNode::IteratorStep(rec.clone()), close(true), close(false))
+            };
             let exc = self.fresh();
+            let mut catch_body = vec![IrStmt::Decl {
+                local: exc,
+                init: IrNode::ExcValue,
+            }];
+            catch_body.extend(throw_close);
+            catch_body.push(IrStmt::Expr(IrNode::Throw(Box::new(IrNode::Local(exc)))));
             out.push(IrStmt::Try {
                 body: vec![IrStmt::While {
-                    cond: IrNode::IteratorStep(rec.clone()),
+                    cond,
                     body,
                     update: Vec::new(),
                     label,
                 }],
-                catch_body: Some(vec![
-                    IrStmt::Decl {
-                        local: exc,
-                        init: IrNode::ExcValue,
-                    },
-                    IrStmt::Expr(IrNode::IteratorClose {
-                        rec: rec.clone(),
-                        throwing: true,
-                    }),
-                    IrStmt::Expr(IrNode::Throw(Box::new(IrNode::Local(exc)))),
-                ]),
-                finally_body: Some(vec![IrStmt::Expr(IrNode::IteratorClose {
-                    rec,
-                    throwing: false,
-                })]),
+                catch_body: Some(catch_body),
+                finally_body: Some(normal_close),
             });
             Ok(())
         })();
         self.pop_scope();
         result
+    }
+
+    /// `AsyncIteratorClose(rec, completion)` (design/symbol-strings.md §5.8):
+    /// `r = AsyncIteratorReturn(rec)`, then unless `r` is the hole (a done or
+    /// stepping record, or no `return` method) await it. A normal completion
+    /// checks the awaited result is an object; a throw completion discards
+    /// any rejection (its caller rethrows the original exception).
+    fn async_iterator_close(&mut self, rec: &IterRecord, throwing: bool) -> Vec<IrStmt> {
+        let result = self.fresh();
+        let awaited = self.lower_await(IrNode::Local(result));
+        let close = if throwing {
+            IrStmt::Try {
+                body: vec![IrStmt::Expr(awaited)],
+                catch_body: Some(Vec::new()),
+                finally_body: None,
+            }
+        } else {
+            IrStmt::Expr(IrNode::IteratorResultCheck(Box::new(awaited)))
+        };
+        vec![
+            IrStmt::Decl {
+                local: result,
+                init: IrNode::AsyncIteratorReturn {
+                    rec: Box::new(rec.clone()),
+                    throwing,
+                },
+            },
+            IrStmt::If {
+                cond: IrNode::IsHole(Box::new(IrNode::Local(result))),
+                then_body: Vec::new(),
+                else_body: vec![close],
+            },
+        ]
     }
 
     /// Declare the four fresh locals of an [`IterRecord`] (each initialized
@@ -2084,6 +2091,58 @@ enum ForOfTarget<'a> {
     Pattern(&'a Pat, bool),
     Var(&'a Pat),
     Assign(&'a Pat),
+}
+
+/// Classify a `for-of` head: a single `const`/`let` identifier binding, a
+/// declared destructuring pattern, a `var` head, or a member / destructuring
+/// assignment target (`o.x`, `[o.a, o.b]`).
+fn for_of_head(left: &ForHead) -> anyhow::Result<ForOfHead<'_>> {
+    Ok(match left {
+        ForHead::VarDecl(var_decl) => {
+            let [declarator] = var_decl.decls.as_slice() else {
+                return Err(CompileError::spanned(
+                    var_decl.span(),
+                    "for-of requires a single loop variable",
+                )
+                .into());
+            };
+            let mutable = var_decl.kind != VarDeclKind::Const;
+            match &declarator.name {
+                // A `var` head assigns the hoisted binding(s).
+                pat if var_decl.kind == VarDeclKind::Var => ForOfHead::Var(pat),
+                Pat::Ident(ident) => ForOfHead::Decl(ident, mutable),
+                pat @ (Pat::Array(_) | Pat::Object(_)) => {
+                    let mut names = Vec::new();
+                    super::capture::pat_names(pat, &mut names);
+                    let mut seen = std::collections::HashSet::new();
+                    if let Some(dup) = names.iter().find(|name| !seen.insert(name.as_str())) {
+                        return Err(CompileError::spanned(
+                            pat.span(),
+                            format!("duplicate binding in for-of head: {dup}"),
+                        )
+                        .into());
+                    }
+                    ForOfHead::Pattern(pat, mutable)
+                }
+                other => {
+                    return Err(CompileError::spanned(
+                        other.span(),
+                        "unsupported for-of binding pattern",
+                    )
+                    .into());
+                }
+            }
+        }
+        // A bare identifier head (`for (x of ..)`) stays rejected.
+        ForHead::Pat(pat) if !is_ident_target(pat) => ForOfHead::Assign(pat),
+        other => {
+            return Err(CompileError::spanned(
+                other.span(),
+                "for-of requires a `const`/`let` loop variable",
+            )
+            .into());
+        }
+    })
 }
 
 /// Whether an assignment-target pattern is a bare identifier (`x` / `(x)`).

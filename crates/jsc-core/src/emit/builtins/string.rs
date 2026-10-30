@@ -590,7 +590,7 @@ fn emit_case_map(
             |f| {
                 s.unit_at(f, i);
                 wasm!(f;
-                    LocalTee(c), I32Const(letters), I32Sub, I32Const(26), I32LtU,
+                    LocalTee(c), LocalGet(c), I32Const(letters), I32Sub, I32Const(26), I32LtU,
                     LocalGet(c), I32Const(accented), I32Sub, I32Const(0x1F), I32LtU,
                     LocalGet(c), I32Const(sign), I32Ne, I32And, I32Or,
                     I32Const(5), I32Shl,
@@ -1019,11 +1019,13 @@ impl Str {
         index: impl Fn(&mut Function),
         unit: impl Fn(&mut Function),
     ) {
-        wasm!(function; LocalGet(self.w), If(BlockType::Empty));
-        self.addr(function, &index);
+        wasm!(function; LocalGet(self.w), If(BlockType::Empty), LocalGet(self.p));
+        index(function);
+        wasm!(function; I32Const(1), I32Shl, I32Add);
         unit(function);
-        wasm!(function; I32Store16(mem16()), Else);
-        self.addr(function, &index);
+        wasm!(function; I32Store16(mem16()), Else, LocalGet(self.p));
+        index(function);
+        wasm!(function; I32Add);
         unit(function);
         wasm!(function; I32Store8(mem8()), End);
     }

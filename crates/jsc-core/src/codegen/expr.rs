@@ -6,6 +6,18 @@ use swc_common::{Span, Spanned};
 use crate::error::CompileError;
 
 impl LowerCtx<'_> {
+    /// The `await` of the already lowered `arg` in the current body (see
+    /// `Expr::Await` in [`Self::lower_expr`]).
+    pub(super) fn lower_await(&mut self, arg: IrNode) -> IrNode {
+        if self.frame().machine == Some(Machine::AsyncGenerator) {
+            generator::await_suspend(arg)
+        } else if self.async_body {
+            IrNode::Yield(Box::new(arg))
+        } else {
+            IrNode::Await(Box::new(arg))
+        }
+    }
+
     /// Recursively lower a single [`Expr`] into an [`IrNode`].
     ///
     /// # Errors
@@ -51,13 +63,7 @@ impl LowerCtx<'_> {
             // awaits the value instead of yielding it.
             Expr::Await(await_expr) => {
                 let arg = self.lower_expr(&await_expr.arg)?;
-                if self.frame().machine == Some(Machine::AsyncGenerator) {
-                    Ok(generator::await_suspend(arg))
-                } else if self.async_body {
-                    Ok(IrNode::Yield(Box::new(arg)))
-                } else {
-                    Ok(IrNode::Await(Box::new(arg)))
-                }
+                Ok(self.lower_await(arg))
             }
             // `yield e` / `yield`: lower the operand and wrap it. The
             // generator segmentation pass consumes every `Yield`; one that reaches
@@ -962,11 +968,17 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        if !inline_member(namespace, key) || (namespace == "JSON" && args.len() > 1) {
+        // `Promise.resolve` / `reject` construct from `this`: only the
+        // inline (never written) `Promise` keeps their `%Promise%` code.
+        let inline = self.shared.globals.inline(namespace);
+        if !inline_member(namespace, key)
+            || (namespace == "JSON" && args.len() > 1)
+            || (namespace == "Promise" && !inline)
+        {
             return self.lower_method_call_user(member, args);
         }
         let arity = inline_arity(namespace, key);
-        if self.shared.globals.inline(namespace) {
+        if inline {
             let (seq, args) = self.fit_inline_args(arity, args);
             let Some(fast) = inline_call(namespace, key, args) else {
                 return Err(anyhow!("{namespace}.{key} has no inline code"));
