@@ -6,18 +6,6 @@ mod common;
 
 use common::{assert_output, assert_uncaught};
 
-/// Compile `src` and assert it is rejected at compile time with a message
-/// containing `message`.
-#[allow(clippy::expect_used)]
-fn assert_compile_error(src: &str, message: &str) {
-    let err = jsc_core::run::compile_and_run(src).expect_err("program should not compile");
-    let text = err.to_string();
-    assert!(
-        text.contains(message),
-        "expected a compile error containing `{message}` for `{src}`, got `{text}`"
-    );
-}
-
 #[test]
 fn next_returns_promises_of_iterator_results() {
     assert_output(
@@ -245,14 +233,6 @@ fn a_reentrant_next_from_the_body_is_queued() {
 }
 
 #[test]
-fn yield_star_in_an_async_generator_is_a_compile_error() {
-    assert_compile_error(
-        "async function* g(){ yield* [1]; }",
-        "`yield*` in an async generator is unsupported",
-    );
-}
-
-#[test]
 fn return_inside_try_finally_settles_after_the_finally() {
     assert_output(
         "async function* g(){ try { yield 1; } finally { console.log('cleanup'); } }
@@ -278,5 +258,139 @@ fn async_generator_prototype_inherits_async_iterator_prototype() {
          console.log(AIP[Symbol.asyncIterator].call(o) === o);
          console.log(Object.getPrototypeOf(AIP) === Object.prototype);",
         "function\ntrue\ntrue\n",
+    );
+}
+
+// async yield*
+
+/// Drains an async iterator with `next()`, printing its values and then
+/// its return value.
+const DRAIN: &str = "async function drain(it){
+       const out = [];
+       let r;
+       while (!(r = await it.next()).done) out.push(r.value);
+       out.push('ret:' + r.value);
+       console.log(out.join(','));
+     }
+     ";
+
+#[test]
+fn yield_star_over_an_async_generator_passes_values_through() {
+    assert_output(
+        &format!(
+            "{DRAIN}async function* inner(){{ yield 1; yield await Promise.resolve(2); return 'r'; }}
+             async function* outer(){{ const v = yield* inner(); yield 'got ' + v; return 'end'; }}
+             drain(outer());"
+        ),
+        "1,2,got r,ret:end\n",
+    );
+}
+
+#[test]
+fn yield_star_over_a_sync_iterable_awaits_its_values() {
+    assert_output(
+        &format!(
+            "{DRAIN}async function* g(){{ yield* [1, 2]; }}
+             drain(g());"
+        ),
+        "1,2,ret:undefined\n",
+    );
+    assert_output(
+        &format!(
+            "{DRAIN}async function* g(){{ yield* [Promise.resolve('a'), 'b']; }}
+             drain(g());"
+        ),
+        "a,b,ret:undefined\n",
+    );
+}
+
+#[test]
+fn yield_star_value_is_the_delegate_return_value() {
+    assert_output(
+        "async function* inner(){ return 7; }
+         async function* outer(){ const v = yield* inner(); return v + 1; }
+         outer().next().then(r => console.log(r.value, r.done));",
+        "8 true\n",
+    );
+}
+
+#[test]
+fn yield_star_forwards_sent_values() {
+    assert_output(
+        "async function* inner(){ const a = yield 'x'; console.log('inner got', a); return a * 2; }
+         async function* outer(){ const v = yield* inner(); console.log('outer got', v); }
+         const it = outer();
+         it.next('ignored').then(r => { console.log(r.value); return it.next(21); })
+           .then(r => console.log(r.value, r.done));",
+        "x\ninner got 21\nouter got 42\nundefined true\n",
+    );
+}
+
+#[test]
+fn yield_star_forwards_throw_to_the_delegate() {
+    assert_output(
+        "async function* inner(){ try { yield 1; } catch (e) { yield 'caught ' + e; } }
+         async function* outer(){ yield* inner(); }
+         const it = outer();
+         it.next().then(() => it.throw('boom'))
+           .then(r => { console.log(r.value, r.done); return it.next(); })
+           .then(r => console.log(r.value, r.done));",
+        "caught boom false\nundefined true\n",
+    );
+}
+
+#[test]
+fn yield_star_throw_without_a_throw_method_closes_then_rejects() {
+    assert_output(
+        "const log = [];
+         const delegate = { [Symbol.asyncIterator]() {
+           return {
+             next() { return Promise.resolve({ value: 1, done: false }); },
+             return() { log.push('return'); return { done: true }; },
+           };
+         } };
+         async function* g(){ yield* delegate; }
+         const it = g();
+         it.next()
+           .then(r => { console.log(r.value, r.done); return it.throw(new Error('x')); })
+           .then(() => console.log('fulfilled'),
+                 e => { console.log(e instanceof TypeError, log.join(',')); return it.next(); })
+           .then(r => console.log(r.value, r.done));",
+        "1 false\ntrue return\nundefined true\n",
+    );
+}
+
+#[test]
+fn yield_star_forwards_return_to_the_delegate() {
+    assert_output(
+        "async function* inner(){ try { yield 1; yield 2; } finally { console.log('inner finally'); } }
+         async function* outer(){ try { yield* inner(); } finally { console.log('outer finally'); } }
+         const it = outer();
+         it.next().then(() => it.return('v'))
+           .then(r => { console.log(r.value, r.done); return it.next(); })
+           .then(r => console.log(r.value, r.done));",
+        "inner finally\nouter finally\nv true\nundefined true\n",
+    );
+    // The returned value is awaited before it reaches the delegate.
+    assert_output(
+        "async function* inner(){ try { yield 1; } finally { console.log('inner finally'); } }
+         async function* outer(){ yield* inner(); }
+         const it = outer();
+         it.next().then(() => it.return(Promise.resolve(5)))
+           .then(r => console.log(r.value, r.done));",
+        "inner finally\n5 true\n",
+    );
+}
+
+#[test]
+fn yield_star_rejects_a_non_object_inner_result() {
+    assert_output(
+        "const delegate = { [Symbol.asyncIterator]() {
+           return { next() { return Promise.resolve(5); } };
+         } };
+         async function* g(){ yield* delegate; }
+         g().next().then(() => console.log('fulfilled'),
+                         e => console.log(e instanceof TypeError, e.message));",
+        "true Iterator result is not an object\n",
     );
 }
