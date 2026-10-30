@@ -40,7 +40,6 @@ fn a_rejected_value_closes_the_sync_iterator() {
     );
 }
 
-// Needs Y5-T3 (`yield*` in async generators).
 #[test]
 fn a_sync_iterator_without_throw_is_closed_then_rejects() {
     assert_output(
