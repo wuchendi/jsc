@@ -43,7 +43,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// Exported for the host promise engines, which settle every promise: a
 /// promise fulfilled with itself is rejected with this error instead.
 pub(in crate::emit) fn emit_promise_self_error(
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
     let mut function = Function::new(type_error_helper_locals());
@@ -76,7 +76,7 @@ fn is_promise(function: &mut Function, local: u32) {
 fn catch_call(frame: Frame) -> IrNode {
     IrNode::MethodCallUser {
         obj: Box::new(IrNode::Local(frame.i64(0))),
-        key: Box::new(IrNode::Str("then".to_owned())),
+        key: Box::new(IrNode::Str("then".into())),
         args: vec![IrNode::Undefined, IrNode::Local(frame.i64(1))],
         obj_local: frame.i64(3),
         callee_local: frame.x64(0),
@@ -90,7 +90,7 @@ pub(super) fn emit_then(
     catch: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, a0, a1) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -125,7 +125,7 @@ pub(super) fn emit_then(
 pub(super) fn emit_finally(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, a0) = (frame.i64(0), frame.i64(1));

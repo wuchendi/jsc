@@ -19,7 +19,6 @@ import {
   EXC_VALUE_EXPORT_NAME,
   FALSE,
   GEN_DONE_OFFSET,
-  HEADER_SIZE,
   HEAP,
   HEAP_PTR_EXPORT_NAME,
   HEAP_PTR_OOM,
@@ -104,6 +103,7 @@ import {
   PROMISE_STATE_OFFSET,
   PROMISE_VALUE_OFFSET,
   QNAN,
+  STR_DATA_OFFSET,
   TRUE,
   TYPE_ARRAY,
   TYPE_FUNCTION,
@@ -121,6 +121,7 @@ import {
   formatValue,
   parseFloatStr,
   parseIntStr,
+  stringText,
   toJsString,
   valueToNumber,
 } from './value.js'
@@ -243,20 +244,26 @@ export function createShim(): Shim {
   }
 
   /**
-   * Allocate a heap STRING block holding `text` through `__new_string`, filling
-   * only the payload (mirrors `host.rs::alloc_string`).
+   * Allocate a heap STRING block holding the code units of `text` in canonical
+   * form (one-byte Latin-1 when every unit is `<= 0xFF`, else UTF-16LE)
+   * through `__new_string(len, twoByte)`, filling only the payload (mirrors
+   * `host.rs::alloc_units`).
    */
   function allocString(text: string): bigint | null {
-    const bytes = utf8Encode.encode(text)
-    const base = guestNew(
-      NEW_STRING_EXPORT_NAME,
-      Math.min(bytes.length, MEMORY_MAX_BYTES),
-    )
+    const len = Math.min(text.length, MEMORY_MAX_BYTES)
+    let twoByte = false
+    for (let i = 0; i < len && !twoByte; i++)
+      twoByte = text.charCodeAt(i) > 0xff
+    const base = guestNew(NEW_STRING_EXPORT_NAME, len, twoByte ? 1 : 0)
     if (base === null) return null
     const view = memView()
-    const at = base + HEADER_SIZE + 4
-    if (at + bytes.length > view.length) return null
-    view.set(bytes, at)
+    const at = base + STR_DATA_OFFSET
+    if (at + (twoByte ? len * 2 : len) > view.length) return null
+    // `at` is 8-aligned, so a `Uint16Array` (little-endian, like wasm) fits.
+    const units = twoByte
+      ? new Uint16Array(view.buffer, view.byteOffset + at, len)
+      : view.subarray(at, at + len)
+    for (let i = 0; i < len; i++) units[i] = text.charCodeAt(i)
     return BigInt(base)
   }
 
@@ -1182,31 +1189,14 @@ function readGenDone(mem: Uint8Array, gen: bigint): boolean {
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true) !== 0
 }
 
-/** The `u32` `len` header of a string block at `ptr + HEADER_SIZE`. */
-function blockLen(mem: Uint8Array, ptr: number): number {
-  const at = ptr + HEADER_SIZE
-  if (at + 4 > mem.length) return 0
-  return (
-    (mem[at]! |
-      (mem[at + 1]! << 8) |
-      (mem[at + 2]! << 16) |
-      (mem[at + 3]! << 24)) >>>
-    0
-  )
-}
-
-/** The UTF-8 payload bytes of a heap STRING block, or `null` when truncated. */
+/**
+ * The UTF-8 bytes of a heap STRING block's text ({@link stringText}): the
+ * byte-offset form the ASCII-exact string ops work on, or `null` when
+ * truncated (mirrors `host.rs::string_bytes`).
+ */
 function stringBytes(mem: Uint8Array, ptr: number): Uint8Array | null {
-  const len = blockLen(mem, ptr)
-  const start = ptr + HEADER_SIZE + 4
-  if (start + len > mem.length) return null
-  return mem.subarray(start, start + len)
-}
-
-/** The text of a heap STRING block (mirrors `host.rs::string_text`). */
-function stringText(mem: Uint8Array, ptr: number): string | null {
-  const bytes = stringBytes(mem, ptr)
-  return bytes === null ? null : utf8Decode(bytes)
+  const text = stringText(mem, ptr)
+  return text === null ? null : utf8Encode.encode(text)
 }
 
 /** Truncate a JS number toward zero to an integer (matches `host.rs::trunc_to_int`). */

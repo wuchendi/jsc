@@ -9,7 +9,7 @@ use super::*;
 /// jsval (matching JS: the completion value of a declaration-only program).
 pub(super) fn emit_main(
     program: &IrProgram,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
     // One i64 local per top-level variable, plus three trailing i64 scratch
@@ -105,7 +105,7 @@ pub(super) fn emit_main(
 /// returns, this constant is unreachable (and thus valid).
 pub(super) fn emit_function(
     func: &IrFunction,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
     let declared = func.locals - func.params;

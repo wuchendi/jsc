@@ -543,12 +543,13 @@ fn json_parse_rejects_malformed_input() {
         ]),
         "true",
     );
-    // Trailing content, unterminated string, empty input, and `\u` all throw.
+    // Trailing content, unterminated string, empty input, and a malformed
+    // `\u` escape all throw.
     for src in [
         "let r=0; try{JSON.parse(\"1 2\")}catch(e){r=1} r",
         "let r=0; try{JSON.parse(\"\\\"abc\")}catch(e){r=1} r",
         "let r=0; try{JSON.parse(\"\")}catch(e){r=1} r",
-        "let r=0; try{JSON.parse(\"\\\"\\\\u0041\\\"\")}catch(e){r=1} r",
+        "let r=0; try{JSON.parse(\"\\\"\\\\u00G1\\\"\")}catch(e){r=1} r",
     ] {
         assert_eq!(jsc(&["-p", src]), "1", "expected `{src}` to throw");
     }

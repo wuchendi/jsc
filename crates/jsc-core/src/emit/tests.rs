@@ -86,7 +86,7 @@ fn string_literal_round_trips_to_a_heap_string() {
     // A string literal lowers to a heap-pointer jsval backed by a data
     // segment; running the module and decoding against its memory yields the
     // text (unquoted via `format_value`).
-    let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
+    let bytes = emit(&expr_program(IrNode::Str("foo".into())));
     validate(&bytes);
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
     let value = crate::run::decode(bits, &memory);
@@ -108,7 +108,7 @@ fn compile_and_run_string_length_end_to_end() {
 #[test]
 fn str_len_reads_byte_length_header() {
     // `"foo".length` reads the u32 header (3) and reboxes it as a number.
-    let node = IrNode::StrLen(Box::new(IrNode::Str("foo".to_owned())));
+    let node = IrNode::StrLen(Box::new(IrNode::Str("foo".into())));
     let bytes = emit(&expr_program(node));
     validate(&bytes);
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
@@ -151,7 +151,7 @@ fn string_index_via_variable() {
 fn str_index_builds_fresh_one_char_string() {
     // `"abc"[2]` allocates a new [len:u32][utf8] blob holding the byte 'c'.
     let node = IrNode::Index {
-        obj: Box::new(IrNode::Str("abc".to_owned())),
+        obj: Box::new(IrNode::Str("abc".into())),
         index: Box::new(IrNode::Num(2.0)),
     };
     let bytes = emit(&expr_program(node));
@@ -302,7 +302,7 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
             IrStmt::Decl {
                 local: 0,
                 init: IrNode::Object {
-                    entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
+                    entries: vec![(PropKey::Static("x".into()), IrNode::Num(10.0))],
                     proto: None,
                     class: crate::abi::CLASS_ORDINARY,
                     reserve: 0,
@@ -310,12 +310,12 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
             },
             IrStmt::Expr(IrNode::IndexSet {
                 obj: Box::new(IrNode::Local(0)),
-                index: Box::new(IrNode::Str("x".to_owned())),
+                index: Box::new(IrNode::Str("x".into())),
                 value: Box::new(IrNode::Num(42.0)),
             }),
             IrStmt::Expr(IrNode::Index {
                 obj: Box::new(IrNode::Local(0)),
-                index: Box::new(IrNode::Str("x".to_owned())),
+                index: Box::new(IrNode::Str("x".into())),
             }),
         ],
         functions: Vec::new(),
@@ -341,7 +341,7 @@ fn object_property_assignment_via_indexset_ir_missing_key_adds() {
             IrStmt::Decl {
                 local: 0,
                 init: IrNode::Object {
-                    entries: vec![(PropKey::Static("x".to_owned()), IrNode::Num(10.0))],
+                    entries: vec![(PropKey::Static("x".into()), IrNode::Num(10.0))],
                     proto: None,
                     class: crate::abi::CLASS_ORDINARY,
                     reserve: 0,
@@ -349,12 +349,12 @@ fn object_property_assignment_via_indexset_ir_missing_key_adds() {
             },
             IrStmt::Expr(IrNode::IndexSet {
                 obj: Box::new(IrNode::Local(0)),
-                index: Box::new(IrNode::Str("y".to_owned())),
+                index: Box::new(IrNode::Str("y".into())),
                 value: Box::new(IrNode::Num(42.0)),
             }),
             IrStmt::Expr(IrNode::Index {
                 obj: Box::new(IrNode::Local(0)),
-                index: Box::new(IrNode::Str("y".to_owned())),
+                index: Box::new(IrNode::Str("y".into())),
             }),
         ],
         functions: Vec::new(),
@@ -374,7 +374,7 @@ fn object_property_assignment_via_indexset_ir_missing_key_adds() {
 fn typeof_string_literal_reports_string() {
     // `typeof "hi"` must map the pointer tag (0b101) to index 4 ("string").
     let bytes = emit(&expr_program(IrNode::TypeOf(Box::new(IrNode::Str(
-        "hi".to_owned(),
+        "hi".into(),
     )))));
     validate(&bytes);
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
@@ -418,7 +418,7 @@ fn string_literal_emits_data_segment_and_advances_heap_ptr() {
     // The literal "foo" (11 bytes, padded to 16) is one more string blob
     // segment ahead of the function data, the realm image, and the intern table.
     let base = emit(&expr_program(IrNode::Num(42.0)));
-    let bytes = emit(&expr_program(IrNode::Str("foo".to_owned())));
+    let bytes = emit(&expr_program(IrNode::Str("foo".into())));
     validate(&bytes);
     let (segments, heap_ptr) = data_layout(&bytes);
     let (base_segments, base_heap_ptr) = data_layout(&base);
@@ -623,8 +623,8 @@ fn emits_valid_module_with_string_concatenation() {
     // typed `if`, and a call into the appended `__concat` helper.
     let bytes = emit(&expr_program(IrNode::Binary {
         op: BinOp::Add,
-        lhs: Box::new(IrNode::Str("foo".to_owned())),
-        rhs: Box::new(IrNode::Str("bar".to_owned())),
+        lhs: Box::new(IrNode::Str("foo".into())),
+        rhs: Box::new(IrNode::Str("bar".into())),
     }));
     validate(&bytes);
     let (bits, memory) = crate::run::run(&bytes).expect("module should run");
@@ -789,7 +789,7 @@ fn static_string_blobs_are_8_aligned() {
     .expect("lower");
     let (offsets, heap_start) = super::sections::collect_strings(&program);
     assert!(offsets.len() >= 3, "three literals interned");
-    for (text, offset) in &offsets {
+    for (text, offset) in offsets.iter() {
         assert_eq!(offset % 8, 0, "blob {text:?} at {offset} is not 8-aligned");
     }
     assert_eq!(
@@ -880,14 +880,30 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     assert_eq!(ptr(&mut store) - a, 8, "__alloc(5) rounds up to 8");
 
     let new_string = instance
-        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
+        .get_typed_func::<(i32, i32), i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
         .expect("__new_string export");
-    let s = new_string.call(&mut store, 3).expect("new string");
+    let s = new_string.call(&mut store, (3, 0)).expect("new string");
     assert_eq!(s % 8, 0);
     let mem = memory.data(&store);
     let s = usize::try_from(s).expect("base");
     assert_eq!(&mem[s..s + 4], &[crate::abi::TYPE_STRING, 0, 0, 0]);
     assert_eq!(&mem[s + 4..s + 8], &3u32.to_le_bytes());
+    // A two-byte string sets the flag; its 3 units take 6 data bytes.
+    let t = new_string
+        .call(&mut store, (3, 1))
+        .expect("new two-byte string");
+    assert_eq!(
+        t - i32::try_from(s).expect("base"),
+        16,
+        "8 + 3 rounds up to 16"
+    );
+    let mem = memory.data(&store);
+    let t = usize::try_from(t).expect("base");
+    assert_eq!(
+        &mem[t..t + 4],
+        &[crate::abi::TYPE_STRING, 0, crate::abi::STR_FLAG_TWO_BYTE, 0]
+    );
+    assert_eq!(&mem[t + 4..t + 8], &3u32.to_le_bytes());
 
     let new_array = instance
         .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_ARRAY_EXPORT_NAME)
@@ -1131,4 +1147,108 @@ fn dirty_bits_are_set_only_when_tested() {
         dirty_bit_sets(&compile("let o = Object; Object.keys({})")),
         0
     );
+}
+
+/// The byte FNV-1a the intern table used before strings hashed code units.
+fn byte_fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811C_9DC5, |h: u32, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
+}
+
+#[test]
+fn fnv1a_over_ascii_units_equals_the_byte_hash() {
+    for text in [
+        "",
+        "a",
+        "length",
+        "prototype",
+        "constructor",
+        "0",
+        "4294967294",
+    ] {
+        let units = crate::ir::JsStr::from(text);
+        assert_eq!(
+            super::fnv1a(units.as_units().iter().copied()),
+            byte_fnv1a(text.as_bytes()),
+            "{text:?}"
+        );
+    }
+    // Pinned values of the 32-bit FNV-1a.
+    assert_eq!(super::fnv1a([]), 0x811C_9DC5);
+    assert_eq!(super::fnv1a("a".encode_utf16()), 0xE40C_292C);
+    // A two-byte unit is one round, not two byte rounds.
+    assert_eq!(
+        super::fnv1a([0x0100]),
+        (0x811C_9DC5u32 ^ 0x0100).wrapping_mul(0x0100_0193)
+    );
+}
+
+#[test]
+fn is_array_index_runs_on_code_units() {
+    let index = |text: &str| super::is_array_index(&text.encode_utf16().collect::<Vec<_>>());
+    assert!(index("0"));
+    assert!(index("7"));
+    assert!(index("4294967294"));
+    assert!(!index("4294967295"));
+    assert!(!index("01"));
+    assert!(!index(""));
+    assert!(!index("-1"));
+    assert!(!index("1.5"));
+    assert!(!index("42949672940"));
+    // A full-width digit is not an index.
+    assert!(!index("\u{FF11}"));
+    assert!(!super::is_array_index(&[0x31, 0xD800]));
+}
+
+#[test]
+fn static_string_blocks_are_canonical() {
+    use crate::ir::JsStr;
+    let header = |block: &[u8]| {
+        (
+            block[0],
+            block[2],
+            u32::from_le_bytes([block[4], block[5], block[6], block[7]]),
+        )
+    };
+    let interned = abi::STR_FLAG_INTERNED;
+    let two_byte = abi::STR_FLAG_TWO_BYTE;
+    // `é` fits Latin-1: a one-byte block holding 0xE9, len 1.
+    let block = super::sections::str_block(&JsStr::from("é"));
+    assert_eq!(header(&block), (abi::TYPE_STRING, interned, 1));
+    assert_eq!(&block[8..], [0xE9]);
+    // `Ā` (U+0100) does not: a TWO_BYTE block, len 1, one UTF-16LE unit.
+    let block = super::sections::str_block(&JsStr::from("Ā"));
+    assert_eq!(header(&block), (abi::TYPE_STRING, interned | two_byte, 1));
+    assert_eq!(&block[8..], [0x00, 0x01]);
+    // A lone surrogate: TWO_BYTE, len 1.
+    let block = super::sections::str_block(&[0xD800].into_iter().collect());
+    assert_eq!(header(&block), (abi::TYPE_STRING, interned | two_byte, 1));
+    assert_eq!(&block[8..], [0x00, 0xD8]);
+    // An astral code point is two units.
+    let block = super::sections::str_block(&JsStr::from("😀"));
+    assert_eq!(header(&block), (abi::TYPE_STRING, interned | two_byte, 2));
+    assert_eq!(&block[8..], [0x3D, 0xD8, 0x00, 0xDE]);
+    // ASCII stays byte-identical; an index spelling keeps ARRAY_INDEX.
+    let block = super::sections::str_block(&JsStr::from("12"));
+    assert_eq!(
+        header(&block),
+        (abi::TYPE_STRING, interned | abi::STR_FLAG_ARRAY_INDEX, 2)
+    );
+    assert_eq!(&block[8..], *b"12");
+}
+
+#[test]
+fn two_byte_literals_take_twice_the_data() {
+    // Five units are 10 data bytes two-byte (a 24-byte block after the 8-byte
+    // header and padding), but 5 one-byte.
+    let program = expr_program(IrNode::Binary {
+        op: BinOp::Add,
+        lhs: Box::new(IrNode::Str("ĀĀĀĀĀ".into())),
+        rhs: Box::new(IrNode::Str("ééééé".into())),
+    });
+    let (offsets, _) = collect_strings(&program);
+    let wide = *offsets.get("ĀĀĀĀĀ").expect("two-byte literal placed");
+    let narrow = *offsets.get("ééééé").expect("one-byte literal placed");
+    assert_eq!(narrow - wide, 24, "8 + 2 * 5 bytes, padded to 8");
 }

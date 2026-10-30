@@ -56,7 +56,7 @@ export const SYMBOL_BLOCK_SIZE = 16
 /** {@link TYPE_SYMBOL} `flags` bit: the symbol is in the `Symbol.for` registry. */
 export const SYMBOL_FLAG_REGISTERED = 4
 
-/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
+/** Header byte 2: the per-kind `flags` byte (string: `INTERNED`, `ARRAY_INDEX`, `TWO_BYTE`; function: `LAZY`, `CONSTRUCTOR`, `CLASS_CTOR`). */
 export const HEADER_FLAGS_OFFSET = 2
 /** Header byte 3: the `TYPE_OBJECT` sub-`class` byte. */
 export const HEADER_CLASS_OFFSET = 3
@@ -76,6 +76,12 @@ export const CLASS_SYMBOL = 7
 export const WRAPPER_VALUE_OFFSET = 16
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
+/** String `flags` bit: the data is UTF-16LE code units (absent: Latin-1 bytes). */
+export const STR_FLAG_TWO_BYTE = 4
+/** Byte offset of a string block's `len:u32`, in UTF-16 code units (header | len @4 | data @8). */
+export const STR_LEN_OFFSET = 4
+/** Byte offset of a string block's data. */
+export const STR_DATA_OFFSET = 8
 
 /** Byte offset of the object-family prefix's `props:u32` slot (the `TYPE_PROPS` table, `0` = none). */
 export const OBJ_PROPS_OFFSET = HEADER_SIZE
@@ -165,7 +171,11 @@ export const HEAP_PTR_EXPORT_NAME = '__heap_ptr'
 export const MEMORY_MAX_PAGES = 8192
 /** The sticky out-of-memory sentinel the guest stores in `__heap_ptr` (`i32`). */
 export const HEAP_PTR_OOM = -1
-/** Export name of the `__new_string(len) -> base` guest string constructor. */
+/**
+ * Export name of the `__new_string(len, twoByte) -> base` guest string constructor:
+ * `len` code units, Latin-1 (`twoByte` 0) or UTF-16LE (`twoByte` 1, sets
+ * `STR_FLAG_TWO_BYTE`); the caller fills the data at `base + STR_DATA_OFFSET`.
+ */
 export const NEW_STRING_EXPORT_NAME = '__new_string'
 /** Export name of the `__new_array(len) -> base` guest array constructor. */
 export const NEW_ARRAY_EXPORT_NAME = '__new_array'

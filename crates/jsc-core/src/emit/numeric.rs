@@ -52,7 +52,7 @@ pub(super) fn emit_mod(
     rhs: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let s0 = scratch;
@@ -89,7 +89,7 @@ fn emit_arith(
     rhs: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let s0 = scratch;
@@ -128,7 +128,7 @@ fn emit_bitwise(
     rhs: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let s0 = scratch;
@@ -200,7 +200,7 @@ pub(super) fn emit_math_call(
     args: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let x = |function: &mut Function, local: u32| {
@@ -379,7 +379,7 @@ fn emit_min_max(
     args: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let fold = if matches!(op, MathOp::Min) {
@@ -497,7 +497,7 @@ pub(super) fn emit_math_spread(
     args: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // Reuse the array higher-order loop's scratch slots (idle here): the array
@@ -716,7 +716,7 @@ pub(super) fn emit_pow(
     exp: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     /// Push the f64 held (as bits) in i64 local `local`.
@@ -981,7 +981,7 @@ pub(super) fn emit_convert_call(
     radix: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if matches!(op, ConvertOp::ToBoolean) {
@@ -1039,7 +1039,7 @@ pub(super) fn emit_convert_call(
 fn emit_symbol_descriptive_string(
     function: &mut Function,
     local: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let desc = local + 1;
@@ -1093,7 +1093,7 @@ pub(super) fn emit_method_call(
     args: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(recv, function, scratch, strings, helpers);
@@ -1131,7 +1131,7 @@ fn emit_add(
     rhs: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let s0 = scratch;
@@ -1172,7 +1172,7 @@ pub(super) fn emit_binary(
     rhs: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match op {
@@ -1296,7 +1296,7 @@ pub(super) fn emit_strict_eq(
     negate: bool,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let s0 = scratch;

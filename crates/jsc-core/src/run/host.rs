@@ -7,8 +7,8 @@ use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
-use super::value::{array_elements, array_layout};
-use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
+use super::value::{array_elements, array_layout, string_units};
+use super::{HEAP, QNAN, STR_DATA_OFFSET, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
 /// methods, dispatched host-side. `IndexOf`/`Slice` exist on both arrays and
@@ -66,8 +66,8 @@ const HEAP_PTR_OOM: i32 = abi::HEAP_PTR_OOM;
 #[allow(clippy::cast_possible_truncation)]
 const MEMORY_MAX_BYTES: usize = abi::MEMORY_MAX_PAGES as usize * 0x1_0000;
 
-/// Call the guest constructor export `name(len) -> base` (`__new_string` /
-/// `__new_array`) and return the new block's base offset, or `None` when the
+/// Call the guest constructor export `name(len) -> base` (`__new_array`) and
+/// return the new block's base offset, or `None` when the
 /// export is missing or the call traps — an out-of-memory trap leaves the
 /// [`abi::HEAP_PTR_OOM`] sentinel for the run stage to report.
 fn guest_new<W: Send + 'static>(
@@ -85,20 +85,40 @@ fn guest_new<W: Send + 'static>(
     usize::try_from(base).ok()
 }
 
-/// Allocate a heap STRING block holding `text` through the guest
-/// `__new_string` export and return its base offset, or `None` if the export is
-/// missing or the allocation/write fails. The guest writes the header; the host
-/// only fills the UTF-8 payload.
+/// Allocate a heap STRING block holding `text` (as UTF-16 code units, see
+/// [`alloc_units`]) and return its base offset.
 pub(super) fn alloc_string<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
     text: &str,
 ) -> Option<u64> {
-    let len = text.len().min(MEMORY_MAX_BYTES);
-    let base = guest_new(caller, abi::NEW_STRING_EXPORT_NAME, len)?;
+    alloc_units(caller, &text.encode_utf16().collect::<Vec<u16>>())
+}
+
+/// Allocate a heap STRING block holding the code units `units` in canonical
+/// form (one-byte Latin-1 when every unit is `<= 0xFF`, else UTF-16LE) through
+/// the guest `__new_string(len, two_byte)` export and return its base offset,
+/// or `None` if the export is missing or the allocation/write fails. The guest
+/// writes the header and the width flag; the host only fills the payload.
+fn alloc_units<W: Send + 'static>(caller: &mut Caller<'_, W>, units: &[u16]) -> Option<u64> {
+    let units = &units[..units.len().min(MEMORY_MAX_BYTES)];
+    let two_byte = units.iter().any(|&unit| unit > 0xFF);
+    let ctor = caller
+        .get_export(abi::NEW_STRING_EXPORT_NAME)
+        .and_then(wasmtime::Extern::into_func)?
+        .typed::<(i32, i32), i32>(&*caller)
+        .ok()?;
+    let len = i32::try_from(units.len()).ok()?;
+    let base = ctor.call(&mut *caller, (len, i32::from(two_byte))).ok()?;
+    let base = usize::try_from(base).ok()?;
+    let data: Vec<u8> = if two_byte {
+        units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+    } else {
+        units.iter().map(|unit| unit.to_le_bytes()[0]).collect()
+    };
     let mem = caller
         .get_export(abi::MEMORY_EXPORT_NAME)
         .and_then(wasmtime::Extern::into_memory)?;
-    mem.write(&mut *caller, base + HEADER_SIZE + 4, text.as_bytes())
+    mem.write(&mut *caller, base + STR_DATA_OFFSET, &data)
         .ok()?;
     Some(base as u64)
 }
@@ -402,19 +422,11 @@ fn heap_ptr(bits: u64) -> Option<usize> {
     }
 }
 
-/// The u32 `len` header of a string block at `ptr + HEADER_SIZE`.
-fn block_len(mem: &[u8], ptr: usize) -> Option<usize> {
-    let at = ptr.checked_add(HEADER_SIZE)?;
-    let bytes = mem.get(at..at + 4)?;
-    usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()
-}
-
-/// The UTF-8 payload bytes of a heap STRING block (`[len:u32][utf8]` at
-/// `ptr + HEADER_SIZE`), or `None` when the block is truncated.
+/// The UTF-8 bytes of a heap STRING block's text ([`string_text`]): the
+/// byte-offset form the ASCII-exact string ops below work on, or `None` when
+/// the block is truncated.
 fn string_bytes(mem: &[u8], ptr: usize) -> Option<Vec<u8>> {
-    let len = block_len(mem, ptr)?;
-    let start = ptr.checked_add(HEADER_SIZE + 4)?;
-    Some(mem.get(start..start + len)?.to_vec())
+    Some(string_text(mem, ptr)?.into_bytes())
 }
 
 /// Truncate a JS number toward zero to a signed integer, saturating out-of-range
@@ -1027,9 +1039,9 @@ fn string_code_at<W: Send + 'static>(
     Some(f64::from(byte).to_bits())
 }
 
-/// The text of a heap STRING block.
+/// The text of a heap STRING block, a lone surrogate replaced by U+FFFD.
 fn string_text(mem: &[u8], ptr: usize) -> Option<String> {
-    Some(String::from_utf8_lossy(&string_bytes(mem, ptr)?).into_owned())
+    Some(String::from_utf16_lossy(&string_units(mem, ptr)?))
 }
 
 /// The number of UTF-16 code units of `text`.

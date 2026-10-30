@@ -258,6 +258,17 @@ fn string_wrapper_exotic_own_properties() {
         "let ks = []; for (let k in new String(\"xyz\")) ks.push(k); ks.join()",
         "0,1,2",
     );
+    // `length` and the indices count code units.
+    assert_number("new String(\"é😀\").length", 3.0);
+    assert_bool("new String(\"é😀\")[0] === \"é\"", true);
+    assert_bool("new String(\"é😀\")[2] === \"\\uDE00\"", true);
+    assert_eval("new String(\"é😀\")[3]", "undefined");
+    assert_bool("2 in new String(\"é😀\")", true);
+    assert_string("Object.keys(new String(\"é😀\")).join()", "0,1,2");
+    assert_string(
+        "let ks = []; for (let k in new String(\"é😀\")) ks.push(k); ks.join()",
+        "0,1,2",
+    );
 }
 
 #[test]

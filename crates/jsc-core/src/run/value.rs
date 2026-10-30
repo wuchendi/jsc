@@ -3,9 +3,9 @@
 
 use super::{
     ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
-    HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
-    PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
-    TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
+    MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, QNAN, STR_DATA_OFFSET, STR_LEN_OFFSET, TYPE_ARRAY, TYPE_DATE,
+    TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -297,22 +297,48 @@ fn decode_size(ptr: usize, memory: &[u8]) -> usize {
     })
 }
 
-/// Resolve a heap string block at base `ptr` into a [`Value::Str`] by reading
-/// `[len:u32 LE][utf8]` at `ptr + HEADER_SIZE` in `memory`.
+/// Resolve a heap string block at base `ptr` into a [`Value::Str`]: its code
+/// units ([`string_units`]) as text, a lone surrogate replaced by U+FFFD (the
+/// output form; host ops that read content use [`string_units`]).
 ///
-/// Defensive: any out-of-range slice yields an empty string and invalid UTF-8 is
-/// replaced lossily, so a malformed pointer never panics (decode stays total).
+/// Defensive: an out-of-range block yields an empty string, so a malformed
+/// pointer never panics (decode stays total).
 fn decode_string(ptr: usize, memory: &[u8]) -> Value {
-    let len_at = ptr + HEADER_SIZE;
-    let Some(len_bytes) = memory.get(len_at..len_at + 4) else {
-        return Value::Str(String::new());
-    };
-    let len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
-    let start = len_at + 4;
-    let Some(str_bytes) = memory.get(start..start + len) else {
-        return Value::Str(String::new());
-    };
-    Value::Str(String::from_utf8_lossy(str_bytes).into_owned())
+    Value::Str(
+        string_units(memory, ptr)
+            .map_or_else(String::new, |units| String::from_utf16_lossy(&units)),
+    )
+}
+
+/// The UTF-16 code units of the heap STRING block at `ptr`: `len` (at
+/// `ptr + STR_LEN_OFFSET`) Latin-1 bytes, each its own code unit, or with
+/// [`crate::abi::STR_FLAG_TWO_BYTE`] `len` UTF-16LE units at `ptr + STR_DATA_OFFSET`.
+/// Lossless (a lone surrogate stays a unit); `None` when the block is
+/// truncated.
+pub(super) fn string_units(memory: &[u8], ptr: usize) -> Option<Vec<u16>> {
+    let flags = *memory.get(ptr.checked_add(crate::abi::HEADER_FLAGS_OFFSET as usize)?)?;
+    let len_at = ptr.checked_add(STR_LEN_OFFSET)?;
+    let len = usize::try_from(u32::from_le_bytes(
+        memory
+            .get(len_at..len_at.checked_add(4)?)?
+            .try_into()
+            .ok()?,
+    ))
+    .ok()?;
+    let start = ptr.checked_add(STR_DATA_OFFSET)?;
+    if flags & crate::abi::STR_FLAG_TWO_BYTE == 0 {
+        let bytes = memory.get(start..start.checked_add(len)?)?;
+        return Some(bytes.iter().map(|&b| u16::from(b)).collect());
+    }
+    let bytes = memory.get(start..start.checked_add(len.checked_mul(2)?)?)?;
+    Some(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .collect(),
+    )
 }
 
 /// The length of the array handle at base `ptr` and the address of its element
@@ -546,7 +572,7 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
             message: field("message").unwrap_or_default(),
         };
     }
-    let mut entries = decode_props(ptr, memory, guard);
+    let entries = decode_props(ptr, memory, guard);
     let class_byte = memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize).copied();
     if class_byte == Some(abi::CLASS_ARGUMENTS) {
         return Value::Arguments(entries);
@@ -556,10 +582,6 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
     {
         let primitive = read_u64(memory, ptr + abi::WRAPPER_VALUE_OFFSET as usize)
             .map_or(Value::Undefined, |bits| decode_in(bits, memory, guard));
-        if let Value::Str(text) = &primitive {
-            let len = text.len();
-            entries.retain(|(key, _)| key.parse::<usize>().map_or(true, |i| i >= len));
-        }
         return Value::Wrapper {
             primitive: Box::new(primitive),
             entries,

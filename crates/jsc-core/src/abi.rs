@@ -97,7 +97,7 @@ pub(crate) const HEADER_SIZE: u32 = 4;
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
 /// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
-/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`] / [`STR_FLAG_TWO_BYTE`], an object-family block's
 /// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
 /// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`], a symbol's
 /// [`SYMBOL_FLAG_REGISTERED`].
@@ -617,6 +617,22 @@ pub(crate) const STR_FLAG_INTERNED: u8 = 1;
 /// intern time.
 pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
+/// String header `flags` bit: the data is UTF-16LE code units (`2 * len`
+/// bytes); absent, it is Latin-1 bytes (`len` bytes). Canonical: set iff some
+/// unit is above `0xFF`. It shares bit `4` with [`SYMBOL_FLAG_REGISTERED`],
+/// which cannot collide: string paths read it only on a [`TYPE_STRING`]
+/// block, and a symbol key never reaches them (unlike `1` / `2`, which key
+/// paths test on any key block).
+pub(crate) const STR_FLAG_TWO_BYTE: u8 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's `len: u32`, the length in UTF-16
+/// code units (the JS `.length`). String block = header | `len: u32` @4 |
+/// data @8 (Latin-1 bytes, or UTF-16LE units with [`STR_FLAG_TWO_BYTE`]).
+pub(crate) const STR_LEN_OFFSET: u32 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's data (see [`STR_LEN_OFFSET`]).
+pub(crate) const STR_DATA_OFFSET: u32 = 8;
+
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
 /// value `undefined`). A method call `obj.m(args)` sets it to the receiver
 /// immediately before the `call_indirect`; every function/arrow prologue
@@ -723,9 +739,13 @@ pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
 /// stores [`HEAP_PTR_OOM`] and traps.
 pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
 
-/// The name under which the module exports the `__new_string(len: i32) -> base:
-/// i32` constructor: a [`TYPE_STRING`] block with `len` set and a `len`-byte
-/// payload for the caller to fill. The hosts allocate every string through it.
+/// The name under which the module exports the `__new_string(len: i32,
+/// two_byte: i32) -> base: i32` constructor: a [`TYPE_STRING`] block of `len`
+/// code units — `len` Latin-1 bytes, or with `two_byte` (`0`/`1`)
+/// [`STR_FLAG_TWO_BYTE`] set and `2 * len` bytes of UTF-16LE units — with
+/// `len` set and the data at [`STR_DATA_OFFSET`] for the caller to fill. The
+/// hosts allocate every string through it, in canonical form (one-byte iff
+/// every unit is `<= 0xFF`).
 pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
 
 /// The name under which the module exports the `__new_array(len: i32) -> base:

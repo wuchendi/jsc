@@ -74,10 +74,7 @@ pub(super) fn emit_coerce_number(function: &mut Function, local: u32, helpers: H
 /// `__convert` to-number op on the primitive (`StringToNumber` rules); a
 /// symbol throws the `TypeError`. A throw from a user `valueOf`/`toString`
 /// stays pending and yields `NaN`.
-pub(super) fn emit_to_number_helper(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(super) fn emit_to_number_helper(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(type_error_helper_locals());
     let (v, scratch) = (0, 1);
     helpers.unwind.borrow_mut().reset();
