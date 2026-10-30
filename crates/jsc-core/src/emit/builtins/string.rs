@@ -228,6 +228,62 @@ const MATCH_ALL_REGEXP: CalleeErrorText<'static> = [
     "TypeError: String.prototype.matchAll needs RegExp, which is not supported yet",
 ];
 
+/// The `TypeError` of `includes` / `startsWith` / `endsWith` with an
+/// `IsRegExp` argument.
+const REGEXP_INCLUDES: CalleeErrorText<'static> = [
+    "First argument to String.prototype.includes must not be a regular expression",
+    "TypeError: First argument to String.prototype.includes must not be a regular expression",
+];
+const REGEXP_STARTS_WITH: CalleeErrorText<'static> = [
+    "First argument to String.prototype.startsWith must not be a regular expression",
+    "TypeError: First argument to String.prototype.startsWith must not be a regular expression",
+];
+const REGEXP_ENDS_WITH: CalleeErrorText<'static> = [
+    "First argument to String.prototype.endsWith must not be a regular expression",
+    "TypeError: First argument to String.prototype.endsWith must not be a regular expression",
+];
+
+/// The `TypeError` of `matchAll` / `replaceAll` with an `IsRegExp` argument
+/// whose `flags` lack `g`.
+const MATCH_ALL_NON_GLOBAL: CalleeErrorText<'static> = [
+    "String.prototype.matchAll called with a non-global RegExp argument",
+    "TypeError: String.prototype.matchAll called with a non-global RegExp argument",
+];
+const REPLACE_ALL_NON_GLOBAL: CalleeErrorText<'static> = [
+    "replaceAll must be called with a global RegExp",
+    "TypeError: replaceAll must be called with a global RegExp",
+];
+
+/// The `TypeError`s of a non-callable `@@match` / `@@matchAll` /
+/// `@@replace` / `@@search` / `@@split` method of a string-method argument.
+const HOOK_NOT_CALLABLE: [CalleeErrorText<'static>; 5] = [
+    [
+        "Symbol.match is not a function",
+        "TypeError: Symbol.match is not a function",
+    ],
+    [
+        "Symbol.matchAll is not a function",
+        "TypeError: Symbol.matchAll is not a function",
+    ],
+    [
+        "Symbol.replace is not a function",
+        "TypeError: Symbol.replace is not a function",
+    ],
+    [
+        "Symbol.search is not a function",
+        "TypeError: Symbol.search is not a function",
+    ],
+    [
+        "Symbol.split is not a function",
+        "TypeError: Symbol.split is not a function",
+    ],
+];
+
+/// The key `matchAll` / `replaceAll` read off an `IsRegExp` argument, and
+/// the flag it must hold.
+const FLAGS_KEY: &str = "flags";
+const GLOBAL_FLAG: &str = "g";
+
 /// The `RangeError` text of `normalize` with an unknown form.
 const NORMALIZE_FORM: [&str; 2] = [
     "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
@@ -287,6 +343,13 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(SEARCH_REGEXP)
         .chain(MATCH_REGEXP)
         .chain(MATCH_ALL_REGEXP)
+        .chain(REGEXP_INCLUDES)
+        .chain(REGEXP_STARTS_WITH)
+        .chain(REGEXP_ENDS_WITH)
+        .chain(MATCH_ALL_NON_GLOBAL)
+        .chain(REPLACE_ALL_NON_GLOBAL)
+        .chain(HOOK_NOT_CALLABLE.into_iter().flatten())
+        .chain([FLAGS_KEY, GLOBAL_FLAG])
         .chain(NORMALIZE_FORM)
         .chain(INVALID_CODE_POINT)
         .chain(NULLISH_TO_OBJECT)
@@ -328,10 +391,11 @@ pub(super) fn emit_this_value(
 /// [`coercions`] in [`coercion_order`], `repeat`'s count check, then the
 /// code-unit body ([`emit_units`]) or the host op, whose refusal sentinels
 /// throw; `match` builds its result array. `concat`, `matchAll`, `replace`
-/// and `replaceAll` continue in their own bodies after the receiver. An
-/// object first argument whose chain holds the method's well-known symbol
-/// ([`hook_of`], `__symbol_get`) throws the interim `TypeError` after the
-/// receiver (Y4 dispatches to it, design/symbol-strings.md §9.4).
+/// and `replaceAll` continue in their own bodies after the receiver. Before
+/// `ToString(this)`, an object first argument of `match` / `matchAll` /
+/// `replace` / `replaceAll` / `search` / `split` with the method's
+/// well-known symbol is called instead ([`emit_dispatch`]); after it,
+/// `includes` / `startsWith` / `endsWith` refuse an `IsRegExp` argument.
 pub(super) fn emit_method(
     op: StringOp,
     function: &mut Function,
@@ -345,16 +409,7 @@ pub(super) fn emit_method(
         // The spread argument array, before `ToString(this)` can republish it.
         wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(frame.x64(0)));
     }
-    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(s));
-    is_string(function, s);
-    wasm!(function; I32Eqz, If(BlockType::Empty));
-    emit_is_nullish(function, s);
-    wasm!(function; If(BlockType::Empty));
-    throw_type_error(function, frame, nullish_text(op), strings, helpers);
-    wasm!(function; End);
-    to_string(function, s, helpers);
-    wasm!(function; End);
-    arg_hook_guard(op, function, frame, a0, strings, helpers);
+    emit_receiver(op, function, frame, strings, helpers);
     match op {
         StringOp::Concat => return emit_concat(function, frame, s, helpers),
         StringOp::MatchAll => {
@@ -440,6 +495,35 @@ pub(super) fn emit_method(
         return;
     }
     emit_host_op(op, flag, function, frame, strings, helpers);
+}
+
+/// The receiver of [`emit_method`] into i64 temp 0: `this`, a
+/// `null`/`undefined` one throws; the well-known symbol dispatch
+/// ([`emit_dispatch`]); `ToString(this)`; then the `IsRegExp` refusal of
+/// `includes` / `startsWith` / `endsWith`.
+fn emit_receiver(
+    op: StringOp,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let s = frame.i64(0);
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(s));
+    emit_is_nullish(function, s);
+    wasm!(function; If(BlockType::Empty));
+    throw_type_error(function, frame, nullish_text(op), strings, helpers);
+    wasm!(function; End);
+    if let Some(symbol) = dispatch_of(op) {
+        emit_dispatch(op, symbol, function, frame, strings, helpers);
+    }
+    is_string(function, s);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    to_string(function, s, helpers);
+    wasm!(function; End);
+    if let Some(text) = regexp_refusal(op) {
+        emit_refuse_regexp(text, function, frame, strings, helpers);
+    }
 }
 
 /// Whether `op` is an upper (`true`) or lower (`false`) case mapping.
@@ -552,42 +636,205 @@ fn emit_host_op(
     wasm!(function; LocalGet(r));
 }
 
-/// Throw the interim `TypeError` when `op`'s first argument (read into i64
-/// `a0`) is an object whose chain holds `op`'s [`hook_of`] symbol.
-fn arg_hook_guard(
-    op: StringOp,
-    function: &mut Function,
-    frame: Frame,
-    a0: u32,
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-) {
-    let Some(symbol) = hook_of(op) else {
-        return;
-    };
-    frame.arg(function, 0);
-    wasm!(function; LocalSet(a0));
-    emit_is_object(function, a0);
-    wasm!(function; If(BlockType::Empty));
-    emit_hook_guard(function, a0, symbol, frame.scratch(), strings, helpers);
-    wasm!(function; End);
-    return_if_pending(function);
-}
-
-/// The well-known symbol `op` consults on an object first argument: `@@match`
-/// (`IsRegExp` of `includes` / `startsWith` / `endsWith`, and `match`),
-/// `@@matchAll`, `@@replace`, `@@search`, `@@split`.
-fn hook_of(op: StringOp) -> Option<WellKnown> {
+/// The well-known symbol `op` dispatches to on an object first argument.
+fn dispatch_of(op: StringOp) -> Option<WellKnown> {
     match op {
-        StringOp::Includes | StringOp::StartsWith | StringOp::EndsWith | StringOp::Match => {
-            Some(WellKnown::Match)
-        }
+        StringOp::Match => Some(WellKnown::Match),
         StringOp::MatchAll => Some(WellKnown::MatchAll),
         StringOp::Replace | StringOp::ReplaceAll => Some(WellKnown::Replace),
         StringOp::Search => Some(WellKnown::Search),
         StringOp::Split => Some(WellKnown::Split),
         _ => None,
     }
+}
+
+/// The `TypeError` of `includes` / `startsWith` / `endsWith` with an
+/// `IsRegExp` argument.
+fn regexp_refusal(op: StringOp) -> Option<CalleeErrorText<'static>> {
+    match op {
+        StringOp::Includes => Some(REGEXP_INCLUDES),
+        StringOp::StartsWith => Some(REGEXP_STARTS_WITH),
+        StringOp::EndsWith => Some(REGEXP_ENDS_WITH),
+        _ => None,
+    }
+}
+
+/// The `TypeError` of a non-callable `symbol` method (`GetMethod`).
+fn not_callable_text(symbol: WellKnown) -> CalleeErrorText<'static> {
+    match symbol {
+        WellKnown::MatchAll => HOOK_NOT_CALLABLE[1],
+        WellKnown::Replace => HOOK_NOT_CALLABLE[2],
+        WellKnown::Search => HOOK_NOT_CALLABLE[3],
+        WellKnown::Split => HOOK_NOT_CALLABLE[4],
+        _ => HOOK_NOT_CALLABLE[0],
+    }
+}
+
+/// Push i32 `1` when `IsRegExp` of the object in i64 `v`:
+/// `ToBoolean(Get(v, @@match))` (no object has `[[RegExpMatcher]]`); the
+/// `@@match` value is left in i64 `m`. A throw returns.
+fn emit_is_regexp(
+    function: &mut Function,
+    frame: Frame,
+    v: u32,
+    m: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    wasm!(function;
+        LocalGet(v), I32Const(realm::symbol_addr(WellKnown::Match, helpers)),
+        Call(helpers.symbol_get()), LocalSet(m),
+    );
+    return_if_pending(function);
+    let truthy = IrNode::ConvertCall {
+        op: ConvertOp::ToBoolean,
+        arg: Box::new(IrNode::Local(m)),
+        radix: None,
+    };
+    emit_node(&truthy, function, frame.scratch(), strings, helpers);
+    wasm!(function; I64Const(TRUE_BITS), I64Eq);
+}
+
+/// `includes` / `startsWith` / `endsWith`: an object first argument that
+/// `IsRegExp` throws `text`.
+fn emit_refuse_regexp(
+    text: CalleeErrorText<'static>,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (a0, m) = (frame.i64(1), frame.i64(3));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(a0));
+    emit_is_object(function, a0);
+    wasm!(function; If(BlockType::Empty));
+    emit_is_regexp(function, frame, a0, m, strings, helpers);
+    wasm!(function; If(BlockType::Empty));
+    throw_type_error(function, frame, text, strings, helpers);
+    wasm!(function; End, End);
+}
+
+/// The well-known symbol dispatch of `op` (`symbol` = [`dispatch_of`]) on an
+/// object first argument `a0`, with `O` = the receiver in i64 temp 0 (not
+/// yet `ToString`ed): `matchAll` / `replaceAll` first require an `IsRegExp`
+/// argument's `ToString(flags)` to hold `g`; then `GetMethod(a0, symbol)`
+/// (`undefined` / `null` falls through to the string path, a non-callable
+/// value throws) is called with `this = a0` and `«O»` (`«O, a1»` for
+/// `replace` / `replaceAll` / `split`), whose result is returned. A
+/// primitive argument skips the lookup.
+fn emit_dispatch(
+    op: StringOp,
+    symbol: WellKnown,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (s, a0, a1, m) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(a0));
+    emit_is_object(function, a0);
+    wasm!(function; If(BlockType::Empty));
+    if let Some(text) = match op {
+        StringOp::MatchAll => Some(MATCH_ALL_NON_GLOBAL),
+        StringOp::ReplaceAll => Some(REPLACE_ALL_NON_GLOBAL),
+        _ => None,
+    } {
+        let flags = frame.x64(1);
+        let locals = i32_locals(frame);
+        let (fv, g) = (Str::at(&locals, 0), Str::at(&locals, 3));
+        let [from, at, j, ok] = [locals[9], locals[10], locals[11], locals[12]];
+        emit_is_regexp(function, frame, a0, m, strings, helpers);
+        wasm!(function;
+            If(BlockType::Empty),
+            LocalGet(a0), I32Const(static_key(strings, FLAGS_KEY)), Call(helpers.get),
+            LocalSet(flags),
+        );
+        return_if_pending(function);
+        // `RequireObjectCoercible(flags)`, then `ToString(flags)` must hold `g`.
+        emit_is_nullish(function, flags);
+        wasm!(function; If(BlockType::Empty));
+        throw_type_error(function, frame, text, strings, helpers);
+        wasm!(function; End);
+        is_string(function, flags);
+        wasm!(function; I32Eqz, If(BlockType::Empty));
+        to_string(function, flags, helpers);
+        wasm!(function; End);
+        push_str(function, strings, GLOBAL_FLAG);
+        wasm!(function; LocalSet(m));
+        fv.open(function, flags);
+        g.open(function, m);
+        wasm!(function; I32Const(0), LocalSet(from));
+        emit_index_of(function, fv, g, from, at, [j, ok]);
+        wasm!(function; LocalGet(at), I32Const(-1), I32Eq, If(BlockType::Empty));
+        throw_type_error(function, frame, text, strings, helpers);
+        wasm!(function; End, End);
+    }
+    wasm!(function;
+        LocalGet(a0), I32Const(realm::symbol_addr(symbol, helpers)), Call(helpers.symbol_get()),
+        LocalSet(m),
+    );
+    return_if_pending(function);
+    emit_is_nullish(function, m);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    emit_is_function(function, m);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    throw_type_error(function, frame, not_callable_text(symbol), strings, helpers);
+    wasm!(function; End);
+    let args: &[u32] = if matches!(
+        op,
+        StringOp::Replace | StringOp::ReplaceAll | StringOp::Split
+    ) {
+        frame.arg(function, 1);
+        wasm!(function; LocalSet(a1));
+        &[s, a1]
+    } else {
+        &[s]
+    };
+    call_with(function, frame, m, a0, args, helpers);
+    wasm!(function; Return, End, End);
+}
+
+/// Call the function in i64 local `callee` with `this` = i64 local `this`
+/// and the arguments `args` (i64 locals), leaving its result; arguments past
+/// `K` go in a published spread argument array.
+fn call_with(
+    function: &mut Function,
+    frame: Frame,
+    callee: u32,
+    this: u32,
+    args: &[u32],
+    helpers: Helpers<'_>,
+) {
+    for slot in 0..frame.k {
+        if let Some(&local) = args.get(slot as usize) {
+            wasm!(function; LocalGet(local));
+        } else {
+            wasm!(function; I64Const(UNDEFINED_BITS));
+        }
+    }
+    if args.len() > frame.k as usize {
+        let spread = frame.scratch() + 35;
+        let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
+        wasm!(function;
+            I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+            LocalSet(spread),
+        );
+        for (j, &arg) in (0u64..).zip(args) {
+            wasm!(function; LocalGet(spread), I32WrapI64);
+            emit_array_elems(function);
+            wasm!(function; LocalGet(arg), I64Store(elem_slot(j)));
+        }
+        wasm!(function; LocalGet(spread), GlobalSet(SPREAD_ARGS_GLOBAL));
+    }
+    wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
+    invoke(
+        function,
+        callee,
+        |function| emit_argc(args.len(), function),
+        helpers,
+    );
 }
 
 /// Throw a `RangeError` with `text` (`[message, stack]`), followed by the

@@ -4,7 +4,9 @@
 //! `Date.prototype[@@toPrimitive]`) and `@@toStringTag` in
 //! `Object.prototype.toString` (builtin tags as real properties, user tags);
 //! `@@hasInstance` in `instanceof` (`InstanceofOperator`) and
-//! `Function.prototype[@@hasInstance]`.
+//! `Function.prototype[@@hasInstance]`; the String-method dispatch to an
+//! object argument's `@@match` / `@@matchAll` / `@@replace` / `@@search` /
+//! `@@split`, and `IsRegExp` in `includes` / `startsWith` / `endsWith`.
 
 mod common;
 use common::{assert_bool, assert_number, assert_string, assert_uncaught};
@@ -333,5 +335,140 @@ fn builtin_constructor_own_has_instance_is_honoured() {
         "Object.defineProperty(Object, Symbol.hasInstance, { value: () => true }); \
          1 instanceof Object",
         true,
+    );
+}
+
+// --- String-method dispatch (@@match / @@matchAll / @@replace / @@search / @@split)
+
+#[test]
+fn string_methods_dispatch_to_the_argument_hook() {
+    assert_string(
+        "'abc'.replace({ [Symbol.replace]: (s, r) => s + r }, 'x')",
+        "abcx",
+    );
+    assert_string(
+        "'abc'.replaceAll({ [Symbol.replace]: (s, r) => r + s }, 'x')",
+        "xabc",
+    );
+    assert_string(
+        "'abc'.split({ [Symbol.split]: (s, n) => s + n }, 2)",
+        "abc2",
+    );
+    assert_string("'abc'.search({ [Symbol.search]: s => s + '!' })", "abc!");
+    assert_string("'abc'.match({ [Symbol.match]: s => s + '?' })", "abc?");
+    assert_string(
+        "'abc'.matchAll({ [Symbol.matchAll]: s => s + '*' })",
+        "abc*",
+    );
+    // `this` is the argument, the receiver is passed before `ToString`.
+    assert_bool(
+        "let o = { [Symbol.search]() { return this === o } }; 'a'.search(o)",
+        true,
+    );
+    assert_bool(
+        "let r = new String('a'); let o = { [Symbol.match](s) { return s === r } }; \
+         String.prototype.match.call(r, o)",
+        true,
+    );
+    // An inherited hook is found through the prototype chain.
+    assert_string(
+        "class S { [Symbol.split](s) { return s.length } } String('abcd'.split(new S()))",
+        "4",
+    );
+}
+
+#[test]
+fn string_method_hook_runs_before_to_string_of_this() {
+    assert_string(
+        "let log = []; let t = { toString() { log.push('this'); return 'abc' } }; \
+         String.prototype.replace.call(t, { [Symbol.replace]() { log.push('hook'); return 1 } }, ''); \
+         log.join()",
+        "hook",
+    );
+}
+
+#[test]
+fn nullish_hook_falls_back_to_the_string_path() {
+    assert_string(
+        "'a[object Object]b'.replace({ [Symbol.replace]: undefined }, '-')",
+        "a-b",
+    );
+    assert_number(
+        "'xnully'.search({ [Symbol.search]: null, toString() { return 'null' } })",
+        1.0,
+    );
+    assert_string(
+        "'a,b'.split({ toString() { return ',' } }).join('|')",
+        "a|b",
+    );
+}
+
+#[test]
+fn non_callable_hook_throws() {
+    for (src, name) in [
+        ("'abc'.match({ [Symbol.match]: 1 })", "match"),
+        ("'abc'.matchAll({ [Symbol.matchAll]: 1 })", "matchAll"),
+        ("'abc'.replace({ [Symbol.replace]: {} }, '')", "replace"),
+        ("'abc'.search({ [Symbol.search]: true })", "search"),
+        ("'abc'.split({ [Symbol.split]: 'x' })", "split"),
+    ] {
+        assert_uncaught(src, &format!("TypeError: Symbol.{name} is not a function"));
+    }
+}
+
+#[test]
+fn is_regexp_argument_throws_in_starts_with_ends_with_includes() {
+    for name in ["startsWith", "endsWith", "includes"] {
+        assert_uncaught(
+            &format!("'a'.{name}({{ [Symbol.match]: true }})"),
+            &format!(
+                "TypeError: First argument to String.prototype.{name} must not be a regular expression"
+            ),
+        );
+    }
+    assert_uncaught(
+        "'a'.startsWith({ [Symbol.match]: 1 })",
+        "TypeError: First argument to String.prototype.startsWith must not be a regular expression",
+    );
+}
+
+#[test]
+fn falsy_match_hook_is_coerced_to_a_string() {
+    assert_bool(
+        "'[object Object]'.startsWith({ [Symbol.match]: false })",
+        true,
+    );
+    assert_bool("'x[object Object]'.includes({ [Symbol.match]: 0 })", true);
+    assert_bool(
+        "'ab'.endsWith({ [Symbol.match]: '', toString() { return 'b' } })",
+        true,
+    );
+}
+
+#[test]
+fn match_all_and_replace_all_require_a_global_regexp_argument() {
+    let hooks = "[Symbol.matchAll]: () => 'm', [Symbol.replace]: () => 'r'";
+    assert_uncaught(
+        &format!("'a'.matchAll({{ [Symbol.match]: true, flags: 'i', {hooks} }})"),
+        "TypeError: String.prototype.matchAll called with a non-global RegExp argument",
+    );
+    assert_uncaught(
+        &format!("'a'.replaceAll({{ [Symbol.match]: true, flags: undefined, {hooks} }}, '')"),
+        "TypeError: replaceAll must be called with a global RegExp",
+    );
+    assert_string(
+        &format!("'a'.matchAll({{ [Symbol.match]: true, flags: 'gi', {hooks} }})"),
+        "m",
+    );
+    assert_string(
+        &format!(
+            "'a'.replaceAll({{ [Symbol.match]: true, flags: {{ toString() {{ return 'g' }} }}, {hooks} }}, '')"
+        ),
+        "r",
+    );
+    // Not `IsRegExp`: `flags` is not read.
+    assert_string(
+        &format!("'a'.replaceAll({{ get flags() {{ throw 1 }}, {hooks} }}, '')"),
+        "r",
     );
 }

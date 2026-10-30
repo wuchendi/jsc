@@ -203,27 +203,3 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "TypeError: o.getFullYear is not a function",
     );
 }
-
-// ---------------------------------------------------------------------------
-// Interim guards (design/symbol-strings.md §9.4): a user well-known symbol
-// hook a consult site does not honour yet throws a named `TypeError`, never a
-// silently wrong result. Each test is deleted by the stage that honours it.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn string_method_symbol_arguments_throw_until_y4() {
-    for (src, name) in [
-        ("'abc'.startsWith({ [Symbol.match]: false })", "match"),
-        ("'abc'.includes({ [Symbol.match]: false })", "match"),
-        ("'abc'.match({ [Symbol.match]() { return 1 } })", "match"),
-        ("'abc'.matchAll({ [Symbol.matchAll]() {} })", "matchAll"),
-        ("'abc'.replace({ [Symbol.replace]() {} }, '')", "replace"),
-        ("'abc'.search({ [Symbol.search]() {} })", "search"),
-        ("'abc'.split({ [Symbol.split]() {} })", "split"),
-    ] {
-        assert_uncaught(
-            src,
-            &format!("TypeError: Symbol.{name} is not supported yet"),
-        );
-    }
-}
