@@ -566,15 +566,11 @@ fn this_primitive(
 /// string, symbol, number or boolean becomes a fresh wrapper object (DESIGN.md
 /// §5.2) over its realm prototype; any other value (an object, or `null`/`undefined`,
 /// which callers reject first) is returned as is. A String wrapper's
-/// `length` and indices are defined as its own read-only, non-configurable
-/// properties (the indices enumerable), so every property operation sees them.
+/// `length` is defined as its own read-only, non-configurable property; its
+/// indices are virtual (`__str_exotic_index`).
 pub(super) fn emit_to_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![
-        (2, ValType::I32),
-        (1, ValType::I64),
-        (3, ValType::I32),
-    ]);
-    let (v, obj, class, proto, len, idx, string) = (0, 1, 2, 3, 4, 5, 6);
+    let mut f = Function::new(vec![(2, ValType::I32), (1, ValType::I64)]);
+    let (v, obj, class, proto) = (0, 1, 2, 3);
     let wrap = |f: &mut Function, c: u8, proto_bits: i64| {
         wasm!(f;
             I32Const(i32::from(c)), LocalSet(class),
@@ -616,20 +612,10 @@ pub(super) fn emit_to_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Func
         I64Store(MemArg { offset: u64::from(abi::WRAPPER_VALUE_OFFSET), align: 3, memory_index: 0 }),
         LocalGet(class), I32Const(i32::from(abi::CLASS_STRING)), I32Eq,
         If(BlockType::Empty),
-        LocalGet(v), I32WrapI64, LocalTee(string),
-        I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }), LocalSet(len),
-        I32Const(0), LocalSet(idx),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(idx), LocalGet(len), I32GeU, BrIf(1),
-        LocalGet(obj),
-        LocalGet(idx), F64ConvertI32U, I64ReinterpretF64, I32Const(1), Call(helpers.to_key),
-        LocalGet(string), LocalGet(idx), Call(helpers.str_index), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-        I32Const(abi::ATTR_ENUMERABLE.cast_signed()), Call(helpers.define),
-        LocalGet(idx), I32Const(1), I32Add, LocalSet(idx),
-        Br(0),
-        End, End,
         LocalGet(obj), I32Const(static_key(strings, INDEX_LENGTH_KEY)),
-        LocalGet(len), F64ConvertI32U, I64ReinterpretF64, I32Const(0), Call(helpers.define),
+        LocalGet(v), I32WrapI64,
+        I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }),
+        F64ConvertI32U, I64ReinterpretF64, I32Const(0), Call(helpers.define),
         End,
         LocalGet(obj), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         End,

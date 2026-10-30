@@ -739,9 +739,13 @@ pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
 /// stores [`HEAP_PTR_OOM`] and traps.
 pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
 
-/// The name under which the module exports the `__new_string(len: i32) -> base:
-/// i32` constructor: a [`TYPE_STRING`] block with `len` set and a `len`-byte
-/// payload for the caller to fill. The hosts allocate every string through it.
+/// The name under which the module exports the `__new_string(len: i32,
+/// two_byte: i32) -> base: i32` constructor: a [`TYPE_STRING`] block of `len`
+/// code units — `len` Latin-1 bytes, or with `two_byte` (`0`/`1`)
+/// [`STR_FLAG_TWO_BYTE`] set and `2 * len` bytes of UTF-16LE units — with
+/// `len` set and the data at [`STR_DATA_OFFSET`] for the caller to fill. The
+/// hosts allocate every string through it, in canonical form (one-byte iff
+/// every unit is `<= 0xFF`).
 pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
 
 /// The name under which the module exports the `__new_array(len: i32) -> base:

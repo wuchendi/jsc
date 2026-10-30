@@ -880,14 +880,30 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     assert_eq!(ptr(&mut store) - a, 8, "__alloc(5) rounds up to 8");
 
     let new_string = instance
-        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
+        .get_typed_func::<(i32, i32), i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
         .expect("__new_string export");
-    let s = new_string.call(&mut store, 3).expect("new string");
+    let s = new_string.call(&mut store, (3, 0)).expect("new string");
     assert_eq!(s % 8, 0);
     let mem = memory.data(&store);
     let s = usize::try_from(s).expect("base");
     assert_eq!(&mem[s..s + 4], &[crate::abi::TYPE_STRING, 0, 0, 0]);
     assert_eq!(&mem[s + 4..s + 8], &3u32.to_le_bytes());
+    // A two-byte string sets the flag; its 3 units take 6 data bytes.
+    let t = new_string
+        .call(&mut store, (3, 1))
+        .expect("new two-byte string");
+    assert_eq!(
+        t - i32::try_from(s).expect("base"),
+        16,
+        "8 + 3 rounds up to 16"
+    );
+    let mem = memory.data(&store);
+    let t = usize::try_from(t).expect("base");
+    assert_eq!(
+        &mem[t..t + 4],
+        &[crate::abi::TYPE_STRING, 0, crate::abi::STR_FLAG_TWO_BYTE, 0]
+    );
+    assert_eq!(&mem[t + 4..t + 8], &3u32.to_le_bytes());
 
     let new_array = instance
         .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_ARRAY_EXPORT_NAME)
