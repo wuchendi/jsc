@@ -1156,8 +1156,8 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
                     seed_callee_error(INSTANCEOF_NOT_CALLABLE, strs);
                     seed_callee_error(INSTANCEOF_NON_OBJECT_PROTOTYPE, strs);
                 }
-                // The runtime-TYPE-BYTE builtins read the receiver's own type byte
-                // only — no interned key or literal to seed.
+                // The builtin fast arms walk the receiver's `proto` chain for a
+                // static prototype — no interned key or literal to seed.
                 InstanceOfKind::Array
                 | InstanceOfKind::Function
                 | InstanceOfKind::Date

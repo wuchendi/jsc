@@ -403,8 +403,8 @@ pub(super) const HAS_INSTANCE_NOT_CALLABLE: CalleeErrorText<'static> = [
 /// `true`/`false` jsval on the stack. The operand `value` is evaluated first,
 /// then the right-hand side. A builtin right-hand side
 /// ([`InstanceOfKind::Array`] .. [`InstanceOfKind::Proto`]) takes its fast test
-/// — the operand's type byte, or a `proto` chain walk for the static
-/// `%Object.prototype%` / error prototype — while the constructor's `@@hasInstance` lookup provably finds
+/// — a `proto` chain walk for the constructor's static prototype — while the
+/// constructor's `@@hasInstance` lookup provably finds
 /// the immutable `%Function.prototype%[@@hasInstance]` ([`emit_builtin_rhs_intact`]);
 /// otherwise, and for [`InstanceOfKind::Ctor`], [`emit_instanceof_operator`].
 pub(super) fn emit_instanceof_node(
@@ -443,34 +443,26 @@ pub(super) fn emit_instanceof_node(
     emit_builtin_rhs_intact(function, ctor, helpers);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
-    let type_byte = match kind {
-        InstanceOfKind::Array => Some(TYPE_ARRAY),
-        InstanceOfKind::Function => Some(TYPE_FUNCTION),
-        InstanceOfKind::Date => Some(TYPE_DATE),
-        _ => None,
-    };
-    if let Some(type_byte) = type_byte {
-        emit_type_byte_instanceof(function, cur, type_byte);
+    // `ctor.prototype` is non-writable and non-configurable, so
+    // `OrdinaryHasInstance` searches the operand's chain for the static
+    // prototype; its first link (the operand's direct `proto`) is the common
+    // hit. A replaced `proto` is honoured: `Object.setPrototypeOf([], null)`
+    // is not an Array instance, `Object.create(Array.prototype)` is.
+    if let InstanceOfKind::Proto(proto) = kind {
+        emit_node(proto, function, scratch, strings, helpers);
     } else {
-        // `Object` / an error constructor: `ctor.prototype` is non-writable and
-        // non-configurable, so `OrdinaryHasInstance` searches the operand's
-        // chain for the static prototype.
-        if let InstanceOfKind::Proto(proto) = kind {
-            emit_node(proto, function, scratch, strings, helpers);
-        } else {
-            function.instruction(&Instruction::I64Const(intrinsic_bits(
-                Intrinsic::ObjectPrototype,
-                helpers,
-            )));
-        }
-        function.instruction(&Instruction::LocalSet(tgt));
-        emit_is_object(function, cur);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-        emit_proto_chain_match(function, cur, tgt);
-        function.instruction(&Instruction::Else);
-        function.instruction(&Instruction::I64Const(FALSE_BITS));
-        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I64Const(intrinsic_bits(
+            realm::prototype_of(ctor),
+            helpers,
+        )));
     }
+    function.instruction(&Instruction::LocalSet(tgt));
+    emit_is_object(function, cur);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    emit_proto_chain_match(function, cur, tgt);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I64Const(intrinsic_bits(
         Intrinsic::Ctor(ctor),
@@ -803,27 +795,6 @@ fn emit_bound_restart(function: &mut Function, f: u32) {
     function.instruction(&Instruction::If(BlockType::Empty));
     emit_bound_target(function, f);
     function.instruction(&Instruction::Br(2)); // -> $again
-    function.instruction(&Instruction::End);
-}
-
-/// Emit a runtime-TYPE-BYTE `instanceof` test for the operand already stashed in
-/// local `v`, leaving a TRUE/FALSE jsval on the stack. `true` iff `v` is a heap
-/// pointer whose type byte equals `type_byte`. The type-byte read is gated
-/// behind [`emit_is_pointer`] so a non-pointer operand (whose wrapped low bits
-/// would be a bogus offset) is simply never an instance.
-fn emit_type_byte_instanceof(function: &mut Function, v: u32, type_byte: i32) {
-    emit_is_pointer(function, v);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    emit_load_type_byte(function, v);
-    function.instruction(&Instruction::I32Const(type_byte));
-    function.instruction(&Instruction::I32Eq);
-    // Box the i32 `1`/`0` into a TRUE/FALSE jsval (`FALSE_BITS | bit`).
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(FALSE_BITS));
-    function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::Else);
-    // A non-pointer operand is never an instance.
-    function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::End);
 }
 

@@ -320,6 +320,37 @@ fn builtin_instanceof_arms_unchanged() {
 }
 
 #[test]
+fn builtin_instanceof_arms_honour_a_replaced_prototype() {
+    assert_bool("Object.setPrototypeOf([], null) instanceof Array", false);
+    assert_bool(
+        "Object.setPrototypeOf({}, Array.prototype) instanceof Array",
+        true,
+    );
+    assert_bool("Object.create(Array.prototype) instanceof Array", true);
+    assert_bool(
+        "class X extends Array {} let x = new X(); x instanceof Array && x instanceof X",
+        true,
+    );
+    assert_bool(
+        "function f() {} Object.setPrototypeOf(f, null); f instanceof Function",
+        false,
+    );
+    assert_bool("Object.create(Date.prototype) instanceof Date", true);
+    assert_bool(
+        "Object.setPrototypeOf(new Date(0), null) instanceof Date",
+        false,
+    );
+    assert_bool("[1, 2] instanceof Array", true);
+    assert_bool(
+        "function f() {} class C {} f instanceof Function && C instanceof Function \
+         && f.bind(null) instanceof Function",
+        true,
+    );
+    assert_bool("new Date(0) instanceof Date", true);
+    assert_bool("1 instanceof Array || 'a' instanceof Function", false);
+}
+
+#[test]
 fn instanceof_object_walks_the_prototype_chain() {
     assert_bool("Object.create(null) instanceof Object", false);
     assert_bool("({}) instanceof Object", true);
