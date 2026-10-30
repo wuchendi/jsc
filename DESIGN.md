@@ -450,7 +450,14 @@ iterator, 32 bytes: `[[IteratedObject]]` at `16` (`undefined` once
 exhausted), `[[NextIndex]]: u32` at `24` (an array index, a string byte
 index, a Map/Set backing slot index), `kind: u8` at `28`: `0`..`2` array
 keys / values / entries, `3` string, `4`..`6` map keys / values / entries,
-`7` / `8` set values / entries; no host reads the payload).
+`7` / `8` set values / entries; `16` an `Iterator.from` wrapper (48 bytes:
+the wrapped iterator at `32`, its `next` at `40`); `17`..`21` a `map` /
+`filter` / `take` / `drop` / `flatMap` helper (80 bytes: `[[NextIndex]]`
+holds the generator state `0` suspended-start, `1` suspended-yield, `2`
+running, `3` completed; the underlying iterator at `32`, its `next` at
+`40`, the counter or remaining limit (`f64`) at `48`, the callback at `56`,
+a `flatMap`'s inner iterator at `64` (`undefined` while none is open) and
+its `next` at `72`); no host reads the payload).
 
 Notes per kind:
 
@@ -1010,8 +1017,9 @@ inheriting `%IteratorPrototype%`), `%AsyncIteratorPrototype%`
 hidden `Symbol.for` registry (`proto` `null`, unreachable from the global
 object; its table maps interned keys to the registered symbols),
 `Array.prototype[@@unscopables]` (`proto` `null`), and
-`%WrapForValidIteratorPrototype%` (`next` / `return`, inheriting
-`%IteratorPrototype%`). Each
+`%WrapForValidIteratorPrototype%` and `%IteratorHelperPrototype%` (each a
+`next` / `return`, inheriting `%IteratorPrototype%`; the latter's
+`@@toStringTag` is `"Iterator Helper"`). Each
 constructor owns `length`, `name`, a
 non-writable `prototype`, and its statics (`%Array%`, `%Map%`, `%Set%` and
 `%Promise%` also `get [@@species]`); each prototype owns a
@@ -1732,7 +1740,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter, `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
-| iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); no iterator helpers yet. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
+| iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. No eager helpers yet. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
 
 No input produces an invalid wasm module.
 

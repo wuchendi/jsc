@@ -1,8 +1,8 @@
 //! Integration tests: the `Iterator` global (`design/symbol-strings.md`
 //! §5.7): the abstract constructor, `Iterator.prototype` (=
 //! `%IteratorPrototype%`) with its `constructor` / `@@toStringTag`
-//! accessors, and `Iterator.from` with its `%WrapForValidIteratorPrototype%`
-//! wrappers.
+//! accessors, `Iterator.from` with its `%WrapForValidIteratorPrototype%`
+//! wrappers, and the lazy helpers over `%IteratorHelperPrototype%`.
 
 mod common;
 use common::{assert_bool, assert_number, assert_string, assert_uncaught};
@@ -221,6 +221,264 @@ fn from_iterates_strings_and_rejects_other_primitives() {
     assert_bool(
         "try { Iterator.from({ [Symbol.iterator]() { return 1; } }); false }
          catch (e) { e instanceof TypeError }",
+        true,
+    );
+}
+
+// --- lazy helpers ---------------------------------------------------------------------
+
+/// A source iterator over `0, 1, 2, ...` (up to `n`) logging its `next` and
+/// `return` calls into `log`.
+const LOGGED: &str = "const log = [];
+     function src(n) {
+       let i = 0;
+       return Object.setPrototypeOf({
+         next() { log.push('next'); return i < n ? { value: i++, done: false } : { value: undefined, done: true }; },
+         return() { log.push('return'); return {}; },
+       }, Iterator.prototype);
+     }";
+
+#[test]
+fn helpers_produce_their_values() {
+    assert_string(
+        "JSON.stringify([...[1, 2, 3].values().map((x, i) => x * 10 + i)])",
+        "[10,21,32]",
+    );
+    assert_string(
+        "JSON.stringify([...[1, 2, 3, 4].values().filter((x, i) => x % 2 === 0 && i > 0)])",
+        "[2,4]",
+    );
+    assert_string("JSON.stringify([...[1, 2, 3].values().take(2)])", "[1,2]");
+    assert_string("JSON.stringify([...[1, 2, 3].values().drop(1)])", "[2,3]");
+    assert_string(
+        "JSON.stringify([...[1, 2].values().flatMap(x => [x, x * 10])])",
+        "[1,10,2,20]",
+    );
+    assert_string(
+        "JSON.stringify([...[1, 2, 3].values().drop(1).map(x => x * 2).take(1)])",
+        "[4]",
+    );
+    assert_string(
+        "JSON.stringify([...[1].values().take(Infinity)].concat([...[1, 2].values().drop(Infinity)]))",
+        "[1]",
+    );
+}
+
+#[test]
+fn helper_prototype_shape() {
+    assert_bool(
+        "const p = Object.getPrototypeOf([].values().map(x => x));
+         Object.getPrototypeOf(p) === Iterator.prototype
+           && typeof p.next === 'function' && typeof p.return === 'function'
+           && p[Symbol.toStringTag] === 'Iterator Helper'",
+        true,
+    );
+    assert_string(
+        "Object.prototype.toString.call([].values().filter(x => x))",
+        "[object Iterator Helper]",
+    );
+    assert_bool(
+        "Iterator.prototype.map.length === 1 && Iterator.prototype.flatMap.name === 'flatMap'",
+        true,
+    );
+    assert_bool(
+        "const r = [1].values().map(x => x).next(); r.value === 1 && r.done === false",
+        true,
+    );
+}
+
+#[test]
+fn helpers_are_lazy() {
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const h = src(3).map(x => x);
+             const before = log.length;
+             h.next();
+             before + ':' + log.join(',')"
+        ),
+        "0:next",
+    );
+    for helper in [
+        "filter(x => true)",
+        "take(1)",
+        "drop(1)",
+        "flatMap(x => [x])",
+    ] {
+        assert_number(&format!("{LOGGED} src(3).{helper}; log.length"), 0.0);
+    }
+}
+
+#[test]
+fn take_closes_the_source_at_the_limit() {
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const h = src(5).take(2);
+             h.next(); h.next();
+             const r = h.next();
+             log.join(',') + ':' + r.done + ':' + h.next().done"
+        ),
+        "next,next,return:true:true",
+    );
+}
+
+#[test]
+fn limits_are_range_checked_after_to_number() {
+    assert_bool(
+        "try { [].values().drop(-1); false } catch (e) { e instanceof RangeError }",
+        true,
+    );
+    assert_bool(
+        "try { [].values().take(NaN); false } catch (e) { e instanceof RangeError }",
+        true,
+    );
+    // `ToNumber` runs first (its `valueOf` is observed), then the source is
+    // closed under the RangeError.
+    assert_string(
+        &format!(
+            "{LOGGED}
+             let e;
+             try {{ src(1).take({{ valueOf() {{ log.push('valueOf'); return NaN; }} }}); }}
+             catch (x) {{ e = x; }}
+             (e instanceof RangeError) + ':' + log.join(',')"
+        ),
+        "true:valueOf,return",
+    );
+    assert_string(
+        &format!(
+            "{LOGGED}
+             let e;
+             try {{ src(1).drop(-1); }} catch (x) {{ e = x; }}
+             (e instanceof RangeError) + ':' + log.join(',')"
+        ),
+        "true:return",
+    );
+    // A fractional limit truncates; `-0.5` is `0`.
+    assert_string(
+        "JSON.stringify([...[1, 2, 3].values().take(1.9)].concat([...[1].values().take(-0.5)]))",
+        "[1]",
+    );
+}
+
+#[test]
+fn a_non_callable_callback_throws_before_any_step() {
+    for helper in ["map", "filter", "flatMap"] {
+        assert_string(
+            &format!(
+                "{LOGGED}
+                 let e;
+                 try {{ src(2).{helper}(1); }} catch (x) {{ e = x; }}
+                 (e instanceof TypeError) + ':' + log.join(',')"
+            ),
+            "true:return",
+        );
+    }
+    // `this` must be an object; nothing else is read.
+    assert_bool(
+        "try { Iterator.prototype.map.call(1, x => x); false } catch (e) { e instanceof TypeError }",
+        true,
+    );
+}
+
+#[test]
+fn a_throwing_callback_closes_the_source() {
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const h = src(3).map(() => {{ throw 7; }});
+             let e;
+             try {{ h.next(); }} catch (x) {{ e = x; }}
+             e + ':' + log.join(',') + ':' + h.next().done"
+        ),
+        "7:next,return:true",
+    );
+}
+
+#[test]
+fn flat_map_rejects_a_string_result() {
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const h = src(2).flatMap(x => 'ab');
+             let e;
+             try {{ h.next(); }} catch (x) {{ e = x; }}
+             (e instanceof TypeError) + ':' + log.join(',')"
+        ),
+        "true:next,return",
+    );
+    // An iterable object (a String wrapper included) is flattened.
+    assert_string(
+        "JSON.stringify([...[1].values().flatMap(() => new String('ab'))])",
+        "[\"a\",\"b\"]",
+    );
+}
+
+#[test]
+fn next_while_running_throws() {
+    assert_bool(
+        "let h; h = [1].values().map(() => h.next());
+         try { h.next(); false } catch (e) { e instanceof TypeError }",
+        true,
+    );
+    // The helper completed under that throw.
+    assert_bool(
+        "let h; h = [1, 2].values().map(() => h.next());
+         try { h.next(); } catch (e) {}
+         h.next().done",
+        true,
+    );
+}
+
+#[test]
+fn return_before_start_closes_the_source() {
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const h = src(3).map(x => x);
+             const r = h.return();
+             log.join(',') + ':' + r.done + ':' + (r.value === undefined) + ':' + h.next().done + ':' + log.length"
+        ),
+        "return:true:true:true:1",
+    );
+    // After a yield `return()` closes the source too; a completed helper does
+    // not close again.
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const h = src(3).filter(x => true);
+             h.next();
+             h.return();
+             h.return();
+             log.join(',')"
+        ),
+        "next,return",
+    );
+    // `flatMap` closes the open inner iterator, then the source.
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const inner = Object.setPrototypeOf({{
+               next() {{ return {{ value: 'i', done: false }}; }},
+               return() {{ log.push('inner'); return {{}}; }},
+             }}, Iterator.prototype);
+             const h = src(3).flatMap(() => inner);
+             h.next().value + ':' + (h.return(), log.join(','))"
+        ),
+        "i:next,inner,return",
+    );
+}
+
+#[test]
+fn helper_methods_reject_other_receivers() {
+    assert_bool(
+        "const { next } = Object.getPrototypeOf([].values().map(x => x));
+         try { next.call([].values()); false } catch (e) { e instanceof TypeError }",
+        true,
+    );
+    assert_bool(
+        "const p = Object.getPrototypeOf([].values().map(x => x));
+         try { p.return.call(Iterator.from({ next() {} })); false } catch (e) { e instanceof TypeError }",
         true,
     );
 }
