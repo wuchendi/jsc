@@ -1648,7 +1648,7 @@ fn emit_class_heritage(
 }
 
 /// Push the jsval in `local` when it is an object-family heap value (any heap
-/// kind but a string), else the i64 pushed by `alt`.
+/// kind but a string or a symbol), else the i64 pushed by `alt`.
 fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(alt);
@@ -1657,13 +1657,17 @@ fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>
 }
 
 /// Push `1` if the jsval in `local` is an object (a heap value other than a
-/// string), else `0`.
+/// string or a symbol), else `0`.
 pub(super) fn emit_is_object(function: &mut Function, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Ne);
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);

@@ -560,8 +560,8 @@ fn this_primitive(
 }
 
 /// `__to_object(v: i64) -> i64`: `ToObject` of a non-nullish jsval: a
-/// string, number or boolean becomes a fresh wrapper object (DESIGN.md §5.2) over
-/// its realm prototype; any other value (an object, or `null`/`undefined`,
+/// string, symbol, number or boolean becomes a fresh wrapper object (DESIGN.md
+/// §5.2) over its realm prototype; any other value (an object, or `null`/`undefined`,
 /// which callers reject first) is returned as is. A String wrapper's
 /// `length` and indices are defined as its own read-only, non-configurable
 /// properties (the indices enumerable), so every property operation sees them.
@@ -572,27 +572,33 @@ pub(super) fn emit_to_object(strings: &HashMap<String, i32>, helpers: Helpers<'_
         (3, ValType::I32),
     ]);
     let (v, obj, class, proto, len, idx, string) = (0, 1, 2, 3, 4, 5, 6);
-    let wrap = |f: &mut Function, c: u8, ctor: BuiltinCtor| {
+    let wrap = |f: &mut Function, c: u8, proto_bits: i64| {
         wasm!(f;
             I32Const(i32::from(c)), LocalSet(class),
-            I64Const(intrinsic_bits(realm::prototype_of(ctor), helpers)), LocalSet(proto),
+            I64Const(proto_bits), LocalSet(proto),
         );
     };
+    let ctor_proto = |ctor| intrinsic_bits(realm::prototype_of(ctor), helpers);
     emit_is_string(&mut f, v);
     wasm!(f; If(BlockType::Empty));
-    wrap(&mut f, abi::CLASS_STRING, BuiltinCtor::String);
+    wrap(&mut f, abi::CLASS_STRING, ctor_proto(BuiltinCtor::String));
+    wasm!(f; Else);
+    emit_is_symbol(&mut f, v);
+    wasm!(f; If(BlockType::Empty));
+    let symbol_proto = SYMBOL_PROTOTYPE.map_or(NULL_BITS, |p| intrinsic_bits(p, helpers));
+    wrap(&mut f, abi::CLASS_SYMBOL, symbol_proto);
     wasm!(f; Else);
     emit_is_number(&mut f, v);
     wasm!(f; If(BlockType::Empty));
-    wrap(&mut f, abi::CLASS_NUMBER, BuiltinCtor::Number);
+    wrap(&mut f, abi::CLASS_NUMBER, ctor_proto(BuiltinCtor::Number));
     wasm!(f;
         Else,
         LocalGet(v), I64Const(TRUE_BITS), I64Eq, LocalGet(v), I64Const(FALSE_BITS), I64Eq, I32Or,
         I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End,
     );
-    wrap(&mut f, abi::CLASS_BOOLEAN, BuiltinCtor::Boolean);
+    wrap(&mut f, abi::CLASS_BOOLEAN, ctor_proto(BuiltinCtor::Boolean));
     wasm!(f;
-        End, End,
+        End, End, End,
         I32Const(abi::WRAPPER_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(obj),
         LocalGet(class), I32Const(24), I32Shl, I32Const(TYPE_OBJECT), I32Or,
         I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),

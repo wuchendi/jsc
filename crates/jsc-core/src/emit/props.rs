@@ -910,8 +910,9 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 /// first from its exotic own keys when it is a string or an array (`length`,
 /// a present index; a hole or an index past the length is not own, so it
 /// reads through the chain), then from its own table, calling an accessor's
-/// getter with `this = recv` (`undefined` when it has none). A string, number
-/// or boolean continues at its realm prototype without allocating a wrapper;
+/// getter with `this = recv` (`undefined` when it has none). A string, symbol,
+/// number or boolean continues at its realm prototype without allocating a
+/// wrapper;
 /// `null`/`undefined` and a key of `0` (never interned) read `undefined`.
 pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
@@ -925,7 +926,17 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
     emit_is_pointer(&mut f, recv);
     wasm!(f;
         If(BlockType::Empty),
-        LocalGet(recv), I32WrapI64, LocalSet(o),
+        LocalGet(recv), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_SYMBOL), I32Eq,
+        If(BlockType::Empty),
+    );
+    if let Some(proto) = SYMBOL_PROTOTYPE {
+        let bits = intrinsic_bits(proto, helpers);
+        wasm!(f; I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o));
+    } else {
+        wasm!(f; I64Const(UNDEFINED_BITS), Return);
+    }
+    wasm!(f;
+        End,
         Else,
     );
     emit_is_number(&mut f, recv);
@@ -1146,7 +1157,7 @@ fn emit_has_lookup(strings: &HashMap<String, i32>, helpers: Helpers<'_>, own: bo
 /// `live` decremented); a non-configurable property throws. On an array an
 /// in-range index becomes a hole and `length` (non-configurable) throws; its
 /// named keys (and a `SPARSE` array's elements past its store) are table
-/// entries. A primitive or string is left unchanged. A delete on a watched
+/// entries. A primitive (a string or symbol included) is left unchanged. A delete on a watched
 /// table sets its dirty bit when the program tracks them.
 pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32)]);
@@ -1156,7 +1167,8 @@ pub(super) fn emit_delete(strings: &HashMap<String, i32>, helpers: Helpers<'_>) 
         I32Eqz, If(BlockType::Empty), Return, End,
         LocalGet(key), I32Eqz, If(BlockType::Empty), Return, End,
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(t),
-        I32Const(TYPE_STRING), I32Eq, If(BlockType::Empty), Return, End,
+        I32Const(TYPE_STRING), I32Eq, LocalGet(t), I32Const(TYPE_SYMBOL), I32Eq, I32Or,
+        If(BlockType::Empty), Return, End,
         LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
@@ -2152,10 +2164,15 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
     let (o, ks, n, i, j, m) = (1, 2, 3, 4, 5, 6);
     let (out, seen, cur, k) = (7, 8, 9, 10);
     let new_array = helpers.new_string + 1;
+    // A primitive (a symbol included) has no enumerable keys of its own or on
+    // its prototype chain.
     emit_is_pointer(&mut f, obj);
     wasm!(f;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(i),
+        I32Const(TYPE_SYMBOL), I32Ne,
+        Else, I32Const(0), End,
         If(BlockType::Empty),
-        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalSet(i),
     );
     emit_is_string_or_array_kind(&mut f, i);
     wasm!(f;

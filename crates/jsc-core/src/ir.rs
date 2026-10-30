@@ -205,9 +205,12 @@ pub enum ArrayHofOp {
 /// [`IrNode::ConvertCall`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertOp {
-    /// `String(x)` — `ToString` in the guest (`__to_string`), so an object's
-    /// user `toString`/`valueOf` runs and may throw.
+    /// `ToString(x)` in the guest (`__to_string`), so an object's user
+    /// `toString`/`valueOf` runs and may throw; a symbol throws.
     ToString,
+    /// `String(x)` called (not constructed): [`ConvertOp::ToString`], except
+    /// a symbol yields its `SymbolDescriptiveString` (`"Symbol(desc)"`).
+    String,
     /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
     /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
     ToNumber,
