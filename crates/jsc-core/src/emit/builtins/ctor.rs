@@ -204,6 +204,21 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         BuiltinCtor::Date => date(&body),
         // A hand-written body (`symbol::emit_ctor`).
         BuiltinCtor::Symbol => IrNode::Undefined,
+        // Abstract: only a subclass `new.target` constructs (the allocated
+        // `this`, `proto` from `new.target`, is the instance).
+        BuiltinCtor::Iterator => ternary(
+            IrNode::Logical {
+                op: LogicalOp::And,
+                lhs: Box::new(body.constructing()),
+                rhs: Box::new(IrNode::Binary {
+                    op: BinOp::Ne,
+                    lhs: Box::new(IrNode::NewTargetGlobal),
+                    rhs: Box::new(IrNode::Intrinsic(GlobalIntrinsic::Ctor(ctor))),
+                }),
+            },
+            IrNode::Undefined,
+            throw_type_error("Abstract class Iterator not directly constructable"),
+        ),
     }
 }
 
