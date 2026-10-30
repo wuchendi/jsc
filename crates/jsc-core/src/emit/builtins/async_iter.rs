@@ -1,4 +1,4 @@
-//! Async iteration (design/symbol-strings.md §5.8): the async record nodes
+//! Async iteration (DESIGN.md §7.8): the async record nodes
 //! ([`IrNode::OpenIterator`] with `is_async`, [`IrNode::AsyncIteratorNext`],
 //! [`IrNode::AsyncIteratorComplete`], [`IrNode::AsyncIteratorReturn`],
 //! [`IrNode::IteratorResultCheck`]), the internal builtins behind them, and
@@ -19,7 +19,7 @@ use super::*;
 use crate::emit::realm::{AsyncGenRequest, AsyncIterOp, IterOp};
 use crate::ir::ConvertOp;
 
-/// The `kind` byte of an async-from-sync iterator object (§5.4).
+/// The `kind` byte of an async-from-sync iterator object (DESIGN.md §5.2).
 const KIND_ASYNC_FROM_SYNC: i32 = 32;
 /// Offset of an iterator object's `[[IteratedObject]]` jsval.
 const ITERATED_OFFSET: u32 = abi::OBJ_PREFIX_SIZE;

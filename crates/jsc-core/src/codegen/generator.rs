@@ -1057,8 +1057,8 @@ impl CfgBuilder {
         Ok(block)
     }
 
-    /// Expand `yield* iterable` ([`IrNode::YieldDelegate`], design/symbol-strings.md
-    /// §5.2, §5.6) into the delegation loop, returning the read of its value
+    /// Expand `yield* iterable` ([`IrNode::YieldDelegate`], DESIGN.md
+    /// §7.8) into the delegation loop, returning the read of its value
     /// (the delegate's return value) in the block control ends in:
     ///
     /// ```text

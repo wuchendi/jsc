@@ -454,7 +454,7 @@ fn collections_from_arguments() {
     );
 }
 
-// --- deletion and live iteration (B2, design/symbol-strings.md §5.5) ------------
+// --- deletion and live iteration (B2, DESIGN.md §5.2) ------------
 
 /// Deleting the visited entry during for-of or `forEach` does not skip the
 /// next one (B2).

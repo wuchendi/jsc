@@ -1868,7 +1868,7 @@ pub(super) fn emit_map_op(
 
 /// `.clear()` on the handle in i64 `handle`: `size = 0`, and every entry
 /// tombstoned in place (`HOLE` key, `undefined` value;
-/// design/symbol-strings.md §5.5). The backing keeps its length, so a live
+/// DESIGN.md §5.2). The backing keeps its length, so a live
 /// iterator continues at its index and sees the entries added after the
 /// `clear`. Uses the i32 scratch locals `scratch + 8` / `+ 9`.
 fn emit_map_clear(handle: u32, function: &mut Function, scratch: u32) {

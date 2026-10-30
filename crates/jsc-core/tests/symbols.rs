@@ -1,6 +1,6 @@
-//! Integration tests: the Symbol primitive (`design/symbol-strings.md` §2):
+//! Integration tests: the Symbol primitive (DESIGN.md §5.2):
 //! `typeof`, Node-style rendering of symbols, symbol-keyed properties,
-//! uncaught symbols, and the conversions and object checks of §2.3 / §2.4.
+//! uncaught symbols, and the conversions and object checks of DESIGN.md §6.5.
 
 mod common;
 use common::{assert_bool, assert_eval, assert_number, assert_string, assert_uncaught};
@@ -48,7 +48,7 @@ fn uncaught_symbol_renders_its_description() {
     assert_uncaught("throw Symbol(\"a\")", "Symbol(a)");
 }
 
-// --- conversions (§2.4) -----------------------------------------------------------
+// --- conversions (DESIGN.md §6.5) -----------------------------------------------------------
 
 /// Evaluate `expr` against `let s = Symbol("x")` inside a `try`, yielding
 /// whether it threw a `TypeError`.
@@ -133,7 +133,7 @@ fn json_skips_symbols() {
     );
 }
 
-// --- wrappers and object checks (§2.3) ----------------------------------------------
+// --- wrappers and object checks (DESIGN.md §6.5) ----------------------------------------------
 
 #[test]
 fn to_object_of_a_symbol_is_a_symbol_wrapper() {

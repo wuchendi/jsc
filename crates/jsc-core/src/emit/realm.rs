@@ -52,7 +52,7 @@ pub(super) enum Intrinsic {
     /// `%AsyncIteratorPrototype%`: `[@@asyncIterator]() { return this }`;
     /// `%AsyncGeneratorPrototype%`'s `proto`.
     AsyncIteratorPrototype,
-    /// `%AsyncFromSyncIteratorPrototype%` (design/symbol-strings.md §5.8):
+    /// `%AsyncFromSyncIteratorPrototype%` (DESIGN.md §7.8):
     /// the promise-returning `next`, `return`, `throw` of the
     /// `CreateAsyncFromSyncIterator` objects; not reachable from the global
     /// object.
@@ -71,15 +71,15 @@ pub(super) enum Intrinsic {
     /// own data properties (each `true`) name the methods `with` skips.
     ArrayUnscopables,
     /// `%WrapForValidIteratorPrototype%`: the `next` / `return` of the
-    /// wrappers `Iterator.from` creates (design/symbol-strings.md §5.7).
+    /// wrappers `Iterator.from` creates (DESIGN.md §7.9).
     WrapForValidIteratorPrototype,
     /// `%IteratorHelperPrototype%`: the `next` / `return` of the helper
-    /// objects the lazy `Iterator.prototype` methods create (§5.7).
+    /// objects the lazy `Iterator.prototype` methods create (DESIGN.md §7.9).
     IteratorHelperPrototype,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
-/// `next` (design/symbol-strings.md §5.4).
+/// `next` (DESIGN.md §6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IterFamily {
     Array,
@@ -125,7 +125,7 @@ const PLAIN_PROTOTYPES: [BuiltinCtor; 9] = [
     BuiltinCtor::Symbol,
 ];
 
-/// A well-known symbol (`design/symbol-strings.md` §4): a static
+/// A well-known symbol (DESIGN.md §6.4): a static
 /// `TYPE_SYMBOL` block of the image whose description is
 /// `"Symbol.<name>"`, the value of the non-writable, non-configurable
 /// `Symbol.<name>`.
@@ -316,7 +316,7 @@ impl Intrinsic {
             Self::IterPrototype(IterFamily::Map) => 18,
             Self::IterPrototype(IterFamily::Set) => 19,
             // `%Array%[@@species]` / `%Promise%[@@species]`
-            // (design/symbol-strings.md §4).
+            // (DESIGN.md §6.4).
             Self::Ctor(BuiltinCtor::Array) => 20,
             Self::Ctor(BuiltinCtor::Promise) => 21,
             _ => return None,
@@ -572,7 +572,7 @@ pub(super) enum Builtin {
     /// installed on any intrinsic.
     MethodCall,
     /// An internal builtin of the iteration protocol
-    /// (design/symbol-strings.md §5.1). Not installed on any intrinsic.
+    /// (DESIGN.md §7.8). Not installed on any intrinsic.
     Protocol(ProtocolOp),
     /// The global `isNaN`.
     IsNaN,
@@ -584,17 +584,17 @@ pub(super) enum Builtin {
     ParseInt,
     /// A `Symbol` static or `%Symbol.prototype%` builtin.
     Symbol(SymbolOp),
-    /// An iteration builtin (design/symbol-strings.md §5.4, §5.8).
+    /// An iteration builtin (DESIGN.md §6.4, §7.8).
     Iter(IterOp),
     /// A `@@species` builtin: a `get [Symbol.species]`, or an internal
     /// closure of the promise `SpeciesConstructor` paths.
     Species(SpeciesOp),
     /// An `Iterator` static, `%WrapForValidIteratorPrototype%` method or
-    /// `%IteratorPrototype%` accessor half (design/symbol-strings.md §5.7).
+    /// `%IteratorPrototype%` accessor half (DESIGN.md §7.9).
     Iterator(IteratorOp),
 }
 
-/// The `Iterator` builtins of design/symbol-strings.md §5.7.
+/// The `Iterator` builtins of DESIGN.md §7.9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IteratorOp {
     /// `Iterator.from`.
@@ -623,7 +623,7 @@ pub(super) enum IteratorOp {
     Eager(EagerKind),
 }
 
-/// The eager `Iterator.prototype` helpers (design/symbol-strings.md §5.7).
+/// The eager `Iterator.prototype` helpers (DESIGN.md §7.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EagerKind {
     /// `reduce(reducer[, initialValue])`.
@@ -654,7 +654,7 @@ impl EagerKind {
     }
 }
 
-/// The lazy `Iterator.prototype` helpers (design/symbol-strings.md §5.7).
+/// The lazy `Iterator.prototype` helpers (DESIGN.md §7.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HelperKind {
     /// `map(mapper)`.
@@ -779,8 +779,8 @@ impl PromiseStaticOp {
     }
 }
 
-/// The `Promise` combinators over an iterable (design/symbol-strings.md
-/// §5.7).
+/// The `Promise` combinators over an iterable (DESIGN.md
+/// §6.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CombinatorOp {
     /// `Promise.all`.
@@ -903,7 +903,7 @@ impl SpeciesOp {
     }
 }
 
-/// `Array.fromAsync` (design/symbol-strings.md §5.8) and the internal
+/// `Array.fromAsync` (DESIGN.md §7.8) and the internal
 /// builtins of its promise-reaction state machine (not installed on any
 /// intrinsic), whose `env` is the loop's state block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -950,7 +950,7 @@ impl FromAsyncOp {
     }
 }
 
-/// An async iteration builtin (design/symbol-strings.md §5.8): the
+/// An async iteration builtin (DESIGN.md §7.8): the
 /// `%AsyncFromSyncIteratorPrototype%` methods, and the internal builtins
 /// behind the async record nodes and their promise reactions (not installed
 /// on any intrinsic), called with `this` and `env` as below.
@@ -1012,8 +1012,8 @@ impl AsyncIterOp {
     ];
 }
 
-/// An internal builtin of the iteration protocol (design/symbol-strings.md
-/// §5.1), called by the record nodes and the consumers with `this` and
+/// An internal builtin of the iteration protocol (DESIGN.md
+/// §7.8), called by the record nodes and the consumers with `this` and
 /// `env` as below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProtocolOp {
@@ -1056,7 +1056,7 @@ pub(super) enum IterOp {
     StringIterator,
     /// The `next` of a builtin iterator prototype.
     Next(IterFamily),
-    /// An async iteration builtin (design/symbol-strings.md §5.8).
+    /// An async iteration builtin (DESIGN.md §7.8).
     Async(AsyncIterOp),
 }
 
@@ -2692,7 +2692,7 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
     }));
 }
 
-/// The iteration entries (design/symbol-strings.md §5.4) past the methods
+/// The iteration entries (DESIGN.md §6.4) past the methods
 /// [`Builtin::prototype`] installs: the `[@@iterator]` of `%Array.prototype%`
 /// (`=== values`), `%Map.prototype%` (`=== entries`), `%Set.prototype%`
 /// (`=== values`, as is `keys`) and `%String.prototype%`, and the
@@ -2753,7 +2753,7 @@ fn iterator_entries(entries: &mut Vec<Entry>) {
 }
 
 /// The `constructor` and `[@@toStringTag]` accessors (configurable only) of
-/// `%IteratorPrototype%` (design/symbol-strings.md §5.4): the getters return
+/// `%IteratorPrototype%` (DESIGN.md §6.4): the getters return
 /// `%Iterator%` / `"Iterator"`, the setters are
 /// `SetterThatIgnoresPrototypeProperties`.
 fn iterator_prototype_entries(entries: &mut Vec<Entry>) {
@@ -3307,7 +3307,7 @@ mod tests {
 
     #[test]
     fn async_from_sync_iterator_prototype_is_hidden() {
-        // `%AsyncFromSyncIteratorPrototype%` (§5.8): unreachable from the
+        // `%AsyncFromSyncIteratorPrototype%` (DESIGN.md §7.8): unreachable from the
         // global object, holding the promise-returning `next` / `return` /
         // `throw` of the async-from-sync wrappers.
         assert_eq!(

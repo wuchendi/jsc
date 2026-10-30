@@ -713,7 +713,7 @@ fn emit_is(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
 }
 
 /// `Object.fromEntries(iterable)`: `RequireObjectCoercible`, then each value
-/// its iterator record yields (design/symbol-strings.md §5.2; `<x> is not
+/// its iterator record yields (DESIGN.md §7.8; `<x> is not
 /// iterable` without one) must be an object whose `0` / `1` become a data
 /// property (`ToPropertyKey(entry[0])`, `CreateDataPropertyOrThrow`) of a
 /// fresh ordinary object. A non-object entry or a throwing entry read or key

@@ -1,8 +1,8 @@
 //! Integration tests: the builtin iterator intrinsics and iterator objects
-//! (`design/symbol-strings.md` §5.4): `keys` / `values` / `entries` /
+//! (DESIGN.md §6.4): `keys` / `values` / `entries` /
 //! `[Symbol.iterator]` on Array, Map, Set and String, their `next`, and the
 //! shared `%IteratorPrototype%`; and the iteration protocol behind every
-//! consumer (§5.1-§5.3): user iterables, `next` read once, the result
+//! consumer (DESIGN.md §7.8, §6.4): user iterables, `next` read once, the result
 //! checks, `IteratorClose` on abrupt exits (B3), and the guarded fast paths
 //! (B1).
 
@@ -203,7 +203,7 @@ fn an_exhausted_iterator_stays_done() {
     );
 }
 
-// --- the protocol (design/symbol-strings.md §5.1-§5.3) -----------------------------
+// --- the protocol (DESIGN.md §7.8, §6.4) -----------------------------
 
 /// A user iterable over `1, 2, 3` that logs `next` / `return` calls into
 /// `log` (`return` logs its argument count).

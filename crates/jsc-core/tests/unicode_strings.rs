@@ -1,5 +1,5 @@
 //! Integration tests: Unicode-aware string semantics on code units
-//! (design/symbol-strings.md §6.6): the full case mappings, `normalize` in all
+//! (DESIGN.md §7.9): the full case mappings, `normalize` in all
 //! four forms and `localeCompare` in code-unit order.
 
 mod common;

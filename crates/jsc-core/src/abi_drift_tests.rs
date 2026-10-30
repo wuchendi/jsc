@@ -461,7 +461,7 @@ fn property_table_layout_matches_design() {
 }
 
 /// Pins the `TYPE_SYMBOL` block layout and the `typeof` word table to
-/// `design/symbol-strings.md` sections 2.2 and 2.4.
+/// DESIGN.md §5.2 and §6.5.
 #[test]
 fn symbol_layout_matches_design() {
     use super::{BLOCK_ALIGN, CLASS_GLOBAL, STR_FLAG_INTERNED, TYPE_ELEMS, TYPEOF_STRINGS};

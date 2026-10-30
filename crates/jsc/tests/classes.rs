@@ -902,7 +902,7 @@ fn derived_class_prototype_chain() {
     );
 }
 
-/// Computed member names (`design/symbol-strings.md` §3.4): methods,
+/// Computed member names (DESIGN.md §7.6): methods,
 /// accessors, generator / async methods and fields (static or not) under a
 /// computed key, string or symbol.
 #[test]
