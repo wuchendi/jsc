@@ -2,7 +2,8 @@
 //! §5.7): the abstract constructor, `Iterator.prototype` (=
 //! `%IteratorPrototype%`) with its `constructor` / `@@toStringTag`
 //! accessors, `Iterator.from` with its `%WrapForValidIteratorPrototype%`
-//! wrappers, and the lazy helpers over `%IteratorHelperPrototype%`.
+//! wrappers, the lazy helpers over `%IteratorHelperPrototype%`, and the
+//! eager helpers.
 
 mod common;
 use common::{assert_bool, assert_number, assert_string, assert_uncaught};
@@ -479,6 +480,152 @@ fn helper_methods_reject_other_receivers() {
     assert_bool(
         "const p = Object.getPrototypeOf([].values().map(x => x));
          try { p.return.call(Iterator.from({ next() {} })); false } catch (e) { e instanceof TypeError }",
+        true,
+    );
+}
+
+// --- eager helpers ------------------------------------------------------------------
+
+#[test]
+fn eager_helpers_produce_their_results() {
+    assert_number("[1, 2, 3].values().reduce((a, x) => a + x)", 6.0);
+    assert_number("[1, 2, 3].values().reduce((a, x) => a + x, 10)", 16.0);
+    assert_string(
+        "JSON.stringify([5, 6].values().reduce((a, x, i) => a.concat([[x, i]]), []))",
+        "[[5,0],[6,1]]",
+    );
+    // Without an initial value the counter starts at 1.
+    assert_string(
+        "JSON.stringify([5, 6, 7].values().reduce((a, x, i) => a + ',' + x + ':' + i))",
+        "\"5,6:1,7:2\"",
+    );
+    assert_string(
+        "JSON.stringify([1, 2, 3].values().map(x => x * 2).toArray())",
+        "[2,4,6]",
+    );
+    assert_bool("Array.isArray([].values().toArray())", true);
+    assert_string(
+        "const out = []; const r = [1, 2].values().forEach((x, i) => out.push(x + ':' + i));
+         out.join(',') + ':' + r",
+        "1:0,2:1:undefined",
+    );
+    assert_bool("[1, 2, 3].values().some(x => x === 2)", true);
+    assert_bool("[1, 2, 3].values().some(x => x === 4)", false);
+    assert_bool("[1, 2, 3].values().every(x => x > 0)", true);
+    assert_bool("[1, 2, 3].values().every(x => x < 2)", false);
+    assert_number("[1, 2, 3].values().find((x, i) => i === 1)", 2.0);
+    assert_bool("[1, 2, 3].values().find(x => x > 3) === undefined", true);
+    assert_bool(
+        "const p = Iterator.prototype;
+         p.reduce.length === 1 && p.toArray.length === 0 && p.forEach.length === 1
+           && p.some.length === 1 && p.every.length === 1 && p.find.length === 1
+           && p.toArray.name === 'toArray' && !Object.getOwnPropertyDescriptor(p, 'find').enumerable",
+        true,
+    );
+}
+
+#[test]
+fn some_every_find_close_on_an_early_result() {
+    for (call, result) in [
+        ("some(x => x === 1)", "true"),
+        ("every(x => x === 0)", "false"),
+        ("find(x => x === 1)", "1"),
+    ] {
+        assert_string(
+            &format!(
+                "{LOGGED}
+                 const r = src(5).{call};
+                 r + ':' + log.join(',')"
+            ),
+            &format!("{result}:next,next,return"),
+        );
+    }
+    // Running to the end does not close.
+    assert_string(
+        &format!(
+            "{LOGGED}
+             const r = src(2).some(x => false);
+             r + ':' + log.join(',')"
+        ),
+        "false:next,next,next",
+    );
+}
+
+#[test]
+fn a_throwing_eager_callback_closes_the_iterator() {
+    for helper in ["reduce", "forEach", "some", "every", "find"] {
+        assert_string(
+            &format!(
+                "{LOGGED}
+                 let e;
+                 try {{ src(3).{helper}(() => {{ throw 7; }}, 0); }} catch (x) {{ e = x; }}
+                 e + ':' + log.join(',')"
+            ),
+            "7:next,return",
+        );
+    }
+    // The callback's throw wins over one from `return`.
+    assert_number(
+        "const it = Object.setPrototypeOf({
+           next() { return { value: 1, done: false }; },
+           return() { throw 2; },
+         }, Iterator.prototype);
+         let e;
+         try { it.forEach(() => { throw 1; }); } catch (x) { e = x; }
+         e",
+        1.0,
+    );
+    // A throwing `next` propagates without closing.
+    assert_string(
+        "const log = [];
+         const it = Object.setPrototypeOf({
+           next() { throw 3; },
+           return() { log.push('return'); return {}; },
+         }, Iterator.prototype);
+         let e;
+         try { it.toArray(); } catch (x) { e = x; }
+         e + ':' + log.length",
+        "3:0",
+    );
+}
+
+#[test]
+fn eager_helpers_validate_before_stepping() {
+    for helper in ["reduce", "forEach", "some", "every", "find"] {
+        assert_string(
+            &format!(
+                "{LOGGED}
+                 let e;
+                 try {{ src(2).{helper}(1); }} catch (x) {{ e = x; }}
+                 (e instanceof TypeError) + ':' + log.join(',')"
+            ),
+            "true:return",
+        );
+    }
+    assert_bool(
+        "try { Iterator.prototype.toArray.call(1); false } catch (e) { e instanceof TypeError }",
+        true,
+    );
+    // `next` is read once.
+    assert_number(
+        "let reads = 0, i = 0;
+         const it = Object.setPrototypeOf({
+           get next() { reads++; return () => ({ value: i, done: i++ > 2 }); },
+         }, Iterator.prototype);
+         it.toArray();
+         reads",
+        1.0,
+    );
+}
+
+#[test]
+fn reduce_of_an_empty_iterator_without_initial_value_throws() {
+    assert_uncaught(
+        "[].values().reduce((a, x) => a + x)",
+        "TypeError: Reduce of empty iterator with no initial value",
+    );
+    assert_bool(
+        "[].values().reduce((a, x) => a + x, undefined) === undefined",
         true,
     );
 }

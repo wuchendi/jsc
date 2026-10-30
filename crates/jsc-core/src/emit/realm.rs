@@ -586,8 +586,7 @@ pub(super) enum Builtin {
     Iterator(IteratorOp),
 }
 
-/// The `Iterator` builtins of design/symbol-strings.md §5.7 (the eager
-/// helpers are Y3-T3).
+/// The `Iterator` builtins of design/symbol-strings.md §5.7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IteratorOp {
     /// `Iterator.from`.
@@ -612,6 +611,39 @@ pub(super) enum IteratorOp {
     HelperNext,
     /// `%IteratorHelperPrototype%.return`.
     HelperReturn,
+    /// An eager `Iterator.prototype` helper: consumes the iterator.
+    Eager(EagerKind),
+}
+
+/// The eager `Iterator.prototype` helpers (design/symbol-strings.md §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EagerKind {
+    /// `reduce(reducer[, initialValue])`.
+    Reduce,
+    /// `toArray()`.
+    ToArray,
+    /// `forEach(fn)`.
+    ForEach,
+    /// `some(predicate)`.
+    Some,
+    /// `every(predicate)`.
+    Every,
+    /// `find(predicate)`.
+    Find,
+}
+
+impl EagerKind {
+    /// The method's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reduce => "reduce",
+            Self::ToArray => "toArray",
+            Self::ForEach => "forEach",
+            Self::Some => "some",
+            Self::Every => "every",
+            Self::Find => "find",
+        }
+    }
 }
 
 /// The lazy `Iterator.prototype` helpers (design/symbol-strings.md §5.7).
@@ -644,7 +676,7 @@ impl HelperKind {
 
 impl IteratorOp {
     /// Every op, in [`Builtin::ALL`] order.
-    const ALL: [IteratorOp; 14] = [
+    const ALL: [IteratorOp; 20] = [
         Self::From,
         Self::WrapNext,
         Self::WrapReturn,
@@ -659,6 +691,12 @@ impl IteratorOp {
         Self::Helper(HelperKind::FlatMap),
         Self::HelperNext,
         Self::HelperReturn,
+        Self::Eager(EagerKind::Reduce),
+        Self::Eager(EagerKind::ToArray),
+        Self::Eager(EagerKind::ForEach),
+        Self::Eager(EagerKind::Some),
+        Self::Eager(EagerKind::Every),
+        Self::Eager(EagerKind::Find),
     ];
 
     /// The builtin's `name`.
@@ -672,6 +710,7 @@ impl IteratorOp {
             Self::TagGet => "get [Symbol.toStringTag]",
             Self::TagSet => "set [Symbol.toStringTag]",
             Self::Helper(kind) => kind.name(),
+            Self::Eager(kind) => kind.name(),
         }
     }
 
@@ -679,6 +718,7 @@ impl IteratorOp {
     fn length(self) -> u32 {
         match self {
             Self::From | Self::ConstructorSet | Self::TagSet | Self::Helper(_) => 1,
+            Self::Eager(kind) => u32::from(kind != EagerKind::ToArray),
             Self::WrapNext
             | Self::WrapReturn
             | Self::ConstructorGet
@@ -692,7 +732,7 @@ impl IteratorOp {
     fn prototype(self) -> Option<Intrinsic> {
         match self {
             Self::WrapNext | Self::WrapReturn => Some(Intrinsic::WrapForValidIteratorPrototype),
-            Self::Helper(_) => Some(Intrinsic::IteratorPrototype),
+            Self::Helper(_) | Self::Eager(_) => Some(Intrinsic::IteratorPrototype),
             Self::HelperNext | Self::HelperReturn => Some(Intrinsic::IteratorHelperPrototype),
             _ => None,
         }
@@ -1286,7 +1326,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 287] = [
+    pub(super) const ALL: [Builtin; 293] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1601,6 +1641,12 @@ impl Builtin {
         Self::Iterator(IteratorOp::ALL[11]),
         Self::Iterator(IteratorOp::ALL[12]),
         Self::Iterator(IteratorOp::ALL[13]),
+        Self::Iterator(IteratorOp::ALL[14]),
+        Self::Iterator(IteratorOp::ALL[15]),
+        Self::Iterator(IteratorOp::ALL[16]),
+        Self::Iterator(IteratorOp::ALL[17]),
+        Self::Iterator(IteratorOp::ALL[18]),
+        Self::Iterator(IteratorOp::ALL[19]),
     ];
 
     /// The function's `name`.
