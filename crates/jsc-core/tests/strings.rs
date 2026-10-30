@@ -156,7 +156,7 @@ fn string_includes() {
     assert_bool("[1,2,3].includes(9)", false);
 }
 
-/// String `padStart`/`padEnd` pad to a BYTE length with a repeated pad string
+/// String `padStart`/`padEnd` pad to a code-unit length with a repeated pad string
 /// (default `" "`); an already-long-enough receiver is returned unchanged.
 #[test]
 fn string_pad() {
@@ -519,6 +519,26 @@ fn repeat_and_pad_audit() {
     assert_string("\"a\".padStart(4, 12)", "121a");
     assert_string("\"a\".padEnd(3, { toString() { return \"z\" } })", "azz");
     assert_string("\"a\".padStart(3, \"\")", "a");
+}
+
+/// `padStart`/`padEnd` follow `StringPad` order: `fillString` is not coerced
+/// when `maxLength` does not exceed the length, and coerced once otherwise.
+#[test]
+fn pad_fill_string_coercion_order() {
+    for name in ["padStart", "padEnd"] {
+        assert_number(
+            &format!("let n = 0; \"abc\".{name}(2, {{ toString() {{ n++; return \"x\"; }} }}); n"),
+            0.0,
+        );
+    }
+    assert_string(
+        "let n = 0; const r = \"abc\".padStart(5, { toString() { n++; return \"x\"; } }); r + n",
+        "xxabc1",
+    );
+    assert_string(
+        "let n = 0; const r = \"abc\".padEnd(5, { toString() { n++; return \"x\"; } }); r + n",
+        "abcxx1",
+    );
 }
 
 #[test]
