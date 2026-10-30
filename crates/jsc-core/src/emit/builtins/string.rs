@@ -1,24 +1,24 @@
 //! `%String.prototype%` methods and the `String` statics. A generic method
-//! takes `ToString(RequireObjectCoercible(this))`, coerces its arguments in the
-//! guest (a user `toString` / `valueOf` may run, and throw), then runs its host
-//! `__method` op; `toString` / `valueOf` are `thisStringValue`. A host op that
-//! refuses its input (a byte position over a non-ASCII string, a lone
-//! surrogate, a `RegExp` pattern; DESIGN.md §13) returns a sentinel the builtin
-//! throws as a named error.
+//! takes `ToString(RequireObjectCoercible(this))` and coerces its arguments in
+//! the guest (a user `toString` / `valueOf` may run, and throw), then works on
+//! the code units at each string's width (one-byte Latin-1 or two-byte
+//! UTF-16, design/symbol-strings.md §6), producing canonical strings; only the
+//! case mappings, `localeCompare` and `normalize` run a host `__method` op.
+//! `toString` / `valueOf` are `thisStringValue`.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// How a method coerces one argument before its host op.
+/// How a method coerces one argument before its body.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Coerce {
     /// Unused: passed as is.
     None,
     /// `ToString` (`undefined` becomes `"undefined"`).
     String,
-    /// `ToString` unless `undefined` (which selects the host default).
+    /// `ToString` unless `undefined` (which selects the default).
     OptString,
-    /// `ToNumber` unless `undefined` (which selects the host default).
+    /// `ToNumber` unless `undefined` (which selects the default).
     Number,
 }
 
@@ -36,8 +36,11 @@ fn coercions(op: StringOp) -> [Coerce; 2] {
         | StringOp::Repeat
         | StringOp::At
         | StringOp::CharCodeAt
-        | StringOp::CodePointAt => [Coerce::Number, Coerce::None],
-        StringOp::PadStart | StringOp::PadEnd => [Coerce::Number, Coerce::OptString],
+        | StringOp::CodePointAt
+        // `padStart` / `padEnd` coerce `fillString` in the body, after the
+        // early return.
+        | StringOp::PadStart
+        | StringOp::PadEnd => [Coerce::Number, Coerce::None],
         StringOp::Split => [Coerce::OptString, Coerce::Number],
         StringOp::LocaleCompare => [Coerce::String, Coerce::None],
         StringOp::Normalize | StringOp::Search | StringOp::Match => {
@@ -53,7 +56,9 @@ fn coercions(op: StringOp) -> [Coerce; 2] {
         | StringOp::Concat
         | StringOp::MatchAll
         | StringOp::Replace
-        | StringOp::ReplaceAll => [Coerce::None, Coerce::None],
+        | StringOp::ReplaceAll
+        | StringOp::IsWellFormed
+        | StringOp::ToWellFormed => [Coerce::None, Coerce::None],
     }
 }
 
@@ -67,39 +72,11 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
     }
 }
 
-/// Whether the host op of `op` may return a refusal sentinel for the
-/// call-site arguments `args` (see [`emit_is_method_refusal`]).
-fn may_refuse(op: StringOp, args: &[IrNode]) -> bool {
-    match op {
-        StringOp::ToUpperCase
-        | StringOp::ToLowerCase
-        | StringOp::ToLocaleUpperCase
-        | StringOp::ToLocaleLowerCase
-        | StringOp::Trim
-        | StringOp::TrimStart
-        | StringOp::TrimEnd
-        | StringOp::Repeat
-        | StringOp::LocaleCompare
-        | StringOp::Concat
-        | StringOp::MatchAll => false,
-        // A position argument counts bytes.
-        StringOp::Includes | StringOp::StartsWith | StringOp::EndsWith => args.len() > 1,
-        // Only an empty separator / pattern splits characters.
-        StringOp::Split | StringOp::Replace | StringOp::ReplaceAll => match args.first() {
-            None => false,
-            Some(IrNode::Str(s)) => s.is_empty(),
-            Some(_) => true,
-        },
-        _ => true,
-    }
-}
-
 /// The host op flag of `op` when the call-site arguments `args` are already
 /// of the types its coercions produce (string / number literals; a missing
 /// argument is `undefined`), so that on a string receiver the builtin is
 /// exactly its host op, inline; with whether that op may refuse its input
-/// (then the call site falls back to the builtin, which throws). `repeat`
-/// (count check), `match` (result array) and the custom bodies never inline.
+/// (`normalize`; then the call site falls back to the builtin, which throws).
 pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(i32, bool)> {
     let ready = |coerce: Coerce, arg: Option<&IrNode>| {
         matches!(
@@ -110,107 +87,76 @@ pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(
                 | (Coerce::Number, Some(IrNode::Num(_)))
         )
     };
-    if matches!(
-        op,
-        StringOp::Repeat
-            | StringOp::Match
-            | StringOp::Concat
-            | StringOp::MatchAll
-            | StringOp::Replace
-            | StringOp::ReplaceAll
-    ) {
-        return None;
-    }
     let [first, second] = coercions(op);
     if !(ready(first, args.first()) && ready(second, args.get(1))) {
         return None;
     }
-    op.flag().map(|flag| (flag, may_refuse(op, args)))
+    op.flag().map(|flag| (flag, op == StringOp::Normalize))
 }
 
 /// Push i32 `1` when the `__method` result on the stack is a refusal
-/// sentinel (`METHOD_UNSUPPORTED`, `METHOD_RANGE_ERROR` or
-/// `METHOD_NEEDS_REGEXP`: `undefined | 1..=3`).
+/// sentinel (`METHOD_UNSUPPORTED` or `METHOD_RANGE_ERROR`: `undefined | 1..=2`).
 pub(in crate::emit) fn emit_is_method_refusal(function: &mut Function) {
     wasm!(function;
-        I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Sub, I64Const(3), I64LtU,
+        I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Sub, I64Const(2), I64LtU,
     );
 }
 
-/// The `TypeError` texts of one `String.prototype` method: a
-/// `null`/`undefined` receiver, and an input its byte-based host op cannot
-/// handle yet.
-struct Texts {
-    nullish: CalleeErrorText<'static>,
-    non_ascii: CalleeErrorText<'static>,
-}
-
-/// The [`Texts`] of `String.prototype.<name>`.
-macro_rules! texts {
+/// The `TypeError` text of `String.prototype.<name>` on a `null`/`undefined`
+/// receiver.
+macro_rules! nullish {
     ($name:literal) => {
-        Texts {
-            nullish: [
-                concat!("String.prototype.", $name, " called on null or undefined"),
-                concat!(
-                    "TypeError: String.prototype.",
-                    $name,
-                    " called on null or undefined"
-                ),
-            ],
-            non_ascii: [
-                concat!(
-                    "String.prototype.",
-                    $name,
-                    " does not support non-ASCII strings yet"
-                ),
-                concat!(
-                    "TypeError: String.prototype.",
-                    $name,
-                    " does not support non-ASCII strings yet"
-                ),
-            ],
-        }
+        [
+            concat!("String.prototype.", $name, " called on null or undefined"),
+            concat!(
+                "TypeError: String.prototype.",
+                $name,
+                " called on null or undefined"
+            ),
+        ]
     };
 }
 
-/// The [`Texts`] of `op`.
-fn texts(op: StringOp) -> Texts {
+/// The `null`/`undefined` receiver text of `op`.
+fn nullish_text(op: StringOp) -> CalleeErrorText<'static> {
     match op {
-        StringOp::IndexOf => texts!("indexOf"),
-        StringOp::Includes => texts!("includes"),
-        StringOp::Slice => texts!("slice"),
-        StringOp::ToUpperCase => texts!("toUpperCase"),
-        StringOp::ToLowerCase => texts!("toLowerCase"),
-        StringOp::ToLocaleUpperCase => texts!("toLocaleUpperCase"),
-        StringOp::ToLocaleLowerCase => texts!("toLocaleLowerCase"),
-        StringOp::CharAt => texts!("charAt"),
-        StringOp::Trim => texts!("trim"),
-        StringOp::TrimStart => texts!("trimStart"),
-        StringOp::TrimEnd => texts!("trimEnd"),
-        StringOp::Repeat => texts!("repeat"),
-        StringOp::StartsWith => texts!("startsWith"),
-        StringOp::EndsWith => texts!("endsWith"),
-        StringOp::PadStart => texts!("padStart"),
-        StringOp::PadEnd => texts!("padEnd"),
-        StringOp::Substring => texts!("substring"),
-        StringOp::Split => texts!("split"),
-        StringOp::At => texts!("at"),
-        StringOp::CharCodeAt => texts!("charCodeAt"),
-        StringOp::CodePointAt => texts!("codePointAt"),
-        StringOp::Concat => texts!("concat"),
-        StringOp::LastIndexOf => texts!("lastIndexOf"),
-        StringOp::LocaleCompare => texts!("localeCompare"),
-        StringOp::Normalize => texts!("normalize"),
-        StringOp::Search => texts!("search"),
-        StringOp::Match => texts!("match"),
-        StringOp::MatchAll => texts!("matchAll"),
-        StringOp::Replace => texts!("replace"),
-        StringOp::ReplaceAll => texts!("replaceAll"),
+        StringOp::IndexOf => nullish!("indexOf"),
+        StringOp::Includes => nullish!("includes"),
+        StringOp::Slice => nullish!("slice"),
+        StringOp::ToUpperCase => nullish!("toUpperCase"),
+        StringOp::ToLowerCase => nullish!("toLowerCase"),
+        StringOp::ToLocaleUpperCase => nullish!("toLocaleUpperCase"),
+        StringOp::ToLocaleLowerCase => nullish!("toLocaleLowerCase"),
+        StringOp::CharAt => nullish!("charAt"),
+        StringOp::Trim => nullish!("trim"),
+        StringOp::TrimStart => nullish!("trimStart"),
+        StringOp::TrimEnd => nullish!("trimEnd"),
+        StringOp::Repeat => nullish!("repeat"),
+        StringOp::StartsWith => nullish!("startsWith"),
+        StringOp::EndsWith => nullish!("endsWith"),
+        StringOp::PadStart => nullish!("padStart"),
+        StringOp::PadEnd => nullish!("padEnd"),
+        StringOp::Substring => nullish!("substring"),
+        StringOp::Split => nullish!("split"),
+        StringOp::At => nullish!("at"),
+        StringOp::CharCodeAt => nullish!("charCodeAt"),
+        StringOp::CodePointAt => nullish!("codePointAt"),
+        StringOp::Concat => nullish!("concat"),
+        StringOp::LastIndexOf => nullish!("lastIndexOf"),
+        StringOp::LocaleCompare => nullish!("localeCompare"),
+        StringOp::Normalize => nullish!("normalize"),
+        StringOp::Search => nullish!("search"),
+        StringOp::Match => nullish!("match"),
+        StringOp::MatchAll => nullish!("matchAll"),
+        StringOp::Replace => nullish!("replace"),
+        StringOp::ReplaceAll => nullish!("replaceAll"),
+        StringOp::IsWellFormed => nullish!("isWellFormed"),
+        StringOp::ToWellFormed => nullish!("toWellFormed"),
     }
 }
 
 /// Every op of this family.
-const OPS: [StringOp; 30] = [
+const OPS: [StringOp; 32] = [
     StringOp::IndexOf,
     StringOp::Includes,
     StringOp::Slice,
@@ -241,6 +187,8 @@ const OPS: [StringOp; 30] = [
     StringOp::MatchAll,
     StringOp::Replace,
     StringOp::ReplaceAll,
+    StringOp::IsWellFormed,
+    StringOp::ToWellFormed,
 ];
 
 /// `thisStringValue` failures.
@@ -269,21 +217,17 @@ const MATCH_ALL_REGEXP: CalleeErrorText<'static> = [
     "TypeError: String.prototype.matchAll needs RegExp, which is not supported yet",
 ];
 
+/// The `TypeError` of `normalize` over non-ASCII text, which needs Unicode
+/// normalization data the hosts do not carry yet.
+const NORMALIZE_UNSUPPORTED: CalleeErrorText<'static> = [
+    "String.prototype.normalize does not support non-ASCII strings yet",
+    "TypeError: String.prototype.normalize does not support non-ASCII strings yet",
+];
+
 /// The `RangeError` text of `normalize` with an unknown form.
 const NORMALIZE_FORM: [&str; 2] = [
     "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
     "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.",
-];
-
-/// The `TypeError`s of `fromCharCode` / `fromCodePoint` building a lone
-/// surrogate, which the UTF-8 string representation cannot hold yet.
-const FROM_CHAR_CODE_SURROGATE: CalleeErrorText<'static> = [
-    "String.fromCharCode cannot build a lone surrogate yet",
-    "TypeError: String.fromCharCode cannot build a lone surrogate yet",
-];
-const FROM_CODE_POINT_SURROGATE: CalleeErrorText<'static> = [
-    "String.fromCodePoint cannot build a lone surrogate yet",
-    "TypeError: String.fromCodePoint cannot build a lone surrogate yet",
 ];
 
 /// The `RangeError` text prefixes of `fromCodePoint` with a value that is not
@@ -300,36 +244,53 @@ const NULLISH_TO_OBJECT: CalleeErrorText<'static> = [
 /// count (the count follows).
 const REPEAT_COUNT: [&str; 2] = ["Invalid count value: ", "RangeError: Invalid count value: "];
 
-/// The `RangeError` of a `repeat` result past [`MAX_STRING_LENGTH`].
-const REPEAT_LENGTH: [&str; 2] = ["Invalid string length", "RangeError: Invalid string length"];
+/// The `RangeError` of a `repeat` / `padStart` / `padEnd` result past
+/// [`MAX_STRING_LENGTH`].
+const STRING_LENGTH: [&str; 2] = ["Invalid string length", "RangeError: Invalid string length"];
 
-/// The longest string a `repeat` builds, in bytes (`2^29 - 24`, as V8).
+/// The longest string a `repeat` / `padStart` / `padEnd` builds, in code
+/// units (`2^29 - 24`, as V8).
 const MAX_STRING_LENGTH: f64 = 536_870_888.0;
 
 /// The own keys of a `match` result besides its element.
 const MATCH_KEYS: [&str; 3] = ["index", "input", "groups"];
 
+/// `StrWhiteSpaceChar` (`WhiteSpace` ∪ `LineTerminator`) as inclusive
+/// code-unit ranges: the set `trim` / `trimStart` / `trimEnd` strip.
+const WHITESPACE: [(i32, i32); 10] = [
+    (0x09, 0x0D),
+    (0x20, 0x20),
+    (0xA0, 0xA0),
+    (0x1680, 0x1680),
+    (0x2000, 0x200A),
+    (0x2028, 0x2029),
+    (0x202F, 0x202F),
+    (0x205F, 0x205F),
+    (0x3000, 0x3000),
+    (0xFEFF, 0xFEFF),
+];
+
+/// The units of `RegExp` pattern syntax: a `search` / `match` string pattern
+/// holding one needs the absent `RegExp`; one without matches its own text.
+const REGEXP_SYNTAX: &[u8] = b"\\^$.*+?()[]{}|";
+
 /// The static strings of this family.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
     OPS.into_iter()
-        .flat_map(|op| {
-            let t = texts(op);
-            t.nullish.into_iter().chain(t.non_ascii)
-        })
+        .flat_map(nullish_text)
         .chain(NOT_STRING_TO_STRING)
         .chain(NOT_STRING_VALUE_OF)
         .chain(SEARCH_REGEXP)
         .chain(MATCH_REGEXP)
         .chain(MATCH_ALL_REGEXP)
+        .chain(NORMALIZE_UNSUPPORTED)
         .chain(NORMALIZE_FORM)
-        .chain(FROM_CHAR_CODE_SURROGATE)
-        .chain(FROM_CODE_POINT_SURROGATE)
         .chain(INVALID_CODE_POINT)
         .chain(NULLISH_TO_OBJECT)
         .chain(REPEAT_COUNT)
-        .chain(REPEAT_LENGTH)
+        .chain(STRING_LENGTH)
         .chain(MATCH_KEYS)
-        .chain(["", "raw"])
+        .chain(["", " ", "raw"])
 }
 
 /// `String.prototype.toString()` / `valueOf()`: `thisStringValue(this)`.
@@ -337,7 +298,7 @@ pub(super) fn emit_this_value(
     value_of: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let text = if value_of {
@@ -361,23 +322,22 @@ pub(super) fn emit_this_value(
 
 /// The generic `String.prototype.<op>(a0, a1)`: `ToString(this)` (a
 /// `null`/`undefined` receiver throws), the argument coercions of
-/// [`coercions`] in [`coercion_order`], `repeat`'s count check, then the host
-/// op, whose refusal sentinels throw; `match` builds its result array.
-/// `concat`, `matchAll`, `replace` and `replaceAll` continue in their own
-/// bodies after the receiver. An object first argument whose chain holds the
-/// method's well-known symbol ([`hook_of`], `__symbol_get`) throws the interim
-/// `TypeError` after the receiver (Y4 dispatches to it,
-/// design/symbol-strings.md §9.4).
+/// [`coercions`] in [`coercion_order`], `repeat`'s count check, then the
+/// code-unit body ([`emit_units`]) or the host op, whose refusal sentinels
+/// throw; `match` builds its result array. `concat`, `matchAll`, `replace`
+/// and `replaceAll` continue in their own bodies after the receiver. An
+/// object first argument whose chain holds the method's well-known symbol
+/// ([`hook_of`], `__symbol_get`) throws the interim `TypeError` after the
+/// receiver (Y4 dispatches to it, design/symbol-strings.md §9.4).
 pub(super) fn emit_method(
     op: StringOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let count = frame.f64(0);
-    let texts = texts(op);
     if op == StringOp::Concat {
         // The spread argument array, before `ToString(this)` can republish it.
         wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(frame.x64(0)));
@@ -387,21 +347,21 @@ pub(super) fn emit_method(
     wasm!(function; I32Eqz, If(BlockType::Empty));
     emit_is_nullish(function, s);
     wasm!(function; If(BlockType::Empty));
-    throw_type_error(function, frame, texts.nullish, strings, helpers);
+    throw_type_error(function, frame, nullish_text(op), strings, helpers);
     wasm!(function; End);
     to_string(function, s, helpers);
     wasm!(function; End);
     arg_hook_guard(op, function, frame, a0, strings, helpers);
-    let flag = match (op, op.flag()) {
-        (StringOp::Concat, _) => return emit_concat(function, frame, s, helpers),
-        (StringOp::MatchAll, _) | (_, None) => {
+    match op {
+        StringOp::Concat => return emit_concat(function, frame, s, helpers),
+        StringOp::MatchAll => {
             return throw_type_error(function, frame, MATCH_ALL_REGEXP, strings, helpers);
         }
-        (StringOp::Replace | StringOp::ReplaceAll, _) => {
+        StringOp::Replace | StringOp::ReplaceAll => {
             return emit_replace(op, function, frame, strings, helpers);
         }
-        (_, Some(flag)) => flag,
-    };
+        _ => {}
+    }
     let [first, second] = coercions(op);
     for i in coercion_order(op) {
         let (coerce, out) = if i == 0 { (first, a0) } else { (second, a1) };
@@ -450,30 +410,60 @@ pub(super) fn emit_method(
         wasm!(function;
             End,
             LocalGet(s), I32WrapI64,
-            I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
+            I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }),
             F64ConvertI32U, LocalGet(count), F64Mul,
             F64Const(Ieee64::from(MAX_STRING_LENGTH)), F64Gt,
             If(BlockType::Empty),
         );
-        throw_range_error(function, frame, REPEAT_LENGTH, None, strings, helpers);
+        throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
         wasm!(function; End, End);
     }
-    if op == StringOp::Match {
+    if matches!(op, StringOp::Search | StringOp::Match) {
         // `RegExpCreate(undefined)` is the empty pattern.
         wasm!(function; LocalGet(a0), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
         push_str(function, strings, "");
         wasm!(function; LocalSet(a0), End);
     }
-    host_call(function, s, flag, a0, a1, helpers);
-    wasm!(function; LocalSet(r));
-    if may_refuse(op, &[IrNode::Undefined, IrNode::Undefined]) {
-        refusal_throws(op, function, frame, r, strings, helpers);
+    let Some(flag) = op.flag() else {
+        emit_units(op, function, frame, strings, helpers);
+        if op == StringOp::Match {
+            wasm!(function; LocalSet(r));
+            emit_match_result(function, frame, s, a0, r, strings, helpers);
+        }
+        return;
+    };
+    emit_host_op(op, flag, function, frame, strings, helpers);
+}
+
+/// The host op `flag` of `op` over the receiver string in i64 temp 0 and the
+/// coerced arguments in i64 temps 1 and 2; `normalize`'s refusal sentinels
+/// throw.
+fn emit_host_op(
+    op: StringOp,
+    flag: i32,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    wasm!(function;
+        LocalGet(s), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method), LocalSet(r),
+    );
+    if op == StringOp::Normalize {
+        let when = |function: &mut Function, sentinel: u64| {
+            wasm!(function;
+                LocalGet(r), I64Const(sentinel.cast_signed()), I64Eq, If(BlockType::Empty),
+            );
+        };
+        when(function, abi::METHOD_UNSUPPORTED);
+        throw_type_error(function, frame, NORMALIZE_UNSUPPORTED, strings, helpers);
+        wasm!(function; End);
+        when(function, abi::METHOD_RANGE_ERROR);
+        throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
+        wasm!(function; End);
     }
-    if op == StringOp::Match {
-        emit_match_result(function, frame, s, a0, r, strings, helpers);
-    } else {
-        wasm!(function; LocalGet(r));
-    }
+    wasm!(function; LocalGet(r));
 }
 
 /// Throw the interim `TypeError` when `op`'s first argument (read into i64
@@ -483,7 +473,7 @@ fn arg_hook_guard(
     function: &mut Function,
     frame: Frame,
     a0: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let Some(symbol) = hook_of(op) else {
@@ -514,53 +504,6 @@ fn hook_of(op: StringOp) -> Option<WellKnown> {
     }
 }
 
-/// Push the `__method` result of host op `flag` over the jsvals in i64
-/// locals `recv`, `a0` and `a1`.
-fn host_call(
-    function: &mut Function,
-    recv: u32,
-    flag: i32,
-    a0: u32,
-    a1: u32,
-    helpers: Helpers<'_>,
-) {
-    wasm!(function;
-        LocalGet(recv), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method),
-    );
-}
-
-/// Throw the error a refusal sentinel in i64 `r` stands for: the method's
-/// non-ASCII `TypeError`, `normalize`'s form `RangeError`, or the `RegExp`
-/// `TypeError` of `search` / `match`.
-fn refusal_throws(
-    op: StringOp,
-    function: &mut Function,
-    frame: Frame,
-    r: u32,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    let when = |function: &mut Function, sentinel: u64| {
-        wasm!(function; LocalGet(r), I64Const(sentinel.cast_signed()), I64Eq, If(BlockType::Empty));
-    };
-    when(function, abi::METHOD_UNSUPPORTED);
-    throw_type_error(function, frame, texts(op).non_ascii, strings, helpers);
-    wasm!(function; End);
-    if op == StringOp::Normalize {
-        when(function, abi::METHOD_RANGE_ERROR);
-        throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
-        wasm!(function; End);
-    }
-    let regexp = match op {
-        StringOp::Search => SEARCH_REGEXP,
-        StringOp::Match => MATCH_REGEXP,
-        _ => return,
-    };
-    when(function, abi::METHOD_NEEDS_REGEXP);
-    throw_type_error(function, frame, regexp, strings, helpers);
-    wasm!(function; End);
-}
-
 /// Throw a `RangeError` with `text` (`[message, stack]`), followed by the
 /// jsval in i64 local `value` when given.
 fn throw_range_error(
@@ -568,16 +511,16 @@ fn throw_range_error(
     frame: Frame,
     text: [&str; 2],
     value: Option<u32>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let part = |prefix: &str| match value {
         Some(local) => IrNode::Binary {
             op: BinOp::Add,
-            lhs: Box::new(IrNode::Str(prefix.to_owned())),
+            lhs: Box::new(IrNode::Str(prefix.into())),
             rhs: Box::new(IrNode::Local(local)),
         },
-        None => IrNode::Str(prefix.to_owned()),
+        None => IrNode::Str(prefix.into()),
     };
     let error = IrNode::error_object(ErrorKind::RangeError, Some(part(text[0])), part(text[1]));
     emit_throw_error(&error, function, frame.scratch(), strings, helpers);
@@ -592,7 +535,7 @@ fn emit_match_result(
     s: u32,
     p: u32,
     r: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let result = frame.x64(0);
@@ -639,73 +582,965 @@ fn emit_concat(function: &mut Function, frame: Frame, s: u32, helpers: Helpers<'
     wasm!(function; LocalGet(s));
 }
 
+/// The i32 locals the code-unit bodies use: the frame's i32 temps, then the
+/// i32 locals of its IR scratch layout ([`Frame::scratch`]), which only an IR
+/// fragment clobbers — a thrown error (which returns) or `match`'s result
+/// array (built last).
+fn i32_locals(frame: Frame) -> [u32; 18] {
+    let x = frame.scratch();
+    [
+        frame.i32(0),
+        frame.i32(1),
+        frame.i32(2),
+        frame.i32(3),
+        frame.x32(0),
+        frame.x32(1),
+        frame.y32(0),
+        frame.y32(1),
+        frame.y32(2),
+        frame.y32(3),
+        x + 3,
+        x + 7,
+        x + 8,
+        x + 9,
+        x + 10,
+        x + 11,
+        x + 12,
+        x + 21,
+    ]
+}
+
+/// A one-byte data [`MemArg`].
+fn mem8() -> MemArg {
+    MemArg {
+        offset: u64::from(abi::STR_DATA_OFFSET),
+        align: 0,
+        memory_index: 0,
+    }
+}
+
+/// A two-byte data [`MemArg`].
+fn mem16() -> MemArg {
+    MemArg {
+        offset: u64::from(abi::STR_DATA_OFFSET),
+        align: 1,
+        memory_index: 0,
+    }
+}
+
+/// The i32 views of a string: its block base `p`, width `w` (`0` one-byte,
+/// `1` two-byte) and length `n` in code units.
+#[derive(Clone, Copy)]
+struct Str {
+    p: u32,
+    w: u32,
+    n: u32,
+}
+
+impl Str {
+    /// Three consecutive locals of `locals` from `at`.
+    fn at(locals: &[u32; 18], at: usize) -> Self {
+        Self {
+            p: locals[at],
+            w: locals[at + 1],
+            n: locals[at + 2],
+        }
+    }
+
+    /// Set the views from the string jsval in i64 `v`.
+    fn open(self, function: &mut Function, v: u32) {
+        wasm!(function; LocalGet(v), I32WrapI64, LocalSet(self.p));
+        emit_str_two_byte(function, self.p);
+        wasm!(function; LocalSet(self.w), LocalGet(self.p));
+        emit_load_str_len(function);
+        wasm!(function; LocalSet(self.n));
+    }
+
+    /// Push the code unit at the index `index` pushes.
+    fn unit(self, function: &mut Function, index: impl Fn(&mut Function)) {
+        wasm!(function; LocalGet(self.w), If(BlockType::Result(ValType::I32)), LocalGet(self.p));
+        index(function);
+        wasm!(function; I32Const(1), I32Shl, I32Add, I32Load16U(mem16()), Else, LocalGet(self.p));
+        index(function);
+        wasm!(function; I32Add, I32Load8U(mem8()), End);
+    }
+
+    /// Push the code unit at the index in i32 local `i`.
+    fn unit_at(self, function: &mut Function, i: u32) {
+        emit_str_unit(function, self.p, i, self.w);
+    }
+
+    /// Push the address of the unit at the index `index` pushes.
+    fn addr(self, function: &mut Function, index: impl Fn(&mut Function)) {
+        wasm!(function; LocalGet(self.p));
+        index(function);
+        wasm!(function;
+            LocalGet(self.w), I32Shl, I32Add, I32Const(abi::STR_DATA_OFFSET.cast_signed()), I32Add,
+        );
+    }
+
+    /// Store the unit `unit` pushes at the index `index` pushes.
+    fn store(
+        self,
+        function: &mut Function,
+        index: impl Fn(&mut Function),
+        unit: impl Fn(&mut Function),
+    ) {
+        wasm!(function; LocalGet(self.w), If(BlockType::Empty));
+        self.addr(function, &index);
+        unit(function);
+        wasm!(function; I32Store16(mem16()), Else);
+        self.addr(function, &index);
+        unit(function);
+        wasm!(function; I32Store8(mem8()), End);
+    }
+}
+
+/// Box the i32 block base on the stack as a heap jsval.
+fn box_heap(function: &mut Function) {
+    wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
+}
+
+/// Push the signed i32 local `x` as a number jsval.
+fn push_number(function: &mut Function, x: u32) {
+    wasm!(function; LocalGet(x), F64ConvertI32S, I64ReinterpretF64);
+}
+
+/// Box the i32 `0` / `1` on the stack as `false` / `true`.
+fn box_bool(function: &mut Function) {
+    wasm!(function; I64ExtendI32U, I64Const(abi::FALSE.cast_signed()), I64Or);
+}
+
+/// i32 `out` = `ToIntegerOrInfinity` of the number jsval in i64 `v`
+/// (`undefined` selects what `default` pushes), saturated to the i32 range
+/// (`NaN` is `0`).
+fn emit_int(function: &mut Function, v: u32, default: impl Fn(&mut Function), out: u32) {
+    wasm!(function;
+        LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Result(ValType::I32)),
+    );
+    default(function);
+    wasm!(function; Else, LocalGet(v), F64ReinterpretI64, I32TruncSatF64S, End, LocalSet(out));
+}
+
+/// Clamp the signed i32 local `x` to `0..=hi` (an i32 local).
+fn emit_clamp(function: &mut Function, x: u32, hi: u32) {
+    wasm!(function;
+        LocalGet(x), I32Const(0), LocalGet(x), I32Const(0), I32GtS, Select, LocalSet(x),
+        LocalGet(x), LocalGet(hi), LocalGet(x), LocalGet(hi), I32LtS, Select, LocalSet(x),
+    );
+}
+
+/// The relative index in i32 local `x` against the length `n` (i32 local):
+/// a negative one counts from the end; clamped to `0..=n`.
+fn emit_relative(function: &mut Function, x: u32, n: u32) {
+    wasm!(function;
+        LocalGet(x), I32Const(0), I32LtS,
+        If(BlockType::Empty), LocalGet(x), LocalGet(n), I32Add, LocalSet(x), End,
+    );
+    emit_clamp(function, x, n);
+}
+
+/// Push `ToUint16` / `ToUint32` (`modulus` `2^16` / `2^32`) of the number
+/// jsval in i64 `v` as an i32: the truncated value modulo `modulus`, exact
+/// for every double (`x` is f64 scratch); `NaN` and the infinities are `0`.
+fn emit_to_uint(function: &mut Function, v: u32, modulus: f64, x: u32) {
+    wasm!(function;
+        LocalGet(v), F64ReinterpretI64, F64Trunc, LocalTee(x),
+        LocalGet(x), F64Const(Ieee64::from(modulus)), F64Div, F64Floor,
+        F64Const(Ieee64::from(modulus)), F64Mul, F64Sub,
+        I32TruncSatF64U,
+    );
+}
+
+/// Push i32 `1` when the code unit in i32 local `c` is in `ranges`
+/// (inclusive).
+fn emit_unit_in(function: &mut Function, c: u32, ranges: impl IntoIterator<Item = (i32, i32)>) {
+    wasm!(function; I32Const(0));
+    for (lo, hi) in ranges {
+        if lo == hi {
+            wasm!(function; LocalGet(c), I32Const(lo), I32Eq, I32Or);
+        } else {
+            wasm!(function; LocalGet(c), I32Const(lo), I32Sub, I32Const(hi - lo + 1), I32LtU, I32Or);
+        }
+    }
+}
+
+/// i32 `dst` = a fresh canonical string of the units of `src` from the index
+/// `from` pushes, as many as `count` pushes (in range); `[dst, n, i]` are
+/// i32 scratch, `n` holding the count.
+fn emit_substring(
+    function: &mut Function,
+    alloc: u32,
+    src: Str,
+    from: impl Fn(&mut Function),
+    count: impl Fn(&mut Function),
+    [dst, n, i]: [u32; 3],
+) {
+    count(function);
+    wasm!(function; LocalSet(n));
+    emit_alloc_str(
+        function,
+        alloc,
+        |f| wasm!(f; LocalGet(n)),
+        |f| wasm!(f; LocalGet(src.w)),
+        dst,
+    );
+    wasm!(function; LocalGet(dst), I32Const(abi::STR_DATA_OFFSET.cast_signed()), I32Add);
+    src.addr(function, from);
+    wasm!(function;
+        LocalGet(n), LocalGet(src.w), I32Shl, MemoryCopy { src_mem: 0, dst_mem: 0 },
+    );
+    emit_str_canonical(function, src.w, dst, i, n);
+}
+
+/// [`emit_substring`] appended to the string in i64 `acc` (nothing for an
+/// empty range).
+fn emit_append_units(
+    function: &mut Function,
+    helpers: Helpers<'_>,
+    acc: u32,
+    src: Str,
+    from: impl Fn(&mut Function),
+    count: impl Fn(&mut Function),
+    tmp: [u32; 3],
+) {
+    count(function);
+    wasm!(function; If(BlockType::Empty));
+    emit_substring(function, helpers.alloc, src, from, count, tmp);
+    wasm!(function; LocalGet(acc), I32WrapI64, LocalGet(tmp[0]), Call(helpers.concat));
+    box_heap(function);
+    wasm!(function; LocalSet(acc), End);
+}
+
+/// Copy the `n` (i32 local) units of `src` to the index `at` pushes of the
+/// block `dst`, at least as wide: `memory.copy` at the same width, else a
+/// widening unit loop (`i` is i32 scratch).
+fn emit_copy_units(
+    function: &mut Function,
+    dst: Str,
+    at: impl Fn(&mut Function),
+    src: Str,
+    n: u32,
+    i: u32,
+) {
+    wasm!(function; LocalGet(dst.w), LocalGet(src.w), I32Eq, If(BlockType::Empty));
+    dst.addr(function, &at);
+    src.addr(function, |f| wasm!(f; I32Const(0)));
+    wasm!(function;
+        LocalGet(n), LocalGet(src.w), I32Shl, MemoryCopy { src_mem: 0, dst_mem: 0 },
+        Else, I32Const(0), LocalSet(i),
+    );
+    count_loop(function, i, n, |function| {
+        dst.store(
+            function,
+            |f| {
+                at(f);
+                wasm!(f; LocalGet(i), I32Add);
+            },
+            |f| src.unit_at(f, i),
+        );
+    });
+    wasm!(function; End);
+}
+
+/// i32 `ok` = whether the units of `t` occur in `s` at the index in i32
+/// local `k` (`k + t.n <= s.n`); `j` is i32 scratch.
+fn emit_matches_at(function: &mut Function, s: Str, k: u32, t: Str, j: u32, ok: u32) {
+    wasm!(function;
+        I32Const(1), LocalSet(ok), I32Const(0), LocalSet(j),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(j), LocalGet(t.n), I32GeU, BrIf(1),
+    );
+    s.unit(function, |f| wasm!(f; LocalGet(k), LocalGet(j), I32Add));
+    t.unit_at(function, j);
+    wasm!(function;
+        I32Ne, If(BlockType::Empty), I32Const(0), LocalSet(ok), Br(2), End,
+        LocalGet(j), I32Const(1), I32Add, LocalSet(j),
+        Br(0),
+        End, End,
+    );
+}
+
+/// `StringIndexOf(s, t, from)` into i32 `out`: the first index `>= from`
+/// (an i32 local in `0..=s.n`) where `t` occurs, else `-1`; `[j, ok]` are
+/// i32 scratch.
+fn emit_index_of(function: &mut Function, s: Str, t: Str, from: u32, out: u32, [j, ok]: [u32; 2]) {
+    wasm!(function;
+        LocalGet(from), LocalSet(out),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(out), LocalGet(t.n), I32Add, LocalGet(s.n), I32GtU,
+        If(BlockType::Empty), I32Const(-1), LocalSet(out), Br(2), End,
+    );
+    emit_matches_at(function, s, out, t, j, ok);
+    wasm!(function;
+        LocalGet(ok), BrIf(1),
+        LocalGet(out), I32Const(1), I32Add, LocalSet(out),
+        Br(0),
+        End, End,
+    );
+}
+
+/// The last index `<= from` (an i32 local with `from + t.n <= s.n`) where
+/// `t` occurs in `s` into i32 `out`, else `-1`; `[j, ok]` are i32 scratch.
+fn emit_last_index_of(
+    function: &mut Function,
+    s: Str,
+    t: Str,
+    from: u32,
+    out: u32,
+    [j, ok]: [u32; 2],
+) {
+    wasm!(function;
+        LocalGet(from), LocalSet(out),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(out), I32Const(0), I32LtS, BrIf(1),
+    );
+    emit_matches_at(function, s, out, t, j, ok);
+    wasm!(function;
+        LocalGet(ok), BrIf(1),
+        LocalGet(out), I32Const(1), I32Sub, LocalSet(out),
+        Br(0),
+        End, End,
+    );
+}
+
+/// Run `lone` at each index `i` (i32 local) of a lone surrogate of the
+/// two-byte string `s` — a lead not followed by a trail, or a trail not
+/// after a lead (the surrogate rule of design/symbol-strings.md §6.6); `c`
+/// is i32 scratch.
+fn emit_lone_surrogates(
+    function: &mut Function,
+    s: Str,
+    i: u32,
+    c: u32,
+    lone: impl FnOnce(&mut Function),
+) {
+    let next = |f: &mut Function| wasm!(f; LocalGet(i), I32Const(1), I32Add);
+    wasm!(function; I32Const(0), LocalSet(i));
+    count_loop(function, i, s.n, |function| {
+        s.unit_at(function, i);
+        wasm!(function;
+            LocalTee(c), I32Const(0xF800), I32And, I32Const(0xD800), I32Eq, If(BlockType::Empty),
+            LocalGet(c), I32Const(0xDC00), I32LtU,
+        );
+        next(function);
+        wasm!(function;
+            LocalGet(s.n), I32LtU, I32And, If(BlockType::Result(ValType::I32)),
+        );
+        s.unit(function, next);
+        wasm!(function;
+            I32Const(0xFC00), I32And, I32Const(0xDC00), I32Eq,
+            Else, I32Const(0), End,
+            // A pair: step over its trail.
+            If(BlockType::Empty),
+        );
+        next(function);
+        wasm!(function; LocalSet(i), Else);
+        lone(function);
+        wasm!(function; End, End);
+    });
+}
+
+/// The code-unit body of `op` over the receiver string in i64 temp 0 and the
+/// coerced arguments in i64 temps 1 and 2, leaving the result jsval (for
+/// `match`, the index).
+fn emit_units(
+    op: StringOp,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    s.open(function, frame.i64(0));
+    match op {
+        StringOp::CharAt | StringOp::At | StringOp::CharCodeAt | StringOp::CodePointAt => {
+            emit_unit_at(op, function, frame, strings, helpers);
+        }
+        StringOp::Slice | StringOp::Substring => emit_slice(op, function, frame, helpers),
+        StringOp::Trim | StringOp::TrimStart | StringOp::TrimEnd => {
+            emit_trim(op, function, frame, helpers);
+        }
+        StringOp::Repeat => emit_repeat(function, frame, strings, helpers),
+        StringOp::PadStart | StringOp::PadEnd => emit_pad(op, function, frame, strings, helpers),
+        StringOp::IndexOf
+        | StringOp::Includes
+        | StringOp::StartsWith
+        | StringOp::EndsWith
+        | StringOp::LastIndexOf
+        | StringOp::Search
+        | StringOp::Match => emit_search(op, function, frame, strings, helpers),
+        StringOp::Split => emit_split(function, frame, helpers),
+        StringOp::IsWellFormed | StringOp::ToWellFormed => {
+            emit_well_formed(op, function, frame, helpers);
+        }
+        _ => {}
+    }
+}
+
+/// `charAt` / `at` / `charCodeAt` / `codePointAt(pos)`: the one-unit
+/// string, unit or code point at `ToIntegerOrInfinity(pos)` (`at` counts a
+/// negative index from the end); out of range `""` / `undefined` / `NaN` /
+/// `undefined`.
+fn emit_unit_at(
+    op: StringOp,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let [pos, unit, next, trail] = [locals[3], locals[4], locals[5], locals[6]];
+    emit_int(function, frame.i64(1), |f| wasm!(f; I32Const(0)), pos);
+    if op == StringOp::At {
+        wasm!(function;
+            LocalGet(pos), I32Const(0), I32LtS,
+            If(BlockType::Empty), LocalGet(pos), LocalGet(s.n), I32Add, LocalSet(pos), End,
+        );
+    }
+    wasm!(function; LocalGet(pos), LocalGet(s.n), I32LtU, If(BlockType::Result(ValType::I64)));
+    match op {
+        StringOp::CharAt | StringOp::At => {
+            wasm!(function; LocalGet(s.p), LocalGet(pos), Call(helpers.str_index));
+            box_heap(function);
+        }
+        StringOp::CodePointAt => {
+            s.unit_at(function, pos);
+            // A lead followed by a trail is a pair; only a two-byte string
+            // holds surrogates.
+            wasm!(function;
+                LocalTee(unit), I32Const(0xFC00), I32And, I32Const(0xD800), I32Eq, LocalGet(s.w), I32And,
+                LocalGet(pos), I32Const(1), I32Add, LocalTee(next), LocalGet(s.n), I32LtU, I32And,
+                If(BlockType::Empty),
+            );
+            s.unit_at(function, next);
+            wasm!(function;
+                LocalTee(trail), I32Const(0xFC00), I32And, I32Const(0xDC00), I32Eq,
+                If(BlockType::Empty),
+                // (unit - 0xD800) * 0x400 + (trail - 0xDC00) + 0x10000
+                LocalGet(unit), I32Const(10), I32Shl, LocalGet(trail), I32Add,
+                I32Const(0x035F_DC00), I32Sub, LocalSet(unit),
+                End, End,
+                LocalGet(unit), F64ConvertI32U, I64ReinterpretF64,
+            );
+        }
+        _ => {
+            s.unit_at(function, pos);
+            wasm!(function; F64ConvertI32U, I64ReinterpretF64);
+        }
+    }
+    wasm!(function; Else);
+    match op {
+        StringOp::CharAt => push_str(function, strings, ""),
+        StringOp::CharCodeAt => wasm!(function; I64Const(abi::QNAN.cast_signed())),
+        _ => wasm!(function; I64Const(UNDEFINED_BITS)),
+    }
+    wasm!(function; End);
+}
+
+/// `slice(start, end)` (relative indices) / `substring(start, end)`
+/// (clamped, swapped when reversed): the units between, `end` defaulting to
+/// the length.
+fn emit_slice(op: StringOp, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let [a, b, lo] = [locals[3], locals[4], locals[5]];
+    let tmp = [locals[6], locals[7], locals[8]];
+    emit_int(function, frame.i64(1), |f| wasm!(f; I32Const(0)), a);
+    emit_int(function, frame.i64(2), |f| wasm!(f; LocalGet(s.n)), b);
+    if op == StringOp::Slice {
+        emit_relative(function, a, s.n);
+        emit_relative(function, b, s.n);
+        wasm!(function; LocalGet(a), LocalSet(lo));
+        // count = max(end - start, 0)
+        wasm!(function;
+            LocalGet(b), LocalGet(a), I32Sub, LocalTee(b), I32Const(0), LocalGet(b), I32Const(0),
+            I32GtS, Select, LocalSet(b),
+        );
+    } else {
+        emit_clamp(function, a, s.n);
+        emit_clamp(function, b, s.n);
+        // lo = min(a, b), count = max(a, b) - lo
+        wasm!(function;
+            LocalGet(a), LocalGet(b), LocalGet(a), LocalGet(b), I32LtS, Select, LocalSet(lo),
+            LocalGet(a), LocalGet(b), I32Add, LocalGet(lo), I32Const(1), I32Shl, I32Sub, LocalSet(b),
+        );
+    }
+    emit_substring(
+        function,
+        helpers.alloc,
+        s,
+        |f| wasm!(f; LocalGet(lo)),
+        |f| wasm!(f; LocalGet(b)),
+        tmp,
+    );
+    wasm!(function; LocalGet(tmp[0]));
+    box_heap(function);
+}
+
+/// `trim` / `trimStart` / `trimEnd()`: the units between the leading and/or
+/// trailing [`WHITESPACE`]; the receiver itself when nothing is stripped.
+fn emit_trim(op: StringOp, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let [start, end, unit, last] = [locals[3], locals[4], locals[5], locals[6]];
+    let tmp = [locals[7], locals[8], locals[9]];
+    wasm!(function; I32Const(0), LocalSet(start), LocalGet(s.n), LocalSet(end));
+    if op != StringOp::TrimEnd {
+        wasm!(function;
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(start), LocalGet(s.n), I32GeU, BrIf(1),
+        );
+        s.unit_at(function, start);
+        wasm!(function; LocalSet(unit));
+        emit_unit_in(function, unit, WHITESPACE);
+        wasm!(function;
+            I32Eqz, BrIf(1),
+            LocalGet(start), I32Const(1), I32Add, LocalSet(start),
+            Br(0),
+            End, End,
+        );
+    }
+    if op != StringOp::TrimStart {
+        wasm!(function;
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(end), LocalGet(start), I32LeU, BrIf(1),
+            LocalGet(end), I32Const(1), I32Sub, LocalSet(last),
+        );
+        s.unit_at(function, last);
+        wasm!(function; LocalSet(unit));
+        emit_unit_in(function, unit, WHITESPACE);
+        wasm!(function;
+            I32Eqz, BrIf(1),
+            LocalGet(last), LocalSet(end),
+            Br(0),
+            End, End,
+        );
+    }
+    wasm!(function;
+        LocalGet(end), LocalGet(start), I32Sub, LocalTee(end), LocalGet(s.n), I32Eq,
+        If(BlockType::Result(ValType::I64)), LocalGet(frame.i64(0)), Else,
+    );
+    emit_substring(
+        function,
+        helpers.alloc,
+        s,
+        |f| wasm!(f; LocalGet(start)),
+        |f| wasm!(f; LocalGet(end)),
+        tmp,
+    );
+    wasm!(function; LocalGet(tmp[0]));
+    box_heap(function);
+    wasm!(function; End);
+}
+
+/// `repeat(count)` past its count checks: `""` for an empty receiver or a
+/// zero count, else the receiver once, then the result so far copied onto
+/// its end until it is `count` times as long.
+fn emit_repeat(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let [count, total, dst, done] = [locals[3], locals[4], locals[5], locals[6]];
+    let d = Str {
+        p: dst,
+        w: s.w,
+        n: total,
+    };
+    emit_int(function, frame.i64(1), |f| wasm!(f; I32Const(0)), count);
+    wasm!(function;
+        LocalGet(s.n), I32Eqz, LocalGet(count), I32Eqz, I32Or,
+        If(BlockType::Result(ValType::I64)),
+    );
+    push_str(function, strings, "");
+    wasm!(function; Else, LocalGet(s.n), LocalGet(count), I32Mul, LocalSet(total));
+    emit_alloc_str(
+        function,
+        helpers.alloc,
+        |f| wasm!(f; LocalGet(total)),
+        |f| wasm!(f; LocalGet(s.w)),
+        dst,
+    );
+    emit_copy_units(function, d, |f| wasm!(f; I32Const(0)), s, s.n, done);
+    wasm!(function;
+        LocalGet(s.n), LocalSet(done),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(done), LocalGet(total), I32GeU, BrIf(1),
+    );
+    d.addr(function, |f| wasm!(f; LocalGet(done)));
+    d.addr(function, |f| wasm!(f; I32Const(0)));
+    // chunk = min(done, total - done)
+    wasm!(function;
+        LocalGet(total), LocalGet(done), I32Sub, LocalTee(count), LocalGet(done),
+        LocalGet(count), LocalGet(done), I32LtU, Select, LocalTee(count),
+        LocalGet(s.w), I32Shl, MemoryCopy { src_mem: 0, dst_mem: 0 },
+        LocalGet(done), LocalGet(count), I32Add, LocalSet(done),
+        Br(0),
+        End, End,
+        LocalGet(dst),
+    );
+    box_heap(function);
+    wasm!(function; End);
+}
+
+/// `padStart` / `padEnd(maxLength, fillString)` (`StringPad` order): the
+/// receiver when `ToLength(maxLength)` does not exceed its length, before
+/// `fillString` is coerced, or when the filler (default `" "`) is empty; a length past [`MAX_STRING_LENGTH`] is a `RangeError`;
+/// else the filler repeated (and cut) to the missing units before / after
+/// the receiver, narrowed.
+fn emit_pad(
+    op: StringOp,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let t = Str::at(&locals, 3);
+    let [total, width, dst, fill, idx, spare] = [
+        locals[6], locals[7], locals[8], locals[9], locals[10], locals[11],
+    ];
+    let (recv, a0, a1, max) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.f64(0));
+    let d = Str {
+        p: dst,
+        w: width,
+        n: total,
+    };
+    wasm!(function;
+        LocalGet(a0), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Result(ValType::F64)),
+        F64Const(Ieee64::from(0.0)), Else, LocalGet(a0), F64ReinterpretI64, F64Trunc, End,
+        LocalTee(max), LocalGet(s.n), F64ConvertI32U, F64Gt, I32Eqz,
+        If(BlockType::Empty), LocalGet(recv), Return, End,
+        LocalGet(a1), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty),
+    );
+    push_str(function, strings, " ");
+    wasm!(function; LocalSet(a1), Else);
+    is_string(function, a1);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    to_string(function, a1, helpers);
+    wasm!(function; End, End);
+    t.open(function, a1);
+    wasm!(function;
+        LocalGet(t.n), I32Eqz, If(BlockType::Empty), LocalGet(recv), Return, End,
+        LocalGet(max), F64Const(Ieee64::from(MAX_STRING_LENGTH)), F64Gt, If(BlockType::Empty),
+    );
+    throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
+    wasm!(function;
+        End,
+        LocalGet(max), I32TruncSatF64U, LocalTee(total), LocalGet(s.n), I32Sub, LocalSet(fill),
+        LocalGet(s.w), LocalGet(t.w), I32Or, LocalSet(width),
+    );
+    emit_alloc_str(
+        function,
+        helpers.alloc,
+        |f| wasm!(f; LocalGet(total)),
+        |f| wasm!(f; LocalGet(width)),
+        dst,
+    );
+    let (fill_at, recv_at) = if op == StringOp::PadStart {
+        (None, Some(fill))
+    } else {
+        (Some(s.n), None)
+    };
+    let at = |f: &mut Function, local: Option<u32>| {
+        f.instruction(&local.map_or(Instruction::I32Const(0), Instruction::LocalGet));
+    };
+    wasm!(function; I32Const(0), LocalSet(idx));
+    count_loop(function, idx, fill, |function| {
+        d.store(
+            function,
+            |f| {
+                at(f, fill_at);
+                wasm!(f; LocalGet(idx), I32Add);
+            },
+            |f| t.unit(f, |f| wasm!(f; LocalGet(idx), LocalGet(t.n), I32RemU)),
+        );
+    });
+    emit_copy_units(function, d, |f| at(f, recv_at), s, s.n, idx);
+    emit_str_canonical(function, width, dst, idx, spare);
+    wasm!(function; LocalGet(dst));
+    box_heap(function);
+}
+
+/// The searches over the string argument in i64 temp 1 (a number position
+/// or `undefined` in i64 temp 2): `indexOf` / `includes` from the clamped
+/// position (default `0`); `startsWith` at it; `endsWith` ending at it
+/// (default the length); `lastIndexOf` at or before it (`NaN` and the
+/// default: the end); `search` / `match` from `0` after the `RegExp`-syntax
+/// check.
+fn emit_search(
+    op: StringOp,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let t = Str::at(&locals, 3);
+    let [k, out, c] = [locals[6], locals[7], locals[8]];
+    let scratch = [locals[9], locals[10]];
+    let a1 = frame.i64(2);
+    t.open(function, frame.i64(1));
+    match op {
+        StringOp::Search | StringOp::Match => {
+            let text = if op == StringOp::Search {
+                SEARCH_REGEXP
+            } else {
+                MATCH_REGEXP
+            };
+            wasm!(function; I32Const(0), LocalSet(k));
+            count_loop(function, k, t.n, |function| {
+                t.unit_at(function, k);
+                wasm!(function; LocalSet(c));
+                emit_unit_in(
+                    function,
+                    c,
+                    REGEXP_SYNTAX.iter().map(|&b| (b.into(), b.into())),
+                );
+                wasm!(function; If(BlockType::Empty));
+                throw_type_error(function, frame, text, strings, helpers);
+                wasm!(function; End);
+            });
+            wasm!(function; I32Const(0), LocalSet(k));
+        }
+        StringOp::EndsWith => {
+            emit_int(function, a1, |f| wasm!(f; LocalGet(s.n)), k);
+            emit_clamp(function, k, s.n);
+        }
+        StringOp::LastIndexOf => {
+            wasm!(function;
+                LocalGet(a1), I64Const(abi::QNAN.cast_signed()), I64Eq,
+                LocalGet(a1), I64Const(UNDEFINED_BITS), I64Eq, I32Or,
+                If(BlockType::Result(ValType::I32)), LocalGet(s.n),
+                Else, LocalGet(a1), F64ReinterpretI64, I32TruncSatF64S, End, LocalSet(k),
+            );
+        }
+        _ => {
+            emit_int(function, a1, |f| wasm!(f; I32Const(0)), k);
+            emit_clamp(function, k, s.n);
+        }
+    }
+    match op {
+        StringOp::StartsWith => {
+            wasm!(function;
+                LocalGet(k), LocalGet(t.n), I32Add, LocalGet(s.n), I32GtU,
+                If(BlockType::Result(ValType::I64)), I64Const(abi::FALSE.cast_signed()), Else,
+            );
+            emit_matches_at(function, s, k, t, scratch[0], scratch[1]);
+            wasm!(function; LocalGet(scratch[1]));
+            box_bool(function);
+            wasm!(function; End);
+        }
+        StringOp::EndsWith => {
+            wasm!(function;
+                LocalGet(k), LocalGet(t.n), I32Sub, LocalTee(k), I32Const(0), I32LtS,
+                If(BlockType::Result(ValType::I64)), I64Const(abi::FALSE.cast_signed()), Else,
+            );
+            emit_matches_at(function, s, k, t, scratch[0], scratch[1]);
+            wasm!(function; LocalGet(scratch[1]));
+            box_bool(function);
+            wasm!(function; End);
+        }
+        StringOp::LastIndexOf => {
+            // The last index a match fits at: `s.n - t.n` (none when negative).
+            wasm!(function;
+                LocalGet(s.n), LocalGet(t.n), I32Sub, LocalTee(c), I32Const(0), I32LtS,
+                If(BlockType::Result(ValType::I64)),
+                I64Const((-1.0f64).to_bits().cast_signed()), Else,
+            );
+            emit_clamp(function, k, c);
+            emit_last_index_of(function, s, t, k, out, scratch);
+            push_number(function, out);
+            wasm!(function; End);
+        }
+        _ => {
+            emit_index_of(function, s, t, k, out, scratch);
+            if op == StringOp::Includes {
+                wasm!(function; LocalGet(out), I32Const(-1), I32Ne);
+                box_bool(function);
+            } else {
+                push_number(function, out);
+            }
+        }
+    }
+}
+
+/// `split(separator, limit)`: at most `ToUint32(limit)` (default `2^32 - 1`)
+/// pieces — none for `0`; the receiver for an `undefined` separator; each
+/// unit for `""`; else the units between the separator's occurrences.
+fn emit_split(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let t = Str::at(&locals, 3);
+    let [lim, a, pos, cnt] = [locals[6], locals[7], locals[8], locals[9]];
+    let scratch = [locals[10], locals[11]];
+    let tmp = [locals[12], locals[13], locals[14]];
+    let (recv, sep, limit, list) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
+    let push = |function: &mut Function, value: &dyn Fn(&mut Function)| {
+        wasm!(function; LocalGet(list), I32WrapI64);
+        value(function);
+        wasm!(function; Call(helpers.array_push), Drop);
+    };
+    let piece = |function: &mut Function| {
+        push(function, &|f| {
+            wasm!(f; LocalGet(tmp[0]));
+            box_heap(f);
+        });
+    };
+    wasm!(function;
+        LocalGet(limit), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Result(ValType::I32)),
+        I32Const(-1), Else,
+    );
+    emit_to_uint(function, limit, 4_294_967_296.0, frame.f64(0));
+    wasm!(function;
+        End, LocalSet(lim),
+        I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        LocalSet(list),
+        LocalGet(lim), I32Eqz, If(BlockType::Empty), LocalGet(list), Return, End,
+        LocalGet(sep), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty),
+    );
+    push(function, &|f| wasm!(f; LocalGet(recv)));
+    wasm!(function; LocalGet(list), Return, End);
+    t.open(function, sep);
+    wasm!(function; LocalGet(t.n), I32Eqz, If(BlockType::Empty));
+    // One piece per unit, up to the limit.
+    wasm!(function;
+        LocalGet(s.n), LocalGet(lim), LocalGet(s.n), LocalGet(lim), I32LtU, Select, LocalSet(cnt),
+        I32Const(0), LocalSet(a),
+    );
+    count_loop(function, a, cnt, |function| {
+        push(function, &|f| {
+            wasm!(f; LocalGet(s.p), LocalGet(a), Call(helpers.str_index));
+            box_heap(f);
+        });
+    });
+    wasm!(function;
+        LocalGet(list), Return, End,
+        I32Const(0), LocalSet(a), I32Const(0), LocalSet(cnt),
+    );
+    emit_index_of(function, s, t, a, pos, scratch);
+    wasm!(function;
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(pos), I32Const(-1), I32Eq, BrIf(1),
+    );
+    emit_substring(
+        function,
+        helpers.alloc,
+        s,
+        |f| wasm!(f; LocalGet(a)),
+        |f| wasm!(f; LocalGet(pos), LocalGet(a), I32Sub),
+        tmp,
+    );
+    piece(function);
+    wasm!(function;
+        LocalGet(cnt), I32Const(1), I32Add, LocalTee(cnt), LocalGet(lim), I32Eq,
+        If(BlockType::Empty), LocalGet(list), Return, End,
+        LocalGet(pos), LocalGet(t.n), I32Add, LocalSet(a),
+    );
+    emit_index_of(function, s, t, a, pos, scratch);
+    wasm!(function; Br(0), End, End);
+    emit_substring(
+        function,
+        helpers.alloc,
+        s,
+        |f| wasm!(f; LocalGet(a)),
+        |f| wasm!(f; LocalGet(s.n), LocalGet(a), I32Sub),
+        tmp,
+    );
+    piece(function);
+    wasm!(function; LocalGet(list));
+}
+
+/// `isWellFormed()`: whether the receiver holds no lone surrogate;
+/// `toWellFormed()`: a copy with each lone surrogate replaced by U+FFFD (the
+/// receiver itself when one-byte, which holds no surrogate).
+fn emit_well_formed(op: StringOp, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let [i, c, ok, dst] = [locals[3], locals[4], locals[5], locals[6]];
+    wasm!(function; LocalGet(s.w), I32Eqz, If(BlockType::Result(ValType::I64)));
+    if op == StringOp::IsWellFormed {
+        wasm!(function; I64Const(abi::TRUE.cast_signed()), Else, I32Const(1), LocalSet(ok));
+        emit_lone_surrogates(function, s, i, c, |f| wasm!(f; I32Const(0), LocalSet(ok)));
+        wasm!(function; LocalGet(ok));
+        box_bool(function);
+    } else {
+        let d = Str { p: dst, ..s };
+        wasm!(function; LocalGet(frame.i64(0)), Else);
+        emit_alloc_str(
+            function,
+            helpers.alloc,
+            |f| wasm!(f; LocalGet(s.n)),
+            |f| wasm!(f; I32Const(1)),
+            dst,
+        );
+        emit_copy_units(function, d, |f| wasm!(f; I32Const(0)), s, s.n, i);
+        emit_lone_surrogates(function, d, i, c, |f| {
+            d.store(f, |f| wasm!(f; LocalGet(i)), |f| wasm!(f; I32Const(0xFFFD)));
+        });
+        wasm!(function; LocalGet(dst));
+        box_heap(function);
+    }
+    wasm!(function; End);
+}
+
 /// `replace` / `replaceAll(searchValue, replaceValue)` over the string in
-/// i64 temp 0 with a string pattern (`ToString(searchValue)`): a callable
-/// `replaceValue` is called with `(match, position, string)` for each match
-/// (UTF-16 positions by the host `indexOf`), its `ToString`ed results
-/// spliced in by the host; any other is `ToString`ed and expanded by the host
-/// (`GetSubstitution`).
-#[allow(clippy::too_many_lines)]
+/// i64 temp 0 with a string pattern (`ToString(searchValue)`): each match
+/// (the first, or every one, the next searched `max(1, len)` past the last)
+/// is replaced by `ToString` of a callable `replaceValue` called with
+/// `(match, position, string)`, else by the `ToString`ed `replaceValue` with
+/// its `GetSubstitution` patterns expanded ([`emit_substitution`]).
 fn emit_replace(
     op: StringOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s, search, replacer, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (list, v) = (frame.x64(0), frame.x64(1));
-    let (len, next) = (frame.i32(0), frame.i32(1));
-    let all = op == StringOp::ReplaceAll;
-    let non_ascii = texts(op).non_ascii;
+    let (acc, v) = (frame.x64(0), frame.x64(1));
+    let locals = i32_locals(frame);
+    let (sv, t) = (Str::at(&locals, 0), Str::at(&locals, 3));
+    let [pos, end, from] = [locals[9], locals[10], locals[11]];
+    let tmp = [locals[15], locals[16], locals[17]];
     frame.arg(function, 0);
     wasm!(function; LocalSet(search));
     to_string(function, search, helpers);
     frame.arg(function, 1);
     wasm!(function; LocalSet(replacer));
-    let flag = if all {
-        abi::METHOD_OP_REPLACE_ALL
-    } else {
-        abi::METHOD_OP_REPLACE
-    };
-    // The host splices the template, or the replacer's results (an array).
-    let splice = |function: &mut Function| {
-        host_call(function, s, flag, search, replacer, helpers);
-        wasm!(function; LocalTee(r), I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Eq);
-        wasm!(function; If(BlockType::Empty));
-        throw_type_error(function, frame, non_ascii, strings, helpers);
-        wasm!(function; End, LocalGet(r));
-    };
     emit_is_function(function, replacer);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     to_string(function, replacer, helpers);
-    splice(function);
-    wasm!(function; Return, End);
-    // The match positions (UTF-16 offsets): `indexOf(search, from)` from 0,
-    // each next one `max(1, len)` past the last; a result before `from` is
-    // the clamped end.
-    let index_of = |function: &mut Function, from: &dyn Fn(&mut Function)| {
-        wasm!(function; LocalGet(s), I32Const(abi::METHOD_OP_INDEX_OF), LocalGet(search));
-        from(function);
-        wasm!(function; Call(helpers.method), LocalSet(r));
-    };
-    wasm!(function; LocalGet(search), I32WrapI64);
-    wasm!(function;
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
-        LocalSet(len),
-        I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-        LocalSet(list),
-    );
-    index_of(
-        function,
-        &|function| wasm!(function; I64Const(0.0f64.to_bits().cast_signed())),
-    );
+    wasm!(function; End);
+    sv.open(function, s);
+    t.open(function, search);
+    wasm!(function; I32Const(0), LocalSet(end), I32Const(0), LocalSet(from));
+    push_str(function, strings, "");
+    wasm!(function; LocalSet(acc));
+    emit_index_of(function, sv, t, from, pos, [tmp[0], tmp[1]]);
     wasm!(function;
         Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(r), I64Const((-1.0f64).to_bits().cast_signed()), I64Eq, BrIf(1),
+        LocalGet(pos), I32Const(-1), I32Eq, BrIf(1),
     );
+    emit_append_units(
+        function,
+        helpers,
+        acc,
+        sv,
+        |f| wasm!(f; LocalGet(end)),
+        |f| wasm!(f; LocalGet(pos), LocalGet(end), I32Sub),
+        tmp,
+    );
+    wasm!(function; LocalGet(pos), LocalGet(t.n), I32Add, LocalSet(end));
+    emit_is_function(function, replacer);
+    wasm!(function; If(BlockType::Empty));
     // The replacer over `(match, position, string)` with `this = undefined`;
-    // its `ToString` result joins the list.
+    // its `ToString` result is appended.
+    push_number(function, pos);
+    wasm!(function; LocalSet(r));
     let args = [search, r, s];
     for slot in 0..frame.k {
         if let Some(&local) = args.get(slot as usize) {
@@ -725,62 +1560,153 @@ fn emit_replace(
     wasm!(function; LocalSet(v));
     return_if_pending(function);
     to_string(function, v, helpers);
-    wasm!(function;
-        LocalGet(list), I32WrapI64, LocalGet(v), Call(helpers.array_push), Drop,
-    );
-    if all {
+    append(function, acc, v, helpers);
+    wasm!(function; Else);
+    emit_substitution(function, frame, helpers);
+    wasm!(function; End);
+    if op == StringOp::ReplaceAll {
         wasm!(function;
-            LocalGet(r), F64ReinterpretI64, I32TruncSatF64U,
-            LocalGet(len), I32Const(1), LocalGet(len), I32Const(1), I32GtU, Select,
-            I32Add, LocalSet(next),
+            LocalGet(pos), LocalGet(t.n), I32Const(1), LocalGet(t.n), I32Const(1), I32GtU, Select,
+            I32Add, LocalTee(from), LocalGet(sv.n), I32GtU, BrIf(1),
         );
-        index_of(function, &|function| {
-            wasm!(function; LocalGet(next), F64ConvertI32U, I64ReinterpretF64);
-        });
-        wasm!(function;
-            LocalGet(r), F64ReinterpretI64, LocalGet(next), F64ConvertI32U, F64Lt, BrIf(1),
-            Br(0),
-        );
+        emit_index_of(function, sv, t, from, pos, [tmp[0], tmp[1]]);
+        wasm!(function; Br(0));
     }
-    wasm!(function; End, End, LocalGet(list), LocalSet(replacer));
-    splice(function);
+    wasm!(function; End, End);
+    emit_append_units(
+        function,
+        helpers,
+        acc,
+        sv,
+        |f| wasm!(f; LocalGet(end)),
+        |f| wasm!(f; LocalGet(sv.n), LocalGet(end), I32Sub),
+        tmp,
+    );
+    wasm!(function; LocalGet(acc));
+}
+
+/// Append `GetSubstitution` of the template string in i64 temp 2 for the
+/// match `[pos, end)` of [`emit_replace`] to its result: `$$` is `$`, `$&`
+/// the match, `` $` `` the units before it, `$'` those after it; every other
+/// `$` (a capture reference, with none captured, or `$<`) stays literal.
+fn emit_substitution(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let acc = frame.x64(0);
+    let locals = i32_locals(frame);
+    let (sv, t, tm) = (
+        Str::at(&locals, 0),
+        Str::at(&locals, 3),
+        Str::at(&locals, 6),
+    );
+    let [pos, end, k, lit, c] = [locals[9], locals[10], locals[11], locals[12], locals[13]];
+    let tmp = [locals[15], locals[16], locals[17]];
+    let append_units = |function: &mut Function,
+                        src: Str,
+                        from: &dyn Fn(&mut Function),
+                        count: &dyn Fn(&mut Function)| {
+        emit_append_units(function, helpers, acc, src, from, count, tmp);
+    };
+    let when = |function: &mut Function, unit: u8| {
+        wasm!(function; LocalGet(c), I32Const(unit.into()), I32Eq, If(BlockType::Empty));
+    };
+    tm.open(function, frame.i64(2));
+    wasm!(function;
+        I32Const(0), LocalSet(k), I32Const(0), LocalSet(lit),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(k), I32Const(1), I32Add, LocalGet(tm.n), I32GeU, BrIf(1),
+    );
+    // c = the unit after a `$` at k, else 0.
+    tm.unit_at(function, k);
+    wasm!(function; I32Const(i32::from(b'$')), I32Eq, If(BlockType::Result(ValType::I32)));
+    tm.unit(function, |f| wasm!(f; LocalGet(k), I32Const(1), I32Add));
+    wasm!(function; Else, I32Const(0), End, LocalSet(c));
+    emit_unit_in(function, c, b"$&`'".iter().map(|&b| (b.into(), b.into())));
+    wasm!(function; If(BlockType::Empty));
+    // The literal units before the pattern (with the `$` of `$$`).
+    append_units(function, tm, &|f| wasm!(f; LocalGet(lit)), &|f| {
+        wasm!(f;
+            LocalGet(k), LocalGet(lit), I32Sub,
+            LocalGet(c), I32Const(i32::from(b'$')), I32Eq, I32Add,
+        );
+    });
+    when(function, b'&');
+    wasm!(function; LocalGet(acc), I32WrapI64, LocalGet(t.p), Call(helpers.concat));
+    box_heap(function);
+    wasm!(function; LocalSet(acc), End);
+    when(function, b'`');
+    append_units(
+        function,
+        sv,
+        &|f| wasm!(f; I32Const(0)),
+        &|f| wasm!(f; LocalGet(pos)),
+    );
+    wasm!(function; End);
+    when(function, b'\'');
+    append_units(function, sv, &|f| wasm!(f; LocalGet(end)), &|f| {
+        wasm!(f; LocalGet(sv.n), LocalGet(end), I32Sub);
+    });
+    wasm!(function;
+        End,
+        LocalGet(k), I32Const(2), I32Add, LocalTee(k), LocalSet(lit),
+        Else,
+        LocalGet(k), I32Const(1), I32Add, LocalSet(k),
+        End,
+        Br(0),
+        End, End,
+    );
+    append_units(function, tm, &|f| wasm!(f; LocalGet(lit)), &|f| {
+        wasm!(f; LocalGet(tm.n), LocalGet(lit), I32Sub);
+    });
 }
 
 /// `String.fromCharCode(...codeUnits)` / `String.fromCodePoint(...codePoints)`:
 /// `ToNumber` of each argument in order (`fromCodePoint` throws a
 /// `RangeError` at the first value that is not an integral `0..=0x10FFFF`),
-/// collected into a fresh array the host turns into the string; a lone
-/// surrogate throws a `TypeError`.
+/// written as its code unit (`ToUint16`) or as the code point's one or two
+/// UTF-16 units (a lone surrogate code point is its own unit) into a two-byte
+/// block of room enough, which ends at the units written and is narrowed.
 pub(super) fn emit_from_char_code(
     code_point: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (v, result, list, spread) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
-    let (n, i) = (frame.i32(0), frame.i32(1));
+    let (value, spread) = (frame.i64(0), frame.x64(0));
+    let locals = i32_locals(frame);
+    let [argc, idx, len, dst, width, unit] = [
+        locals[0], locals[1], locals[2], locals[3], locals[4], locals[5],
+    ];
     let point = frame.f64(0);
+    let d = Str {
+        p: dst,
+        w: width,
+        n: len,
+    };
     // The spread argument array, before a `valueOf` can republish it.
-    wasm!(function;
-        GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread),
-        I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-        LocalSet(list),
-    );
+    wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
     push_argc(function, frame);
-    wasm!(function; LocalSet(n), I32Const(0), LocalSet(i));
-    count_loop(function, i, n, |function| {
-        arg_at(function, frame, i, spread, v);
-        emit_is_number(function, v);
+    wasm!(function;
+        LocalSet(argc), I32Const(0), LocalSet(idx), I32Const(0), LocalSet(len), I32Const(1), LocalSet(width),
+    );
+    emit_alloc_str(
+        function,
+        helpers.alloc,
+        |f| wasm!(f; LocalGet(argc), I32Const(i32::from(code_point)), I32Shl),
+        |f| wasm!(f; I32Const(1)),
+        dst,
+    );
+    count_loop(function, idx, argc, |function| {
+        arg_at(function, frame, idx, spread, value);
+        emit_is_number(function, value);
         wasm!(function;
             I32Eqz, If(BlockType::Empty),
-            LocalGet(v), Call(helpers.to_number), LocalSet(v),
+            LocalGet(value), Call(helpers.to_number), LocalSet(value),
         );
         return_if_pending(function);
         wasm!(function; End);
         if code_point {
             wasm!(function;
-                LocalGet(v), F64ReinterpretI64, LocalTee(point), LocalGet(point), F64Trunc, F64Ne,
+                LocalGet(value), F64ReinterpretI64, LocalTee(point), LocalGet(point), F64Trunc, F64Ne,
                 LocalGet(point), F64Const(Ieee64::from(0.0)), F64Lt, I32Or,
                 LocalGet(point), F64Const(Ieee64::from(1_114_111.0)), F64Gt, I32Or,
                 If(BlockType::Empty),
@@ -789,29 +1715,49 @@ pub(super) fn emit_from_char_code(
                 function,
                 frame,
                 INVALID_CODE_POINT,
-                Some(v),
+                Some(value),
                 strings,
                 helpers,
             );
-            wasm!(function; End);
+            wasm!(function;
+                End,
+                LocalGet(point), I32TruncSatF64U, LocalTee(unit), I32Const(0xFFFF), I32GtU,
+                If(BlockType::Empty),
+            );
+            // A supplementary code point: its lead, then its trail.
+            d.store(
+                function,
+                |f| wasm!(f; LocalGet(len)),
+                |f| {
+                    wasm!(f;
+                        LocalGet(unit), I32Const(0x1_0000), I32Sub, I32Const(10), I32ShrU,
+                        I32Const(0xD800), I32Or,
+                    );
+                },
+            );
+            wasm!(function;
+                LocalGet(len), I32Const(1), I32Add, LocalSet(len),
+                LocalGet(unit), I32Const(0x3FF), I32And, I32Const(0xDC00), I32Or, LocalSet(unit),
+                End,
+            );
+        } else {
+            emit_to_uint(function, value, 65_536.0, point);
+            wasm!(function; LocalSet(unit));
         }
-        wasm!(function;
-            LocalGet(list), I32WrapI64, LocalGet(v), Call(helpers.array_push), Drop,
+        d.store(
+            function,
+            |f| wasm!(f; LocalGet(len)),
+            |f| wasm!(f; LocalGet(unit)),
         );
+        wasm!(function; LocalGet(len), I32Const(1), I32Add, LocalSet(len));
     });
-    let (flag, surrogate) = if code_point {
-        (abi::METHOD_OP_FROM_CODE_POINT, FROM_CODE_POINT_SURROGATE)
-    } else {
-        (abi::METHOD_OP_FROM_CHAR_CODE, FROM_CHAR_CODE_SURROGATE)
-    };
-    wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(v));
-    host_call(function, list, flag, v, v, helpers);
     wasm!(function;
-        LocalTee(result), I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Eq,
-        If(BlockType::Empty),
+        LocalGet(dst), LocalGet(len),
+        I32Store(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }),
     );
-    throw_type_error(function, frame, surrogate, strings, helpers);
-    wasm!(function; End, LocalGet(result));
+    emit_str_narrow(function, dst, idx, unit);
+    wasm!(function; LocalGet(dst));
+    box_heap(function);
 }
 
 /// `String.raw(template, ...substitutions)`: `raw = ToObject(ToObject(
@@ -820,7 +1766,7 @@ pub(super) fn emit_from_char_code(
 pub(super) fn emit_raw(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (raw, v, acc, spread) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));

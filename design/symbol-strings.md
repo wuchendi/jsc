@@ -1092,6 +1092,33 @@ Y1 reason drafts (one line per affected row, for the final CI pass):
   (Y1-T1).
 - `fib`, `math`, `push_1e5`, `console_log`: must not change.
 
+U1 reason drafts (one line per affected row, for the final CI pass):
+
+- `string_methods`: `slice`, `charAt`, `indexOf`, `includes`, `split`,
+  `trim`, `startsWith` run in the guest on code units (U1-T4): `host_calls`
+  drop (only `toUpperCase` / `toLowerCase` stay host ops), fuel rises
+  (guest loops are metered, host time is not); `user_ops` changes only where
+  a former inline host op site now calls the builtin; `out + ...` pays the
+  `__concat` width branch (U1-T2).
+- `json`: `__json_escape` gains the per-unit width branch and lone-surrogate
+  test; `__json_string` parses `\u` escapes and narrows its result;
+  `JSON.stringify(again)` pays the same escape path (U1-T2): small fuel rise.
+- `for_in`: `keys + k` pays the `__concat` width branch (an empty `keys`
+  returns `k` without copying); `__str_eq` pointer fast path and 8-byte
+  compare on key lookups (U1-T2): small change either way.
+- `map_set`, `for_of`, `spread`, `class_methods`: `'k' + i` /
+  `name + ':'` concat width branch and `__str_eq` on Map key compares
+  (U1-T2); string for-of / spread walk `__str_to_array` on code units, a
+  one-byte string skipping the surrogate test (U1-T2): small change, the
+  array / Map / generator per-iteration fuel unchanged.
+- `array_hofs`: `indexOf` / `includes` keep their host array arms; no
+  `Array.prototype.slice` or String method: unchanged apart from shared
+  helper bodies.
+- every row: ASCII intern hashes are unchanged (FNV-1a over units, U1-T1b),
+  so the static intern table and literal layout are identical.
+- `fib`, `math`, `push_1e5`, `console_log`, `generators`, `object_reads`:
+  must not change.
+
 ---
 
 ## 9. Staged migration

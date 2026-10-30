@@ -78,7 +78,7 @@ pub(super) fn require_object_coercible(
     function: &mut Function,
     frame: Frame,
     this: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_nullish(function, this);
@@ -93,7 +93,7 @@ pub(super) fn require_object_coercible(
 pub(super) fn emit_has_own_property(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, key) = (frame.i64(0), frame.i32(0));
@@ -116,7 +116,7 @@ pub(super) fn emit_has_own_property(
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, kind, tag) = (frame.i64(0), frame.i32(0), frame.i64(1));
@@ -196,7 +196,7 @@ pub(super) fn emit_to_string(
 pub(super) fn emit_value_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let this = frame.i64(0);
@@ -210,7 +210,7 @@ pub(super) fn emit_value_of(
 pub(super) fn emit_is_prototype_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, this) = (frame.i64(0), frame.i64(1));
@@ -245,7 +245,7 @@ pub(super) fn emit_is_prototype_of(
 pub(super) fn emit_property_is_enumerable(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, key) = (frame.i64(0), frame.i32(0));
@@ -266,7 +266,7 @@ pub(super) fn emit_property_is_enumerable(
 pub(super) fn emit_to_locale_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, method) = (frame.i64(0), frame.i64(1));
@@ -295,7 +295,7 @@ pub(super) fn emit_define_accessor(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, accessor) = (frame.i64(0), frame.i64(1));
@@ -351,7 +351,7 @@ pub(super) fn emit_lookup_accessor(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, desc) = (frame.i64(0), frame.i64(1));
@@ -389,7 +389,7 @@ pub(super) fn emit_lookup_accessor(
 pub(super) fn emit_proto_get(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let this = frame.i64(0);
@@ -408,7 +408,7 @@ pub(super) fn emit_proto_get(
 pub(super) fn emit_proto_set(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, proto, r) = (frame.i64(0), frame.i64(1), frame.i32(0));

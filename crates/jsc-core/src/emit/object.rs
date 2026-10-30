@@ -23,7 +23,7 @@ pub(super) fn emit_object_node(
     reserve: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // The i32 scratch local (declared just past the three i64 scratch locals) is
@@ -43,7 +43,7 @@ pub(super) fn emit_object_node(
         } else {
             16 + 16 * cap.cast_signed()
         };
-    let mut static_keys: Vec<&str> = Vec::with_capacity(entries.len());
+    let mut static_keys: Vec<&JsStr> = Vec::with_capacity(entries.len());
     for (key, _) in entries {
         if let PropKey::Static(k) | PropKey::Hidden(k) | PropKey::Fixed(k) = key {
             static_keys.push(k);
@@ -100,7 +100,7 @@ pub(super) fn emit_object_node(
                 tflags |= abi::PROPS_HAS_NON_ENUM;
             }
             if let PropKey::Static(k) | PropKey::Hidden(k) | PropKey::Fixed(k) = key
-                && is_array_index(k)
+                && is_array_index(k.as_units())
             {
                 tflags |= abi::PROPS_HAS_INDEX_KEYS;
             }
@@ -131,7 +131,7 @@ pub(super) fn emit_object_node(
                 continue;
             };
             let entry = u64::from(abi::OBJ_PREFIX_SIZE) + 16 + 16 * k as u64;
-            let interned = static_key(strings, name).cast_unsigned();
+            let interned = static_str_key(strings, name).cast_unsigned();
             function.instruction(&Instruction::LocalTee(dst));
             function.instruction(&Instruction::LocalGet(dst));
             function.instruction(&Instruction::I64Const(word(interned, attrs)));
@@ -185,12 +185,12 @@ fn emit_define_entry(
     value: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match key {
         PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => {
-            function.instruction(&Instruction::I32Const(static_key(strings, name)));
+            function.instruction(&Instruction::I32Const(static_str_key(strings, name)));
         }
         PropKey::Computed(expr) | PropKey::HiddenComputed(expr) => {
             emit_node(expr, function, scratch, strings, helpers);
@@ -233,7 +233,7 @@ pub(super) fn emit_define_props_node(
     entries: &[(PropKey, IrNode)],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(obj, function, scratch, strings, helpers);
@@ -273,7 +273,7 @@ pub(super) fn emit_make_accessor_node(
     setter: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let dst = scratch + 3;
@@ -333,7 +333,7 @@ pub(super) fn emit_object_builtin_node(
     arg: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);
@@ -380,7 +380,7 @@ pub(super) fn emit_object_has_node(
     obj: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_key_lookup(key, function, scratch, strings, helpers);
@@ -408,7 +408,7 @@ pub(super) fn emit_instanceof_node(
     kind: &InstanceOfKind,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(value, function, scratch, strings, helpers);
@@ -485,7 +485,7 @@ pub(super) fn emit_instanceof_node(
         emit_get_call(
             function,
             tgt,
-            &IrNode::Str("prototype".to_owned()),
+            &IrNode::Str("prototype".into()),
             scratch + 18,
             strings,
             helpers,
@@ -627,7 +627,7 @@ pub(super) fn emit_object_delete_node(
     key: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(obj, function, scratch, strings, helpers);
@@ -647,7 +647,7 @@ pub(super) fn emit_json_stringify_node(
     arg: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);
@@ -750,7 +750,7 @@ pub(super) fn emit_date_new_node(
     arg: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let v = scratch;
@@ -866,8 +866,8 @@ pub(super) const INVALID_TIME_VALUE: [&str; 2] =
 fn invalid_time_value() -> IrNode {
     IrNode::error_object(
         ErrorKind::RangeError,
-        Some(IrNode::Str(INVALID_TIME_VALUE[0].to_owned())),
-        IrNode::Str(INVALID_TIME_VALUE[1].to_owned()),
+        Some(IrNode::Str(INVALID_TIME_VALUE[0].into())),
+        IrNode::Str(INVALID_TIME_VALUE[1].into()),
     )
 }
 
@@ -883,7 +883,7 @@ pub(super) fn emit_date_field(
     recv_local: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // valueOf() = getTime() = the raw stored ms (a number's i64 IS its f64 bits).
@@ -1224,7 +1224,7 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     function.instruction(&Instruction::LocalSet(at));
 
     // Allocate the block: HEADER + u32 len + payload; write type + len.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4 + ISO_STRING_LEN));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET + ISO_STRING_LEN));
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(helpers.alloc));
@@ -1241,7 +1241,7 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -1305,7 +1305,7 @@ fn emit_iso_year(function: &mut Function, bptr: u32, at: u32, year: u32, abs_yea
     function.instruction(&Instruction::I64GeS);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::I32Store8(MemArg {
-        offset: (HEADER_SIZE as u64) + 4,
+        offset: u64::from(abi::STR_DATA_OFFSET),
         align: 0,
         memory_index: 0,
     }));
@@ -1344,7 +1344,7 @@ fn emit_date_string(
     bits: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     use Instruction as I;
@@ -1357,7 +1357,7 @@ fn emit_date_string(
     );
     let (weekday, abs_year, t) = (scratch + 24, scratch + 25, scratch);
     let (bptr, digits, sign, at) = (scratch + 3, scratch + 8, scratch + 9, scratch + 10);
-    let payload = u64::from((HEADER_SIZE + 4).cast_unsigned());
+    let payload = u64::from(abi::STR_DATA_OFFSET);
     let tail = i32::try_from(DATE_TAIL.len()).unwrap_or(0);
     let wasm = |function: &mut Function, ops: &[Instruction<'_>]| {
         for op in ops {
@@ -1426,7 +1426,7 @@ fn emit_date_string(
     wasm(
         function,
         &[
-            I::I32Const(HEADER_SIZE + 4 + fixed),
+            I::I32Const(STR_DATA_OFFSET + fixed),
             I::LocalGet(sign),
             I::I32Add,
             I::LocalGet(digits),
@@ -1446,20 +1446,20 @@ fn emit_date_string(
             I::LocalGet(digits),
             I::I32Add,
             I::I32Store(MemArg {
-                offset: HEADER_SIZE as u64,
+                offset: STR_LEN_OFFSET,
                 align: 2,
                 memory_index: 0,
             }),
         ],
     );
     // Weekday and month names, copied from their static tables.
-    let table = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE) + HEADER_SIZE + 4;
+    let table = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE) + STR_DATA_OFFSET;
     for (pos, names, index) in [(0, DATE_WEEKDAYS, weekday), (4, DATE_MONTHS, month)] {
         wasm(
             function,
             &[
                 I::LocalGet(bptr),
-                I::I32Const(HEADER_SIZE + 4 + pos),
+                I::I32Const(STR_DATA_OFFSET + pos),
                 I::I32Add,
                 I::I32Const(table(names)),
                 I::LocalGet(index),
@@ -1545,7 +1545,7 @@ fn emit_date_string(
         &[
             I::LocalGet(bptr),
             I::I32Load(MemArg {
-                offset: HEADER_SIZE as u64,
+                offset: STR_LEN_OFFSET,
                 align: 2,
                 memory_index: 0,
             }),
@@ -1554,7 +1554,7 @@ fn emit_date_string(
             I::LocalGet(bptr),
             I::I32Add,
             I::LocalTee(at),
-            I::I32Const(HEADER_SIZE + 4),
+            I::I32Const(STR_DATA_OFFSET),
             I::I32Add,
             I::I32Const(table(DATE_TAIL)),
             I::I32Const(tail),
@@ -1584,12 +1584,12 @@ fn emit_date_string(
 }
 
 /// Write one fixed ASCII byte `ch` at payload offset `pos` of the string block in
-/// `bptr` (payload begins at `HEADER_SIZE + 4`).
+/// `bptr` (payload begins at `STR_DATA_OFFSET`).
 fn emit_iso_byte(function: &mut Function, bptr: u32, pos: u64, ch: u8) {
     function.instruction(&Instruction::LocalGet(bptr));
     function.instruction(&Instruction::I32Const(i32::from(ch)));
     function.instruction(&Instruction::I32Store8(MemArg {
-        offset: (HEADER_SIZE as u64) + 4 + pos,
+        offset: u64::from(abi::STR_DATA_OFFSET) + pos,
         align: 0,
         memory_index: 0,
     }));
@@ -1611,7 +1611,7 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
         function.instruction(&Instruction::I64Add);
         function.instruction(&Instruction::I32WrapI64);
         function.instruction(&Instruction::I32Store8(MemArg {
-            offset: (HEADER_SIZE as u64) + 4 + pos + u64::from(i),
+            offset: u64::from(abi::STR_DATA_OFFSET) + pos + u64::from(i),
             align: 0,
             memory_index: 0,
         }));
@@ -1630,7 +1630,7 @@ pub(super) fn emit_map_op(
     args: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // Push argument slot `i`, or `undefined` when the call supplied fewer.
@@ -1713,7 +1713,7 @@ pub(super) fn emit_object_rest_node(
     exclude: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(source, function, scratch, strings, helpers);
@@ -1724,7 +1724,7 @@ pub(super) fn emit_object_rest_node(
 /// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for the
 /// heap array/string in `s0` (`0 <= idx < len`, `trunc(idx) == idx`), else `0`.
 /// The length is the u32 at `+len_offset` ([`ARRAY_LEN_OFFSET`] for an array,
-/// [`HEADER_SIZE`] for a string).
+/// [`STR_LEN_OFFSET`] for a string).
 /// The compares run on `f64`, where every non-number jsval (a boxed tag) and the
 /// canonical NaN read as NaN and so fail all three — a string key or `NaN`
 /// is never mistaken for index `0`.
@@ -1792,7 +1792,7 @@ fn emit_index_string_key(
     function: &mut Function,
     s1: u32,
     tmp: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_string(function, s1);
@@ -1885,7 +1885,7 @@ pub(super) fn emit_index_node(
     checked: bool,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let s0 = scratch + 17;
@@ -1929,7 +1929,7 @@ pub(super) fn emit_size_read(
     obj: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let recv = scratch + 17;
@@ -1947,7 +1947,7 @@ pub(super) fn emit_size_read(
     emit_u32_field_boxed(function, recv, MAP_SIZE_OFFSET);
     function.instruction(&Instruction::Else);
     enter_frame(helpers);
-    let key = IrNode::Str("size".to_owned());
+    let key = IrNode::Str("size".into());
     emit_index_node(
         &IrNode::Local(recv),
         &key,
@@ -1968,7 +1968,7 @@ fn emit_get_call(
     s0: u32,
     index: &IrNode,
     s1: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::LocalGet(s0));
@@ -1986,7 +1986,7 @@ fn emit_index_dynamic(
     scratch: u32,
     s0: u32,
     s1: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
@@ -2040,10 +2040,10 @@ fn emit_index_dynamic(
     // `__str_index` (reboxed as a heap jsval).
     emit_index_string_key(function, s1, scratch, strings, helpers);
     function.instruction(&Instruction::If(BlockType::Empty));
-    emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
+    emit_u32_field_boxed(function, s0, STR_LEN_OFFSET);
     function.instruction(&Instruction::Br(4));
     function.instruction(&Instruction::End);
-    emit_index_in_bounds(function, s0, s1, HEADER_SIZE as u64);
+    emit_index_in_bounds(function, s0, s1, STR_LEN_OFFSET);
     function.instruction(&Instruction::If(BlockType::Empty));
     emit_str_index_boxed(function, s0, s1, helpers);
     function.instruction(&Instruction::Br(4));
@@ -2093,7 +2093,7 @@ pub(super) fn emit_index_set_node(
     value: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let s0 = scratch + 14;
@@ -2135,8 +2135,8 @@ pub(super) fn emit_index_set_node(
     // A static named key (not an array index, not `length`) is an ordinary
     // property on every receiver, arrays included.
     if let IrNode::Str(name) = index
-        && name != INDEX_LENGTH_KEY
-        && !is_array_index(name)
+        && *name != INDEX_LENGTH_KEY
+        && !is_array_index(name.as_units())
     {
         emit_set_call(function, s0, index, s1, sval, strings, helpers);
         function.instruction(&Instruction::LocalGet(sval));
@@ -2168,7 +2168,7 @@ fn emit_set_call(
     index: &IrNode,
     s1: u32,
     sval: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::LocalGet(s0));
@@ -2263,7 +2263,7 @@ pub(super) fn emit_index_op_set_node(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let IrNode::IndexOpSet {
@@ -2408,7 +2408,7 @@ pub(super) fn emit_nullish_check_node(
     key: &str,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(value, function, scratch, strings, helpers);
@@ -2416,7 +2416,7 @@ pub(super) fn emit_nullish_check_node(
         return;
     }
     function.instruction(&Instruction::LocalSet(scratch));
-    let key = IrNode::Str(key.to_owned());
+    let key = IrNode::Str(key.into());
     emit_nullish_guard(function, scratch, &key, false, scratch, strings, helpers);
     function.instruction(&Instruction::LocalGet(scratch));
 }
@@ -2433,7 +2433,7 @@ pub(super) fn emit_nullish_guard(
     key: &IrNode,
     set: bool,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::LocalGet(recv));
@@ -2460,7 +2460,7 @@ pub(super) fn emit_nullish_guard(
 /// [`NULLISH_ERROR_STRS`] fragments plus `String(key)`:
 /// `Cannot read properties of null (reading 'x')`, with `.stack` prefixed
 /// `TypeError: `.
-pub(super) fn emit_nullish_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     // Params occupy locals 0..3; the shared `TypeError`-helper locals follow.
     let (recv, key, set) = (0, 1, 2);
     let scratch = 3;
@@ -2531,7 +2531,7 @@ fn emit_raise_type_error(
     function: &mut Function,
     msg: u32,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let stack = msg + 1;
@@ -2566,7 +2566,7 @@ fn emit_raise_type_error(
 /// a primitive `recv` — `Cannot create property '<String(key)>' on
 /// <number|string|boolean> '<String(recv)>'`; every other mode wraps
 /// `String(key)` in its [`PROP_KEYED_MSGS`] fragments.
-pub(super) fn emit_prop_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (recv, key, mode) = (0, 1, 2);
     let scratch = 3;
     let msg = scratch + 24;

@@ -51,7 +51,7 @@ pub(super) fn emit(
     op: ReflectOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match op {
@@ -95,7 +95,7 @@ fn require_object(
     frame: Frame,
     local: u32,
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_object(function, local);
@@ -110,7 +110,7 @@ fn arg_to_object(
     frame: Frame,
     i: u32,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     frame.arg(function, i);
@@ -197,7 +197,7 @@ pub(super) fn define_or_throw(
 fn emit_define_property(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let o = frame.i64(0);
@@ -231,7 +231,7 @@ fn emit_define_property(
 fn emit_define_properties(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let o = frame.i64(0);
@@ -260,7 +260,7 @@ fn object_define_properties(
     function: &mut Function,
     frame: Frame,
     o: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (props, attrs) = (frame.i64(1), frame.i64(2));
@@ -327,7 +327,7 @@ fn object_define_properties(
 fn emit_get_own_property_descriptor(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, key) = (frame.i64(0), frame.i32(0));
@@ -344,7 +344,7 @@ fn emit_get_own_property_descriptor(
 fn emit_get_own_property_descriptors(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, kv, d) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -490,12 +490,7 @@ fn require_proto(function: &mut Function, proto: u32, helpers: Helpers<'_>) {
 /// `Object.create(O, Properties)`: `O` must be an object or `null`; a fresh
 /// ordinary object with `proto` `O`, then `ObjectDefineProperties` when
 /// `Properties` is not `undefined`.
-fn emit_create(
-    function: &mut Function,
-    frame: Frame,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
+fn emit_create(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
     let (proto, o, base) = (frame.i64(0), frame.i64(3), frame.i32(0));
     frame.arg(function, 0);
     wasm!(function; LocalSet(proto));
@@ -517,7 +512,7 @@ fn emit_create(
 fn emit_get_prototype_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let v = frame.i64(0);
@@ -532,7 +527,7 @@ fn emit_get_prototype_of(
 fn emit_set_prototype_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, proto, r) = (frame.i64(0), frame.i64(1), frame.i32(0));
@@ -563,7 +558,7 @@ fn emit_set_prototype_of(
 fn emit_get_own_property_names(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, kv) = (frame.i64(0), frame.i64(1));
@@ -621,7 +616,7 @@ fn emit_get_own_property_names(
 fn emit_get_own_property_symbols(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, key) = (frame.i64(0), frame.i32(0));
@@ -637,12 +632,7 @@ fn emit_get_own_property_symbols(
 /// an own enumerable property when reached (`__own_enum`) is read with
 /// `[[Get]]` and written to the target with a strict `[[Set]]` (a throw
 /// returns); returns the target.
-fn emit_assign(
-    function: &mut Function,
-    frame: Frame,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
+fn emit_assign(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
     let (to, from, kv, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (n, i, ks, len) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
     let (at, spread) = (frame.x32(0), frame.x64(0));
@@ -699,12 +689,7 @@ fn emit_assign(
 
 /// `Object.hasOwn(O, P)`: `ToObject(O)`, then `ToPropertyKey(P)`, then
 /// whether the own property exists (`__has_own`).
-fn emit_has_own(
-    function: &mut Function,
-    frame: Frame,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
+fn emit_has_own(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
     let (v, key) = (frame.i64(0), frame.i32(0));
     arg_to_object(function, frame, 0, v, strings, helpers);
     frame.arg(function, 1);
@@ -736,7 +721,7 @@ fn emit_is(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
 fn emit_from_entries(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (src, item, kv, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));

@@ -138,7 +138,7 @@ pub(super) fn emit_array_node(
     elems: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // The two transient i32 scratch locals: `dst` duplicates the block base
@@ -228,7 +228,7 @@ pub(super) fn emit_array_spread(
     parts: &[SpreadElem],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // base = a fresh empty array, left (i32) on the operand stack.
@@ -306,7 +306,7 @@ pub(super) fn emit_iterator_guard(
     value: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_hook_guard(
@@ -366,7 +366,7 @@ pub(super) fn emit_iter_source(
     live: bool,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(value, function, scratch, strings, helpers);
@@ -380,7 +380,7 @@ pub(super) fn emit_iter_len(
     operand: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let value = scratch + 22;
@@ -404,7 +404,7 @@ pub(super) fn emit_iter_item(
     index: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, at, slot) = (scratch + 22, scratch + 23, scratch + 21);
@@ -469,7 +469,7 @@ pub(super) fn emit_array_push_node(
     value: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::LocalGet(local));
@@ -716,7 +716,7 @@ pub(super) fn emit_array_hof(
     this_arg: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let arr = scratch + 8;

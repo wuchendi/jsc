@@ -17,7 +17,7 @@ use super::*;
 pub(super) fn emit_iter_source(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, item, key, entry) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
