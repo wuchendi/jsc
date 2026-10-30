@@ -237,21 +237,3 @@ fn is_concat_spreadable_throws_until_y4() {
         text,
     );
 }
-
-#[test]
-fn string_method_symbol_arguments_throw_until_y4() {
-    for (src, name) in [
-        ("'abc'.startsWith({ [Symbol.match]: false })", "match"),
-        ("'abc'.includes({ [Symbol.match]: false })", "match"),
-        ("'abc'.match({ [Symbol.match]() { return 1 } })", "match"),
-        ("'abc'.matchAll({ [Symbol.matchAll]() {} })", "matchAll"),
-        ("'abc'.replace({ [Symbol.replace]() {} }, '')", "replace"),
-        ("'abc'.search({ [Symbol.search]() {} })", "search"),
-        ("'abc'.split({ [Symbol.split]() {} })", "split"),
-    ] {
-        assert_uncaught(
-            src,
-            &format!("TypeError: Symbol.{name} is not supported yet"),
-        );
-    }
-}
