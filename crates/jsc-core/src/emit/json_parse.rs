@@ -44,10 +44,10 @@ fn byte_mem() -> MemArg {
     }
 }
 
-/// The u32 length-header `MemArg` (`+HEADER_SIZE` from a block base).
+/// The u32 length-header `MemArg` (`+STR_LEN_OFFSET` from a string block base).
 fn len_header() -> MemArg {
     MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     }
@@ -181,7 +181,7 @@ pub(super) fn emit_json_ws() -> Function {
 
 /// `__json_throw() -> i64`: stash a `SyntaxError` in `$exc_value`, set the
 /// pending flag + clear any routed completion, and return a dummy `undefined`.
-pub(super) fn emit_json_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_json_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     // The full `emit_main` scratch-local layout (starting at local 0, since this
     // helper has no params) so `emit_node` can build the error object exactly as
     // it would in `main`.
@@ -228,8 +228,8 @@ pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     function.instruction(&Instruction::I32Sub);
     function.instruction(&Instruction::LocalSet(cap));
-    // str_base = __alloc(HEADER_SIZE + 4 + cap); write TYPE_STRING byte.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    // str_base = __alloc(STR_DATA_OFFSET + cap); write TYPE_STRING byte.
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::LocalGet(cap));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(alloc_index));
@@ -237,9 +237,9 @@ pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::LocalGet(str_base));
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Store8(byte_mem()));
-    // wp = str_base + HEADER_SIZE + 4 (the write cursor).
+    // wp = str_base + STR_DATA_OFFSET (the write cursor).
     function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(wp));
 
@@ -297,11 +297,11 @@ pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
 
-    // len2 = wp - (str_base + HEADER_SIZE + 4); write it as the u32 length header.
+    // len2 = wp - (str_base + STR_DATA_OFFSET); write it as the u32 length header.
     function.instruction(&Instruction::LocalGet(wp));
     function.instruction(&Instruction::LocalGet(str_base));
     function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::I32Sub);
     function.instruction(&Instruction::LocalSet(len2));
     function.instruction(&Instruction::LocalGet(str_base));
@@ -392,12 +392,12 @@ pub(super) fn emit_json_number(
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
 
-    // len2 = pos - start; str_base = __alloc(HEADER_SIZE+4+len2); copy the token.
+    // len2 = pos - start; str_base = __alloc(STR_DATA_OFFSET+len2); copy the token.
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     function.instruction(&Instruction::LocalGet(start));
     function.instruction(&Instruction::I32Sub);
     function.instruction(&Instruction::LocalSet(len2));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::LocalGet(len2));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(alloc_index));
@@ -408,9 +408,9 @@ pub(super) fn emit_json_number(
     function.instruction(&Instruction::LocalGet(str_base));
     function.instruction(&Instruction::LocalGet(len2));
     function.instruction(&Instruction::I32Store(len_header()));
-    // memory.copy(dst = str_base+HEADER_SIZE+4, src = DATA+start, size = len2).
+    // memory.copy(dst = str_base+STR_DATA_OFFSET, src = DATA+start, size = len2).
     function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
     function.instruction(&Instruction::LocalGet(start));
@@ -689,13 +689,13 @@ pub(super) fn emit_json_parse(helpers: Helpers<'_>) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32), (1, ValType::I64)]);
     let (s, base, result) = (0, 1, 2);
 
-    // base = wrap(s); DATA = base + HEADER_SIZE + 4; LEN = load_u32(base+HEADER);
+    // base = wrap(s); DATA = base + STR_DATA_OFFSET; LEN = load_u32(base+STR_LEN_OFFSET);
     // POS = 0.
     function.instruction(&Instruction::LocalGet(s));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
     function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::GlobalSet(JSON_DATA_GLOBAL));
     function.instruction(&Instruction::LocalGet(base));
@@ -730,7 +730,7 @@ pub(super) fn emit_json_parse_node(
     arg: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);

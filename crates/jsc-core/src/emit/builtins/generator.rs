@@ -69,8 +69,8 @@ fn resume(generator: u32, sent: u32) -> IrNode {
 fn done_result(value: u32) -> IrNode {
     IrNode::Object {
         entries: vec![
-            (PropKey::Static("value".to_owned()), IrNode::Local(value)),
-            (PropKey::Static("done".to_owned()), IrNode::Bool(true)),
+            (PropKey::Static("value".into()), IrNode::Local(value)),
+            (PropKey::Static("done".into()), IrNode::Bool(true)),
         ],
         proto: None,
         class: abi::CLASS_ORDINARY,
@@ -86,7 +86,7 @@ fn this_generator(
     this: u32,
     arg: u32,
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
@@ -139,7 +139,7 @@ fn check_limit(
     generator: u32,
     bit: u32,
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     field(function, generator, abi::GEN_LIMITS_OFFSET);
@@ -152,7 +152,7 @@ fn check_limit(
 pub(super) fn emit_next(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, arg) = (frame.i64(0), frame.i64(1));
@@ -180,7 +180,7 @@ pub(super) fn emit_next(
 pub(super) fn emit_return(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, arg) = (frame.i64(0), frame.i64(1));
@@ -221,7 +221,7 @@ pub(super) fn emit_return(
 pub(super) fn emit_throw(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, arg) = (frame.i64(0), frame.i64(1));
@@ -357,8 +357,8 @@ fn m64(offset: u64) -> MemArg {
 fn iter_result(value: u32, done: bool) -> IrNode {
     IrNode::Object {
         entries: vec![
-            (PropKey::Static("value".to_owned()), IrNode::Local(value)),
-            (PropKey::Static("done".to_owned()), IrNode::Bool(done)),
+            (PropKey::Static("value".into()), IrNode::Local(value)),
+            (PropKey::Static("done".into()), IrNode::Bool(done)),
         ],
         proto: None,
         class: abi::CLASS_ORDINARY,
@@ -370,8 +370,8 @@ fn iter_result(value: u32, done: bool) -> IrNode {
 fn type_error(text: CalleeErrorText<'static>) -> IrNode {
     IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(text[0].to_owned())),
-        IrNode::Str(text[1].to_owned()),
+        Some(IrNode::Str(text[0].into())),
+        IrNode::Str(text[1].into()),
     )
 }
 
@@ -436,7 +436,7 @@ fn fulfill_front(
     generator: u32,
     value: u32,
     done: bool,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let result = iter_result(value, done);
@@ -500,7 +500,7 @@ pub(super) fn emit_async_method(
     request: AsyncGenRequest,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {
@@ -562,7 +562,7 @@ pub(super) fn emit_async_method(
 pub(super) fn emit_async_drain(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {
@@ -681,7 +681,7 @@ pub(super) fn emit_async_drain(
 pub(super) fn emit_async_step(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {
@@ -760,7 +760,7 @@ pub(super) fn emit_async_reaction(
     reaction: AsyncGenReaction,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {

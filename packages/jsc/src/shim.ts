@@ -19,7 +19,6 @@ import {
   EXC_VALUE_EXPORT_NAME,
   FALSE,
   GEN_DONE_OFFSET,
-  HEADER_SIZE,
   HEAP,
   HEAP_PTR_EXPORT_NAME,
   HEAP_PTR_OOM,
@@ -104,6 +103,8 @@ import {
   PROMISE_STATE_OFFSET,
   PROMISE_VALUE_OFFSET,
   QNAN,
+  STR_DATA_OFFSET,
+  STR_LEN_OFFSET,
   TRUE,
   TYPE_ARRAY,
   TYPE_FUNCTION,
@@ -254,7 +255,7 @@ export function createShim(): Shim {
     )
     if (base === null) return null
     const view = memView()
-    const at = base + HEADER_SIZE + 4
+    const at = base + STR_DATA_OFFSET
     if (at + bytes.length > view.length) return null
     view.set(bytes, at)
     return BigInt(base)
@@ -1182,9 +1183,9 @@ function readGenDone(mem: Uint8Array, gen: bigint): boolean {
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true) !== 0
 }
 
-/** The `u32` `len` header of a string block at `ptr + HEADER_SIZE`. */
+/** The `u32` `len` header of a string block at `ptr + STR_LEN_OFFSET`. */
 function blockLen(mem: Uint8Array, ptr: number): number {
-  const at = ptr + HEADER_SIZE
+  const at = ptr + STR_LEN_OFFSET
   if (at + 4 > mem.length) return 0
   return (
     (mem[at]! |
@@ -1198,7 +1199,7 @@ function blockLen(mem: Uint8Array, ptr: number): number {
 /** The UTF-8 payload bytes of a heap STRING block, or `null` when truncated. */
 function stringBytes(mem: Uint8Array, ptr: number): Uint8Array | null {
   const len = blockLen(mem, ptr)
-  const start = ptr + HEADER_SIZE + 4
+  const start = ptr + STR_DATA_OFFSET
   if (start + len > mem.length) return null
   return mem.subarray(start, start + len)
 }

@@ -30,7 +30,6 @@ import {
   FUNC_INDEX_OFFSET,
   HEADER_CLASS_OFFSET,
   HEADER_FLAGS_OFFSET,
-  HEADER_SIZE,
   HEAP,
   HOLE,
   MAP_SIZE_OFFSET,
@@ -49,7 +48,9 @@ import {
   PROPS_HEADER_SIZE,
   PROPS_TFLAGS_OFFSET,
   QNAN,
+  STR_DATA_OFFSET,
   STR_FLAG_ARRAY_INDEX,
+  STR_LEN_OFFSET,
   SYMBOL_DESCRIPTION_OFFSET,
   TYPE_ARRAY,
   TYPE_DATE,
@@ -284,11 +285,11 @@ function decodeDate(ptr: number, mem: Uint8Array): Value {
   return { kind: 'date', ms: bits === undefined ? Number.NaN : bitsToF64(bits) }
 }
 
-/** Resolve a heap string block at `ptr`: `[len:u32][utf8]` at `ptr + HEADER_SIZE`. */
+/** Resolve a heap string block at `ptr`: `len:u32` at `ptr + STR_LEN_OFFSET`, UTF-8 at `ptr + STR_DATA_OFFSET`. */
 function decodeString(ptr: number, mem: Uint8Array): Value {
-  const len = readU32(mem, ptr + HEADER_SIZE)
+  const len = readU32(mem, ptr + STR_LEN_OFFSET)
   if (len === undefined) return { kind: 'string', value: '' }
-  const start = ptr + HEADER_SIZE + 4
+  const start = ptr + STR_DATA_OFFSET
   if (start + len > mem.length) return { kind: 'string', value: '' }
   return {
     kind: 'string',

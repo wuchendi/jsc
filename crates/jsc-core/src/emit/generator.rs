@@ -37,7 +37,7 @@ pub(super) fn emit_make_generator(
     limits: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let env_base = scratch + 21;
@@ -173,7 +173,7 @@ pub(super) fn emit_gen_resume(
     sent: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let handle_slot = scratch + 22;
@@ -286,7 +286,7 @@ fn emit_result_object(
     handle_slot: u32,
     scratch: u32,
     function: &mut Function,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::I64Const(TRUE_BITS));
@@ -301,11 +301,8 @@ fn emit_result_object(
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::LocalSet(scratch));
     let entries = [
-        (
-            PropKey::Static("value".to_owned()),
-            IrNode::Local(sm_result),
-        ),
-        (PropKey::Static("done".to_owned()), IrNode::Local(scratch)),
+        (PropKey::Static("value".into()), IrNode::Local(sm_result)),
+        (PropKey::Static("done".into()), IrNode::Local(scratch)),
     ];
     emit_object_node(
         &entries,
@@ -331,7 +328,7 @@ fn emit_result_object(
 /// generator and returns with the exception still pending.
 pub(super) fn emit_generator_sm(
     func: &IrFunction,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
     let Some(segments) = func.machine.as_ref() else {
@@ -486,7 +483,7 @@ fn emit_segment_term(
     loop_rel: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match term {

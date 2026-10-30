@@ -285,7 +285,7 @@ impl LowerCtx<'_> {
                         local: proto,
                         init: IrNode::Index {
                             obj: Box::new(callee),
-                            index: Box::new(IrNode::Str("prototype".to_owned())),
+                            index: Box::new(IrNode::Str("prototype".into())),
                         },
                     },
                     IrStmt::Decl {
@@ -373,7 +373,7 @@ impl LowerCtx<'_> {
         };
         let field = |kind: &AccessKind, key: &str| IrNode::Index {
             obj: Box::new(read(kind)),
-            index: Box::new(IrNode::Str(key.to_owned())),
+            index: Box::new(IrNode::Str(key.into())),
         };
 
         // Generator: $r = $it.next(); while (!$r.done) { yield $r.value; $r = $it.next(); }
@@ -1199,7 +1199,7 @@ impl CfgBuilder {
                 let obj = self.spill(obj)?;
                 let callee = self.spill(IrNode::Index {
                     obj: Box::new(obj.clone()),
-                    index: Box::new(IrNode::Str(key)),
+                    index: Box::new(IrNode::Str(key.into())),
                 })?;
                 self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
             }

@@ -164,10 +164,7 @@ fn emit_accessor_block(
 /// accessor rejects a `get` / `set` that is not `SameValue`. An update sets
 /// the table's `HAS_NON_ENUM` flag and its dirty bit.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
-pub(in crate::emit) fn emit_define_own(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(in crate::emit) fn emit_define_own(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(7, ValType::I32), (2, ValType::I64)]);
     let (o, key, desc, value, get, set) = (0, 1, 2, 3, 4, 5);
     let (e, a, m, t, i, b, p) = (6, 7, 8, 9, 10, 11, 12);
@@ -489,10 +486,7 @@ pub(in crate::emit) fn emit_define_own(
 /// callable nor `undefined` throws, and so does mixing `get` / `set` with
 /// `value` / `writable`. A throw leaves the exception pending and appends
 /// nothing.
-pub(in crate::emit) fn emit_to_desc(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(in crate::emit) fn emit_to_desc(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(1, ValType::I32), (5, ValType::I64)]);
     let (attrs, list, desc) = (0, 1, 2);
     let (v, value, get, set, scratch) = (3, 4, 5, 6, 7);
@@ -577,10 +571,7 @@ pub(in crate::emit) fn emit_to_desc(
 /// `LENGTH_READONLY`; its store elements (holes are absent) have the default
 /// attributes and its table elements their own; a `LAZY` function is
 /// materialized by the lookup.
-pub(in crate::emit) fn emit_own_desc(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(in crate::emit) fn emit_own_desc(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
     let (obj, key) = (0, 1);
     let (o, e, i, d, a) = (2, 3, 4, 5, 6);
@@ -793,10 +784,7 @@ pub(in crate::emit) fn emit_test_integrity() -> Function {
 /// absent) are; any other key — a `SPARSE` or dictionary-mode array's
 /// elements included — is its table entry's `E` (a `LAZY` function is
 /// materialized by the lookup).
-pub(in crate::emit) fn emit_own_enum(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(in crate::emit) fn emit_own_enum(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(3, ValType::I32)]);
     let (obj, key, o, i, a) = (0, 1, 2, 3, 4);
     wasm!(f;

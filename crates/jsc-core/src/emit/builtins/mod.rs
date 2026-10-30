@@ -224,7 +224,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// Emit the body of `builtin`.
 pub(super) fn emit_builtin(
     builtin: Builtin,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
     let (k, mut f) = (helpers.max_args, Frame::function());
@@ -333,7 +333,7 @@ fn emit_fragment(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
@@ -346,7 +346,7 @@ fn emit_string_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -370,7 +370,7 @@ fn emit_object_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -418,7 +418,7 @@ fn emit_array_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -468,7 +468,7 @@ fn emit_number_family(
     builtin: Builtin,
     f: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match builtin {
@@ -503,7 +503,7 @@ fn throw_type_error(
     function: &mut Function,
     frame: Frame,
     text: CalleeErrorText<'_>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_throw_not_a_function(function, text, frame.scratch(), strings, helpers);
@@ -533,7 +533,7 @@ fn this_primitive(
     class: u8,
     is_prim: fn(&mut Function, u32),
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(out));
@@ -568,7 +568,7 @@ fn this_primitive(
 /// which callers reject first) is returned as is. A String wrapper's
 /// `length` and indices are defined as its own read-only, non-configurable
 /// properties (the indices enumerable), so every property operation sees them.
-pub(super) fn emit_to_object(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_to_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![
         (2, ValType::I32),
         (1, ValType::I64),
@@ -617,7 +617,7 @@ pub(super) fn emit_to_object(strings: &HashMap<String, i32>, helpers: Helpers<'_
         LocalGet(class), I32Const(i32::from(abi::CLASS_STRING)), I32Eq,
         If(BlockType::Empty),
         LocalGet(v), I32WrapI64, LocalTee(string),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }), LocalSet(len),
+        I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }), LocalSet(len),
         I32Const(0), LocalSet(idx),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(idx), LocalGet(len), I32GeU, BrIf(1),
@@ -662,7 +662,7 @@ fn emit_drop(
     function: &mut Function,
     frame: Frame,
     node: &IrNode,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(node, function, frame.scratch(), strings, helpers);
@@ -697,6 +697,6 @@ fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Fu
 }
 
 /// Push the heap jsval of the static string `text`.
-fn push_str(function: &mut Function, strings: &HashMap<String, i32>, text: &str) {
+fn push_str(function: &mut Function, strings: &StrOffsets, text: &str) {
     wasm!(function; I64Const(HEAP_BITS | i64::from(static_key(strings, text))));
 }
