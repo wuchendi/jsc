@@ -392,17 +392,21 @@ pub(super) fn emit_object_has_node(
     function.instruction(&Instruction::I64Or);
 }
 
-/// Emit an `x instanceof RHS` identity test, leaving a `true`/`false`
-/// jsval on the stack. The operand `value` is evaluated first, then the
-/// right-hand side. The runtime-TYPE-BYTE builtins test the operand's heap kind;
-/// the prototype kinds gate the operand with [`emit_is_object`] (a primitive is
-/// never an instance) and walk its `proto` chain for
-/// the target prototype: the static error prototype ([`InstanceOfKind::Proto`])
-/// or, for [`InstanceOfKind::Ctor`] (`OrdinaryHasInstance`), `Get(C,
-/// "prototype")` of the callable-guarded right-hand side `C`, which must be an
-/// object. An object `C` whose chain holds a `@@hasInstance` (`__symbol_get`)
-/// throws the interim `TypeError` first (Y4 honours it).
-#[allow(clippy::too_many_lines)] // straight-line per-kind emit, not branching depth
+/// The `TypeError` of a non-callable, non-nullish `@@hasInstance`
+/// (`GetMethod` in `InstanceofOperator`).
+pub(super) const HAS_INSTANCE_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Symbol.hasInstance is not a function",
+    "TypeError: Symbol.hasInstance is not a function",
+];
+
+/// Emit an `x instanceof RHS` test (`InstanceofOperator`), leaving a
+/// `true`/`false` jsval on the stack. The operand `value` is evaluated first,
+/// then the right-hand side. A builtin right-hand side
+/// ([`InstanceOfKind::Array`] .. [`InstanceOfKind::Proto`]) takes its fast test
+/// — the operand's type byte, or a `proto` chain walk for the static error
+/// prototype — while the constructor's `@@hasInstance` lookup provably finds
+/// the immutable `%Function.prototype%[@@hasInstance]` ([`emit_builtin_rhs_intact`]);
+/// otherwise, and for [`InstanceOfKind::Ctor`], [`emit_instanceof_operator`].
 pub(super) fn emit_instanceof_node(
     value: &IrNode,
     kind: &InstanceOfKind,
@@ -411,105 +415,295 @@ pub(super) fn emit_instanceof_node(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    emit_node(value, function, scratch, strings, helpers);
-    // The runtime-TYPE-BYTE builtins test the receiver's heap kind directly:
-    // `Array`/`Function`/`Date` match their own byte; `Object` matches ANY
-    // object (a primitive string or symbol is not one). The operand is
-    // stashed in a dedicated high slot.
-    let v = scratch + 17;
-    let (rhs, ctor) = match kind {
-        InstanceOfKind::Array
-        | InstanceOfKind::Function
-        | InstanceOfKind::Date
-        | InstanceOfKind::Object => {
-            function.instruction(&Instruction::LocalSet(v));
-            let type_byte = match kind {
-                InstanceOfKind::Array => Some(TYPE_ARRAY),
-                InstanceOfKind::Function => Some(TYPE_FUNCTION),
-                InstanceOfKind::Date => Some(TYPE_DATE),
-                _ => None,
-            };
-            return emit_type_byte_instanceof(function, v, type_byte);
-        }
-        InstanceOfKind::Proto(proto) => (proto, false),
-        InstanceOfKind::Ctor(ctor) => (ctor, true),
-    };
-
-    // `cur` walks the receiver's `proto` chain; `tgt` holds the right-hand side
-    // and then the target prototype. Both are dedicated high slots (`+19`/`+20`)
-    // the `prototype` read below (`+17`/`+18`) does not touch. The operand rides
-    // the operand stack while the right-hand side evaluates.
+    // `cur` holds the operand, `tgt` the right-hand side. Both are dedicated
+    // high slots (`+19`/`+20`) the `prototype` read (`+17`/`+18`) does not
+    // touch. The operand rides the operand stack while the right-hand side
+    // evaluates.
     let cur = scratch + 19;
     let tgt = scratch + 20;
-    emit_node(rhs, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(tgt));
-    function.instruction(&Instruction::LocalSet(cur));
-    if ctor {
-        // A `@@hasInstance` on an object `C`'s chain is not honoured before Y4:
-        // the interim `TypeError` (design/symbol-strings.md §9.4).
-        emit_is_object(function, tgt);
-        function.instruction(&Instruction::If(BlockType::Empty));
-        enter_frame(helpers);
-        emit_hook_guard(
-            function,
-            tgt,
-            WellKnown::HasInstance,
-            scratch,
-            strings,
-            helpers,
-        );
-        if helpers.has_accessors {
-            emit_propagate_if_pending(function, helpers);
+    emit_node(value, function, scratch, strings, helpers);
+    let ctor = match kind {
+        InstanceOfKind::Ctor(rhs) => {
+            emit_node(rhs, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalSet(tgt));
+            function.instruction(&Instruction::LocalSet(cur));
+            emit_instanceof_operator(function, cur, tgt, false, scratch, strings, helpers);
+            return;
         }
-        leave_frame(helpers);
-        function.instruction(&Instruction::End);
-        // `IsCallable(C)`, checked before the receiver (a primitive operand still
-        // throws for a non-callable right-hand side).
-        emit_callable_guard(
-            function,
-            INSTANCEOF_NOT_CALLABLE,
-            tgt,
-            scratch,
-            strings,
-            helpers,
-        );
-        // OrdinaryHasInstance step 2: a bound `C` tests its target instead.
-        emit_unwrap_bound(function, tgt);
-    }
-
-    emit_is_object(function, cur);
+        InstanceOfKind::Array => BuiltinCtor::Array,
+        InstanceOfKind::Function => BuiltinCtor::Function,
+        InstanceOfKind::Date => BuiltinCtor::Date,
+        InstanceOfKind::Object => BuiltinCtor::Object,
+        InstanceOfKind::Proto(proto) => match **proto {
+            IrNode::ErrorProto(kind) => BuiltinCtor::Error(kind),
+            _ => unreachable!("an instanceof Proto arm carries an ErrorProto"),
+        },
+    };
+    function.instruction(&Instruction::LocalSet(cur));
+    emit_builtin_rhs_intact(function, ctor, helpers);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
-    if ctor {
-        // P = Get(C, "prototype"); a non-object P throws.
-        emit_get_call(
-            function,
-            tgt,
-            &IrNode::Str("prototype".into()),
-            scratch + 18,
-            strings,
-            helpers,
-        );
-        if helpers.has_accessors {
-            emit_propagate_if_pending(function, helpers);
-        }
+    if let InstanceOfKind::Proto(proto) = kind {
+        emit_node(proto, function, scratch, strings, helpers);
         function.instruction(&Instruction::LocalSet(tgt));
+        emit_is_object(function, cur);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        emit_proto_chain_match(function, cur, tgt);
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::I64Const(FALSE_BITS));
+        function.instruction(&Instruction::End);
+    } else {
+        let type_byte = match kind {
+            InstanceOfKind::Array => Some(TYPE_ARRAY),
+            InstanceOfKind::Function => Some(TYPE_FUNCTION),
+            InstanceOfKind::Date => Some(TYPE_DATE),
+            _ => None,
+        };
+        emit_type_byte_instanceof(function, cur, type_byte);
+    }
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I64Const(intrinsic_bits(
+        Intrinsic::Ctor(ctor),
+        helpers,
+    )));
+    function.instruction(&Instruction::LocalSet(tgt));
+    emit_instanceof_operator(function, cur, tgt, false, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// Push i32 `1` when `Get(ctor, @@hasInstance)` of the builtin constructor
+/// `ctor` is sure to find `%Function.prototype%[@@hasInstance]` (which is
+/// non-writable and non-configurable): every object on its static chain up
+/// to `%Function.prototype%` (the native errors pass `%Error%`) still has
+/// its realm `proto` and no symbol-keyed own property.
+fn emit_builtin_rhs_intact(function: &mut Function, ctor: BuiltinCtor, helpers: Helpers<'_>) {
+    let props = MemArg {
+        offset: u64::from(abi::OBJ_PROPS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    };
+    let proto_slot = MemArg {
+        offset: OBJ_PROTO_OFFSET,
+        align: 3,
+        memory_index: 0,
+    };
+    function.instruction(&Instruction::I32Const(1));
+    let mut link = Intrinsic::Ctor(ctor);
+    while let Some(next) = link.proto() {
+        let addr = (intrinsic_bits(link, helpers) & 0xffff_ffff).cast_unsigned();
+        let addr = Instruction::I32Const(u32::try_from(addr).unwrap_or(0).cast_signed());
+        // No own table, or a table without HAS_SYMBOL_KEYS.
+        function.instruction(&addr);
+        function.instruction(&Instruction::I32Load(props));
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::Else);
+        function.instruction(&addr);
+        function.instruction(&Instruction::I32Load(props));
+        function.instruction(&Instruction::I32Load8U(MemArg {
+            offset: u64::from(abi::PROPS_TFLAGS_OFFSET),
+            align: 0,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(i32::from(
+            abi::PROPS_HAS_SYMBOL_KEYS,
+        )));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::I32And);
+        // proto == the realm's next link.
+        function.instruction(&addr);
+        function.instruction(&Instruction::I64Load(proto_slot));
+        function.instruction(&Instruction::I64Const(intrinsic_bits(next, helpers)));
+        function.instruction(&Instruction::I64Eq);
+        function.instruction(&Instruction::I32And);
+        if next == Intrinsic::FunctionPrototype {
+            break;
+        }
+        link = next;
+    }
+}
+
+/// Emit `InstanceofOperator(V, C)` (`ordinary == false`) or
+/// `OrdinaryHasInstance(C, V)` (`ordinary == true`, the body of
+/// `%Function.prototype%[@@hasInstance]`) for the operand in i64 local `cur`
+/// and the right-hand side in i64 local `tgt`, leaving a `true`/`false` jsval.
+///
+/// `InstanceofOperator`: a non-object `C` throws; `GetMethod(C, @@hasInstance)`
+/// (`__symbol_get`) is called with `this = C` and its result coerced with
+/// `ToBoolean` (a non-callable one throws). The builtin
+/// `%Function.prototype%[@@hasInstance]` runs inline, and so does an absent
+/// one after the `IsCallable(C)` check: `OrdinaryHasInstance`, where a
+/// non-callable `C` is `false` and a bound `C` restarts `InstanceofOperator`
+/// on its target; otherwise a non-object `V` is `false` and `Get(C,
+/// "prototype")` (an object, else a `TypeError`) is searched for on `V`'s
+/// `proto` chain. Clobbers `cur`, `tgt`, and `+17`/`+18`.
+pub(super) fn emit_instanceof_operator(
+    function: &mut Function,
+    cur: u32,
+    tgt: u32,
+    ordinary: bool,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let method = scratch + 17;
+    let builtin = realm::method_bits(Builtin::FunctionHasInstance, helpers);
+    // $out: the result.
+    function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    // $ord: branched to with a callable, unbound `C` for the chain walk.
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    enter_frame(helpers);
+    if ordinary {
+        emit_is_function(function, tgt);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::I64Const(FALSE_BITS));
+        function.instruction(&Instruction::Br(2)); // -> $out
+        function.instruction(&Instruction::End);
+        emit_is_bound(function, tgt);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::BrIf(0)); // -> $ord
+        emit_bound_target(function, tgt);
+    } else {
+        // InstanceofOperator step 1: a non-object `C` throws.
         emit_is_object(function, tgt);
         function.instruction(&Instruction::I32Eqz);
         function.instruction(&Instruction::If(BlockType::Empty));
         enter_frame(helpers);
-        emit_throw_not_a_function(
-            function,
-            INSTANCEOF_NON_OBJECT_PROTOTYPE,
-            scratch,
-            strings,
-            helpers,
-        );
+        emit_throw_not_a_function(function, INSTANCEOF_NOT_CALLABLE, scratch, strings, helpers);
         leave_frame(helpers);
         function.instruction(&Instruction::End);
     }
-    // Walk the receiver's `proto` chain for pointer identity with the target
-    // prototype: `true` iff some link is the SAME block. A chain ends at `null`.
+    // $again: `InstanceofOperator(V, tgt)`.
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    enter_frame(helpers);
+    function.instruction(&Instruction::LocalGet(tgt));
+    function.instruction(&Instruction::I32Const(realm::symbol_addr(
+        WellKnown::HasInstance,
+        helpers,
+    )));
+    function.instruction(&Instruction::Call(helpers.symbol_get()));
+    if helpers.has_accessors {
+        emit_propagate_if_pending(function, helpers);
+    }
+    function.instruction(&Instruction::LocalSet(method));
+    // The builtin: `OrdinaryHasInstance(C, V)` inline.
+    function.instruction(&Instruction::LocalGet(method));
+    function.instruction(&Instruction::I64Const(builtin));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_is_function(function, tgt);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::Br(4)); // -> $out
+    function.instruction(&Instruction::End);
+    emit_bound_restart(function, tgt);
+    function.instruction(&Instruction::Br(2)); // -> $ord
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    // Absent: `IsCallable(C)`, then `OrdinaryHasInstance(C, V)`.
+    emit_is_nullish(function, method);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_callable_guard(
+        function,
+        INSTANCEOF_NOT_CALLABLE,
+        tgt,
+        scratch,
+        strings,
+        helpers,
+    );
+    emit_bound_restart(function, tgt);
+    function.instruction(&Instruction::Br(2)); // -> $ord
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    // A user `@@hasInstance`: `ToBoolean(Call(method, C, « V »))`.
+    emit_callable_guard(
+        function,
+        HAS_INSTANCE_NOT_CALLABLE,
+        method,
+        scratch,
+        strings,
+        helpers,
+    );
+    emit_accessor_call(function, method, tgt, Some(cur), scratch + 7, helpers);
+    emit_propagate_if_pending(function, helpers);
+    function.instruction(&Instruction::LocalSet(method));
+    emit_cond(&IrNode::Local(method), function, scratch, strings, helpers);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::Br(2)); // -> $out
+    leave_frame(helpers);
+    function.instruction(&Instruction::End); // loop
+    function.instruction(&Instruction::Unreachable);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End); // $ord
+    emit_ordinary_chain(function, cur, tgt, scratch, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End); // $out
+}
+
+/// The tail of `OrdinaryHasInstance` for the callable, unbound `C` in i64
+/// local `tgt`: a non-object `V` (i64 local `cur`) is `false`; otherwise `P =
+/// Get(C, "prototype")` (an object, else a `TypeError`) is searched for on
+/// `V`'s `proto` chain. Leaves a `true`/`false` jsval.
+fn emit_ordinary_chain(
+    function: &mut Function,
+    cur: u32,
+    tgt: u32,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    emit_is_object(function, cur);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    // P = Get(C, "prototype"); a non-object P throws.
+    emit_get_call(
+        function,
+        tgt,
+        &IrNode::Str("prototype".into()),
+        scratch + 18,
+        strings,
+        helpers,
+    );
+    if helpers.has_accessors {
+        emit_propagate_if_pending(function, helpers);
+    }
+    function.instruction(&Instruction::LocalSet(tgt));
+    emit_is_object(function, tgt);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_throw_not_a_function(
+        function,
+        INSTANCEOF_NON_OBJECT_PROTOTYPE,
+        scratch,
+        strings,
+        helpers,
+    );
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    emit_proto_chain_match(function, cur, tgt);
+    leave_frame(helpers);
+    function.instruction(&Instruction::Else);
+    // A non-object operand is never an instance.
+    function.instruction(&Instruction::I64Const(FALSE_BITS));
+    function.instruction(&Instruction::End);
+}
+
+/// Walk the `proto` chain of the object in i64 local `cur` for pointer
+/// identity with the object in i64 local `tgt`, leaving `true` iff some link
+/// is the SAME block (a chain ends at `null`). Clobbers `cur`.
+fn emit_proto_chain_match(function: &mut Function, cur: u32, tgt: u32) {
     let proto_slot = MemArg {
         offset: OBJ_PROTO_OFFSET,
         align: 3,
@@ -549,18 +743,10 @@ pub(super) fn emit_instanceof_node(
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::I64Or);
-    leave_frame(helpers);
-    function.instruction(&Instruction::Else);
-    // A receiver without a `proto` slot is never an instance.
-    function.instruction(&Instruction::I64Const(FALSE_BITS));
-    function.instruction(&Instruction::End);
 }
 
-/// Replace the function in i64 local `f` by its bound target while it is a
-/// bound function (the first element of its `env` array, DESIGN.md §5.5).
-fn emit_unwrap_bound(function: &mut Function, f: u32) {
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
+/// Push i32 `1` if the function in i64 local `f` is a bound function.
+fn emit_is_bound(function: &mut Function, f: u32) {
     function.instruction(&Instruction::LocalGet(f));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load8U(MemArg {
@@ -570,8 +756,11 @@ fn emit_unwrap_bound(function: &mut Function, f: u32) {
     }));
     function.instruction(&Instruction::I32Const(i32::from(abi::FUNC_FLAG_BOUND)));
     function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::BrIf(1));
+}
+
+/// Replace the bound function in i64 local `f` by its target (the first
+/// element of its `env` array, DESIGN.md §5.5).
+fn emit_bound_target(function: &mut Function, f: u32) {
     function.instruction(&Instruction::LocalGet(f));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I64Load(MemArg {
@@ -583,8 +772,16 @@ fn emit_unwrap_bound(function: &mut Function, f: u32) {
     emit_array_elems(function);
     function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::LocalSet(f));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End);
+}
+
+/// `OrdinaryHasInstance` step 2 inside [`emit_instanceof_operator`]'s loop (two
+/// frames deep): a bound function in i64 local `f` restarts
+/// `InstanceofOperator` on its target.
+fn emit_bound_restart(function: &mut Function, f: u32) {
+    emit_is_bound(function, f);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    emit_bound_target(function, f);
+    function.instruction(&Instruction::Br(2)); // -> $again
     function.instruction(&Instruction::End);
 }
 

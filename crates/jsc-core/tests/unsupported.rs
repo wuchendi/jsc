@@ -211,14 +211,6 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn user_has_instance_throws_until_y4() {
-    assert_uncaught(
-        "function F() {} Object.defineProperty(F, Symbol.hasInstance, { value: () => true }); ({}) instanceof F",
-        "TypeError: Symbol.hasInstance is not supported yet",
-    );
-}
-
-#[test]
 fn string_method_symbol_arguments_throw_until_y4() {
     for (src, name) in [
         ("'abc'.startsWith({ [Symbol.match]: false })", "match"),

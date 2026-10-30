@@ -63,11 +63,7 @@ pub(super) const SYMBOL_TO_NUMBER: CalleeErrorText<'static> = [
 /// The interim `TypeError`s of a well-known symbol hook a consult site finds
 /// before the stage that honours it (design/symbol-strings.md §9.4), in
 /// [`hook_text`] order.
-const HOOK_TEXTS: [CalleeErrorText<'static>; 5] = [
-    [
-        "Symbol.hasInstance is not supported yet",
-        "TypeError: Symbol.hasInstance is not supported yet",
-    ],
+const HOOK_TEXTS: [CalleeErrorText<'static>; 4] = [
     [
         "Symbol.match is not supported yet",
         "TypeError: Symbol.match is not supported yet",
@@ -95,17 +91,16 @@ const HOOK_SPLIT: CalleeErrorText<'static> = [
 /// The interim `TypeError` of a `symbol` hook (see [`HOOK_TEXTS`]); `None`
 /// for the symbols without an interim guard (`@@iterator`, honoured by the
 /// iteration protocol; `@@toPrimitive` / `@@toStringTag`, honoured by
-/// `ToPrimitive` / `Object.prototype.toString`; `@@species` /
-/// `@@isConcatSpreadable`, honoured by `ArraySpeciesCreate` /
-/// `SpeciesConstructor` / `concat`; `@@asyncIterator`, `@@unscopables`,
-/// without a consult site).
+/// `ToPrimitive` / `Object.prototype.toString`; `@@hasInstance`, honoured by
+/// `instanceof`; `@@species` / `@@isConcatSpreadable`, honoured by
+/// `ArraySpeciesCreate` / `SpeciesConstructor` / `concat`; `@@asyncIterator`,
+/// `@@unscopables`, without a consult site).
 pub(super) fn hook_text(symbol: WellKnown) -> Option<CalleeErrorText<'static>> {
     let at = match symbol {
-        WellKnown::HasInstance => 0,
-        WellKnown::Match => 1,
-        WellKnown::MatchAll => 2,
-        WellKnown::Replace => 3,
-        WellKnown::Search => 4,
+        WellKnown::Match => 0,
+        WellKnown::MatchAll => 1,
+        WellKnown::Replace => 2,
+        WellKnown::Search => 3,
         WellKnown::Split => return Some(HOOK_SPLIT),
         WellKnown::Iterator
         | WellKnown::Species
@@ -113,7 +108,8 @@ pub(super) fn hook_text(symbol: WellKnown) -> Option<CalleeErrorText<'static>> {
         | WellKnown::AsyncIterator
         | WellKnown::Unscopables
         | WellKnown::ToPrimitive
-        | WellKnown::ToStringTag => return None,
+        | WellKnown::ToStringTag
+        | WellKnown::HasInstance => return None,
     };
     Some(HOOK_TEXTS[at])
 }

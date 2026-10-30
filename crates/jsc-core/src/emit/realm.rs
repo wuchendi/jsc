@@ -224,7 +224,7 @@ impl From<GlobalIntrinsic> for Intrinsic {
 
 impl Intrinsic {
     /// The intrinsic's `proto` (`None` = `null`).
-    fn proto(self) -> Option<Intrinsic> {
+    pub(super) fn proto(self) -> Option<Intrinsic> {
         match self {
             Self::ObjectPrototype | Self::SymbolRegistry | Self::ArrayUnscopables => None,
             Self::FunctionPrototype
@@ -379,6 +379,8 @@ pub(super) enum Builtin {
     Bind,
     /// `Function.prototype.toString`.
     FunctionToString,
+    /// `Function.prototype[@@hasInstance]` (`OrdinaryHasInstance`).
+    FunctionHasInstance,
     /// The call/construct trampoline of every bound function (DESIGN.md
     /// §5.5): `env` is the `[target, boundThis, ...boundArgs]` array. Not
     /// installed on any intrinsic.
@@ -843,6 +845,17 @@ impl NumberTest {
     }
 }
 
+/// The name of a `%Function.prototype%` method.
+fn function_name(builtin: Builtin) -> &'static str {
+    match builtin {
+        Builtin::Call => "call",
+        Builtin::Apply => "apply",
+        Builtin::Bind => "bind",
+        Builtin::FunctionHasInstance => "[Symbol.hasInstance]",
+        _ => "",
+    }
+}
+
 /// The name of a `Math` method.
 fn math_name(op: MathOp) -> &'static str {
     match op {
@@ -1145,7 +1158,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 271] = [
+    pub(super) const ALL: [Builtin; 272] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1163,6 +1176,7 @@ impl Builtin {
         Self::Apply,
         Self::Bind,
         Self::FunctionToString,
+        Self::FunctionHasInstance,
         Self::BoundCall,
         Self::ErrorToString,
         Self::Math(MathOp::Floor),
@@ -1501,9 +1515,9 @@ impl Builtin {
             Self::StringFromCharCode => "fromCharCode",
             Self::StringFromCodePoint => "fromCodePoint",
             Self::StringRaw => "raw",
-            Self::Call => "call",
-            Self::Apply => "apply",
-            Self::Bind => "bind",
+            Self::Call | Self::Apply | Self::Bind | Self::FunctionHasInstance => {
+                function_name(self)
+            }
             Self::Math(op) => math_name(op),
             Self::NumberToFixed => "toFixed",
             Self::NumberToExponential => "toExponential",
@@ -1993,6 +2007,14 @@ pub(super) fn registry() -> Vec<Entry> {
         ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
+        // Non-writable, non-enumerable, non-configurable: `instanceof` relies
+        // on it never changing (the builtin `instanceof` fast paths).
+        Entry {
+            intrinsic: FunctionPrototype,
+            key: Key::Symbol(WellKnown::HasInstance),
+            attrs: CONST_ATTRS,
+            value: Value::Method(Builtin::FunctionHasInstance),
+        },
     ]);
     for kind in ErrorKind::ALL {
         let proto = Intrinsic::ErrorPrototype(kind);
@@ -2772,7 +2794,8 @@ mod tests {
                         | BuiltinCtor::Date
                 ) | Intrinsic::Ctor(
                     BuiltinCtor::Array | BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Promise
-                ) | Intrinsic::IteratorPrototype
+                ) | Intrinsic::FunctionPrototype
+                    | Intrinsic::IteratorPrototype
                     | Intrinsic::AsyncIteratorPrototype
                     | Intrinsic::IterPrototype(_)
                     | Intrinsic::GeneratorPrototype
