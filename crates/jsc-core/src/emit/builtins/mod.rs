@@ -39,6 +39,10 @@ mod string;
 mod symbol;
 
 use crate::emit::realm::ArrayCopyOp;
+pub(super) use iter::{
+    CloseMode, ST_ARGS, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
+    emit_iterator_close, emit_iterator_step, emit_iterator_value,
+};
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 use number::NumberFormat;
@@ -85,6 +89,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(generator::async_fragments(k));
     nodes.extend(date::fragments(k));
     nodes.extend(json::fragments());
+    nodes.extend(iter::fragments(k));
     nodes
 }
 
@@ -122,6 +127,7 @@ impl Frame {
             (4, ValType::I32),
             (2, ValType::F64),
             (6, ValType::F64),
+            (4, ValType::I64),
         ])
     }
 
@@ -199,6 +205,11 @@ impl Frame {
     fn zf64(self, n: u32) -> u32 {
         self.scratch() + 48 + n
     }
+
+    /// Further i64 temp `n` (`0..4`): an iterator record's places.
+    fn z64(self, n: u32) -> u32 {
+        self.scratch() + 54 + n
+    }
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -218,6 +229,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(generator::async_strings())
         .chain(json::strings())
         .chain(symbol::STRINGS)
+        .chain(iter::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -290,7 +302,8 @@ pub(super) fn emit_builtin(
         | Builtin::BooleanToString
         | Builtin::BooleanValueOf => emit_number_family(builtin, &mut f, frame, strings, helpers),
         Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
-        Builtin::IterSource => iter::emit_iter_source(&mut f, frame, strings, helpers),
+        Builtin::Protocol(op) => iter::emit_protocol(op, &mut f, frame, strings, helpers),
+        Builtin::Iter(op) => iter::emit(op, &mut f, frame, strings, helpers),
         Builtin::PropertyIsEnumerable
         | Builtin::DefineAccessor { .. }
         | Builtin::LookupAccessor { .. }

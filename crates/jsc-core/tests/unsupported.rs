@@ -213,41 +213,6 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn user_iterator_hook_throws_until_y2() {
-    let text = "TypeError: Symbol.iterator protocol is not supported yet";
-    let iterable = "let o = { [Symbol.iterator]() { return [][Symbol.iterator]() } };";
-    for consumer in [
-        "for (const x of o) {}",
-        "[...o]",
-        "let [a] = o",
-        "new Map(o)",
-        "new Set(o)",
-        "Array.from(o)",
-        "Object.fromEntries(o)",
-        "function* g() { yield* o } g().next()",
-    ] {
-        assert_uncaught(&format!("{iterable} {consumer}"), text);
-    }
-    // A modified `@@iterator` on a builtin prototype, or an own one on an array.
-    assert_uncaught(
-        "Array.prototype[Symbol.iterator] = function () {}; for (const x of [1]) {}",
-        text,
-    );
-    assert_uncaught(
-        "let a = [1]; a[Symbol.iterator] = function () {}; [...a]",
-        text,
-    );
-    assert_uncaught(
-        "String.prototype[Symbol.iterator] = function () {}; for (const c of 'ab') {}",
-        text,
-    );
-    assert_uncaught(
-        "function* g() { yield 1 } let it = g(); it[Symbol.iterator] = function () {}; for (const x of it) {}",
-        text,
-    );
-}
-
-#[test]
 fn user_to_primitive_hook_throws_until_y4() {
     let text = "TypeError: Symbol.toPrimitive is not supported yet";
     let obj = "let o = { [Symbol.toPrimitive]() { return 1 } };";

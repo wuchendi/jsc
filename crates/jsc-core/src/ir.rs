@@ -688,9 +688,46 @@ pub enum ProtoKind {
 pub enum SpreadElem {
     /// A plain element/argument `e`, appended as a single value.
     Item(IrNode),
-    /// A spread source `...e`: every element of the (array) value is appended in
-    /// order.
+    /// A spread source `...e`: every value its iterator yields is appended in
+    /// order (`IterableToList`, design/symbol-strings.md §5.2).
     Spread(IrNode),
+    /// An internal argument-list array (a bound function's or a builtin
+    /// constructor's arguments): its elements are appended as they are,
+    /// without the iteration protocol.
+    List(IrNode),
+}
+
+/// The iterator record of design/symbol-strings.md §5.1, held in four places
+/// (each a [`IrNode::Local`], or the frame-cell read a generator promotes it
+/// to) that the record nodes read and write: it never escapes, so it is not
+/// a heap block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IterRecord {
+    /// The iterator object, or the iterated source on a fast path.
+    pub iter: IrNode,
+    /// The cached `next` method, or the fast-path cursor (a number).
+    pub next: IrNode,
+    /// The record state (a number: done, a fast-path kind, or the protocol).
+    pub state: IrNode,
+    /// The last step's result object, or its value on a fast path.
+    pub result: IrNode,
+}
+
+impl IterRecord {
+    /// The four places, in evaluation order.
+    pub fn places(&self) -> [&IrNode; 4] {
+        [&self.iter, &self.next, &self.state, &self.result]
+    }
+
+    /// The four places, mutably.
+    pub fn places_mut(&mut self) -> [&mut IrNode; 4] {
+        [
+            &mut self.iter,
+            &mut self.next,
+            &mut self.state,
+            &mut self.result,
+        ]
+    }
 }
 
 /// How a spread call reaches its callee, mirroring the direct/indirect
@@ -959,35 +996,41 @@ pub enum IrNode {
         /// [`crate::abi::GEN_LIMIT_THROW`]).
         limits: u32,
     },
-    /// Whether the sub-expression is a generator handle: yields a
-    /// boolean jsval. Used by `for-of`/spread to branch between driving a
-    /// generator via `.next()` and the ordinary array/string index walk.
-    IsGenerator(Box<IrNode>),
-    /// `GetIterator` of a non-generator iteration source (for-of, `yield*`,
-    /// spread, array destructuring), as a value [`IrNode::IterLen`] /
-    /// [`IrNode::IterItem`] walk by index: an array or string is itself, a
-    /// `String` wrapper its string, an `arguments` object and (when not `live`)
-    /// a generator a fresh array of its values, a `Map` / `Set` itself when
-    /// `live` and otherwise a fresh array of its `[key, value]` entries /
-    /// values. Anything else throws `<x> is not iterable`.
-    IterSource {
+    /// `GetIterator(value, sync)` (design/symbol-strings.md §5.1): evaluate
+    /// `value` and open its iterator into the record `rec`. A source passing
+    /// its guarded fast path (§5.3: a clean array or `arguments`, string,
+    /// `Map`, `Set` or generator) is walked directly (`rec.iter` is the source,
+    /// `rec.next` its cursor); any other value runs the protocol:
+    /// `GetMethod(value, @@iterator)` (`<x> is not iterable` when absent),
+    /// the call, the object check, and `rec.next = Get(iterator, "next")`
+    /// read once. Yields `undefined`.
+    GetIterator {
         /// The iterated value.
         value: Box<IrNode>,
-        /// Whether a `Map` / `Set` is walked live (for-of, `yield*`).
-        live: bool,
+        /// The record the iterator is opened into.
+        rec: Box<IterRecord>,
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
     },
-    /// The current length of an [`IrNode::IterSource`] value: its `length`,
-    /// or the entry count of a `Map` / `Set` (re-read per step, so entries
-    /// added during the walk are visited).
-    IterLen(Box<IrNode>),
-    /// Element `index` of an [`IrNode::IterSource`] value: `iterable[index]`,
-    /// or the `index`-th entry of a `Map` (a fresh `[key, value]` array) /
-    /// `Set` (the value).
-    IterItem {
-        /// The iteration source.
-        iterable: Box<IrNode>,
-        /// The element index (a number jsval).
-        index: Box<IrNode>,
+    /// `IteratorStep` of the record: advance it and yield `true` when it
+    /// produced a value (left in `rec.result` for [`IrNode::IteratorValue`]),
+    /// `false` once done. A `next` result that is not an object throws; any
+    /// throw leaves the record done (never closed afterwards).
+    IteratorStep(Box<IterRecord>),
+    /// `IteratorValue` of the last successful [`IrNode::IteratorStep`]:
+    /// `Get(result, "value")` of a protocol result (which re-arms the
+    /// record's close), the value itself on a fast path.
+    IteratorValue(Box<IterRecord>),
+    /// `IteratorClose(rec, completion)` of a record not yet done (a done
+    /// record is left alone): `GetMethod(iterator, "return")`, its call, and
+    /// for a non-throw completion the object check of its result. With
+    /// `throwing` (a throw completion, run from a `catch` that rethrows) any
+    /// throw of the close itself is discarded. The record is done afterwards.
+    IteratorClose {
+        /// The record to close.
+        rec: Box<IterRecord>,
+        /// Whether the completion being propagated is a throw.
+        throwing: bool,
     },
     /// Drive a generator one step — `gen.next(sent)`. Evaluate `gen` to
     /// a handle, `call_indirect` its state machine with `(sent, gen)`, then build
@@ -2124,9 +2167,6 @@ impl IrNode {
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::AwaitMark(inner)
-            | IrNode::IsGenerator(inner)
-            | IrNode::IterSource { value: inner, .. }
-            | IrNode::IterLen(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
             | IrNode::NullishCheck { value: inner, .. }
@@ -2166,10 +2206,6 @@ impl IrNode {
                 exclude: b,
             }
             | IrNode::Index { obj: a, index: b }
-            | IrNode::IterItem {
-                iterable: a,
-                index: b,
-            }
             | IrNode::MakeAccessor {
                 getter: a,
                 setter: b,
@@ -2270,8 +2306,16 @@ impl IrNode {
                         || f(value)
                 })
             }
+            IrNode::GetIterator { value, rec, .. } => {
+                f(value) || rec.places().into_iter().any(&mut f)
+            }
+            IrNode::IteratorStep(rec)
+            | IrNode::IteratorValue(rec)
+            | IrNode::IteratorClose { rec, .. } => rec.places().into_iter().any(&mut f),
             IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
-                SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
+                SpreadElem::Item(value) | SpreadElem::Spread(value) | SpreadElem::List(value) => {
+                    f(value)
+                }
             }),
             IrNode::CallSpread { target, args } => {
                 matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } | SpreadCallee::Method { callee, .. } if f(callee))
@@ -2324,9 +2368,6 @@ impl IrNode {
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::AwaitMark(inner)
-            | IrNode::IsGenerator(inner)
-            | IrNode::IterSource { value: inner, .. }
-            | IrNode::IterLen(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
             | IrNode::NullishCheck { value: inner, .. }
@@ -2365,10 +2406,6 @@ impl IrNode {
                 exclude: b,
             }
             | IrNode::Index { obj: a, index: b }
-            | IrNode::IterItem {
-                iterable: a,
-                index: b,
-            }
             | IrNode::MakeAccessor {
                 getter: a,
                 setter: b,
@@ -2486,10 +2523,20 @@ impl IrNode {
                 }
                 out
             }
+            IrNode::GetIterator { value, rec, .. } => {
+                let mut out: Vec<&mut IrNode> = vec![&mut **value];
+                out.extend(rec.places_mut());
+                out
+            }
+            IrNode::IteratorStep(rec)
+            | IrNode::IteratorValue(rec)
+            | IrNode::IteratorClose { rec, .. } => rec.places_mut().into_iter().collect(),
             IrNode::ArraySpread(elems) => elems
                 .iter_mut()
                 .map(|elem| match elem {
-                    SpreadElem::Item(value) | SpreadElem::Spread(value) => value,
+                    SpreadElem::Item(value)
+                    | SpreadElem::Spread(value)
+                    | SpreadElem::List(value) => value,
                 })
                 .collect(),
             IrNode::CallSpread { target, args } => {

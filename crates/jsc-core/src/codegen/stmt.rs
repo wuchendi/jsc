@@ -1640,19 +1640,28 @@ impl LowerCtx<'_> {
         result
     }
 
-    /// Lower a `for (const v of ITER) body` over an array or string, desugared to
-    /// a counted index loop lowered to [`IrStmt::While`]. `ITER` is evaluated
-    /// ONCE into a temp local, its `.length` cached ONCE into another temp, and an
-    /// index counter walks `0..length`. Caching the length matches the C-style
-    /// counted-loop desugar: for the array/string iterables supported here the
-    /// length is fixed for the loop's duration, so re-reading it each iteration
-    /// (as JS `for-of` semantically does) would observe no difference.
+    /// Lower a `for (const v of ITER) body` through the iterator protocol
+    /// (design/symbol-strings.md §5.2): `ITER` is evaluated once and opened
+    /// into a fresh [`IterRecord`] ([`IrNode::GetIterator`], whose guarded
+    /// fast paths walk a clean array, string, `Map`, `Set` or generator
+    /// directly), then
     ///
-    /// The loop binding is a fresh block-scoped local rebound each iteration:
-    /// `iter[i]` is assigned into it as the FIRST statement of the body (so a
-    /// captured binding gets a fresh cell per iteration, like a `let`). The index
-    /// increment lives in the loop's `update` slot so a `continue` still advances
-    /// it (mirroring [`Self::lower_for`]). The `for-of` head opens a lexical
+    /// ```text
+    /// try {
+    ///   while (IteratorStep(rec)) { const v = IteratorValue(rec); BODY }
+    /// } catch (e) { IteratorClose(rec, throw); throw e }
+    /// finally { IteratorClose(rec) }
+    /// ```
+    ///
+    /// so a `break`, `return`, labelled jump or throw out of the body (or the
+    /// head's destructuring) closes the iterator, while a done record or a
+    /// throw from the iterator itself does not ([`IrNode::IteratorClose`]
+    /// skips a done record; the `catch` close leaves the record done for the
+    /// `finally`).
+    ///
+    /// The loop binding is a fresh block-scoped local rebound each iteration
+    /// as the FIRST statement of the body (so a captured binding gets a fresh
+    /// cell per iteration, like a `let`). The `for-of` head opens a lexical
     /// scope, so the binding is not visible after the loop.
     ///
     /// The head is a `const`/`let` single-identifier binding, or a member /
@@ -1721,22 +1730,46 @@ impl LowerCtx<'_> {
 
         self.push_scope();
         let result = (|| {
-            // Evaluate the iterable ONCE into a temp. At runtime a GENERATOR is
-            // driven via the iterator protocol; any other value is walked by
-            // index through its `GetIterator` source (array, string, live
-            // Map/Set), which throws for a non-iterable.
-            let iter = self.lower_expr(&for_of.right)?;
-            let iter_local = self.fresh();
-            out.push(IrStmt::Decl {
-                local: iter_local,
-                init: iter,
-            });
-            let gen_body = self.lower_for_of_generator(head, iter_local, &for_of.body, label)?;
-            let index_body = self.lower_for_of_index(head, iter_local, &for_of.body, label)?;
-            out.push(IrStmt::If {
-                cond: IrNode::IsGenerator(Box::new(IrNode::Local(iter_local))),
-                then_body: gen_body,
-                else_body: index_body,
+            let value = self.lower_expr(&for_of.right)?;
+            let rec = self.fresh_iter_record(out);
+            out.push(IrStmt::Expr(IrNode::GetIterator {
+                value: Box::new(value),
+                rec: rec.clone(),
+                sealed: self.shared.globals.intrinsics_sealed(),
+            }));
+            let target = self.declare_for_of_head(head);
+            self.breakable_inc();
+            self.loopable_inc();
+            let mut body = Vec::new();
+            let bound = self
+                .bind_for_of_target(target, IrNode::IteratorValue(rec.clone()), &mut body)
+                .and_then(|()| self.lower_for_of_body(&for_of.body, &mut body));
+            self.loopable_dec();
+            self.breakable_dec();
+            bound?;
+            let exc = self.fresh();
+            out.push(IrStmt::Try {
+                body: vec![IrStmt::While {
+                    cond: IrNode::IteratorStep(rec.clone()),
+                    body,
+                    update: Vec::new(),
+                    label,
+                }],
+                catch_body: Some(vec![
+                    IrStmt::Decl {
+                        local: exc,
+                        init: IrNode::ExcValue,
+                    },
+                    IrStmt::Expr(IrNode::IteratorClose {
+                        rec: rec.clone(),
+                        throwing: true,
+                    }),
+                    IrStmt::Expr(IrNode::Throw(Box::new(IrNode::Local(exc)))),
+                ]),
+                finally_body: Some(vec![IrStmt::Expr(IrNode::IteratorClose {
+                    rec,
+                    throwing: false,
+                })]),
             });
             Ok(())
         })();
@@ -1744,118 +1777,24 @@ impl LowerCtx<'_> {
         result
     }
 
-    /// Lower the index branch of a `for-of`: replace the iterable with its
-    /// [`IrNode::IterSource`], walk `0 <= i < IterLen(src)` (re-read per step,
-    /// so elements and entries added by the body are visited), and bind the
-    /// loop variable to `IterItem(src, i)` as the first body statement, with
-    /// `i++` in the loop's `update` slot so a `continue` still advances it.
-    /// Returns the branch statements.
-    fn lower_for_of_index(
-        &mut self,
-        head: ForOfHead<'_>,
-        iter_local: u32,
-        for_body: &Stmt,
-        label: Option<u32>,
-    ) -> anyhow::Result<Vec<IrStmt>> {
-        let mut out = vec![IrStmt::Expr(IrNode::Assign {
-            local: iter_local,
-            value: Box::new(IrNode::IterSource {
-                value: Box::new(IrNode::Local(iter_local)),
-                live: true,
-            }),
-        })];
-        let idx_local = self.fresh();
-        out.push(IrStmt::Decl {
-            local: idx_local,
-            init: IrNode::Num(0.0),
-        });
-        let cond = IrNode::Binary {
-            op: BinOp::Lt,
-            lhs: Box::new(IrNode::Local(idx_local)),
-            rhs: Box::new(IrNode::IterLen(Box::new(IrNode::Local(iter_local)))),
+    /// Declare the four fresh locals of an [`IterRecord`] (each initialized
+    /// to `undefined`, so a generator body promotes them like any temporary
+    /// it writes) and return the record over them.
+    pub(super) fn fresh_iter_record(&mut self, out: &mut Vec<IrStmt>) -> Box<IterRecord> {
+        let mut place = || {
+            let local = self.fresh();
+            out.push(IrStmt::Decl {
+                local,
+                init: IrNode::Undefined,
+            });
+            IrNode::Local(local)
         };
-        let target = self.declare_for_of_head(head);
-        self.breakable_inc();
-        self.loopable_inc();
-        let mut body = Vec::new();
-        let elem = IrNode::IterItem {
-            iterable: Box::new(IrNode::Local(iter_local)),
-            index: Box::new(IrNode::Local(idx_local)),
-        };
-        self.bind_for_of_target(target, elem, &mut body)?;
-        self.lower_for_of_body(for_body, &mut body)?;
-        self.loopable_dec();
-        self.breakable_dec();
-        let update = vec![IrStmt::Expr(IrNode::Assign {
-            local: idx_local,
-            value: Box::new(IrNode::Binary {
-                op: BinOp::Add,
-                lhs: Box::new(IrNode::Local(idx_local)),
-                rhs: Box::new(IrNode::Num(1.0)),
-            }),
-        })];
-        out.push(IrStmt::While {
-            cond,
-            body,
-            update,
-            label,
-        });
-        Ok(out)
-    }
-
-    /// Lower the GENERATOR-drive branch of a `for-of`: consume the handle
-    /// via the iterator protocol —
-    ///
-    /// ```text
-    /// let $r = iter.next();
-    /// while (true) { if ($r.done) break; const x = $r.value; BODY; }   // update: $r = iter.next()
-    /// ```
-    ///
-    /// — with `$r` refreshed in the loop's `update` slot so a `continue` advances it.
-    fn lower_for_of_generator(
-        &mut self,
-        head: ForOfHead<'_>,
-        iter_local: u32,
-        for_body: &Stmt,
-        label: Option<u32>,
-    ) -> anyhow::Result<Vec<IrStmt>> {
-        let next = || IrNode::GenResume {
-            handle: Box::new(IrNode::Local(iter_local)),
-            sent: Box::new(IrNode::Undefined),
-        };
-        let member = |r: u32, key: &str| IrNode::Index {
-            obj: Box::new(IrNode::Local(r)),
-            index: Box::new(IrNode::Str(key.to_owned())),
-        };
-        let mut out = Vec::new();
-        let r_local = self.fresh();
-        out.push(IrStmt::Decl {
-            local: r_local,
-            init: next(),
-        });
-        let target = self.declare_for_of_head(head);
-        self.breakable_inc();
-        self.loopable_inc();
-        let mut body = Vec::new();
-        body.push(IrStmt::If {
-            cond: member(r_local, "done"),
-            then_body: vec![IrStmt::Break(None)],
-            else_body: Vec::new(),
-        });
-        self.bind_for_of_target(target, member(r_local, "value"), &mut body)?;
-        self.lower_for_of_body(for_body, &mut body)?;
-        self.loopable_dec();
-        self.breakable_dec();
-        out.push(IrStmt::While {
-            cond: IrNode::Bool(true),
-            body,
-            update: vec![IrStmt::Expr(IrNode::Assign {
-                local: r_local,
-                value: Box::new(next()),
-            })],
-            label,
-        });
-        Ok(out)
+        Box::new(IterRecord {
+            iter: place(),
+            next: place(),
+            state: place(),
+            result: place(),
+        })
     }
 
     /// Lower a `for-of` body; an empty body (`for (o.x of xs);`) lowers to
@@ -2054,13 +1993,10 @@ impl LowerCtx<'_> {
     }
 }
 
-/// The `GetIterator` snapshot array an array pattern destructures `value`
-/// through.
+/// The snapshot array an array pattern destructures `value` through: every
+/// value its iterator yields (`IterableToList`, the spread of `value`).
 fn iter_snapshot(value: IrNode) -> IrNode {
-    IrNode::IterSource {
-        value: Box::new(value),
-        live: false,
-    }
+    IrNode::ArraySpread(vec![SpreadElem::Spread(value)])
 }
 
 /// Whether `expr` is a compile-time literal that is definitely NOT enumerable by
@@ -2182,13 +2118,17 @@ fn reject_class_member(member: &ClassMember) -> anyhow::Error {
     CompileError::spanned(span, msg).into()
 }
 
+/// The name of a derived class's default-constructor rest binding (not
+/// spellable in source).
+pub(super) const DEFAULT_CTOR_ARGS: &str = "%args";
+
 /// The parameter and body of a derived class's default constructor,
 /// `constructor(...args) { super(...args) }`. The rest binding's name cannot
 /// be spelled in source, so field initializers never see it.
 fn default_derived_ctor() -> (Pat, Vec<Stmt>) {
     use swc_common::DUMMY_SP;
     use swc_ecma_ast::{BindingIdent, CallExpr, RestPat, Super};
-    let args = Ident::new_no_ctxt("%args".into(), DUMMY_SP);
+    let args = Ident::new_no_ctxt(DEFAULT_CTOR_ARGS.into(), DUMMY_SP);
     let rest = Pat::Rest(RestPat {
         span: DUMMY_SP,
         dot3_token: DUMMY_SP,

@@ -261,3 +261,15 @@ fn return_at_a_yield_inside_try_finally_rejects_precisely() {
         "true async generator return() at a yield inside try/finally is not supported\n",
     );
 }
+
+#[test]
+fn async_generator_prototype_inherits_async_iterator_prototype() {
+    assert_output(
+        "const AIP = Object.getPrototypeOf(Object.getPrototypeOf(async function*(){}.prototype));
+         console.log(typeof AIP[Symbol.asyncIterator]);
+         const o = {};
+         console.log(AIP[Symbol.asyncIterator].call(o) === o);
+         console.log(Object.getPrototypeOf(AIP) === Object.prototype);",
+        "function\ntrue\ntrue\n",
+    );
+}
