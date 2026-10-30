@@ -1381,9 +1381,16 @@ catch binding).
   guarded fast path while its builtin `@@iterator` and iterator `next` are
   provably intact (the dirty bits of §6.4); an `arguments` object is walked
   by index while its own `@@iterator` is still `%Array.prototype.values%`
-  (and the Array Iterator bits are clean). `for await` is rejected
-  at compile time. The loop head declares its binding with `const`/`let`
-  (identifier or pattern) or assigns a pattern (`for ([a] of xs)`).
+  (and the Array Iterator bits are clean). The loop head declares its
+  binding with `const`/`let`/`var` (identifier or pattern) or assigns a
+  pattern (`for ([a] of xs)`).
+- **`for await`** (in async functions, async generators and the top level of
+  `main`) has `for-of`'s shape and head forms over an async record (§7.8):
+  each step awaits `next()`, then checks the result is an object; an abrupt
+  body exit calls `return()` (if any) and awaits it, a normal completion
+  then requiring an object result while a throw completion discards any
+  rejection; a throw from a step does not close. It has no fast path: every
+  step is a microtask turn.
 - **`for-in`** iterates the key snapshot of §6.3; strings and arrays list their
   index keys first.
 
@@ -1659,7 +1666,11 @@ control flow. A `yield` may appear inside a larger expression
   (bit `64`) is iterated through the protocol, never by direct state-machine
   resumes. Each delegated step calls the cached `next` (or the
   `throw` / `return` method read per step); there is no fast path for a
-  clean generator delegate.
+  clean generator delegate. In an async generator the delegate is opened
+  with the async `GetIterator` and every inner result (the `return()` of a
+  closed delegate included) is awaited before its check (ES2025 §15.5.5); a
+  non-object result throws `Iterator result <x> is not an object` in both
+  forms.
 
 **`async`/`await`.** An `async function` (in every position a `function*` may
 take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
@@ -1699,7 +1710,25 @@ the body is busy:
   rejects). `return(v)` at a suspended `yield` resumes the body with a
   return completion there, which awaits `v`, then runs the enclosing
   `finally` blocks like a generator's.
-- `yield*` in an async generator is a compile error.
+- `yield*` in an async generator delegates through the async protocol (see
+  generators above).
+
+**Async iteration.** The async `GetIterator` (`IrNode::OpenIterator` with
+`is_async`, `emit/builtins/async_iter.rs`) calls `@@asyncIterator` (a
+non-object result throws); without one it wraps the sync iterator of
+`@@iterator` in `CreateAsyncFromSyncIterator`, and with neither throws
+`TypeError: <x> is not async iterable`. `%AsyncFromSyncIteratorPrototype%`
+(hidden, `CLASS_ITERATOR` kind `32`, a 48-byte block holding the sync record)
+has guest `next` / `return` / `throw`: each calls the sync method and returns
+a promise for `{ value, done }` after `Promise.resolve(value)`; a rejected
+value closes the sync iterator unless done. A missing `return` fulfills
+`{ value, done: true }`; a missing `throw` closes the sync iterator, then
+rejects with `TypeError: The iterator does not provide a 'throw' method`.
+The consumers (`for await`, async `yield*`) await `next()` through the
+state machine (`AsyncIteratorNext` / `AsyncIteratorComplete` /
+`AsyncIteratorReturn`); the wrapper's builtin bodies need a positional
+slot, so a program with a `for await` has `K` ≥ 1 (§4.2).
+`Array.fromAsync` is not implemented.
 
 **Promises.** `new Promise(executor)`, `Promise.resolve`, `Promise.reject`,
 `Promise.prototype.then` / `catch` / `finally` (§6.7).
@@ -2071,8 +2100,7 @@ Each item below is current behaviour of this tree.
 
 **Generators & async**
 
-- No `for await` and no `Symbol.asyncIterator`; `yield*` is rejected in an
-  async generator.
+- No `Array.fromAsync`.
 - A `yield`/`await` that would carry a per-node compiler temporary across the
   suspend is a compile error (`super.m(yield x)`, `o[yield k]?.(yield v)`).
 - `yield*` has no fast path for a clean generator delegate: each delegated
@@ -2161,7 +2189,9 @@ Its stage U1 is done: Latin-1 / UTF-16 strings with code-unit `.length`,
 indexing and comparison, lossless literals, and the `String.prototype`
 methods in the guest. Its stage U2 is done: the code-point string iterator,
 full lossless case mapping, `normalize` in all four forms, and lossless
-code-unit `localeCompare`.
+code-unit `localeCompare`. Its stage Y5 is done except `Array.fromAsync`:
+the async `GetIterator`, `%AsyncFromSyncIteratorPrototype%`, `for await`
+and `yield*` in async generators (pulled forward from phase 5).
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
@@ -2185,8 +2215,7 @@ code-unit `localeCompare`.
 ### Phase 5 — Language completeness
 
 - Private fields and methods, static blocks, object spread.
-- `for await` and async `yield*`, labeled statements, all remaining early
-  errors.
+- Labeled statements, all remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
 - `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,

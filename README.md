@@ -104,7 +104,7 @@ CI (`.github/workflows/`):
 | **Operators** | comma, arithmetic, bitwise and shift, comparison, `==`/`===` and negations, logical and `??`, `typeof`, `instanceof`, `in`, `delete`, compound assignment, `++`/`--`, optional chaining `?.`; `ToPrimitive` / `ToNumber` / `ToString` call user `valueOf` / `toString` |
 | **Bindings** | `var` hoisted to function scope (top-level `var` and function declarations are global-object properties), block-scoped `let`/`const` (assigning a `const` is a compile error); array/object destructuring with defaults and rest; spread in array literals and calls |
 | **Objects** | dynamic properties with a prototype chain and property descriptors (writable / enumerable / configurable, accessors), extensibility, `seal` / `freeze`; object literals with computed keys, methods, getters/setters and `__proto__`; arrays with holes (read through the prototype chain), growth by index, sparse storage and `length` writes |
-| **Control flow** | `if`, `for`, `while`, `do`/`while`, `for-of`, `for-in`, `switch`, labels, ternary |
+| **Control flow** | `if`, `for`, `while`, `do`/`while`, `for-of`, `for await`, `for-in`, `switch`, labels, ternary |
 | **Functions** | declarations, expressions, arrows, closures (capture by reference), default and rest parameters, `arguments`; functions are objects; `call`/`apply`; missing arguments are `undefined`, extra arguments are ignored; generator and `async` functions, expressions, methods and async generators, top-level `await`; `bind`; parameter TDZ |
 | **Classes** | class declarations and expressions, fields, methods, constructors, `extends` any constructor (including builtins)/`super`, `new.target`, static methods and fields, getters/setters |
 | **Built-ins** | function objects on real prototypes, usable as values: `console.log`, `Math`, `Object`, `String`/`Number`/`Boolean` (and wrapper objects), `parseInt`/`parseFloat`, `isNaN`/`isFinite`, `globalThis`, `Object` reflection (`defineProperty(ies)`, `getOwnPropertyDescriptor(s)`, `create`, `getPrototypeOf` / `setPrototypeOf`, `assign`, `keys` / `values` / `entries`, …), the ES2025 `Array`, `String`, `Number` and `Math` methods, `Map`/`Set`, `JSON.parse`/`stringify` (reviver, replacer, `space`), `Date` |
@@ -129,7 +129,7 @@ Details are in [DESIGN.md](DESIGN.md).
 ## Current limitations
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
-- **Language gaps.** No object spread, private `#` members, static blocks, computed class member names, `for await`, or `yield*` in async generators.
+- **Language gaps.** No object spread, private `#` members, static blocks, or computed class member names.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
 - **Not self-contained.** The module imports seven host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
 - **Byte strings.** Strings are byte sequences, not UTF-16: `"é".length` is `2`; string methods throw `TypeError` where a non-ASCII position would otherwise be wrong.
