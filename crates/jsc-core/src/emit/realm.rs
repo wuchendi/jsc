@@ -70,6 +70,12 @@ pub(super) enum Intrinsic {
     /// `Array.prototype[@@unscopables]`: a `null`-prototype object whose
     /// own data properties (each `true`) name the methods `with` skips.
     ArrayUnscopables,
+    /// `%WrapForValidIteratorPrototype%`: the `next` / `return` of the
+    /// wrappers `Iterator.from` creates (design/symbol-strings.md §5.7).
+    WrapForValidIteratorPrototype,
+    /// `%IteratorHelperPrototype%`: the `next` / `return` of the helper
+    /// objects the lazy `Iterator.prototype` methods create (§5.7).
+    IteratorHelperPrototype,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -211,6 +217,7 @@ pub(super) fn prototype_of(ctor: BuiltinCtor) -> Intrinsic {
         BuiltinCtor::Object => Intrinsic::ObjectPrototype,
         BuiltinCtor::Function => Intrinsic::FunctionPrototype,
         BuiltinCtor::Error(kind) => Intrinsic::ErrorPrototype(kind),
+        BuiltinCtor::Iterator => Intrinsic::IteratorPrototype,
         _ => Intrinsic::Prototype(ctor),
     }
 }
@@ -241,7 +248,10 @@ impl Intrinsic {
             | Self::Prototype(_)
             | Self::IteratorPrototype
             | Self::AsyncIteratorPrototype => Some(Self::ObjectPrototype),
-            Self::IterPrototype(_) | Self::GeneratorPrototype => Some(Self::IteratorPrototype),
+            Self::IterPrototype(_)
+            | Self::GeneratorPrototype
+            | Self::WrapForValidIteratorPrototype
+            | Self::IteratorHelperPrototype => Some(Self::IteratorPrototype),
             Self::AsyncGeneratorPrototype | Self::AsyncFromSyncIteratorPrototype => {
                 Some(Self::AsyncIteratorPrototype)
             }
@@ -345,6 +355,8 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::AsyncGeneratorPrototype,
             Intrinsic::SymbolRegistry,
             Intrinsic::ArrayUnscopables,
+            Intrinsic::WrapForValidIteratorPrototype,
+            Intrinsic::IteratorHelperPrototype,
         ])
 }
 
@@ -577,6 +589,162 @@ pub(super) enum Builtin {
     /// A `@@species` builtin: a `get [Symbol.species]`, or an internal
     /// closure of the promise `SpeciesConstructor` paths.
     Species(SpeciesOp),
+    /// An `Iterator` static, `%WrapForValidIteratorPrototype%` method or
+    /// `%IteratorPrototype%` accessor half (design/symbol-strings.md §5.7).
+    Iterator(IteratorOp),
+}
+
+/// The `Iterator` builtins of design/symbol-strings.md §5.7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IteratorOp {
+    /// `Iterator.from`.
+    From,
+    /// `%WrapForValidIteratorPrototype%.next`.
+    WrapNext,
+    /// `%WrapForValidIteratorPrototype%.return`.
+    WrapReturn,
+    /// The getter of `Iterator.prototype.constructor`: `%Iterator%`.
+    ConstructorGet,
+    /// The setter of `Iterator.prototype.constructor`
+    /// (`SetterThatIgnoresPrototypeProperties`).
+    ConstructorSet,
+    /// The getter of `Iterator.prototype[@@toStringTag]`: `"Iterator"`.
+    TagGet,
+    /// The setter of `Iterator.prototype[@@toStringTag]`
+    /// (`SetterThatIgnoresPrototypeProperties`).
+    TagSet,
+    /// A lazy `Iterator.prototype` helper: a fresh helper object.
+    Helper(HelperKind),
+    /// `%IteratorHelperPrototype%.next`.
+    HelperNext,
+    /// `%IteratorHelperPrototype%.return`.
+    HelperReturn,
+    /// An eager `Iterator.prototype` helper: consumes the iterator.
+    Eager(EagerKind),
+}
+
+/// The eager `Iterator.prototype` helpers (design/symbol-strings.md §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EagerKind {
+    /// `reduce(reducer[, initialValue])`.
+    Reduce,
+    /// `toArray()`.
+    ToArray,
+    /// `forEach(fn)`.
+    ForEach,
+    /// `some(predicate)`.
+    Some,
+    /// `every(predicate)`.
+    Every,
+    /// `find(predicate)`.
+    Find,
+}
+
+impl EagerKind {
+    /// The method's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reduce => "reduce",
+            Self::ToArray => "toArray",
+            Self::ForEach => "forEach",
+            Self::Some => "some",
+            Self::Every => "every",
+            Self::Find => "find",
+        }
+    }
+}
+
+/// The lazy `Iterator.prototype` helpers (design/symbol-strings.md §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HelperKind {
+    /// `map(mapper)`.
+    Map,
+    /// `filter(predicate)`.
+    Filter,
+    /// `take(limit)`.
+    Take,
+    /// `drop(limit)`.
+    Drop,
+    /// `flatMap(mapper)`.
+    FlatMap,
+}
+
+impl HelperKind {
+    /// The method's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::Filter => "filter",
+            Self::Take => "take",
+            Self::Drop => "drop",
+            Self::FlatMap => "flatMap",
+        }
+    }
+}
+
+impl IteratorOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [IteratorOp; 20] = [
+        Self::From,
+        Self::WrapNext,
+        Self::WrapReturn,
+        Self::ConstructorGet,
+        Self::ConstructorSet,
+        Self::TagGet,
+        Self::TagSet,
+        Self::Helper(HelperKind::Map),
+        Self::Helper(HelperKind::Filter),
+        Self::Helper(HelperKind::Take),
+        Self::Helper(HelperKind::Drop),
+        Self::Helper(HelperKind::FlatMap),
+        Self::HelperNext,
+        Self::HelperReturn,
+        Self::Eager(EagerKind::Reduce),
+        Self::Eager(EagerKind::ToArray),
+        Self::Eager(EagerKind::ForEach),
+        Self::Eager(EagerKind::Some),
+        Self::Eager(EagerKind::Every),
+        Self::Eager(EagerKind::Find),
+    ];
+
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::From => "from",
+            Self::WrapNext | Self::HelperNext => "next",
+            Self::WrapReturn | Self::HelperReturn => "return",
+            Self::ConstructorGet => "get constructor",
+            Self::ConstructorSet => "set constructor",
+            Self::TagGet => "get [Symbol.toStringTag]",
+            Self::TagSet => "set [Symbol.toStringTag]",
+            Self::Helper(kind) => kind.name(),
+            Self::Eager(kind) => kind.name(),
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::From | Self::ConstructorSet | Self::TagSet | Self::Helper(_) => 1,
+            Self::Eager(kind) => u32::from(kind != EagerKind::ToArray),
+            Self::WrapNext
+            | Self::WrapReturn
+            | Self::ConstructorGet
+            | Self::TagGet
+            | Self::HelperNext
+            | Self::HelperReturn => 0,
+        }
+    }
+
+    /// The prototype holding this builtin under its [`Self::name`].
+    fn prototype(self) -> Option<Intrinsic> {
+        match self {
+            Self::WrapNext | Self::WrapReturn => Some(Intrinsic::WrapForValidIteratorPrototype),
+            Self::Helper(_) | Self::Eager(_) => Some(Intrinsic::IteratorPrototype),
+            Self::HelperNext | Self::HelperReturn => Some(Intrinsic::IteratorHelperPrototype),
+            _ => None,
+        }
+    }
 }
 
 /// The `@@species` builtins: the `get [Symbol.species]` accessors, and the
@@ -1295,7 +1463,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 286] = [
+    pub(super) const ALL: [Builtin; 307] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1373,6 +1541,7 @@ impl Builtin {
         Self::Ctor(BuiltinCtor::Promise),
         Self::Ctor(BuiltinCtor::Date),
         Self::Ctor(BuiltinCtor::Symbol),
+        Self::Ctor(BuiltinCtor::Iterator),
         Self::ObjectStatic(ObjectBuiltinOp::Keys),
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
@@ -1609,6 +1778,26 @@ impl Builtin {
         Self::Species(SpeciesOp::ALL[8]),
         Self::Species(SpeciesOp::ALL[9]),
         Self::Species(SpeciesOp::ALL[10]),
+        Self::Iterator(IteratorOp::ALL[0]),
+        Self::Iterator(IteratorOp::ALL[1]),
+        Self::Iterator(IteratorOp::ALL[2]),
+        Self::Iterator(IteratorOp::ALL[3]),
+        Self::Iterator(IteratorOp::ALL[4]),
+        Self::Iterator(IteratorOp::ALL[5]),
+        Self::Iterator(IteratorOp::ALL[6]),
+        Self::Iterator(IteratorOp::ALL[7]),
+        Self::Iterator(IteratorOp::ALL[8]),
+        Self::Iterator(IteratorOp::ALL[9]),
+        Self::Iterator(IteratorOp::ALL[10]),
+        Self::Iterator(IteratorOp::ALL[11]),
+        Self::Iterator(IteratorOp::ALL[12]),
+        Self::Iterator(IteratorOp::ALL[13]),
+        Self::Iterator(IteratorOp::ALL[14]),
+        Self::Iterator(IteratorOp::ALL[15]),
+        Self::Iterator(IteratorOp::ALL[16]),
+        Self::Iterator(IteratorOp::ALL[17]),
+        Self::Iterator(IteratorOp::ALL[18]),
+        Self::Iterator(IteratorOp::ALL[19]),
     ];
 
     /// The function's `name`.
@@ -1626,6 +1815,7 @@ impl Builtin {
             Self::ProtoSet => "set __proto__",
             Self::CollectionSize { .. } => "get size",
             Self::Species(op) => op.name(),
+            Self::Iterator(op) => op.name(),
             method => method.method_name(),
         }
     }
@@ -1763,7 +1953,9 @@ impl Builtin {
             | Self::ArrayReverse
             | Self::ArrayShift
             | Self::ArrayCopy(ArrayCopyOp::ToReversed)
-            | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol) => 0,
+            | Self::Ctor(
+                BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol | BuiltinCtor::Iterator,
+            ) => 0,
             Self::Iter(op) => op.length(),
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(
@@ -1789,6 +1981,7 @@ impl Builtin {
             Self::ObjectReflect(op) => op.length(),
             Self::Symbol(op) => op.length(),
             Self::Species(op) => op.length(),
+            Self::Iterator(op) => op.length(),
             Self::JsonStringify => 3,
             // Every other builtin takes one argument.
             _ => 1,
@@ -1847,6 +2040,7 @@ impl Builtin {
             }
             Self::AsyncGeneratorMethod(_) => return Some(Intrinsic::AsyncGeneratorPrototype),
             Self::Iter(op) => return op.prototype(),
+            Self::Iterator(op) => return op.prototype(),
             _ => None,
         };
         ctor.map(Intrinsic::Prototype)
@@ -1971,7 +2165,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 30] = [
+const GLOBALS: [(&str, u32, Value); 31] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2085,6 +2279,11 @@ const GLOBALS: [(&str, u32, Value); 30] = [
         "Symbol",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Symbol)),
+    ),
+    (
+        "Iterator",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Iterator)),
     ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
@@ -2244,6 +2443,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
             ],
             BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
             BuiltinCtor::Date => &[Builtin::DateNow],
+            BuiltinCtor::Iterator => &[Builtin::Iterator(IteratorOp::From)],
             BuiltinCtor::Symbol => &[
                 Builtin::Symbol(SymbolOp::For),
                 Builtin::Symbol(SymbolOp::KeyFor),
@@ -2273,8 +2473,12 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 entries.push(entry(intrinsic, symbol.name(), CONST_ATTRS, value));
             }
         }
-        let ctor = Value::Intrinsic(intrinsic);
-        entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
+        // `%IteratorPrototype%`'s `constructor` is an accessor
+        // ([`iterator_prototype_entries`]).
+        if ctor != BuiltinCtor::Iterator {
+            let ctor = Value::Intrinsic(intrinsic);
+            entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
+        }
     }
     for builtin in Builtin::ALL {
         if let Some(prototype) = builtin.prototype() {
@@ -2292,6 +2496,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
     }
     symbol_prototype_entries(entries);
     iterator_entries(entries);
+    iterator_prototype_entries(entries);
     well_known_entries(entries);
     species_entries(entries);
 }
@@ -2379,6 +2584,7 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
         ),
         (Intrinsic::IterPrototype(IterFamily::Map), "Map Iterator"),
         (Intrinsic::IterPrototype(IterFamily::Set), "Set Iterator"),
+        (Intrinsic::IteratorHelperPrototype, "Iterator Helper"),
     ];
     entries.extend(tags.map(|(intrinsic, tag)| Entry {
         intrinsic,
@@ -2444,6 +2650,34 @@ fn iterator_entries(entries: &mut Vec<Entry>) {
             Intrinsic::AsyncIteratorPrototype,
             WellKnown::AsyncIterator,
             Builtin::Iter(IterOp::AsyncIteratorSelf),
+        ),
+    ]);
+}
+
+/// The `constructor` and `[@@toStringTag]` accessors (configurable only) of
+/// `%IteratorPrototype%` (design/symbol-strings.md §5.4): the getters return
+/// `%Iterator%` / `"Iterator"`, the setters are
+/// `SetterThatIgnoresPrototypeProperties`.
+fn iterator_prototype_entries(entries: &mut Vec<Entry>) {
+    let accessor = |key, get, set| Entry {
+        intrinsic: Intrinsic::IteratorPrototype,
+        key,
+        attrs: ACCESSOR_ATTRS,
+        value: Value::Accessor {
+            get: Builtin::Iterator(get),
+            set: Some(Builtin::Iterator(set)),
+        },
+    };
+    entries.extend([
+        accessor(
+            Key::Str("constructor"),
+            IteratorOp::ConstructorGet,
+            IteratorOp::ConstructorSet,
+        ),
+        accessor(
+            Key::Symbol(WellKnown::ToStringTag),
+            IteratorOp::TagGet,
+            IteratorOp::TagSet,
         ),
     ]);
 }
@@ -3014,6 +3248,41 @@ mod tests {
             assert_eq!(IterPrototype(family).proto(), Some(IteratorPrototype));
             assert!(IterPrototype(family).watch_bit().is_some());
         }
+        // `Iterator.prototype` is `%IteratorPrototype%`, whose `constructor`
+        // and `@@toStringTag` are accessors; the wrappers inherit it.
+        assert_eq!(prototype_of(BuiltinCtor::Iterator), IteratorPrototype);
+        assert_eq!(
+            Intrinsic::WrapForValidIteratorPrototype.proto(),
+            Some(IteratorPrototype)
+        );
+        let registry = registry();
+        let own = |key| {
+            registry
+                .iter()
+                .filter(|e| e.intrinsic == IteratorPrototype && e.key == key)
+                .map(|e| (e.attrs, e.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            own(Key::Str("constructor")),
+            [(
+                ACCESSOR_ATTRS,
+                Value::Accessor {
+                    get: Builtin::Iterator(IteratorOp::ConstructorGet),
+                    set: Some(Builtin::Iterator(IteratorOp::ConstructorSet)),
+                }
+            )]
+        );
+        assert_eq!(
+            own(Key::Symbol(WellKnown::ToStringTag)),
+            [(
+                ACCESSOR_ATTRS,
+                Value::Accessor {
+                    get: Builtin::Iterator(IteratorOp::TagGet),
+                    set: Some(Builtin::Iterator(IteratorOp::TagSet)),
+                }
+            )]
+        );
         // The iterator prototypes' bits (15..=19) and the `%Array%` /
         // `%Promise%` ones (20, 21), all distinct.
         let mut bits: Vec<u8> = intrinsics().filter_map(Intrinsic::watch_bit).collect();
@@ -3021,7 +3290,6 @@ mod tests {
         bits.dedup();
         assert_eq!(bits, (0..=21).collect::<Vec<u8>>());
         // The `[@@iterator]` aliases share one method block.
-        let registry = registry();
         let symbol_method = |intrinsic, symbol| {
             registry.iter().find_map(|e| {
                 (e.intrinsic == intrinsic && e.key == Key::Symbol(symbol)).then_some(e.value)
