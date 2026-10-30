@@ -291,6 +291,59 @@ fn decode_pointer_reads_string_from_memory() {
     assert_eq!(decode(bits, &memory), Value::Str("hi".to_owned()));
 }
 
+/// A hand-built heap string block at base offset 8: header with `flags`,
+/// `len` code units, then `data`. Returns the memory and its heap jsval.
+fn string_block(flags: u8, len: u32, data: &[u8]) -> (Vec<u8>, u64) {
+    let mut memory = vec![0u8; 8];
+    memory.extend_from_slice(&[TYPE_STRING, 0, flags, 0]);
+    memory.extend_from_slice(&len.to_le_bytes());
+    memory.extend_from_slice(data);
+    (memory, 0x7FFD_0000_0000_0000_u64 | 0x8)
+}
+
+#[test]
+fn decode_one_byte_string_is_latin1() {
+    // One-byte blocks are Latin-1: 0x80..=0x9F are U+0080..U+009F (not the
+    // windows-1252 punctuation) and 0xE9 is U+00E9.
+    let (memory, bits) = string_block(0, 4, &[0x80, 0x99, 0xE9, 0xFF]);
+    assert_eq!(
+        decode(bits, &memory),
+        Value::Str("\u{80}\u{99}\u{e9}\u{ff}".to_owned())
+    );
+}
+
+#[test]
+fn decode_two_byte_string_reads_utf16le_units() {
+    // "é😀" as UTF-16LE: U+00E9, then the pair D83D DE00; `len` counts units.
+    let units: Vec<u8> = [0x00E9_u16, 0xD83D, 0xDE00]
+        .iter()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    let (memory, bits) = string_block(crate::abi::STR_FLAG_TWO_BYTE, 3, &units);
+    assert_eq!(decode(bits, &memory), Value::Str("é😀".to_owned()));
+    assert_eq!(
+        super::value::string_units(&memory, 8),
+        Some(vec![0x00E9, 0xD83D, 0xDE00])
+    );
+}
+
+#[test]
+fn decode_lone_surrogate_renders_replacement_but_units_stay_lossless() {
+    let (memory, bits) = string_block(crate::abi::STR_FLAG_TWO_BYTE, 2, &[0x00, 0xD8, 0x61, 0x00]);
+    assert_eq!(decode(bits, &memory), Value::Str("\u{FFFD}a".to_owned()));
+    assert_eq!(
+        super::value::string_units(&memory, 8),
+        Some(vec![0xD800, 0x0061])
+    );
+}
+
+#[test]
+fn decode_truncated_two_byte_string_is_empty() {
+    // Two units need four payload bytes; a short block decodes as "".
+    let (memory, bits) = string_block(crate::abi::STR_FLAG_TWO_BYTE, 2, &[0x61, 0x00]);
+    assert_eq!(decode(bits, &memory), Value::Str(String::new()));
+}
+
 #[test]
 fn decode_out_of_range_pointer_is_undefined() {
     // A heap pointer past the end of memory must not panic — its type byte
