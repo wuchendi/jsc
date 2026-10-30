@@ -515,7 +515,7 @@ the stages before it honours a user value (§9.4).
 |---|---|---|---|---|
 | `@@iterator` | `GetIterator`: for-of, spread, array destructuring, `yield*`, `Array.from`, Map/Set ctors, `Object.fromEntries`, `AggregateError`, `Promise.*` combinators, `Iterator.from`, `CreateAsyncFromSyncIterator` | `core/emit/builtins/iter.rs` `emit_iter_source`, `core/emit/array.rs` `emit_array_spread`, `core/codegen/stmt.rs` `lower_for_of` / `iter_snapshot`, `core/codegen/generator.rs` `lower_yield_delegate`, `core/emit/builtins/map_set.rs` `emit_ctor`, `core/emit/builtins/array.rs` `emit_from`, `core/emit/builtins/object_static.rs` `emit_from_entries` | **Y2** (guard Y1) | §5.3 |
 | `@@asyncIterator` | `GetIterator(async)`: `for await`, async `yield*`, `Array.fromAsync`; `%AsyncIteratorPrototype%[@@asyncIterator]` | `lower_for_of` (`for await` rejected), `lower_yield_delegate` (async rejected) | **Y5** (§5.8); defined in Y1; `%AsyncIteratorPrototype%` in Y2-T1 | — (generic protocol only) |
-| `@@hasInstance` | `InstanceofOperator` before `OrdinaryHasInstance`; `%Function.prototype%[@@hasInstance]` | `core/emit/object.rs` `emit_instanceof_node`, `core/codegen/expr.rs` `instanceof_kind` | **Y4** (guard Y1) | sealed builtin RHS type-byte arms unchanged (overriding needs `defineProperty` on the ctor or a class `static [Symbol.hasInstance]`, which shadows the name so `sealed` is false); generic arm: `HAS_SYMBOL_KEYS` test on the RHS's own table, then compare with the known builtin value |
+| `@@hasInstance` | `InstanceofOperator` before `OrdinaryHasInstance`; `%Function.prototype%[@@hasInstance]` | `core/emit/object.rs` `emit_instanceof_node`, `core/codegen/expr.rs` `instanceof_kind` | **Y4** (guard Y1, replaced in Y4) | builtin RHS arms (`Array` / `Function` / `Date` type byte; `Object` and the errors walk the operand's chain for the static prototype) behind a run-time intact test, not `sealed` (`Object.defineProperty(Array, Symbol.hasInstance, ..)` keeps the name sealed): each ctor on the static chain up to `%Function.prototype%` has its realm `proto` and no own `@@hasInstance` (`HAS_SYMBOL_KEYS` clear inline, else a `__prop_find` miss, so `%Array%`'s `@@species` getter keeps the arm); otherwise and for any other RHS: `__symbol_get` of `@@hasInstance`, `%Function.prototype%[@@hasInstance]` recognised by value and run inline |
 | `@@toPrimitive` | `ToPrimitive`; `Date.prototype[@@toPrimitive]`, `Symbol.prototype[@@toPrimitive]` | `core/emit/convert.rs` `emit_to_primitive` (the Date hint special case becomes the real `Date.prototype[@@toPrimitive]`) | **Y4** (guard Y1) | walk the proto chain testing `HAS_SYMBOL_KEYS` per table; do the real `__get` only at the first table that has it |
 | `@@toStringTag` | `Object.prototype.toString`; builtin tags (Map/Set/Promise/Generator/AsyncGenerator/Symbol/Math/JSON/iterator prototypes) | `core/emit/builtins/object.rs` `emit_to_string` (kind table) | **Y4** (guard Y1) | same chain test; fallback is the builtin-tag table; builtin tags installed as real properties and the kind shortcuts for Map/Set/Promise/Generator deleted (an async generator then tags `AsyncGenerator`, fixing the DESIGN §13 item) |
 | `@@species` | `ArraySpeciesCreate` (`map/filter/slice/splice/concat/flat/flatMap`), `SpeciesConstructor` (`Promise.prototype.then/finally`) | `core/emit/builtins/array.rs` `species_ctor` (today walks `C`'s chain for a builtin ctor as a stand-in), `core/emit/builtins/promise.rs` (no `SpeciesConstructor` today) | **Y4** for Array and Promise (guard Y1) | array `ProtoGuard` path proves `proto == %Array.prototype%` with clean bit, hence `constructor === %Array%`; `%Array%[@@species]` / `%Promise%[@@species]` need new ctor dirty bits |
@@ -1161,6 +1161,29 @@ Y2 reason drafts (one line per affected row, for the final CI pass):
   consults do a real lookup (Y2-T1).
 - `fib`, `math`, `push_1e5`, `console_log`: must not change.
 
+Y4 reason drafts (one line per affected row, for the final CI pass):
+
+- `class_methods`, `array_hofs`, `string_methods`: `ToPrimitive` does a real
+  `@@toPrimitive` lookup only where `HAS_SYMBOL_KEYS` is set on the chain
+  (`%Date.prototype%` and every prototype that gained a tag) (Y4-T1);
+  `Object.prototype.toString` does `ToObject` plus one `__symbol_get` per
+  call (Y4-T1).
+- rows with `instanceof Array` / `Error` / ...: the inline intact guard costs
+  ~10 ops / fuel per test; a generic `instanceof` does a real `__get` of
+  `@@hasInstance` (`%Function.prototype%` has a symbol key) (Y4-T2); the
+  guard looks up `@@hasInstance` with `__prop_find` only on a constructor
+  table with `HAS_SYMBOL_KEYS`, so `instanceof Array` takes the type-byte arm
+  again despite `%Array%`'s `@@species` getter (Y4-T5); `instanceof Object`
+  walks the operand's chain for `%Object.prototype%` instead of one kind
+  test (Y4-T5, a correctness fix).
+- `array_hofs`, promise rows: sealed programs using `map` / `filter` /
+  `then` / `finally` now track dirty bits (bits 20 / 21); `species_ctor`
+  with tracking is `Get(constructor)` plus a compare (Y4-T3).
+- `string_methods`: a receiver `is_nullish` test and an `is_object` test on
+  `arg0` for the six dispatch methods and `includes` / `startsWith` /
+  `endsWith` (Y4-T4).
+- `fib`, `math`, `push_1e5`, `console_log`: must not change.
+
 ---
 
 ## 9. Staged migration
@@ -1325,12 +1348,12 @@ Hot files between the two L2s and how they are sequenced:
 | behaviour reachable from | until | interim result |
 |---|---|---|
 | user `[Symbol.iterator]` on an object, or a modified `@@iterator` on a builtin prototype (Y1 makes the symbol writable as a key) | Y2 | every `IterSource` / spread / `GenResume` path (for-of, spread, destructuring, `yield*`, `Array.from`, `Object.fromEntries`, Map/Set ctors) does the real `GetMethod(v, @@iterator)` when the guard bits are not clean; a non-builtin value → `TypeError: Symbol.iterator protocol is not supported yet` |
-| user `[Symbol.toPrimitive]` | Y4 | `ToPrimitive` chain test finds one → `TypeError: Symbol.toPrimitive is not supported yet` |
-| user `[Symbol.toStringTag]` differing from the builtin tag table | Y4 | `TypeError: Symbol.toStringTag is not supported yet` |
-| user `[Symbol.hasInstance]` on an `instanceof` RHS | Y4 | `TypeError: Symbol.hasInstance is not supported yet` |
-| `C[Symbol.species]` reached by `ArraySpeciesCreate` with a `C` whose own table has `HAS_SYMBOL_KEYS` (a user `@@species`) | Y4 | `TypeError: Symbol.species is not supported yet` (today's stand-in of `species_ctor` stays for every other `C`) |
-| `[Symbol.isConcatSpreadable]` on a `concat` argument/receiver | Y4 | `TypeError: Symbol.isConcatSpreadable is not supported yet` |
-| object argument with `@@match/matchAll/replace/search/split` to a String method | Y4 | `TypeError: Symbol.<name> is not supported yet` |
+| user `[Symbol.toPrimitive]` | Y4 | `ToPrimitive` chain test finds one → `TypeError: Symbol.toPrimitive is not supported yet` — **replaced in Y4-T1** (honoured; message deleted) |
+| user `[Symbol.toStringTag]` differing from the builtin tag table | Y4 | `TypeError: Symbol.toStringTag is not supported yet` — **replaced in Y4-T1** |
+| user `[Symbol.hasInstance]` on an `instanceof` RHS | Y4 | `TypeError: Symbol.hasInstance is not supported yet` — **replaced in Y4-T2** |
+| `C[Symbol.species]` reached by `ArraySpeciesCreate` with a `C` whose own table has `HAS_SYMBOL_KEYS` (a user `@@species`) | Y4 | `TypeError: Symbol.species is not supported yet` (today's stand-in of `species_ctor` stays for every other `C`) — **replaced in Y4-T3** (`Get(C, @@species)`; stand-in deleted) |
+| `[Symbol.isConcatSpreadable]` on a `concat` argument/receiver | Y4 | `TypeError: Symbol.isConcatSpreadable is not supported yet` — **replaced in Y4-T3** |
+| object argument with `@@match/matchAll/replace/search/split` to a String method | Y4 | `TypeError: Symbol.<name> is not supported yet` — **replaced in Y4-T4** (the shared `HOOK_TEXTS` / `emit_hook_guard` machinery is deleted) |
 | user `[Symbol.asyncIterator]` | Y5 | no consult site exists (`for await`, async `yield*` are compile errors; `Array.fromAsync` is absent); defining the key is harmless |
 | `for await`, `yield*` in an async generator | Y5 | today's compile errors stay until deleted in Y5 |
 | `Iterator`, `Iterator.from`, helpers | Y3 | absent: `Iterator is not defined` (`ReferenceError`, unchanged) |

@@ -46,8 +46,15 @@ const RESTRICTED_PROPERTY: CalleeErrorText<'static> = [
     "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
 ];
 
-/// The static strings of this family.
-pub(super) const STRINGS: [&str; 15] = [
+/// The static strings of this family (`[@@hasInstance]`'s included).
+pub(super) const STRINGS: [&str; 22] = [
+    "prototype",
+    INSTANCEOF_NOT_CALLABLE[0],
+    INSTANCEOF_NOT_CALLABLE[1],
+    INSTANCEOF_NON_OBJECT_PROTOTYPE[0],
+    INSTANCEOF_NON_OBJECT_PROTOTYPE[1],
+    HAS_INSTANCE_NOT_CALLABLE[0],
+    HAS_INSTANCE_NOT_CALLABLE[1],
     BIND_NOT_CALLABLE[0],
     BIND_NOT_CALLABLE[1],
     TO_STRING_NOT_CALLABLE[0],
@@ -64,6 +71,23 @@ pub(super) const STRINGS: [&str; 15] = [
     RESTRICTED_PROPERTY[0],
     RESTRICTED_PROPERTY[1],
 ];
+
+/// `Function.prototype[@@hasInstance](V)`: `OrdinaryHasInstance(this, V)` —
+/// `false` for a non-callable `this`, `InstanceofOperator(V, target)` for a
+/// bound one, else the `prototype` chain walk.
+pub(super) fn emit_has_instance(
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let scratch = frame.scratch();
+    let (value, ctor) = (scratch + 19, scratch + 20);
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(ctor));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(value));
+    emit_instanceof_operator(function, value, ctor, true, scratch, strings, helpers);
+}
 
 /// The IR fragments of this family's bodies, for the static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
