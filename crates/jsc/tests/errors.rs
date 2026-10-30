@@ -374,19 +374,12 @@ fn property_write_error_unwinds_through_finally_and_calls() {
 }
 
 /// Out-of-scope class forms are rejected at compile time with a
-/// non-zero exit and an explanatory, spanned message. Constructors, methods,
-/// accessors (instance and static), generator, async and async generator
-/// methods, fields, `extends`, and class expressions are supported (see the
-/// classes suites); computed and private members stay out of scope.
+/// non-zero exit and an explanatory, spanned message. Every other member form,
+/// computed names included, is supported (see the classes suites); private
+/// members stay out of scope.
 #[test]
 fn unsupported_class_forms_error() {
-    let cases = [
-        ("class A{ [k] = 1 } 1", "computed"),
-        // A computed accessor is still rejected.
-        ("class A{ get [k](){return 1} } 1", "computed"),
-        ("class A{ #p = 1 } 1", "private"),
-        ("class A{ [k](){} } 1", "computed"),
-    ];
+    let cases = [("class A{ #p = 1 } 1", "private")];
     for (src, needle) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
             .args(["-e", src])

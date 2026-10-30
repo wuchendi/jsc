@@ -525,7 +525,7 @@ fn json_parse_scalars_and_composites() {
     );
 }
 
-/// Malformed (or unsupported — a `\u` escape) input throws a catchable branded
+/// Malformed input throws a catchable branded
 /// `Error` whose `.name` is `SyntaxError`.
 #[test]
 fn json_parse_rejects_malformed_input() {
