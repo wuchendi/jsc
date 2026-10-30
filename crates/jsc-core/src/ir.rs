@@ -540,11 +540,13 @@ pub enum BuiltinCtor {
     Date,
     /// `Symbol`.
     Symbol,
+    /// `Iterator` (abstract: only a subclass constructs).
+    Iterator,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 19] = [
+    pub(crate) const ALL: [BuiltinCtor; 20] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -564,6 +566,7 @@ impl BuiltinCtor {
         Self::Promise,
         Self::Date,
         Self::Symbol,
+        Self::Iterator,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -581,6 +584,7 @@ impl BuiltinCtor {
             Self::Promise => "Promise",
             Self::Date => "Date",
             Self::Symbol => "Symbol",
+            Self::Iterator => "Iterator",
         }
     }
 
