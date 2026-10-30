@@ -1,4 +1,4 @@
-//! The `Iterator` global (design/symbol-strings.md §5.7; the abstract
+//! The `Iterator` global (DESIGN.md §7.9; the abstract
 //! constructor's body is in [`super::ctor`]): `Iterator.from` with its `%WrapForValidIteratorPrototype%`
 //! wrappers, the `constructor` / `[@@toStringTag]` accessors of
 //! `%IteratorPrototype%` (`Iterator.prototype`), and the lazy helpers
@@ -7,7 +7,7 @@
 //! `toArray` / `forEach` / `some` / `every` / `find`.
 //!
 //! A wrapper is a `CLASS_ITERATOR` object of kind [`WRAP_KIND`] whose
-//! 32-byte head is the one of the builtin iterators (§5.4), followed by the
+//! 32-byte head is the one of the builtin iterators (DESIGN.md §5.2), followed by the
 //! wrapped record: the iterator at [`WRAP_ITERATOR_OFFSET`] and its `next`
 //! at [`WRAP_NEXT_OFFSET`].
 //!
@@ -25,7 +25,7 @@ use crate::emit::realm::{EagerKind, HelperKind, IteratorOp};
 use crate::ir::ConvertOp;
 
 /// The `kind` byte of a `%WrapForValidIteratorPrototype%` object (the first
-/// of the helper kinds, §5.4).
+/// of the helper kinds, DESIGN.md §5.2).
 const WRAP_KIND: i32 = 16;
 /// Offset of the head's `[[IteratedObject]]` (unused by a wrapper).
 const WRAP_ITERATED_OFFSET: u64 = abi::OBJ_PREFIX_SIZE as u64;
@@ -905,7 +905,7 @@ fn helper_receiver(
 }
 
 /// `%IteratorHelperPrototype%.next()`: `GeneratorResume` of the helper's
-/// closure (§5.7), running until its next yield or completion.
+/// closure (DESIGN.md §7.9), running until its next yield or completion.
 fn emit_helper_next(
     function: &mut Function,
     frame: Frame,

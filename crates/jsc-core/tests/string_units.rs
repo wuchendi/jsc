@@ -1,8 +1,8 @@
-//! Integration tests: strings as UTF-16 code units (design/symbol-strings.md
-//! §6): `.length` and `s[i]` count code units, equality and `<` / `sort`
+//! Integration tests: strings as UTF-16 code units (DESIGN.md
+//! §5.2): `.length` and `s[i]` count code units, equality and `<` / `sort`
 //! compare code units, concatenation mixes widths, string iteration steps by
 //! code point, JSON escapes and gaps work on code units, and a String
-//! wrapper's index properties are virtual (§6.10).
+//! wrapper's index properties are virtual (DESIGN.md §5.3).
 
 mod common;
 use common::{assert_bool, assert_number, assert_string};

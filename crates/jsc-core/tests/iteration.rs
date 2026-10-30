@@ -1,5 +1,5 @@
 //! Integration tests: `GetIterator` of the builtin iterables (their guarded
-//! fast paths and the protocol, design/symbol-strings.md §5.3) — for-of,
+//! fast paths and the protocol, DESIGN.md §6.4) — for-of,
 //! `yield*`, spread (array literal and call arguments) and array
 //! destructuring over arrays, strings, generators, `Map` / `Set` handles,
 //! `String` wrappers and `arguments`, and the `<x> is not iterable`
@@ -60,7 +60,7 @@ fn for_of_skips_entries_deleted_before_they_are_reached() {
 
 #[test]
 fn deleting_the_current_entry_visits_the_next_one() {
-    // Deletion tombstones the entry in place (design/symbol-strings.md §5.5).
+    // Deletion tombstones the entry in place (DESIGN.md §5.2).
     assert_string(
         &collected("const s = new Set([1, 2, 3]); for (const v of s) { out.push(v); s.delete(v) }"),
         "[1,2,3]",

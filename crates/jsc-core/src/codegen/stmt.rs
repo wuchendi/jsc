@@ -943,7 +943,7 @@ impl LowerCtx<'_> {
     }
 
     /// Destructure `source` through the iterator protocol
-    /// (design/symbol-strings.md §5.2): open it into a fresh [`IterRecord`],
+    /// (DESIGN.md §7.8): open it into a fresh [`IterRecord`],
     /// let `body` step the record lazily per element, then close it unless
     /// done (an empty pattern closes without stepping). With `guard` (an
     /// element that can throw), the elements run as
@@ -1670,7 +1670,7 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a `for (const v of ITER) body` through the iterator protocol
-    /// (design/symbol-strings.md §5.2): `ITER` is evaluated once and opened
+    /// (DESIGN.md §7.8): `ITER` is evaluated once and opened
     /// into a fresh [`IterRecord`] ([`IrNode::GetIterator`], whose guarded
     /// fast paths walk a clean array, string, `Map`, `Set` or generator
     /// directly), then
@@ -1693,7 +1693,7 @@ impl LowerCtx<'_> {
     /// cell per iteration, like a `let`). The `for-of` head opens a lexical
     /// scope, so the binding is not visible after the loop.
     ///
-    /// `for await (const v of ITER) body` (§5.8) has the same shape over an
+    /// `for await (const v of ITER) body` (DESIGN.md §7.8) has the same shape over an
     /// async record ([`IrNode::OpenIterator`] with `is_async`): each step
     /// awaits `next()` ([`IrNode::AsyncIteratorComplete`] over the awaited
     /// [`IrNode::AsyncIteratorNext`]) and each close awaits `return()`
@@ -1780,7 +1780,7 @@ impl LowerCtx<'_> {
         result
     }
 
-    /// `AsyncIteratorClose(rec, completion)` (design/symbol-strings.md §5.8):
+    /// `AsyncIteratorClose(rec, completion)` (DESIGN.md §7.8):
     /// `r = AsyncIteratorReturn(rec)`, then unless `r` is the hole (a done or
     /// stepping record, or no `return` method) await it. A normal completion
     /// checks the awaited result is an object; a throw completion discards

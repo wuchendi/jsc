@@ -447,8 +447,8 @@ read-only property and its indices virtually, §5.3), `6` `CLASS_GLOBAL` (the gl
 block), `7` `CLASS_SYMBOL` (a Symbol wrapper, `[[SymbolData]]` at
 `WRAPPER_VALUE_OFFSET`), `8` `CLASS_ITERATOR` (an Array / String / Map / Set
 iterator, 32 bytes: `[[IteratedObject]]` at `16` (`undefined` once
-exhausted), `[[NextIndex]]: u32` at `24` (an array index, a string byte
-index, a Map/Set backing slot index), `kind: u8` at `28`: `0`..`2` array
+exhausted), `[[NextIndex]]: u32` at `24` (an array index, a string
+code-unit index, a Map/Set backing slot index), `kind: u8` at `28`: `0`..`2` array
 keys / values / entries, `3` string, `4`..`6` map keys / values / entries,
 `7` / `8` set values / entries; `16` an `Iterator.from` wrapper (48 bytes:
 the wrapped iterator at `32`, its `next` at `40`); `17`..`21` a `map` /
@@ -756,7 +756,12 @@ The layouts above are chosen so a collector can be added without relayout:
   `0..len`), a property table's live keys and values, a function's or
   generator's `env`, Map/Set `entries`, a promise's `value`, a wrapper's
   `[[PrimitiveValue]]`, env cells, a cell's value, an accessor's getter and
-  setter.
+  setter, a symbol's description, an iterator object's jsval slots (its
+  `[[IteratedObject]]`, and a helper's or wrapper's underlying iterator,
+  `next`, callback and inner iterator). Symbol keys are traced like string
+  keys; registered symbols stay alive through the static `Symbol.for`
+  registry table, as the spec requires. Map/Set backings are compacted only
+  together with a forwarding step that live iterators follow.
 - **Intern table.** Weak: the sweep clears slots whose string is unmarked.
 - **Reserved now.** Header byte 1, 8-byte alignment, every internal store a
   headered block, every reference at a kind-known offset, host allocation only
@@ -849,7 +854,7 @@ function-index order:
 | JSON (§7.9) | `__json_rep(holder, key, value, replacer, list, stack)` — `SerializeJSONProperty` (`toJSON`, replacer function with `this = holder`, property list, wrapper unwrapping, cycle `TypeError` via the `stack` array); `__json_indent(s, gap)` — re-indent compact text for `space`; `__json_revive(holder, key, reviver)` — `InternalizeJSONProperty` |
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 | promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
-| well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the consult sites of the interim hook guards, §13); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
+| well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)
@@ -1090,6 +1095,24 @@ cleared. Bits: `0` `%Object.prototype%`, `1` `%Array.prototype%`, `2`
 `%SetIteratorPrototype%`, `20` `%Array%`, `21` `%Promise%` (their
 `@@species`).
 
+**Well-known symbols.** The 13 `Symbol.*` statics are the static realm
+blocks above; `Symbol` is an ordinary global, so `Symbol.iterator` is a
+`__get` on `%Symbol%` and a user value is matched by identity. Builtins and
+codegen read a hook with `__symbol_get` (§6.2), so an object chain that never
+held a symbol key costs one `HAS_SYMBOL_KEYS` test per level:
+
+| symbol | consulted by |
+|---|---|
+| `@@iterator` | `GetIterator` (§7.8): `for-of`, spread, array destructuring, `yield*`, `Array.from`, the Map/Set constructors, `Object.fromEntries`, `AggregateError`'s errors, the `Promise` combinators, `Iterator.from` and `flatMap`, `Math.sumPrecise`, the async-from-sync fallback |
+| `@@asyncIterator` | the async `GetIterator` (§7.8): `for await`, `yield*` in an async generator, `Array.fromAsync` |
+| `@@hasInstance` | `instanceof` before `OrdinaryHasInstance` (§7.6) |
+| `@@toPrimitive` | `ToPrimitive` (§6.5) |
+| `@@toStringTag` | `Object.prototype.toString` (§7.9) |
+| `@@species` | `ArraySpeciesCreate` (§7.9), `SpeciesConstructor` in `Promise.prototype.then` / `finally` (§6.7) |
+| `@@isConcatSpreadable` | `Array.prototype.concat` (§7.9) |
+| `@@match`, `@@matchAll`, `@@replace`, `@@search`, `@@split` | the String methods given an object argument, and `IsRegExp` (§7.9) |
+| `@@unscopables` | nothing (`with` is rejected); `Array.prototype[@@unscopables]` exists |
+
 **Guarded fast paths.** Specializations are optimizations over the generic
 path, never semantics:
 
@@ -1101,7 +1124,7 @@ path, never semantics:
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear (an array also needs `%Object.prototype%`'s, since its fast paths read a hole as absent and append without consulting the chain); `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`); `map` / `filter` (a plain array) and `then` / `catch` / `finally` (a `%Promise%`) also need `%Array%`'s / `%Promise%`'s bit clear, even when intrinsics-sealed (the global constructor is always reachable), so such a site turns dirty tracking on | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
-| `GetIterator` (for-of, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes (`design/symbol-strings.md` §5.3); decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's, and its body has no `yield*`), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: its own `@@iterator` is still the data property `%Array.prototype.values%`. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
+| `GetIterator` (for-of, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes; decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's, and its body has no `yield*`), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: its own `@@iterator` is still the data property `%Array.prototype.values%`. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
 | `x instanceof C` for an unshadowed, sealed `Array` / `Function` / `Date` / `Object` / Error-family `C` | a `proto` walk for the constructor's static prototype (`%Array.prototype%`, `%Function.prototype%`, `%Date.prototype%`, `%Object.prototype%`, an error prototype); the operand's direct `proto` is the first link, so a replaced `proto` is honoured | a run-time intact test: `C` and each constructor on its static chain up to `%Function.prototype%` (a native error: `%Error%`) has its realm `proto` and no own `@@hasInstance` (a table without `HAS_SYMBOL_KEYS` passes inline, else a `__prop_find` miss decides, so `%Array%`'s own `get [Symbol.species]` keeps the arm), so `GetMethod(C, @@hasInstance)` is the immutable `%Function.prototype%[@@hasInstance]` | `InstanceofOperator` (§7.6) on the realm constructor |
 | `x instanceof C` otherwise | `InstanceofOperator` (§7.6) | — | — |
 | `ArraySpeciesCreate` / `SpeciesConstructor` (`%Promise%`) in a builtin body | `ArrayCreate` / the host promise op, no `@@species` read | `constructor` is `%Array%` / `%Promise%` and its bit is clear, with dirty tracking | `Get(C, @@species)` |
@@ -1209,7 +1232,7 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
   `Promise.resolve(x)` of a never-written `Promise` global. The combinators
   `Promise.all` / `allSettled` / `any` / `race` (`emit/builtins/promise.rs`)
   build `NewPromiseCapability(this)`, read `this.resolve` once, open the
-  iterable's iterator record (design/symbol-strings.md §5.1) and per value
+  iterable's iterator record (§7.8) and per value
   call `resolve` with `this`, then `Invoke(next, "then", «onF, onR»)` with
   internal element closures (`Builtin::Species(SpeciesOp::Element)`, `env =
   [state, index, alreadyCalled]` over a shared `[values,
@@ -1394,8 +1417,7 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 labels on loops), `return`, `throw`, `try`/`catch`/`finally` (with or without a
 catch binding).
 
-- **`for-of`** runs the iteration protocol (`design/symbol-strings.md`
-  §5.1-§5.3): `GetIterator` (`@@iterator`, called once; `next` read once;
+- **`for-of`** runs the iteration protocol (§7.8): `GetIterator` (`@@iterator`, called once; `next` read once;
   `TypeError: x is not iterable` without a callable `@@iterator`, an async
   generator included), `IteratorStep` / `IteratorValue` per iteration (a
   non-object result throws), and `IteratorClose` when the body exits by
@@ -1519,7 +1541,7 @@ those of `switch` and loops are not tracked.
   `__rest`) in declarations, parameters, and `for-of` heads; destructuring
   assignment as an expression statement, with member targets (`[o.x] = xs`).
   An array pattern runs the iteration protocol lazily
-  (`design/symbol-strings.md` §5.2): `GetIterator`, one `IteratorStep` per
+  (§7.8): `GetIterator`, one `IteratorStep` per
   hole or element (an element reads `undefined` once done; a hole reads no
   value), a rest drains, and `IteratorClose` follows the pattern unless the
   iterator is done (an empty pattern closes without stepping) or a default,
@@ -1635,6 +1657,49 @@ those of `switch` and loops are not tracked.
   catchable (§5.6).
 
 ### 7.8 Iteration, generators & async
+
+**Iteration protocol.** Every consumer opens an iterator record
+(`IterRecord`, `ir.rs`: the iterator, its cached `next`, a state and the last
+result, held in locals or generator frame cells; it never escapes, so it is
+not a heap block) and drives it with the record nodes:
+
+- **`GetIterator`** (`IrNode::GetIterator`, the internal `Protocol`
+  builtins of `emit/builtins/iter.rs`): `GetMethod(value, @@iterator)`
+  (`TypeError: <x> is not iterable` when absent), its call (a non-object
+  result throws `TypeError: Result of the Symbol.iterator method is not an
+  object`), then `next` read once, so later changes to `next` are
+  unobservable. A source passing its guarded fast path (§6.4) is walked
+  directly instead, decided once at this point. `IrNode::OpenIterator`
+  always opens the protocol iterator (`yield*`), or with `is_async` the
+  async record (below).
+- **`IteratorStep` / `IteratorValue`**: call the cached `next`; a non-object
+  result throws `TypeError: Iterator result <x> is not an object`;
+  `ToBoolean(result.done)` ends the walk; `value` is read only when not done.
+  Any throw from the step leaves the record done, so it is never closed
+  afterwards.
+- **`IteratorClose`** (`IrNode::IteratorClose`): `GetMethod(iterator,
+  "return")` and its call on a record not yet done; for a throw completion
+  any throw of the close is discarded and the original rethrown; otherwise
+  a throwing `return()` propagates and a non-object result throws.
+- **`IterableToList`** (`SpreadElem::Spread`, `ProtocolOp::ToList`): drain,
+  never close.
+
+| consumer | steps | closes on |
+|---|---|---|
+| `for-of` (§7.3) | one per iteration | `break`, `return`, a labelled jump, a throw from the body or the head's destructuring |
+| array destructuring (§7.5) | one per element or hole; a rest drains; an empty pattern steps nothing | after the pattern unless done; a throw from a default, nested pattern or target |
+| spread (array, call, `new`), `AggregateError` | drain | never |
+| Map/Set constructors (`AddEntriesFromIterable`), `Object.fromEntries` | one per entry | an adder or define throw, a non-object entry, a throwing entry read |
+| `Array.from`, `Math.sumPrecise` | one per value | a `mapFn` or define throw; a non-number value (`sumPrecise`) |
+| `Promise.all` / `allSettled` / `any` / `race` (§6.7) | one per value | a throw not raised by the iterator itself |
+| `yield*` | forwarded `next` / `throw` / `return` | a `throw` on a delegate without `throw` |
+| `Iterator.from`, the helpers (§7.9) | on demand | the helper's `return()`, a throwing callback, an early result |
+| `for await`, async `yield*`, `Array.fromAsync` | awaited per step (below) | `AsyncIteratorClose` (the `return()` result awaited) |
+
+Codegen wraps a closing consumer's steps (a `for-of` body, a pattern whose
+elements can throw) as `try { BODY } catch (e) { IteratorClose(rec, throw);
+throw e } finally { IteratorClose(rec) }` over the `finally` routing of §6.6;
+a record that is done (exhausted, or its step threw) is left alone.
 
 **Generators.** A `function*` — declaration (top-level or nested, hoisted like
 any nested function declaration), expression, or object-literal / class
@@ -1783,7 +1848,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`: a string `@@toStringTag` on the receiver's chain, else the builtin tag; `Map`, `Set`, `Promise`, `Generator`, `AsyncGenerator`, `Symbol`, `Math`, `JSON` and the Array / String / Map / Set Iterator prototypes own a configurable-only `@@toStringTag`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors, `[@@hasInstance]` (`OrdinaryHasInstance`; non-writable, non-enumerable, non-configurable); `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor), `Array.fromAsync(items, mapFn, thisArg)` (the same over an async or sync iterable or an array-like, every element and mapped value awaited, §7.8); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` (`constructor[@@species]`; `%Array%`, `%Map%`, `%Set%` and `%Promise%` have the builtin `get [Symbol.species]` returning `this`), `concat` spreads the items `IsConcatSpreadable` accepts (`@@isConcatSpreadable`, else `IsArray`), and `Array.prototype[@@unscopables]` is the spec's `null`-prototype list |
-| `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order, not locale collation), `normalize` (all four forms; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings, lossless; a one-byte receiver maps in the guest), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`, §5.4); `search`, `match`, `matchAll`, `replace`, `replaceAll`, `split` call an object argument's `@@search` / `@@match` / `@@matchAll` / `@@replace` / `@@split` method with `(O, …)` before `ToString(this)` (`matchAll` / `replaceAll` first require an `IsRegExp` argument's `flags` to hold `g`), and `includes` / `startsWith` / `endsWith` throw a `TypeError` for an `IsRegExp` argument (`ToBoolean(arg[@@match])`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all but the host case-mapping path (§6.1), `localeCompare` and `normalize` (host, §6.1) run in the guest on code units (`emit/builtins/string.rs`), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
+| `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order, not locale collation), `normalize` (all four forms; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings, lossless; a one-byte receiver maps in the guest), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`); `search`, `match`, `matchAll`, `replace`, `replaceAll`, `split` call an object argument's `@@search` / `@@match` / `@@matchAll` / `@@replace` / `@@split` method with `(O, …)` before `ToString(this)` (`matchAll` / `replaceAll` first require an `IsRegExp` argument's `flags` to hold `g`), and `includes` / `startsWith` / `endsWith` throw a `TypeError` for an `IsRegExp` argument (`ToBoolean(arg[@@match])`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all but the host case-mapping path (§6.1), `localeCompare` and `normalize` (host, §6.1) run in the guest on code units (`emit/builtins/string.rs`), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | `sumPrecise(items)` (any iterable of numbers, else a `TypeError` after closing it; summed exactly in a fixed-point limb accumulator and rounded once; `NaN` / opposite infinities give `NaN`, no value or only `-0` gives `-0`), and every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string (a string's first 10 code units), `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw, a lone surrogate written as `\udxxx`), `JSON.parse(text, reviver)` (in-wasm recursive descent, `\uXXXX` escapes incl. lone surrogates, reviver walk) |
@@ -1907,7 +1972,7 @@ Errors are printed to stderr.
   rewrites it to the current passes (with PATH_PREFIX filters, only the entries
   under those prefixes are replaced).
 - **History.** `--history` appends `commit pass eligible total` for a full run to
-  `tests/test262/history.tsv`. The current metric is its last row:
+  `tests/test262/history.tsv`; earlier rows include:
 
   | commit | pass | eligible | total |
   |---|---|---|---|
@@ -1917,8 +1982,8 @@ Errors are printed to stderr.
   | `968dd97` | 19243 | 30014 | 47665 |
   | `eee36ef` | 19378 | 30014 | 47665 |
 
-  i.e. **19378 / 30014 eligible tests pass (≈ 64.6 %)**, out of 47665 tests in
-  the pinned checkout; `baseline.txt` holds the same 19378 paths. The drop in
+  The current metric is its last row: **23684 / 32889 eligible tests pass
+  (≈ 72.0 %)**; `baseline.txt` holds the same 23684 paths. The drop in
   rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
   `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
   (1413 pass).
@@ -2102,7 +2167,9 @@ Each item below is current behaviour of this tree.
   element reads through the prototype chain, L2-V T3, and `var` hoisting /
   global declarations, L2-V T1: 514 of built-ins/{Array 174, String 191,
   Function 135, Math 9, Number 5}; NativeErrors and AggregateError have
-  none), by cause and owner:
+  none; counted at `eee36ef`, before `Symbol`, the iteration protocol and
+  UTF-16 strings, which fixed the 88 failures those causes accounted for),
+  by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number |
   |---|---|---|---|---|---|---|
@@ -2113,10 +2180,7 @@ Each item below is current behaviour of this tree.
   | `asyncTest` used by a test without the `async` flag | L2-R (runner) | 67 | | | | |
   | `nativeFunctionMatcher.js` harness | L2-R (runner) | | | 1 | | |
   | `void` | L2-L | 5 | 36 | 7 | | 1 |
-  | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
-  | `Symbol` / `@@toStringTag` | Y1–Y4 (landed; recount at the next baseline) | 24 | 7 | 1 | | |
-  | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | Y2 / Y5 / Y3 (landed; recount at the next baseline) | 19 | | | 8 | |
-  | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | U1/U2 (landed; recount at the next baseline) | | 29 | | | |
+  | tagged templates, `for-in` heads (and `yield*` in async generators, since fixed) | L2-L | 4 | 4 | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
   property table, so element access on a large frozen or attributed array is
@@ -2166,7 +2230,8 @@ Each item below is current behaviour of this tree.
   exhaustion is not catchable. The intern table never shrinks.
 - Map / Set backing arrays never shrink: `delete` and `clear` leave
   tombstones (§5.2), so set / delete churn grows the backing without bound
-  (phase 4, `design/symbol-strings.md` Risk R6).
+  and lookups scan the tombstones (compaction needs live iterators to
+  follow the move; phase 4).
 
 ---
 
@@ -2210,46 +2275,28 @@ installed on the realm's prototypes, and phase 3 extends that set.
 
 ### Phase 3 — Built-in library and strings
 
-**Status: wave 3a complete** (M3 reached: 64.6 % of eligible tests pass).
-3a delivered property descriptors and `Object` reflection, `bind`, the ES2025
-`Array` / `String` / `Number` / `Math` methods, `AggregateError`, Date TimeClip,
-the async test262 runner, and language completions pulled forward from phase 5
-(comma, generator and async expressions / methods, async generators,
-non-simple parameters, early errors, `var` hoisting and global bindings).
-Wave 3c (`Symbol`, the iteration protocol incl. async iteration, Latin-1 /
-UTF-16 strings) is complete apart from its CI pass (the full test suite,
-test262 baseline and opcount snapshot run in GitHub Actions); its design is
-`design/symbol-strings.md`.
-Its stage Y1 is done: `Symbol` (registry, wrappers, the 13 well-known
-symbols), symbol-keyed properties, and computed class member names (pulled
-forward from phase 5); the well-known symbol hooks throw until Y2 / Y4 (§13).
-Its stage U1 is done: Latin-1 / UTF-16 strings with code-unit `.length`,
-indexing and comparison, lossless literals, and the `String.prototype`
-methods in the guest. Its stage U2 is done: the code-point string iterator,
-full lossless case mapping, `normalize` in all four forms, and lossless
-code-unit `localeCompare`. Its stage Y5 is done: the async `GetIterator`,
-`%AsyncFromSyncIteratorPrototype%`, `for await`, `yield*` in async
-generators (pulled forward from phase 5) and `Array.fromAsync`. Its stage
-Y2 is done: the generic iteration protocol (iterator records, `IteratorClose`
-on abrupt exits, lazy array destructuring, `yield*` and generator
-`return` / `throw` routing, Map/Set tombstones for live iterators). Its stage
-Y4 is done: `@@toPrimitive`, `@@toStringTag`, `@@hasInstance`, `@@species`,
-`@@isConcatSpreadable` and the String-method symbol dispatch are honoured.
-Its stage Y3 is done: the `Iterator` global, `Iterator.from` and the lazy and
-eager iterator helpers, the `Promise` combinators (`all`, `allSettled`,
-`any`, `race`) with `this`-aware `Promise.resolve` / `reject`, and
-`Math.sumPrecise`.
+**Status: complete** (M3 reached: 72.0 % of eligible tests pass, §10).
+Wave 3a delivered property descriptors and `Object` reflection, `bind`, the
+ES2025 `Array` / `String` / `Number` / `Math` methods, `AggregateError`, Date
+TimeClip, the async test262 runner, and language completions pulled forward
+from phase 5 (comma, generator and async expressions / methods, async
+generators, non-simple parameters, early errors, `var` hoisting and global
+bindings). Wave 3c delivered `Symbol` (registry, wrappers, the 13 well-known
+symbols and their hooks), symbol-keyed properties and computed class member
+names (pulled forward from phase 5); the generic iteration protocol
+(iterator records, `IteratorClose` on abrupt exits, lazy array
+destructuring, `yield*` and generator `return` / `throw` routing, Map/Set
+tombstones for live iterators); async iteration (`for await`, `yield*` in
+async generators, `%AsyncFromSyncIteratorPrototype%`, `Array.fromAsync`);
+the `Iterator` global with `Iterator.from` and the lazy and eager helpers;
+the `Promise` combinators (`all`, `allSettled`, `any`, `race`) with
+`this`-aware `Promise.resolve` / `reject`, and `Math.sumPrecise`; and
+Latin-1 / UTF-16 strings (code-unit `.length`, indexing and comparison,
+lossless literals, the `String.prototype` methods in the guest, the
+code-point string iterator, full case mapping, `normalize`).
 
-- The remaining built-ins on the realm's prototypes: `Date` parsing and local
-  time. `Object` reflection is done: property descriptors, integrity levels,
-  array dictionary mode, every `Object` static and `Object.prototype` method
-  of §7.9 (with `__proto__` and the legacy accessor methods); the test262
-  runner includes `propertyHelper.js` tests.
-- `Symbol` and a generic iteration protocol behind for-of, spread, and
-  destructuring, with the `Iterator` helpers (done in Y1 / Y2 / Y4 / Y3).
-- Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
-  and surrogate pairs, the string iterator, full case mapping and `normalize`
-  (done in U1 / U2).
+Still open from the phase-3 scope: `Date` string parsing and local time
+(§13).
 
 ### Phase 4 — Runtime independence and memory
 

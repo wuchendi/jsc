@@ -247,7 +247,7 @@ pub(super) fn load_entry(
 }
 
 /// Advance the i32 backing slot index `i` of the handle in `handle` past
-/// tombstones (a `HOLE` key, design/symbol-strings.md §5.5), stopping at the
+/// tombstones (a `HOLE` key, DESIGN.md §5.2), stopping at the
 /// next live entry or the end (`at`, `key`, `value` temps).
 pub(super) fn skip_tombstones(
     function: &mut Function,
@@ -309,7 +309,7 @@ pub(super) fn emit_size(
 
 /// `forEach(callback, thisArg)`: `callback(value, key, map)` (a Set passes
 /// its value as both) with `this = thisArg` for each live entry in insertion
-/// order, walking the backing live (design/symbol-strings.md §5.5): the slot
+/// order, walking the backing live (DESIGN.md §5.2): the slot
 /// count is re-read each step so entries added by a callback are visited,
 /// and tombstones (deleted or cleared entries) are skipped in place, so a
 /// deletion never shifts the walk.
@@ -419,7 +419,7 @@ fn call_adder(
 
 /// `new Map(iterable)` / `new Set(iterable)`: the allocation of
 /// [`super::ctor::fragment`], then, for a non-nullish `iterable`,
-/// `AddEntriesFromIterable` (design/symbol-strings.md §5.2): the adder
+/// `AddEntriesFromIterable` (DESIGN.md §7.8): the adder
 /// `map.set` / `set.add` is read once from the new collection (a user
 /// override runs; the builtin itself is called inline), then each value of
 /// `iterable`'s iterator record (a guarded fast path or the protocol; `<x> is

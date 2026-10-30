@@ -1,7 +1,7 @@
 //! Integration tests: the `Promise` combinators `all` / `allSettled` / `any`
 //! / `race` over the iteration protocol, `Promise.resolve` / `reject` with
 //! `this` as the constructor, and `Math.sumPrecise`
-//! (`design/symbol-strings.md` §5.7, Y3-T4).
+//! (DESIGN.md §6.7, Y3-T4).
 
 mod common;
 use common::{assert_bool, assert_nan, assert_number, assert_output, assert_string};

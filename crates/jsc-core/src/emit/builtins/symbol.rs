@@ -1,5 +1,5 @@
 //! `Symbol`, `Symbol.for` / `Symbol.keyFor` and the `%Symbol.prototype%`
-//! methods (`design/symbol-strings.md` §2.5, §2.6): a symbol is a fresh
+//! methods (DESIGN.md §7.9): a symbol is a fresh
 //! `TYPE_SYMBOL` block; registered symbols live in the hidden realm registry
 //! block, keyed by their interned key string.
 
