@@ -1884,6 +1884,9 @@ Each item below is current behaviour of this tree.
   `@@search` / `@@split` to a String method each throw `TypeError:
   Symbol.<name> is not supported yet` (`Symbol.iterator protocol is not
   supported yet`).
+- `Symbol.iterator` and the other `Symbol.*` statics are not folded at
+  compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
+  member is an ordinary `__get` on it.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
@@ -1959,8 +1962,13 @@ Each item below is current behaviour of this tree.
 - Destructuring assignment works only as an expression statement; it is
   rejected in expression position (`x = [a] = b`), and a `for-of` head must
   declare its binding or be a pattern (`for (a of xs)` is rejected).
-- Not supported: private `#` members, static blocks, computed class member
-  names.
+- Not supported: private `#` members, static blocks.
+- A numeric or BigInt literal class member key (`class { 1() {} }`) is a
+  compile error.
+- A later accessor half merges into an earlier accessor of the same literal
+  name across an intervening data method: `get a() {} a() {} set a(v) {}`
+  leaves an accessor with both the getter and the setter, where the spec
+  leaves only the setter (silently wrong).
 
 **Generators & async**
 
@@ -2048,6 +2056,9 @@ the async test262 runner, and language completions pulled forward from phase 5
 non-simple parameters, early errors, `var` hoisting and global bindings).
 Wave 3c (`Symbol`, the iteration protocol incl. async iteration, Latin-1 /
 UTF-16 strings) is in progress; its design is `design/symbol-strings.md`.
+Its stage Y1 is done: `Symbol` (registry, wrappers, the 13 well-known
+symbols), symbol-keyed properties, and computed class member names (pulled
+forward from phase 5); the well-known symbol hooks throw until Y2 / Y4 (§13).
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
@@ -2069,8 +2080,7 @@ UTF-16 strings) is in progress; its design is `design/symbol-strings.md`.
 
 ### Phase 5 — Language completeness
 
-- Private fields and methods, static blocks, computed class member names,
-  object spread.
+- Private fields and methods, static blocks, object spread.
 - `for await` and async `yield*`, labeled statements, all remaining early
   errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
