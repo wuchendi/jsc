@@ -51,6 +51,118 @@ pub(super) const SYMBOL_TO_NUMBER: CalleeErrorText<'static> = [
     "TypeError: Cannot convert a Symbol value to a number",
 ];
 
+/// The interim `TypeError`s of a well-known symbol hook a consult site finds
+/// before the stage that honours it (design/symbol-strings.md §9.4), in
+/// [`hook_text`] order.
+const HOOK_TEXTS: [CalleeErrorText<'static>; 10] = [
+    [
+        "Symbol.iterator protocol is not supported yet",
+        "TypeError: Symbol.iterator protocol is not supported yet",
+    ],
+    [
+        "Symbol.toPrimitive is not supported yet",
+        "TypeError: Symbol.toPrimitive is not supported yet",
+    ],
+    [
+        "Symbol.toStringTag is not supported yet",
+        "TypeError: Symbol.toStringTag is not supported yet",
+    ],
+    [
+        "Symbol.hasInstance is not supported yet",
+        "TypeError: Symbol.hasInstance is not supported yet",
+    ],
+    [
+        "Symbol.species is not supported yet",
+        "TypeError: Symbol.species is not supported yet",
+    ],
+    [
+        "Symbol.isConcatSpreadable is not supported yet",
+        "TypeError: Symbol.isConcatSpreadable is not supported yet",
+    ],
+    [
+        "Symbol.match is not supported yet",
+        "TypeError: Symbol.match is not supported yet",
+    ],
+    [
+        "Symbol.matchAll is not supported yet",
+        "TypeError: Symbol.matchAll is not supported yet",
+    ],
+    [
+        "Symbol.replace is not supported yet",
+        "TypeError: Symbol.replace is not supported yet",
+    ],
+    [
+        "Symbol.search is not supported yet",
+        "TypeError: Symbol.search is not supported yet",
+    ],
+];
+
+/// See [`HOOK_TEXTS`]: `Symbol.split`.
+const HOOK_SPLIT: CalleeErrorText<'static> = [
+    "Symbol.split is not supported yet",
+    "TypeError: Symbol.split is not supported yet",
+];
+
+/// The interim `TypeError` of a `symbol` hook (see [`HOOK_TEXTS`]); `None`
+/// for the symbols without a consult site (`@@asyncIterator`,
+/// `@@unscopables`).
+pub(super) fn hook_text(symbol: WellKnown) -> Option<CalleeErrorText<'static>> {
+    let at = match symbol {
+        WellKnown::Iterator => 0,
+        WellKnown::ToPrimitive => 1,
+        WellKnown::ToStringTag => 2,
+        WellKnown::HasInstance => 3,
+        WellKnown::Species => 4,
+        WellKnown::IsConcatSpreadable => 5,
+        WellKnown::Match => 6,
+        WellKnown::MatchAll => 7,
+        WellKnown::Replace => 8,
+        WellKnown::Search => 9,
+        WellKnown::Split => return Some(HOOK_SPLIT),
+        WellKnown::AsyncIterator | WellKnown::Unscopables => return None,
+    };
+    Some(HOOK_TEXTS[at])
+}
+
+/// Push i32 `1` when `Get(v, symbol)` of the jsval in i64 `local` is not
+/// `undefined` (`__symbol_get`: no lookup unless the chain holds a symbol
+/// key).
+pub(super) fn emit_has_hook(
+    function: &mut Function,
+    local: u32,
+    symbol: WellKnown,
+    helpers: Helpers<'_>,
+) {
+    wasm!(function;
+        LocalGet(local), I32Const(realm::symbol_addr(symbol, helpers)), Call(helpers.symbol_get()),
+        I64Const(UNDEFINED_BITS), I64Ne,
+    );
+}
+
+/// Throw the interim `TypeError` of `symbol` (design/symbol-strings.md §9.4)
+/// when the jsval in i64 `local` has a `symbol` hook ([`emit_has_hook`]):
+/// the consult site does not honour a user hook before its stage. Usable in
+/// a user function, a builtin body (`scratch` = its frame's scratch) or a
+/// helper.
+pub(super) fn emit_hook_guard(
+    function: &mut Function,
+    local: u32,
+    symbol: WellKnown,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let Some(text) = hook_text(symbol) else {
+        return;
+    };
+    emit_has_hook(function, local, symbol, helpers);
+    wasm!(function; If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_throw_not_a_function(function, text, scratch, strings, helpers);
+    leave_frame(helpers);
+    wasm!(function; End);
+}
+
 /// The default `join` separator.
 const COMMA: &str = ",";
 
@@ -61,7 +173,16 @@ pub(super) const SYMBOL_OPEN: &str = "Symbol(";
 pub(super) const SYMBOL_CLOSE: &str = ")";
 
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 12] = [
+pub(super) fn strings() -> impl Iterator<Item = &'static str> {
+    HOOK_TEXTS
+        .into_iter()
+        .chain([HOOK_SPLIT])
+        .flatten()
+        .chain(STRINGS)
+}
+
+/// The fixed static strings of this family (see [`strings`]).
+const STRINGS: [&str; 12] = [
     NO_PRIMITIVE[0],
     NO_PRIMITIVE[1],
     SYMBOL_TO_STRING[0],
@@ -108,12 +229,15 @@ pub(super) fn throw_if_symbol(
     wasm!(f; Return, End);
 }
 
-/// `__to_primitive(v: i64, hint: i32) -> i64`: `ToPrimitive` without
-/// `Symbol.toPrimitive` (phase 3). A primitive is returned as is; an object
-/// runs `OrdinaryToPrimitive`: `valueOf` then `toString` (hint string:
-/// `toString` first, and a Date's default hint is string), each looked up
-/// through the `proto` chain, skipped unless callable, its result skipped
-/// unless a primitive; neither -> `TypeError`.
+/// `__to_primitive(v: i64, hint: i32) -> i64`: `ToPrimitive`. A primitive is
+/// returned as is. An object's `@@toPrimitive` (`__symbol_get`) is honoured
+/// only when it is `%Symbol.prototype%[@@toPrimitive]` (called with `this =
+/// v`); any other user hook throws the interim `TypeError` (Y4 honours it,
+/// design/symbol-strings.md §9.4). Without one, `OrdinaryToPrimitive`:
+/// `valueOf` then `toString` (hint string: `toString` first, and a Date's
+/// default hint is string), each looked up through the `proto` chain,
+/// skipped unless callable, its result skipped unless a primitive; neither
+/// -> `TypeError`.
 pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
     let (v, hint, method, result, key, second, base) = (0, 1, 2, 3, 4, 5, 6);
     let scratch = 7;
@@ -123,6 +247,21 @@ pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers
     helpers.unwind.borrow_mut().reset();
     emit_is_object(&mut f, v);
     wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End);
+    let builtin = realm::method_bits(Builtin::Symbol(realm::SymbolOp::ToPrimitive), helpers);
+    wasm!(f;
+        LocalGet(v), I32Const(realm::symbol_addr(WellKnown::ToPrimitive, helpers)),
+        Call(helpers.symbol_get()), LocalTee(method), I64Const(UNDEFINED_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(method), I64Const(builtin), I64Eq,
+        If(BlockType::Empty),
+    );
+    emit_accessor_call(&mut f, method, v, None, base, helpers);
+    wasm!(f; Return, End);
+    if let Some(text) = hook_text(WellKnown::ToPrimitive) {
+        emit_throw_not_a_function(&mut f, text, scratch, strings, helpers);
+    }
+    wasm!(f; End);
+    return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
     wasm!(f; LocalGet(hint), I32Eqz);
     emit_load_type_byte(&mut f, v);
     wasm!(f;
@@ -411,16 +550,17 @@ pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'
     f
 }
 
-/// Replace an object key in i64 `local` by its `ToPropertyKey` (a string
-/// jsval), propagating a user `toString`/`valueOf` throw, so a key read and
-/// written by one expression (`o[k] op= v`, `o[k]++`) is converted once.
+/// Replace an object key in i64 `local` by its `ToPrimitive(hint string)` (a
+/// primitive whose `ToPropertyKey` calls no user code: a `Symbol` wrapper
+/// yields its symbol), propagating a user `toString`/`valueOf` throw, so a key
+/// read and written by one expression (`o[k] op= v`, `o[k]++`) is converted
+/// once.
 pub(super) fn emit_key_to_primitive(function: &mut Function, local: u32, helpers: Helpers<'_>) {
     emit_is_object(function, local);
     wasm!(function; If(BlockType::Empty));
     enter_frame(helpers);
     wasm!(function;
-        LocalGet(local), Call(helpers.to_str()),
-        I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(local),
+        LocalGet(local), I32Const(HINT_STRING), Call(helpers.to_primitive()), LocalSet(local),
     );
     emit_propagate_if_pending(function, helpers);
     leave_frame(helpers);

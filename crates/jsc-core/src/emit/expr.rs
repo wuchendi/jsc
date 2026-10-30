@@ -234,8 +234,11 @@ pub(super) fn emit_node(
             // Evaluate into a stable scratch slot, test the type byte, and box the
             // i32 result as a boolean jsval. `select` wants (a, b, cond), so stash
             // the cond in the i32 scratch and push it last.
+            // The for-of / `yield*` dispatch: a user `@@iterator` is not
+            // honoured before Y2 (§9.4), on the generator path either.
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::LocalSet(scratch + 22));
+            emit_iterator_guard(scratch + 22, function, scratch, strings, helpers);
             emit_is_generator(function, scratch + 22);
             function.instruction(&Instruction::LocalSet(scratch + 21));
             function.instruction(&Instruction::I64Const(TRUE_BITS));
@@ -345,6 +348,24 @@ pub(super) fn emit_node(
         IrNode::ToObject(operand) => {
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.to_object()));
+        }
+        IrNode::ToPropertyKey(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(1));
+            function.instruction(&Instruction::Call(helpers.to_key));
+            emit_propagate_if_pending(function, helpers);
+            function.instruction(&Instruction::I64ExtendI32U);
+            function.instruction(&Instruction::I64Const(HEAP_BITS));
+            function.instruction(&Instruction::I64Or);
+        }
+        IrNode::SetFunctionName {
+            func,
+            key,
+            prefix,
+            local,
+        } => {
+            emit_node(func, function, scratch, strings, helpers);
+            emit_set_function_name(*key, prefix, *local, function, strings, helpers);
         }
         IrNode::ThisGlobal => {
             // Snapshot read of the `this`-binding carrier; emitted only in a
@@ -2871,4 +2892,64 @@ pub(super) fn emit_typeof_node(
         function.instruction(&Instruction::I32Ne);
         function.instruction(&Instruction::Select);
     }
+}
+
+/// The tail of an [`IrNode::SetFunctionName`], with the function value on the
+/// stack: stash it in `local`, redefine its own `name` (configurable only) as
+/// `prefix` + the key in `key` (a string key itself; a symbol `"[desc]"`, or
+/// `""` when its description is `undefined`), and push the function again.
+fn emit_set_function_name(
+    key: u32,
+    prefix: &str,
+    local: u32,
+    function: &mut Function,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let description = MemArg {
+        offset: u64::from(abi::SYMBOL_DESCRIPTION_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    let text = |function: &mut Function, text: &str| {
+        function.instruction(&Instruction::I32Const(static_key(strings, text)));
+    };
+    function.instruction(&Instruction::LocalTee(local));
+    function.instruction(&Instruction::I32WrapI64);
+    text(function, "name");
+    if !prefix.is_empty() {
+        text(function, prefix);
+    }
+    emit_is_symbol(function, key);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(description));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    text(function, "");
+    function.instruction(&Instruction::Else);
+    text(function, "[");
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(description));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.concat));
+    text(function, "]");
+    function.instruction(&Instruction::Call(helpers.concat));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::End);
+    if !prefix.is_empty() {
+        function.instruction(&Instruction::Call(helpers.concat));
+    }
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::I32Const(abi::ATTR_CONFIGURABLE.cast_signed()));
+    function.instruction(&Instruction::Call(helpers.define));
+    function.instruction(&Instruction::LocalGet(local));
 }

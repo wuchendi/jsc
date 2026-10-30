@@ -1139,6 +1139,11 @@ impl Helpers<'_> {
         self.to_primitive() + 16
     }
 
+    /// `__symbol_get(v, sym) -> i64` (see [`props::emit_symbol_get`]).
+    fn symbol_get(self) -> u32 {
+        self.to_primitive() + 17
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1290,7 +1295,8 @@ use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
 use realm::{
-    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, intrinsic_bits,
+    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, WellKnown,
+    intrinsic_bits,
 };
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
@@ -1532,7 +1538,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_intern(helpers));
     code.function(&emit_index_value());
     code.function(&emit_index_string(helpers));
-    code.function(&emit_to_key(helpers));
+    code.function(&emit_to_key(&offsets, helpers));
     code.function(&emit_prop_find(helpers));
     code.function(&emit_define(helpers));
     code.function(&emit_fn_materialize(&offsets, helpers));
@@ -1633,6 +1639,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_own_enum(&offsets, helpers));
     code.function(&emit_set_proto(helpers));
     code.function(&builtins::emit_promise_self_error(&offsets, helpers));
+    code.function(&emit_symbol_get(helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

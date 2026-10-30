@@ -516,9 +516,12 @@ the canonical block for `s`'s content, inserting `s` (and flagging it) on a
 miss and doubling the table into a heap copy once more than half full;
 `__intern_find(s)` returns `0` on a miss, which means "absent everywhere".
 Literal-key sites pass the constant key address; computed keys go through
-`__to_key(v, insert)` (`ToPropertyKey`: an interned string is its own key, an
-integer `0 ≤ v < 2^32 - 1` is formatted in the guest, anything else goes
-through `__to_string`). Lookups use `insert = 0` but still intern a canonical
+`__to_key(v, insert)` (`ToPropertyKey`: an interned string is its own key, a
+symbol is its own key — its block address, never interned —, an object is
+converted with `ToPrimitive` (hint string; a `Symbol` wrapper yields its
+symbol) first, an integer `0 ≤ v < 2^32 - 1` is formatted in the guest,
+anything else goes through `__to_string`). `__define` sets the table's
+`HAS_SYMBOL_KEYS` when it appends a symbol key. Lookups use `insert = 0` but still intern a canonical
 array index, so an element is found by an index key no property used. The
 table is never pruned.
 
@@ -813,6 +816,7 @@ function-index order:
 | JSON (§7.9) | `__json_rep(holder, key, value, replacer, list, stack)` — `SerializeJSONProperty` (`toJSON`, replacer function with `this = holder`, property list, wrapper unwrapping, cycle `TypeError` via the `stack` array); `__json_indent(s, gap)` — re-indent compact text for `space`; `__json_revive(holder, key, reviver)` — `InternalizeJSONProperty` |
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 | promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
+| well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, short-circuited to `undefined` unless a table on `v`'s chain has `HAS_SYMBOL_KEYS` (the consult sites of the interim hook guards, §13) |
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already
@@ -905,11 +909,18 @@ tables. Keys are interned `u32`s.
   that is neither an object nor `null` is ignored) calls `__set_proto` and
   throws on a rejection.
 - **Own-key order** (`__own_keys(obj, mode)`, behind `Object.keys/values/entries`,
-  `JSON.stringify`, object rest, and the renderers): integer keys ascending
-  (array elements skipping holes, then table keys flagged `ARRAY_INDEX` sorted
-  numerically when the table has `HAS_INDEX_KEYS`), then the other string keys
-  in insertion order. `mode` selects enumerable keys, values, entries, or all
-  keys. Values and entries follow EnumerableOwnProperties: the key list is
+  `JSON.stringify`, `for-in`, object rest, the `Object` statics, and the
+  renderers): integer keys ascending (array elements skipping holes, then
+  table keys flagged `ARRAY_INDEX` sorted numerically when the table has
+  `HAS_INDEX_KEYS`), then the other string keys in insertion order, then — in
+  `OWN_ALL_KEYS` only — the symbol keys in insertion order. `mode` selects
+  enumerable string keys, values, entries, all string keys (`OWN_ALL`,
+  `getOwnPropertyNames`), all symbol keys (`OWN_SYMBOLS`,
+  `getOwnPropertySymbols`), or every key (`OWN_ALL_KEYS`: object rest,
+  `Object.assign`, `defineProperties` / `create`,
+  `getOwnPropertyDescriptors`, which check enumerability per key); every
+  string-key mode skips symbol keys, and the symbol walks are skipped when the
+  table lacks `HAS_SYMBOL_KEYS`. Values and entries follow EnumerableOwnProperties: the key list is
   taken once, then each key is re-checked as own and enumerable (`__own_enum`)
   when visited and skipped if a getter deleted it or made it non-enumerable;
   a key a getter adds is not visited. Only a getter can run between the
@@ -920,7 +931,9 @@ tables. Keys are interned `u32`s.
   enumerable string keys, then each prototype's enumerable keys not already
   seen (a key seen at a nearer level, enumerable or not, shadows it).
 - **Object rest** (`__rest`): a fresh object with every own enumerable property
-  of the source whose key is not in the exclusion list.
+  of the source (string keys, then symbol keys; an object source re-checks
+  each key as own and enumerable when visited) whose key is not in the
+  exclusion list.
 
 ### 6.4 Realm, global object, and fast paths
 
@@ -1046,7 +1059,10 @@ cell, which records why a change was accepted.
 
 ### 6.5 Conversions
 
-- **`ToPrimitive`** (`__to_primitive(v, hint)`) is `OrdinaryToPrimitive`: it
+- **`ToPrimitive`** (`__to_primitive(v, hint)`) first looks up the object's
+  `@@toPrimitive` (`__symbol_get`): `%Symbol.prototype%[@@toPrimitive]` is
+  called (a `Symbol` wrapper yields its symbol), any other hook throws the
+  interim `TypeError` (§13). Without one it is `OrdinaryToPrimitive`: it
   calls `valueOf` then `toString` (`toString` first for hint string) through
   `__get`, takes the first primitive result, and throws `TypeError` when
   neither yields one. The host never sees an object that has a user
@@ -1350,7 +1366,12 @@ those of `switch` and loops are not tracked.
 
 - **Object literals** with identifier, string, numeric, and computed keys,
   shorthand properties, methods, and getters/setters; keys are defined in
-  source order with `__define`, `proto = %Object.prototype%`. A `__proto__: v`
+  source order with `__define`, `proto = %Object.prototype%`. A method,
+  accessor, or anonymous function / arrow value under a computed (or
+  numeric) key gets its `name` at run time from the key, converted once
+  before the value (`SetFunctionName`: the string key, `"[desc]"` for a
+  symbol, `""` for a symbol without a description; `get ` / `set `
+  prefixed). A `__proto__: v`
   entry (identifier or string key; not computed, shorthand, method or
   accessor) defines no property: `v` is evaluated in source order and becomes
   the `[[Prototype]]` when it is an object or `null`, else it is ignored
@@ -1545,7 +1566,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 |---|---|
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` (both, like `Number(s)`, skip JS whitespace: Unicode `WhiteSpace`, `LineTerminator`, U+FEFF) |
 | `console` | `log` |
-| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over what `for-of` iterates); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
+| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over what `for-of` iterates); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
 | `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
@@ -1839,8 +1860,18 @@ Each item below is current behaviour of this tree.
   pattern with RegExp syntax throws a `TypeError`, and `matchAll` (a RegExp
   string iterator) always throws one.
 - No `void`.
-- `Symbol` exists (§7) but symbol-keyed properties on user objects and
-  user-defined iterables do not yet (wave 3c, `design/symbol-strings.md`).
+- Symbol-keyed properties work on every object, but no well-known symbol
+  hook is honoured yet (wave 3c, `design/symbol-strings.md` §9.4): a user
+  `@@iterator` reached by for-of, spread, destructuring, `yield*`,
+  `Array.from`, `Object.fromEntries` or the Map/Set constructors, a user
+  `@@toPrimitive` (only `%Symbol.prototype%`'s is called), a
+  `@@toStringTag` other than `%Symbol.prototype%`'s, an `instanceof`
+  right-hand side's `@@hasInstance`, a `@@species` on the constructor
+  `ArraySpeciesCreate` reads, a `@@isConcatSpreadable` on a `concat` item,
+  and an object argument's `@@match` / `@@matchAll` / `@@replace` /
+  `@@search` / `@@split` to a String method each throw `TypeError:
+  Symbol.<name> is not supported yet` (`Symbol.iterator protocol is not
+  supported yet`).
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
@@ -1856,15 +1887,15 @@ Each item below is current behaviour of this tree.
 - Property tables are linear-scanned; there are no inline caches.
 - No object spread (`{...o}`); object patterns accept only identifier and
   string keys; `catch` parameters must be identifiers.
-- `ArraySpeciesCreate` reads `constructor` only (there is no `Symbol`, so no
-  `@@species`): `undefined` creates a plain array, a non-object throws, and an
-  object `C` stands in for `C[@@species]` as the builtin `@@species` getters
-  would answer: `C` itself when its prototype chain reaches `%Array%`,
+- `ArraySpeciesCreate` reads `constructor` and no builtin `@@species` exists
+  yet (a user one throws, above): `undefined` creates a plain array, a
+  non-object throws, and an object `C` stands in for `C[@@species]` as the
+  builtin `@@species` getters would answer: `C` itself when its prototype chain reaches `%Array%`,
   `%Map%`, `%Set%` or `%Promise%` (so an `Array` subclass gets instances of
   itself, `%Array%` a plain array), else a plain array. `concat` spreads by
-  `IsArray` only (no `@@isConcatSpreadable`), and `Array.from` treats an object
-  that is neither an array-like source nor a runtime iterable as an array-like
-  (user `@@iterator` waits for `Symbol`).
+  `IsArray` only (a `@@isConcatSpreadable` throws), and `Array.from` treats an
+  object that is neither an array-like source nor a runtime iterable as an
+  array-like (a user `@@iterator` throws).
 - Array-like lengths are clamped to `2^32 - 1` by the generic loops of `map`,
   `filter`, `forEach`, `reduce`, `join`, `concat` and `flat` (`map` sizes its
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the

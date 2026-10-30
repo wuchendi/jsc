@@ -673,6 +673,7 @@ pub(super) enum ReflectOp {
     GetPrototypeOf,
     SetPrototypeOf,
     GetOwnPropertyNames,
+    GetOwnPropertySymbols,
     Assign,
     HasOwn,
     Is,
@@ -681,7 +682,7 @@ pub(super) enum ReflectOp {
 
 impl ReflectOp {
     /// Every op, in [`Builtin::ALL`] order.
-    const ALL: [ReflectOp; 18] = [
+    const ALL: [ReflectOp; 19] = [
         Self::DefineProperty,
         Self::DefineProperties,
         Self::GetOwnPropertyDescriptor,
@@ -696,6 +697,7 @@ impl ReflectOp {
         Self::GetPrototypeOf,
         Self::SetPrototypeOf,
         Self::GetOwnPropertyNames,
+        Self::GetOwnPropertySymbols,
         Self::Assign,
         Self::HasOwn,
         Self::Is,
@@ -719,6 +721,7 @@ impl ReflectOp {
             Self::GetPrototypeOf => "getPrototypeOf",
             Self::SetPrototypeOf => "setPrototypeOf",
             Self::GetOwnPropertyNames => "getOwnPropertyNames",
+            Self::GetOwnPropertySymbols => "getOwnPropertySymbols",
             Self::Assign => "assign",
             Self::HasOwn => "hasOwn",
             Self::Is => "is",
@@ -901,7 +904,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 238] = [
+    pub(super) const ALL: [Builtin; 239] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -999,6 +1002,7 @@ impl Builtin {
         Self::ObjectReflect(ReflectOp::ALL[15]),
         Self::ObjectReflect(ReflectOp::ALL[16]),
         Self::ObjectReflect(ReflectOp::ALL[17]),
+        Self::ObjectReflect(ReflectOp::ALL[18]),
         Self::IsArray,
         Self::ArrayOf,
         Self::ArrayFrom,
@@ -1852,7 +1856,7 @@ fn symbol_prototype_entries(entries: &mut Vec<Entry>) {
 }
 
 /// The statics of `Object`, in slot order.
-const OBJECT_STATICS: [Builtin; 21] = [
+const OBJECT_STATICS: [Builtin; 22] = [
     Builtin::ObjectStatic(ObjectBuiltinOp::Keys),
     Builtin::ObjectStatic(ObjectBuiltinOp::Values),
     Builtin::ObjectStatic(ObjectBuiltinOp::Entries),
@@ -1874,6 +1878,7 @@ const OBJECT_STATICS: [Builtin; 21] = [
     Builtin::ObjectReflect(ReflectOp::ALL[15]),
     Builtin::ObjectReflect(ReflectOp::ALL[16]),
     Builtin::ObjectReflect(ReflectOp::ALL[17]),
+    Builtin::ObjectReflect(ReflectOp::ALL[18]),
 ];
 
 /// The builtin method `intrinsic.key` of the registry, if any.
@@ -2004,6 +2009,12 @@ pub(super) fn intrinsic_addr_bits(base: i32, intrinsic: Intrinsic) -> i64 {
 /// The heap-pointer jsval of `intrinsic` (a compile-time constant).
 pub(super) fn intrinsic_bits(intrinsic: Intrinsic, helpers: Helpers<'_>) -> i64 {
     intrinsic_addr_bits(helpers.realm(), intrinsic)
+}
+
+/// The address of `symbol`'s static `TYPE_SYMBOL` block: its property key (a
+/// compile-time constant).
+pub(super) fn symbol_addr(symbol: WellKnown, helpers: Helpers<'_>) -> i32 {
+    (helpers.realm().cast_unsigned() + symbol_offset(&registry(), symbol)).cast_signed()
 }
 
 /// The heap-pointer jsval of `builtin`'s static method block (a

@@ -233,7 +233,7 @@ pub(super) fn emit_builtin(
     match builtin {
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(&mut f, frame, strings, helpers),
-        Builtin::ObjectToString => object::emit_to_string(&mut f, frame, strings),
+        Builtin::ObjectToString => object::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::ValueOf => object::emit_value_of(&mut f, frame, strings, helpers),
         Builtin::IsPrototypeOf => object::emit_is_prototype_of(&mut f, frame, strings, helpers),
         Builtin::ToLocaleString => object::emit_to_locale_string(&mut f, frame, strings, helpers),

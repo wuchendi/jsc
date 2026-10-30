@@ -108,13 +108,18 @@ pub(super) fn emit_has_own_property(
 }
 
 /// `Object.prototype.toString()`: `"[object <tag>]"` with the builtin tag of
-/// `this`, Map/Set/Promise/Generator by kind (`Symbol.toStringTag` is phase 3).
+/// `this`, Map/Set/Promise/Generator by kind. A `@@toStringTag` on `this`'s
+/// chain (`__symbol_get`) other than `%Symbol.prototype%`'s `"Symbol"` seen
+/// from a symbol or `Symbol` wrapper (which the kind table agrees with)
+/// throws the interim `TypeError` (Y4 honours it, design/symbol-strings.md
+/// §9.4).
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
     strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
 ) {
-    let (this, kind) = (frame.i64(0), frame.i32(0));
+    let (this, kind, tag) = (frame.i64(0), frame.i32(0), frame.i64(1));
     let tag_if = |function: &mut Function, tag: &str| {
         wasm!(function; If(BlockType::Empty));
         push_str(function, strings, tag);
@@ -124,6 +129,20 @@ pub(super) fn emit_to_string(
     tag_if(function, TAG_UNDEFINED);
     wasm!(function; LocalGet(this), I64Const(NULL_BITS), I64Eq);
     tag_if(function, TAG_NULL);
+    wasm!(function;
+        LocalGet(this), I32Const(realm::symbol_addr(WellKnown::ToStringTag, helpers)),
+        Call(helpers.symbol_get()), LocalTee(tag), I64Const(UNDEFINED_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(tag), I64Const(HEAP_BITS | i64::from(static_key(strings, "Symbol"))), I64Ne,
+    );
+    emit_is_symbol(function, this);
+    emit_is_wrapper(function, this, abi::CLASS_SYMBOL);
+    wasm!(function; I32Or, I32Eqz, I32Or, If(BlockType::Empty));
+    if let Some(text) = hook_text(WellKnown::ToStringTag) {
+        throw_type_error(function, frame, text, strings, helpers);
+    }
+    wasm!(function; End, End);
+    return_if_pending(function);
     wasm!(function;
         LocalGet(this), I64Const(TRUE_BITS), I64Eq,
         LocalGet(this), I64Const(FALSE_BITS), I64Eq, I32Or,
