@@ -1175,7 +1175,7 @@ Y4 reason drafts (one line per affected row, for the final CI pass):
   table with `HAS_SYMBOL_KEYS`, so `instanceof Array` takes the type-byte arm
   again despite `%Array%`'s `@@species` getter (Y4-T5); `instanceof Object`
   walks the operand's chain for `%Object.prototype%` instead of one kind
-  test (Y4-T5, a correctness fix).
+  test (Y4-T5, a correctness fix); `instanceof Array` / `Function` / `Date` walk the chain for the realm prototype instead of a type-byte test, one extra proto load + compare in the common case (Y4-T6, a correctness fix).
 - `array_hofs`, promise rows: sealed programs using `map` / `filter` /
   `then` / `finally` now track dirty bits (bits 20 / 21); `species_ctor`
   with tracking is `Get(constructor)` plus a compare (Y4-T3).

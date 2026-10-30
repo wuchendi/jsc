@@ -385,17 +385,21 @@ pub enum PropKey {
 /// the immutable `%Function.prototype%[@@hasInstance]`. A failing test runs
 /// `InstanceofOperator` on the constructor's realm value instead.
 ///
-/// The fast arms: `Array` / `Function` / `Date` match the receiver's runtime
-/// TYPE BYTE; `Object` and the error constructors search the receiver's
-/// `proto` chain for the constructor's (non-writable, non-configurable)
-/// static prototype, so `Object.create(null) instanceof Object` is `false`.
+/// The fast arms search the receiver's `proto` chain for the constructor's
+/// (non-writable, non-configurable) static prototype, so
+/// `Object.create(null) instanceof Object` and
+/// `Object.setPrototypeOf([], null) instanceof Array` are `false` while
+/// `Object.create(Array.prototype) instanceof Array` is `true`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceOfKind {
-    /// `instanceof Array` — the receiver is a heap `TYPE_ARRAY` block.
+    /// `instanceof Array` — `%Array.prototype%` is on the receiver's `proto`
+    /// chain.
     Array,
-    /// `instanceof Function` — the receiver is a heap `TYPE_FUNCTION` value.
+    /// `instanceof Function` — `%Function.prototype%` is on the receiver's
+    /// `proto` chain.
     Function,
-    /// `instanceof Date` — the receiver is a heap `TYPE_DATE` block.
+    /// `instanceof Date` — `%Date.prototype%` is on the receiver's `proto`
+    /// chain.
     Date,
     /// `instanceof Object` — `%Object.prototype%` is on the receiver's `proto`
     /// chain.
