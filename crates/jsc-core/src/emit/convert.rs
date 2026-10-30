@@ -63,11 +63,7 @@ pub(super) const SYMBOL_TO_NUMBER: CalleeErrorText<'static> = [
 /// The interim `TypeError`s of a well-known symbol hook a consult site finds
 /// before the stage that honours it (design/symbol-strings.md §9.4), in
 /// [`hook_text`] order.
-const HOOK_TEXTS: [CalleeErrorText<'static>; 7] = [
-    [
-        "Symbol.hasInstance is not supported yet",
-        "TypeError: Symbol.hasInstance is not supported yet",
-    ],
+const HOOK_TEXTS: [CalleeErrorText<'static>; 6] = [
     [
         "Symbol.species is not supported yet",
         "TypeError: Symbol.species is not supported yet",
@@ -103,23 +99,24 @@ const HOOK_SPLIT: CalleeErrorText<'static> = [
 /// The interim `TypeError` of a `symbol` hook (see [`HOOK_TEXTS`]); `None`
 /// for the symbols without an interim guard (`@@iterator`, honoured by the
 /// iteration protocol; `@@toPrimitive` / `@@toStringTag`, honoured by
-/// `ToPrimitive` / `Object.prototype.toString`; `@@asyncIterator`,
+/// `ToPrimitive` / `Object.prototype.toString`; `@@hasInstance`, honoured by
+/// `instanceof`; `@@asyncIterator`,
 /// `@@unscopables`, without a consult site).
 pub(super) fn hook_text(symbol: WellKnown) -> Option<CalleeErrorText<'static>> {
     let at = match symbol {
-        WellKnown::HasInstance => 0,
-        WellKnown::Species => 1,
-        WellKnown::IsConcatSpreadable => 2,
-        WellKnown::Match => 3,
-        WellKnown::MatchAll => 4,
-        WellKnown::Replace => 5,
-        WellKnown::Search => 6,
+        WellKnown::Species => 0,
+        WellKnown::IsConcatSpreadable => 1,
+        WellKnown::Match => 2,
+        WellKnown::MatchAll => 3,
+        WellKnown::Replace => 4,
+        WellKnown::Search => 5,
         WellKnown::Split => return Some(HOOK_SPLIT),
         WellKnown::Iterator
         | WellKnown::AsyncIterator
         | WellKnown::Unscopables
         | WellKnown::ToPrimitive
-        | WellKnown::ToStringTag => return None,
+        | WellKnown::ToStringTag
+        | WellKnown::HasInstance => return None,
     };
     Some(HOOK_TEXTS[at])
 }

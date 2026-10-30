@@ -2,7 +2,9 @@
 //! (`design/symbol-strings.md` §4): `@@toPrimitive` in `ToPrimitive`
 //! (hint strings, `GetMethod` errors, the `OrdinaryToPrimitive` fallback,
 //! `Date.prototype[@@toPrimitive]`) and `@@toStringTag` in
-//! `Object.prototype.toString` (builtin tags as real properties, user tags).
+//! `Object.prototype.toString` (builtin tags as real properties, user tags);
+//! `@@hasInstance` in `instanceof` (`InstanceofOperator`) and
+//! `Function.prototype[@@hasInstance]`.
 
 mod common;
 use common::{assert_bool, assert_number, assert_string, assert_uncaught};
@@ -172,5 +174,164 @@ fn non_string_to_string_tag_is_ignored() {
     assert_string(
         "delete Map.prototype[Symbol.toStringTag]; Object.prototype.toString.call(new Map())",
         "[object Object]",
+    );
+}
+
+// --- @@hasInstance ---------------------------------------------------------------
+
+#[test]
+fn user_has_instance_on_an_object_rhs() {
+    assert_bool("1 instanceof { [Symbol.hasInstance]: () => true }", true);
+    assert_bool(
+        "({}) instanceof { [Symbol.hasInstance]: () => false }",
+        false,
+    );
+    assert_bool(
+        "let seen; let C = { [Symbol.hasInstance](v) { seen = [this, v]; return true } }; \
+         let x = {}; x instanceof C && seen[0] === C && seen[1] === x",
+        true,
+    );
+}
+
+#[test]
+fn static_has_instance_on_a_class() {
+    assert_bool(
+        "class Even { static [Symbol.hasInstance](n) { return n % 2 === 0 } } \
+         2 instanceof Even && !(3 instanceof Even)",
+        true,
+    );
+    assert_bool(
+        "class A { static [Symbol.hasInstance]() { return false } } new A() instanceof A",
+        false,
+    );
+    // A subclass inherits the static hook.
+    assert_bool(
+        "class A { static [Symbol.hasInstance]() { return true } } class B extends A {} \
+         1 instanceof B",
+        true,
+    );
+}
+
+#[test]
+fn has_instance_result_is_coerced_with_to_boolean() {
+    assert_bool("1 instanceof { [Symbol.hasInstance]: () => 'x' }", true);
+    assert_bool("1 instanceof { [Symbol.hasInstance]: () => 0 }", false);
+    assert_bool("1 instanceof { [Symbol.hasInstance]: () => ({}) }", true);
+    assert_bool("1 instanceof { [Symbol.hasInstance]: () => '' }", false);
+    assert_string(
+        "typeof (1 instanceof { [Symbol.hasInstance]: () => 1 })",
+        "boolean",
+    );
+}
+
+#[test]
+fn non_callable_has_instance_throws() {
+    assert_uncaught(
+        "({}) instanceof { [Symbol.hasInstance]: 1 }",
+        "TypeError: Symbol.hasInstance is not a function",
+    );
+    assert_uncaught(
+        "function F() {} Object.defineProperty(F, Symbol.hasInstance, { value: {} }); \
+         ({}) instanceof F",
+        "TypeError: Symbol.hasInstance is not a function",
+    );
+    // An absent hook on a non-callable right-hand side still throws.
+    assert_uncaught(
+        "({}) instanceof {}",
+        "TypeError: Right-hand side of 'instanceof' is not callable",
+    );
+    // A null hook is absent: `OrdinaryHasInstance` runs.
+    assert_bool(
+        "function F() {} Object.defineProperty(F, Symbol.hasInstance, { value: null }); \
+         new F() instanceof F",
+        true,
+    );
+}
+
+#[test]
+fn function_prototype_has_instance_descriptor() {
+    let d = "let d = Object.getOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance);";
+    assert_bool(
+        &format!(
+            "{d} typeof d.value === 'function' && !d.writable && !d.enumerable && !d.configurable"
+        ),
+        true,
+    );
+    assert_string(&format!("{d} d.value.name"), "[Symbol.hasInstance]");
+    assert_number(&format!("{d} d.value.length"), 1.0);
+    // Non-writable: an assignment through a constructor does not shadow it.
+    assert_bool(
+        "function F() {} try { F[Symbol.hasInstance] = () => true } catch (e) {} \
+         !Object.getOwnPropertySymbols(F).length && !(1 instanceof F)",
+        true,
+    );
+}
+
+#[test]
+fn function_prototype_has_instance_call() {
+    let h = "let h = Function.prototype[Symbol.hasInstance];";
+    assert_bool(&format!("{h} class A {{}} h.call(A, new A())"), true);
+    assert_bool(&format!("{h} class A {{}} h.call(A, {{}})"), false);
+    // A non-callable `this` is `false`, not a `TypeError`.
+    assert_bool(&format!("{h} h.call({{}}, {{}})"), false);
+    // A primitive value is `false`.
+    assert_bool(&format!("{h} class A {{}} h.call(A, 1)"), false);
+    // `this`'s own `@@hasInstance` is not consulted.
+    assert_bool(
+        &format!("{h} class A {{ static [Symbol.hasInstance]() {{ return true }} }} h.call(A, 1)"),
+        false,
+    );
+}
+
+#[test]
+fn function_prototype_has_instance_on_a_bound_function() {
+    let h = "let h = Function.prototype[Symbol.hasInstance];";
+    assert_bool(
+        &format!("{h} class A {{}} let B = A.bind(null); h.call(B, new A())"),
+        true,
+    );
+    assert_bool(
+        &format!("{h} class A {{}} let B = A.bind(null); h.call(B, {{}})"),
+        false,
+    );
+    assert_bool(
+        "class A {} let B = A.bind(null).bind(null); new A() instanceof B",
+        true,
+    );
+    // A bound function restarts `InstanceofOperator` on its target.
+    assert_bool(
+        "class A { static [Symbol.hasInstance]() { return true } } 1 instanceof A.bind(null)",
+        true,
+    );
+}
+
+#[test]
+fn builtin_instanceof_arms_unchanged() {
+    assert_bool("[] instanceof Array", true);
+    assert_bool("({}) instanceof Array", false);
+    assert_bool("(() => 1) instanceof Function", true);
+    assert_bool("new Date(0) instanceof Date", true);
+    assert_bool("[] instanceof Object", true);
+    assert_bool("1 instanceof Object", false);
+    assert_bool("new TypeError('x') instanceof Error", true);
+    assert_bool("new RangeError('x') instanceof TypeError", false);
+}
+
+#[test]
+fn builtin_constructor_own_has_instance_is_honoured() {
+    assert_bool(
+        "Object.defineProperty(Array, Symbol.hasInstance, { value: () => false }); \
+         [] instanceof Array",
+        false,
+    );
+    assert_bool(
+        "Object.defineProperty(Error, Symbol.hasInstance, { value: () => true }); \
+         1 instanceof TypeError",
+        true,
+    );
+    assert_bool(
+        "Object.defineProperty(Object, Symbol.hasInstance, { value: () => true }); \
+         1 instanceof Object",
+        true,
     );
 }
