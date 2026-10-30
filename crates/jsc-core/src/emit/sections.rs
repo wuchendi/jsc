@@ -838,6 +838,9 @@ pub(super) fn collect_node<'a>(
         | IrNode::Throw(operand)
         // A generator `yield e` carries only its operand.
         | IrNode::Yield(operand)
+        | IrNode::YieldDelegate {
+            iterable: operand, ..
+        }
         | IrNode::AwaitMark(operand)
         | IrNode::ObjectBuiltin { arg: operand, .. } => {
             collect_node(operand, order, seen);
@@ -1175,6 +1178,7 @@ pub(super) fn collect_node<'a>(
         // guard) and resume a generator fast path (a running generator
         // throws); their own texts are the realm's (`builtins::strings`).
         IrNode::GetIterator { .. }
+        | IrNode::OpenIterator { .. }
         | IrNode::IteratorStep(_)
         | IrNode::IteratorValue(_)
         | IrNode::IteratorClose { .. } => {
@@ -1185,7 +1189,7 @@ pub(super) fn collect_node<'a>(
                     order.push(key);
                 }
             }
-            if let IrNode::GetIterator { value, .. } = node {
+            if let IrNode::GetIterator { value, .. } | IrNode::OpenIterator { value, .. } = node {
                 collect_node(value, order, seen);
             }
         }

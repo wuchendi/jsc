@@ -462,12 +462,11 @@ Notes per kind:
   rejected `2`, plus the settled `value`) so a memory snapshot can render them;
   reactions live in the host engine (§6.7).
 - **Generator** handles carry the state-machine table slot, the resume state,
-  the `done` flag, the guest-only `limits` bits (`1` the body has a `finally`
-  or `yield*`, so `return()` at a suspended `yield` is unsupported; `2` the body
-  has a `yield*`, so `throw()` is unsupported; `4` the state machine is
+  the `done` flag, the guest-only `limits` bits (`4` the state machine is
   running, so re-entering it throws; `8` an async generator; `16` its last
   suspend was an `await`; `32` it is executing or awaiting, so queued requests
-  wait), the frame (a `TYPE_ENV` of cells holding every generator local), and
+  wait; bits `8..=9` the resumption mode — `1` throw, `2` return — of a resume
+  entered with the value pending, written by `throw()` / `return()`), the frame (a `TYPE_ENV` of cells holding every generator local), and
   an async generator's request queue (§7.8): a linked list of internal
   `TYPE_ENV` records `[value, promise, kind, next]`.
 - **Accessor** blocks are the value of an `ACCESSOR` property-table entry; they
@@ -1053,7 +1052,7 @@ path, never semantics:
 | `N.m(..)` on a non-inline namespace (`NamespaceGuard`) | the same inline code | watched namespace: `N === %N%` and its dirty bit clear; constructor namespace: `N.m` is the builtin method | the generic method call |
 | `recv.m(..)` with a builtin prototype method name (`ProtoGuard`) | inline per receiver family (Array, Map, Set, Map-or-Set, Promise, Date, Generator) | the kind byte matches, `props == 0` (an array also not `DICTIONARY`), `proto` is the family's realm prototype, and (unless intrinsics-sealed) its dirty bit is clear (an array also needs `%Object.prototype%`'s, since its fast paths read a hole as absent and append without consulting the chain); `push(x)` also needs `length < 2^32 - 1` (the builtin throws the `RangeError`) | a string receiver whose key names a `String.prototype` builtin calls it directly (its dirty bit clear); else one call of the shared out-of-line `MethodCall` builtin |
 | `.length` | string `len @4`, array `len @16` | the kind byte | `__get(recv, "length")` |
-| `GetIterator` (for-of, `yield*`, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes (`design/symbol-strings.md` §5.3); decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: no `@@iterator` on its chain. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
+| `GetIterator` (for-of, spread, destructuring, `Array.from`, `Object.fromEntries`, the Map/Set constructors) | a clean array / `arguments` walked by index, a string by code point, a `Map` / `Set` by backing entry, a generator by direct state-machine resumes (`design/symbol-strings.md` §5.3); decided once per loop | the receiver test of `ProtoGuard` for its family (a generator: the `next` call site's), plus clear bits for its iterator prototype and `%IteratorPrototype%` (a string: `%String.prototype%`'s); `arguments`: no `@@iterator` on its chain. Unless intrinsics-sealed, only with dirty tracking (a builtin body or a spread tests the bits only when the program tracks them; a spread source or an unsealed `GetIterator` turns tracking on) | the protocol: `GetMethod(@@iterator)`, its call, `next` read once (the internal `Protocol` builtins) |
 | `x instanceof C` | — | — | `OrdinaryHasInstance` (§7.6) |
 
 The shared **`MethodCall`** builtin is the generic call for every guarded site:
@@ -1538,8 +1537,13 @@ control flow. A `yield` may appear inside a larger expression
   inherits its function's `prototype` read at call time, or
   `%GeneratorPrototype%` when that is not an object; so `g() instanceof g`.
   `it.next(v)` sends `v` and returns a fresh `{ value, done }` object;
-  `return(v)` and `throw(e)` complete or throw at the suspended `yield`
-  (`throw` reaches an enclosing `catch`). These are ordinary methods: a user
+  `throw(e)` throws at the suspended `yield` (reaching an enclosing `catch`)
+  and `return(v)` injects a return completion there: the state machine
+  resumes with `v` pending and the mode set, and the resumed `yield` enters
+  its return block, which runs the enclosing `finally` blocks (a `finally`
+  may `yield` again or override the value) before completing with
+  `{ value: v, done: true }`. Before the first `next` or after completion
+  both complete the generator directly. These are ordinary methods: a user
   object's own `next` is called like any method. An `it.next(v)` call site
   runs the resume inline while `it` is a generator without own properties
   whose `proto` is `%GeneratorPrototype%`, or an object without own
@@ -1547,8 +1551,15 @@ control flow. A `yield` may appear inside a larger expression
   `%GeneratorPrototype%` is clean (§6.4); otherwise it is a method call.
   `%GeneratorFunction.prototype%` is not modeled: a generator function
   inherits `%Function.prototype%`.
-- `yield* g` as a statement delegates to any iterable source (§7.3); in
-  expression position it is a compile error.
+- `yield* g` is an expression whose value is the delegate's return value.
+  The CFG builder expands it into a loop over the protocol iterator of `g`
+  (`next` read once): the outer generator's `next(v)` / `throw(e)` /
+  `return(v)` resume its `yield` into per-mode blocks that call the
+  delegate's `next(v)` / `throw(e)` / `return(v)` (`GetMethod`); a delegate
+  without `throw` is closed, then a `TypeError` is thrown; one without
+  `return` completes the outer generator with `return v`; a non-object
+  result throws a `TypeError`. The outer generator yields the result's
+  `value` (a fresh result object, not the delegate's).
 
 **`async`/`await`.** An `async function` (in every position a `function*` may
 take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
@@ -1585,9 +1596,9 @@ the body is busy:
 - An abrupt request before the body started completes it. On a completed
   generator `next` fulfills `{ undefined, done: true }`, `throw(e)` rejects
   with `e`, and `return(v)` awaits `v` and fulfills `{ v, done: true }` (or
-  rejects). `return(v)` at a suspended `yield` completes the generator the
-  same way, except that a body with a `finally` rejects it with a
-  `TypeError` (as for generators).
+  rejects). `return(v)` at a suspended `yield` resumes the body with a
+  return completion there, which awaits `v`, then runs the enclosing
+  `finally` blocks like a generator's.
 - `yield*` in an async generator is a compile error.
 
 **Promises.** `new Promise(executor)`, `Promise.resolve`, `Promise.reject`,
@@ -1995,21 +2006,15 @@ Each item below is current behaviour of this tree.
   async generator.
 - A `yield`/`await` that would carry a per-node compiler temporary across the
   suspend is a compile error (`super.m(yield x)`, `o[yield k]?.(yield v)`).
-- `yield*` is supported only as a statement; it does not thread sent values or
-  the delegate's return value.
-- `return()` at a suspended `yield` in a body with a `finally` or a `yield*`,
-  and `throw()` in a body with a `yield*`, throw a `TypeError` (an async
-  generator's `return()` rejects with it) — so does the `IteratorClose` of
-  such a generator when a `for-of` over it exits early (on a throw exit the
-  close's error is discarded and the `finally` does not run); `return()` of a
-  generator suspended inside a `for-of` does not close that loop's iterator.
+- `yield*` yields a fresh `{ value, done }` object carrying the delegate
+  result's `value` rather than the delegate's result object itself, and
+  calls the delegate's methods without a fast path for a clean generator.
 - An async generator object renders as `Object [Generator]` and
   `Object.prototype.toString` reports `[object Generator]` for it; functions
   render as `[Function: f]` whatever their kind.
 - Array destructuring drains its source completely before binding (no
   `IteratorClose`; an infinite generator runs out of memory); `for-of`,
-  `yield*` and the builtin consumers step lazily. `yield*` forwards values
-  only (no sent value, `return()` / `throw()`, or result value), and the
+  `yield*` and the builtin consumers step lazily, and the
   Map/Set constructors collect a source other than a clean Map/Set first
   (no `IteratorClose` when the adder throws).
 - Thenables are not assimilated: `await t` and `Promise.resolve(t)` on a

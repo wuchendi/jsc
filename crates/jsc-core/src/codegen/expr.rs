@@ -62,9 +62,11 @@ impl LowerCtx<'_> {
             // `yield e` / `yield`: lower the operand and wrap it. The
             // generator segmentation pass consumes every `Yield`; one that reaches
             // the backend means an unsupported yield position (rejected there).
-            // `yield*` (delegate) is a statement, lowered by `lower_yield_delegate`.
+            // `yield* e` lowers to an `IrNode::YieldDelegate` the CFG builder
+            // expands (see `lower_yield_delegate`).
             // In an async generator `yield e` first awaits `e`.
-            Expr::Yield(yield_expr) if !yield_expr.delegate => {
+            Expr::Yield(yield_expr) if yield_expr.delegate => self.lower_yield_delegate(yield_expr),
+            Expr::Yield(yield_expr) => {
                 let arg = match &yield_expr.arg {
                     Some(arg) => self.lower_expr(arg)?,
                     None => IrNode::Undefined,
@@ -2352,7 +2354,6 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
-        Expr::Yield(_) => "`yield*` is only supported as a statement",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",

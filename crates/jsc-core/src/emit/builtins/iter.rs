@@ -942,6 +942,30 @@ pub(in crate::emit) fn emit_get_iterator(
     wasm!(function; End);
 }
 
+/// Emit [`IrNode::OpenIterator`]: evaluate `value`, then open its protocol
+/// iterator into `rec` (no fast path; a throw leaves the record done).
+pub(in crate::emit) fn emit_open_iterator(
+    value: &IrNode,
+    rec: &IterRecord,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let (v, method) = (scratch + 22, scratch + 24);
+    emit_node(value, function, scratch, strings, helpers);
+    wasm!(function; LocalSet(v));
+    store(
+        function,
+        &rec.state,
+        IrNode::Num(ST_DONE),
+        scratch,
+        strings,
+        helpers,
+    );
+    emit_iter_open(function, v, method, rec, scratch, strings, helpers);
+}
+
 /// Emit [`IrNode::IteratorStep`], pushing i32 `1` when the record produced
 /// a value (in `rec.result`), `0` once done. The fast paths run in the
 /// order array, string, Map, Set, generator, `arguments`.

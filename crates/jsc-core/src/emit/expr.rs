@@ -234,6 +234,10 @@ pub(super) fn emit_node(
             builtins::emit_get_iterator(value, rec, *sealed, function, scratch, strings, helpers);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
+        IrNode::OpenIterator { value, rec } => {
+            builtins::emit_open_iterator(value, rec, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
         IrNode::IteratorStep(rec) => {
             builtins::emit_iterator_step(rec, function, scratch, strings, helpers);
             function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
@@ -259,7 +263,7 @@ pub(super) fn emit_node(
         }
         // `Yield` is consumed by the generator segmentation pass; reaching emit
         // means an unsupported yield position slipped past codegen's diagnostics.
-        IrNode::Yield(_) => {
+        IrNode::Yield(_) | IrNode::YieldDelegate { .. } => {
             unreachable!("a `yield` survived to emit — codegen must reject it first")
         }
         IrNode::AwaitMark(operand) => {

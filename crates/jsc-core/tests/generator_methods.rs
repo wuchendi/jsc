@@ -213,3 +213,45 @@ fn a_line_terminator_after_async_in_a_method_is_a_syntax_error() {
         "1 2 true 3\n",
     );
 }
+
+#[test]
+fn return_at_a_yield_in_try_finally_runs_the_finally() {
+    assert_output(
+        "function* g(){ try { yield 1; yield 2 } finally { console.log('f') } }
+         const it = g(); it.next();
+         const r = it.return(7); console.log(r.value, r.done, it.next().done)",
+        "f\n7 true true\n",
+    );
+}
+
+#[test]
+fn a_finally_that_yields_suspends_the_return_again() {
+    assert_output(
+        "function* g(){ try { yield 1 } finally { yield 'cleanup'; console.log('after') } }
+         const it = g(); it.next();
+         const a = it.return(3); console.log(a.value, a.done);
+         const b = it.next(); console.log(b.value, b.done)",
+        "cleanup false\nafter\n3 true\n",
+    );
+}
+
+#[test]
+fn a_finally_that_returns_overrides_the_return() {
+    assert_output(
+        "function* g(){ try { yield 1 } finally { return 'mine' } }
+         const it = g(); it.next();
+         const r = it.return(3); console.log(r.value, r.done)",
+        "mine true\n",
+    );
+}
+
+#[test]
+fn throw_at_a_yield_star_reaches_the_delegate_catch() {
+    assert_output(
+        "function* inner(){ try { yield 1 } catch (e) { console.log('inner caught', e); yield 2 } }
+         function* g(){ yield* inner(); yield 3 }
+         const it = g(); it.next();
+         const r = it.throw('boom'); console.log(r.value, r.done, it.next().value)",
+        "inner caught boom\n2 false 3\n",
+    );
+}
