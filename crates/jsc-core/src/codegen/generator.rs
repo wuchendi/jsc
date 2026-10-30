@@ -1117,6 +1117,7 @@ impl CfgBuilder {
         self.push(IrStmt::Expr(IrNode::OpenIterator {
             value: Box::new(iterable),
             rec: d.rec.clone(),
+            is_async: false,
         }))?;
         self.push(IrStmt::Expr(slot_set(received, IrNode::Undefined)))?;
         self.push(IrStmt::Expr(d.set_mode(MODE_NEXT)))?;
