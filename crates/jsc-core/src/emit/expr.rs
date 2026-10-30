@@ -2218,8 +2218,9 @@ fn emit_promise_resolve(
 /// Steps: (1) `P = __promise(NEW)`, stashed in the dedicated `p_local`; (2) build
 /// `resolve`/`reject` FUNCTION values pointing at the settler funcref slots with
 /// `P` in their env slot; (3) call `executor(resolve, reject)` synchronously
-/// through `call_indirect` (env-last ABI), padding/truncating the two settlers to
-/// the fixed `K` positional slots; (4) if the executor left `$exc_pending` set (it
+/// through `call_indirect` (env-last ABI), padding the two settlers to the fixed
+/// `K` positional slots (under `K < 2` publishing them as the spread argument
+/// array, which carries the overflow); (4) if the executor left `$exc_pending` set (it
 /// threw), reject `P` with the thrown value and clear the flag — a throwing
 /// executor rejects the promise rather than propagating; (5) push `P`.
 ///
@@ -2243,31 +2244,18 @@ pub(super) fn emit_promise_ctor(
     function.instruction(&Instruction::LocalSet(p_local));
 
     // Push the K padded positional args: resolve (a0), reject (a1), then undefined
-    // padding — dropping any settler beyond K (JS ignores extra args), exactly as
-    // `emit_call_args` would for a two-argument call.
+    // padding. Under `K < 2` the settlers overflow the slots instead: they ride
+    // in the spread argument array published after the executor is evaluated
+    // (as a builtin call does), so a callee reading argument 1 past `K` (the
+    // `GetCapabilitiesExecutor`, `arguments`) still sees `reject`.
     let k = helpers.max_args as usize;
-    emit_settler_value(
-        helpers.settle_resolve_slot,
-        p_local,
-        function,
-        scratch,
-        helpers,
-    );
-    if k < 1 {
-        function.instruction(&Instruction::Drop);
-    }
-    emit_settler_value(
-        helpers.settle_reject_slot,
-        p_local,
-        function,
-        scratch,
-        helpers,
-    );
-    if k < 2 {
-        function.instruction(&Instruction::Drop);
-    }
-    for _ in 2..k {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    if k >= 2 {
+        for slot in [helpers.settle_resolve_slot, helpers.settle_reject_slot] {
+            emit_settler_value(slot, p_local, function, scratch, helpers);
+        }
+        for _ in 2..k {
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
     }
 
     // Evaluate the executor once, stash its block base, and call it env-last. A
@@ -2287,6 +2275,30 @@ pub(super) fn emit_promise_ctor(
     }
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(exec_base));
+    if k < 2 {
+        let spread = scratch + 4;
+        function.instruction(&Instruction::I32Const(2));
+        function.instruction(&Instruction::Call(helpers.new_array()));
+        function.instruction(&Instruction::I64ExtendI32U);
+        function.instruction(&Instruction::I64Const(HEAP_BITS));
+        function.instruction(&Instruction::I64Or);
+        function.instruction(&Instruction::LocalSet(spread));
+        for (i, slot) in (0u64..).zip([helpers.settle_resolve_slot, helpers.settle_reject_slot]) {
+            function.instruction(&Instruction::LocalGet(spread));
+            function.instruction(&Instruction::I32WrapI64);
+            emit_array_elems(function);
+            emit_settler_value(slot, p_local, function, scratch, helpers);
+            function.instruction(&Instruction::I64Store(elem_slot(i)));
+        }
+        function.instruction(&Instruction::LocalGet(spread));
+        function.instruction(&Instruction::GlobalSet(SPREAD_ARGS_GLOBAL));
+        if k == 1 {
+            function.instruction(&Instruction::LocalGet(spread));
+            function.instruction(&Instruction::I32WrapI64);
+            emit_array_elems(function);
+            function.instruction(&Instruction::I64Load(elem_slot(0)));
+        }
+    }
     emit_reset_this(function);
     function.instruction(&Instruction::LocalGet(exec_base));
     function.instruction(&Instruction::I64Load(MemArg {
