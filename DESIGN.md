@@ -2109,7 +2109,7 @@ Each item below is current behaviour of this tree.
   | `void` | L2-L | 5 | 36 | 7 | | 1 |
   | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
   | `Symbol` / `@@toStringTag` | Y1–Y4 (landed; recount at the next baseline) | 24 | 7 | 1 | | |
-  | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
+  | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | Y2 / Y5 / Y3 (landed; recount at the next baseline) | 19 | | | 8 | |
   | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | U1/U2 (landed; recount at the next baseline) | | 29 | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
@@ -2211,7 +2211,9 @@ the async test262 runner, and language completions pulled forward from phase 5
 (comma, generator and async expressions / methods, async generators,
 non-simple parameters, early errors, `var` hoisting and global bindings).
 Wave 3c (`Symbol`, the iteration protocol incl. async iteration, Latin-1 /
-UTF-16 strings) is in progress; its design is `design/symbol-strings.md`.
+UTF-16 strings) is complete apart from its CI pass (the full test suite,
+test262 baseline and opcount snapshot run in GitHub Actions); its design is
+`design/symbol-strings.md`.
 Its stage Y1 is done: `Symbol` (registry, wrappers, the 13 well-known
 symbols), symbol-keyed properties, and computed class member names (pulled
 forward from phase 5); the well-known symbol hooks throw until Y2 / Y4 (§13).
@@ -2221,7 +2223,16 @@ methods in the guest. Its stage U2 is done: the code-point string iterator,
 full lossless case mapping, `normalize` in all four forms, and lossless
 code-unit `localeCompare`. Its stage Y5 is done: the async `GetIterator`,
 `%AsyncFromSyncIteratorPrototype%`, `for await`, `yield*` in async
-generators (pulled forward from phase 5) and `Array.fromAsync`.
+generators (pulled forward from phase 5) and `Array.fromAsync`. Its stage
+Y2 is done: the generic iteration protocol (iterator records, `IteratorClose`
+on abrupt exits, lazy array destructuring, `yield*` and generator
+`return` / `throw` routing, Map/Set tombstones for live iterators). Its stage
+Y4 is done: `@@toPrimitive`, `@@toStringTag`, `@@hasInstance`, `@@species`,
+`@@isConcatSpreadable` and the String-method symbol dispatch are honoured.
+Its stage Y3 is done: the `Iterator` global, `Iterator.from` and the lazy and
+eager iterator helpers, the `Promise` combinators (`all`, `allSettled`,
+`any`, `race`) with `this`-aware `Promise.resolve` / `reject`, and
+`Math.sumPrecise`.
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
@@ -2229,7 +2240,7 @@ generators (pulled forward from phase 5) and `Array.fromAsync`.
   of §7.9 (with `__proto__` and the legacy accessor methods); the test262
   runner includes `propertyHelper.js` tests.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
-  destructuring.
+  destructuring, with the `Iterator` helpers (done in Y1 / Y2 / Y4 / Y3).
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
   and surrogate pairs, the string iterator, full case mapping and `normalize`
   (done in U1 / U2).
