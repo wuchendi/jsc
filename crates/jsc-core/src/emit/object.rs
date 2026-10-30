@@ -1623,7 +1623,7 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
 /// each `__map_*` helper. A missing key/value argument is `undefined` (JS
 /// treats `map.set()` as `set(undefined, undefined)`); `.set`/`.add` yield the
 /// receiver handle (chainable), `.has`/`.delete` box their `1`/`0` result as a
-/// boolean jsval, `.clear` empties the backing and yields `undefined`.
+/// boolean jsval, `.clear` tombstones every entry and yields `undefined`.
 pub(super) fn emit_map_op(
     op: MapOp,
     handle: u32,
@@ -1680,28 +1680,76 @@ pub(super) fn emit_map_op(
             function.instruction(&Instruction::I64Or);
         }
         MapOp::Clear => {
-            // size = 0; the backing array's len = 0.
-            for (load_entries, offset) in [(false, MAP_SIZE_OFFSET), (true, ARRAY_LEN_OFFSET)] {
-                function.instruction(&Instruction::LocalGet(handle));
-                function.instruction(&Instruction::I32WrapI64);
-                if load_entries {
-                    function.instruction(&Instruction::I64Load(MemArg {
-                        offset: MAP_ENTRIES_OFFSET,
-                        align: 3,
-                        memory_index: 0,
-                    }));
-                    function.instruction(&Instruction::I32WrapI64);
-                }
-                function.instruction(&Instruction::I32Const(0));
-                function.instruction(&Instruction::I32Store(MemArg {
-                    offset,
-                    align: 2,
-                    memory_index: 0,
-                }));
-            }
+            emit_map_clear(handle, function, scratch);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
     }
+}
+
+/// `.clear()` on the handle in i64 `handle`: `size = 0`, and every entry
+/// tombstoned in place (`HOLE` key, `undefined` value;
+/// design/symbol-strings.md §5.5). The backing keeps its length, so a live
+/// iterator continues at its index and sees the entries added after the
+/// `clear`. Uses the i32 scratch locals `scratch + 8` / `+ 9`.
+fn emit_map_clear(handle: u32, function: &mut Function, scratch: u32) {
+    let (at, end) = (scratch + 8, scratch + 9);
+    let slot = |offset| MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    };
+    function.instruction(&Instruction::LocalGet(handle));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Store(MemArg {
+        offset: MAP_SIZE_OFFSET,
+        align: 2,
+        memory_index: 0,
+    }));
+    // at = the first element slot; end = at + 8 * len.
+    function.instruction(&Instruction::LocalGet(handle));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(slot(MAP_ENTRIES_OFFSET)));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalTee(end));
+    function.instruction(&Instruction::I32Load(MemArg {
+        offset: ARRAY_ELEMS_OFFSET,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(at));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::LocalGet(end));
+    function.instruction(&Instruction::I32Load(MemArg {
+        offset: ARRAY_LEN_OFFSET,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(end));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::LocalGet(end));
+    function.instruction(&Instruction::I32GeU);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Store(slot(0)));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Store(slot(8)));
+    function.instruction(&Instruction::LocalGet(at));
+    function.instruction(&Instruction::I32Const(16));
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::LocalSet(at));
+    function.instruction(&Instruction::Br(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
 }
 
 /// Emit an object-rest binding `{...rest} = source`, leaving the fresh

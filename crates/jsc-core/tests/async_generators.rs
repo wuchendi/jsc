@@ -253,11 +253,30 @@ fn yield_star_in_an_async_generator_is_a_compile_error() {
 }
 
 #[test]
-fn return_at_a_yield_inside_try_finally_rejects_precisely() {
+fn return_inside_try_finally_settles_after_the_finally() {
     assert_output(
         "async function* g(){ try { yield 1; } finally { console.log('cleanup'); } }
          const it = g();
-         it.next().then(() => it.return(2)).then(null, e => console.log(e instanceof TypeError, e.message));",
-        "true async generator return() at a yield inside try/finally is not supported\n",
+         it.next().then(() => it.return(2)).then(r => console.log(r.value, r.done));",
+        "cleanup\n2 true\n",
+    );
+    // The returned value is awaited at the `yield` first.
+    assert_output(
+        "async function* g(){ try { yield 1; } finally { console.log('cleanup'); } }
+         const it = g();
+         it.next().then(() => it.return(Promise.resolve(5))).then(r => console.log(r.value, r.done));",
+        "cleanup\n5 true\n",
+    );
+}
+
+#[test]
+fn async_generator_prototype_inherits_async_iterator_prototype() {
+    assert_output(
+        "const AIP = Object.getPrototypeOf(Object.getPrototypeOf(async function*(){}.prototype));
+         console.log(typeof AIP[Symbol.asyncIterator]);
+         const o = {};
+         console.log(AIP[Symbol.asyncIterator].call(o) === o);
+         console.log(Object.getPrototypeOf(AIP) === Object.prototype);",
+        "function\ntrue\ntrue\n",
     );
 }

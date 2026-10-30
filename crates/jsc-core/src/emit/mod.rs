@@ -36,7 +36,7 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
+    IterRecord, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
     SpreadCallee, SpreadElem,
 };
 
@@ -963,7 +963,7 @@ struct Helpers<'a> {
     same_value_zero: u32,
     /// `__map_find(handle: i32, key: i64) -> i32`: the byte address of the
     /// matching key slot in a Map/Set's backing array (a `__same_value_zero` linear scan over
-    /// the even element slots), or `-1` on a miss. Shared by get/has/set/delete.
+    /// the even element slots, skipping `HOLE` tombstones), or `-1` on a miss. Shared by get/has/set/delete.
     map_find: u32,
     /// `__map_set(handle: i32, key: i64, val: i64)`: update the existing
     /// entry for `key`, or append `(key, val)` to the growable backing (via
@@ -975,9 +975,9 @@ struct Helpers<'a> {
     map_get: u32,
     /// `__map_has(handle: i32, key: i64) -> i32`: `1` iff `__map_find` hits.
     map_has: u32,
-    /// `__map_delete(handle: i32, key: i64) -> i32`: compact the matching
-    /// entry out of the backing (shift trailing pairs down, drop `size`/`len` by
-    /// one entry) and return `1`, or `0` on a miss.
+    /// `__map_delete(handle: i32, key: i64) -> i32`: tombstone the matching
+    /// entry in place (`HOLE` key, `undefined` value), drop `size` by one and
+    /// return `1`, or `0` on a miss.
     map_delete: u32,
     /// `__loose_eq(a: i64, b: i64) -> i32`: loose `==` (Abstract Equality with
     /// number/string/boolean coercion; `null`/`undefined` mutually equal; objects
@@ -1295,8 +1295,8 @@ use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
 use realm::{
-    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, WellKnown,
-    intrinsic_bits,
+    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ProtocolOp, ReflectOp, StringOp,
+    WellKnown, intrinsic_bits,
 };
 #[allow(clippy::wildcard_imports)]
 use runtime::*;

@@ -198,6 +198,35 @@ pub(super) fn emit_gen_resume(
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 
+    emit_gen_drive(
+        handle_slot,
+        sent,
+        sm_result,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+
+    // 4. Build the `{ value, done }` result object from the SM's value and the
+    // handle's `done` flag.
+    emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
+}
+
+/// Resume the generator handle in i64 `handle_slot` once with `sent`
+/// (steps 2b-3 of [`emit_gen_resume`]): a running generator throws, else the
+/// state machine runs with the running bit set, its returned value lands in
+/// i64 `sm_result` (the handle's `done` flag tells a yield from the return),
+/// and a throw it left pending unwinds.
+pub(super) fn emit_gen_drive(
+    handle_slot: u32,
+    sent: &IrNode,
+    sm_result: u32,
+    function: &mut Function,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
     // 2b. A running generator (resumed from its own body) throws; otherwise it
     // is marked running for the resume.
     let limits = MemArg {
@@ -271,10 +300,6 @@ pub(super) fn emit_gen_resume(
     function.instruction(&Instruction::LocalSet(sm_result));
     set_running(function, false);
     emit_propagate_if_pending(function, helpers);
-
-    // 4. Build the `{ value, done }` result object from the SM's value and the
-    // handle's `done` flag.
-    emit_result_object(sm_result, handle_slot, scratch, function, strings, helpers);
 }
 
 /// Emit the `{ value, done }` iterator result object, leaving its jsval on the
@@ -386,7 +411,7 @@ pub(super) fn emit_generator_sm(
     let targets: Vec<u32> = (0..n).collect();
     function.instruction(&Instruction::BrTable(targets.into(), n));
 
-    let resumes = resume_blocks(segments);
+    let resumes = resume_routes(segments);
 
     for (index, segment) in (0u32..).zip(segments) {
         // Close this block's dispatch frame; its code follows the `End`.
@@ -402,10 +427,10 @@ pub(super) fn emit_generator_sm(
             function.instruction(&Instruction::I32Const(0));
             function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
         }
-        // A resume entered with the exception pending throws into this block's
-        // active handler (its landing pad, or the outermost one).
-        if resumes.contains(&index) {
-            emit_propagate_if_pending(&mut function, helpers);
+        // A resume entered with the exception pending is a `throw()` /
+        // `return()` resumption (or a rejected `await`), routed by its mode.
+        if let Some(&route) = resumes.get(&index) {
+            emit_resume_route(&mut function, gen_local, route, loop_depth, helpers);
         }
         emit_stmts(
             &segment.stmts,
@@ -463,16 +488,93 @@ pub(super) fn emit_generator_sm(
     function
 }
 
-/// The blocks a suspend resumes into: the resumer may enter one with an
-/// exception pending (a rejected `await`), which must throw at the suspend point.
-fn resume_blocks(segments: &[GenSegment]) -> HashSet<u32> {
+/// The blocks a suspend resumes into, with the suspend's `on_return` /
+/// `on_throw` blocks: the resumer may enter one with an exception pending.
+fn resume_routes(segments: &[GenSegment]) -> HashMap<u32, (Option<u32>, Option<u32>)> {
     segments
         .iter()
         .filter_map(|segment| match segment.term {
-            GenTerm::Yield { resume, .. } => Some(resume),
+            GenTerm::Yield {
+                resume,
+                on_return,
+                on_throw,
+                ..
+            } => Some((resume, (on_return, on_throw))),
             _ => None,
         })
         .collect()
+}
+
+/// Emit the entry of a resume block (its suspend's `on_return` / `on_throw`
+/// blocks), entered with an exception pending by a
+/// `throw(e)` / `return(v)` resumption (the value in `$exc_value`, the mode
+/// in the handle's [`abi::GEN_RESUME_MODE_MASK`] field) or a rejected
+/// `await`. A return with an `on_return` block clears the exception and
+/// the mode and re-dispatches there; any other throw re-dispatches to
+/// `on_throw` the same way (a `yield*` forwarding it), or throws at the
+/// suspend point into the block's active handler. `loop_depth` is the
+/// dispatch loop's unwind depth.
+fn emit_resume_route(
+    function: &mut Function,
+    gen_local: u32,
+    (on_return, on_throw): (Option<u32>, Option<u32>),
+    loop_depth: u32,
+    helpers: Helpers<'_>,
+) {
+    if on_return.is_none() && on_throw.is_none() {
+        emit_propagate_if_pending(function, helpers);
+        return;
+    }
+    let limits = MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    };
+    // Clear the pending exception and the mode, then `state = target`; `br`.
+    let enter = |function: &mut Function, target: u32| {
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
+        function.instruction(&Instruction::LocalGet(gen_local));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalGet(gen_local));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Load(limits));
+        function.instruction(&Instruction::I32Const(
+            (!abi::GEN_RESUME_MODE_MASK).cast_signed(),
+        ));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Store(limits));
+        store_gen_i32(function, gen_local, GEN_STATE_OFFSET, target.cast_signed());
+        let loop_rel = helpers.unwind.borrow().depth - loop_depth;
+        function.instruction(&Instruction::Br(loop_rel));
+    };
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    if let Some(on_return) = on_return {
+        function.instruction(&Instruction::LocalGet(gen_local));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Load(limits));
+        function.instruction(&Instruction::I32Const(
+            abi::GEN_RESUME_MODE_MASK.cast_signed(),
+        ));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Const(
+            (abi::GEN_RESUME_MODE_RETURN << abi::GEN_RESUME_MODE_SHIFT).cast_signed(),
+        ));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        enter(function, on_return);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
+    match on_throw {
+        Some(on_throw) => enter(function, on_throw),
+        None => emit_throw_return(function, helpers),
+    }
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// Emit a basic block's terminator. `loop_rel` is the `br` immediate
@@ -490,7 +592,7 @@ fn emit_segment_term(
     helpers: Helpers<'_>,
 ) {
     match term {
-        GenTerm::Yield { value, resume } => {
+        GenTerm::Yield { value, resume, .. } => {
             // Evaluate the yielded value (it may throw), then state = resume and
             // return it (done stays 0).
             emit_node(value, function, scratch, strings, helpers);
