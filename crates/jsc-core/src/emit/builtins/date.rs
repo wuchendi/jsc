@@ -9,10 +9,27 @@ const NOT_DATE: CalleeErrorText<'static> = [
     "TypeError: this is not a Date object.",
 ];
 
+/// The `TypeError` of `Date.prototype[@@toPrimitive]` on a non-object.
+const TO_PRIMITIVE_NOT_OBJECT: CalleeErrorText<'static> = [
+    "Date.prototype [ @@toPrimitive ] called on non-object",
+    "TypeError: Date.prototype [ @@toPrimitive ] called on non-object",
+];
+
+/// The `TypeError` of `Date.prototype[@@toPrimitive]` with a hint other
+/// than `"default"`, `"number"` or `"string"`.
+const INVALID_HINT: CalleeErrorText<'static> = ["Invalid hint", "TypeError: Invalid hint"];
+
 /// The static strings of this family (the method texts included).
-pub(super) const STRINGS: [&str; 8] = [
+pub(super) const STRINGS: [&str; 15] = [
     NOT_DATE[0],
     NOT_DATE[1],
+    TO_PRIMITIVE_NOT_OBJECT[0],
+    TO_PRIMITIVE_NOT_OBJECT[1],
+    INVALID_HINT[0],
+    INVALID_HINT[1],
+    "default",
+    "number",
+    "string",
     INVALID_DATE,
     INVALID_TIME_VALUE[0],
     INVALID_TIME_VALUE[1],
@@ -122,5 +139,44 @@ pub(super) fn emit_to_json(
         frame.scratch(),
         strings,
         helpers,
+    );
+}
+
+/// `Date.prototype[@@toPrimitive](hint)`: `this` must be an object; hint
+/// `"string"` / `"default"` try `toString` first, `"number"` `valueOf`
+/// first (`OrdinaryToPrimitive`, `__to_primitive` with [`HINT_ORDINARY`]);
+/// any other hint throws the `TypeError`. Generic over any object receiver.
+pub(super) fn emit_to_primitive(
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (this, arg, hint) = (frame.i64(0), frame.i64(1), frame.i32(0));
+    wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
+    emit_is_object(function, this);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    throw_type_error(function, frame, TO_PRIMITIVE_NOT_OBJECT, strings, helpers);
+    wasm!(function; End, I32Const(-1), LocalSet(hint));
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(arg));
+    emit_is_string(function, arg);
+    wasm!(function; If(BlockType::Empty));
+    for (name, value) in [
+        ("string", HINT_STRING),
+        ("default", HINT_STRING),
+        ("number", HINT_NUMBER),
+    ] {
+        wasm!(function;
+            LocalGet(arg), I32WrapI64, I32Const(static_key(strings, name)), Call(helpers.str_eq),
+            If(BlockType::Empty), I32Const(value), LocalSet(hint), End,
+        );
+    }
+    wasm!(function; End, LocalGet(hint), I32Const(0), I32LtS, If(BlockType::Empty));
+    throw_type_error(function, frame, INVALID_HINT, strings, helpers);
+    wasm!(function;
+        End,
+        LocalGet(this), LocalGet(hint), I32Const(HINT_ORDINARY), I32Or,
+        Call(helpers.to_primitive()),
     );
 }
