@@ -1,8 +1,9 @@
-//! Integration tests: `GetIterator` of the index-walked iteration sources —
-//! for-of, `yield*`, spread (array literal and call arguments) and array
+//! Integration tests: `GetIterator` of the builtin iterables (their guarded
+//! fast paths and the protocol, design/symbol-strings.md §5.3) — for-of,
+//! `yield*`, spread (array literal and call arguments) and array
 //! destructuring over arrays, strings, generators, `Map` / `Set` handles,
 //! `String` wrappers and `arguments`, and the `<x> is not iterable`
-//! `TypeError` of every other value.
+//! `TypeError` of every value without a callable `@@iterator`.
 
 mod common;
 use common::{assert_rejected, assert_string, assert_uncaught};
@@ -58,12 +59,11 @@ fn for_of_skips_entries_deleted_before_they_are_reached() {
 }
 
 #[test]
-fn deleting_the_current_entry_skips_the_next_one() {
-    // Known deviation (like forEach): the backing store compacts on delete,
-    // so deleting the visited entry shifts the next one under the cursor.
+fn deleting_the_current_entry_visits_the_next_one() {
+    // Deletion tombstones the entry in place (design/symbol-strings.md §5.5).
     assert_string(
         &collected("const s = new Set([1, 2, 3]); for (const v of s) { out.push(v); s.delete(v) }"),
-        "[1,3]",
+        "[1,2,3]",
     );
 }
 
@@ -178,8 +178,9 @@ fn for_of_over_an_array_visits_elements_pushed_by_the_body() {
 
 // --- not iterable ------------------------------------------------------------
 
-/// Each non-iterable source, with its message.
-const NOT_ITERABLE: [(&str, &str); 9] = [
+/// Each non-iterable source, with its message (`GetMethod(v, @@iterator)`
+/// is absent or not callable).
+const NOT_ITERABLE: [(&str, &str); 11] = [
     ("Promise.resolve(1)", "object is not iterable"),
     ("new Date(0)", "object is not iterable"),
     ("({ a: 1 })", "object is not iterable"),
@@ -189,6 +190,8 @@ const NOT_ITERABLE: [(&str, &str); 9] = [
     ("new Number(1)", "object is not iterable"),
     ("new Boolean(false)", "object is not iterable"),
     ("undefined", "undefined is not iterable"),
+    ("({ [Symbol.iterator]: 1 })", "object is not iterable"),
+    ("({ [Symbol.iterator]: null })", "object is not iterable"),
 ];
 
 #[test]

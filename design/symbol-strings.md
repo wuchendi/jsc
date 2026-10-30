@@ -999,7 +999,7 @@ Reasons: each host op exists twice (Rust + TS), phase 4 removes both hosts
 | stage | added | deleted |
 |---|---|---|
 | Y1 | `TYPE_SYMBOL = 14`, `SYMBOL_DESCRIPTION_OFFSET = 8`, `SYMBOL_BLOCK_SIZE = 16`, `SYMBOL_FLAG_REGISTERED = 4`, `CLASS_SYMBOL = 7`, `PROPS_HAS_SYMBOL_KEYS = 8`, `TYPEOF_STRINGS` + `"symbol"` | — |
-| Y2 | `CLASS_ITERATOR = 8` (+ payload offsets only if a host renders them), `GEN_RESUME_MODE_MASK = 0x300`, `GEN_RESUME_MODE_SHIFT = 8` (guest-only, Rust only like the other `GEN_*` limits bits) | `GEN_LIMIT_RETURN`, `GEN_LIMIT_THROW` (Rust only; `pkg/abi.ts` never mirrored them) |
+| Y2 | `CLASS_ITERATOR = 8` (+ payload offsets only if a host renders them), `GEN_RESUME_MODE_MASK = 0x300`, `GEN_RESUME_MODE_SHIFT = 8`, `GEN_DELEGATES = 64`, `GEN_DELEGATED_RESULT = 128` (guest-only, Rust only like the other `GEN_*` limits bits; the last two Y2-T6) | `GEN_LIMIT_RETURN`, `GEN_LIMIT_THROW` (Rust only; `pkg/abi.ts` never mirrored them) |
 | U1 | `STR_LEN_OFFSET = 4`, `STR_DATA_OFFSET = 8`, `STR_FLAG_TWO_BYTE = 4`, `__new_string(len, two_byte)` doc | the moved `METHOD_OP_*` of §7.5, `METHOD_NEEDS_REGEXP` |
 | U2 | — | `METHOD_UNSUPPORTED` |
 | Y5 | — (iterator kind `32` is a payload value, not an ABI constant) | — |
@@ -1116,8 +1116,34 @@ U1 reason drafts (one line per affected row, for the final CI pass):
   helper bodies.
 - every row: ASCII intern hashes are unchanged (FNV-1a over units, U1-T1b),
   so the static intern table and literal layout are identical.
-- `fib`, `math`, `push_1e5`, `console_log`, `generators`, `object_reads`:
-  must not change.
+- `fib`, `math`, `push_1e5`, `console_log`, `object_reads`: must not
+  change; `generators` changes only by Y2 (see the Y2 drafts below).
+
+Y2 reason drafts (one line per affected row, for the final CI pass):
+
+- `for_of`: per loop a `GetIterator` classify plus the try/catch/finally
+  landing of the close; per iteration the array path is at most the old
+  index walk, a string similar (`__str_iter_next`), a `Map` at most the old
+  walk (slot walk, `[k, v]` built via `ArraySpread`), and a generator drops
+  sharply (direct state-machine resume, no result object) (Y2-T2); array
+  destructuring now steps a record (Y2-T3); the generator classify also
+  tests the `GEN_DELEGATES` bit (one load, Y2-T6).
+- `spread`: a per-source classify guard; a `Map` spread now runs the
+  protocol (rises; spec-observable) (Y2-T2); an `arguments` spread is the
+  `ToList` index walk (Y2-T5).
+- `generators`: `return(7)` at a suspended `yield` resumes the state machine
+  (completion routing; small fuel rise); `it.next()` is unchanged apart from
+  one `GEN_DELEGATED_RESULT` bit test per resume (Y2-T4, Y2-T6).
+- `map_set`: a `HOLE` compare per scanned slot in `__map_find`; `delete`
+  without `memory.copy`; a tombstone test per entry in `forEach` and the
+  iterators; the constructor goes through the iterator record (Y2-T5).
+- rows with spread, destructuring, unsealed for-of or `arguments`: dirty
+  tracking is now on (a few fuel per watched-table write) (Y2-T2);
+  `arguments` creation defines an own `@@iterator` (Y2-T5).
+- rows with an object `ToPrimitive` on arrays or strings: the Array, String,
+  Map and Set prototypes carry `HAS_SYMBOL_KEYS`, so the well-known-symbol
+  consults do a real lookup (Y2-T1).
+- `fib`, `math`, `push_1e5`, `console_log`: must not change.
 
 ---
 

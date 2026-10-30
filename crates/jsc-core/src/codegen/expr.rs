@@ -62,9 +62,11 @@ impl LowerCtx<'_> {
             // `yield e` / `yield`: lower the operand and wrap it. The
             // generator segmentation pass consumes every `Yield`; one that reaches
             // the backend means an unsupported yield position (rejected there).
-            // `yield*` (delegate) is a statement, lowered by `lower_yield_delegate`.
+            // `yield* e` lowers to an `IrNode::YieldDelegate` the CFG builder
+            // expands (see `lower_yield_delegate`).
             // In an async generator `yield e` first awaits `e`.
-            Expr::Yield(yield_expr) if !yield_expr.delegate => {
+            Expr::Yield(yield_expr) if yield_expr.delegate => self.lower_yield_delegate(yield_expr),
+            Expr::Yield(yield_expr) => {
                 let arg = match &yield_expr.arg {
                     Some(arg) => self.lower_expr(arg)?,
                     None => IrNode::Undefined,
@@ -2075,7 +2077,13 @@ impl LowerCtx<'_> {
             if !has_spread {
                 lowered.push(value);
             } else if arg.spread.is_some() {
-                parts.push(SpreadElem::Spread(value));
+                // A derived class's default constructor forwards its argument
+                // list as is, without the iteration protocol.
+                parts.push(if is_default_ctor_args(&arg.expr) {
+                    SpreadElem::List(value)
+                } else {
+                    SpreadElem::Spread(value)
+                });
             } else {
                 parts.push(SpreadElem::Item(value));
             }
@@ -2370,7 +2378,6 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
-        Expr::Yield(_) => "`yield*` is only supported as a statement",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
@@ -2426,22 +2433,29 @@ fn static_key_name(key: &PropKey, span: Span) -> anyhow::Result<String> {
 }
 
 /// Append one accessor half (`getter` or setter function `value`) under `key`:
-/// it completes the accessor entry of the same static key when one exists,
-/// else starts a new accessor entry with the other half `undefined`.
+/// it completes the accessor entry of the same static key when that entry is
+/// the latest definition of the key (no data member of the key, and no
+/// computed member that may share it, follows it), else starts a new accessor
+/// entry with the other half `undefined`, a partial descriptor applied over
+/// whatever the key holds by then.
 pub(super) fn push_accessor_half(
     entries: &mut Vec<(PropKey, IrNode)>,
     key: PropKey,
     value: IrNode,
     getter: bool,
 ) {
-    let existing = entries.iter_mut().rev().find_map(|(k, v)| match v {
-        IrNode::MakeAccessor { getter, setter }
-            if !matches!(k, PropKey::Computed(_) | PropKey::HiddenComputed(_)) && *k == key =>
+    let latest = entries
+        .iter_mut()
+        .rev()
+        .find(|(k, _)| matches!(k, PropKey::Computed(_) | PropKey::HiddenComputed(_)) || *k == key);
+    let existing = match latest {
+        Some((k, IrNode::MakeAccessor { getter, setter }))
+            if !matches!(k, PropKey::Computed(_) | PropKey::HiddenComputed(_)) =>
         {
             Some((getter, setter))
         }
         _ => None,
-    });
+    };
     if let Some((get, set)) = existing {
         **if getter { get } else { set } = value;
         return;
@@ -2458,4 +2472,11 @@ pub(super) fn push_accessor_half(
             setter: Box::new(set),
         },
     ));
+}
+
+/// Whether `expr` is the rest binding of a derived class's default
+/// constructor (`constructor(...args) { super(...args) }`), whose name cannot
+/// be spelled in source.
+fn is_default_ctor_args(expr: &Expr) -> bool {
+    matches!(expr, Expr::Ident(ident) if ident.sym.as_ref() == super::stmt::DEFAULT_CTOR_ARGS)
 }
