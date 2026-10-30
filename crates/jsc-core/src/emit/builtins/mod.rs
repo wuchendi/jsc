@@ -36,6 +36,7 @@ mod object;
 mod object_static;
 mod promise;
 mod string;
+mod symbol;
 
 use crate::emit::realm::ArrayCopyOp;
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
@@ -216,6 +217,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(generator::strings())
         .chain(generator::async_strings())
         .chain(json::strings())
+        .chain(symbol::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -225,9 +227,8 @@ pub(super) fn emit_builtin(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) -> Function {
-    let k = helpers.max_args;
+    let (k, mut f) = (helpers.max_args, Frame::function());
     let frame = Frame { k };
-    let mut f = Frame::function();
     helpers.unwind.borrow_mut().reset();
     match builtin {
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
@@ -297,7 +298,7 @@ pub(super) fn emit_builtin(
         | Builtin::CollectionOp { .. }
         | Builtin::CollectionForEach { .. }
         | Builtin::CollectionSize { .. }
-        | Builtin::Ctor(BuiltinCtor::Map | BuiltinCtor::Set)
+        | Builtin::Ctor(BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol)
         | Builtin::PromiseThen
         | Builtin::PromiseCatch
         | Builtin::PromiseFinally
@@ -313,6 +314,7 @@ pub(super) fn emit_builtin(
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
         Builtin::IsFinite => global::emit_is_finite(&mut f, frame, helpers),
+        Builtin::Symbol(op) => symbol::emit(op, &mut f, frame, strings, helpers),
         Builtin::Math(_)
         | Builtin::ConsoleLog
         | Builtin::Ctor(_)
@@ -390,6 +392,7 @@ fn emit_object_family(
         Builtin::CollectionSize { set } => map_set::emit_size(set, f, frame, strings, helpers),
         Builtin::Ctor(BuiltinCtor::Map) => map_set::emit_ctor(false, f, frame, strings, helpers),
         Builtin::Ctor(BuiltinCtor::Set) => map_set::emit_ctor(true, f, frame, strings, helpers),
+        Builtin::Ctor(BuiltinCtor::Symbol) => symbol::emit_ctor(f, frame, strings, helpers),
         Builtin::PromiseThen => promise::emit_then(false, f, frame, strings, helpers),
         Builtin::PromiseCatch => promise::emit_then(true, f, frame, strings, helpers),
         Builtin::PromiseFinally => promise::emit_finally(f, frame, strings, helpers),
@@ -560,8 +563,8 @@ fn this_primitive(
 }
 
 /// `__to_object(v: i64) -> i64`: `ToObject` of a non-nullish jsval: a
-/// string, number or boolean becomes a fresh wrapper object (DESIGN.md §5.2) over
-/// its realm prototype; any other value (an object, or `null`/`undefined`,
+/// string, symbol, number or boolean becomes a fresh wrapper object (DESIGN.md
+/// §5.2) over its realm prototype; any other value (an object, or `null`/`undefined`,
 /// which callers reject first) is returned as is. A String wrapper's
 /// `length` and indices are defined as its own read-only, non-configurable
 /// properties (the indices enumerable), so every property operation sees them.
@@ -572,27 +575,36 @@ pub(super) fn emit_to_object(strings: &HashMap<String, i32>, helpers: Helpers<'_
         (3, ValType::I32),
     ]);
     let (v, obj, class, proto, len, idx, string) = (0, 1, 2, 3, 4, 5, 6);
-    let wrap = |f: &mut Function, c: u8, ctor: BuiltinCtor| {
+    let wrap = |f: &mut Function, c: u8, proto_bits: i64| {
         wasm!(f;
             I32Const(i32::from(c)), LocalSet(class),
-            I64Const(intrinsic_bits(realm::prototype_of(ctor), helpers)), LocalSet(proto),
+            I64Const(proto_bits), LocalSet(proto),
         );
     };
+    let ctor_proto = |ctor| intrinsic_bits(realm::prototype_of(ctor), helpers);
     emit_is_string(&mut f, v);
     wasm!(f; If(BlockType::Empty));
-    wrap(&mut f, abi::CLASS_STRING, BuiltinCtor::String);
+    wrap(&mut f, abi::CLASS_STRING, ctor_proto(BuiltinCtor::String));
+    wasm!(f; Else);
+    emit_is_symbol(&mut f, v);
+    wasm!(f; If(BlockType::Empty));
+    wrap(
+        &mut f,
+        abi::CLASS_SYMBOL,
+        intrinsic_bits(SYMBOL_PROTOTYPE, helpers),
+    );
     wasm!(f; Else);
     emit_is_number(&mut f, v);
     wasm!(f; If(BlockType::Empty));
-    wrap(&mut f, abi::CLASS_NUMBER, BuiltinCtor::Number);
+    wrap(&mut f, abi::CLASS_NUMBER, ctor_proto(BuiltinCtor::Number));
     wasm!(f;
         Else,
         LocalGet(v), I64Const(TRUE_BITS), I64Eq, LocalGet(v), I64Const(FALSE_BITS), I64Eq, I32Or,
         I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End,
     );
-    wrap(&mut f, abi::CLASS_BOOLEAN, BuiltinCtor::Boolean);
+    wrap(&mut f, abi::CLASS_BOOLEAN, ctor_proto(BuiltinCtor::Boolean));
     wasm!(f;
-        End, End,
+        End, End, End,
         I32Const(abi::WRAPPER_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(obj),
         LocalGet(class), I32Const(24), I32Shl, I32Const(TYPE_OBJECT), I32Or,
         I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),

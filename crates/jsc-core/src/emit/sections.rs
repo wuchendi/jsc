@@ -814,7 +814,7 @@ pub(super) fn collect_node<'a>(
                 collect_node(arg, order, seen);
             }
         }
-        // `typeof` interns the six type-string words so the strict-equality path
+        // `typeof` interns the seven type-string words so the strict-equality path
         // can compare a `typeof` result (a boxed immediate) against a string
         // literal by content — see `emit_typeof_to_string`.
         IrNode::TypeOf(operand) => {

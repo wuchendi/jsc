@@ -205,9 +205,12 @@ pub enum ArrayHofOp {
 /// [`IrNode::ConvertCall`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertOp {
-    /// `String(x)` — `ToString` in the guest (`__to_string`), so an object's
-    /// user `toString`/`valueOf` runs and may throw.
+    /// `ToString(x)` in the guest (`__to_string`), so an object's user
+    /// `toString`/`valueOf` runs and may throw; a symbol throws.
     ToString,
+    /// `String(x)` called (not constructed): [`ConvertOp::ToString`], except
+    /// a symbol yields its `SymbolDescriptiveString` (`"Symbol(desc)"`).
+    String,
     /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
     /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
     ToNumber,
@@ -431,11 +434,13 @@ pub enum BuiltinCtor {
     Promise,
     /// `Date`.
     Date,
+    /// `Symbol`.
+    Symbol,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 18] = [
+    pub(crate) const ALL: [BuiltinCtor; 19] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -454,6 +459,7 @@ impl BuiltinCtor {
         Self::Set,
         Self::Promise,
         Self::Date,
+        Self::Symbol,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -470,6 +476,7 @@ impl BuiltinCtor {
             Self::Set => "Set",
             Self::Promise => "Promise",
             Self::Date => "Date",
+            Self::Symbol => "Symbol",
         }
     }
 

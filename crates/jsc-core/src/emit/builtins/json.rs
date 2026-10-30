@@ -356,7 +356,8 @@ pub(super) fn emit_parse(
 
 /// `__json_rep(holder, key, value, replacer, list, stack) -> i64`:
 /// `SerializeJSONProperty` — the JSON text of `value` (the property `key` of
-/// `holder`) as a string jsval, or `undefined` when it is not serializable.
+/// `holder`) as a string jsval, or `undefined` when it is not serializable
+/// (`undefined`, a function, a symbol).
 /// An object's callable `toJSON` maps `value` first, called with `this =
 /// value` and the key; then the replacer function (when not `undefined`),
 /// called with `this = holder`. `key` is a string jsval, or an array index
@@ -422,6 +423,8 @@ pub(in crate::emit) fn emit_json_rep(
     unwrap_primitive(&mut f, value);
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
     emit_is_function(&mut f, value);
+    wasm!(f; I32Or);
+    emit_is_symbol(&mut f, value);
     wasm!(f; I32Or, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
     emit_is_object(&mut f, value);
     wasm!(f;

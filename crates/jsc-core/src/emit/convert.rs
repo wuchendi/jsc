@@ -39,14 +39,38 @@ const NO_PRIMITIVE: CalleeErrorText<'static> = [
     "TypeError: Cannot convert object to primitive value",
 ];
 
+/// The `TypeError` of `ToString(symbol)`.
+const SYMBOL_TO_STRING: CalleeErrorText<'static> = [
+    "Cannot convert a Symbol value to a string",
+    "TypeError: Cannot convert a Symbol value to a string",
+];
+
+/// The `TypeError` of `ToNumber(symbol)`.
+pub(super) const SYMBOL_TO_NUMBER: CalleeErrorText<'static> = [
+    "Cannot convert a Symbol value to a number",
+    "TypeError: Cannot convert a Symbol value to a number",
+];
+
 /// The default `join` separator.
 const COMMA: &str = ",";
 
+/// The `SymbolDescriptiveString` fragments `String(symbol)` splices around
+/// the description.
+pub(super) const SYMBOL_OPEN: &str = "Symbol(";
+/// See [`SYMBOL_OPEN`].
+pub(super) const SYMBOL_CLOSE: &str = ")";
+
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 6] = [
+pub(super) const STRINGS: [&str; 12] = [
     NO_PRIMITIVE[0],
     NO_PRIMITIVE[1],
+    SYMBOL_TO_STRING[0],
+    SYMBOL_TO_STRING[1],
+    SYMBOL_TO_NUMBER[0],
+    SYMBOL_TO_NUMBER[1],
     COMMA,
+    SYMBOL_OPEN,
+    SYMBOL_CLOSE,
     "",
     "toString",
     "valueOf",
@@ -57,6 +81,31 @@ fn return_if_pending(function: &mut Function, ret: &Instruction<'_>) {
     wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
     function.instruction(ret);
     wasm!(function; Return, End);
+}
+
+/// When the jsval in `v` is a symbol, leave the `TypeError` `text` pending and
+/// return the value `ret` pushes (a helper returning other than `i64` cannot
+/// unwind through [`emit_throw_error`]). The helper's locals must start with
+/// [`type_error_helper_locals`] at `scratch`.
+pub(super) fn throw_if_symbol(
+    f: &mut Function,
+    v: u32,
+    text: CalleeErrorText<'_>,
+    ret: &Instruction<'_>,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    emit_is_symbol(f, v);
+    wasm!(f; If(BlockType::Empty));
+    emit_node(&callee_type_error(text), f, scratch, strings, helpers);
+    wasm!(f;
+        GlobalSet(EXC_VALUE_GLOBAL),
+        I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
+        I32Const(0), GlobalSet(CF_KIND_GLOBAL),
+    );
+    f.instruction(ret);
+    wasm!(f; Return, End);
 }
 
 /// `__to_primitive(v: i64, hint: i32) -> i64`: `ToPrimitive` without
@@ -110,12 +159,14 @@ pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers
 }
 
 /// `__to_string(v: i64) -> i32`: `ToString(v)` as a heap-string base. A
-/// string is itself; an object is first converted with hint string; the
-/// remaining primitives are formatted by the host. A pending throw returns
-/// the empty string.
+/// string is itself; an object is first converted with hint string; a symbol
+/// throws the `TypeError`; the remaining primitives are formatted by the
+/// host. A pending throw returns the empty string.
 pub(super) fn emit_to_string(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
-    let v = 0;
-    let mut f = Function::new(vec![]);
+    let (v, scratch) = (0, 1);
+    let mut f = Function::new(type_error_helper_locals());
+    helpers.unwind.borrow_mut().reset();
+    let empty = Instruction::I32Const(static_key(strings, ""));
     emit_is_string(&mut f, v);
     wasm!(f; If(BlockType::Result(ValType::I32)), LocalGet(v), I32WrapI64, Else);
     emit_is_object(&mut f, v);
@@ -123,8 +174,17 @@ pub(super) fn emit_to_string(strings: &HashMap<String, i32>, helpers: Helpers<'_
         If(BlockType::Empty),
         LocalGet(v), I32Const(HINT_STRING), Call(helpers.to_primitive()), LocalSet(v),
     );
-    return_if_pending(&mut f, &Instruction::I32Const(static_key(strings, "")));
+    return_if_pending(&mut f, &empty);
     wasm!(f; End);
+    throw_if_symbol(
+        &mut f,
+        v,
+        SYMBOL_TO_STRING,
+        &empty,
+        scratch,
+        strings,
+        helpers,
+    );
     emit_is_string(&mut f, v);
     wasm!(f;
         If(BlockType::Result(ValType::I32)),
@@ -139,7 +199,8 @@ pub(super) fn emit_to_string(strings: &HashMap<String, i32>, helpers: Helpers<'_
 }
 
 /// Set i32 local `kind` to the type byte of the heap value in `x`, or `-1`
-/// for a non-heap value (so `kind == 0` is a string, `kind > 0` an object).
+/// for a non-heap value (so `kind == 0` is a string, `kind > 0` an object or
+/// a symbol).
 fn load_kind(function: &mut Function, x: u32, kind: u32) {
     emit_is_pointer(function, x);
     wasm!(function; If(BlockType::Result(ValType::I32)));
@@ -148,12 +209,14 @@ fn load_kind(function: &mut Function, x: u32, kind: u32) {
 }
 
 /// `__add(a: i64, b: i64) -> i64`: the `+` operator once either operand is
-/// a heap value: `ToPrimitive` both (hint default; only objects call out),
-/// then concatenate the `ToString`s when either primitive is a string, else
-/// add the `ToNumber`s.
+/// a heap value: `ToPrimitive` both (hint default; only objects call out, a
+/// symbol comes back as is), then concatenate the `ToString`s when either
+/// primitive is a string, else add the `ToNumber`s (a symbol throws in
+/// either conversion).
 pub(super) fn emit_add_helper(helpers: Helpers<'_>) -> Function {
-    let (a, b, ka, kb) = (0, 1, 2, 3);
-    let mut f = Function::new(vec![(2, ValType::I32)]);
+    let (a, b, ka, kb, lhs, num) = (0, 1, 2, 3, 4, 5);
+    let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::F64)]);
+    let undefined = Instruction::I64Const(UNDEFINED_BITS);
     for (x, kind) in [(a, ka), (b, kb)] {
         load_kind(&mut f, x, kind);
         wasm!(f;
@@ -161,30 +224,34 @@ pub(super) fn emit_add_helper(helpers: Helpers<'_>) -> Function {
             If(BlockType::Empty),
             LocalGet(x), I32Const(HINT_DEFAULT), Call(helpers.to_primitive()), LocalSet(x),
         );
-        return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
+        return_if_pending(&mut f, &undefined);
         load_kind(&mut f, x, kind);
         wasm!(f; End);
     }
     // Both operands are primitives now: a string is its own `ToString`, the
-    // rest are formatted by the host.
+    // rest go through `__to_string` (a symbol throws, the host formats the
+    // others).
     let primitive_to_string = |f: &mut Function, x: u32, kind: u32| {
         wasm!(f;
             LocalGet(kind), I32Eqz,
             If(BlockType::Result(ValType::I32)),
             LocalGet(x), I32WrapI64,
             Else,
-            LocalGet(x), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+            LocalGet(x), Call(helpers.to_str()),
             End,
         );
     };
     wasm!(f; LocalGet(ka), I32Eqz, LocalGet(kb), I32Eqz, I32Or, If(BlockType::Result(ValType::I64)));
     primitive_to_string(&mut f, a, ka);
+    wasm!(f; LocalSet(lhs));
+    return_if_pending(&mut f, &undefined);
+    wasm!(f; LocalGet(lhs));
     primitive_to_string(&mut f, b, kb);
+    wasm!(f; Call(helpers.concat), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Else);
+    wasm!(f; LocalGet(a), Call(helpers.to_number), F64ReinterpretI64, LocalSet(num));
+    return_if_pending(&mut f, &undefined);
     wasm!(f;
-        Call(helpers.concat), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-        Else,
-        LocalGet(a), Call(helpers.to_number), F64ReinterpretI64,
-        LocalGet(b), Call(helpers.to_number), F64ReinterpretI64,
+        LocalGet(num), LocalGet(b), Call(helpers.to_number), F64ReinterpretI64,
         F64Add, Call(helpers.box_f64),
         End,
         End,
@@ -207,7 +274,8 @@ fn pick_relational(function: &mut Function, op: u32, cmps: [&dyn Fn(&mut Functio
 
 /// `__compare(a: i64, b: i64, op: i32) -> i32`: the relational operators
 /// once an operand is not a number: `ToPrimitive` both (hint number), then
-/// two strings compare by bytes and anything else by `ToNumber`.
+/// two strings compare by bytes and anything else by `ToNumber` (which
+/// throws for a symbol).
 pub(super) fn emit_compare(helpers: Helpers<'_>) -> Function {
     let (a, b, op, ord, lhs, rhs) = (0, 1, 2, 3, 4, 5);
     let mut f = Function::new(vec![(1, ValType::I32), (2, ValType::F64)]);
@@ -236,8 +304,10 @@ pub(super) fn emit_compare(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         Else,
         LocalGet(a), Call(helpers.to_number), F64ReinterpretI64, LocalSet(lhs),
-        LocalGet(b), Call(helpers.to_number), F64ReinterpretI64, LocalSet(rhs),
     );
+    return_if_pending(&mut f, &Instruction::I32Const(0));
+    wasm!(f; LocalGet(b), Call(helpers.to_number), F64ReinterpretI64, LocalSet(rhs));
+    return_if_pending(&mut f, &Instruction::I32Const(0));
     let float = |cmp: Instruction<'static>| move |function: &mut Function| wasm!(function; LocalGet(lhs), LocalGet(rhs), cmp.clone());
     pick_relational(
         &mut f,
