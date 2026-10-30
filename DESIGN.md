@@ -995,10 +995,12 @@ prototypes (`Error`, `TypeError`, `RangeError`, `ReferenceError`,
 `SyntaxError`, `EvalError`, `URIError`), the global object
 (`CLASS_GLOBAL`), `Math`, `JSON`, `console`, the constructors (`Object`,
 `Function`, `Array`, `String`, `Number`, `Boolean`, the seven error
-constructors, `Map`, `Set`, `Promise`, `Date`, `Symbol`; native error
-constructors inherit from `Error`, the rest from `%Function.prototype%`), the
-prototypes of `Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-`Date`, `Symbol`, `%IteratorPrototype%` (`[@@iterator]() { return this }`),
+constructors, `Map`, `Set`, `Promise`, `Date`, `Symbol`, `Iterator`; native
+error constructors inherit from `Error`, the rest from `%Function.prototype%`),
+the prototypes of `Array`, `String`, `Number`, `Boolean`, `Map`, `Set`,
+`Promise`, `Date`, `Symbol`, `%IteratorPrototype%` (`Iterator.prototype`:
+`[@@iterator]() { return this }`, and `constructor` / `@@toStringTag`
+accessors),
 `%ArrayIteratorPrototype%`, `%StringIteratorPrototype%`,
 `%MapIteratorPrototype%`, `%SetIteratorPrototype%` (each a `next`,
 inheriting `%IteratorPrototype%`), `%AsyncIteratorPrototype%`
@@ -1006,8 +1008,10 @@ inheriting `%IteratorPrototype%`), `%AsyncIteratorPrototype%`
 `%IteratorPrototype%`), `%AsyncGeneratorPrototype%` (inheriting
 `%AsyncIteratorPrototype%`), and the
 hidden `Symbol.for` registry (`proto` `null`, unreachable from the global
-object; its table maps interned keys to the registered symbols), and
-`Array.prototype[@@unscopables]` (`proto` `null`). Each
+object; its table maps interned keys to the registered symbols),
+`Array.prototype[@@unscopables]` (`proto` `null`), and
+`%WrapForValidIteratorPrototype%` (`next` / `return`, inheriting
+`%IteratorPrototype%`). Each
 constructor owns `length`, `name`, a
 non-writable `prototype`, and its statics (`%Array%`, `%Map%`, `%Set%` and
 `%Promise%` also `get [@@species]`); each prototype owns a
@@ -1728,7 +1732,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter, `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
-| iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); no `Iterator` global or helpers, and `%IteratorPrototype%` has no `@@toStringTag` yet |
+| iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); no iterator helpers yet. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
 
 No input produces an invalid wasm module.
 

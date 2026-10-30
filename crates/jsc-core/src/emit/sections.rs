@@ -1399,15 +1399,22 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// `defineProperties` / `create` / `__defineGetter__` / `__defineSetter__`),
 /// or can reach the realm's accessors (the `%Function.prototype%` `caller` /
 /// `arguments` poison pair, the `Map`/`Set` `size` getters, the
-/// `Object.prototype.__proto__` pair): it names them, or reads or writes a
-/// member under a key computed at run time. Then `__get` / `__set` must
+/// `Object.prototype.__proto__` pair, the `constructor` / `@@toStringTag`
+/// pairs of `%Iterator.prototype%`, which a program reaches only through
+/// `Iterator`, a prototype read or write, or `constructor`): it names them,
+/// or reads or writes a member under a key computed at run time. Then `__get` / `__set` must
 /// dispatch to getters and setters. (The builtins only read fixed keys:
 /// `length`, indices, `prototype`, `name`, `message`; `Object.assign` writes
 /// its sources' keys, which may be `__proto__`, so naming it counts.)
 fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
-        IrNode::MakeAccessor { .. } | IrNode::SizeRead { .. } => true,
+        IrNode::MakeAccessor { .. }
+        | IrNode::SizeRead { .. }
+        | IrNode::Intrinsic(GlobalIntrinsic::Ctor(BuiltinCtor::Iterator)) => true,
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            global.name == "Iterator"
+        }
         IrNode::Str(s) => [
             "caller",
             "arguments",
@@ -1419,6 +1426,10 @@ fn program_has_accessors(program: &IrProgram) -> bool {
             "__proto__",
             "__defineGetter__",
             "__defineSetter__",
+            "Iterator",
+            "constructor",
+            "getPrototypeOf",
+            "setPrototypeOf",
         ]
         .iter()
         .any(|name| s == name),
