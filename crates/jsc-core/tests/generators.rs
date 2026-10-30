@@ -1235,3 +1235,19 @@ fn return_closes_a_user_iterator_of_a_suspended_for_of() {
         "5 true 1\n",
     );
 }
+
+#[test]
+fn closing_a_generator_suspended_in_try_finally_runs_the_finally() {
+    // An array pattern leaving the generator undone closes it.
+    assert_output(
+        "function* g(){ try { yield 1; yield 2 } finally { console.log('f') } }
+         let a; [a] = g(); const [b] = g(); console.log(a, b)",
+        "f\nf\n1 1\n",
+    );
+    // A `for-of` exited by `break`.
+    assert_output(
+        "function* g(){ try { yield 1; yield 2 } finally { console.log('f') } }
+         for (const x of g()) { console.log(x); break }",
+        "1\nf\n",
+    );
+}

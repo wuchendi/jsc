@@ -117,6 +117,16 @@ pub(super) fn emit_node(
             let bits = intrinsic_bits(Intrinsic::from(*global), helpers);
             function.instruction(&Instruction::I64Const(bits));
         }
+        IrNode::IteratorSymbol => {
+            let addr = realm::symbol_addr(realm::WellKnown::Iterator, helpers);
+            function.instruction(&Instruction::I64Const(
+                HEAP_BITS | i64::from(addr.cast_unsigned()),
+            ));
+        }
+        IrNode::ArrayValues => {
+            let values = Builtin::Iter(realm::IterOp::ArrayIter(realm::IterKind::Values));
+            function.instruction(&Instruction::I64Const(realm::method_bits(values, helpers)));
+        }
         IrNode::GlobalGet {
             global,
             typeof_operand,

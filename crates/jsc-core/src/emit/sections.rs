@@ -1240,6 +1240,8 @@ pub(super) fn collect_node<'a>(
         }
         IrNode::ErrorProto(_)
         | IrNode::Intrinsic(_)
+        | IrNode::IteratorSymbol
+        | IrNode::ArrayValues
         | IrNode::Num(_)
         | IrNode::Bool(_)
         | IrNode::Null
@@ -1392,10 +1394,6 @@ fn program_tests_dirty_bits(program: &IrProgram) -> bool {
         IrNode::ArraySpread(parts) => parts
             .iter()
             .any(|part| matches!(part, SpreadElem::Spread(_))),
-        // An `arguments` object is iterated through the fast path only (it
-        // has no own `@@iterator` yet), which a builtin consumer takes only
-        // while the bits are tracked.
-        IrNode::Object { class, .. } => *class == abi::CLASS_ARGUMENTS,
         IrNode::NamespaceGuard { namespace, .. } => {
             realm::Intrinsic::from(*namespace).watch_bit().is_some()
         }

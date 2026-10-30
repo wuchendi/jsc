@@ -4,9 +4,8 @@
 mod common;
 use common::jsc;
 
-/// Array destructuring in declarations desugars to indexed
-/// reads off the initializer — plain elements, holes, defaults, rest, `const`,
-/// and nested patterns.
+/// Array destructuring in declarations steps the initializer's iterator —
+/// plain elements, holes, defaults, rest, `const`, and nested patterns.
 #[test]
 fn array_destructuring_declarations_via_eval() {
     // Plain two-element bind.
@@ -188,5 +187,122 @@ fn empty_object_pattern_rejects_nullish() {
              console.log(f({}), g(0))"
         ]),
         "TypeError\nTypeError\n1 2"
+    );
+}
+
+/// A logging iterable for the protocol tests below: `next` yields 1, 2, ...
+/// (`undefined` each time with `blank`; endless unless `limit`), and every
+/// `next` / `return` call is logged.
+const LOGGED: &str = "const log = []; \
+     function logged(limit, blank) { let n = 0; return { [Symbol.iterator]() { return { \
+       next() { n++; log.push('next'); return { value: blank ? undefined : n, done: limit !== undefined && n > limit } }, \
+       return() { log.push('return'); return {} } } } } }; ";
+
+/// B4: an empty pattern never steps a generator (its body never runs) and
+/// closes it; an elision steps once; an element steps once and closes.
+#[test]
+fn array_pattern_steps_lazily_and_closes_generators() {
+    let program = "let ran = 0; \
+         function* g() { ran++; yield 1; ran++; yield 2; ran++ } \
+         let it = g(); let [] = it; console.log(ran, it.next().done); \
+         it = g(); [] = it; console.log(ran, it.next().done); \
+         it = g(); [,] = it; console.log(ran, it.next().done); \
+         it = g(); let [a] = it; console.log(ran, a, it.next().done); \
+         for (let [] of [g()]) console.log(ran)";
+    assert_eq!(jsc(&["-e", program]), "0 true\n0 true\n1 true\n2 1 true\n2");
+}
+
+/// An element against a protocol iterator steps once, then calls `return`
+/// exactly once; elisions step without closing early; a done iterator is
+/// not closed.
+#[test]
+fn array_pattern_closes_protocol_iterator_once() {
+    let program = format!(
+        "{LOGGED} \
+         let [a] = logged(); console.log(a, log.join()); log.length = 0; \
+         [,] = logged(); console.log(log.join()); log.length = 0; \
+         [] = logged(); console.log(log.join()); log.length = 0; \
+         let [b, c, d] = logged(1); console.log(b, c, d, log.join())"
+    );
+    assert_eq!(
+        jsc(&["-e", &program]),
+        "1 next,return\nnext,return\nreturn\n1 undefined undefined next,next"
+    );
+}
+
+/// An element pattern over an endless iterator terminates (no drain).
+#[test]
+fn array_pattern_over_infinite_iterator_terminates() {
+    let program = "function* infinite() { let i = 0; while (true) yield i++ } \
+         const [a, b] = infinite(); let x, y; [x, , y] = infinite(); \
+         console.log(a, b, x, y)";
+    assert_eq!(jsc(&["-e", program]), "0 1 0 2");
+}
+
+/// A throwing default initializer closes the iterator before the throw
+/// propagates; a throw from `next` itself does not close it.
+#[test]
+fn array_pattern_default_throw_closes() {
+    let program = format!(
+        "{LOGGED} \
+         try {{ let [a, b = (() => {{ throw new Error('boom') }})()] = logged(undefined, true) }} \
+         catch (e) {{ console.log(e.message, log.join()) }} log.length = 0; \
+         let o = {{}}; \
+         try {{ [o.a, o.b = (() => {{ throw 1 }})()] = logged(undefined, true) }} \
+         catch (e) {{ console.log(e, log.join()) }} log.length = 0; \
+         const bad = {{ [Symbol.iterator]() {{ return {{ \
+           next() {{ throw 2 }}, return() {{ log.push('return'); return {{}} }} }} }} }}; \
+         try {{ let [z = 0] = bad }} catch (e) {{ console.log(e, log.length) }}"
+    );
+    assert_eq!(
+        jsc(&["-e", &program]),
+        "boom next,next,return\n1 next,next,return\n2 0"
+    );
+}
+
+/// A rest element drains the iterator and does not close it.
+#[test]
+fn array_rest_drains_without_close() {
+    let program = format!(
+        "{LOGGED} \
+         let [a, ...r] = logged(3); console.log(a, r.join(), log.join()); log.length = 0; \
+         let s; [, ...s] = logged(2); console.log(s.join(), log.join())"
+    );
+    assert_eq!(
+        jsc(&["-e", &program]),
+        "1 2,3 next,next,next,next\n2 next,next,next"
+    );
+}
+
+/// `next` calls and default evaluations interleave in element order.
+#[test]
+fn array_pattern_interleaves_steps_and_defaults() {
+    let program = format!(
+        "{LOGGED} \
+         function f() {{ log.push('f'); return 'F' }} \
+         function h() {{ log.push('h'); return 'H' }} \
+         let [a = f(), b = h()] = logged(undefined, true); console.log(a, b, log.join()); log.length = 0; \
+         let x, y; [x = f(), y = h()] = logged(undefined, true); console.log(x, y, log.join())"
+    );
+    assert_eq!(
+        jsc(&["-e", &program]),
+        "F H next,f,next,h,return\nF H next,f,next,h,return"
+    );
+}
+
+/// A for-of head pattern closes each element's iterator; a parameter
+/// pattern closes its argument's iterator.
+#[test]
+fn for_of_heads_and_parameters_close() {
+    let program = format!(
+        "{LOGGED} \
+         for (const [a] of [logged(), logged()]) log.push(a); console.log(log.join()); \
+         log.length = 0; \
+         function p([a]) {{ return a }} console.log(p(logged()), log.join()); log.length = 0; \
+         const q = ([a, b]) => a + b; console.log(q(logged()), log.join())"
+    );
+    assert_eq!(
+        jsc(&["-e", &program]),
+        "next,return,1,next,return,1\n1 next,return\n3 next,next,return"
     );
 }

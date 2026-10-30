@@ -840,6 +840,11 @@ pub enum IrNode {
     ErrorProto(ErrorKind),
     /// The static object of a global intrinsic (a compile-time constant).
     Intrinsic(GlobalIntrinsic),
+    /// The well-known symbol `@@iterator` (a compile-time constant).
+    IteratorSymbol,
+    /// `%Array.prototype.values%` (a compile-time constant): the own
+    /// `@@iterator` of an `arguments` object.
+    ArrayValues,
     /// Read the global-object property of an unresolved identifier: `HasProperty`
     /// then `Get`, throwing the reference's `ReferenceError` on a miss; as a
     /// `typeof` operand (`typeof_operand`) a miss reads `undefined` instead.
@@ -2182,6 +2187,8 @@ impl IrNode {
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
             | IrNode::Intrinsic(_)
+            | IrNode::IteratorSymbol
+            | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
             | IrNode::DateField { .. } => false,
@@ -2386,6 +2393,8 @@ impl IrNode {
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
             | IrNode::Intrinsic(_)
+            | IrNode::IteratorSymbol
+            | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
             | IrNode::DateField { .. } => Vec::new(),

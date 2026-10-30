@@ -40,7 +40,7 @@ mod symbol;
 
 use crate::emit::realm::ArrayCopyOp;
 pub(super) use iter::{
-    CloseMode, ST_ARGS, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
+    CloseMode, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
     emit_iterator_close, emit_iterator_step, emit_iterator_value, emit_open_iterator,
 };
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};

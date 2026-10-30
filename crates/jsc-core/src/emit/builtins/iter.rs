@@ -527,9 +527,9 @@ fn step_string(
     st.store_index(function);
 }
 
-/// A Map / Set Iterator step into `value`: the next backing entry pair
-/// (re-reading the live entry count, so appended entries are seen), as its
-/// key, value or `[key, value]` (a Set's value is its key).
+/// A Map / Set Iterator step into `value`: the next live backing entry pair
+/// (tombstones skipped; the slot count re-read, so appended entries are
+/// seen), as its key, value or `[key, value]` (a Set's value is its key).
 fn step_collection(
     set: bool,
     function: &mut Function,
@@ -537,6 +537,7 @@ fn step_collection(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    map_set::skip_tombstones(function, st.target, st.i, st.at, st.value, st.item);
     map_set::entries_len(function, st.target);
     wasm!(function; LocalSet(st.len));
     st.end_at_len(function, strings, helpers);
@@ -616,18 +617,19 @@ pub(in crate::emit) const ST_ARRAY: f64 = 1.0;
 /// byte index).
 pub(in crate::emit) const ST_STRING: f64 = 2.0;
 /// Record state: a clean `Map` walked live (`next` holds the backing slot).
-pub(super) const ST_MAP: f64 = 3.0;
+const ST_MAP: f64 = 3.0;
 /// Record state: a clean `Set` walked live (`next` holds the backing slot).
-pub(super) const ST_SET: f64 = 4.0;
+const ST_SET: f64 = 4.0;
 /// Record state: a clean generator stepped by its state machine.
 pub(in crate::emit) const ST_GEN: f64 = 5.0;
-/// Record state: an `arguments` object without a symbol-keyed hook on its
-/// chain, walked like an array (until its own `@@iterator` lands).
-pub(in crate::emit) const ST_ARGS: f64 = 6.0;
+/// Record state: an `arguments` object whose own `@@iterator` is still
+/// `%Array.prototype.values%`, walked like an array.
+const ST_ARGS: f64 = 6.0;
 /// Record state: an open protocol record (closing calls `return`).
 const ST_PROTOCOL: f64 = 7.0;
-/// Record state: a protocol step in flight, or its value not yet read
-/// (closing does nothing: a throw from the iterator is not closed).
+/// Record state: a protocol step or its value read in flight, left behind
+/// by a throw from either (closing does nothing: a throw from the iterator
+/// is not closed).
 const ST_STEPPING: f64 = 8.0;
 
 /// The jsval of record state `state`.
@@ -755,8 +757,9 @@ fn call_internal(
 /// no `return` on `%IteratorPrototype%`) through the watched dirty bits,
 /// unless `sealed`. Without dirty tracking (and not `sealed`) the bits prove
 /// nothing, so every value takes the protocol. An `arguments` object takes
-/// the array walk while no symbol-keyed `@@iterator` is on its chain (a
-/// lookup that may throw: it propagates). `tmp` is a free i32 local.
+/// the array walk while its own `@@iterator` is still the data property
+/// `%Array.prototype.values%` (read without a getter call). `tmp` is a free
+/// i32 local.
 pub(in crate::emit) fn emit_iter_classify(
     function: &mut Function,
     v: u32,
@@ -794,21 +797,16 @@ pub(in crate::emit) fn emit_iter_classify(
     }
     emit_is_wrapper(function, v, abi::CLASS_ARGUMENTS);
     bits_clear(function, &[family(IterFamily::Array), iterator], sealed);
-    wasm!(function; I32And, If(BlockType::Result(ValType::I64)));
-    // The lookup sits inside the string arm, the four kind arms and this one.
-    for _ in 0..arms.len() + 2 {
-        enter_frame(helpers);
-    }
+    let values = Builtin::Iter(IterOp::ArrayIter(IterKind::Values));
     wasm!(function;
-        LocalGet(v), I32Const(realm::symbol_addr(WellKnown::Iterator, helpers)),
-        Call(helpers.symbol_get()),
-    );
-    emit_propagate_if_pending(function, helpers);
-    for _ in 0..arms.len() + 2 {
-        leave_frame(helpers);
-    }
-    wasm!(function;
-        I64Const(UNDEFINED_BITS), I64Eq,
+        I32And, If(BlockType::Result(ValType::I64)),
+        LocalGet(v), I32WrapI64, I32Const(realm::symbol_addr(WellKnown::Iterator, helpers)),
+        Call(helpers.prop_find), LocalTee(tmp),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(tmp),
+        I64Load(MemArg { offset: u64::from(abi::PROP_VALUE_OFFSET), align: 3, memory_index: 0 }),
+        I64Const(realm::method_bits(values, helpers)), I64Eq,
+        Else, I32Const(0), End,
         If(BlockType::Result(ValType::I64)), I64Const(st(ST_ARGS)),
         Else, I64Const(st(ST_PROTOCOL)), End,
         Else, I64Const(st(ST_PROTOCOL)), End,
@@ -1119,8 +1117,8 @@ fn step_code_point(
     wasm!(function; I32Const(1), End);
 }
 
-/// A Map / Set step: the next backing entry (re-reading the live entry
-/// count), as `[key, value]` / the value.
+/// A Map / Set step: the next live backing entry (tombstones skipped; the
+/// slot count re-read), as `[key, value]` / the value.
 fn step_entry(
     rec: &IterRecord,
     set: bool,
@@ -1139,7 +1137,9 @@ fn step_entry(
     load(function, &rec.iter, scratch, strings, helpers);
     wasm!(function; LocalSet(handle));
     load(function, &rec.next, scratch, strings, helpers);
-    wasm!(function; F64ReinterpretI64, I32TruncSatF64U, LocalTee(i));
+    wasm!(function; F64ReinterpretI64, I32TruncSatF64U, LocalSet(i));
+    map_set::skip_tombstones(function, handle, i, at, key, value);
+    wasm!(function; LocalGet(i));
     map_set::entries_len(function, handle);
     wasm!(function; I32GeU, If(BlockType::Result(ValType::I32)));
     step_done(rec, function, scratch, strings, helpers);
@@ -1212,7 +1212,9 @@ fn step_generator(
 }
 
 /// A protocol step ([`ProtocolOp::Step`]) with the record marked stepping
-/// for its duration, so a throw from `next` leaves it unclosed.
+/// for its duration, so a throw from `next` leaves it unclosed; a produced
+/// result leaves it open again, so an elision (a step without a value read)
+/// still closes it.
 fn step_protocol(
     rec: &IterRecord,
     function: &mut Function,
@@ -1253,12 +1255,21 @@ fn step_protocol(
         strings,
         helpers,
     );
+    store(
+        function,
+        &rec.state,
+        IrNode::Num(ST_PROTOCOL),
+        scratch,
+        strings,
+        helpers,
+    );
     wasm!(function; I32Const(1), End);
 }
 
 /// Emit [`IrNode::IteratorValue`], pushing the stepped value: the fast
 /// paths' value itself, or `Get(result, "value")` of a protocol result
-/// (after which the record is open again, so a later abrupt exit closes it).
+/// (with the record marked stepping for the read, so a throw from it leaves
+/// the record unclosed). Read once per successful step.
 pub(in crate::emit) fn emit_iterator_value(
     rec: &IterRecord,
     function: &mut Function,
@@ -1266,10 +1277,11 @@ pub(in crate::emit) fn emit_iterator_value(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    state_is(function, rec, ST_STEPPING, scratch, strings, helpers);
+    state_is(function, rec, ST_PROTOCOL, scratch, strings, helpers);
     wasm!(function; If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
     let read = IrNode::Seq(vec![
+        place_set(&rec.state, IrNode::Num(ST_STEPPING)),
         place_set(
             &rec.result,
             IrNode::Index {
@@ -1594,26 +1606,35 @@ fn emit_close_body(
 }
 
 /// The [`ProtocolOp::ToList`] body: `this` is the iterated value; a fresh
-/// array of every value its protocol iterator yields (never closed: a throw
-/// marks it done).
+/// array of every value its iterator record yields (on its guarded fast
+/// path, e.g. a clean `arguments` walked by index, or through the
+/// protocol; never closed: a throw marks it done).
 fn emit_to_list_body(
     function: &mut Function,
     frame: Frame,
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    let (v, method, value) = (frame.i64(0), frame.i64(1), frame.i64(2));
+    let (v, value) = (frame.i64(0), frame.i64(2));
     let rec = local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
     let (list, scratch) = (frame.i32(0), frame.scratch());
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(v));
-    emit_iter_open(function, v, method, &rec, scratch, strings, helpers);
+    emit_get_iterator(
+        &IrNode::Local(v),
+        &rec,
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
     wasm!(function;
         I32Const(0), Call(helpers.new_array()), LocalSet(list),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
     enter_frame(helpers);
     enter_frame(helpers);
-    step_protocol(&rec, function, scratch, strings, helpers);
+    emit_iterator_step(&rec, function, scratch, strings, helpers);
     wasm!(function; I32Eqz, BrIf(1));
     emit_iterator_value(&rec, function, scratch, strings, helpers);
     wasm!(function;

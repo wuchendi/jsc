@@ -206,9 +206,10 @@ pub(super) fn emit_array_node(
 /// A [`Spread`] source is `IterableToList` (design/symbol-strings.md §5.2):
 /// on its guarded fast path (§5.3, [`builtins::emit_iter_classify`]) a clean
 /// array is itself, a string its characters (`__str_to_array`) and a
-/// generator its drained values (`__gen_to_array`); `arguments` is copied
-/// by `Array.prototype.slice`; every other value runs the protocol
-/// ([`ProtocolOp::ToList`], which throws `<x> is not iterable`).
+/// generator its drained values (`__gen_to_array`); every other value
+/// (`arguments` included) goes through [`ProtocolOp::ToList`], which walks
+/// a clean `arguments` by index and runs the protocol otherwise (throwing
+/// `<x> is not iterable`).
 ///
 /// The handle base is kept purely on the operand stack (both runtime helpers
 /// take it as their deepest argument and return it), so a nested spread array
@@ -273,7 +274,7 @@ pub(super) fn emit_array_spread(
 /// Push the array of values a spread of the jsval in i64 `value` appends,
 /// by its record state in i64 `state` ([`builtins::emit_iter_classify`]):
 /// the array itself, a string's characters, a generator's drained values,
-/// a copy of `arguments`, else the protocol's list. A throw propagates.
+/// else [`ProtocolOp::ToList`]'s list. A throw propagates.
 fn emit_spread_list(value: u32, state: u32, function: &mut Function, helpers: Helpers<'_>) {
     let state_is = |function: &mut Function, kind: f64| {
         function.instruction(&Instruction::LocalGet(state));
@@ -282,12 +283,7 @@ fn emit_spread_list(value: u32, state: u32, function: &mut Function, helpers: He
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         function.instruction(&Instruction::LocalGet(value));
     };
-    let (array, string, generator, arguments) = (
-        builtins::ST_ARRAY,
-        builtins::ST_STRING,
-        builtins::ST_GEN,
-        builtins::ST_ARGS,
-    );
+    let (array, string, generator) = (builtins::ST_ARRAY, builtins::ST_STRING, builtins::ST_GEN);
     state_is(function, array);
     function.instruction(&Instruction::Else);
     state_is(function, string);
@@ -299,26 +295,16 @@ fn emit_spread_list(value: u32, state: u32, function: &mut Function, helpers: He
     for _ in 0..3 {
         enter_frame(helpers);
     }
-    let builtin = |function: &mut Function, builtin: Builtin| {
-        for _ in 0..helpers.max_args {
-            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        }
-        function.instruction(&Instruction::LocalGet(value));
-        function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
-        function.instruction(&Instruction::I64Const(0));
-        emit_argc(0, function);
-        function.instruction(&Instruction::Call(helpers.builtin(builtin)));
-    };
-    function.instruction(&Instruction::LocalGet(state));
-    function.instruction(&Instruction::I64Const(
-        f64::to_bits(arguments).cast_signed(),
+    for _ in 0..helpers.max_args {
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    }
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+    function.instruction(&Instruction::I64Const(0));
+    emit_argc(0, function);
+    function.instruction(&Instruction::Call(
+        helpers.builtin(Builtin::Protocol(ProtocolOp::ToList)),
     ));
-    function.instruction(&Instruction::I64Eq);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    builtin(function, Builtin::ArraySlice);
-    function.instruction(&Instruction::Else);
-    builtin(function, Builtin::Protocol(ProtocolOp::ToList));
-    function.instruction(&Instruction::End);
     emit_propagate_if_pending(function, helpers);
     for _ in 0..3 {
         leave_frame(helpers);

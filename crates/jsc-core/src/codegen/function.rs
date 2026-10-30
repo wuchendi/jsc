@@ -685,7 +685,8 @@ impl LowerCtx<'_> {
 
     /// The prologue building this function's `arguments` object into `local`:
     /// an ordinary object of class ARGUMENTS (`proto` `%Object.prototype%`)
-    /// with a non-enumerable `length` = `n` and the own
+    /// with a non-enumerable `length` = `n`, a non-enumerable `@@iterator` =
+    /// `%Array.prototype.values%`, and the own
     /// properties `"0".."n-1"` holding every actual argument (slots `0..k`, then
     /// the spread overflow). Unmapped: the values are copied, never aliased.
     fn lower_arguments_object(&mut self, local: u32, k: u32) -> Vec<IrStmt> {
@@ -698,10 +699,16 @@ impl LowerCtx<'_> {
             IrStmt::Decl {
                 local,
                 init: IrNode::Object {
-                    entries: vec![(PropKey::Hidden("length".to_owned()), IrNode::Local(n))],
+                    entries: vec![
+                        (PropKey::Hidden("length".to_owned()), IrNode::Local(n)),
+                        (
+                            PropKey::HiddenComputed(IrNode::IteratorSymbol),
+                            IrNode::ArrayValues,
+                        ),
+                    ],
                     proto: None,
                     class: crate::abi::CLASS_ARGUMENTS,
-                    reserve: k + 1,
+                    reserve: k + 2,
                 },
             },
         ];

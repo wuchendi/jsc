@@ -706,10 +706,12 @@ impl LowerCtx<'_> {
     /// Desugar a binding pattern `pat`, bound to the already-lowered `source`
     /// value, into declaration statements appended to `out`. The plain
     /// `Pat::Ident` case binds one local (boxing a captured binding into a cell,
-    /// like the fast path in [`Self::lower_var_decl`]); `Pat::Array` evaluates
-    /// `source` ONCE into a hidden temp local and binds each element from an
-    /// indexed read, handling holes (skipped indices), defaults (`[a = 9]`), a
-    /// trailing rest (`[a, ...r]`), and nested patterns (`[[a]]`) by recursion.
+    /// like the fast path in [`Self::lower_var_decl`]); `Pat::Array` opens
+    /// `source`'s iterator and steps it lazily per element
+    /// ([`Self::destructure_array`]): a hole steps without a value, an element
+    /// binds the stepped value (`undefined` once done; a default `[a = 9]`
+    /// fills `undefined`), a trailing rest (`[a, ...r]`) drains, and a nested
+    /// pattern (`[[a]]`) recurses.
     /// `mutable` is the binding mutability (`false` for `const`). Shared by
     /// parameter and object destructuring.
     pub(super) fn lower_binding_pattern(
@@ -725,31 +727,37 @@ impl LowerCtx<'_> {
                 Ok(())
             }
             Pat::Array(arr) => {
-                // Evaluate the initializer ONCE into a hidden temp local as its
-                // `GetIterator` snapshot array, then read each element out of
-                // it by index.
-                let temp = self.fresh();
-                out.push(IrStmt::Decl {
-                    local: temp,
-                    init: iter_snapshot(source),
-                });
-                for (i, elem) in arr.elems.iter().enumerate() {
-                    // A hole (`let [, b] = ..`) skips its index.
-                    let Some(elem) = elem else { continue };
-                    // A trailing rest (`...r`) collects the remaining elements.
-                    if let Pat::Rest(rest) = elem {
-                        self.lower_array_rest(&rest.arg, temp, i, mutable, out)?;
-                        continue;
+                // Only a default, a nested pattern or a `var` write (a global
+                // property) can throw between steps and need the close.
+                let guard = self.binding_var
+                    || arr
+                        .elems
+                        .iter()
+                        .flatten()
+                        .any(|elem| !matches!(elem, Pat::Ident(_) | Pat::Rest(_)));
+                self.destructure_array(source, guard, out, |this, rec, out| {
+                    for elem in &arr.elems {
+                        match elem {
+                            None => {
+                                this.push_effect(IrNode::IteratorStep(Box::new(rec.clone())), out);
+                            }
+                            Some(Pat::Rest(rest)) => {
+                                let value = IrNode::Local(this.collect_array_rest(rec, out));
+                                this.lower_binding_pattern(&rest.arg, value, mutable, out)?;
+                            }
+                            Some(elem) => {
+                                let value = this.step_value(rec, out);
+                                this.bind_with_default(
+                                    elem,
+                                    &|| IrNode::Local(value),
+                                    mutable,
+                                    out,
+                                )?;
+                            }
+                        }
                     }
-                    // A default (`[a = 9]`) binds the default expression only when
-                    // the slot reads back `undefined`.
-                    let read = || IrNode::Index {
-                        obj: Box::new(IrNode::Local(temp)),
-                        index: Box::new(index_num(i)),
-                    };
-                    self.bind_with_default(elem, &read, mutable, out)?;
-                }
-                Ok(())
+                    Ok(())
+                })
             }
             // An object pattern (`let {x, y: b, z = 7, ...rest} = ..`) evaluates
             // `source` ONCE into a hidden temp local, then binds each property from
@@ -906,7 +914,7 @@ impl LowerCtx<'_> {
     /// `read`, applying a `Pat::Assign` default (`= expr`) when present — the
     /// default binds only when the read yields `undefined`. `read` is called up to
     /// twice (the `undefined` guard plus the value), so it must be side-effect-free
-    /// (an indexed read off the hidden temp). Shared by the array-element and
+    /// (a read of a hidden temp). Shared by the array-element and
     /// object-property desugars.
     fn bind_with_default(
         &mut self,
@@ -933,61 +941,98 @@ impl LowerCtx<'_> {
         self.lower_binding_pattern(target, value, mutable, out)
     }
 
-    /// Collect a rest element `...target` from `temp[start..temp.length]` into a
-    /// fresh array, then bind `target` to it. Emits a counted runtime loop
-    /// (`temp.length` is dynamic) that pushes each remaining element onto a hidden
-    /// array temp, mirroring the `for-of` index-loop shape.
-    fn lower_array_rest(
+    /// Destructure `source` through the iterator protocol
+    /// (design/symbol-strings.md §5.2): open it into a fresh [`IterRecord`],
+    /// let `body` step the record lazily per element, then close it unless
+    /// done (an empty pattern closes without stepping). With `guard` (an
+    /// element that can throw), the elements run as
+    ///
+    /// ```text
+    /// try { BODY } catch (e) { IteratorClose(rec, throw); throw e }
+    /// finally { IteratorClose(rec) }
+    /// ```
+    ///
+    /// so a throw from a default, nested pattern or target closes the
+    /// iterator, while a throw from the iterator itself does not.
+    fn destructure_array(
         &mut self,
-        target: &Pat,
-        temp: u32,
-        start: usize,
-        mutable: bool,
+        source: IrNode,
+        guard: bool,
         out: &mut Vec<IrStmt>,
+        body: impl FnOnce(&mut Self, &IterRecord, &mut Vec<IrStmt>) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let rest = self.collect_array_rest(temp, start, out);
-        self.lower_binding_pattern(target, IrNode::Local(rest), mutable, out)
+        let rec = self.fresh_iter_record(out);
+        let open = IrNode::GetIterator {
+            value: Box::new(source),
+            rec: rec.clone(),
+            sealed: self.shared.globals.intrinsics_sealed(),
+        };
+        self.push_effect(open, out);
+        let mut elems = Vec::new();
+        body(self, &rec, &mut elems)?;
+        let close = |throwing| IrNode::IteratorClose {
+            rec: rec.clone(),
+            throwing,
+        };
+        if !guard {
+            out.extend(elems);
+            self.push_effect(close(false), out);
+            return Ok(());
+        }
+        let exc = self.fresh();
+        out.push(IrStmt::Try {
+            body: elems,
+            catch_body: Some(vec![
+                IrStmt::Decl {
+                    local: exc,
+                    init: IrNode::ExcValue,
+                },
+                IrStmt::Expr(close(true)),
+                IrStmt::Expr(IrNode::Throw(Box::new(IrNode::Local(exc)))),
+            ]),
+            finally_body: Some(vec![IrStmt::Expr(close(false))]),
+        });
+        Ok(())
     }
 
-    /// Emit the loop collecting `temp[start..temp.length]` into a fresh array
-    /// local and return that local (shared by rest bindings and rest assignment
-    /// targets).
-    fn collect_array_rest(&mut self, temp: u32, start: usize, out: &mut Vec<IrStmt>) -> u32 {
+    /// Emit `node` for its effect only, as the `Decl` of a scratch local so it
+    /// never becomes `main`'s completion value.
+    fn push_effect(&mut self, node: IrNode, out: &mut Vec<IrStmt>) {
+        let local = self.fresh();
+        out.push(IrStmt::Decl { local, init: node });
+    }
+
+    /// Step `rec` once into a fresh local holding the produced value, or
+    /// `undefined` once the record is done, and return that local.
+    fn step_value(&mut self, rec: &IterRecord, out: &mut Vec<IrStmt>) -> u32 {
+        let value = self.fresh();
+        out.push(IrStmt::Decl {
+            local: value,
+            init: IrNode::Ternary {
+                cond: Box::new(IrNode::IteratorStep(Box::new(rec.clone()))),
+                then_branch: Box::new(IrNode::IteratorValue(Box::new(rec.clone()))),
+                else_branch: Box::new(IrNode::Undefined),
+            },
+        });
+        value
+    }
+
+    /// Emit the loop draining `rec` into a fresh array local and return that
+    /// local (shared by rest bindings and rest assignment targets).
+    fn collect_array_rest(&mut self, rec: &IterRecord, out: &mut Vec<IrStmt>) -> u32 {
         // The rest array grows via `push`, so it must be a plain local.
         let rest = self.fresh();
         out.push(IrStmt::Decl {
             local: rest,
             init: IrNode::Array(Vec::new()),
         });
-        let idx = self.fresh();
-        out.push(IrStmt::Decl {
-            local: idx,
-            init: index_num(start),
-        });
-        let cond = IrNode::Binary {
-            op: BinOp::Lt,
-            lhs: Box::new(IrNode::Local(idx)),
-            rhs: Box::new(IrNode::StrLen(Box::new(IrNode::Local(temp)))),
-        };
-        let body = vec![IrStmt::Expr(IrNode::ArrayPush {
-            local: rest,
-            value: Box::new(IrNode::Index {
-                obj: Box::new(IrNode::Local(temp)),
-                index: Box::new(IrNode::Local(idx)),
-            }),
-        })];
-        let update = vec![IrStmt::Expr(IrNode::Assign {
-            local: idx,
-            value: Box::new(IrNode::Binary {
-                op: BinOp::Add,
-                lhs: Box::new(IrNode::Local(idx)),
-                rhs: Box::new(IrNode::Num(1.0)),
-            }),
-        })];
         out.push(IrStmt::While {
-            cond,
-            body,
-            update,
+            cond: IrNode::IteratorStep(Box::new(rec.clone())),
+            body: vec![IrStmt::Expr(IrNode::ArrayPush {
+                local: rest,
+                value: Box::new(IrNode::IteratorValue(Box::new(rec.clone()))),
+            })],
+            update: Vec::new(),
             label: None,
         });
         rest
@@ -1006,15 +1051,8 @@ impl LowerCtx<'_> {
         let temp = self.fresh();
         out.push(IrStmt::Decl { local: temp, init });
         match pat {
-            AssignTargetPat::Array(arr) => {
-                // The statement's value stays the RHS itself.
-                let source = self.fresh();
-                out.push(IrStmt::Decl {
-                    local: source,
-                    init: iter_snapshot(IrNode::Local(temp)),
-                });
-                self.assign_array_pat(arr, source, out)?;
-            }
+            // The statement's value stays the RHS itself.
+            AssignTargetPat::Array(arr) => self.assign_array_pat(arr, IrNode::Local(temp), out)?,
             AssignTargetPat::Object(obj) => self.assign_object_pat(obj, temp, out)?,
             AssignTargetPat::Invalid(invalid) => {
                 return Err(
@@ -1043,14 +1081,7 @@ impl LowerCtx<'_> {
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
         match target {
-            Pat::Array(arr) => {
-                let temp = self.fresh();
-                out.push(IrStmt::Decl {
-                    local: temp,
-                    init: iter_snapshot(value),
-                });
-                self.assign_array_pat(arr, temp, out)
-            }
+            Pat::Array(arr) => self.assign_array_pat(arr, value, out),
             Pat::Object(obj) => {
                 let temp = self.fresh();
                 out.push(IrStmt::Decl {
@@ -1067,28 +1098,32 @@ impl LowerCtx<'_> {
         }
     }
 
-    /// Assign each element of an array assignment pattern from `temp[i]`; a hole
-    /// skips its index and a trailing rest collects the remaining elements.
+    /// Assign each element of an array assignment pattern from `source`'s
+    /// iterator, stepped lazily ([`Self::destructure_array`]): a hole steps
+    /// without a value, an element's target reference is evaluated before its
+    /// step, and a trailing rest drains the remaining values.
     fn assign_array_pat(
         &mut self,
         arr: &ArrayPat,
-        temp: u32,
+        source: IrNode,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        for (i, elem) in arr.elems.iter().enumerate() {
-            let Some(elem) = elem else { continue };
-            if let Pat::Rest(rest) = elem {
-                self.assign_element(&rest.arg, out, |this, out| {
-                    IrNode::Local(this.collect_array_rest(temp, i, out))
-                })?;
-                continue;
+        // Any target (its reference, default or write) can throw.
+        let guard = arr.elems.iter().any(Option::is_some);
+        self.destructure_array(source, guard, out, |this, rec, out| {
+            for elem in &arr.elems {
+                match elem {
+                    None => this.push_effect(IrNode::IteratorStep(Box::new(rec.clone())), out),
+                    Some(Pat::Rest(rest)) => this.assign_element(&rest.arg, out, |this, out| {
+                        IrNode::Local(this.collect_array_rest(rec, out))
+                    })?,
+                    Some(elem) => this.assign_element(elem, out, |this, out| {
+                        IrNode::Local(this.step_value(rec, out))
+                    })?,
+                }
             }
-            self.assign_element(elem, out, |_, _| IrNode::Index {
-                obj: Box::new(IrNode::Local(temp)),
-                index: Box::new(index_num(i)),
-            })?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Assign each property of an object assignment pattern from `temp.key`; a
@@ -1986,12 +2021,6 @@ impl LowerCtx<'_> {
     }
 }
 
-/// The snapshot array an array pattern destructures `value` through: every
-/// value its iterator yields (`IterableToList`, the spread of `value`).
-fn iter_snapshot(value: IrNode) -> IrNode {
-    IrNode::ArraySpread(vec![SpreadElem::Spread(value)])
-}
-
 /// Whether `expr` is a compile-time literal that is definitely NOT enumerable by
 /// `for-in` — a number/boolean/null/bigint/regex literal. An object enumerates its
 /// keys, an array/string its index keys, and anything dynamic (an identifier, a
@@ -2063,10 +2092,6 @@ fn is_ident_target(pat: &Pat) -> bool {
         Pat::Expr(expr) => matches!(strip_parens(expr), Expr::Ident(_)),
         _ => false,
     }
-}
-
-fn index_num(i: usize) -> IrNode {
-    IrNode::Num(f64::from(u32::try_from(i).unwrap_or(u32::MAX)))
 }
 
 /// The class-member name early errors (`SyntaxError`s) of a literal key: a
