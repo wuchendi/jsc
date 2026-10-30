@@ -211,37 +211,6 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn user_to_primitive_hook_throws_until_y4() {
-    let text = "TypeError: Symbol.toPrimitive is not supported yet";
-    let obj = "let o = { [Symbol.toPrimitive]() { return 1 } };";
-    for use_site in ["o + 1", "`${o}`", "+o", "o < 2", "({})[o]", "String(o)"] {
-        assert_uncaught(&format!("{obj} {use_site}"), text);
-    }
-}
-
-#[test]
-fn user_to_string_tag_throws_until_y4() {
-    let text = "TypeError: Symbol.toStringTag is not supported yet";
-    assert_uncaught(
-        "let o = { [Symbol.toStringTag]: 'X' }; Object.prototype.toString.call(o)",
-        text,
-    );
-    assert_uncaught("let o = { [Symbol.toStringTag]: 'X' }; String(o)", text);
-    assert_uncaught(
-        "class C {} Object.defineProperty(C.prototype, Symbol.toStringTag, { value: 'C' }); `${new C()}`",
-        text,
-    );
-}
-
-#[test]
-fn user_has_instance_throws_until_y4() {
-    assert_uncaught(
-        "function F() {} Object.defineProperty(F, Symbol.hasInstance, { value: () => true }); ({}) instanceof F",
-        "TypeError: Symbol.hasInstance is not supported yet",
-    );
-}
-
-#[test]
 fn user_species_throws_until_y4() {
     let text = "TypeError: Symbol.species is not supported yet";
     let setup =

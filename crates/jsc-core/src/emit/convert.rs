@@ -26,6 +26,9 @@ pub(super) const HINT_DEFAULT: i32 = 0;
 pub(super) const HINT_NUMBER: i32 = 1;
 /// `ToPrimitive` hint `"string"`.
 pub(super) const HINT_STRING: i32 = 2;
+/// Flag or-ed into a hint: skip the `@@toPrimitive` lookup and run
+/// `OrdinaryToPrimitive` (`Date.prototype[@@toPrimitive]`).
+pub(super) const HINT_ORDINARY: i32 = 4;
 
 /// `__compare` op codes, in [`BinOp`] relational order.
 pub(super) const REL_LT: i32 = 0;
@@ -37,6 +40,12 @@ pub(super) const REL_GE: i32 = 3;
 const NO_PRIMITIVE: CalleeErrorText<'static> = [
     "Cannot convert object to primitive value",
     "TypeError: Cannot convert object to primitive value",
+];
+
+/// The `TypeError` of a non-callable `@@toPrimitive` (`GetMethod`).
+const TO_PRIMITIVE_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Symbol.toPrimitive is not a function",
+    "TypeError: Symbol.toPrimitive is not a function",
 ];
 
 /// The `TypeError` of `ToString(symbol)`.
@@ -54,19 +63,7 @@ pub(super) const SYMBOL_TO_NUMBER: CalleeErrorText<'static> = [
 /// The interim `TypeError`s of a well-known symbol hook a consult site finds
 /// before the stage that honours it (design/symbol-strings.md §9.4), in
 /// [`hook_text`] order.
-const HOOK_TEXTS: [CalleeErrorText<'static>; 9] = [
-    [
-        "Symbol.toPrimitive is not supported yet",
-        "TypeError: Symbol.toPrimitive is not supported yet",
-    ],
-    [
-        "Symbol.toStringTag is not supported yet",
-        "TypeError: Symbol.toStringTag is not supported yet",
-    ],
-    [
-        "Symbol.hasInstance is not supported yet",
-        "TypeError: Symbol.hasInstance is not supported yet",
-    ],
+const HOOK_TEXTS: [CalleeErrorText<'static>; 6] = [
     [
         "Symbol.species is not supported yet",
         "TypeError: Symbol.species is not supported yet",
@@ -101,21 +98,25 @@ const HOOK_SPLIT: CalleeErrorText<'static> = [
 
 /// The interim `TypeError` of a `symbol` hook (see [`HOOK_TEXTS`]); `None`
 /// for the symbols without an interim guard (`@@iterator`, honoured by the
-/// iteration protocol; `@@asyncIterator`, `@@unscopables`, without a
-/// consult site).
+/// iteration protocol; `@@toPrimitive` / `@@toStringTag`, honoured by
+/// `ToPrimitive` / `Object.prototype.toString`; `@@hasInstance`, honoured by
+/// `instanceof`; `@@asyncIterator`,
+/// `@@unscopables`, without a consult site).
 pub(super) fn hook_text(symbol: WellKnown) -> Option<CalleeErrorText<'static>> {
     let at = match symbol {
-        WellKnown::ToPrimitive => 0,
-        WellKnown::ToStringTag => 1,
-        WellKnown::HasInstance => 2,
-        WellKnown::Species => 3,
-        WellKnown::IsConcatSpreadable => 4,
-        WellKnown::Match => 5,
-        WellKnown::MatchAll => 6,
-        WellKnown::Replace => 7,
-        WellKnown::Search => 8,
+        WellKnown::Species => 0,
+        WellKnown::IsConcatSpreadable => 1,
+        WellKnown::Match => 2,
+        WellKnown::MatchAll => 3,
+        WellKnown::Replace => 4,
+        WellKnown::Search => 5,
         WellKnown::Split => return Some(HOOK_SPLIT),
-        WellKnown::Iterator | WellKnown::AsyncIterator | WellKnown::Unscopables => return None,
+        WellKnown::Iterator
+        | WellKnown::AsyncIterator
+        | WellKnown::Unscopables
+        | WellKnown::ToPrimitive
+        | WellKnown::ToStringTag
+        | WellKnown::HasInstance => return None,
     };
     Some(HOOK_TEXTS[at])
 }
@@ -178,9 +179,11 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 }
 
 /// The fixed static strings of this family (see [`strings`]).
-const STRINGS: [&str; 12] = [
+const STRINGS: [&str; 17] = [
     NO_PRIMITIVE[0],
     NO_PRIMITIVE[1],
+    TO_PRIMITIVE_NOT_CALLABLE[0],
+    TO_PRIMITIVE_NOT_CALLABLE[1],
     SYMBOL_TO_STRING[0],
     SYMBOL_TO_STRING[1],
     SYMBOL_TO_NUMBER[0],
@@ -191,6 +194,9 @@ const STRINGS: [&str; 12] = [
     "",
     "toString",
     "valueOf",
+    "default",
+    "number",
+    "string",
 ];
 
 /// Return `ret` (pushed by `ret`) when the last call left an exception pending.
@@ -226,14 +232,16 @@ pub(super) fn throw_if_symbol(
 }
 
 /// `__to_primitive(v: i64, hint: i32) -> i64`: `ToPrimitive`. A primitive is
-/// returned as is. An object's `@@toPrimitive` (`__symbol_get`) is honoured
-/// only when it is `%Symbol.prototype%[@@toPrimitive]` (called with `this =
-/// v`); any other user hook throws the interim `TypeError` (Y4 honours it,
-/// design/symbol-strings.md §9.4). Without one, `OrdinaryToPrimitive`:
-/// `valueOf` then `toString` (hint string: `toString` first, and a Date's
-/// default hint is string), each looked up through the `proto` chain,
-/// skipped unless callable, its result skipped unless a primitive; neither
-/// -> `TypeError`.
+/// returned as is. An object's `@@toPrimitive` (`GetMethod` through
+/// `__symbol_get`, skipped when `hint` carries [`HINT_ORDINARY`]) is called
+/// with `this = v` and the hint string (`"default"` / `"number"` /
+/// `"string"`); a non-callable method or an object result throws the
+/// `TypeError`. The builtins skip the call: `%Symbol.prototype%`'s returns
+/// `thisSymbolValue(v)`, `%Date.prototype%`'s maps hint default to string.
+/// Without one (`undefined` / `null`), `OrdinaryToPrimitive`: `valueOf`
+/// then `toString` (hint string: `toString` first), each looked up through
+/// the `proto` chain, skipped unless callable, its result skipped unless a
+/// primitive; neither -> `TypeError`.
 pub(super) fn emit_to_primitive(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (v, hint, method, result, key, second, base) = (0, 1, 2, 3, 4, 5, 6);
     let scratch = 7;
@@ -243,32 +251,56 @@ pub(super) fn emit_to_primitive(strings: &StrOffsets, helpers: Helpers<'_>) -> F
     helpers.unwind.borrow_mut().reset();
     emit_is_object(&mut f, v);
     wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End);
-    let builtin = realm::method_bits(Builtin::Symbol(realm::SymbolOp::ToPrimitive), helpers);
+    let symbol = realm::method_bits(Builtin::Symbol(realm::SymbolOp::ToPrimitive), helpers);
+    let date = realm::method_bits(
+        Builtin::DateGeneric(realm::DateGenericOp::ToPrimitive),
+        helpers,
+    );
+    let hint_str = |name| HEAP_BITS | i64::from(static_key(strings, name));
     wasm!(f;
-        LocalGet(v), I32Const(realm::symbol_addr(WellKnown::ToPrimitive, helpers)),
-        Call(helpers.symbol_get()), LocalTee(method), I64Const(UNDEFINED_BITS), I64Ne,
+        LocalGet(hint), I32Const(HINT_ORDINARY), I32And, I32Eqz,
         If(BlockType::Empty),
-        LocalGet(method), I64Const(builtin), I64Eq,
+        LocalGet(v), I32Const(realm::symbol_addr(WellKnown::ToPrimitive, helpers)),
+        Call(helpers.symbol_get()), LocalSet(method),
+    );
+    return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
+    emit_is_nullish(&mut f, method);
+    wasm!(f;
+        I32Eqz, If(BlockType::Empty),
+        LocalGet(method), I64Const(symbol), I64Eq,
         If(BlockType::Empty),
     );
     emit_accessor_call(&mut f, method, v, None, base, helpers);
-    wasm!(f; Return, End);
-    if let Some(text) = hook_text(WellKnown::ToPrimitive) {
-        emit_throw_not_a_function(&mut f, text, scratch, strings, helpers);
-    }
-    wasm!(f; End);
-    return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
-    wasm!(f; LocalGet(hint), I32Eqz);
-    emit_load_type_byte(&mut f, v);
     wasm!(f;
-        I32Const(TYPE_DATE), I32Eq, I32And,
-        If(BlockType::Empty), I32Const(HINT_STRING), LocalSet(hint), End,
+        Return,
+        End,
+        LocalGet(method), I64Const(date), I64Eq,
+        If(BlockType::Empty),
+        I32Const(HINT_STRING), LocalGet(hint), LocalGet(hint), I32Eqz, Select, LocalSet(hint),
+        Else,
     );
+    emit_is_function(&mut f, method);
+    wasm!(f; I32Eqz, If(BlockType::Empty));
+    emit_throw_not_a_function(&mut f, TO_PRIMITIVE_NOT_CALLABLE, scratch, strings, helpers);
+    wasm!(f;
+        End,
+        I64Const(hint_str("string")), I64Const(hint_str("number")),
+        LocalGet(hint), I32Const(HINT_STRING), I32Eq, Select,
+        I64Const(hint_str("default")), LocalGet(hint), Select, LocalSet(result),
+    );
+    emit_accessor_call(&mut f, method, v, Some(result), base, helpers);
+    wasm!(f; LocalSet(result));
+    return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
+    emit_is_object(&mut f, result);
+    wasm!(f; If(BlockType::Empty));
+    emit_throw_not_a_function(&mut f, NO_PRIMITIVE, scratch, strings, helpers);
+    wasm!(f; End, LocalGet(result), Return, End, End, End);
     let (to_string, value_of) = (
         static_key(strings, "toString"),
         static_key(strings, "valueOf"),
     );
     wasm!(f;
+        LocalGet(hint), I32Const(HINT_ORDINARY - 1), I32And, LocalSet(hint),
         I32Const(to_string), I32Const(value_of),
         LocalGet(hint), I32Const(HINT_STRING), I32Eq, Select, LocalSet(key),
         I32Const(value_of), I32Const(to_string),

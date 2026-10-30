@@ -38,7 +38,7 @@ mod promise;
 mod string;
 mod symbol;
 
-use crate::emit::realm::ArrayCopyOp;
+use crate::emit::realm::{ArrayCopyOp, DateGenericOp};
 pub(super) use iter::{
     CloseMode, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
     emit_iterator_close, emit_iterator_step, emit_iterator_value, emit_open_iterator,
@@ -104,6 +104,13 @@ struct Frame {
 }
 
 impl Frame {
+    /// The frame of a builtin body under the program's arity `K`.
+    fn of(helpers: Helpers<'_>) -> Self {
+        Self {
+            k: helpers.max_args,
+        }
+    }
+
     /// The wasm function with a frame's locals.
     fn function() -> Function {
         Function::new(vec![
@@ -239,8 +246,7 @@ pub(super) fn emit_builtin(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) -> Function {
-    let (k, mut f) = (helpers.max_args, Frame::function());
-    let frame = Frame { k };
+    let (mut f, frame) = (Frame::function(), Frame::of(helpers));
     helpers.unwind.borrow_mut().reset();
     match builtin {
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
@@ -252,12 +258,14 @@ pub(super) fn emit_builtin(
         Builtin::ProtoGet => object::emit_proto_get(&mut f, frame, strings, helpers),
         Builtin::ProtoSet => object::emit_proto_set(&mut f, frame, strings, helpers),
         Builtin::ObjectReflect(op) => object_static::emit(op, &mut f, frame, strings, helpers),
-        Builtin::Call => function::emit_call(&mut f, frame, strings, helpers),
-        Builtin::Apply => function::emit_apply(&mut f, frame, strings, helpers),
-        Builtin::Bind => function::emit_bind(&mut f, frame, strings, helpers),
-        Builtin::FunctionToString => function::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::BoundCall => function::emit_bound_call(&mut f, frame, strings, helpers),
-        Builtin::ThrowTypeError => function::emit_throw_type_error(&mut f, frame, strings, helpers),
+        Builtin::Call
+        | Builtin::Apply
+        | Builtin::Bind
+        | Builtin::FunctionToString
+        | Builtin::FunctionHasInstance
+        | Builtin::BoundCall
+        | Builtin::ThrowTypeError
+        | Builtin::MethodCall => emit_function_family(builtin, &mut f, frame, strings, helpers),
         Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
         Builtin::ArrayPush
         | Builtin::ArrayPop
@@ -301,7 +309,6 @@ pub(super) fn emit_builtin(
         | Builtin::ParseInt
         | Builtin::BooleanToString
         | Builtin::BooleanValueOf => emit_number_family(builtin, &mut f, frame, strings, helpers),
-        Builtin::MethodCall => function::emit_method_call(&mut f, frame, strings, helpers),
         Builtin::Protocol(op) => iter::emit_protocol(op, &mut f, frame, strings, helpers),
         Builtin::Iter(op) => iter::emit(op, &mut f, frame, strings, helpers),
         Builtin::PropertyIsEnumerable
@@ -322,7 +329,7 @@ pub(super) fn emit_builtin(
         | Builtin::AsyncGeneratorDrain
         | Builtin::AsyncGeneratorStep
         | Builtin::AsyncGeneratorReaction(_)
-        | Builtin::DateToJson => emit_object_family(builtin, &mut f, frame, strings, helpers),
+        | Builtin::DateGeneric(_) => emit_object_family(builtin, &mut f, frame, strings, helpers),
         Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
@@ -397,7 +404,12 @@ fn emit_object_family(
             object::emit_lookup_accessor(set, f, frame, strings, helpers);
         }
         Builtin::DateMethod(op) => date::emit_method(op, f, frame, strings, helpers),
-        Builtin::DateToJson => date::emit_to_json(f, frame, strings, helpers),
+        Builtin::DateGeneric(DateGenericOp::ToJson) => {
+            date::emit_to_json(f, frame, strings, helpers);
+        }
+        Builtin::DateGeneric(DateGenericOp::ToPrimitive) => {
+            date::emit_to_primitive(f, frame, strings, helpers);
+        }
         Builtin::CollectionOp { set, op } => map_set::emit_op(set, op, f, frame, strings, helpers),
         Builtin::CollectionForEach { set } => {
             map_set::emit_for_each(set, f, frame, strings, helpers);
@@ -421,6 +433,29 @@ fn emit_object_family(
             generator::emit_async_reaction(reaction, f, frame, strings, helpers);
         }
         // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
+}
+
+/// Emit the body of a `%Function.prototype%` method, the bound-function
+/// trampoline, `%ThrowTypeError%` or the out-of-line method call into `f`
+/// (the variants [`emit_builtin`] routes here).
+fn emit_function_family(
+    builtin: Builtin,
+    f: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::Call => function::emit_call(f, frame, strings, helpers),
+        Builtin::Apply => function::emit_apply(f, frame, strings, helpers),
+        Builtin::Bind => function::emit_bind(f, frame, strings, helpers),
+        Builtin::FunctionToString => function::emit_to_string(f, frame, strings, helpers),
+        Builtin::FunctionHasInstance => function::emit_has_instance(f, frame, strings, helpers),
+        Builtin::BoundCall => function::emit_bound_call(f, frame, strings, helpers),
+        Builtin::ThrowTypeError => function::emit_throw_type_error(f, frame, strings, helpers),
+        Builtin::MethodCall => function::emit_method_call(f, frame, strings, helpers),
         _ => {}
     }
 }

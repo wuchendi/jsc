@@ -221,7 +221,7 @@ impl From<GlobalIntrinsic> for Intrinsic {
 
 impl Intrinsic {
     /// The intrinsic's `proto` (`None` = `null`).
-    fn proto(self) -> Option<Intrinsic> {
+    pub(super) fn proto(self) -> Option<Intrinsic> {
         match self {
             Self::ObjectPrototype | Self::SymbolRegistry => None,
             Self::FunctionPrototype
@@ -371,6 +371,8 @@ pub(super) enum Builtin {
     Bind,
     /// `Function.prototype.toString`.
     FunctionToString,
+    /// `Function.prototype[@@hasInstance]` (`OrdinaryHasInstance`).
+    FunctionHasInstance,
     /// The call/construct trampoline of every bound function (DESIGN.md
     /// §5.5): `env` is the `[target, boundThis, ...boundArgs]` array. Not
     /// installed on any intrinsic.
@@ -485,8 +487,8 @@ pub(super) enum Builtin {
     BooleanValueOf,
     /// A `Date.prototype` method (`toString`, `getTime`, `valueOf`, ..).
     DateMethod(DateOp),
-    /// `Date.prototype.toJSON`.
-    DateToJson,
+    /// A generic `%Date.prototype%` method (any receiver).
+    DateGeneric(DateGenericOp),
     /// A `%Map.prototype%` (`set == false`) / `%Set.prototype%` method with
     /// an inline body.
     CollectionOp {
@@ -661,6 +663,25 @@ impl IterOp {
     }
 }
 
+/// A generic `%Date.prototype%` method: its receiver need not be a Date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DateGenericOp {
+    /// `Date.prototype.toJSON`.
+    ToJson,
+    /// `Date.prototype[@@toPrimitive]` (installed under its symbol key).
+    ToPrimitive,
+}
+
+impl DateGenericOp {
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ToJson => "toJSON",
+            Self::ToPrimitive => "[Symbol.toPrimitive]",
+        }
+    }
+}
+
 /// A `Symbol` static or `%Symbol.prototype%` builtin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SymbolOp {
@@ -743,6 +764,17 @@ impl NumberTest {
             Self::Finite => "isFinite",
             Self::NaN => "isNaN",
         }
+    }
+}
+
+/// The name of a `%Function.prototype%` method.
+fn function_name(builtin: Builtin) -> &'static str {
+    match builtin {
+        Builtin::Call => "call",
+        Builtin::Apply => "apply",
+        Builtin::Bind => "bind",
+        Builtin::FunctionHasInstance => "[Symbol.hasInstance]",
+        _ => "",
     }
 }
 
@@ -1048,7 +1080,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 259] = [
+    pub(super) const ALL: [Builtin; 261] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1066,6 +1098,7 @@ impl Builtin {
         Self::Apply,
         Self::Bind,
         Self::FunctionToString,
+        Self::FunctionHasInstance,
         Self::BoundCall,
         Self::ErrorToString,
         Self::Math(MathOp::Floor),
@@ -1248,7 +1281,8 @@ impl Builtin {
         Self::DateMethod(DateOp::GetMinutes),
         Self::DateMethod(DateOp::GetSeconds),
         Self::DateMethod(DateOp::ToIsoString),
-        Self::DateToJson,
+        Self::DateGeneric(DateGenericOp::ToJson),
+        Self::DateGeneric(DateGenericOp::ToPrimitive),
         Self::CollectionOp {
             set: false,
             op: MapOp::Get,
@@ -1369,7 +1403,7 @@ impl Builtin {
             }
             Self::Symbol(op) => op.name(),
             Self::DateMethod(op) => op.name(),
-            Self::DateToJson => "toJSON",
+            Self::DateGeneric(op) => op.name(),
             Self::CollectionOp { op, .. } => op.name(),
             Self::CollectionSize { .. } => "get size",
             Self::PromiseThen => "then",
@@ -1383,9 +1417,9 @@ impl Builtin {
             Self::StringFromCharCode => "fromCharCode",
             Self::StringFromCodePoint => "fromCodePoint",
             Self::StringRaw => "raw",
-            Self::Call => "call",
-            Self::Apply => "apply",
-            Self::Bind => "bind",
+            Self::Call | Self::Apply | Self::Bind | Self::FunctionHasInstance => {
+                function_name(self)
+            }
             Self::Math(op) => math_name(op),
             Self::NumberToFixed => "toFixed",
             Self::NumberToExponential => "toExponential",
@@ -1547,7 +1581,9 @@ impl Builtin {
             | Self::NumberToPrecision
             | Self::NumberToLocaleString => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
-            Self::DateMethod(_) | Self::DateToJson => Some(BuiltinCtor::Date),
+            Self::DateMethod(_) | Self::DateGeneric(DateGenericOp::ToJson) => {
+                Some(BuiltinCtor::Date)
+            }
             Self::Symbol(SymbolOp::ToString | SymbolOp::ValueOf) => Some(BuiltinCtor::Symbol),
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
                 Some(collection(set))
@@ -1869,6 +1905,14 @@ pub(super) fn registry() -> Vec<Entry> {
         ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
+        // Non-writable, non-enumerable, non-configurable: `instanceof` relies
+        // on it never changing (the builtin `instanceof` fast paths).
+        Entry {
+            intrinsic: FunctionPrototype,
+            key: Key::Symbol(WellKnown::HasInstance),
+            attrs: CONST_ATTRS,
+            value: Value::Method(Builtin::FunctionHasInstance),
+        },
     ]);
     for kind in ErrorKind::ALL {
         let proto = Intrinsic::ErrorPrototype(kind);
@@ -1990,6 +2034,44 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
     }
     symbol_prototype_entries(entries);
     iterator_entries(entries);
+    well_known_entries(entries);
+}
+
+/// `%Date.prototype%[@@toPrimitive]` and the builtin `[@@toStringTag]`s
+/// (configurable only) `Object.prototype.toString` reads; `%Symbol.prototype%`'s
+/// is in [`symbol_prototype_entries`].
+fn well_known_entries(entries: &mut Vec<Entry>) {
+    entries.push(Entry {
+        intrinsic: Intrinsic::Prototype(BuiltinCtor::Date),
+        key: Key::Symbol(WellKnown::ToPrimitive),
+        attrs: FN_FACT_ATTRS,
+        value: Value::Method(Builtin::DateGeneric(DateGenericOp::ToPrimitive)),
+    });
+    let tags = [
+        (Intrinsic::Prototype(BuiltinCtor::Map), "Map"),
+        (Intrinsic::Prototype(BuiltinCtor::Set), "Set"),
+        (Intrinsic::Prototype(BuiltinCtor::Promise), "Promise"),
+        (Intrinsic::GeneratorPrototype, "Generator"),
+        (Intrinsic::AsyncGeneratorPrototype, "AsyncGenerator"),
+        (Intrinsic::Math, "Math"),
+        (Intrinsic::Json, "JSON"),
+        (
+            Intrinsic::IterPrototype(IterFamily::Array),
+            "Array Iterator",
+        ),
+        (
+            Intrinsic::IterPrototype(IterFamily::String),
+            "String Iterator",
+        ),
+        (Intrinsic::IterPrototype(IterFamily::Map), "Map Iterator"),
+        (Intrinsic::IterPrototype(IterFamily::Set), "Set Iterator"),
+    ];
+    entries.extend(tags.map(|(intrinsic, tag)| Entry {
+        intrinsic,
+        key: Key::Symbol(WellKnown::ToStringTag),
+        attrs: FN_FACT_ATTRS,
+        value: Value::Str(tag),
+    }));
 }
 
 /// The iteration entries (design/symbol-strings.md §5.4) past the methods
