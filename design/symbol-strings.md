@@ -1119,6 +1119,22 @@ U1 reason drafts (one line per affected row, for the final CI pass):
 - `fib`, `math`, `push_1e5`, `console_log`, `object_reads`: must not
   change; `generators` changes only by Y2 (see the Y2 drafts below).
 
+U2 reason drafts (one line per affected row, for the final CI pass):
+
+- `string_methods`: `toUpperCase` / `toLowerCase` on the one-byte `s` now
+  go through the builtin and map per unit in the guest (U2-T2) instead of
+  the inline host call: `host_calls` drop by the 20 case calls, fuel rises
+  for the metered guest loop, `user_ops` changes at the two former inline
+  sites; no `normalize` / `localeCompare` call, so their unchanged host path
+  does not show.
+- every row: the two interned static strings of the deleted
+  `NORMALIZE_UNSUPPORTED` message are gone (U2-T3), so the static intern
+  table shrinks and intern-table probe fuel may shift by a few.
+- `fib`, `math`, `push_1e5`, `console_log`, `object_reads`, `json`,
+  `for_in`, `map_set`, `for_of`, `spread`, `class_methods`, `array_hofs`,
+  `generators`: no case / `normalize` / `localeCompare` call; must not
+  change beyond the intern-table line above.
+
 Y2 reason drafts (one line per affected row, for the final CI pass):
 
 - `for_of`: per loop a `GetIterator` classify plus the try/catch/finally

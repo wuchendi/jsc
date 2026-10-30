@@ -787,10 +787,14 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   primitives, plus a `Date` (its `toString` text). A string argument to op `0` is returned unchanged; any
   other result string is allocated through `__new_string`.
 - **`__method` ops.** `0` `indexOf` / `1` `includes` (an array receiver:
-  element search), `4` `toUpperCase`, `5` `toLowerCase`,
+  element search), `4` `toUpperCase`, `5` `toLowerCase` (full Unicode
+  default case mapping — `SpecialCasing`, `Final_Sigma` — over each run of
+  well-formed text; the guest maps one-byte receivers itself and calls these
+  only for two-byte receivers and the one-byte `µ` / `ß` / `ÿ` uppercase
+  cases),
   `17` `Number.prototype.toString(radix)` (a number receiver and an integral
-  radix in `2..=36`), `22` `localeCompare` (code-unit order), `23`
-  `normalize`, `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
+  radix in `2..=36`), `22` `localeCompare` (code-unit order, not locale
+  collation), `23` `normalize` (`NFC` / `NFD` / `NFKC` / `NFKD`), `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
   finite number receiver and an integral digit count already range-checked
   in the guest; `undefined` for a `toExponential` without digits; rendered
   from the exact decimal expansion, ties away from zero), `43` a `Math`
@@ -799,13 +803,12 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   their inverses, `atan2` with `x` in `arg0`, and `random`; the Rust host
   uses the platform libm and a `xorshift64*` generator, the JS shim its own
   `Math`). Every other `String.prototype` method and `String.fromCharCode` /
-  `fromCodePoint` run in the guest on code units (§7.9). The native host
-  reads a string receiver as lossy text (a lone surrogate becomes U+FFFD,
-  §13); the shim's are lossless JS strings. An op
-  that cannot produce a correct result returns a refusal sentinel the
-  calling builtin throws: `METHOD_UNSUPPORTED` (`HOLE`; `normalize` of a
-  non-ASCII string, §13) as a named `TypeError`, `METHOD_RANGE_ERROR`
-  (`undefined | 2`, an unknown `normalize` form) as a `RangeError`. The
+  `fromCodePoint` run in the guest on code units (§7.9). Both hosts read a
+  string receiver losslessly (the native host through `string_units`, the
+  shim as JS strings): a lone surrogate passes through case mapping and
+  `normalize` unchanged. An unknown `normalize` form returns the refusal
+  sentinel `METHOD_RANGE_ERROR` (`undefined | 2`), which the calling builtin
+  throws as a `RangeError`. The
   calling string builtin coerces the receiver (`ToString`) and its arguments
   in the guest first, so user `toString`/`valueOf` run in the guest and the
   host only sees primitives.
@@ -1215,9 +1218,11 @@ drift test): string `len @4` (`STR_LEN_OFFSET`) / data `@8`
 `TYPE_ELEMS` store (and a sparse array's index keys); promise `state @16` /
 `value @24`; generator `done @24`; Map/Set `size @16`; Date `ms @16`; property
 tables, the function info table, and `class` bytes for rendering. The Rust
-decoder `string_units` is lossless (a Latin-1 byte is its own unit);
-`decode_string` and the host ops (case mapping, `localeCompare`,
-`normalize`, ToNumber, `parseInt`, `parseFloat`) read it as lossy text, a
+decoder `string_units` is lossless (a Latin-1 byte is its own unit), and the
+string host ops (case mapping, `localeCompare`, `normalize`) read their
+operands through it; `normalize` uses `icu_normalizer` (an optional dependency
+enabled by the `native-run` feature). `decode_string` renders text for output
+and the number parsers (ToNumber, `parseInt`, `parseFloat`) as lossy text, a
 lone surrogate becoming U+FFFD (safe for the number parsers: a lone surrogate
 is never whitespace or a digit). `alloc_units` allocates a result through
 `__new_string`, narrowing when every unit is `<= 0xFF`. The shim's
@@ -1684,7 +1689,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
-| `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`, §5.4); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all but the case mappings, `localeCompare` and `normalize` (host, §6.1) run in the guest on code units (`emit/builtins/string.rs`), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
+| `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order, not locale collation), `normalize` (all four forms; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings, lossless; a one-byte receiver maps in the guest), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`, §5.4); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all but the host case-mapping path (§6.1), `localeCompare` and `normalize` (host, §6.1) run in the guest on code units (`emit/builtins/string.rs`), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string (a string's first 10 code units), `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw, a lone surrogate written as `\udxxx`), `JSON.parse(text, reviver)` (in-wasm recursive descent, `\uXXXX` escapes incl. lone surrogates, reviver walk) |
@@ -1952,15 +1957,11 @@ Each item below is current behaviour of this tree.
 
 - Strings are Latin-1 / UTF-16 code units (§5.2): `.length`, indexing,
   comparison and every guest `String.prototype` method are exact for any
-  text, lone surrogates included. What remains: `toUpperCase` /
-  `toLowerCase` (and their `toLocale*` forms), `localeCompare` and
-  `normalize` run on the host over lossy text, so a lone surrogate in the
-  receiver becomes U+FFFD in their result, and `normalize` throws a
-  `TypeError` for any non-ASCII receiver (no normalizer yet, wave 3c U2);
-  a key with a lone surrogate cannot name a
-  function (a method, accessor or anonymous function under it is a compile
-  error: function names are host text); there are no ropes, so `s = s + x`
-  in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
+  text, lone surrogates included. `localeCompare` is code-unit order, not
+  locale collation, and the `toLocale*Case` methods use no locale data; a
+  key with a lone surrogate cannot name a function (a method, accessor or
+  anonymous function under it is a compile error: function names are host
+  text); there are no ropes, so `s = s + x` in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
   pattern as RegExp source: a pattern with RegExp syntax throws a
   `TypeError`, and `matchAll` (a RegExp string iterator) always throws one.
 - No `void`.
@@ -2025,7 +2026,7 @@ Each item below is current behaviour of this tree.
   | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
   | `Symbol` / `@@toStringTag` (`Math` / `JSON` receivers tag as `[object Object]`) | D3 | 24 | 7 | 1 | | |
   | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
-  | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | U1 (landed; recount at the next baseline) | | 29 | | | |
+  | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | U1/U2 (landed; recount at the next baseline) | | 29 | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
   property table, so element access on a large frozen or attributed array is
@@ -2136,8 +2137,9 @@ symbols), symbol-keyed properties, and computed class member names (pulled
 forward from phase 5); the well-known symbol hooks throw until Y2 / Y4 (§13).
 Its stage U1 is done: Latin-1 / UTF-16 strings with code-unit `.length`,
 indexing and comparison, lossless literals, and the `String.prototype`
-methods in the guest; U2 (string iterator, case mapping, `normalize`)
-remains.
+methods in the guest. Its stage U2 is done: the code-point string iterator,
+full lossless case mapping, `normalize` in all four forms, and lossless
+code-unit `localeCompare`.
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
@@ -2147,8 +2149,8 @@ remains.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
   destructuring.
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
-  and surrogate pairs (done in U1; the string iterator, full case mapping
-  and `normalize` follow in U2).
+  and surrogate pairs, the string iterator, full case mapping and `normalize`
+  (done in U1 / U2).
 
 ### Phase 4 — Runtime independence and memory
 
