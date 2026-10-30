@@ -929,12 +929,8 @@ pub(super) fn emit_get(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> 
         LocalGet(recv), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_SYMBOL), I32Eq,
         If(BlockType::Empty),
     );
-    if let Some(proto) = SYMBOL_PROTOTYPE {
-        let bits = intrinsic_bits(proto, helpers);
-        wasm!(f; I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o));
-    } else {
-        wasm!(f; I64Const(UNDEFINED_BITS), Return);
-    }
+    let bits = intrinsic_bits(SYMBOL_PROTOTYPE, helpers);
+    wasm!(f; I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o));
     wasm!(f;
         End,
         Else,

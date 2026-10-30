@@ -834,8 +834,7 @@ tables. Keys are interned `u32`s.
   table (a sparse element past the store is a table entry); an accessor
   calls its getter with `this = recv` (`undefined` without a getter). A string, number, or boolean
   continues at its realm prototype without allocating a wrapper (a symbol at
-  `%Symbol.prototype%`, which reads `undefined` until the `Symbol` builtins
-  register it);
+  `%Symbol.prototype%`);
   `null`/`undefined` read `undefined` (member-access sites throw the nullish
   `TypeError` before calling it).
 - **`__set(recv, key, v)`** — strict `OrdinarySet`. The first own-or-inherited
@@ -927,12 +926,15 @@ tables. Keys are interned `u32`s.
 
 **Realm image.** Every intrinsic is a static block in the data segment, laid
 out by `emit/realm.rs` from one registry of `(intrinsic, key, attrs, value)`
-entries (`value` is a builtin method, a string, a number, `undefined`, another
-intrinsic, or an accessor pair). Each intrinsic is an object-family block
-(a `TYPE_FUNCTION` block when callable) followed by a full `TYPE_PROPS` table;
-then one static `LAZY` `TYPE_FUNCTION` block per builtin method (`env =
-undefined`, `func_idx` = its builtin table slot); then one static
-`TYPE_ACCESSOR` block per accessor entry. Every intrinsic address is a
+entries (`key` is an interned string or a well-known symbol; `value` is a
+builtin method, a string, a number, `undefined`, another intrinsic, a
+well-known symbol, or an accessor pair). Each intrinsic is an object-family
+block (a `TYPE_FUNCTION` block when callable) followed by a full `TYPE_PROPS`
+table (flagged `PROPS_HAS_SYMBOL_KEYS` when it holds a symbol key); then one
+static `LAZY` `TYPE_FUNCTION` block per builtin method (`env = undefined`,
+`func_idx` = its builtin table slot); then one static `TYPE_ACCESSOR` block
+per accessor entry; then the 13 well-known symbols as static `TYPE_SYMBOL`
+blocks (description `"Symbol.iterator"`, ..). Every intrinsic address is a
 compile-time constant and the realm costs nothing at startup; user mutation
 works like on any object.
 
@@ -942,10 +944,13 @@ prototypes (`Error`, `TypeError`, `RangeError`, `ReferenceError`,
 `SyntaxError`, `EvalError`, `URIError`), the global object
 (`CLASS_GLOBAL`), `Math`, `JSON`, `console`, the constructors (`Object`,
 `Function`, `Array`, `String`, `Number`, `Boolean`, the seven error
-constructors, `Map`, `Set`, `Promise`, `Date`; native error constructors
-inherit from `Error`, the rest from `%Function.prototype%`), the prototypes of
-`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`, `Date`, and
-`%GeneratorPrototype%`. Each constructor owns `length`, `name`, a
+constructors, `Map`, `Set`, `Promise`, `Date`, `Symbol`; native error
+constructors inherit from `Error`, the rest from `%Function.prototype%`), the
+prototypes of `Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
+`Date`, `Symbol`, `%GeneratorPrototype%`, `%AsyncGeneratorPrototype%`, and the
+hidden `Symbol.for` registry (`proto` `null`, unreachable from the global
+object; its table maps interned keys to the registered symbols). Each
+constructor owns `length`, `name`, a
 non-writable `prototype`, and its statics; each prototype owns a
 `constructor` back-link. Builtin methods are writable, configurable, and not
 enumerable.
@@ -1008,7 +1013,7 @@ cleared. Bits: `0` `%Object.prototype%`, `1` `%Array.prototype%`, `2`
 `%String.prototype%`, `3` `%Number.prototype%`, `4` `%Boolean.prototype%`,
 `5` `%Function.prototype%`, `6` `%Promise.prototype%`, `7` `%Map.prototype%`,
 `8` `%Set.prototype%`, `9` `%Date.prototype%`, `10` `Math`, `11` `JSON`,
-`12` `console`, `13` `%GeneratorPrototype%`.
+`12` `console`, `13` `%GeneratorPrototype%`, `14` `%Symbol.prototype%`.
 
 **Guarded fast paths.** Specializations are optimizations over the generic
 path, never semantics:
@@ -1550,6 +1555,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`; Set `add`/`has`/`delete`/`clear`/`forEach`/`size` |
 | `Promise` | §6.7, §7.8 |
 | `Date` | `new Date()`, `new Date(ms)`, `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`; `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `toISOString`, `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`) — all UTC, computed in wasm |
+| `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter, `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
 
@@ -1833,8 +1839,9 @@ Each item below is current behaviour of this tree.
   pattern with RegExp syntax throws a `TypeError`, and `matchAll` (a RegExp
   string iterator) always throws one.
 - No `void`.
-- Not available: `RegExp` (literals and constructor), `Symbol` (so no
-  user-defined iterables), `BigInt`, `Proxy`, `Reflect`,
+- `Symbol` exists (§7) but symbol-keyed properties on user objects and
+  user-defined iterables do not yet (wave 3c, `design/symbol-strings.md`).
+- Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9: no `Array.prototype.keys` / `values` /

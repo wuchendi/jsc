@@ -202,6 +202,8 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             body.requires_new(ctor, body.with_proto(ctor, promise))
         }
         BuiltinCtor::Date => date(&body),
+        // A hand-written body (`symbol::emit_ctor`).
+        BuiltinCtor::Symbol => IrNode::Undefined,
     }
 }
 

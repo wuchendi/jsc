@@ -383,9 +383,8 @@ const SYMBOL_DESCRIPTION_OFFSET: u64 = abi::SYMBOL_DESCRIPTION_OFFSET as u64;
 
 /// `%Symbol.prototype%` (design/symbol-strings.md §2.6): where a property read
 /// on a symbol primitive continues and the prototype of its `ToObject`
-/// wrapper. `None` until the `Symbol` builtins register the intrinsic: a read
-/// on a symbol is then `undefined` and a wrapper's prototype is `null`.
-const SYMBOL_PROTOTYPE: Option<Intrinsic> = None;
+/// wrapper.
+const SYMBOL_PROTOTYPE: Intrinsic = Intrinsic::Prototype(BuiltinCtor::Symbol);
 
 /// The TYPE BYTE of an instance-accessor block. See [`abi::TYPE_ACCESSOR`].
 const TYPE_ACCESSOR: i32 = abi::TYPE_ACCESSOR as i32;

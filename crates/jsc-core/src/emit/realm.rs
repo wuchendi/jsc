@@ -10,9 +10,10 @@
 //! `LAZY`, no properties, `proto = %Function.prototype%`, `env = undefined`,
 //! and the funcref-table slot of its uniform-ABI wasm body
 //! ([`super::builtins`]), and finally one static `TYPE_ACCESSOR` block per
-//! [`Value::Accessor`] entry, holding its getter/setter method blocks. A
-//! static table that a user mutation overflows is rebuilt on the heap by
-//! `__define` like any other.
+//! [`Value::Accessor`] entry, holding its getter/setter method blocks, and
+//! last one static `TYPE_SYMBOL` block per [`WellKnown`] symbol. A static
+//! table that a user mutation overflows is rebuilt on the heap by `__define`
+//! like any other.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -39,7 +40,7 @@ pub(super) enum Intrinsic {
     Ctor(BuiltinCtor),
     /// `%<Ctor>.prototype%` of a constructor without a dedicated variant
     /// (`Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-    /// `Date`): `constructor` and the prototype methods.
+    /// `Date`, `Symbol`): `constructor` and the prototype methods.
     Prototype(BuiltinCtor),
     /// `%GeneratorPrototype%`: `next`, `return`, `throw`; every generator
     /// object's `proto`.
@@ -47,10 +48,14 @@ pub(super) enum Intrinsic {
     /// `%AsyncGeneratorPrototype%`: the promise-returning `next`, `return`,
     /// `throw` of every async generator object.
     AsyncGeneratorPrototype,
+    /// The hidden `Symbol.for` registry (`proto` `null`, unreachable from
+    /// the global object): its table maps interned key strings to the
+    /// registered symbols.
+    SymbolRegistry,
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
-const PLAIN_PROTOTYPES: [BuiltinCtor; 8] = [
+const PLAIN_PROTOTYPES: [BuiltinCtor; 9] = [
     BuiltinCtor::Array,
     BuiltinCtor::String,
     BuiltinCtor::Number,
@@ -59,7 +64,94 @@ const PLAIN_PROTOTYPES: [BuiltinCtor; 8] = [
     BuiltinCtor::Set,
     BuiltinCtor::Promise,
     BuiltinCtor::Date,
+    BuiltinCtor::Symbol,
 ];
+
+/// A well-known symbol (`design/symbol-strings.md` §4): a static
+/// `TYPE_SYMBOL` block of the image whose description is
+/// `"Symbol.<name>"`, the value of the non-writable, non-configurable
+/// `Symbol.<name>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WellKnown {
+    AsyncIterator,
+    HasInstance,
+    IsConcatSpreadable,
+    Iterator,
+    Match,
+    MatchAll,
+    Replace,
+    Search,
+    Species,
+    Split,
+    ToPrimitive,
+    ToStringTag,
+    Unscopables,
+}
+
+impl WellKnown {
+    /// Every well-known symbol, in image order.
+    const ALL: [WellKnown; 13] = [
+        Self::AsyncIterator,
+        Self::HasInstance,
+        Self::IsConcatSpreadable,
+        Self::Iterator,
+        Self::Match,
+        Self::MatchAll,
+        Self::Replace,
+        Self::Search,
+        Self::Species,
+        Self::Split,
+        Self::ToPrimitive,
+        Self::ToStringTag,
+        Self::Unscopables,
+    ];
+
+    /// The `Symbol` static's key.
+    fn name(self) -> &'static str {
+        match self {
+            Self::AsyncIterator => "asyncIterator",
+            Self::HasInstance => "hasInstance",
+            Self::IsConcatSpreadable => "isConcatSpreadable",
+            Self::Iterator => "iterator",
+            Self::Match => "match",
+            Self::MatchAll => "matchAll",
+            Self::Replace => "replace",
+            Self::Search => "search",
+            Self::Species => "species",
+            Self::Split => "split",
+            Self::ToPrimitive => "toPrimitive",
+            Self::ToStringTag => "toStringTag",
+            Self::Unscopables => "unscopables",
+        }
+    }
+
+    /// The symbol's `description`.
+    fn description(self) -> &'static str {
+        match self {
+            Self::AsyncIterator => "Symbol.asyncIterator",
+            Self::HasInstance => "Symbol.hasInstance",
+            Self::IsConcatSpreadable => "Symbol.isConcatSpreadable",
+            Self::Iterator => "Symbol.iterator",
+            Self::Match => "Symbol.match",
+            Self::MatchAll => "Symbol.matchAll",
+            Self::Replace => "Symbol.replace",
+            Self::Search => "Symbol.search",
+            Self::Species => "Symbol.species",
+            Self::Split => "Symbol.split",
+            Self::ToPrimitive => "Symbol.toPrimitive",
+            Self::ToStringTag => "Symbol.toStringTag",
+            Self::Unscopables => "Symbol.unscopables",
+        }
+    }
+
+    /// The symbol's position in [`Self::ALL`].
+    fn index(self) -> u32 {
+        (0u32..)
+            .zip(Self::ALL)
+            .find_map(|(index, w)| (w == self).then_some(index))
+            .unwrap_or(0)
+    }
+}
 
 /// The `prototype` intrinsic of `ctor`.
 pub(super) fn prototype_of(ctor: BuiltinCtor) -> Intrinsic {
@@ -87,7 +179,7 @@ impl Intrinsic {
     /// The intrinsic's `proto` (`None` = `null`).
     fn proto(self) -> Option<Intrinsic> {
         match self {
-            Self::ObjectPrototype => None,
+            Self::ObjectPrototype | Self::SymbolRegistry => None,
             Self::FunctionPrototype
             | Self::ErrorPrototype(ErrorKind::Error)
             | Self::Global
@@ -151,6 +243,7 @@ impl Intrinsic {
             Self::Json => 11,
             Self::Console => 12,
             Self::GeneratorPrototype => 13,
+            Self::Prototype(BuiltinCtor::Symbol) => 14,
             _ => return None,
         })
     }
@@ -181,6 +274,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
         .chain([
             Intrinsic::GeneratorPrototype,
             Intrinsic::AsyncGeneratorPrototype,
+            Intrinsic::SymbolRegistry,
         ])
 }
 
@@ -405,6 +499,47 @@ pub(super) enum Builtin {
     ParseFloat,
     /// The global `parseInt` (also `Number.parseInt`).
     ParseInt,
+    /// A `Symbol` static or `%Symbol.prototype%` builtin.
+    Symbol(SymbolOp),
+}
+
+/// A `Symbol` static or `%Symbol.prototype%` builtin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SymbolOp {
+    /// `Symbol.for`.
+    For,
+    /// `Symbol.keyFor`.
+    KeyFor,
+    /// `Symbol.prototype.toString`.
+    ToString,
+    /// `Symbol.prototype.valueOf`.
+    ValueOf,
+    /// The getter of `Symbol.prototype.description`.
+    Description,
+    /// `Symbol.prototype[@@toPrimitive]`.
+    ToPrimitive,
+}
+
+impl SymbolOp {
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::For => "for",
+            Self::KeyFor => "keyFor",
+            Self::ToString => "toString",
+            Self::ValueOf => "valueOf",
+            Self::Description => "get description",
+            Self::ToPrimitive => "[Symbol.toPrimitive]",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::For | Self::KeyFor | Self::ToPrimitive => 1,
+            Self::ToString | Self::ValueOf | Self::Description => 0,
+        }
+    }
 }
 
 /// An async generator request (`%AsyncGeneratorPrototype%` method).
@@ -766,7 +901,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 231] = [
+    pub(super) const ALL: [Builtin; 238] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -842,6 +977,7 @@ impl Builtin {
         Self::Ctor(BuiltinCtor::Set),
         Self::Ctor(BuiltinCtor::Promise),
         Self::Ctor(BuiltinCtor::Date),
+        Self::Ctor(BuiltinCtor::Symbol),
         Self::ObjectStatic(ObjectBuiltinOp::Keys),
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
@@ -1025,6 +1161,12 @@ impl Builtin {
         Self::IsFinite,
         Self::ParseFloat,
         Self::ParseInt,
+        Self::Symbol(SymbolOp::For),
+        Self::Symbol(SymbolOp::KeyFor),
+        Self::Symbol(SymbolOp::ToString),
+        Self::Symbol(SymbolOp::ValueOf),
+        Self::Symbol(SymbolOp::Description),
+        Self::Symbol(SymbolOp::ToPrimitive),
     ];
 
     /// The function's `name`.
@@ -1057,6 +1199,7 @@ impl Builtin {
             Self::ValueOf | Self::StringValueOf | Self::NumberValueOf | Self::BooleanValueOf => {
                 "valueOf"
             }
+            Self::Symbol(op) => op.name(),
             Self::DateMethod(op) => op.name(),
             Self::DateToJson => "toJSON",
             Self::CollectionOp { op, .. } => op.name(),
@@ -1167,7 +1310,7 @@ impl Builtin {
             | Self::ArrayReverse
             | Self::ArrayShift
             | Self::ArrayCopy(ArrayCopyOp::ToReversed)
-            | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set) => 0,
+            | Self::Ctor(BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol) => 0,
             Self::Ctor(BuiltinCtor::Date) => 7,
             Self::Math(
                 MathOp::Min
@@ -1190,6 +1333,7 @@ impl Builtin {
             | Self::DefineAccessor { .. } => 2,
             Self::StringMethod(op) => op.length(),
             Self::ObjectReflect(op) => op.length(),
+            Self::Symbol(op) => op.length(),
             Self::JsonStringify => 3,
             // Every other builtin takes one argument.
             _ => 1,
@@ -1234,6 +1378,7 @@ impl Builtin {
             | Self::NumberToLocaleString => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
             Self::DateMethod(_) | Self::DateToJson => Some(BuiltinCtor::Date),
+            Self::Symbol(SymbolOp::ToString | SymbolOp::ValueOf) => Some(BuiltinCtor::Symbol),
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
                 Some(collection(set))
             }
@@ -1272,6 +1417,8 @@ pub(super) enum Value {
     Undefined,
     /// Another intrinsic object.
     Intrinsic(Intrinsic),
+    /// A well-known symbol: its static `TYPE_SYMBOL` block.
+    Symbol(WellKnown),
     /// An accessor property: its static `TYPE_ACCESSOR` block holding the
     /// method blocks of `get` and `set` (the entry has [`abi::ATTR_ACCESSOR`]).
     Accessor {
@@ -1282,13 +1429,22 @@ pub(super) enum Value {
     },
 }
 
+/// A registry entry's property key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Key {
+    /// An interned string key.
+    Str(&'static str),
+    /// A well-known symbol key: its static block.
+    Symbol(WellKnown),
+}
+
 /// One own property of an intrinsic.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Entry {
     /// The intrinsic owning the property.
     pub(super) intrinsic: Intrinsic,
-    /// The property key (interned).
-    pub(super) key: &'static str,
+    /// The property key.
+    pub(super) key: Key,
     /// The property attributes ([`abi::ATTR_WRITABLE`] ..).
     pub(super) attrs: u32,
     /// The property value.
@@ -1355,7 +1511,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 29] = [
+const GLOBALS: [(&str, u32, Value); 30] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -1465,6 +1621,11 @@ const GLOBALS: [(&str, u32, Value); 29] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Date)),
     ),
+    (
+        "Symbol",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Symbol)),
+    ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
     (
@@ -1495,7 +1656,7 @@ pub(super) fn registry() -> Vec<Entry> {
     use Intrinsic::{FunctionPrototype, ObjectPrototype};
     let entry = |intrinsic, key, attrs, value| Entry {
         intrinsic,
-        key,
+        key: Key::Str(key),
         attrs,
         value,
     };
@@ -1575,7 +1736,7 @@ pub(super) fn registry() -> Vec<Entry> {
 fn constructor_entries(entries: &mut Vec<Entry>) {
     let entry = |intrinsic, key, attrs, value| Entry {
         intrinsic,
-        key,
+        key: Key::Str(key),
         attrs,
         value,
     };
@@ -1610,6 +1771,10 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
             ],
             BuiltinCtor::Promise => &[Builtin::PromiseResolve, Builtin::PromiseReject],
             BuiltinCtor::Date => &[Builtin::DateNow],
+            BuiltinCtor::Symbol => &[
+                Builtin::Symbol(SymbolOp::For),
+                Builtin::Symbol(SymbolOp::KeyFor),
+            ],
             BuiltinCtor::Number => &[
                 Builtin::NumberIs(NumberTest::Integer),
                 Builtin::NumberIs(NumberTest::SafeInteger),
@@ -1629,6 +1794,12 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 entries.push(entry(intrinsic, key, CONST_ATTRS, Value::Num(value)));
             }
         }
+        if ctor == BuiltinCtor::Symbol {
+            for symbol in WellKnown::ALL {
+                let value = Value::Symbol(symbol);
+                entries.push(entry(intrinsic, symbol.name(), CONST_ATTRS, value));
+            }
+        }
         let ctor = Value::Intrinsic(intrinsic);
         entries.push(entry(prototype, "constructor", METHOD_ATTRS, ctor));
     }
@@ -1646,6 +1817,38 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         let prototype = Intrinsic::Prototype(collection(set));
         entries.push(entry(prototype, "size", ACCESSOR_ATTRS, size));
     }
+    symbol_prototype_entries(entries);
+}
+
+/// The `%Symbol.prototype%` entries past `constructor` / `toString` /
+/// `valueOf`: the `description` getter, `[@@toPrimitive]` and
+/// `[@@toStringTag]` (both configurable only).
+fn symbol_prototype_entries(entries: &mut Vec<Entry>) {
+    let intrinsic = Intrinsic::Prototype(BuiltinCtor::Symbol);
+    let description = Value::Accessor {
+        get: Builtin::Symbol(SymbolOp::Description),
+        set: None,
+    };
+    entries.extend([
+        Entry {
+            intrinsic,
+            key: Key::Str("description"),
+            attrs: ACCESSOR_ATTRS,
+            value: description,
+        },
+        Entry {
+            intrinsic,
+            key: Key::Symbol(WellKnown::ToPrimitive),
+            attrs: FN_FACT_ATTRS,
+            value: Value::Method(Builtin::Symbol(SymbolOp::ToPrimitive)),
+        },
+        Entry {
+            intrinsic,
+            key: Key::Symbol(WellKnown::ToStringTag),
+            attrs: FN_FACT_ATTRS,
+            value: Value::Str("Symbol"),
+        },
+    ]);
 }
 
 /// The statics of `Object`, in slot order.
@@ -1676,7 +1879,11 @@ const OBJECT_STATICS: [Builtin; 21] = [
 /// The builtin method `intrinsic.key` of the registry, if any.
 pub(super) fn method_of(intrinsic: Intrinsic, key: &str) -> Option<Builtin> {
     registry().into_iter().find_map(|e| match e.value {
-        Value::Method(builtin) if e.intrinsic == intrinsic && e.key == key => Some(builtin),
+        Value::Method(builtin)
+            if e.intrinsic == intrinsic && matches!(e.key, Key::Str(k) if k == key) =>
+        {
+            Some(builtin)
+        }
         _ => None,
     })
 }
@@ -1693,12 +1900,18 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
                 | Value::Num(_)
                 | Value::Undefined
                 | Value::Intrinsic(_)
+                | Value::Symbol(_)
                 | Value::Accessor { .. } => None,
             };
-            [Some(e.key), value]
+            let key = match e.key {
+                Key::Str(key) => Some(key),
+                Key::Symbol(_) => None,
+            };
+            [key, value]
         })
         .flatten()
         .chain(Builtin::ALL.map(Builtin::name))
+        .chain(WellKnown::ALL.map(WellKnown::description))
 }
 
 /// The number of registry entries of `intrinsic`.
@@ -1760,15 +1973,26 @@ fn accessor_offset(registry: &[Entry], entry: usize) -> u32 {
         + abi::ACCESSOR_BLOCK_SIZE * u32::try_from(before).unwrap_or(0)
 }
 
+/// The byte offset of the first well-known symbol block from the image base
+/// (right after the accessor blocks).
+fn symbols_offset(registry: &[Entry]) -> u32 {
+    let methods = u32::try_from(methods(registry).count()).unwrap_or(0);
+    let accessors = u32::try_from(accessors(registry).count()).unwrap_or(0);
+    intrinsics().map(|i| block_size(registry, i)).sum::<u32>()
+        + abi::FUNC_BLOCK_SIZE * methods
+        + abi::ACCESSOR_BLOCK_SIZE * accessors
+}
+
+/// The byte offset of the well-known symbol block of `symbol` from the image
+/// base.
+fn symbol_offset(registry: &[Entry], symbol: WellKnown) -> u32 {
+    symbols_offset(registry) + abi::SYMBOL_BLOCK_SIZE * symbol.index()
+}
+
 /// The byte size of the whole image (a multiple of 8, like every block).
 pub(super) fn image_size() -> i32 {
-    let registry = registry();
-    let methods = u32::try_from(methods(&registry).count()).unwrap_or(0);
-    let accessors = u32::try_from(accessors(&registry).count()).unwrap_or(0);
-    let size = intrinsics().map(|i| block_size(&registry, i)).sum::<u32>()
-        + abi::FUNC_BLOCK_SIZE * methods
-        + abi::ACCESSOR_BLOCK_SIZE * accessors;
-    size.cast_signed()
+    let symbols = u32::try_from(WellKnown::ALL.len()).unwrap_or(0);
+    (symbols_offset(&registry()) + abi::SYMBOL_BLOCK_SIZE * symbols).cast_signed()
 }
 
 /// The heap-pointer jsval of `intrinsic` in the image at `base`.
@@ -1830,7 +2054,17 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
         let (watched, bit) = intrinsic
             .watch_bit()
             .map_or((0, 0), |bit| (abi::PROPS_WATCHED, bit));
-        blob.extend_from_slice(&[abi::TYPE_PROPS, 0, abi::PROPS_HAS_NON_ENUM | watched, bit]);
+        let symbol_keys = registry
+            .iter()
+            .any(|e| e.intrinsic == intrinsic && matches!(e.key, Key::Symbol(_)));
+        let tflags = abi::PROPS_HAS_NON_ENUM
+            | watched
+            | if symbol_keys {
+                abi::PROPS_HAS_SYMBOL_KEYS
+            } else {
+                0
+            };
+        blob.extend_from_slice(&[abi::TYPE_PROPS, 0, tflags, bit]);
         for field in [count, count, count] {
             blob.extend_from_slice(&field.to_le_bytes());
         }
@@ -1846,9 +2080,14 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
                 Value::Num(n) => n.to_bits(),
                 Value::Undefined => abi::UNDEFINED,
                 Value::Intrinsic(i) => heap(base + intrinsic_offset(&registry, i)),
+                Value::Symbol(symbol) => heap(base + symbol_offset(&registry, symbol)),
                 Value::Accessor { .. } => heap(base + accessor_offset(&registry, i)),
             };
-            blob.extend_from_slice(&at(e.key).to_le_bytes());
+            let key = match e.key {
+                Key::Str(key) => at(key),
+                Key::Symbol(symbol) => base + symbol_offset(&registry, symbol),
+            };
+            blob.extend_from_slice(&key.to_le_bytes());
             blob.extend_from_slice(&e.attrs.to_le_bytes());
             blob.extend_from_slice(&value.to_le_bytes());
         }
@@ -1870,6 +2109,11 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) 
                 blob.extend_from_slice(&method.to_le_bytes());
             }
         }
+    }
+    for symbol in WellKnown::ALL {
+        blob.extend_from_slice(&[abi::TYPE_SYMBOL, 0, 0, 0]);
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&heap(at(symbol.description())).to_le_bytes());
     }
     blob
 }
@@ -1953,7 +2197,13 @@ mod tests {
             for (k, e) in (0..).zip(registry.iter().filter(|e| e.intrinsic == intrinsic)) {
                 let entry = table + abi::PROPS_HEADER_SIZE + abi::PROP_ENTRY_SIZE * k;
                 let key = u32_at(&image, entry + abi::PROP_KEY_OFFSET);
-                assert_eq!(Some(key.cast_signed()), strings.get(e.key).copied());
+                let expected = match e.key {
+                    Key::Str(key) => strings.get(key).copied(),
+                    Key::Symbol(symbol) => Some(
+                        (base.cast_unsigned() + symbol_offset(&registry, symbol)).cast_signed(),
+                    ),
+                };
+                assert_eq!(Some(key.cast_signed()), expected);
             }
         }
         // Every method block is a lazy function inheriting %Function.prototype%,
@@ -1992,22 +2242,21 @@ mod tests {
                 .iter()
                 .filter(|e| e.intrinsic == Intrinsic::FunctionPrototype),
         ) {
-            if e.key != "caller" && e.key != "arguments" {
+            let Key::Str(key @ ("caller" | "arguments")) = e.key else {
                 continue;
-            }
+            };
             let entry = table + abi::PROPS_HEADER_SIZE + abi::PROP_ENTRY_SIZE * k;
             assert_eq!(
                 u32_at(&image, entry + abi::PROP_ATTRS_OFFSET),
                 abi::ATTR_ACCESSOR | abi::ATTR_CONFIGURABLE,
-                "{}: attrs",
-                e.key
+                "{key}: attrs"
             );
             let block = u32_at(&image, entry + abi::PROP_VALUE_OFFSET) - base.cast_unsigned();
             assert_eq!(image[block as usize], abi::TYPE_ACCESSOR);
             // get === set === the one %ThrowTypeError% for both properties.
             assert_eq!(u64_at(&image, block + abi::ACCESSOR_GET_OFFSET), thrower);
             assert_eq!(u64_at(&image, block + abi::ACCESSOR_SET_OFFSET), thrower);
-            found.push(e.key);
+            found.push(key);
         }
         assert_eq!(found, ["caller", "arguments"]);
         // %ThrowTypeError% is a plain (non-constructor) function: length 0, name "".
@@ -2015,6 +2264,54 @@ mod tests {
         assert_eq!(Builtin::ThrowTypeError.name(), "");
         let at = method_offset(&registry, Builtin::ThrowTypeError) as usize;
         assert_eq!(image[at + 2] & abi::FUNC_FLAG_CONSTRUCTOR, 0);
+    }
+
+    #[test]
+    fn well_known_symbols_are_static_symbol_blocks() {
+        let (base, strings) = (4096, offsets());
+        let image = image(base, 9, &strings);
+        let registry = registry();
+        for symbol in WellKnown::ALL {
+            let at = symbol_offset(&registry, symbol);
+            assert_eq!(at % 8, 0, "{symbol:?}: 8-aligned");
+            assert_eq!(
+                &image[at as usize..at as usize + 8],
+                &[abi::TYPE_SYMBOL, 0, 0, 0, 0, 0, 0, 0]
+            );
+            let description = u64_at(&image, at + abi::SYMBOL_DESCRIPTION_OFFSET);
+            let expected = strings.get(symbol.description()).copied().unwrap_or(0);
+            assert_eq!(description, abi::HEAP | u64::from(expected.cast_unsigned()));
+            // `Symbol.<name>` holds the block, non-writable/enumerable/configurable.
+            let entry = registry
+                .iter()
+                .find(|e| {
+                    e.intrinsic == Intrinsic::Ctor(BuiltinCtor::Symbol)
+                        && e.key == Key::Str(symbol.name())
+                })
+                .map(|e| (e.attrs, e.value));
+            assert_eq!(entry, Some((CONST_ATTRS, Value::Symbol(symbol))));
+        }
+        // Only a table holding a symbol key is flagged HAS_SYMBOL_KEYS.
+        for intrinsic in intrinsics() {
+            let prefix = if intrinsic.call().is_some() {
+                abi::FUNC_BLOCK_SIZE
+            } else {
+                abi::OBJ_PREFIX_SIZE
+            };
+            let table = intrinsic_offset(&registry, intrinsic) + prefix;
+            let tflags = image[(table + abi::PROPS_TFLAGS_OFFSET) as usize];
+            let symbol_keys = intrinsic == Intrinsic::Prototype(BuiltinCtor::Symbol);
+            assert_eq!(
+                tflags & abi::PROPS_HAS_SYMBOL_KEYS != 0,
+                symbol_keys,
+                "{intrinsic:?}: HAS_SYMBOL_KEYS"
+            );
+        }
+        assert_eq!(
+            Intrinsic::Prototype(BuiltinCtor::Symbol).watch_bit(),
+            Some(14)
+        );
+        assert_eq!(Intrinsic::SymbolRegistry.proto(), None);
     }
 
     #[test]
