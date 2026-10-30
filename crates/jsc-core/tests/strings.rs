@@ -3,7 +3,8 @@
 mod common;
 use common::{assert_bool, assert_eval, assert_nan, assert_number, assert_output, assert_string};
 
-/// String `toUpperCase`/`toLowerCase` are ASCII case folds producing NEW strings.
+/// String `toUpperCase`/`toLowerCase` map one-byte receivers to NEW strings
+/// (the guest Latin-1 path).
 #[test]
 fn string_case_fold() {
     assert_string("\"abc\".toUpperCase()", "ABC");
