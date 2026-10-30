@@ -1963,9 +1963,9 @@ impl LowerCtx<'_> {
     /// binding or declaration that shadows one of those names (DF11) — is
     /// `InstanceofOperator` on its value. The builtin tests are fast paths
     /// only: the emitter runs them while the constructor's `@@hasInstance`
-    /// is the intact `%Function.prototype%[@@hasInstance]` (no symbol-keyed
-    /// own property, realm `proto`), else `InstanceofOperator` on the
-    /// constructor.
+    /// is the intact `%Function.prototype%[@@hasInstance]` (no own
+    /// `@@hasInstance` on the static chain, realm `proto`), else
+    /// `InstanceofOperator` on the constructor.
     fn instanceof_kind(&mut self, right: &Expr) -> anyhow::Result<InstanceOfKind> {
         if let Expr::Ident(id) = right {
             let name = id.sym.as_ref();

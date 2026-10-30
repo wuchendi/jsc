@@ -403,8 +403,8 @@ pub(super) const HAS_INSTANCE_NOT_CALLABLE: CalleeErrorText<'static> = [
 /// `true`/`false` jsval on the stack. The operand `value` is evaluated first,
 /// then the right-hand side. A builtin right-hand side
 /// ([`InstanceOfKind::Array`] .. [`InstanceOfKind::Proto`]) takes its fast test
-/// — the operand's type byte, or a `proto` chain walk for the static error
-/// prototype — while the constructor's `@@hasInstance` lookup provably finds
+/// — the operand's type byte, or a `proto` chain walk for the static
+/// `%Object.prototype%` / error prototype — while the constructor's `@@hasInstance` lookup provably finds
 /// the immutable `%Function.prototype%[@@hasInstance]` ([`emit_builtin_rhs_intact`]);
 /// otherwise, and for [`InstanceOfKind::Ctor`], [`emit_instanceof_operator`].
 pub(super) fn emit_instanceof_node(
@@ -443,8 +443,26 @@ pub(super) fn emit_instanceof_node(
     emit_builtin_rhs_intact(function, ctor, helpers);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
-    if let InstanceOfKind::Proto(proto) = kind {
-        emit_node(proto, function, scratch, strings, helpers);
+    let type_byte = match kind {
+        InstanceOfKind::Array => Some(TYPE_ARRAY),
+        InstanceOfKind::Function => Some(TYPE_FUNCTION),
+        InstanceOfKind::Date => Some(TYPE_DATE),
+        _ => None,
+    };
+    if let Some(type_byte) = type_byte {
+        emit_type_byte_instanceof(function, cur, type_byte);
+    } else {
+        // `Object` / an error constructor: `ctor.prototype` is non-writable and
+        // non-configurable, so `OrdinaryHasInstance` searches the operand's
+        // chain for the static prototype.
+        if let InstanceOfKind::Proto(proto) = kind {
+            emit_node(proto, function, scratch, strings, helpers);
+        } else {
+            function.instruction(&Instruction::I64Const(intrinsic_bits(
+                Intrinsic::ObjectPrototype,
+                helpers,
+            )));
+        }
         function.instruction(&Instruction::LocalSet(tgt));
         emit_is_object(function, cur);
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
@@ -452,14 +470,6 @@ pub(super) fn emit_instanceof_node(
         function.instruction(&Instruction::Else);
         function.instruction(&Instruction::I64Const(FALSE_BITS));
         function.instruction(&Instruction::End);
-    } else {
-        let type_byte = match kind {
-            InstanceOfKind::Array => Some(TYPE_ARRAY),
-            InstanceOfKind::Function => Some(TYPE_FUNCTION),
-            InstanceOfKind::Date => Some(TYPE_DATE),
-            _ => None,
-        };
-        emit_type_byte_instanceof(function, cur, type_byte);
     }
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I64Const(intrinsic_bits(
@@ -476,7 +486,9 @@ pub(super) fn emit_instanceof_node(
 /// `ctor` is sure to find `%Function.prototype%[@@hasInstance]` (which is
 /// non-writable and non-configurable): every object on its static chain up
 /// to `%Function.prototype%` (the native errors pass `%Error%`) still has
-/// its realm `proto` and no symbol-keyed own property.
+/// its realm `proto` and no own `@@hasInstance` (a table without
+/// `HAS_SYMBOL_KEYS` is skipped inline; otherwise `__prop_find` decides, so
+/// `%Array%`'s own `@@species` getter keeps the fast arm).
 fn emit_builtin_rhs_intact(function: &mut Function, ctor: BuiltinCtor, helpers: Helpers<'_>) {
     let props = MemArg {
         offset: u64::from(abi::OBJ_PROPS_OFFSET),
@@ -488,12 +500,14 @@ fn emit_builtin_rhs_intact(function: &mut Function, ctor: BuiltinCtor, helpers: 
         align: 3,
         memory_index: 0,
     };
+    let has_instance = realm::symbol_addr(WellKnown::HasInstance, helpers);
     function.instruction(&Instruction::I32Const(1));
     let mut link = Intrinsic::Ctor(ctor);
     while let Some(next) = link.proto() {
         let addr = (intrinsic_bits(link, helpers) & 0xffff_ffff).cast_unsigned();
         let addr = Instruction::I32Const(u32::try_from(addr).unwrap_or(0).cast_signed());
-        // No own table, or a table without HAS_SYMBOL_KEYS.
+        // No own table, a table without HAS_SYMBOL_KEYS, or no own
+        // @@hasInstance entry.
         function.instruction(&addr);
         function.instruction(&Instruction::I32Load(props));
         function.instruction(&Instruction::I32Eqz);
@@ -511,7 +525,14 @@ fn emit_builtin_rhs_intact(function: &mut Function, ctor: BuiltinCtor, helpers: 
             abi::PROPS_HAS_SYMBOL_KEYS,
         )));
         function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&addr);
+        function.instruction(&Instruction::I32Const(has_instance));
+        function.instruction(&Instruction::Call(helpers.prop_find));
         function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::I32Const(1));
+        function.instruction(&Instruction::End);
         function.instruction(&Instruction::End);
         function.instruction(&Instruction::I32And);
         // proto == the realm's next link.
@@ -787,19 +808,10 @@ fn emit_bound_restart(function: &mut Function, f: u32) {
 
 /// Emit a runtime-TYPE-BYTE `instanceof` test for the operand already stashed in
 /// local `v`, leaving a TRUE/FALSE jsval on the stack. `true` iff `v` is a heap
-/// pointer whose type byte equals `type_byte` — or, for `None` (the
-/// `instanceof Object` case), iff `v` is an object ([`emit_is_object`]: any heap
-/// kind but a primitive string or symbol). The type-byte read is gated behind
-/// [`emit_is_pointer`] so a non-pointer operand (whose wrapped low bits would be
-/// a bogus offset) is simply never an instance.
-fn emit_type_byte_instanceof(function: &mut Function, v: u32, type_byte: Option<i32>) {
-    let Some(type_byte) = type_byte else {
-        emit_is_object(function, v);
-        function.instruction(&Instruction::I64ExtendI32U);
-        function.instruction(&Instruction::I64Const(FALSE_BITS));
-        function.instruction(&Instruction::I64Or);
-        return;
-    };
+/// pointer whose type byte equals `type_byte`. The type-byte read is gated
+/// behind [`emit_is_pointer`] so a non-pointer operand (whose wrapped low bits
+/// would be a bogus offset) is simply never an instance.
+fn emit_type_byte_instanceof(function: &mut Function, v: u32, type_byte: i32) {
     emit_is_pointer(function, v);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     emit_load_type_byte(function, v);
