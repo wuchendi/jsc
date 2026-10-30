@@ -320,6 +320,54 @@ fn builtin_instanceof_arms_unchanged() {
 }
 
 #[test]
+fn instanceof_object_walks_the_prototype_chain() {
+    assert_bool("Object.create(null) instanceof Object", false);
+    assert_bool("({}) instanceof Object", true);
+    assert_bool("class A {} new A() instanceof Object", true);
+    assert_bool(
+        "class A {} class B extends A {} new B() instanceof Object",
+        true,
+    );
+    assert_bool(
+        "let o = {}; Object.setPrototypeOf(o, null); o instanceof Object",
+        false,
+    );
+    assert_bool(
+        "let a = []; Object.setPrototypeOf(a, null); a instanceof Object",
+        false,
+    );
+    assert_bool(
+        "Object.create(Object.create(null)) instanceof Object",
+        false,
+    );
+    assert_bool("Object.prototype instanceof Object", false);
+    assert_bool(
+        "(() => 1) instanceof Object && new Map() instanceof Object",
+        true,
+    );
+}
+
+#[test]
+fn array_species_getter_keeps_the_builtin_instanceof_arm() {
+    // `%Array%` owns `get [Symbol.species]`; only an own `@@hasInstance`
+    // leaves the fast arm.
+    assert_bool(
+        "Object.getOwnPropertySymbols(Array).length > 0 && [] instanceof Array",
+        true,
+    );
+    assert_bool("({}) instanceof Array", false);
+    assert_bool(
+        "Array[Symbol('x')] = 1; [] instanceof Array && !(1 instanceof Array)",
+        true,
+    );
+    assert_bool(
+        "Object.setPrototypeOf(Array, { [Symbol.hasInstance]: () => false }); \
+         [] instanceof Array",
+        false,
+    );
+}
+
+#[test]
 fn builtin_constructor_own_has_instance_is_honoured() {
     assert_bool(
         "Object.defineProperty(Array, Symbol.hasInstance, { value: () => false }); \

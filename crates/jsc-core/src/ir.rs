@@ -377,17 +377,18 @@ pub enum PropKey {
 
 /// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
 /// is accepted: the general case is [`InstanceOfKind::Ctor`]
-/// (`OrdinaryHasInstance`). The builtin names that are not yet runtime values
-/// are recognized syntactically at codegen when no binding shadows them: the
-/// three builtin error constructors walk the receiver's `proto` chain for their
-/// static prototype ([`InstanceOfKind::Proto`]).
+/// (`InstanceofOperator`). An unshadowed, sealed builtin constructor name is
+/// recognized syntactically at codegen and gets a fast arm, which the emitter
+/// takes only behind a run-time intact test: every object on the
+/// constructor's static chain up to `%Function.prototype%` still has its
+/// realm `proto` and no own `@@hasInstance`, so `Get(C, @@hasInstance)` is
+/// the immutable `%Function.prototype%[@@hasInstance]`. A failing test runs
+/// `InstanceofOperator` on the constructor's realm value instead.
 ///
-/// The builtin constructors `Array`/`Object`/`Function`/`Date` match by the
-/// receiver's runtime TYPE BYTE rather than a prototype hop: `Array` /
-/// `Function` / `Date` match their own type byte, and `Object` matches ANY heap
-/// pointer that is not a primitive string (so arrays, plain objects, functions,
-/// maps, sets, promises, generators, errors, and dates are all `instanceof
-/// Object`, while a string/number/boolean/null/undefined is not).
+/// The fast arms: `Array` / `Function` / `Date` match the receiver's runtime
+/// TYPE BYTE; `Object` and the error constructors search the receiver's
+/// `proto` chain for the constructor's (non-writable, non-configurable)
+/// static prototype, so `Object.create(null) instanceof Object` is `false`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceOfKind {
     /// `instanceof Array` — the receiver is a heap `TYPE_ARRAY` block.
@@ -396,8 +397,8 @@ pub enum InstanceOfKind {
     Function,
     /// `instanceof Date` — the receiver is a heap `TYPE_DATE` block.
     Date,
-    /// `instanceof Object` — the receiver is any heap pointer that is not a
-    /// primitive string.
+    /// `instanceof Object` — `%Object.prototype%` is on the receiver's `proto`
+    /// chain.
     Object,
     /// `instanceof E` for an unshadowed builtin error constructor: some object
     /// on the receiver's `proto` chain must be the SAME object as the static
@@ -406,10 +407,12 @@ pub enum InstanceOfKind {
     /// until a match or `null`.
     Proto(Box<IrNode>),
     /// `instanceof C` for any other right-hand side expression:
-    /// `OrdinaryHasInstance(C, x)`. A non-callable `C` throws a `TypeError`; a
-    /// non-object receiver is `false`; otherwise `Get(C, "prototype")` (a
-    /// non-object one throws a `TypeError`) is searched for on the receiver's
-    /// `proto` chain like [`InstanceOfKind::Proto`].
+    /// `InstanceofOperator(x, C)`. A non-object `C` throws a `TypeError`; a
+    /// user `C[@@hasInstance]` is called; otherwise `OrdinaryHasInstance`: a
+    /// non-callable `C` throws a `TypeError`, a non-object receiver is
+    /// `false`, and `Get(C, "prototype")` (a non-object one throws a
+    /// `TypeError`) is searched for on the receiver's `proto` chain like
+    /// [`InstanceOfKind::Proto`].
     Ctor(Box<IrNode>),
 }
 
