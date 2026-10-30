@@ -626,8 +626,9 @@ pub(in crate::emit) const ST_GEN: f64 = 5.0;
 pub(in crate::emit) const ST_ARGS: f64 = 6.0;
 /// Record state: an open protocol record (closing calls `return`).
 const ST_PROTOCOL: f64 = 7.0;
-/// Record state: a protocol step in flight, or its value not yet read
-/// (closing does nothing: a throw from the iterator is not closed).
+/// Record state: a protocol step or its value read in flight, left behind
+/// by a throw from either (closing does nothing: a throw from the iterator
+/// is not closed).
 const ST_STEPPING: f64 = 8.0;
 
 /// The jsval of record state `state`.
@@ -1188,7 +1189,9 @@ fn step_generator(
 }
 
 /// A protocol step ([`ProtocolOp::Step`]) with the record marked stepping
-/// for its duration, so a throw from `next` leaves it unclosed.
+/// for its duration, so a throw from `next` leaves it unclosed; a produced
+/// result leaves it open again, so an elision (a step without a value read)
+/// still closes it.
 fn step_protocol(
     rec: &IterRecord,
     function: &mut Function,
@@ -1229,12 +1232,21 @@ fn step_protocol(
         strings,
         helpers,
     );
+    store(
+        function,
+        &rec.state,
+        IrNode::Num(ST_PROTOCOL),
+        scratch,
+        strings,
+        helpers,
+    );
     wasm!(function; I32Const(1), End);
 }
 
 /// Emit [`IrNode::IteratorValue`], pushing the stepped value: the fast
 /// paths' value itself, or `Get(result, "value")` of a protocol result
-/// (after which the record is open again, so a later abrupt exit closes it).
+/// (with the record marked stepping for the read, so a throw from it leaves
+/// the record unclosed). Read once per successful step.
 pub(in crate::emit) fn emit_iterator_value(
     rec: &IterRecord,
     function: &mut Function,
@@ -1242,10 +1254,11 @@ pub(in crate::emit) fn emit_iterator_value(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
-    state_is(function, rec, ST_STEPPING, scratch, strings, helpers);
+    state_is(function, rec, ST_PROTOCOL, scratch, strings, helpers);
     wasm!(function; If(BlockType::Result(ValType::I64)));
     enter_frame(helpers);
     let read = IrNode::Seq(vec![
+        place_set(&rec.state, IrNode::Num(ST_STEPPING)),
         place_set(
             &rec.result,
             IrNode::Index {

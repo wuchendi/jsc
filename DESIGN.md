@@ -1410,6 +1410,13 @@ those of `switch` and loops are not tracked.
   patterns (identifier and string keys, rename, defaults, nesting, rest via
   `__rest`) in declarations, parameters, and `for-of` heads; destructuring
   assignment as an expression statement, with member targets (`[o.x] = xs`).
+  An array pattern runs the iteration protocol lazily
+  (`design/symbol-strings.md` §5.2): `GetIterator`, one `IteratorStep` per
+  hole or element (an element reads `undefined` once done; a hole reads no
+  value), a rest drains, and `IteratorClose` follows the pattern unless the
+  iterator is done (an empty pattern closes without stepping) or a default,
+  nested pattern or target throws — never after a throw from the iterator
+  itself.
 - **Arrays.** Literals (with elisions), indexing, element stores with growth by
   index, named properties, `.length` reads and writes, and the builtins of
   §7.9 (§5.4).
@@ -2000,18 +2007,16 @@ Each item below is current behaviour of this tree.
 - `return()` at a suspended `yield` in a body with a `finally` or a `yield*`,
   and `throw()` in a body with a `yield*`, throw a `TypeError` (an async
   generator's `return()` rejects with it) — so does the `IteratorClose` of
-  such a generator when a `for-of` over it exits early (on a throw exit the
-  close's error is discarded and the `finally` does not run); `return()` of a
-  generator suspended inside a `for-of` does not close that loop's iterator.
+  such a generator when a `for-of` over it exits early or an array pattern
+  leaves it undone (on a throw exit the close's error is discarded and the
+  `finally` does not run); `return()` of a generator suspended inside a
+  `for-of` or an array pattern does not close that iterator.
 - An async generator object renders as `Object [Generator]` and
   `Object.prototype.toString` reports `[object Generator]` for it; functions
   render as `[Function: f]` whatever their kind.
-- Array destructuring drains its source completely before binding (no
-  `IteratorClose`; an infinite generator runs out of memory); `for-of`,
-  `yield*` and the builtin consumers step lazily. `yield*` forwards values
-  only (no sent value, `return()` / `throw()`, or result value), and the
-  Map/Set constructors collect a source other than a clean Map/Set first
-  (no `IteratorClose` when the adder throws).
+- `yield*` forwards values only (no sent value, `return()` / `throw()`, or
+  result value), and the Map/Set constructors collect a source other than a
+  clean Map/Set first (no `IteratorClose` when the adder throws).
 - Thenables are not assimilated: `await t` and `Promise.resolve(t)` on a
   non-promise thenable yield `t` itself; `Promise.prototype.finally` on one
   throws a `TypeError`.
