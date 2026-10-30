@@ -205,9 +205,12 @@ pub enum ArrayHofOp {
 /// [`IrNode::ConvertCall`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertOp {
-    /// `String(x)` — `ToString` in the guest (`__to_string`), so an object's
-    /// user `toString`/`valueOf` runs and may throw.
+    /// `ToString(x)` in the guest (`__to_string`), so an object's user
+    /// `toString`/`valueOf` runs and may throw; a symbol throws.
     ToString,
+    /// `String(x)` called (not constructed): [`ConvertOp::ToString`], except
+    /// a symbol yields its `SymbolDescriptiveString` (`"Symbol(desc)"`).
+    String,
     /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
     /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
     ToNumber,
@@ -431,11 +434,13 @@ pub enum BuiltinCtor {
     Promise,
     /// `Date`.
     Date,
+    /// `Symbol`.
+    Symbol,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 18] = [
+    pub(crate) const ALL: [BuiltinCtor; 19] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -454,6 +459,7 @@ impl BuiltinCtor {
         Self::Set,
         Self::Promise,
         Self::Date,
+        Self::Symbol,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -470,6 +476,7 @@ impl BuiltinCtor {
             Self::Set => "Set",
             Self::Promise => "Promise",
             Self::Date => "Date",
+            Self::Symbol => "Symbol",
         }
     }
 
@@ -873,6 +880,25 @@ pub enum IrNode {
     /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
     /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
     ToObject(Box<IrNode>),
+    /// `ToPropertyKey` of the value, as a key jsval: an interned string or a
+    /// symbol. An object's user `toString` / `valueOf` throw propagates.
+    ToPropertyKey(Box<IrNode>),
+    /// `SetFunctionName(func, key, prefix)` at run time for a function value
+    /// defined under a computed key (an object literal method, accessor, or
+    /// anonymous function / arrow value): `func` is evaluated into `local`,
+    /// its own `name` is redefined (configurable only) as `prefix` followed by
+    /// the key — a string key itself, a symbol `"[desc]"` (`""` when the
+    /// description is `undefined`) — and `func` is the result.
+    SetFunctionName {
+        /// The function value.
+        func: Box<IrNode>,
+        /// The local holding the [`IrNode::ToPropertyKey`] key jsval.
+        key: u32,
+        /// `""`, `"get "` or `"set "`.
+        prefix: &'static str,
+        /// Fresh temp local holding the evaluated `func`.
+        local: u32,
+    },
     /// A class heritage `extends value` (DESIGN.md §7.6): evaluate `value` into
     /// `parent`; unless it is `null` it must be a constructor, and `proto` gets
     /// `Get(parent, "prototype")`, which must be an object or `null` (`proto` is
@@ -2089,6 +2115,8 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::ToObject(inner)
+            | IrNode::ToPropertyKey(inner)
+            | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::AwaitMark(inner)
@@ -2287,6 +2315,8 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::ToObject(inner)
+            | IrNode::ToPropertyKey(inner)
+            | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
             | IrNode::AwaitMark(inner)

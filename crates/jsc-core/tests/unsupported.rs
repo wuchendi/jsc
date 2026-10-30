@@ -214,3 +214,121 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
         "TypeError: o.getFullYear is not a function",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Interim guards (design/symbol-strings.md §9.4): a user well-known symbol
+// hook a consult site does not honour yet throws a named `TypeError`, never a
+// silently wrong result. Each test is deleted by the stage that honours it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_iterator_hook_throws_until_y2() {
+    let text = "TypeError: Symbol.iterator protocol is not supported yet";
+    let iterable = "let o = { [Symbol.iterator]() { return [][Symbol.iterator]() } };";
+    for consumer in [
+        "for (const x of o) {}",
+        "[...o]",
+        "let [a] = o",
+        "new Map(o)",
+        "new Set(o)",
+        "Array.from(o)",
+        "Object.fromEntries(o)",
+        "function* g() { yield* o } g().next()",
+    ] {
+        assert_uncaught(&format!("{iterable} {consumer}"), text);
+    }
+    // A modified `@@iterator` on a builtin prototype, or an own one on an array.
+    assert_uncaught(
+        "Array.prototype[Symbol.iterator] = function () {}; for (const x of [1]) {}",
+        text,
+    );
+    assert_uncaught(
+        "let a = [1]; a[Symbol.iterator] = function () {}; [...a]",
+        text,
+    );
+    assert_uncaught(
+        "String.prototype[Symbol.iterator] = function () {}; for (const c of 'ab') {}",
+        text,
+    );
+    assert_uncaught(
+        "function* g() { yield 1 } let it = g(); it[Symbol.iterator] = function () {}; for (const x of it) {}",
+        text,
+    );
+}
+
+#[test]
+fn user_to_primitive_hook_throws_until_y4() {
+    let text = "TypeError: Symbol.toPrimitive is not supported yet";
+    let obj = "let o = { [Symbol.toPrimitive]() { return 1 } };";
+    for use_site in ["o + 1", "`${o}`", "+o", "o < 2", "({})[o]", "String(o)"] {
+        assert_uncaught(&format!("{obj} {use_site}"), text);
+    }
+}
+
+#[test]
+fn user_to_string_tag_throws_until_y4() {
+    let text = "TypeError: Symbol.toStringTag is not supported yet";
+    assert_uncaught(
+        "let o = { [Symbol.toStringTag]: 'X' }; Object.prototype.toString.call(o)",
+        text,
+    );
+    assert_uncaught("let o = { [Symbol.toStringTag]: 'X' }; String(o)", text);
+    assert_uncaught(
+        "class C {} Object.defineProperty(C.prototype, Symbol.toStringTag, { value: 'C' }); `${new C()}`",
+        text,
+    );
+}
+
+#[test]
+fn user_has_instance_throws_until_y4() {
+    assert_uncaught(
+        "function F() {} Object.defineProperty(F, Symbol.hasInstance, { value: () => true }); ({}) instanceof F",
+        "TypeError: Symbol.hasInstance is not supported yet",
+    );
+}
+
+#[test]
+fn user_species_throws_until_y4() {
+    let text = "TypeError: Symbol.species is not supported yet";
+    let setup =
+        "let C = function () {}; C[Symbol.species] = Array; let a = [1]; a.constructor = C;";
+    for method in [
+        "a.map(x => x)",
+        "a.filter(x => x)",
+        "a.slice()",
+        "a.concat()",
+    ] {
+        assert_uncaught(&format!("{setup} {method}"), text);
+    }
+}
+
+#[test]
+fn is_concat_spreadable_throws_until_y4() {
+    let text = "TypeError: Symbol.isConcatSpreadable is not supported yet";
+    assert_uncaught(
+        "let o = { [Symbol.isConcatSpreadable]: true, length: 1, 0: 'x' }; [].concat(o)",
+        text,
+    );
+    assert_uncaught(
+        "let a = [1]; a[Symbol.isConcatSpreadable] = false; a.concat([2])",
+        text,
+    );
+}
+
+#[test]
+fn string_method_symbol_arguments_throw_until_y4() {
+    for (src, name) in [
+        ("'abc'.startsWith({ [Symbol.match]: false })", "match"),
+        ("'abc'.includes({ [Symbol.match]: false })", "match"),
+        ("'abc'.match({ [Symbol.match]() { return 1 } })", "match"),
+        ("'abc'.matchAll({ [Symbol.matchAll]() {} })", "matchAll"),
+        ("'abc'.replace({ [Symbol.replace]() {} }, '')", "replace"),
+        ("'abc'.search({ [Symbol.search]() {} })", "search"),
+        ("'abc'.split({ [Symbol.split]() {} })", "split"),
+    ] {
+        assert_uncaught(
+            src,
+            &format!("TypeError: Symbol.{name} is not supported yet"),
+        );
+    }
+}
