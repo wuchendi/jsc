@@ -36,8 +36,11 @@ fn coercions(op: StringOp) -> [Coerce; 2] {
         | StringOp::Repeat
         | StringOp::At
         | StringOp::CharCodeAt
-        | StringOp::CodePointAt => [Coerce::Number, Coerce::None],
-        StringOp::PadStart | StringOp::PadEnd => [Coerce::Number, Coerce::OptString],
+        | StringOp::CodePointAt
+        // `padStart` / `padEnd` coerce `fillString` in the body, after the
+        // early return.
+        | StringOp::PadStart
+        | StringOp::PadEnd => [Coerce::Number, Coerce::None],
         StringOp::Split => [Coerce::OptString, Coerce::Number],
         StringOp::LocaleCompare => [Coerce::String, Coerce::None],
         StringOp::Normalize | StringOp::Search | StringOp::Match => {
@@ -1181,9 +1184,9 @@ fn emit_repeat(function: &mut Function, frame: Frame, strings: &StrOffsets, help
     wasm!(function; End);
 }
 
-/// `padStart` / `padEnd(maxLength, fillString)`: the receiver when
-/// `ToLength(maxLength)` does not exceed its length or the filler (default
-/// `" "`) is empty; a length past [`MAX_STRING_LENGTH`] is a `RangeError`;
+/// `padStart` / `padEnd(maxLength, fillString)` (`StringPad` order): the
+/// receiver when `ToLength(maxLength)` does not exceed its length, before
+/// `fillString` is coerced, or when the filler (default `" "`) is empty; a length past [`MAX_STRING_LENGTH`] is a `RangeError`;
 /// else the filler repeated (and cut) to the missing units before / after
 /// the receiver, narrowed.
 fn emit_pad(
@@ -1213,7 +1216,11 @@ fn emit_pad(
         LocalGet(a1), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty),
     );
     push_str(function, strings, " ");
-    wasm!(function; LocalSet(a1), End);
+    wasm!(function; LocalSet(a1), Else);
+    is_string(function, a1);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    to_string(function, a1, helpers);
+    wasm!(function; End, End);
     t.open(function, a1);
     wasm!(function;
         LocalGet(t.n), I32Eqz, If(BlockType::Empty), LocalGet(recv), Return, End,
