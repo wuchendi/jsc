@@ -17,7 +17,7 @@ env:
 
 jobs:
   rust:
-    name: rust (fmt + clippy + test + deny + shear + typos)
+    name: rust (fmt + clippy + doctests + deny + shear + typos)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,9 +49,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --workspace
 
-      - name: Test (nextest)
-        run: cargo nextest run --workspace --no-fail-fast
-
       - name: Doctests
         run: cargo test --doc --workspace
 
@@ -61,6 +58,33 @@ jobs:
       # cargo-deny reads manifests/lockfile only — no workspace compile needed.
       - name: Supply-chain (cargo-deny)
         run: cargo deny check
+
+  test:
+    name: test (nextest ${{ matrix.part }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain 1.99.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # One quarter of the workspace tests; every partition runs to the end.
+      - name: Test (nextest)
+        run: cargo nextest run --workspace --no-fail-fast --partition count:${{ matrix.part }}/4
 
   test262:
     name: test262 (baseline regression gate)
