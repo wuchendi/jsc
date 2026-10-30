@@ -163,14 +163,9 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         }
         METHOD_OP_TO_UPPER | METHOD_OP_TO_LOWER => match type_byte {
             Some(TYPE_STRING) => {
-                let text = string_text(&mem, ptr?)?;
-                // The full Unicode default case mappings (`ß` -> `SS`, final sigma).
-                let mapped = if op == METHOD_OP_TO_UPPER {
-                    text.to_uppercase()
-                } else {
-                    text.to_lowercase()
-                };
-                alloc_string(caller, &mapped).map(|base| HEAP | base)
+                let units = string_units(&mem, ptr?)?;
+                let mapped = map_case(&units, op == METHOD_OP_TO_UPPER);
+                alloc_units(caller, &mapped).map(|base| HEAP | base)
             }
             _ => None,
         },
@@ -202,6 +197,35 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         },
         _ => None,
     }
+}
+
+/// The full Unicode default case mapping of the code units `units` (upper when
+/// `upper`): each maximal run of valid code points maps through std
+/// (`SpecialCasing`: `ß` -> `SS`; `Final_Sigma` in the run), a lone surrogate
+/// passes through as its unit.
+fn map_case(units: &[u16], upper: bool) -> Vec<u16> {
+    let mut out = Vec::with_capacity(units.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut Vec<u16>| {
+        let mapped = if upper {
+            run.to_uppercase()
+        } else {
+            run.to_lowercase()
+        };
+        out.extend(mapped.encode_utf16());
+        run.clear();
+    };
+    for decoded in char::decode_utf16(units.iter().copied()) {
+        match decoded {
+            Ok(c) => run.push(c),
+            Err(lone) => {
+                flush(&mut run, &mut out);
+                out.push(lone.unpaired_surrogate());
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// The linear-memory byte offset of a heap jsval (single heap tag `0b101`), or

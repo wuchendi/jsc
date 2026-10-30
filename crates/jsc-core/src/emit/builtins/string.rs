@@ -87,6 +87,10 @@ pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(
                 | (Coerce::Number, Some(IrNode::Num(_)))
         )
     };
+    // Case mapping takes its Latin-1 fast path in the builtin.
+    if case_upper(op).is_some() {
+        return None;
+    }
     let [first, second] = coercions(op);
     if !(ready(first, args.first()) && ready(second, args.get(1))) {
         return None;
@@ -432,7 +436,95 @@ pub(super) fn emit_method(
         }
         return;
     };
+    if let Some(upper) = case_upper(op) {
+        emit_case_map(upper, op, flag, function, frame, strings, helpers);
+        return;
+    }
     emit_host_op(op, flag, function, frame, strings, helpers);
+}
+
+/// Whether `op` is an upper (`true`) or lower (`false`) case mapping.
+fn case_upper(op: StringOp) -> Option<bool> {
+    match op {
+        StringOp::ToUpperCase | StringOp::ToLocaleUpperCase => Some(true),
+        StringOp::ToLowerCase | StringOp::ToLocaleLowerCase => Some(false),
+        _ => None,
+    }
+}
+
+/// `toUpperCase` / `toLowerCase` (and the `toLocale*` twins) over the string
+/// in i64 temp 0: a one-byte receiver whose mapping stays one-byte at the
+/// same length (lowercasing always; uppercasing unless it holds `µ`, `ß` or
+/// `ÿ`) maps per unit in the guest, anything else runs the host op `flag`.
+fn emit_case_map(
+    upper: bool,
+    op: StringOp,
+    flag: i32,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let locals = i32_locals(frame);
+    let s = Str::at(&locals, 0);
+    let [i, c, ok, dst] = [locals[3], locals[4], locals[5], locals[6]];
+    s.open(function, frame.i64(0));
+    wasm!(function; LocalGet(s.w), I32Eqz, LocalSet(ok));
+    if upper {
+        wasm!(function; LocalGet(ok), If(BlockType::Empty), I32Const(0), LocalSet(i));
+        count_loop(function, i, s.n, |function| {
+            s.unit_at(function, i);
+            wasm!(function;
+                LocalTee(c), I32Const(0xB5), I32Eq,
+                LocalGet(c), I32Const(0xDF), I32Eq, I32Or,
+                LocalGet(c), I32Const(0xFF), I32Eq, I32Or,
+                If(BlockType::Empty), I32Const(0), LocalSet(ok), Br(2), End,
+            );
+        });
+        wasm!(function; End);
+    }
+    // A mapped unit and its case pair are `0x20` apart: `A-Z` / `a-z` and
+    // `U+00C0..=U+00DE` / `U+00E0..=U+00FE` but `×` / `÷`.
+    let (letters, accented, sign) = if upper {
+        (0x61, 0xE0, 0xF7)
+    } else {
+        (0x41, 0xC0, 0xD7)
+    };
+    let d = Str { p: dst, ..s };
+    wasm!(function; LocalGet(ok), If(BlockType::Result(ValType::I64)));
+    emit_alloc_str(
+        function,
+        helpers.alloc,
+        |f| wasm!(f; LocalGet(s.n)),
+        |f| wasm!(f; I32Const(0)),
+        dst,
+    );
+    wasm!(function; I32Const(0), LocalSet(i));
+    count_loop(function, i, s.n, |function| {
+        d.store(
+            function,
+            |f| wasm!(f; LocalGet(i)),
+            |f| {
+                s.unit_at(f, i);
+                wasm!(f;
+                    LocalTee(c), I32Const(letters), I32Sub, I32Const(26), I32LtU,
+                    LocalGet(c), I32Const(accented), I32Sub, I32Const(0x1F), I32LtU,
+                    LocalGet(c), I32Const(sign), I32Ne, I32And, I32Or,
+                    I32Const(5), I32Shl,
+                );
+                if upper {
+                    wasm!(f; I32Sub);
+                } else {
+                    wasm!(f; I32Add);
+                }
+            },
+        );
+    });
+    wasm!(function; LocalGet(dst));
+    box_heap(function);
+    wasm!(function; Else);
+    emit_host_op(op, flag, function, frame, strings, helpers);
+    wasm!(function; End);
 }
 
 /// The host op `flag` of `op` over the receiver string in i64 temp 0 and the
