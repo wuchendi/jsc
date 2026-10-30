@@ -376,6 +376,10 @@ const TYPE_DATE: i32 = abi::TYPE_DATE as i32;
 const DATE_MS_OFFSET: u64 = abi::DATE_MS_OFFSET as u64;
 const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 
+/// The TYPE BYTE of a Symbol primitive block. Maps to `typeof` "symbol". See
+/// [`abi::TYPE_SYMBOL`] for the full layout.
+const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+
 /// The TYPE BYTE of an instance-accessor block. See [`abi::TYPE_ACCESSOR`].
 const TYPE_ACCESSOR: i32 = abi::TYPE_ACCESSOR as i32;
 const ACCESSOR_GET_OFFSET: u64 = abi::ACCESSOR_GET_OFFSET as u64;
