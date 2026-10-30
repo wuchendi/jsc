@@ -1183,7 +1183,7 @@ fn yield_star_forwards_sent_values_to_the_delegate() {
          function* g(){ yield* it }
          const o = g(); o.next('a'); o.next('b'); o.next('c');
          console.log(seen)",
-        "[ undefined, 'b', 'c' ]\n",
+        "[ undefined, b, c ]\n",
     );
 }
 

@@ -3286,6 +3286,7 @@ mod tests {
                     | Intrinsic::IteratorPrototype
                     | Intrinsic::AsyncIteratorPrototype
                     | Intrinsic::IterPrototype(_)
+                    | Intrinsic::IteratorHelperPrototype
                     | Intrinsic::GeneratorPrototype
                     | Intrinsic::AsyncGeneratorPrototype
                     | Intrinsic::Math

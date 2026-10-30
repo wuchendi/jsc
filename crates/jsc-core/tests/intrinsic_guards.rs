@@ -23,7 +23,7 @@ fn unknown_namespace_members_are_runtime_reads() {
         "TypeError: console.warn is not a function",
     );
     // Inherited members of a namespace or constructor are reachable.
-    assert_string("Math.toString()", "[object Object]");
+    assert_string("Math.toString()", "[object Math]");
     assert_bool("Object.hasOwnProperty('keys')", true);
 }
 
