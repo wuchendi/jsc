@@ -255,6 +255,54 @@ fn resolve_and_reject_reject_a_non_constructor_this() {
     );
 }
 
+// --- one-argument programs ---------------------------------------------------------
+//
+// The widest call in each of these sources takes one argument (`K = 1`), so the
+// executor's `reject` and a two-handler `then` overflow the positional slots.
+
+#[test]
+fn combinators_in_one_argument_programs() {
+    assert_output(
+        "Promise.all([1, 2]).then((v) => console.log(v.length));",
+        "2\n",
+    );
+    assert_output("Promise.race([1]).then((v) => console.log(v));", "1\n");
+    assert_output(
+        "Promise.allSettled([1]).then((v) => console.log(v.length));",
+        "1\n",
+    );
+    assert_output("Promise.any([1]).then((v) => console.log(v));", "1\n");
+    assert_output("Promise.all([]).then((v) => console.log(v.length));", "0\n");
+}
+
+#[test]
+fn capability_executor_gets_both_settlers_in_one_argument_programs() {
+    assert_output(
+        "new Promise(function () { console.log(typeof arguments[1]); });",
+        "function\n",
+    );
+    assert_output(
+        "class P extends Promise {} P.resolve(1).then((v) => console.log(v));",
+        "1\n",
+    );
+    assert_output(
+        "class P extends Promise {} P.reject(2).catch((v) => console.log(v));",
+        "2\n",
+    );
+    assert_output(
+        "class P extends Promise {} P.reject(3).finally(() => console.log(0)).catch((v) => console.log(v));",
+        "0\n3\n",
+    );
+    assert_output(
+        "class P extends Promise {} P.all([P.resolve(4)]).then((v) => console.log(v[0]));",
+        "4\n",
+    );
+    assert_output(
+        "class P extends Promise {} P.race([P.reject(5)]).catch((v) => console.log(v));",
+        "5\n",
+    );
+}
+
 // --- Math.sumPrecise ----------------------------------------------------------------
 
 #[test]
