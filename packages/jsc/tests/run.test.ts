@@ -622,6 +622,30 @@ it('runs the moved string methods on code units like the Rust host', async () =>
   }
 })
 
+it('normalizes and compares strings losslessly like the Rust host', async () => {
+  const cases: [string, string][] = [
+    ["'\\u0041\\u030A'.normalize('NFC') === '\\u00C5'", 'true'],
+    ["'\\u00C5'.normalize('NFD') === '\\u0041\\u030A'", 'true'],
+    ["'\\uFB01'.normalize('NFKC')", 'fi'],
+    ["'\\u1E9B\\u0323'.normalize('NFKD') === '\\u0073\\u0323\\u0307'", 'true'],
+    ["'e\\u0301'.normalize() === '\\u00E9'", 'true'],
+    [
+      "try { 'abc'.normalize('nfc') } catch (e) { e.name + '|' + e.message }",
+      'RangeError|The normalization form should be one of NFC, NFD, NFKC, NFKD.',
+    ],
+    ["'a\\uD800'.normalize('NFC') === 'a\\uD800'", 'true'],
+    ["'a\\uD800'.normalize('NFC').length", '2'],
+    ["'a'.localeCompare('b') < 0", 'true'],
+    ["'b'.localeCompare('a') > 0", 'true'],
+    ["'a'.localeCompare('a')", '0'],
+    ["'\\uFFFF'.localeCompare('\\u{10000}') > 0", 'true'],
+    ["'\\uD800'.localeCompare('\\uDC00') < 0", 'true'],
+  ]
+  for (const [src, expected] of cases) {
+    expect((await run(src)).result, src).toBe(expected)
+  }
+})
+
 it('renders symbols like the Rust host', async () => {
   expect((await run('typeof Symbol()')).result).toBe('symbol')
   expect((await run('Symbol("a")')).result).toBe('Symbol(a)')

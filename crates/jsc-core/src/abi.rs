@@ -839,11 +839,6 @@ pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
 /// `undefined`).
 pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
 
-/// `__method` result: the string op cannot produce a correct result for its
-/// input yet (`normalize` over non-ASCII text); the calling builtin throws a
-/// `TypeError`. [`HOLE`], which no JS value produces.
-pub(crate) const METHOD_UNSUPPORTED: u64 = HOLE;
-
 /// `__method` result: the argument is out of range (an unknown `normalize`
 /// form); the calling builtin throws a `RangeError`.
 pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
