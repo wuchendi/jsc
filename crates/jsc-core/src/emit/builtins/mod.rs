@@ -38,7 +38,7 @@ mod promise;
 mod string;
 mod symbol;
 
-use crate::emit::realm::ArrayCopyOp;
+use crate::emit::realm::{ArrayCopyOp, DateGenericOp};
 pub(super) use iter::{
     CloseMode, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
     emit_iterator_close, emit_iterator_step, emit_iterator_value, emit_open_iterator,
@@ -322,7 +322,7 @@ pub(super) fn emit_builtin(
         | Builtin::AsyncGeneratorDrain
         | Builtin::AsyncGeneratorStep
         | Builtin::AsyncGeneratorReaction(_)
-        | Builtin::DateToJson => emit_object_family(builtin, &mut f, frame, strings, helpers),
+        | Builtin::DateGeneric(_) => emit_object_family(builtin, &mut f, frame, strings, helpers),
         Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
@@ -397,7 +397,12 @@ fn emit_object_family(
             object::emit_lookup_accessor(set, f, frame, strings, helpers);
         }
         Builtin::DateMethod(op) => date::emit_method(op, f, frame, strings, helpers),
-        Builtin::DateToJson => date::emit_to_json(f, frame, strings, helpers),
+        Builtin::DateGeneric(DateGenericOp::ToJson) => {
+            date::emit_to_json(f, frame, strings, helpers);
+        }
+        Builtin::DateGeneric(DateGenericOp::ToPrimitive) => {
+            date::emit_to_primitive(f, frame, strings, helpers);
+        }
         Builtin::CollectionOp { set, op } => map_set::emit_op(set, op, f, frame, strings, helpers),
         Builtin::CollectionForEach { set } => {
             map_set::emit_for_each(set, f, frame, strings, helpers);
