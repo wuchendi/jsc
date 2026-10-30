@@ -62,6 +62,9 @@ pub(super) enum Intrinsic {
     /// the global object): its table maps interned key strings to the
     /// registered symbols.
     SymbolRegistry,
+    /// `Array.prototype[@@unscopables]`: a `null`-prototype object whose
+    /// own data properties (each `true`) name the methods `with` skips.
+    ArrayUnscopables,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -221,9 +224,9 @@ impl From<GlobalIntrinsic> for Intrinsic {
 
 impl Intrinsic {
     /// The intrinsic's `proto` (`None` = `null`).
-    fn proto(self) -> Option<Intrinsic> {
+    pub(super) fn proto(self) -> Option<Intrinsic> {
         match self {
-            Self::ObjectPrototype | Self::SymbolRegistry => None,
+            Self::ObjectPrototype | Self::SymbolRegistry | Self::ArrayUnscopables => None,
             Self::FunctionPrototype
             | Self::ErrorPrototype(ErrorKind::Error)
             | Self::Global
@@ -295,6 +298,10 @@ impl Intrinsic {
             Self::IterPrototype(IterFamily::String) => 17,
             Self::IterPrototype(IterFamily::Map) => 18,
             Self::IterPrototype(IterFamily::Set) => 19,
+            // `%Array%[@@species]` / `%Promise%[@@species]`
+            // (design/symbol-strings.md §4).
+            Self::Ctor(BuiltinCtor::Array) => 20,
+            Self::Ctor(BuiltinCtor::Promise) => 21,
             _ => return None,
         })
     }
@@ -329,6 +336,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::GeneratorPrototype,
             Intrinsic::AsyncGeneratorPrototype,
             Intrinsic::SymbolRegistry,
+            Intrinsic::ArrayUnscopables,
         ])
 }
 
@@ -371,6 +379,8 @@ pub(super) enum Builtin {
     Bind,
     /// `Function.prototype.toString`.
     FunctionToString,
+    /// `Function.prototype[@@hasInstance]` (`OrdinaryHasInstance`).
+    FunctionHasInstance,
     /// The call/construct trampoline of every bound function (DESIGN.md
     /// §5.5): `env` is the `[target, boundThis, ...boundArgs]` array. Not
     /// installed on any intrinsic.
@@ -485,8 +495,8 @@ pub(super) enum Builtin {
     BooleanValueOf,
     /// A `Date.prototype` method (`toString`, `getTime`, `valueOf`, ..).
     DateMethod(DateOp),
-    /// `Date.prototype.toJSON`.
-    DateToJson,
+    /// A generic `%Date.prototype%` method (any receiver).
+    DateGeneric(DateGenericOp),
     /// A `%Map.prototype%` (`set == false`) / `%Set.prototype%` method with
     /// an inline body.
     CollectionOp {
@@ -556,6 +566,76 @@ pub(super) enum Builtin {
     Symbol(SymbolOp),
     /// An iteration builtin (design/symbol-strings.md §5.4).
     Iter(IterOp),
+    /// A `@@species` builtin: a `get [Symbol.species]`, or an internal
+    /// closure of the promise `SpeciesConstructor` paths.
+    Species(SpeciesOp),
+}
+
+/// The `@@species` builtins: the `get [Symbol.species]` accessors, and the
+/// internal closures of the `SpeciesConstructor` paths of
+/// `Promise.prototype.then` / `finally` (each a fresh function block whose
+/// `env` holds its captured values; not installed on any intrinsic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpeciesOp {
+    /// The `get [Symbol.species]` of `%Array%` / `%Map%` / `%Set%` /
+    /// `%Promise%`: returns `this`.
+    Getter(BuiltinCtor),
+    /// `GetCapabilitiesExecutor(resolve, reject)`: `env` is the capability
+    /// record array `[resolve, reject]`.
+    Executor,
+    /// The reaction of a `then` whose result promise is a species instance:
+    /// `env` is `[handler, resolve, reject]` (`reject` = the rejection
+    /// reaction).
+    Reaction {
+        /// The rejection reaction rather than the fulfillment one.
+        reject: bool,
+    },
+    /// `thenFinally` / `catchFinally` (`reject`) of `finally`: `env` is
+    /// `[onFinally, C]`.
+    Finally {
+        /// `catchFinally` rather than `thenFinally`.
+        reject: bool,
+    },
+    /// The `() => value` / `() => throw reason` (`throw`) closure of
+    /// `thenFinally` / `catchFinally`: `env` is the value.
+    Thunk {
+        /// Throw the value rather than return it.
+        throw: bool,
+    },
+}
+
+impl SpeciesOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [SpeciesOp; 11] = [
+        Self::Getter(BuiltinCtor::Array),
+        Self::Getter(BuiltinCtor::Map),
+        Self::Getter(BuiltinCtor::Set),
+        Self::Getter(BuiltinCtor::Promise),
+        Self::Executor,
+        Self::Reaction { reject: false },
+        Self::Reaction { reject: true },
+        Self::Finally { reject: false },
+        Self::Finally { reject: true },
+        Self::Thunk { throw: false },
+        Self::Thunk { throw: true },
+    ];
+
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Getter(_) => "get [Symbol.species]",
+            _ => "",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::Executor => 2,
+            Self::Reaction { .. } | Self::Finally { .. } => 1,
+            Self::Getter(_) | Self::Thunk { .. } => 0,
+        }
+    }
 }
 
 /// An internal builtin of the iteration protocol (design/symbol-strings.md
@@ -661,6 +741,25 @@ impl IterOp {
     }
 }
 
+/// A generic `%Date.prototype%` method: its receiver need not be a Date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DateGenericOp {
+    /// `Date.prototype.toJSON`.
+    ToJson,
+    /// `Date.prototype[@@toPrimitive]` (installed under its symbol key).
+    ToPrimitive,
+}
+
+impl DateGenericOp {
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ToJson => "toJSON",
+            Self::ToPrimitive => "[Symbol.toPrimitive]",
+        }
+    }
+}
+
 /// A `Symbol` static or `%Symbol.prototype%` builtin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SymbolOp {
@@ -743,6 +842,17 @@ impl NumberTest {
             Self::Finite => "isFinite",
             Self::NaN => "isNaN",
         }
+    }
+}
+
+/// The name of a `%Function.prototype%` method.
+fn function_name(builtin: Builtin) -> &'static str {
+    match builtin {
+        Builtin::Call => "call",
+        Builtin::Apply => "apply",
+        Builtin::Bind => "bind",
+        Builtin::FunctionHasInstance => "[Symbol.hasInstance]",
+        _ => "",
     }
 }
 
@@ -1048,7 +1158,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 259] = [
+    pub(super) const ALL: [Builtin; 272] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1066,6 +1176,7 @@ impl Builtin {
         Self::Apply,
         Self::Bind,
         Self::FunctionToString,
+        Self::FunctionHasInstance,
         Self::BoundCall,
         Self::ErrorToString,
         Self::Math(MathOp::Floor),
@@ -1248,7 +1359,8 @@ impl Builtin {
         Self::DateMethod(DateOp::GetMinutes),
         Self::DateMethod(DateOp::GetSeconds),
         Self::DateMethod(DateOp::ToIsoString),
-        Self::DateToJson,
+        Self::DateGeneric(DateGenericOp::ToJson),
+        Self::DateGeneric(DateGenericOp::ToPrimitive),
         Self::CollectionOp {
             set: false,
             op: MapOp::Get,
@@ -1335,6 +1447,17 @@ impl Builtin {
         Self::Iter(IterOp::ALL[12]),
         Self::Iter(IterOp::ALL[13]),
         Self::Iter(IterOp::ALL[14]),
+        Self::Species(SpeciesOp::ALL[0]),
+        Self::Species(SpeciesOp::ALL[1]),
+        Self::Species(SpeciesOp::ALL[2]),
+        Self::Species(SpeciesOp::ALL[3]),
+        Self::Species(SpeciesOp::ALL[4]),
+        Self::Species(SpeciesOp::ALL[5]),
+        Self::Species(SpeciesOp::ALL[6]),
+        Self::Species(SpeciesOp::ALL[7]),
+        Self::Species(SpeciesOp::ALL[8]),
+        Self::Species(SpeciesOp::ALL[9]),
+        Self::Species(SpeciesOp::ALL[10]),
     ];
 
     /// The function's `name`.
@@ -1348,6 +1471,18 @@ impl Builtin {
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
             | Self::AsyncGeneratorReaction(_) => "",
+            Self::ProtoGet => "get __proto__",
+            Self::ProtoSet => "set __proto__",
+            Self::CollectionSize { .. } => "get size",
+            Self::Species(op) => op.name(),
+            method => method.method_name(),
+        }
+    }
+
+    /// The `name` of a builtin installed as a method, static or constructor
+    /// (the anonymous and accessor builtins are named by [`Self::name`]).
+    fn method_name(self) -> &'static str {
+        match self {
             Self::HasOwnProperty => "hasOwnProperty",
             Self::IsPrototypeOf => "isPrototypeOf",
             Self::PropertyIsEnumerable => "propertyIsEnumerable",
@@ -1355,8 +1490,6 @@ impl Builtin {
             Self::DefineAccessor { set: true } => "__defineSetter__",
             Self::LookupAccessor { set: false } => "__lookupGetter__",
             Self::LookupAccessor { set: true } => "__lookupSetter__",
-            Self::ProtoGet => "get __proto__",
-            Self::ProtoSet => "set __proto__",
             Self::ObjectToString
             | Self::ErrorToString
             | Self::ArrayToString
@@ -1369,9 +1502,8 @@ impl Builtin {
             }
             Self::Symbol(op) => op.name(),
             Self::DateMethod(op) => op.name(),
-            Self::DateToJson => "toJSON",
+            Self::DateGeneric(op) => op.name(),
             Self::CollectionOp { op, .. } => op.name(),
-            Self::CollectionSize { .. } => "get size",
             Self::PromiseThen => "then",
             Self::PromiseCatch => "catch",
             Self::PromiseFinally => "finally",
@@ -1383,9 +1515,9 @@ impl Builtin {
             Self::StringFromCharCode => "fromCharCode",
             Self::StringFromCodePoint => "fromCodePoint",
             Self::StringRaw => "raw",
-            Self::Call => "call",
-            Self::Apply => "apply",
-            Self::Bind => "bind",
+            Self::Call | Self::Apply | Self::Bind | Self::FunctionHasInstance => {
+                function_name(self)
+            }
             Self::Math(op) => math_name(op),
             Self::NumberToFixed => "toFixed",
             Self::NumberToExponential => "toExponential",
@@ -1438,6 +1570,7 @@ impl Builtin {
             Self::IsNaN => "isNaN",
             Self::IsFinite => "isFinite",
             Self::Iter(op) => op.name(),
+            _ => "",
         }
     }
 
@@ -1504,6 +1637,7 @@ impl Builtin {
             Self::StringMethod(op) => op.length(),
             Self::ObjectReflect(op) => op.length(),
             Self::Symbol(op) => op.length(),
+            Self::Species(op) => op.length(),
             Self::JsonStringify => 3,
             // Every other builtin takes one argument.
             _ => 1,
@@ -1547,7 +1681,9 @@ impl Builtin {
             | Self::NumberToPrecision
             | Self::NumberToLocaleString => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
-            Self::DateMethod(_) | Self::DateToJson => Some(BuiltinCtor::Date),
+            Self::DateMethod(_) | Self::DateGeneric(DateGenericOp::ToJson) => {
+                Some(BuiltinCtor::Date)
+            }
             Self::Symbol(SymbolOp::ToString | SymbolOp::ValueOf) => Some(BuiltinCtor::Symbol),
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
                 Some(collection(set))
@@ -1586,6 +1722,8 @@ pub(super) enum Value {
     Num(f64),
     /// `undefined`.
     Undefined,
+    /// A boolean.
+    Bool(bool),
     /// Another intrinsic object.
     Intrinsic(Intrinsic),
     /// A well-known symbol: its static `TYPE_SYMBOL` block.
@@ -1869,6 +2007,14 @@ pub(super) fn registry() -> Vec<Entry> {
         ),
         entry(FunctionPrototype, "caller", POISON_ATTRS, POISON),
         entry(FunctionPrototype, "arguments", POISON_ATTRS, POISON),
+        // Non-writable, non-enumerable, non-configurable: `instanceof` relies
+        // on it never changing (the builtin `instanceof` fast paths).
+        Entry {
+            intrinsic: FunctionPrototype,
+            key: Key::Symbol(WellKnown::HasInstance),
+            attrs: CONST_ATTRS,
+            value: Value::Method(Builtin::FunctionHasInstance),
+        },
     ]);
     for kind in ErrorKind::ALL {
         let proto = Intrinsic::ErrorPrototype(kind);
@@ -1990,6 +2136,100 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
     }
     symbol_prototype_entries(entries);
     iterator_entries(entries);
+    well_known_entries(entries);
+    species_entries(entries);
+}
+
+/// The method names `Array.prototype[@@unscopables]` lists.
+const UNSCOPABLES: [&str; 16] = [
+    "at",
+    "copyWithin",
+    "entries",
+    "fill",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "flat",
+    "flatMap",
+    "includes",
+    "keys",
+    "toReversed",
+    "toSorted",
+    "toSpliced",
+    "values",
+];
+
+/// The `get [@@species]` accessors (configurable only) of `%Array%`,
+/// `%Map%`, `%Set%` and `%Promise%`, and `Array.prototype[@@unscopables]`
+/// (configurable only) with its `null`-prototype list object (each entry a
+/// writable, enumerable, configurable `true`).
+fn species_entries(entries: &mut Vec<Entry>) {
+    let ctors = [
+        BuiltinCtor::Array,
+        BuiltinCtor::Map,
+        BuiltinCtor::Set,
+        BuiltinCtor::Promise,
+    ];
+    entries.extend(ctors.map(|ctor| Entry {
+        intrinsic: Intrinsic::Ctor(ctor),
+        key: Key::Symbol(WellKnown::Species),
+        attrs: ACCESSOR_ATTRS,
+        value: Value::Accessor {
+            get: Builtin::Species(SpeciesOp::Getter(ctor)),
+            set: None,
+        },
+    }));
+    entries.push(Entry {
+        intrinsic: Intrinsic::Prototype(BuiltinCtor::Array),
+        key: Key::Symbol(WellKnown::Unscopables),
+        attrs: FN_FACT_ATTRS,
+        value: Value::Intrinsic(Intrinsic::ArrayUnscopables),
+    });
+    let all = abi::ATTR_WRITABLE | abi::ATTR_ENUMERABLE | abi::ATTR_CONFIGURABLE;
+    entries.extend(UNSCOPABLES.map(|key| Entry {
+        intrinsic: Intrinsic::ArrayUnscopables,
+        key: Key::Str(key),
+        attrs: all,
+        value: Value::Bool(true),
+    }));
+}
+
+/// `%Date.prototype%[@@toPrimitive]` and the builtin `[@@toStringTag]`s
+/// (configurable only) `Object.prototype.toString` reads; `%Symbol.prototype%`'s
+/// is in [`symbol_prototype_entries`].
+fn well_known_entries(entries: &mut Vec<Entry>) {
+    entries.push(Entry {
+        intrinsic: Intrinsic::Prototype(BuiltinCtor::Date),
+        key: Key::Symbol(WellKnown::ToPrimitive),
+        attrs: FN_FACT_ATTRS,
+        value: Value::Method(Builtin::DateGeneric(DateGenericOp::ToPrimitive)),
+    });
+    let tags = [
+        (Intrinsic::Prototype(BuiltinCtor::Map), "Map"),
+        (Intrinsic::Prototype(BuiltinCtor::Set), "Set"),
+        (Intrinsic::Prototype(BuiltinCtor::Promise), "Promise"),
+        (Intrinsic::GeneratorPrototype, "Generator"),
+        (Intrinsic::AsyncGeneratorPrototype, "AsyncGenerator"),
+        (Intrinsic::Math, "Math"),
+        (Intrinsic::Json, "JSON"),
+        (
+            Intrinsic::IterPrototype(IterFamily::Array),
+            "Array Iterator",
+        ),
+        (
+            Intrinsic::IterPrototype(IterFamily::String),
+            "String Iterator",
+        ),
+        (Intrinsic::IterPrototype(IterFamily::Map), "Map Iterator"),
+        (Intrinsic::IterPrototype(IterFamily::Set), "Set Iterator"),
+    ];
+    entries.extend(tags.map(|(intrinsic, tag)| Entry {
+        intrinsic,
+        key: Key::Symbol(WellKnown::ToStringTag),
+        attrs: FN_FACT_ATTRS,
+        value: Value::Str(tag),
+    }));
 }
 
 /// The iteration entries (design/symbol-strings.md §5.4) past the methods
@@ -2132,6 +2372,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
                 Value::Method(_)
                 | Value::Num(_)
                 | Value::Undefined
+                | Value::Bool(_)
                 | Value::Intrinsic(_)
                 | Value::Symbol(_)
                 | Value::Accessor { .. } => None,
@@ -2318,6 +2559,8 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &StrOffsets) -> Vec<u8>
                 Value::Num(n) if n.is_nan() => abi::QNAN,
                 Value::Num(n) => n.to_bits(),
                 Value::Undefined => abi::UNDEFINED,
+                Value::Bool(true) => abi::TRUE,
+                Value::Bool(false) => abi::FALSE,
                 Value::Intrinsic(i) => heap(base + intrinsic_offset(&registry, i)),
                 Value::Symbol(symbol) => heap(base + symbol_offset(&registry, symbol)),
                 Value::Accessor { .. } => heap(base + accessor_offset(&registry, i)),
@@ -2547,8 +2790,18 @@ mod tests {
                         | BuiltinCtor::String
                         | BuiltinCtor::Map
                         | BuiltinCtor::Set
-                ) | Intrinsic::IteratorPrototype
+                        | BuiltinCtor::Promise
+                        | BuiltinCtor::Date
+                ) | Intrinsic::Ctor(
+                    BuiltinCtor::Array | BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Promise
+                ) | Intrinsic::FunctionPrototype
+                    | Intrinsic::IteratorPrototype
                     | Intrinsic::AsyncIteratorPrototype
+                    | Intrinsic::IterPrototype(_)
+                    | Intrinsic::GeneratorPrototype
+                    | Intrinsic::AsyncGeneratorPrototype
+                    | Intrinsic::Math
+                    | Intrinsic::Json
             );
             assert_eq!(
                 tflags & abi::PROPS_HAS_SYMBOL_KEYS != 0,
@@ -2580,11 +2833,12 @@ mod tests {
             assert_eq!(IterPrototype(family).proto(), Some(IteratorPrototype));
             assert!(IterPrototype(family).watch_bit().is_some());
         }
-        // Five new dirty bits (15..=19), all distinct.
+        // The iterator prototypes' bits (15..=19) and the `%Array%` /
+        // `%Promise%` ones (20, 21), all distinct.
         let mut bits: Vec<u8> = intrinsics().filter_map(Intrinsic::watch_bit).collect();
         bits.sort_unstable();
         bits.dedup();
-        assert_eq!(bits, (0..=19).collect::<Vec<u8>>());
+        assert_eq!(bits, (0..=21).collect::<Vec<u8>>());
         // The `[@@iterator]` aliases share one method block.
         let registry = registry();
         let symbol_method = |intrinsic, symbol| {

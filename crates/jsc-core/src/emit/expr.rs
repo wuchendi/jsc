@@ -1266,6 +1266,13 @@ pub(super) fn emit_proto_guard(
         } else {
             found(function, slot);
         }
+        if let Some(bit) = species_bit(path) {
+            function.instruction(&Instruction::GlobalGet(DIRTY_GLOBAL));
+            function.instruction(&Instruction::I32Const(1 << bit));
+            function.instruction(&Instruction::I32And);
+            function.instruction(&Instruction::I32Eqz);
+            function.instruction(&Instruction::I32And);
+        }
         if matches!(path, IrNode::ArrayPush { .. }) {
             emit_push_room_test(function, scratch + 3);
         }
@@ -1395,6 +1402,24 @@ fn early_marker(slot: usize) -> i64 {
 
 /// Whether the fast paths of `kind` read the receiver's own properties, so
 /// arguments that run after the early read can invalidate them.
+/// The dirty bit of the constructor whose builtin `@@species` the fast path
+/// `path` assumes (`map` / `filter` create a plain array, `then` / `catch` /
+/// `finally` a `%Promise%`): the receiver test proves `constructor` is
+/// `%Array%` / `%Promise%`, not that its `@@species` is untouched, and the
+/// global constructor is reachable even in an intrinsics-sealed program, so
+/// the bit is tested whatever `sealed` says.
+pub(super) fn species_bit(path: &IrNode) -> Option<u8> {
+    let ctor = match path {
+        IrNode::ArrayHof {
+            op: ArrayHofOp::Map | ArrayHofOp::Filter,
+            ..
+        } => BuiltinCtor::Array,
+        IrNode::PromiseThen { .. } | IrNode::PromiseFinally { .. } => BuiltinCtor::Promise,
+        _ => return None,
+    };
+    Intrinsic::Ctor(ctor).watch_bit()
+}
+
 fn props_sensitive(kind: ProtoKind) -> bool {
     matches!(kind, ProtoKind::Array | ProtoKind::Promise)
 }
