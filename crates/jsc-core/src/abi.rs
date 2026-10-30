@@ -409,17 +409,31 @@ pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 `done` flag.
 pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
-/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 resume
-/// `limits` bits ([`GEN_LIMIT_RETURN`], [`GEN_LIMIT_THROW`]), guest-only.
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 `limits`
+/// bits ([`GEN_RUNNING`] .. [`GEN_BUSY`], the [`GEN_RESUME_MODE_MASK`]
+/// field), guest-only.
 pub(crate) const GEN_LIMITS_OFFSET: u32 = OBJ_PREFIX_SIZE + 12;
 
-/// Generator `limits` bit: the body has a `finally` or a `yield*`, so a
-/// `return()` at a suspended `yield` (which must run them) is unsupported.
-pub(crate) const GEN_LIMIT_RETURN: u32 = 1;
+/// Generator `limits` field: the resumption mode of a resume entered with an
+/// exception pending — [`GEN_RESUME_MODE_THROW`] (the pending value is
+/// thrown at the suspended `yield`) or [`GEN_RESUME_MODE_RETURN`] (it is the
+/// value of a return completion injected there). Written by `throw()` /
+/// `return()` (and the async generator request serving) before the resume,
+/// consumed by the resumed `yield`; a resume without a pending exception is
+/// `next(v)` whatever the field holds.
+pub(crate) const GEN_RESUME_MODE_MASK: u32 = 0x300;
 
-/// Generator `limits` bit: the body has a `yield*`, so a `throw()` at a
-/// suspended `yield` (which must forward to the delegate) is unsupported.
-pub(crate) const GEN_LIMIT_THROW: u32 = 2;
+/// The shift of the [`GEN_RESUME_MODE_MASK`] field.
+pub(crate) const GEN_RESUME_MODE_SHIFT: u32 = 8;
+
+/// [`GEN_RESUME_MODE_MASK`] value: `next(v)`.
+pub(crate) const GEN_RESUME_MODE_NEXT: u32 = 0;
+
+/// [`GEN_RESUME_MODE_MASK`] value: `throw(e)`.
+pub(crate) const GEN_RESUME_MODE_THROW: u32 = 1;
+
+/// [`GEN_RESUME_MODE_MASK`] value: `return(v)`.
+pub(crate) const GEN_RESUME_MODE_RETURN: u32 = 2;
 
 /// Generator `limits` bit: the state machine is running (set around each
 /// resume), so a `next()` / `return()` / `throw()` from its own body throws.

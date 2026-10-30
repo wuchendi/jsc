@@ -997,8 +997,8 @@ pub enum IrNode {
         slots: Vec<IrNode>,
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
-        /// The resume `limits` bits of the handle ([`crate::abi::GEN_LIMIT_RETURN`],
-        /// [`crate::abi::GEN_LIMIT_THROW`]).
+        /// The initial `limits` bits of the handle ([`crate::abi::GEN_ASYNC`]
+        /// for an async generator, else `0`).
         limits: u32,
     },
     /// `GetIterator(value, sync)` (design/symbol-strings.md §5.1): evaluate
@@ -1016,6 +1016,28 @@ pub enum IrNode {
         rec: Box<IterRecord>,
         /// Whether the program is intrinsics-sealed (no dirty-bit test).
         sealed: bool,
+    },
+    /// `GetIterator(value, sync)` without the fast paths: always open the
+    /// protocol iterator (`GetMethod(value, @@iterator)`, the call, the object
+    /// check, `rec.next` read once), leaving `rec.iter` the iterator object
+    /// and `rec.next` its `next`, for a consumer that calls them itself
+    /// (`yield*`). Yields `undefined`.
+    OpenIterator {
+        /// The iterated value.
+        value: Box<IrNode>,
+        /// The record the iterator is opened into.
+        rec: Box<IterRecord>,
+    },
+    /// `yield* iterable` in a generator body (design/symbol-strings.md §5.6):
+    /// the CFG builder expands it into the delegation loop, forwarding each
+    /// `next(v)` / `throw(e)` / `return(v)` to the delegate; its value is the
+    /// delegate's return value. Never reaches emit.
+    YieldDelegate {
+        /// The delegated iterable.
+        iterable: Box<IrNode>,
+        /// A raw local holding the delegate iterator as `this` of each
+        /// forwarded call (see [`IrNode::ThisCall`]).
+        this_local: u32,
     },
     /// `IteratorStep` of the record: advance it and yield `true` when it
     /// produced a value (left in `rec.result` for [`IrNode::IteratorValue`]),
@@ -1968,6 +1990,14 @@ pub enum GenTerm {
         value: IrNode,
         /// The block index to resume at on the next `.next()`.
         resume: u32,
+        /// The block a `return(v)` resumption enters (the returned value
+        /// readable through [`IrNode::ExcValue`]); `None` for an `await`,
+        /// which is never resumed by `return()`.
+        on_return: Option<u32>,
+        /// The block a `throw(e)` resumption enters with the exception
+        /// cleared (a `yield*` forwarding it to its delegate); `None` throws
+        /// it at the suspend point instead.
+        on_throw: Option<u32>,
     },
     /// A `return value` (or falling off the body end): set `gen.done = 1` and
     /// return `value` (`undefined` when `None`).
@@ -2173,6 +2203,9 @@ impl IrNode {
             | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::YieldDelegate {
+                iterable: inner, ..
+            }
             | IrNode::AwaitMark(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
@@ -2313,7 +2346,7 @@ impl IrNode {
                         || f(value)
                 })
             }
-            IrNode::GetIterator { value, rec, .. } => {
+            IrNode::GetIterator { value, rec, .. } | IrNode::OpenIterator { value, rec } => {
                 f(value) || rec.places().into_iter().any(&mut f)
             }
             IrNode::IteratorStep(rec)
@@ -2376,6 +2409,9 @@ impl IrNode {
             | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::YieldDelegate {
+                iterable: inner, ..
+            }
             | IrNode::AwaitMark(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
@@ -2532,7 +2568,7 @@ impl IrNode {
                 }
                 out
             }
-            IrNode::GetIterator { value, rec, .. } => {
+            IrNode::GetIterator { value, rec, .. } | IrNode::OpenIterator { value, rec } => {
                 let mut out: Vec<&mut IrNode> = vec![&mut **value];
                 out.extend(rec.places_mut());
                 out

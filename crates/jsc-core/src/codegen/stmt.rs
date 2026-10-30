@@ -28,13 +28,6 @@ impl LowerCtx<'_> {
         }
         match stmt {
             Stmt::Expr(expr_stmt) => {
-                // `yield* iterable;` delegates to an inner generator: it
-                // desugars to a driving loop rather than a single expression.
-                if let Expr::Yield(yield_expr) = expr_stmt.expr.as_ref()
-                    && yield_expr.delegate
-                {
-                    return self.lower_yield_delegate(yield_expr, out);
-                }
                 // `[a, o.b] = rhs;` / `({k: o.p} = rhs);` desugars to a sequence of
                 // statements, so it is lowered here rather than as an expression.
                 if let Expr::Assign(assign) = strip_parens(&expr_stmt.expr)
