@@ -207,6 +207,19 @@ pub(super) fn emit_node(
             emit_is_object(function, scratch + 22);
             emit_box_bool(function, scratch);
         }
+        IrNode::IsArray(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalSet(scratch + 22));
+            emit_is_pointer(function, scratch + 22);
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            emit_load_type_byte(function, scratch + 22);
+            function.instruction(&Instruction::I32Const(TYPE_ARRAY));
+            function.instruction(&Instruction::I32Eq);
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I32Const(0));
+            function.instruction(&Instruction::End);
+            emit_box_bool(function, scratch);
+        }
         IrNode::SetProto { obj, proto } => {
             emit_node(obj, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32WrapI64);

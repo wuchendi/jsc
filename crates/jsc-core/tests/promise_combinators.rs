@@ -201,6 +201,31 @@ fn all_uses_this_as_the_constructor() {
     );
 }
 
+/// A callable but non-constructor `this` (a builtin function, an arrow, a
+/// method) throws a `TypeError` from `NewPromiseCapability`, with and
+/// without an iterable argument.
+#[test]
+fn a_non_constructor_function_this_throws() {
+    for m in ["all", "allSettled", "race", "any", "resolve", "reject"] {
+        for c in ["Math.max", "parseInt", "() => 1", "({ m() {} }).m"] {
+            assert_bool(
+                &format!(
+                    "try {{ Promise.{m}.call({c}); false }} catch (e) {{ e instanceof TypeError }}"
+                ),
+                true,
+            );
+        }
+    }
+    assert_bool(
+        "try { Promise.all.call(Math.max, []); false } catch (e) { e instanceof TypeError }",
+        true,
+    );
+    assert_output(
+        "Promise.all.call(Promise, [1]).then((v) => console.log(v.length, v[0]));",
+        "1 1\n",
+    );
+}
+
 #[test]
 fn combinator_function_properties() {
     assert_string(

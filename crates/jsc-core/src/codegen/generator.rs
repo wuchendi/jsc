@@ -808,7 +808,7 @@ impl CfgBuilder {
         self.terminate(GenTerm::Jump(body_b));
         self.cur = body_b as usize;
         self.lower_stmts(body)?;
-        self.complete_normally(after)?;
+        self.complete_normally(after, finally.is_some())?;
         if catch_entry.is_some() {
             self.handlers.pop();
         }
@@ -818,7 +818,7 @@ impl CfgBuilder {
         if let (Some(entry), Some(catch_body)) = (catch_entry, catch_body) {
             self.cur = entry as usize;
             self.lower_stmts(catch_body)?;
-            self.complete_normally(after)?;
+            self.complete_normally(after, finally.is_some())?;
         }
 
         let (Some(on_throw), Some(finally_body)) = (finally, finally_body) else {
@@ -885,13 +885,15 @@ impl CfgBuilder {
         Ok(())
     }
 
-    /// End a guarded body / catch body that falls through: run the innermost
-    /// `finally` with a normal completion, or continue at `after`.
-    fn complete_normally(&mut self, after: u32) -> anyhow::Result<()> {
+    /// End a guarded body / catch body that falls through: run this `try`'s
+    /// own `finally` (`has_finally`, the innermost one) with a normal
+    /// completion, or continue at `after`. An enclosing statement's `finally`
+    /// is not entered: falling out of this `try` stays inside it.
+    fn complete_normally(&mut self, after: u32, has_finally: bool) -> anyhow::Result<()> {
         if self.terminated() {
             return Ok(());
         }
-        match self.finallies.last() {
+        match self.finallies.last().filter(|_| has_finally) {
             Some(ctx) => {
                 let (kind, entry) = (ctx.kind, ctx.entry);
                 self.push(IrStmt::Expr(slot_set(kind, IrNode::Num(COMPLETION_NORMAL))))?;
