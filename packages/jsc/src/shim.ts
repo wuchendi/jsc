@@ -314,7 +314,8 @@ export function createShim(): Shim {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const text = stringText(mem, ptr)
         if (text === null) return null
-        // The full Unicode default case mappings (`ß` -> `SS`, final sigma).
+        // The full Unicode default case mappings (`ß` -> `SS`, final sigma);
+        // lone surrogates pass through unchanged.
         const base = allocString(
           op === METHOD_OP_TO_UPPER ? text.toUpperCase() : text.toLowerCase(),
         )
