@@ -136,3 +136,31 @@ fn locale_compare_code_unit_order() {
         true,
     );
 }
+
+// string iterator
+
+/// A valid surrogate pair is one step; any other unit (a lone surrogate
+/// included) is its own step.
+#[test]
+fn string_iterator_steps_by_code_point() {
+    assert_number("[...\"a😀b\"].length", 3.0);
+    assert_bool("[...\"a😀b\"][1] === \"😀\"", true);
+    assert_number("[...\"\\uD800\\uD800\"].length", 2.0);
+    assert_number("let n = 0; for (const c of \"😀\") n++; n", 1.0);
+    assert_number("Array.from(\"😀\").length", 1.0);
+    assert_bool("const [a, b] = \"é😀\"; b === \"😀\"", true);
+}
+
+/// `%StringIteratorPrototype%.next` brand-checks its receiver and stays done
+/// once exhausted.
+#[test]
+fn string_iterator_next() {
+    assert_string(
+        &caught("\"😀\"[Symbol.iterator]().next.call({})"),
+        "TypeError|next method called on incompatible receiver",
+    );
+    assert_bool(
+        "const it = \"a\"[Symbol.iterator](); it.next(); it.next().done",
+        true,
+    );
+}
