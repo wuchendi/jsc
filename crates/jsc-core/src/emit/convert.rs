@@ -8,6 +8,8 @@
 //! Each helper leaves a throw from a user `valueOf`/`toString` pending and
 //! returns a harmless value; the emitting site propagates it.
 
+use super::builtins::emit_is_wrapper;
+use super::realm::{IterKind, IterOp};
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -143,7 +145,9 @@ pub(super) fn emit_has_hook(
 /// when the jsval in i64 `local` has a `symbol` hook ([`emit_has_hook`]):
 /// the consult site does not honour a user hook before its stage. Usable in
 /// a user function, a builtin body (`scratch` = its frame's scratch) or a
-/// helper.
+/// helper. `@@iterator` tolerates the builtin iterator methods
+/// ([`emit_iterator_hook_guard`]) and then clobbers the i64 scratch slot
+/// `scratch + 23` (so `local` must be another one).
 pub(super) fn emit_hook_guard(
     function: &mut Function,
     local: u32,
@@ -152,6 +156,10 @@ pub(super) fn emit_hook_guard(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) {
+    if symbol == WellKnown::Iterator {
+        let tmp = scratch + 23;
+        return emit_iterator_hook_guard(function, local, tmp, scratch, strings, helpers);
+    }
     let Some(text) = hook_text(symbol) else {
         return;
     };
@@ -161,6 +169,80 @@ pub(super) fn emit_hook_guard(
     emit_throw_not_a_function(function, text, scratch, strings, helpers);
     leave_frame(helpers);
     wasm!(function; End);
+}
+
+/// Throw the interim `@@iterator` `TypeError` (design/symbol-strings.md
+/// §9.4) when `Get(v, @@iterator)` of the jsval in i64 `local` is neither
+/// `undefined` nor the builtin the iteration paths stand in for: the realm's
+/// `Array.prototype.values` for an array, `String.prototype[@@iterator]` for
+/// a string or `String` wrapper, `Map.prototype.entries` / `Set.prototype.values`
+/// for a Map / Set, and `%IteratorPrototype%[@@iterator]` for a generator
+/// (§5.4). Any other value is a user iterator, not honoured before Y2-T2.
+/// `tmp` is a free i64 local.
+fn emit_iterator_hook_guard(
+    function: &mut Function,
+    local: u32,
+    tmp: u32,
+    scratch: u32,
+    strings: &HashMap<String, i32>,
+    helpers: Helpers<'_>,
+) {
+    let Some(text) = hook_text(WellKnown::Iterator) else {
+        return;
+    };
+    let symbol = realm::symbol_addr(WellKnown::Iterator, helpers);
+    wasm!(function;
+        LocalGet(local), I32Const(symbol), Call(helpers.symbol_get()), LocalTee(tmp),
+        I64Const(UNDEFINED_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(tmp),
+    );
+    let method = |builtin| Instruction::I64Const(realm::method_bits(builtin, helpers));
+    let string_iter = method(Builtin::Iter(IterOp::StringIterator));
+    let by_kind = [
+        (
+            TYPE_ARRAY,
+            method(Builtin::Iter(IterOp::ArrayIter(IterKind::Values))),
+        ),
+        (TYPE_STRING, string_iter.clone()),
+        (
+            TYPE_MAP,
+            method(Builtin::Iter(IterOp::CollectionIter {
+                set: false,
+                kind: IterKind::Entries,
+            })),
+        ),
+        (
+            TYPE_SET,
+            method(Builtin::Iter(IterOp::CollectionIter {
+                set: true,
+                kind: IterKind::Values,
+            })),
+        ),
+        (TYPE_GENERATOR, method(Builtin::Iter(IterOp::IteratorSelf))),
+    ];
+    emit_is_pointer(function, local);
+    wasm!(function; If(BlockType::Result(ValType::I64)));
+    for (kind, builtin) in &by_kind {
+        emit_load_type_byte(function, local);
+        wasm!(function; I32Const(*kind), I32Eq, If(BlockType::Result(ValType::I64)));
+        function.instruction(builtin);
+        wasm!(function; Else);
+    }
+    emit_is_wrapper(function, local, abi::CLASS_STRING);
+    wasm!(function; If(BlockType::Result(ValType::I64)));
+    function.instruction(&string_iter);
+    wasm!(function; Else, I64Const(0), End);
+    for _ in &by_kind {
+        wasm!(function; End);
+    }
+    wasm!(function; Else, I64Const(0), End, I64Ne, If(BlockType::Empty));
+    enter_frame(helpers);
+    enter_frame(helpers);
+    emit_throw_not_a_function(function, text, scratch, strings, helpers);
+    leave_frame(helpers);
+    leave_frame(helpers);
+    wasm!(function; End, End);
 }
 
 /// The default `join` separator.
