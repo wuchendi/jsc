@@ -1208,8 +1208,8 @@ pub(super) fn emit_proto_guard(
     if let Some((flag, may_fail)) = inline_string {
         // A host op that may refuse its input (DESIGN.md §13) runs inside a
         // block: its result leaves the block unless it is the
-        // `METHOD_UNSUPPORTED`-family sentinel, which falls through to the
-        // builtin call below (the builtin throws).
+        // `METHOD_RANGE_ERROR` sentinel, which falls through to the builtin
+        // call below (the builtin throws).
         if may_fail {
             function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
             enter_frame(helpers);
