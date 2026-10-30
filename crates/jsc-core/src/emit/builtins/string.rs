@@ -450,7 +450,7 @@ pub(super) fn emit_method(
         wasm!(function;
             End,
             LocalGet(s), I32WrapI64,
-            I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
+            I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }),
             F64ConvertI32U, LocalGet(count), F64Mul,
             F64Const(Ieee64::from(MAX_STRING_LENGTH)), F64Gt,
             If(BlockType::Empty),
@@ -691,7 +691,7 @@ fn emit_replace(
     };
     wasm!(function; LocalGet(search), I32WrapI64);
     wasm!(function;
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
+        I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }),
         LocalSet(len),
         I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         LocalSet(list),

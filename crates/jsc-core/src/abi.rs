@@ -617,6 +617,13 @@ pub(crate) const STR_FLAG_INTERNED: u8 = 1;
 /// intern time.
 pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
+/// Byte offset of a [`TYPE_STRING`] block's `len: u32` (the UTF-8 byte count).
+/// String block = header | `len: u32` @4 | data @8.
+pub(crate) const STR_LEN_OFFSET: u32 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's UTF-8 data (see [`STR_LEN_OFFSET`]).
+pub(crate) const STR_DATA_OFFSET: u32 = 8;
+
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
 /// value `undefined`). A method call `obj.m(args)` sets it to the receiver
 /// immediately before the `call_indirect`; every function/arrow prologue

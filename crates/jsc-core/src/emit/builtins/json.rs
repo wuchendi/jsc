@@ -53,11 +53,11 @@ fn root_holder(value: u32) -> IrNode {
 }
 
 /// The payload offset of a string block (past the header and the length).
-const PAYLOAD: i32 = HEADER_SIZE + 4;
+const PAYLOAD: i32 = STR_DATA_OFFSET;
 
 /// A string block's u32 byte length.
 const STR_LEN: MemArg = MemArg {
-    offset: HEADER_SIZE as u64,
+    offset: STR_LEN_OFFSET,
     align: 2,
     memory_index: 0,
 };

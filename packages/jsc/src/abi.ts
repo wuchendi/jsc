@@ -76,6 +76,10 @@ export const CLASS_SYMBOL = 7
 export const WRAPPER_VALUE_OFFSET = 16
 /** String `flags` bit: the content is a canonical array index. */
 export const STR_FLAG_ARRAY_INDEX = 2
+/** Byte offset of a string block's `len:u32` (header | len @4 | data @8). */
+export const STR_LEN_OFFSET = 4
+/** Byte offset of a string block's data. */
+export const STR_DATA_OFFSET = 8
 
 /** Byte offset of the object-family prefix's `props:u32` slot (the `TYPE_PROPS` table, `0` = none). */
 export const OBJ_PROPS_OFFSET = HEADER_SIZE

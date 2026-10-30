@@ -1944,7 +1944,7 @@ pub(super) fn emit_cell_new(
 }
 
 /// Emit `<recv>.length`: for a string or array operand (low 32 bits are the
-/// block base) read its u32 length (a string's at `base + HEADER_SIZE`, an
+/// block base) read its u32 length (a string's at `base + STR_LEN_OFFSET`, an
 /// array's at `base + ARRAY_LEN_OFFSET`) and rebox it as a number jsval; any other heap operand reads its `length` property
 /// through `__get`; a primitive operand yields `undefined` without touching
 /// memory. The operand is stashed in the general i64 scratch slot (`+0`).
@@ -1985,11 +1985,7 @@ pub(super) fn emit_str_len(
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I32Load(MemArg {
-        offset: HEADER_SIZE as u64,
-        align: 2,
-        memory_index: 0,
-    }));
+    emit_load_str_len(function);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);

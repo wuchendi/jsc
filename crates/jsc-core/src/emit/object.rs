@@ -1224,7 +1224,7 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     function.instruction(&Instruction::LocalSet(at));
 
     // Allocate the block: HEADER + u32 len + payload; write type + len.
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4 + ISO_STRING_LEN));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET + ISO_STRING_LEN));
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(helpers.alloc));
@@ -1241,7 +1241,7 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -1305,7 +1305,7 @@ fn emit_iso_year(function: &mut Function, bptr: u32, at: u32, year: u32, abs_yea
     function.instruction(&Instruction::I64GeS);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::I32Store8(MemArg {
-        offset: (HEADER_SIZE as u64) + 4,
+        offset: u64::from(abi::STR_DATA_OFFSET),
         align: 0,
         memory_index: 0,
     }));
@@ -1357,7 +1357,7 @@ fn emit_date_string(
     );
     let (weekday, abs_year, t) = (scratch + 24, scratch + 25, scratch);
     let (bptr, digits, sign, at) = (scratch + 3, scratch + 8, scratch + 9, scratch + 10);
-    let payload = u64::from((HEADER_SIZE + 4).cast_unsigned());
+    let payload = u64::from(abi::STR_DATA_OFFSET);
     let tail = i32::try_from(DATE_TAIL.len()).unwrap_or(0);
     let wasm = |function: &mut Function, ops: &[Instruction<'_>]| {
         for op in ops {
@@ -1426,7 +1426,7 @@ fn emit_date_string(
     wasm(
         function,
         &[
-            I::I32Const(HEADER_SIZE + 4 + fixed),
+            I::I32Const(STR_DATA_OFFSET + fixed),
             I::LocalGet(sign),
             I::I32Add,
             I::LocalGet(digits),
@@ -1446,20 +1446,20 @@ fn emit_date_string(
             I::LocalGet(digits),
             I::I32Add,
             I::I32Store(MemArg {
-                offset: HEADER_SIZE as u64,
+                offset: STR_LEN_OFFSET,
                 align: 2,
                 memory_index: 0,
             }),
         ],
     );
     // Weekday and month names, copied from their static tables.
-    let table = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE) + HEADER_SIZE + 4;
+    let table = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE) + STR_DATA_OFFSET;
     for (pos, names, index) in [(0, DATE_WEEKDAYS, weekday), (4, DATE_MONTHS, month)] {
         wasm(
             function,
             &[
                 I::LocalGet(bptr),
-                I::I32Const(HEADER_SIZE + 4 + pos),
+                I::I32Const(STR_DATA_OFFSET + pos),
                 I::I32Add,
                 I::I32Const(table(names)),
                 I::LocalGet(index),
@@ -1545,7 +1545,7 @@ fn emit_date_string(
         &[
             I::LocalGet(bptr),
             I::I32Load(MemArg {
-                offset: HEADER_SIZE as u64,
+                offset: STR_LEN_OFFSET,
                 align: 2,
                 memory_index: 0,
             }),
@@ -1554,7 +1554,7 @@ fn emit_date_string(
             I::LocalGet(bptr),
             I::I32Add,
             I::LocalTee(at),
-            I::I32Const(HEADER_SIZE + 4),
+            I::I32Const(STR_DATA_OFFSET),
             I::I32Add,
             I::I32Const(table(DATE_TAIL)),
             I::I32Const(tail),
@@ -1584,12 +1584,12 @@ fn emit_date_string(
 }
 
 /// Write one fixed ASCII byte `ch` at payload offset `pos` of the string block in
-/// `bptr` (payload begins at `HEADER_SIZE + 4`).
+/// `bptr` (payload begins at `STR_DATA_OFFSET`).
 fn emit_iso_byte(function: &mut Function, bptr: u32, pos: u64, ch: u8) {
     function.instruction(&Instruction::LocalGet(bptr));
     function.instruction(&Instruction::I32Const(i32::from(ch)));
     function.instruction(&Instruction::I32Store8(MemArg {
-        offset: (HEADER_SIZE as u64) + 4 + pos,
+        offset: u64::from(abi::STR_DATA_OFFSET) + pos,
         align: 0,
         memory_index: 0,
     }));
@@ -1611,7 +1611,7 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
         function.instruction(&Instruction::I64Add);
         function.instruction(&Instruction::I32WrapI64);
         function.instruction(&Instruction::I32Store8(MemArg {
-            offset: (HEADER_SIZE as u64) + 4 + pos + u64::from(i),
+            offset: u64::from(abi::STR_DATA_OFFSET) + pos + u64::from(i),
             align: 0,
             memory_index: 0,
         }));
@@ -1724,7 +1724,7 @@ pub(super) fn emit_object_rest_node(
 /// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for the
 /// heap array/string in `s0` (`0 <= idx < len`, `trunc(idx) == idx`), else `0`.
 /// The length is the u32 at `+len_offset` ([`ARRAY_LEN_OFFSET`] for an array,
-/// [`HEADER_SIZE`] for a string).
+/// [`STR_LEN_OFFSET`] for a string).
 /// The compares run on `f64`, where every non-number jsval (a boxed tag) and the
 /// canonical NaN read as NaN and so fail all three — a string key or `NaN`
 /// is never mistaken for index `0`.
@@ -2040,10 +2040,10 @@ fn emit_index_dynamic(
     // `__str_index` (reboxed as a heap jsval).
     emit_index_string_key(function, s1, scratch, strings, helpers);
     function.instruction(&Instruction::If(BlockType::Empty));
-    emit_u32_field_boxed(function, s0, HEADER_SIZE as u64);
+    emit_u32_field_boxed(function, s0, STR_LEN_OFFSET);
     function.instruction(&Instruction::Br(4));
     function.instruction(&Instruction::End);
-    emit_index_in_bounds(function, s0, s1, HEADER_SIZE as u64);
+    emit_index_in_bounds(function, s0, s1, STR_LEN_OFFSET);
     function.instruction(&Instruction::If(BlockType::Empty));
     emit_str_index_boxed(function, s0, s1, helpers);
     function.instruction(&Instruction::Br(4));

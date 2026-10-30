@@ -8,7 +8,10 @@ use wasmtime::{AsContextMut, Caller, Global};
 use crate::abi;
 
 use super::value::{array_elements, array_layout};
-use super::{HEADER_SIZE, HEAP, QNAN, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
+use super::{
+    HEAP, QNAN, STR_DATA_OFFSET, STR_LEN_OFFSET, TYPE_ARRAY, TYPE_STRING, Value, decode,
+    to_js_string,
+};
 
 /// The `__method` op flags (see [`abi`]): the non-callback array/string
 /// methods, dispatched host-side. `IndexOf`/`Slice` exist on both arrays and
@@ -98,7 +101,7 @@ pub(super) fn alloc_string<W: Send + 'static>(
     let mem = caller
         .get_export(abi::MEMORY_EXPORT_NAME)
         .and_then(wasmtime::Extern::into_memory)?;
-    mem.write(&mut *caller, base + HEADER_SIZE + 4, text.as_bytes())
+    mem.write(&mut *caller, base + STR_DATA_OFFSET, text.as_bytes())
         .ok()?;
     Some(base as u64)
 }
@@ -402,18 +405,18 @@ fn heap_ptr(bits: u64) -> Option<usize> {
     }
 }
 
-/// The u32 `len` header of a string block at `ptr + HEADER_SIZE`.
+/// The u32 `len` header of a string block at `ptr + STR_LEN_OFFSET`.
 fn block_len(mem: &[u8], ptr: usize) -> Option<usize> {
-    let at = ptr.checked_add(HEADER_SIZE)?;
+    let at = ptr.checked_add(STR_LEN_OFFSET)?;
     let bytes = mem.get(at..at + 4)?;
     usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()
 }
 
 /// The UTF-8 payload bytes of a heap STRING block (`[len:u32][utf8]` at
-/// `ptr + HEADER_SIZE`), or `None` when the block is truncated.
+/// `ptr + STR_LEN_OFFSET`), or `None` when the block is truncated.
 fn string_bytes(mem: &[u8], ptr: usize) -> Option<Vec<u8>> {
     let len = block_len(mem, ptr)?;
-    let start = ptr.checked_add(HEADER_SIZE + 4)?;
+    let start = ptr.checked_add(STR_DATA_OFFSET)?;
     Some(mem.get(start..start + len)?.to_vec())
 }
 

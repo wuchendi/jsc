@@ -114,13 +114,13 @@ pub(super) fn emit_new_string(alloc: u32) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let (len, base) = (0, 1);
     function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4));
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::I32Add);
     emit_new_block(&mut function, alloc, base, TYPE_STRING);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Store(MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     }));
@@ -136,6 +136,17 @@ fn mem32(offset: u64) -> MemArg {
         align: 2,
         memory_index: 0,
     }
+}
+
+/// Replace the string block base on the stack with its u32 `len`.
+pub(super) fn emit_load_str_len(function: &mut Function) {
+    function.instruction(&Instruction::I32Load(mem32(STR_LEN_OFFSET)));
+}
+
+/// Replace the string block base on the stack with the address of its data.
+pub(super) fn emit_str_data(function: &mut Function) {
+    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
+    function.instruction(&Instruction::I32Add);
 }
 
 /// An 8-byte-aligned `i64` [`MemArg`] at `offset`.
@@ -332,33 +343,33 @@ pub(super) fn emit_settler(op: i32, helpers: Helpers<'_>) -> Function {
 /// Emit the `__concat(a: i32, b: i32) -> i32` string concatenator.
 ///
 /// `a`/`b` are base offsets of two `[type=0][pad×3][len:u32 LE][utf8]` heap
-/// strings. It reads each length header (at `+HEADER_SIZE`), allocates
-/// `HEADER_SIZE + 4 + lenA + lenB` bytes via `__alloc` (at `alloc_index`), writes
+/// strings. It reads each length header (at `+STR_LEN_OFFSET`), allocates
+/// `STR_DATA_OFFSET + lenA + lenB` bytes via `__alloc` (at `alloc_index`), writes
 /// the `TYPE_STRING` type byte and the combined length header, copies both UTF-8
-/// payloads (from `+HEADER_SIZE+4`) into place with `memory.copy`, and returns the
+/// payloads (from `+STR_DATA_OFFSET`) into place with `memory.copy`, and returns the
 /// fresh block's base offset. The two `i32` parameters occupy locals 0/1; three
 /// extra `i32` locals hold `lenA`, `lenB`, and `dst`.
 pub(super) fn emit_concat(alloc_index: u32) -> Function {
     let mut function = Function::new(vec![(3, ValType::I32)]);
     let (a, b, len_a, len_b, dst) = (0, 1, 2, 3, 4);
-    // The u32 length header sits at `+HEADER_SIZE`; the UTF-8 payload at
-    // `+HEADER_SIZE+4`.
+    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
+    // `+STR_DATA_OFFSET`.
     let header = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     };
-    let payload = HEADER_SIZE + 4;
+    let payload = STR_DATA_OFFSET;
 
-    // lenA = load(a + HEADER_SIZE); lenB = load(b + HEADER_SIZE).
+    // lenA = load(a + STR_LEN_OFFSET); lenB = load(b + STR_LEN_OFFSET).
     function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Load(header));
+    emit_load_str_len(&mut function);
     function.instruction(&Instruction::LocalSet(len_a));
     function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Load(header));
+    emit_load_str_len(&mut function);
     function.instruction(&Instruction::LocalSet(len_b));
 
-    // dst = __alloc(HEADER_SIZE + 4 + lenA + lenB).
+    // dst = __alloc(STR_DATA_OFFSET + lenA + lenB).
     function.instruction(&Instruction::LocalGet(len_a));
     function.instruction(&Instruction::LocalGet(len_b));
     function.instruction(&Instruction::I32Add);
@@ -376,7 +387,7 @@ pub(super) fn emit_concat(alloc_index: u32) -> Function {
         memory_index: 0,
     }));
 
-    // Store the combined length (lenA + lenB) as the u32 header at dst+HEADER_SIZE.
+    // Store the combined length (lenA + lenB) as the u32 header at dst+STR_LEN_OFFSET.
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(len_a));
     function.instruction(&Instruction::LocalGet(len_b));
@@ -427,10 +438,10 @@ pub(super) fn emit_concat(alloc_index: u32) -> Function {
 pub(super) fn emit_str_eq() -> Function {
     let mut function = Function::new(vec![(2, ValType::I32)]);
     let (a, b, len, i) = (0, 1, 2, 3);
-    // The u32 length header sits at `+HEADER_SIZE`; the UTF-8 payload at
-    // `+HEADER_SIZE+4` (block header).
+    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
+    // `+STR_DATA_OFFSET`.
     let header = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     };
@@ -439,9 +450,9 @@ pub(super) fn emit_str_eq() -> Function {
         align: 0,
         memory_index: 0,
     };
-    let payload = HEADER_SIZE + 4;
+    let payload = STR_DATA_OFFSET;
 
-    // len = load(a + HEADER_SIZE); if len != load(b + HEADER_SIZE) { return 0 }.
+    // len = load(a + STR_LEN_OFFSET); if len != load(b + STR_LEN_OFFSET) { return 0 }.
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::I32Load(header));
     function.instruction(&Instruction::LocalSet(len));
@@ -505,10 +516,10 @@ pub(super) fn emit_str_cmp() -> Function {
     let mut function = Function::new(vec![(6, ValType::I32)]);
     let (a, b, len_a, len_b, min, i) = (0, 1, 2, 3, 4, 5);
     let (byte_a, byte_b) = (6, 7);
-    // The u32 length header sits at `+HEADER_SIZE`; the UTF-8 payload at
-    // `+HEADER_SIZE+4` (block header).
+    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
+    // `+STR_DATA_OFFSET`.
     let header = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     };
@@ -517,9 +528,9 @@ pub(super) fn emit_str_cmp() -> Function {
         align: 0,
         memory_index: 0,
     };
-    let payload = HEADER_SIZE + 4;
+    let payload = STR_DATA_OFFSET;
 
-    // lenA = load(a + HEADER_SIZE); lenB = load(b + HEADER_SIZE); min = min(..).
+    // lenA = load(a + STR_LEN_OFFSET); lenB = load(b + STR_LEN_OFFSET); min = min(..).
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::I32Load(header));
     function.instruction(&Instruction::LocalSet(len_a));
@@ -601,10 +612,10 @@ pub(super) fn emit_str_cmp() -> Function {
 pub(super) fn emit_str_index(alloc_index: u32) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let (ptr, i, dst) = (0, 1, 2);
-    // The u32 length header sits at `+HEADER_SIZE`; the UTF-8 payload at
-    // `+HEADER_SIZE+4` (block header).
+    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
+    // `+STR_DATA_OFFSET`.
     let header = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     };
@@ -613,9 +624,9 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
         align: 0,
         memory_index: 0,
     };
-    let payload = HEADER_SIZE + 4;
+    let payload = STR_DATA_OFFSET;
 
-    // dst = __alloc(HEADER_SIZE + 4 + 1).
+    // dst = __alloc(STR_DATA_OFFSET + 1).
     function.instruction(&Instruction::I32Const(payload + 1));
     function.instruction(&Instruction::Call(alloc_index));
     function.instruction(&Instruction::LocalSet(dst));
@@ -625,7 +636,7 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Store8(byte));
 
-    // Store the u32 length header (1) at dst + HEADER_SIZE.
+    // Store the u32 length header (1) at dst + STR_LEN_OFFSET.
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Store(header));
@@ -635,8 +646,7 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
     function.instruction(&Instruction::I32Const(payload));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
+    emit_str_data(&mut function);
     function.instruction(&Instruction::LocalGet(i));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I32Load8U(byte));
@@ -1004,17 +1014,17 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
     let (str_ptr, len, dst, i, o, b) = (0, 1, 2, 3, 4, 5);
     let esc = 6;
     let header = MemArg {
-        offset: HEADER_SIZE as u64,
+        offset: STR_LEN_OFFSET,
         align: 2,
         memory_index: 0,
     };
-    let payload = HEADER_SIZE + 4;
+    let payload = STR_DATA_OFFSET;
 
-    // len = load(str_ptr + HEADER_SIZE).
+    // len = load(str_ptr + STR_LEN_OFFSET).
     function.instruction(&Instruction::LocalGet(str_ptr));
-    function.instruction(&Instruction::I32Load(header));
+    emit_load_str_len(&mut function);
     function.instruction(&Instruction::LocalSet(len));
-    // dst = __alloc(HEADER_SIZE + 4 + 6*len + 2); worst-case `\u00XX` expansion
+    // dst = __alloc(STR_DATA_OFFSET + 6*len + 2); worst-case `\u00XX` expansion
     // plus the two surrounding quotes.
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(6));
@@ -1437,11 +1447,11 @@ pub(super) fn emit_str_to_array(new_array_index: u32, str_index_index: u32) -> F
     let mut function = Function::new(vec![(5, ValType::I32)]);
     let (s, ptr, len, arr, i, store) = (0, 1, 2, 3, 4, 5);
 
-    // ptr = wrap(s); len = load_u32(ptr + HEADER_SIZE) (the string's byte length).
+    // ptr = wrap(s); len = load_u32(ptr + STR_LEN_OFFSET) (the string's byte length).
     function.instruction(&Instruction::LocalGet(s));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalTee(ptr));
-    function.instruction(&Instruction::I32Load(mem32(HEADER_SIZE as u64)));
+    emit_load_str_len(&mut function);
     function.instruction(&Instruction::LocalTee(len));
     // arr = __new_array(len); store = arr.elems.
     function.instruction(&Instruction::Call(new_array_index));

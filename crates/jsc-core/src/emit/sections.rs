@@ -522,9 +522,9 @@ pub(super) fn emit_data_section(
     let mut segments: Vec<(&String, i32)> = offsets.iter().map(|(s, o)| (s, *o)).collect();
     segments.sort_by_key(|(_, offset)| *offset);
     let mut data = DataSection::new();
-    let header_size = HEADER_SIZE as usize;
+    let (len_offset, data_offset) = (abi::STR_LEN_OFFSET as usize, abi::STR_DATA_OFFSET as usize);
     for (text, offset) in segments {
-        let mut blob = Vec::with_capacity(header_size + 4 + text.len());
+        let mut blob = Vec::with_capacity(data_offset + text.len());
         // Block header: the TYPE_STRING type byte at offset 0, a zero `gc` byte,
         // the string `flags`, and a zero `class` byte.
         let index_flag = if is_array_index(text) {
@@ -535,7 +535,7 @@ pub(super) fn emit_data_section(
         blob.push(u8::try_from(TYPE_STRING).unwrap_or(0));
         blob.push(0);
         blob.push(abi::STR_FLAG_INTERNED | index_flag);
-        blob.resize(header_size, 0);
+        blob.resize(len_offset, 0);
         let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
         blob.extend_from_slice(&len.to_le_bytes());
         blob.extend_from_slice(text.as_bytes());
@@ -689,7 +689,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
         offsets.insert(text.to_owned(), next);
         // Each blob is `[type=0][pad×3][len:u32][utf8]` (block header): the block
         // header, the 4-byte length header, plus the byte length, padded to 8.
-        let blob_len = HEADER_SIZE + 4 + i32::try_from(text.len()).unwrap_or(i32::MAX);
+        let blob_len = STR_DATA_OFFSET + i32::try_from(text.len()).unwrap_or(i32::MAX);
         next = next
             .saturating_add(blob_len)
             .saturating_add(BLOCK_ALIGN - 1)
