@@ -2058,7 +2058,13 @@ impl LowerCtx<'_> {
             if !has_spread {
                 lowered.push(value);
             } else if arg.spread.is_some() {
-                parts.push(SpreadElem::Spread(value));
+                // A derived class's default constructor forwards its argument
+                // list as is, without the iteration protocol.
+                parts.push(if is_default_ctor_args(&arg.expr) {
+                    SpreadElem::List(value)
+                } else {
+                    SpreadElem::Spread(value)
+                });
             } else {
                 parts.push(SpreadElem::Item(value));
             }
@@ -2439,4 +2445,11 @@ pub(super) fn push_accessor_half(
             setter: Box::new(set),
         },
     ));
+}
+
+/// Whether `expr` is the rest binding of a derived class's default
+/// constructor (`constructor(...args) { super(...args) }`), whose name cannot
+/// be spelled in source.
+fn is_default_ctor_args(expr: &Expr) -> bool {
+    matches!(expr, Expr::Ident(ident) if ident.sym.as_ref() == super::stmt::DEFAULT_CTOR_ARGS)
 }

@@ -1,7 +1,10 @@
 //! Integration tests: the builtin iterator intrinsics and iterator objects
 //! (`design/symbol-strings.md` §5.4): `keys` / `values` / `entries` /
 //! `[Symbol.iterator]` on Array, Map, Set and String, their `next`, and the
-//! shared `%IteratorPrototype%`.
+//! shared `%IteratorPrototype%`; and the iteration protocol behind every
+//! consumer (§5.1-§5.3): user iterables, `next` read once, the result
+//! checks, `IteratorClose` on abrupt exits (B3), and the guarded fast paths
+//! (B1).
 
 mod common;
 use common::{assert_bool, assert_number, assert_string, assert_uncaught};
@@ -197,5 +200,260 @@ fn an_exhausted_iterator_stays_done() {
     assert_bool(
         "const a = []; const it = a.values(); it.next(); a.push(1); it.next().done",
         true,
+    );
+}
+
+// --- the protocol (design/symbol-strings.md §5.1-§5.3) -----------------------------
+
+/// A user iterable over `1, 2, 3` that logs `next` / `return` calls into
+/// `log` (`return` logs its argument count).
+const COUNTER: &str = "const log = [];
+     const it = {
+       [Symbol.iterator]() { log.push('iter'); return this },
+       i: 0,
+       next() { log.push('next'); this.i++; return { value: this.i, done: this.i > 3 } },
+       return() { log.push('return:' + arguments.length); return {} },
+     };";
+
+#[test]
+fn user_iterables_feed_every_consumer() {
+    let cases = [
+        (
+            "const out = []; for (const x of it) out.push(x); out.join(',')",
+            "1,2,3",
+        ),
+        ("[...it].join(',')", "1,2,3"),
+        ("[0, ...it, 4].join(',')", "0,1,2,3,4"),
+        (
+            "function f(a, b, c) { return a + b + c } String(f(...it))",
+            "6",
+        ),
+        ("Array.from(it).join(',')", "1,2,3"),
+        ("Array.from(it, (x, i) => x * 10 + i).join(',')", "10,21,32"),
+        ("new AggregateError(it).errors.join(',')", "1,2,3"),
+        ("const [a, b] = it; a + ',' + b", "1,2"),
+        ("function* g() { yield* it } [...g()].join(',')", "1,2,3"),
+    ];
+    for (consumer, expected) in cases {
+        assert_string(&format!("{COUNTER} {consumer}"), expected);
+    }
+    assert_string(
+        "const entries = { *[Symbol.iterator]() { yield ['a', 1]; yield ['b', 2] } };
+         JSON.stringify(Object.fromEntries(entries))",
+        "{\"a\":1,\"b\":2}",
+    );
+}
+
+#[test]
+fn a_completed_loop_does_not_close() {
+    assert_string(
+        &format!("{COUNTER} for (const x of it) {{}} log.join(',')"),
+        "iter,next,next,next,next",
+    );
+    assert_string(
+        &format!("{COUNTER} [...it]; log.join(',')"),
+        "iter,next,next,next,next",
+    );
+}
+
+#[test]
+fn next_is_read_once() {
+    assert_string(
+        "let reads = 0; const out = [];
+         const it = { i: 0, [Symbol.iterator]() { return this },
+           get next() { reads++; return () => ({ value: ++this.i, done: this.i > 2 }) } };
+         for (const x of it) out.push(x);
+         [...it];
+         reads + ':' + out.join(',')",
+        "2:1,2",
+    );
+    // Replacing `next` mid-loop is unobservable.
+    assert_string(
+        "const out = [];
+         const it = { i: 0, [Symbol.iterator]() { return this },
+           next() { return { value: ++this.i, done: this.i > 3 } } };
+         for (const x of it) { out.push(x); it.next = () => ({ done: true }) }
+         out.join(',')",
+        "1,2,3",
+    );
+}
+
+#[test]
+fn a_non_object_step_result_throws_type_error() {
+    let source = "const it = { [Symbol.iterator]() { return { next() { return 1 } } } };";
+    for consumer in ["for (const x of it) {}", "[...it]", "Array.from(it)"] {
+        assert_uncaught(
+            &format!("{source} {consumer}"),
+            "TypeError: Iterator result 1 is not an object",
+        );
+    }
+}
+
+#[test]
+fn an_iterator_method_returning_a_primitive_throws_type_error() {
+    let source = "const it = { [Symbol.iterator]() { return 1 } };";
+    for consumer in ["for (const x of it) {}", "[...it]", "new Set(it)"] {
+        assert_uncaught(
+            &format!("{source} {consumer}"),
+            "TypeError: Result of the Symbol.iterator method is not an object",
+        );
+    }
+}
+
+#[test]
+fn a_non_callable_next_throws_type_error() {
+    assert_uncaught(
+        "const it = { [Symbol.iterator]() { return { next: 1 } } }; for (const x of it) {}",
+        "TypeError: 1 is not a function",
+    );
+}
+
+#[test]
+fn modified_builtin_iterators_are_honoured() {
+    assert_string(
+        "Array.prototype[Symbol.iterator] = function* () { yield 'x'; yield 'y' };
+         const out = []; for (const v of [1, 2, 3]) out.push(v);
+         out.join(',') + '|' + [...[1, 2, 3]].join(',')",
+        "x,y|x,y",
+    );
+    assert_string(
+        "const a = [1, 2]; a[Symbol.iterator] = function* () { yield 'own' }; [...a].join(',')",
+        "own",
+    );
+    assert_number(
+        "Object.getPrototypeOf([][Symbol.iterator]()).next = () => ({ done: true });
+         [...[1, 2]].length",
+        0.0,
+    );
+    assert_string(
+        "String.prototype[Symbol.iterator] = function* () { yield 'S' };
+         const out = []; for (const c of 'ab') out.push(c); out.join(',')",
+        "S",
+    );
+}
+
+// --- B1: an own `next` on a generator object ----------------------------------------
+
+#[test]
+fn an_own_next_on_a_generator_is_called() {
+    let generator = "let n = 0; function* g() { yield 1; yield 2 }
+         const it = g(); it.next = function () { n++; return { done: true } };";
+    assert_number(&format!("{generator} for (const x of it) {{}} n"), 1.0);
+    assert_number(&format!("{generator} [...it].length"), 0.0);
+    assert_number(&format!("{generator} [...it]; n"), 1.0);
+    assert_number(&format!("{generator} Array.from(it).length"), 0.0);
+    assert_number(&format!("{generator} Array.from(it); n"), 1.0);
+}
+
+// --- B3: IteratorClose on abrupt exits -----------------------------------------------
+
+#[test]
+fn break_return_and_throw_close_a_user_iterator_once_without_arguments() {
+    assert_string(
+        &format!("{COUNTER} for (const x of it) break; log.join(',')"),
+        "iter,next,return:0",
+    );
+    assert_string(
+        &format!("{COUNTER} function f() {{ for (const x of it) return x }} f(); log.join(',')"),
+        "iter,next,return:0",
+    );
+    assert_string(
+        &format!("{COUNTER} try {{ for (const x of it) throw 1 }} catch (e) {{}} log.join(',')"),
+        "iter,next,return:0",
+    );
+    assert_string(
+        &format!(
+            "{COUNTER} outer: for (const y of [1]) {{ for (const x of it) continue outer }} \
+             log.join(',')"
+        ),
+        "iter,next,return:0",
+    );
+    // A throw from the head's destructuring closes too.
+    assert_string(
+        &format!(
+            "{COUNTER} try {{ for (const [a] of {{ [Symbol.iterator]() {{ return it }} }}) {{}} }} \
+             catch (e) {{}} log.join(',')"
+        ),
+        "next,return:0",
+    );
+}
+
+#[test]
+fn a_throw_from_the_iterator_does_not_close() {
+    assert_string(
+        "const log = [];
+         const it = { [Symbol.iterator]() { return this },
+           next() { throw 'boom' }, return() { log.push('return'); return {} } };
+         try { for (const x of it) {} } catch (e) { log.push(e) }
+         log.join(',')",
+        "boom",
+    );
+    assert_string(
+        "const log = [];
+         const it = { [Symbol.iterator]() { return this },
+           next() { return { get value() { throw 'value' }, done: false } },
+           return() { log.push('return'); return {} } };
+         try { for (const x of it) {} } catch (e) { log.push(e) }
+         log.join(',')",
+        "value",
+    );
+}
+
+#[test]
+fn a_non_object_return_result_throws_only_on_non_throw_exits() {
+    let source = "const it = { [Symbol.iterator]() { return this },
+           next() { return { value: 1, done: false } }, return() { return 5 } };";
+    assert_uncaught(
+        &format!("{source} for (const x of it) break"),
+        "TypeError: Iterator result 5 is not an object",
+    );
+    // A throw completion wins over the close's own failure.
+    assert_string(
+        &format!(
+            "{source} let e; try {{ for (const x of it) throw 'body' }} catch (x) {{ e = x }} e"
+        ),
+        "body",
+    );
+    // A `return` method that throws replaces a break, but not a throw.
+    assert_string(
+        "const it = { [Symbol.iterator]() { return this },
+           next() { return { value: 1, done: false } }, return() { throw 'close' } };
+         let a, b;
+         try { for (const x of it) break } catch (e) { a = e }
+         try { for (const x of it) throw 'body' } catch (e) { b = e }
+         a + ',' + b",
+        "close,body",
+    );
+}
+
+#[test]
+fn break_return_and_throw_run_a_generators_finally() {
+    let generator = "const log = [];
+         function* g() { try { yield 1; yield 2 } finally { log.push('f') } }";
+    assert_string(
+        &format!("{generator} for (const x of g()) break; log.join(',')"),
+        "f",
+    );
+    assert_string(
+        &format!("{generator} function h() {{ for (const x of g()) return x }} h(); log.join(',')"),
+        "f",
+    );
+    assert_string(
+        &format!("{generator} try {{ for (const x of g()) throw 0 }} catch (e) {{}} log.join(',')"),
+        "f",
+    );
+}
+
+#[test]
+fn closing_a_done_or_builtin_iterator_is_harmless() {
+    assert_string(
+        "const out = [];
+         for (const x of [1, 2, 3]) { if (x === 2) break; out.push(x) }
+         for (const c of 'abc') { if (c === 'b') break; out.push(c) }
+         for (const [k] of new Map([[7, 0], [8, 0]])) { out.push(k); break }
+         function* g() { yield 'g'; yield 'h' }
+         for (const v of g()) { out.push(v); break }
+         out.join(',')",
+        "1,a,7,g",
     );
 }
