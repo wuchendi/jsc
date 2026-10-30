@@ -23,7 +23,7 @@ const ITER_KIND_OFFSET: u32 = abi::OBJ_PREFIX_SIZE + 12;
 const ITER_BLOCK_SIZE: i32 = 32;
 
 /// The `kind` byte of an iterator of `family` yielding `kind` (a string
-/// iterator yields code units; a Set's keys are its values).
+/// iterator yields code points; a Set's keys are its values).
 fn kind_byte(family: IterFamily, kind: IterKind) -> i32 {
     match (family, kind) {
         (IterFamily::Array, IterKind::Keys) => 0,
@@ -499,13 +499,13 @@ fn step_array(function: &mut Function, st: Step, strings: &StrOffsets, helpers: 
     wasm!(function; LocalSet(st.value), End, End);
 }
 
-/// A String Iterator step into `value`: the next code unit's string.
+/// A String Iterator step into `value`: the next code point's string.
 fn step_string(function: &mut Function, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
     wasm!(function; LocalGet(st.target), I32WrapI64, LocalTee(st.at));
     emit_load_str_len(function);
     wasm!(function; LocalSet(st.len));
     st.end_at_len(function, strings, helpers);
-    emit_str_iter_next(function, st.at, st.i, helpers);
+    emit_str_iter_next(function, st.at, st.i, st.len, st.kind, helpers);
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(st.value));
     st.store_index(function);
 }
@@ -552,13 +552,31 @@ fn step_collection(
 }
 
 /// `__str_iter_next(s, i)` (design/symbol-strings.md §5.4): push the fresh
-/// one-unit string of code unit `i` of the string at i32 `s` (`i` below its
-/// length) and advance `i` past it. One step is one code unit; combining a
-/// surrogate pair into one code point is U2-T1's.
-fn emit_str_iter_next(function: &mut Function, s: u32, i: u32, helpers: Helpers<'_>) {
+/// string of the code point at unit `i` of the string at i32 `s` (`len` its
+/// length, `i < len`) and advance `i` past it: a lead surrogate followed by
+/// a trail is one two-unit string, any other unit (a lone surrogate
+/// included) a one-unit string; a one-byte string has no surrogates. `t` is
+/// an i32 temp.
+fn emit_str_iter_next(
+    function: &mut Function,
+    s: u32,
+    i: u32,
+    len: u32,
+    t: u32,
+    helpers: Helpers<'_>,
+) {
+    emit_str_two_byte(function, s);
+    wasm!(function; If(BlockType::Result(ValType::I32)));
+    emit_surrogate_pair_at(function, s, i, len);
+    wasm!(function; Else, I32Const(0), End, If(BlockType::Result(ValType::I32)));
+    emit_str_pair(function, helpers.alloc, s, i, t);
     wasm!(function;
+        LocalGet(t),
+        LocalGet(i), I32Const(2), I32Add, LocalSet(i),
+        Else,
         LocalGet(s), LocalGet(i), Call(helpers.str_index),
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        End,
     );
 }
 
@@ -569,8 +587,8 @@ const ST_DONE: f64 = 0.0;
 /// Record state: a clean array or `arguments` object walked by index
 /// (`next` holds the index).
 pub(in crate::emit) const ST_ARRAY: f64 = 1.0;
-/// Record state: a primitive string walked by code unit (`next` holds the
-/// unit index).
+/// Record state: a primitive string walked by code point (`next` holds the
+/// code-unit index).
 pub(in crate::emit) const ST_STRING: f64 = 2.0;
 /// Record state: a clean `Map` walked live (`next` holds the backing slot).
 const ST_MAP: f64 = 3.0;
@@ -1035,7 +1053,7 @@ fn step_indexed(
     wasm!(function; I64Const(TRUE_BITS), I64Eq);
 }
 
-/// A string step: the next code unit's string (`__str_iter_next`).
+/// A string step: the next code point's string (`__str_iter_next`).
 fn step_code_point(
     rec: &IterRecord,
     function: &mut Function,
@@ -1043,7 +1061,13 @@ fn step_code_point(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (s, i, len, out) = (scratch + 8, scratch + 9, scratch + 10, scratch + 24);
+    let (s, i, len, t, out) = (
+        scratch + 8,
+        scratch + 9,
+        scratch + 10,
+        scratch + 11,
+        scratch + 24,
+    );
     load(function, &rec.iter, scratch, strings, helpers);
     wasm!(function; I32WrapI64, LocalTee(s));
     emit_load_str_len(function);
@@ -1055,7 +1079,7 @@ fn step_code_point(
     );
     step_done(rec, function, scratch, strings, helpers);
     wasm!(function; Else);
-    emit_str_iter_next(function, s, i, helpers);
+    emit_str_iter_next(function, s, i, len, t, helpers);
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(out));
     store(
         function,

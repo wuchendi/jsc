@@ -199,6 +199,40 @@ pub(super) fn emit_str_unit(function: &mut Function, s: u32, i: u32, w: u32) {
     );
 }
 
+/// Push `1` when units `i` and `i + 1` (i32 local `i`; `i + 1` checked
+/// against the length in i32 local `len`) of the two-byte string block in
+/// i32 local `s` are a lead (`D800–DBFF`) and a trail (`DC00–DFFF`)
+/// surrogate, else `0`.
+pub(super) fn emit_surrogate_pair_at(function: &mut Function, s: u32, i: u32, len: u32) {
+    wasm!(function;
+        LocalGet(i), I32Const(1), I32Add, LocalGet(len), I32LtU,
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(s), LocalGet(i), I32Const(1), I32Shl, I32Add, I32Load16U(mem16(DATA)),
+        I32Const(0xFC00), I32And, I32Const(0xD800), I32Eq,
+        LocalGet(s), LocalGet(i), I32Const(1), I32Shl, I32Add, I32Load16U(mem16(DATA + 2)),
+        I32Const(0xFC00), I32And, I32Const(0xDC00), I32Eq, I32And,
+        Else, I32Const(0), End,
+    );
+}
+
+/// `dst` = a fresh two-unit, two-byte string of units `i` and `i + 1` (i32
+/// local `i`) of the two-byte string block in i32 local `s`.
+pub(super) fn emit_str_pair(function: &mut Function, alloc: u32, s: u32, i: u32, dst: u32) {
+    emit_alloc_str(
+        function,
+        alloc,
+        |f| wasm!(f; I32Const(2)),
+        |f| wasm!(f; I32Const(1)),
+        dst,
+    );
+    wasm!(function;
+        LocalGet(dst),
+        LocalGet(s), LocalGet(i), I32Const(1), I32Shl, I32Add,
+        I32Load(MemArg { offset: DATA, align: 1, memory_index: 0 }),
+        I32Store(mem32(DATA)),
+    );
+}
+
 /// Store the code unit pushed by `unit` as unit `i` (i32 local) of the string
 /// block in i32 local `s` of the width in i32 local `w`.
 pub(super) fn emit_store_unit(
@@ -1395,13 +1429,6 @@ pub(super) fn emit_str_to_array(
 ) -> Function {
     let mut function = Function::new(vec![(8, ValType::I32)]);
     let (s, ptr, len, arr, i, store, k, w, dst) = (0, 1, 2, 3, 4, 5, 6, 7, 8);
-    // Push the code unit at byte offset `at` past unit `i` of a two-byte `ptr`.
-    let unit_at = |f: &mut Function, at: u64| {
-        wasm!(f;
-            LocalGet(ptr), LocalGet(i), I32Const(1), I32Shl, I32Add, I32Load16U(mem16(DATA + at)),
-        );
-    };
-
     // ptr = wrap(s); len = its code-unit length; arr = __new_array(len);
     // store = arr.elems.
     wasm!(function; LocalGet(s), I32WrapI64, LocalTee(ptr));
@@ -1418,31 +1445,11 @@ pub(super) fn emit_str_to_array(
         LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
         LocalGet(w),
         If(BlockType::Result(ValType::I32)),
-        LocalGet(i), I32Const(1), I32Add, LocalGet(len), I32LtU,
-        If(BlockType::Result(ValType::I32)),
     );
-    unit_at(&mut function, 0);
-    wasm!(function; I32Const(0xFC00), I32And, I32Const(0xD800), I32Eq);
-    unit_at(&mut function, 2);
+    emit_surrogate_pair_at(&mut function, ptr, i, len);
+    wasm!(function; Else, I32Const(0), End, If(BlockType::Empty));
+    emit_str_pair(&mut function, alloc_index, ptr, i, dst);
     wasm!(function;
-        I32Const(0xFC00), I32And, I32Const(0xDC00), I32Eq, I32And,
-        Else, I32Const(0), End,
-        Else, I32Const(0), End,
-        If(BlockType::Empty),
-    );
-    // A surrogate pair: a fresh two-unit, two-byte string.
-    emit_alloc_str(
-        &mut function,
-        alloc_index,
-        |f| wasm!(f; I32Const(2)),
-        |f| wasm!(f; I32Const(1)),
-        dst,
-    );
-    wasm!(function;
-        LocalGet(dst),
-        LocalGet(ptr), LocalGet(i), I32Const(1), I32Shl, I32Add,
-        I32Load(MemArg { offset: DATA, align: 1, memory_index: 0 }),
-        I32Store(mem32(DATA)),
         LocalGet(i), I32Const(2), I32Add, LocalSet(i),
         Else,
         LocalGet(ptr), LocalGet(i), Call(str_index_index), LocalSet(dst),

@@ -1116,8 +1116,8 @@ U1 reason drafts (one line per affected row, for the final CI pass):
   helper bodies.
 - every row: ASCII intern hashes are unchanged (FNV-1a over units, U1-T1b),
   so the static intern table and literal layout are identical.
-- `fib`, `math`, `push_1e5`, `console_log`, `generators`, `object_reads`:
-  must not change.
+- `fib`, `math`, `push_1e5`, `console_log`, `object_reads`: must not
+  change; `generators` changes only by Y2 (see the Y2 drafts below).
 
 Y2 reason drafts (one line per affected row, for the final CI pass):
 
