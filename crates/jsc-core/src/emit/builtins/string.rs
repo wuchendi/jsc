@@ -91,15 +91,22 @@ pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(
     if !(ready(first, args.first()) && ready(second, args.get(1))) {
         return None;
     }
-    op.flag().map(|flag| (flag, op == StringOp::Normalize))
+    // Only `normalize` with a form that is not a literal valid one may refuse.
+    let may_fail = op == StringOp::Normalize
+        && match args.first() {
+            None => false,
+            Some(IrNode::Str(form)) => !["NFC", "NFD", "NFKC", "NFKD"]
+                .iter()
+                .any(|valid| form == valid),
+            Some(_) => true,
+        };
+    op.flag().map(|flag| (flag, may_fail))
 }
 
-/// Push i32 `1` when the `__method` result on the stack is a refusal
-/// sentinel (`METHOD_UNSUPPORTED` or `METHOD_RANGE_ERROR`: `undefined | 1..=2`).
+/// Push i32 `1` when the `__method` result on the stack is the refusal
+/// sentinel `METHOD_RANGE_ERROR`.
 pub(in crate::emit) fn emit_is_method_refusal(function: &mut Function) {
-    wasm!(function;
-        I64Const(abi::METHOD_UNSUPPORTED.cast_signed()), I64Sub, I64Const(2), I64LtU,
-    );
+    wasm!(function; I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq);
 }
 
 /// The `TypeError` text of `String.prototype.<name>` on a `null`/`undefined`
@@ -217,13 +224,6 @@ const MATCH_ALL_REGEXP: CalleeErrorText<'static> = [
     "TypeError: String.prototype.matchAll needs RegExp, which is not supported yet",
 ];
 
-/// The `TypeError` of `normalize` over non-ASCII text, which needs Unicode
-/// normalization data the hosts do not carry yet.
-const NORMALIZE_UNSUPPORTED: CalleeErrorText<'static> = [
-    "String.prototype.normalize does not support non-ASCII strings yet",
-    "TypeError: String.prototype.normalize does not support non-ASCII strings yet",
-];
-
 /// The `RangeError` text of `normalize` with an unknown form.
 const NORMALIZE_FORM: [&str; 2] = [
     "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
@@ -283,7 +283,6 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(SEARCH_REGEXP)
         .chain(MATCH_REGEXP)
         .chain(MATCH_ALL_REGEXP)
-        .chain(NORMALIZE_UNSUPPORTED)
         .chain(NORMALIZE_FORM)
         .chain(INVALID_CODE_POINT)
         .chain(NULLISH_TO_OBJECT)
@@ -436,8 +435,8 @@ pub(super) fn emit_method(
 }
 
 /// The host op `flag` of `op` over the receiver string in i64 temp 0 and the
-/// coerced arguments in i64 temps 1 and 2; `normalize`'s refusal sentinels
-/// throw.
+/// coerced arguments in i64 temps 1 and 2; `normalize`'s refusal sentinel
+/// throws.
 fn emit_host_op(
     op: StringOp,
     flag: i32,
@@ -451,15 +450,10 @@ fn emit_host_op(
         LocalGet(s), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method), LocalSet(r),
     );
     if op == StringOp::Normalize {
-        let when = |function: &mut Function, sentinel: u64| {
-            wasm!(function;
-                LocalGet(r), I64Const(sentinel.cast_signed()), I64Eq, If(BlockType::Empty),
-            );
-        };
-        when(function, abi::METHOD_UNSUPPORTED);
-        throw_type_error(function, frame, NORMALIZE_UNSUPPORTED, strings, helpers);
-        wasm!(function; End);
-        when(function, abi::METHOD_RANGE_ERROR);
+        wasm!(function;
+            LocalGet(r), I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq,
+            If(BlockType::Empty),
+        );
         throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
         wasm!(function; End);
     }

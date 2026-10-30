@@ -432,7 +432,6 @@ fn normalize_forms() {
         &caught("\"abc\".normalize(\"nfc\")"),
         "RangeError|The normalization form should be one of NFC, NFD, NFKC, NFKD.",
     );
-    assert_type_error_with("\"\u{e9}\".normalize()", "non-ASCII");
     assert_number("String.prototype.normalize.length", 0.0);
 }
 

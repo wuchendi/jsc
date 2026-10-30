@@ -58,7 +58,6 @@ import {
   METHOD_OP_TO_LOWER,
   METHOD_OP_TO_UPPER,
   METHOD_RANGE_ERROR,
-  METHOD_UNSUPPORTED,
   NEW_PROMISE_EXPORT_NAME,
   NEW_STRING_EXPORT_NAME,
   PRINT_FLAG_END,
@@ -323,9 +322,11 @@ export function createShim(): Shim {
       case METHOD_OP_LOCALE_COMPARE: {
         if (ptr === null || typeByte !== TYPE_STRING) return null
         const self = stringText(mem, ptr)
-        if (self === null) return null
-        const that = toJsString(decode(arg0, mem))
-        // Code-unit order.
+        const thatPtr = heapPtr(arg0)
+        const that = thatPtr === null ? null : stringText(mem, thatPtr)
+        if (self === null || that === null) return null
+        // Code-unit order over the lossless text; the guest coerced the
+        // argument to a string.
         return f64ToBits(self < that ? -1 : self > that ? 1 : 0)
       }
       case METHOD_OP_NORMALIZE: {
@@ -337,9 +338,9 @@ export function createShim(): Shim {
           formValue.kind === 'undefined' ? 'NFC' : toJsString(formValue)
         if (!['NFC', 'NFD', 'NFKC', 'NFKD'].includes(form))
           return METHOD_RANGE_ERROR
-        // Every form maps an ASCII string to itself; Unicode normalization is
-        // not available to the native host yet.
-        return isAscii(text) ? recv : METHOD_UNSUPPORTED
+        // A lone surrogate passes through `normalize` unchanged.
+        const base = allocString(text.normalize(form))
+        return base === null ? null : HEAP | base
       }
       case METHOD_OP_NUMBER_TO_STRING: {
         const value = decode(recv, mem)
@@ -858,11 +859,4 @@ function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
     if (strictEqBits(elem, needle, mem)) return indexBits(i)
   }
   return f64ToBits(-1)
-}
-
-/** Whether every code unit of `text` is ASCII. */
-function isAscii(text: string): boolean {
-  for (let i = 0; i < text.length; i++)
-    if (text.charCodeAt(i) > 0x7f) return false
-  return true
 }

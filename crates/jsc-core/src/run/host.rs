@@ -3,6 +3,7 @@
 //! memory and (for the methods that build a fresh value) allocating a new heap
 //! block through the guest's exported constructors.
 
+use icu_normalizer::{ComposingNormalizerBorrowed, DecomposingNormalizerBorrowed};
 use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
@@ -25,9 +26,8 @@ const METHOD_OP_MATH: i32 = abi::METHOD_OP_MATH;
 const METHOD_OP_LOCALE_COMPARE: i32 = abi::METHOD_OP_LOCALE_COMPARE;
 const METHOD_OP_NORMALIZE: i32 = abi::METHOD_OP_NORMALIZE;
 
-/// The `__method` results the calling builtin turns into a throw; see
-/// [`abi::METHOD_UNSUPPORTED`] and its siblings.
-const UNSUPPORTED: u64 = abi::METHOD_UNSUPPORTED;
+/// The `__method` result the calling builtin turns into a `RangeError`; see
+/// [`abi::METHOD_RANGE_ERROR`].
 const RANGE_ERROR: u64 = abi::METHOD_RANGE_ERROR;
 
 /// The NaN-boxed `true`/`false` jsval bits; see [`abi::TRUE`] / [`abi::FALSE`].
@@ -95,9 +95,8 @@ pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bo
 ///
 /// `IndexOf`/`Includes` take an array receiver; the number ops a number
 /// receiver; the string ops a string receiver, their arguments already
-/// coerced by the guest builtins. `normalize` over non-ASCII text returns
-/// [`UNSUPPORTED`] (no Unicode normalization yet), which the builtin throws
-/// as a `TypeError`.
+/// coerced by the guest builtins. `normalize` with an unknown form returns
+/// [`RANGE_ERROR`], which the builtin throws as a `RangeError`.
 #[allow(clippy::too_many_lines)] // one flat dispatch over the op flags
 pub(super) fn method_dispatch<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
@@ -176,11 +175,11 @@ pub(super) fn method_dispatch<W: Send + 'static>(
         },
         METHOD_OP_LOCALE_COMPARE => match type_byte {
             Some(TYPE_STRING) => {
-                let this = string_text(&mem, ptr?)?;
-                let that = to_js_string(&decode(arg0.cast_unsigned(), &mem));
-                // Code-unit order.
-                let order = this.encode_utf16().cmp(that.encode_utf16());
-                Some(f64::from(order as i8).to_bits())
+                // Code-unit order over the lossless units; the guest coerced
+                // the argument to a string.
+                let this = string_units(&mem, ptr?)?;
+                let that = string_units(&mem, heap_ptr(arg0.cast_unsigned())?)?;
+                Some(f64::from(this.cmp(&that) as i8).to_bits())
             }
             _ => None,
         },
@@ -193,15 +192,42 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                 if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
                     return Some(RANGE_ERROR);
                 }
-                // Every form maps an ASCII string to itself; Unicode
-                // normalization is not available yet.
-                let ascii = string_text(&mem, ptr?)?.is_ascii();
-                Some(if ascii { recv } else { UNSUPPORTED })
+                let units = normalize_units(&string_units(&mem, ptr?)?, &form);
+                alloc_units(caller, &units).map(|base| HEAP | base)
             }
             _ => None,
         },
         _ => None,
     }
+}
+
+/// `units` in the Unicode normalization `form` (`NFC`, `NFD`, `NFKC` or
+/// `NFKD`). A lone surrogate never combines, so it passes through unchanged
+/// and the well-formed runs between lone surrogates normalize on their own.
+fn normalize_units(units: &[u16], form: &str) -> Vec<u16> {
+    let normalize = |run: &str, out: &mut Vec<u16>| {
+        let normalized = match form {
+            "NFD" => DecomposingNormalizerBorrowed::new_nfd().normalize(run),
+            "NFKC" => ComposingNormalizerBorrowed::new_nfkc().normalize(run),
+            "NFKD" => DecomposingNormalizerBorrowed::new_nfkd().normalize(run),
+            _ => ComposingNormalizerBorrowed::new_nfc().normalize(run),
+        };
+        out.extend(normalized.encode_utf16());
+    };
+    let mut out = Vec::with_capacity(units.len());
+    let mut run = String::new();
+    for decoded in char::decode_utf16(units.iter().copied()) {
+        match decoded {
+            Ok(ch) => run.push(ch),
+            Err(lone) => {
+                normalize(&run, &mut out);
+                run.clear();
+                out.push(lone.unpaired_surrogate());
+            }
+        }
+    }
+    normalize(&run, &mut out);
+    out
 }
 
 /// The linear-memory byte offset of a heap jsval (single heap tag `0b101`), or
