@@ -1986,8 +1986,8 @@ installed on the realm's prototypes, and phase 3 extends that set.
 the async test262 runner, and language completions pulled forward from phase 5
 (comma, generator and async expressions / methods, async generators,
 non-simple parameters, early errors, `var` hoisting and global bindings).
-Wave 3c (`Symbol`, the iteration protocol, Latin-1 / UTF-16 strings) is designed
-and awaits approval.
+Wave 3c (`Symbol`, the iteration protocol incl. async iteration, Latin-1 /
+UTF-16 strings) is in progress; its design is `design/symbol-strings.md`.
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
