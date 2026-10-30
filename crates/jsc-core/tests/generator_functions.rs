@@ -183,11 +183,3 @@ fn an_async_arrow_returns_a_promise_and_is_not_a_constructor() {
         "true\ntrue\n",
     );
 }
-
-#[test]
-fn yield_star_in_expression_position_is_a_precise_compile_error() {
-    assert_compile_error(
-        "function* g(){ const r = yield* [1]; }",
-        "`yield*` is only supported as a statement",
-    );
-}

@@ -713,11 +713,11 @@ fn emit_is(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
 }
 
 /// `Object.fromEntries(iterable)`: `RequireObjectCoercible`, then each value
-/// the iteration machinery yields (`IterSource`: an array, string,
-/// generator, `Map` / `Set`, `arguments`; anything else throws `is not
-/// iterable`) must be an object whose `0` / `1` become a data property
-/// (`ToPropertyKey(entry[0])`, `CreateDataPropertyOrThrow`) of a fresh
-/// ordinary object.
+/// its iterator record yields (design/symbol-strings.md §5.2; `<x> is not
+/// iterable` without one) must be an object whose `0` / `1` become a data
+/// property (`ToPropertyKey(entry[0])`, `CreateDataPropertyOrThrow`) of a
+/// fresh ordinary object. A non-object entry or a throwing entry read or key
+/// conversion closes the iterator.
 fn emit_from_entries(
     function: &mut Function,
     frame: Frame,
@@ -725,59 +725,73 @@ fn emit_from_entries(
     helpers: Helpers<'_>,
 ) {
     let (src, item, kv, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (res, list, i, key) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (res, key) = (frame.i32(0), frame.i32(3));
+    let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
+    let scratch = frame.scratch();
     frame.arg(function, 0);
     wasm!(function; LocalSet(src));
     object::require_object_coercible(function, frame, src, strings, helpers);
-    for _ in 0..frame.k {
-        wasm!(function; I64Const(UNDEFINED_BITS));
-    }
-    wasm!(function; LocalGet(src), GlobalSet(THIS_GLOBAL), I64Const(0));
-    emit_argc(0, function);
-    wasm!(function; Call(helpers.builtin(Builtin::IterSource)), LocalSet(item));
-    return_if_pending(function);
-    wasm!(function;
-        LocalGet(item), I32WrapI64, LocalSet(list),
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(res),
+    emit_get_iterator(
+        &IrNode::Local(src),
+        &rec,
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
     );
+    wasm!(function; I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(res));
     emit_object_prefix(
         function,
         res,
         TYPE_OBJECT,
         intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
     );
-    wasm!(function;
-        I32Const(0), LocalSet(i),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i), LocalGet(list), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU, BrIf(1),
-        LocalGet(list),
-    );
-    emit_array_elems(function);
-    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)));
-    emit_elem_get(function, item, list, i, helpers);
-    wasm!(function; LocalSet(item));
-    emit_is_object(function, item);
-    wasm!(function; I32Eqz, If(BlockType::Empty));
-    emit_drop(
+    iter::guarded(function, helpers, |function| {
+        wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
+        enter_frame(helpers);
+        enter_frame(helpers);
+        emit_iterator_step(&rec, function, scratch, strings, helpers);
+        wasm!(function; I32Eqz, BrIf(1));
+        emit_iterator_value(&rec, function, scratch, strings, helpers);
+        wasm!(function; LocalSet(item));
+        emit_is_object(function, item);
+        wasm!(function; I32Eqz, If(BlockType::Empty));
+        enter_frame(helpers);
+        emit_drop(
+            function,
+            frame,
+            &map_set::not_an_entry(item),
+            strings,
+            helpers,
+        );
+        leave_frame(helpers);
+        wasm!(function; End);
+        for (index, out) in [("0", kv), ("1", v)] {
+            wasm!(function; LocalGet(item), I32Const(static_key(strings, index)), Call(helpers.get), LocalSet(out));
+            emit_propagate_if_pending(function, helpers);
+        }
+        wasm!(function; LocalGet(kv), I32Const(1), Call(helpers.to_key), LocalSet(key));
+        emit_propagate_if_pending(function, helpers);
+        wasm!(function;
+            LocalGet(res), LocalGet(key), LocalGet(v), I32Const(abi::ATTRS_DEFAULT.cast_signed()),
+            Call(helpers.define),
+        );
+        leave_frame(helpers);
+        leave_frame(helpers);
+        wasm!(function; Br(0), End, End);
+    });
+    wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+    emit_iterator_close(
+        &rec,
+        CloseMode::Pending,
         function,
-        frame,
-        &map_set::not_an_entry(item),
+        scratch,
         strings,
         helpers,
     );
-    wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
-    for (index, out) in [("0", kv), ("1", v)] {
-        wasm!(function; LocalGet(item), I32Const(static_key(strings, index)), Call(helpers.get), LocalSet(out));
-        return_if_pending(function);
-    }
-    wasm!(function; LocalGet(kv), I32Const(1), Call(helpers.to_key), LocalSet(key));
-    return_if_pending(function);
     wasm!(function;
-        LocalGet(res), LocalGet(key), LocalGet(v), I32Const(abi::ATTRS_DEFAULT.cast_signed()),
-        Call(helpers.define),
-        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Br(0),
-        End, End,
+        I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(res), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
     );
 }
