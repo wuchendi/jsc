@@ -1194,6 +1194,8 @@ Y5 reason drafts (one line per affected row, for the final CI pass):
 - `fib`, `math`, `push_1e5`, `console_log`, `object_reads`, `json`,
   `for_in`, `map_set`, `for_of`, `spread`, `class_methods`, `array_hofs`,
   `generators`, `string_methods`: must not change beyond the line above.
+- every row: `Array.fromAsync` adds five builtins (`Builtin::ALL` +5,
+  Y5-T4) and two interned `TypeError` texts; same shift as above.
 
 ---
 

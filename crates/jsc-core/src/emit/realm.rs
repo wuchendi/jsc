@@ -646,6 +646,53 @@ impl SpeciesOp {
     }
 }
 
+/// `Array.fromAsync` (design/symbol-strings.md §5.8) and the internal
+/// builtins of its promise-reaction state machine (not installed on any
+/// intrinsic), whose `env` is the loop's state block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FromAsyncOp {
+    /// `Array.fromAsync(items, mapFn, thisArg)`: returns a promise.
+    Entry,
+    /// One step of the loop, resumed at the phase the state block records;
+    /// a throw is left pending for the caller to reject (or close) with.
+    Run,
+    /// The fulfillment reaction of each await: stores the value, then runs.
+    Resume,
+    /// The rejection reaction of each await: rejects the result promise,
+    /// closing the iterator first while a mapped value is in flight.
+    Reject,
+    /// The reaction of the awaited `return()` result of a close: rejects the
+    /// result promise with the stored reason.
+    Rethrow,
+}
+
+impl FromAsyncOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    const ALL: [FromAsyncOp; 5] = [
+        Self::Entry,
+        Self::Run,
+        Self::Resume,
+        Self::Reject,
+        Self::Rethrow,
+    ];
+
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Entry => "fromAsync",
+            _ => "",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::Run => 0,
+            _ => 1,
+        }
+    }
+}
+
 /// An async iteration builtin (design/symbol-strings.md §5.8): the
 /// `%AsyncFromSyncIteratorPrototype%` methods, and the internal builtins
 /// behind the async record nodes and their promise reactions (not installed
@@ -675,6 +722,8 @@ pub(super) enum AsyncIterOp {
     /// The rejection reaction of `AsyncFromSyncIteratorContinuation`
     /// (`env` is the sync iterator): close it, then rethrow the reason.
     CloseRejected,
+    /// `Array.fromAsync` and its internal builtins.
+    FromAsync(FromAsyncOp),
 }
 
 impl AsyncIterOp {
@@ -682,12 +731,13 @@ impl AsyncIterOp {
     fn name(self) -> &'static str {
         match self {
             Self::FromSync(request) => request.name(),
+            Self::FromAsync(op) => op.name(),
             _ => "",
         }
     }
 
     /// Every op, in [`Builtin::ALL`] order.
-    const ALL: [AsyncIterOp; 9] = [
+    const ALL: [AsyncIterOp; 14] = [
         Self::Open,
         Self::Step,
         Self::Complete,
@@ -697,6 +747,11 @@ impl AsyncIterOp {
         Self::FromSync(AsyncGenRequest::Throw),
         Self::Unwrap,
         Self::CloseRejected,
+        Self::FromAsync(FromAsyncOp::ALL[0]),
+        Self::FromAsync(FromAsyncOp::ALL[1]),
+        Self::FromAsync(FromAsyncOp::ALL[2]),
+        Self::FromAsync(FromAsyncOp::ALL[3]),
+        Self::FromAsync(FromAsyncOp::ALL[4]),
     ];
 }
 
@@ -800,6 +855,7 @@ impl IterOp {
             Self::Async(
                 AsyncIterOp::FromSync(_) | AsyncIterOp::Unwrap | AsyncIterOp::CloseRejected,
             ) => 1,
+            Self::Async(AsyncIterOp::FromAsync(op)) => op.length(),
             _ => 0,
         }
     }
@@ -1239,7 +1295,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 281] = [
+    pub(super) const ALL: [Builtin; 286] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1537,6 +1593,11 @@ impl Builtin {
         Self::Iter(IterOp::Async(AsyncIterOp::ALL[6])),
         Self::Iter(IterOp::Async(AsyncIterOp::ALL[7])),
         Self::Iter(IterOp::Async(AsyncIterOp::ALL[8])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[9])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[10])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[11])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[12])),
+        Self::Iter(IterOp::Async(AsyncIterOp::ALL[13])),
         Self::Species(SpeciesOp::ALL[0]),
         Self::Species(SpeciesOp::ALL[1]),
         Self::Species(SpeciesOp::ALL[2]),
@@ -2170,7 +2231,12 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
         ));
         let statics: &[Builtin] = match ctor {
             BuiltinCtor::Object => &OBJECT_STATICS,
-            BuiltinCtor::Array => &[Builtin::IsArray, Builtin::ArrayOf, Builtin::ArrayFrom],
+            BuiltinCtor::Array => &[
+                Builtin::IsArray,
+                Builtin::ArrayOf,
+                Builtin::ArrayFrom,
+                Builtin::Iter(IterOp::Async(AsyncIterOp::FromAsync(FromAsyncOp::Entry))),
+            ],
             BuiltinCtor::String => &[
                 Builtin::StringFromCharCode,
                 Builtin::StringFromCodePoint,
