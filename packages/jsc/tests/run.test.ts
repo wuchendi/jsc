@@ -716,3 +716,22 @@ it('maps case on lossless code units like the Rust host', async () => {
     expect((await run(src)).result, src).toBe(expected)
   }
 })
+
+it('iterates strings by code point like the Rust host', async () => {
+  const cases: [string, string][] = [
+    ["[...'a😀b'].length", '3'],
+    ["[...'a😀b'][1] === '😀'", 'true'],
+    ["[...'\\uD800\\uD800'].length", '2'],
+    ["let n = 0; for (const c of '😀') n++; n", '1'],
+    ["Array.from('😀').length", '1'],
+    ["const [a, b] = 'é😀'; b === '😀'", 'true'],
+    [
+      "try { '😀'[Symbol.iterator]().next.call({}) } catch (e) { e.name + '|' + e.message }",
+      'TypeError|next method called on incompatible receiver',
+    ],
+    ["const it = 'a'[Symbol.iterator](); it.next(); it.next().done", 'true'],
+  ]
+  for (const [src, expected] of cases) {
+    expect((await run(src)).result, src).toBe(expected)
+  }
+})
