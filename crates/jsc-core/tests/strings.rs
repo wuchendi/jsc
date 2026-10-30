@@ -704,3 +704,18 @@ fn well_formed_and_narrowing() {
         "\u{e9}\u{e9}|\u{e9}\u{e9}",
     );
 }
+
+/// Guest string builders store each unit at its data offset exactly once and
+/// keep the case-map operand stack balanced.
+#[test]
+fn string_builders_store_units_in_place() {
+    assert_string("\"AB\".toLowerCase()", "ab");
+    assert_string("\"ab\".toUpperCase()", "AB");
+    assert_string("\"ÀÉ×\".toLowerCase()", "àé×");
+    assert_string("\"ab\".padStart(4, \"x\")", "xxab");
+    assert_string("\"ab\".repeat(3)", "ababab");
+    assert_string("\"a+b\".replaceAll(\"+\", \"-\")", "a-b");
+    assert_string("\"hello\".split(\"\").join(\"|\")", "h|e|l|l|o");
+    assert_string("\"é\".padEnd(3, \"é\")", "ééé");
+    assert_number("\"😀\".padEnd(4, \"😀\").length", 4.0);
+}
