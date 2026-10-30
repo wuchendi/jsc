@@ -97,7 +97,7 @@ pub(crate) const HEADER_SIZE: u32 = 4;
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
 /// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
-/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`] / [`STR_FLAG_TWO_BYTE`], an object-family block's
 /// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
 /// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`], a symbol's
 /// [`SYMBOL_FLAG_REGISTERED`].
@@ -617,11 +617,20 @@ pub(crate) const STR_FLAG_INTERNED: u8 = 1;
 /// intern time.
 pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
 
-/// Byte offset of a [`TYPE_STRING`] block's `len: u32` (the UTF-8 byte count).
-/// String block = header | `len: u32` @4 | data @8.
+/// String header `flags` bit: the data is UTF-16LE code units (`2 * len`
+/// bytes); absent, it is Latin-1 bytes (`len` bytes). Canonical: set iff some
+/// unit is above `0xFF`. It shares bit `4` with [`SYMBOL_FLAG_REGISTERED`],
+/// which cannot collide: string paths read it only on a [`TYPE_STRING`]
+/// block, and a symbol key never reaches them (unlike `1` / `2`, which key
+/// paths test on any key block).
+pub(crate) const STR_FLAG_TWO_BYTE: u8 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's `len: u32`, the length in UTF-16
+/// code units (the JS `.length`). String block = header | `len: u32` @4 |
+/// data @8 (Latin-1 bytes, or UTF-16LE units with [`STR_FLAG_TWO_BYTE`]).
 pub(crate) const STR_LEN_OFFSET: u32 = 4;
 
-/// Byte offset of a [`TYPE_STRING`] block's UTF-8 data (see [`STR_LEN_OFFSET`]).
+/// Byte offset of a [`TYPE_STRING`] block's data (see [`STR_LEN_OFFSET`]).
 pub(crate) const STR_DATA_OFFSET: u32 = 8;
 
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial

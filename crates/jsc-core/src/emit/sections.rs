@@ -508,38 +508,23 @@ pub(super) fn build_globals(
 }
 
 /// Build the data section from the string-literal offset map: one active segment
-/// per literal, each a string block `[type][gc][flags][class][len:u32 LE][utf8]`
-/// written at its compile-time offset (its `flags` already `INTERNED`, plus
-/// `ARRAY_INDEX` for a canonical index spelling), in ascending offset order for
-/// deterministic output, then the intern table's u32 slots, the function data,
-/// and the realm image.
+/// per literal, each a string block `[type][gc][flags][class][len:u32 LE][data]`
+/// written at its compile-time offset in canonical form ([`str_data`]; `len`
+/// counts code units), its `flags` already `INTERNED`, plus `TWO_BYTE` for
+/// UTF-16 data and `ARRAY_INDEX` for a canonical index spelling, in ascending
+/// offset order for deterministic output, then the intern table's u32 slots,
+/// the function data, and the realm image.
 pub(super) fn emit_data_section(
-    offsets: &HashMap<String, i32>,
+    offsets: &StrOffsets,
     intern: &InternTable,
     functions: &[IrFunction],
     layout: FnLayout,
 ) -> DataSection {
-    let mut segments: Vec<(&String, i32)> = offsets.iter().map(|(s, o)| (s, *o)).collect();
+    let mut segments: Vec<(&JsStr, i32)> = offsets.iter().collect();
     segments.sort_by_key(|(_, offset)| *offset);
     let mut data = DataSection::new();
-    let (len_offset, data_offset) = (abi::STR_LEN_OFFSET as usize, abi::STR_DATA_OFFSET as usize);
     for (text, offset) in segments {
-        let mut blob = Vec::with_capacity(data_offset + text.len());
-        // Block header: the TYPE_STRING type byte at offset 0, a zero `gc` byte,
-        // the string `flags`, and a zero `class` byte.
-        let index_flag = if is_array_index(text) {
-            abi::STR_FLAG_ARRAY_INDEX
-        } else {
-            0
-        };
-        blob.push(u8::try_from(TYPE_STRING).unwrap_or(0));
-        blob.push(0);
-        blob.push(abi::STR_FLAG_INTERNED | index_flag);
-        blob.resize(len_offset, 0);
-        let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
-        blob.extend_from_slice(&len.to_le_bytes());
-        blob.extend_from_slice(text.as_bytes());
-        data.active(0, &ConstExpr::i32_const(offset), blob);
+        data.active(0, &ConstExpr::i32_const(offset), str_block(text));
     }
     let table: Vec<u8> = intern
         .slots
@@ -557,6 +542,28 @@ pub(super) fn emit_data_section(
     data
 }
 
+/// The static block of the interned string `text`: the `TYPE_STRING` type
+/// byte, a zero `gc` byte, the `flags` (`INTERNED`, plus `TWO_BYTE` /
+/// `ARRAY_INDEX`), a zero `class` byte, `len` in code units, then
+/// [`str_data`].
+pub(super) fn str_block(text: &JsStr) -> Vec<u8> {
+    let data = str_data(text);
+    let mut blob = Vec::with_capacity(abi::STR_DATA_OFFSET as usize + data.len());
+    let mut flags = abi::STR_FLAG_INTERNED;
+    if is_two_byte(text) {
+        flags |= abi::STR_FLAG_TWO_BYTE;
+    }
+    if is_array_index(text.as_units()) {
+        flags |= abi::STR_FLAG_ARRAY_INDEX;
+    }
+    blob.extend_from_slice(&[u8::try_from(TYPE_STRING).unwrap_or(0), 0, flags]);
+    blob.resize(abi::STR_LEN_OFFSET as usize, 0);
+    let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
+    blob.extend_from_slice(&len.to_le_bytes());
+    blob.extend_from_slice(&data);
+    blob
+}
+
 /// Lay out the function data: the `__fn_info` table base at
 /// [`abi::FN_INFO_ADDR`], one `[name key][length]` info entry per function
 /// (then the two settlers' and the builtins'), and one static `TYPE_FUNCTION`
@@ -565,7 +572,7 @@ pub(super) fn emit_data_section(
 /// `%Function.prototype%` as its prototype, and an `undefined` environment.
 fn emit_fn_data(
     data: &mut DataSection,
-    offsets: &HashMap<String, i32>,
+    offsets: &StrOffsets,
     functions: &[IrFunction],
     layout: FnLayout,
 ) {
@@ -625,11 +632,11 @@ pub(super) fn fn_flags(kind: FnKind) -> u8 {
 /// compile-time byte offset in linear memory.
 ///
 /// Literals are placed from [`HEAP_BASE`] in first-appearance order, each
-/// occupying its `[type][pad×3][len:u32 LE][utf8]` block padded up to
-/// [`BLOCK_ALIGN`] so every blob base is 8-aligned. Identical literals are
+/// occupying its canonical [`str_block`] padded up to [`BLOCK_ALIGN`] so
+/// every blob base is 8-aligned. Identical literals (equal code units) are
 /// deduplicated onto one offset. Returns the offset map plus the first free
 /// offset after all literal data (8-aligned), where the intern table is placed.
-pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32) {
+pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     let fragments: Vec<IrNode> = Builtin::ALL
         .into_iter()
         .filter_map(|b| builtins::fragment(b, program.arity))
@@ -637,8 +644,8 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
         .collect();
     // `"length"` is always interned: the property helpers compare a key against
     // it to resolve a string's or array's exotic `length`.
-    let mut order: Vec<&str> = vec![INDEX_LENGTH_KEY];
-    let mut seen: HashSet<&str> = HashSet::from([INDEX_LENGTH_KEY]);
+    let mut strs = Strs::default();
+    strs.add(INDEX_LENGTH_KEY);
     // The realm's strings, the builtin bodies' strings, the Error instance
     // `stack` key, a function object's materialized keys and every function's
     // `name`.
@@ -649,33 +656,31 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
         .chain(FN_KEYS);
     let names = program.functions.iter().map(|f| f.info.name.as_str());
     for text in realm_strs.map(|s| -> &str { s }).chain(names) {
-        if seen.insert(text) {
-            order.push(text);
-        }
+        strs.add(text);
     }
     // The namespace builtins' IR bodies.
     for fragment in &fragments {
-        collect_node(fragment, &mut order, &mut seen);
+        collect_node(fragment, &mut strs);
     }
     for stmt in &program.stmts {
-        collect_stmt(stmt, &mut order, &mut seen);
+        collect_stmt(stmt, &mut strs);
     }
     for func in &program.functions {
         for stmt in &func.body {
-            collect_stmt(stmt, &mut order, &mut seen);
+            collect_stmt(stmt, &mut strs);
         }
         // A generator state machine carries its code in segments, not `body`:
         // walk each segment's statements and its terminator value.
         if let Some(segments) = &func.machine {
             for segment in segments {
                 for stmt in &segment.stmts {
-                    collect_stmt(stmt, &mut order, &mut seen);
+                    collect_stmt(stmt, &mut strs);
                 }
                 match &segment.term {
                     crate::ir::GenTerm::Yield { value, .. }
                     | crate::ir::GenTerm::Branch { cond: value, .. }
                     | crate::ir::GenTerm::Return(Some(value)) => {
-                        collect_node(value, &mut order, &mut seen);
+                        collect_node(value, &mut strs);
                     }
                     crate::ir::GenTerm::Return(None) | crate::ir::GenTerm::Jump(_) => {}
                 }
@@ -683,13 +688,13 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
         }
     }
 
-    let mut offsets = HashMap::with_capacity(order.len());
+    let mut offsets = StrOffsets::default();
     let mut next = HEAP_BASE;
-    for text in order {
-        offsets.insert(text.to_owned(), next);
-        // Each blob is `[type=0][pad×3][len:u32][utf8]` (block header): the block
-        // header, the 4-byte length header, plus the byte length, padded to 8.
-        let blob_len = STR_DATA_OFFSET + i32::try_from(text.len()).unwrap_or(i32::MAX);
+    for text in strs.order {
+        // Each blob is the block header, the 4-byte length, then the data:
+        // `len` bytes, or `2 * len` for a two-byte string, padded to 8.
+        let blob_len = STR_DATA_OFFSET + i32::try_from(str_data(&text).len()).unwrap_or(i32::MAX);
+        offsets.0.insert(text, next);
         next = next
             .saturating_add(blob_len)
             .saturating_add(BLOCK_ALIGN - 1)
@@ -698,19 +703,92 @@ pub(super) fn collect_strings(program: &IrProgram) -> (HashMap<String, i32>, i32
     (offsets, next)
 }
 
+/// The compile-time offset of every static string block ([`collect_strings`]),
+/// keyed on the string's code units.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StrOffsets(HashMap<JsStr, i32>);
+
+impl StrOffsets {
+    /// The block offset of the compiler-built string `text`.
+    pub(crate) fn get(&self, text: &str) -> Option<&i32> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        self.0.get(units.as_slice())
+    }
+
+    /// The block offset of the string `text`.
+    pub(crate) fn get_str(&self, text: &JsStr) -> Option<&i32> {
+        self.0.get(text.as_units())
+    }
+
+    /// The number of static strings.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Every `(string, block offset)` pair, in no particular order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&JsStr, i32)> {
+        self.0.iter().map(|(text, offset)| (text, *offset))
+    }
+}
+
+impl FromIterator<(JsStr, i32)> for StrOffsets {
+    fn from_iter<I: IntoIterator<Item = (JsStr, i32)>>(entries: I) -> Self {
+        Self(entries.into_iter().collect())
+    }
+}
+
+/// The distinct strings [`collect_strings`] places, in first-appearance order.
+#[derive(Debug, Default)]
+pub(super) struct Strs<'a> {
+    order: Vec<JsStr>,
+    seen: HashSet<JsStr>,
+    /// The compiler-built strings already added, to skip re-encoding them.
+    seen_str: HashSet<&'a str>,
+}
+
+impl<'a> Strs<'a> {
+    /// Record the compiler-built string `text` unless already seen.
+    fn add(&mut self, text: &'a str) {
+        if self.seen_str.insert(text) {
+            self.add_units(&JsStr::from(text));
+        }
+    }
+
+    /// Record the string `text` unless already seen.
+    fn add_units(&mut self, text: &JsStr) {
+        if !self.seen.contains(text) {
+            self.seen.insert(text.clone());
+            self.order.push(text.clone());
+        }
+    }
+}
+
+/// Whether the canonical block of `text` is two-byte: some code unit is above
+/// `0xFF` (else every unit fits one Latin-1 byte).
+pub(super) fn is_two_byte(text: &JsStr) -> bool {
+    text.as_units().iter().any(|&unit| unit > 0xFF)
+}
+
+/// A static string's block data in canonical form: UTF-16LE units when
+/// [`is_two_byte`], else one Latin-1 byte per unit.
+pub(super) fn str_data(text: &JsStr) -> Vec<u8> {
+    let units = text.as_units();
+    if is_two_byte(text) {
+        units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+    } else {
+        units.iter().map(|&unit| unit.to_le_bytes()[0]).collect()
+    }
+}
+
 /// Walk one statement, recording each distinct string literal in appearance
 /// order (see [`collect_strings`]).
-pub(super) fn collect_stmt<'a>(
-    stmt: &'a IrStmt,
-    order: &mut Vec<&'a str>,
-    seen: &mut HashSet<&'a str>,
-) {
+pub(super) fn collect_stmt<'a>(stmt: &'a IrStmt, strs: &mut Strs<'a>) {
     match stmt {
-        IrStmt::Decl { init, .. } => collect_node(init, order, seen),
-        IrStmt::Expr(node) => collect_node(node, order, seen),
+        IrStmt::Decl { init, .. } => collect_node(init, strs),
+        IrStmt::Expr(node) => collect_node(node, strs),
         IrStmt::Return(value) => {
             if let Some(node) = value {
-                collect_node(node, order, seen);
+                collect_node(node, strs);
             }
         }
         IrStmt::If {
@@ -718,27 +796,27 @@ pub(super) fn collect_stmt<'a>(
             then_body,
             else_body,
         } => {
-            collect_node(cond, order, seen);
+            collect_node(cond, strs);
             for stmt in then_body.iter().chain(else_body) {
-                collect_stmt(stmt, order, seen);
+                collect_stmt(stmt, strs);
             }
         }
         IrStmt::While {
             cond, body, update, ..
         } => {
-            collect_node(cond, order, seen);
+            collect_node(cond, strs);
             for stmt in body.iter().chain(update) {
-                collect_stmt(stmt, order, seen);
+                collect_stmt(stmt, strs);
             }
         }
         IrStmt::Switch { disc, cases, .. } => {
-            collect_node(disc, order, seen);
+            collect_node(disc, strs);
             for case in cases {
                 if let Some(test) = &case.test {
-                    collect_node(test, order, seen);
+                    collect_node(test, strs);
                 }
                 for stmt in &case.body {
-                    collect_stmt(stmt, order, seen);
+                    collect_stmt(stmt, strs);
                 }
             }
         }
@@ -750,7 +828,7 @@ pub(super) fn collect_stmt<'a>(
         } => {
             let clauses = catch_body.iter().chain(finally_body).flatten();
             for stmt in body.iter().chain(clauses) {
-                collect_stmt(stmt, order, seen);
+                collect_stmt(stmt, strs);
             }
         }
     }
@@ -759,32 +837,24 @@ pub(super) fn collect_stmt<'a>(
 /// Walk one expression node, recording each distinct string literal in
 /// appearance order (see [`collect_strings`]).
 #[allow(clippy::too_many_lines)]
-pub(super) fn collect_node<'a>(
-    node: &'a IrNode,
-    order: &mut Vec<&'a str>,
-    seen: &mut HashSet<&'a str>,
-) {
+pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
     match node {
         IrNode::Str(text) => {
-            if seen.insert(text.as_str()) {
-                order.push(text.as_str());
-            }
+            strs.add_units(text);
         }
         IrNode::Binary { lhs, rhs, .. } | IrNode::Logical { lhs, rhs, .. } => {
-            collect_node(lhs, order, seen);
-            collect_node(rhs, order, seen);
+            collect_node(lhs, strs);
+            collect_node(rhs, strs);
         }
         // The nullish guard interns its error strings and the read key.
         IrNode::NullishCheck { value, key } => {
-            seed_nullish_strs(order, seen);
-            if seen.insert(key.as_str()) {
-                order.push(key.as_str());
-            }
-            collect_node(value, order, seen);
+            seed_nullish_strs(strs);
+            strs.add(key);
+            collect_node(value, strs);
         }
-        IrNode::ArrayPush { value, .. } => collect_node(value, order, seen),
+        IrNode::ArrayPush { value, .. } => collect_node(value, strs),
         IrNode::Assign { value, .. } => {
-            collect_node(value, order, seen);
+            collect_node(value, strs);
         }
         // A direct call and a `console.log` both just collect their argument
         // literals (`console.log` has no callee expression to walk).
@@ -793,7 +863,7 @@ pub(super) fn collect_node<'a>(
         | IrNode::MathCall { args, .. }
         | IrNode::CollectionOp { args, .. } => {
             for arg in args {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
         }
         // An indirect call and a `super(..)`/`super.m(..)` `ThisCall` both intern
@@ -810,10 +880,10 @@ pub(super) fn collect_node<'a>(
             not_callable,
             ..
         } => {
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            collect_node(callee, order, seen);
+            seed_callee_error(callee_error_text(not_callable), strs);
+            collect_node(callee, strs);
             for arg in args {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
         }
         // `typeof` interns the seven type-string words so the strict-equality path
@@ -821,11 +891,9 @@ pub(super) fn collect_node<'a>(
         // literal by content — see `emit_typeof_to_string`.
         IrNode::TypeOf(operand) => {
             for word in crate::abi::TYPEOF_STRINGS {
-                if seen.insert(word) {
-                    order.push(word);
-                }
+                strs.add(word);
             }
-            collect_node(operand, order, seen);
+            collect_node(operand, strs);
         }
         IrNode::StrLen(operand)
         | IrNode::Not(operand)
@@ -843,90 +911,88 @@ pub(super) fn collect_node<'a>(
         | IrNode::IterSource { value: operand, .. }
         | IrNode::IterLen(operand)
         | IrNode::ObjectBuiltin { arg: operand, .. } => {
-            collect_node(operand, order, seen);
+            collect_node(operand, strs);
         }
         IrNode::SetFunctionName { func, prefix, .. } => {
             for text in ["name", "", "[", "]", prefix] {
-                if seen.insert(text) {
-                    order.push(text);
-                }
+                strs.add(text);
             }
-            collect_node(func, order, seen);
+            collect_node(func, strs);
         }
         IrNode::ConvertCall { arg, radix, .. } => {
-            collect_node(arg, order, seen);
+            collect_node(arg, strs);
             if let Some(radix) = radix {
-                collect_node(radix, order, seen);
+                collect_node(radix, strs);
             }
         }
         IrNode::FuncValue { captures, .. } => {
             for capture in captures {
-                collect_node(capture, order, seen);
+                collect_node(capture, strs);
             }
         }
         IrNode::DefineProps { obj, entries, .. } => {
-            collect_node(obj, order, seen);
-            collect_entries(entries, order, seen);
+            collect_node(obj, strs);
+            collect_entries(entries, strs);
         }
         IrNode::CellSet { cell, value } => {
-            collect_node(cell, order, seen);
-            collect_node(value, order, seen);
+            collect_node(cell, strs);
+            collect_node(value, strs);
         }
         IrNode::ClassHeritage { value, .. } => {
-            seed_prop_strs(order, seen);
-            collect_node(value, order, seen);
+            seed_prop_strs(strs);
+            collect_node(value, strs);
         }
         IrNode::SetProto { obj, proto } => {
-            collect_node(obj, order, seen);
-            collect_node(proto, order, seen);
+            collect_node(obj, strs);
+            collect_node(proto, strs);
         }
         IrNode::Array(elems) | IrNode::Seq(elems) => {
             for elem in elems {
-                collect_node(elem, order, seen);
+                collect_node(elem, strs);
             }
         }
         IrNode::ArraySpread(parts) => {
             for part in parts {
-                collect_spread_elem(part, order, seen);
+                collect_spread_elem(part, strs);
             }
         }
         IrNode::CallSpread { target, args } => {
             match target {
                 SpreadCallee::Indirect(callee, not_callable) => {
                     if !is_static_function(callee) {
-                        seed_callee_error(callee_error_text(not_callable), order, seen);
+                        seed_callee_error(callee_error_text(not_callable), strs);
                     }
-                    collect_node(callee, order, seen);
+                    collect_node(callee, strs);
                 }
                 SpreadCallee::This { callee, .. } => {
                     if !is_static_function(callee) {
-                        seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
+                        seed_callee_error(EXPRESSION_NOT_A_FUNCTION, strs);
                     }
-                    collect_node(callee, order, seen);
+                    collect_node(callee, strs);
                 }
                 SpreadCallee::Method {
                     callee,
                     not_callable,
                     ..
                 } => {
-                    seed_callee_error(callee_error_text(not_callable), order, seen);
-                    collect_node(callee, order, seen);
+                    seed_callee_error(callee_error_text(not_callable), strs);
+                    collect_node(callee, strs);
                 }
                 SpreadCallee::Direct(_) => {}
             }
-            collect_node(args, order, seen);
+            collect_node(args, strs);
         }
         IrNode::MathSpread { args, .. } | IrNode::ConsoleLogSpread { args } => {
-            collect_node(args, order, seen);
+            collect_node(args, strs);
         }
         IrNode::Object { entries, proto, .. } => {
             // Each static key is an interned string (its blob must live in the
             // data segment so a literal can name it); recurse into the proto,
             // each computed key, and each value.
             if let Some(proto) = proto {
-                collect_node(proto, order, seen);
+                collect_node(proto, strs);
             }
-            collect_entries(entries, order, seen);
+            collect_entries(entries, strs);
         }
         IrNode::ArrayHof {
             array,
@@ -936,18 +1002,18 @@ pub(super) fn collect_node<'a>(
             ..
         } => {
             if !is_static_function(callback) {
-                seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
+                seed_callee_error(EXPRESSION_NOT_A_FUNCTION, strs);
             }
-            collect_node(array, order, seen);
-            collect_node(callback, order, seen);
+            collect_node(array, strs);
+            collect_node(callback, strs);
             for node in [init, this_arg].into_iter().flatten() {
-                collect_node(node, order, seen);
+                collect_node(node, strs);
             }
         }
         IrNode::MethodCall { recv, args, .. } => {
-            collect_node(recv, order, seen);
+            collect_node(recv, strs);
             for arg in args {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
         }
         IrNode::MethodCallUser {
@@ -959,12 +1025,12 @@ pub(super) fn collect_node<'a>(
         } => {
             // Seed the runtime callee-is-a-function guard's TypeError
             // strings so their data-segment blobs exist when the guard throws.
-            seed_callee_error(callee_error_text(not_callable), order, seen);
-            seed_nullish_strs(order, seen);
-            collect_node(obj, order, seen);
-            collect_node(key, order, seen);
+            seed_callee_error(callee_error_text(not_callable), strs);
+            seed_nullish_strs(strs);
+            collect_node(obj, strs);
+            collect_node(key, strs);
             for arg in args {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
         }
         IrNode::NamespaceGuard {
@@ -975,14 +1041,14 @@ pub(super) fn collect_node<'a>(
             slow,
             ..
         } => {
-            seed_strs_ref(&[key], order, seen);
-            seed_nullish_strs(order, seen);
-            collect_node(obj, order, seen);
+            seed_strs_ref(&[key], strs);
+            seed_nullish_strs(strs);
+            collect_node(obj, strs);
             for arg in args {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
-            collect_node(fast, order, seen);
-            collect_node(slow, order, seen);
+            collect_node(fast, strs);
+            collect_node(slow, strs);
         }
         IrNode::ProtoGuard {
             recv,
@@ -995,41 +1061,39 @@ pub(super) fn collect_node<'a>(
         } => {
             // The generic call reads the interned key and builds the
             // nullish-receiver or not-a-function `TypeError`.
-            seed_strs_ref(&[key, &not_callable.message], order, seen);
-            seed_nullish_strs(order, seen);
-            collect_node(recv, order, seen);
+            seed_strs_ref(&[key, &not_callable.message], strs);
+            seed_nullish_strs(strs);
+            collect_node(recv, strs);
             for arg in args {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
             for (_, path) in fast {
-                collect_node(path, order, seen);
+                collect_node(path, strs);
             }
             if let Some(callee) = callee {
                 // Every other receiver calls the early read, guarded.
-                seed_callee_error(callee_error_text(not_callable), order, seen);
-                collect_node(callee, order, seen);
+                seed_callee_error(callee_error_text(not_callable), strs);
+                collect_node(callee, strs);
             }
         }
         // The generic `[[Get]]` reads the interned key.
         IrNode::ProtoMethod { recv, key, .. } => {
-            seed_strs_ref(&[key], order, seen);
-            collect_node(recv, order, seen);
+            seed_strs_ref(&[key], strs);
+            collect_node(recv, strs);
         }
         // The slow path is a `size` member read.
         IrNode::SizeRead { obj, .. } => {
-            seed_strs(&["size"], order, seen);
-            seed_nullish_strs(order, seen);
-            collect_node(obj, order, seen);
+            seed_strs(&["size"], strs);
+            seed_nullish_strs(strs);
+            collect_node(obj, strs);
         }
         // An invalid date's `toString()` is the interned `"Invalid Date"`
         // literal; its `toISOString()` throws a `RangeError`.
         IrNode::DateField { op, .. } => match op {
             DateOp::ToString => {
-                if seen.insert(INVALID_DATE) {
-                    order.push(INVALID_DATE);
-                }
+                strs.add(INVALID_DATE);
             }
-            DateOp::ToIsoString => seed_strs(&INVALID_TIME_VALUE, order, seen),
+            DateOp::ToIsoString => seed_strs(&INVALID_TIME_VALUE, strs),
             _ => {}
         },
         IrNode::Construct {
@@ -1040,51 +1104,51 @@ pub(super) fn collect_node<'a>(
             new_target,
             ..
         } => {
-            seed_callee_error(callee_error_text(not_constructor), order, seen);
-            collect_node(callee, order, seen);
+            seed_callee_error(callee_error_text(not_constructor), strs);
+            collect_node(callee, strs);
             for arg in args {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
             if let Some(spread) = spread {
-                collect_node(spread, order, seen);
+                collect_node(spread, strs);
             }
             if let Some(new_target) = new_target {
-                collect_node(new_target, order, seen);
+                collect_node(new_target, strs);
             }
         }
         IrNode::ObjectRest { source, exclude } => {
-            collect_node(source, order, seen);
-            collect_node(exclude, order, seen);
+            collect_node(source, strs);
+            collect_node(exclude, strs);
         }
         IrNode::Index { obj, index }
         | IrNode::IterItem {
             iterable: obj,
             index,
         } => {
-            seed_nullish_strs(order, seen);
-            collect_node(obj, order, seen);
-            collect_node(index, order, seen);
+            seed_nullish_strs(strs);
+            collect_node(obj, strs);
+            collect_node(index, strs);
         }
         IrNode::MakeAccessor { getter, setter } => {
-            collect_node(getter, order, seen);
-            collect_node(setter, order, seen);
+            collect_node(getter, strs);
+            collect_node(setter, strs);
         }
         IrNode::ObjectHas { key, obj } => {
-            collect_node(key, order, seen);
-            collect_node(obj, order, seen);
+            collect_node(key, strs);
+            collect_node(obj, strs);
         }
         IrNode::InstanceOf { value, kind } => {
-            collect_node(value, order, seen);
+            collect_node(value, strs);
             match kind {
                 // A static error prototype walk.
-                InstanceOfKind::Proto(proto) => collect_node(proto, order, seen),
+                InstanceOfKind::Proto(proto) => collect_node(proto, strs),
                 // `OrdinaryHasInstance` reads `C.prototype` and may throw either
                 // `TypeError`.
                 InstanceOfKind::Ctor(ctor) => {
-                    collect_node(ctor, order, seen);
-                    seed_strs(&["prototype"], order, seen);
-                    seed_callee_error(INSTANCEOF_NOT_CALLABLE, order, seen);
-                    seed_callee_error(INSTANCEOF_NON_OBJECT_PROTOTYPE, order, seen);
+                    collect_node(ctor, strs);
+                    seed_strs(&["prototype"], strs);
+                    seed_callee_error(INSTANCEOF_NOT_CALLABLE, strs);
+                    seed_callee_error(INSTANCEOF_NON_OBJECT_PROTOTYPE, strs);
                 }
                 // The runtime-TYPE-BYTE builtins read the receiver's own type byte
                 // only — no interned key or literal to seed.
@@ -1095,87 +1159,85 @@ pub(super) fn collect_node<'a>(
             }
         }
         IrNode::ObjectDelete { obj, key } => {
-            seed_prop_strs(order, seen);
-            collect_node(obj, order, seen);
-            collect_node(key, order, seen);
+            seed_prop_strs(strs);
+            collect_node(obj, strs);
+            collect_node(key, strs);
         }
         IrNode::JsonStringify { arg } => {
-            collect_node(arg, order, seen);
+            collect_node(arg, strs);
             // Seed the serializer's literal token strings (`null`/`true`/`false`
             // and the structural punctuation) so their `[len][utf8]` blocks exist
             // in the data segment for `__json_rep` / `__json_str` to splice.
             for tok in JSON_TOKEN_STRS {
-                if seen.insert(tok) {
-                    order.push(tok);
-                }
+                strs.add(tok);
             }
         }
         IrNode::JsonParse { arg } => {
-            collect_node(arg, order, seen);
+            collect_node(arg, strs);
             // Seed the syntax-error object's static strings so `__json_throw` can
             // build its `SyntaxError` on malformed input.
-            seed_strs(&JSON_PARSE_ERROR_STRS, order, seen);
+            seed_strs(&JSON_PARSE_ERROR_STRS, strs);
         }
         IrNode::IndexSet { obj, index, value } => {
-            seed_nullish_strs(order, seen);
-            seed_prop_strs(order, seen);
-            collect_node(obj, order, seen);
-            collect_node(index, order, seen);
-            collect_node(value, order, seen);
+            seed_nullish_strs(strs);
+            seed_prop_strs(strs);
+            collect_node(obj, strs);
+            collect_node(index, strs);
+            collect_node(value, strs);
         }
         IrNode::IndexOpSet {
             obj, index, rhs, ..
         } => {
-            seed_nullish_strs(order, seen);
-            seed_prop_strs(order, seen);
-            collect_node(obj, order, seen);
-            collect_node(index, order, seen);
-            collect_node(rhs, order, seen);
+            seed_nullish_strs(strs);
+            seed_prop_strs(strs);
+            collect_node(obj, strs);
+            collect_node(index, strs);
+            collect_node(rhs, strs);
         }
         IrNode::Ternary {
             cond,
             then_branch,
             else_branch,
         } => {
-            collect_node(cond, order, seen);
-            collect_node(then_branch, order, seen);
-            collect_node(else_branch, order, seen);
+            collect_node(cond, strs);
+            collect_node(then_branch, strs);
+            collect_node(else_branch, strs);
         }
         // The promise primitives carry only sub-expressions to walk.
         IrNode::PromiseResolve(operand)
         | IrNode::PromiseReject(operand)
-        | IrNode::Await(operand) => collect_node(operand, order, seen),
+        | IrNode::Await(operand) => collect_node(operand, strs),
         IrNode::PromiseThen {
             promise,
             on_fulfilled,
             on_rejected,
         } => {
-            collect_node(promise, order, seen);
-            collect_node(on_fulfilled, order, seen);
-            collect_node(on_rejected, order, seen);
+            collect_node(promise, strs);
+            collect_node(on_fulfilled, strs);
+            collect_node(on_rejected, strs);
         }
         IrNode::PromiseFinally {
             promise,
             on_finally,
         } => {
-            collect_node(promise, order, seen);
-            collect_node(on_finally, order, seen);
+            collect_node(promise, strs);
+            collect_node(on_finally, strs);
         }
         // `new Promise(executor)` carries only the executor sub-expression to walk
         // (the settler functions are runtime-emitted, no literals).
         IrNode::PromiseCtor { executor, .. } => {
             if !is_static_function(executor) {
-                seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
+                seed_callee_error(EXPRESSION_NOT_A_FUNCTION, strs);
             }
-            collect_node(executor, order, seen);
+            collect_node(executor, strs);
         }
         // `AsyncSpawn` wraps the inner `MakeGenerator` — walk it so the
         // constructor's per-parameter argument reads are interned.
-        IrNode::AsyncSpawn(make_generator) => collect_node(make_generator, order, seen),
+        IrNode::AsyncSpawn(make_generator) => collect_node(make_generator, strs),
         // `MakeGenerator` carries the constructor's per-parameter argument reads.
         IrNode::MakeGenerator { slots, .. } => {
             for slot in slots {
-                collect_node(slot, order, seen);
+                collect_node(slot, strs);
             }
         }
         // `gen.next(sent)` builds a `{ value, done }` result object, so both keys'
@@ -1183,20 +1245,18 @@ pub(super) fn collect_node<'a>(
         // receiver throws a `TypeError`, so seed its strings too.
         IrNode::GenResume { handle, sent } => {
             for key in ["value", "done"] {
-                if seen.insert(key) {
-                    order.push(key);
-                }
+                strs.add(key);
             }
-            seed_callee_error(EXPRESSION_NOT_A_FUNCTION, order, seen);
-            seed_callee_error(GENERATOR_RUNNING, order, seen);
-            collect_node(handle, order, seen);
-            collect_node(sent, order, seen);
+            seed_callee_error(EXPRESSION_NOT_A_FUNCTION, strs);
+            seed_callee_error(GENERATOR_RUNNING, strs);
+            collect_node(handle, strs);
+            collect_node(sent, strs);
         }
         // The `Date` builtins carry no string literals; recurse into
         // the timestamp / receiver sub-expressions (`Date.now()` has neither).
         IrNode::DateNew { arg } => {
             if let Some(arg) = arg {
-                collect_node(arg, order, seen);
+                collect_node(arg, strs);
             }
         }
         // A global reference interns its key and, unless it reads `undefined`
@@ -1206,22 +1266,22 @@ pub(super) fn collect_node<'a>(
             global,
             typeof_operand,
         } => {
-            seed_strs_ref(&[&global.name], order, seen);
+            seed_strs_ref(&[&global.name], strs);
             if !typeof_operand {
-                seed_strs_ref(&[&global.message, &global.stack], order, seen);
+                seed_strs_ref(&[&global.message, &global.stack], strs);
             }
         }
         IrNode::GlobalDeclare { name, value } => {
-            seed_strs_ref(&[name], order, seen);
+            seed_strs_ref(&[name], strs);
             if let Some(value) = value {
-                seed_prop_strs(order, seen);
-                collect_node(value, order, seen);
+                seed_prop_strs(strs);
+                collect_node(value, strs);
             }
         }
         IrNode::GlobalSet { global, value } => {
-            seed_strs_ref(&[&global.name, &global.message, &global.stack], order, seen);
-            seed_prop_strs(order, seen);
-            collect_node(value, order, seen);
+            seed_strs_ref(&[&global.name, &global.message, &global.stack], strs);
+            seed_prop_strs(strs);
+            collect_node(value, strs);
         }
         IrNode::ErrorProto(_)
         | IrNode::Intrinsic(_)
@@ -1250,80 +1310,62 @@ pub(super) fn collect_node<'a>(
     }
 }
 
-/// Record each of `strs` not yet seen, in order; see [`collect_node`].
-fn seed_strs<'a>(strs: &[&'static str], order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
-    for &s in strs {
-        if seen.insert(s) {
-            order.push(s);
-        }
+/// Record each of `texts` not yet seen, in order; see [`collect_node`].
+fn seed_strs(texts: &[&'static str], strs: &mut Strs<'_>) {
+    for &s in texts {
+        strs.add(s);
     }
 }
 
-/// Record each of the borrowed `strs` not yet seen, in order; see
+/// Record each of the borrowed `texts` not yet seen, in order; see
 /// [`collect_node`].
-fn seed_strs_ref<'a>(strs: &[&'a String], order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
-    for s in strs {
-        if seen.insert(s.as_str()) {
-            order.push(s.as_str());
-        }
+fn seed_strs_ref<'a>(texts: &[&'a String], strs: &mut Strs<'a>) {
+    for s in texts {
+        strs.add(s);
     }
 }
 
 /// Seed the nullish-receiver guard's [`NULLISH_ERROR_STRS`] so
 /// `__nullish_throw` finds their `[len][utf8]` blobs in the data segment; see
 /// [`collect_node`].
-fn seed_nullish_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
-    seed_strs(&NULLISH_ERROR_STRS, order, seen);
+fn seed_nullish_strs(strs: &mut Strs<'_>) {
+    seed_strs(&NULLISH_ERROR_STRS, strs);
 }
 
 /// Seed a not-callable guard's [`CalleeErrorText`] so the `TypeError` it
 /// throws finds their `[len][utf8]` blobs in the data segment; see
 /// [`collect_node`].
-fn seed_callee_error<'a>(
-    text: CalleeErrorText<'a>,
-    order: &mut Vec<&'a str>,
-    seen: &mut HashSet<&'a str>,
-) {
+fn seed_callee_error<'a>(text: CalleeErrorText<'a>, strs: &mut Strs<'a>) {
     for s in text {
-        if seen.insert(s) {
-            order.push(s);
-        }
+        strs.add(s);
     }
 }
 
 /// Seed the member-store guard's [`PROP_ERROR_STRS`] so `__prop_throw` finds
 /// their `[len][utf8]` blobs in the data segment; see [`collect_node`].
-fn seed_prop_strs<'a>(order: &mut Vec<&'a str>, seen: &mut HashSet<&'a str>) {
+fn seed_prop_strs(strs: &mut Strs<'_>) {
     let keyed = PROP_KEYED_MSGS
         .iter()
         .flat_map(|&(_, prefix, suffix)| [prefix, suffix]);
     for s in PROP_ERROR_STRS.into_iter().chain(keyed) {
-        if seen.insert(s) {
-            order.push(s);
-        }
+        strs.add(s);
     }
 }
 
 /// Record the static keys of object-literal / defined-property `entries` (each
 /// an interned string whose blob must live in the data segment), and the
 /// literals of each computed key and value; see [`collect_node`].
-fn collect_entries<'a>(
-    entries: &'a [(PropKey, IrNode)],
-    order: &mut Vec<&'a str>,
-    seen: &mut HashSet<&'a str>,
-) {
+fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
     for (key, value) in entries {
         match key {
             PropKey::Static(key) | PropKey::Hidden(key) | PropKey::Fixed(key) => {
-                if seen.insert(key.as_str()) {
-                    order.push(key.as_str());
-                }
+                strs.add_units(key);
             }
             PropKey::Computed(key) | PropKey::HiddenComputed(key) => {
-                collect_node(key, order, seen);
+                collect_node(key, strs);
             }
         }
-        collect_node(value, order, seen);
+        collect_node(value, strs);
     }
 }
 
@@ -1341,19 +1383,20 @@ fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
         IrNode::MakeAccessor { .. } | IrNode::SizeRead { .. } => true,
-        IrNode::Str(s) => matches!(
-            s.as_str(),
-            "caller"
-                | "arguments"
-                | "size"
-                | "defineProperty"
-                | "defineProperties"
-                | "create"
-                | "assign"
-                | "__proto__"
-                | "__defineGetter__"
-                | "__defineSetter__"
-        ),
+        IrNode::Str(s) => [
+            "caller",
+            "arguments",
+            "size",
+            "defineProperty",
+            "defineProperties",
+            "create",
+            "assign",
+            "__proto__",
+            "__defineGetter__",
+            "__defineSetter__",
+        ]
+        .iter()
+        .any(|name| s == name),
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }
         | IrNode::IndexOpSet { index: key, .. }
@@ -1403,12 +1446,8 @@ fn program_any(program: &IrProgram, pred: impl Fn(&IrNode) -> bool + Copy) -> bo
 
 /// Record the string literals of one spread element (its plain-item or
 /// spread-source sub-expression); see [`collect_node`].
-pub(super) fn collect_spread_elem<'a>(
-    part: &'a SpreadElem,
-    order: &mut Vec<&'a str>,
-    seen: &mut HashSet<&'a str>,
-) {
+pub(super) fn collect_spread_elem<'a>(part: &'a SpreadElem, strs: &mut Strs<'a>) {
     match part {
-        SpreadElem::Item(node) | SpreadElem::Spread(node) => collect_node(node, order, seen),
+        SpreadElem::Item(node) | SpreadElem::Spread(node) => collect_node(node, strs),
     }
 }

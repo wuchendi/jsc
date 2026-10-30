@@ -9,7 +9,7 @@ pub(super) fn emit_node(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match node {
@@ -28,7 +28,7 @@ pub(super) fn emit_node(
             // with the literal's compile-time byte offset in static data.
             // `collect_strings` walked the same tree, so every literal has an
             // offset; fall back to HEAP_BASE rather than panic if one is missing.
-            let offset = strings.get(text.as_str()).copied().unwrap_or(HEAP_BASE);
+            let offset = strings.get_str(text).copied().unwrap_or(HEAP_BASE);
             function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(offset)));
         }
         IrNode::Bool(value) => {
@@ -621,7 +621,7 @@ pub(super) fn emit_call_args(
     args: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let k = helpers.max_args as usize;
@@ -662,7 +662,7 @@ pub(super) fn emit_method_call_user(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let IrNode::MethodCallUser {
@@ -734,7 +734,7 @@ fn emit_bound_call(
     text: CalleeErrorText<'_>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let base = scratch + 7;
@@ -785,7 +785,7 @@ pub(super) fn emit_this_call(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let IrNode::ThisCall {
@@ -867,7 +867,7 @@ pub(super) fn emit_namespace_guard(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let IrNode::NamespaceGuard {
@@ -889,7 +889,7 @@ pub(super) fn emit_namespace_guard(
     let read = |function: &mut Function| {
         emit_index_node(
             &IrNode::Local(*obj_local),
-            &IrNode::Str(key.clone()),
+            &IrNode::Str(key.as_str().into()),
             true,
             function,
             scratch,
@@ -1150,7 +1150,7 @@ pub(super) fn emit_proto_guard(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let IrNode::ProtoGuard {
@@ -1402,7 +1402,7 @@ pub(super) fn emit_proto_method(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let IrNode::ProtoMethod {
@@ -1439,7 +1439,7 @@ pub(super) fn emit_proto_method(
     }
     emit_index_node(
         &IrNode::Local(local),
-        &IrNode::Str(key.clone()),
+        &IrNode::Str(key.as_str().into()),
         false,
         function,
         scratch,
@@ -1493,7 +1493,7 @@ pub(super) fn emit_construct(
     node: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let IrNode::Construct {
@@ -1627,7 +1627,7 @@ fn emit_class_heritage(
     proto: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(value, function, scratch, strings, helpers);
@@ -1790,7 +1790,7 @@ pub(super) fn emit_func_value(
     kind: FnKind,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let dst = scratch + 3;
@@ -1856,7 +1856,7 @@ pub(super) fn emit_env_block(
     captures: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let dst = scratch + 3;
@@ -1908,7 +1908,7 @@ pub(super) fn emit_cell_new(
     value: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let dst = scratch + 3;
@@ -1952,7 +1952,7 @@ pub(super) fn emit_str_len(
     operand: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(operand, function, scratch, strings, helpers);
@@ -2043,7 +2043,7 @@ pub(super) fn emit_cell_set(
     value: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let tmp = scratch + 5;
@@ -2082,7 +2082,7 @@ pub(super) fn emit_promise_call(
     b: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::I32Const(op));
@@ -2109,7 +2109,7 @@ pub(super) fn emit_promise_ctor(
     p_local: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let exec_base = scratch + 7;
@@ -2262,7 +2262,7 @@ pub(super) fn emit_call_indirect(
     not_callable: &CalleeError,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let base = scratch + 7;
@@ -2322,7 +2322,7 @@ pub(super) fn emit_throw_not_a_function(
     function: &mut Function,
     text: CalleeErrorText<'_>,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_throw_error(
@@ -2340,7 +2340,7 @@ pub(super) fn emit_throw_error(
     error: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(error, function, scratch, strings, helpers);
@@ -2356,8 +2356,8 @@ pub(super) fn emit_throw_error(
 fn reference_error(global: &GlobalRef) -> IrNode {
     IrNode::error_object(
         ErrorKind::ReferenceError,
-        Some(IrNode::Str(global.message.clone())),
-        IrNode::Str(global.stack.clone()),
+        Some(IrNode::Str(global.message.as_str().into())),
+        IrNode::Str(global.stack.as_str().into()),
     )
 }
 
@@ -2365,7 +2365,7 @@ fn reference_error(global: &GlobalRef) -> IrNode {
 fn emit_global_has(
     function: &mut Function,
     global: &GlobalRef,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     function.instruction(&Instruction::I32Const(static_key(strings, &global.name)));
@@ -2383,7 +2383,7 @@ fn emit_global_get(
     typeof_operand: bool,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_global_has(function, global, strings, helpers);
@@ -2422,7 +2422,7 @@ fn emit_global_set(
     value: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(value, function, scratch, strings, helpers);
@@ -2461,7 +2461,7 @@ fn emit_global_declare(
     value: Option<&IrNode>,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let global = intrinsic_bits(Intrinsic::Global, helpers);
@@ -2504,7 +2504,7 @@ pub(super) fn emit_callable_guard(
     text: CalleeErrorText<'_>,
     local: u32,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_function(function, local);
@@ -2536,7 +2536,7 @@ pub(super) fn emit_call_spread(
     args: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // The argument array's block base and element count (reusing the array
@@ -2632,7 +2632,7 @@ fn emit_spread_args_setup(
     len: u32,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(args, function, scratch, strings, helpers);
@@ -2702,7 +2702,7 @@ pub(super) fn emit_console_log(
     args: &[IrNode],
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if args.is_empty() {
@@ -2735,7 +2735,7 @@ pub(super) fn emit_console_log_spread(
     args: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (base, len, idx, elem) = (scratch + 8, scratch + 9, scratch + 10, scratch + 13);
@@ -2809,7 +2809,7 @@ pub(super) fn emit_typeof_node(
     operand: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(operand, function, scratch, strings, helpers);
@@ -2899,7 +2899,7 @@ fn emit_set_function_name(
     prefix: &str,
     local: u32,
     function: &mut Function,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let description = MemArg {

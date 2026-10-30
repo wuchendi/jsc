@@ -2026,7 +2026,7 @@ pub(super) fn method_bits(builtin: Builtin, helpers: Helpers<'_>) -> i64 {
 
 /// Build the image bytes for `base`: `first_slot` is the funcref-table slot
 /// of [`Builtin::ALL`]'s first entry, `strings` the static-string offsets.
-pub(super) fn image(base: i32, first_slot: u32, strings: &HashMap<String, i32>) -> Vec<u8> {
+pub(super) fn image(base: i32, first_slot: u32, strings: &StrOffsets) -> Vec<u8> {
     let registry = registry();
     let at = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE).cast_unsigned();
     let heap = |addr: u32| abi::HEAP | u64::from(addr);
@@ -2135,10 +2135,10 @@ mod tests {
 
     /// Static-string offsets for every realm string, as `collect_strings`
     /// would assign them.
-    fn offsets() -> HashMap<String, i32> {
+    fn offsets() -> StrOffsets {
         (0..)
             .zip(strings())
-            .map(|(i, s)| (s.to_owned(), HEAP_BASE + 16 * i))
+            .map(|(i, s)| (JsStr::from(s), HEAP_BASE + 16 * i))
             .collect()
     }
 

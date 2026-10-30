@@ -102,7 +102,7 @@ fn load_description(function: &mut Function, symbol: u32) {
 pub(super) fn emit_ctor(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (description, block) = (frame.i64(0), frame.i32(0));
@@ -127,7 +127,7 @@ pub(super) fn emit(
     op: SymbolOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     match op {
@@ -172,12 +172,7 @@ fn emit_for(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
 
 /// `Symbol.keyFor(sym)`: the key of a registered symbol, `undefined` for any
 /// other symbol, a `TypeError` for a non-symbol.
-fn emit_key_for(
-    function: &mut Function,
-    frame: Frame,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
+fn emit_key_for(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
     let symbol = frame.i64(0);
     frame.arg(function, 0);
     wasm!(function; LocalSet(symbol));
@@ -202,7 +197,7 @@ fn emit_method(
     op: SymbolOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (symbol, description) = (frame.i64(0), frame.i64(1));

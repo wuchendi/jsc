@@ -26,7 +26,7 @@ fn this_date(
     function: &mut Function,
     frame: Frame,
     this: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
@@ -47,7 +47,7 @@ pub(super) fn emit_method(
     op: DateOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let this = frame.i64(0);
@@ -76,7 +76,7 @@ fn to_json_object(frame: Frame) -> IrNode {
 fn to_iso_string_call(frame: Frame) -> IrNode {
     IrNode::MethodCallUser {
         obj: Box::new(IrNode::Local(frame.i64(0))),
-        key: Box::new(IrNode::Str("toISOString".to_owned())),
+        key: Box::new(IrNode::Str("toISOString".into())),
         args: vec![],
         obj_local: frame.i64(2),
         callee_local: frame.x64(0),
@@ -90,7 +90,7 @@ fn to_iso_string_call(frame: Frame) -> IrNode {
 pub(super) fn emit_to_json(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, tv) = (frame.i64(0), frame.i64(1));

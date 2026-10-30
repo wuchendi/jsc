@@ -36,7 +36,7 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
+    JsStr, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
     SpreadCallee, SpreadElem,
 };
 
@@ -463,8 +463,8 @@ const INSTANCEOF_NON_OBJECT_PROTOTYPE: CalleeErrorText<'static> = [
 fn callee_type_error([message, stack]: CalleeErrorText<'_>) -> IrNode {
     IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(stack.to_owned()),
+        Some(IrNode::Str(message.into())),
+        IrNode::Str(stack.into()),
     )
 }
 
@@ -697,8 +697,8 @@ const JSON_PARSE_ERROR_STRS: [&str; 2] = [JSON_ERROR_MSG, JSON_ERROR_STACK];
 fn json_syntax_error() -> IrNode {
     IrNode::error_object(
         ErrorKind::SyntaxError,
-        Some(IrNode::Str(JSON_ERROR_MSG.to_owned())),
-        IrNode::Str(JSON_ERROR_STACK.to_owned()),
+        Some(IrNode::Str(JSON_ERROR_MSG.into())),
+        IrNode::Str(JSON_ERROR_STACK.into()),
     )
 }
 
@@ -726,7 +726,7 @@ struct JsonTokens {
 }
 
 impl JsonTokens {
-    fn resolve(offsets: &HashMap<String, i32>) -> Self {
+    fn resolve(offsets: &StrOffsets) -> Self {
         let at = |s: &str| offsets.get(s).copied().unwrap_or(HEAP_BASE);
         Self {
             null: at("null"),

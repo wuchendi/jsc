@@ -181,7 +181,7 @@ pub(super) fn emit_json_ws() -> Function {
 
 /// `__json_throw() -> i64`: stash a `SyntaxError` in `$exc_value`, set the
 /// pending flag + clear any routed completion, and return a dummy `undefined`.
-pub(super) fn emit_json_throw(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_json_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     // The full `emit_main` scratch-local layout (starting at local 0, since this
     // helper has no params) so `emit_node` can build the error object exactly as
     // it would in `main`.
@@ -730,7 +730,7 @@ pub(super) fn emit_json_parse_node(
     arg: &IrNode,
     function: &mut Function,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_node(arg, function, scratch, strings, helpers);
