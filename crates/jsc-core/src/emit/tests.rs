@@ -1271,4 +1271,10 @@ fn builtin_bodies_validate() {
         ];
         console.log(r.length)",
     ));
+    validate(&compile(
+        "const it = Iterator.from([1, 2, 3]).map((x) => x * 2).filter((x) => x > 2);
+        console.log(it.take(1).toArray(), Math.sumPrecise([0.1, 0.2]));
+        Promise.all([Promise.resolve(1), 2]).then((v) => console.log(v));
+        Promise.any([Promise.reject(1)]).catch((e) => console.log(e.errors));",
+    ));
 }

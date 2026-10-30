@@ -3305,24 +3305,13 @@ mod tests {
     }
 
     #[test]
-    fn iterator_prototypes_form_the_spec_chain() {
-        use Intrinsic::{
-            AsyncGeneratorPrototype, AsyncIteratorPrototype, GeneratorPrototype, IterPrototype,
-            IteratorPrototype, ObjectPrototype,
-        };
-        assert_eq!(IteratorPrototype.proto(), Some(ObjectPrototype));
-        assert_eq!(AsyncIteratorPrototype.proto(), Some(ObjectPrototype));
-        assert_eq!(GeneratorPrototype.proto(), Some(IteratorPrototype));
-        assert_eq!(
-            AsyncGeneratorPrototype.proto(),
-            Some(AsyncIteratorPrototype)
-        );
+    fn async_from_sync_iterator_prototype_is_hidden() {
         // `%AsyncFromSyncIteratorPrototype%` (§5.8): unreachable from the
         // global object, holding the promise-returning `next` / `return` /
         // `throw` of the async-from-sync wrappers.
         assert_eq!(
             Intrinsic::AsyncFromSyncIteratorPrototype.proto(),
-            Some(AsyncIteratorPrototype)
+            Some(Intrinsic::AsyncIteratorPrototype)
         );
         assert_eq!(Intrinsic::AsyncFromSyncIteratorPrototype.watch_bit(), None);
         for request in [
@@ -3341,6 +3330,21 @@ mod tests {
             registry()
                 .iter()
                 .all(|e| e.value != Value::Intrinsic(Intrinsic::AsyncFromSyncIteratorPrototype))
+        );
+    }
+
+    #[test]
+    fn iterator_prototypes_form_the_spec_chain() {
+        use Intrinsic::{
+            AsyncGeneratorPrototype, AsyncIteratorPrototype, GeneratorPrototype, IterPrototype,
+            IteratorPrototype, ObjectPrototype,
+        };
+        assert_eq!(IteratorPrototype.proto(), Some(ObjectPrototype));
+        assert_eq!(AsyncIteratorPrototype.proto(), Some(ObjectPrototype));
+        assert_eq!(GeneratorPrototype.proto(), Some(IteratorPrototype));
+        assert_eq!(
+            AsyncGeneratorPrototype.proto(),
+            Some(AsyncIteratorPrototype)
         );
         for family in IterFamily::ALL {
             assert_eq!(IterPrototype(family).proto(), Some(IteratorPrototype));
