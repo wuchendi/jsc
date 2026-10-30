@@ -15,6 +15,7 @@ const TAG_NULL: &str = "[object Null]";
 const TAG_BOOLEAN: &str = "[object Boolean]";
 const TAG_NUMBER: &str = "[object Number]";
 const TAG_STRING: &str = "[object String]";
+const TAG_SYMBOL: &str = "[object Symbol]";
 const TAG_ARRAY: &str = "[object Array]";
 const TAG_FUNCTION: &str = "[object Function]";
 const TAG_DATE: &str = "[object Date]";
@@ -44,7 +45,7 @@ const SETTER_NOT_CALLABLE: CalleeErrorText<'static> = [
 ];
 
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 23] = [
+pub(super) const STRINGS: [&str; 24] = [
     NULLISH_TO_OBJECT[0],
     NULLISH_TO_OBJECT[1],
     TO_STRING_NOT_CALLABLE[0],
@@ -58,6 +59,7 @@ pub(super) const STRINGS: [&str; 23] = [
     TAG_BOOLEAN,
     TAG_NUMBER,
     TAG_STRING,
+    TAG_SYMBOL,
     TAG_ARRAY,
     TAG_FUNCTION,
     TAG_DATE,
@@ -133,6 +135,8 @@ pub(super) fn emit_to_string(
     wasm!(function; LocalTee(kind), I32Const(TYPE_STRING), I32Eq);
     tag_if(function, TAG_STRING);
     for (type_byte, tag) in [
+        // `%Symbol.prototype%[@@toStringTag]` (Y4 reads it as a property).
+        (TYPE_SYMBOL, TAG_SYMBOL),
         (TYPE_ARRAY, TAG_ARRAY),
         (TYPE_FUNCTION, TAG_FUNCTION),
         (TYPE_DATE, TAG_DATE),
@@ -160,6 +164,7 @@ pub(super) fn emit_to_string(
         (abi::CLASS_BOOLEAN, TAG_BOOLEAN),
         (abi::CLASS_NUMBER, TAG_NUMBER),
         (abi::CLASS_STRING, TAG_STRING),
+        (abi::CLASS_SYMBOL, TAG_SYMBOL),
     ] {
         wasm!(function; LocalGet(kind), I32Const(i32::from(class)), I32Eq);
         tag_if(function, tag);

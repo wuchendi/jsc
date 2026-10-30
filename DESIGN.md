@@ -816,8 +816,9 @@ function-index order:
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already
-is a number. `__to_object(v)` wraps a string, number, or boolean in a fresh
-wrapper object (§5.2) and returns any object unchanged.
+is a number; a symbol throws `TypeError`. `__to_object(v)` wraps a string,
+symbol, number, or boolean in a fresh wrapper object (§5.2) and returns any
+object unchanged.
 
 ### 6.3 Property algorithms
 
@@ -832,7 +833,8 @@ tables. Keys are interned `u32`s.
   past `length` is not own and reads on through the chain), then from its own
   table (a sparse element past the store is a table entry); an accessor
   calls its getter with `this = recv` (`undefined` without a getter). A string, number, or boolean
-  continues at its realm prototype without allocating a wrapper;
+  continues at its realm prototype without allocating a wrapper (a symbol at
+  `%Symbol.prototype%`);
   `null`/`undefined` read `undefined` (member-access sites throw the nullish
   `TypeError` before calling it).
 - **`__set(recv, key, v)`** — strict `OrdinarySet`. The first own-or-inherited
@@ -843,8 +845,8 @@ tables. Keys are interned `u32`s.
   a non-writable data property throws, an own writable one is overwritten;
   otherwise a `0b0111` own data property is added (a non-extensible object
   throws). An array element the array does not own consults the chain
-  through `__proto_set` first (§5.4). Member stores on a primitive throw (`Cannot create property 'k' on
-  string 'abc'`); on `null`/`undefined` they throw `Cannot set properties of
+  through `__proto_set` first (§5.4). Member stores on a primitive (a symbol included) throw (`Cannot create
+  property 'k' on string 'abc'`); on `null`/`undefined` they throw `Cannot set properties of
   undefined (setting 'k')`.
 - **`__has(key, obj)`** — `HasProperty` (backs `in`): at each object of the
   chain its exotic own keys (a hole is not own), then its own table. A primitive right-hand side
@@ -1050,15 +1052,17 @@ cell, which records why a change was accepted.
   neither yields one. The host never sees an object that has a user
   `toString`/`valueOf`.
 - **`ToString`** (`__to_string`): a string is itself; an object is converted
-  with hint string first; the remaining primitives are formatted by the host
-  (`__convert` op `0`, ECMAScript `Number::toString` digits).
+  with hint string first; a symbol throws `TypeError` (only a called
+  `String(sym)` yields `"Symbol(desc)"`); the remaining primitives are
+  formatted by the host (`__convert` op `0`, ECMAScript `Number::toString`
+  digits).
 - **`ToNumber`** (`__to_number`): §6.2.
 - **`+`** (`__add`): once an operand is a heap value, both operands go through
   `ToPrimitive` (hint default), then concatenation if either is a string,
-  else numeric addition.
+  else numeric addition (a symbol throws in either conversion).
 - **Relational** (`__compare`): two numbers compare inline; otherwise
   `ToPrimitive` (hint number), then two strings compare by bytes and anything
-  else by `ToNumber`.
+  else by `ToNumber` (a symbol throws).
 - **`Array.prototype.join` / `toString`** (`__array_join`): `ToString` of each
   element (`null`, `undefined`, and holes are empty); a cyclic element joins
   as `""` (the `JOINING` flag).
@@ -1237,7 +1241,8 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   numbers compare as `f64`; two strings by content; number vs. string converts
   the string; an object against a non-nullish primitive is replaced by its
   `ToPrimitive` (hint default) and compared again (`[] == 0` is `true`); two
-  objects compare by identity.
+  objects compare by identity; a symbol equals only itself (and its wrapper,
+  through `ToPrimitive`), never a number or string.
 - **SameValueZero** (`__same_value_zero`) backs Map/Set keys and `includes`:
   strings by content, numbers by `f64` equality or both NaN, everything else by
   identity.
@@ -1546,7 +1551,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
-| `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
+| `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`; Set `add`/`has`/`delete`/`clear`/`forEach`/`size` |
 | `Promise` | §6.7, §7.8 |
 | `Date` | `new Date()`, `new Date(ms)`, `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`; `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `toISOString`, `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`) — all UTC, computed in wasm |

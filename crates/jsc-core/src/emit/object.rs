@@ -386,9 +386,9 @@ pub(super) fn emit_instanceof_node(
 ) {
     emit_node(value, function, scratch, strings, helpers);
     // The runtime-TYPE-BYTE builtins test the receiver's heap kind directly:
-    // `Array`/`Function`/`Date` match their own byte; `Object` matches ANY heap
-    // pointer whose byte is not `TYPE_STRING` (a primitive string is not an
-    // object). The operand is stashed in a dedicated high slot.
+    // `Array`/`Function`/`Date` match their own byte; `Object` matches ANY
+    // object (a primitive string or symbol is not one). The operand is
+    // stashed in a dedicated high slot.
     let v = scratch + 17;
     let (rhs, ctor) = match kind {
         InstanceOfKind::Array
@@ -396,13 +396,13 @@ pub(super) fn emit_instanceof_node(
         | InstanceOfKind::Date
         | InstanceOfKind::Object => {
             function.instruction(&Instruction::LocalSet(v));
-            let (type_byte, negate) = match kind {
-                InstanceOfKind::Array => (TYPE_ARRAY, false),
-                InstanceOfKind::Function => (TYPE_FUNCTION, false),
-                InstanceOfKind::Date => (TYPE_DATE, false),
-                _ => (TYPE_STRING, true),
+            let type_byte = match kind {
+                InstanceOfKind::Array => Some(TYPE_ARRAY),
+                InstanceOfKind::Function => Some(TYPE_FUNCTION),
+                InstanceOfKind::Date => Some(TYPE_DATE),
+                _ => None,
             };
-            return emit_type_byte_instanceof(function, v, type_byte, negate);
+            return emit_type_byte_instanceof(function, v, type_byte);
         }
         InstanceOfKind::Proto(proto) => (proto, false),
         InstanceOfKind::Ctor(ctor) => (ctor, true),
@@ -449,14 +449,7 @@ pub(super) fn emit_instanceof_node(
             emit_propagate_if_pending(function, helpers);
         }
         function.instruction(&Instruction::LocalSet(tgt));
-        emit_is_pointer(function, tgt);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-        emit_load_type_byte(function, tgt);
-        function.instruction(&Instruction::I32Const(TYPE_STRING));
-        function.instruction(&Instruction::I32Ne);
-        function.instruction(&Instruction::Else);
-        function.instruction(&Instruction::I32Const(0));
-        function.instruction(&Instruction::End);
+        emit_is_object(function, tgt);
         function.instruction(&Instruction::I32Eqz);
         function.instruction(&Instruction::If(BlockType::Empty));
         enter_frame(helpers);
@@ -552,22 +545,24 @@ fn emit_unwrap_bound(function: &mut Function, f: u32) {
 
 /// Emit a runtime-TYPE-BYTE `instanceof` test for the operand already stashed in
 /// local `v`, leaving a TRUE/FALSE jsval on the stack. `true` iff `v` is a heap
-/// pointer whose type byte equals `type_byte` — or, when `negate` is set, whose
-/// type byte does NOT equal `type_byte` (the `instanceof Object` case with
-/// `type_byte == TYPE_STRING`, matching any heap pointer that is not a primitive
-/// string). The type-byte read is gated behind [`emit_is_pointer`] so a
-/// non-pointer operand (whose wrapped low bits would be a bogus offset) is simply
-/// never an instance.
-fn emit_type_byte_instanceof(function: &mut Function, v: u32, type_byte: i32, negate: bool) {
+/// pointer whose type byte equals `type_byte` — or, for `None` (the
+/// `instanceof Object` case), iff `v` is an object ([`emit_is_object`]: any heap
+/// kind but a primitive string or symbol). The type-byte read is gated behind
+/// [`emit_is_pointer`] so a non-pointer operand (whose wrapped low bits would be
+/// a bogus offset) is simply never an instance.
+fn emit_type_byte_instanceof(function: &mut Function, v: u32, type_byte: Option<i32>) {
+    let Some(type_byte) = type_byte else {
+        emit_is_object(function, v);
+        function.instruction(&Instruction::I64ExtendI32U);
+        function.instruction(&Instruction::I64Const(FALSE_BITS));
+        function.instruction(&Instruction::I64Or);
+        return;
+    };
     emit_is_pointer(function, v);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     emit_load_type_byte(function, v);
     function.instruction(&Instruction::I32Const(type_byte));
-    if negate {
-        function.instruction(&Instruction::I32Ne);
-    } else {
-        function.instruction(&Instruction::I32Eq);
-    }
+    function.instruction(&Instruction::I32Eq);
     // Box the i32 `1`/`0` into a TRUE/FALSE jsval (`FALSE_BITS | bit`).
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
@@ -2079,18 +2074,12 @@ pub(super) fn emit_index_set_node(
             helpers,
         );
     }
-    // A primitive receiver (number/boolean, or a heap string) takes no property:
-    // throw the strict-mode create-property error before any heap access. The
-    // type byte is read only behind the pointer test.
+    // A primitive receiver (number/boolean, or a heap string or symbol) takes
+    // no property: throw the strict-mode create-property error before any heap
+    // access.
     if !never_primitive(obj) {
-        emit_is_pointer(function, s0);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-        emit_load_type_byte(function, s0);
-        function.instruction(&Instruction::I32Const(TYPE_STRING));
-        function.instruction(&Instruction::I32Eq);
-        function.instruction(&Instruction::Else);
-        function.instruction(&Instruction::I32Const(1));
-        function.instruction(&Instruction::End);
+        emit_is_object(function, s0);
+        function.instruction(&Instruction::I32Eqz);
         function.instruction(&Instruction::If(BlockType::Empty));
         enter_frame(helpers);
         emit_prop_throw_call(function, s0, s1, PROP_THROW_PRIMITIVE, helpers);
@@ -2553,14 +2542,17 @@ pub(super) fn emit_prop_throw(strings: &HashMap<String, i32>, helpers: Helpers<'
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     // prefix + String(key) + "' on " + kind + " '" + String(recv) + "'", where
-    // kind is number / string (the only heap primitive) / boolean.
+    // kind is number / symbol / string (the heap primitives) / boolean.
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_PREFIX)));
     to_string(&mut function, key);
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_MID)));
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at("number")));
+    function.instruction(&Instruction::I32Const(at("symbol")));
     function.instruction(&Instruction::I32Const(at("string")));
+    emit_is_symbol(&mut function, recv);
+    function.instruction(&Instruction::Select);
     function.instruction(&Instruction::I32Const(at("boolean")));
     emit_is_pointer(&mut function, recv);
     function.instruction(&Instruction::Select);
