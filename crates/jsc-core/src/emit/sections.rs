@@ -80,7 +80,11 @@ pub(super) fn build_type_and_function_sections<'a>(
         intern: index(),
         index_value: index(),
         index_string: index(),
-        to_key: index(),
+        // `__str_exotic_index` takes the index right after `__index_string`.
+        to_key: {
+            index();
+            index()
+        },
         prop_find: index(),
         define: index(),
         // `__fn_materialize` takes the index right after `__define`.
@@ -204,19 +208,23 @@ pub(super) fn build_type_and_function_sections<'a>(
         .function([ValType::I64, ValType::I64], [ValType::I64]);
 
     // The exported guest constructors, the LAST defined functions:
-    // `__new_string(len: i32) -> i32`, `__new_array(len: i32) -> i32`, and
-    // `__new_promise() -> i32`. Their types follow the import types.
+    // `__new_string(len: i32, two_byte: i32) -> i32`, `__new_array(len: i32)
+    // -> i32`, and `__new_promise() -> i32`. Their types follow the import
+    // types.
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32], [ValType::I32]);
+    functions.function(next_type + 7);
     types.ty().function([ValType::I32], [ValType::I32]);
-    functions.function(next_type + 7);
-    functions.function(next_type + 7);
-    types.ty().function([], [ValType::I32]);
     functions.function(next_type + 8);
+    types.ty().function([], [ValType::I32]);
+    functions.function(next_type + 9);
     // The realm functions follow: `__has_own(key: i32, obj: i64) -> i32`,
     // then the builtin bodies with the uniform type.
     types
         .ty()
         .function([ValType::I32, ValType::I64], [ValType::I32]);
-    functions.function(next_type + 9);
+    functions.function(next_type + 10);
     for _ in Builtin::ALL {
         functions.function(fn_type);
     }
@@ -274,7 +282,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[], &[ValType::I64]),
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
     ];
-    for (ty, (params, results)) in (next_type + 10..).zip(conversions) {
+    for (ty, (params, results)) in (next_type + 11..).zip(conversions) {
         types
             .ty()
             .function(params.iter().copied(), results.iter().copied());
@@ -316,6 +324,8 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32], &[I32]),
         (&[I32], &[I32]),
         (&[I32], &[I32]),
+        // `__str_exotic_index(o, key) -> i32`.
+        (&[I32, I32], &[I32]),
         // `__to_key(v, insert) -> key`.
         (&[I64, I32], &[I32]),
         // `__prop_find(o, key) -> entry`.

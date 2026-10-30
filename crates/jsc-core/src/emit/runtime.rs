@@ -1,6 +1,15 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Emit each listed instruction in order: `wasm!(function; LocalGet(0), ..)`.
+macro_rules! wasm {
+    ($function:expr; $($op:expr),* $(,)?) => {{
+        #[allow(unused_imports)]
+        use Instruction::*;
+        $( $function.instruction(&$op); )*
+    }};
+}
+
 /// Emit the `__alloc(size: i32) -> i32` bump allocator: return the current
 /// `__heap_ptr`, then advance it by `size` rounded up to [`BLOCK_ALIGN`] (so
 /// every block base stays 8-aligned), growing linear memory on demand, and write
@@ -107,26 +116,147 @@ fn emit_new_block(function: &mut Function, alloc: u32, base: u32, type_byte: i32
     }));
 }
 
-/// Emit the exported `__new_string(len: i32) -> i32` constructor: a
-/// [`TYPE_STRING`] block `[0][0×3][len:u32][len bytes]` whose payload the host
-/// fills. Local 0 is `len`; local 1 the base.
+/// Emit the exported `__new_string(len: i32, two_byte: i32) -> i32`
+/// constructor: a [`TYPE_STRING`] block of `len` code units — Latin-1 bytes,
+/// or UTF-16LE units with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) —
+/// whose data the host fills. Locals 0/1 are the params; local 2 the base.
 pub(super) fn emit_new_string(alloc: u32) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
-    let (len, base) = (0, 1);
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
-    function.instruction(&Instruction::I32Add);
-    emit_new_block(&mut function, alloc, base, TYPE_STRING);
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: STR_LEN_OFFSET,
-        align: 2,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::End);
+    let (len, two_byte, base) = (0, 1, 2);
+    emit_alloc_str(
+        &mut function,
+        alloc,
+        |f| wasm!(f; LocalGet(len)),
+        |f| wasm!(f; LocalGet(two_byte)),
+        base,
+    );
+    wasm!(function; LocalGet(base), End);
     function
+}
+
+/// The `STR_FLAG_TWO_BYTE` bit of a string block's flags byte.
+const TWO_BYTE: i32 = abi::STR_FLAG_TWO_BYTE as i32;
+
+/// A byte [`MemArg`] at `offset`.
+fn mem8(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 0,
+        memory_index: 0,
+    }
+}
+
+/// A 2-byte-aligned `u16` [`MemArg`] at `offset`.
+fn mem16(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 1,
+        memory_index: 0,
+    }
+}
+
+/// The string data offset as a [`MemArg`] offset.
+const DATA: u64 = abi::STR_DATA_OFFSET as u64;
+
+/// `s = __alloc(STR_DATA_OFFSET + (len << w))` as a [`TYPE_STRING`] block of
+/// `len` code units (pushed by `len`), `TWO_BYTE` when `w` (pushes `0`/`1`),
+/// leaving the base in i32 local `s`.
+pub(super) fn emit_alloc_str(
+    function: &mut Function,
+    alloc: u32,
+    len: impl Fn(&mut Function),
+    w: impl Fn(&mut Function),
+    s: u32,
+) {
+    len(function);
+    w(function);
+    wasm!(function; I32Shl, I32Const(STR_DATA_OFFSET), I32Add, Call(alloc), LocalTee(s));
+    wasm!(function; I32Const((TWO_BYTE << 16) | TYPE_STRING), I32Const(TYPE_STRING));
+    w(function);
+    wasm!(function; Select, I32Store(mem32(0)), LocalGet(s));
+    len(function);
+    wasm!(function; I32Store(mem32(STR_LEN_OFFSET)));
+}
+
+/// Push `1` when the string block in i32 local `s` is `TWO_BYTE`, else `0`.
+pub(super) fn emit_str_two_byte(function: &mut Function, s: u32) {
+    wasm!(function;
+        LocalGet(s), I32Load8U(mem8(u64::from(abi::HEADER_FLAGS_OFFSET))),
+        I32Const(TWO_BYTE), I32And, I32Const(0), I32Ne,
+    );
+}
+
+/// Push code unit `i` (i32 local) of the string block in i32 local `s`, read
+/// at the width in i32 local `w` (`0` one-byte, `1` two-byte).
+pub(super) fn emit_str_unit(function: &mut Function, s: u32, i: u32, w: u32) {
+    wasm!(function;
+        LocalGet(w),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(s), LocalGet(i), I32Const(1), I32Shl, I32Add, I32Load16U(mem16(DATA)),
+        Else,
+        LocalGet(s), LocalGet(i), I32Add, I32Load8U(mem8(DATA)),
+        End,
+    );
+}
+
+/// Store the code unit pushed by `unit` as unit `i` (i32 local) of the string
+/// block in i32 local `s` of the width in i32 local `w`.
+pub(super) fn emit_store_unit(
+    function: &mut Function,
+    s: u32,
+    i: u32,
+    w: u32,
+    unit: impl Fn(&mut Function),
+) {
+    wasm!(function;
+        LocalGet(w),
+        If(BlockType::Empty),
+        LocalGet(s), LocalGet(i), I32Const(1), I32Shl, I32Add,
+    );
+    unit(function);
+    wasm!(function; I32Store16(mem16(DATA)), Else, LocalGet(s), LocalGet(i), I32Add);
+    unit(function);
+    wasm!(function; I32Store8(mem8(DATA)), End);
+}
+
+/// [`emit_str_narrow`] the string block in i32 local `s` when the i32 local
+/// `w` (its width) is set.
+pub(super) fn emit_str_canonical(function: &mut Function, w: u32, s: u32, i: u32, n: u32) {
+    wasm!(function; LocalGet(w), If(BlockType::Empty));
+    emit_str_narrow(function, s, i, n);
+    wasm!(function; End);
+}
+
+/// Narrow the `TWO_BYTE` string block in i32 local `s` in place to one-byte
+/// when every code unit is `<= 0xFF` (the canonical form); `i` and `n` are
+/// i32 scratch.
+pub(super) fn emit_str_narrow(function: &mut Function, s: u32, i: u32, n: u32) {
+    let flags = mem8(u64::from(abi::HEADER_FLAGS_OFFSET));
+    wasm!(function;
+        LocalGet(s), I32Load(mem32(STR_LEN_OFFSET)), LocalSet(n),
+        Block(BlockType::Empty),
+        I32Const(0), LocalSet(i),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
+        LocalGet(s), LocalGet(i), I32Const(1), I32Shl, I32Add, I32Load16U(mem16(DATA)),
+        I32Const(0xFF), I32GtU, BrIf(2),
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+        // Every unit fits a byte: unit `i` moves to byte `i` (`i <= 2i`, so
+        // nothing unread is overwritten).
+        I32Const(0), LocalSet(i),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
+        LocalGet(s), LocalGet(i), I32Add,
+        LocalGet(s), LocalGet(i), I32Const(1), I32Shl, I32Add, I32Load16U(mem16(DATA)),
+        I32Store8(mem8(DATA)),
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+        LocalGet(s), LocalGet(s), I32Load8U(flags), I32Const(!TWO_BYTE), I32And, I32Store8(flags),
+        End,
+    );
 }
 
 /// A 4-byte-aligned `u32` [`MemArg`] at `offset`.
@@ -342,319 +472,202 @@ pub(super) fn emit_settler(op: i32, helpers: Helpers<'_>) -> Function {
 
 /// Emit the `__concat(a: i32, b: i32) -> i32` string concatenator.
 ///
-/// `a`/`b` are base offsets of two `[type=0][pad×3][len:u32 LE][utf8]` heap
-/// strings. It reads each length header (at `+STR_LEN_OFFSET`), allocates
-/// `STR_DATA_OFFSET + lenA + lenB` bytes via `__alloc` (at `alloc_index`), writes
-/// the `TYPE_STRING` type byte and the combined length header, copies both UTF-8
-/// payloads (from `+STR_DATA_OFFSET`) into place with `memory.copy`, and returns the
-/// fresh block's base offset. The two `i32` parameters occupy locals 0/1; three
-/// extra `i32` locals hold `lenA`, `lenB`, and `dst`.
+/// An empty operand returns the other one (strings are immutable). Otherwise
+/// it allocates a block of `lenA + lenB` code units, two-byte iff either
+/// operand is (so the result is canonical), and copies both operands' units
+/// into place: `memory.copy` when an operand has the result's width, a
+/// widening unit loop for a one-byte operand of a two-byte result. Params
+/// occupy locals 0/1; extra `i32` locals hold `lenA`, `lenB`, the result
+/// width, `dst`, and the loop index.
 pub(super) fn emit_concat(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(3, ValType::I32)]);
-    let (a, b, len_a, len_b, dst) = (0, 1, 2, 3, 4);
-    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
-    // `+STR_DATA_OFFSET`.
-    let header = MemArg {
-        offset: STR_LEN_OFFSET,
-        align: 2,
-        memory_index: 0,
+    let mut function = Function::new(vec![(5, ValType::I32)]);
+    let (a, b, len_a, len_b, w, dst, i) = (0, 1, 2, 3, 4, 5, 6);
+    wasm!(function; LocalGet(a));
+    emit_load_str_len(&mut function);
+    wasm!(function;
+        LocalTee(len_a), I32Eqz, If(BlockType::Empty), LocalGet(b), Return, End,
+        LocalGet(b),
+    );
+    emit_load_str_len(&mut function);
+    wasm!(function; LocalTee(len_b), I32Eqz, If(BlockType::Empty), LocalGet(a), Return, End);
+    emit_str_two_byte(&mut function, a);
+    emit_str_two_byte(&mut function, b);
+    wasm!(function; I32Or, LocalSet(w));
+    emit_alloc_str(
+        &mut function,
+        alloc_index,
+        |f| wasm!(f; LocalGet(len_a), LocalGet(len_b), I32Add),
+        |f| wasm!(f; LocalGet(w)),
+        dst,
+    );
+    // Copy `len` units of `src` to unit offset `at` (pushed) of `dst`.
+    let copy = |f: &mut Function, src: u32, len: u32, at: &dyn Fn(&mut Function)| {
+        wasm!(f; LocalGet(w));
+        emit_str_two_byte(f, src);
+        wasm!(f; I32Eq, If(BlockType::Empty), LocalGet(dst));
+        at(f);
+        wasm!(f;
+            LocalGet(w), I32Shl, I32Add, I32Const(STR_DATA_OFFSET), I32Add,
+            LocalGet(src), I32Const(STR_DATA_OFFSET), I32Add,
+            LocalGet(len), LocalGet(w), I32Shl,
+            MemoryCopy { src_mem: 0, dst_mem: 0 },
+            Else,
+            // A one-byte operand of a two-byte result: widen each unit.
+            I32Const(0), LocalSet(i),
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
+            LocalGet(dst),
+        );
+        at(f);
+        wasm!(f;
+            LocalGet(i), I32Add, I32Const(1), I32Shl, I32Add,
+            LocalGet(src), LocalGet(i), I32Add, I32Load8U(mem8(DATA)),
+            I32Store16(mem16(DATA)),
+            LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+            Br(0),
+            End, End,
+            End,
+        );
     };
-    let payload = STR_DATA_OFFSET;
-
-    // lenA = load(a + STR_LEN_OFFSET); lenB = load(b + STR_LEN_OFFSET).
-    function.instruction(&Instruction::LocalGet(a));
-    emit_load_str_len(&mut function);
-    function.instruction(&Instruction::LocalSet(len_a));
-    function.instruction(&Instruction::LocalGet(b));
-    emit_load_str_len(&mut function);
-    function.instruction(&Instruction::LocalSet(len_b));
-
-    // dst = __alloc(STR_DATA_OFFSET + lenA + lenB).
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::LocalGet(len_b));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-
-    // Write the TYPE_STRING type byte at dst (offset 0).
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_STRING));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-
-    // Store the combined length (lenA + lenB) as the u32 header at dst+STR_LEN_OFFSET.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::LocalGet(len_b));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(header));
-
-    // Copy lenA bytes from a+payload to dst+payload.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-
-    // Copy lenB bytes from b+payload to dst+payload+lenA.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(len_b));
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-
-    // Return dst.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
+    copy(&mut function, a, len_a, &|f| wasm!(f; I32Const(0)));
+    copy(&mut function, b, len_b, &|f| wasm!(f; LocalGet(len_a)));
+    wasm!(function; LocalGet(dst), End);
     function
 }
 
-/// Emit the `__str_eq(a: i32, b: i32) -> i32` byte-content string comparator.
+/// Emit the `__str_eq(a: i32, b: i32) -> i32` content string comparator.
 ///
-/// `a`/`b` are byte offsets of two `[len:u32 LE][utf8]` heap strings. Returns `1`
-/// when the two payloads are byte-for-byte equal, else `0`: unequal lengths fail
-/// immediately, otherwise the bytes `[a+4..]` and `[b+4..]` are compared one at a
-/// time. Params occupy locals 0/1; two extra `i32` locals hold the shared length
-/// and the loop index.
+/// Returns `1` when the two strings hold the same code units, else `0`: the
+/// same block is equal; differing `TWO_BYTE` flags (canonical strings of
+/// different widths never match) or lengths fail immediately; otherwise the
+/// `len << two_byte` data bytes are compared 8 at a time with `i64.load`,
+/// then the tail byte by byte. Params occupy locals 0/1; extra `i32` locals
+/// hold the data byte count and the byte offset.
 pub(super) fn emit_str_eq() -> Function {
     let mut function = Function::new(vec![(2, ValType::I32)]);
-    let (a, b, len, i) = (0, 1, 2, 3);
-    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
-    // `+STR_DATA_OFFSET`.
-    let header = MemArg {
-        offset: STR_LEN_OFFSET,
-        align: 2,
-        memory_index: 0,
-    };
-    let byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    let payload = STR_DATA_OFFSET;
-
-    // len = load(a + STR_LEN_OFFSET); if len != load(b + STR_LEN_OFFSET) { return 0 }.
-    function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(len));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
-
-    // Compare bytes; `i` starts at 0 (the fresh local's default).
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if i >= len { break -> all bytes matched }.
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // if byte(a + payload + i) != byte(b + payload + i) { return 0 }.
-    function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(byte));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(byte));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
-    // i += 1; continue.
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(i));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
-
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::End);
+    let (a, b, n, p) = (0, 1, 2, 3);
+    let flags = mem8(u64::from(abi::HEADER_FLAGS_OFFSET));
+    wasm!(function;
+        LocalGet(a), LocalGet(b), I32Eq, If(BlockType::Empty), I32Const(1), Return, End,
+        LocalGet(a), I32Load8U(flags), LocalGet(b), I32Load8U(flags), I32Xor,
+        I32Const(TWO_BYTE), I32And,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(a), I32Load(mem32(STR_LEN_OFFSET)), LocalTee(n),
+        LocalGet(b), I32Load(mem32(STR_LEN_OFFSET)), I32Ne,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(n),
+    );
+    emit_str_two_byte(&mut function, a);
+    wasm!(function;
+        I32Shl, LocalSet(n),
+        // Eight bytes at a time; `p` starts at 0.
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(p), I32Const(8), I32Add, LocalGet(n), I32GtU, BrIf(1),
+        LocalGet(a), LocalGet(p), I32Add, I64Load(mem64(DATA)),
+        LocalGet(b), LocalGet(p), I32Add, I64Load(mem64(DATA)),
+        I64Ne, If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(p), I32Const(8), I32Add, LocalSet(p),
+        Br(0),
+        End, End,
+        // The tail.
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(p), LocalGet(n), I32GeU, BrIf(1),
+        LocalGet(a), LocalGet(p), I32Add, I32Load8U(mem8(DATA)),
+        LocalGet(b), LocalGet(p), I32Add, I32Load8U(mem8(DATA)),
+        I32Ne, If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(p), I32Const(1), I32Add, LocalSet(p),
+        Br(0),
+        End, End,
+        I32Const(1),
+        End,
+    );
     function
 }
 
-/// Emit the `__str_cmp(a: i32, b: i32) -> i32` lexicographic byte comparator.
+/// Emit the `__str_cmp(a: i32, b: i32) -> i32` code-unit order comparator.
 ///
-/// Returns `-1` / `0` / `1`: the bytes are compared over `min(lenA, lenB)`, and
-/// the first differing pair decides the sign (unsigned byte order); if the shared
-/// prefix is equal, the shorter string is "less" (sign of `lenA - lenB`). Params
-/// occupy locals 0/1; extra `i32` locals hold `lenA`, `lenB`, `min`, the loop
-/// index, and the two current bytes.
+/// Returns `-1` / `0` / `1`: the code units are compared over
+/// `min(lenA, lenB)`, and the first differing pair decides the sign (unsigned
+/// unit order); if the shared prefix is equal, the shorter string is "less"
+/// (sign of `lenA - lenB`). Two one-byte strings compare bytes; otherwise each
+/// side's units are read at its own width. Params occupy locals 0/1; extra
+/// `i32` locals hold `lenA`, `lenB`, `min`, the loop index, the two current
+/// units, and the two widths.
 pub(super) fn emit_str_cmp() -> Function {
-    let mut function = Function::new(vec![(6, ValType::I32)]);
+    let mut function = Function::new(vec![(8, ValType::I32)]);
     let (a, b, len_a, len_b, min, i) = (0, 1, 2, 3, 4, 5);
-    let (byte_a, byte_b) = (6, 7);
-    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
-    // `+STR_DATA_OFFSET`.
-    let header = MemArg {
-        offset: STR_LEN_OFFSET,
-        align: 2,
-        memory_index: 0,
+    let (unit_a, unit_b, w_a, w_b) = (6, 7, 8, 9);
+    wasm!(function;
+        LocalGet(a), I32Load(mem32(STR_LEN_OFFSET)), LocalSet(len_a),
+        LocalGet(b), I32Load(mem32(STR_LEN_OFFSET)), LocalSet(len_b),
+        LocalGet(len_a), LocalGet(len_b), LocalGet(len_a), LocalGet(len_b), I32LtU, Select,
+        LocalSet(min),
+    );
+    emit_str_two_byte(&mut function, a);
+    wasm!(function; LocalSet(w_a));
+    emit_str_two_byte(&mut function, b);
+    wasm!(function; LocalSet(w_b));
+    // Compare the shared prefix, returning on the first differing pair.
+    let prefix = |f: &mut Function, load: &dyn Fn(&mut Function, u32, u32)| {
+        wasm!(f;
+            I32Const(0), LocalSet(i),
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(i), LocalGet(min), I32GeU, BrIf(1),
+        );
+        load(f, a, w_a);
+        wasm!(f; LocalSet(unit_a));
+        load(f, b, w_b);
+        wasm!(f;
+            LocalTee(unit_b), LocalGet(unit_a), I32Ne,
+            If(BlockType::Empty),
+            I32Const(-1), I32Const(1), LocalGet(unit_a), LocalGet(unit_b), I32LtU, Select, Return,
+            End,
+            LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+            Br(0),
+            End, End,
+        );
     };
-    let byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    let payload = STR_DATA_OFFSET;
-
-    // lenA = load(a + STR_LEN_OFFSET); lenB = load(b + STR_LEN_OFFSET); min = min(..).
-    function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(len_a));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Load(header));
-    function.instruction(&Instruction::LocalSet(len_b));
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::LocalGet(len_b));
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::LocalGet(len_b));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::LocalSet(min));
-
-    // Compare the shared prefix byte by byte; `i` starts at 0.
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if i >= min { break -> prefixes equal }.
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::LocalGet(min));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // byteA = byte(a + payload + i); byteB = byte(b + payload + i).
-    function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(byte));
-    function.instruction(&Instruction::LocalSet(byte_a));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(byte));
-    function.instruction(&Instruction::LocalSet(byte_b));
-    // if byteA != byteB { return byteA < byteB ? -1 : 1 }.
-    function.instruction(&Instruction::LocalGet(byte_a));
-    function.instruction(&Instruction::LocalGet(byte_b));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(-1));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::LocalGet(byte_a));
-    function.instruction(&Instruction::LocalGet(byte_b));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
-    // i += 1; continue.
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(i));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
-
-    // Prefixes equal: sign(lenA - lenB) = (lenA > lenB) - (lenA < lenB).
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::LocalGet(len_b));
-    function.instruction(&Instruction::I32GtU);
-    function.instruction(&Instruction::LocalGet(len_a));
-    function.instruction(&Instruction::LocalGet(len_b));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::End);
+    wasm!(function; LocalGet(w_a), LocalGet(w_b), I32Or, If(BlockType::Empty));
+    prefix(&mut function, &|f, s, w| emit_str_unit(f, s, i, w));
+    wasm!(function; Else);
+    prefix(&mut function, &|f, s, _| {
+        wasm!(f; LocalGet(s), LocalGet(i), I32Add, I32Load8U(mem8(DATA)));
+    });
+    wasm!(function;
+        End,
+        // Prefixes equal: sign(lenA - lenB) = (lenA > lenB) - (lenA < lenB).
+        LocalGet(len_a), LocalGet(len_b), I32GtU,
+        LocalGet(len_a), LocalGet(len_b), I32LtU,
+        I32Sub,
+        End,
+    );
     function
 }
 
-/// Emit the `__str_index(ptr: i32, i: i32) -> i32` one-char string builder.
+/// Emit the `__str_index(ptr: i32, i: i32) -> i32` one-unit string builder.
 ///
-/// `ptr` is the byte offset of a `[len:u32 LE][utf8]` heap string; `i` is a byte
-/// index assumed in bounds (`0 <= i < len`). It reads the byte at `ptr + 4 + i`,
-/// allocates a fresh `4 + 1` byte blob via `__alloc` (at `alloc_index`), writes a
-/// u32 length header of `1`, stores the byte at `dst + 4`, and returns `dst`. The
-/// two `i32` parameters occupy locals 0/1; one extra `i32` local holds `dst`.
+/// `ptr` is a string block; `i` is a code-unit index assumed in bounds
+/// (`0 <= i < len`). It reads unit `i` at the string's width and returns a
+/// fresh one-unit string in canonical form: one-byte when the unit is
+/// `<= 0xFF`, else two-byte. The two `i32` parameters occupy locals 0/1;
+/// extra `i32` locals hold `dst`, the unit, and the width.
 pub(super) fn emit_str_index(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
-    let (ptr, i, dst) = (0, 1, 2);
-    // The u32 length header sits at `+STR_LEN_OFFSET`; the UTF-8 payload at
-    // `+STR_DATA_OFFSET`.
-    let header = MemArg {
-        offset: STR_LEN_OFFSET,
-        align: 2,
-        memory_index: 0,
-    };
-    let byte = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    let payload = STR_DATA_OFFSET;
-
-    // dst = __alloc(STR_DATA_OFFSET + 1).
-    function.instruction(&Instruction::I32Const(payload + 1));
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-
-    // Write the TYPE_STRING type byte at dst (offset 0).
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_STRING));
-    function.instruction(&Instruction::I32Store8(byte));
-
-    // Store the u32 length header (1) at dst + STR_LEN_OFFSET.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Store(header));
-
-    // Store byte(ptr + payload + i) at dst + payload.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(ptr));
-    emit_str_data(&mut function);
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(byte));
-    function.instruction(&Instruction::I32Store8(byte));
-
-    // Return dst.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
+    let mut function = Function::new(vec![(3, ValType::I32)]);
+    let (ptr, i, dst, unit, w) = (0, 1, 2, 3, 4);
+    emit_str_two_byte(&mut function, ptr);
+    wasm!(function; LocalSet(w));
+    emit_str_unit(&mut function, ptr, i, w);
+    wasm!(function; LocalTee(unit), I32Const(0xFF), I32GtU, LocalSet(w));
+    emit_alloc_str(
+        &mut function,
+        alloc_index,
+        |f| wasm!(f; I32Const(1)),
+        |f| wasm!(f; LocalGet(w)),
+        dst,
+    );
+    wasm!(function; I32Const(0), LocalSet(i));
+    emit_store_unit(&mut function, dst, i, w, |f| wasm!(f; LocalGet(unit)));
+    wasm!(function; LocalGet(dst), End);
     function
 }
 
@@ -954,112 +967,59 @@ fn emit_concat_by_index(
     function.instruction(&Instruction::End);
 }
 
-/// A one-byte store [`MemArg`] (`offset 0`, `align 0`) for the JSON string builder.
-fn byte_store() -> MemArg {
-    MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }
-}
-
-/// Emit `store8(dst + payload + o, c); o += 1` — append the constant byte `c` to a
-/// heap-string block being built at `dst`, advancing the write cursor `o`.
-fn json_put_const(function: &mut Function, dst: u32, o: u32, payload: i32, c: i32) {
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(c));
-    function.instruction(&Instruction::I32Store8(byte_store()));
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(o));
-}
-
-/// Emit `store8(dst + payload + o, <local val>); o += 1` — like [`json_put_const`]
-/// but the byte comes from local `val`.
-fn json_put_local(function: &mut Function, dst: u32, o: u32, payload: i32, val: u32) {
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I32Store8(byte_store()));
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(o));
-}
-
 /// Emit the `__json_escape(str_ptr: i32) -> str_base: i32` helper: build a
-/// FRESH heap string that is the JSON-quoted + escaped form of the `[len][utf8]`
-/// string at `str_ptr` — a leading `"`, each source byte emitted verbatim except
-/// `"`/`\` and the whitespace controls (`\b \t \n \f \r`) which become their
-/// two-char backslash escapes and any other byte `< 0x20` which becomes `\u00XX`
-/// (lowercase hex), then a trailing `"`.
+/// FRESH heap string that is the JSON-quoted + escaped form
+/// (`QuoteJSONString`) of the string at `str_ptr` — a leading `"`, each source
+/// code unit emitted verbatim except `"`/`\` and the whitespace controls
+/// (`\b \t \n \f \r`) which become their two-char backslash escapes, and
+/// any other unit `< 0x20` and any lone surrogate which become `\uXXXX`
+/// (lowercase hex; a well-formed surrogate pair is copied verbatim), then a
+/// trailing `"`.
 ///
-/// The output block is bump-allocated at the worst case (`6*len + 2` payload
-/// bytes, the `\u00XX` expansion) in a SINGLE pass; the `len` header is written
-/// back as the actual escaped length `o`, so any surplus tail bytes are harmless
-/// unused heap. Params occupy local 0; six `i32` locals hold `len`, `dst`, the
-/// read index `i`, the write cursor `o`, the current byte `b`, and the two-char
-/// escape char `esc` (`0` when the byte has none).
+/// The output has the source's width and is bump-allocated at the worst case
+/// (`6*len + 2` units, the `\uXXXX` expansion) in a SINGLE pass; the `len`
+/// header is written back as the actual escaped length `o`, so any surplus
+/// tail is harmless unused heap. A two-byte result is then narrowed when
+/// every unit fits a byte (escaped lone surrogates leave only ASCII). Param
+/// occupies local 0; `i32` locals hold `len`, `dst`, the read index `i`, the
+/// write cursor `o`, the current unit `b`, the two-char escape char `esc`
+/// (`0` when the unit has none), and the width `w`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(6, ValType::I32)]);
-    let (str_ptr, len, dst, i, o, b) = (0, 1, 2, 3, 4, 5);
-    let esc = 6;
-    let header = MemArg {
-        offset: STR_LEN_OFFSET,
-        align: 2,
-        memory_index: 0,
+    let mut function = Function::new(vec![(7, ValType::I32)]);
+    let (str_ptr, len, dst, i, o, b, esc, w) = (0, 1, 2, 3, 4, 5, 6, 7);
+    // Append the unit pushed by `unit` at `o`; o += 1.
+    let put = |f: &mut Function, unit: &dyn Fn(&mut Function)| {
+        emit_store_unit(f, dst, o, w, unit);
+        wasm!(f; LocalGet(o), I32Const(1), I32Add, LocalSet(o));
     };
-    let payload = STR_DATA_OFFSET;
+    let put_const = |f: &mut Function, c: u8| put(f, &|f| wasm!(f; I32Const(i32::from(c))));
 
-    // len = load(str_ptr + STR_LEN_OFFSET).
-    function.instruction(&Instruction::LocalGet(str_ptr));
+    wasm!(function; LocalGet(str_ptr));
     emit_load_str_len(&mut function);
-    function.instruction(&Instruction::LocalSet(len));
-    // dst = __alloc(STR_DATA_OFFSET + 6*len + 2); worst-case `\u00XX` expansion
-    // plus the two surrounding quotes.
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(6));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Const(payload + 2));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(dst));
-    // Write the TYPE_STRING type byte at dst (offset 0). `i`/`o` start at 0.
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(TYPE_STRING));
-    function.instruction(&Instruction::I32Store8(byte_store()));
+    wasm!(function; LocalSet(len));
+    emit_str_two_byte(&mut function, str_ptr);
+    wasm!(function; LocalSet(w));
+    emit_alloc_str(
+        &mut function,
+        alloc_index,
+        |f| wasm!(f; LocalGet(len), I32Const(6), I32Mul, I32Const(2), I32Add),
+        |f| wasm!(f; LocalGet(w)),
+        dst,
+    );
+    // Opening quote; `i`/`o` start at 0.
+    put_const(&mut function, b'"');
 
-    // Opening quote.
-    json_put_const(&mut function, dst, o, payload, i32::from(b'"'));
-
-    // Scan the source bytes `0..len`.
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // b = load8u(str_ptr + payload + i).
-    function.instruction(&Instruction::LocalGet(str_ptr));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Load8U(byte_store()));
-    function.instruction(&Instruction::LocalSet(b));
-    // esc = 0, then set it for each two-char escape byte (each byte matches at
+    // Scan the source units `0..len`.
+    wasm!(function;
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
+    );
+    emit_str_unit(&mut function, str_ptr, i, w);
+    // esc = 0, then set it for each two-char escape unit (each unit matches at
     // most one, so independent `if`s do not conflict).
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(esc));
-    for (byte, escchar) in [
+    wasm!(function; LocalSet(b), I32Const(0), LocalSet(esc));
+    for (unit, escchar) in [
         (b'"', b'"'),
         (b'\\', b'\\'),
         (0x08, b'b'),
@@ -1068,90 +1028,76 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
         (0x0c, b'f'),
         (0x0d, b'r'),
     ] {
-        function.instruction(&Instruction::LocalGet(b));
-        function.instruction(&Instruction::I32Const(i32::from(byte)));
-        function.instruction(&Instruction::I32Eq);
-        function.instruction(&Instruction::If(BlockType::Empty));
-        function.instruction(&Instruction::I32Const(i32::from(escchar)));
-        function.instruction(&Instruction::LocalSet(esc));
-        function.instruction(&Instruction::End);
+        wasm!(function;
+            LocalGet(b), I32Const(i32::from(unit)), I32Eq,
+            If(BlockType::Empty), I32Const(i32::from(escchar)), LocalSet(esc), End,
+        );
     }
-    // if esc != 0 { write '\' then esc } else if b < 0x20 { \u00XX } else { b }.
-    function.instruction(&Instruction::LocalGet(esc));
-    function.instruction(&Instruction::If(BlockType::Empty));
-    json_put_const(&mut function, dst, o, payload, i32::from(b'\\'));
-    json_put_local(&mut function, dst, o, payload, esc);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(0x20));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // `\u00` prefix, then the two hex nibbles of `b` (< 0x20, so the high nibble
-    // is 0 or 1).
-    json_put_const(&mut function, dst, o, payload, i32::from(b'\\'));
-    json_put_const(&mut function, dst, o, payload, i32::from(b'u'));
-    json_put_const(&mut function, dst, o, payload, i32::from(b'0'));
-    json_put_const(&mut function, dst, o, payload, i32::from(b'0'));
-    // High nibble digit: '0' + (b >> 4).
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(i32::from(b'0')));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(4));
-    function.instruction(&Instruction::I32ShrU);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store8(byte_store()));
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(o));
-    // Low nibble digit: lo = b & 0xf; digit = lo + (lo < 10 ? '0' : 'a'-10).
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::I32Const(payload));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(0xf));
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::I32Const(i32::from(b'0')));
-    function.instruction(&Instruction::I32Const(i32::from(b'a') - 10));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(0xf));
-    function.instruction(&Instruction::I32And);
-    function.instruction(&Instruction::I32Const(10));
-    function.instruction(&Instruction::I32LtU);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store8(byte_store()));
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(o));
-    function.instruction(&Instruction::Else);
-    // Ordinary byte: copy verbatim.
-    json_put_local(&mut function, dst, o, payload, b);
-    function.instruction(&Instruction::End); // if b < 0x20
-    function.instruction(&Instruction::End); // if esc != 0
-    // i += 1; continue.
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(i));
-    function.instruction(&Instruction::Br(1));
-    function.instruction(&Instruction::End); // if i < len
-    function.instruction(&Instruction::End); // loop
+    // if esc != 0 { '\' esc } else if b is a surrogate { pair verbatim, or
+    // \uXXXX } else if b < 0x20 { \uXXXX } else { b }.
+    wasm!(function; LocalGet(esc), If(BlockType::Empty));
+    put_const(&mut function, b'\\');
+    put(&mut function, &|f| wasm!(f; LocalGet(esc)));
+    wasm!(function;
+        Else,
+        // esc = 1 when `b` is copied verbatim.
+        LocalGet(b), I32Const(0x20), I32GeU, LocalSet(esc),
+        LocalGet(b), I32Const(0xF800), I32And, I32Const(0xD800), I32Eq,
+        If(BlockType::Empty),
+        I32Const(0), LocalSet(esc),
+        // A lead followed by a trail is a well-formed pair.
+        LocalGet(b), I32Const(0xDC00), I32LtU,
+        LocalGet(i), I32Const(1), I32Add, LocalGet(len), I32LtU, I32And,
+        If(BlockType::Empty),
+        LocalGet(i), I32Const(1), I32Add, LocalSet(esc),
+    );
+    emit_str_unit(&mut function, str_ptr, esc, w);
+    wasm!(function;
+        I32Const(0xFC00), I32And, I32Const(0xDC00), I32Eq,
+        If(BlockType::Empty),
+    );
+    // The lead goes out now; the trail is the verbatim unit of this step.
+    put(&mut function, &|f| wasm!(f; LocalGet(b)));
+    wasm!(function; LocalGet(esc), LocalSet(i));
+    emit_str_unit(&mut function, str_ptr, i, w);
+    wasm!(function;
+        LocalSet(b), I32Const(1), LocalSet(esc),
+        Else, I32Const(0), LocalSet(esc),
+        End,
+        End,
+        End,
+        LocalGet(esc),
+        If(BlockType::Empty),
+    );
+    put(&mut function, &|f| wasm!(f; LocalGet(b)));
+    wasm!(function; Else);
+    // `\u` then four lowercase hex digits.
+    put_const(&mut function, b'\\');
+    put_const(&mut function, b'u');
+    for shift in [12, 8, 4, 0] {
+        put(&mut function, &|f| {
+            wasm!(f;
+                LocalGet(b), I32Const(shift), I32ShrU, I32Const(0xf), I32And,
+                I32Const(i32::from(b'0')), I32Const(i32::from(b'a') - 10),
+                LocalGet(b), I32Const(shift), I32ShrU, I32Const(0xf), I32And, I32Const(10), I32LtU,
+                Select, I32Add,
+            );
+        });
+    }
+    wasm!(function;
+        End, // verbatim
+        End, // esc != 0
+        // i += 1; continue.
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+    );
 
     // Closing quote, then write the actual escaped length `o` as the u32 header.
-    json_put_const(&mut function, dst, o, payload, i32::from(b'"'));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::LocalGet(o));
-    function.instruction(&Instruction::I32Store(header));
-    function.instruction(&Instruction::LocalGet(dst));
-    function.instruction(&Instruction::End);
+    put_const(&mut function, b'"');
+    wasm!(function; LocalGet(dst), LocalGet(o), I32Store(mem32(STR_LEN_OFFSET)));
+    emit_str_canonical(&mut function, w, dst, i, b);
+    wasm!(function; LocalGet(dst), End);
     function
 }
 
@@ -1436,64 +1382,85 @@ fn emit_loose_eq_to_primitive(function: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Emit the `__str_to_array(s: i64) -> i64` string-spread helper: build a fresh
-/// `TYPE_ARRAY` whose elements are the source string's characters as one-byte
-/// heap strings (`[..."abc"]` → `["a", "b", "c"]`). The character walk is
-/// byte-indexed (matching for-of / indexing over a string), so multi-byte UTF-8
-/// is split per byte — the same limitation the rest of the string surface has.
-/// `s` is a heap-string jsval; the returned jsval is a boxed heap array. Fixes
-/// the pre-existing garbage-value bug where `[...str]` fell through to
-/// `__array_concat` (which reinterpreted the string's UTF-8 bytes as jsvals).
-pub(super) fn emit_str_to_array(new_array_index: u32, str_index_index: u32) -> Function {
-    let mut function = Function::new(vec![(5, ValType::I32)]);
-    let (s, ptr, len, arr, i, store) = (0, 1, 2, 3, 4, 5);
+/// `TYPE_ARRAY` whose elements are the source string's code points as strings
+/// (`[..."a😀"]` → `["a", "😀"]`), the walk for-of / spread / `Array.from`
+/// share: a lead `D800–DBFF` followed by a trail `DC00–DFFF` yields a
+/// two-unit string, any other unit a one-unit string (`__str_index`; a
+/// one-byte string has no surrogates). `s` is a heap-string jsval; the
+/// returned jsval is a boxed heap array of at most `len` elements.
+pub(super) fn emit_str_to_array(
+    new_array_index: u32,
+    str_index_index: u32,
+    alloc_index: u32,
+) -> Function {
+    let mut function = Function::new(vec![(8, ValType::I32)]);
+    let (s, ptr, len, arr, i, store, k, w, dst) = (0, 1, 2, 3, 4, 5, 6, 7, 8);
+    // Push the code unit at byte offset `at` past unit `i` of a two-byte `ptr`.
+    let unit_at = |f: &mut Function, at: u64| {
+        wasm!(f;
+            LocalGet(ptr), LocalGet(i), I32Const(1), I32Shl, I32Add, I32Load16U(mem16(DATA + at)),
+        );
+    };
 
-    // ptr = wrap(s); len = load_u32(ptr + STR_LEN_OFFSET) (the string's byte length).
-    function.instruction(&Instruction::LocalGet(s));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalTee(ptr));
+    // ptr = wrap(s); len = its code-unit length; arr = __new_array(len);
+    // store = arr.elems.
+    wasm!(function; LocalGet(s), I32WrapI64, LocalTee(ptr));
     emit_load_str_len(&mut function);
-    function.instruction(&Instruction::LocalTee(len));
-    // arr = __new_array(len); store = arr.elems.
-    function.instruction(&Instruction::Call(new_array_index));
-    function.instruction(&Instruction::LocalTee(arr));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
-    function.instruction(&Instruction::LocalSet(store));
-
-    // Fill element k = box(__str_index(ptr, k)) for k in 0..len; `i` starts at 0.
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // address = store + 8*i (element slot at MemArg offset ELEMS_DATA_OFFSET).
-    function.instruction(&Instruction::LocalGet(store));
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(3));
-    function.instruction(&Instruction::I32Shl);
-    function.instruction(&Instruction::I32Add);
-    // value = HEAP_BITS | extend_u(__str_index(ptr, i)).
-    function.instruction(&Instruction::LocalGet(ptr));
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::Call(str_index_index));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::I64Store(mem64(ELEMS_DATA_OFFSET)));
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(i));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-
-    // Rebox the array handle base as a heap jsval.
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(HEAP_BITS));
-    function.instruction(&Instruction::I64Or);
-    function.instruction(&Instruction::End);
+    wasm!(function;
+        LocalTee(len), Call(new_array_index), LocalTee(arr),
+        I32Load(mem32(ARRAY_ELEMS_OFFSET)), LocalSet(store),
+    );
+    emit_str_two_byte(&mut function, ptr);
+    wasm!(function;
+        LocalSet(w),
+        // Element k = the code point at unit i; `i` and `k` start at 0.
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
+        LocalGet(w),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(i), I32Const(1), I32Add, LocalGet(len), I32LtU,
+        If(BlockType::Result(ValType::I32)),
+    );
+    unit_at(&mut function, 0);
+    wasm!(function; I32Const(0xFC00), I32And, I32Const(0xD800), I32Eq);
+    unit_at(&mut function, 2);
+    wasm!(function;
+        I32Const(0xFC00), I32And, I32Const(0xDC00), I32Eq, I32And,
+        Else, I32Const(0), End,
+        Else, I32Const(0), End,
+        If(BlockType::Empty),
+    );
+    // A surrogate pair: a fresh two-unit, two-byte string.
+    emit_alloc_str(
+        &mut function,
+        alloc_index,
+        |f| wasm!(f; I32Const(2)),
+        |f| wasm!(f; I32Const(1)),
+        dst,
+    );
+    wasm!(function;
+        LocalGet(dst),
+        LocalGet(ptr), LocalGet(i), I32Const(1), I32Shl, I32Add,
+        I32Load(MemArg { offset: DATA, align: 1, memory_index: 0 }),
+        I32Store(mem32(DATA)),
+        LocalGet(i), I32Const(2), I32Add, LocalSet(i),
+        Else,
+        LocalGet(ptr), LocalGet(i), Call(str_index_index), LocalSet(dst),
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        End,
+        // store[k] = box(dst); k += 1.
+        LocalGet(store), LocalGet(k), I32Const(3), I32Shl, I32Add,
+        LocalGet(dst), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        I64Store(mem64(ELEMS_DATA_OFFSET)),
+        LocalGet(k), I32Const(1), I32Add, LocalSet(k),
+        Br(0),
+        End, End,
+        // The array holds `k` code points (a pair is one element).
+        LocalGet(arr), LocalGet(k), I32Store(mem32(ARRAY_LEN_OFFSET)),
+        // Rebox the array handle base as a heap jsval.
+        LocalGet(arr), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        End,
+    );
     function
 }
 

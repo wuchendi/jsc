@@ -191,9 +191,10 @@ const CF_VALUE_GLOBAL: u32 = 4;
 const THIS_GLOBAL: u32 = abi::THIS_GLOBAL_INDEX;
 
 /// The `JSON.parse` recursive-descent cursor globals (all i32, appended after
-/// [`THIS_GLOBAL`]): `$__json_data` is the byte offset of the input string's UTF-8
-/// payload (`base + STR_DATA_OFFSET`), `$__json_pos` is the current byte offset
-/// into that payload, and `$__json_len` is the input's byte length. Set once at
+/// [`THIS_GLOBAL`]): `$__json_data` is the byte offset of the input string's
+/// data (`base + STR_DATA_OFFSET`, 8-aligned) with its low bit set for a
+/// `TWO_BYTE` input, `$__json_pos` is the current code-unit index into that
+/// data, and `$__json_len` is the input's code-unit length. Set once at
 /// `__json_parse` entry; the recursive helpers read `$__json_len`/advance
 /// `$__json_pos`. A parse runs synchronously to completion, so no re-entrancy
 /// disturbs them.
@@ -885,9 +886,9 @@ struct Helpers<'a> {
     /// `settle_resolve_slot` is also the user function count.
     settle_resolve_slot: u32,
     settle_reject_slot: u32,
-    /// `__new_string(len: i32) -> i32`: the exported string constructor,
-    /// followed by `__new_array` (`new_string + 1`), `__new_promise`
-    /// (`new_string + 2`), `__has_own` (`new_string + 3`), and the builtin
+    /// `__new_string(len: i32, two_byte: i32) -> i32`: the exported string
+    /// constructor, followed by `__new_array` (`new_string + 1`),
+    /// `__new_promise` (`new_string + 2`), `__has_own` (`new_string + 3`), and the builtin
     /// bodies ([`Self::builtin`]), appended after the settlers so every other
     /// index stays stable.
     new_string: u32,
@@ -916,7 +917,8 @@ struct Helpers<'a> {
     intern: u32,
     /// `__index_value(s) -> i32`: a canonical array-index string's value, else `-1`.
     index_value: u32,
-    /// `__index_string(n) -> s`: a fresh string of the unsigned `n`'s digits.
+    /// `__index_string(n) -> s`: a fresh string of the unsigned `n`'s digits,
+    /// followed by `__str_exotic_index` ([`Self::str_exotic_index`]).
     index_string: u32,
     /// `__to_key(v, insert) -> key`: `ToPropertyKey` of a jsval as an interned key
     /// (`insert` interns a miss; otherwise a miss is `0`).
@@ -1158,6 +1160,12 @@ impl Helpers<'_> {
     /// `__new_string`.
     fn new_array(self) -> u32 {
         self.new_string + 1
+    }
+
+    /// `__str_exotic_index(o, key) -> i32`: the `String` wrapper own index
+    /// `key` names on `o`, else `-1`; right after `__index_string`.
+    fn str_exotic_index(self) -> u32 {
+        self.index_string + 1
     }
 
     /// `__array_reserve(base, need)`: grow the array handle's element store to
@@ -1542,6 +1550,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_intern(helpers));
     code.function(&emit_index_value());
     code.function(&emit_index_string(helpers));
+    code.function(&emit_str_exotic_index(helpers));
     code.function(&emit_to_key(&offsets, helpers));
     code.function(&emit_prop_find(helpers));
     code.function(&emit_define(helpers));
@@ -1587,7 +1596,11 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
     // Map/Set helpers.
     code.function(&emit_loose_eq(helpers));
-    code.function(&emit_str_to_array(helpers.new_array(), helpers.str_index));
+    code.function(&emit_str_to_array(
+        helpers.new_array(),
+        helpers.str_index,
+        helpers.alloc,
+    ));
     // The in-wasm `JSON.parse` family, in the order their indices were assigned.
     code.function(&emit_json_ws());
     code.function(&emit_json_throw(&offsets, helpers));

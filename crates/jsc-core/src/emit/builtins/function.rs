@@ -565,13 +565,10 @@ pub(super) fn emit_to_string(
 ) {
     let target = frame.i64(0);
     let (name, len, i, start) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let c = frame.x32(0);
+    let (c, w) = (frame.x32(0), frame.x32(1));
     let at = |function: &mut Function| {
-        wasm!(function;
-            LocalGet(name), LocalGet(i), I32Add,
-            I32Load8U(MemArg { offset: u64::from(abi::STR_DATA_OFFSET), align: 0, memory_index: 0 }),
-            LocalTee(c),
-        );
+        emit_str_unit(function, name, i, w);
+        wasm!(function; LocalTee(c));
     };
     this_callable(
         function,
@@ -583,6 +580,13 @@ pub(super) fn emit_to_string(
     );
     let get_ = i32::from_le_bytes(*b"get ");
     let set_ = i32::from_le_bytes(*b"set ");
+    // The same prefixes as two-byte units.
+    let wide = |p: &[u8; 4]| i64::from_le_bytes([p[0], 0, p[1], 0, p[2], 0, p[3], 0]);
+    let data = MemArg {
+        offset: u64::from(abi::STR_DATA_OFFSET),
+        align: 0,
+        memory_index: 0,
+    };
     wasm!(function;
         LocalGet(target), I32WrapI64,
         I32Load(MemArg { offset: FUNC_INDEX_OFFSET, align: 2, memory_index: 0 }),
@@ -591,20 +595,29 @@ pub(super) fn emit_to_string(
         LocalTee(name),
         I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }),
         LocalSet(len),
+    );
+    emit_str_two_byte(function, name);
+    wasm!(function;
+        LocalSet(w),
         // An accessor's `get ` / `set ` prefix.
         I32Const(0), LocalSet(start),
         LocalGet(len), I32Const(4), I32GtU,
         If(BlockType::Empty),
-        LocalGet(name),
-        I32Load(MemArg { offset: u64::from(abi::STR_DATA_OFFSET), align: 0, memory_index: 0 }),
+        LocalGet(w),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(name), I64Load(data), LocalTee(target),
+        I64Const(wide(b"get ")), I64Eq, LocalGet(target), I64Const(wide(b"set ")), I64Eq, I32Or,
+        Else,
+        LocalGet(name), I32Load(data),
         LocalTee(c), I32Const(get_), I32Eq, LocalGet(c), I32Const(set_), I32Eq, I32Or,
+        End,
         If(BlockType::Empty), I32Const(4), LocalSet(start), End,
         End,
         LocalGet(start), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
     );
-    // Valid: `$`, `_`, a letter, a non-ASCII byte, or a digit past the start.
+    // Valid: `$`, `_`, a letter, a non-ASCII unit, or a digit past the start.
     at(function);
     wasm!(function;
         I32Const(0x20), I32Or, I32Const(i32::from(b'a')), I32Sub, I32Const(26), I32LtU,

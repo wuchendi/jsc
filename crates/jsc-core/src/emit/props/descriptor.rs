@@ -139,7 +139,8 @@ fn emit_accessor_block(
 /// `__define_own(o: i32, key: i32, desc: i32, value: i64, get: i64, set: i64)
 /// -> i32`: `ValidateAndApplyPropertyDescriptor` (ECMA-262 10.1.6.3) of the
 /// descriptor record `(desc, value, get, set)` on the own property `key` (an
-/// interned key) of the object-family block `o`. Returns [`DEFINE_OK`],
+/// interned key) of the object-family block `o` (a `String` wrapper's index
+/// only validates against its fixed descriptor). Returns [`DEFINE_OK`],
 /// [`DEFINE_REJECT`], or [`DEFINE_NOT_EXTENSIBLE`]; only an array's `length`
 /// may leave an exception pending (its `ToNumber` / `RangeError`, or the
 /// `TypeError` of a shrink stopped by a non-configurable element).
@@ -181,6 +182,31 @@ pub(in crate::emit) fn emit_define_own(strings: &StrOffsets, helpers: Helpers<'_
         wasm!(f; LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(bit), I32And);
     };
 
+    // A String wrapper's index: `IsCompatiblePropertyDescriptor` against its
+    // virtual `{value: s[i], writable: false, enumerable: true,
+    // configurable: false}`; nothing changes.
+    emit_if_str_exotic(&mut f, o, key, i, helpers, |f| {
+        emit_flag(f, desc, accessor_desc);
+        present_true(f, ATTR_CONFIGURABLE);
+        wasm!(f; I32Or);
+        present_true(f, ATTR_WRITABLE);
+        wasm!(f;
+            I32Or,
+            LocalGet(desc), I32Const(DESC_HAS_ENUMERABLE | ATTR_ENUMERABLE), I32And,
+            I32Const(DESC_HAS_ENUMERABLE), I32Eq, I32Or,
+            If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+            LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And,
+            If(BlockType::Empty),
+        );
+        emit_str_exotic_value(f, o, i, helpers);
+        wasm!(f; LocalSet(x));
+        emit_same_value(f, value, x, helpers);
+        wasm!(f;
+            I32Eqz, If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+            End,
+            I32Const(DEFINE_OK), Return,
+        );
+    });
     wasm!(f;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
@@ -569,8 +595,9 @@ pub(in crate::emit) fn emit_to_desc(strings: &StrOffsets, helpers: Helpers<'_>) 
 /// `set`, then `enumerable`, `configurable`; `undefined` when absent. An
 /// array's `length` is non-enumerable, non-configurable, and writable unless
 /// `LENGTH_READONLY`; its store elements (holes are absent) have the default
-/// attributes and its table elements their own; a `LAZY` function is
-/// materialized by the lookup.
+/// attributes and its table elements their own; a `String` wrapper's index is
+/// `{value: s[i], writable: false, enumerable: true, configurable: false}`;
+/// a `LAZY` function is materialized by the lookup.
 pub(in crate::emit) fn emit_own_desc(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
     let (obj, key) = (0, 1);
@@ -580,6 +607,12 @@ pub(in crate::emit) fn emit_own_desc(strings: &StrOffsets, helpers: Helpers<'_>)
         LocalGet(key), I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(obj), I32WrapI64, LocalSet(o),
         Block(BlockType::Empty),
+    );
+    emit_if_str_exotic(&mut f, o, key, i, helpers, |f| {
+        emit_str_exotic_value(f, o, i, helpers);
+        wasm!(f; LocalSet(v), I32Const(ATTR_ENUMERABLE), LocalSet(a), Br(2));
+    });
+    wasm!(f;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
@@ -748,7 +781,8 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>) -> Function {
 /// [`INTEGRITY_NON_EXTENSIBLE`], `IsExtensible(obj)`; otherwise
 /// `TestIntegrityLevel` — the object is not extensible and every own property
 /// is non-configurable (and, [`INTEGRITY_FROZEN`], every own data property
-/// non-writable, an array's `length` included).
+/// non-writable, an array's `length` included). A `String` wrapper's virtual
+/// indices are always frozen.
 pub(in crate::emit) fn emit_test_integrity() -> Function {
     let mut f = Function::new(vec![(5, ValType::I32)]);
     let (obj, level) = (0, 1);
@@ -779,9 +813,9 @@ pub(in crate::emit) fn emit_test_integrity() -> Function {
 }
 
 /// `__own_enum(obj: i64, key: i32) -> i32`: whether the object `obj` has an
-/// own enumerable property `key` (an interned key, `0` = absent): an array's
-/// `length` is not enumerable and its present store elements (holes are
-/// absent) are; any other key — a `SPARSE` or dictionary-mode array's
+/// own enumerable property `key` (an interned key, `0` = absent): a `String`
+/// wrapper's index is enumerable, an array's `length` is not and its present
+/// store elements (holes are absent) are; any other key — a `SPARSE` or dictionary-mode array's
 /// elements included — is its table entry's `E` (a `LAZY` function is
 /// materialized by the lookup).
 pub(in crate::emit) fn emit_own_enum(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
@@ -789,7 +823,18 @@ pub(in crate::emit) fn emit_own_enum(strings: &StrOffsets, helpers: Helpers<'_>)
     let (obj, key, o, i, a) = (0, 1, 2, 3, 4);
     wasm!(f;
         LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
-        LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(obj), I32WrapI64, LocalSet(o),
+    );
+    emit_if_str_exotic(
+        &mut f,
+        o,
+        key,
+        i,
+        helpers,
+        |f| wasm!(f; I32Const(1), Return),
+    );
+    wasm!(f;
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
         If(BlockType::Empty), I32Const(0), Return, End,
