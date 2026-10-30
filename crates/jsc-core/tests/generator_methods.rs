@@ -196,14 +196,6 @@ fn async_functions_and_methods_have_no_prototype() {
 }
 
 #[test]
-fn computed_generator_class_methods_stay_rejected() {
-    assert_compile_error(
-        "const k = 'g'; class C { *[k](){ yield 1; } }",
-        "computed class method names are not supported",
-    );
-}
-
-#[test]
 fn a_line_terminator_after_async_in_a_method_is_a_syntax_error() {
     for src in [
         "({ async\n foo(){} });",

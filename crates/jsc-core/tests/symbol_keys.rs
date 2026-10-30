@@ -243,6 +243,18 @@ fn computed_string_key_names_its_function() {
 }
 
 #[test]
+fn anonymous_class_under_a_computed_key_is_named_by_it() {
+    assert_string("let s = Symbol('c'); ({ [s]: class {} })[s].name", "[c]");
+    assert_string("let k = 'C'; ({ [k]: class {} }).C.name", "C");
+    // A named class keeps its own name; a static `name` member wins.
+    assert_string("({ ['k']: class Own {} }).k.name", "Own");
+    assert_string(
+        "typeof ({ ['k']: class { static name() {} } }).k.name",
+        "function",
+    );
+}
+
+#[test]
 fn computed_key_is_converted_once_before_the_value() {
     assert_string(
         "let log = []; let k = { toString() { log.push('k'); return 'm' } }; \

@@ -152,10 +152,14 @@ pub(super) fn emit_object_node(
 
 /// The `attrs` an entry `(key, value)` is defined with: an accessor value is
 /// an `ACCESSOR` property, a [`PropKey::Fixed`] key is non-writable,
-/// non-enumerable, and non-configurable, a [`PropKey::Hidden`] key is
-/// non-enumerable, and everything else is writable and configurable.
+/// non-enumerable, and non-configurable, a [`PropKey::Hidden`] or
+/// [`PropKey::HiddenComputed`] key is non-enumerable, and everything else is
+/// writable and configurable.
 fn attrs_of(key: &PropKey, value: &IrNode) -> u32 {
-    let enumerable = if matches!(key, PropKey::Hidden(_) | PropKey::Fixed(_)) {
+    let enumerable = if matches!(
+        key,
+        PropKey::Hidden(_) | PropKey::Fixed(_) | PropKey::HiddenComputed(_)
+    ) {
         0
     } else {
         abi::ATTR_ENUMERABLE
@@ -171,7 +175,11 @@ fn attrs_of(key: &PropKey, value: &IrNode) -> u32 {
 
 /// With the target block base already on the stack, push the entry's interned
 /// key (a constant, or `ToPropertyKey` of a computed key), its value, and its
-/// [`attrs_of`], and call `__define`.
+/// [`attrs_of`], and call `__define`. An accessor half (one of its getter /
+/// setter `undefined`, see `push_accessor_half`) is a partial descriptor
+/// instead, applied with `__define_own`: it keeps the other half of an
+/// accessor already defined under the same key (`get [k]() {}` then
+/// `set [k](v) {}`).
 fn emit_define_entry(
     key: &PropKey,
     value: &IrNode,
@@ -184,10 +192,28 @@ fn emit_define_entry(
         PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => {
             function.instruction(&Instruction::I32Const(static_key(strings, name)));
         }
-        PropKey::Computed(expr) => {
+        PropKey::Computed(expr) | PropKey::HiddenComputed(expr) => {
             emit_node(expr, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::Call(helpers.to_key));
+        }
+    }
+    if let IrNode::MakeAccessor { getter, setter } = value {
+        let half = match (getter.as_ref(), setter.as_ref()) {
+            (IrNode::Undefined, _) => DESC_HAS_SET,
+            (_, IrNode::Undefined) => DESC_HAS_GET,
+            _ => 0,
+        };
+        if half != 0 {
+            let attrs = attrs_of(key, value) & (abi::ATTR_ENUMERABLE | abi::ATTR_CONFIGURABLE);
+            let desc = half | DESC_HAS_ENUMERABLE | DESC_HAS_CONFIGURABLE | attrs.cast_signed();
+            function.instruction(&Instruction::I32Const(desc));
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+            emit_node(getter, function, scratch, strings, helpers);
+            emit_node(setter, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.define_own()));
+            function.instruction(&Instruction::Drop);
+            return;
         }
     }
     emit_node(value, function, scratch, strings, helpers);

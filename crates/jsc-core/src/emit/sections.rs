@@ -1319,7 +1319,9 @@ fn collect_entries<'a>(
                     order.push(key.as_str());
                 }
             }
-            PropKey::Computed(key) => collect_node(key, order, seen),
+            PropKey::Computed(key) | PropKey::HiddenComputed(key) => {
+                collect_node(key, order, seen);
+            }
         }
         collect_node(value, order, seen);
     }

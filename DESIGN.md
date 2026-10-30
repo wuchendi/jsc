@@ -1400,6 +1400,18 @@ those of `switch` and loops are not tracked.
   on it; static methods, accessors, and fields are own properties of `C`.
   Methods may be generator, `async` or async generator methods (§7.8); `this`
   and `super.x` work in their bodies across suspensions.
+- **Computed member names.** `[expr]` names a method, accessor, or field
+  (static or not). Every computed key is evaluated and converted
+  (`ToPropertyKey`) once, in source order, at class definition — right after
+  the heritage, before any field initializer runs; instance fields reuse the
+  converted keys on each construction. The function `name` is set at run
+  time from the key (`"[desc]"` for a symbol, `"get "` / `"set "` prefixed for
+  accessors), as for an anonymous function or class value under a computed
+  key (`{[k]: class {}}` too). A computed accessor half is a partial
+  descriptor (`__define_own`), so `get [k]()` / `set [k](v)` share one
+  property. A computed `"constructor"` is an ordinary method; a computed
+  static `"prototype"` throws a `TypeError` (the literal forms stay early
+  errors).
   Calling `C` without `new` throws `TypeError: Class constructor C cannot be
   invoked without 'new'`.
 - **Fields.** Instance fields (`f = init`, or `f;` for `undefined`) are
@@ -1610,7 +1622,7 @@ is recovered with `downcast_ref`.
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
 supported`, `with statements are not supported`, `private class fields are not
-supported`, `class static blocks are not supported`, `computed class method names are not supported`,
+supported`, `class static blocks are not supported`,
 `async generator functions are unsupported`, `a label may only be applied to a loop`,
 `destructuring assignment is only supported as an expression statement`.
 
