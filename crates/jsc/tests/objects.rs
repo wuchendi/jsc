@@ -632,6 +632,55 @@ fn object_literal_accessors() {
     );
 }
 
+/// Each object-literal member replaces the property in order: an accessor
+/// half merges with the other half only when no same-key data member sits in
+/// between.
+#[test]
+fn object_literal_accessor_halves_across_data_member_via_eval() {
+    let desc = "let f = (o) => { let d = Object.getOwnPropertyDescriptor(o, 'a'); \
+                return 'value' in d ? 'data:' + d.value : typeof d.get + ',' + typeof d.set }; ";
+    // A data member between the halves: the setter alone survives.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ get a() {{ return 1 }}, a: 2, set a(v) {{}} }}))")
+        ]),
+        "undefined,function"
+    );
+    // Adjacent halves still form one accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ get a() {{ return 1 }}, set a(v) {{}} }}))")
+        ]),
+        "function,function"
+    );
+    // A later data member replaces the accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ get a() {{ return 1 }}, a: 1 }}))")
+        ]),
+        "data:1"
+    );
+    // A later getter replaces the data member, without a setter.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ a: 1, get a() {{ return 3 }} }}))")
+        ]),
+        "function,undefined"
+    );
+    // A data method between the halves counts as a data member too.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ set a(v) {{}}, a() {{}}, get a() {{ return 1 }} }}))")
+        ]),
+        "function,undefined"
+    );
+}
+
 /// The prototype and own-key `Object` statics run end to end through the
 /// built binary.
 #[test]

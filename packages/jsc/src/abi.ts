@@ -72,6 +72,8 @@ export const CLASS_NUMBER = 4
 export const CLASS_STRING = 5
 /** `TYPE_OBJECT` `class` byte of a Symbol wrapper object. */
 export const CLASS_SYMBOL = 7
+/** `TYPE_OBJECT` `class` byte of a builtin iterator object (Array, String, Map or Set iterator). */
+export const CLASS_ITERATOR = 8
 /** Offset of a wrapper object's `[[PrimitiveValue]]` jsval. */
 export const WRAPPER_VALUE_OFFSET = 16
 /** String `flags` bit: the content is a canonical array index. */
