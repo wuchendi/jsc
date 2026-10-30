@@ -1295,3 +1295,39 @@ fn yield_star_does_not_read_the_delegate_value_in_a_sync_generator() {
         "0\n1 1\n2 3\n",
     );
 }
+
+#[test]
+fn resuming_inside_a_try_in_a_for_of_continues_after_the_try() {
+    // Falling out of a `try` without its own `finally` must not run the
+    // enclosing for-of's close-the-iterator `finally` (which ends the loop).
+    for (try_stmt, expected) in [
+        (
+            "try { throw 1 } catch (e) { r.push('c'); yield; r.push('j') }",
+            "c,j,k,c,j,k,l\n",
+        ),
+        (
+            "try { r.push('t'); yield; r.push('j') } catch (e) {}",
+            "t,j,k,t,j,k,l\n",
+        ),
+        (
+            "try { throw 1 } catch (e) { r.push('c'); yield* [0]; r.push('j') }",
+            "c,j,k,c,j,k,l\n",
+        ),
+        (
+            "try { r.push('t'); yield* [0]; r.push('j') } catch (e) {}",
+            "t,j,k,t,j,k,l\n",
+        ),
+    ] {
+        assert_output(
+            &format!(
+                "const r = [];
+                 const g = (function* () {{
+                   for (var x of [1, 2]) {{ {try_stmt} r.push('k') }}
+                   r.push('l')
+                 }})();
+                 g.next(); g.next(); g.next(); console.log(r.join())"
+            ),
+            expected,
+        );
+    }
+}
