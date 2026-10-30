@@ -186,8 +186,8 @@ fn unknown_method_in_function_free_program_throws_typeerror() {
     // one is a runtime TypeError even when the program declares no function (no
     // funcref table), never a compile-time rejection or invalid wasm.
     assert_uncaught(
-        "let m = new Map(); m.entries()",
-        "TypeError: m.entries is not a function",
+        "let m = new Map(); m.zzz()",
+        "TypeError: m.zzz is not a function",
     );
     assert_uncaught(
         "let o = { a: 1 }; o = { b: 2 }; o.zzz()",

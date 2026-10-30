@@ -504,10 +504,10 @@ fn clear_during_iteration_then_set_visits_the_new_entry() {
          s.forEach(v => { seen.push(v); if (v === 1) { s.clear(); s.add(5) } }); seen.join()",
         "1,5",
     );
-    both_string(
+    both_number(
         "const s = new Set([1, 2]); const it = s.values(); it.next(); \
          s.clear(); s.add(3); it.next().value",
-        "3",
+        3.0,
     );
 }
 
