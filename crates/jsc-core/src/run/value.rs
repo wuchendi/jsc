@@ -3,9 +3,9 @@
 
 use super::{
     ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
-    HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
-    PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
-    TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
+    MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, QNAN, STR_DATA_OFFSET, STR_LEN_OFFSET, TYPE_ARRAY, TYPE_DATE,
+    TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -298,17 +298,18 @@ fn decode_size(ptr: usize, memory: &[u8]) -> usize {
 }
 
 /// Resolve a heap string block at base `ptr` into a [`Value::Str`] by reading
-/// `[len:u32 LE][utf8]` at `ptr + HEADER_SIZE` in `memory`.
+/// the `len: u32 LE` at `ptr + STR_LEN_OFFSET` and the UTF-8 data at
+/// `ptr + STR_DATA_OFFSET` in `memory`.
 ///
 /// Defensive: any out-of-range slice yields an empty string and invalid UTF-8 is
 /// replaced lossily, so a malformed pointer never panics (decode stays total).
 fn decode_string(ptr: usize, memory: &[u8]) -> Value {
-    let len_at = ptr + HEADER_SIZE;
+    let len_at = ptr + STR_LEN_OFFSET;
     let Some(len_bytes) = memory.get(len_at..len_at + 4) else {
         return Value::Str(String::new());
     };
     let len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
-    let start = len_at + 4;
+    let start = ptr + STR_DATA_OFFSET;
     let Some(str_bytes) = memory.get(start..start + len) else {
         return Value::Str(String::new());
     };

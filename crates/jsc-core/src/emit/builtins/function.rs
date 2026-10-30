@@ -74,7 +74,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
 pub(super) fn emit_throw_type_error(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     throw_type_error(function, frame, RESTRICTED_PROPERTY, strings, helpers);
@@ -87,7 +87,7 @@ fn this_callable(
     frame: Frame,
     target: u32,
     text: CalleeErrorText<'_>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(target));
@@ -129,7 +129,7 @@ fn call_with_array(
 pub(super) fn emit_call(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, this) = (frame.i64(0), frame.i64(1));
@@ -192,7 +192,7 @@ pub(super) fn emit_call(
 pub(super) fn emit_apply(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, this, list, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -265,7 +265,7 @@ pub(super) fn emit_apply(
 pub(super) fn emit_method_call(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (recv, method, msg, stack) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -378,7 +378,7 @@ fn store_args(
 pub(super) fn emit_bind(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, v, tmp) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -485,7 +485,7 @@ fn bound_construct(frame: Frame) -> IrNode {
 pub(super) fn emit_bound_call(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, this, args, nt) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -560,7 +560,7 @@ pub(super) fn emit_bound_call(
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let target = frame.i64(0);
@@ -569,7 +569,7 @@ pub(super) fn emit_to_string(
     let at = |function: &mut Function| {
         wasm!(function;
             LocalGet(name), LocalGet(i), I32Add,
-            I32Load8U(MemArg { offset: u64::from(abi::HEADER_SIZE) + 4, align: 0, memory_index: 0 }),
+            I32Load8U(MemArg { offset: u64::from(abi::STR_DATA_OFFSET), align: 0, memory_index: 0 }),
             LocalTee(c),
         );
     };
@@ -589,14 +589,14 @@ pub(super) fn emit_to_string(
         I32Const(abi::FN_INFO_ENTRY_SIZE.cast_signed()), I32Mul, I32Const(helpers.fn_info), I32Add,
         I32Load(MemArg { offset: u64::from(abi::FN_INFO_NAME_OFFSET), align: 2, memory_index: 0 }),
         LocalTee(name),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE), align: 2, memory_index: 0 }),
+        I32Load(MemArg { offset: u64::from(abi::STR_LEN_OFFSET), align: 2, memory_index: 0 }),
         LocalSet(len),
         // An accessor's `get ` / `set ` prefix.
         I32Const(0), LocalSet(start),
         LocalGet(len), I32Const(4), I32GtU,
         If(BlockType::Empty),
         LocalGet(name),
-        I32Load(MemArg { offset: u64::from(abi::HEADER_SIZE) + 4, align: 0, memory_index: 0 }),
+        I32Load(MemArg { offset: u64::from(abi::STR_DATA_OFFSET), align: 0, memory_index: 0 }),
         LocalTee(c), I32Const(get_), I32Eq, LocalGet(c), I32Const(set_), I32Eq, I32Or,
         If(BlockType::Empty), I32Const(4), LocalSet(start), End,
         End,

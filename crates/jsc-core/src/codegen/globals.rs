@@ -342,8 +342,9 @@ impl Visit for Scan {
     }
 
     fn visit_str(&mut self, s: &Str) {
-        if let Some(s) = s.value.as_str() {
-            self.name(s);
+        let text = super::lit_str(s);
+        if PROTOTYPE_REACHING.iter().any(|name| text == *name) {
+            self.facts.reaches_prototypes = true;
         }
     }
 

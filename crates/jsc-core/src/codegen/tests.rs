@@ -48,7 +48,58 @@ fn lowers_string_literal() {
     // A string literal lowers to `IrNode::Str` carrying the decoded text.
     assert_eq!(
         lower_expr("\"foo\"").expect("should lower"),
-        IrNode::Str("foo".to_owned())
+        IrNode::Str("foo".into())
+    );
+}
+
+/// The code units of a lowered single string-literal expression.
+fn literal_units(src: &str) -> Vec<u16> {
+    match lower_expr(src).expect("should lower") {
+        IrNode::Str(text) => text.as_units().to_vec(),
+        other => unreachable!("expected a string literal, got {other:?}"),
+    }
+}
+
+#[test]
+fn lone_surrogate_literal_is_lossless() {
+    // A lone surrogate keeps its own unit (not U+FFFD).
+    assert_eq!(literal_units(r#""\uD800""#), [0xD800]);
+    assert_eq!(literal_units(r#""a\uDBFFb""#), [0x61, 0xDBFF, 0x62]);
+}
+
+#[test]
+fn non_ascii_literals_lower_to_code_units() {
+    // `é` is one unit; an astral code point is its surrogate pair.
+    assert_eq!(literal_units(r#""é""#), [0x00E9]);
+    assert_eq!(literal_units(r#""é""#), [0x00E9]);
+    assert_eq!(literal_units(r#""\u{1F600}""#), [0xD83D, 0xDE00]);
+    // An escaped pair joins into the same two units.
+    assert_eq!(literal_units(r#""😀""#), [0xD83D, 0xDE00]);
+}
+
+#[test]
+fn template_cooked_lone_surrogate_is_lossless() {
+    assert_eq!(literal_units(r"`\uD800`"), [0xD800]);
+    // With a substitution, the trailing quasi keeps its lone surrogate too
+    // (`JsStr`'s `Debug` spells a lone surrogate `\u{dc00}`).
+    let node = lower_expr(r"`a${1}\uDC00`").expect("should lower");
+    let shown = format!("{node:?}");
+    assert!(shown.contains(r#""\u{dc00}""#), "{shown}");
+    assert!(!shown.contains('\u{FFFD}'), "{shown}");
+}
+
+#[test]
+fn lone_surrogate_property_key_is_lossless() {
+    let program = lower_src(r#"let o = {"\uD800": 1}; o"#).expect("should lower");
+    let IrStmt::Decl { init, .. } = &program.stmts[0] else {
+        unreachable!("expected a declaration");
+    };
+    let IrNode::Object { entries, .. } = init else {
+        unreachable!("expected an object literal");
+    };
+    assert_eq!(
+        entries[0].0,
+        PropKey::Static([0xD800].into_iter().collect())
     );
 }
 
@@ -142,8 +193,8 @@ fn lowers_object_literal() {
         *init,
         IrNode::Object {
             entries: vec![
-                (PropKey::Static("a".to_owned()), IrNode::Num(1.0)),
-                (PropKey::Static("b".to_owned()), IrNode::Num(2.0)),
+                (PropKey::Static("a".into()), IrNode::Num(1.0)),
+                (PropKey::Static("b".into()), IrNode::Num(2.0)),
             ],
             proto: None,
             class: crate::abi::CLASS_ORDINARY,
@@ -164,7 +215,7 @@ fn lowers_computed_and_numeric_literal_keys() {
         unreachable!("expected an object literal");
     };
     assert!(matches!(entries[0].0, PropKey::Computed(IrNode::Local(_))));
-    assert_eq!(entries[1].0, PropKey::Static("b".to_owned()));
+    assert_eq!(entries[1].0, PropKey::Static("b".into()));
     assert_eq!(entries[2].0, PropKey::Computed(IrNode::Num(1.0)));
 }
 
@@ -178,13 +229,10 @@ fn lowers_error_constructor_to_object() {
         program.stmts[0],
         IrStmt::Expr(IrNode::Object {
             entries: vec![
+                (PropKey::Hidden("message".into()), IrNode::Str("bad".into())),
                 (
-                    PropKey::Hidden("message".to_owned()),
-                    IrNode::Str("bad".to_owned())
-                ),
-                (
-                    PropKey::Hidden("stack".to_owned()),
-                    IrNode::Str("TypeError: bad".to_owned())
+                    PropKey::Hidden("stack".into()),
+                    IrNode::Str("TypeError: bad".into())
                 ),
             ],
             proto: Some(Box::new(IrNode::ErrorProto(ErrorKind::TypeError))),
@@ -211,7 +259,7 @@ fn lowers_error_dynamic_message_once() {
         if matches!(&**lhs, IrNode::Assign { .. }) && **rhs == IrNode::Undefined));
     assert_eq!(
         **then_branch,
-        IrNode::error_object(ErrorKind::Error, None, IrNode::Str("Error".to_owned()))
+        IrNode::error_object(ErrorKind::Error, None, IrNode::Str("Error".into()))
     );
     let IrNode::Object { entries, .. } = &**else_branch else {
         unreachable!("expected the error object");
@@ -231,7 +279,7 @@ fn lowers_error_no_arg_to_inherited_message() {
             IrStmt::Expr(IrNode::error_object(
                 ErrorKind::Error,
                 None,
-                IrNode::Str("Error".to_owned()),
+                IrNode::Str("Error".into()),
             )),
             "for `{src}`"
         );
@@ -253,7 +301,7 @@ fn lowers_static_property_read_as_index() {
         program.stmts[1],
         IrStmt::Expr(IrNode::Index {
             obj: Box::new(IrNode::Local(0)),
-            index: Box::new(IrNode::Str("a".to_owned())),
+            index: Box::new(IrNode::Str("a".into())),
         })
     );
 }
@@ -266,7 +314,7 @@ fn lowers_static_property_assignment_as_indexset() {
         program.stmts[1],
         IrStmt::Expr(IrNode::IndexSet {
             obj: Box::new(IrNode::Local(0)),
-            index: Box::new(IrNode::Str("a".to_owned())),
+            index: Box::new(IrNode::Str("a".into())),
             value: Box::new(IrNode::Num(7.0)),
         })
     );
@@ -281,7 +329,7 @@ fn lowers_length_assignment_as_indexset() {
         program.stmts[1],
         IrStmt::Expr(IrNode::IndexSet {
             obj: Box::new(IrNode::Local(0)),
-            index: Box::new(IrNode::Str("length".to_owned())),
+            index: Box::new(IrNode::Str("length".into())),
             value: Box::new(IrNode::Num(5.0)),
         })
     );
@@ -477,7 +525,7 @@ fn lowers_static_property_compound_assignment_as_indexopset() {
         program.stmts[1],
         IrStmt::Expr(IrNode::IndexOpSet {
             obj: Box::new(IrNode::Local(0)),
-            index: Box::new(IrNode::Str("x".to_owned())),
+            index: Box::new(IrNode::Str("x".into())),
             op: BinOp::Sub,
             rhs: Box::new(IrNode::Num(1.0)),
             obj_local: 1,
@@ -498,7 +546,7 @@ fn lowers_length_compound_assignment_and_update() {
         let program = lower_src(src).expect("should lower");
         assert!(
             matches!(&program.stmts[1], IrStmt::Expr(IrNode::IndexOpSet { index, .. })
-                if **index == IrNode::Str("length".to_owned())),
+                if **index == IrNode::Str("length".into())),
             "`{src}` should lower to an IndexOpSet on `length`"
         );
     }

@@ -453,10 +453,10 @@ impl LowerCtx<'_> {
                     cond: Box::new(IrNode::Binary {
                         op: BinOp::Eq,
                         lhs: Box::new(IrNode::Local(local)),
-                        rhs: Box::new(IrNode::Str("prototype".to_owned())),
+                        rhs: Box::new(IrNode::Str("prototype".into())),
                     }),
                     then_branch: Box::new(IrNode::Throw(Box::new(type_error(IrNode::Str(
-                        "Classes may not have a static property named 'prototype'".to_owned(),
+                        "Classes may not have a static property named 'prototype'".into(),
                     ))))),
                     else_branch: Box::new(IrNode::Undefined),
                 });
@@ -547,14 +547,14 @@ impl LowerCtx<'_> {
         // collapses to one accessor property.
         let (class_local, class_id) = self.hidden_local();
         let mut proto_entries = vec![(
-            PropKey::Hidden("constructor".to_owned()),
+            PropKey::Hidden("constructor".into()),
             IrNode::Local(class_local),
         )];
         for (i, m) in methods {
             self.lower_class_method(m, keys[i].map(|k| k.0), &mut proto_entries)?;
         }
         let mut class_entries = vec![(
-            PropKey::Fixed("prototype".to_owned()),
+            PropKey::Fixed("prototype".into()),
             IrNode::Object {
                 entries: proto_entries,
                 proto: heritage.map(|h| Box::new(IrNode::Local(h.2))),
@@ -607,7 +607,7 @@ impl LowerCtx<'_> {
             } else {
                 let key = prop_key_name(&p.key)?;
                 let value = match &p.value {
-                    Some(init) => self.lower_named_expr(init, &key)?,
+                    Some(init) => self.lower_key_named_expr(init, &key, p.key.span())?,
                     None => IrNode::Undefined,
                 };
                 (PropKey::Static(key), value)
@@ -639,8 +639,9 @@ impl LowerCtx<'_> {
         let (key, name) = if let Some(local) = computed {
             (PropKey::HiddenComputed(IrNode::Local(local)), String::new())
         } else {
-            let name = prop_key_name(&m.key)?;
-            (PropKey::Hidden(name.clone()), name)
+            let key = prop_key_name(&m.key)?;
+            let name = key_fn_name(&key, m.key.span())?;
+            (PropKey::Hidden(key), name)
         };
         let (accessor, prefix) = match m.kind {
             MethodKind::Getter => (Some(true), "get "),
@@ -703,7 +704,7 @@ impl LowerCtx<'_> {
                     }),
                     then_branch: Box::new(self.derived_this(fi)),
                     else_branch: Box::new(IrNode::Throw(Box::new(type_error(IrNode::Str(
-                        "Derived constructors may only return object or undefined".to_owned(),
+                        "Derived constructors may only return object or undefined".into(),
                     ))))),
                 }),
             },
@@ -777,7 +778,7 @@ impl LowerCtx<'_> {
                     }));
                 }
                 // The statically-known destructured keys, excluded from a rest.
-                let mut bound_keys: Vec<String> = Vec::new();
+                let mut bound_keys: Vec<JsStr> = Vec::new();
                 for prop in &obj.props {
                     match prop {
                         // `{key: pat}` (or renamed `{key: name}`): read `temp.key`
@@ -795,7 +796,7 @@ impl LowerCtx<'_> {
                         // Shorthand `{x}` or shorthand-with-default `{z = 7}`: the
                         // key IS the bound name; a default fills an `undefined` read.
                         ObjectPatProp::Assign(assign) => {
-                            let key = assign.key.id.sym.as_ref().to_owned();
+                            let key = JsStr::from(assign.key.id.sym.as_ref());
                             bound_keys.push(key.clone());
                             let read = || IrNode::Index {
                                 obj: Box::new(IrNode::Local(temp)),
@@ -1106,11 +1107,11 @@ impl LowerCtx<'_> {
         temp: u32,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let read = |key: &str| IrNode::Index {
+        let read = |key: &JsStr| IrNode::Index {
             obj: Box::new(IrNode::Local(temp)),
-            index: Box::new(IrNode::Str(key.to_owned())),
+            index: Box::new(IrNode::Str(key.clone())),
         };
-        let mut bound_keys: Vec<String> = Vec::new();
+        let mut bound_keys: Vec<JsStr> = Vec::new();
         for prop in &obj.props {
             match prop {
                 ObjectPatProp::KeyValue(kv) => {
@@ -1121,7 +1122,7 @@ impl LowerCtx<'_> {
                 }
                 // Shorthand `{x}` / `{x = 7}` assigns the binding named by the key.
                 ObjectPatProp::Assign(assign) => {
-                    let key = assign.key.id.sym.as_ref().to_owned();
+                    let key = JsStr::from(assign.key.id.sym.as_ref());
                     let target = self.assignable_binding(&assign.key.id)?;
                     let value = self.apply_default(read(&key), assign.value.as_deref(), out)?;
                     bound_keys.push(key);
@@ -1232,7 +1233,7 @@ impl LowerCtx<'_> {
                         out.push(IrStmt::Decl { local: key, init });
                         IrNode::Local(key)
                     }
-                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
                     MemberProp::PrivateName(_) => {
                         return Err(CompileError::spanned(
                             m.span(),
@@ -1825,7 +1826,7 @@ impl LowerCtx<'_> {
         };
         let member = |r: u32, key: &str| IrNode::Index {
             obj: Box::new(IrNode::Local(r)),
-            index: Box::new(IrNode::Str(key.to_owned())),
+            index: Box::new(IrNode::Str(key.into())),
         };
         let mut out = Vec::new();
         let r_local = self.fresh();
@@ -2082,10 +2083,10 @@ fn non_enumerable_literal(expr: &Expr) -> bool {
 /// identifier and string-literal keys are supported (mirroring the object-literal
 /// keys in [`LowerCtx::lower_object`]); a computed or numeric key is a spanned
 /// error.
-pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<String> {
+pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<JsStr> {
     match key {
-        PropName::Ident(id) => Ok(id.sym.as_ref().to_owned()),
-        PropName::Str(s) => Ok(s.value.to_string_lossy().into_owned()),
+        PropName::Ident(id) => Ok(id.sym.as_ref().into()),
+        PropName::Str(s) => Ok(lit_str(s)),
         _ => Err(CompileError::spanned(
             key.span(),
             "unsupported object-pattern key: only identifier and string keys are supported \
@@ -2153,9 +2154,9 @@ fn check_member_name(key: &PropName, is_static: bool, field: bool) -> anyhow::Re
             if id.sym.starts_with(['\u{200c}', '\u{200d}']) {
                 return Err(CompileError::spanned(key.span(), "invalid identifier start").into());
             }
-            id.sym.as_ref().to_owned()
+            id.sym.as_ref().into()
         }
-        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
+        PropName::Str(s) => lit_str(s),
         _ => return Ok(()),
     };
     let msg = if is_static && name == "prototype" {
@@ -2218,7 +2219,7 @@ fn default_derived_ctor() -> (Pat, Vec<Stmt>) {
 /// statements and expressions but does NOT descend into nested `function`/arrow
 /// bodies: a nested `function` rebinds `this`, and an arrow-captured `this.f = ..`
 /// running later is a documented gap.
-fn collect_instance_fields(stmts: &[Stmt]) -> Vec<String> {
+fn collect_instance_fields(stmts: &[Stmt]) -> Vec<JsStr> {
     let mut fields = Vec::new();
     for stmt in stmts {
         collect_fields_stmt(stmt, &mut fields);
@@ -2227,7 +2228,7 @@ fn collect_instance_fields(stmts: &[Stmt]) -> Vec<String> {
 }
 
 /// Record a `this.<name> = ..` assignment target's field name (deduplicated).
-fn record_this_field(target: &AssignTarget, fields: &mut Vec<String>) {
+fn record_this_field(target: &AssignTarget, fields: &mut Vec<JsStr>) {
     let AssignTarget::Simple(SimpleAssignTarget::Member(m)) = target else {
         return;
     };
@@ -2235,9 +2236,9 @@ fn record_this_field(target: &AssignTarget, fields: &mut Vec<String>) {
         return;
     }
     let name = match &m.prop {
-        MemberProp::Ident(id) => Some(id.sym.as_ref().to_owned()),
+        MemberProp::Ident(id) => Some(JsStr::from(id.sym.as_ref())),
         MemberProp::Computed(c) => match c.expr.as_ref() {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+            Expr::Lit(Lit::Str(s)) => Some(lit_str(s)),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
@@ -2252,7 +2253,7 @@ fn record_this_field(target: &AssignTarget, fields: &mut Vec<String>) {
 /// Walk a statement for `this.<name> = ..` field assignments (see
 /// [`collect_instance_fields`]); recurses through control flow but not into
 /// nested function/arrow bodies.
-fn collect_fields_stmt(stmt: &Stmt, fields: &mut Vec<String>) {
+fn collect_fields_stmt(stmt: &Stmt, fields: &mut Vec<JsStr>) {
     match stmt {
         Stmt::Expr(e) => collect_fields_expr(&e.expr, fields),
         Stmt::Decl(Decl::Var(v)) => {
@@ -2347,7 +2348,7 @@ fn collect_fields_stmt(stmt: &Stmt, fields: &mut Vec<String>) {
 /// Walk an expression for `this.<name> = ..` field assignments (see
 /// [`collect_instance_fields`]); does not descend into nested function/arrow
 /// bodies (those rebind or merely capture `this`).
-fn collect_fields_expr(expr: &Expr, fields: &mut Vec<String>) {
+fn collect_fields_expr(expr: &Expr, fields: &mut Vec<JsStr>) {
     match expr {
         Expr::Assign(a) => {
             record_this_field(&a.left, fields);

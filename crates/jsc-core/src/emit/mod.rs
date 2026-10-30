@@ -36,7 +36,7 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
+    JsStr, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
     SpreadCallee, SpreadElem,
 };
 
@@ -192,7 +192,7 @@ const THIS_GLOBAL: u32 = abi::THIS_GLOBAL_INDEX;
 
 /// The `JSON.parse` recursive-descent cursor globals (all i32, appended after
 /// [`THIS_GLOBAL`]): `$__json_data` is the byte offset of the input string's UTF-8
-/// payload (`base + HEADER_SIZE + 4`), `$__json_pos` is the current byte offset
+/// payload (`base + STR_DATA_OFFSET`), `$__json_pos` is the current byte offset
 /// into that payload, and `$__json_len` is the input's byte length. Set once at
 /// `__json_parse` entry; the recursive helpers read `$__json_len`/advance
 /// `$__json_pos`. A parse runs synchronously to completion, so no re-entrancy
@@ -286,6 +286,10 @@ const ABI_TRAILING_PARAMS: u32 = abi::ABI_TRAILING_PARAMS;
 /// Type byte for a heap string block: `[type=0][pad×3][len:u32][utf8]` (payload
 /// after the [`HEADER_SIZE`] header). Maps to `typeof` "string".
 const TYPE_STRING: i32 = abi::TYPE_STRING as i32;
+/// String block field offsets: the u32 `len` (a load/store `MemArg` offset) and
+/// the UTF-8 data (an `i32` addend). See [`abi::STR_LEN_OFFSET`].
+const STR_LEN_OFFSET: u64 = abi::STR_LEN_OFFSET as u64;
+const STR_DATA_OFFSET: i32 = abi::STR_DATA_OFFSET.cast_signed();
 
 /// Type byte, field offsets, and size of an array handle (`length` and the
 /// base of its element store). Maps to `typeof` "object". See
@@ -459,8 +463,8 @@ const INSTANCEOF_NON_OBJECT_PROTOTYPE: CalleeErrorText<'static> = [
 fn callee_type_error([message, stack]: CalleeErrorText<'_>) -> IrNode {
     IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(stack.to_owned()),
+        Some(IrNode::Str(message.into())),
+        IrNode::Str(stack.into()),
     )
 }
 
@@ -693,8 +697,8 @@ const JSON_PARSE_ERROR_STRS: [&str; 2] = [JSON_ERROR_MSG, JSON_ERROR_STACK];
 fn json_syntax_error() -> IrNode {
     IrNode::error_object(
         ErrorKind::SyntaxError,
-        Some(IrNode::Str(JSON_ERROR_MSG.to_owned())),
-        IrNode::Str(JSON_ERROR_STACK.to_owned()),
+        Some(IrNode::Str(JSON_ERROR_MSG.into())),
+        IrNode::Str(JSON_ERROR_STACK.into()),
     )
 }
 
@@ -722,7 +726,7 @@ struct JsonTokens {
 }
 
 impl JsonTokens {
-    fn resolve(offsets: &HashMap<String, i32>) -> Self {
+    fn resolve(offsets: &StrOffsets) -> Self {
         let at = |s: &str| offsets.get(s).copied().unwrap_or(HEAP_BASE);
         Self {
             null: at("null"),

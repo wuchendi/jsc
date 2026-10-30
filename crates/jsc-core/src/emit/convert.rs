@@ -149,7 +149,7 @@ pub(super) fn emit_hook_guard(
     local: u32,
     symbol: WellKnown,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let Some(text) = hook_text(symbol) else {
@@ -214,7 +214,7 @@ pub(super) fn throw_if_symbol(
     text: CalleeErrorText<'_>,
     ret: &Instruction<'_>,
     scratch: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_symbol(f, v);
@@ -238,7 +238,7 @@ pub(super) fn throw_if_symbol(
 /// default hint is string), each looked up through the `proto` chain,
 /// skipped unless callable, its result skipped unless a primitive; neither
 /// -> `TypeError`.
-pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_to_primitive(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (v, hint, method, result, key, second, base) = (0, 1, 2, 3, 4, 5, 6);
     let scratch = 7;
     let mut locals = vec![(2, ValType::I64), (3, ValType::I32)];
@@ -301,7 +301,7 @@ pub(super) fn emit_to_primitive(strings: &HashMap<String, i32>, helpers: Helpers
 /// string is itself; an object is first converted with hint string; a symbol
 /// throws the `TypeError`; the remaining primitives are formatted by the
 /// host. A pending throw returns the empty string.
-pub(super) fn emit_to_string(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_to_string(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (v, scratch) = (0, 1);
     let mut f = Function::new(type_error_helper_locals());
     helpers.unwind.borrow_mut().reset();
@@ -468,7 +468,7 @@ pub(super) fn emit_compare(helpers: Helpers<'_>) -> Function {
 /// `undefined` and absent elements are empty; a hole reads through the
 /// prototype chain) joined by it. An array already being
 /// joined (a cycle) joins as the empty string.
-pub(super) fn emit_array_join(strings: &HashMap<String, i32>, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_array_join(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (recv, sep_v, arr, len, i, acc, sep, e) = (0, 1, 2, 3, 4, 5, 6, 7);
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
     let empty = static_key(strings, "");
