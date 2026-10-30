@@ -125,5 +125,14 @@ jobs:
       - name: Check against baseline
         run: cargo run --release -p jsc-test262 -- --check
 
+      # Per-test results, so the baseline and history can be regenerated from CI.
+      - name: Upload test262 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-results
+          path: .tmp/test262-results.tsv
+          if-no-files-found: ignore
+
   # NOTE: portable musl / multi-platform release binaries are built by
   # release.yml on `v*` tags (and manual dispatch), not on every push.
