@@ -442,7 +442,12 @@ non-enumerable `length`), `3` / `4` / `5` `CLASS_BOOLEAN` / `CLASS_NUMBER` /
 `WRAPPER_VALUE_OFFSET = 16`; a String wrapper owns its `length` and indices as
 read-only properties), `6` `CLASS_GLOBAL` (the global object, a static realm
 block), `7` `CLASS_SYMBOL` (a Symbol wrapper, `[[SymbolData]]` at
-`WRAPPER_VALUE_OFFSET`).
+`WRAPPER_VALUE_OFFSET`), `8` `CLASS_ITERATOR` (an Array / String / Map / Set
+iterator, 32 bytes: `[[IteratedObject]]` at `16` (`undefined` once
+exhausted), `[[NextIndex]]: u32` at `24` (an array index, a string byte
+index, a Map/Set backing slot index), `kind: u8` at `28`: `0`..`2` array
+keys / values / entries, `3` string, `4`..`6` map keys / values / entries,
+`7` / `8` set values / entries; no host reads the payload).
 
 Notes per kind:
 
@@ -960,7 +965,13 @@ prototypes (`Error`, `TypeError`, `RangeError`, `ReferenceError`,
 constructors, `Map`, `Set`, `Promise`, `Date`, `Symbol`; native error
 constructors inherit from `Error`, the rest from `%Function.prototype%`), the
 prototypes of `Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-`Date`, `Symbol`, `%GeneratorPrototype%`, `%AsyncGeneratorPrototype%`, and the
+`Date`, `Symbol`, `%IteratorPrototype%` (`[@@iterator]() { return this }`),
+`%ArrayIteratorPrototype%`, `%StringIteratorPrototype%`,
+`%MapIteratorPrototype%`, `%SetIteratorPrototype%` (each a `next`,
+inheriting `%IteratorPrototype%`), `%AsyncIteratorPrototype%`
+(`[@@asyncIterator]() { return this }`), `%GeneratorPrototype%` (inheriting
+`%IteratorPrototype%`), `%AsyncGeneratorPrototype%` (inheriting
+`%AsyncIteratorPrototype%`), and the
 hidden `Symbol.for` registry (`proto` `null`, unreachable from the global
 object; its table maps interned keys to the registered symbols). Each
 constructor owns `length`, `name`, a
@@ -1026,7 +1037,10 @@ cleared. Bits: `0` `%Object.prototype%`, `1` `%Array.prototype%`, `2`
 `%String.prototype%`, `3` `%Number.prototype%`, `4` `%Boolean.prototype%`,
 `5` `%Function.prototype%`, `6` `%Promise.prototype%`, `7` `%Map.prototype%`,
 `8` `%Set.prototype%`, `9` `%Date.prototype%`, `10` `Math`, `11` `JSON`,
-`12` `console`, `13` `%GeneratorPrototype%`, `14` `%Symbol.prototype%`.
+`12` `console`, `13` `%GeneratorPrototype%`, `14` `%Symbol.prototype%`,
+`15` `%IteratorPrototype%`, `16` `%ArrayIteratorPrototype%`, `17`
+`%StringIteratorPrototype%`, `18` `%MapIteratorPrototype%`, `19`
+`%SetIteratorPrototype%`.
 
 **Guarded fast paths.** Specializations are optimizations over the generic
 path, never semantics:
@@ -1580,17 +1594,18 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `console` | `log` |
 | `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over what `for-of` iterates); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors; `Function(..)` throws `TypeError` |
-| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
-| `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`; `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
+| `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (array-likes and the runtime iterables: arrays, strings, `Map`, `Set`, generators, `arguments`; `this` constructed when a constructor); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` from `constructor` (§13) |
+| `String` | `String(v)`, `new String(v)` (wrapper); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `lastIndexOf`, `localeCompare` (code-unit order), `normalize` (ASCII strings; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat`, `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `trim`, `trimEnd`, `trimStart` (JS whitespace), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one UTF-8 sequence, i.e. one code point, per `next`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
 | `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string, `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw), `JSON.parse(text, reviver)` (in-wasm recursive descent, reviver walk) |
-| `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`; Set `add`/`has`/`delete`/`clear`/`forEach`/`size` |
+| `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`/`keys`/`values`/`entries` (also `[@@iterator]`); Set `add`/`has`/`delete`/`clear`/`forEach`/`size`/`values` (also `keys` and `[@@iterator]`)/`entries`; the iterators walk the live backing entries, so entries appended during iteration are seen |
 | `Promise` | §6.7, §7.8 |
 | `Date` | `new Date()`, `new Date(ms)`, `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`; `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `toISOString`, `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`) — all UTC, computed in wasm |
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter, `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
+| iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); no `Iterator` global or helpers, and the iterator prototypes have no `@@toStringTag` yet |
 
 No input produces an invalid wasm module.
 
@@ -1873,8 +1888,12 @@ Each item below is current behaviour of this tree.
   string iterator) always throws one.
 - No `void`.
 - Symbol-keyed properties work on every object, but no well-known symbol
-  hook is honoured yet (wave 3c, `design/symbol-strings.md` §9.4): a user
-  `@@iterator` reached by for-of, spread, destructuring, `yield*`,
+  hook is honoured yet (wave 3c, `design/symbol-strings.md` §9.4): an
+  `@@iterator` other than the builtin one the runtime iteration stands in for
+  (`Array.prototype.values` for an array, `String.prototype[@@iterator]` for a
+  string or `String` wrapper, `Map.prototype.entries` / `Set.prototype.values`
+  for a Map / Set, `%IteratorPrototype%[@@iterator]` for a generator; so also
+  any `@@iterator` of another object, such as an iterator object) reached by for-of, spread, destructuring, `yield*`,
   `Array.from`, `Object.fromEntries` or the Map/Set constructors, a user
   `@@toPrimitive` (only `%Symbol.prototype%`'s is called), a
   `@@toStringTag` other than `%Symbol.prototype%`'s, an `instanceof`
@@ -1890,8 +1909,7 @@ Each item below is current behaviour of this tree.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
-- The builtin library is exactly §7.9: no `Array.prototype.keys` / `values` /
-  `entries`, no `String.prototype.isWellFormed` / `toWellFormed` (they wait
+- The builtin library is exactly §7.9: no `String.prototype.isWellFormed` / `toWellFormed` (they wait
   for UTF-16 strings), no `Math.sumPrecise` (it waits for the iterator
   protocol), …, no `Promise.all` / `race` / `allSettled` / `any`.
 - The `Math` transcendental functions follow the host libm (Rust) or the JS
@@ -1944,7 +1962,8 @@ Each item below is current behaviour of this tree.
 - `sort` without a comparator orders by the byte order of the UTF-8
   `ToString` keys (code-point order), which differs from the specified UTF-16
   code-unit order only between astral characters and `U+E000`..`U+FFFF`.
-- `Map`/`Set`: deleting the current entry during `forEach` skips the next one;
+- `Map`/`Set`: deleting the current entry during `forEach` or a Map / Set
+  Iterator walk skips the next one;
   the constructors collect their iterable argument eagerly, with no
   `IteratorClose`.
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
