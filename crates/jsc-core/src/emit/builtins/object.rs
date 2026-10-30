@@ -15,17 +15,15 @@ const TAG_NULL: &str = "[object Null]";
 const TAG_BOOLEAN: &str = "[object Boolean]";
 const TAG_NUMBER: &str = "[object Number]";
 const TAG_STRING: &str = "[object String]";
-const TAG_SYMBOL: &str = "[object Symbol]";
 const TAG_ARRAY: &str = "[object Array]";
 const TAG_FUNCTION: &str = "[object Function]";
 const TAG_DATE: &str = "[object Date]";
 const TAG_ERROR: &str = "[object Error]";
 const TAG_ARGUMENTS: &str = "[object Arguments]";
-const TAG_MAP: &str = "[object Map]";
-const TAG_SET: &str = "[object Set]";
-const TAG_PROMISE: &str = "[object Promise]";
-const TAG_GENERATOR: &str = "[object Generator]";
 const TAG_OBJECT: &str = "[object Object]";
+/// The fragments around a `@@toStringTag` string.
+const TAG_OPEN: &str = "[object ";
+const TAG_CLOSE: &str = "]";
 
 /// The `TypeError` of `toLocaleString` when `this.toString` is not callable.
 const TO_STRING_NOT_CALLABLE: CalleeErrorText<'static> = [
@@ -45,7 +43,7 @@ const SETTER_NOT_CALLABLE: CalleeErrorText<'static> = [
 ];
 
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 24] = [
+pub(super) const STRINGS: [&str; 21] = [
     NULLISH_TO_OBJECT[0],
     NULLISH_TO_OBJECT[1],
     TO_STRING_NOT_CALLABLE[0],
@@ -59,17 +57,14 @@ pub(super) const STRINGS: [&str; 24] = [
     TAG_BOOLEAN,
     TAG_NUMBER,
     TAG_STRING,
-    TAG_SYMBOL,
     TAG_ARRAY,
     TAG_FUNCTION,
     TAG_DATE,
     TAG_ERROR,
     TAG_ARGUMENTS,
     TAG_OBJECT,
-    TAG_MAP,
-    TAG_SET,
-    TAG_PROMISE,
-    TAG_GENERATOR,
+    TAG_OPEN,
+    TAG_CLOSE,
 ];
 
 /// Throw the `ToObject` `TypeError` when the `this` value in `this` is
@@ -107,12 +102,11 @@ pub(super) fn emit_has_own_property(
     );
 }
 
-/// `Object.prototype.toString()`: `"[object <tag>]"` with the builtin tag of
-/// `this`, Map/Set/Promise/Generator by kind. A `@@toStringTag` on `this`'s
-/// chain (`__symbol_get`) other than `%Symbol.prototype%`'s `"Symbol"` seen
-/// from a symbol or `Symbol` wrapper (which the kind table agrees with)
-/// throws the interim `TypeError` (Y4 honours it, design/symbol-strings.md
-/// §9.4).
+/// `Object.prototype.toString()`: `"[object Undefined]"` /
+/// `"[object Null]"`; else `O = ToObject(this)` and `"[object <tag>]"` with
+/// `Get(O, @@toStringTag)` (`__symbol_get`) when it is a string, else the
+/// builtin tag of `O` (Array, Function, Date, Error, Arguments, Boolean,
+/// Number, String, else Object).
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
@@ -130,41 +124,30 @@ pub(super) fn emit_to_string(
     wasm!(function; LocalGet(this), I64Const(NULL_BITS), I64Eq);
     tag_if(function, TAG_NULL);
     wasm!(function;
-        LocalGet(this), I32Const(realm::symbol_addr(WellKnown::ToStringTag, helpers)),
-        Call(helpers.symbol_get()), LocalTee(tag), I64Const(UNDEFINED_BITS), I64Ne,
-        If(BlockType::Empty),
-        LocalGet(tag), I64Const(HEAP_BITS | i64::from(static_key(strings, "Symbol"))), I64Ne,
+        LocalGet(this), Call(helpers.to_object()), LocalTee(this),
+        I32Const(realm::symbol_addr(WellKnown::ToStringTag, helpers)),
+        Call(helpers.symbol_get()), LocalSet(tag),
     );
-    emit_is_symbol(function, this);
-    emit_is_wrapper(function, this, abi::CLASS_SYMBOL);
-    wasm!(function; I32Or, I32Eqz, I32Or, If(BlockType::Empty));
-    if let Some(text) = hook_text(WellKnown::ToStringTag) {
-        throw_type_error(function, frame, text, strings, helpers);
-    }
-    wasm!(function; End, End);
     return_if_pending(function);
-    wasm!(function;
-        LocalGet(this), I64Const(TRUE_BITS), I64Eq,
-        LocalGet(this), I64Const(FALSE_BITS), I64Eq, I32Or,
-    );
-    tag_if(function, TAG_BOOLEAN);
-    emit_is_number(function, this);
-    tag_if(function, TAG_NUMBER);
+    emit_is_string(function, tag);
+    wasm!(function; If(BlockType::Empty));
+    let tagged = IrNode::Binary {
+        op: BinOp::Add,
+        lhs: Box::new(IrNode::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(IrNode::Str(TAG_OPEN.into())),
+            rhs: Box::new(IrNode::Local(tag)),
+        }),
+        rhs: Box::new(IrNode::Str(TAG_CLOSE.into())),
+    };
+    emit_node(&tagged, function, frame.scratch(), strings, helpers);
+    wasm!(function; Return, End);
     emit_load_type_byte(function, this);
-    wasm!(function; LocalTee(kind), I32Const(TYPE_STRING), I32Eq);
-    tag_if(function, TAG_STRING);
+    wasm!(function; LocalSet(kind));
     for (type_byte, tag) in [
-        // `%Symbol.prototype%[@@toStringTag]` (Y4 reads it as a property).
-        (TYPE_SYMBOL, TAG_SYMBOL),
         (TYPE_ARRAY, TAG_ARRAY),
         (TYPE_FUNCTION, TAG_FUNCTION),
         (TYPE_DATE, TAG_DATE),
-        // The builtin `@@toStringTag`s of these kinds' prototypes (phase 3
-        // makes them real properties).
-        (TYPE_MAP, TAG_MAP),
-        (TYPE_SET, TAG_SET),
-        (i32::from(abi::TYPE_PROMISE), TAG_PROMISE),
-        (TYPE_GENERATOR, TAG_GENERATOR),
     ] {
         wasm!(function; LocalGet(kind), I32Const(type_byte), I32Eq);
         tag_if(function, tag);
@@ -183,7 +166,6 @@ pub(super) fn emit_to_string(
         (abi::CLASS_BOOLEAN, TAG_BOOLEAN),
         (abi::CLASS_NUMBER, TAG_NUMBER),
         (abi::CLASS_STRING, TAG_STRING),
-        (abi::CLASS_SYMBOL, TAG_SYMBOL),
     ] {
         wasm!(function; LocalGet(kind), I32Const(i32::from(class)), I32Eq);
         tag_if(function, tag);
