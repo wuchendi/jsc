@@ -1156,8 +1156,8 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
                     seed_callee_error(INSTANCEOF_NOT_CALLABLE, strs);
                     seed_callee_error(INSTANCEOF_NON_OBJECT_PROTOTYPE, strs);
                 }
-                // The runtime-TYPE-BYTE builtins read the receiver's own type byte
-                // only — no interned key or literal to seed.
+                // The builtin fast arms walk the receiver's `proto` chain for a
+                // static prototype — no interned key or literal to seed.
                 InstanceOfKind::Array
                 | InstanceOfKind::Function
                 | InstanceOfKind::Date
@@ -1430,7 +1430,9 @@ fn program_has_accessors(program: &IrProgram) -> bool {
     })
 }
 
-/// Whether `program` tests a dirty bit (a [`IrNode::ProtoGuard`], a
+/// Whether `program` tests a dirty bit (a [`IrNode::ProtoGuard`] — sealed
+/// too when a fast path relies on a builtin `@@species`
+/// ([`super::expr::species_bit`]) —, a
 /// [`IrNode::NamespaceGuard`] on a watched namespace, or an iteration fast
 /// path: a [`IrNode::GetIterator`], a spread source, or an `arguments`
 /// object, whose guard is the iterator prototypes' bits 15..=19,
@@ -1438,6 +1440,13 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 /// `__set` / `__define` / `__delete` must set the bits (DESIGN.md §6.4).
 fn program_tests_dirty_bits(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
+        IrNode::ProtoGuard { fast, .. }
+            if fast
+                .iter()
+                .any(|(_, path)| super::expr::species_bit(path).is_some()) =>
+        {
+            true
+        }
         IrNode::ProtoGuard { sealed, .. }
         | IrNode::ProtoMethod { sealed, .. }
         | IrNode::SizeRead { sealed, .. }
