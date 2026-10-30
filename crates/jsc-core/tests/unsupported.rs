@@ -219,34 +219,6 @@ fn user_has_instance_throws_until_y4() {
 }
 
 #[test]
-fn user_species_throws_until_y4() {
-    let text = "TypeError: Symbol.species is not supported yet";
-    let setup =
-        "let C = function () {}; C[Symbol.species] = Array; let a = [1]; a.constructor = C;";
-    for method in [
-        "a.map(x => x)",
-        "a.filter(x => x)",
-        "a.slice()",
-        "a.concat()",
-    ] {
-        assert_uncaught(&format!("{setup} {method}"), text);
-    }
-}
-
-#[test]
-fn is_concat_spreadable_throws_until_y4() {
-    let text = "TypeError: Symbol.isConcatSpreadable is not supported yet";
-    assert_uncaught(
-        "let o = { [Symbol.isConcatSpreadable]: true, length: 1, 0: 'x' }; [].concat(o)",
-        text,
-    );
-    assert_uncaught(
-        "let a = [1]; a[Symbol.isConcatSpreadable] = false; a.concat([2])",
-        text,
-    );
-}
-
-#[test]
 fn string_method_symbol_arguments_throw_until_y4() {
     for (src, name) in [
         ("'abc'.startsWith({ [Symbol.match]: false })", "match"),

@@ -972,7 +972,7 @@ fn construct(frame: Frame, c: u32, len: Option<u32>, what: &str) -> IrNode {
 
 /// One argument of a [`call_fn`] call.
 #[derive(Clone, Copy)]
-enum CallArg {
+pub(super) enum CallArg {
     /// The jsval in an i64 local.
     Val(u32),
     /// The i32 index in a local, as a number.
@@ -983,7 +983,7 @@ enum CallArg {
 /// leaving its result (or a pending throw): the first `K` in the positional
 /// slots and, when there are more, all of them in a fresh spread argument
 /// array published for the callee (built in the [`Frame::arg`] temp).
-fn push_call(
+pub(super) fn push_call(
     function: &mut Function,
     frame: Frame,
     callee: u32,
@@ -1102,14 +1102,12 @@ fn construct_or_create(
 
 /// The constructor `ArraySpeciesCreate(o, ..)` uses, into i64 `c`
 /// (`undefined` for `ArrayCreate`): a non-array `o` creates an array; else
-/// `C = Get(o, "constructor")`: `undefined` creates an array, a non-object
-/// throws, and an object is its own species when its prototype chain reaches
-/// a builtin constructor with a `@@species` getter returning `this`
-/// (`%Array%`, `%Map%`, `%Set%`, `%Promise%`), else (`C[@@species]` is
-/// `undefined`) an array is created; `%Array%` itself creates an array. No
-/// builtin defines `@@species` yet, so a `C` whose chain holds a `@@species`
-/// (a user hook, `__symbol_get`) throws the interim `TypeError` (Y4 honours
-/// it, design/symbol-strings.md §9.4).
+/// `C = Get(o, "constructor")`; an object `C` is replaced by
+/// `Get(C, @@species)` (`null` counts as `undefined`); `undefined` creates
+/// an array and any other `C` must be a constructor ([`species_from`]
+/// throws otherwise). `%Array%` itself creates an array, so `C === %Array%`
+/// with `%Array%`'s dirty bit clear (its builtin `get [@@species]`
+/// returning `this`) skips the `@@species` read.
 fn species_ctor(
     function: &mut Function,
     frame: Frame,
@@ -1118,62 +1116,47 @@ fn species_ctor(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (walk, found) = (frame.y64(5), frame.y32(0));
-    let bits = |ctor| intrinsic_bits(Intrinsic::Ctor(ctor), helpers);
+    let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
     wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(c));
-    is_array(function, o);
+    emit_is_pointer(function, o);
+    wasm!(function; If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, o);
     wasm!(function;
+        I32Const(TYPE_ARRAY), I32Eq,
+        Else, I32Const(0), End,
         If(BlockType::Empty),
         LocalGet(o), I32Const(static_key(strings, CONSTRUCTOR)), Call(helpers.get), LocalSet(c),
     );
     return_if_pending(function);
-    wasm!(function; LocalGet(c), I64Const(UNDEFINED_BITS), I64Ne, If(BlockType::Empty));
+    let bit = Intrinsic::Ctor(BuiltinCtor::Array).watch_bit();
+    let fast = bit.filter(|_| helpers.dirty_tracking);
+    if let Some(bit) = fast {
+        wasm!(function;
+            LocalGet(c), I64Const(array), I64Eq,
+            GlobalGet(DIRTY_GLOBAL), I32Const(1 << bit), I32And, I32Eqz, I32And,
+            If(BlockType::Empty), I64Const(UNDEFINED_BITS), LocalSet(c), Else,
+        );
+    }
     emit_is_object(function, c);
-    wasm!(function; I32Eqz, If(BlockType::Empty));
-    throw_type_error(function, frame, CTOR_NOT_OBJECT, strings, helpers);
-    wasm!(function; End);
-    emit_hook_guard(
-        function,
-        c,
-        WellKnown::Species,
-        frame.scratch(),
-        strings,
-        helpers,
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(c), I32Const(realm::symbol_addr(WellKnown::Species, helpers)),
+        Call(helpers.symbol_get()), LocalSet(c),
     );
     return_if_pending(function);
+    emit_is_nullish(function, c);
     wasm!(function;
-        LocalGet(c), LocalSet(walk), I32Const(0), LocalSet(found),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-    );
-    emit_is_pointer(function, walk);
-    wasm!(function; I32Eqz, BrIf(1));
-    for (i, ctor) in [
-        BuiltinCtor::Array,
-        BuiltinCtor::Map,
-        BuiltinCtor::Set,
-        BuiltinCtor::Promise,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        wasm!(function; LocalGet(walk), I64Const(bits(ctor)), I64Eq);
-        if i > 0 {
-            wasm!(function; I32Or);
-        }
-    }
-    wasm!(function;
-        If(BlockType::Empty), I32Const(1), LocalSet(found), Br(2), End,
-        LocalGet(walk), I32WrapI64,
-        I64Load(MemArg { offset: u64::from(abi::OBJ_PROTO_OFFSET), align: 3, memory_index: 0 }),
-        LocalSet(walk),
-        Br(0),
-        End, End,
-        LocalGet(found), I32Eqz,
-        LocalGet(c), I64Const(bits(BuiltinCtor::Array)), I64Eq, I32Or,
+        LocalGet(c), I64Const(array), I64Eq, I32Or,
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), LocalSet(c), End,
-        End,
-        End,
+        Else,
+        LocalGet(c), I64Const(UNDEFINED_BITS), I64Ne, If(BlockType::Empty),
     );
+    throw_type_error(function, frame, CTOR_NOT_OBJECT, strings, helpers);
+    wasm!(function; End, End);
+    if fast.is_some() {
+        wasm!(function; End);
+    }
+    wasm!(function; End);
 }
 
 /// The array of `ArraySpeciesCreate` from the [`species_ctor`] in i64 `c`
@@ -1694,11 +1677,11 @@ pub(super) fn emit_last_index_of(
 // --- concat / flat / flatMap --------------------------------------------------------
 
 /// `Array.prototype.concat(...items)`: `A = ArraySpeciesCreate(O, 0)`; for
-/// each of `O, ...items` an array (`IsArray`) appends its present indices at
-/// `n + k` (`n` advancing over holes too), any other value is one element;
-/// then `Set(A, "length", n)`. An object item whose chain holds a
-/// `@@isConcatSpreadable` (`__symbol_get`) throws the interim `TypeError`
-/// (Y4 honours it, design/symbol-strings.md §9.4).
+/// each of `O, ...items` a spreadable one (`IsConcatSpreadable`: an object
+/// whose `Get(item, @@isConcatSpreadable)` is `ToBoolean`-true, or with that
+/// `undefined`, an array) appends its present indices below
+/// `LengthOfArrayLike(item)` at `n + k` (`n` advancing over holes too), any
+/// other value is one element; then `Set(A, "length", n)`.
 pub(super) fn emit_concat(
     function: &mut Function,
     frame: Frame,
@@ -1725,20 +1708,26 @@ pub(super) fn emit_concat(
         I32Const(0), LocalSet(j),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
+    // `IsConcatSpreadable(item)` into i32 `len`.
+    wasm!(function; I32Const(0), LocalSet(len));
     emit_is_object(function, item);
-    wasm!(function; If(BlockType::Empty));
-    emit_hook_guard(
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(item), I32Const(realm::symbol_addr(WellKnown::IsConcatSpreadable, helpers)),
+        Call(helpers.symbol_get()), LocalSet(v),
+    );
+    return_if_pending(function);
+    wasm!(function; LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
+    emit_load_type_byte(function, item);
+    wasm!(function; I32Const(TYPE_ARRAY), I32Eq, LocalSet(len), Else);
+    emit_cond(
+        &IrNode::Local(v),
         function,
-        item,
-        WellKnown::IsConcatSpreadable,
         frame.scratch(),
         strings,
         helpers,
     );
-    wasm!(function; End);
-    return_if_pending(function);
-    is_array(function, item);
-    wasm!(function; If(BlockType::Empty));
+    wasm!(function; LocalSet(len), End, End, LocalGet(len), If(BlockType::Empty));
     length_of(function, item, len, strings, helpers);
     wasm!(function; I32Const(0), LocalSet(k));
     count_loop(function, k, len, |function| {
