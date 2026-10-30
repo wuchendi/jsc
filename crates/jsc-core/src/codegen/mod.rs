@@ -33,9 +33,9 @@ use globals::GlobalFacts;
 
 use crate::ir::{
     ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, GlobalIntrinsic,
-    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, JsStr, LogicalOp,
-    MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind, SpreadCallee,
-    SpreadElem,
+    GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, IterRecord, JsStr,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
+    SpreadCallee, SpreadElem,
 };
 
 /// A string literal's value as UTF-16 code units, losslessly: swc keeps a lone

@@ -1469,6 +1469,7 @@ pub(super) fn emit_str_to_array(
 /// `handle` is the base of a `TYPE_MAP`/`TYPE_SET` block; its `entries` slot (at
 /// [`MAP_ENTRIES_OFFSET`]) holds the backing array jsval. Reads the array's
 /// `len` and element store, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
+/// skipping tombstones (a `HOLE` key, design/symbol-strings.md §5.5) and
 /// returning the byte ADDRESS of the first slot whose value is `__same_value_zero` (at
 /// `svz_index`) to `key`, or `-1` on a miss. The value slot sits 8 bytes past the
 /// returned address. Params occupy locals 0/1; four extra `i32` locals hold the
@@ -1516,7 +1517,12 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
     function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalSet(slot));
-    // if __same_value_zero(load_i64(slot), key) { return slot }.
+    // if load_i64(slot) != HOLE && __same_value_zero(load_i64(slot), key) { return slot }.
+    function.instruction(&Instruction::LocalGet(slot));
+    function.instruction(&Instruction::I64Load(elem));
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(slot));
     function.instruction(&Instruction::I64Load(elem));
     function.instruction(&Instruction::LocalGet(key));
@@ -1524,6 +1530,7 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(slot));
     function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     // i += 2 (skip the value slot); continue.
     function.instruction(&Instruction::LocalGet(i));
@@ -1544,7 +1551,8 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
 /// Looks the key up with `__map_find` (at `map_find_index`): on a hit it
 /// overwrites the value slot (8 bytes past the found key slot); on a miss it appends
 /// `key` then `val` to the backing array in place via `__array_push` (at
-/// `array_push_index`) and bumps the u32 `size` header by one. `set.add` reuses
+/// `array_push_index`) and bumps the u32 `size` header by one (a key deleted
+/// before is not found, so re-adding it appends). `set.add` reuses
 /// this with `val = undefined`. Params occupy locals 0/1/2; two extra `i32`
 /// locals hold the found address and the backing array base.
 pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Function {
@@ -1651,22 +1659,23 @@ pub(super) fn emit_map_has(map_find_index: u32) -> Function {
 /// Emit the `__map_delete(handle: i32, key: i64) -> i32` Map/Set remover.
 ///
 /// Looks the key up with `__map_find` (at `map_find_index`); on a miss returns `0`.
-/// On a hit it COMPACTS the two-slot `(key, value)` entry out of the backing array —
-/// `memory.copy` shifts every trailing pair down one entry (16 bytes) — decrements
-/// the backing's u32 `len` by 2 and the handle's u32 `size` header by 1, and
-/// returns `1`. Params occupy locals 0/1; four extra `i32` locals hold the found
-/// address, the backing base, its length, and the shift byte count.
+/// On a hit it TOMBSTONES the entry in place (design/symbol-strings.md §5.5):
+/// the key slot becomes `HOLE` and the value slot `undefined`, so the backing
+/// keeps every other entry at its index and a live iterator or `forEach`
+/// continues at the next one. The handle's u32 `size` header (the live count)
+/// drops by 1; returns `1`. Params occupy locals 0/1; one extra `i32` local
+/// holds the found address.
 pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
-    let mut function = Function::new(vec![(4, ValType::I32)]);
-    let (handle, key, addr, arr, len, count) = (0, 1, 2, 3, 4, 5);
-    let entries_slot = MemArg {
-        offset: MAP_ENTRIES_OFFSET,
-        align: 3,
-        memory_index: 0,
-    };
+    let mut function = Function::new(vec![(1, ValType::I32)]);
+    let (handle, key, addr) = (0, 1, 2);
     let size_slot = MemArg {
         offset: MAP_SIZE_OFFSET,
         align: 2,
+        memory_index: 0,
+    };
+    let slot = |offset| MemArg {
+        offset,
+        align: 0,
         memory_index: 0,
     };
 
@@ -1682,48 +1691,13 @@ pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
 
-    // arr = wrap(load_i64(handle + entries_slot)); len = arr.len.
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::I64Load(entries_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(arr));
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
-    function.instruction(&Instruction::LocalSet(len));
-
-    // count = (arr.elems + ELEMS_DATA_OFFSET + 8*len) - (addr + 16): trailing
-    // bytes to move.
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
-    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
+    // key slot = HOLE; value slot = undefined.
     function.instruction(&Instruction::LocalGet(addr));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::LocalSet(count));
-
-    // memory.copy(dst = addr, src = addr + 16, count): shift trailing pairs down.
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Store(slot(0)));
     function.instruction(&Instruction::LocalGet(addr));
-    function.instruction(&Instruction::LocalGet(addr));
-    function.instruction(&Instruction::I32Const(16));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalGet(count));
-    function.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-
-    // len -= 2 (drop the entry's two slots).
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Store(slot(8)));
     // size -= 1.
     function.instruction(&Instruction::LocalGet(handle));
     function.instruction(&Instruction::LocalGet(handle));

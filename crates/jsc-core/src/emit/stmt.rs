@@ -613,6 +613,10 @@ pub(super) fn emit_cond(
         emit_is_construct_call(function, *argc);
         return;
     }
+    if let IrNode::IteratorStep(rec) = cond {
+        builtins::emit_iterator_step(rec, function, scratch, strings, helpers);
+        return;
+    }
     emit_node(cond, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
 
