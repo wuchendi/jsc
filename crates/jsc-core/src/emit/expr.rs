@@ -244,9 +244,38 @@ pub(super) fn emit_node(
             builtins::emit_get_iterator(value, rec, *sealed, function, scratch, strings, helpers);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
-        IrNode::OpenIterator { value, rec } => {
-            builtins::emit_open_iterator(value, rec, function, scratch, strings, helpers);
+        IrNode::OpenIterator {
+            value,
+            rec,
+            is_async,
+        } => {
+            if *is_async {
+                builtins::emit_open_async_iterator(value, rec, function, scratch, strings, helpers);
+            } else {
+                builtins::emit_open_iterator(value, rec, function, scratch, strings, helpers);
+            }
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+        IrNode::AsyncIteratorNext(rec) => {
+            builtins::emit_async_iterator_next(rec, function, scratch, strings, helpers);
+        }
+        IrNode::AsyncIteratorComplete { rec, result } => {
+            builtins::emit_async_iterator_complete(
+                rec, result, function, scratch, strings, helpers,
+            );
+            function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            function.instruction(&Instruction::I64Const(TRUE_BITS));
+            function.instruction(&Instruction::Else);
+            function.instruction(&Instruction::I64Const(FALSE_BITS));
+            function.instruction(&Instruction::End);
+        }
+        IrNode::AsyncIteratorReturn { rec, throwing } => {
+            builtins::emit_async_iterator_return(
+                rec, *throwing, function, scratch, strings, helpers,
+            );
+        }
+        IrNode::IteratorResultCheck(operand) => {
+            builtins::emit_iterator_result_check(operand, function, scratch, strings, helpers);
         }
         IrNode::IteratorStep(rec) => {
             builtins::emit_iterator_step(rec, function, scratch, strings, helpers);

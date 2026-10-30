@@ -57,7 +57,7 @@
 //! the body captures them by reference like any enclosing binding.
 //!
 //! Still rejected (deferred): a `yield` whose continuation would read a per-node
-//! scratch local set before the suspend; and async generators.
+//! scratch local set before the suspend.
 //!
 //! A closure nested in the body captures the frame's env cells by reference
 //! (see [`LowerCtx::capture_source`]), so it shares them with the body across
@@ -283,18 +283,11 @@ impl LowerCtx<'_> {
     /// Lower `yield* iterable` to an [`IrNode::YieldDelegate`], which the
     /// CFG builder expands into the delegation loop
     /// ([`CfgBuilder::linearize_delegate`]); its value is the delegate's
-    /// return value. In an async generator it is unsupported (stage Y5).
+    /// return value.
     pub(super) fn lower_yield_delegate(
         &mut self,
         yield_expr: &swc_ecma_ast::YieldExpr,
     ) -> anyhow::Result<IrNode> {
-        if self.frame().machine == Some(Machine::AsyncGenerator) {
-            return Err(CompileError::spanned(
-                yield_expr.span,
-                "`yield*` in an async generator is unsupported",
-            )
-            .into());
-        }
         let Some(arg) = &yield_expr.arg else {
             return Err(
                 CompileError::spanned(yield_expr.span, "`yield*` requires an operand").into(),
@@ -432,12 +425,6 @@ struct LoopCtx {
 const NO_THROW_METHOD: [&str; 2] = [
     "The iterator does not provide a 'throw' method",
     "TypeError: The iterator does not provide a 'throw' method",
-];
-
-/// The `TypeError` of a `yield*` delegate result that is not an object.
-const RESULT_NOT_OBJECT: [&str; 2] = [
-    "Iterator result is not an object",
-    "TypeError: Iterator result is not an object",
 ];
 
 /// The resumption modes of a `yield*` loop (its `mode` cell).
@@ -1091,6 +1078,15 @@ impl CfgBuilder {
     /// outer generator enters its own block (`on_throw` / `on_return`), which
     /// records the mode and value and loops. Its `this_local` binds the
     /// iterator as `this` of each call.
+    ///
+    /// In an async generator (ES2025 §15.5.5, generatorKind async) the
+    /// iterator opens async (a sync iterable through the async-from-sync
+    /// wrapper), every call result is awaited before the check, a missing
+    /// `throw` closes the delegate with an awaited `AsyncIteratorClose`, a
+    /// missing `return` and a `done` return-mode result await their value
+    /// before returning, and the `yield` is an `AsyncGeneratorYield` of
+    /// `r.value` (not re-awaited; the outer resumer wraps it). A `return(v)`
+    /// resumption awaits `v` first; a rejection forwards as a throw.
     fn linearize_delegate(&mut self, node: IrNode) -> anyhow::Result<IrNode> {
         let IrNode::YieldDelegate {
             iterable,
@@ -1117,6 +1113,7 @@ impl CfgBuilder {
         self.push(IrStmt::Expr(IrNode::OpenIterator {
             value: Box::new(iterable),
             rec: d.rec.clone(),
+            is_async: self.async_generator,
         }))?;
         self.push(IrStmt::Expr(slot_set(received, IrNode::Undefined)))?;
         self.push(IrStmt::Expr(d.set_mode(MODE_NEXT)))?;
@@ -1124,15 +1121,23 @@ impl CfgBuilder {
         self.terminate(GenTerm::Jump(head));
         self.cur = head as usize;
         let check = self.new_block();
-        self.delegate_call(&d, check)?;
+        if self.async_generator {
+            // Every call result is awaited before the check.
+            let awaited = self.new_block();
+            self.delegate_call(&d, awaited)?;
+            self.cur = awaited as usize;
+            let value = self.linearize(await_suspend(slot_get(result)))?;
+            self.push(IrStmt::Expr(place_set(&d.rec.result, value)))?;
+            self.terminate(GenTerm::Jump(check));
+        } else {
+            self.delegate_call(&d, check)?;
+        }
 
         // check: the result must be an object; `done` ends the delegation.
         self.cur = check as usize;
-        self.push(IrStmt::If {
-            cond: IrNode::Not(Box::new(IrNode::IsObject(Box::new(slot_get(result))))),
-            then_body: vec![IrStmt::Expr(throw_type_error(RESULT_NOT_OBJECT))],
-            else_body: Vec::new(),
-        })?;
+        self.push(IrStmt::Expr(IrNode::IteratorResultCheck(Box::new(
+            slot_get(result),
+        ))))?;
         let (done_b, yield_b) = (self.new_block(), self.new_block());
         self.terminate(GenTerm::Branch {
             cond: member(result, "done"),
@@ -1147,28 +1152,26 @@ impl CfgBuilder {
             else_block: exit,
         });
         self.cur = return_done as usize;
-        self.return_out(Some(member(result, "value")))?;
+        let value = self.await_if_async(member(result, "value"))?;
+        self.return_out(Some(value))?;
 
         // yield: every resumption records its mode and value, then loops.
+        // An async generator yields `r.value`, a sync one `r` itself.
         self.cur = yield_b as usize;
         let (resume, on_throw, on_return) = (self.new_block(), self.new_block(), self.new_block());
+        let (value, raw) = if self.async_generator {
+            (member(result, "value"), false)
+        } else {
+            (slot_get(result), true)
+        };
         self.terminate(GenTerm::Yield {
-            value: slot_get(result),
+            value,
             resume,
             on_return: Some(on_return),
             on_throw: Some(on_throw),
-            raw: true,
+            raw,
         });
-        for (block, resumed, value) in [
-            (resume, MODE_NEXT, IrNode::SentValue),
-            (on_throw, MODE_THROW, IrNode::ExcValue),
-            (on_return, MODE_RETURN, IrNode::ExcValue),
-        ] {
-            self.cur = block as usize;
-            self.push(IrStmt::Expr(slot_set(received, value)))?;
-            self.push(IrStmt::Expr(d.set_mode(resumed)))?;
-            self.terminate(GenTerm::Jump(head));
-        }
+        self.delegate_resumptions(&d, head, [resume, on_throw, on_return])?;
 
         self.cur = exit as usize;
         self.suspended = true;
@@ -1176,11 +1179,51 @@ impl CfgBuilder {
         Ok(member(result, "value"))
     }
 
+    /// The resumption blocks of a `yield*` loop's `yield` (`resume`,
+    /// `on_throw`, `on_return`): each records the mode and value in `d`, then
+    /// jumps back to `head`. In an async generator `return(v)` awaits `v`
+    /// first (AsyncGeneratorYield): its value forwards as a return, a
+    /// rejection as a throw.
+    fn delegate_resumptions(
+        &mut self,
+        d: &Delegate,
+        head: u32,
+        [resume, on_throw, on_return]: [u32; 3],
+    ) -> anyhow::Result<()> {
+        let mut resumptions = vec![
+            (resume, MODE_NEXT, IrNode::SentValue),
+            (on_throw, MODE_THROW, IrNode::ExcValue),
+        ];
+        if self.async_generator {
+            let (fulfilled, rejected) = (self.new_block(), self.new_block());
+            self.cur = on_return as usize;
+            self.terminate(GenTerm::Yield {
+                value: IrNode::AwaitMark(Box::new(IrNode::ExcValue)),
+                resume: fulfilled,
+                on_return: None,
+                on_throw: Some(rejected),
+                raw: false,
+            });
+            resumptions.push((fulfilled, MODE_RETURN, IrNode::SentValue));
+            resumptions.push((rejected, MODE_THROW, IrNode::ExcValue));
+        } else {
+            resumptions.push((on_return, MODE_RETURN, IrNode::ExcValue));
+        }
+        for (block, resumed, value) in resumptions {
+            self.cur = block as usize;
+            self.push(IrStmt::Expr(slot_set(d.received, value)))?;
+            self.push(IrStmt::Expr(d.set_mode(resumed)))?;
+            self.terminate(GenTerm::Jump(head));
+        }
+        Ok(())
+    }
+
     /// The head of a `yield*` loop (the current block): call the delegate's
     /// method for the resumption mode into `rec.result` and continue at
     /// `check` — `next(v)`; `throw(e)`, or with no `throw` method close the
     /// delegate and throw a `TypeError`; `return(v)`, or with no `return`
-    /// method complete with `return v`.
+    /// method complete with `return v` (in an async generator the delegate
+    /// is closed with an awaited `AsyncIteratorClose` and `v` is awaited).
     fn delegate_call(&mut self, d: &Delegate, check: u32) -> anyhow::Result<()> {
         let (call_next, abrupt) = (self.new_block(), self.new_block());
         self.terminate(GenTerm::Branch {
@@ -1223,14 +1266,19 @@ impl CfgBuilder {
             });
             self.cur = missing as usize;
             if key == "throw" {
-                self.push(IrStmt::Expr(IrNode::IteratorClose {
-                    rec: d.rec.clone(),
-                    throwing: false,
-                }))?;
+                if self.async_generator {
+                    self.async_close(d)?;
+                } else {
+                    self.push(IrStmt::Expr(IrNode::IteratorClose {
+                        rec: d.rec.clone(),
+                        throwing: false,
+                    }))?;
+                }
                 self.push(IrStmt::Expr(throw_type_error(NO_THROW_METHOD)))?;
                 self.terminate(GenTerm::Return(None)); // unreachable: the throw transfers
             } else {
-                self.return_out(Some(slot_get(d.received)))?;
+                let value = self.await_if_async(slot_get(d.received))?;
+                self.return_out(Some(value))?;
             }
         }
         self.cur = call_method as usize;
@@ -1240,6 +1288,42 @@ impl CfgBuilder {
         )))?;
         self.terminate(GenTerm::Jump(check));
         Ok(())
+    }
+
+    /// `AsyncIteratorClose(rec, normal)` of a `yield*` delegate (the current
+    /// block): call its `return` (when present), await the result and check
+    /// it is an object; control continues in a new current block. The
+    /// `method` cell holds the unawaited result.
+    fn async_close(&mut self, d: &Delegate) -> anyhow::Result<()> {
+        self.push(IrStmt::Expr(slot_set(
+            d.method,
+            IrNode::AsyncIteratorReturn {
+                rec: d.rec.clone(),
+                throwing: false,
+            },
+        )))?;
+        let (await_b, closed) = (self.new_block(), self.new_block());
+        self.terminate(GenTerm::Branch {
+            cond: IrNode::IsHole(Box::new(slot_get(d.method))),
+            then_block: closed,
+            else_block: await_b,
+        });
+        self.cur = await_b as usize;
+        let value = self.linearize(await_suspend(slot_get(d.method)))?;
+        self.push(IrStmt::Expr(IrNode::IteratorResultCheck(Box::new(value))))?;
+        self.terminate(GenTerm::Jump(closed));
+        self.cur = closed as usize;
+        Ok(())
+    }
+
+    /// `Await(value)` in an async generator (a suspend; a rejection throws
+    /// here), else `value`.
+    fn await_if_async(&mut self, value: IrNode) -> anyhow::Result<IrNode> {
+        if self.async_generator {
+            self.linearize(await_suspend(value))
+        } else {
+            Ok(value)
+        }
     }
 
     /// A fresh frame cell slot (an env cell the constructor pre-creates), which —
