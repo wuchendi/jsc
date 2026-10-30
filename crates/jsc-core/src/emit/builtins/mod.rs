@@ -36,6 +36,7 @@ mod object;
 mod object_static;
 mod promise;
 mod string;
+mod symbol;
 
 use crate::emit::realm::ArrayCopyOp;
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
@@ -216,6 +217,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(generator::strings())
         .chain(generator::async_strings())
         .chain(json::strings())
+        .chain(symbol::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -225,9 +227,8 @@ pub(super) fn emit_builtin(
     strings: &HashMap<String, i32>,
     helpers: Helpers<'_>,
 ) -> Function {
-    let k = helpers.max_args;
+    let (k, mut f) = (helpers.max_args, Frame::function());
     let frame = Frame { k };
-    let mut f = Frame::function();
     helpers.unwind.borrow_mut().reset();
     match builtin {
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
@@ -297,7 +298,7 @@ pub(super) fn emit_builtin(
         | Builtin::CollectionOp { .. }
         | Builtin::CollectionForEach { .. }
         | Builtin::CollectionSize { .. }
-        | Builtin::Ctor(BuiltinCtor::Map | BuiltinCtor::Set)
+        | Builtin::Ctor(BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol)
         | Builtin::PromiseThen
         | Builtin::PromiseCatch
         | Builtin::PromiseFinally
@@ -313,6 +314,7 @@ pub(super) fn emit_builtin(
         Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
         Builtin::IsNaN => global::emit_is_nan(&mut f, frame, helpers),
         Builtin::IsFinite => global::emit_is_finite(&mut f, frame, helpers),
+        Builtin::Symbol(op) => symbol::emit(op, &mut f, frame, strings, helpers),
         Builtin::Math(_)
         | Builtin::ConsoleLog
         | Builtin::Ctor(_)
@@ -390,6 +392,7 @@ fn emit_object_family(
         Builtin::CollectionSize { set } => map_set::emit_size(set, f, frame, strings, helpers),
         Builtin::Ctor(BuiltinCtor::Map) => map_set::emit_ctor(false, f, frame, strings, helpers),
         Builtin::Ctor(BuiltinCtor::Set) => map_set::emit_ctor(true, f, frame, strings, helpers),
+        Builtin::Ctor(BuiltinCtor::Symbol) => symbol::emit_ctor(f, frame, strings, helpers),
         Builtin::PromiseThen => promise::emit_then(false, f, frame, strings, helpers),
         Builtin::PromiseCatch => promise::emit_then(true, f, frame, strings, helpers),
         Builtin::PromiseFinally => promise::emit_finally(f, frame, strings, helpers),
