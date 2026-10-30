@@ -83,13 +83,18 @@ fn statics_are_function_properties() {
     assert_number("const n = Date.now; typeof n() === 'number' ? 1 : 0", 1.0);
     assert_string("Object.keys.name", "keys");
     assert_number("Promise.resolve.length", 1.0);
+    // `Promise.resolve` / `reject` construct from `this`.
     assert_output(
-        "const r = Promise.resolve; r(5).then(function (v) { console.log(v) })",
+        "const r = Promise.resolve; r.call(Promise, 5).then(function (v) { console.log(v) })",
         "5\n",
     );
     assert_output(
-        "const r = Promise.reject; r(6).catch(function (v) { console.log(v) })",
+        "const r = Promise.reject; r.call(Promise, 6).catch(function (v) { console.log(v) })",
         "6\n",
+    );
+    assert_bool(
+        "const r = Promise.resolve; try { r(5); false } catch (e) { e instanceof TypeError }",
+        true,
     );
     // A replaced static is honoured.
     assert_number(

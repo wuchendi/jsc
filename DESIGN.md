@@ -450,7 +450,14 @@ iterator, 32 bytes: `[[IteratedObject]]` at `16` (`undefined` once
 exhausted), `[[NextIndex]]: u32` at `24` (an array index, a string byte
 index, a Map/Set backing slot index), `kind: u8` at `28`: `0`..`2` array
 keys / values / entries, `3` string, `4`..`6` map keys / values / entries,
-`7` / `8` set values / entries; no host reads the payload).
+`7` / `8` set values / entries; `16` an `Iterator.from` wrapper (48 bytes:
+the wrapped iterator at `32`, its `next` at `40`); `17`..`21` a `map` /
+`filter` / `take` / `drop` / `flatMap` helper (80 bytes: `[[NextIndex]]`
+holds the generator state `0` suspended-start, `1` suspended-yield, `2`
+running, `3` completed; the underlying iterator at `32`, its `next` at
+`40`, the counter or remaining limit (`f64`) at `48`, the callback at `56`,
+a `flatMap`'s inner iterator at `64` (`undefined` while none is open) and
+its `next` at `72`); no host reads the payload).
 
 Notes per kind:
 
@@ -995,10 +1002,12 @@ prototypes (`Error`, `TypeError`, `RangeError`, `ReferenceError`,
 `SyntaxError`, `EvalError`, `URIError`), the global object
 (`CLASS_GLOBAL`), `Math`, `JSON`, `console`, the constructors (`Object`,
 `Function`, `Array`, `String`, `Number`, `Boolean`, the seven error
-constructors, `Map`, `Set`, `Promise`, `Date`, `Symbol`; native error
-constructors inherit from `Error`, the rest from `%Function.prototype%`), the
-prototypes of `Array`, `String`, `Number`, `Boolean`, `Map`, `Set`, `Promise`,
-`Date`, `Symbol`, `%IteratorPrototype%` (`[@@iterator]() { return this }`),
+constructors, `Map`, `Set`, `Promise`, `Date`, `Symbol`, `Iterator`; native
+error constructors inherit from `Error`, the rest from `%Function.prototype%`),
+the prototypes of `Array`, `String`, `Number`, `Boolean`, `Map`, `Set`,
+`Promise`, `Date`, `Symbol`, `%IteratorPrototype%` (`Iterator.prototype`:
+`[@@iterator]() { return this }`, and `constructor` / `@@toStringTag`
+accessors),
 `%ArrayIteratorPrototype%`, `%StringIteratorPrototype%`,
 `%MapIteratorPrototype%`, `%SetIteratorPrototype%` (each a `next`,
 inheriting `%IteratorPrototype%`), `%AsyncIteratorPrototype%`
@@ -1006,8 +1015,11 @@ inheriting `%IteratorPrototype%`), `%AsyncIteratorPrototype%`
 `%IteratorPrototype%`), `%AsyncGeneratorPrototype%` (inheriting
 `%AsyncIteratorPrototype%`), and the
 hidden `Symbol.for` registry (`proto` `null`, unreachable from the global
-object; its table maps interned keys to the registered symbols), and
-`Array.prototype[@@unscopables]` (`proto` `null`). Each
+object; its table maps interned keys to the registered symbols),
+`Array.prototype[@@unscopables]` (`proto` `null`), and
+`%WrapForValidIteratorPrototype%` and `%IteratorHelperPrototype%` (each a
+`next` / `return`, inheriting `%IteratorPrototype%`; the latter's
+`@@toStringTag` is `"Iterator Helper"`). Each
 constructor owns `length`, `name`, a
 non-writable `prototype`, and its statics (`%Array%`, `%Map%`, `%Set%` and
 `%Promise%` also `get [@@species]`); each prototype owns a
@@ -1190,6 +1202,22 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
   spec's closures (`PromiseResolve(C, onFinally())` then a value / thrower
   thunk). An awaited non-promise is treated as already
   fulfilled (`await 5` → `5`).
+- `Promise.resolve` / `Promise.reject` construct from `this`:
+  `PromiseResolve(C, x)` (a promise whose `constructor` is `C` is returned
+  as is) / `NewPromiseCapability(C)`; `C === %Promise%` takes the host op
+  (for `resolve` only a non-promise `x`), and so does the inline
+  `Promise.resolve(x)` of a never-written `Promise` global. The combinators
+  `Promise.all` / `allSettled` / `any` / `race` (`emit/builtins/promise.rs`)
+  build `NewPromiseCapability(this)`, read `this.resolve` once, open the
+  iterable's iterator record (design/symbol-strings.md §5.1) and per value
+  call `resolve` with `this`, then `Invoke(next, "then", «onF, onR»)` with
+  internal element closures (`Builtin::Species(SpeciesOp::Element)`, `env =
+  [state, index, alreadyCalled]` over a shared `[values,
+  remainingElements, settle]`). A throw closes the iterator unless it came
+  from the iterator itself, then rejects the result promise. `this ===
+  %Promise%` with its builtin `resolve`, its and `%Promise.prototype%`'s
+  dirty bits clear and a `%Promise%` instance without own properties skips
+  the `resolve` call and registers the reactions through `__then`.
 - **Re-entry.** Reactions are guest closures; the engine runs them by calling the
   exported `__invoke1(fn, arg)` trampoline, which issues the uniform-ABI
   `call_indirect`. A callback that throws sets `$exc_pending`; the engine reads
@@ -1738,7 +1766,8 @@ result, array-like element and mapped value (one microtask turn per step); a
 reactions read the settled value from slot 0, so they trap when `K` = 0.
 
 **Promises.** `new Promise(executor)`, `Promise.resolve`, `Promise.reject`,
-`Promise.prototype.then` / `catch` / `finally` (§6.7).
+`Promise.all` / `allSettled` / `any` / `race`, `Promise.prototype.then` /
+`catch` / `finally` (§6.7).
 
 ### 7.9 Built-ins
 
@@ -1756,15 +1785,15 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor), `Array.fromAsync(items, mapFn, thisArg)` (the same over an async or sync iterable or an array-like, every element and mapped value awaited, §7.8); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` (`constructor[@@species]`; `%Array%`, `%Map%`, `%Set%` and `%Promise%` have the builtin `get [Symbol.species]` returning `this`), `concat` spreads the items `IsConcatSpreadable` accepts (`@@isConcatSpreadable`, else `IsArray`), and `Array.prototype[@@unscopables]` is the spec's `null`-prototype list |
 | `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order, not locale collation), `normalize` (all four forms; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode mappings, lossless; a one-byte receiver maps in the guest), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`, §5.4); `search`, `match`, `matchAll`, `replace`, `replaceAll`, `split` call an object argument's `@@search` / `@@match` / `@@matchAll` / `@@replace` / `@@split` method with `(O, …)` before `ToString(this)` (`matchAll` / `replaceAll` first require an `IsRegExp` argument's `flags` to hold `g`), and `includes` / `startsWith` / `endsWith` throw a `TypeError` for an `IsRegExp` argument (`ToBoolean(arg[@@match])`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all but the host case-mapping path (§6.1), `localeCompare` and `normalize` (host, §6.1) run in the guest on code units (`emit/builtins/string.rs`), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
 | `Number` / `Boolean` | `Number(v)`, `Boolean(v)`, wrappers via `new`; `Number.isInteger`, `isSafeInteger`, `isFinite`, `isNaN` (no coercion), `Number.parseFloat` / `parseInt` (the global functions); `EPSILON`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`, `MIN_VALUE`, `NaN`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`; `Number.prototype.toString(radix)`, `toFixed`, `toExponential`, `toPrecision`, `toLocaleString` (= `toString()`), `valueOf`; `Boolean.prototype.toString`, `valueOf` |
-| `Math` | every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
+| `Math` | `sumPrecise(items)` (any iterable of numbers, else a `TypeError` after closing it; summed exactly in a fixed-point limb accumulator and rounded once; `NaN` / opposite infinities give `NaN`, no value or only `-0` gives `-0`), and every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string (a string's first 10 code units), `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw, a lone surrogate written as `\udxxx`), `JSON.parse(text, reviver)` (in-wasm recursive descent, `\uXXXX` escapes incl. lone surrogates, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`/`keys`/`values`/`entries` (also `[@@iterator]`); Set `add`/`has`/`delete`/`clear`/`forEach`/`size`/`values` (also `keys` and `[@@iterator]`)/`entries`; the iterators walk the live backing entries, so entries appended during iteration are seen |
-| `Promise` | §6.7, §7.8; `then` / `finally` create their result through `SpeciesConstructor(this, %Promise%)` (`get [Symbol.species]` on `%Promise%`); `Promise.resolve` / `Promise.reject` ignore `this` and always build a `%Promise%` (§13) |
+| `Promise` | §6.7, §7.8; `then` / `finally` create their result through `SpeciesConstructor(this, %Promise%)` (`get [Symbol.species]` on `%Promise%`); `Promise.resolve` / `Promise.reject` construct from `this` (`PromiseResolve(C, x)` / `NewPromiseCapability(C)`; a non-constructor `this` throws `TypeError`); `Promise.all`, `allSettled`, `any` (all rejected: an `AggregateError` with `errors`), `race` over any iterable (§6.7) |
 | `Date` | `new Date()`, `new Date(ms)`, `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`; `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `toISOString`, `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`), `[@@toPrimitive]` (configurable only) — all UTC, computed in wasm |
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter, `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
-| iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); no `Iterator` global or helpers, and `%IteratorPrototype%` has no `@@toStringTag` yet |
+| iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. The eager helpers `reduce` / `toArray` / `forEach` / `some` / `every` / `find` validate `this` and the callback the same way, read `next` once and consume the iterator, passing a counter as the callback's last argument (`reduce` without an initial value starts from the first value with counter `1`, and throws `TypeError` on an empty iterator); a throwing callback closes the iterator under its throw, `some` / `every` / `find` close it on an early result, and a throw from `next` or a result's `value` propagates without closing. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
 
 No input produces an invalid wasm module.
 
@@ -2044,8 +2073,7 @@ Each item below is current behaviour of this tree.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
   `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
-- The builtin library is exactly §7.9: no `Math.sumPrecise` (it waits for the iterator
-  protocol), …, no `Promise.all` / `race` / `allSettled` / `any`.
+- The builtin library is exactly §7.9.
 - The `Math` transcendental functions follow the host libm (Rust) or the JS
   engine (shim), which may differ in the last ulp.
 
@@ -2081,7 +2109,7 @@ Each item below is current behaviour of this tree.
   | `void` | L2-L | 5 | 36 | 7 | | 1 |
   | tagged templates, `yield*` in async generators, `for-in` heads | L2-L | 4 | 4 | | | |
   | `Symbol` / `@@toStringTag` | Y1–Y4 (landed; recount at the next baseline) | 24 | 7 | 1 | | |
-  | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | D3 | 19 | | | 8 | |
+  | iterator methods (`keys` / `values` / `entries`, `Array.fromAsync`, `Math.sumPrecise`) | Y2 / Y5 / Y3 (landed; recount at the next baseline) | 19 | | | 8 | |
   | UTF-16 strings (non-ASCII positions, `isWellFormed` / `toWellFormed`) | U1/U2 (landed; recount at the next baseline) | | 29 | | | |
   | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
@@ -2115,10 +2143,6 @@ Each item below is current behaviour of this tree.
   render as `[Function: f]` whatever their kind.
 - Thenables are not assimilated: `await t` and `Promise.resolve(t)` on a
   non-promise thenable yield `t` itself.
-- `Promise.resolve` / `Promise.reject` ignore their `this`: they always build
-  a `%Promise%` (`PromiseResolve(%Promise%, v)`), so a subclass or another
-  constructor as receiver is not honoured (`then` / `finally` do use
-  `SpeciesConstructor`).
 
 **Date**
 
@@ -2187,7 +2211,9 @@ the async test262 runner, and language completions pulled forward from phase 5
 (comma, generator and async expressions / methods, async generators,
 non-simple parameters, early errors, `var` hoisting and global bindings).
 Wave 3c (`Symbol`, the iteration protocol incl. async iteration, Latin-1 /
-UTF-16 strings) is in progress; its design is `design/symbol-strings.md`.
+UTF-16 strings) is complete apart from its CI pass (the full test suite,
+test262 baseline and opcount snapshot run in GitHub Actions); its design is
+`design/symbol-strings.md`.
 Its stage Y1 is done: `Symbol` (registry, wrappers, the 13 well-known
 symbols), symbol-keyed properties, and computed class member names (pulled
 forward from phase 5); the well-known symbol hooks throw until Y2 / Y4 (§13).
@@ -2197,7 +2223,16 @@ methods in the guest. Its stage U2 is done: the code-point string iterator,
 full lossless case mapping, `normalize` in all four forms, and lossless
 code-unit `localeCompare`. Its stage Y5 is done: the async `GetIterator`,
 `%AsyncFromSyncIteratorPrototype%`, `for await`, `yield*` in async
-generators (pulled forward from phase 5) and `Array.fromAsync`.
+generators (pulled forward from phase 5) and `Array.fromAsync`. Its stage
+Y2 is done: the generic iteration protocol (iterator records, `IteratorClose`
+on abrupt exits, lazy array destructuring, `yield*` and generator
+`return` / `throw` routing, Map/Set tombstones for live iterators). Its stage
+Y4 is done: `@@toPrimitive`, `@@toStringTag`, `@@hasInstance`, `@@species`,
+`@@isConcatSpreadable` and the String-method symbol dispatch are honoured.
+Its stage Y3 is done: the `Iterator` global, `Iterator.from` and the lazy and
+eager iterator helpers, the `Promise` combinators (`all`, `allSettled`,
+`any`, `race`) with `this`-aware `Promise.resolve` / `reject`, and
+`Math.sumPrecise`.
 
 - The remaining built-ins on the realm's prototypes: `Date` parsing and local
   time. `Object` reflection is done: property descriptors, integrity levels,
@@ -2205,7 +2240,7 @@ generators (pulled forward from phase 5) and `Array.fromAsync`.
   of §7.9 (with `__proto__` and the legacy accessor methods); the test262
   runner includes `propertyHelper.js` tests.
 - `Symbol` and a generic iteration protocol behind for-of, spread, and
-  destructuring.
+  destructuring, with the `Iterator` helpers (done in Y1 / Y2 / Y4 / Y3).
 - Latin-1 / UTF-16 dual string representation with spec `.length`, indexing,
   and surrogate pairs, the string iterator, full case mapping and `normalize`
   (done in U1 / U2).
