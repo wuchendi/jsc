@@ -54,11 +54,7 @@ pub(super) const SYMBOL_TO_NUMBER: CalleeErrorText<'static> = [
 /// The interim `TypeError`s of a well-known symbol hook a consult site finds
 /// before the stage that honours it (design/symbol-strings.md §9.4), in
 /// [`hook_text`] order.
-const HOOK_TEXTS: [CalleeErrorText<'static>; 10] = [
-    [
-        "Symbol.iterator protocol is not supported yet",
-        "TypeError: Symbol.iterator protocol is not supported yet",
-    ],
+const HOOK_TEXTS: [CalleeErrorText<'static>; 9] = [
     [
         "Symbol.toPrimitive is not supported yet",
         "TypeError: Symbol.toPrimitive is not supported yet",
@@ -104,22 +100,22 @@ const HOOK_SPLIT: CalleeErrorText<'static> = [
 ];
 
 /// The interim `TypeError` of a `symbol` hook (see [`HOOK_TEXTS`]); `None`
-/// for the symbols without a consult site (`@@asyncIterator`,
-/// `@@unscopables`).
+/// for the symbols without an interim guard (`@@iterator`, honoured by the
+/// iteration protocol; `@@asyncIterator`, `@@unscopables`, without a
+/// consult site).
 pub(super) fn hook_text(symbol: WellKnown) -> Option<CalleeErrorText<'static>> {
     let at = match symbol {
-        WellKnown::Iterator => 0,
-        WellKnown::ToPrimitive => 1,
-        WellKnown::ToStringTag => 2,
-        WellKnown::HasInstance => 3,
-        WellKnown::Species => 4,
-        WellKnown::IsConcatSpreadable => 5,
-        WellKnown::Match => 6,
-        WellKnown::MatchAll => 7,
-        WellKnown::Replace => 8,
-        WellKnown::Search => 9,
+        WellKnown::ToPrimitive => 0,
+        WellKnown::ToStringTag => 1,
+        WellKnown::HasInstance => 2,
+        WellKnown::Species => 3,
+        WellKnown::IsConcatSpreadable => 4,
+        WellKnown::Match => 5,
+        WellKnown::MatchAll => 6,
+        WellKnown::Replace => 7,
+        WellKnown::Search => 8,
         WellKnown::Split => return Some(HOOK_SPLIT),
-        WellKnown::AsyncIterator | WellKnown::Unscopables => return None,
+        WellKnown::Iterator | WellKnown::AsyncIterator | WellKnown::Unscopables => return None,
     };
     Some(HOOK_TEXTS[at])
 }

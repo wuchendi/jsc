@@ -313,7 +313,7 @@ fn array(body: &Body) -> IrNode {
         rhs: Box::new(IrNode::Str("number".to_owned())),
     };
     let one = ternary(is_number, with_length, IrNode::Array(vec![body.arg(0)]));
-    let spread = IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::SpreadArgsGlobal)]);
+    let spread = IrNode::ArraySpread(vec![SpreadElem::List(IrNode::SpreadArgsGlobal)]);
     let elements = (0..=body.k).rev().fold(spread, |more, n| {
         ternary(
             body.argc_is(n),

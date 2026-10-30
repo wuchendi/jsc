@@ -937,19 +937,6 @@ fn more_fragments(k: u32) -> Vec<IrNode> {
     vec![
         construct(frame, o, Some(o), SPECIES_NOT_CTOR),
         construct(frame, o, None, THIS_NOT_CTOR),
-        IrNode::GenResume {
-            handle: Box::new(IrNode::Local(o)),
-            sent: Box::new(IrNode::Undefined),
-        },
-        IrNode::IterSource {
-            value: Box::new(IrNode::Local(o)),
-            live: true,
-        },
-        IrNode::IterLen(Box::new(IrNode::Local(o))),
-        IrNode::IterItem {
-            iterable: Box::new(IrNode::Local(o)),
-            index: Box::new(IrNode::Local(o)),
-        },
     ]
 }
 
@@ -1047,20 +1034,6 @@ fn require_callable(
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, text, strings, helpers);
     wasm!(function; End);
-}
-
-/// Push i32 `1` when the jsval in `local` is a heap block of one of `kinds`.
-fn is_type(function: &mut Function, local: u32, kinds: &[i32]) {
-    emit_is_pointer(function, local);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    for (i, &kind) in kinds.iter().enumerate() {
-        emit_load_type_byte(function, local);
-        wasm!(function; I32Const(kind), I32Eq);
-        if i > 0 {
-            wasm!(function; I32Or);
-        }
-    }
-    wasm!(function; Else, I32Const(0), End);
 }
 
 /// `ArrayCreate(len)` into i64 `out` for the number jsval in i64 `len`: a
@@ -1242,7 +1215,9 @@ fn create_data_property(
         If(BlockType::Empty),
         LocalGet(a), LocalGet(key), LocalGet(v), Call(helpers.array_define()),
     );
-    return_if_pending(function);
+    enter_frame(helpers);
+    emit_propagate_if_pending(function, helpers);
+    leave_frame(helpers);
     wasm!(function;
         Else,
         LocalGet(key), I32Const(1), Call(helpers.to_key), LocalSet(k),
@@ -1258,7 +1233,12 @@ fn create_data_property(
         End,
         If(BlockType::Empty),
     );
+    // Inside the `else` arm and this `if` (a handler may be active).
+    enter_frame(helpers);
+    enter_frame(helpers);
     throw_type_error(function, frame, CANNOT_DEFINE, strings, helpers);
+    leave_frame(helpers);
+    leave_frame(helpers);
     wasm!(function;
         End,
         LocalGet(a), I32WrapI64, LocalGet(k), LocalGet(v),
@@ -1323,39 +1303,14 @@ pub(super) fn emit_of(
     wasm!(function; LocalGet(target));
 }
 
-/// On a pending throw, `IteratorClose` the generator in i64 `generator` (its
-/// `return()`, whose own completion is discarded) and return with the
-/// original throw pending.
-fn close_on_throw(function: &mut Function, frame: Frame, generator: u32, helpers: Helpers<'_>) {
-    let exc = frame.y64(5);
-    wasm!(function;
-        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
-        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(exc),
-        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
-    );
-    for _ in 0..frame.k {
-        wasm!(function; I64Const(UNDEFINED_BITS));
-    }
-    wasm!(function; LocalGet(generator), GlobalSet(THIS_GLOBAL), I64Const(UNDEFINED_BITS));
-    emit_argc(0, function);
-    wasm!(function;
-        Call(helpers.builtin(Builtin::GeneratorReturn)), Drop,
-        LocalGet(exc), GlobalSet(EXC_VALUE_GLOBAL),
-        I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
-        I64Const(UNDEFINED_BITS), Return,
-        End,
-    );
-}
-
 /// `Array.from(items, mapFn, thisArg)`: a non-callable `mapFn` throws first.
-/// An iterable the runtime iterates (a generator, stepped and closed on an
-/// abrupt `mapFn`; an array, string, `String` wrapper, `Map`, `Set` or
-/// `arguments`, walked live) fills `A = IsConstructor(this) ?
-/// Construct(this) : ArrayCreate(0)` by `CreateDataPropertyOrThrow`; any
-/// other object is an array-like (`ToObject`, `LengthOfArrayLike`, `A` from
-/// `Construct(this, [len])`, `Get` per index). `A.length` is set last. An
-/// `items` whose chain holds a `@@iterator` (a user hook, `__symbol_get`)
-/// throws the interim `TypeError` (design/symbol-strings.md §9.4).
+/// `GetMethod(items, @@iterator)` (through the guarded fast paths of
+/// design/symbol-strings.md §5.3) decides: an iterable fills `A =
+/// IsConstructor(this) ? Construct(this) : ArrayCreate(0)` by
+/// `CreateDataPropertyOrThrow` from its iterator record, closing the
+/// iterator when `mapFn` or the define throws; any other value is an
+/// array-like (`ToObject`, `LengthOfArrayLike`, `A` from `Construct(this,
+/// [len])`, `Get` per index). `A.length` is set last.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_from(
     function: &mut Function,
@@ -1366,6 +1321,9 @@ pub(super) fn emit_from(
     let (c, items, map_fn, this_arg) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (a, v, kv, len_v) = (frame.x64(0), frame.x64(1), frame.y64(0), frame.y64(1));
     let (k, len, mapping, key) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let method = frame.y64(4);
+    let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
+    let scratch = frame.scratch();
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(c));
     frame.arg(function, 0);
     wasm!(function; LocalSet(items));
@@ -1383,19 +1341,11 @@ pub(super) fn emit_from(
     wasm!(function; If(BlockType::Empty));
     throw_type_error(function, frame, FROM_NULLISH, strings, helpers);
     wasm!(function; End);
-    // A user `@@iterator` is not honoured before Y2 (§9.4).
-    emit_hook_guard(
-        function,
-        items,
-        WellKnown::Iterator,
-        frame.scratch(),
-        strings,
-        helpers,
-    );
-    return_if_pending(function);
-    // `v = mapFn(v, k)` when mapping, then `A[k] = v`, `k += 1`.
-    let store = |function: &mut Function, close: bool| {
+    // `v = mapFn(v, k)` when mapping, then `A[k] = v`, `k += 1`; a throw
+    // propagates (to the caller's handler, if any).
+    let store = |function: &mut Function| {
         wasm!(function; LocalGet(mapping), If(BlockType::Empty));
+        enter_frame(helpers);
         push_call(
             function,
             frame,
@@ -1405,79 +1355,26 @@ pub(super) fn emit_from(
             helpers,
         );
         wasm!(function; LocalSet(v));
-        if close {
-            close_on_throw(function, frame, items, helpers);
-        } else {
-            return_if_pending(function);
-        }
+        emit_propagate_if_pending(function, helpers);
+        leave_frame(helpers);
         wasm!(function; End);
         index_value(function, k);
         wasm!(function; LocalSet(kv));
         create_data_property(function, frame, a, kv, v, strings, helpers);
         wasm!(function; LocalGet(k), I32Const(1), I32Add, LocalSet(k));
     };
-    let finish = |function: &mut Function| {
-        index_value(function, k);
-        wasm!(function; LocalSet(kv));
-        set_length(function, frame, a, kv, strings, helpers);
-        wasm!(function; LocalGet(a), Return);
-    };
     wasm!(function; I32Const(0), LocalSet(k));
-    // A generator: step it until done.
-    is_type(function, items, &[TYPE_GENERATOR]);
-    wasm!(function; If(BlockType::Empty));
-    construct_or_create(function, frame, c, None, a, strings, helpers);
-    wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
-    let resume = IrNode::GenResume {
-        handle: Box::new(IrNode::Local(items)),
-        sent: Box::new(IrNode::Undefined),
-    };
-    emit_node(&resume, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(v));
-    return_if_pending(function);
+    // The record state of `items`' fast path, or the protocol.
+    emit_iter_classify(function, items, false, frame.y32(0), helpers);
+    wasm!(function; LocalTee(frame.z64(2)), I64Const(iter::protocol_state()), I64Eq, If(BlockType::Empty));
     wasm!(function;
-        LocalGet(v), I32Const(static_key(strings, "done")), Call(helpers.get),
-        I64Const(TRUE_BITS), I64Eq, BrIf(1),
-        LocalGet(v), I32Const(static_key(strings, "value")), Call(helpers.get), LocalSet(v),
+        LocalGet(items), I32Const(realm::symbol_addr(WellKnown::Iterator, helpers)),
+        Call(helpers.symbol_get()), LocalSet(method),
     );
-    store(function, true);
-    wasm!(function; Br(0), End, End);
-    finish(function);
-    wasm!(function; End);
-    // The other runtime iterables: walked live by index.
-    emit_is_string(function, items);
-    is_type(function, items, &[TYPE_ARRAY, TYPE_MAP, TYPE_SET]);
-    wasm!(function; I32Or);
-    emit_is_wrapper(function, items, abi::CLASS_STRING);
-    wasm!(function; I32Or);
-    emit_is_wrapper(function, items, abi::CLASS_ARGUMENTS);
-    wasm!(function; I32Or, If(BlockType::Empty));
-    construct_or_create(function, frame, c, None, a, strings, helpers);
-    let source = IrNode::IterSource {
-        value: Box::new(IrNode::Local(items)),
-        live: true,
-    };
-    emit_node(&source, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(items));
     return_if_pending(function);
-    wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
-    index_value(function, k);
-    wasm!(function; LocalTee(kv), F64ReinterpretI64);
-    let length = IrNode::IterLen(Box::new(IrNode::Local(items)));
-    emit_node(&length, function, frame.scratch(), strings, helpers);
-    wasm!(function; F64ReinterpretI64, F64Ge, BrIf(1));
-    let item = IrNode::IterItem {
-        iterable: Box::new(IrNode::Local(items)),
-        index: Box::new(IrNode::Local(kv)),
-    };
-    emit_node(&item, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(v));
-    return_if_pending(function);
-    store(function, false);
-    wasm!(function; Br(0), End, End);
-    finish(function);
-    wasm!(function; End);
-    // An array-like.
+    // No `@@iterator`: an array-like.
+    emit_is_nullish(function, method);
+    wasm!(function; If(BlockType::Empty));
     wasm!(function; LocalGet(items), Call(helpers.to_object()), LocalSet(items));
     length_of(function, items, len, strings, helpers);
     index_value(function, len);
@@ -1485,11 +1382,46 @@ pub(super) fn emit_from(
     construct_or_create(function, frame, c, Some(len_v), a, strings, helpers);
     count_loop(function, k, len, |function| {
         get_index(function, items, k, key, v, helpers);
-        store(function, false);
+        store(function);
         // `store` advanced `k`; the loop advances it again.
         wasm!(function; LocalGet(k), I32Const(1), I32Sub, LocalSet(k));
     });
     set_length(function, frame, a, len_v, strings, helpers);
+    wasm!(function; LocalGet(a), Return, End);
+    construct_or_create(function, frame, c, None, a, strings, helpers);
+    iter::emit_iter_open_with(function, items, method, &rec, scratch, strings, helpers);
+    wasm!(function; Else);
+    wasm!(function; LocalGet(items), LocalSet(frame.z64(0)), I64Const(0), LocalSet(frame.z64(1)));
+    construct_or_create(function, frame, c, None, a, strings, helpers);
+    wasm!(function; End);
+    // Step the record; a throw from `mapFn` or the define closes it (one
+    // from the iterator itself leaves it done, so the close does nothing).
+    iter::guarded(function, helpers, |function| {
+        wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
+        enter_frame(helpers);
+        enter_frame(helpers);
+        emit_iterator_step(&rec, function, scratch, strings, helpers);
+        wasm!(function; I32Eqz, BrIf(1));
+        emit_iterator_value(&rec, function, scratch, strings, helpers);
+        wasm!(function; LocalSet(v));
+        store(function);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        wasm!(function; Br(0), End, End);
+    });
+    wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+    emit_iterator_close(
+        &rec,
+        CloseMode::Pending,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
+    index_value(function, k);
+    wasm!(function; LocalSet(kv));
+    set_length(function, frame, a, kv, strings, helpers);
     wasm!(function; LocalGet(a));
 }
 
