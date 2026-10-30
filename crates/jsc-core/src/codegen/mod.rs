@@ -605,8 +605,9 @@ struct LowerCtx<'a> {
     current_super: Option<SuperScope>,
     /// The instance field declarations of the class whose constructor is being
     /// lowered: a base constructor defines them on entry, a derived one after
-    /// each `super(..)`.
-    class_fields: Vec<ClassProp>,
+    /// each `super(..)`. A computed field name carries the class frame and the
+    /// hidden id of its key, converted once at class definition time.
+    class_fields: Vec<(ClassProp, Option<(usize, u32)>)>,
     /// While lowering `static` field initializers: the class frame and the
     /// hidden id of the class value, which `this` resolves to there.
     static_init: Option<(usize, u32)>,

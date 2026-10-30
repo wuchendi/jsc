@@ -286,8 +286,8 @@ impl LowerCtx<'_> {
             // A class expression; an anonymous one has the empty name here
             // (`lower_named_expr` names it after its binding).
             Expr::Class(class_expr) => match &class_expr.ident {
-                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true),
-                None => self.lower_class(&class_expr.class, "", false),
+                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true, None),
+                None => self.lower_class(&class_expr.class, "", false, None),
             },
             // `new.target`: the enclosing non-arrow function's snapshot; outside
             // any function it is a SyntaxError.
@@ -536,7 +536,7 @@ impl LowerCtx<'_> {
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
             Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
-                self.lower_class(&class_expr.class, name, false)
+                self.lower_class(&class_expr.class, name, false, None)
             }
             _ => self.lower_expr(expr),
         }
@@ -1700,10 +1700,13 @@ impl LowerCtx<'_> {
                             let value = self.lower_named_expr(&kv.value, &name)?;
                             (PropKey::Static(name), value)
                         }
-                        key if is_anonymous_function(&kv.value) => {
+                        key if is_anonymous_definition(&kv.value) => {
                             let (key, named) = self.computed_name_key(key);
-                            let value = self.lower_expr(&kv.value)?;
-                            (key, self.set_computed_name(value, named, ""))
+                            let value = match named {
+                                Some(named) => self.lower_computed_named_expr(&kv.value, named)?,
+                                None => self.lower_expr(&kv.value)?,
+                            };
+                            (key, value)
                         }
                         key => (key, self.lower_expr(&kv.value)?),
                     };
@@ -1780,7 +1783,7 @@ impl LowerCtx<'_> {
     /// it: the key is converted once (`ToPropertyKey`, before the value runs)
     /// into a fresh local, which the entry's [`Self::set_computed_name`]
     /// reads. Any other key is returned as is, with `None`.
-    fn computed_name_key(&mut self, key: PropKey) -> (PropKey, Option<u32>) {
+    pub(super) fn computed_name_key(&mut self, key: PropKey) -> (PropKey, Option<u32>) {
         let PropKey::Computed(expr) = key else {
             return (key, None);
         };
@@ -1798,7 +1801,7 @@ impl LowerCtx<'_> {
     /// The function `value` of an entry under the computed key converted into
     /// `key` (see [`Self::computed_name_key`]), with its `name` set at run
     /// time from that key and `prefix`; `value` itself without one.
-    fn set_computed_name(
+    pub(super) fn set_computed_name(
         &mut self,
         value: IrNode,
         key: Option<u32>,
@@ -1812,6 +1815,27 @@ impl LowerCtx<'_> {
             key,
             prefix,
             local: self.fresh(),
+        }
+    }
+
+    /// Lower `expr`, the value of an entry under the computed key converted
+    /// into the local `key` (see [`Self::computed_name_key`]): an anonymous
+    /// function, arrow, or class definition gets its `name` from the key at
+    /// run time (a class before its static members are defined).
+    pub(super) fn lower_computed_named_expr(
+        &mut self,
+        expr: &Expr,
+        key: u32,
+    ) -> anyhow::Result<IrNode> {
+        match expr {
+            Expr::Class(class_expr) if class_expr.ident.is_none() => {
+                self.lower_class(&class_expr.class, "", false, Some(key))
+            }
+            _ if is_anonymous_function(expr) => {
+                let value = self.lower_expr(expr)?;
+                Ok(self.set_computed_name(value, Some(key), ""))
+            }
+            _ => self.lower_expr(expr),
         }
     }
 
@@ -2359,13 +2383,19 @@ fn is_anonymous_function(expr: &Expr) -> bool {
     matches!(expr, Expr::Arrow(_)) || matches!(expr, Expr::Fn(f) if f.ident.is_none())
 }
 
+/// Whether `expr` is an anonymous function or class definition
+/// (`IsAnonymousFunctionDefinition`), named by the key it is defined under.
+pub(super) fn is_anonymous_definition(expr: &Expr) -> bool {
+    is_anonymous_function(expr) || matches!(expr, Expr::Class(c) if c.ident.is_none())
+}
+
 /// The compile-time name of a static property key (`""` for a computed key,
 /// whose name is set at run time instead, [`IrNode::SetFunctionName`]): the
 /// `name` given to a method or accessor defined under it.
 fn static_key_name(key: &PropKey) -> &str {
     match key {
         PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => name,
-        PropKey::Computed(_) => "",
+        PropKey::Computed(_) | PropKey::HiddenComputed(_) => "",
     }
 }
 
@@ -2380,7 +2410,7 @@ pub(super) fn push_accessor_half(
 ) {
     let existing = entries.iter_mut().rev().find_map(|(k, v)| match v {
         IrNode::MakeAccessor { getter, setter }
-            if !matches!(k, PropKey::Computed(_)) && *k == key =>
+            if !matches!(k, PropKey::Computed(_) | PropKey::HiddenComputed(_)) && *k == key =>
         {
             Some((getter, setter))
         }

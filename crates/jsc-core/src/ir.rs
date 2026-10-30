@@ -276,6 +276,9 @@ pub enum PropKey {
     /// A computed key (`{[k]: v}`, or a numeric literal key `{1: v}`), converted
     /// with `ToPropertyKey` and interned at run time.
     Computed(IrNode),
+    /// A computed key of a NON-enumerable (writable, configurable) property:
+    /// a class method or accessor under a computed name (`[k]() {}`).
+    HiddenComputed(IrNode),
 }
 
 /// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
@@ -884,8 +887,9 @@ pub enum IrNode {
     /// symbol. An object's user `toString` / `valueOf` throw propagates.
     ToPropertyKey(Box<IrNode>),
     /// `SetFunctionName(func, key, prefix)` at run time for a function value
-    /// defined under a computed key (an object literal method, accessor, or
-    /// anonymous function / arrow value): `func` is evaluated into `local`,
+    /// defined under a computed key (an object literal or class method,
+    /// accessor, or anonymous function / arrow / class value, a class field
+    /// initializer included): `func` is evaluated into `local`,
     /// its own `name` is redefined (configurable only) as `prefix` followed by
     /// the key — a string key itself, a symbol `"[desc]"` (`""` when the
     /// description is `undefined`) — and `func` is the result.
@@ -2255,16 +2259,16 @@ impl IrNode {
             }
             IrNode::SetProto { obj, proto } => f(obj) || f(proto),
             IrNode::Object { entries, proto, .. } => {
-                proto.as_deref().is_some_and(&mut f)
-                    || entries.iter().any(|(key, value)| {
-                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
-                    })
+                proto.as_deref().is_some_and(&mut f) || entries.iter().any(|(key, value)| {
+                    matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
+                        || f(value)
+                })
             }
             IrNode::DefineProps { obj, entries, .. } => {
-                f(obj)
-                    || entries.iter().any(|(key, value)| {
-                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
-                    })
+                f(obj) || entries.iter().any(|(key, value)| {
+                    matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
+                        || f(value)
+                })
             }
             IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
                 SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
@@ -2465,7 +2469,7 @@ impl IrNode {
             IrNode::Object { entries, proto, .. } => {
                 let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
                 for (key, value) in entries {
-                    if let PropKey::Computed(key) = key {
+                    if let PropKey::Computed(key) | PropKey::HiddenComputed(key) = key {
                         out.push(key);
                     }
                     out.push(value);
@@ -2475,7 +2479,7 @@ impl IrNode {
             IrNode::DefineProps { obj, entries, .. } => {
                 let mut out: Vec<&mut IrNode> = vec![&mut **obj];
                 for (key, value) in entries {
-                    if let PropKey::Computed(key) = key {
+                    if let PropKey::Computed(key) | PropKey::HiddenComputed(key) = key {
                         out.push(key);
                     }
                     out.push(value);

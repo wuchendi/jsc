@@ -16,15 +16,6 @@ fn rejects_spread() {
 }
 
 #[test]
-fn rejects_computed_class_fields() {
-    // Class declarations and expressions, `extends` of any expression, and
-    // plain/static members are supported (see the classes suites); computed
-    // field forms remain out of scope.
-    assert_rejected("class A { [k] = 1 } new A()");
-    assert_rejected("let C = class { [k] = 1 }; new C()");
-}
-
-#[test]
 fn rejects_unsupported_for_of_and_for_in() {
     // A bare-identifier `for-of` head and a statically non-enumerable
     // `for-in` head still trap (a non-iterable `for-of` source is a run-time
