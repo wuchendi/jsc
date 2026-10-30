@@ -4,10 +4,11 @@
 # missing (probed against jsc); partially working features stay enabled so
 # their failures are counted. Remove entries as support lands.
 
-# Symbols: async iteration (`for await`, async `yield*`) is not implemented;
-# symbols as WeakMap keys need WeakMap
-Symbol.asyncIterator
+# Symbols as WeakMap keys need WeakMap
 symbols-as-weakmap-keys
+
+# Array.fromAsync: until Y5-T4
+Array.fromAsync
 
 # Proxy / Reflect (no globals)
 Proxy
