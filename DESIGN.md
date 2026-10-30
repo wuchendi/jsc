@@ -1952,17 +1952,23 @@ All workflows use Rust toolchain `1.99.1`.
 or with `gh workflow run ci.yml --ref <branch>`. Pushes and pull requests do
 not run it.
 
-**Job `rust`** (fmt + clippy + test + deny + shear + typos):
+**Job `rust`** (fmt + clippy + doctests + deny + shear + typos):
 
 - `cargo fmt --all --check`
 - `typos`
 - `cargo clippy --all-targets --workspace` (deny-warnings from the workspace lints)
-- `cargo nextest run --workspace` (includes the opcount snapshot gate, §6.4;
-  the M1 harness tests in `crates/jsc/tests/test262_harness.rs` print a notice
-  and pass when the test262 checkout is absent, as in this job)
 - `cargo test --doc --workspace`
 - `cargo shear`
 - `cargo deny check`
+
+**Job `test`** (matrix of 4): `cargo nextest run --workspace --no-fail-fast
+--partition count:N/4`, so the suite runs in four parallel quarters and every
+failure is reported (includes the opcount snapshot gate, §6.4; the M1 harness
+tests in `crates/jsc/tests/test262_harness.rs` print a notice and pass when the
+test262 checkout is absent, as in this job). Dev and test builds use
+`opt-level = 1` for the workspace and `opt-level = 3` for dependencies
+(`Cargo.toml`), because every test compiles and runs JS programs through swc,
+the emitter and wasmtime.
 
 **Job `test262`** (baseline regression gate, 90-minute timeout): fetch test262
 (cached on the hash of `scripts/test262-fetch.sh`), `cargo build --release -p
