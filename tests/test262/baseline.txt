@@ -168,6 +168,7 @@ built-ins/Array/isArray/15.4.3.2-0-1.js
 built-ins/Array/isArray/15.4.3.2-0-2.js
 built-ins/Array/isArray/15.4.3.2-0-3.js
 built-ins/Array/isArray/15.4.3.2-0-4.js
+built-ins/Array/isArray/15.4.3.2-0-5.js
 built-ins/Array/isArray/15.4.3.2-0-6.js
 built-ins/Array/isArray/15.4.3.2-0-7.js
 built-ins/Array/isArray/15.4.3.2-1-1.js
@@ -205,6 +206,7 @@ built-ins/Array/length/S15.4.2.2_A2.3_T2.js
 built-ins/Array/length/S15.4.2.2_A2.3_T3.js
 built-ins/Array/length/S15.4.2.2_A2.3_T4.js
 built-ins/Array/length/S15.4.2.2_A2.3_T5.js
+built-ins/Array/length/S15.4.4_A1.3_T1.js
 built-ins/Array/length/S15.4.5.1_A1.1_T1.js
 built-ins/Array/length/S15.4.5.1_A1.1_T2.js
 built-ins/Array/length/S15.4.5.1_A1.2_T1.js
@@ -547,6 +549,7 @@ built-ins/Array/prototype/every/call-with-boolean.js
 built-ins/Array/prototype/every/length.js
 built-ins/Array/prototype/every/name.js
 built-ins/Array/prototype/every/prop-desc.js
+built-ins/Array/prototype/exotic-array.js
 built-ins/Array/prototype/fill/call-with-boolean.js
 built-ins/Array/prototype/fill/coerced-indexes.js
 built-ins/Array/prototype/fill/fill-values-custom-start-and-end.js
@@ -1502,6 +1505,7 @@ built-ins/Array/prototype/lastIndexOf/length-zero-returns-minus-one.js
 built-ins/Array/prototype/lastIndexOf/length.js
 built-ins/Array/prototype/lastIndexOf/name.js
 built-ins/Array/prototype/lastIndexOf/prop-desc.js
+built-ins/Array/prototype/length.js
 built-ins/Array/prototype/map/15.4.4.19-1-1.js
 built-ins/Array/prototype/map/15.4.4.19-1-10.js
 built-ins/Array/prototype/map/15.4.4.19-1-11.js

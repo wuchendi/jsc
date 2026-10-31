@@ -1001,10 +1001,16 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
             function_proto(&memory, proto);
         } else {
             // Arrays, Map/Set, promises and dates inherit from their realm
-            // prototype, generators from %Object.prototype%: an ordinary object.
+            // prototype, generators from %Object.prototype%: an ordinary
+            // object, except %Array.prototype%, itself an array.
             assert_eq!((proto >> 48) & 0b111, 0b101, "{src}: proto is a heap block");
             let at = usize::try_from(proto & 0xFFFF_FFFF).expect("base");
-            assert_eq!(memory[at], TYPE_OBJECT, "{src}: proto");
+            let proto_kind = if kind == TYPE_ARRAY {
+                TYPE_ARRAY
+            } else {
+                TYPE_OBJECT
+            };
+            assert_eq!(memory[at], proto_kind, "{src}: proto");
         }
         (base, memory)
     };
