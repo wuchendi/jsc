@@ -17,6 +17,7 @@ import {
   CLASS_BOOLEAN,
   CLASS_ERROR,
   CLASS_STRING,
+  CLASS_SYMBOL,
   DATE_MS_OFFSET,
   ELEMS_CAP_OFFSET,
   ELEMS_DATA_OFFSET,
@@ -29,7 +30,6 @@ import {
   FUNC_INDEX_OFFSET,
   HEADER_CLASS_OFFSET,
   HEADER_FLAGS_OFFSET,
-  HEADER_SIZE,
   HEAP,
   HOLE,
   MAP_SIZE_OFFSET,
@@ -48,7 +48,11 @@ import {
   PROPS_HEADER_SIZE,
   PROPS_TFLAGS_OFFSET,
   QNAN,
+  STR_DATA_OFFSET,
   STR_FLAG_ARRAY_INDEX,
+  STR_FLAG_TWO_BYTE,
+  STR_LEN_OFFSET,
+  SYMBOL_DESCRIPTION_OFFSET,
   TYPE_ARRAY,
   TYPE_DATE,
   TYPE_FUNCTION,
@@ -58,6 +62,7 @@ import {
   TYPE_PROMISE,
   TYPE_SET,
   TYPE_STRING,
+  TYPE_SYMBOL,
   U32_MASK,
   U64_MASK,
   UNDEFINED,
@@ -71,6 +76,7 @@ export type Value =
   | { kind: 'null' }
   | { kind: 'undefined' }
   | { kind: 'string'; value: string }
+  | { kind: 'symbol'; description: string | undefined }
   | { kind: 'array'; items: Value[]; props: [string, Value][] }
   | { kind: 'holes'; count: number }
   | { kind: 'object'; entries: [string, Value][] }
@@ -145,9 +151,6 @@ function readU64(mem: Uint8Array, off: number): bigint | undefined {
   return value
 }
 
-const utf8 = new TextDecoder()
-const utf8Encode = new TextEncoder()
-
 /**
  * Decode raw jsval `bits` into a {@link Value} per the NaN-box layout.
  *
@@ -217,6 +220,8 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
   switch (ty) {
     case TYPE_STRING:
       return decodeString(ptr, mem)
+    case TYPE_SYMBOL:
+      return decodeSymbol(ptr, mem)
     case TYPE_MAP:
       return { kind: 'map', size: decodeSize(ptr, mem) }
     case TYPE_SET:
@@ -227,6 +232,20 @@ function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
       return decodeDate(ptr, mem)
     default:
       return { kind: 'undefined' }
+  }
+}
+
+/**
+ * Resolve a heap symbol block at `ptr` by its description jsval (mirrors
+ * `value.rs::decode_symbol`): a string is the description, anything else is
+ * `Symbol()`.
+ */
+function decodeSymbol(ptr: number, mem: Uint8Array): Value {
+  const bits = readU64(mem, ptr + SYMBOL_DESCRIPTION_OFFSET)
+  const desc = bits === undefined ? undefined : decode(bits, mem)
+  return {
+    kind: 'symbol',
+    description: desc?.kind === 'string' ? desc.value : undefined,
   }
 }
 
@@ -264,16 +283,44 @@ function decodeDate(ptr: number, mem: Uint8Array): Value {
   return { kind: 'date', ms: bits === undefined ? Number.NaN : bitsToF64(bits) }
 }
 
-/** Resolve a heap string block at `ptr`: `[len:u32][utf8]` at `ptr + HEADER_SIZE`. */
+/** Resolve a heap string block at `ptr` (see {@link stringText}); a truncated block reads as `''`. */
 function decodeString(ptr: number, mem: Uint8Array): Value {
-  const len = readU32(mem, ptr + HEADER_SIZE)
-  if (len === undefined) return { kind: 'string', value: '' }
-  const start = ptr + HEADER_SIZE + 4
-  if (start + len > mem.length) return { kind: 'string', value: '' }
-  return {
-    kind: 'string',
-    value: utf8.decode(mem.subarray(start, start + len)),
+  return { kind: 'string', value: stringText(mem, ptr) ?? '' }
+}
+
+/** Code units per `String.fromCharCode` call (keeps the argument list small). */
+const CHAR_CODE_CHUNK = 0x2000
+
+/**
+ * The text of the heap STRING block at `ptr`, or `null` when truncated: `len`
+ * (at `ptr + STR_LEN_OFFSET`) Latin-1 bytes, or with `STR_FLAG_TWO_BYTE` `len`
+ * UTF-16LE units, at `ptr + STR_DATA_OFFSET`. Lossless (a lone surrogate stays
+ * a unit); `TextDecoder` is avoided on purpose — its `latin1` label is
+ * windows-1252 and `utf-16le` replaces lone surrogates (mirrors
+ * `value.rs::string_units`).
+ */
+export function stringText(mem: Uint8Array, ptr: number): string | null {
+  const len = readU32(mem, ptr + STR_LEN_OFFSET)
+  if (len === undefined) return null
+  const twoByte =
+    ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & STR_FLAG_TWO_BYTE) !== 0
+  const start = ptr + STR_DATA_OFFSET
+  const size = twoByte ? len * 2 : len
+  if (start + size > mem.length) return null
+  let units: Uint8Array | Uint16Array = mem.subarray(start, start + len)
+  if (twoByte) {
+    // A copy when the view is not 2-aligned (a `Uint16Array` needs it).
+    const bytes =
+      (mem.byteOffset + start) % 2 === 0
+        ? mem.subarray(start, start + size)
+        : mem.slice(start, start + size)
+    units = new Uint16Array(bytes.buffer, bytes.byteOffset, len)
   }
+  let text = ''
+  for (let i = 0; i < len; i += CHAR_CODE_CHUNK) {
+    text += String.fromCharCode(...units.subarray(i, i + CHAR_CODE_CHUNK))
+  }
+  return text
 }
 
 /**
@@ -321,7 +368,7 @@ export function arrayElements(
   }
   if (sparse) {
     const keyed: [number, bigint][] = []
-    for (const [index, , , bits] of tableEntries(ptr, mem)) {
+    for (const { index, bits } of tableEntries(ptr, mem)) {
       if (index !== undefined) keyed.push([index, bits])
     }
     keyed.sort((a, b) => a[0] - b[0])
@@ -354,8 +401,9 @@ function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
  * Decode the own enumerable properties of the object-family block at `ptr` by
  * walking its property table (mirrors `value.rs::decode_props`): tombstones
  * and non-enumerable entries are skipped, integer keys come first in
- * ascending order when the table has `HAS_INDEX_KEYS`, then the other keys in
- * slot order. An accessor property decodes as `accessor`.
+ * ascending order when the table has `HAS_INDEX_KEYS`, then the other string
+ * keys in slot order, then the symbol keys in slot order. An accessor
+ * property decodes as `accessor`.
  */
 function decodeProps(
   ptr: number,
@@ -365,20 +413,20 @@ function decodeProps(
   // An array's integer keys are its (sparse) elements, decoded by `decodeArray`.
   const array = mem[ptr] === TYPE_ARRAY
   const keyed = tableEntries(ptr, mem).filter(
-    ([index]) => !(array && index !== undefined),
+    ({ index }) => !(array && index !== undefined),
   )
-  // A stable sort keeps the non-index keys in slot order after the indices.
+  // A stable sort keeps the string keys in slot order after the indices, and
+  // the symbol keys in slot order after those.
+  const rank = (e: TableEntry) => (e.index !== undefined ? 0 : e.symbol ? 2 : 1)
   keyed.sort((a, b) =>
-    a[0] === undefined
-      ? b[0] === undefined
-        ? 0
-        : 1
-      : b[0] === undefined
-        ? -1
-        : a[0] - b[0],
+    rank(a) !== rank(b)
+      ? rank(a) - rank(b)
+      : a.index !== undefined && b.index !== undefined
+        ? a.index - b.index
+        : 0,
   )
   const entries: [string, Value][] = []
-  for (const [, key, attrs, bits] of keyed) {
+  for (const { key, attrs, bits } of keyed) {
     if ((attrs & ATTR_ACCESSOR) !== 0) {
       const pair = Number(bits & U32_MASK)
       const half = (offset: number) => {
@@ -401,35 +449,49 @@ function decodeProps(
 }
 
 /**
- * The live enumerable entries of the property table of the object-family
- * block at `ptr`, in slot order, as `[index, key, attrs, bits]` — `index` is
- * the value of an integer key (mirrors `value.rs::table_entries`).
+ * One live enumerable property table entry (mirrors `value.rs::TableEntry`):
+ * `index` is the value of an integer key, `symbol` marks a symbol key, and
+ * `key` is the rendered key (a symbol key as `[Symbol(desc)]`).
  */
-function tableEntries(
-  ptr: number,
-  mem: Uint8Array,
-): [number | undefined, string, number, bigint][] {
+interface TableEntry {
+  index: number | undefined
+  symbol: boolean
+  key: string
+  attrs: number
+  bits: bigint
+}
+
+/**
+ * The live enumerable entries of the property table of the object-family
+ * block at `ptr`, in slot order; a key is a string or a symbol block, told
+ * apart by its type byte (mirrors `value.rs::table_entries`).
+ */
+function tableEntries(ptr: number, mem: Uint8Array): TableEntry[] {
   const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
   if (props === 0) return []
   const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
   const tflags = mem[props + PROPS_TFLAGS_OFFSET] ?? 0
-  const keyed: [number | undefined, string, number, bigint][] = []
+  const keyed: TableEntry[] = []
   for (let k = 0; k < count; k++) {
     const entry = props + PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k
     const key = readU32(mem, entry + PROP_KEY_OFFSET)
     const attrs = readU32(mem, entry + PROP_ATTRS_OFFSET)
     const bits = readU64(mem, entry + PROP_VALUE_OFFSET)
     if (key === undefined || attrs === undefined || bits === undefined) break
-    if (key === 0) continue
+    if (key === 0 || (attrs & ATTR_ENUMERABLE) === 0) continue
+    if (mem[key] === TYPE_SYMBOL) {
+      const text = `[${formatValue(decodeSymbol(key, mem))}]`
+      keyed.push({ index: undefined, symbol: true, key: text, attrs, bits })
+      continue
+    }
     const text = stringAt(key, mem)
-    if ((attrs & ATTR_ENUMERABLE) === 0) continue
     const flags = mem[key + HEADER_FLAGS_OFFSET] ?? 0
     const index =
       (tflags & PROPS_HAS_INDEX_KEYS) !== 0 &&
       (flags & STR_FLAG_ARRAY_INDEX) !== 0
         ? Number(text)
         : undefined
-    keyed.push([index, text, attrs, bits])
+    keyed.push({ index, symbol: false, key: text, attrs, bits })
   }
   return keyed
 }
@@ -455,20 +517,16 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
       message: field('message') ?? '',
     }
   }
-  let entries = decodeProps(ptr, mem, guard)
+  const entries = decodeProps(ptr, mem, guard)
   const classByte = mem[ptr + HEADER_CLASS_OFFSET] ?? 0
   if (classByte === CLASS_ARGUMENTS) return { kind: 'arguments', entries }
-  if (classByte >= CLASS_BOOLEAN && classByte <= CLASS_STRING) {
+  if (
+    (classByte >= CLASS_BOOLEAN && classByte <= CLASS_STRING) ||
+    classByte === CLASS_SYMBOL
+  ) {
     const bits = readU64(mem, ptr + WRAPPER_VALUE_OFFSET)
     const primitive: Value =
       bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard)
-    if (primitive.kind === 'string') {
-      // A String wrapper's own indices are its characters, not properties.
-      const len = utf8Encode.encode(primitive.value).length
-      entries = entries.filter(
-        ([key]) => !(/^\d+$/.test(key) && Number(key) < len),
-      )
-    }
     return { kind: 'wrapper', primitive, entries }
   }
   const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
@@ -532,7 +590,10 @@ function heapObject(bits: bigint, mem: Uint8Array): number | undefined {
     return undefined
   const ptr = Number(bits & U32_MASK)
   const ty = mem[ptr]
-  return ty === undefined || ty === TYPE_STRING || ty === TYPE_ARRAY
+  return ty === undefined ||
+    ty === TYPE_STRING ||
+    ty === TYPE_ARRAY ||
+    ty === TYPE_SYMBOL
     ? undefined
     : ptr
 }
@@ -620,6 +681,9 @@ export function formatValue(value: Value): string {
     // A string renders as its raw text, with no surrounding quotes.
     case 'string':
       return value.value
+    // A symbol renders Node-console style by its description.
+    case 'symbol':
+      return `Symbol(${value.description ?? ''})`
     case 'array':
       return formatArray(value.items, value.props)
     // A hole outside an array (never produced) reads as `undefined`.
@@ -638,7 +702,9 @@ export function formatValue(value: Value): string {
           ? `[String: '${p.value}']`
           : p.kind === 'number'
             ? `[Number: ${Object.is(p.value, -0) ? '-0' : formatNumber(p.value)}]`
-            : `[Boolean: ${formatValue(p)}]`
+            : p.kind === 'symbol'
+              ? `[Symbol: ${formatValue(p)}]`
+              : `[Boolean: ${formatValue(p)}]`
       return value.entries.length === 0
         ? head
         : `${head} ${formatEntries(value.entries)}`

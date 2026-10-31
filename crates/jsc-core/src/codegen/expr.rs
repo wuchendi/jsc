@@ -6,6 +6,18 @@ use swc_common::{Span, Spanned};
 use crate::error::CompileError;
 
 impl LowerCtx<'_> {
+    /// The `await` of the already lowered `arg` in the current body (see
+    /// `Expr::Await` in [`Self::lower_expr`]).
+    pub(super) fn lower_await(&mut self, arg: IrNode) -> IrNode {
+        if self.frame().machine == Some(Machine::AsyncGenerator) {
+            generator::await_suspend(arg)
+        } else if self.async_body {
+            IrNode::Yield(Box::new(arg))
+        } else {
+            IrNode::Await(Box::new(arg))
+        }
+    }
+
     /// Recursively lower a single [`Expr`] into an [`IrNode`].
     ///
     /// # Errors
@@ -16,7 +28,7 @@ impl LowerCtx<'_> {
     pub(super) fn lower_expr(&mut self, expr: &Expr) -> anyhow::Result<IrNode> {
         match expr {
             Expr::Lit(Lit::Num(n)) => Ok(IrNode::Num(n.value)),
-            Expr::Lit(Lit::Str(s)) => Ok(IrNode::Str(s.value.to_string_lossy().into_owned())),
+            Expr::Lit(Lit::Str(s)) => Ok(IrNode::Str(lit_str(s))),
             Expr::Lit(Lit::Bool(b)) => Ok(IrNode::Bool(b.value)),
             Expr::Lit(Lit::Null(_)) => Ok(IrNode::Null),
             // A declared local shadows a function of the same name and the
@@ -51,20 +63,16 @@ impl LowerCtx<'_> {
             // awaits the value instead of yielding it.
             Expr::Await(await_expr) => {
                 let arg = self.lower_expr(&await_expr.arg)?;
-                if self.frame().machine == Some(Machine::AsyncGenerator) {
-                    Ok(generator::await_suspend(arg))
-                } else if self.async_body {
-                    Ok(IrNode::Yield(Box::new(arg)))
-                } else {
-                    Ok(IrNode::Await(Box::new(arg)))
-                }
+                Ok(self.lower_await(arg))
             }
             // `yield e` / `yield`: lower the operand and wrap it. The
             // generator segmentation pass consumes every `Yield`; one that reaches
             // the backend means an unsupported yield position (rejected there).
-            // `yield*` (delegate) is a statement, lowered by `lower_yield_delegate`.
+            // `yield* e` lowers to an `IrNode::YieldDelegate` the CFG builder
+            // expands (see `lower_yield_delegate`).
             // In an async generator `yield e` first awaits `e`.
-            Expr::Yield(yield_expr) if !yield_expr.delegate => {
+            Expr::Yield(yield_expr) if yield_expr.delegate => self.lower_yield_delegate(yield_expr),
+            Expr::Yield(yield_expr) => {
                 let arg = match &yield_expr.arg {
                     Some(arg) => self.lower_expr(arg)?,
                     None => IrNode::Undefined,
@@ -110,7 +118,7 @@ impl LowerCtx<'_> {
                 // the property name lowered to a heap-string key.
                 MemberProp::Ident(id) => Ok(IrNode::Index {
                     obj: Box::new(self.lower_expr(&member.obj)?),
-                    index: Box::new(IrNode::Str(id.sym.as_ref().to_owned())),
+                    index: Box::new(IrNode::Str(id.sym.as_ref().into())),
                 }),
                 MemberProp::Computed(c) => Ok(IrNode::Index {
                     obj: Box::new(self.lower_expr(&member.obj)?),
@@ -221,7 +229,7 @@ impl LowerCtx<'_> {
                     Expr::Member(member) => {
                         let obj = self.lower_expr(&member.obj)?;
                         let key = match &member.prop {
-                            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
                             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
                             MemberProp::PrivateName(_) => {
                                 return Err(CompileError::spanned(
@@ -286,8 +294,8 @@ impl LowerCtx<'_> {
             // A class expression; an anonymous one has the empty name here
             // (`lower_named_expr` names it after its binding).
             Expr::Class(class_expr) => match &class_expr.ident {
-                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true),
-                None => self.lower_class(&class_expr.class, "", false),
+                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true, None),
+                None => self.lower_class(&class_expr.class, "", false, None),
             },
             // `new.target`: the enclosing non-arrow function's snapshot; outside
             // any function it is a SyntaxError.
@@ -323,7 +331,7 @@ impl LowerCtx<'_> {
         let cooked = |q: &swc_ecma_ast::TplElement| {
             q.cooked
                 .as_ref()
-                .map_or_else(String::new, |c| c.to_string_lossy().into_owned())
+                .map_or_else(JsStr::default, |c| c.to_ill_formed_utf16().collect())
         };
         let mut acc = IrNode::Str(cooked(&tpl.quasis[0]));
         for (expr, quasi) in tpl.exprs.iter().zip(tpl.quasis.iter().skip(1)) {
@@ -440,7 +448,7 @@ impl LowerCtx<'_> {
             return Ok(nullish_short_circuit(callee, method, tail));
         }
         let key = match prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::PrivateName(_) => {
                 return Err(
@@ -485,7 +493,7 @@ impl LowerCtx<'_> {
                 }
                 MemberProp::Ident(id) => Ok(IrNode::Index {
                     obj: Box::new(obj),
-                    index: Box::new(IrNode::Str(id.sym.as_ref().to_owned())),
+                    index: Box::new(IrNode::Str(id.sym.as_ref().into())),
                 }),
                 MemberProp::Computed(c) => Ok(IrNode::Index {
                     obj: Box::new(obj),
@@ -531,12 +539,27 @@ impl LowerCtx<'_> {
     /// Lower `expr` as the value of a binding or property named `name`: an
     /// anonymous function or arrow gets `name` as its `name` (`NamedEvaluation`);
     /// any other expression lowers as usual.
+    /// [`Self::lower_named_expr`] under the static property key `key` (spanned
+    /// `span`): only an anonymous definition takes the key as its `name`.
+    pub(super) fn lower_key_named_expr(
+        &mut self,
+        expr: &Expr,
+        key: &JsStr,
+        span: Span,
+    ) -> anyhow::Result<IrNode> {
+        if !is_anonymous_definition(expr) {
+            return self.lower_expr(expr);
+        }
+        let name = key_fn_name(key, span)?;
+        self.lower_named_expr(expr, &name)
+    }
+
     pub(super) fn lower_named_expr(&mut self, expr: &Expr, name: &str) -> anyhow::Result<IrNode> {
         match expr {
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
             Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
-                self.lower_class(&class_expr.class, name, false)
+                self.lower_class(&class_expr.class, name, false, None)
             }
             _ => self.lower_expr(expr),
         }
@@ -669,7 +692,7 @@ impl LowerCtx<'_> {
     /// Lower the key of `super.x` / `super[k]`.
     fn lower_super_key(&mut self, super_prop: &SuperPropExpr) -> anyhow::Result<IrNode> {
         Ok(match &super_prop.prop {
-            SuperProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            SuperProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             SuperProp::Computed(c) => self.lower_expr(&c.expr)?,
         })
     }
@@ -945,11 +968,17 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        if !inline_member(namespace, key) || (namespace == "JSON" && args.len() > 1) {
+        // `Promise.resolve` / `reject` construct from `this`: only the
+        // inline (never written) `Promise` keeps their `%Promise%` code.
+        let inline = self.shared.globals.inline(namespace);
+        if !inline_member(namespace, key)
+            || (namespace == "JSON" && args.len() > 1)
+            || (namespace == "Promise" && !inline)
+        {
             return self.lower_method_call_user(member, args);
         }
         let arity = inline_arity(namespace, key);
-        if self.shared.globals.inline(namespace) {
+        if inline {
             let (seq, args) = self.fit_inline_args(arity, args);
             let Some(fast) = inline_call(namespace, key, args) else {
                 return Err(anyhow!("{namespace}.{key} has no inline code"));
@@ -1167,7 +1196,7 @@ impl LowerCtx<'_> {
         args: Box<IrNode>,
     ) -> anyhow::Result<IrNode> {
         let key = match &member.prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::PrivateName(_) => {
                 return Err(CompileError::spanned(
@@ -1328,7 +1357,7 @@ impl LowerCtx<'_> {
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
         let key = match &member.prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::PrivateName(_) => {
                 return Err(CompileError::spanned(
@@ -1456,7 +1485,7 @@ impl LowerCtx<'_> {
                 let obj = self.lower_expr(&m.obj)?;
                 let index = match &m.prop {
                     MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
                     MemberProp::PrivateName(_) => {
                         return Err(CompileError::spanned(
                             m.span(),
@@ -1586,7 +1615,7 @@ impl LowerCtx<'_> {
         let obj = self.lower_expr(&member.obj)?;
         let index = match &member.prop {
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().to_owned()),
+            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::PrivateName(_) => {
                 return Err(CompileError::spanned(
                     member.span(),
@@ -1695,15 +1724,27 @@ impl LowerCtx<'_> {
                 }
                 Prop::KeyValue(kv) => {
                     let key = self.lower_prop_key(&kv.key)?;
-                    let value = match &key {
-                        PropKey::Static(name) => self.lower_named_expr(&kv.value, name)?,
-                        _ => self.lower_expr(&kv.value)?,
+                    let entry = match key {
+                        PropKey::Static(name) => {
+                            let value =
+                                self.lower_key_named_expr(&kv.value, &name, kv.key.span())?;
+                            (PropKey::Static(name), value)
+                        }
+                        key if is_anonymous_definition(&kv.value) => {
+                            let (key, named) = self.computed_name_key(key);
+                            let value = match named {
+                                Some(named) => self.lower_computed_named_expr(&kv.value, named)?,
+                                None => self.lower_expr(&kv.value)?,
+                            };
+                            (key, value)
+                        }
+                        key => (key, self.lower_expr(&kv.value)?),
                     };
-                    entries.push((key, value));
+                    entries.push(entry);
                 }
                 // Shorthand `{n}` ≡ `{n: n}`: the value is the identifier read.
                 Prop::Shorthand(ident) => {
-                    let key = PropKey::Static(ident.sym.as_ref().to_owned());
+                    let key = PropKey::Static(ident.sym.as_ref().into());
                     let value = self.lower_ident(ident.sym.as_ref(), ident.span)?;
                     entries.push((key, value));
                 }
@@ -1711,11 +1752,14 @@ impl LowerCtx<'_> {
                 // function value (like an arrow) that carries `this`.
                 Prop::Method(method) => {
                     let key = self.lower_prop_key(&method.key)?;
-                    let value = self.lower_method(&method.function, static_key_name(&key))?;
-                    entries.push((key, value));
+                    let (key, named) = self.computed_name_key(key);
+                    let name = static_key_name(&key, method.key.span())?;
+                    let value = self.lower_method(&method.function, &name)?;
+                    entries.push((key, self.set_computed_name(value, named, "")));
                 }
                 Prop::Getter(getter) => {
                     let key = self.lower_prop_key(&getter.key)?;
+                    let (key, named) = self.computed_name_key(key);
                     let block = getter
                         .function
                         .body
@@ -1723,17 +1767,19 @@ impl LowerCtx<'_> {
                         .ok_or_else(|| anyhow!("getter requires a body"))?;
                     let param_pats: Vec<&Pat> =
                         getter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = format!("get {}", static_key_name(&key));
+                    let name = format!("get {}", static_key_name(&key, getter.key.span())?);
                     let value = self.lower_lifted_function(
                         &param_pats,
                         BodyKind::Block(&block.stmts),
                         &name,
                         FnKind::Plain,
                     )?;
+                    let value = self.set_computed_name(value, named, "get ");
                     push_accessor_half(&mut entries, key, value, true);
                 }
                 Prop::Setter(setter) => {
                     let key = self.lower_prop_key(&setter.key)?;
+                    let (key, named) = self.computed_name_key(key);
                     let block = setter
                         .function
                         .body
@@ -1741,13 +1787,14 @@ impl LowerCtx<'_> {
                         .ok_or_else(|| anyhow!("setter requires a body"))?;
                     let param_pats: Vec<&Pat> =
                         setter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = format!("set {}", static_key_name(&key));
+                    let name = format!("set {}", static_key_name(&key, setter.key.span())?);
                     let value = self.lower_lifted_function(
                         &param_pats,
                         BodyKind::Block(&block.stmts),
                         &name,
                         FnKind::Plain,
                     )?;
+                    let value = self.set_computed_name(value, named, "set ");
                     push_accessor_half(&mut entries, key, value, false);
                 }
                 Prop::Assign(_) => {
@@ -1761,6 +1808,66 @@ impl LowerCtx<'_> {
             return Ok(literal_object(entries));
         };
         Ok(self.with_proto_entry(entries, at, value))
+    }
+
+    /// A computed object-literal key whose entry is a function value named by
+    /// it: the key is converted once (`ToPropertyKey`, before the value runs)
+    /// into a fresh local, which the entry's [`Self::set_computed_name`]
+    /// reads. Any other key is returned as is, with `None`.
+    pub(super) fn computed_name_key(&mut self, key: PropKey) -> (PropKey, Option<u32>) {
+        let PropKey::Computed(expr) = key else {
+            return (key, None);
+        };
+        let local = self.fresh();
+        let key = IrNode::Seq(vec![
+            IrNode::Assign {
+                local,
+                value: Box::new(IrNode::ToPropertyKey(Box::new(expr))),
+            },
+            IrNode::Local(local),
+        ]);
+        (PropKey::Computed(key), Some(local))
+    }
+
+    /// The function `value` of an entry under the computed key converted into
+    /// `key` (see [`Self::computed_name_key`]), with its `name` set at run
+    /// time from that key and `prefix`; `value` itself without one.
+    pub(super) fn set_computed_name(
+        &mut self,
+        value: IrNode,
+        key: Option<u32>,
+        prefix: &'static str,
+    ) -> IrNode {
+        let Some(key) = key else {
+            return value;
+        };
+        IrNode::SetFunctionName {
+            func: Box::new(value),
+            key,
+            prefix,
+            local: self.fresh(),
+        }
+    }
+
+    /// Lower `expr`, the value of an entry under the computed key converted
+    /// into the local `key` (see [`Self::computed_name_key`]): an anonymous
+    /// function, arrow, or class definition gets its `name` from the key at
+    /// run time (a class before its static members are defined).
+    pub(super) fn lower_computed_named_expr(
+        &mut self,
+        expr: &Expr,
+        key: u32,
+    ) -> anyhow::Result<IrNode> {
+        match expr {
+            Expr::Class(class_expr) if class_expr.ident.is_none() => {
+                self.lower_class(&class_expr.class, "", false, Some(key))
+            }
+            _ if is_anonymous_function(expr) => {
+                let value = self.lower_expr(expr)?;
+                Ok(self.set_computed_name(value, Some(key), ""))
+            }
+            _ => self.lower_expr(expr),
+        }
     }
 
     /// The object literal `entries` with a `__proto__: value` entry after the
@@ -1822,8 +1929,8 @@ impl LowerCtx<'_> {
     /// converted with `ToPropertyKey` at run time.
     fn lower_prop_key(&mut self, name: &PropName) -> anyhow::Result<PropKey> {
         match name {
-            PropName::Ident(id) => Ok(PropKey::Static(id.sym.as_ref().to_owned())),
-            PropName::Str(s) => Ok(PropKey::Static(s.value.to_string_lossy().into_owned())),
+            PropName::Ident(id) => Ok(PropKey::Static(id.sym.as_ref().into())),
+            PropName::Str(s) => Ok(PropKey::Static(lit_str(s))),
             PropName::Num(n) => Ok(PropKey::Computed(IrNode::Num(n.value))),
             PropName::Computed(c) => Ok(PropKey::Computed(self.lower_expr(&c.expr)?)),
             PropName::BigInt(_) => Err(CompileError::spanned(
@@ -1866,7 +1973,11 @@ impl LowerCtx<'_> {
     /// An unshadowed, sealed `Error`-family/`Array`/`Function`/`Date`/`Object`
     /// identifier takes its builtin test; any other expression — including a
     /// binding or declaration that shadows one of those names (DF11) — is
-    /// `OrdinaryHasInstance` on its value.
+    /// `InstanceofOperator` on its value. The builtin tests are fast paths
+    /// only: the emitter runs them while the constructor's `@@hasInstance`
+    /// is the intact `%Function.prototype%[@@hasInstance]` (no own
+    /// `@@hasInstance` on the static chain, realm `proto`), else
+    /// `InstanceofOperator` on the constructor.
     fn instanceof_kind(&mut self, right: &Expr) -> anyhow::Result<InstanceOfKind> {
         if let Expr::Ident(id) = right {
             let name = id.sym.as_ref();
@@ -1982,7 +2093,13 @@ impl LowerCtx<'_> {
             if !has_spread {
                 lowered.push(value);
             } else if arg.spread.is_some() {
-                parts.push(SpreadElem::Spread(value));
+                // A derived class's default constructor forwards its argument
+                // list as is, without the iteration protocol.
+                parts.push(if is_default_ctor_args(&arg.expr) {
+                    SpreadElem::List(value)
+                } else {
+                    SpreadElem::Spread(value)
+                });
             } else {
                 parts.push(SpreadElem::Item(value));
             }
@@ -2050,16 +2167,22 @@ impl LowerCtx<'_> {
     /// string literal or `undefined` resolves both at compile time.
     fn lower_error_object(&mut self, kind: ErrorKind, message: Option<IrNode>) -> IrNode {
         let name = kind.name();
-        let stack_of = |text: &str| {
-            IrNode::Str(if text.is_empty() {
+        let stack_of = |text: &JsStr| {
+            let prefix = if text.is_empty() {
                 name.to_owned()
             } else {
-                format!("{name}: {text}")
-            })
+                format!("{name}: ")
+            };
+            IrNode::Str(
+                prefix
+                    .encode_utf16()
+                    .chain(text.as_units().iter().copied())
+                    .collect(),
+            )
         };
         match message {
             None | Some(IrNode::Undefined) => {
-                IrNode::error_object(kind, None, IrNode::Str(name.to_owned()))
+                IrNode::error_object(kind, None, IrNode::Str(name.into()))
             }
             Some(IrNode::Str(text)) => {
                 let stack = stack_of(&text);
@@ -2173,7 +2296,7 @@ fn literal_object(entries: Vec<(PropKey, IrNode)>) -> IrNode {
 pub(super) fn is_proto_key(key: &PropName) -> bool {
     match key {
         PropName::Ident(id) => id.sym.as_ref() == "__proto__",
-        PropName::Str(s) => s.value.to_string_lossy() == "__proto__",
+        PropName::Str(s) => lit_str(s) == "__proto__",
         _ => false,
     }
 }
@@ -2207,12 +2330,13 @@ fn nullish_check(value: IrNode, key: &str) -> IrNode {
 
 /// The statically-known method name of a member callee: `obj.m` and the
 /// string-literal computed form `obj["m"]` both name `m`; a dynamic computed key
-/// `obj[k]` is only known at runtime, so it has no static name.
+/// `obj[k]` is only known at runtime, so it has no static name (nor has a
+/// literal with a lone surrogate, which no Rust `String` spells).
 fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
     match &member.prop {
         MemberProp::Ident(id) => Some(id.sym.as_ref().to_owned()),
         MemberProp::Computed(c) => match c.expr.as_ref() {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
+            Expr::Lit(Lit::Str(s)) => lit_str(s).to_rust_string(),
             _ => None,
         },
         MemberProp::PrivateName(_) => None,
@@ -2270,7 +2394,6 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
         Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
-        Expr::Yield(_) => "`yield*` is only supported as a statement",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
@@ -2300,32 +2423,55 @@ fn seq_then(mut seq: Vec<IrNode>, last: IrNode) -> IrNode {
     IrNode::Seq(seq)
 }
 
-/// The compile-time name of a static property key (`""` for a computed key):
-/// the `name` given to a method or accessor defined under it.
-fn static_key_name(key: &PropKey) -> &str {
+/// Whether `expr` is an anonymous function definition named by the property
+/// it initializes (`IsAnonymousFunctionDefinition`): an arrow or a function
+/// expression without its own name.
+fn is_anonymous_function(expr: &Expr) -> bool {
+    matches!(expr, Expr::Arrow(_)) || matches!(expr, Expr::Fn(f) if f.ident.is_none())
+}
+
+/// Whether `expr` is an anonymous function or class definition
+/// (`IsAnonymousFunctionDefinition`), named by the key it is defined under.
+pub(super) fn is_anonymous_definition(expr: &Expr) -> bool {
+    is_anonymous_function(expr) || matches!(expr, Expr::Class(c) if c.ident.is_none())
+}
+
+/// The compile-time name of a static property key (`""` for a computed key,
+/// whose name is set at run time instead, [`IrNode::SetFunctionName`]): the
+/// `name` given to a method or accessor defined under it.
+fn static_key_name(key: &PropKey, span: Span) -> anyhow::Result<String> {
     match key {
-        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => name,
-        PropKey::Computed(_) => "",
+        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => {
+            key_fn_name(name, span)
+        }
+        PropKey::Computed(_) | PropKey::HiddenComputed(_) => Ok(String::new()),
     }
 }
 
 /// Append one accessor half (`getter` or setter function `value`) under `key`:
-/// it completes the accessor entry of the same static key when one exists,
-/// else starts a new accessor entry with the other half `undefined`.
+/// it completes the accessor entry of the same static key when that entry is
+/// the latest definition of the key (no data member of the key, and no
+/// computed member that may share it, follows it), else starts a new accessor
+/// entry with the other half `undefined`, a partial descriptor applied over
+/// whatever the key holds by then.
 pub(super) fn push_accessor_half(
     entries: &mut Vec<(PropKey, IrNode)>,
     key: PropKey,
     value: IrNode,
     getter: bool,
 ) {
-    let existing = entries.iter_mut().rev().find_map(|(k, v)| match v {
-        IrNode::MakeAccessor { getter, setter }
-            if !matches!(k, PropKey::Computed(_)) && *k == key =>
+    let latest = entries
+        .iter_mut()
+        .rev()
+        .find(|(k, _)| matches!(k, PropKey::Computed(_) | PropKey::HiddenComputed(_)) || *k == key);
+    let existing = match latest {
+        Some((k, IrNode::MakeAccessor { getter, setter }))
+            if !matches!(k, PropKey::Computed(_) | PropKey::HiddenComputed(_)) =>
         {
             Some((getter, setter))
         }
         _ => None,
-    });
+    };
     if let Some((get, set)) = existing {
         **if getter { get } else { set } = value;
         return;
@@ -2342,4 +2488,11 @@ pub(super) fn push_accessor_half(
             setter: Box::new(set),
         },
     ));
+}
+
+/// Whether `expr` is the rest binding of a derived class's default
+/// constructor (`constructor(...args) { super(...args) }`), whose name cannot
+/// be spelled in source.
+fn is_default_ctor_args(expr: &Expr) -> bool {
+    matches!(expr, Expr::Ident(ident) if ident.sym.as_ref() == super::stmt::DEFAULT_CTOR_ARGS)
 }

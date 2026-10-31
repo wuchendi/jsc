@@ -71,13 +71,14 @@ pub(crate) const HOLE: u64 = UNDEFINED | 1;
 /// `emit_typeof_node` interns and selects between; the decoder reads them back as
 /// ordinary strings. Keeping them a single source shared by the emitter and the
 /// runtime prevents the index/word tables from drifting apart.
-pub(crate) const TYPEOF_STRINGS: [&str; 6] = [
+pub(crate) const TYPEOF_STRINGS: [&str; 7] = [
     "number",
     "boolean",
     "undefined",
     "object",
     "string",
     "function",
+    "symbol",
 ];
 
 /// The NaN-boxed heap-pointer header: [`QNAN`] plus tag `0b101` — the SINGLE tag
@@ -96,9 +97,10 @@ pub(crate) const HEADER_SIZE: u32 = 4;
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
 /// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
-/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`], an object-family block's
+/// [`STR_FLAG_INTERNED`] / [`STR_FLAG_ARRAY_INDEX`] / [`STR_FLAG_TWO_BYTE`], an object-family block's
 /// [`OBJ_FLAG_NOT_EXTENSIBLE`], a function's [`FUNC_FLAG_LAZY`] /
-/// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`].
+/// [`FUNC_FLAG_CONSTRUCTOR`] / [`FUNC_FLAG_CLASS_CTOR`], a symbol's
+/// [`SYMBOL_FLAG_REGISTERED`].
 pub(crate) const HEADER_FLAGS_OFFSET: u32 = 2;
 
 /// Header byte 3: the `TYPE_OBJECT` sub-`class` byte ([`CLASS_ORDINARY`],
@@ -135,6 +137,18 @@ pub(crate) const CLASS_STRING: u8 = 5;
 
 /// [`TYPE_OBJECT`] `class` byte: the global object (a static realm block).
 pub(crate) const CLASS_GLOBAL: u8 = 6;
+
+/// [`TYPE_OBJECT`] `class` byte: a Symbol wrapper object (created only by
+/// `ToObject`), its `[[SymbolData]]` (the [`TYPE_SYMBOL`] jsval) at
+/// [`WRAPPER_VALUE_OFFSET`].
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
+pub(crate) const CLASS_SYMBOL: u8 = 7;
+
+/// [`TYPE_OBJECT`] `class` byte: a builtin iterator object (an Array, String,
+/// Map or Set iterator; DESIGN.md §5.2). Its 32-byte block
+/// holds the iterated value, the next index and the iterator kind past the
+/// object-family prefix; no host reads the payload.
+pub(crate) const CLASS_ITERATOR: u8 = 8;
 
 /// Offset of a wrapper object's `[[PrimitiveValue]]` jsval (an `i64`) from
 /// its base, right after the object-family prefix.
@@ -395,17 +409,31 @@ pub(crate) const GEN_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i32 `done` flag.
 pub(crate) const GEN_DONE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
-/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 resume
-/// `limits` bits ([`GEN_LIMIT_RETURN`], [`GEN_LIMIT_THROW`]), guest-only.
+/// Byte offset (from a [`TYPE_GENERATOR`] block base) of the u32 `limits`
+/// bits ([`GEN_RUNNING`] .. [`GEN_DELEGATED_RESULT`], the [`GEN_RESUME_MODE_MASK`]
+/// field), guest-only.
 pub(crate) const GEN_LIMITS_OFFSET: u32 = OBJ_PREFIX_SIZE + 12;
 
-/// Generator `limits` bit: the body has a `finally` or a `yield*`, so a
-/// `return()` at a suspended `yield` (which must run them) is unsupported.
-pub(crate) const GEN_LIMIT_RETURN: u32 = 1;
+/// Generator `limits` field: the resumption mode of a resume entered with an
+/// exception pending — [`GEN_RESUME_MODE_THROW`] (the pending value is
+/// thrown at the suspended `yield`) or [`GEN_RESUME_MODE_RETURN`] (it is the
+/// value of a return completion injected there). Written by `throw()` /
+/// `return()` (and the async generator request serving) before the resume,
+/// consumed by the resumed `yield`; a resume without a pending exception is
+/// `next(v)` whatever the field holds.
+pub(crate) const GEN_RESUME_MODE_MASK: u32 = 0x300;
 
-/// Generator `limits` bit: the body has a `yield*`, so a `throw()` at a
-/// suspended `yield` (which must forward to the delegate) is unsupported.
-pub(crate) const GEN_LIMIT_THROW: u32 = 2;
+/// The shift of the [`GEN_RESUME_MODE_MASK`] field.
+pub(crate) const GEN_RESUME_MODE_SHIFT: u32 = 8;
+
+/// [`GEN_RESUME_MODE_MASK`] value: `next(v)`.
+pub(crate) const GEN_RESUME_MODE_NEXT: u32 = 0;
+
+/// [`GEN_RESUME_MODE_MASK`] value: `throw(e)`.
+pub(crate) const GEN_RESUME_MODE_THROW: u32 = 1;
+
+/// [`GEN_RESUME_MODE_MASK`] value: `return(v)`.
+pub(crate) const GEN_RESUME_MODE_RETURN: u32 = 2;
 
 /// Generator `limits` bit: the state machine is running (set around each
 /// resume), so a `next()` / `return()` / `throw()` from its own body throws.
@@ -423,6 +451,17 @@ pub(crate) const GEN_AWAIT: u32 = 16;
 /// Async generator `limits` bit: the body is executing or awaiting (an
 /// `await` or a `return()` value), so a queued request waits.
 pub(crate) const GEN_BUSY: u32 = 32;
+
+/// Generator `limits` bit, set at construction: the body has a `yield*`, so
+/// a resume may pass the delegate's result object through
+/// ([`GEN_DELEGATED_RESULT`]); such a handle never takes the direct
+/// state-machine iteration fast path.
+pub(crate) const GEN_DELEGATES: u32 = 64;
+
+/// Generator `limits` bit: the state machine's last suspend was a `yield*`
+/// step returning the delegate's result object itself (not a value to
+/// wrap), which the resumer returns as-is and clears the bit.
+pub(crate) const GEN_DELEGATED_RESULT: u32 = 128;
 
 /// Byte offset (from a [`TYPE_GENERATOR`] block base) of the i64 `env` frame
 /// jsval, 8-byte aligned past the `limits` word.
@@ -530,6 +569,11 @@ pub(crate) const PROPS_HAS_NON_ENUM: u8 = 2;
 /// dirty-bit index. A rebuilt table keeps both.
 pub(crate) const PROPS_WATCHED: u8 = 4;
 
+/// [`TYPE_PROPS`] `tflags` bit: some key is a [`TYPE_SYMBOL`] block, so string
+/// key enumeration must skip it and symbol enumeration has entries to list.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const PROPS_HAS_SYMBOL_KEYS: u8 = 8;
+
 /// Byte offset (from a [`TYPE_PROPS`] block base) of a watched table's u8
 /// dirty-bit index.
 pub(crate) const PROPS_WATCH_BIT_OFFSET: u32 = 3;
@@ -547,6 +591,35 @@ pub(crate) const ELEMS_CAP_OFFSET: u32 = HEADER_SIZE;
 /// Byte offset (from a [`TYPE_ELEMS`] block base) of element 0; element `i`
 /// is the jsval at `ELEMS_DATA_OFFSET + 8 * i`.
 pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
+
+/// TYPE BYTE of a Symbol primitive: a heap block under the single [`HEAP`]
+/// tag, so its jsval's low 32 bits double as a property key (a `u32` block
+/// pointer, like an interned string's). `typeof` is `"symbol"`. Layout:
+/// `[type=14][gc][flags][class=0][reserved:u32 = 0][description:i64]`, the
+/// description (a string jsval or `undefined`) at
+/// [`SYMBOL_DESCRIPTION_OFFSET`], [`SYMBOL_BLOCK_SIZE`] bytes. The only flag
+/// is [`SYMBOL_FLAG_REGISTERED`]; bits `1` and `2` stay clear so a symbol key
+/// never looks like an interned string ([`STR_FLAG_INTERNED`]) or an array
+/// index ([`STR_FLAG_ARRAY_INDEX`]), and the reserved word at offset 4 reads
+/// as "no own properties" if a symbol is mistaken for an object-family block.
+/// The description is immutable; identity is the block address. Well-known
+/// symbols are static blocks in the realm image.
+pub(crate) const TYPE_SYMBOL: u8 = 14;
+
+/// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
+/// (an `i64`: a string jsval or `undefined`).
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
+pub(crate) const SYMBOL_DESCRIPTION_OFFSET: u32 = 8;
+
+/// Byte size of a [`TYPE_SYMBOL`] block.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const SYMBOL_BLOCK_SIZE: u32 = 16;
+
+/// [`TYPE_SYMBOL`] header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the
+/// symbol is in the `Symbol.for` registry (its description is the registry
+/// key), so `Symbol.keyFor` returns the description.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const SYMBOL_FLAG_REGISTERED: u8 = 4;
 
 /// Property `attrs` bit: a data property's value may be reassigned (ignored
 /// for an accessor).
@@ -574,6 +647,22 @@ pub(crate) const STR_FLAG_INTERNED: u8 = 1;
 /// (`"0"` or a nonzero digit followed by digits, value `< 2^32 - 1`). Set at
 /// intern time.
 pub(crate) const STR_FLAG_ARRAY_INDEX: u8 = 2;
+
+/// String header `flags` bit: the data is UTF-16LE code units (`2 * len`
+/// bytes); absent, it is Latin-1 bytes (`len` bytes). Canonical: set iff some
+/// unit is above `0xFF`. It shares bit `4` with [`SYMBOL_FLAG_REGISTERED`],
+/// which cannot collide: string paths read it only on a [`TYPE_STRING`]
+/// block, and a symbol key never reaches them (unlike `1` / `2`, which key
+/// paths test on any key block).
+pub(crate) const STR_FLAG_TWO_BYTE: u8 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's `len: u32`, the length in UTF-16
+/// code units (the JS `.length`). String block = header | `len: u32` @4 |
+/// data @8 (Latin-1 bytes, or UTF-16LE units with [`STR_FLAG_TWO_BYTE`]).
+pub(crate) const STR_LEN_OFFSET: u32 = 4;
+
+/// Byte offset of a [`TYPE_STRING`] block's data (see [`STR_LEN_OFFSET`]).
+pub(crate) const STR_DATA_OFFSET: u32 = 8;
 
 /// The wasm global index of the `this`-binding carrier (`__this`, i64, initial
 /// value `undefined`). A method call `obj.m(args)` sets it to the receiver
@@ -681,9 +770,13 @@ pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
 /// stores [`HEAP_PTR_OOM`] and traps.
 pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
 
-/// The name under which the module exports the `__new_string(len: i32) -> base:
-/// i32` constructor: a [`TYPE_STRING`] block with `len` set and a `len`-byte
-/// payload for the caller to fill. The hosts allocate every string through it.
+/// The name under which the module exports the `__new_string(len: i32,
+/// two_byte: i32) -> base: i32` constructor: a [`TYPE_STRING`] block of `len`
+/// code units — `len` Latin-1 bytes, or with `two_byte` (`0`/`1`)
+/// [`STR_FLAG_TWO_BYTE`] set and `2 * len` bytes of UTF-16LE units — with
+/// `len` set and the data at [`STR_DATA_OFFSET`] for the caller to fill. The
+/// hosts allocate every string through it, in canonical form (one-byte iff
+/// every unit is `<= 0xFF`).
 pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
 
 /// The name under which the module exports the `__new_array(len: i32) -> base:
@@ -753,14 +846,11 @@ pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
 /// `__convert` op flag: parse a leading float (`parseFloat(x)`).
 pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;
 
-/// `__method` op flag: `indexOf` (overloaded on array/string).
+/// `__method` op flag: array `indexOf`.
 pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
-/// `__method` op flag: `includes`.
+/// `__method` op flag: array `includes`.
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `slice` (overloaded on array/string).
-pub(crate) const METHOD_OP_SLICE: i32 = 3;
 
 /// `__method` op flag: `toUpperCase`.
 pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
@@ -768,55 +858,9 @@ pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
 /// `__method` op flag: `toLowerCase`.
 pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
 
-/// `__method` op flag: `charAt`.
-pub(crate) const METHOD_OP_CHAR_AT: i32 = 6;
-
-/// `__method` op flag: `trim` (string).
-pub(crate) const METHOD_OP_TRIM: i32 = 7;
-
-/// `__method` op flag: `trimStart` (string).
-pub(crate) const METHOD_OP_TRIM_START: i32 = 8;
-
-/// `__method` op flag: `trimEnd` (string).
-pub(crate) const METHOD_OP_TRIM_END: i32 = 9;
-
-/// `__method` op flag: `repeat` (string).
-pub(crate) const METHOD_OP_REPEAT: i32 = 10;
-
-/// `__method` op flag: `startsWith` (string).
-pub(crate) const METHOD_OP_STARTS_WITH: i32 = 11;
-
-/// `__method` op flag: `endsWith` (string).
-pub(crate) const METHOD_OP_ENDS_WITH: i32 = 12;
-
-/// `__method` op flag: `padStart` (string).
-pub(crate) const METHOD_OP_PAD_START: i32 = 13;
-
-/// `__method` op flag: `padEnd` (string).
-pub(crate) const METHOD_OP_PAD_END: i32 = 14;
-
-/// `__method` op flag: `substring` (string).
-pub(crate) const METHOD_OP_SUBSTRING: i32 = 15;
-
-/// `__method` op flag: `split` (string, yields an array).
-pub(crate) const METHOD_OP_SPLIT: i32 = 16;
-
 /// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
 /// `arg0` an integral radix in `2..=36`).
 pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
-
-/// `__method` op flag: `String.prototype.at` (string, a number or
-/// `undefined` index).
-pub(crate) const METHOD_OP_AT: i32 = 18;
-
-/// `__method` op flag: `String.prototype.charCodeAt` (string).
-pub(crate) const METHOD_OP_CHAR_CODE_AT: i32 = 19;
-
-/// `__method` op flag: `String.prototype.codePointAt` (string).
-pub(crate) const METHOD_OP_CODE_POINT_AT: i32 = 20;
-
-/// `__method` op flag: `String.prototype.lastIndexOf` (string).
-pub(crate) const METHOD_OP_LAST_INDEX_OF: i32 = 21;
 
 /// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
 /// order).
@@ -826,37 +870,10 @@ pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
 /// `undefined`).
 pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
 
-/// `__method` op flag: the index of a string pattern without `RegExp` syntax
-/// (`String.prototype.search` / `match`; `undefined` is the empty pattern).
-pub(crate) const METHOD_OP_SEARCH: i32 = 24;
-
-/// `__method` op flag: `String.prototype.replace` with a string pattern and a
-/// replacement template (`GetSubstitution`).
-pub(crate) const METHOD_OP_REPLACE: i32 = 25;
-
-/// `__method` op flag: `String.prototype.replaceAll` with a string pattern and
-/// a replacement template.
-pub(crate) const METHOD_OP_REPLACE_ALL: i32 = 26;
-
-/// `__method` op flag: `String.fromCharCode` (an array receiver of numbers).
-pub(crate) const METHOD_OP_FROM_CHAR_CODE: i32 = 27;
-
-/// `__method` op flag: `String.fromCodePoint` (an array receiver of
-/// validated code points).
-pub(crate) const METHOD_OP_FROM_CODE_POINT: i32 = 28;
-
-/// `__method` result: the string op cannot produce a correct result for its
-/// input yet (a byte position over a non-ASCII string, a lone surrogate); the
-/// calling builtin throws a `TypeError`. [`HOLE`], which no JS value produces.
-pub(crate) const METHOD_UNSUPPORTED: u64 = HOLE;
-
 /// `__method` result: the argument is out of range (an unknown `normalize`
 /// form); the calling builtin throws a `RangeError`.
 pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
 
-/// `__method` result: the pattern has `RegExp` syntax, which needs the absent
-/// `RegExp`; the calling builtin throws a `TypeError`.
-pub(crate) const METHOD_NEEDS_REGEXP: u64 = UNDEFINED | 3;
 /// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
 /// receiver, `arg0` an integral `f` in `0..=100`).
 pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;

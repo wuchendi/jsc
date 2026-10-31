@@ -901,3 +901,253 @@ fn derived_class_prototype_chain() {
         "9"
     );
 }
+
+/// Computed member names (DESIGN.md §7.6): methods,
+/// accessors, generator / async methods and fields (static or not) under a
+/// computed key, string or symbol.
+#[test]
+fn class_computed_methods_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let k = 'm'; class A { [k]() { return 1 } [k + '2']() { return 2 } } \
+             let a = new A(); console.log(a.m(), a.m2(), A.prototype.propertyIsEnumerable('m'))"
+        ]),
+        "1 2 false"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let s = Symbol('s'); class A { [s]() { return 3 } } console.log(new A()[s]())"
+        ]),
+        "3"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let k = 'f'; class A { static [k]() { return 4 } } \
+             console.log(A.f(), A.propertyIsEnumerable('f'), new A().f)"
+        ]),
+        "4 false undefined"
+    );
+}
+
+#[test]
+fn class_computed_accessors_via_eval() {
+    // A getter and a setter under the same computed key share one accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let k = 'v'; class A { get [k]() { return this._v } set [k](x) { this._v = x * 2 } } \
+             let a = new A(); a.v = 5; let d = Object.getOwnPropertyDescriptor(A.prototype, 'v'); \
+             console.log(a.v, typeof d.get, typeof d.set, d.enumerable, d.configurable)"
+        ]),
+        "10 function function false true"
+    );
+    // A computed half completes a literal-key half, either way round.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class A { get v() { return 1 } set ['v'](x) {} static set w(x) {} static get ['w']() { return 2 } } \
+             let d = Object.getOwnPropertyDescriptor(A.prototype, 'v'); \
+             let e = Object.getOwnPropertyDescriptor(A, 'w'); \
+             console.log(typeof d.get, typeof d.set, typeof e.get, typeof e.set, A.w)"
+        ]),
+        "function function function function 2"
+    );
+}
+
+/// Each class method replaces the property in order, on the prototype and on
+/// the constructor alike: an accessor half merges with the other half only
+/// when no same-key method sits in between.
+#[test]
+fn class_accessor_halves_across_method_via_eval() {
+    let desc = "let f = (o) => { let d = Object.getOwnPropertyDescriptor(o, 'a'); \
+                return 'value' in d ? 'data:' + typeof d.value : typeof d.get + ',' + typeof d.set }; ";
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ get a() {{ return 1 }} a() {{}} set a(v) {{}} \
+                 static get a() {{ return 1 }} static a() {{}} static set a(v) {{}} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "undefined,function undefined,function"
+    );
+    // Adjacent halves still form one accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ get a() {{ return 1 }} set a(v) {{}} \
+                 static get a() {{ return 1 }} static set a(v) {{}} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "function,function function,function"
+    );
+    // A later method replaces the accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ get a() {{ return 1 }} a() {{}} \
+                 static get a() {{ return 1 }} static a() {{}} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "data:function data:function"
+    );
+    // A later getter replaces the method, without a setter.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!(
+                "{desc}class C {{ a() {{}} get a() {{ return 3 }} \
+                 static a() {{}} static get a() {{ return 3 }} }} \
+                 console.log(f(C.prototype), f(C))"
+            )
+        ]),
+        "function,undefined function,undefined"
+    );
+}
+
+#[test]
+fn class_computed_generator_and_async_methods_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class R { *[Symbol.iterator]() { yield 1; yield 2 } } \
+             let g = new R()[Symbol.iterator](); \
+             console.log(g.next().value, g.next().value, R.prototype[Symbol.iterator].name)"
+        ]),
+        "1 2 [Symbol.iterator]"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let k = 'a'; class A { async [k]() { return 7 } } \
+             new A().a().then(v => console.log(v, A.prototype.a.name))"
+        ]),
+        "7 a"
+    );
+}
+
+#[test]
+fn class_computed_fields_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let k = 'x'; class A { [k] = 1; [k + 'y'] = this.x + 1 } \
+             let a = new A(); console.log(a.x, a.xy, Object.keys(a).join())"
+        ]),
+        "1 2 x,xy"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let k = 's'; class A { static [k] = 3; static [k + 't'] } \
+             console.log(A.s, A.st, Object.getOwnPropertyDescriptor(A, 's').enumerable)"
+        ]),
+        "3 undefined true"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let s = Symbol('f'); class A { [s] = 9 } class B extends A { [String(s)] = 1 } \
+             let b = new B(); console.log(b[s], b['Symbol(f)'])"
+        ]),
+        "9 1"
+    );
+    // An anonymous function or class value is named by its computed key.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let k = 'f'; class A { [k] = class {}; static [k] = () => 1 } \
+             console.log(new A().f.name, A.f.name)"
+        ]),
+        "f f"
+    );
+}
+
+/// Every computed key is evaluated and converted (`ToPropertyKey`) once, in
+/// source order, at class definition time — before any field initializer
+/// runs; instance fields reuse the converted keys on every construction.
+#[test]
+fn class_computed_key_evaluation_order_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let log = []; let key = (n) => ({ toString() { log.push('k' + n); return 'p' + n } }); \
+             class A { [key(1)] = log.push('i1'); static [key(2)] = log.push('s2'); \
+                       [key(3)]() {} static [key(4)]() {} } \
+             log.push('defined'); new A(); new A(); console.log(log.join())"
+        ]),
+        "k1,k2,k3,k4,s2,defined,i1,i1"
+    );
+}
+
+#[test]
+fn class_computed_method_names_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let s = Symbol('d'); class A { [s]() {} static ['st']() {} get ['g']() { return 1 } set ['g'](v) {} } \
+             let d = Object.getOwnPropertyDescriptor(A.prototype, 'g'); \
+             console.log(A.prototype[s].name, A.st.name, d.get.name, d.set.name)"
+        ]),
+        "[d] st get g set g"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class B { [Symbol()]() {} } \
+             console.log(B.prototype[Object.getOwnPropertySymbols(B.prototype)[0]].name === '')"
+        ]),
+        "true"
+    );
+}
+
+/// A computed `"constructor"` key is an ordinary method (it replaces
+/// `prototype.constructor`), and a computed non-static `"prototype"` is too.
+#[test]
+fn class_computed_constructor_is_an_ordinary_method_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class A { ['constructor']() { return 1 } } \
+             console.log(A.prototype.constructor === A, A.prototype.constructor(), typeof new A())"
+        ]),
+        "false 1 object"
+    );
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "class A { ['prototype']() { return 5 } ['constructor'] = 6 } \
+             let a = new A(); console.log(a.prototype(), a.constructor)"
+        ]),
+        "5 6"
+    );
+}
+
+/// A computed static member named `"prototype"` throws a `TypeError` at
+/// class definition: a method or accessor before the later keys are
+/// evaluated, a field when it is defined.
+#[test]
+fn class_computed_static_prototype_throws_via_eval() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "let log = []; \
+             try { class A { static ['proto' + 'type']() {} static [log.push('later')]() {} } } \
+             catch (e) { log.push(e instanceof TypeError) } \
+             try { class B { static get ['prototype']() { return 1 } } } \
+             catch (e) { log.push(e instanceof TypeError) } \
+             try { class C { static ['prototype'] = 1 } } \
+             catch (e) { log.push(e instanceof TypeError) } \
+             console.log(log.join())"
+        ]),
+        "true,true,true"
+    );
+}

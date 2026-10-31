@@ -149,7 +149,7 @@ fn is_boolean(function: &mut Function, local: u32) {
 pub(super) fn emit_number_value_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let x = frame.i64(0);
@@ -174,7 +174,7 @@ pub(super) fn emit_number_value_of(
 pub(super) fn emit_number_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (x, radix_v) = (frame.i64(0), frame.i64(1));
@@ -208,8 +208,8 @@ pub(super) fn emit_number_to_string(
     );
     let error = IrNode::error_object(
         ErrorKind::RangeError,
-        Some(IrNode::Str(BAD_RADIX[0].to_owned())),
-        IrNode::Str(BAD_RADIX[1].to_owned()),
+        Some(IrNode::Str(BAD_RADIX[0].into())),
+        IrNode::Str(BAD_RADIX[1].into()),
     );
     emit_throw_error(&error, function, frame.scratch(), strings, helpers);
     wasm!(function;
@@ -236,7 +236,7 @@ fn return_to_string(function: &mut Function, x: u32, helpers: Helpers<'_>) {
 pub(super) fn emit_number_to_locale_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let x = frame.i64(0);
@@ -264,7 +264,7 @@ pub(super) fn emit_number_format(
     format: NumberFormat,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (x, arg) = (frame.i64(0), frame.i64(1));
@@ -305,8 +305,8 @@ pub(super) fn emit_number_format(
         let [message, stack] = BAD_DIGITS[format.index()];
         let error = IrNode::error_object(
             ErrorKind::RangeError,
-            Some(IrNode::Str(message.to_owned())),
-            IrNode::Str(stack.to_owned()),
+            Some(IrNode::Str(message.into())),
+            IrNode::Str(stack.into()),
         );
         emit_throw_error(&error, function, frame.scratch(), strings, helpers);
         wasm!(function; End);
@@ -342,7 +342,7 @@ pub(super) fn emit_boolean(
     value_of: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let b = frame.i64(0);
@@ -370,4 +370,292 @@ pub(super) fn emit_boolean(
     wasm!(function; Else);
     push_str(function, strings, FALSE_TEXT);
     wasm!(function; End);
+}
+
+// --- Math.sumPrecise ---------------------------------------------------------
+
+/// The `TypeError` of `Math.sumPrecise` over a non-number value.
+const SUM_NOT_NUMBER: CalleeErrorText<'static> = [
+    "Math.sumPrecise requires an iterable of numbers",
+    "TypeError: Math.sumPrecise requires an iterable of numbers",
+];
+
+/// The static strings of `Math.sumPrecise`.
+pub(super) const SUM_STRINGS: [&str; 2] = SUM_NOT_NUMBER;
+
+/// The exact accumulator of `Math.sumPrecise`: a two's-complement fixed-point
+/// integer in units of `2^-1074` (the least subnormal), one 32-bit limb per
+/// i64 slot, least significant first. [`SUM_PAD`] zero slots below the
+/// value let the rounding read two limbs under the leading one unchecked;
+/// the [`SUM_TOP`] slot holds the sign. A finite double spans bits
+/// `0..2098`, and `2^53` of them fit in `2151` bits, below the sign slot.
+const SUM_SLOTS: i32 = 72;
+/// The zero slots below the value.
+const SUM_PAD: i32 = 2;
+/// The sign slot (the last one).
+const SUM_TOP: i32 = SUM_SLOTS - 1;
+/// A 32-bit limb.
+const LIMB_MASK: i64 = 0xFFFF_FFFF;
+
+/// `sumPrecise` states (the proposal's `state`, `finite` meaning "a finite
+/// value other than `-0` was seen").
+const SUM_MINUS_ZERO: i32 = 0;
+const SUM_FINITE: i32 = 1;
+const SUM_PLUS_INF: i32 = 2;
+const SUM_MINUS_INF: i32 = 3;
+const SUM_NAN: i32 = 4;
+
+/// The i64 memory operand of slot byte offset `offset`.
+fn slot(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+/// `Math.sumPrecise(items)`: `GetIterator(items)`, then every value must be
+/// a number (else close and `TypeError`); `NaN` and `+∞`/`-∞` (both: `NaN`)
+/// dominate, `-0` is skipped, and the finite values are summed exactly
+/// ([`add_exact`]) and rounded once ([`round_exact`]). No value (or only
+/// `-0`) yields `-0`.
+pub(super) fn emit_sum_precise(
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (items, v) = (frame.i64(0), frame.i64(1));
+    let (acc, state) = (frame.i32(0), frame.i32(1));
+    let temps = [frame.i64(2), frame.i64(3), frame.x64(0), frame.x64(1)];
+    let (cursor, bound) = (frame.i32(2), frame.i32(3));
+    let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
+    let scratch = frame.scratch();
+    frame.arg(function, 0);
+    wasm!(function; LocalSet(items));
+    emit_get_iterator(
+        &IrNode::Local(items),
+        &rec,
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    wasm!(function;
+        I32Const(SUM_SLOTS * 8), Call(helpers.alloc), LocalTee(acc),
+        I32Const(0), I32Const(SUM_SLOTS * 8), MemoryFill(0),
+        I32Const(SUM_MINUS_ZERO), LocalSet(state),
+    );
+    iter::guarded(function, helpers, |function| {
+        wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
+        enter_frame(helpers);
+        enter_frame(helpers);
+        emit_iterator_step(&rec, function, scratch, strings, helpers);
+        wasm!(function; I32Eqz, BrIf(1));
+        emit_iterator_value(&rec, function, scratch, strings, helpers);
+        wasm!(function; LocalSet(v));
+        emit_is_number(function, v);
+        wasm!(function; I32Eqz, If(BlockType::Empty));
+        enter_frame(helpers);
+        throw_type_error(function, frame, SUM_NOT_NUMBER, strings, helpers);
+        leave_frame(helpers);
+        let inf = f64::INFINITY.to_bits().cast_signed();
+        let minus_inf = f64::NEG_INFINITY.to_bits().cast_signed();
+        let minus_zero = (-0.0f64).to_bits().cast_signed();
+        wasm!(function;
+            End,
+            LocalGet(state), I32Const(SUM_NAN), I32Ne, If(BlockType::Empty),
+            LocalGet(v), F64ReinterpretI64, LocalGet(v), F64ReinterpretI64, F64Ne,
+            If(BlockType::Empty), I32Const(SUM_NAN), LocalSet(state), Else,
+            LocalGet(v), I64Const(inf), I64Eq,
+            If(BlockType::Empty),
+            I32Const(SUM_NAN), I32Const(SUM_PLUS_INF),
+            LocalGet(state), I32Const(SUM_MINUS_INF), I32Eq, Select, LocalSet(state),
+            Else,
+            LocalGet(v), I64Const(minus_inf), I64Eq,
+            If(BlockType::Empty),
+            I32Const(SUM_NAN), I32Const(SUM_MINUS_INF),
+            LocalGet(state), I32Const(SUM_PLUS_INF), I32Eq, Select, LocalSet(state),
+            Else,
+            LocalGet(v), I64Const(minus_zero), I64Ne,
+            LocalGet(state), I32Const(SUM_PLUS_INF), I32LtU, I32And,
+            If(BlockType::Empty), I32Const(SUM_FINITE), LocalSet(state),
+        );
+        add_exact(function, acc, v, [cursor, bound], temps);
+        wasm!(function; End, End, End, End, End);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        wasm!(function; Br(0), End, End);
+    });
+    wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+    emit_iterator_close(
+        &rec,
+        CloseMode::Pending,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    wasm!(function;
+        I64Const(UNDEFINED_BITS), Return, End,
+        LocalGet(state), I32Const(SUM_FINITE), I32Eq, If(BlockType::Result(ValType::F64)),
+    );
+    round_exact(function, acc, [cursor, bound, frame.x32(0)], temps);
+    wasm!(function;
+        F64ReinterpretI64,
+        Else,
+        F64Const(Ieee64::from(f64::INFINITY)), F64Const(Ieee64::from(f64::NEG_INFINITY)),
+        LocalGet(state), I32Const(SUM_PLUS_INF), I32Eq, Select,
+        F64Const(Ieee64::from(-0.0)), F64Const(Ieee64::from(f64::NAN)),
+        LocalGet(state), I32Const(SUM_MINUS_ZERO), I32Eq, Select,
+        LocalGet(state), I32Const(SUM_PLUS_INF), I32GeU, LocalGet(state), I32Const(SUM_MINUS_INF),
+        I32LeU, I32And, Select,
+        End,
+    );
+    emit_box_f64(function, helpers);
+}
+
+/// Add the finite number (other than `-0`) whose bits are in i64 `x` to the
+/// accumulator at i32 `acc` exactly: its 53-bit significand `m` at bit `p`
+/// (`p = E - 1` for a normal, `0` for a subnormal) lands as three 32-bit
+/// digits (negated for a negative `x`) on the slots from `p / 32`, then the
+/// carries ripple up (to the sign slot at most).
+fn add_exact(
+    function: &mut Function,
+    acc: u32,
+    bits: u32,
+    [bit, at]: [u32; 2],
+    [hi, lo, sign, sum]: [u32; 4],
+) {
+    let frac = (1i64 << 52) - 1;
+    wasm!(function;
+        LocalGet(bits), I64Const(52), I64ShrU, I64Const(0x7FF), I64And, I32WrapI64, LocalSet(bit),
+        LocalGet(bits), I64Const(frac), I64And, LocalSet(hi),
+        LocalGet(bit), If(BlockType::Empty),
+        LocalGet(hi), I64Const(1i64 << 52), I64Or, LocalSet(hi),
+        LocalGet(bit), I32Const(1), I32Sub, LocalSet(bit),
+        End,
+        LocalGet(bits), I64Const(63), I64ShrS, LocalSet(sign),
+        LocalGet(hi), I64Const(LIMB_MASK), I64And,
+        LocalGet(bit), I32Const(31), I32And, I64ExtendI32U, I64Shl, LocalSet(lo),
+        LocalGet(hi), I64Const(32), I64ShrU,
+        LocalGet(bit), I32Const(31), I32And, I64ExtendI32U, I64Shl, LocalSet(hi),
+        LocalGet(acc), LocalGet(bit), I32Const(5), I32ShrU, I32Const(SUM_PAD), I32Add,
+        I32Const(3), I32Shl, I32Add, LocalSet(at),
+    );
+    // The three digits: `lo` low half, `lo` high half + `hi` low half, `hi`
+    // high half; each `(d ^ s) - s` (negated when `x < 0`).
+    let digits: [&dyn Fn(&mut Function); 3] = [
+        &|function: &mut Function| wasm!(function; LocalGet(lo), I64Const(LIMB_MASK), I64And),
+        &|function: &mut Function| {
+            wasm!(function;
+                LocalGet(lo), I64Const(32), I64ShrU, LocalGet(hi), I64Const(LIMB_MASK), I64And, I64Add,
+            );
+        },
+        &|function: &mut Function| wasm!(function; LocalGet(hi), I64Const(32), I64ShrU),
+    ];
+    for (k, digit) in (0u64..).zip(digits) {
+        wasm!(function; LocalGet(at), LocalGet(at), I64Load(slot(8 * k)));
+        digit(function);
+        wasm!(function; LocalGet(sign), I64Xor, LocalGet(sign), I64Sub, I64Add, I64Store(slot(8 * k)));
+    }
+    // Ripple: past the three digits with no carry left, or at the sign slot
+    // (which keeps the sign, unmasked).
+    wasm!(function;
+        LocalGet(at), I32Const(24), I32Add, LocalSet(bit),
+        I64Const(0), LocalSet(sign),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(at), LocalGet(acc), I32Const(SUM_TOP * 8), I32Add, I32Eq,
+        If(BlockType::Empty),
+        LocalGet(at), LocalGet(at), I64Load(slot(0)), LocalGet(sign), I64Add, I64Store(slot(0)),
+        Br(2),
+        End,
+        LocalGet(at), I64Load(slot(0)), LocalGet(sign), I64Add, LocalSet(sum),
+        LocalGet(at), LocalGet(sum), I64Const(LIMB_MASK), I64And, I64Store(slot(0)),
+        LocalGet(sum), I64Const(32), I64ShrS, LocalSet(sign),
+        LocalGet(at), I32Const(8), I32Add, LocalTee(at),
+        LocalGet(bit), I32GeU, LocalGet(sign), I64Eqz, I32And, BrIf(1),
+        Br(0),
+        End, End,
+    );
+}
+
+/// Push the bits of the double nearest (ties to even) to the accumulator at
+/// i32 `acc`: negate a negative value, find the leading slot `H` and the
+/// bit length `L`; `L <= 53` is exact (the integer is the subnormal /
+/// smallest-normal bit pattern itself), else the 64 bits under the leading
+/// one give the significand `M`, its round bit and part of the sticky bits
+/// (the rest: the slots below), and the result is `(L - 53) << 52 + M`
+/// (a carry out of `M` bumps the exponent; at the top, `+∞`).
+fn round_exact(
+    function: &mut Function,
+    acc: u32,
+    [at, width, neg]: [u32; 3],
+    [window, len, carry, sticky]: [u32; 4],
+) {
+    let top = u64::try_from(SUM_TOP * 8).unwrap_or(0);
+    let inf = f64::INFINITY.to_bits().cast_signed();
+    wasm!(function;
+        LocalGet(acc), I64Load(slot(top)), I64Const(0), I64LtS, LocalTee(neg),
+        If(BlockType::Empty),
+        LocalGet(acc), LocalSet(at), I64Const(0), LocalSet(carry),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(carry), LocalGet(at), I64Load(slot(0)), I64Sub, LocalSet(len),
+        LocalGet(at), LocalGet(len), I64Const(LIMB_MASK), I64And, I64Store(slot(0)),
+        LocalGet(len), I64Const(32), I64ShrS, LocalSet(carry),
+        LocalGet(at), LocalGet(acc), I32Const(SUM_TOP * 8), I32Add, I32Eq, BrIf(1),
+        LocalGet(at), I32Const(8), I32Add, LocalSet(at),
+        Br(0),
+        End, End,
+        End,
+        // The leading slot (`H`); none above the padding: `+0`.
+        LocalGet(acc), I32Const(SUM_TOP * 8), I32Add, LocalSet(at),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(at), LocalGet(acc), I32Const(SUM_PAD * 8), I32Add, I32LtU, BrIf(1),
+        LocalGet(at), I64Load(slot(0)), I64Const(0), I64Ne, BrIf(1),
+        LocalGet(at), I32Const(8), I32Sub, LocalSet(at),
+        Br(0),
+        End, End,
+        LocalGet(at), LocalGet(acc), I32Const(SUM_PAD * 8), I32Add, I32LtU,
+        If(BlockType::Result(ValType::I64)), I64Const(0), Else,
+        // `b`: the leading slot's bit length; `L` in `t`.
+        I32Const(64), LocalGet(at), I64Load(slot(0)), I64Clz, I32WrapI64, I32Sub, LocalSet(width),
+        LocalGet(at), LocalGet(acc), I32Sub, I32Const(3), I32ShrU, I32Const(SUM_PAD), I32Sub,
+        I32Const(5), I32Shl, LocalGet(width), I32Add, I64ExtendI32U, LocalTee(len),
+        I64Const(53), I64LeU,
+        If(BlockType::Result(ValType::I64)),
+        LocalGet(acc), I64Load(slot(8 * 2)),
+        LocalGet(acc), I64Load(slot(8 * 3)), I64Const(32), I64Shl, I64Or,
+        Else,
+        // The 64 bits under the leading one.
+        LocalGet(at), I64Load(slot(0)), I64Const(64), LocalGet(width), I64ExtendI32U, I64Sub, I64Shl,
+        LocalGet(at), I32Const(8), I32Sub, I64Load(slot(0)),
+        I64Const(32), LocalGet(width), I64ExtendI32U, I64Sub, I64Shl, I64Or,
+        LocalGet(at), I32Const(16), I32Sub, I64Load(slot(0)), LocalGet(width), I64ExtendI32U, I64ShrU,
+        I64Or, LocalSet(window),
+        // Sticky: the 10 bits under the round bit, the low `b` bits of the
+        // slot two under `H`, and every slot below it.
+        LocalGet(window), I64Const(0x3FF), I64And,
+        LocalGet(at), I32Const(16), I32Sub, I64Load(slot(0)),
+        I64Const(1), LocalGet(width), I64ExtendI32U, I64Shl, I64Const(1), I64Sub, I64And,
+        I64Or, LocalSet(sticky),
+        LocalGet(at), I32Const(24), I32Sub, LocalSet(width),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(width), LocalGet(acc), I32LtU, BrIf(1),
+        LocalGet(sticky), LocalGet(width), I64Load(slot(0)), I64Or, LocalSet(sticky),
+        LocalGet(width), I32Const(8), I32Sub, LocalSet(width),
+        Br(0),
+        End, End,
+        // `M` (53 bits), rounded to nearest, ties to even.
+        LocalGet(window), I64Const(10), I64ShrU, I64Const(1), I64And, I32WrapI64,
+        LocalGet(sticky), I64Const(0), I64Ne,
+        LocalGet(window), I64Const(11), I64ShrU, I64Const(1), I64And, I32WrapI64, I32Or, I32And,
+        I64ExtendI32U, LocalGet(window), I64Const(11), I64ShrU, I64Add,
+        LocalGet(len), I64Const(53), I64Sub, I64Const(52), I64Shl, I64Add, LocalTee(window),
+        I64Const(inf), LocalGet(window), I64Const(inf), I64LtU, Select,
+        End,
+        End,
+        I64Const(i64::MIN), I64Const(0), LocalGet(neg), Select, I64Or,
+    );
 }

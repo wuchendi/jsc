@@ -33,6 +33,14 @@ must_use_candidate      = "allow"
 missing_errors_doc      = "allow"
 missing_panics_doc      = "allow"
 
+# Dev/test builds optimize: every test compiles and runs JS programs through
+# swc + emit + wasmtime/cranelift, which are far too slow unoptimized.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 lto           = "fat"
 codegen-units = 1

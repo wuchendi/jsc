@@ -334,3 +334,28 @@ fn plain_objects_named_caller_are_unaffected() {
     assert_number("const o = {}; o.arguments = 2; o.arguments", 2.0);
     assert_eval("({}).caller", "undefined");
 }
+
+/// `%Symbol.prototype%` is a watched intrinsic: a mutation is observed by
+/// every later method call on a symbol, wrapper or not.
+#[test]
+fn symbol_prototype_is_watched() {
+    assert_string(
+        "Symbol.prototype.toString = function () { return \"mine\"; }; Symbol(\"a\").toString()",
+        "mine",
+    );
+    assert_string(
+        "Symbol.prototype.toString = function () { return \"mine\"; }; Object(Symbol(\"a\")).toString()",
+        "mine",
+    );
+    assert_string(
+        "Symbol.prototype.tag = function () { return typeof this; }; Symbol().tag()",
+        "symbol",
+    );
+    assert_string(
+        "Object.defineProperty(Symbol.prototype, \"description\", { get() { return \"d\"; } }); \
+         Symbol(\"a\").description",
+        "d",
+    );
+    // Untouched, the builtin answers.
+    assert_string("Symbol(\"a\").toString()", "Symbol(a)");
+}

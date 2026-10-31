@@ -15,15 +15,15 @@ fn unknown_namespace_members_are_runtime_reads() {
     assert_bool("Math.foo === undefined", true);
     assert_uncaught("JSON.foo(1)", "TypeError: JSON.foo is not a function");
     assert_uncaught(
-        "Promise.all([])",
-        "TypeError: Promise.all is not a function",
+        "Promise.foo([])",
+        "TypeError: Promise.foo is not a function",
     );
     assert_uncaught(
         "console.warn(1)",
         "TypeError: console.warn is not a function",
     );
     // Inherited members of a namespace or constructor are reachable.
-    assert_string("Math.toString()", "[object Object]");
+    assert_string("Math.toString()", "[object Math]");
     assert_bool("Object.hasOwnProperty('keys')", true);
 }
 

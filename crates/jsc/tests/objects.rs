@@ -525,7 +525,7 @@ fn json_parse_scalars_and_composites() {
     );
 }
 
-/// Malformed (or unsupported — a `\u` escape) input throws a catchable branded
+/// Malformed input throws a catchable branded
 /// `Error` whose `.name` is `SyntaxError`.
 #[test]
 fn json_parse_rejects_malformed_input() {
@@ -543,12 +543,13 @@ fn json_parse_rejects_malformed_input() {
         ]),
         "true",
     );
-    // Trailing content, unterminated string, empty input, and `\u` all throw.
+    // Trailing content, unterminated string, empty input, and a malformed
+    // `\u` escape all throw.
     for src in [
         "let r=0; try{JSON.parse(\"1 2\")}catch(e){r=1} r",
         "let r=0; try{JSON.parse(\"\\\"abc\")}catch(e){r=1} r",
         "let r=0; try{JSON.parse(\"\")}catch(e){r=1} r",
-        "let r=0; try{JSON.parse(\"\\\"\\\\u0041\\\"\")}catch(e){r=1} r",
+        "let r=0; try{JSON.parse(\"\\\"\\\\u00G1\\\"\")}catch(e){r=1} r",
     ] {
         assert_eq!(jsc(&["-p", src]), "1", "expected `{src}` to throw");
     }
@@ -628,6 +629,55 @@ fn object_literal_accessors() {
              o.a; o.b = 9; console.log(o.a, c)"
         ]),
         "10 10"
+    );
+}
+
+/// Each object-literal member replaces the property in order: an accessor
+/// half merges with the other half only when no same-key data member sits in
+/// between.
+#[test]
+fn object_literal_accessor_halves_across_data_member_via_eval() {
+    let desc = "let f = (o) => { let d = Object.getOwnPropertyDescriptor(o, 'a'); \
+                return 'value' in d ? 'data:' + d.value : typeof d.get + ',' + typeof d.set }; ";
+    // A data member between the halves: the setter alone survives.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ get a() {{ return 1 }}, a: 2, set a(v) {{}} }}))")
+        ]),
+        "undefined,function"
+    );
+    // Adjacent halves still form one accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ get a() {{ return 1 }}, set a(v) {{}} }}))")
+        ]),
+        "function,function"
+    );
+    // A later data member replaces the accessor.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ get a() {{ return 1 }}, a: 1 }}))")
+        ]),
+        "data:1"
+    );
+    // A later getter replaces the data member, without a setter.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ a: 1, get a() {{ return 3 }} }}))")
+        ]),
+        "function,undefined"
+    );
+    // A data method between the halves counts as a data member too.
+    assert_eq!(
+        jsc(&[
+            "-e",
+            &format!("{desc}console.log(f({{ set a(v) {{}}, a() {{}}, get a() {{ return 1 }} }}))")
+        ]),
+        "function,undefined"
     );
 }
 

@@ -71,7 +71,7 @@ impl Body {
         let own = IrNode::Intrinsic(GlobalIntrinsic::Ctor(ctor));
         let prototype = |obj: IrNode| IrNode::Index {
             obj: Box::new(obj),
-            index: Box::new(IrNode::Str("prototype".to_owned())),
+            index: Box::new(IrNode::Str("prototype".into())),
         };
         let p = self.temp(0);
         IrNode::Seq(vec![
@@ -131,8 +131,8 @@ fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) -> IrNode {
 fn throw_type_error(message: &str) -> IrNode {
     IrNode::Throw(Box::new(IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(format!("TypeError: {message}")),
+        Some(IrNode::Str(message.into())),
+        IrNode::Str(format!("TypeError: {message}").into()),
     )))
 }
 
@@ -152,11 +152,16 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         BuiltinCtor::Object => object(&body),
         BuiltinCtor::Function => throw_type_error("the Function constructor is not supported"),
         BuiltinCtor::Array => array(&body),
-        BuiltinCtor::String => {
-            conversion(&body, ctor, ConvertOp::ToString, IrNode::Str(String::new()))
+        BuiltinCtor::String => conversion(
+            &body,
+            ctor,
+            [ConvertOp::String, ConvertOp::ToString],
+            IrNode::Str("".into()),
+        ),
+        BuiltinCtor::Number => conversion(&body, ctor, [ConvertOp::ToNumber; 2], IrNode::Num(0.0)),
+        BuiltinCtor::Boolean => {
+            conversion(&body, ctor, [ConvertOp::ToBoolean; 2], IrNode::Bool(false))
         }
-        BuiltinCtor::Number => conversion(&body, ctor, ConvertOp::ToNumber, IrNode::Num(0.0)),
-        BuiltinCtor::Boolean => conversion(&body, ctor, ConvertOp::ToBoolean, IrNode::Bool(false)),
         BuiltinCtor::Error(ErrorKind::AggregateError) => aggregate_error(&body),
         BuiltinCtor::Error(kind) => {
             let (proto, options) = (body.temp(1), body.temp(3));
@@ -197,6 +202,23 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             body.requires_new(ctor, body.with_proto(ctor, promise))
         }
         BuiltinCtor::Date => date(&body),
+        // A hand-written body (`symbol::emit_ctor`).
+        BuiltinCtor::Symbol => IrNode::Undefined,
+        // Abstract: only a subclass `new.target` constructs (the allocated
+        // `this`, `proto` from `new.target`, is the instance).
+        BuiltinCtor::Iterator => ternary(
+            IrNode::Logical {
+                op: LogicalOp::And,
+                lhs: Box::new(body.constructing()),
+                rhs: Box::new(IrNode::Binary {
+                    op: BinOp::Ne,
+                    lhs: Box::new(IrNode::NewTargetGlobal),
+                    rhs: Box::new(IrNode::Intrinsic(GlobalIntrinsic::Ctor(ctor))),
+                }),
+            },
+            IrNode::Undefined,
+            throw_type_error("Abstract class Iterator not directly constructable"),
+        ),
     }
 }
 
@@ -235,7 +257,7 @@ fn aggregate_error(body: &Body) -> IrNode {
             obj: Box::new(IrNode::Local(obj)),
             local: proto,
             entries: vec![(
-                PropKey::Hidden("errors".to_owned()),
+                PropKey::Hidden("errors".into()),
                 IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::Local(errors))]),
             )],
         },
@@ -295,7 +317,7 @@ fn array(body: &Body) -> IrNode {
         },
         IrNode::IndexSet {
             obj: Box::new(IrNode::Local(arr)),
-            index: Box::new(IrNode::Str(INDEX_LENGTH_KEY.to_owned())),
+            index: Box::new(IrNode::Str(INDEX_LENGTH_KEY.into())),
             value: Box::new(body.arg(0)),
         },
         IrNode::Local(arr),
@@ -303,10 +325,10 @@ fn array(body: &Body) -> IrNode {
     let is_number = IrNode::Binary {
         op: BinOp::Eq,
         lhs: Box::new(IrNode::TypeOf(Box::new(body.arg(0)))),
-        rhs: Box::new(IrNode::Str("number".to_owned())),
+        rhs: Box::new(IrNode::Str("number".into())),
     };
     let one = ternary(is_number, with_length, IrNode::Array(vec![body.arg(0)]));
-    let spread = IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::SpreadArgsGlobal)]);
+    let spread = IrNode::ArraySpread(vec![SpreadElem::List(IrNode::SpreadArgsGlobal)]);
     let elements = (0..=body.k).rev().fold(spread, |more, n| {
         ternary(
             body.argc_is(n),
@@ -317,25 +339,33 @@ fn array(body: &Body) -> IrNode {
     body.with_proto(BuiltinCtor::Array, ternary(body.argc_is(1), one, elements))
 }
 
-/// `String(v)` / `Number(v)` / `Boolean(v)`: the conversion of the first
-/// argument (`empty` without one); under `new`, its wrapper object (design
-/// 2.4) with `proto` from `new.target`.
-fn conversion(body: &Body, ctor: BuiltinCtor, op: ConvertOp, empty: IrNode) -> IrNode {
-    let convert = IrNode::ConvertCall {
-        op,
-        arg: Box::new(body.arg(0)),
-        radix: None,
+/// `String(v)` / `Number(v)` / `Boolean(v)`: the conversion `call` of the
+/// first argument (`empty` without one); under `new`, the wrapper object
+/// (design 2.4) of its conversion `construct`, with `proto` from `new.target`
+/// (`String(symbol)` describes the symbol, `new String(symbol)` throws).
+fn conversion(
+    body: &Body,
+    ctor: BuiltinCtor,
+    [call, construct]: [ConvertOp; 2],
+    empty: IrNode,
+) -> IrNode {
+    let value = |op, empty| {
+        let convert = IrNode::ConvertCall {
+            op,
+            arg: Box::new(body.arg(0)),
+            radix: None,
+        };
+        ternary(body.argc_is(0), empty, convert)
     };
-    let value = ternary(body.argc_is(0), empty, convert);
     let v = body.temp(3);
     let wrapper = IrNode::Seq(vec![
         IrNode::Assign {
             local: v,
-            value: Box::new(value.clone()),
+            value: Box::new(value(construct, empty.clone())),
         },
         body.with_proto(ctor, IrNode::ToObject(Box::new(IrNode::Local(v)))),
     ]);
-    ternary(body.constructing(), wrapper, value)
+    ternary(body.constructing(), wrapper, value(call, empty))
 }
 
 /// `new Date()` / `new Date(ms)` / `new Date(year, month, ..)`; called,

@@ -5,7 +5,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::emit::realm::ArrayFindOp;
+use crate::emit::realm::{ArrayFindOp, AsyncIterOp, FromAsyncOp, IterOp};
 
 /// The `TypeError`s of one method: a `null`/`undefined` receiver, and a
 /// non-callable callback (callback methods only).
@@ -180,7 +180,7 @@ fn this_object(
     frame: Frame,
     o: u32,
     nullish: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(o));
@@ -224,7 +224,7 @@ fn length_of(
     function: &mut Function,
     o: u32,
     len: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(o), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get));
@@ -277,7 +277,7 @@ fn to_integer(function: &mut Function, r: u32, helpers: Helpers<'_>) {
 pub(super) fn emit_push(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -339,7 +339,7 @@ pub(super) fn emit_push(
         LocalGet(flen), LocalGet(n), F64ConvertI32U, F64Add,
         I64ReinterpretF64, LocalSet(kv),
     );
-    let length = IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = IrNode::Str(INDEX_LENGTH_KEY.into());
     emit_drop(function, frame, &set(o, length, kv), strings, helpers);
     wasm!(function; LocalGet(kv));
 }
@@ -350,12 +350,12 @@ pub(super) fn emit_push(
 pub(super) fn emit_pop(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2));
     let len = frame.yf64(0);
-    let length = || IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = || IrNode::Str(INDEX_LENGTH_KEY.into());
     this_object(function, frame, o, POP.nullish, strings, helpers);
     is_array(function, o);
     wasm!(function; If(BlockType::Empty));
@@ -404,7 +404,7 @@ pub(super) fn emit_hof(
     op: ArrayHofOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = hof_texts(op);
@@ -563,7 +563,7 @@ pub(super) fn emit_search(
     includes: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = if includes { &INCLUDES } else { &INDEX_OF };
@@ -642,7 +642,7 @@ pub(super) fn emit_search(
 pub(super) fn emit_join(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, sep_v, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -693,7 +693,7 @@ pub(super) fn emit_join(
 pub(super) fn emit_to_locale_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, f) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -747,14 +747,15 @@ pub(super) fn emit_to_locale_string(
 
 /// `Array.prototype.slice(start, end)`: `k` and `final` from the relative
 /// `start` and `end` (`len` when `undefined`), `A = ArraySpeciesCreate(O,
-/// count)`; an array whose species is `ArrayCreate` then runs the call sites'
-/// host slice over `[k, final)`; otherwise each present index of `[k, final)`
+/// count)`; a dense array whose species is `ArrayCreate` then copies its
+/// store slots `[k, final)` (a hole stays a hole) into a fresh array;
+/// otherwise each present index of `[k, final)`
 /// is copied into `A` by `CreateDataPropertyOrThrow` (an absent one stays a
 /// hole) and `A.length` is set.
 pub(super) fn emit_slice(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, end_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -773,15 +774,29 @@ pub(super) fn emit_slice(
     relative_arg(function, end_v, true, rel, len, fin, helpers);
     species_ctor(function, frame, o, c, strings, helpers);
     indexless_array(function, o, helpers);
+    let (n, dst) = (frame.i32(0), frame.i32(1));
+    let data = |function: &mut Function| {
+        emit_array_elems(function);
+        wasm!(function; I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()), I32Add);
+    };
     wasm!(function;
         LocalGet(c), I64Const(UNDEFINED_BITS), I64Eq, I32And,
+        LocalGet(o), I32WrapI64,
+        I32Load8U(MemArg { offset: u64::from(abi::HEADER_FLAGS_OFFSET), align: 0, memory_index: 0 }),
+        I32Const(ARRAY_SPARSE), I32And, I32Eqz, I32And,
         If(BlockType::Empty),
-        LocalGet(o), I32Const(abi::METHOD_OP_SLICE),
+        LocalGet(fin), LocalGet(k), F64Sub, I32TruncSatF64U, LocalTee(n),
+        Call(helpers.new_array()), LocalSet(dst),
+        LocalGet(n), If(BlockType::Empty), LocalGet(dst),
     );
-    num(function, k);
-    num(function, fin);
+    data(function);
+    wasm!(function; LocalGet(o), I32WrapI64);
+    data(function);
     wasm!(function;
-        Call(helpers.method), Return,
+        LocalGet(k), I32TruncSatF64U, I32Const(3), I32Shl, I32Add,
+        LocalGet(n), I32Const(3), I32Shl, MemoryCopy { src_mem: 0, dst_mem: 0 },
+        End,
+        LocalGet(dst), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Return,
         End,
         // count = max(final - k, 0)
         LocalGet(fin), LocalGet(k), F64Sub, F64Const(Ieee64::from(0.0)), F64Max,
@@ -817,7 +832,7 @@ pub(super) fn emit_slice(
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, join, base) = (frame.i64(0), frame.i64(1), frame.i32(0));
@@ -923,6 +938,8 @@ fn more_strings() -> impl Iterator<Item = &'static str> {
         )
         .chain(FROM_NULLISH)
         .chain(FROM_NOT_CALLABLE)
+        .chain(FROM_ASYNC_NULLISH)
+        .chain(FROM_ASYNC_NOT_CALLABLE)
         .chain(CTOR_NOT_OBJECT)
         .chain(CANNOT_DEFINE)
         .chain([CONSTRUCTOR, "done", "value"])
@@ -937,19 +954,6 @@ fn more_fragments(k: u32) -> Vec<IrNode> {
     vec![
         construct(frame, o, Some(o), SPECIES_NOT_CTOR),
         construct(frame, o, None, THIS_NOT_CTOR),
-        IrNode::GenResume {
-            handle: Box::new(IrNode::Local(o)),
-            sent: Box::new(IrNode::Undefined),
-        },
-        IrNode::IterSource {
-            value: Box::new(IrNode::Local(o)),
-            live: true,
-        },
-        IrNode::IterLen(Box::new(IrNode::Local(o))),
-        IrNode::IterItem {
-            iterable: Box::new(IrNode::Local(o)),
-            index: Box::new(IrNode::Local(o)),
-        },
     ]
 }
 
@@ -970,7 +974,7 @@ fn construct(frame: Frame, c: u32, len: Option<u32>, what: &str) -> IrNode {
 
 /// One argument of a [`call_fn`] call.
 #[derive(Clone, Copy)]
-enum CallArg {
+pub(super) enum CallArg {
     /// The jsval in an i64 local.
     Val(u32),
     /// The i32 index in a local, as a number.
@@ -981,7 +985,7 @@ enum CallArg {
 /// leaving its result (or a pending throw): the first `K` in the positional
 /// slots and, when there are more, all of them in a fresh spread argument
 /// array published for the callee (built in the [`Frame::arg`] temp).
-fn push_call(
+pub(super) fn push_call(
     function: &mut Function,
     frame: Frame,
     callee: u32,
@@ -1040,27 +1044,13 @@ fn require_callable(
     frame: Frame,
     local: u32,
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_function(function, local);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, text, strings, helpers);
     wasm!(function; End);
-}
-
-/// Push i32 `1` when the jsval in `local` is a heap block of one of `kinds`.
-fn is_type(function: &mut Function, local: u32, kinds: &[i32]) {
-    emit_is_pointer(function, local);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    for (i, &kind) in kinds.iter().enumerate() {
-        emit_load_type_byte(function, local);
-        wasm!(function; I32Const(kind), I32Eq);
-        if i > 0 {
-            wasm!(function; I32Or);
-        }
-    }
-    wasm!(function; Else, I32Const(0), End);
 }
 
 /// `ArrayCreate(len)` into i64 `out` for the number jsval in i64 `len`: a
@@ -1070,14 +1060,14 @@ fn array_create(
     frame: Frame,
     len: u32,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
         I32Const(0), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         LocalSet(out),
     );
-    let length = IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = IrNode::Str(INDEX_LENGTH_KEY.into());
     emit_drop(function, frame, &set(out, length, len), strings, helpers);
 }
 
@@ -1090,7 +1080,7 @@ fn construct_or_create(
     c: u32,
     len: Option<u32>,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
@@ -1114,67 +1104,61 @@ fn construct_or_create(
 
 /// The constructor `ArraySpeciesCreate(o, ..)` uses, into i64 `c`
 /// (`undefined` for `ArrayCreate`): a non-array `o` creates an array; else
-/// `C = Get(o, "constructor")`: `undefined` creates an array, a non-object
-/// throws, and an object is its own species when its prototype chain reaches
-/// a builtin constructor with a `@@species` getter returning `this`
-/// (`%Array%`, `%Map%`, `%Set%`, `%Promise%`), else (`C[@@species]` is
-/// `undefined`) an array is created; `%Array%` itself creates an array. There
-/// is no `Symbol`, so no other `@@species` exists (DESIGN.md §13).
+/// `C = Get(o, "constructor")`; an object `C` is replaced by
+/// `Get(C, @@species)` (`null` counts as `undefined`); `undefined` creates
+/// an array and any other `C` must be a constructor ([`species_from`]
+/// throws otherwise). `%Array%` itself creates an array, so `C === %Array%`
+/// with `%Array%`'s dirty bit clear (its builtin `get [@@species]`
+/// returning `this`) skips the `@@species` read.
 fn species_ctor(
     function: &mut Function,
     frame: Frame,
     o: u32,
     c: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (walk, found) = (frame.y64(5), frame.y32(0));
-    let bits = |ctor| intrinsic_bits(Intrinsic::Ctor(ctor), helpers);
+    let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
     wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(c));
-    is_array(function, o);
+    emit_is_pointer(function, o);
+    wasm!(function; If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, o);
     wasm!(function;
+        I32Const(TYPE_ARRAY), I32Eq,
+        Else, I32Const(0), End,
         If(BlockType::Empty),
         LocalGet(o), I32Const(static_key(strings, CONSTRUCTOR)), Call(helpers.get), LocalSet(c),
     );
     return_if_pending(function);
-    wasm!(function; LocalGet(c), I64Const(UNDEFINED_BITS), I64Ne, If(BlockType::Empty));
-    emit_is_object(function, c);
-    wasm!(function; I32Eqz, If(BlockType::Empty));
-    throw_type_error(function, frame, CTOR_NOT_OBJECT, strings, helpers);
-    wasm!(function;
-        End,
-        LocalGet(c), LocalSet(walk), I32Const(0), LocalSet(found),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-    );
-    emit_is_pointer(function, walk);
-    wasm!(function; I32Eqz, BrIf(1));
-    for (i, ctor) in [
-        BuiltinCtor::Array,
-        BuiltinCtor::Map,
-        BuiltinCtor::Set,
-        BuiltinCtor::Promise,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        wasm!(function; LocalGet(walk), I64Const(bits(ctor)), I64Eq);
-        if i > 0 {
-            wasm!(function; I32Or);
-        }
+    let bit = Intrinsic::Ctor(BuiltinCtor::Array).watch_bit();
+    let fast = bit.filter(|_| helpers.dirty_tracking);
+    if let Some(bit) = fast {
+        wasm!(function;
+            LocalGet(c), I64Const(array), I64Eq,
+            GlobalGet(DIRTY_GLOBAL), I32Const(1 << bit), I32And, I32Eqz, I32And,
+            If(BlockType::Empty), I64Const(UNDEFINED_BITS), LocalSet(c), Else,
+        );
     }
+    emit_is_object(function, c);
     wasm!(function;
-        If(BlockType::Empty), I32Const(1), LocalSet(found), Br(2), End,
-        LocalGet(walk), I32WrapI64,
-        I64Load(MemArg { offset: u64::from(abi::OBJ_PROTO_OFFSET), align: 3, memory_index: 0 }),
-        LocalSet(walk),
-        Br(0),
-        End, End,
-        LocalGet(found), I32Eqz,
-        LocalGet(c), I64Const(bits(BuiltinCtor::Array)), I64Eq, I32Or,
-        If(BlockType::Empty), I64Const(UNDEFINED_BITS), LocalSet(c), End,
-        End,
-        End,
+        If(BlockType::Empty),
+        LocalGet(c), I32Const(realm::symbol_addr(WellKnown::Species, helpers)),
+        Call(helpers.symbol_get()), LocalSet(c),
     );
+    return_if_pending(function);
+    emit_is_nullish(function, c);
+    wasm!(function;
+        LocalGet(c), I64Const(array), I64Eq, I32Or,
+        If(BlockType::Empty), I64Const(UNDEFINED_BITS), LocalSet(c), End,
+        Else,
+        LocalGet(c), I64Const(UNDEFINED_BITS), I64Ne, If(BlockType::Empty),
+    );
+    throw_type_error(function, frame, CTOR_NOT_OBJECT, strings, helpers);
+    wasm!(function; End, End);
+    if fast.is_some() {
+        wasm!(function; End);
+    }
+    wasm!(function; End);
 }
 
 /// The array of `ArraySpeciesCreate` from the [`species_ctor`] in i64 `c`
@@ -1185,7 +1169,7 @@ fn species_from(
     c: u32,
     len: u32,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(c), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
@@ -1204,7 +1188,7 @@ fn species_create(
     o: u32,
     len: u32,
     out: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let c = frame.y64(0);
@@ -1222,7 +1206,7 @@ fn create_data_property(
     a: u32,
     key: u32,
     v: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (k, entry) = (frame.y32(2), frame.y32(3));
@@ -1231,7 +1215,9 @@ fn create_data_property(
         If(BlockType::Empty),
         LocalGet(a), LocalGet(key), LocalGet(v), Call(helpers.array_define()),
     );
-    return_if_pending(function);
+    enter_frame(helpers);
+    emit_propagate_if_pending(function, helpers);
+    leave_frame(helpers);
     wasm!(function;
         Else,
         LocalGet(key), I32Const(1), Call(helpers.to_key), LocalSet(k),
@@ -1247,7 +1233,12 @@ fn create_data_property(
         End,
         If(BlockType::Empty),
     );
+    // Inside the `else` arm and this `if` (a handler may be active).
+    enter_frame(helpers);
+    enter_frame(helpers);
     throw_type_error(function, frame, CANNOT_DEFINE, strings, helpers);
+    leave_frame(helpers);
+    leave_frame(helpers);
     wasm!(function;
         End,
         LocalGet(a), I32WrapI64, LocalGet(k), LocalGet(v),
@@ -1262,10 +1253,10 @@ fn set_length(
     frame: Frame,
     a: u32,
     len: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let length = IrNode::Str(INDEX_LENGTH_KEY.to_owned());
+    let length = IrNode::Str(INDEX_LENGTH_KEY.into());
     emit_drop(function, frame, &set(a, length, len), strings, helpers);
 }
 
@@ -1289,7 +1280,7 @@ fn down_loop_f64(function: &mut Function, k: u32, body: impl FnOnce(&mut Functio
 pub(super) fn emit_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (c, target, item, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1312,47 +1303,27 @@ pub(super) fn emit_of(
     wasm!(function; LocalGet(target));
 }
 
-/// On a pending throw, `IteratorClose` the generator in i64 `generator` (its
-/// `return()`, whose own completion is discarded) and return with the
-/// original throw pending.
-fn close_on_throw(function: &mut Function, frame: Frame, generator: u32, helpers: Helpers<'_>) {
-    let exc = frame.y64(5);
-    wasm!(function;
-        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
-        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(exc),
-        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
-    );
-    for _ in 0..frame.k {
-        wasm!(function; I64Const(UNDEFINED_BITS));
-    }
-    wasm!(function; LocalGet(generator), GlobalSet(THIS_GLOBAL), I64Const(UNDEFINED_BITS));
-    emit_argc(0, function);
-    wasm!(function;
-        Call(helpers.builtin(Builtin::GeneratorReturn)), Drop,
-        LocalGet(exc), GlobalSet(EXC_VALUE_GLOBAL),
-        I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
-        I64Const(UNDEFINED_BITS), Return,
-        End,
-    );
-}
-
 /// `Array.from(items, mapFn, thisArg)`: a non-callable `mapFn` throws first.
-/// An iterable the runtime iterates (a generator, stepped and closed on an
-/// abrupt `mapFn`; an array, string, `String` wrapper, `Map`, `Set` or
-/// `arguments`, walked live) fills `A = IsConstructor(this) ?
-/// Construct(this) : ArrayCreate(0)` by `CreateDataPropertyOrThrow`; any
-/// other object is an array-like (`ToObject`, `LengthOfArrayLike`, `A` from
-/// `Construct(this, [len])`, `Get` per index). `A.length` is set last.
+/// `GetMethod(items, @@iterator)` (through the guarded fast paths of
+/// DESIGN.md §6.4) decides: an iterable fills `A =
+/// IsConstructor(this) ? Construct(this) : ArrayCreate(0)` by
+/// `CreateDataPropertyOrThrow` from its iterator record, closing the
+/// iterator when `mapFn` or the define throws; any other value is an
+/// array-like (`ToObject`, `LengthOfArrayLike`, `A` from `Construct(this,
+/// [len])`, `Get` per index). `A.length` is set last.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_from(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (c, items, map_fn, this_arg) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (a, v, kv, len_v) = (frame.x64(0), frame.x64(1), frame.y64(0), frame.y64(1));
     let (k, len, mapping, key) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let method = frame.y64(4);
+    let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
+    let scratch = frame.scratch();
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(c));
     frame.arg(function, 0);
     wasm!(function; LocalSet(items));
@@ -1370,9 +1341,11 @@ pub(super) fn emit_from(
     wasm!(function; If(BlockType::Empty));
     throw_type_error(function, frame, FROM_NULLISH, strings, helpers);
     wasm!(function; End);
-    // `v = mapFn(v, k)` when mapping, then `A[k] = v`, `k += 1`.
-    let store = |function: &mut Function, close: bool| {
+    // `v = mapFn(v, k)` when mapping, then `A[k] = v`, `k += 1`; a throw
+    // propagates (to the caller's handler, if any).
+    let store = |function: &mut Function| {
         wasm!(function; LocalGet(mapping), If(BlockType::Empty));
+        enter_frame(helpers);
         push_call(
             function,
             frame,
@@ -1382,79 +1355,26 @@ pub(super) fn emit_from(
             helpers,
         );
         wasm!(function; LocalSet(v));
-        if close {
-            close_on_throw(function, frame, items, helpers);
-        } else {
-            return_if_pending(function);
-        }
+        emit_propagate_if_pending(function, helpers);
+        leave_frame(helpers);
         wasm!(function; End);
         index_value(function, k);
         wasm!(function; LocalSet(kv));
         create_data_property(function, frame, a, kv, v, strings, helpers);
         wasm!(function; LocalGet(k), I32Const(1), I32Add, LocalSet(k));
     };
-    let finish = |function: &mut Function| {
-        index_value(function, k);
-        wasm!(function; LocalSet(kv));
-        set_length(function, frame, a, kv, strings, helpers);
-        wasm!(function; LocalGet(a), Return);
-    };
     wasm!(function; I32Const(0), LocalSet(k));
-    // A generator: step it until done.
-    is_type(function, items, &[TYPE_GENERATOR]);
-    wasm!(function; If(BlockType::Empty));
-    construct_or_create(function, frame, c, None, a, strings, helpers);
-    wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
-    let resume = IrNode::GenResume {
-        handle: Box::new(IrNode::Local(items)),
-        sent: Box::new(IrNode::Undefined),
-    };
-    emit_node(&resume, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(v));
-    return_if_pending(function);
+    // The record state of `items`' fast path, or the protocol.
+    emit_iter_classify(function, items, false, frame.y32(0), helpers);
+    wasm!(function; LocalTee(frame.z64(2)), I64Const(iter::protocol_state()), I64Eq, If(BlockType::Empty));
     wasm!(function;
-        LocalGet(v), I32Const(static_key(strings, "done")), Call(helpers.get),
-        I64Const(TRUE_BITS), I64Eq, BrIf(1),
-        LocalGet(v), I32Const(static_key(strings, "value")), Call(helpers.get), LocalSet(v),
+        LocalGet(items), I32Const(realm::symbol_addr(WellKnown::Iterator, helpers)),
+        Call(helpers.symbol_get()), LocalSet(method),
     );
-    store(function, true);
-    wasm!(function; Br(0), End, End);
-    finish(function);
-    wasm!(function; End);
-    // The other runtime iterables: walked live by index.
-    emit_is_string(function, items);
-    is_type(function, items, &[TYPE_ARRAY, TYPE_MAP, TYPE_SET]);
-    wasm!(function; I32Or);
-    emit_is_wrapper(function, items, abi::CLASS_STRING);
-    wasm!(function; I32Or);
-    emit_is_wrapper(function, items, abi::CLASS_ARGUMENTS);
-    wasm!(function; I32Or, If(BlockType::Empty));
-    construct_or_create(function, frame, c, None, a, strings, helpers);
-    let source = IrNode::IterSource {
-        value: Box::new(IrNode::Local(items)),
-        live: true,
-    };
-    emit_node(&source, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(items));
     return_if_pending(function);
-    wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
-    index_value(function, k);
-    wasm!(function; LocalTee(kv), F64ReinterpretI64);
-    let length = IrNode::IterLen(Box::new(IrNode::Local(items)));
-    emit_node(&length, function, frame.scratch(), strings, helpers);
-    wasm!(function; F64ReinterpretI64, F64Ge, BrIf(1));
-    let item = IrNode::IterItem {
-        iterable: Box::new(IrNode::Local(items)),
-        index: Box::new(IrNode::Local(kv)),
-    };
-    emit_node(&item, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(v));
-    return_if_pending(function);
-    store(function, false);
-    wasm!(function; Br(0), End, End);
-    finish(function);
-    wasm!(function; End);
-    // An array-like.
+    // No `@@iterator`: an array-like.
+    emit_is_nullish(function, method);
+    wasm!(function; If(BlockType::Empty));
     wasm!(function; LocalGet(items), Call(helpers.to_object()), LocalSet(items));
     length_of(function, items, len, strings, helpers);
     index_value(function, len);
@@ -1462,12 +1382,654 @@ pub(super) fn emit_from(
     construct_or_create(function, frame, c, Some(len_v), a, strings, helpers);
     count_loop(function, k, len, |function| {
         get_index(function, items, k, key, v, helpers);
-        store(function, false);
+        store(function);
         // `store` advanced `k`; the loop advances it again.
         wasm!(function; LocalGet(k), I32Const(1), I32Sub, LocalSet(k));
     });
     set_length(function, frame, a, len_v, strings, helpers);
+    wasm!(function; LocalGet(a), Return, End);
+    construct_or_create(function, frame, c, None, a, strings, helpers);
+    iter::emit_iter_open_with(function, items, method, &rec, scratch, strings, helpers);
+    wasm!(function; Else);
+    wasm!(function; LocalGet(items), LocalSet(frame.z64(0)), I64Const(0), LocalSet(frame.z64(1)));
+    construct_or_create(function, frame, c, None, a, strings, helpers);
+    wasm!(function; End);
+    // Step the record; a throw from `mapFn` or the define closes it (one
+    // from the iterator itself leaves it done, so the close does nothing).
+    iter::guarded(function, helpers, |function| {
+        wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
+        enter_frame(helpers);
+        enter_frame(helpers);
+        emit_iterator_step(&rec, function, scratch, strings, helpers);
+        wasm!(function; I32Eqz, BrIf(1));
+        emit_iterator_value(&rec, function, scratch, strings, helpers);
+        wasm!(function; LocalSet(v));
+        store(function);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        wasm!(function; Br(0), End, End);
+    });
+    wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+    emit_iterator_close(
+        &rec,
+        CloseMode::Pending,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
+    index_value(function, k);
+    wasm!(function; LocalSet(kv));
+    set_length(function, frame, a, kv, strings, helpers);
     wasm!(function; LocalGet(a));
+}
+
+// --- Array.fromAsync ------------------------------------------------------------------
+
+/// The `TypeError` of `Array.fromAsync` over `null` / `undefined`.
+const FROM_ASYNC_NULLISH: CalleeErrorText<'static> = [
+    "Array.fromAsync requires an array-like or iterable object",
+    "TypeError: Array.fromAsync requires an array-like or iterable object",
+];
+
+/// The `TypeError` of `Array.fromAsync` with a non-callable `mapFn`.
+const FROM_ASYNC_NOT_CALLABLE: CalleeErrorText<'static> = [
+    "Array.fromAsync: when provided, the second argument must be a function",
+    "TypeError: Array.fromAsync: when provided, the second argument must be a function",
+];
+
+/// The byte offsets of an `Array.fromAsync` state block (the `env` of its
+/// internal builtins): i64 jsvals, then the i32 phase and the i32 flag set
+/// while an abrupt completion must close the iterator.
+const FA_PROMISE: u32 = 0;
+/// `A`.
+const FA_TARGET: u32 = 8;
+/// The `this` of the call (`C`).
+const FA_CTOR: u32 = 16;
+/// `items`, then the iterator or the array-like.
+const FA_SOURCE: u32 = 24;
+/// The iterator's `next`, or the array-like's length.
+const FA_NEXT: u32 = 32;
+const FA_MAP: u32 = 40;
+const FA_THIS_ARG: u32 = 48;
+/// `k`, a number jsval.
+const FA_K: u32 = 56;
+/// The value an await resumed with, or the reason a close rethrows.
+const FA_VALUE: u32 = 64;
+const FA_PHASE: u32 = 72;
+const FA_OPEN: u32 = 76;
+const FA_SIZE: i32 = 80;
+
+/// The phases of the state machine: the start, then what the pending await
+/// resumes with (a `next()` result, a mapped value, an array-like element).
+const PH_START: i32 = 0;
+const PH_ITER_RESULT: i32 = 1;
+const PH_ITER_MAPPED: i32 = 2;
+const PH_LIKE_VALUE: i32 = 3;
+const PH_LIKE_MAPPED: i32 = 4;
+
+/// The `Array.fromAsync` builtin `op`.
+fn from_async(op: FromAsyncOp) -> Builtin {
+    Builtin::Iter(IterOp::Async(AsyncIterOp::FromAsync(op)))
+}
+
+fn fa_slot(offset: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(offset),
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+fn fa_flag(offset: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(offset),
+        align: 2,
+        memory_index: 0,
+    }
+}
+
+/// Emit the body of the `Array.fromAsync` builtin `op`. The algorithm is an
+/// async function (ES2026 §23.1.2.2), so it runs as a promise-reaction state
+/// machine over a state block: [`FromAsyncOp::Run`] does one step and either
+/// awaits (`PromiseResolve(x).then(Resume, Reject)`, the phase recorded)
+/// or settles the result promise; a throw it leaves pending rejects the
+/// result promise, after `AsyncIteratorClose` while the flag is set.
+pub(super) fn emit_from_async(
+    op: FromAsyncOp,
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (st, reason, st64) = (frame.i32(0), frame.x64(0), frame.y64(1));
+    match op {
+        FromAsyncOp::Entry => from_async_entry(function, frame, helpers),
+        FromAsyncOp::Run => from_async_run(function, frame, strings, helpers),
+        FromAsyncOp::Resume | FromAsyncOp::Reject => {
+            if frame.k == 0 {
+                // A reaction receives its value in slot 0; a program calling
+                // `Array.fromAsync` with an argument has `K >= 1`.
+                wasm!(function; Unreachable);
+                return;
+            }
+            frame.arg(function, 0);
+            wasm!(function;
+                LocalSet(reason),
+                LocalGet(frame.k), LocalTee(st64), I32WrapI64, LocalSet(st),
+            );
+            if op == FromAsyncOp::Resume {
+                wasm!(function; LocalGet(st), LocalGet(reason), I64Store(fa_slot(FA_VALUE)));
+                let run = from_async(FromAsyncOp::Run);
+                iter::call_internal(function, run, st64, Some(st64), helpers);
+                wasm!(function; Drop);
+                from_async_abrupt(function, frame, helpers);
+            } else {
+                from_async_reject(function, frame, helpers);
+            }
+            wasm!(function; I64Const(UNDEFINED_BITS));
+        }
+        FromAsyncOp::Rethrow => {
+            wasm!(function;
+                LocalGet(frame.k), I32WrapI64, LocalSet(st),
+                I32Const(PROMISE_OP_SETTLE_REJECT),
+                LocalGet(st), I64Load(fa_slot(FA_PROMISE)),
+                LocalGet(st), I64Load(fa_slot(FA_VALUE)),
+                Call(helpers.promise), Drop,
+                I64Const(UNDEFINED_BITS),
+            );
+        }
+    }
+}
+
+/// `Array.fromAsync(items, mapFn, thisArg)`: a fresh state block and result
+/// promise, then the first [`FromAsyncOp::Run`] step; never a synchronous
+/// throw.
+fn from_async_entry(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let (st, p, st64) = (frame.i32(0), frame.i64(0), frame.y64(1));
+    wasm!(function; I32Const(FA_SIZE), Call(helpers.alloc), LocalSet(st));
+    for (i, offset) in (0..).zip([FA_SOURCE, FA_MAP, FA_THIS_ARG]) {
+        wasm!(function; LocalGet(st));
+        frame.arg(function, i);
+        wasm!(function; I64Store(fa_slot(offset)));
+    }
+    let zero = 0.0f64.to_bits().cast_signed();
+    wasm!(function;
+        LocalGet(st), GlobalGet(THIS_GLOBAL), I64Store(fa_slot(FA_CTOR)),
+        LocalGet(st), I64Const(UNDEFINED_BITS), I64Store(fa_slot(FA_TARGET)),
+        LocalGet(st), I64Const(zero), I64Store(fa_slot(FA_K)),
+        LocalGet(st), I32Const(PH_START), I32Store(fa_flag(FA_PHASE)),
+        LocalGet(st), I32Const(0), I32Store(fa_flag(FA_OPEN)),
+        I32Const(PROMISE_OP_NEW), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
+        Call(helpers.promise), LocalSet(p),
+        LocalGet(st), LocalGet(p), I64Store(fa_slot(FA_PROMISE)),
+        LocalGet(st), I64ExtendI32U, LocalSet(st64),
+    );
+    let run = from_async(FromAsyncOp::Run);
+    iter::call_internal(function, run, st64, Some(st64), helpers);
+    wasm!(function; Drop);
+    from_async_abrupt(function, frame, helpers);
+    wasm!(function; LocalGet(p));
+}
+
+/// After a [`FromAsyncOp::Run`] step: a pending throw is taken and rejects
+/// the result promise ([`from_async_reject`]). Expects the state block in
+/// i32 `frame.i32(0)` and its jsval in `frame.y64(1)`.
+fn from_async_abrupt(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    wasm!(function;
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
+        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(frame.x64(0)),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL), I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+    );
+    from_async_reject(function, frame, helpers);
+    wasm!(function; End);
+}
+
+/// Reject the result promise with the reason in `frame.x64(0)`; while the
+/// close flag is set, `AsyncIteratorClose` with that throw completion first:
+/// `return()` is called (a throw of `GetMethod` or the call is discarded)
+/// and its result awaited (either settlement rejecting with the reason, via
+/// [`FromAsyncOp::Rethrow`]).
+fn from_async_reject(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let (st, reason, it, r, st64) = (
+        frame.i32(0),
+        frame.x64(0),
+        frame.x64(1),
+        frame.y64(0),
+        frame.y64(1),
+    );
+    let reject = |function: &mut Function| {
+        wasm!(function;
+            I32Const(PROMISE_OP_SETTLE_REJECT),
+            LocalGet(st), I64Load(fa_slot(FA_PROMISE)), LocalGet(reason),
+            Call(helpers.promise), Drop,
+        );
+    };
+    wasm!(function;
+        LocalGet(st), I32Load(fa_flag(FA_OPEN)), If(BlockType::Empty),
+        LocalGet(st), I32Const(0), I32Store(fa_flag(FA_OPEN)),
+        LocalGet(st), LocalGet(reason), I64Store(fa_slot(FA_VALUE)),
+        LocalGet(st), I64Load(fa_slot(FA_SOURCE)), LocalSet(it),
+    );
+    let ret = Builtin::Iter(IterOp::Async(AsyncIterOp::Return));
+    iter::call_internal(function, ret, it, None, helpers);
+    wasm!(function;
+        LocalSet(r),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL), I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+        I64Const(HOLE_BITS), LocalSet(r),
+        End,
+        LocalGet(r), I64Const(HOLE_BITS), I64Ne, If(BlockType::Empty),
+        I32Const(PROMISE_OP_RESOLVE), LocalGet(r), I64Const(UNDEFINED_BITS), Call(helpers.promise),
+        LocalGet(st), I64ExtendI32U, LocalSet(st64),
+    );
+    let rethrow = helpers.builtin_slot(from_async(FromAsyncOp::Rethrow));
+    let scratch = frame.scratch();
+    emit_settler_value(rethrow, st64, function, scratch, helpers);
+    emit_settler_value(rethrow, st64, function, scratch, helpers);
+    wasm!(function; Call(helpers.then), Drop, Else);
+    reject(function);
+    wasm!(function; End, Else);
+    reject(function);
+    wasm!(function; End);
+}
+
+/// `Await(value)` of a [`FromAsyncOp::Run`] step, resuming at `phase`:
+/// `PromiseResolve(value).then(Resume, Reject)`, then return.
+fn from_async_await(
+    function: &mut Function,
+    frame: Frame,
+    st: u32,
+    value: u32,
+    phase: i32,
+    helpers: Helpers<'_>,
+) {
+    let slot = |op| helpers.builtin_slot(from_async(op));
+    let scratch = frame.scratch();
+    wasm!(function;
+        LocalGet(st), I32Const(phase), I32Store(fa_flag(FA_PHASE)),
+        I32Const(PROMISE_OP_RESOLVE), LocalGet(value), I64Const(UNDEFINED_BITS), Call(helpers.promise),
+    );
+    emit_settler_value(
+        slot(FromAsyncOp::Resume),
+        frame.k,
+        function,
+        scratch,
+        helpers,
+    );
+    emit_settler_value(
+        slot(FromAsyncOp::Reject),
+        frame.k,
+        function,
+        scratch,
+        helpers,
+    );
+    wasm!(function; Call(helpers.then), Drop, I64Const(UNDEFINED_BITS), Return);
+}
+
+/// The locals of a [`FromAsyncOp::Run`] body.
+#[derive(Clone, Copy)]
+struct Run<'a> {
+    frame: Frame,
+    strings: &'a StrOffsets,
+    helpers: Helpers<'a>,
+    /// The state block (i32).
+    st: u32,
+    /// The phase (i32).
+    phase: u32,
+    /// `k` (i32).
+    index: u32,
+    /// An i32 key temp.
+    key: u32,
+    /// The array-like's length (i32).
+    len: u32,
+    /// Whether the iterator is async (i32).
+    is_async: u32,
+    /// An i32 temp.
+    obj: u32,
+    /// `A` (i64).
+    target: u32,
+    /// The value in flight (i64).
+    value: u32,
+    /// A call result (i64).
+    result: u32,
+    /// The iterator method (i64).
+    method: u32,
+    /// `items`, then the iterator or the array-like (i64).
+    source: u32,
+    /// The iterator's `next`, or the length as a number (i64).
+    next: u32,
+    /// `C` (i64).
+    ctor: u32,
+    /// `k` as a number (i64).
+    key_value: u32,
+    /// `mapFn` (i64).
+    map_fn: u32,
+    /// `thisArg` (i64).
+    this_arg: u32,
+}
+
+impl<'a> Run<'a> {
+    fn new(frame: Frame, strings: &'a StrOffsets, helpers: Helpers<'a>) -> Self {
+        Self {
+            frame,
+            strings,
+            helpers,
+            st: frame.i32(0),
+            phase: frame.i32(1),
+            index: frame.i32(2),
+            key: frame.i32(3),
+            len: frame.x32(0),
+            is_async: frame.y32(0),
+            obj: frame.y32(1),
+            target: frame.i64(0),
+            value: frame.i64(1),
+            result: frame.i64(2),
+            method: frame.i64(3),
+            source: frame.x64(0),
+            next: frame.x64(1),
+            ctor: frame.y64(0),
+            key_value: frame.y64(1),
+            map_fn: frame.y64(4),
+            this_arg: frame.y64(5),
+        }
+    }
+
+    fn load(self, function: &mut Function, offset: u32, out: u32) {
+        wasm!(function; LocalGet(self.st), I64Load(fa_slot(offset)), LocalSet(out));
+    }
+
+    fn store(self, function: &mut Function, offset: u32, from: u32) {
+        wasm!(function; LocalGet(self.st), LocalGet(from), I64Store(fa_slot(offset)));
+    }
+
+    fn set_open(self, function: &mut Function, open: i32) {
+        wasm!(function; LocalGet(self.st), I32Const(open), I32Store(fa_flag(FA_OPEN)));
+    }
+
+    /// Push i32 `1` when there is a `mapFn`.
+    fn mapping(self, function: &mut Function) {
+        wasm!(function; LocalGet(self.map_fn), I64Const(UNDEFINED_BITS), I64Ne);
+    }
+
+    /// `Set(A, "length", n)` for the number jsval in `n`, then fulfill the
+    /// result promise with `A` and return.
+    fn finish(self, function: &mut Function, n: u32) {
+        set_length(
+            function,
+            self.frame,
+            self.target,
+            n,
+            self.strings,
+            self.helpers,
+        );
+        wasm!(function;
+            I32Const(PROMISE_OP_SETTLE_FULFILL),
+            LocalGet(self.st), I64Load(fa_slot(FA_PROMISE)), LocalGet(self.target),
+            Call(self.helpers.promise), Drop,
+            I64Const(UNDEFINED_BITS), Return,
+        );
+    }
+
+    /// `Call(next, iterator)`, then await its result.
+    fn iter_next(self, function: &mut Function) {
+        self.set_open(function, 0);
+        let step = Builtin::Iter(IterOp::Async(AsyncIterOp::Step));
+        iter::call_internal(function, step, self.source, Some(self.next), self.helpers);
+        wasm!(function; LocalSet(self.result));
+        return_if_pending(function);
+        from_async_await(
+            function,
+            self.frame,
+            self.st,
+            self.result,
+            PH_ITER_RESULT,
+            self.helpers,
+        );
+    }
+
+    /// `k < len ? Await(Get(arrayLike, k)) : finish`.
+    fn like_next(self, function: &mut Function) {
+        wasm!(function; LocalGet(self.index), LocalGet(self.len), I32GeU, If(BlockType::Empty));
+        self.finish(function, self.next);
+        wasm!(function; End);
+        get_index(
+            function,
+            self.source,
+            self.index,
+            self.key,
+            self.value,
+            self.helpers,
+        );
+        from_async_await(
+            function,
+            self.frame,
+            self.st,
+            self.value,
+            PH_LIKE_VALUE,
+            self.helpers,
+        );
+    }
+
+    /// With a `mapFn`: `Await(Call(mapFn, thisArg, [v, k]))`, resuming at
+    /// `phase`.
+    fn map_await(self, function: &mut Function, phase: i32) {
+        self.mapping(function);
+        wasm!(function; If(BlockType::Empty));
+        let args = [CallArg::Val(self.value), CallArg::Index(self.index)];
+        let (map_fn, this_arg) = (self.map_fn, self.this_arg);
+        call_fn(
+            function,
+            self.frame,
+            map_fn,
+            this_arg,
+            &args,
+            self.result,
+            self.helpers,
+        );
+        from_async_await(
+            function,
+            self.frame,
+            self.st,
+            self.result,
+            phase,
+            self.helpers,
+        );
+        wasm!(function; End);
+    }
+
+    /// Throw the `TypeError` `text` and return.
+    fn throw(self, function: &mut Function, text: CalleeErrorText<'static>) {
+        throw_type_error(function, self.frame, text, self.strings, self.helpers);
+    }
+
+    /// `method = GetMethod(items, symbol)` (unchecked).
+    fn get_method(self, function: &mut Function, symbol: WellKnown) {
+        wasm!(function;
+            LocalGet(self.source), I32Const(realm::symbol_addr(symbol, self.helpers)),
+            Call(self.helpers.symbol_get()), LocalSet(self.method),
+        );
+        return_if_pending(function);
+    }
+
+    /// The start: the `mapFn` check, the iterator method, then the iterator
+    /// path or the array-like path up to the first await.
+    fn start(self, function: &mut Function) {
+        let (strings, helpers) = (self.strings, self.helpers);
+        self.load(function, FA_CTOR, self.ctor);
+        self.mapping(function);
+        wasm!(function; If(BlockType::Empty));
+        let frame = self.frame;
+        require_callable(
+            function,
+            frame,
+            self.map_fn,
+            FROM_ASYNC_NOT_CALLABLE,
+            strings,
+            helpers,
+        );
+        wasm!(function; End);
+        emit_is_nullish(function, self.source);
+        wasm!(function; If(BlockType::Empty));
+        self.throw(function, FROM_ASYNC_NULLISH);
+        wasm!(function; End);
+        self.get_method(function, WellKnown::AsyncIterator);
+        emit_is_nullish(function, self.method);
+        wasm!(function; I32Eqz, LocalTee(self.is_async), I32Eqz, If(BlockType::Empty));
+        self.get_method(function, WellKnown::Iterator);
+        wasm!(function; End);
+        emit_is_nullish(function, self.method);
+        wasm!(function; I32Eqz, If(BlockType::Empty));
+        self.start_iterator(function);
+        wasm!(function; End);
+        // No iterator method: an array-like.
+        wasm!(function; LocalGet(self.source), Call(helpers.to_object()), LocalSet(self.source));
+        length_of(function, self.source, self.len, strings, helpers);
+        index_value(function, self.len);
+        wasm!(function; LocalSet(self.next));
+        self.store(function, FA_SOURCE, self.source);
+        self.store(function, FA_NEXT, self.next);
+        let (ctor, target) = (self.ctor, self.target);
+        construct_or_create(
+            function,
+            frame,
+            ctor,
+            Some(self.next),
+            target,
+            strings,
+            helpers,
+        );
+        self.store(function, FA_TARGET, target);
+        self.like_next(function);
+    }
+
+    /// The iterator path of the start: `A`, then `GetIteratorFromMethod`
+    /// (a sync iterator through `CreateAsyncFromSyncIterator`).
+    fn start_iterator(self, function: &mut Function) {
+        let (frame, strings, helpers) = (self.frame, self.strings, self.helpers);
+        let (method, result, next) = (self.method, self.result, self.next);
+        emit_is_function(function, method);
+        wasm!(function; I32Eqz, If(BlockType::Empty));
+        let error = iter::not_a_function(method, result);
+        iter::throw_and_return(function, frame, &error, strings, helpers);
+        wasm!(function; End);
+        construct_or_create(
+            function,
+            frame,
+            self.ctor,
+            None,
+            self.target,
+            strings,
+            helpers,
+        );
+        self.store(function, FA_TARGET, self.target);
+        iter::call_method(function, frame, method, self.source, result, helpers);
+        emit_is_object(function, result);
+        wasm!(function; I32Eqz, If(BlockType::Empty), LocalGet(self.is_async), If(BlockType::Empty));
+        self.throw(function, async_iter::ASYNC_ITERATOR_NOT_OBJECT);
+        wasm!(function; End);
+        self.throw(function, iter::ITERATOR_NOT_OBJECT);
+        wasm!(function;
+            End,
+            LocalGet(result), I32Const(static_key(strings, "next")), Call(helpers.get), LocalSet(next),
+        );
+        return_if_pending(function);
+        wasm!(function; LocalGet(self.is_async), I32Eqz, If(BlockType::Empty));
+        async_iter::create(function, result, next, self.obj, helpers);
+        wasm!(function;
+            LocalTee(result), I32Const(static_key(strings, "next")), Call(helpers.get), LocalSet(next),
+            End,
+            LocalGet(result), LocalSet(self.source),
+        );
+        self.store(function, FA_SOURCE, self.source);
+        self.store(function, FA_NEXT, next);
+        self.iter_next(function);
+    }
+
+    /// A resumed await: a `next()` result is checked (`done` finishes) and
+    /// its value mapped; an array-like element is mapped; a mapped value (or
+    /// an unmapped one) is defined, then the next step runs.
+    fn resume(self, function: &mut Function) {
+        let (strings, helpers) = (self.strings, self.helpers);
+        let (value, result, index, key_value) =
+            (self.value, self.result, self.index, self.key_value);
+        self.load(function, FA_VALUE, value);
+        wasm!(function; LocalGet(self.phase), I32Const(PH_ITER_RESULT), I32Eq, If(BlockType::Empty));
+        let complete = Builtin::Iter(IterOp::Async(AsyncIterOp::Complete));
+        iter::call_internal(function, complete, value, None, helpers);
+        wasm!(function; LocalSet(result));
+        return_if_pending(function);
+        wasm!(function; LocalGet(result), I64Const(HOLE_BITS), I64Eq, If(BlockType::Empty));
+        self.load(function, FA_K, key_value);
+        self.finish(function, key_value);
+        wasm!(function;
+            End,
+            LocalGet(result), I32Const(static_key(strings, "value")), Call(helpers.get), LocalSet(value),
+        );
+        return_if_pending(function);
+        self.set_open(function, 1);
+        self.map_await(function, PH_ITER_MAPPED);
+        wasm!(function; End, LocalGet(self.phase), I32Const(PH_LIKE_VALUE), I32Eq, If(BlockType::Empty));
+        self.map_await(function, PH_LIKE_MAPPED);
+        wasm!(function; End);
+        // `CreateDataPropertyOrThrow(A, k, v)`, `k += 1`, the next step.
+        index_value(function, index);
+        wasm!(function; LocalSet(key_value));
+        create_data_property(
+            function,
+            self.frame,
+            self.target,
+            key_value,
+            value,
+            strings,
+            helpers,
+        );
+        wasm!(function; LocalGet(index), I32Const(1), I32Add, LocalSet(index));
+        index_value(function, index);
+        wasm!(function; LocalSet(key_value));
+        self.store(function, FA_K, key_value);
+        wasm!(function; LocalGet(self.phase), I32Const(PH_LIKE_VALUE), I32LtU, If(BlockType::Empty));
+        self.iter_next(function);
+        wasm!(function; End);
+        self.like_next(function);
+    }
+}
+
+/// The [`FromAsyncOp::Run`] body (`env` the state block): at the start,
+/// the `mapFn` check, `GetMethod(items, @@asyncIterator)`, then
+/// `GetMethod(items, @@iterator)`; an iterator path builds `A =
+/// IsConstructor(C) ? Construct(C) : ArrayCreate(0)` and opens the async
+/// iterator (a sync one through `CreateAsyncFromSyncIterator`); the
+/// array-like path takes `ToObject`, `LengthOfArrayLike` and `A` from
+/// `Construct(C, [len])`. Each step then awaits a `next()` result, each
+/// `Get(arrayLike, k)` and each mapped value; a value is defined by
+/// `CreateDataPropertyOrThrow(A, k, v)`; `Set(A, "length", k)` precedes the
+/// fulfillment with `A`. The close flag covers the `mapFn` call, its await
+/// and the define of the iterator path.
+fn from_async_run(
+    function: &mut Function,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let run = Run::new(frame, strings, helpers);
+    wasm!(function; LocalGet(frame.k), I32WrapI64, LocalSet(run.st));
+    run.load(function, FA_TARGET, run.target);
+    run.load(function, FA_SOURCE, run.source);
+    run.load(function, FA_NEXT, run.next);
+    run.load(function, FA_MAP, run.map_fn);
+    run.load(function, FA_THIS_ARG, run.this_arg);
+    wasm!(function;
+        LocalGet(run.st), I64Load(fa_slot(FA_K)), F64ReinterpretI64, I32TruncSatF64U, LocalSet(run.index),
+        LocalGet(run.next), F64ReinterpretI64, I32TruncSatF64U, LocalSet(run.len),
+        LocalGet(run.st), I32Load(fa_flag(FA_PHASE)), LocalTee(run.phase),
+        I32Const(PH_START), I32Eq, If(BlockType::Empty),
+    );
+    run.start(function);
+    wasm!(function; End);
+    run.resume(function);
+    wasm!(function; I64Const(UNDEFINED_BITS));
 }
 
 // --- at / find* / some / every / reduceRight / lastIndexOf ----------------------------
@@ -1477,7 +2039,7 @@ fn length_of_f64(
     function: &mut Function,
     o: u32,
     len: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(o), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get));
@@ -1498,7 +2060,7 @@ fn length_of_f64(
 pub(super) fn emit_at(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let o = frame.i64(0);
@@ -1529,7 +2091,7 @@ pub(super) fn emit_find(
     op: ArrayFindOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = find_texts(op);
@@ -1609,7 +2171,7 @@ pub(super) fn emit_find(
 pub(super) fn emit_reduce_right(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, callback, this_arg, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1668,7 +2230,7 @@ pub(super) fn emit_reduce_right(
 pub(super) fn emit_last_index_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -1724,13 +2286,15 @@ pub(super) fn emit_last_index_of(
 // --- concat / flat / flatMap --------------------------------------------------------
 
 /// `Array.prototype.concat(...items)`: `A = ArraySpeciesCreate(O, 0)`; for
-/// each of `O, ...items` an array (`IsArray`; no `@@isConcatSpreadable`)
-/// appends its present indices at `n + k` (`n` advancing over holes too), any
+/// each of `O, ...items` a spreadable one (`IsConcatSpreadable`: an object
+/// whose `Get(item, @@isConcatSpreadable)` is `ToBoolean`-true, or with that
+/// `undefined`, an array) appends its present indices below
+/// `LengthOfArrayLike(item)` at `n + k` (`n` advancing over holes too), any
 /// other value is one element; then `Set(A, "length", n)`.
 pub(super) fn emit_concat(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, item, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -1753,8 +2317,26 @@ pub(super) fn emit_concat(
         I32Const(0), LocalSet(j),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
-    is_array(function, item);
-    wasm!(function; If(BlockType::Empty));
+    // `IsConcatSpreadable(item)` into i32 `len`.
+    wasm!(function; I32Const(0), LocalSet(len));
+    emit_is_object(function, item);
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(item), I32Const(realm::symbol_addr(WellKnown::IsConcatSpreadable, helpers)),
+        Call(helpers.symbol_get()), LocalSet(v),
+    );
+    return_if_pending(function);
+    wasm!(function; LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
+    emit_load_type_byte(function, item);
+    wasm!(function; I32Const(TYPE_ARRAY), I32Eq, LocalSet(len), Else);
+    emit_cond(
+        &IrNode::Local(v),
+        function,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    wasm!(function; LocalSet(len), End, End, LocalGet(len), If(BlockType::Empty));
     length_of(function, item, len, strings, helpers);
     wasm!(function; I32Const(0), LocalSet(k));
     count_loop(function, k, len, |function| {
@@ -1798,7 +2380,7 @@ pub(super) fn emit_flat(
     map: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = if map { &FLAT_MAP } else { &FLAT };
@@ -2054,7 +2636,7 @@ fn set_at(
     function: &mut Function,
     frame: Frame,
     (o, f, v, kv): (u32, u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2074,7 +2656,7 @@ fn delete_at(
     function: &mut Function,
     frame: Frame,
     (o, f, kv): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2090,7 +2672,7 @@ fn move_or_delete(
     frame: Frame,
     (o, from, to): (u32, u32, u32),
     (key, v, kv): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     has_at(function, o, from, key, helpers);
@@ -2108,7 +2690,7 @@ fn set_length_f64(
     function: &mut Function,
     frame: Frame,
     (o, f, kv): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2124,7 +2706,7 @@ fn check_new_length(
     frame: Frame,
     len: u32,
     delta: impl FnOnce(&mut Function),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(len));
@@ -2149,7 +2731,7 @@ fn check_new_length(
 pub(super) fn emit_splice(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2284,7 +2866,7 @@ pub(super) fn emit_splice(
 pub(super) fn emit_reverse(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, lv, uv, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2334,7 +2916,7 @@ pub(super) fn emit_reverse(
 pub(super) fn emit_shift(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, first, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2376,7 +2958,7 @@ pub(super) fn emit_shift(
 pub(super) fn emit_unshift(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, saved) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
@@ -2434,7 +3016,7 @@ pub(super) fn emit_unshift(
 pub(super) fn emit_fill(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, end_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2469,7 +3051,7 @@ pub(super) fn emit_fill(
 pub(super) fn emit_copy_within(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, target_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2552,7 +3134,7 @@ pub(super) fn emit_sort(
     copy: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, cmp, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2770,7 +3352,7 @@ fn put_at(
     function: &mut Function,
     frame: Frame,
     (a, f, v, kv): (u32, u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, f);
@@ -2784,7 +3366,7 @@ fn array_create_f64(
     function: &mut Function,
     frame: Frame,
     (len, kv, out): (u32, u32, u32),
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     num(function, len);
@@ -2800,7 +3382,7 @@ fn array_create_f64(
 pub(super) fn emit_with(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, index_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2825,8 +3407,8 @@ pub(super) fn emit_with(
     );
     let error = IrNode::error_object(
         ErrorKind::RangeError,
-        Some(IrNode::Str(WITH_OUT_OF_RANGE[0].to_owned())),
-        IrNode::Str(WITH_OUT_OF_RANGE[1].to_owned()),
+        Some(IrNode::Str(WITH_OUT_OF_RANGE[0].into())),
+        IrNode::Str(WITH_OUT_OF_RANGE[1].into()),
     );
     emit_throw_error(&error, function, frame.scratch(), strings, helpers);
     wasm!(function; End);
@@ -2854,7 +3436,7 @@ pub(super) fn emit_with(
 pub(super) fn emit_to_reversed(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, a, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -2889,7 +3471,7 @@ pub(super) fn emit_to_reversed(
 pub(super) fn emit_to_spliced(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, elem, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));

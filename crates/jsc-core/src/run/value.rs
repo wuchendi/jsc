@@ -3,9 +3,9 @@
 
 use super::{
     ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
-    HEADER_SIZE, MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
-    PROMISE_VALUE_OFFSET, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
-    TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
+    MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
+    PROMISE_VALUE_OFFSET, QNAN, STR_DATA_OFFSET, STR_LEN_OFFSET, TYPE_ARRAY, TYPE_DATE,
+    TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
@@ -26,6 +26,9 @@ pub enum Value {
     /// `typeof` result is an ordinary heap string too (there is no immediate
     /// encoding), so it decodes here.
     Str(String),
+    /// A Symbol primitive (type byte `14`): its description, `None` for
+    /// `Symbol()`. Renders Node-style as `Symbol(desc)` / `Symbol()`.
+    Symbol(Option<String>),
     /// A heap array, read from linear memory via an array-pointer jsval: its
     /// elements (each run of holes one [`Value::Holes`]), decoded recursively
     /// so arrays nest, then its own enumerable named properties as in
@@ -50,10 +53,11 @@ pub enum Value {
         /// The own enumerable properties, as in [`Value::Object`].
         entries: Vec<(String, Value)>,
     },
-    /// A Boolean/Number/String wrapper object (a `TYPE_OBJECT` of class
-    /// `BOOLEAN`/`NUMBER`/`STRING`): its `[[PrimitiveValue]]` and its own
-    /// enumerable properties (a String wrapper's indices left out). Renders
-    /// Node-style as `[String: 'abc']`, then `{ x: 1 }` when it has properties.
+    /// A Boolean/Number/String/Symbol wrapper object (a `TYPE_OBJECT` of class
+    /// `BOOLEAN`/`NUMBER`/`STRING`/`SYMBOL`): its `[[PrimitiveValue]]` and its
+    /// own enumerable properties (a String wrapper's indices left out). Renders
+    /// Node-style as `[String: 'abc']` / `[Symbol: Symbol(a)]`, then `{ x: 1 }`
+    /// when it has properties.
     Wrapper {
         /// The wrapped primitive.
         primitive: Box<Value>,
@@ -225,12 +229,25 @@ fn decode_heap(bits: u64, memory: &[u8], guard: &mut Guard) -> Value {
     }
     match ty {
         Some(TYPE_STRING) => decode_string(ptr, memory),
+        Some(crate::abi::TYPE_SYMBOL) => decode_symbol(ptr, memory),
         Some(TYPE_MAP) => Value::Map(decode_size(ptr, memory)),
         Some(TYPE_SET) => Value::Set(decode_size(ptr, memory)),
         Some(TYPE_GENERATOR) => Value::Generator,
         Some(TYPE_DATE) => decode_date(ptr, memory),
         _ => Value::Undefined,
     }
+}
+
+/// Resolve a heap `TYPE_SYMBOL` block at base `ptr` into a [`Value::Symbol`]
+/// by reading its description jsval: a string is the description, anything
+/// else (`undefined`, or a truncated block) is `Symbol()`.
+fn decode_symbol(ptr: usize, memory: &[u8]) -> Value {
+    let description = read_u64(memory, ptr + crate::abi::SYMBOL_DESCRIPTION_OFFSET as usize)
+        .and_then(|bits| match decode(bits, memory) {
+            Value::Str(text) => Some(text),
+            _ => None,
+        });
+    Value::Symbol(description)
 }
 
 /// Resolve a heap `Date` block at base `ptr` into a [`Value::Date`] by reading its
@@ -280,22 +297,48 @@ fn decode_size(ptr: usize, memory: &[u8]) -> usize {
     })
 }
 
-/// Resolve a heap string block at base `ptr` into a [`Value::Str`] by reading
-/// `[len:u32 LE][utf8]` at `ptr + HEADER_SIZE` in `memory`.
+/// Resolve a heap string block at base `ptr` into a [`Value::Str`]: its code
+/// units ([`string_units`]) as text, a lone surrogate replaced by U+FFFD (the
+/// output form; host ops that read content use [`string_units`]).
 ///
-/// Defensive: any out-of-range slice yields an empty string and invalid UTF-8 is
-/// replaced lossily, so a malformed pointer never panics (decode stays total).
+/// Defensive: an out-of-range block yields an empty string, so a malformed
+/// pointer never panics (decode stays total).
 fn decode_string(ptr: usize, memory: &[u8]) -> Value {
-    let len_at = ptr + HEADER_SIZE;
-    let Some(len_bytes) = memory.get(len_at..len_at + 4) else {
-        return Value::Str(String::new());
-    };
-    let len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4])) as usize;
-    let start = len_at + 4;
-    let Some(str_bytes) = memory.get(start..start + len) else {
-        return Value::Str(String::new());
-    };
-    Value::Str(String::from_utf8_lossy(str_bytes).into_owned())
+    Value::Str(
+        string_units(memory, ptr)
+            .map_or_else(String::new, |units| String::from_utf16_lossy(&units)),
+    )
+}
+
+/// The UTF-16 code units of the heap STRING block at `ptr`: `len` (at
+/// `ptr + STR_LEN_OFFSET`) Latin-1 bytes, each its own code unit, or with
+/// [`crate::abi::STR_FLAG_TWO_BYTE`] `len` UTF-16LE units at `ptr + STR_DATA_OFFSET`.
+/// Lossless (a lone surrogate stays a unit); `None` when the block is
+/// truncated.
+pub(super) fn string_units(memory: &[u8], ptr: usize) -> Option<Vec<u16>> {
+    let flags = *memory.get(ptr.checked_add(crate::abi::HEADER_FLAGS_OFFSET as usize)?)?;
+    let len_at = ptr.checked_add(STR_LEN_OFFSET)?;
+    let len = usize::try_from(u32::from_le_bytes(
+        memory
+            .get(len_at..len_at.checked_add(4)?)?
+            .try_into()
+            .ok()?,
+    ))
+    .ok()?;
+    let start = ptr.checked_add(STR_DATA_OFFSET)?;
+    if flags & crate::abi::STR_FLAG_TWO_BYTE == 0 {
+        let bytes = memory.get(start..start.checked_add(len)?)?;
+        return Some(bytes.iter().map(|&b| u16::from(b)).collect());
+    }
+    let bytes = memory.get(start..start.checked_add(len.checked_mul(2)?)?)?;
+    Some(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .collect(),
+    )
 }
 
 /// The length of the array handle at base `ptr` and the address of its element
@@ -341,7 +384,7 @@ pub(super) fn array_elements(memory: &[u8], ptr: usize) -> Option<(usize, Vec<(u
     if sparse {
         let mut keyed: Vec<(usize, u64)> = table_entries(ptr, memory)
             .into_iter()
-            .filter_map(|(index, _, _, bits)| Some((index? as usize, bits)))
+            .filter_map(|entry| Some((entry.index? as usize, entry.bits)))
             .collect();
         keyed.sort_unstable_by_key(|&(index, _)| index);
         present.extend(keyed);
@@ -402,11 +445,19 @@ fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> Vec<(String, Va
     let array = memory.get(ptr) == Some(&TYPE_ARRAY);
     let mut keyed = table_entries(ptr, memory);
     // An array's integer keys are its (sparse) elements, decoded by `decode_array`.
-    keyed.retain(|(index, ..)| !(array && index.is_some()));
-    // A stable sort keeps the non-index keys in slot order after the indices.
-    keyed.sort_by_key(|(index, ..)| index.map_or((1, 0), |i| (0, i)));
+    keyed.retain(|entry| !(array && entry.index.is_some()));
+    // A stable sort keeps the string keys in slot order after the indices,
+    // and the symbol keys in slot order after those.
+    keyed.sort_by_key(|entry| match (entry.index, entry.symbol) {
+        (Some(i), _) => (0, i),
+        (None, false) => (1, 0),
+        (None, true) => (2, 0),
+    });
     let mut entries = Vec::with_capacity(keyed.len());
-    for (_, key, attrs, bits) in keyed {
+    for TableEntry {
+        key, attrs, bits, ..
+    } in keyed
+    {
         let value = if attrs & abi::ATTR_ACCESSOR != 0 {
             let pair = (bits & 0xFFFF_FFFF) as usize;
             let half = |offset: u32| {
@@ -424,12 +475,27 @@ fn decode_props(ptr: usize, memory: &[u8], guard: &mut Guard) -> Vec<(String, Va
     entries
 }
 
+/// One live enumerable entry of a `TYPE_PROPS` table (see [`table_entries`]).
+struct TableEntry {
+    /// The value of an integer key (a string flagged `ARRAY_INDEX` in a table
+    /// with `HAS_INDEX_KEYS`).
+    index: Option<u32>,
+    /// Whether the key is a `TYPE_SYMBOL` block.
+    symbol: bool,
+    /// The key as rendered: a string key's text, a symbol key's
+    /// `[Symbol(desc)]`.
+    key: String,
+    /// The entry's `attrs`.
+    attrs: u32,
+    /// The entry's value bits.
+    bits: u64,
+}
+
 /// The live enumerable entries of the `TYPE_PROPS` table of the object-family
-/// block at base `ptr`, in slot order, as `(index, key text, attrs, value
-/// bits)` — `index` is the value of an integer key (a string flagged
-/// `ARRAY_INDEX` in a table with `HAS_INDEX_KEYS`). Tombstones and
+/// block at base `ptr`, in slot order. A key is a string block or a
+/// `TYPE_SYMBOL` block, told apart by its type byte. Tombstones and
 /// non-enumerable entries are skipped; a truncated table stops early.
-fn table_entries(ptr: usize, memory: &[u8]) -> Vec<(Option<u32>, String, u32, u64)> {
+fn table_entries(ptr: usize, memory: &[u8]) -> Vec<TableEntry> {
     use crate::abi;
     let props = read_u32(memory, ptr + abi::OBJ_PROPS_OFFSET as usize).unwrap_or(0) as usize;
     if props == 0 {
@@ -440,8 +506,7 @@ fn table_entries(ptr: usize, memory: &[u8]) -> Vec<(Option<u32>, String, u32, u6
         .get(props + abi::PROPS_TFLAGS_OFFSET as usize)
         .copied()
         .unwrap_or(0);
-    // (index value for an integer key, key text, attrs, value bits)
-    let mut keyed: Vec<(Option<u32>, String, u32, u64)> = Vec::with_capacity(count);
+    let mut keyed = Vec::with_capacity(count);
     for k in 0..count {
         let entry = props + abi::PROPS_HEADER_SIZE as usize + abi::PROP_ENTRY_SIZE as usize * k;
         let (Some(key), Some(attrs), Some(bits)) = (
@@ -451,15 +516,23 @@ fn table_entries(ptr: usize, memory: &[u8]) -> Vec<(Option<u32>, String, u32, u6
         ) else {
             break;
         };
-        if key == 0 {
+        if key == 0 || attrs & abi::ATTR_ENUMERABLE == 0 {
+            continue;
+        }
+        if memory.get(key as usize) == Some(&abi::TYPE_SYMBOL) {
+            let text = format!("[{}]", format_value(&decode_symbol(key as usize, memory)));
+            keyed.push(TableEntry {
+                index: None,
+                symbol: true,
+                key: text,
+                attrs,
+                bits,
+            });
             continue;
         }
         let Value::Str(text) = decode_string(key as usize, memory) else {
             continue;
         };
-        if attrs & abi::ATTR_ENUMERABLE == 0 {
-            continue;
-        }
         let flags = memory
             .get(key as usize + abi::HEADER_FLAGS_OFFSET as usize)
             .copied()
@@ -468,7 +541,13 @@ fn table_entries(ptr: usize, memory: &[u8]) -> Vec<(Option<u32>, String, u32, u6
             && flags & abi::STR_FLAG_ARRAY_INDEX != 0)
             .then(|| text.parse::<u32>().ok())
             .flatten();
-        keyed.push((index, text, attrs, bits));
+        keyed.push(TableEntry {
+            index,
+            symbol: false,
+            key: text,
+            attrs,
+            bits,
+        });
     }
     keyed
 }
@@ -493,18 +572,16 @@ fn decode_object(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
             message: field("message").unwrap_or_default(),
         };
     }
-    let mut entries = decode_props(ptr, memory, guard);
+    let entries = decode_props(ptr, memory, guard);
     let class_byte = memory.get(ptr + abi::HEADER_CLASS_OFFSET as usize).copied();
     if class_byte == Some(abi::CLASS_ARGUMENTS) {
         return Value::Arguments(entries);
     }
-    if let Some(abi::CLASS_BOOLEAN | abi::CLASS_NUMBER | abi::CLASS_STRING) = class_byte {
+    if let Some(abi::CLASS_BOOLEAN | abi::CLASS_NUMBER | abi::CLASS_STRING | abi::CLASS_SYMBOL) =
+        class_byte
+    {
         let primitive = read_u64(memory, ptr + abi::WRAPPER_VALUE_OFFSET as usize)
             .map_or(Value::Undefined, |bits| decode_in(bits, memory, guard));
-        if let Value::Str(text) = &primitive {
-            let len = text.len();
-            entries.retain(|(key, _)| key.parse::<usize>().map_or(true, |i| i >= len));
-        }
         return Value::Wrapper {
             primitive: Box::new(primitive),
             entries,
@@ -560,14 +637,14 @@ fn decode_function(ptr: usize, memory: &[u8], guard: &mut Guard) -> Value {
 }
 
 /// The block base of `bits` when it is a heap pointer to an object-family
-/// block that carries a `props` slot (not a string or array).
+/// block that carries a `props` slot (not a string, array, or symbol).
 fn heap_object(bits: u64, memory: &[u8]) -> Option<usize> {
     if bits & QNAN != QNAN || (bits >> 48) & 0b111 != 0b101 {
         return None;
     }
     let ptr = (bits & 0xFFFF_FFFF) as usize;
     let ty = *memory.get(ptr)?;
-    (ty != TYPE_STRING && ty != TYPE_ARRAY).then_some(ptr)
+    (ty != TYPE_STRING && ty != TYPE_ARRAY && ty != crate::abi::TYPE_SYMBOL).then_some(ptr)
 }
 
 /// The value bits of the own DATA property `key` of the object-family block
@@ -719,6 +796,10 @@ pub fn format_value(value: &Value) -> String {
         // A string renders as its raw text, with no surrounding quotes (a `typeof`
         // result is an ordinary string, so `console.log(typeof x)` prints the word).
         Value::Str(s) => s.clone(),
+        // A symbol renders Node-console style by its description.
+        Value::Symbol(description) => {
+            format!("Symbol({})", description.as_deref().unwrap_or_default())
+        }
         // An array renders Node-console style: `[ 1, 2, 3 ]`, `[]` when empty,
         // a run of holes as `<N empty items>`, named properties last.
         Value::Array(elems, props) => {
@@ -830,12 +911,13 @@ pub fn format_value(value: &Value) -> String {
 }
 
 /// Render a wrapper object Node-console style: `[String: 'abc']`,
-/// `[Number: -0]`, `[Boolean: true]`, then its own properties when it has any.
+/// `[Number: -0]`, `[Boolean: true]`, `[Symbol: Symbol(a)]`, then its own properties when it has any.
 fn format_wrapper(primitive: &Value, entries: &[(String, Value)]) -> String {
     let head = match primitive {
         Value::Str(text) => format!("[String: '{text}']"),
         Value::Number(n) if *n == 0.0 && n.is_sign_negative() => "[Number: -0]".to_owned(),
         Value::Number(n) => format!("[Number: {}]", format_number(*n)),
+        Value::Symbol(_) => format!("[Symbol: {}]", format_value(primitive)),
         other => format!("[Boolean: {}]", format_value(other)),
     };
     if entries.is_empty() {
@@ -904,6 +986,7 @@ pub fn to_js_string(value: &Value) -> String {
         | Value::Null
         | Value::Undefined
         | Value::Str(_)
+        | Value::Symbol(_)
         | Value::Function { .. }
         | Value::Date(_) => format_value(value),
     }

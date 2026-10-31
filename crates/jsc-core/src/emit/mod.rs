@@ -36,8 +36,8 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
-    SpreadCallee, SpreadElem,
+    IterRecord, JsStr, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey,
+    ProtoKind, SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -191,9 +191,10 @@ const CF_VALUE_GLOBAL: u32 = 4;
 const THIS_GLOBAL: u32 = abi::THIS_GLOBAL_INDEX;
 
 /// The `JSON.parse` recursive-descent cursor globals (all i32, appended after
-/// [`THIS_GLOBAL`]): `$__json_data` is the byte offset of the input string's UTF-8
-/// payload (`base + HEADER_SIZE + 4`), `$__json_pos` is the current byte offset
-/// into that payload, and `$__json_len` is the input's byte length. Set once at
+/// [`THIS_GLOBAL`]): `$__json_data` is the byte offset of the input string's
+/// data (`base + STR_DATA_OFFSET`, 8-aligned) with its low bit set for a
+/// `TWO_BYTE` input, `$__json_pos` is the current code-unit index into that
+/// data, and `$__json_len` is the input's code-unit length. Set once at
 /// `__json_parse` entry; the recursive helpers read `$__json_len`/advance
 /// `$__json_pos`. A parse runs synchronously to completion, so no re-entrancy
 /// disturbs them.
@@ -286,6 +287,10 @@ const ABI_TRAILING_PARAMS: u32 = abi::ABI_TRAILING_PARAMS;
 /// Type byte for a heap string block: `[type=0][pad×3][len:u32][utf8]` (payload
 /// after the [`HEADER_SIZE`] header). Maps to `typeof` "string".
 const TYPE_STRING: i32 = abi::TYPE_STRING as i32;
+/// String block field offsets: the u32 `len` (a load/store `MemArg` offset) and
+/// the UTF-8 data (an `i32` addend). See [`abi::STR_LEN_OFFSET`].
+const STR_LEN_OFFSET: u64 = abi::STR_LEN_OFFSET as u64;
+const STR_DATA_OFFSET: i32 = abi::STR_DATA_OFFSET.cast_signed();
 
 /// Type byte, field offsets, and size of an array handle (`length` and the
 /// base of its element store). Maps to `typeof` "object". See
@@ -376,6 +381,16 @@ const TYPE_DATE: i32 = abi::TYPE_DATE as i32;
 const DATE_MS_OFFSET: u64 = abi::DATE_MS_OFFSET as u64;
 const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 
+/// The TYPE BYTE of a Symbol primitive block. Maps to `typeof` "symbol". See
+/// [`abi::TYPE_SYMBOL`] for the full layout.
+const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+const SYMBOL_DESCRIPTION_OFFSET: u64 = abi::SYMBOL_DESCRIPTION_OFFSET as u64;
+
+/// `%Symbol.prototype%` (DESIGN.md §7.9): where a property read
+/// on a symbol primitive continues and the prototype of its `ToObject`
+/// wrapper.
+const SYMBOL_PROTOTYPE: Intrinsic = Intrinsic::Prototype(BuiltinCtor::Symbol);
+
 /// The TYPE BYTE of an instance-accessor block. See [`abi::TYPE_ACCESSOR`].
 const TYPE_ACCESSOR: i32 = abi::TYPE_ACCESSOR as i32;
 const ACCESSOR_GET_OFFSET: u64 = abi::ACCESSOR_GET_OFFSET as u64;
@@ -449,8 +464,8 @@ const INSTANCEOF_NON_OBJECT_PROTOTYPE: CalleeErrorText<'static> = [
 fn callee_type_error([message, stack]: CalleeErrorText<'_>) -> IrNode {
     IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(message.to_owned())),
-        IrNode::Str(stack.to_owned()),
+        Some(IrNode::Str(message.into())),
+        IrNode::Str(stack.into()),
     )
 }
 
@@ -650,7 +665,7 @@ const PROP_THROW_PROTO_IMMUTABLE: i32 = 20;
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
 /// [`collect_node`] at every member store and `delete` site
 /// so their `[len][utf8]` blobs exist when they throw.
-const PROP_ERROR_STRS: [&str; 10] = [
+const PROP_ERROR_STRS: [&str; 11] = [
     ARRAY_LENGTH_MSG,
     ARRAY_LENGTH_STACK,
     TYPE_ERROR_STACK_PREFIX,
@@ -659,6 +674,7 @@ const PROP_ERROR_STRS: [&str; 10] = [
     PRIM_CREATE_QUOTE,
     PRIM_CREATE_SUFFIX,
     "number",
+    "symbol",
     "string",
     "boolean",
 ];
@@ -682,8 +698,8 @@ const JSON_PARSE_ERROR_STRS: [&str; 2] = [JSON_ERROR_MSG, JSON_ERROR_STACK];
 fn json_syntax_error() -> IrNode {
     IrNode::error_object(
         ErrorKind::SyntaxError,
-        Some(IrNode::Str(JSON_ERROR_MSG.to_owned())),
-        IrNode::Str(JSON_ERROR_STACK.to_owned()),
+        Some(IrNode::Str(JSON_ERROR_MSG.into())),
+        IrNode::Str(JSON_ERROR_STACK.into()),
     )
 }
 
@@ -711,7 +727,7 @@ struct JsonTokens {
 }
 
 impl JsonTokens {
-    fn resolve(offsets: &HashMap<String, i32>) -> Self {
+    fn resolve(offsets: &StrOffsets) -> Self {
         let at = |s: &str| offsets.get(s).copied().unwrap_or(HEAP_BASE);
         Self {
             null: at("null"),
@@ -870,9 +886,9 @@ struct Helpers<'a> {
     /// `settle_resolve_slot` is also the user function count.
     settle_resolve_slot: u32,
     settle_reject_slot: u32,
-    /// `__new_string(len: i32) -> i32`: the exported string constructor,
-    /// followed by `__new_array` (`new_string + 1`), `__new_promise`
-    /// (`new_string + 2`), `__has_own` (`new_string + 3`), and the builtin
+    /// `__new_string(len: i32, two_byte: i32) -> i32`: the exported string
+    /// constructor, followed by `__new_array` (`new_string + 1`),
+    /// `__new_promise` (`new_string + 2`), `__has_own` (`new_string + 3`), and the builtin
     /// bodies ([`Self::builtin`]), appended after the settlers so every other
     /// index stays stable.
     new_string: u32,
@@ -901,7 +917,8 @@ struct Helpers<'a> {
     intern: u32,
     /// `__index_value(s) -> i32`: a canonical array-index string's value, else `-1`.
     index_value: u32,
-    /// `__index_string(n) -> s`: a fresh string of the unsigned `n`'s digits.
+    /// `__index_string(n) -> s`: a fresh string of the unsigned `n`'s digits,
+    /// followed by `__str_exotic_index` ([`Self::str_exotic_index`]).
     index_string: u32,
     /// `__to_key(v, insert) -> key`: `ToPropertyKey` of a jsval as an interned key
     /// (`insert` interns a miss; otherwise a miss is `0`).
@@ -952,7 +969,7 @@ struct Helpers<'a> {
     same_value_zero: u32,
     /// `__map_find(handle: i32, key: i64) -> i32`: the byte address of the
     /// matching key slot in a Map/Set's backing array (a `__same_value_zero` linear scan over
-    /// the even element slots), or `-1` on a miss. Shared by get/has/set/delete.
+    /// the even element slots, skipping `HOLE` tombstones), or `-1` on a miss. Shared by get/has/set/delete.
     map_find: u32,
     /// `__map_set(handle: i32, key: i64, val: i64)`: update the existing
     /// entry for `key`, or append `(key, val)` to the growable backing (via
@@ -964,9 +981,9 @@ struct Helpers<'a> {
     map_get: u32,
     /// `__map_has(handle: i32, key: i64) -> i32`: `1` iff `__map_find` hits.
     map_has: u32,
-    /// `__map_delete(handle: i32, key: i64) -> i32`: compact the matching
-    /// entry out of the backing (shift trailing pairs down, drop `size`/`len` by
-    /// one entry) and return `1`, or `0` on a miss.
+    /// `__map_delete(handle: i32, key: i64) -> i32`: tombstone the matching
+    /// entry in place (`HOLE` key, `undefined` value), drop `size` by one and
+    /// return `1`, or `0` on a miss.
     map_delete: u32,
     /// `__loose_eq(a: i64, b: i64) -> i32`: loose `==` (Abstract Equality with
     /// number/string/boolean coercion; `null`/`undefined` mutually equal; objects
@@ -1128,6 +1145,11 @@ impl Helpers<'_> {
         self.to_primitive() + 16
     }
 
+    /// `__symbol_get(v, sym) -> i64` (see [`props::emit_symbol_get`]).
+    fn symbol_get(self) -> u32 {
+        self.to_primitive() + 17
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1138,6 +1160,12 @@ impl Helpers<'_> {
     /// `__new_string`.
     fn new_array(self) -> u32 {
         self.new_string + 1
+    }
+
+    /// `__str_exotic_index(o, key) -> i32`: the `String` wrapper own index
+    /// `key` names on `o`, else `-1`; right after `__index_string`.
+    fn str_exotic_index(self) -> u32 {
+        self.index_string + 1
     }
 
     /// `__array_reserve(base, need)`: grow the array handle's element store to
@@ -1279,7 +1307,8 @@ use object::*;
 #[allow(clippy::wildcard_imports)]
 use props::*;
 use realm::{
-    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ReflectOp, StringOp, intrinsic_bits,
+    AsyncGenReaction, AsyncGenRequest, Builtin, Intrinsic, ProtocolOp, ReflectOp, StringOp,
+    WellKnown, intrinsic_bits,
 };
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
@@ -1521,7 +1550,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_intern(helpers));
     code.function(&emit_index_value());
     code.function(&emit_index_string(helpers));
-    code.function(&emit_to_key(helpers));
+    code.function(&emit_str_exotic_index(helpers));
+    code.function(&emit_to_key(&offsets, helpers));
     code.function(&emit_prop_find(helpers));
     code.function(&emit_define(helpers));
     code.function(&emit_fn_materialize(&offsets, helpers));
@@ -1566,7 +1596,11 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
     // Map/Set helpers.
     code.function(&emit_loose_eq(helpers));
-    code.function(&emit_str_to_array(helpers.new_array(), helpers.str_index));
+    code.function(&emit_str_to_array(
+        helpers.new_array(),
+        helpers.str_index,
+        helpers.alloc,
+    ));
     // The in-wasm `JSON.parse` family, in the order their indices were assigned.
     code.function(&emit_json_ws());
     code.function(&emit_json_throw(&offsets, helpers));
@@ -1585,7 +1619,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // every helper index stays stable; the `__async_step` trampoline
     // follows it, then the two `new Promise` settler functions.
     code.function(&emit_box_f64_helper());
-    code.function(&emit_to_number_helper(helpers));
+    code.function(&emit_to_number_helper(&offsets, helpers));
     code.function(&emit_invoke1(helpers));
     code.function(&generator::emit_async_step(helpers));
     code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
@@ -1622,6 +1656,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_own_enum(&offsets, helpers));
     code.function(&emit_set_proto(helpers));
     code.function(&builtins::emit_promise_self_error(&offsets, helpers));
+    code.function(&emit_symbol_get(helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

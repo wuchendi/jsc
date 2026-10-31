@@ -98,8 +98,6 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
         not_an_entry(local),
         adder_not_callable(local, false),
         adder_not_callable(local, true),
-        IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::Local(local))]),
-        IrNode::Array(vec![IrNode::Local(local), IrNode::Local(local)]),
     ]
 }
 
@@ -121,7 +119,7 @@ fn throw_message(message: IrNode, tmp: u32) -> IrNode {
         IrNode::Throw(Box::new(IrNode::error_object(
             ErrorKind::TypeError,
             Some(IrNode::Local(tmp)),
-            concat(IrNode::Str("TypeError: ".to_owned()), IrNode::Local(tmp)),
+            concat(IrNode::Str("TypeError: ".into()), IrNode::Local(tmp)),
         ))),
     ])
 }
@@ -143,10 +141,10 @@ pub(super) fn not_iterable(local: u32) -> IrNode {
     let kind = IrNode::TypeOf(Box::new(IrNode::Local(local)));
     let primitive = concat(
         concat(
-            concat(kind.clone(), IrNode::Str(" ".to_owned())),
+            concat(kind.clone(), IrNode::Str(" ".into())),
             IrNode::Local(local),
         ),
-        IrNode::Str(" is not iterable".to_owned()),
+        IrNode::Str(" is not iterable".into()),
     );
     let nullish = IrNode::Binary {
         op: BinOp::LooseEq,
@@ -155,12 +153,12 @@ pub(super) fn not_iterable(local: u32) -> IrNode {
     };
     let message = IrNode::Ternary {
         cond: Box::new(IrNode::IsObject(Box::new(IrNode::Local(local)))),
-        then_branch: Box::new(concat(kind, IrNode::Str(" is not iterable".to_owned()))),
+        then_branch: Box::new(concat(kind, IrNode::Str(" is not iterable".into()))),
         else_branch: Box::new(IrNode::Ternary {
             cond: Box::new(nullish),
             then_branch: Box::new(concat(
                 IrNode::Local(local),
-                IrNode::Str(" is not iterable".to_owned()),
+                IrNode::Str(" is not iterable".into()),
             )),
             else_branch: Box::new(primitive),
         }),
@@ -172,11 +170,8 @@ pub(super) fn not_iterable(local: u32) -> IrNode {
 /// `local` that is not an object.
 pub(super) fn not_an_entry(local: u32) -> IrNode {
     let message = concat(
-        concat(
-            IrNode::Str("Iterator value ".to_owned()),
-            IrNode::Local(local),
-        ),
-        IrNode::Str(" is not an entry object".to_owned()),
+        concat(IrNode::Str("Iterator value ".into()), IrNode::Local(local)),
+        IrNode::Str(" is not an entry object".into()),
     );
     throw_message(message, local)
 }
@@ -186,10 +181,11 @@ pub(super) fn not_an_entry(local: u32) -> IrNode {
 fn adder_not_callable(local: u32, set: bool) -> IrNode {
     let (key, object) = if set { ("add", "Set") } else { ("set", "Map") };
     let message = concat(
-        concat(IrNode::Str("'".to_owned()), IrNode::Local(local)),
-        IrNode::Str(format!(
-            "' returned for property '{key}' of object '#<{object}>' is not a function"
-        )),
+        concat(IrNode::Str("'".into()), IrNode::Local(local)),
+        IrNode::Str(
+            format!("' returned for property '{key}' of object '#<{object}>' is not a function")
+                .into(),
+        ),
     );
     throw_message(message, local)
 }
@@ -202,7 +198,7 @@ fn this_collection(
     this: u32,
     builtin: Builtin,
     set: bool,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
@@ -218,8 +214,8 @@ fn this_collection(
     wasm!(function; End);
 }
 
-/// Push the live entry count (`2 · size` slots) of the backing array of the
-/// handle in `handle`.
+/// Push the slot count (two per entry, tombstones included) of the backing
+/// array of the handle in `handle`.
 pub(super) fn entries_len(function: &mut Function, handle: u32) {
     wasm!(function;
         LocalGet(handle), I32WrapI64,
@@ -250,13 +246,36 @@ pub(super) fn load_entry(
     );
 }
 
+/// Advance the i32 backing slot index `i` of the handle in `handle` past
+/// tombstones (a `HOLE` key, DESIGN.md §5.2), stopping at the
+/// next live entry or the end (`at`, `key`, `value` temps).
+pub(super) fn skip_tombstones(
+    function: &mut Function,
+    handle: u32,
+    i: u32,
+    at: u32,
+    key: u32,
+    value: u32,
+) {
+    wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty), LocalGet(i));
+    entries_len(function, handle);
+    wasm!(function; I32GeU, BrIf(1));
+    load_entry(function, handle, i, at, key, value);
+    wasm!(function;
+        LocalGet(key), I64Const(HOLE_BITS), I64Ne, BrIf(1),
+        LocalGet(i), I32Const(2), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+    );
+}
+
 /// A `Map.prototype` / `Set.prototype` method with an inline body.
 pub(super) fn emit_op(
     set: bool,
     op: MapOp,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, a0, a1) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -279,7 +298,7 @@ pub(super) fn emit_size(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let this = frame.i64(0);
@@ -289,14 +308,16 @@ pub(super) fn emit_size(
 }
 
 /// `forEach(callback, thisArg)`: `callback(value, key, map)` (a Set passes
-/// its value as both) with `this = thisArg` for each entry in insertion
-/// order, re-reading the entry count each step so entries added by a
-/// callback are visited and a `clear` ends the walk.
+/// its value as both) with `this = thisArg` for each live entry in insertion
+/// order, walking the backing live (DESIGN.md §5.2): the slot
+/// count is re-read each step so entries added by a callback are visited,
+/// and tombstones (deleted or cleared entries) are skipped in place, so a
+/// deletion never shifts the walk.
 pub(super) fn emit_for_each(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, callback, this_arg, key) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -325,6 +346,7 @@ pub(super) fn emit_for_each(
     entries_len(function, this);
     wasm!(function; I32GeU, BrIf(1));
     load_entry(function, this, i, at, key, value);
+    wasm!(function; LocalGet(key), I64Const(HOLE_BITS), I64Ne, If(BlockType::Empty));
     let args = if set {
         [key, key, this]
     } else {
@@ -348,6 +370,7 @@ pub(super) fn emit_for_each(
     wasm!(function; Drop);
     return_if_pending(function);
     wasm!(function;
+        End,
         LocalGet(i), I32Const(2), I32Add, LocalSet(i),
         Br(0),
         End, End,
@@ -355,32 +378,74 @@ pub(super) fn emit_for_each(
     );
 }
 
+/// Call the adder in i64 `adder` with `this` = the collection in i64 `map`
+/// on `args` (a Set's one value, a Map's key and value): inline
+/// `__map_set` when i32 `builtin_adder` is set, else a call (a throw left
+/// pending).
+fn call_adder(
+    function: &mut Function,
+    frame: Frame,
+    map: u32,
+    adder: u32,
+    builtin_adder: u32,
+    args: &[u32],
+    helpers: Helpers<'_>,
+) {
+    wasm!(function; LocalGet(builtin_adder), If(BlockType::Empty), LocalGet(map), I32WrapI64);
+    for &arg in args {
+        wasm!(function; LocalGet(arg));
+    }
+    if args.len() == 1 {
+        wasm!(function; I64Const(UNDEFINED_BITS));
+    }
+    wasm!(function; Call(helpers.map_set), Else);
+    for slot in 0..frame.k {
+        if let Some(&local) = args.get(slot as usize) {
+            wasm!(function; LocalGet(local));
+        } else {
+            wasm!(function; I64Const(UNDEFINED_BITS));
+        }
+    }
+    wasm!(function; LocalGet(map), GlobalSet(THIS_GLOBAL));
+    let count = args.len().min(frame.k as usize);
+    invoke(
+        function,
+        adder,
+        |function| emit_argc(count, function),
+        helpers,
+    );
+    wasm!(function; Drop, End);
+}
+
 /// `new Map(iterable)` / `new Set(iterable)`: the allocation of
-/// [`super::ctor::fragment`], then, for a non-nullish `iterable`, each value
-/// it yields added through `map.set(k, v)` / `set.add(v)` (looked up on the
-/// new collection, so a user override runs; the builtin itself is called
-/// inline). The iterables are arrays, strings and generators (drained into
-/// an array first) and `Map`/`Set` handles (walked live; a Map yields its
-/// `[key, value]` entries); anything else is a `TypeError`. A `Map` entry
-/// must be an object, read at keys `"0"` and `"1"`.
-#[allow(clippy::too_many_lines)]
+/// [`super::ctor::fragment`], then, for a non-nullish `iterable`,
+/// `AddEntriesFromIterable` (DESIGN.md §7.8): the adder
+/// `map.set` / `set.add` is read once from the new collection (a user
+/// override runs; the builtin itself is called inline), then each value of
+/// `iterable`'s iterator record (a guarded fast path or the protocol; `<x> is
+/// not iterable` without one) is added. A `Map` entry must be an object,
+/// read at keys `"0"` and `"1"`. A non-object entry (`TypeError`), a
+/// throwing entry read or a throwing adder closes the iterator; a throw from
+/// the iterator itself does not.
 pub(super) fn emit_ctor(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (map, src) = (frame.x64(0), frame.x64(1));
     let (adder, item, key, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (i, builtin_adder, at) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let builtin_adder = frame.i32(1);
+    let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
+    let scratch = frame.scratch();
     let ctor = if set {
         BuiltinCtor::Set
     } else {
         BuiltinCtor::Map
     };
     let alloc = super::ctor::fragment(ctor, frame.k);
-    emit_node(&alloc, function, frame.scratch(), strings, helpers);
+    emit_node(&alloc, function, scratch, strings, helpers);
     wasm!(function; LocalSet(map));
     return_if_pending(function);
     frame.arg(function, 0);
@@ -410,119 +475,53 @@ pub(super) fn emit_ctor(
         I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(adder), I64Const(realm::method_bits(builtin, helpers)), I64Eq, LocalSet(builtin_adder),
     );
-    // Add the value in `item`: a Map destructures it into `key`/`value`.
-    let add = |function: &mut Function| {
+    emit_get_iterator(
+        &IrNode::Local(src),
+        &rec,
+        false,
+        function,
+        scratch,
+        strings,
+        helpers,
+    );
+    iter::guarded(function, helpers, |function| {
+        wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
+        enter_frame(helpers);
+        enter_frame(helpers);
+        emit_iterator_step(&rec, function, scratch, strings, helpers);
+        wasm!(function; I32Eqz, BrIf(1));
+        emit_iterator_value(&rec, function, scratch, strings, helpers);
+        wasm!(function; LocalSet(item));
         if !set {
             emit_is_object(function, item);
             wasm!(function; I32Eqz, If(BlockType::Empty));
+            enter_frame(helpers);
             emit_drop(function, frame, &not_an_entry(item), strings, helpers);
-            wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
+            leave_frame(helpers);
+            wasm!(function; End);
             for (key_text, out) in ENTRY_KEYS.into_iter().zip([key, value]) {
                 wasm!(function;
                     LocalGet(item), I32Const(static_key(strings, key_text)), Call(helpers.get),
                     LocalSet(out),
                 );
-                return_if_pending(function);
+                emit_propagate_if_pending(function, helpers);
             }
         }
         let args: &[u32] = if set { &[item] } else { &[key, value] };
-        wasm!(function; LocalGet(builtin_adder), If(BlockType::Empty), LocalGet(map), I32WrapI64);
-        for &arg in args {
-            wasm!(function; LocalGet(arg));
-        }
-        if set {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-        wasm!(function; Call(helpers.map_set), Else);
-        for slot in 0..frame.k {
-            if let Some(&local) = args.get(slot as usize) {
-                wasm!(function; LocalGet(local));
-            } else {
-                wasm!(function; I64Const(UNDEFINED_BITS));
-            }
-        }
-        wasm!(function; LocalGet(map), GlobalSet(THIS_GLOBAL));
-        let count = args.len().min(frame.k as usize);
-        invoke(
-            function,
-            adder,
-            |function| emit_argc(count, function),
-            helpers,
-        );
-        wasm!(function; Drop);
-        return_if_pending(function);
-        wasm!(function; End);
-    };
-    // A Map/Set source: its entries, live.
-    emit_is_pointer(function, src);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, src);
-    wasm!(function; I32Const(TYPE_MAP), I32Eq);
-    emit_load_type_byte(function, src);
-    wasm!(function;
-        I32Const(TYPE_SET), I32Eq, I32Or,
-        Else, I32Const(0), End,
-        If(BlockType::Empty),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i),
-    );
-    entries_len(function, src);
-    wasm!(function; I32GeU, BrIf(1));
-    load_entry(function, src, i, at, key, value);
-    emit_load_type_byte(function, src);
-    wasm!(function; I32Const(TYPE_MAP), I32Eq, If(BlockType::Result(ValType::I64)));
-    let entry = IrNode::Array(vec![IrNode::Local(key), IrNode::Local(value)]);
-    emit_node(&entry, function, frame.scratch(), strings, helpers);
-    wasm!(function; Else, LocalGet(key), End, LocalSet(item));
-    add(function);
-    wasm!(function;
-        LocalGet(i), I32Const(2), I32Add, LocalSet(i),
-        Br(0),
-        End, End,
-        LocalGet(map), Return,
-        End,
-    );
-    // An array, string or generator: its values, collected first.
-    emit_is_string(function, src);
-    emit_is_generator(function, src);
-    wasm!(function; I32Or);
-    emit_is_pointer(function, src);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, src);
-    wasm!(function;
-        I32Const(TYPE_ARRAY), I32Eq,
-        Else, I32Const(0), End,
-        I32Or,
-        If(BlockType::Empty),
-    );
-    let values = IrNode::ArraySpread(vec![SpreadElem::Spread(IrNode::Local(src))]);
-    emit_node(&values, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(src));
-    return_if_pending(function);
-    wasm!(function;
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i), LocalGet(src), I32WrapI64,
-        I32Load(MemArg { offset: ARRAY_LEN_OFFSET, align: 2, memory_index: 0 }),
-        I32GeU, BrIf(1),
-        LocalGet(src), I32WrapI64,
-    );
-    emit_array_elems(function);
-    wasm!(function; LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)), LocalSet(item));
-    emit_elem_read(function, item);
-    wasm!(function; LocalSet(item));
-    add(function);
-    wasm!(function;
-        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Br(0),
-        End, End,
-        LocalGet(map), Return,
-        End,
-    );
-    emit_node(
-        &not_iterable(src),
+        call_adder(function, frame, map, adder, builtin_adder, args, helpers);
+        emit_propagate_if_pending(function, helpers);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        wasm!(function; Br(0), End, End);
+    });
+    wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+    emit_iterator_close(
+        &rec,
+        CloseMode::Pending,
         function,
-        frame.scratch(),
+        scratch,
         strings,
         helpers,
     );
+    wasm!(function; I64Const(UNDEFINED_BITS), Return, End, LocalGet(map));
 }

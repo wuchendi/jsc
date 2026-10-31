@@ -370,6 +370,173 @@ fn iterable_constructors_call_the_adder() {
     );
 }
 
+/// `AddEntriesFromIterable`: the adder is read once, before the iterator
+/// opens; a throwing adder closes a user iterator and the adder's error
+/// propagates.
+#[test]
+fn iterable_constructors_close_on_a_throwing_adder() {
+    both_string(
+        "const log = []; \
+         const it = { [Symbol.iterator]() { return this }, \
+           next() { log.push('next'); return { value: [1, 2], done: false } }, \
+           return() { log.push('return'); return {} } }; \
+         class M extends Map { set(k, v) { log.push('set'); throw new Error('boom') } } \
+         try { new M(it) } catch (e) { log.push(e.message) } log.join()",
+        "next,set,return,boom",
+    );
+    both_string(
+        "const log = []; \
+         const it = { [Symbol.iterator]() { return this }, \
+           next() { return { value: 1, done: false } }, \
+           return() { log.push('return'); return {} } }; \
+         class S extends Set { add(v) { throw new RangeError('no') } } \
+         try { new S(it) } catch (e) { log.push(e.name) } log.join()",
+        "return,RangeError",
+    );
+    // The adder is read once, before `@@iterator` is called.
+    both_string(
+        "const log = []; \
+         class S extends Set { get add() { log.push('get add'); return Set.prototype.add } } \
+         const it = { [Symbol.iterator]() { log.push('iterator'); return [1, 2][Symbol.iterator]() } }; \
+         const s = new S(it); log.push(s.size); log.join()",
+        "get add,iterator,2",
+    );
+}
+
+/// A non-object `Map` entry closes the iterator, then throws `TypeError`; a
+/// throw from `next` itself does not close.
+#[test]
+fn map_constructor_closes_on_a_non_object_entry() {
+    both_string(
+        "const log = []; \
+         const it = { [Symbol.iterator]() { return this }, \
+           next() { return { value: 7, done: false } }, \
+           return() { log.push('return'); return {} } }; \
+         try { new Map(it) } catch (e) { log.push(e instanceof TypeError, e.message) } log.join()",
+        "return,true,Iterator value 7 is not an entry object",
+    );
+    both_string(
+        "const log = []; \
+         const it = { [Symbol.iterator]() { return this }, \
+           next() { throw new Error('next') }, \
+           return() { log.push('return'); return {} } }; \
+         try { new Map(it) } catch (e) { log.push(e.message) } log.join()",
+        "next",
+    );
+}
+
+/// `new Set(arguments)` / `new Map(arguments)` iterate the `arguments`
+/// object through its own `@@iterator` (`%Array.prototype.values%`).
+#[test]
+fn collections_from_arguments() {
+    both_number(
+        "function f() { return new Set(arguments) } f(1, 2, 2, 3).size",
+        3.0,
+    );
+    both_number(
+        "function f() { return new Map(arguments) } f([1, 'a'], [2, 'b']).get(2) === 'b' ? 1 : 0",
+        1.0,
+    );
+    both_bool(
+        "function f() { return arguments[Symbol.iterator] === Array.prototype.values } f()",
+        true,
+    );
+    both_string(
+        "function f() { const d = Object.getOwnPropertyDescriptor(arguments, Symbol.iterator); \
+           return [d.writable, d.enumerable, d.configurable].join() } f()",
+        "true,false,true",
+    );
+    // A replaced own `@@iterator` is honoured.
+    both_number(
+        "function f() { arguments[Symbol.iterator] = function* () { yield 9 }; \
+           return [...new Set(arguments)][0] } f(1, 2)",
+        9.0,
+    );
+}
+
+// --- deletion and live iteration (B2, DESIGN.md §5.2) ------------
+
+/// Deleting the visited entry during for-of or `forEach` does not skip the
+/// next one (B2).
+#[test]
+fn delete_during_iteration_visits_every_entry() {
+    both_string(
+        "const m = new Map([[1, 'a'], [2, 'b'], [3, 'c']]); const seen = []; \
+         for (const [k] of m) { seen.push(k); if (k === 1) m.delete(1) } seen.join()",
+        "1,2,3",
+    );
+    both_string(
+        "const m = new Map([[1, 'a'], [2, 'b'], [3, 'c']]); const seen = []; \
+         m.forEach((v, k) => { seen.push(k); if (k === 1) m.delete(1) }); seen.join()",
+        "1,2,3",
+    );
+    both_string(
+        "const s = new Set([1, 2, 3]); const seen = []; \
+         for (const v of s) { seen.push(v); s.delete(v) } seen.join() + '/' + s.size",
+        "1,2,3/0",
+    );
+    both_string(
+        "const s = new Set([1, 2, 3]); const seen = []; \
+         s.forEach(v => { seen.push(v); s.delete(v) }); seen.join() + '/' + s.size",
+        "1,2,3/0",
+    );
+    // Through an iterator object.
+    both_string(
+        "const m = new Map([[1, 1], [2, 2], [3, 3]]); const it = m.keys(); \
+         const a = it.next().value; m.delete(a); m.delete(2); \
+         a + ',' + it.next().value + ',' + it.next().done",
+        "1,3,true",
+    );
+}
+
+/// `clear()` during iteration, then `set`: the live iterator continues and
+/// visits the new entry.
+#[test]
+fn clear_during_iteration_then_set_visits_the_new_entry() {
+    both_string(
+        "const m = new Map([[1, 1], [2, 2]]); const seen = []; \
+         for (const [k] of m) { seen.push(k); if (k === 1) { m.clear(); m.set(9, 9) } } \
+         seen.join() + '/' + m.size",
+        "1,9/1",
+    );
+    both_string(
+        "const s = new Set([1, 2]); const seen = []; \
+         s.forEach(v => { seen.push(v); if (v === 1) { s.clear(); s.add(5) } }); seen.join()",
+        "1,5",
+    );
+    both_number(
+        "const s = new Set([1, 2]); const it = s.values(); it.next(); \
+         s.clear(); s.add(3); it.next().value",
+        3.0,
+    );
+}
+
+/// `size` counts live entries; re-adding a deleted key appends it.
+#[test]
+fn size_and_re_adding_after_deletes() {
+    both_number(
+        "const m = new Map([[1, 1], [2, 2], [3, 3]]); m.delete(2); m.delete(2); m.delete(9); m.size",
+        2.0,
+    );
+    both_number(
+        "const s = new Set([1, 2, 3]); s.clear(); s.add(4); s.size",
+        1.0,
+    );
+    both_string(
+        "const m = new Map([['a', 1], ['b', 2], ['c', 3]]); m.delete('a'); m.set('a', 4); \
+         [...m.keys()].join() + '/' + m.get('a') + '/' + m.size",
+        "b,c,a/4/3",
+    );
+    both_string(
+        "const s = new Set([1, 2, 3]); s.delete(1); s.add(1); [...s].join()",
+        "2,3,1",
+    );
+    both_bool(
+        "const m = new Map([[NaN, 1]]); m.delete(NaN); !m.has(NaN) && m.get(NaN) === undefined",
+        true,
+    );
+}
+
 // --- Date ------------------------------------------------------------------------
 
 #[test]

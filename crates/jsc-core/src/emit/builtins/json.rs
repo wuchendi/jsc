@@ -45,7 +45,7 @@ pub(super) fn fragments() -> Vec<IrNode> {
 /// or reviver walk.
 fn root_holder(value: u32) -> IrNode {
     IrNode::Object {
-        entries: vec![(PropKey::Static(String::new()), IrNode::Local(value))],
+        entries: vec![(PropKey::Static("".into()), IrNode::Local(value))],
         proto: None,
         class: abi::CLASS_ORDINARY,
         reserve: 0,
@@ -53,19 +53,12 @@ fn root_holder(value: u32) -> IrNode {
 }
 
 /// The payload offset of a string block (past the header and the length).
-const PAYLOAD: i32 = HEADER_SIZE + 4;
+const PAYLOAD: i32 = STR_DATA_OFFSET;
 
-/// A string block's u32 byte length.
+/// A string block's u32 code-unit length.
 const STR_LEN: MemArg = MemArg {
-    offset: HEADER_SIZE as u64,
+    offset: STR_LEN_OFFSET,
     align: 2,
-    memory_index: 0,
-};
-
-/// One payload byte (the address on the stack is the block base plus index).
-const BYTE: MemArg = MemArg {
-    offset: PAYLOAD as u64,
-    align: 0,
     memory_index: 0,
 };
 
@@ -153,7 +146,7 @@ fn call_with(function: &mut Function, target: u32, this: u32, args: &[u32], help
 pub(super) fn emit_stringify(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, rep, list, s) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
@@ -261,9 +254,9 @@ pub(super) fn emit_stringify(
 
 /// The gap of `space` (i64 local) into i32 local `gap` (`0` for none): a
 /// Number / String wrapper is converted first; a number is that many spaces
-/// (at most 10), a string its first 10 characters.
+/// (at most 10), a string its first 10 code units.
 fn emit_gap(function: &mut Function, frame: Frame, space: u32, gap: u32, helpers: Helpers<'_>) {
-    let (len, i, count) = (frame.x32(0), frame.x32(1), frame.i32(0));
+    let (len, i, count, w) = (frame.x32(0), frame.x32(1), frame.i32(0), frame.i32(1));
     let width = frame.f64(0);
     emit_is_wrapper(function, space, abi::CLASS_NUMBER);
     wasm!(function; If(BlockType::Empty), LocalGet(space), Call(helpers.to_number), LocalSet(space));
@@ -281,7 +274,7 @@ fn emit_gap(function: &mut Function, frame: Frame, space: u32, gap: u32, helpers
         LocalGet(space), F64ReinterpretI64, F64Trunc, F64Const(Ieee64::from(10.0)), F64Min,
         LocalTee(width), F64Const(Ieee64::from(1.0)), F64Ge,
         If(BlockType::Empty),
-        LocalGet(width), I32TruncF64U, LocalTee(count), Call(helpers.new_string), LocalTee(gap),
+        LocalGet(width), I32TruncF64U, LocalTee(count), I32Const(0), Call(helpers.new_string), LocalTee(gap),
         I32Const(PAYLOAD), I32Add, I32Const(i32::from(b' ')), LocalGet(count),
         MemoryFill(0),
         End,
@@ -290,31 +283,27 @@ fn emit_gap(function: &mut Function, frame: Frame, space: u32, gap: u32, helpers
     emit_is_string(function, space);
     wasm!(function;
         If(BlockType::Empty),
-        // `i` = the byte offset past the first 10 characters (UTF-8 lead
-        // bytes), `count` the characters seen.
-        LocalGet(space), I32WrapI64, LocalTee(gap), I32Load(STR_LEN), LocalSet(len),
-        I32Const(0), LocalSet(i), I32Const(0), LocalSet(count),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
-        LocalGet(gap), LocalGet(i), I32Add, I32Load8U(BYTE), I32Const(0xc0), I32And,
-        I32Const(0x80), I32Ne,
-        If(BlockType::Empty),
-        LocalGet(count), I32Const(10), I32Eq, BrIf(2),
-        LocalGet(count), I32Const(1), I32Add, LocalSet(count),
-        End,
-        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-        Br(0),
-        End, End,
-        LocalGet(i), I32Eqz,
+        // The first 10 code units: an empty string is no gap; a longer one is
+        // cut to a fresh 10-unit string of its width, narrowed when its units
+        // fit a byte.
+        LocalGet(space), I32WrapI64, LocalTee(gap), I32Load(STR_LEN), LocalTee(len), I32Eqz,
         If(BlockType::Empty),
         I32Const(0), LocalSet(gap),
         Else,
-        LocalGet(i), LocalGet(len), I32LtU,
+        LocalGet(len), I32Const(10), I32GtU,
         If(BlockType::Empty),
-        LocalGet(i), Call(helpers.new_string), LocalTee(len), I32Const(PAYLOAD), I32Add,
-        LocalGet(gap), I32Const(PAYLOAD), I32Add, LocalGet(i),
-        MemoryCopy { src_mem: 0, dst_mem: 0 },
-        LocalGet(len), LocalSet(gap),
+        I32Const(10),
+    );
+    emit_str_two_byte(function, gap);
+    wasm!(function; Call(helpers.new_string), LocalTee(i), I32Const(PAYLOAD), I32Add);
+    wasm!(function; LocalGet(gap), I32Const(PAYLOAD), I32Add, I32Const(10));
+    emit_str_two_byte(function, gap);
+    wasm!(function; I32Shl, MemoryCopy { src_mem: 0, dst_mem: 0 });
+    emit_str_two_byte(function, i);
+    wasm!(function; LocalSet(w));
+    emit_str_canonical(function, w, i, len, count);
+    wasm!(function;
+        LocalGet(i), LocalSet(gap),
         End,
         End,
         End,
@@ -326,7 +315,7 @@ fn emit_gap(function: &mut Function, frame: Frame, space: u32, gap: u32, helpers
 pub(super) fn emit_parse(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (text, reviver, value) = (frame.i64(0), frame.i64(1), frame.i64(2));
@@ -356,7 +345,8 @@ pub(super) fn emit_parse(
 
 /// `__json_rep(holder, key, value, replacer, list, stack) -> i64`:
 /// `SerializeJSONProperty` — the JSON text of `value` (the property `key` of
-/// `holder`) as a string jsval, or `undefined` when it is not serializable.
+/// `holder`) as a string jsval, or `undefined` when it is not serializable
+/// (`undefined`, a function, a symbol).
 /// An object's callable `toJSON` maps `value` first, called with `this =
 /// value` and the key; then the replacer function (when not `undefined`),
 /// called with `this = holder`. `key` is a string jsval, or an array index
@@ -367,10 +357,7 @@ pub(super) fn emit_parse(
 /// arrays and objects being serialized: meeting one again throws a
 /// `TypeError`. A throw returns with it pending.
 #[allow(clippy::too_many_lines)]
-pub(in crate::emit) fn emit_json_rep(
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) -> Function {
+pub(in crate::emit) fn emit_json_rep(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (holder, key, value, rep, list, stack) = (0, 1, 2, 3, 4, 5);
     let (ptr, n, i, first, acc, keys, j, m) = (6, 7, 8, 9, 10, 11, 12, 13);
     let (elem, s, k, to_json) = (14, 15, 16, 17);
@@ -422,6 +409,8 @@ pub(in crate::emit) fn emit_json_rep(
     unwrap_primitive(&mut f, value);
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
     emit_is_function(&mut f, value);
+    wasm!(f; I32Or);
+    emit_is_symbol(&mut f, value);
     wasm!(f; I32Or, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
     emit_is_object(&mut f, value);
     wasm!(f;
@@ -524,21 +513,25 @@ pub(in crate::emit) fn emit_json_rep(
 /// newline plus one gap per nesting level after each `[`/`{` of a non-empty
 /// container, each `,` and before each closing bracket, and `": "` for `":"`;
 /// string contents are copied unchanged. Two passes: the length, then the
-/// bytes.
+/// code units. Each input is read at its width; the result is two-byte when
+/// either is, then narrowed when its units fit a byte.
 pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
     let (s, gap) = (0, 1);
     let (len, glen, i, o, depth, b, quoted, dst, g) = (2, 3, 4, 5, 6, 7, 8, 9, 10);
-    let mut f = Function::new(vec![(9, ValType::I32)]);
+    let (ws, wg, w, k) = (11, 12, 13, 14);
+    let mut f = Function::new(vec![(13, ValType::I32)]);
     wasm!(f;
         LocalGet(s), I32Load(STR_LEN), LocalSet(len),
         LocalGet(gap), I32Load(STR_LEN), LocalSet(glen),
     );
+    emit_str_two_byte(&mut f, s);
+    wasm!(f; LocalTee(ws));
+    emit_str_two_byte(&mut f, gap);
+    wasm!(f; LocalTee(wg), I32Or, LocalSet(w));
     for write in [false, true] {
-        let put = |f: &mut Function, byte: &dyn Fn(&mut Function)| {
+        let put = |f: &mut Function, unit: &dyn Fn(&mut Function)| {
             if write {
-                wasm!(f; LocalGet(dst), LocalGet(o), I32Add);
-                byte(f);
-                wasm!(f; I32Store8(BYTE));
+                emit_store_unit(f, dst, o, w, unit);
             }
             wasm!(f; LocalGet(o), I32Const(1), I32Add, LocalSet(o));
         };
@@ -551,16 +544,15 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
                 LocalGet(depth), LocalSet(g),
                 Block(BlockType::Empty), Loop(BlockType::Empty),
                 LocalGet(g), I32Eqz, BrIf(1),
+                I32Const(0), LocalSet(k),
+                Block(BlockType::Empty), Loop(BlockType::Empty),
+                LocalGet(k), LocalGet(glen), I32GeU, BrIf(1),
             );
-            if write {
-                wasm!(f;
-                    LocalGet(dst), I32Const(PAYLOAD), I32Add, LocalGet(o), I32Add,
-                    LocalGet(gap), I32Const(PAYLOAD), I32Add, LocalGet(glen),
-                    MemoryCopy { src_mem: 0, dst_mem: 0 },
-                );
-            }
+            put(f, &|f| emit_str_unit(f, gap, k, wg));
             wasm!(f;
-                LocalGet(o), LocalGet(glen), I32Add, LocalSet(o),
+                LocalGet(k), I32Const(1), I32Add, LocalSet(k),
+                Br(0),
+                End, End,
                 LocalGet(g), I32Const(1), I32Sub, LocalSet(g),
                 Br(0),
                 End, End,
@@ -568,10 +560,8 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
         };
         // b = s[i]; i += 1.
         let next = |f: &mut Function| {
-            wasm!(f;
-                LocalGet(s), LocalGet(i), I32Add, I32Load8U(BYTE), LocalSet(b),
-                LocalGet(i), I32Const(1), I32Add, LocalSet(i),
-            );
+            emit_str_unit(f, s, i, ws);
+            wasm!(f; LocalSet(b), LocalGet(i), I32Const(1), I32Add, LocalSet(i));
         };
         let is = |f: &mut Function, c: u8| wasm!(f; LocalGet(b), I32Const(i32::from(c)), I32Eq);
         wasm!(f;
@@ -603,8 +593,9 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
         is(&mut f, b'[');
         wasm!(f; I32Or, If(BlockType::Empty));
         // An empty container stays `{}` / `[]`.
+        emit_str_unit(&mut f, s, i, ws);
         wasm!(f;
-            LocalGet(s), LocalGet(i), I32Add, I32Load8U(BYTE), LocalTee(g),
+            LocalTee(g),
             I32Const(i32::from(b'}')), I32Eq, LocalGet(g), I32Const(i32::from(b']')), I32Eq, I32Or,
             If(BlockType::Empty),
         );
@@ -622,9 +613,10 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
         put_const(&mut f, b' ');
         wasm!(f; End, End, End, Br(0), End, End);
         if !write {
-            wasm!(f; LocalGet(o), Call(helpers.new_string), LocalSet(dst));
+            wasm!(f; LocalGet(o), LocalGet(w), Call(helpers.new_string), LocalSet(dst));
         }
     }
+    emit_str_canonical(&mut f, w, dst, i, g);
     wasm!(f; LocalGet(dst), End);
     f
 }

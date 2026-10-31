@@ -205,9 +205,12 @@ pub enum ArrayHofOp {
 /// [`IrNode::ConvertCall`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertOp {
-    /// `String(x)` — `ToString` in the guest (`__to_string`), so an object's
-    /// user `toString`/`valueOf` runs and may throw.
+    /// `ToString(x)` in the guest (`__to_string`), so an object's user
+    /// `toString`/`valueOf` runs and may throw; a symbol throws.
     ToString,
+    /// `String(x)` called (not constructed): [`ConvertOp::ToString`], except
+    /// a symbol yields its `SymbolDescriptiveString` (`"Symbol(desc)"`).
+    String,
     /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
     /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
     ToNumber,
@@ -258,46 +261,148 @@ pub enum ObjectBuiltinOp {
     ForInKeys,
 }
 
+/// A compile-time JS string as UTF-16 code units: the text of a string literal
+/// ([`IrNode::Str`]) or a static property key ([`PropKey`]). Unlike a Rust
+/// `String` it holds a lone surrogate (`"\uD800"`) as its own unit, so a
+/// literal reaches the data section losslessly. Compiler-built text converts
+/// with `From<&str>`.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JsStr(Box<[u16]>);
+
+impl JsStr {
+    /// The UTF-16 code units.
+    pub fn as_units(&self) -> &[u16] {
+        &self.0
+    }
+
+    /// The length in code units (the JS `.length`).
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the string is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether every code unit is ASCII.
+    pub fn is_ascii(&self) -> bool {
+        self.0.iter().all(|&unit| unit < 0x80)
+    }
+
+    /// The text as a Rust string, or `None` when it holds a lone surrogate.
+    pub fn to_rust_string(&self) -> Option<String> {
+        String::from_utf16(&self.0).ok()
+    }
+}
+
+impl From<&str> for JsStr {
+    fn from(text: &str) -> Self {
+        Self(text.encode_utf16().collect())
+    }
+}
+
+impl From<String> for JsStr {
+    fn from(text: String) -> Self {
+        Self::from(text.as_str())
+    }
+}
+
+impl FromIterator<u16> for JsStr {
+    fn from_iter<I: IntoIterator<Item = u16>>(units: I) -> Self {
+        Self(units.into_iter().collect())
+    }
+}
+
+impl std::borrow::Borrow<[u16]> for JsStr {
+    fn borrow(&self) -> &[u16] {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for JsStr {
+    fn eq(&self, other: &str) -> bool {
+        self.0.iter().copied().eq(other.encode_utf16())
+    }
+}
+
+impl PartialEq<&str> for JsStr {
+    fn eq(&self, other: &&str) -> bool {
+        *self == **other
+    }
+}
+
+/// Diagnostics only: a lone surrogate renders as U+FFFD.
+impl std::fmt::Display for JsStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        char::decode_utf16(self.0.iter().copied())
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .try_for_each(|c| std::fmt::Write::write_char(f, c))
+    }
+}
+
+/// A quoted string literal; a lone surrogate renders as `\u{d800}`.
+impl std::fmt::Debug for JsStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"")?;
+        for c in char::decode_utf16(self.0.iter().copied()) {
+            match c {
+                Ok(c) => write!(f, "{}", c.escape_debug())?,
+                Err(lone) => write!(f, "\\u{{{:x}}}", lone.unpaired_surrogate())?,
+            }
+        }
+        f.write_str("\"")
+    }
+}
+
 /// The key of one [`IrNode::Object`] entry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropKey {
     /// A compile-time string key of an enumerable data property.
-    Static(String),
+    Static(JsStr),
     /// A compile-time string key of a NON-enumerable (writable, configurable)
     /// property: class prototype methods/accessors, `constructor`, static
     /// methods, and an error's own `message` / `stack`.
-    Hidden(String),
+    Hidden(JsStr),
     /// A compile-time string key of a non-writable, non-enumerable,
     /// non-configurable data property: a class's `prototype`.
-    Fixed(String),
+    Fixed(JsStr),
     /// A computed key (`{[k]: v}`, or a numeric literal key `{1: v}`), converted
     /// with `ToPropertyKey` and interned at run time.
     Computed(IrNode),
+    /// A computed key of a NON-enumerable (writable, configurable) property:
+    /// a class method or accessor under a computed name (`[k]() {}`).
+    HiddenComputed(IrNode),
 }
 
 /// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
 /// is accepted: the general case is [`InstanceOfKind::Ctor`]
-/// (`OrdinaryHasInstance`). The builtin names that are not yet runtime values
-/// are recognized syntactically at codegen when no binding shadows them: the
-/// three builtin error constructors walk the receiver's `proto` chain for their
-/// static prototype ([`InstanceOfKind::Proto`]).
+/// (`InstanceofOperator`). An unshadowed, sealed builtin constructor name is
+/// recognized syntactically at codegen and gets a fast arm, which the emitter
+/// takes only behind a run-time intact test: every object on the
+/// constructor's static chain up to `%Function.prototype%` still has its
+/// realm `proto` and no own `@@hasInstance`, so `Get(C, @@hasInstance)` is
+/// the immutable `%Function.prototype%[@@hasInstance]`. A failing test runs
+/// `InstanceofOperator` on the constructor's realm value instead.
 ///
-/// The builtin constructors `Array`/`Object`/`Function`/`Date` match by the
-/// receiver's runtime TYPE BYTE rather than a prototype hop: `Array` /
-/// `Function` / `Date` match their own type byte, and `Object` matches ANY heap
-/// pointer that is not a primitive string (so arrays, plain objects, functions,
-/// maps, sets, promises, generators, errors, and dates are all `instanceof
-/// Object`, while a string/number/boolean/null/undefined is not).
+/// The fast arms search the receiver's `proto` chain for the constructor's
+/// (non-writable, non-configurable) static prototype, so
+/// `Object.create(null) instanceof Object` and
+/// `Object.setPrototypeOf([], null) instanceof Array` are `false` while
+/// `Object.create(Array.prototype) instanceof Array` is `true`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceOfKind {
-    /// `instanceof Array` — the receiver is a heap `TYPE_ARRAY` block.
+    /// `instanceof Array` — `%Array.prototype%` is on the receiver's `proto`
+    /// chain.
     Array,
-    /// `instanceof Function` — the receiver is a heap `TYPE_FUNCTION` value.
+    /// `instanceof Function` — `%Function.prototype%` is on the receiver's
+    /// `proto` chain.
     Function,
-    /// `instanceof Date` — the receiver is a heap `TYPE_DATE` block.
+    /// `instanceof Date` — `%Date.prototype%` is on the receiver's `proto`
+    /// chain.
     Date,
-    /// `instanceof Object` — the receiver is any heap pointer that is not a
-    /// primitive string.
+    /// `instanceof Object` — `%Object.prototype%` is on the receiver's `proto`
+    /// chain.
     Object,
     /// `instanceof E` for an unshadowed builtin error constructor: some object
     /// on the receiver's `proto` chain must be the SAME object as the static
@@ -306,10 +411,12 @@ pub enum InstanceOfKind {
     /// until a match or `null`.
     Proto(Box<IrNode>),
     /// `instanceof C` for any other right-hand side expression:
-    /// `OrdinaryHasInstance(C, x)`. A non-callable `C` throws a `TypeError`; a
-    /// non-object receiver is `false`; otherwise `Get(C, "prototype")` (a
-    /// non-object one throws a `TypeError`) is searched for on the receiver's
-    /// `proto` chain like [`InstanceOfKind::Proto`].
+    /// `InstanceofOperator(x, C)`. A non-object `C` throws a `TypeError`; a
+    /// user `C[@@hasInstance]` is called; otherwise `OrdinaryHasInstance`: a
+    /// non-callable `C` throws a `TypeError`, a non-object receiver is
+    /// `false`, and `Get(C, "prototype")` (a non-object one throws a
+    /// `TypeError`) is searched for on the receiver's `proto` chain like
+    /// [`InstanceOfKind::Proto`].
     Ctor(Box<IrNode>),
 }
 
@@ -431,11 +538,15 @@ pub enum BuiltinCtor {
     Promise,
     /// `Date`.
     Date,
+    /// `Symbol`.
+    Symbol,
+    /// `Iterator` (abstract: only a subclass constructs).
+    Iterator,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 18] = [
+    pub(crate) const ALL: [BuiltinCtor; 20] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -454,6 +565,8 @@ impl BuiltinCtor {
         Self::Set,
         Self::Promise,
         Self::Date,
+        Self::Symbol,
+        Self::Iterator,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -470,6 +583,8 @@ impl BuiltinCtor {
             Self::Set => "Set",
             Self::Promise => "Promise",
             Self::Date => "Date",
+            Self::Symbol => "Symbol",
+            Self::Iterator => "Iterator",
         }
     }
 
@@ -678,9 +793,46 @@ pub enum ProtoKind {
 pub enum SpreadElem {
     /// A plain element/argument `e`, appended as a single value.
     Item(IrNode),
-    /// A spread source `...e`: every element of the (array) value is appended in
-    /// order.
+    /// A spread source `...e`: every value its iterator yields is appended in
+    /// order (`IterableToList`, DESIGN.md §7.8).
     Spread(IrNode),
+    /// An internal argument-list array (a bound function's or a builtin
+    /// constructor's arguments): its elements are appended as they are,
+    /// without the iteration protocol.
+    List(IrNode),
+}
+
+/// The iterator record of DESIGN.md §7.8, held in four places
+/// (each a [`IrNode::Local`], or the frame-cell read a generator promotes it
+/// to) that the record nodes read and write: it never escapes, so it is not
+/// a heap block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IterRecord {
+    /// The iterator object, or the iterated source on a fast path.
+    pub iter: IrNode,
+    /// The cached `next` method, or the fast-path cursor (a number).
+    pub next: IrNode,
+    /// The record state (a number: done, a fast-path kind, or the protocol).
+    pub state: IrNode,
+    /// The last step's result object, or its value on a fast path.
+    pub result: IrNode,
+}
+
+impl IterRecord {
+    /// The four places, in evaluation order.
+    pub fn places(&self) -> [&IrNode; 4] {
+        [&self.iter, &self.next, &self.state, &self.result]
+    }
+
+    /// The four places, mutably.
+    pub fn places_mut(&mut self) -> [&mut IrNode; 4] {
+        [
+            &mut self.iter,
+            &mut self.next,
+            &mut self.state,
+            &mut self.result,
+        ]
+    }
 }
 
 /// How a spread call reaches its callee, mirroring the direct/indirect
@@ -723,9 +875,10 @@ pub enum IrNode {
     /// A string literal. It lowers to a heap-pointer jsval (single heap tag
     /// `0b101`) whose payload is the compile-time byte offset of the literal's
     /// block base in the emitted linear memory's static data. The block is
-    /// `[type=0][pad×3][len:u32][utf8]` — a `HEADER_SIZE`-byte type header
-    /// in front of the `[len][utf8]` payload.
-    Str(String),
+    /// `[type=0][gc][flags][class][len:u32][data]` — a `HEADER_SIZE`-byte
+    /// header, the length in UTF-16 code units, then Latin-1 bytes or (with
+    /// `STR_FLAG_TWO_BYTE`) UTF-16LE units.
+    Str(JsStr),
     /// A boolean literal (`true`/`false`).
     Bool(bool),
     /// The `null` literal.
@@ -793,6 +946,11 @@ pub enum IrNode {
     ErrorProto(ErrorKind),
     /// The static object of a global intrinsic (a compile-time constant).
     Intrinsic(GlobalIntrinsic),
+    /// The well-known symbol `@@iterator` (a compile-time constant).
+    IteratorSymbol,
+    /// `%Array.prototype.values%` (a compile-time constant): the own
+    /// `@@iterator` of an `arguments` object.
+    ArrayValues,
     /// Read the global-object property of an unresolved identifier: `HasProperty`
     /// then `Get`, throwing the reference's `ReferenceError` on a miss; as a
     /// `typeof` operand (`typeof_operand`) a miss reads `undefined` instead.
@@ -870,9 +1028,32 @@ pub enum IrNode {
     /// Whether the value is an object (a heap value other than a string), as a
     /// boolean jsval.
     IsObject(Box<IrNode>),
+    /// `IsArray` of the value (`Array.isArray`), as a boolean jsval: whether it
+    /// is an Array exotic object (a `TYPE_ARRAY` handle), whatever its `proto`.
+    IsArray(Box<IrNode>),
     /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
     /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
     ToObject(Box<IrNode>),
+    /// `ToPropertyKey` of the value, as a key jsval: an interned string or a
+    /// symbol. An object's user `toString` / `valueOf` throw propagates.
+    ToPropertyKey(Box<IrNode>),
+    /// `SetFunctionName(func, key, prefix)` at run time for a function value
+    /// defined under a computed key (an object literal or class method,
+    /// accessor, or anonymous function / arrow / class value, a class field
+    /// initializer included): `func` is evaluated into `local`,
+    /// its own `name` is redefined (configurable only) as `prefix` followed by
+    /// the key — a string key itself, a symbol `"[desc]"` (`""` when the
+    /// description is `undefined`) — and `func` is the result.
+    SetFunctionName {
+        /// The function value.
+        func: Box<IrNode>,
+        /// The local holding the [`IrNode::ToPropertyKey`] key jsval.
+        key: u32,
+        /// `""`, `"get "` or `"set "`.
+        prefix: &'static str,
+        /// Fresh temp local holding the evaluated `func`.
+        local: u32,
+    },
     /// A class heritage `extends value` (DESIGN.md §7.6): evaluate `value` into
     /// `parent`; unless it is `null` it must be a constructor, and `proto` gets
     /// `Get(parent, "prototype")`, which must be an object or `null` (`proto` is
@@ -925,39 +1106,125 @@ pub enum IrNode {
         slots: Vec<IrNode>,
         /// The total number of frame cells (parameters plus every body local).
         total: u32,
-        /// The resume `limits` bits of the handle ([`crate::abi::GEN_LIMIT_RETURN`],
-        /// [`crate::abi::GEN_LIMIT_THROW`]).
+        /// The initial `limits` bits of the handle ([`crate::abi::GEN_ASYNC`]
+        /// for an async generator, [`crate::abi::GEN_DELEGATES`] for a body
+        /// with a `yield*`).
         limits: u32,
     },
-    /// Whether the sub-expression is a generator handle: yields a
-    /// boolean jsval. Used by `for-of`/spread to branch between driving a
-    /// generator via `.next()` and the ordinary array/string index walk.
-    IsGenerator(Box<IrNode>),
-    /// `GetIterator` of a non-generator iteration source (for-of, `yield*`,
-    /// spread, array destructuring), as a value [`IrNode::IterLen`] /
-    /// [`IrNode::IterItem`] walk by index: an array or string is itself, a
-    /// `String` wrapper its string, an `arguments` object and (when not `live`)
-    /// a generator a fresh array of its values, a `Map` / `Set` itself when
-    /// `live` and otherwise a fresh array of its `[key, value]` entries /
-    /// values. Anything else throws `<x> is not iterable`.
-    IterSource {
+    /// `GetIterator(value, sync)` (DESIGN.md §7.8): evaluate
+    /// `value` and open its iterator into the record `rec`. A source passing
+    /// its guarded fast path (DESIGN.md §6.4: a clean array or `arguments`, string,
+    /// `Map`, `Set` or generator) is walked directly (`rec.iter` is the source,
+    /// `rec.next` its cursor); any other value runs the protocol:
+    /// `GetMethod(value, @@iterator)` (`<x> is not iterable` when absent),
+    /// the call, the object check, and `rec.next = Get(iterator, "next")`
+    /// read once. Yields `undefined`.
+    GetIterator {
         /// The iterated value.
         value: Box<IrNode>,
-        /// Whether a `Map` / `Set` is walked live (for-of, `yield*`).
-        live: bool,
+        /// The record the iterator is opened into.
+        rec: Box<IterRecord>,
+        /// Whether the program is intrinsics-sealed (no dirty-bit test).
+        sealed: bool,
     },
-    /// The current length of an [`IrNode::IterSource`] value: its `length`,
-    /// or the entry count of a `Map` / `Set` (re-read per step, so entries
-    /// added during the walk are visited).
-    IterLen(Box<IrNode>),
-    /// Element `index` of an [`IrNode::IterSource`] value: `iterable[index]`,
-    /// or the `index`-th entry of a `Map` (a fresh `[key, value]` array) /
-    /// `Set` (the value).
-    IterItem {
-        /// The iteration source.
+    /// `GetIterator(value, sync)` without the fast paths: always open the
+    /// protocol iterator (`GetMethod(value, @@iterator)`, the call, the object
+    /// check, `rec.next` read once), leaving `rec.iter` the iterator object
+    /// and `rec.next` its `next`, for a consumer that calls them itself
+    /// (`yield*`). Yields `undefined`.
+    ///
+    /// With `is_async`, `GetIterator(value, async)` (DESIGN.md
+    /// §7.8): `GetMethod(value, @@asyncIterator)`, else
+    /// `CreateAsyncFromSyncIterator` over `GetIterator(value, sync)` (a
+    /// `%AsyncFromSyncIteratorPrototype%` object), else `<x> is not async
+    /// iterable`; then the call, the object check and `rec.next` read once.
+    /// An async record has no fast path and is driven only by
+    /// [`IrNode::AsyncIteratorNext`] / [`IrNode::AsyncIteratorComplete`] /
+    /// [`IrNode::IteratorValue`] and closed by [`IrNode::AsyncIteratorReturn`]
+    /// (never by [`IrNode::IteratorStep`] / [`IrNode::IteratorClose`]).
+    OpenIterator {
+        /// The iterated value.
+        value: Box<IrNode>,
+        /// The record the iterator is opened into.
+        rec: Box<IterRecord>,
+        /// `GetIterator(value, async)` rather than `sync`.
+        is_async: bool,
+    },
+    /// The call half of an async `IteratorStep` (DESIGN.md
+    /// §7.8): `Call(rec.next, rec.iter)`, yielding its result for the caller
+    /// to `Await` (every step is a microtask turn). The record is marked
+    /// stepping until [`IrNode::AsyncIteratorComplete`], so a throw from the
+    /// call or the await leaves it unclosed.
+    ///
+    /// A `for await` step lowers to
+    /// `AsyncIteratorComplete { rec, result: Await(AsyncIteratorNext(rec)) }`
+    /// (`false` ends the loop), then `IteratorValue(rec)`.
+    AsyncIteratorNext(Box<IterRecord>),
+    /// The check half of an async `IteratorStep`: evaluate `result` (the
+    /// awaited [`IrNode::AsyncIteratorNext`] value); a non-object throws
+    /// `Iterator result <x> is not an object` (the record stays unclosed);
+    /// yields `false` (the record done) when `ToBoolean(result.done)`, else
+    /// `true` with `result` left in `rec.result` for [`IrNode::IteratorValue`]
+    /// and the record open again (closed on an abrupt exit).
+    AsyncIteratorComplete {
+        /// The record being stepped.
+        rec: Box<IterRecord>,
+        /// The awaited step result.
+        result: Box<IrNode>,
+    },
+    /// The call half of `AsyncIteratorClose(rec, completion)`
+    /// (DESIGN.md §7.8) of a record not yet done (a done or
+    /// stepping record yields the hole): `GetMethod(iterator, "return")`
+    /// (the hole when `undefined` / `null`) and its call, yielding the call's
+    /// result for the caller to `Await`. The record is done afterwards. With
+    /// `throwing` (a throw completion, run from a `catch` that rethrows) a
+    /// throw of the `GetMethod` or the call is discarded (the hole).
+    ///
+    /// A close lowers to `r = AsyncIteratorReturn { rec, throwing }`, then
+    /// unless `IsHole(r)`: for a non-throw completion
+    /// `IteratorResultCheck(Await(r))`; for a throw completion `Await(r)`
+    /// inside a `try` whose `catch` discards (the original throw is
+    /// rethrown afterwards either way).
+    AsyncIteratorReturn {
+        /// The record to close.
+        rec: Box<IterRecord>,
+        /// Whether the completion being propagated is a throw.
+        throwing: bool,
+    },
+    /// The result check of a non-throw `AsyncIteratorClose`: evaluate the
+    /// operand (the awaited `return()` result) and throw `Iterator result
+    /// <x> is not an object` unless it is an object; yields `undefined`.
+    IteratorResultCheck(Box<IrNode>),
+    /// `yield* iterable` in a generator body (DESIGN.md §7.8):
+    /// the CFG builder expands it into the delegation loop, forwarding each
+    /// `next(v)` / `throw(e)` / `return(v)` to the delegate; its value is the
+    /// delegate's return value. Never reaches emit.
+    YieldDelegate {
+        /// The delegated iterable.
         iterable: Box<IrNode>,
-        /// The element index (a number jsval).
-        index: Box<IrNode>,
+        /// A raw local holding the delegate iterator as `this` of each
+        /// forwarded call (see [`IrNode::ThisCall`]).
+        this_local: u32,
+    },
+    /// `IteratorStep` of the record: advance it and yield `true` when it
+    /// produced a value (left in `rec.result` for [`IrNode::IteratorValue`]),
+    /// `false` once done. A `next` result that is not an object throws; any
+    /// throw leaves the record done (never closed afterwards).
+    IteratorStep(Box<IterRecord>),
+    /// `IteratorValue` of the last successful [`IrNode::IteratorStep`]:
+    /// `Get(result, "value")` of a protocol result (which re-arms the
+    /// record's close), the value itself on a fast path.
+    IteratorValue(Box<IterRecord>),
+    /// `IteratorClose(rec, completion)` of a record not yet done (a done
+    /// record is left alone): `GetMethod(iterator, "return")`, its call, and
+    /// for a non-throw completion the object check of its result. With
+    /// `throwing` (a throw completion, run from a `catch` that rethrows) any
+    /// throw of the close itself is discarded. The record is done afterwards.
+    IteratorClose {
+        /// The record to close.
+        rec: Box<IterRecord>,
+        /// Whether the completion being propagated is a throw.
+        throwing: bool,
     },
     /// Drive a generator one step — `gen.next(sent)`. Evaluate `gen` to
     /// a handle, `call_indirect` its state machine with `(sent, gen)`, then build
@@ -1890,6 +2157,18 @@ pub enum GenTerm {
         value: IrNode,
         /// The block index to resume at on the next `.next()`.
         resume: u32,
+        /// The block a `return(v)` resumption enters (the returned value
+        /// readable through [`IrNode::ExcValue`]); `None` for an `await`,
+        /// which is never resumed by `return()`.
+        on_return: Option<u32>,
+        /// The block a `throw(e)` resumption enters with the exception
+        /// cleared (a `yield*` forwarding it to its delegate); `None` throws
+        /// it at the suspend point instead.
+        on_throw: Option<u32>,
+        /// `value` is a `yield*` delegate's result object, which the resumer
+        /// returns as the outer result as-is (the state machine sets
+        /// [`crate::abi::GEN_DELEGATED_RESULT`]) instead of wrapping it.
+        raw: bool,
     },
     /// A `return value` (or falling off the body end): set `gen.done = 1` and
     /// return `value` (`undefined` when `None`).
@@ -1944,8 +2223,8 @@ impl IrNode {
     /// An Error instance like [`Self::error_object`] whose `proto` is the
     /// value of `proto` (a subclass prototype for `new.target`).
     fn error_with_proto(proto: IrNode, message: Option<IrNode>, stack: IrNode) -> Self {
-        let message = message.map(|message| (PropKey::Hidden("message".to_owned()), message));
-        let stack = (PropKey::Hidden("stack".to_owned()), stack);
+        let message = message.map(|message| (PropKey::Hidden("message".into()), message));
+        let stack = (PropKey::Hidden("stack".into()), stack);
         Self::Object {
             entries: message.into_iter().chain([stack]).collect(),
             proto: Some(Box::new(proto)),
@@ -1979,12 +2258,12 @@ impl IrNode {
             cond: Box::new(IrNode::Binary {
                 op: BinOp::Eq,
                 lhs: Box::new(IrNode::Local(msg)),
-                rhs: Box::new(IrNode::Str(String::new())),
+                rhs: Box::new(IrNode::Str("".into())),
             }),
-            then_branch: Box::new(IrNode::Str(name.to_owned())),
+            then_branch: Box::new(IrNode::Str(name.into())),
             else_branch: Box::new(IrNode::Binary {
                 op: BinOp::Add,
-                lhs: Box::new(IrNode::Str(format!("{name}: "))),
+                lhs: Box::new(IrNode::Str(format!("{name}: ").into())),
                 rhs: Box::new(IrNode::Local(msg)),
             }),
         };
@@ -2000,7 +2279,7 @@ impl IrNode {
             then_branch: Box::new(Self::error_with_proto(
                 proto.clone(),
                 None,
-                IrNode::Str(name.to_owned()),
+                IrNode::Str(name.into()),
             )),
             else_branch: Box::new(Self::error_with_proto(proto, Some(text), stack)),
         }
@@ -2017,7 +2296,7 @@ impl IrNode {
         obj: u32,
         scratch: u32,
     ) -> Self {
-        let cause = || IrNode::Str("cause".to_owned());
+        let cause = || IrNode::Str("cause".into());
         let has_cause = IrNode::Logical {
             op: LogicalOp::And,
             lhs: Box::new(IrNode::IsObject(Box::new(options.clone()))),
@@ -2030,7 +2309,7 @@ impl IrNode {
             obj: Box::new(IrNode::Local(obj)),
             local: scratch,
             entries: vec![(
-                PropKey::Hidden("cause".to_owned()),
+                PropKey::Hidden("cause".into()),
                 IrNode::Index {
                     obj: Box::new(options),
                     index: Box::new(cause()),
@@ -2079,6 +2358,8 @@ impl IrNode {
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
             | IrNode::Intrinsic(_)
+            | IrNode::IteratorSymbol
+            | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
             | IrNode::DateField { .. } => false,
@@ -2088,13 +2369,17 @@ impl IrNode {
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
+            | IrNode::IsArray(inner)
             | IrNode::ToObject(inner)
+            | IrNode::ToPropertyKey(inner)
+            | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::YieldDelegate {
+                iterable: inner, ..
+            }
+            | IrNode::IteratorResultCheck(inner)
             | IrNode::AwaitMark(inner)
-            | IrNode::IsGenerator(inner)
-            | IrNode::IterSource { value: inner, .. }
-            | IrNode::IterLen(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
             | IrNode::NullishCheck { value: inner, .. }
@@ -2134,10 +2419,6 @@ impl IrNode {
                 exclude: b,
             }
             | IrNode::Index { obj: a, index: b }
-            | IrNode::IterItem {
-                iterable: a,
-                index: b,
-            }
             | IrNode::MakeAccessor {
                 getter: a,
                 setter: b,
@@ -2227,19 +2508,31 @@ impl IrNode {
             }
             IrNode::SetProto { obj, proto } => f(obj) || f(proto),
             IrNode::Object { entries, proto, .. } => {
-                proto.as_deref().is_some_and(&mut f)
-                    || entries.iter().any(|(key, value)| {
-                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
-                    })
+                proto.as_deref().is_some_and(&mut f) || entries.iter().any(|(key, value)| {
+                    matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
+                        || f(value)
+                })
             }
             IrNode::DefineProps { obj, entries, .. } => {
-                f(obj)
-                    || entries.iter().any(|(key, value)| {
-                        matches!(key, PropKey::Computed(key) if f(key)) || f(value)
-                    })
+                f(obj) || entries.iter().any(|(key, value)| {
+                    matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
+                        || f(value)
+                })
             }
+            IrNode::GetIterator { value, rec, .. }
+            | IrNode::OpenIterator { value, rec, .. }
+            | IrNode::AsyncIteratorComplete { rec, result: value } => {
+                f(value) || rec.places().into_iter().any(&mut f)
+            }
+            IrNode::IteratorStep(rec)
+            | IrNode::IteratorValue(rec)
+            | IrNode::IteratorClose { rec, .. }
+            | IrNode::AsyncIteratorNext(rec)
+            | IrNode::AsyncIteratorReturn { rec, .. } => rec.places().into_iter().any(&mut f),
             IrNode::ArraySpread(elems) => elems.iter().any(|elem| match elem {
-                SpreadElem::Item(value) | SpreadElem::Spread(value) => f(value),
+                SpreadElem::Item(value) | SpreadElem::Spread(value) | SpreadElem::List(value) => {
+                    f(value)
+                }
             }),
             IrNode::CallSpread { target, args } => {
                 matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } | SpreadCallee::Method { callee, .. } if f(callee))
@@ -2277,6 +2570,8 @@ impl IrNode {
             | IrNode::DeclFunc(_)
             | IrNode::ErrorProto(_)
             | IrNode::Intrinsic(_)
+            | IrNode::IteratorSymbol
+            | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
             | IrNode::DateField { .. } => Vec::new(),
@@ -2286,13 +2581,17 @@ impl IrNode {
             | IrNode::CellGet(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
+            | IrNode::IsArray(inner)
             | IrNode::ToObject(inner)
+            | IrNode::ToPropertyKey(inner)
+            | IrNode::SetFunctionName { func: inner, .. }
             | IrNode::ClassHeritage { value: inner, .. }
             | IrNode::Yield(inner)
+            | IrNode::YieldDelegate {
+                iterable: inner, ..
+            }
+            | IrNode::IteratorResultCheck(inner)
             | IrNode::AwaitMark(inner)
-            | IrNode::IsGenerator(inner)
-            | IrNode::IterSource { value: inner, .. }
-            | IrNode::IterLen(inner)
             | IrNode::TypeOf(inner)
             | IrNode::StrLen(inner)
             | IrNode::NullishCheck { value: inner, .. }
@@ -2331,10 +2630,6 @@ impl IrNode {
                 exclude: b,
             }
             | IrNode::Index { obj: a, index: b }
-            | IrNode::IterItem {
-                iterable: a,
-                index: b,
-            }
             | IrNode::MakeAccessor {
                 getter: a,
                 setter: b,
@@ -2435,7 +2730,7 @@ impl IrNode {
             IrNode::Object { entries, proto, .. } => {
                 let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
                 for (key, value) in entries {
-                    if let PropKey::Computed(key) = key {
+                    if let PropKey::Computed(key) | PropKey::HiddenComputed(key) = key {
                         out.push(key);
                     }
                     out.push(value);
@@ -2445,17 +2740,31 @@ impl IrNode {
             IrNode::DefineProps { obj, entries, .. } => {
                 let mut out: Vec<&mut IrNode> = vec![&mut **obj];
                 for (key, value) in entries {
-                    if let PropKey::Computed(key) = key {
+                    if let PropKey::Computed(key) | PropKey::HiddenComputed(key) = key {
                         out.push(key);
                     }
                     out.push(value);
                 }
                 out
             }
+            IrNode::GetIterator { value, rec, .. }
+            | IrNode::OpenIterator { value, rec, .. }
+            | IrNode::AsyncIteratorComplete { rec, result: value } => {
+                let mut out: Vec<&mut IrNode> = vec![&mut **value];
+                out.extend(rec.places_mut());
+                out
+            }
+            IrNode::IteratorStep(rec)
+            | IrNode::IteratorValue(rec)
+            | IrNode::IteratorClose { rec, .. }
+            | IrNode::AsyncIteratorNext(rec)
+            | IrNode::AsyncIteratorReturn { rec, .. } => rec.places_mut().into_iter().collect(),
             IrNode::ArraySpread(elems) => elems
                 .iter_mut()
                 .map(|elem| match elem {
-                    SpreadElem::Item(value) | SpreadElem::Spread(value) => value,
+                    SpreadElem::Item(value)
+                    | SpreadElem::Spread(value)
+                    | SpreadElem::List(value) => value,
                 })
                 .collect(),
             IrNode::CallSpread { target, args } => {

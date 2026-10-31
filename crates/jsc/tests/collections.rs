@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 mod common;
-use common::jsc;
+use common::{jsc, jsc_raw_stdout};
 
 /// Map/Set basics run inline with `-p` through the built binary.
 ///
@@ -78,7 +78,7 @@ fn map_update_and_miss_via_eval() {
     );
 }
 
-/// `delete` returns a boolean and compacts the entry out so a later `get`/`has`
+/// `delete` returns a boolean and tombstones the entry so a later `get`/`has`
 /// misses and `size` shrinks; the surviving entries stay intact and a key can be
 /// re-inserted afterward.
 #[test]
@@ -177,4 +177,18 @@ fn method_name_fallback_to_user_method() {
 fn iterable_constructor_arguments() {
     assert_eq!(jsc(&["-p", "new Map([[1,2]]).get(1)"]), "2");
     assert_eq!(jsc(&["-p", "new Set([1,2,2]).size"]), "2");
+}
+
+/// `console.log` of a Map / Set after deletes and a `clear` renders the live
+/// entry count (deleted entries are tombstones the renderer never counts).
+#[test]
+fn console_log_after_deletes() {
+    assert_eq!(
+        jsc_raw_stdout(&[
+            "-e",
+            "const m = new Map([[1, 1], [2, 2], [3, 3]]); m.delete(1); m.delete(3); \
+             const s = new Set([1, 2]); s.clear(); s.add(5); s.delete(9); console.log(m, s, [m])"
+        ]),
+        "Map(1) Set(1) [ Map(1) ]\n"
+    );
 }

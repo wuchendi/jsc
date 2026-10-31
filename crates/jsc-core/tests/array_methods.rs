@@ -83,6 +83,36 @@ fn new_methods_have_name_and_length() {
 
 // --- Array.of / Array.from -----------------------------------------------------
 
+/// `Array.isArray` tests the Array exotic brand, not the `proto` chain that
+/// `instanceof Array` walks.
+#[test]
+fn is_array_tests_the_brand_not_the_prototype() {
+    both_bool(
+        "var C = function () {}; C.prototype = []; Array.isArray(new C())",
+        false,
+    );
+    both_bool(
+        "var C = function () {}; C.prototype = Array.prototype; Array.isArray(new C())",
+        false,
+    );
+    both_bool("Array.isArray(Object.create(Array.prototype))", false);
+    both_bool("Object.create(Array.prototype) instanceof Array", true);
+    both_bool("Array.isArray(Object.setPrototypeOf([], null))", true);
+    both_bool("[] instanceof Array", true);
+    both_bool("Array.isArray([])", true);
+    both_bool("Array.isArray(new Array(3))", true);
+    both_bool("Array.isArray({})", false);
+    both_bool(
+        "Array.isArray('abc') || Array.isArray(1) || Array.isArray()",
+        false,
+    );
+    both_bool("class B extends Array {} Array.isArray(new B())", true);
+    both_bool(
+        "const i = Array.isArray; var C = function () {}; C.prototype = []; i(new C())",
+        false,
+    );
+}
+
 #[test]
 fn array_of_builds_from_arguments() {
     both_string("JSON.stringify(Array.of(7, 'x', null))", "[7,\"x\",null]");

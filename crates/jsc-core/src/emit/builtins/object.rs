@@ -20,11 +20,10 @@ const TAG_FUNCTION: &str = "[object Function]";
 const TAG_DATE: &str = "[object Date]";
 const TAG_ERROR: &str = "[object Error]";
 const TAG_ARGUMENTS: &str = "[object Arguments]";
-const TAG_MAP: &str = "[object Map]";
-const TAG_SET: &str = "[object Set]";
-const TAG_PROMISE: &str = "[object Promise]";
-const TAG_GENERATOR: &str = "[object Generator]";
 const TAG_OBJECT: &str = "[object Object]";
+/// The fragments around a `@@toStringTag` string.
+const TAG_OPEN: &str = "[object ";
+const TAG_CLOSE: &str = "]";
 
 /// The `TypeError` of `toLocaleString` when `this.toString` is not callable.
 const TO_STRING_NOT_CALLABLE: CalleeErrorText<'static> = [
@@ -44,7 +43,7 @@ const SETTER_NOT_CALLABLE: CalleeErrorText<'static> = [
 ];
 
 /// The static strings of this family.
-pub(super) const STRINGS: [&str; 23] = [
+pub(super) const STRINGS: [&str; 21] = [
     NULLISH_TO_OBJECT[0],
     NULLISH_TO_OBJECT[1],
     TO_STRING_NOT_CALLABLE[0],
@@ -64,10 +63,8 @@ pub(super) const STRINGS: [&str; 23] = [
     TAG_ERROR,
     TAG_ARGUMENTS,
     TAG_OBJECT,
-    TAG_MAP,
-    TAG_SET,
-    TAG_PROMISE,
-    TAG_GENERATOR,
+    TAG_OPEN,
+    TAG_CLOSE,
 ];
 
 /// Throw the `ToObject` `TypeError` when the `this` value in `this` is
@@ -76,7 +73,7 @@ pub(super) fn require_object_coercible(
     function: &mut Function,
     frame: Frame,
     this: u32,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_nullish(function, this);
@@ -91,7 +88,7 @@ pub(super) fn require_object_coercible(
 pub(super) fn emit_has_own_property(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, key) = (frame.i64(0), frame.i32(0));
@@ -105,14 +102,18 @@ pub(super) fn emit_has_own_property(
     );
 }
 
-/// `Object.prototype.toString()`: `"[object <tag>]"` with the builtin tag of
-/// `this`, Map/Set/Promise/Generator by kind (`Symbol.toStringTag` is phase 3).
+/// `Object.prototype.toString()`: `"[object Undefined]"` /
+/// `"[object Null]"`; else `O = ToObject(this)` and `"[object <tag>]"` with
+/// `Get(O, @@toStringTag)` (`__symbol_get`) when it is a string, else the
+/// builtin tag of `O` (Array, Function, Date, Error, Arguments, Boolean,
+/// Number, String, else Object).
 pub(super) fn emit_to_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
 ) {
-    let (this, kind) = (frame.i64(0), frame.i32(0));
+    let (this, kind, tag) = (frame.i64(0), frame.i32(0), frame.i64(1));
     let tag_if = |function: &mut Function, tag: &str| {
         wasm!(function; If(BlockType::Empty));
         push_str(function, strings, tag);
@@ -123,25 +124,30 @@ pub(super) fn emit_to_string(
     wasm!(function; LocalGet(this), I64Const(NULL_BITS), I64Eq);
     tag_if(function, TAG_NULL);
     wasm!(function;
-        LocalGet(this), I64Const(TRUE_BITS), I64Eq,
-        LocalGet(this), I64Const(FALSE_BITS), I64Eq, I32Or,
+        LocalGet(this), Call(helpers.to_object()), LocalTee(this),
+        I32Const(realm::symbol_addr(WellKnown::ToStringTag, helpers)),
+        Call(helpers.symbol_get()), LocalSet(tag),
     );
-    tag_if(function, TAG_BOOLEAN);
-    emit_is_number(function, this);
-    tag_if(function, TAG_NUMBER);
+    return_if_pending(function);
+    emit_is_string(function, tag);
+    wasm!(function; If(BlockType::Empty));
+    let tagged = IrNode::Binary {
+        op: BinOp::Add,
+        lhs: Box::new(IrNode::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(IrNode::Str(TAG_OPEN.into())),
+            rhs: Box::new(IrNode::Local(tag)),
+        }),
+        rhs: Box::new(IrNode::Str(TAG_CLOSE.into())),
+    };
+    emit_node(&tagged, function, frame.scratch(), strings, helpers);
+    wasm!(function; Return, End);
     emit_load_type_byte(function, this);
-    wasm!(function; LocalTee(kind), I32Const(TYPE_STRING), I32Eq);
-    tag_if(function, TAG_STRING);
+    wasm!(function; LocalSet(kind));
     for (type_byte, tag) in [
         (TYPE_ARRAY, TAG_ARRAY),
         (TYPE_FUNCTION, TAG_FUNCTION),
         (TYPE_DATE, TAG_DATE),
-        // The builtin `@@toStringTag`s of these kinds' prototypes (phase 3
-        // makes them real properties).
-        (TYPE_MAP, TAG_MAP),
-        (TYPE_SET, TAG_SET),
-        (i32::from(abi::TYPE_PROMISE), TAG_PROMISE),
-        (TYPE_GENERATOR, TAG_GENERATOR),
     ] {
         wasm!(function; LocalGet(kind), I32Const(type_byte), I32Eq);
         tag_if(function, tag);
@@ -172,7 +178,7 @@ pub(super) fn emit_to_string(
 pub(super) fn emit_value_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let this = frame.i64(0);
@@ -186,7 +192,7 @@ pub(super) fn emit_value_of(
 pub(super) fn emit_is_prototype_of(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, this) = (frame.i64(0), frame.i64(1));
@@ -221,7 +227,7 @@ pub(super) fn emit_is_prototype_of(
 pub(super) fn emit_property_is_enumerable(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, key) = (frame.i64(0), frame.i32(0));
@@ -242,7 +248,7 @@ pub(super) fn emit_property_is_enumerable(
 pub(super) fn emit_to_locale_string(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, method) = (frame.i64(0), frame.i64(1));
@@ -271,7 +277,7 @@ pub(super) fn emit_define_accessor(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, accessor) = (frame.i64(0), frame.i64(1));
@@ -327,7 +333,7 @@ pub(super) fn emit_lookup_accessor(
     set: bool,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, desc) = (frame.i64(0), frame.i64(1));
@@ -365,7 +371,7 @@ pub(super) fn emit_lookup_accessor(
 pub(super) fn emit_proto_get(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let this = frame.i64(0);
@@ -384,7 +390,7 @@ pub(super) fn emit_proto_get(
 pub(super) fn emit_proto_set(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, proto, r) = (frame.i64(0), frame.i64(1), frame.i32(0));

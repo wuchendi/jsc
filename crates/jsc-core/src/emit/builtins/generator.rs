@@ -19,31 +19,13 @@ const NOT_GENERATOR: [CalleeErrorText<'static>; 3] = [
     ],
 ];
 
-/// The `TypeError` of `return()` at a suspended `yield` that must run a
-/// `finally` or forward to a `yield*` delegate.
-const RETURN_UNSUPPORTED: CalleeErrorText<'static> = [
-    "generator return() at a yield inside try/finally or yield* is not supported",
-    "TypeError: generator return() at a yield inside try/finally or yield* is not supported",
-];
-
-/// The `TypeError` of `throw()` at a suspended `yield` that must forward to
-/// a `yield*` delegate.
-const THROW_UNSUPPORTED: CalleeErrorText<'static> = [
-    "generator throw() at a yield* is not supported",
-    "TypeError: generator throw() at a yield* is not supported",
-];
-
 /// A `state` past every state-machine block: resuming it returns
 /// `undefined`, like a generator the machine itself completed.
 const COMPLETED_STATE: i32 = i32::MAX;
 
 /// The static strings of this family.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
-    NOT_GENERATOR
-        .into_iter()
-        .flatten()
-        .chain(RETURN_UNSUPPORTED)
-        .chain(THROW_UNSUPPORTED)
+    NOT_GENERATOR.into_iter().flatten()
 }
 
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
@@ -69,8 +51,8 @@ fn resume(generator: u32, sent: u32) -> IrNode {
 fn done_result(value: u32) -> IrNode {
     IrNode::Object {
         entries: vec![
-            (PropKey::Static("value".to_owned()), IrNode::Local(value)),
-            (PropKey::Static("done".to_owned()), IrNode::Bool(true)),
+            (PropKey::Static("value".into()), IrNode::Local(value)),
+            (PropKey::Static("done".into()), IrNode::Bool(true)),
         ],
         proto: None,
         class: abi::CLASS_ORDINARY,
@@ -86,7 +68,7 @@ fn this_generator(
     this: u32,
     arg: u32,
     text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
@@ -131,28 +113,37 @@ fn complete(function: &mut Function, generator: u32) {
     }
 }
 
-/// Throw `text` when the generator's `limits` has `bit`.
-#[allow(clippy::too_many_arguments)]
-fn check_limit(
-    function: &mut Function,
-    frame: Frame,
-    generator: u32,
-    bit: u32,
-    text: CalleeErrorText<'static>,
-    strings: &HashMap<String, i32>,
-    helpers: Helpers<'_>,
-) {
-    field(function, generator, abi::GEN_LIMITS_OFFSET);
-    wasm!(function; I32Const(bit.cast_signed()), I32And, If(BlockType::Empty));
-    throw_type_error(function, frame, text, strings, helpers);
-    wasm!(function; End);
+/// Store `mode` into the generator's [`abi::GEN_RESUME_MODE_MASK`] field.
+fn set_resume_mode(function: &mut Function, generator: u32, mode: u32) {
+    let limits = MemArg {
+        offset: u64::from(abi::GEN_LIMITS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    };
+    wasm!(function;
+        LocalGet(generator), I32WrapI64,
+        LocalGet(generator), I32WrapI64, I32Load(limits),
+        I32Const((!abi::GEN_RESUME_MODE_MASK).cast_signed()), I32And,
+        I32Const((mode << abi::GEN_RESUME_MODE_SHIFT).cast_signed()), I32Or,
+        I32Store(limits),
+    );
+}
+
+/// Make the value in `value` pending as a `mode` resumption's value (see
+/// [`abi::GEN_RESUME_MODE_MASK`]) of the generator in `generator`.
+fn pend_resumption(function: &mut Function, generator: u32, value: u32, mode: u32) {
+    set_resume_mode(function, generator, mode);
+    wasm!(function;
+        LocalGet(value), GlobalSet(EXC_VALUE_GLOBAL),
+        I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
+    );
 }
 
 /// `next(value)`: resume at the suspended `yield` with `value`.
 pub(super) fn emit_next(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, arg) = (frame.i64(0), frame.i64(1));
@@ -174,13 +165,14 @@ pub(super) fn emit_next(
     );
 }
 
-/// `return(value)`: complete the generator and yield `{ value, done: true }`.
-/// At a suspended `yield` this is only supported when no `finally` or
-/// `yield*` must run (the generator's `limits`).
+/// `return(value)`: at a suspended `yield`, resume the state machine with a
+/// return completion injected there (it runs the enclosing `finally` blocks
+/// and forwards to a `yield*` delegate, and may suspend again); otherwise
+/// complete the generator and yield `{ value, done: true }`.
 pub(super) fn emit_return(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, arg) = (frame.i64(0), frame.i64(1));
@@ -194,20 +186,21 @@ pub(super) fn emit_return(
         helpers,
     );
     not_suspended(function, this);
-    wasm!(function; I32Eqz, If(BlockType::Empty));
-    check_limit(
-        function,
-        frame,
-        this,
-        abi::GEN_LIMIT_RETURN,
-        RETURN_UNSUPPORTED,
-        strings,
-        helpers,
-    );
-    wasm!(function; End);
+    wasm!(function; If(BlockType::Empty));
     complete(function, this);
     emit_node(
         &done_result(arg),
+        function,
+        frame.scratch(),
+        strings,
+        helpers,
+    );
+    wasm!(function; Return, End);
+    pend_resumption(function, this, arg, abi::GEN_RESUME_MODE_RETURN);
+    let undefined = frame.i64(2);
+    wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(undefined));
+    emit_node(
+        &resume(this, undefined),
         function,
         frame.scratch(),
         strings,
@@ -221,7 +214,7 @@ pub(super) fn emit_return(
 pub(super) fn emit_throw(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, arg) = (frame.i64(0), frame.i64(1));
@@ -240,19 +233,7 @@ pub(super) fn emit_throw(
     complete(function, this);
     emit_drop(function, frame, &throw, strings, helpers);
     wasm!(function; End);
-    check_limit(
-        function,
-        frame,
-        this,
-        abi::GEN_LIMIT_THROW,
-        THROW_UNSUPPORTED,
-        strings,
-        helpers,
-    );
-    wasm!(function;
-        LocalGet(arg), GlobalSet(EXC_VALUE_GLOBAL),
-        I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
-    );
+    pend_resumption(function, this, arg, abi::GEN_RESUME_MODE_THROW);
     let undefined = frame.i64(2);
     wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(undefined));
     emit_node(
@@ -290,29 +271,16 @@ const NOT_ASYNC_GENERATOR: [CalleeErrorText<'static>; 3] = [
     ],
 ];
 
-/// The rejection of `return()` at a suspended `yield` that must run a
-/// `finally`.
-const ASYNC_RETURN_UNSUPPORTED: CalleeErrorText<'static> = [
-    "async generator return() at a yield inside try/finally is not supported",
-    "TypeError: async generator return() at a yield inside try/finally is not supported",
-];
-
 /// The static strings of the async generator bodies.
 pub(super) fn async_strings() -> impl Iterator<Item = &'static str> {
-    NOT_ASYNC_GENERATOR
-        .into_iter()
-        .flatten()
-        .chain(ASYNC_RETURN_UNSUPPORTED)
+    NOT_ASYNC_GENERATOR.into_iter().flatten()
 }
 
 /// The IR fragments the async generator bodies emit, for the static-string
 /// scan.
 pub(super) fn async_fragments(k: u32) -> Vec<IrNode> {
     let local = Frame { k }.i64(0);
-    vec![
-        iter_result(local, false),
-        type_error(ASYNC_RETURN_UNSUPPORTED),
-    ]
+    vec![iter_result(local, false)]
 }
 
 /// A request record: a `TYPE_ENV` block of four slots — the request's
@@ -327,6 +295,12 @@ const REQ_SIZE: i32 = HEADER_SIZE + 4 + 32;
 /// The queue's head (u32) and tail (u32) in the generator block.
 const QUEUE_HEAD: u64 = abi::GEN_QUEUE_OFFSET as u64;
 const QUEUE_TAIL: u64 = QUEUE_HEAD + 4;
+
+/// The `env` of an [`Builtin::AsyncGeneratorStep`] call resuming with
+/// resumption `mode` (an [`abi::GEN_RESUME_MODE_MASK`] value).
+fn step_mode(mode: u32) -> i64 {
+    f64::from(mode).to_bits().cast_signed()
+}
 
 /// A request's code in its record.
 fn request_code(request: AsyncGenRequest) -> i64 {
@@ -357,8 +331,8 @@ fn m64(offset: u64) -> MemArg {
 fn iter_result(value: u32, done: bool) -> IrNode {
     IrNode::Object {
         entries: vec![
-            (PropKey::Static("value".to_owned()), IrNode::Local(value)),
-            (PropKey::Static("done".to_owned()), IrNode::Bool(done)),
+            (PropKey::Static("value".into()), IrNode::Local(value)),
+            (PropKey::Static("done".into()), IrNode::Bool(done)),
         ],
         proto: None,
         class: abi::CLASS_ORDINARY,
@@ -370,8 +344,8 @@ fn iter_result(value: u32, done: bool) -> IrNode {
 fn type_error(text: CalleeErrorText<'static>) -> IrNode {
     IrNode::error_object(
         ErrorKind::TypeError,
-        Some(IrNode::Str(text[0].to_owned())),
-        IrNode::Str(text[1].to_owned()),
+        Some(IrNode::Str(text[0].into())),
+        IrNode::Str(text[1].into()),
     )
 }
 
@@ -436,7 +410,7 @@ fn fulfill_front(
     generator: u32,
     value: u32,
     done: bool,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let result = iter_result(value, done);
@@ -500,7 +474,7 @@ pub(super) fn emit_async_method(
     request: AsyncGenRequest,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {
@@ -562,7 +536,7 @@ pub(super) fn emit_async_method(
 pub(super) fn emit_async_drain(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {
@@ -622,66 +596,46 @@ pub(super) fn emit_async_drain(
     wasm!(function; Else, I64Const(UNDEFINED_BITS), LocalSet(value));
     fulfill_front(function, frame, generator, value, true, strings, helpers);
     wasm!(function; End, Br(1), End);
-    // Suspended at a `yield`: `return(v)` completes (unless a `finally`
-    // must run) and awaits `v`; `next` / `throw` resume the body.
-    wasm!(function; LocalGet(kind), I32Const(ret), I32Eq, If(BlockType::Empty));
-    limits_bits(function, generator, abi::GEN_LIMIT_RETURN);
-    wasm!(function; If(BlockType::Empty));
-    let error = type_error(ASYNC_RETURN_UNSUPPORTED);
-    settle_front(
-        function,
-        generator,
-        PROMISE_OP_SETTLE_REJECT,
-        |f| emit_node(&error, f, frame.scratch(), strings, helpers),
-        helpers,
-    );
-    wasm!(function; Br(2), End);
-    complete(function, generator);
-    set_limits(function, generator, abi::GEN_BUSY, true);
-    await_value(
-        function,
-        frame,
-        generator,
-        value,
-        [
-            AsyncGenReaction::ReturnFulfilled,
-            AsyncGenReaction::ReturnRejected,
-        ],
-        helpers,
-    );
-    wasm!(function; Br(2), End);
-    let mode = |throws: bool| if throws { TRUE_BITS } else { FALSE_BITS };
-    wasm!(function; LocalGet(kind), I32Const(throw), I32Eq, If(BlockType::Empty));
+    // Suspended at a `yield`: resume the body with the request's
+    // resumption (a `return(v)` awaits `v` at the `yield`, then returns
+    // through its `finally` blocks).
+    for (code, mode) in [
+        (ret, abi::GEN_RESUME_MODE_RETURN),
+        (throw, abi::GEN_RESUME_MODE_THROW),
+    ] {
+        wasm!(function; LocalGet(kind), I32Const(code), I32Eq, If(BlockType::Empty));
+        call_internal(
+            function,
+            frame,
+            Builtin::AsyncGeneratorStep,
+            generator,
+            Some(value),
+            step_mode(mode),
+            helpers,
+        );
+        wasm!(function; Br(1), End);
+    }
     call_internal(
         function,
         frame,
         Builtin::AsyncGeneratorStep,
         generator,
         Some(value),
-        mode(true),
+        step_mode(abi::GEN_RESUME_MODE_NEXT),
         helpers,
     );
-    wasm!(function; Else);
-    call_internal(
-        function,
-        frame,
-        Builtin::AsyncGeneratorStep,
-        generator,
-        Some(value),
-        mode(false),
-        helpers,
-    );
-    wasm!(function; End, Br(0), End, End, I64Const(UNDEFINED_BITS));
+    wasm!(function; Br(0), End, End, I64Const(UNDEFINED_BITS));
 }
 
-/// Resume the async generator in argument 0 with argument 1 (thrown at the
-/// suspend when `env` is `true`): an `await` registers the reactions that
+/// Resume the async generator in argument 0 with argument 1 as the
+/// resumption `env` names ([`step_mode`]; a throw or return resumption makes
+/// it pending, see [`abi::GEN_RESUME_MODE_MASK`]): an `await` registers the reactions that
 /// resume it (the body stays busy); a `yield`, completion or throw settles
 /// the front request.
 pub(super) fn emit_async_step(
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {
@@ -695,13 +649,11 @@ pub(super) fn emit_async_step(
     wasm!(function; LocalSet(sent));
     set_limits(function, generator, abi::GEN_BUSY | abi::GEN_RUNNING, true);
     set_limits(function, generator, abi::GEN_AWAIT, false);
-    wasm!(function;
-        LocalGet(frame.k), I64Const(TRUE_BITS), I64Eq,
-        If(BlockType::Empty),
-        LocalGet(sent), GlobalSet(EXC_VALUE_GLOBAL), I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
-        I64Const(UNDEFINED_BITS), LocalSet(sent),
-        End,
-    );
+    for mode in [abi::GEN_RESUME_MODE_THROW, abi::GEN_RESUME_MODE_RETURN] {
+        wasm!(function; LocalGet(frame.k), I64Const(step_mode(mode)), I64Eq, If(BlockType::Empty));
+        pend_resumption(function, generator, sent, mode);
+        wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(sent), End);
+    }
     // SM(sent, gen, …, env = gen.env, argc = 2).
     wasm!(function; LocalGet(sent), LocalGet(generator));
     for _ in 2..frame.k {
@@ -760,7 +712,7 @@ pub(super) fn emit_async_reaction(
     reaction: AsyncGenReaction,
     function: &mut Function,
     frame: Frame,
-    strings: &HashMap<String, i32>,
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     if frame.k < 2 {
@@ -773,14 +725,18 @@ pub(super) fn emit_async_reaction(
     wasm!(function; LocalSet(value));
     match reaction {
         AsyncGenReaction::AwaitFulfilled | AsyncGenReaction::AwaitRejected => {
-            let throws = reaction == AsyncGenReaction::AwaitRejected;
+            let mode = if reaction == AsyncGenReaction::AwaitRejected {
+                abi::GEN_RESUME_MODE_THROW
+            } else {
+                abi::GEN_RESUME_MODE_NEXT
+            };
             call_internal(
                 function,
                 frame,
                 Builtin::AsyncGeneratorStep,
                 generator,
                 Some(value),
-                if throws { TRUE_BITS } else { FALSE_BITS },
+                step_mode(mode),
                 helpers,
             );
         }

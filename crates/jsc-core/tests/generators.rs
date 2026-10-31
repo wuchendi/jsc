@@ -1079,20 +1079,6 @@ fn generator_return_completes_the_generator() {
 }
 
 #[test]
-fn generator_return_through_finally_is_a_named_limitation() {
-    assert_uncaught(
-        "function* g() { try { yield 1 } finally { console.log('f') } } \
-         const it = g(); it.next(); it.return(1)",
-        "TypeError: generator return() at a yield inside try/finally or yield* is not supported",
-    );
-    // Before the first `next` (or after completion) no `finally` is active.
-    assert_bool(
-        "function* g() { try { yield 1 } finally {} } g().return(1).done",
-        true,
-    );
-}
-
-#[test]
 fn generator_throw_throws_at_the_suspended_yield() {
     assert_output(
         "function* g() { try { yield 1 } catch (e) { console.log('caught', e); yield 2 } } \
@@ -1114,15 +1100,6 @@ fn generator_throw_throws_at_the_suspended_yield() {
         "function* g() { yield 1; yield 2 } const it = g(); it.next(); \
          try { it.throw(4) } catch (e) {} console.log(it.next().done)",
         "true\n",
-    );
-}
-
-#[test]
-fn generator_throw_through_yield_star_is_a_named_limitation() {
-    assert_uncaught(
-        "function* inner() { yield 1 } function* g() { yield* inner() } \
-         const it = g(); it.next(); it.throw(1)",
-        "TypeError: generator throw() at a yield* is not supported",
     );
 }
 
@@ -1171,4 +1148,186 @@ fn map_set_and_date_methods_take_a_suspending_argument() {
          const it = g(); it.next(); it.next('k'); it.next(9); it.next('v'); it.next();",
         "9 true 7\n",
     );
+}
+
+#[test]
+fn yield_star_evaluates_to_the_delegate_return_value() {
+    assert_output(
+        "function* inner(){ yield 1; return 'done' }
+         function* g(){ const r = yield* inner(); console.log('r', r); yield r }
+         console.log([...g()].join(','))",
+        "r done\n1,done\n",
+    );
+    // In a nested expression position.
+    assert_output(
+        "function* inner(){ return 2 }
+         function* g(){ return 1 + (yield* inner()) * 10 }
+         console.log(g().next().value)",
+        "21\n",
+    );
+}
+
+#[test]
+fn yield_star_forwards_sent_values_to_the_delegate() {
+    assert_output(
+        "function* inner(){ const a = yield 'x'; const b = yield 'y'; console.log('inner', a, b); return a + b }
+         function* g(){ const r = yield* inner(); console.log('outer', r) }
+         const it = g(); it.next('ignored'); it.next(1); it.next(2);",
+        "inner 1 2\nouter 3\n",
+    );
+    // A user iterator receives the value through `next(v)`.
+    assert_output(
+        "const seen = [];
+         const it = { [Symbol.iterator]() { return this },
+                      next(v) { seen.push(v); return { value: seen.length, done: seen.length > 2 } } };
+         function* g(){ yield* it }
+         const o = g(); o.next('a'); o.next('b'); o.next('c');
+         console.log(seen)",
+        "[ undefined, b, c ]\n",
+    );
+}
+
+#[test]
+fn yield_star_throw_to_a_delegate_without_throw_closes_it_then_throws() {
+    assert_output(
+        "let closed = 0;
+         const it = { [Symbol.iterator]() { return this },
+                      next() { return { value: 1, done: false } },
+                      return() { closed++; return {} } };
+         function* g(){ yield* it }
+         const o = g(); o.next();
+         try { o.throw(new Error('x')) } catch (e) { console.log(e instanceof TypeError, e.message) }
+         console.log(closed, o.next().done)",
+        "true The iterator does not provide a 'throw' method\n1 true\n",
+    );
+}
+
+#[test]
+fn yield_star_forwards_return_to_the_delegate() {
+    assert_output(
+        "function* inner(){ try { yield 1; yield 2 } finally { console.log('inner finally') } }
+         function* g(){ try { yield* inner() } finally { console.log('outer finally') } }
+         const o = g(); o.next();
+         const r = o.return(9); console.log(r.value, r.done, o.next().done)",
+        "inner finally\nouter finally\n9 true true\n",
+    );
+    // A user delegate's `return(v)` result decides: done ends the outer.
+    assert_output(
+        "const it = { [Symbol.iterator]() { return this },
+                      next() { return { value: 1, done: false } },
+                      return(v) { console.log('ret', v); return { value: v * 2, done: true } } };
+         function* g(){ yield* it }
+         const o = g(); o.next(); const r = o.return(4); console.log(r.value, r.done)",
+        "ret 4\n8 true\n",
+    );
+}
+
+#[test]
+fn return_closes_a_user_iterator_of_a_suspended_for_of() {
+    assert_output(
+        "let closed = 0;
+         const it = { [Symbol.iterator]() { return this },
+                      next() { return { value: 1, done: false } },
+                      return() { closed++; return {} } };
+         function* g(){ for (const x of it) yield x }
+         const o = g(); o.next();
+         const r = o.return(5); console.log(r.value, r.done, closed)",
+        "5 true 1\n",
+    );
+}
+
+#[test]
+fn closing_a_generator_suspended_in_try_finally_runs_the_finally() {
+    // An array pattern leaving the generator undone closes it.
+    assert_output(
+        "function* g(){ try { yield 1; yield 2 } finally { console.log('f') } }
+         let a; [a] = g(); const [b] = g(); console.log(a, b)",
+        "f\nf\n1 1\n",
+    );
+    // A `for-of` exited by `break`.
+    assert_output(
+        "function* g(){ try { yield 1; yield 2 } finally { console.log('f') } }
+         for (const x of g()) { console.log(x); break }",
+        "1\nf\n",
+    );
+}
+
+#[test]
+fn yield_star_returns_the_delegate_result_object_itself() {
+    // Spec `GeneratorYield(innerResult)`: next / throw / return each hand
+    // back the delegate's own result object while it is not done.
+    assert_output(
+        "let last;
+         const it = { [Symbol.iterator]() { return this },
+                      next() { last = { value: 1, done: false }; return last },
+                      throw(e) { last = { value: e, done: false }; return last },
+                      return(v) { last = { value: v, done: false }; return last } };
+         function* g(){ yield* it }
+         const o = g();
+         console.log(o.next() === last, o.throw(2) === last, o.return(3) === last)",
+        "true true true\n",
+    );
+}
+
+#[test]
+fn yield_star_keeps_extra_properties_of_the_delegate_result() {
+    assert_output(
+        "const it = { [Symbol.iterator]() { return this },
+                      next() { return { value: 1, done: false, extra: 'x' } } };
+         function* g(){ yield* it }
+         const r = g().next(); console.log(r.value, r.done, r.extra, Object.keys(r).join())",
+        "1 false x value,done,extra\n",
+    );
+}
+
+#[test]
+fn yield_star_does_not_read_the_delegate_value_in_a_sync_generator() {
+    // Only `done` is read by `yield*` per step; `value` is read by the outer
+    // consumer (the spread), and once by `yield*` for the completion value.
+    assert_output(
+        "let reads = 0, n = 0;
+         const it = { [Symbol.iterator]() { return this },
+                      next() { n++; return { done: n > 2, get value() { reads++; return n } } } };
+         function* g(){ yield* it }
+         const o = g(); const r = o.next(); console.log(reads);
+         console.log(r.value, reads);
+         const xs = [...g()]; console.log(xs.join(), reads)",
+        "0\n1 1\n2 3\n",
+    );
+}
+
+#[test]
+fn resuming_inside_a_try_in_a_for_of_continues_after_the_try() {
+    // Falling out of a `try` without its own `finally` must not run the
+    // enclosing for-of's close-the-iterator `finally` (which ends the loop).
+    for (try_stmt, expected) in [
+        (
+            "try { throw 1 } catch (e) { r.push('c'); yield; r.push('j') }",
+            "c,j,k,c,j,k,l\n",
+        ),
+        (
+            "try { r.push('t'); yield; r.push('j') } catch (e) {}",
+            "t,j,k,t,j,k,l\n",
+        ),
+        (
+            "try { throw 1 } catch (e) { r.push('c'); yield* [0]; r.push('j') }",
+            "c,j,k,c,j,k,l\n",
+        ),
+        (
+            "try { r.push('t'); yield* [0]; r.push('j') } catch (e) {}",
+            "t,j,k,t,j,k,l\n",
+        ),
+    ] {
+        assert_output(
+            &format!(
+                "const r = [];
+                 const g = (function* () {{
+                   for (var x of [1, 2]) {{ {try_stmt} r.push('k') }}
+                   r.push('l')
+                 }})();
+                 g.next(); g.next(); g.next(); console.log(r.join())"
+            ),
+            expected,
+        );
+    }
 }
