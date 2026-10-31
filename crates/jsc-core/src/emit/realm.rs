@@ -331,6 +331,41 @@ impl Intrinsic {
             abi::CLASS_ORDINARY
         }
     }
+
+    /// `%Array.prototype%` is an Array exotic object (`IsArray` is true,
+    /// `length` 0): a `TYPE_ARRAY` handle in dictionary mode, so every
+    /// element written to it lands in its watched table and sets its dirty
+    /// bit like any other property write.
+    fn is_array(self) -> bool {
+        self == Self::Prototype(BuiltinCtor::Array)
+    }
+
+    /// The header of the intrinsic's block.
+    fn header(self) -> [u8; 4] {
+        if self.call().is_some() {
+            [abi::TYPE_FUNCTION, 0, self.flags(), 0]
+        } else if self.is_array() {
+            [
+                abi::TYPE_ARRAY,
+                0,
+                abi::ARRAY_FLAG_SPARSE | abi::ARRAY_FLAG_DICTIONARY,
+                0,
+            ]
+        } else {
+            [abi::TYPE_OBJECT, 0, 0, self.class()]
+        }
+    }
+
+    /// The byte size of the intrinsic's block before its `TYPE_PROPS` table.
+    fn prefix_size(self) -> u32 {
+        if self.call().is_some() {
+            abi::FUNC_BLOCK_SIZE
+        } else if self.is_array() {
+            abi::ARRAY_BLOCK_SIZE
+        } else {
+            abi::OBJ_PREFIX_SIZE
+        }
+    }
 }
 
 /// Every intrinsic, in image order.
@@ -2884,12 +2919,9 @@ fn entry_count(registry: &[Entry], intrinsic: Intrinsic) -> u32 {
 
 /// The byte size of `intrinsic`'s block plus its property table.
 fn block_size(registry: &[Entry], intrinsic: Intrinsic) -> u32 {
-    let prefix = if intrinsic.call().is_some() {
-        abi::FUNC_BLOCK_SIZE
-    } else {
-        abi::OBJ_PREFIX_SIZE
-    };
-    prefix + abi::PROPS_HEADER_SIZE + abi::PROP_ENTRY_SIZE * entry_count(registry, intrinsic)
+    intrinsic.prefix_size()
+        + abi::PROPS_HEADER_SIZE
+        + abi::PROP_ENTRY_SIZE * entry_count(registry, intrinsic)
 }
 
 /// The builtins with a static method block (a method or an accessor half), in
@@ -3002,21 +3034,14 @@ pub(super) fn image(base: i32, first_slot: u32, strings: &StrOffsets) -> Vec<u8>
         let proto = intrinsic
             .proto()
             .map_or(abi::NULL, |p| heap(base + intrinsic_offset(&registry, p)));
-        let (header, prefix) = match intrinsic.call() {
-            Some(_) => (
-                [abi::TYPE_FUNCTION, 0, intrinsic.flags(), 0],
-                abi::FUNC_BLOCK_SIZE,
-            ),
-            None => (
-                [abi::TYPE_OBJECT, 0, 0, intrinsic.class()],
-                abi::OBJ_PREFIX_SIZE,
-            ),
-        };
-        blob.extend_from_slice(&header);
-        blob.extend_from_slice(&(addr + prefix).to_le_bytes());
+        blob.extend_from_slice(&intrinsic.header());
+        blob.extend_from_slice(&(addr + intrinsic.prefix_size()).to_le_bytes());
         blob.extend_from_slice(&proto.to_le_bytes());
         if let Some(builtin) = intrinsic.call() {
             fn_payload(&mut blob, builtin);
+        } else if intrinsic.is_array() {
+            // `length` 0, no element store.
+            blob.extend_from_slice(&0u64.to_le_bytes());
         }
         let count = entry_count(&registry, intrinsic);
         let (watched, bit) = intrinsic
@@ -3131,18 +3156,15 @@ mod tests {
             assert_eq!(intrinsic_addr_bits(base + 64, intrinsic), bits + 64);
             assert_eq!(bits, HEAP_BITS | i64::from(base + offset.cast_signed()));
             // Header, `props` right behind the prefix, `proto` per the registry.
-            let callable = intrinsic.call().is_some();
-            let kind = if callable {
+            let kind = if intrinsic.call().is_some() {
                 abi::TYPE_FUNCTION
+            } else if intrinsic.is_array() {
+                abi::TYPE_ARRAY
             } else {
                 abi::TYPE_OBJECT
             };
             assert_eq!(image[offset as usize], kind, "{intrinsic:?}: kind");
-            let prefix = if callable {
-                abi::FUNC_BLOCK_SIZE
-            } else {
-                abi::OBJ_PREFIX_SIZE
-            };
+            let prefix = intrinsic.prefix_size();
             let props = u32_at(&image, offset + abi::OBJ_PROPS_OFFSET);
             assert_eq!(props, base.cast_unsigned() + offset + prefix);
             let proto = u64_at(&image, offset + abi::OBJ_PROTO_OFFSET);
@@ -3263,12 +3285,7 @@ mod tests {
         }
         // Only a table holding a symbol key is flagged HAS_SYMBOL_KEYS.
         for intrinsic in intrinsics() {
-            let prefix = if intrinsic.call().is_some() {
-                abi::FUNC_BLOCK_SIZE
-            } else {
-                abi::OBJ_PREFIX_SIZE
-            };
-            let table = intrinsic_offset(&registry, intrinsic) + prefix;
+            let table = intrinsic_offset(&registry, intrinsic) + intrinsic.prefix_size();
             let tflags = image[(table + abi::PROPS_TFLAGS_OFFSET) as usize];
             let symbol_keys = matches!(
                 intrinsic,

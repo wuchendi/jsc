@@ -992,8 +992,10 @@ out by `emit/realm.rs` from one registry of `(intrinsic, key, attrs, value)`
 entries (`key` is an interned string or a well-known symbol; `value` is a
 builtin method, a string, a number, `undefined`, another intrinsic, a
 well-known symbol, or an accessor pair). Each intrinsic is an object-family
-block (a `TYPE_FUNCTION` block when callable) followed by a full `TYPE_PROPS`
-table (flagged `PROPS_HAS_SYMBOL_KEYS` when it holds a symbol key); then one
+block (a `TYPE_FUNCTION` block when callable; `%Array.prototype%` is a
+`TYPE_ARRAY` handle in dictionary mode, `length` 0 and no store, so it is an
+Array exotic object whose element writes land in its watched table) followed
+by a full `TYPE_PROPS` table (flagged `PROPS_HAS_SYMBOL_KEYS` when it holds a symbol key); then one
 static `LAZY` `TYPE_FUNCTION` block per builtin method (`env = undefined`,
 `func_idx` = its builtin table slot); then one static `TYPE_ACCESSOR` block
 per accessor entry; then the 13 well-known symbols as static `TYPE_SYMBOL`
@@ -2158,11 +2160,10 @@ Each item below is current behaviour of this tree.
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the
   `RangeError` first); every other `Array.prototype` method uses the full
   `ToLength` range.
-- `Array.prototype`, `String.prototype` and `Number.prototype` are ordinary
-  objects, not an array / `String` / `Number` exotic object:
-  `Array.isArray(Array.prototype)` is `false`, `Array.prototype.length` is
-  `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
-  `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
+- `String.prototype` and `Number.prototype` are ordinary objects, not a
+  `String` / `Number` exotic object: `String.prototype.valueOf()` throws
+  `TypeError`, and `Object.prototype.toString.call(Number.prototype)` is
+  `"[object Object]"`.
 - The remaining test262 failures of the phase-3 built-in families (after
   element reads through the prototype chain, L2-V T3, and `var` hoisting /
   global declarations, L2-V T1: 514 of built-ins/{Array 174, String 191,

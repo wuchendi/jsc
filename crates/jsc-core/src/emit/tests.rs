@@ -914,7 +914,7 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let arr = usize::try_from(arr).expect("base");
     assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
     assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
-    // `proto` = `%Array.prototype%`, an ordinary object.
+    // `proto` = `%Array.prototype%`.
     assert_eq!(
         mem[arr + 14..arr + 16],
         [0xFD, 0x7F],
