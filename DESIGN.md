@@ -2125,10 +2125,8 @@ Each item below is current behaviour of this tree.
 - Strings are Latin-1 / UTF-16 code units (§5.2): `.length`, indexing,
   comparison and every guest `String.prototype` method are exact for any
   text, lone surrogates included. `localeCompare` is code-unit order, not
-  locale collation, and the `toLocale*Case` methods use no locale data; a
-  key with a lone surrogate cannot name a function (a method, accessor or
-  anonymous function under it is a compile error: function names are host
-  text); there are no ropes, so `s = s + x` in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
+  locale collation, and the `toLocale*Case` methods use no locale data;
+  there are no ropes, so `s = s + x` in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
   pattern as RegExp source: a pattern with RegExp syntax throws a
   `TypeError`, and `matchAll` (a RegExp string iterator) always throws one.
 - No `void`.

@@ -20,7 +20,7 @@ use crate::error::CompileError;
 pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::Result<IrFunction> {
     let mut ctx = LowerCtx::new(shared);
     let param_pats: Vec<&Pat> = fn_decl.function.params.iter().map(|p| &p.pat).collect();
-    let name = fn_decl.ident.sym.as_ref();
+    let name = &JsStr::from(fn_decl.ident.sym.as_ref());
     let block = fn_decl
         .function
         .body
@@ -34,7 +34,7 @@ pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::R
     if let Some(machine) = state_machine(&fn_decl.function) {
         let callee = shared
             .funcs
-            .get(name)
+            .get(fn_decl.ident.sym.as_ref())
             .filter(|_| machine.has_prototype())
             .map(|sig| IrNode::DeclFunc(sig.index - 1));
         let (mut func, _env) =
@@ -49,13 +49,13 @@ pub(super) fn lower_function(fn_decl: &FnDecl, shared: &Shared<'_>) -> anyhow::R
 
 /// The [`FnInfo`] of a function named `name` with parameters `param_pats`:
 /// its `length` counts the parameters before the first default or rest.
-pub(super) fn fn_info(name: &str, param_pats: &[&Pat], kind: FnKind) -> FnInfo {
+pub(super) fn fn_info(name: &JsStr, param_pats: &[&Pat], kind: FnKind) -> FnInfo {
     let length = param_pats
         .iter()
         .take_while(|p| !matches!(p, Pat::Assign(_) | Pat::Rest(_)))
         .count();
     FnInfo {
-        name: name.to_owned(),
+        name: name.clone(),
         length: u32::try_from(length).unwrap_or(u32::MAX),
         kind,
     }
@@ -795,7 +795,7 @@ impl LowerCtx<'_> {
         &mut self,
         param_pats: &[&Pat],
         body_kind: BodyKind<'_>,
-        name: &str,
+        name: &JsStr,
         kind: FnKind,
     ) -> anyhow::Result<IrNode> {
         self.lower_lifted(param_pats, body_kind, name, kind, false, None)
@@ -812,7 +812,7 @@ impl LowerCtx<'_> {
         &mut self,
         param_pats: &[&Pat],
         body_kind: BodyKind<'_>,
-        name: &str,
+        name: &JsStr,
         kind: FnKind,
         arrow: bool,
         machine: Option<(Machine, swc_common::Span)>,
@@ -925,7 +925,7 @@ impl LowerCtx<'_> {
     /// (registered in the funcref table, may capture enclosing bindings like an
     /// arrow) and return the [`IrNode::FuncValue`] building its value.
     pub(super) fn lower_nested_fn_value(&mut self, fn_decl: &FnDecl) -> anyhow::Result<IrNode> {
-        self.lower_function_value(&fn_decl.function, fn_decl.ident.sym.as_ref())
+        self.lower_function_value(&fn_decl.function, &JsStr::from(fn_decl.ident.sym.as_ref()))
     }
 
     /// Lift a `function`-keyword function (a nested declaration or an
@@ -936,7 +936,7 @@ impl LowerCtx<'_> {
     pub(super) fn lower_function_value(
         &mut self,
         function: &swc_ecma_ast::Function,
-        name: &str,
+        name: &JsStr,
     ) -> anyhow::Result<IrNode> {
         self.lower_callable(function, name, FnKind::Constructor)
     }
@@ -947,7 +947,7 @@ impl LowerCtx<'_> {
     pub(super) fn lower_method(
         &mut self,
         function: &swc_ecma_ast::Function,
-        name: &str,
+        name: &JsStr,
     ) -> anyhow::Result<IrNode> {
         self.lower_callable(function, name, FnKind::Plain)
     }
@@ -958,7 +958,7 @@ impl LowerCtx<'_> {
     fn lower_callable(
         &mut self,
         function: &swc_ecma_ast::Function,
-        name: &str,
+        name: &JsStr,
         kind: FnKind,
     ) -> anyhow::Result<IrNode> {
         let block = function
@@ -990,7 +990,11 @@ impl LowerCtx<'_> {
     /// forms all lower the same way. Arrows read the enclosing function's
     /// `new.target`/`arguments`, and are not constructors. `name` is the
     /// inferred `name` (`""` when anonymous).
-    pub(super) fn lower_arrow(&mut self, arrow: &ArrowExpr, name: &str) -> anyhow::Result<IrNode> {
+    pub(super) fn lower_arrow(
+        &mut self,
+        arrow: &ArrowExpr,
+        name: &JsStr,
+    ) -> anyhow::Result<IrNode> {
         let param_pats: Vec<&Pat> = arrow.params.iter().collect();
         let body_kind = match arrow.body.as_ref() {
             ArrowFunctionBody::FunctionBody(block) => BodyKind::Block(&block.stmts),
@@ -1065,7 +1069,7 @@ impl LowerCtx<'_> {
             let Some((frame, id)) = *computed else {
                 let key = super::stmt::prop_key_name(&p.key)?;
                 let value = match &p.value {
-                    Some(init) => self.lower_key_named_expr(init, &key, p.key.span())?,
+                    Some(init) => self.lower_key_named_expr(init, &key)?,
                     None => IrNode::Undefined,
                 };
                 entries.push((PropKey::Static(key), value));
@@ -1200,16 +1204,21 @@ pub(super) fn guard(cond: IrNode, error: IrNode) -> IrNode {
 /// `if (argc >= 0) throw TypeError("Class constructor <name> cannot be invoked
 /// without 'new'")`, the class constructor prologue rejecting a plain call
 /// (`argc` is the local `argc`).
-fn class_call_guard(name: &str, argc: u32) -> IrStmt {
-    let message = format!("Class constructor {name} cannot be invoked without 'new'");
-    let stack = format!("TypeError: {message}");
+fn class_call_guard(name: &JsStr, argc: u32) -> IrStmt {
+    let message: JsStr = prefixed_name("Class constructor ", name)
+        .as_units()
+        .iter()
+        .copied()
+        .chain(" cannot be invoked without 'new'".encode_utf16())
+        .collect();
+    let stack = prefixed_name("TypeError: ", &message);
     IrStmt::If {
         cond: IrNode::IsConstructCall(argc),
         then_body: Vec::new(),
         else_body: vec![IrStmt::Expr(IrNode::Throw(Box::new(IrNode::error_object(
             ErrorKind::TypeError,
-            Some(IrNode::Str(message.into())),
-            IrNode::Str(stack.into()),
+            Some(IrNode::Str(message)),
+            IrNode::Str(stack),
         ))))],
     }
 }

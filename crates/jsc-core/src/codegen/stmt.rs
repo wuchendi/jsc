@@ -269,7 +269,7 @@ impl LowerCtx<'_> {
             // `const` with no initializer is already rejected by the parser.
             let init = match (declarator.init.as_ref(), &declarator.name) {
                 (Some(init), Pat::Ident(ident)) => {
-                    self.lower_named_expr(init, ident.id.sym.as_ref())?
+                    self.lower_named_expr(init, &JsStr::from(ident.id.sym.as_ref()))?
                 }
                 (Some(init), _) => self.lower_expr(init)?,
                 (None, _) => IrNode::Undefined,
@@ -296,7 +296,7 @@ impl LowerCtx<'_> {
     ) -> anyhow::Result<()> {
         let name = class_decl.ident.sym.as_ref();
         let local = self.declare(name, true, class_decl.ident.span.lo.0);
-        let value = self.lower_class(&class_decl.class, name, true, None)?;
+        let value = self.lower_class(&class_decl.class, &JsStr::from(name), true, None)?;
         self.push_binding(local, value, out);
         Ok(())
     }
@@ -331,7 +331,7 @@ impl LowerCtx<'_> {
     pub(super) fn lower_class(
         &mut self,
         class: &Class,
-        name: &str,
+        name: &JsStr,
         inner_name: bool,
         name_key: Option<u32>,
     ) -> anyhow::Result<IrNode> {
@@ -387,7 +387,8 @@ impl LowerCtx<'_> {
         let mut seq = Vec::new();
         // The class scope: the inner name binding (immutable).
         self.push_scope();
-        let inner = inner_name.then(|| self.declare(name, false, class.span.lo.0));
+        // `inner_name` is only set for an identifier, so `name` is lossless text.
+        let inner = inner_name.then(|| self.declare(&name.to_string(), false, class.span.lo.0));
         if let Some(local) = inner
             && self.is_cell(local)
             && self.env_slot_for_local(local).is_none()
@@ -482,10 +483,13 @@ impl LowerCtx<'_> {
             }
         }
         let reserve = u32::try_from(fields.len()).unwrap_or(u32::MAX);
-        self.shared
-            .classes
-            .borrow_mut()
-            .insert(name.to_owned(), ClassInfo { fields });
+        // Only an identifier names a recorded class (`new C()` looks it up).
+        if let Some(name) = name.to_rust_string() {
+            self.shared
+                .classes
+                .borrow_mut()
+                .insert(name, ClassInfo { fields });
+        }
 
         let prev_super = self.current_super.replace(SuperScope {
             frame: self.top(),
@@ -600,7 +604,7 @@ impl LowerCtx<'_> {
             } else {
                 let key = prop_key_name(&p.key)?;
                 let value = match &p.value {
-                    Some(init) => self.lower_key_named_expr(init, &key, p.key.span())?,
+                    Some(init) => self.lower_key_named_expr(init, &key)?,
                     None => IrNode::Undefined,
                 };
                 (PropKey::Static(key), value)
@@ -630,10 +634,13 @@ impl LowerCtx<'_> {
         entries: &mut Vec<(PropKey, IrNode)>,
     ) -> anyhow::Result<()> {
         let (key, name) = if let Some(local) = computed {
-            (PropKey::HiddenComputed(IrNode::Local(local)), String::new())
+            (
+                PropKey::HiddenComputed(IrNode::Local(local)),
+                JsStr::default(),
+            )
         } else {
             let key = prop_key_name(&m.key)?;
-            let name = key_fn_name(&key, m.key.span())?;
+            let name = key.clone();
             (PropKey::Hidden(key), name)
         };
         let (accessor, prefix) = match m.kind {
@@ -641,7 +648,7 @@ impl LowerCtx<'_> {
             MethodKind::Setter => (Some(false), "set "),
             MethodKind::Method => (None, ""),
         };
-        let value = self.lower_method(&m.function, &format!("{prefix}{name}"))?;
+        let value = self.lower_method(&m.function, &prefixed_name(prefix, &name))?;
         let value = self.set_computed_name(value, computed, prefix);
         match accessor {
             Some(getter) => push_accessor_half(entries, key, value, getter),
