@@ -168,7 +168,7 @@ jsc/
 `default-features = false` leaves frontend + codegen + emit only. Dependencies:
 `swc_ecma_parser 46`, `swc_ecma_ast 29`, `swc_ecma_visit 29`, `swc_common 26`,
 `swc_ecma_transforms_base 50`, `swc_ecma_transforms_typescript 56`,
-`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 49`; `wasmparser 0.262` is
+`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 50`; `wasmparser 0.262` is
 a dev-dependency.
 
 **`jsc`.** A thin `clap` shell (§9). `#![forbid(unsafe_code)]`.
