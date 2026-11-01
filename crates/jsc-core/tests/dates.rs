@@ -832,9 +832,13 @@ fn new_date_converts_its_argument_with_to_primitive() {
         "new Date(new String('2020')).getTime()",
         1_577_836_800_000.0,
     );
-    // A Date argument contributes its time value without `ToPrimitive`.
+    // A Date argument contributes its time value without `ToPrimitive` (the
+    // override is defined: the inherited `Date.prototype[@@toPrimitive]` is
+    // read-only, so assigning it throws).
     both_number(
-        "const d = new Date(5); d[Symbol.toPrimitive] = () => 7; new Date(d).getTime()",
+        "const d = new Date(5); \
+         Object.defineProperty(d, Symbol.toPrimitive, { value: () => 7, configurable: true }); \
+         new Date(d).getTime()",
         5.0,
     );
     both_bool(

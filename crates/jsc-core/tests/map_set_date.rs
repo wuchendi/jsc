@@ -583,7 +583,6 @@ fn date_time_clip_truncates_and_bounds() {
         ("-8.64e15", -8.64e15),
         ("1.9", 1.0),
         ("-1.9", -1.0),
-        ("'7'", 7.0),
     ] {
         both_ctors(
             |d| format!("new {d}({arg}).getTime()"),
@@ -597,6 +596,9 @@ fn date_time_clip_truncates_and_bounds() {
         "Infinity",
         "-Infinity",
         "NaN",
+        // A string argument is parsed as a date string, not converted with
+        // `ToNumber`: `'7'` is no spec format.
+        "'7'",
     ] {
         both_ctors(
             |d| format!("isNaN(new {d}({arg}).getTime())"),
