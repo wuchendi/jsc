@@ -1605,13 +1605,16 @@ impl LowerCtx<'_> {
                     }),
                 }
             }
-            // A destructuring assignment desugars to statements, so it is only
-            // lowered in statement position (see `lower_stmt`).
-            AssignTarget::Pat(_) => Err(CompileError::spanned(
-                assign.left.span(),
-                "destructuring assignment is only supported as an expression statement",
-            )
-            .into()),
+            // A destructuring assignment desugars to statements run in place by
+            // an [`IrNode::Block`] whose value is the RHS.
+            AssignTarget::Pat(pat) => {
+                let mut stmts = Vec::new();
+                let temp = self.lower_destructuring_assign(pat, &assign.right, &mut stmts)?;
+                Ok(IrNode::Block {
+                    stmts,
+                    value: Box::new(IrNode::Local(temp)),
+                })
+            }
             AssignTarget::Simple(_) => Err(CompileError::spanned(
                 assign.left.span(),
                 "unsupported assignment target",

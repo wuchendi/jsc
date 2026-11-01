@@ -1284,3 +1284,20 @@ fn builtin_bodies_validate() {
         Promise.any([Promise.reject(1)]).catch((e) => console.log(e.errors));",
     ));
 }
+
+#[test]
+fn expression_position_destructuring_validates() {
+    // A statement block in expression position runs under operands already
+    // pushed (a call argument, a `?:` arm, a `for` update, a generator).
+    validate(&compile(
+        "let a, b, o = {};
+        function f(x, y) { return y }
+        f(1, [a, [b = 2], ...o.r] = [1, [], 3]);
+        true ? ({ a, b: { c: b } = {} } = { a: 1 }) : 0;
+        for (let i = 0; i < 3; i++, [a, b] = [b, a]) {}
+        const g = (x) => [a] = x;
+        function* gen() { const r = [a = yield 1] = []; return f(yield 2, [b] = [r]) }
+        for (a of [1]) {} for ([a, b] in { ab: 1 }) {} for (const { length } in 'x') {}
+        console.log(g([1]), gen().next())",
+    ));
+}

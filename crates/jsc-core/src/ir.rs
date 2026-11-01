@@ -1772,6 +1772,18 @@ pub enum IrNode {
     /// arguments, the nullish-guarded receiver of a `push`/`pop`, and the
     /// operand of `void` (followed by `Undefined`).
     Seq(Vec<IrNode>),
+    /// Run `stmts` (stack-neutral statements with no `return`, `break` or
+    /// `continue` escaping them), then evaluate `value`, the node's value.
+    /// Built by codegen for a construct that desugars to statements in
+    /// expression position: a destructuring assignment (DESIGN.md §7.3).
+    /// [`Self::any_child`] / [`Self::children_mut`] see every expression of
+    /// the statements (recursively) and then `value`.
+    Block {
+        /// The statements run first.
+        stmts: Vec<IrStmt>,
+        /// The node's value, evaluated after `stmts`.
+        value: Box<IrNode>,
+    },
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
     /// `__own_keys` (`__for_in_keys`), which builds a fresh array in own-key
@@ -2479,6 +2491,9 @@ impl IrNode {
             | IrNode::ConsoleLog { args }
             | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter().any(f),
+            IrNode::Block { stmts, value } => {
+                stmts.iter().any(|stmt| stmt.any_node_deep(&mut f)) || f(value)
+            }
             IrNode::CallIndirect {
                 callee: recv, args, ..
             }
@@ -2695,6 +2710,14 @@ impl IrNode {
             | IrNode::ConsoleLog { args }
             | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter_mut().collect(),
+            IrNode::Block { stmts, value } => {
+                let mut out = Vec::new();
+                for stmt in stmts {
+                    stmt.nodes_mut_deep(&mut out);
+                }
+                out.push(&mut **value);
+                out
+            }
             IrNode::CallIndirect {
                 callee: recv, args, ..
             }
@@ -2814,6 +2837,64 @@ impl IrStmt {
                         .any(|case| case.test.as_ref().is_some_and(&mut f))
             }
             IrStmt::Break(_) | IrStmt::Continue(_) | IrStmt::Try { .. } => false,
+        }
+    }
+
+    /// Whether `f` holds for any expression of this statement or of a nested
+    /// statement, at any depth (an [`IrNode::Block`]'s children).
+    fn any_node_deep(&self, f: &mut dyn FnMut(&IrNode) -> bool) -> bool {
+        self.any_node(&mut *f) || self.any_stmt(|inner| inner.any_node_deep(&mut *f))
+    }
+
+    /// Mutable references to every expression of this statement and of its
+    /// nested statements, in [`Self::any_node_deep`] order.
+    fn nodes_mut_deep<'a>(&'a mut self, out: &mut Vec<&'a mut IrNode>) {
+        let nested: Vec<&'a mut Vec<IrStmt>> = match self {
+            IrStmt::Decl { init: node, .. } | IrStmt::Expr(node) => {
+                out.push(node);
+                Vec::new()
+            }
+            IrStmt::Return(value) => {
+                out.extend(value.as_mut());
+                Vec::new()
+            }
+            IrStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                out.push(cond);
+                vec![then_body, else_body]
+            }
+            IrStmt::While {
+                cond, body, update, ..
+            } => {
+                out.push(cond);
+                vec![body, update]
+            }
+            IrStmt::Switch { disc, cases, .. } => {
+                out.push(disc);
+                let mut bodies = Vec::new();
+                for case in cases {
+                    out.extend(case.test.as_mut());
+                    bodies.push(&mut case.body);
+                }
+                bodies
+            }
+            IrStmt::Break(_) | IrStmt::Continue(_) => Vec::new(),
+            IrStmt::Try {
+                body,
+                catch_body,
+                finally_body,
+            } => std::iter::once(body)
+                .chain(catch_body.as_mut())
+                .chain(finally_body.as_mut())
+                .collect(),
+        };
+        for stmts in nested {
+            for stmt in stmts {
+                stmt.nodes_mut_deep(out);
+            }
         }
     }
 

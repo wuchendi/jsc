@@ -1375,6 +1375,7 @@ impl CfgBuilder {
                 Ok(IrNode::SentValue)
             }
             node @ IrNode::YieldDelegate { .. } => self.linearize_delegate(node),
+            IrNode::Block { stmts, value } => self.linearize_block(&stmts, *value),
             IrNode::Ternary {
                 cond,
                 then_branch,
@@ -1469,6 +1470,17 @@ impl CfgBuilder {
                 Ok(node)
             }
         }
+    }
+
+    /// Linearize a statement block in expression position (a destructuring
+    /// assignment) with a suspend inside: its statements lower into the CFG in
+    /// place (every earlier operand is already spilled), then its value. A raw
+    /// local read after it must have been set since.
+    fn linearize_block(&mut self, stmts: &[IrStmt], value: IrNode) -> anyhow::Result<IrNode> {
+        self.lower_stmts(stmts)?;
+        self.suspended = true;
+        self.live.clear();
+        self.linearize(value)
     }
 
     /// Linearize the arguments of a call of the already spilled `callee` with
@@ -1696,6 +1708,14 @@ fn collect_node_locals(
     crossing: &mut HashSet<u32>,
     in_cfg: bool,
 ) {
+    // A statement block's declarations are temporaries like a statement's.
+    if let IrNode::Block { stmts, value } = node {
+        for stmt in stmts {
+            collect_locals(stmt, written, crossing, in_cfg);
+        }
+        collect_node_locals(value, written, crossing, in_cfg);
+        return;
+    }
     if let IrNode::Assign { local, .. } = node {
         written.insert(*local);
     }
@@ -1802,6 +1822,11 @@ fn remap_stmts(stmts: &mut [IrStmt], map: &HashMap<u32, u32>) {
 /// node reading its receiver from a raw local (an array push/pop, a Map/Set
 /// method, a Date field) first reloads that local from the cell.
 fn remap_node(node: &mut IrNode, map: &HashMap<u32, u32>) {
+    if let IrNode::Block { stmts, value } = node {
+        remap_stmts(stmts, map);
+        remap_node(value, map);
+        return;
+    }
     for child in node.children_mut() {
         remap_node(child, map);
     }
