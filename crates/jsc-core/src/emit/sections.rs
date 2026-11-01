@@ -241,8 +241,12 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
     // i64) -> i32`; then the exported `__promise_self_error() -> i64`; then
-    // `__symbol_get(v: i64, sym: i32) -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 18] = [
+    // `__symbol_get(v: i64, sym: i32) -> i64`; then the private-name helpers
+    // `__private_find(o: i64, key: i32) -> i32`, `__private_add(o: i64, key:
+    // i32, v: i64, attrs: i32, name: i32)`, `__private_get(o: i64, key: i32,
+    // name: i32) -> i64` and `__private_set(o: i64, key: i32, v: i64, name:
+    // i32) -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 22] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -281,6 +285,22 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I32, ValType::I64], &[ValType::I32]),
         (&[], &[ValType::I64]),
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
+        (&[ValType::I64, ValType::I32], &[ValType::I32]),
+        (
+            &[
+                ValType::I64,
+                ValType::I32,
+                ValType::I64,
+                ValType::I32,
+                ValType::I32,
+            ],
+            &[],
+        ),
+        (&[ValType::I64, ValType::I32, ValType::I32], &[ValType::I64]),
+        (
+            &[ValType::I64, ValType::I32, ValType::I64, ValType::I32],
+            &[ValType::I64],
+        ),
     ];
     for (ty, (params, results)) in (next_type + 11..).zip(conversions) {
         types
@@ -1135,6 +1155,35 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         IrNode::ObjectRest { source, exclude } => {
             collect_node(source, strs);
             collect_node(exclude, strs);
+        }
+        IrNode::PrivateName(name) => strs.add_units(name),
+        IrNode::PrivEnvLoad { env, .. } => collect_node(env, strs),
+        IrNode::PrivEnvStore { env, value, .. } => {
+            collect_node(env, strs);
+            collect_node(value, strs);
+        }
+        IrNode::PrivateGet { obj, key, name } => {
+            strs.add_units(name);
+            collect_node(obj, strs);
+            collect_node(key, strs);
+        }
+        IrNode::PrivateAdd {
+            obj,
+            key,
+            value,
+            name,
+            ..
+        }
+        | IrNode::PrivateSet {
+            obj,
+            key,
+            value,
+            name,
+        } => {
+            strs.add_units(name);
+            collect_node(obj, strs);
+            collect_node(key, strs);
+            collect_node(value, strs);
         }
         IrNode::Index { obj, index } => {
             seed_nullish_strs(strs);

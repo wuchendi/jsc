@@ -24,9 +24,9 @@ use swc_ecma_ast::{
     ArrayLit, ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget,
     AssignTargetPat, BinaryOp, Callee, Class, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl,
     Expr, ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, Lit, MemberProp, MethodKind, ObjectLit,
-    ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr, ParamOrTsParamProp, Pat, Program, Prop,
-    PropName, PropOrSpread, SimpleAssignTarget, Stmt, SuperProp, SuperPropExpr, SwitchStmt,
-    UnaryOp, UpdateExpr, UpdateOp, VarDeclKind, VarDeclOrExpr,
+    ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr, ParamOrTsParamProp, Pat, PrivateName,
+    PrivateProp, Program, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, SuperProp,
+    SuperPropExpr, SwitchStmt, UnaryOp, UpdateExpr, UpdateOp, VarDeclKind, VarDeclOrExpr,
 };
 
 use globals::GlobalFacts;
@@ -593,6 +593,36 @@ struct SuperScope {
     reserve: u32,
 }
 
+/// One class body's private names (DESIGN.md §7.6): the class frame, the
+/// hidden id of its `%penv` array, and each declared `"#x"` with its slot.
+struct PrivateScope {
+    /// The frame depth holding `%penv`.
+    frame: usize,
+    /// Hidden id of `%penv`.
+    penv: u32,
+    /// The declared names, in declaration order.
+    names: Vec<(JsStr, PrivateKind)>,
+}
+
+/// What a private name denotes.
+#[derive(Clone, Copy)]
+enum PrivateKind {
+    /// A field (instance or static): `%penv[slot]` holds its private symbol.
+    Field(u32),
+}
+
+/// An instance field of the class whose constructor is being lowered (see
+/// [`LowerCtx::class_fields`]).
+#[derive(Clone)]
+enum ClassField {
+    /// A public field; a computed name carries the class frame and the hidden
+    /// id of its key, converted once at class definition time.
+    Public(ClassProp, Option<(usize, u32)>),
+    /// A private field: the class frame, the hidden id of `%penv` and the
+    /// slot of its private symbol.
+    Private(PrivateProp, usize, u32, u32),
+}
+
 /// Lowering context: a stack of function frames. Each frame maps
 /// declared names to their [`Binding`] over its own wasm locals; name
 /// resolution walks the innermost frame's scopes outward, then continues into
@@ -624,10 +654,12 @@ struct LowerCtx<'a> {
     /// class does not leak its scope to an enclosing one.
     current_super: Option<SuperScope>,
     /// The instance field declarations of the class whose constructor is being
-    /// lowered: a base constructor defines them on entry, a derived one after
-    /// each `super(..)`. A computed field name carries the class frame and the
-    /// hidden id of its key, converted once at class definition time.
-    class_fields: Vec<(ClassProp, Option<(usize, u32)>)>,
+    /// lowered, public and private in source order: a base constructor
+    /// defines them on entry, a derived one after each `super(..)`.
+    class_fields: Vec<ClassField>,
+    /// The private names of the enclosing class bodies, innermost last
+    /// (DESIGN.md §7.6): `#x` resolves to the innermost one declaring it.
+    private_scopes: Vec<PrivateScope>,
     /// While lowering `static` field initializers: the class frame and the
     /// hidden id of the class value, which `this` resolves to there.
     static_init: Option<(usize, u32)>,

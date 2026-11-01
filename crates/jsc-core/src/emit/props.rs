@@ -773,7 +773,8 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>) -> Function {
 /// install): overwrite in place when present, else append. Redefining a
 /// non-configurable property throws `Cannot redefine property: k`, and adding
 /// to a `NOT_EXTENSIBLE` object throws `Cannot define property k, object is
-/// not extensible` (both left pending, nothing changed). A missing table
+/// not extensible` (both left pending, nothing changed) unless `key` is a
+/// private name. A missing table
 /// starts at capacity 4; a full one is rebuilt with capacity `max(4, 2 *
 /// live)` (the same capacity when tombstones free half), keeping the live
 /// entries in order (and the table's watch flag and bit), and `o`'s `props`
@@ -794,7 +795,13 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
         If(BlockType::Empty),
+        // A private name is added to a non-extensible object too (§7.6).
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+        LocalGet(key),
+    );
+    emit_is_private_key(&mut f);
+    wasm!(f;
+        I32Eqz, I32And,
         If(BlockType::Empty),
     );
     throw(&mut f, PROP_THROW_DEFINE_NOT_EXTENSIBLE);
@@ -2085,7 +2092,7 @@ pub(super) fn emit_array_set_length(strings: &StrOffsets, helpers: Helpers<'_>) 
 /// ([`OWN_ENTRIES`]). Symbol keys are skipped, except that [`OWN_ALL_KEYS`]
 /// appends them after the string keys and [`OWN_SYMBOLS`] lists only them
 /// (both in slot order, the walk skipped when the table lacks
-/// `HAS_SYMBOL_KEYS`). A string lists its indices, a `String` wrapper its
+/// `HAS_SYMBOL_KEYS`; private names are never listed). A string lists its indices, a `String` wrapper its
 /// indices before its table keys; an array its present
 /// (non-hole) store indices, then its table keys (a `SPARSE` array's elements
 /// past the store sort first as integer keys); a primitive has no own keys.
@@ -2147,12 +2154,15 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
             End, End,
         );
     };
-    // Append each included symbol key of the table `p` (`end` set) to out[j..].
+    // Append each included symbol key of the table `p` (`end` set) to out[j..];
+    // a private name is never listed (§7.6).
     let symbol_pass = |f: &mut Function| {
         entry_loop_head(f);
         include(f);
         is_symbol(f);
-        wasm!(f; I32And, If(BlockType::Empty));
+        wasm!(f; LocalGet(k));
+        emit_is_private_key(f);
+        wasm!(f; I32Eqz, I32And, I32And, If(BlockType::Empty));
         emit_elem_addr(f, out, j);
         wasm!(f; LocalGet(k));
         emit_box_heap(f);
@@ -2633,5 +2643,114 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
     );
     emit_box_heap(&mut f);
     wasm!(f; End);
+    f
+}
+
+/// The header word mask and value of a private-name key block (DESIGN.md
+/// §7.6): kind byte `TYPE_SYMBOL` with `SYMBOL_FLAG_PRIVATE` set.
+const PRIVATE_KEY_MASK: i32 = 0xFF | (abi::SYMBOL_FLAG_PRIVATE as i32) << 16;
+/// See [`PRIVATE_KEY_MASK`].
+const PRIVATE_KEY_WORD: i32 = TYPE_SYMBOL | (abi::SYMBOL_FLAG_PRIVATE as i32) << 16;
+
+/// Replace the i32 key block address on the stack with `1` when it is a
+/// private name, else `0`.
+pub(super) fn emit_is_private_key(function: &mut Function) {
+    wasm!(function;
+        I32Load(m32(0)), I32Const(PRIVATE_KEY_MASK), I32And, I32Const(PRIVATE_KEY_WORD), I32Eq,
+    );
+}
+
+/// Set i32 local `e` to the own entry of the jsval in i64 local `o` keyed by
+/// the private name in i32 local `key`, or `0`: a primitive, or an object
+/// without a table (a `LAZY` function holds no private entry, so it is not
+/// materialized), has none.
+fn emit_private_entry(function: &mut Function, o: u32, key: u32, e: u32, helpers: Helpers<'_>) {
+    wasm!(function; I32Const(0), LocalSet(e));
+    emit_is_object(function, o);
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(o), I32WrapI64, I32Load(m32(OBJ_PROPS)),
+        If(BlockType::Empty),
+        LocalGet(o), I32WrapI64, LocalGet(key), Call(helpers.prop_find), LocalSet(e),
+        End,
+        End,
+    );
+}
+
+/// Raise the `__prop_throw` `TypeError` of `mode` naming the static `"#x"`
+/// string in i32 local `name` (the receiver jsval in i64 local `o`).
+fn emit_private_throw(function: &mut Function, o: u32, name: u32, mode: i32, helpers: Helpers<'_>) {
+    wasm!(function; LocalGet(o), LocalGet(name));
+    emit_box_heap(function);
+    wasm!(function; I32Const(mode), Call(helpers.prop_throw));
+}
+
+/// `__private_find(o: i64, key: i32) -> i32`: `1` iff `o` is an object whose
+/// own table holds the private name `key` (no prototype walk).
+pub(super) fn emit_private_find(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, key, e) = (0, 1, 2);
+    emit_private_entry(&mut f, o, key, e, helpers);
+    wasm!(f; LocalGet(e), I32Const(0), I32Ne, End);
+    f
+}
+
+/// `__private_add(o: i64, key: i32, v: i64, attrs: i32, name: i32)`:
+/// `PrivateFieldAdd` of the private name `key` to the object `o` — a present
+/// entry throws `Cannot initialize #x twice on the same object`, else
+/// `__define` appends it (skipping its not-extensible check for a private
+/// key).
+pub(super) fn emit_private_add(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
+    let (o, key, v, attrs, name) = (0, 1, 2, 3, 4);
+    wasm!(f;
+        LocalGet(o), LocalGet(key), Call(helpers.private_find()),
+        If(BlockType::Empty),
+    );
+    emit_private_throw(&mut f, o, name, PROP_THROW_PRIVATE_INIT, helpers);
+    wasm!(f;
+        Return,
+        End,
+        LocalGet(o), I32WrapI64, LocalGet(key), LocalGet(v), LocalGet(attrs), Call(helpers.define),
+        End,
+    );
+    f
+}
+
+/// `__private_get(o: i64, key: i32, name: i32) -> i64`: the value of the
+/// private field `key` of `o`; absent (a primitive included) throws `Cannot
+/// read private member #x from an object whose class did not declare it`.
+pub(super) fn emit_private_get(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, key, name, e) = (0, 1, 2, 3);
+    emit_private_entry(&mut f, o, key, e, helpers);
+    wasm!(f; LocalGet(e), I32Eqz, If(BlockType::Empty));
+    emit_private_throw(&mut f, o, name, PROP_THROW_PRIVATE_READ, helpers);
+    wasm!(f;
+        I64Const(UNDEFINED_BITS), Return,
+        End,
+        LocalGet(e), I64Load(m64(E_VALUE)),
+        End,
+    );
+    f
+}
+
+/// `__private_set(o: i64, key: i32, v: i64, name: i32) -> i64`: replace the
+/// value of the private field `key` of `o` (its attrs ignored) and return
+/// `v`; absent throws `Cannot write private member #x to an object whose
+/// class did not declare it`.
+pub(super) fn emit_private_set(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, key, v, name, e) = (0, 1, 2, 3, 4);
+    emit_private_entry(&mut f, o, key, e, helpers);
+    wasm!(f; LocalGet(e), I32Eqz, If(BlockType::Empty));
+    emit_private_throw(&mut f, o, name, PROP_THROW_PRIVATE_WRITE, helpers);
+    wasm!(f;
+        LocalGet(v), Return,
+        End,
+        LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)),
+        LocalGet(v),
+        End,
+    );
     f
 }

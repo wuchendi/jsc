@@ -325,8 +325,12 @@ impl LowerCtx<'_> {
     /// computed key an anonymous class is defined under (`{[k]: class {}}`):
     /// its `name` is set from it before the static members are defined.
     ///
+    /// A private field (`#x`, `static #x`) is a private name minted per class
+    /// evaluation into `%penv` (DESIGN.md §7.6): instance ones are added with
+    /// the public fields, in source order, static ones with the static fields.
+    ///
     /// Out-of-scope forms are rejected WITH SPANS: decorators, private
-    /// members, static blocks.
+    /// methods and accessors, static blocks.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_class(
         &mut self,
@@ -342,14 +346,17 @@ impl LowerCtx<'_> {
         }
 
         // Collect the (at most one) constructor, the methods and accessors
-        // (instance or static), and the fields; every other member is out of
-        // scope. Each member is held with its index in the body, which keys
-        // its computed name (`keys`, below).
+        // (instance or static), and the fields (public or private, held as
+        // their `ClassMember`); every other member is out of scope. Each
+        // member is held with its index in the body, which keys its computed
+        // name (`keys`, below). A private field's slot in `%penv` follows the
+        // class value and brand slots, in declaration order.
         let mut ctor = None;
         let mut methods: Vec<(usize, &ClassMethod)> = Vec::new();
         let mut static_methods: Vec<(usize, &ClassMethod)> = Vec::new();
-        let mut field_props: Vec<(usize, &ClassProp)> = Vec::new();
-        let mut static_fields: Vec<(usize, &ClassProp)> = Vec::new();
+        let mut field_props: Vec<(usize, &ClassMember)> = Vec::new();
+        let mut static_fields: Vec<(usize, &ClassMember)> = Vec::new();
+        let mut private_names: Vec<(JsStr, PrivateKind)> = Vec::new();
         for (i, member) in class.body.iter().enumerate() {
             match member {
                 ClassMember::Constructor(c) => {
@@ -373,9 +380,26 @@ impl LowerCtx<'_> {
                 ClassMember::ClassProp(p) => {
                     check_member_name(&p.key, p.is_static, true)?;
                     if p.is_static {
-                        static_fields.push((i, p));
+                        static_fields.push((i, member));
                     } else {
-                        field_props.push((i, p));
+                        field_props.push((i, member));
+                    }
+                }
+                ClassMember::PrivateProp(p) => {
+                    let name = JsStr::from(format!("#{}", p.key.name));
+                    if private_names.iter().any(|(declared, _)| *declared == name) {
+                        return Err(CompileError::spanned(
+                            p.key.span,
+                            format!("duplicate private name {name}"),
+                        )
+                        .into());
+                    }
+                    let slot = u32::try_from(private_names.len() + 2)?;
+                    private_names.push((name, PrivateKind::Field(slot)));
+                    if p.is_static {
+                        static_fields.push((i, member));
+                    } else {
+                        field_props.push((i, member));
                     }
                 }
                 // A stray `;` in the class body binds nothing — harmless.
@@ -413,6 +437,32 @@ impl LowerCtx<'_> {
                 });
                 Some((parent, parent_id, proto, proto_id))
             }
+        };
+
+        // The private environment `%penv` (DESIGN.md §7.6), when the body
+        // declares a private name: `[class, brand, ..private symbols]`, minted
+        // after the heritage (which sees only the enclosing classes' names)
+        // and before the computed keys.
+        let penv = if private_names.is_empty() {
+            None
+        } else {
+            let (local, id) = self.hidden_local();
+            let mut slots = vec![IrNode::Undefined, IrNode::Undefined];
+            slots.extend(
+                private_names
+                    .iter()
+                    .map(|(name, _)| IrNode::PrivateName(name.clone())),
+            );
+            seq.push(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Array(slots)),
+            });
+            self.private_scopes.push(PrivateScope {
+                frame: self.top(),
+                penv: id,
+                names: private_names,
+            });
+            Some((local, id))
         };
 
         // The computed member names, by member index: each evaluated once, in
@@ -475,7 +525,10 @@ impl LowerCtx<'_> {
         };
         let own = field_props
             .iter()
-            .filter_map(|(_, p)| prop_key_name(&p.key).ok())
+            .filter_map(|(_, m)| match m {
+                ClassMember::ClassProp(p) => prop_key_name(&p.key).ok(),
+                _ => None,
+            })
             .chain(collect_instance_fields(ctor_stmts));
         for f in own {
             if !fields.contains(&f) {
@@ -502,13 +555,20 @@ impl LowerCtx<'_> {
         // The constructor function value — the class value itself. A derived
         // class without a constructor gets `constructor(...args) { super(...args) }`.
         let frame = self.top();
-        let prev_fields = std::mem::replace(
-            &mut self.class_fields,
-            field_props
-                .iter()
-                .map(|&(i, p)| (p.clone(), keys[i].map(|(_, id)| (frame, id))))
-                .collect(),
-        );
+        let mut class_fields = Vec::with_capacity(field_props.len());
+        for &(i, member) in &field_props {
+            class_fields.push(match member {
+                ClassMember::PrivateProp(p) => {
+                    let (_, id, slot, _) = self.private_slot(&p.key)?;
+                    ClassField::Private(p.clone(), frame, id, slot)
+                }
+                ClassMember::ClassProp(p) => {
+                    ClassField::Public(p.clone(), keys[i].map(|(_, id)| (frame, id)))
+                }
+                other => return Err(reject_class_member(other)),
+            });
+        }
+        let prev_fields = std::mem::replace(&mut self.class_fields, class_fields);
         let kind = if heritage.is_some() {
             FnKind::DerivedClass
         } else {
@@ -587,14 +647,42 @@ impl LowerCtx<'_> {
                 proto: Box::new(IrNode::Local(parent)),
             });
         }
+        if let Some((local, _)) = penv {
+            seq.push(IrNode::PrivEnvStore {
+                env: Box::new(IrNode::Local(local)),
+                slot: 0,
+                value: Box::new(IrNode::Local(class_local)),
+            });
+        }
         if let Some(local) = inner {
             seq.push(self.init_binding(local, IrNode::Local(class_local)));
         }
 
-        // Static fields, in source order, defined (CreateDataProperty) once the
-        // class value and its inner binding exist; `this` is the class.
+        // Static fields, in source order, defined (CreateDataProperty, or
+        // PrivateFieldAdd for a private one) once the class value and its inner
+        // binding exist; `this` is the class.
         let prev_static = self.static_init.replace((self.top(), class_id));
-        for (i, p) in static_fields {
+        for (i, member) in static_fields {
+            let p = match member {
+                ClassMember::ClassProp(p) => p,
+                ClassMember::PrivateProp(p) => {
+                    let name = JsStr::from(format!("#{}", p.key.name));
+                    let value = match &p.value {
+                        Some(init) => self.lower_key_named_expr(init, &name)?,
+                        None => IrNode::Undefined,
+                    };
+                    let (key, _) = self.private_field(&p.key)?;
+                    seq.push(IrNode::PrivateAdd {
+                        obj: Box::new(IrNode::Local(class_local)),
+                        key: Box::new(key),
+                        value: Box::new(value),
+                        attrs: crate::abi::ATTR_WRITABLE,
+                        name,
+                    });
+                    continue;
+                }
+                other => return Err(reject_class_member(other)),
+            };
             let entry = if let Some((key, _)) = keys[i] {
                 let value = match &p.value {
                     Some(init) => self.lower_computed_named_expr(init, key)?,
@@ -618,6 +706,9 @@ impl LowerCtx<'_> {
         }
         self.static_init = prev_static;
         self.current_super = prev_super;
+        if penv.is_some() {
+            self.private_scopes.pop();
+        }
         self.pop_scope();
         seq.push(IrNode::Local(class_local));
         Ok(IrNode::Seq(seq))
@@ -1269,12 +1360,9 @@ impl LowerCtx<'_> {
                         IrNode::Local(key)
                     }
                     MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-                    MemberProp::PrivateName(_) => {
-                        return Err(CompileError::spanned(
-                            m.span(),
-                            "unsupported assignment target",
-                        )
-                        .into());
+                    MemberProp::PrivateName(p) => {
+                        let (key, name) = self.private_field(p)?;
+                        return Ok(AssignRef::Private { obj, key, name });
                     }
                 };
                 Ok(AssignRef::Member { obj, key })
@@ -1309,6 +1397,12 @@ impl LowerCtx<'_> {
                 obj: Box::new(IrNode::Local(obj)),
                 index: Box::new(key),
                 value: Box::new(value),
+            },
+            AssignRef::Private { obj, key, name } => IrNode::PrivateSet {
+                obj: Box::new(IrNode::Local(obj)),
+                key: Box::new(key),
+                value: Box::new(value),
+                name,
             },
         }
     }
@@ -2077,6 +2171,9 @@ enum AssignRef {
     /// A member `obj[key]`: the object stashed in a local, the key either a
     /// static string or a stashed local.
     Member { obj: u32, key: IrNode },
+    /// A private field `obj.#x` (DESIGN.md §7.6): the stashed object, the
+    /// private symbol read and its `"#x"` text.
+    Private { obj: u32, key: IrNode, name: JsStr },
 }
 
 /// The head of a `for-of` loop: a fresh `const`/`let` binding or
@@ -2190,13 +2287,12 @@ fn check_member_name(key: &PropName, is_static: bool, field: bool) -> anyhow::Re
 }
 
 /// Build the spanned rejection for a non-method, non-constructor, non-field class
-/// member. Private / static-block forms are out of scope entirely. Each carries
-/// the member's span. (Methods and plain instance fields are handled in
+/// member. Private methods / accessors and static blocks are out of scope.
+/// Each carries the member's span. (Methods and fields are handled in
 /// [`LowerCtx::lower_class_decl`] directly — supported or rejected there.)
 fn reject_class_member(member: &ClassMember) -> anyhow::Error {
     let (span, msg) = match member {
         ClassMember::PrivateMethod(m) => (m.span(), "private class methods are not supported"),
-        ClassMember::PrivateProp(p) => (p.span(), "private class fields are not supported"),
         ClassMember::StaticBlock(b) => (b.span(), "class static blocks are not supported"),
         other => (other.span(), "unsupported class member"),
     };
