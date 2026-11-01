@@ -241,14 +241,16 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
     // i64) -> i32`; then the exported `__promise_self_error() -> i64`; then
-    // `__symbol_get(v: i64, sym: i32) -> i64`; then the private-name helpers
-    // `__private_find(o: i64, key: i32) -> i32`, `__private_add(o: i64, key:
-    // i32, v: i64, attrs: i32, name: i32)`, `__private_get(o: i64, key: i32,
-    // name: i32) -> i64`, `__private_set(o: i64, key: i32, v: i64, name:
-    // i32) -> i64`, `__private_brand(o: i64, v: i64, brand: i64, name: i32,
-    // mode: i32) -> i64` and `__private_in(o: i64, brand: i64, name: i32) ->
-    // i64`.
-    let conversions: [(&[ValType], &[ValType]); 24] = [
+    // `__symbol_get(v: i64, sym: i32) -> i64`; then the `super` property
+    // helpers `__super_get(home: i64, key: i32, recv: i64) -> i64` and
+    // `__super_set(home: i64, key: i32, v: i64, recv: i64)`; then the
+    // private-name helpers `__private_find(o: i64, key: i32) -> i32`,
+    // `__private_add(o: i64, key: i32, v: i64, attrs: i32, name: i32)`,
+    // `__private_get(o: i64, key: i32, name: i32) -> i64`, `__private_set(o:
+    // i64, key: i32, v: i64, name: i32) -> i64`, `__private_brand(o: i64, v:
+    // i64, brand: i64, name: i32, mode: i32) -> i64` and `__private_in(o: i64,
+    // brand: i64, name: i32) -> i64`.
+    let conversions: [(&[ValType], &[ValType]); 26] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -287,6 +289,11 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I32, ValType::I64], &[ValType::I32]),
         (&[], &[ValType::I64]),
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
+        (&[ValType::I64, ValType::I32, ValType::I64], &[ValType::I64]),
+        (
+            &[ValType::I64, ValType::I32, ValType::I64, ValType::I64],
+            &[],
+        ),
         (&[ValType::I64, ValType::I32], &[ValType::I32]),
         (
             &[
@@ -958,6 +965,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         | IrNode::ToPropertyKey(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
+        | IrNode::SuperBase(operand)
         | IrNode::Throw(operand)
         // A generator `yield e` carries only its operand.
         | IrNode::Yield(operand)
@@ -1277,6 +1285,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
             }
         }
         IrNode::ObjectDelete { obj, key } => {
+            seed_nullish_strs(strs);
             seed_prop_strs(strs);
             collect_node(obj, strs);
             collect_node(key, strs);
@@ -1295,6 +1304,25 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
             // Seed the syntax-error object's static strings so `__json_throw` can
             // build its `SyntaxError` on malformed input.
             seed_strs(&JSON_PARSE_ERROR_STRS, strs);
+        }
+        IrNode::SuperGet { this, key, home } => {
+            seed_nullish_strs(strs);
+            collect_node(this, strs);
+            collect_node(key, strs);
+            collect_node(home, strs);
+        }
+        IrNode::SuperSet {
+            this,
+            key,
+            home,
+            value,
+        } => {
+            seed_nullish_strs(strs);
+            seed_prop_strs(strs);
+            collect_node(this, strs);
+            collect_node(key, strs);
+            collect_node(home, strs);
+            collect_node(value, strs);
         }
         IrNode::IndexSet { obj, index, value } => {
             seed_nullish_strs(strs);
@@ -1561,6 +1589,8 @@ fn program_has_accessors(program: &IrProgram) -> bool {
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }
         | IrNode::IndexOpSet { index: key, .. }
+        | IrNode::SuperGet { key, .. }
+        | IrNode::SuperSet { key, .. }
         | IrNode::MethodCallUser { key, .. } => computed(key),
         _ => false,
     })

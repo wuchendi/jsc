@@ -1049,8 +1049,24 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 /// wrapper;
 /// `null`/`undefined` and a key of `0` (never interned) read `undefined`.
 pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_get_from(strings, helpers, false)
+}
+
+/// `__super_get(home: i64, key: i32, recv: i64) -> i64`: `home.[[Get]](key,
+/// recv)` — [`emit_get`]'s lookup starting at `home` (a `super` reference's
+/// home object prototype), a getter called with `this = recv`.
+pub(super) fn emit_super_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_get_from(strings, helpers, true)
+}
+
+/// The body of [`emit_get`] (`receiver` = `false`: the lookup starts at the
+/// receiver) and [`emit_super_get`] (an extra receiver param).
+fn emit_get_from(strings: &StrOffsets, helpers: Helpers<'_>, receiver: bool) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
-    let (recv, key, o, e, t, i, p) = (0, 1, 2, 3, 4, 5, 6);
+    let shift = u32::from(receiver);
+    let (recv, key) = (0, 1);
+    let (o, e, t, i, p) = (2 + shift, 3 + shift, 4 + shift, 5 + shift, 6 + shift);
+    let this = if receiver { 2 } else { recv };
     let base = t;
     let proto_base = |ctor| {
         let bits = intrinsic_bits(realm::prototype_of(ctor), helpers);
@@ -1107,7 +1123,7 @@ pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         );
         emit_is_function(&mut f, p);
         wasm!(f; I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
-        emit_accessor_call(&mut f, p, recv, None, base, helpers);
+        emit_accessor_call(&mut f, p, this, None, base, helpers);
         wasm!(f; Return, End);
     }
     wasm!(f;
@@ -1214,17 +1230,48 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>) -> Function {
 /// dirty bit when the program tracks them (an add does so in `__define`). A
 /// throw leaves the exception pending.
 pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
+    emit_set_from(None, helpers)
+}
+
+/// `__super_set(home: i64, key: i32, v: i64, recv: i64)`: `home.[[Set]](key,
+/// v, recv)` (strict), the store of a `super` reference. The lookup of
+/// [`emit_set`] starts at `home` (the home object's prototype, an object): an
+/// accessor calls its setter with `this = recv` (a getter-only one throws), a
+/// non-writable data property throws. A writable data property or a miss
+/// writes `recv` instead (`OrdinarySetWithOwnDescriptor`): a primitive `recv`
+/// throws; an own table property of `recv` that is an accessor or read-only
+/// throws (as do a `String` wrapper's index and a read-only array `length`),
+/// a writable one takes the value in place; an exotic own key (an array
+/// element or `length`) is updated with `__define_own` of `{value}`, and a
+/// missing key is created with `CreateDataProperty` (a non-extensible `recv`
+/// throws). A throw leaves the exception pending.
+pub(super) fn emit_super_set(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_set_from(Some(strings), helpers)
+}
+
+/// The body of [`emit_set`] (`receiver` = `None`) and [`emit_super_set`]
+/// (an extra receiver param; `Some` carries the static key offsets).
+fn emit_set_from(receiver: Option<&StrOffsets>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
+    let shift = u32::from(receiver.is_some());
     let (recv, key, v) = (0, 1, 2);
-    let (o, q, e, own, a, s) = (3, 4, 5, 6, 7, 8);
+    let (o, q, e, own, a, s) = (
+        3 + shift,
+        4 + shift,
+        5 + shift,
+        6 + shift,
+        7 + shift,
+        8 + shift,
+    );
+    let this = if receiver.is_some() { 3 } else { recv };
     wasm!(f;
         LocalGet(recv), I32WrapI64, LocalTee(o), LocalSet(q),
-        I32Const(1), LocalSet(own),
+        I32Const(i32::from(receiver.is_none())), LocalSet(own),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
     // A String wrapper's index is a read-only data property.
     emit_if_str_exotic(&mut f, q, key, a, helpers, |f| {
-        emit_prop_throw_return(f, recv, key, PROP_THROW_READ_ONLY, helpers);
+        emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
     });
     wasm!(f;
         LocalGet(q), LocalGet(key), Call(helpers.prop_find), LocalTee(e), BrIf(1),
@@ -1250,40 +1297,121 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
         );
         emit_is_function(&mut f, s);
         wasm!(f; If(BlockType::Empty));
-        emit_accessor_call(&mut f, s, recv, Some(v), q, helpers);
+        emit_accessor_call(&mut f, s, this, Some(v), q, helpers);
         wasm!(f; Drop, Return, End);
-        emit_prop_throw_return(&mut f, recv, key, PROP_THROW_GETTER_ONLY, helpers);
+        emit_prop_throw_return(&mut f, this, key, PROP_THROW_GETTER_ONLY, helpers);
         wasm!(f; End);
     }
     wasm!(f;
         LocalGet(a), I32Const(ATTR_WRITABLE), I32And, I32Eqz,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(&mut f, recv, key, PROP_THROW_READ_ONLY, helpers);
+    emit_prop_throw_return(&mut f, this, key, PROP_THROW_READ_ONLY, helpers);
+    wasm!(f; End);
+    let Some(strings) = receiver else {
+        wasm!(f;
+            LocalGet(own),
+            If(BlockType::Empty),
+            LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)),
+        );
+        emit_store_dirty(&mut f, o, a, helpers);
+        wasm!(f;
+            Return,
+            End,
+            End,
+            LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+            If(BlockType::Empty),
+        );
+        emit_prop_throw_return(&mut f, recv, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
+        wasm!(f;
+            End,
+            LocalGet(o), LocalGet(key), LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
+            End,
+        );
+        return f;
+    };
+    // A writable data property or a miss: the receiver takes the value.
+    wasm!(f; End);
+    emit_receiver_set(&mut f, [this, key, v], [o, e, a], strings, helpers);
+    wasm!(f; End);
+    f
+}
+
+/// The receiver half of [`emit_super_set`] (`OrdinarySetWithOwnDescriptor`
+/// steps 2.b-e): store the jsval `v` under the interned `key` on the jsval
+/// `this`, with the i32 scratch locals `o`, `e`, `a`.
+fn emit_receiver_set(
+    f: &mut Function,
+    [this, key, v]: [u32; 3],
+    [o, e, a]: [u32; 3],
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    emit_is_object(f, this);
+    wasm!(f; I32Eqz, If(BlockType::Empty));
+    emit_prop_throw_return(f, this, key, PROP_THROW_PRIMITIVE, helpers);
+    wasm!(f; End, LocalGet(this), I32WrapI64, LocalSet(o));
+    emit_if_str_exotic(f, o, key, a, helpers, |f| {
+        emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    });
+    wasm!(f;
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq, I32And,
+        If(BlockType::Empty),
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And,
+        If(BlockType::Empty),
+    );
+    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
     wasm!(f;
         End,
-        LocalGet(own),
+        End,
+        LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e),
         If(BlockType::Empty),
-        LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)),
+        LocalGet(e), I32Load(m32(E_ATTRS)), LocalSet(a),
     );
-    if helpers.dirty_tracking {
-        wasm!(f; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(a));
-        emit_mark_dirty(&mut f, a);
+    if helpers.has_accessors {
+        wasm!(f; LocalGet(a), I32Const(ATTR_ACCESSOR), I32And, If(BlockType::Empty));
+        emit_prop_throw_return(f, this, key, PROP_THROW_GETTER_ONLY, helpers);
+        wasm!(f; End);
     }
+    wasm!(f;
+        LocalGet(a), I32Const(ATTR_WRITABLE), I32And, I32Eqz,
+        If(BlockType::Empty),
+    );
+    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    wasm!(f; End, LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)));
+    emit_store_dirty(f, o, a, helpers);
+    // An exotic own key keeps its attributes; a missing one is created.
     wasm!(f;
         Return,
         End,
-        End,
-        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+        LocalGet(o), LocalGet(key),
+        I32Const(DESC_HAS_VALUE), I32Const(DESC_DATA_DEFAULT),
+        LocalGet(key), LocalGet(this), Call(helpers.has_own()), Select,
+        LocalGet(v), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
+        Call(helpers.define_own()), LocalSet(a),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
+        LocalGet(a), I32Const(DEFINE_NOT_EXTENSIBLE), I32Eq,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(&mut f, recv, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
+    emit_prop_throw_return(f, this, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
     wasm!(f;
         End,
-        LocalGet(o), LocalGet(key), LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
-        End,
+        LocalGet(a), I32Const(DEFINE_REJECT), I32Eq,
+        If(BlockType::Empty),
     );
-    f
+    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    wasm!(f; End);
+}
+
+/// Set the dirty bit of the own table of the object-family block `o` (i32
+/// local; `table` is an i32 scratch local) after an in-place store, when the
+/// program tracks dirty bits.
+fn emit_store_dirty(function: &mut Function, o: u32, table: u32, helpers: Helpers<'_>) {
+    if helpers.dirty_tracking {
+        wasm!(function; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(table));
+        emit_mark_dirty(function, table);
+    }
 }
 
 /// `__has(key: i32, obj: i64) -> i32`: `HasProperty` of the interned `key`

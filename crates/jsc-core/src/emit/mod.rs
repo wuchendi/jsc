@@ -1211,37 +1211,47 @@ impl Helpers<'_> {
         self.to_primitive() + 17
     }
 
+    /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).
+    fn super_get(self) -> u32 {
+        self.to_primitive() + 18
+    }
+
+    /// `__super_set(home, key, v, recv)` (see [`props::emit_super_set`]).
+    fn super_set(self) -> u32 {
+        self.to_primitive() + 19
+    }
+
     /// `__private_find(o, key) -> i32` (see [`props::emit_private_find`]).
     fn private_find(self) -> u32 {
-        self.to_primitive() + 18
+        self.to_primitive() + 20
     }
 
     /// `__private_add(o, key, v, attrs, name)` (see
     /// [`props::emit_private_add`]).
     fn private_add(self) -> u32 {
-        self.to_primitive() + 19
+        self.to_primitive() + 21
     }
 
     /// `__private_get(o, key, name) -> i64` (see [`props::emit_private_get`]).
     fn private_get(self) -> u32 {
-        self.to_primitive() + 20
+        self.to_primitive() + 22
     }
 
     /// `__private_set(o, key, v, name) -> i64` (see
     /// [`props::emit_private_set`]).
     fn private_set(self) -> u32 {
-        self.to_primitive() + 21
+        self.to_primitive() + 23
     }
 
     /// `__private_brand(o, v, brand, name, mode) -> i64` (see
     /// [`props::emit_private_brand`]).
     fn private_brand(self) -> u32 {
-        self.to_primitive() + 22
+        self.to_primitive() + 24
     }
 
     /// `__private_in(o, brand, name) -> i64` (see [`props::emit_private_in`]).
     fn private_in(self) -> u32 {
-        self.to_primitive() + 23
+        self.to_primitive() + 25
     }
 
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
@@ -1751,6 +1761,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_set_proto(helpers));
     code.function(&builtins::emit_promise_self_error(&offsets, helpers));
     code.function(&emit_symbol_get(helpers));
+    code.function(&emit_super_get(&offsets, helpers));
+    code.function(&emit_super_set(&offsets, helpers));
     code.function(&emit_private_find(helpers));
     code.function(&emit_private_add(helpers));
     code.function(&emit_private_get(helpers));

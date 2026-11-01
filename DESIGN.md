@@ -855,6 +855,7 @@ function-index order:
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 | promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
+| `super` references (§6.3) | `__super_get(home, key, recv)`, `__super_set(home, key, v, recv)` |
 | private names (§7.6) | `__private_find(o, key)`, `__private_add(o, key, v, attrs, name)`, `__private_get(o, key, name)`, `__private_set(o, key, v, name)`, `__private_brand(o, v, brand, name, mode)`, `__private_in(o, brand, name)` |
 
 The string helpers work on code units at either width: `__concat` makes a
@@ -903,6 +904,18 @@ tables. Keys are interned `u32`s.
   through `__proto_set` first (§5.4). Member stores on a primitive (a symbol included) throw (`Cannot create
   property 'k' on string 'abc'`); on `null`/`undefined` they throw `Cannot set properties of
   undefined (setting 'k')`.
+- **`__super_get(home, key, recv)` / `__super_set(home, key, v, recv)`** —
+  `home.[[Get]](key, recv)` / `home.[[Set]](key, v, recv)` for a `super`
+  reference (§7.6): the walk of `__get` / `__set` starts at the super base
+  `home` (the home object's prototype, read at the reference), and a getter or setter found on the way is called with
+  `this = recv`. A setter-less accessor or a non-writable data property on
+  the chain throws; a writable data property or a miss writes the receiver
+  (`OrdinarySetWithOwnDescriptor`): a primitive `recv` throws, an own
+  accessor or read-only own property of `recv` (a `String` wrapper's index,
+  a read-only array `length`) throws, an own writable table property takes
+  the value in place, an exotic own key (an array element or `length`) is
+  updated by `__define_own` of `{value}`, and a missing key is created
+  (`CreateDataProperty`; a non-extensible `recv` throws).
 - **`__has(key, obj)`** — `HasProperty` (backs `in`): at each object of the
   chain its exotic own keys (a hole is not own), then its own table. A primitive right-hand side
   throws a `TypeError`. `__has_own` is the same without the chain
@@ -1409,13 +1422,15 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   identity.
 - **Logical** `!`, `&&`, `||`, `??` (each yields an operand value, not a coerced
   boolean) and `&&=`, `||=`, `??=` (short circuit).
-- **Assignment targets** are an identifier, a member `o.k` / `o[k]` (either
-  one parenthesized any number of times: `(a) = 1`, `((o.x)) += 1`, `++(a)`)
-  or a destructuring pattern (§7.3). A compound, `**=` or logical assignment
-  to a member evaluates the base and the key once (a `**=` / logical one
-  converts the key once with `ToPropertyKey`); a short-circuited `&&=` /
-  `||=` / `??=` skips both the right-hand side and the store, so no setter
-  runs. An anonymous function assigned by `=` or a logical assignment to an
+- **Assignment targets** are an identifier, a member `o.k` / `o[k]`, a
+  `super` property `super.k` / `super[k]` (§7.6; any of them parenthesized
+  any number of times: `(a) = 1`, `((o.x)) += 1`, `++(a)`) or a
+  destructuring pattern (§7.3). A compound, `**=` or logical assignment to a
+  member evaluates the base and the key once (a `**=` / logical one converts
+  the key once with `ToPropertyKey`, after a `null` / `undefined` base has
+  thrown its `TypeError`, so a key's `toString` never runs then); a
+  short-circuited `&&=` / `||=` / `??=` skips both the right-hand side and
+  the store, so no setter runs. An anonymous function assigned by `=` or a logical assignment to an
   unparenthesized identifier is named after it. An invalid target (`f() = 1`,
   `1 = 2`, `a + b = c`, `(a, b) = c`, `a?.b = 1`) is an early `SyntaxError`
   (`Invalid left-hand side in assignment`).
@@ -1427,10 +1442,15 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   alone keep the reference: `(o.m)()` calls with `this = o`); `yield`/`await`
   operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
-  (`__delete`; parentheses around the member are transparent). `delete x` of
-  an identifier is an early `SyntaxError` (strict code); `delete` of any other
-  non-reference (`delete 1`, `delete f()`) evaluates its operand and yields
-  `true`.
+  (`__delete`; parentheses around the member are transparent; a `null` /
+  `undefined` base throws a `TypeError` before the key converts). `delete x`
+  of an identifier is an early `SyntaxError` (strict code); `delete super.x`
+  / `delete super[k]` reads `this`, evaluates `k`, then throws
+  `ReferenceError: Unsupported reference to 'super'`; `delete` of an
+  optional chain (`delete o?.x`, `delete o?.a.b`, `delete o?.[k]`) deletes
+  the final reference unless the chain short-circuits, and yields `true`
+  either way; `delete` of any other non-reference (`delete 1`, `delete f()`,
+  `delete o?.f()`) evaluates its operand and yields `true`.
 - **`void`** evaluates its operand for its effects (calls, assignments,
   throws, `yield` / `await`) and yields `undefined`; a literal operand folds
   to `undefined`.
@@ -1681,13 +1701,39 @@ those of `switch` and loops are not tracked.
   (any expression; it must be a constructor or `null`), links
   `B.prototype.[[Prototype]]` to `E.prototype` and `B.[[Prototype]]` to `E`
   (statics are inherited). `B` is `SELF_ALLOC`: its `this` is in TDZ until
-  `super(args)` constructs it from `E` with `new.target`; touching `this` first
+  `super(args)` constructs it with `new.target` from `B`'s prototype at the
+  call (`GetSuperConstructor`: `E` unless `Object.setPrototypeOf(B, ..)`
+  moved it; read before the arguments, a non-constructor throws `TypeError:
+  Super constructor is not a constructor` after them); touching `this` first
   throws `ReferenceError: Must call super constructor in derived class before
   accessing 'this' …`. `super.m(args)` calls the parent prototype's method with
   the current `this`. A derived class without a constructor forwards its
   arguments. Builtin parents (`Error`, `Map`, `Set`, `Promise`, `Date`,
   `Array`) work through the same path: their constructors allocate from
   `new.target.prototype`.
+- **`super` properties.** In a class method, accessor or constructor (and
+  an arrow inside one), `super.x` / `super[k]` is a
+  reference whose base is the home object's `[[Prototype]]`, read at each
+  reference after `k` is evaluated and before it converts (`GetSuperBase`;
+  `IrNode::SuperBase`) — the home object is the class's `prototype` for an
+  instance member (constructor and instance field initializers included)
+  and the class itself for a static one (static field initializers and
+  static blocks included), so a later `Object.setPrototypeOf` of either is
+  observed. The class keeps both home objects in two hidden cells, created
+  and filled around its `DefineProps` only when a member references
+  `super` (the constructor closure exists before the class value). The
+  receiver is the current `this`, read first (TDZ-checked in a derived
+  constructor), before `k` is evaluated. A read is `__super_get` (a getter
+  runs with `this`); `super.x = v` is `__super_set` (§6.3: an inherited
+  setter runs with `this`, otherwise `this` gets the own property, the
+  prototype is unchanged, and a read-only, setter-less or non-extensible
+  failure throws a `TypeError`), with `k` converted after `v` runs. Compound,
+  `**=`, logical and `++` / `--` forms read through `__super_get` and store
+  through `__super_set` on the same base, converting `k` once before the
+  right-hand side (a short-circuited logical assignment skips the
+  right-hand side and the store); a `null` base (`class extends null`, or a
+  prototype set to `null`) throws a `TypeError` before `k` converts. `delete super.x` throws a `ReferenceError` (§7.2). They work
+  in generator and async methods across suspensions.
 - **`new X(args)`.** `IsConstructor(X)` (a function with `CONSTRUCTOR`; else
   `TypeError: X is not a constructor`); unless `X` is `SELF_ALLOC`, `this` = a
   fresh object whose `proto` is `Get(X, "prototype")` when that is an object,
@@ -1865,7 +1911,7 @@ invisibility and the early errors — and static blocks.
 **Static blocks** (phase 5a, built in P4). `static { .. }` lowers to a lifted
 zero-parameter method function (`lower_lifted_function`, method kind, not
 a constructor, `name` `""`, the static `super` scope so `super.x` reads
-the parent constructor) created and called immediately with `this` = the
+the class's current prototype) created and called immediately with `this` = the
 class at its source position in the static-element pass; the call gives it
 its own `var` scope, `new.target` `undefined`, the class-scope captures
 (inner name, `%penv`) and exception propagation for free. One closure is
@@ -2395,12 +2441,6 @@ Each item below is current behaviour of this tree.
   (§6.4).
 - An assignment to an unresolvable name evaluates its right-hand side before
   the `HasProperty` check throws the `ReferenceError`.
-- Assigning to, incrementing or deleting a `super` property (`super.x = v`,
-  `super[k]++`, `delete super.x`) and `delete` of an optional chain
-  (`delete o?.x`) are compile errors.
-- A `**=` or logical assignment to a computed member on a `null` /
-  `undefined` base converts the key (`ToPropertyKey`, which may run a user
-  `toString`) before the `TypeError`.
 - `-p` completion values come from expression statements and `try`
   statements; `switch` and loops contribute none.
 
@@ -2477,6 +2517,8 @@ Each item below is current behaviour of this tree.
   `undefined`.
 - A BigInt literal property key (`{1n: v}`, `class { 1n() {} }`, `{1n: a} =
   o`) is a compile error (`BigInt` is not available).
+- `super` outside a class body (an object-literal method) is a compile
+  error.
 
 **Generators & async**
 
@@ -2586,7 +2628,9 @@ code-point string iterator, full case mapping, `normalize`).
 
 ### Phase 5 — Language completeness
 
-- Private fields and methods, static blocks, object spread (phase 5a, done).
+- Private fields and methods, static blocks, object spread and rest,
+  destructuring assignment anywhere, tagged templates, labeled statements,
+  `super` property assignment (phase 5a, done).
 - All remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
