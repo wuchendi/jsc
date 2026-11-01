@@ -33,7 +33,9 @@
 //! The hidden temporaries a `for-of`/`for-in` desugaring keeps in raw wasm locals
 //! (its iterable, index, length, step result, key snapshot) are PROMOTED to frame
 //! cells before the CFG is built ([`promote_raw_locals`]), so such a loop may
-//! suspend in its body or iterable. A `switch` crossing a suspend is flattened
+//! suspend in its body or iterable; so is a temporary that later statements read
+//! across a suspending one (a destructuring source around a `yield` in a
+//! computed key). A `switch` crossing a suspend is flattened
 //! into a chain of strict-equality test blocks and one block per clause body,
 //! with fall-through jumps and its own `break` target.
 //!
@@ -1688,10 +1690,10 @@ fn is_inline(stmt: &IrStmt) -> bool {
 /// Promote to frame cells the raw wasm locals that a CFG-lowered statement may
 /// carry across a suspend. In a generator body every source variable is already
 /// an env cell, so a raw local declared by a [`IrStmt::Decl`] or written by an
-/// [`IrNode::Assign`] is a statement-level compiler temporary (a `for-of`/
-/// `for-in` iterable, index, length, step result or key snapshot). Each such
-/// local referenced inside a statement that is not emitted inline gets a fresh
-/// frame cell (numbered from `next_slot`), and EVERY read and write of it in the
+/// [`IrNode::Assign`] is a compiler temporary (a `for-of`/`for-in` iterable,
+/// index, length, step result or key snapshot, a destructuring source). Each
+/// such local referenced inside a statement that is not emitted inline, or by
+/// two top-level statements around one that is not, gets a fresh frame cell (numbered from `next_slot`), and EVERY read and write of it in the
 /// whole body is rewritten to that cell, so the inline statements that
 /// initialize it write the cell too. Per-node scratch locals (`obj_local`, ...)
 /// are never `Decl`/`Assign` targets and stay raw, as does a `super.m(..)`
@@ -1703,6 +1705,24 @@ fn promote_raw_locals(stmts: &[IrStmt], next_slot: &mut u32) -> Vec<IrStmt> {
     for stmt in stmts {
         collect_locals(stmt, &mut written, &mut crossing, false);
     }
+    // A temporary referenced by two top-level statements with a suspending one
+    // between them lives across that suspend even when every statement touching
+    // it is inline (a destructuring declaration's source, read after a `yield`
+    // in a computed key).
+    let mut spans: HashMap<u32, (usize, usize)> = HashMap::new();
+    for (i, stmt) in stmts.iter().enumerate() {
+        let mut referenced = HashSet::new();
+        collect_locals(stmt, &mut HashSet::new(), &mut referenced, true);
+        for local in referenced {
+            spans.entry(local).or_insert((i, i)).1 = i;
+        }
+    }
+    let suspending: Vec<usize> = (0..stmts.len())
+        .filter(|&i| !is_inline(&stmts[i]))
+        .collect();
+    crossing.extend(spans.into_iter().filter_map(|(local, (first, last))| {
+        (first < last && suspending.iter().any(|&i| first < i && i < last)).then_some(local)
+    }));
     let mut pinned = HashSet::new();
     for stmt in stmts {
         collect_this_call_locals(stmt, &mut pinned);

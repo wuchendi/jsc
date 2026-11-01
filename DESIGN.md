@@ -2052,7 +2052,9 @@ point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
 `loop { br_table(state) }`, while regions without a suspend keep ordinary wasm
 control flow. A `yield` may appear inside a larger expression
 (`1 + (yield 2)`, a loop condition, a destructuring assignment's RHS or
-default); the expression is linearized around it.
+default, a computed pattern key); the expression is linearized around it, and
+a compiler temporary that later statements read across the suspend (the
+source of `const { [yield k]: v } = o`) lives in a frame cell.
 
 - Each generator function owns a `prototype` (writable, non-enumerable,
   non-configurable): a fresh object inheriting `%GeneratorPrototype%`
