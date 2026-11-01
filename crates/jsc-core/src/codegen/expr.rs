@@ -809,10 +809,16 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// The `this` a `super.x` reference reads first (TDZ-checked in a derived
-    /// constructor; an arrow's is its enclosing function's, a generator/async
-    /// method's lives in its frame cell).
+    /// The `this` a `super.x` reference reads first (the class in a static
+    /// field initializer; TDZ-checked in a derived constructor; an arrow's is
+    /// its enclosing function's, a generator/async method's lives in its frame
+    /// cell).
     fn super_this(&mut self, span: Span) -> anyhow::Result<IrNode> {
+        if let Some((frame, id)) = self.static_init
+            && self.only_arrows_above(frame)
+        {
+            return Ok(self.read_hidden(frame, id));
+        }
         if let Some(fi) = self.derived_frame() {
             return Ok(self.derived_this(fi));
         }

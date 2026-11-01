@@ -650,6 +650,10 @@ impl CaptureResolver {
                     if let MemberProp::Computed(c) = &m.prop {
                         self.expr(&c.expr);
                     }
+                } else if let AssignTarget::Simple(SimpleAssignTarget::SuperProp(sp)) = &a.left
+                    && let swc_ecma_ast::SuperProp::Computed(c) = &sp.prop
+                {
+                    self.expr(&c.expr);
                 } else if let AssignTarget::Pat(pat) = &a.left {
                     // A destructuring assignment (`[o] = ..`, `({o} = ..)`) rebinds
                     // its targets — record every simple-ident target as referenced.
