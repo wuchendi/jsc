@@ -550,8 +550,8 @@ pub(super) enum Builtin {
     BooleanValueOf,
     /// A `Date.prototype` method (`toString`, `getTime`, `valueOf`, ..).
     DateMethod(DateOp),
-    /// A generic `%Date.prototype%` method (any receiver).
-    DateGeneric(DateGenericOp),
+    /// Any other `Date` builtin with a hand-written body.
+    DateBody(DateBodyOp),
     /// A `%Map.prototype%` (`set == false`) / `%Set.prototype%` method with
     /// an inline body.
     CollectionOp {
@@ -1170,21 +1170,91 @@ impl IterOp {
     }
 }
 
-/// A generic `%Date.prototype%` method: its receiver need not be a Date.
+/// A `Date` builtin other than a field method ([`DateOp`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DateGenericOp {
-    /// `Date.prototype.toJSON`.
+pub(super) enum DateBodyOp {
+    /// `Date.prototype.toJSON` (generic over any receiver).
     ToJson,
-    /// `Date.prototype[@@toPrimitive]` (installed under its symbol key).
+    /// `Date.prototype[@@toPrimitive]` (generic over any object; installed
+    /// under its symbol key).
     ToPrimitive,
+    /// The `Date.UTC` static.
+    Utc,
+    /// A `Date.prototype` setter; `utc` for its `setUTC*` twin (the same
+    /// body: the local time zone is UTC).
+    Set {
+        /// The field (or fields) the setter replaces.
+        op: DateSetOp,
+        /// Whether this is the `setUTC*` function.
+        utc: bool,
+    },
 }
 
-impl DateGenericOp {
+impl DateBodyOp {
     /// The builtin's `name`.
     fn name(self) -> &'static str {
         match self {
             Self::ToJson => "toJSON",
             Self::ToPrimitive => "[Symbol.toPrimitive]",
+            Self::Utc => "UTC",
+            Self::Set { op, utc } => op.name(utc),
+        }
+    }
+}
+
+/// A `%Date.prototype%` setter, by the first field it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DateSetOp {
+    /// `setMilliseconds(ms)`.
+    Milliseconds,
+    /// `setSeconds(sec [, ms])`.
+    Seconds,
+    /// `setMinutes(min [, sec [, ms]])`.
+    Minutes,
+    /// `setHours(hour [, min [, sec [, ms]]])`.
+    Hours,
+    /// `setDate(date)`.
+    Date,
+    /// `setMonth(month [, date])`.
+    Month,
+    /// `setFullYear(year [, month [, date]])`.
+    FullYear,
+    /// `setTime(time)` (no `setUTC*` twin).
+    Time,
+    /// Annex B `setYear(year)` (no `setUTC*` twin).
+    Year,
+}
+
+impl DateSetOp {
+    /// The builtin's `name` (the `setUTC*` one for `utc`).
+    fn name(self, utc: bool) -> &'static str {
+        match (self, utc) {
+            (Self::Milliseconds, false) => "setMilliseconds",
+            (Self::Milliseconds, true) => "setUTCMilliseconds",
+            (Self::Seconds, false) => "setSeconds",
+            (Self::Seconds, true) => "setUTCSeconds",
+            (Self::Minutes, false) => "setMinutes",
+            (Self::Minutes, true) => "setUTCMinutes",
+            (Self::Hours, false) => "setHours",
+            (Self::Hours, true) => "setUTCHours",
+            (Self::Date, false) => "setDate",
+            (Self::Date, true) => "setUTCDate",
+            (Self::Month, false) => "setMonth",
+            (Self::Month, true) => "setUTCMonth",
+            (Self::FullYear, false) => "setFullYear",
+            (Self::FullYear, true) => "setUTCFullYear",
+            (Self::Time, _) => "setTime",
+            (Self::Year, _) => "setYear",
+        }
+    }
+
+    /// The builtin's `length`: the number of fields it takes.
+    pub(super) fn length(self) -> u32 {
+        match self {
+            Self::Milliseconds | Self::Date | Self::Time | Self::Year => 1,
+            Self::Seconds | Self::Month => 2,
+            Self::Minutes | Self::FullYear => 3,
+            Self::Hours => 4,
         }
     }
 }
@@ -1587,7 +1657,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 316] = [
+    pub(super) const ALL: [Builtin; 344] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1694,6 +1764,7 @@ impl Builtin {
         Self::PromiseStatic(PromiseStaticOp::Resolve),
         Self::PromiseStatic(PromiseStaticOp::Reject),
         Self::DateNow,
+        Self::DateBody(DateBodyOp::Utc),
         Self::ArrayPush,
         Self::ArrayPop,
         Self::ArrayHof(ArrayHofOp::Map),
@@ -1788,9 +1859,84 @@ impl Builtin {
         Self::DateMethod(DateOp::GetHours),
         Self::DateMethod(DateOp::GetMinutes),
         Self::DateMethod(DateOp::GetSeconds),
+        Self::DateMethod(DateOp::GetMilliseconds),
+        Self::DateMethod(DateOp::GetTimezoneOffset),
+        Self::DateMethod(DateOp::GetUtcFullYear),
+        Self::DateMethod(DateOp::GetUtcMonth),
+        Self::DateMethod(DateOp::GetUtcDate),
+        Self::DateMethod(DateOp::GetUtcDay),
+        Self::DateMethod(DateOp::GetUtcHours),
+        Self::DateMethod(DateOp::GetUtcMinutes),
+        Self::DateMethod(DateOp::GetUtcSeconds),
+        Self::DateMethod(DateOp::GetUtcMilliseconds),
+        Self::DateMethod(DateOp::GetYear),
         Self::DateMethod(DateOp::ToIsoString),
-        Self::DateGeneric(DateGenericOp::ToJson),
-        Self::DateGeneric(DateGenericOp::ToPrimitive),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Milliseconds,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Seconds,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Minutes,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Hours,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Date,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Month,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::FullYear,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Milliseconds,
+            utc: true,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Seconds,
+            utc: true,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Minutes,
+            utc: true,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Hours,
+            utc: true,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Date,
+            utc: true,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Month,
+            utc: true,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::FullYear,
+            utc: true,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Time,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::Set {
+            op: DateSetOp::Year,
+            utc: false,
+        }),
+        Self::DateBody(DateBodyOp::ToJson),
+        Self::DateBody(DateBodyOp::ToPrimitive),
         Self::CollectionOp {
             set: false,
             op: MapOp::Get,
@@ -1976,7 +2122,7 @@ impl Builtin {
             }
             Self::Symbol(op) => op.name(),
             Self::DateMethod(op) => op.name(),
-            Self::DateGeneric(op) => op.name(),
+            Self::DateBody(op) => op.name(),
             Self::CollectionOp { op, .. } => op.name(),
             Self::PromiseThen => "then",
             Self::PromiseCatch => "catch",
@@ -2090,7 +2236,8 @@ impl Builtin {
                 BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol | BuiltinCtor::Iterator,
             ) => 0,
             Self::Iter(op) => op.length(),
-            Self::Ctor(BuiltinCtor::Date) => 7,
+            Self::Ctor(BuiltinCtor::Date) | Self::DateBody(DateBodyOp::Utc) => 7,
+            Self::DateBody(DateBodyOp::Set { op, .. }) => op.length(),
             Self::Math(
                 MathOp::Min
                 | MathOp::Max
@@ -2158,7 +2305,7 @@ impl Builtin {
             | Self::NumberToPrecision
             | Self::NumberToLocaleString => Some(BuiltinCtor::Number),
             Self::BooleanToString | Self::BooleanValueOf => Some(BuiltinCtor::Boolean),
-            Self::DateMethod(_) | Self::DateGeneric(DateGenericOp::ToJson) => {
+            Self::DateMethod(_) | Self::DateBody(DateBodyOp::Set { .. } | DateBodyOp::ToJson) => {
                 Some(BuiltinCtor::Date)
             }
             Self::Symbol(SymbolOp::ToString | SymbolOp::ValueOf) => Some(BuiltinCtor::Symbol),
@@ -2575,7 +2722,7 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 Builtin::StringRaw,
             ],
             BuiltinCtor::Promise => &PROMISE_STATICS,
-            BuiltinCtor::Date => &[Builtin::DateNow],
+            BuiltinCtor::Date => &[Builtin::DateNow, Builtin::DateBody(DateBodyOp::Utc)],
             BuiltinCtor::Iterator => &[Builtin::Iterator(IteratorOp::From)],
             BuiltinCtor::Symbol => &[
                 Builtin::Symbol(SymbolOp::For),
@@ -2697,7 +2844,7 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
         intrinsic: Intrinsic::Prototype(BuiltinCtor::Date),
         key: Key::Symbol(WellKnown::ToPrimitive),
         attrs: FN_FACT_ATTRS,
-        value: Value::Method(Builtin::DateGeneric(DateGenericOp::ToPrimitive)),
+        value: Value::Method(Builtin::DateBody(DateBodyOp::ToPrimitive)),
     });
     let tags = [
         (Intrinsic::Prototype(BuiltinCtor::Map), "Map"),

@@ -148,10 +148,7 @@ pub(super) fn emit_to_primitive(strings: &StrOffsets, helpers: Helpers<'_>) -> F
     emit_is_object(&mut f, v);
     wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End);
     let symbol = realm::method_bits(Builtin::Symbol(realm::SymbolOp::ToPrimitive), helpers);
-    let date = realm::method_bits(
-        Builtin::DateGeneric(realm::DateGenericOp::ToPrimitive),
-        helpers,
-    );
+    let date = realm::method_bits(Builtin::DateBody(realm::DateBodyOp::ToPrimitive), helpers);
     let hint_str = |name| HEAP_BITS | i64::from(static_key(strings, name));
     wasm!(f;
         LocalGet(hint), I32Const(HINT_ORDINARY), I32And, I32Eqz,

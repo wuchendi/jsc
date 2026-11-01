@@ -7,10 +7,13 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use super::date::date_fields_time;
+
 /// The fragment builder of one body: the `K` argument slots, `argc` and the
 /// i64 temps of a [`Frame`].
-struct Body {
-    k: u32,
+pub(super) struct Body {
+    /// The uniform ABI's positional arity `K`.
+    pub(super) k: u32,
 }
 
 impl Body {
@@ -27,7 +30,7 @@ impl Body {
     /// spread call or construct with more arguments published (`undefined`
     /// past the argument count). Read it before any user code runs: a nested
     /// spread call replaces that array.
-    fn spread_arg(&self, i: u32) -> IrNode {
+    pub(super) fn spread_arg(&self, i: u32) -> IrNode {
         if i < self.k {
             return IrNode::Local(i);
         }
@@ -46,7 +49,7 @@ impl Body {
     }
 
     /// Temp local `n` (`0..4`).
-    fn temp(&self, n: u32) -> u32 {
+    pub(super) fn temp(&self, n: u32) -> u32 {
         self.k + 2 + n
     }
 
@@ -119,7 +122,7 @@ impl Body {
 }
 
 /// `cond ? then_branch : else_branch`.
-fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) -> IrNode {
+pub(super) fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) -> IrNode {
     IrNode::Ternary {
         cond: Box::new(cond),
         then_branch: Box::new(then_branch),
@@ -400,141 +403,25 @@ fn date(body: &Body) -> IrNode {
 }
 
 /// The calendar-field form over at least two arguments (UTC: there is no
-/// local time zone): every field captured first (a spread call's past the
-/// `K` slots too) and converted with `ToNumber` in order (absent `date` is
-/// `1`, absent time fields `0`), then `MakeDate(MakeDay(MakeFullYear(year),
-/// month, date), MakeTime(h, min, s, ms))` into a fresh Date, whose
-/// `TimeClip` turns a non-finite or out-of-range value into an invalid date.
-/// Uses temp 3.
+/// local time zone): [`date_fields_time`] into temp 3, then a fresh Date of
+/// it, whose `TimeClip` turns a non-finite or out-of-range value into an
+/// invalid date.
 fn date_fields(body: &Body) -> IrNode {
-    let frame = Frame { k: body.k };
-    let f: [u32; 7] = [
-        frame.y64(0),
-        frame.y64(1),
-        frame.y64(2),
-        frame.y64(3),
-        frame.y64(4),
-        frame.y64(5),
-        frame.x64(0),
-    ];
     let t = body.temp(3);
-    let mut seq: Vec<IrNode> = (0..7u32)
-        .zip(f)
-        .map(|(i, l)| {
-            let default = if i == 2 { 1.0 } else { 0.0 };
-            let present = bin(BinOp::Gt, IrNode::ArgCount(body.k + 1), num(f64::from(i)));
-            assign(l, ternary(present, body.spread_arg(i), num(default)))
-        })
-        .collect();
-    seq.extend(f.map(|l| {
-        let arg = Box::new(IrNode::Local(l));
-        assign(
-            l,
-            IrNode::ConvertCall {
-                op: ConvertOp::ToNumber,
-                arg,
-                radix: None,
-            },
-        )
-    }));
-    seq.extend(make_day(f[0], f[1], f[2], t));
-    // MakeDate(day, MakeTime(h, min, s, ms)).
-    seq.push(assign(
-        t,
-        sum([
-            bin(BinOp::Mul, IrNode::Local(t), num(86_400_000.0)),
-            bin(BinOp::Mul, trunc(f[3]), num(3_600_000.0)),
-            bin(BinOp::Mul, trunc(f[4]), num(60_000.0)),
-            bin(BinOp::Mul, trunc(f[5]), num(1000.0)),
-            trunc(f[6]),
-        ]),
-    ));
+    let mut seq = date_fields_time(body, t);
     seq.push(IrNode::DateNew {
         arg: Some(Box::new(IrNode::Local(t))),
     });
     IrNode::Seq(seq)
 }
 
-/// `MakeDay(MakeFullYear(year), month, date)` over the number locals into
-/// local `t` (clobbering `year` and `month`): the month index carries into
-/// the year, then `days_from_civil` of the month's first day over a
-/// March-based year (`year` becomes the year of era, `month` the March-based
-/// month, `t` the era), plus `date - 1`. NaN and infinities propagate.
-fn make_day(year: u32, month: u32, date: u32, t: u32) -> [IrNode; 8] {
-    let local = IrNode::Local;
-    let two_digit = IrNode::Logical {
-        op: LogicalOp::And,
-        lhs: Box::new(bin(BinOp::Ge, trunc(year), num(0.0))),
-        rhs: Box::new(bin(BinOp::Le, trunc(year), num(99.0))),
-    };
-    let before_march = || bin(BinOp::Lt, local(month), num(2.0));
-    let full_year = ternary(
-        two_digit,
-        bin(BinOp::Add, num(1900.0), trunc(year)),
-        trunc(year),
-    );
-    let carry = bin(BinOp::Mul, num(12.0), floor_div(trunc(month), 12.0));
-    [
-        assign(year, full_year),
-        assign(
-            year,
-            bin(BinOp::Add, local(year), floor_div(trunc(month), 12.0)),
-        ),
-        assign(month, bin(BinOp::Sub, trunc(month), carry)),
-        assign(
-            year,
-            ternary(
-                before_march(),
-                bin(BinOp::Sub, local(year), num(1.0)),
-                local(year),
-            ),
-        ),
-        assign(
-            month,
-            ternary(
-                before_march(),
-                bin(BinOp::Add, local(month), num(10.0)),
-                bin(BinOp::Sub, local(month), num(2.0)),
-            ),
-        ),
-        assign(t, floor_div(local(year), 400.0)),
-        assign(
-            year,
-            bin(
-                BinOp::Sub,
-                local(year),
-                bin(BinOp::Mul, local(t), num(400.0)),
-            ),
-        ),
-        assign(
-            t,
-            sum([
-                bin(BinOp::Mul, local(t), num(146_097.0)),
-                bin(BinOp::Mul, local(year), num(365.0)),
-                floor_div(local(year), 4.0),
-                bin(BinOp::Sub, num(0.0), floor_div(local(year), 100.0)),
-                floor_div(
-                    bin(
-                        BinOp::Add,
-                        bin(BinOp::Mul, num(153.0), local(month)),
-                        num(2.0),
-                    ),
-                    5.0,
-                ),
-                num(-719_469.0),
-                trunc(date),
-            ]),
-        ),
-    ]
-}
-
 /// The number literal `n`.
-fn num(n: f64) -> IrNode {
+pub(super) fn num(n: f64) -> IrNode {
     IrNode::Num(n)
 }
 
 /// `lhs op rhs`.
-fn bin(op: BinOp, lhs: IrNode, rhs: IrNode) -> IrNode {
+pub(super) fn bin(op: BinOp, lhs: IrNode, rhs: IrNode) -> IrNode {
     IrNode::Binary {
         op,
         lhs: Box::new(lhs),
@@ -543,7 +430,7 @@ fn bin(op: BinOp, lhs: IrNode, rhs: IrNode) -> IrNode {
 }
 
 /// `Math.trunc` of the number in local `l`.
-fn trunc(l: u32) -> IrNode {
+pub(super) fn trunc(l: u32) -> IrNode {
     IrNode::MathCall {
         op: MathOp::Trunc,
         args: vec![IrNode::Local(l)],
@@ -551,7 +438,7 @@ fn trunc(l: u32) -> IrNode {
 }
 
 /// `Math.floor(n / d)`.
-fn floor_div(n: IrNode, d: f64) -> IrNode {
+pub(super) fn floor_div(n: IrNode, d: f64) -> IrNode {
     IrNode::MathCall {
         op: MathOp::Floor,
         args: vec![bin(BinOp::Div, n, num(d))],
@@ -559,7 +446,7 @@ fn floor_div(n: IrNode, d: f64) -> IrNode {
 }
 
 /// `l = value`.
-fn assign(l: u32, value: IrNode) -> IrNode {
+pub(super) fn assign(l: u32, value: IrNode) -> IrNode {
     IrNode::Assign {
         local: l,
         value: Box::new(value),
@@ -567,7 +454,7 @@ fn assign(l: u32, value: IrNode) -> IrNode {
 }
 
 /// The left-to-right sum of `terms`.
-fn sum<const N: usize>(terms: [IrNode; N]) -> IrNode {
+pub(super) fn sum<const N: usize>(terms: [IrNode; N]) -> IrNode {
     terms
         .into_iter()
         .reduce(|acc, term| bin(BinOp::Add, acc, term))

@@ -910,7 +910,7 @@ pub(super) fn emit_map_new_node(
 }
 
 /// The i64/f64 `ms` payload slot of a `TYPE_DATE` block, 8-byte aligned.
-fn date_ms_slot() -> MemArg {
+pub(super) fn date_ms_slot() -> MemArg {
     MemArg {
         offset: DATE_MS_OFFSET,
         align: 3,
@@ -997,7 +997,7 @@ const MAX_TIME_VALUE: f64 = 8.64e15;
 /// `TimeClip` (ES2024 §21.4.1.31) of the f64 on the stack, leaving its bits in
 /// i64 `out`: `NaN` unless finite with `|t| <= 8.64e15`, else `t` truncated
 /// toward zero with `-0` normalized to `+0`.
-fn emit_time_clip(function: &mut Function, out: u32) {
+pub(super) fn emit_time_clip(function: &mut Function, out: u32) {
     function.instruction(&Instruction::I64ReinterpretF64);
     function.instruction(&Instruction::LocalSet(out));
     // trunc(t) + 0 turns a -0 into +0.
@@ -1091,6 +1091,9 @@ pub(super) fn emit_date_field(
         emit_date_iso(bits, function, scratch, helpers);
     } else if matches!(op, DateOp::ToString) {
         emit_date_string(bits, function, scratch, strings, helpers);
+    } else if matches!(op, DateOp::GetTimezoneOffset) {
+        // `LocalTZA = 0`: a valid date's offset is `+0`.
+        function.instruction(&Instruction::I64Const(0));
     } else {
         emit_date_int_field(op, bits, function, scratch);
         // Integer field -> a number jsval (a number's i64 IS its f64 bit pattern).
@@ -1279,35 +1282,42 @@ fn emit_date_civil(
     function.instruction(&Instruction::LocalSet(year));
 }
 
-/// Emit the integer-valued `Date` getter for `op` (all UTC), leaving the raw i64
-/// field on the stack (the caller boxes it into a number jsval). Uses the `Date`
-/// scratch slots (`D0`..`D5` = `scratch+24..+29`) plus one low i64 temp; a `Date`
-/// method takes no arguments, so no child sub-expression is live in these slots.
+/// Emit the integer-valued `Date` getter for `op` (all UTC: `LocalTZA = 0`, so
+/// a local getter is its `getUTC*` twin),
+/// leaving the raw i64 field on the stack (the caller boxes it into a number
+/// jsval). Uses the `Date` scratch slots (`D0`..`D5` = `scratch+24..+29`) plus
+/// one low i64 temp; a `Date` method takes no arguments, so no child
+/// sub-expression is live in these slots.
 fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: u32) {
     let days = scratch + 26;
     let tod = scratch + 27;
     emit_days_tod(function, bits, days, tod, scratch + 25, scratch + 28);
     match op {
-        DateOp::GetHours => {
+        DateOp::GetHours | DateOp::GetUtcHours => {
             function.instruction(&Instruction::LocalGet(tod));
             function.instruction(&Instruction::I64Const(3_600_000));
             function.instruction(&Instruction::I64DivS);
         }
-        DateOp::GetMinutes => {
+        DateOp::GetMinutes | DateOp::GetUtcMinutes => {
             function.instruction(&Instruction::LocalGet(tod));
             function.instruction(&Instruction::I64Const(60_000));
             function.instruction(&Instruction::I64DivS);
             function.instruction(&Instruction::I64Const(60));
             function.instruction(&Instruction::I64RemS);
         }
-        DateOp::GetSeconds => {
+        DateOp::GetSeconds | DateOp::GetUtcSeconds => {
             function.instruction(&Instruction::LocalGet(tod));
             function.instruction(&Instruction::I64Const(1000));
             function.instruction(&Instruction::I64DivS);
             function.instruction(&Instruction::I64Const(60));
             function.instruction(&Instruction::I64RemS);
         }
-        DateOp::GetDay => {
+        DateOp::GetMilliseconds | DateOp::GetUtcMilliseconds => {
+            function.instruction(&Instruction::LocalGet(tod));
+            function.instruction(&Instruction::I64Const(1000));
+            function.instruction(&Instruction::I64RemS);
+        }
+        DateOp::GetDay | DateOp::GetUtcDay => {
             // ((days + 4) mod 7), Euclidean so a pre-epoch day count stays in 0..6.
             let x = scratch + 24;
             let r = scratch + 25;
@@ -1332,7 +1342,13 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
             function.instruction(&Instruction::I64Mul);
             function.instruction(&Instruction::I64Add);
         }
-        DateOp::GetFullYear | DateOp::GetMonth | DateOp::GetDate => {
+        DateOp::GetFullYear
+        | DateOp::GetUtcFullYear
+        | DateOp::GetYear
+        | DateOp::GetMonth
+        | DateOp::GetUtcMonth
+        | DateOp::GetDate
+        | DateOp::GetUtcDate => {
             let year = scratch + 29;
             let month = scratch + 28;
             let day = scratch + 27;
@@ -1347,10 +1363,16 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
                 scratch,
             );
             match op {
-                DateOp::GetFullYear => {
+                DateOp::GetFullYear | DateOp::GetUtcFullYear => {
                     function.instruction(&Instruction::LocalGet(year));
                 }
-                DateOp::GetMonth => {
+                // Annex B `getYear()` is the year minus 1900.
+                DateOp::GetYear => {
+                    function.instruction(&Instruction::LocalGet(year));
+                    function.instruction(&Instruction::I64Const(1900));
+                    function.instruction(&Instruction::I64Sub);
+                }
+                DateOp::GetMonth | DateOp::GetUtcMonth => {
                     // getMonth() is 0-based.
                     function.instruction(&Instruction::LocalGet(month));
                     function.instruction(&Instruction::I64Const(1));
@@ -1361,8 +1383,12 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
                 }
             }
         }
-        DateOp::GetTime | DateOp::ValueOf | DateOp::ToIsoString | DateOp::ToString => {
-            unreachable!("valueOf / toISOString are handled by emit_date_field")
+        DateOp::GetTime
+        | DateOp::ValueOf
+        | DateOp::ToIsoString
+        | DateOp::ToString
+        | DateOp::GetTimezoneOffset => {
+            unreachable!("valueOf / toISOString / getTimezoneOffset are handled above")
         }
     }
 }
