@@ -1696,7 +1696,9 @@ those of `switch` and loops are not tracked.
 - **Fields.** Instance fields (`f = init`, or `f;` for `undefined`) are
   defined with `__define` in source order before the constructor body (for a
   derived class, right after `super(..)` returns). Static field initializers
-  run after the class binding exists, in source order, with `this` = the class.
+  run after the class binding exists, in source order, with `this` = the class
+  and the static `super` scope (`super.x` reads the class's current
+  prototype, as in a static method).
 - **Inheritance.** `class B extends E` evaluates `E` once at class definition
   (any expression; it must be a constructor or `null`), links
   `B.prototype.[[Prototype]]` to `E.prototype` and `B.[[Prototype]]` to `E`
