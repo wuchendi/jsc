@@ -140,7 +140,19 @@ fn chained_and_new_tags() {
         "function t(s) { return (s2) => s[0] + s2[0]; } t`a``b`",
         "ab",
     );
-    assert_str("function C(s) { this.s = s[0]; } (new C`x`).s", "x");
+    // `new tag`x`` is `new (tag`x`)`: the tag is called (strict, so `this` is
+    // `undefined`) and its result is the constructor.
+    assert_str(
+        "let seen = []; function C(a) { this.a = a; } \
+         function tag(s) { seen.push(s[0]); return C; } \
+         let i = new tag`x`; let j = new tag`y`(1); \
+         [i instanceof C, i.a, j instanceof C, j.a, seen.join('')].join()",
+        "true,,true,1,xy",
+    );
+    assert_uncaught(
+        "function C(s) { this.s = s[0]; } new C`x`",
+        "TypeError: Cannot set properties of undefined (setting 's')",
+    );
 }
 
 #[test]
