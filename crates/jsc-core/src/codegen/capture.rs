@@ -691,6 +691,12 @@ impl CaptureResolver {
                     self.expr(e);
                 }
             }
+            Expr::TaggedTpl(t) => {
+                self.expr(&t.tag);
+                for e in &t.tpl.exprs {
+                    self.expr(e);
+                }
+            }
             Expr::Seq(s) => {
                 for e in &s.exprs {
                     self.expr(e);

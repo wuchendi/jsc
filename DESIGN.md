@@ -316,7 +316,7 @@ the table, including one without user functions.
 | 12 | `$__new_target` | `i64` | — | `new.target` carrier, initialized to `undefined` |
 | 13 | `$__spread_args` | `i64` | — | argument array of a spread call / construct, initialized to `undefined` |
 | 14 | `$__intrinsics_dirty` | `i32` | — | one dirty bit per watched intrinsic (§6.4) |
-| 15+ | module cells | `i64` | — | one cell pointer per module binding (`15 + slot`, §7.1) |
+| 15+ | module cells | `i64` | — | one cell pointer per module binding (`15 + slot`, §7.1), then one per tagged-template site (§7.4) |
 
 **Exports.** `main`, `memory`, `__heap_ptr`, `__exc_pending`, `__exc_value`,
 `__invoke1(fn: i64, arg: i64) -> i64`, `__async_step(gen: i64, sent: i64) -> i64`,
@@ -1415,6 +1415,9 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 - **`void`** evaluates its operand for its effects (calls, assignments,
   throws, `yield` / `await`) and yields `undefined`; a literal operand folds
   to `undefined`.
+- **Template literals** `` `a${x}b` `` concatenate the cooked strings with
+  `ToString` of each substitution; an invalid escape is a `SyntaxError`
+  (swc). Tagged templates are calls (§7.4).
 - **Member access on `null`/`undefined`** throws a `TypeError`
   (`Cannot read properties of null (reading 'x')`), catchable like any throw.
 
@@ -1513,6 +1516,20 @@ those of `switch` and loops are not tracked.
   generator/async body's `this` cell by reference, so it survives suspension.
 - **Arity.** `length` is the count of parameters before the first default or
   rest; arity is never checked, at compile time or at run time.
+- **Tagged templates** `` tag`a${x}b` `` lower through the ordinary call
+  path: `this` is bound for a member tag (`` o.f`x` ``, `` o[k]`x` ``,
+  `` (o.f)`x` ``, `` super.m`x` ``), a non-callable tag is the same
+  `TypeError` as a call, and the substitutions run left to right after the
+  tag. The first argument is the site's template object
+  (`GetTemplateObject`): a frozen array of the cooked strings (`undefined`
+  for an invalid escape) with a non-writable, non-enumerable,
+  non-configurable `raw` holding the frozen array of the raw strings (CR and
+  CRLF normalized to LF). Each site owns a module cell (§4.2, after the
+  module bindings' cells) holding the hole until the site first runs, which
+  builds the object into it; every later evaluation of that site, in a loop
+  or another call, yields the same object, and two sites never share one.
+  A tagged template in an optional chain (`` a?.b`x` ``) is a `SyntaxError`
+  (swc).
 - **Call evaluation order.** A call evaluates its callee first — for a
   member callee the base, then the key, then the `[[Get]]` (a getter runs
   here) — then the arguments left to right, then `IsCallable` and the call;
@@ -2190,7 +2207,7 @@ Each item below is current behaviour of this tree.
   | `void` (59; the cause is removed — §7.2, recount pending) | language | | | | | | |
   | thenables are not assimilated (`Array.fromAsync`, below) | async | 14 | | | | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
-  | tagged templates, `for-in` heads | language | 2 | 4 | | | | |
+  | `for-in` heads (tagged templates removed — §7.4, recount pending) | language | 2 | 4 | | | | |
   | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
   | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
   | CR line terminators hide the frontmatter `includes` (`nativeFunctionMatcher.js`) | runner | | | 1 | | | |
