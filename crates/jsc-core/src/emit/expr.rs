@@ -272,6 +272,52 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::Call(helpers.private_set()));
             emit_propagate_if_pending(function, helpers);
         }
+        IrNode::PrivateBrand {
+            obj,
+            value,
+            brand,
+            name,
+            write,
+        } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            if let Some(value) = value {
+                emit_node(value, function, scratch, strings, helpers);
+            } else {
+                function.instruction(&Instruction::LocalTee(scratch));
+                function.instruction(&Instruction::LocalGet(scratch));
+            }
+            emit_node(brand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(static_str(strings, name)));
+            function.instruction(&Instruction::I32Const(if *write {
+                PROP_THROW_PRIVATE_WRITE
+            } else {
+                PROP_THROW_PRIVATE_READ
+            }));
+            function.instruction(&Instruction::Call(helpers.private_brand()));
+            emit_propagate_if_pending(function, helpers);
+        }
+        IrNode::PrivateThrow { error, name } => {
+            let (key, mode) = match error {
+                PrivateError::NoGetter => (static_str(strings, name), PROP_THROW_PRIVATE_NO_GETTER),
+                PrivateError::NoSetter => (static_str(strings, name), PROP_THROW_PRIVATE_NO_SETTER),
+                PrivateError::MethodNotWritable => {
+                    (static_key(strings, ""), PROP_THROW_PRIVATE_METHOD_WRITE)
+                }
+            };
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+            function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(key)));
+            function.instruction(&Instruction::I32Const(mode));
+            function.instruction(&Instruction::Call(helpers.prop_throw));
+            emit_propagate_if_pending(function, helpers);
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+        IrNode::PrivateIn { obj, brand, name } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            emit_node(brand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(static_str(strings, name)));
+            function.instruction(&Instruction::Call(helpers.private_in()));
+            emit_propagate_if_pending(function, helpers);
+        }
         IrNode::SetProto { obj, proto } => {
             emit_node(obj, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32WrapI64);

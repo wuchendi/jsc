@@ -855,6 +855,7 @@ function-index order:
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 | promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
+| private names (§7.6) | `__private_find(o, key)`, `__private_add(o, key, v, attrs, name)`, `__private_get(o, key, name)`, `__private_set(o, key, v, name)`, `__private_brand(o, v, brand, name, mode)`, `__private_in(o, brand, name)` |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)
@@ -1629,11 +1630,11 @@ those of `switch` and loops are not tracked.
   non-constructor is not a constructor (`TypeError: B is not a constructor`).
 
 **Private names** (phase 5a; stages P2–P5 implement this text verbatim.
-Built (P2): private instance and static **fields** — names, `%penv`,
-resolution, storage, the four helpers, instance and static initialization,
-the field operations and invisibility. Built (P4): static blocks. Until P3
-and P5 land, private methods and accessors and `#x in o` stay spanned
-rejections, §8, §13.)
+Built (P2–P4): private instance and static fields, methods and accessors
+(generator, async and async generator methods included) — names, `%penv`,
+resolution, storage, brands, the helpers, instance and static
+initialization, every operation, `#x in o` and invisibility — and static
+blocks. Until P5 lands, the early errors below are partial.)
 
 - **Names.** A private name is a `TYPE_SYMBOL` block with header flag `8`
   `SYMBOL_FLAG_PRIVATE` (bits `1`/`2` stay clear, `4` is `REGISTERED`;
@@ -1665,14 +1666,15 @@ rejections, §8, §13.)
 - **Resolution** is lexical at compile time: `LowerCtx::private_scopes`
   (new) is a stack of `{ frame, penv_id, names }`, each name
   `{ "#x", kind: Field(slot) | Method(slot) | Accessor(get, set), static }`
-  (P2 builds `Field(slot)`; the other kinds and `static` land with P3).
+  (`static` matters only for methods and accessors, whose brand it picks).
   `lower_class` pushes the scope after lowering the heritage (which sees only
   the enclosing classes' names) and pops it with the class scope. `#x`
   resolves to the innermost class declaring it, so a nested class shadows
   an outer name and a nested class not declaring `#x` uses the outer one.
   Until P5's early errors, an unresolved `#x` is the spanned compile error
-  `private name #x is not defined` and a repeated field name `duplicate
-  private name #x`.
+  `private name #x is not defined` and a repeated name (other than one
+  getter plus one setter of the same static-ness) `duplicate private name
+  #x`.
 - **Storage.** A private field is an own entry keyed by its symbol in the
   object's ordinary `TYPE_PROPS` table, attrs `WRITABLE` only; the instance
   brand is an entry keyed by the brand symbol, attrs `0`, value `undefined`.
@@ -1694,11 +1696,22 @@ rejections, §8, §13.)
   returns `v`) on a field: absent (a primitive included, no `ToObject`) →
   `TypeError: Cannot read private member #x from an object whose class did
   not declare it` / `Cannot write private member #x to an object whose class
-  did not declare it`; a set ignores attrs. The messages are new
-  `__prop_throw` modes (`21`–`23`, the `"#x"` string as the key). The IR
-  nodes are `PrivateAdd { obj, key, value, attrs, name }`, `PrivateGet {
-  obj, key, name }` and `PrivateSet { obj, key, value, name }` (`key` a
-  `PrivEnvLoad`).
+  did not declare it`; a set ignores attrs.
+  `__private_brand(o, v, brand, name, mode)` (returns `v`): `o` must hold
+  `brand` — an own entry keyed by it when it is a private symbol (a field
+  or the instance brand), else be `brand` itself, an object (a static
+  member's class) — or the read / write message (`mode`) is thrown;
+  `__private_in(o, brand, name)` (a boolean): a non-object `o` throws the
+  `in` message, else the same test. The messages are new `__prop_throw`
+  modes `21`–`27` (the `"#x"` string as the key; `26`, `Private method is
+  not writable`, takes the empty string; `27`, the `in` message, the key
+  `"#x' in " + String(o)` that `__private_in` builds). The IR nodes are
+  `PrivateAdd { obj, key, value, attrs, name }`, `PrivateGet { obj, key,
+  name }` and `PrivateSet { obj, key, value, name }` (`key` a
+  `PrivEnvLoad`), `PrivateBrand { obj, value, brand, name, write }`
+  (evaluates `obj`, then a write's `value`, then checks; yields `value`,
+  else `obj`), `PrivateThrow { error, name }` and `PrivateIn { obj, brand,
+  name }`.
 - **Methods and accessors.** `o.#m` brand-checks (`__private_find(o,
   brand)`, or the slot-`0` identity when static), throwing the read / write
   message above naming `#m`, then: a method reads its closure (one per
@@ -1706,7 +1719,11 @@ rejections, §8, §13.)
   is called with `this = o`; a missing getter throws `TypeError: '#x' was
   defined without a getter`. A write after the brand check throws
   `TypeError: Private method is not writable` for a method, calls the
-  setter, or throws `TypeError: '#x' was defined without a setter`. Closures
+  setter, or throws `TypeError: '#x' was defined without a setter`. A getter
+  read is an `IrNode::ThisCall` whose callee snapshots the checked receiver
+  into its `this_local`; a setter write snapshots `o`, then calls the setter
+  with the brand-checked value (`o`, `v`, check, call; the expression yields
+  `v`). Closures
   are lowered like `lower_class_method` with `name` `"#m"` / `"get #x"` /
   `"set #x"` (generator, async and async generator methods included),
   instance ones with the prototype `super` scope, static ones with
@@ -1736,10 +1753,10 @@ rejections, §8, §13.)
   generator linearization spills the callee and the receiver and rebinds
   it, like a user method call). There is no
   `super.#x` (a parse error). `#x in o`: `o` not an object → `TypeError:
-  Cannot use 'in' operator to search for '#x' in <o>` (new `__prop_throw`
-  mode rendering `o` as `PROP_THROW_IN` does); else `__private_find` of the
-  field or brand symbol, or the slot-`0` identity; no prototype, getter or
-  proxy is consulted.
+  Cannot use 'in' operator to search for '#x' in <o>` (`__private_in`,
+  rendering `o` with `String` as `PROP_THROW_IN` does); else
+  `__private_find` of the field or brand symbol, or the slot-`0` identity;
+  no prototype, getter or proxy is consulted.
 - **Invisibility.** The private symbol is only ever passed as a key
   argument of the helpers above: no expression yields it, so `typeof`,
   `description`, `String(sym)`, `__get`, `__set`, `__has`, `__has_own`,
@@ -1788,9 +1805,9 @@ The static-block checks landed with P4 (swc reports several of them first,
 with its own messages). `super.#x` and private names in object literals are
 parse errors. P2 deleted the diagnostics `private class fields are not
 supported` and `private fields are not supported` (until P5, `delete o.#x`
-is the spanned `private fields cannot be deleted`); P4 deleted `class static
-blocks are not supported`; P3 deletes `private class methods are not
-supported` (and its §8, §13 mentions) as its forms land.
+is the spanned `private fields cannot be deleted`); P3 deleted `private
+class methods are not supported` and P4 `class static blocks are not
+supported`.
 
 ### 7.7 Errors
 
@@ -2060,8 +2077,8 @@ is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`, `private class methods are not
-supported`, `async generator functions are unsupported`, `a label may only be applied to a loop`,
+supported`, `with statements are not supported`,
+`async generator functions are unsupported`, `a label may only be applied to a loop`,
 `destructuring assignment is only supported as an expression statement`.
 
 **Run-time errors** carry no source span:
@@ -2362,7 +2379,6 @@ Each item below is current behaviour of this tree.
 - Destructuring assignment works only as an expression statement; it is
   rejected in expression position (`x = [a] = b`), and a `for-of` head must
   declare its binding or be a pattern (`for (a of xs)` is rejected).
-- Not supported: private methods and accessors, `#x in o`.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
   `undefined`.

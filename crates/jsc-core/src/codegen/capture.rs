@@ -518,7 +518,20 @@ impl CaptureResolver {
                         m.function.body.as_ref().map(|b| &b.stmts),
                     );
                 }
+                ClassMember::PrivateMethod(m) => {
+                    self.function(
+                        &m.function.params,
+                        m.function.body.as_ref().map(|b| &b.stmts),
+                    );
+                }
                 ClassMember::ClassProp(p) => {
+                    if let Some(value) = &p.value {
+                        self.enter_function();
+                        self.expr(value);
+                        self.exit_function();
+                    }
+                }
+                ClassMember::PrivateProp(p) => {
                     if let Some(value) = &p.value {
                         self.enter_function();
                         self.expr(value);

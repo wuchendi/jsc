@@ -181,7 +181,9 @@ fn scan_class_arity(class: &swc_ecma_ast::Class) -> usize {
                 own.max(params).max(body)
             }
             ClassMember::Method(m) => scan_function_arity(&m.function),
+            ClassMember::PrivateMethod(m) => scan_function_arity(&m.function),
             ClassMember::ClassProp(p) => p.value.as_deref().map_or(0, scan_expr_arity),
+            ClassMember::PrivateProp(p) => p.value.as_deref().map_or(0, scan_expr_arity),
             ClassMember::StaticBlock(b) => scan_stmts_arity(&b.body.stmts),
             _ => 0,
         })

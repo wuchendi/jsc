@@ -34,8 +34,8 @@ use globals::GlobalFacts;
 use crate::ir::{
     ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, GlobalIntrinsic,
     GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, IterRecord, JsStr,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
-    SpreadCallee, SpreadElem,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PrivateError, PropKey,
+    ProtoKind, SpreadCallee, SpreadElem,
 };
 
 /// A string literal's value as UTF-16 code units, losslessly: swc keeps a lone
@@ -609,6 +609,37 @@ struct PrivateScope {
 enum PrivateKind {
     /// A field (instance or static): `%penv[slot]` holds its private symbol.
     Field(u32),
+    /// A method: `%penv[slot]` holds its closure.
+    Method {
+        /// The closure's slot.
+        slot: u32,
+        /// A static method (brand-checked against the class, slot `0`).
+        is_static: bool,
+    },
+    /// An accessor: two consecutive slots, the getter's then the setter's;
+    /// each is `None` when that half is not declared.
+    Accessor {
+        /// The getter's slot.
+        get: Option<u32>,
+        /// The setter's slot.
+        set: Option<u32>,
+        /// A static accessor (brand-checked against the class, slot `0`).
+        is_static: bool,
+    },
+}
+
+/// A resolved private name reference `#x` (DESIGN.md §7.6), see
+/// [`LowerCtx::private_ref`].
+struct PrivateRef {
+    /// The read of the declaring class body's `%penv`.
+    env: IrNode,
+    /// What the name denotes.
+    kind: PrivateKind,
+    /// The `"#x"` source text.
+    name: JsStr,
+    /// An accessor's fresh temps: the getter call's receiver, the setter
+    /// call's receiver and the written value.
+    temps: Option<[u32; 3]>,
 }
 
 /// An instance field of the class whose constructor is being lowered (see
@@ -621,6 +652,10 @@ enum ClassField {
     /// A private field: the class frame, the hidden id of `%penv` and the
     /// slot of its private symbol.
     Private(PrivateProp, usize, u32, u32),
+    /// The instance brand (DESIGN.md §7.6), added before every field: the
+    /// class frame, the hidden id of `%penv` and the `"#m"` the brand is
+    /// named after.
+    Brand(usize, u32, JsStr),
 }
 
 /// Lowering context: a stack of function frames. Each frame maps
