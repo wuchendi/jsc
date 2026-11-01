@@ -144,3 +144,24 @@ fn works_in_an_async_function() {
         "5\n",
     );
 }
+
+#[test]
+fn private_member_targets() {
+    // A private field as a nested pattern target, a `for-of` / `for-in`
+    // assignment head, and a pattern default; a missing brand throws.
+    assert_string(
+        "class C { #a; #b; #k = '';
+           run() {
+             const r = [[this.#a], { b: this.#b = 7 }] = [[1], {}];
+             for (this.#a of [2, 3]) {}
+             for (this.#k in { p: 1, q: 2 }) {}
+             return [this.#a, this.#b, this.#k, r.length].join() } }
+         new C().run()",
+        "3,7,q,2",
+    );
+    assert_string(
+        "class C { #a; static f(o) { [o.#a] = [1] } }
+         try { C.f({}) } catch (e) { e instanceof TypeError ? 'TypeError' : 'other' }",
+        "TypeError",
+    );
+}

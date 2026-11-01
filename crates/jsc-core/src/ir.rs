@@ -375,6 +375,19 @@ pub enum PropKey {
     HiddenComputed(IrNode),
 }
 
+/// The `TypeError` of an [`IrNode::PrivateThrow`] (DESIGN.md §7.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateError {
+    /// A read of an accessor without a getter: `'#x' was defined without a
+    /// getter`.
+    NoGetter,
+    /// A write of an accessor without a setter: `'#x' was defined without a
+    /// setter`.
+    NoSetter,
+    /// A write of a private method: `Private method is not writable`.
+    MethodNotWritable,
+}
+
 /// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
 /// is accepted: the general case is [`InstanceOfKind::Ctor`]
 /// (`InstanceofOperator`). An unshadowed, sealed builtin constructor name is
@@ -1077,6 +1090,110 @@ pub enum IrNode {
         obj: Box<IrNode>,
         /// The new prototype (an object or `null`).
         proto: Box<IrNode>,
+    },
+    /// A fresh private name (DESIGN.md §7.6): a `TYPE_SYMBOL` block flagged
+    /// [`crate::abi::SYMBOL_FLAG_PRIVATE`] whose description is the static
+    /// string (`"#x"`). Minted once per class evaluation into `%penv`.
+    PrivateName(JsStr),
+    /// Read slot `slot` of a class body's private environment `env` (the
+    /// internal dense array `%penv`, which never grows).
+    PrivEnvLoad {
+        /// The `%penv` array.
+        env: Box<IrNode>,
+        /// The element index.
+        slot: u32,
+    },
+    /// Store `value` into slot `slot` of the private environment `env`;
+    /// yields `undefined`.
+    PrivEnvStore {
+        /// The `%penv` array.
+        env: Box<IrNode>,
+        /// The element index.
+        slot: u32,
+        /// The stored value.
+        value: Box<IrNode>,
+    },
+    /// `PrivateFieldAdd` (`__private_add`): `obj` (an object), then the private
+    /// name `key`, then `value` are evaluated; an own entry keyed `key` already
+    /// present throws `TypeError: Cannot initialize #x twice on the same
+    /// object`, else the entry is added with `attrs` (also to a
+    /// non-extensible object). Yields `undefined`.
+    PrivateAdd {
+        /// The object the entry is added to.
+        obj: Box<IrNode>,
+        /// The private name symbol.
+        key: Box<IrNode>,
+        /// The field value.
+        value: Box<IrNode>,
+        /// The entry's attributes.
+        attrs: u32,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+    },
+    /// `obj.#x` on a field (`__private_get`): the own entry keyed `key`
+    /// (no prototype walk), or `TypeError: Cannot read private member #x from
+    /// an object whose class did not declare it` (a primitive included).
+    PrivateGet {
+        /// The receiver.
+        obj: Box<IrNode>,
+        /// The private name symbol.
+        key: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+    },
+    /// `obj.#x = value` on a field (`__private_set`): `obj`, `key`, `value`
+    /// in order, then the own entry's value is replaced (its attrs ignored), or
+    /// `TypeError: Cannot write private member #x to an object whose class did
+    /// not declare it`. Yields `value`.
+    PrivateSet {
+        /// The receiver.
+        obj: Box<IrNode>,
+        /// The private name symbol.
+        key: Box<IrNode>,
+        /// The stored value.
+        value: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+    },
+    /// The brand check of a private method or accessor access (DESIGN.md
+    /// §7.6, `__private_brand`): `obj`, then `value` (a write's right-hand
+    /// side), then `brand` are evaluated; `obj` must hold `brand` — an own
+    /// entry keyed by it when it is a private symbol (a field or the instance
+    /// brand), else be the object `brand` itself (a static member's class) —
+    /// or `TypeError: Cannot read private member #x from an object whose class
+    /// did not declare it` (`write`: `Cannot write private member #x to ..`).
+    /// Yields `value`, or `obj` when there is none.
+    PrivateBrand {
+        /// The receiver.
+        obj: Box<IrNode>,
+        /// A write's value, evaluated before the check.
+        value: Option<Box<IrNode>>,
+        /// The brand: a private symbol or the class value (`%penv` slot `0`).
+        brand: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+        /// Whether the access is a write (picks the message).
+        write: bool,
+    },
+    /// Throw the private-member `TypeError` `error` naming `name` (`"#x"`);
+    /// yields `undefined` (never reached).
+    PrivateThrow {
+        /// Which `TypeError`.
+        error: PrivateError,
+        /// The source name (`"#x"`).
+        name: JsStr,
+    },
+    /// `#x in obj` (DESIGN.md §7.6, `__private_in`): a non-object `obj` throws
+    /// `TypeError: Cannot use 'in' operator to search for '#x' in <obj>`; else
+    /// whether `obj` holds `brand` (as [`IrNode::PrivateBrand`] tests it), no
+    /// prototype walk. Yields a boolean.
+    PrivateIn {
+        /// The right-hand side.
+        obj: Box<IrNode>,
+        /// The field symbol, the instance brand or the class value.
+        brand: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
     },
     /// A `yield expr` expression. Produced by lowering a generator
     /// body; the generator segmentation pass CONSUMES every `Yield`, turning it
@@ -2423,7 +2540,9 @@ impl IrNode {
             | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
-            | IrNode::DateField { .. } => false,
+            | IrNode::DateField { .. }
+            | IrNode::PrivateName(_)
+            | IrNode::PrivateThrow { .. } => false,
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -2461,7 +2580,8 @@ impl IrNode {
             | IrNode::SizeRead { obj: inner, .. }
             | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
-            | IrNode::MathSpread { args: inner, .. } => f(inner),
+            | IrNode::MathSpread { args: inner, .. }
+            | IrNode::PrivEnvLoad { env: inner, .. } => f(inner),
             IrNode::InstanceOf { value, kind } => {
                 f(value)
                     || match kind {
@@ -2580,6 +2700,18 @@ impl IrNode {
                     || new_target.as_deref().is_some_and(f)
             }
             IrNode::SetProto { obj, proto } => f(obj) || f(proto),
+            IrNode::PrivEnvStore { env, value, .. } => f(env) || f(value),
+            IrNode::PrivateGet { obj, key, .. } => f(obj) || f(key),
+            IrNode::PrivateBrand {
+                obj, value, brand, ..
+            } => f(obj) || value.as_deref().is_some_and(&mut f) || f(brand),
+            IrNode::PrivateIn { obj, brand, .. } => f(obj) || f(brand),
+            IrNode::PrivateAdd {
+                obj, key, value, ..
+            }
+            | IrNode::PrivateSet {
+                obj, key, value, ..
+            } => f(obj) || f(key) || f(value),
             IrNode::Object { entries, proto, .. } => {
                 proto.as_deref().is_some_and(&mut f) || entries.iter().any(|(key, value)| {
                     matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
@@ -2647,7 +2779,9 @@ impl IrNode {
             | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
-            | IrNode::DateField { .. } => Vec::new(),
+            | IrNode::DateField { .. }
+            | IrNode::PrivateName(_)
+            | IrNode::PrivateThrow { .. } => Vec::new(),
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -2685,7 +2819,8 @@ impl IrNode {
             | IrNode::SizeRead { obj: inner, .. }
             | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
-            | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
+            | IrNode::MathSpread { args: inner, .. }
+            | IrNode::PrivEnvLoad { env: inner, .. } => vec![&mut **inner],
             IrNode::InstanceOf { value, kind } => match kind {
                 InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => {
                     vec![&mut **value, &mut **rhs]
@@ -2817,6 +2952,23 @@ impl IrNode {
                 .chain(new_target.as_deref_mut())
                 .collect(),
             IrNode::SetProto { obj, proto } => vec![&mut **obj, &mut **proto],
+            IrNode::PrivEnvStore { env, value, .. } => vec![&mut **env, &mut **value],
+            IrNode::PrivateGet { obj, key, .. } => vec![&mut **obj, &mut **key],
+            IrNode::PrivateBrand {
+                obj, value, brand, ..
+            } => std::iter::once(&mut **obj)
+                .chain(value.as_deref_mut())
+                .chain(std::iter::once(&mut **brand))
+                .collect(),
+            IrNode::PrivateIn { obj, brand, .. } => vec![&mut **obj, &mut **brand],
+            IrNode::PrivateAdd {
+                obj, key, value, ..
+            }
+            | IrNode::PrivateSet {
+                obj, key, value, ..
+            } => {
+                vec![&mut **obj, &mut **key, &mut **value]
+            }
             IrNode::Object { entries, proto, .. } => {
                 let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
                 for (key, value) in entries {

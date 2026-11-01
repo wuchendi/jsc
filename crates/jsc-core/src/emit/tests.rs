@@ -1318,3 +1318,24 @@ fn expression_position_destructuring_validates() {
         console.log(g([1]), gen().next())",
     ));
 }
+
+#[test]
+fn super_and_private_helpers_validate() {
+    // The `super` property helpers and the private-name helpers share the
+    // conversion-helper index range; using both checks their indices and
+    // signatures agree.
+    validate(&compile(
+        "class A { get x() { return 1 } set x(v) {} }
+        class B extends A {
+          #p = 1; #m() { return super.x } get #g() { return this.#p } static #s = 2;
+          run(o) {
+            super.x = 2; super.x += this.#p; super['x']++;
+            this.#p = super.x; this.#p ??= 3; this.#p++;
+            [this.#p] = [4];
+            return [this.#m(), this.#g, B.#s, #p in o].join();
+          }
+          static { super.y = B.#s; }
+        }
+        console.log(new B().run({}))",
+    ));
+}

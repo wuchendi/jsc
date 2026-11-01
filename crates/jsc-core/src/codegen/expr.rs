@@ -125,11 +125,10 @@ impl LowerCtx<'_> {
                     obj: Box::new(self.lower_expr(&member.obj)?),
                     index: Box::new(self.lower_expr(&c.expr)?),
                 }),
-                MemberProp::PrivateName(_) => Err(CompileError::spanned(
-                    member.span(),
-                    "private fields are not supported",
-                )
-                .into()),
+                MemberProp::PrivateName(p) => {
+                    let obj = self.lower_expr(&member.obj)?;
+                    self.lower_private_get(obj, p)
+                }
             },
             // An array literal `[e0, e1, ..]` lowers to a heap array.
             Expr::Array(arr) => self.lower_array(arr),
@@ -155,10 +154,17 @@ impl LowerCtx<'_> {
             }),
             // `key in obj`: an own-key membership test, lowered to a runtime
             // key-table scan. `left` is the property key, `right` the object.
-            Expr::Bin(b) if matches!(b.op, BinaryOp::In) => Ok(IrNode::ObjectHas {
-                key: Box::new(self.lower_expr(&b.left)?),
-                obj: Box::new(self.lower_expr(&b.right)?),
-            }),
+            // `#x in obj` tests the private name (DESIGN.md §7.6).
+            Expr::Bin(b) if matches!(b.op, BinaryOp::In) => match &*b.left {
+                Expr::PrivateName(p) => {
+                    let target = self.private_ref(p)?;
+                    Ok(target.has(self.lower_expr(&b.right)?))
+                }
+                left => Ok(IrNode::ObjectHas {
+                    key: Box::new(self.lower_expr(left)?),
+                    obj: Box::new(self.lower_expr(&b.right)?),
+                }),
+            },
             // `x instanceof RHS` (DESIGN.md §7.6): any right-hand side expression.
             Expr::Bin(b) if matches!(b.op, BinaryOp::InstanceOf) => {
                 self.lower_instanceof(&b.left, &b.right)
@@ -266,7 +272,7 @@ impl LowerCtx<'_> {
                             MemberProp::PrivateName(_) => {
                                 return Err(CompileError::spanned(
                                     member.span(),
-                                    "private fields are not supported",
+                                    "private fields cannot be deleted",
                                 )
                                 .into());
                             }
@@ -410,17 +416,11 @@ impl LowerCtx<'_> {
     fn lower_opt_chain(&mut self, chain: &OptChainExpr, delete: bool) -> anyhow::Result<IrNode> {
         let mut links = Vec::new();
         let root = collect_chain_links(chain, &mut links);
-        if delete
-            && let Some(ChainLink::Member {
-                prop,
-                optional,
-                span,
-            }) = links.pop()
-        {
+        if delete && let Some(ChainLink::Member { prop, optional }) = links.pop() {
             links.push(ChainLink::Delete {
                 prop,
                 optional,
-                span,
+                span: chain.span,
             });
         }
         // `o.m?.(..)`: the callee `o.m` is a plain member expression; split it
@@ -431,7 +431,6 @@ impl LowerCtx<'_> {
                 ChainLink::Member {
                     prop: &member.prop,
                     optional: false,
-                    span: member.span,
                 },
             );
             let base = self.lower_expr(&member.obj)?;
@@ -474,10 +473,8 @@ impl LowerCtx<'_> {
         link: &ChainLink<'_>,
         rest: &[ChainLink<'_>],
     ) -> anyhow::Result<IrNode> {
-        let (
-            ChainLink::Member { prop, span, .. },
-            Some((ChainLink::Call { args, optional }, after)),
-        ) = (link, rest.split_first())
+        let (ChainLink::Member { prop, .. }, Some((ChainLink::Call { args, optional }, after))) =
+            (link, rest.split_first())
         else {
             let applied = self.apply_link(obj, link)?;
             return self.build_chain(applied, rest);
@@ -506,10 +503,9 @@ impl LowerCtx<'_> {
         let key = match prop {
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::PrivateName(_) => {
-                return Err(
-                    CompileError::spanned(*span, "private fields are not supported").into(),
-                );
+            MemberProp::PrivateName(p) => {
+                let call = self.lower_private_call(obj, p, args, None)?;
+                return self.build_chain(call, after);
             }
         };
         let obj_local = self.fresh();
@@ -543,7 +539,7 @@ impl LowerCtx<'_> {
     /// `obj.length`; a call becomes an indirect call with `obj` as the callee.
     fn apply_link(&mut self, obj: IrNode, link: &ChainLink<'_>) -> anyhow::Result<IrNode> {
         match link {
-            ChainLink::Member { prop, span, .. } => match prop {
+            ChainLink::Member { prop, .. } => match prop {
                 MemberProp::Ident(id) if id.sym.as_ref() == "length" => {
                     Ok(IrNode::StrLen(Box::new(nullish_check(obj, "length"))))
                 }
@@ -555,9 +551,7 @@ impl LowerCtx<'_> {
                     obj: Box::new(obj),
                     index: Box::new(self.lower_expr(&c.expr)?),
                 }),
-                MemberProp::PrivateName(_) => {
-                    Err(CompileError::spanned(*span, "private fields are not supported").into())
-                }
+                MemberProp::PrivateName(p) => self.lower_private_get(obj, p),
             },
             ChainLink::Call { args, .. } => {
                 let args = self.lower_chain_args(args)?;
@@ -570,7 +564,7 @@ impl LowerCtx<'_> {
                     MemberProp::PrivateName(_) => {
                         return Err(CompileError::spanned(
                             *span,
-                            "private fields are not supported",
+                            "private fields cannot be deleted",
                         )
                         .into());
                     }
@@ -737,7 +731,7 @@ impl LowerCtx<'_> {
         }
         seq.push(self.derived_bind_this(fi, IrNode::Local(result)));
         self.frames[fi].supers.this_bound |= top_level;
-        if let Some(fields) = self.lower_field_inits(IrNode::Local(result))? {
+        if let Some(fields) = self.lower_field_inits(&IrNode::Local(result))? {
             seq.push(fields);
         }
         seq.push(IrNode::Local(result));
@@ -1463,28 +1457,25 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Box<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let key = match &member.prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::PrivateName(_) => {
-                return Err(CompileError::spanned(
-                    member.span(),
-                    "private fields are not supported",
-                )
-                .into());
-            }
+        let this_local = self.fresh();
+        let read = match &member.prop {
+            MemberProp::Ident(id) => IrNode::Index {
+                obj: Box::new(IrNode::Local(this_local)),
+                index: Box::new(IrNode::Str(id.sym.as_ref().into())),
+            },
+            MemberProp::Computed(c) => IrNode::Index {
+                obj: Box::new(IrNode::Local(this_local)),
+                index: Box::new(self.lower_expr(&c.expr)?),
+            },
+            MemberProp::PrivateName(p) => self.lower_private_get(IrNode::Local(this_local), p)?,
         };
         let obj = self.lower_expr(&member.obj)?;
-        let this_local = self.fresh();
         let callee = IrNode::Seq(vec![
             IrNode::Assign {
                 local: this_local,
                 value: Box::new(obj),
             },
-            IrNode::Index {
-                obj: Box::new(IrNode::Local(this_local)),
-                index: Box::new(key),
-            },
+            read,
         ]);
         Ok(IrNode::CallSpread {
             target: SpreadCallee::Method {
@@ -1614,11 +1605,142 @@ impl LowerCtx<'_> {
         Ok(IrNode::Seq(seq))
     }
 
+    /// `obj.#x` on the already lowered receiver `obj` (DESIGN.md §7.6).
+    fn lower_private_get(&mut self, obj: IrNode, prop: &PrivateName) -> anyhow::Result<IrNode> {
+        Ok(self.private_ref(prop)?.read(obj))
+    }
+
+    /// `obj.#x(args)` on the already lowered receiver `obj`: the receiver,
+    /// then the private read (throwing before the arguments run), then the
+    /// arguments; the call binds `this = obj`. `source` names the callee in
+    /// the not-a-function `TypeError`.
+    fn lower_private_call(
+        &mut self,
+        obj: IrNode,
+        prop: &PrivateName,
+        args: Vec<IrNode>,
+        source: Option<&str>,
+    ) -> anyhow::Result<IrNode> {
+        let this_local = self.fresh();
+        let callee = self.fresh();
+        let read = self.lower_private_get(IrNode::Local(this_local), prop)?;
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: this_local,
+                value: Box::new(obj),
+            },
+            IrNode::Assign {
+                local: callee,
+                value: Box::new(read),
+            },
+            IrNode::ThisCall {
+                callee: Box::new(IrNode::Local(callee)),
+                args,
+                this_local,
+                construct: false,
+                not_callable: not_a_function(source),
+            },
+        ]))
+    }
+
+    /// `obj.#x = v`, `obj.#x op= v`, `obj.#x **= v` and the logical
+    /// `obj.#x ??= v` / `||=` / `&&=` (short-circuiting the store): `obj` is
+    /// evaluated once, then `v` (after the read, for every compound form).
+    fn lower_private_assign(
+        &mut self,
+        assign: &AssignExpr,
+        member: &swc_ecma_ast::MemberExpr,
+        prop: &PrivateName,
+    ) -> anyhow::Result<IrNode> {
+        let obj = self.lower_expr(&member.obj)?;
+        let target = self.private_ref(prop)?;
+        let rhs = self.lower_expr(&assign.right)?;
+        if assign.op == AssignOp::Assign {
+            return Ok(target.write(obj, rhs));
+        }
+        let tmp = self.fresh();
+        let get = target.read(IrNode::Local(tmp));
+        let set = |value: IrNode| target.write(IrNode::Local(tmp), value);
+        let result = if let Some(op) = map_logical_assign_op(assign.op) {
+            IrNode::Logical {
+                op,
+                lhs: Box::new(get),
+                rhs: Box::new(set(rhs)),
+            }
+        } else if assign.op == AssignOp::ExpAssign {
+            set(IrNode::MathCall {
+                op: MathOp::Pow,
+                args: vec![get, rhs],
+            })
+        } else {
+            let op = map_assign_op(assign.op, assign.span())?
+                .ok_or_else(|| CompileError::spanned(assign.span(), "unsupported assignment"))?;
+            set(IrNode::Binary {
+                op,
+                lhs: Box::new(get),
+                rhs: Box::new(rhs),
+            })
+        };
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: tmp,
+                value: Box::new(obj),
+            },
+            result,
+        ]))
+    }
+
+    /// `obj.#x++` / `--obj.#x` on the already lowered receiver `obj`: read,
+    /// `ToNumber`, store the sum; a postfix update yields the old number.
+    fn lower_private_update(
+        &mut self,
+        update: &UpdateExpr,
+        obj: IrNode,
+        prop: &PrivateName,
+    ) -> anyhow::Result<IrNode> {
+        let target = self.private_ref(prop)?;
+        let (tmp, old) = (self.fresh(), self.fresh());
+        let delta = if matches!(update.op, UpdateOp::PlusPlus) {
+            1.0
+        } else {
+            -1.0
+        };
+        let read = IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            arg: Box::new(target.read(IrNode::Local(tmp))),
+            radix: None,
+        };
+        let store = target.write(
+            IrNode::Local(tmp),
+            IrNode::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(IrNode::Local(old)),
+                rhs: Box::new(IrNode::Num(delta)),
+            },
+        );
+        let mut seq = vec![
+            IrNode::Assign {
+                local: tmp,
+                value: Box::new(obj),
+            },
+            IrNode::Assign {
+                local: old,
+                value: Box::new(read),
+            },
+            store,
+        ];
+        if !update.prefix {
+            seq.push(IrNode::Local(old));
+        }
+        Ok(IrNode::Seq(seq))
+    }
+
     /// Lower a user method call `obj.m(args)` / `obj[k](args)` into an
     /// [`IrNode::MethodCallUser`] binding `this = obj`. The receiver is
     /// evaluated once into a fresh temp; the callee is the function value at the
     /// member `key`; the `__this` global is set to the receiver just before the
-    /// indirect call. A private-name member (`obj.#m`) is unsupported.
+    /// indirect call. A private-name member (`obj.#m`) is
+    /// [`Self::lower_private_call`].
     fn lower_method_call_user(
         &mut self,
         member: &swc_ecma_ast::MemberExpr,
@@ -1627,12 +1749,10 @@ impl LowerCtx<'_> {
         let key = match &member.prop {
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::PrivateName(_) => {
-                return Err(CompileError::spanned(
-                    member.span(),
-                    "private fields are not supported",
-                )
-                .into());
+            MemberProp::PrivateName(p) => {
+                let obj = self.lower_expr(&member.obj)?;
+                let name = member_source_name(member);
+                return self.lower_private_call(obj, p, args, name.as_deref());
             }
         };
         let obj = self.lower_expr(&member.obj)?;
@@ -1683,7 +1803,10 @@ impl LowerCtx<'_> {
                     && matches!(op, AssignKind::Plain | AssignKind::Logical(_));
                 self.lower_ident_assign(ident, op, &assign.right, named)
             }
-            Target::Member(member) => self.lower_member_assign(member, op, &assign.right),
+            Target::Member(member) => match &member.prop {
+                MemberProp::PrivateName(p) => self.lower_private_assign(assign, member, p),
+                _ => self.lower_member_assign(member, op, &assign.right),
+            },
             Target::SuperProp(super_prop) => {
                 self.lower_super_assign(super_prop, SuperWrite::Assign(op, &assign.right))
             }
@@ -1936,13 +2059,7 @@ impl LowerCtx<'_> {
         let index = match &member.prop {
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-            MemberProp::PrivateName(_) => {
-                return Err(CompileError::spanned(
-                    member.span(),
-                    "unsupported increment/decrement target",
-                )
-                .into());
-            }
+            MemberProp::PrivateName(p) => return self.lower_private_update(update, obj, p),
         };
         let delta = if matches!(update.op, UpdateOp::PlusPlus) {
             1.0
@@ -2617,6 +2734,140 @@ impl LowerCtx<'_> {
     }
 }
 
+impl PrivateRef {
+    /// `%penv[slot]`.
+    fn slot(&self, slot: u32) -> IrNode {
+        IrNode::PrivEnvLoad {
+            env: Box::new(self.env.clone()),
+            slot,
+        }
+    }
+
+    /// What a holder of the name carries (DESIGN.md §7.6): a field's private
+    /// symbol, the instance brand (slot `1`) or, for a static method or
+    /// accessor, the class value (slot `0`).
+    pub(super) fn brand(&self) -> IrNode {
+        self.slot(match self.kind {
+            PrivateKind::Field(slot) => slot,
+            PrivateKind::Method { is_static, .. } | PrivateKind::Accessor { is_static, .. } => {
+                u32::from(!is_static)
+            }
+        })
+    }
+
+    /// The brand check of `obj` (`value` is a write's right-hand side,
+    /// evaluated before it); yields `value`, else `obj`.
+    fn check(&self, obj: IrNode, value: Option<IrNode>, write: bool) -> IrNode {
+        IrNode::PrivateBrand {
+            obj: Box::new(obj),
+            value: value.map(Box::new),
+            brand: Box::new(self.brand()),
+            name: self.name.clone(),
+            write,
+        }
+    }
+
+    /// The `TypeError` `error` naming `#x`.
+    fn throw(&self, error: PrivateError) -> IrNode {
+        IrNode::PrivateThrow {
+            error,
+            name: self.name.clone(),
+        }
+    }
+
+    /// `obj.#x`: a field's value; after the brand check, a method's closure
+    /// (shared by every holder) or the getter called with `this = obj`.
+    fn read(&self, obj: IrNode) -> IrNode {
+        match self.kind {
+            PrivateKind::Field(slot) => IrNode::PrivateGet {
+                obj: Box::new(obj),
+                key: Box::new(self.slot(slot)),
+                name: self.name.clone(),
+            },
+            PrivateKind::Method { slot, .. } => {
+                IrNode::Seq(vec![self.check(obj, None, false), self.slot(slot)])
+            }
+            PrivateKind::Accessor { get: Some(get), .. } => {
+                let [this_local, ..] = self.temps.unwrap_or_default();
+                IrNode::ThisCall {
+                    callee: Box::new(IrNode::Seq(vec![
+                        IrNode::Assign {
+                            local: this_local,
+                            value: Box::new(self.check(obj, None, false)),
+                        },
+                        self.slot(get),
+                    ])),
+                    args: Vec::new(),
+                    this_local,
+                    construct: false,
+                    not_callable: CalleeError::not_a_function(&self.name.to_string()),
+                }
+            }
+            PrivateKind::Accessor { get: None, .. } => IrNode::Seq(vec![
+                self.check(obj, None, false),
+                self.throw(PrivateError::NoGetter),
+            ]),
+        }
+    }
+
+    /// `obj.#x = value` (`obj`, then `value`, then the check), yielding
+    /// `value`: a field's store, or the setter called with `this = obj`; a
+    /// method or a getter-only accessor throws after the brand check.
+    pub(super) fn write(&self, obj: IrNode, value: IrNode) -> IrNode {
+        match self.kind {
+            PrivateKind::Field(slot) => IrNode::PrivateSet {
+                obj: Box::new(obj),
+                key: Box::new(self.slot(slot)),
+                value: Box::new(value),
+                name: self.name.clone(),
+            },
+            PrivateKind::Method { .. } => IrNode::Seq(vec![
+                self.check(obj, Some(value), true),
+                self.throw(PrivateError::MethodNotWritable),
+            ]),
+            PrivateKind::Accessor { set: Some(set), .. } => {
+                // The receiver is snapshotted first; the call's argument is the
+                // value, brand-checked after it is evaluated.
+                let [_, this_local, stored] = self.temps.unwrap_or_default();
+                let checked = self.check(IrNode::Local(this_local), Some(value), true);
+                IrNode::Seq(vec![
+                    IrNode::Assign {
+                        local: this_local,
+                        value: Box::new(obj),
+                    },
+                    IrNode::ThisCall {
+                        callee: Box::new(self.slot(set)),
+                        args: vec![IrNode::Seq(vec![
+                            IrNode::Assign {
+                                local: stored,
+                                value: Box::new(checked),
+                            },
+                            IrNode::Local(stored),
+                        ])],
+                        this_local,
+                        construct: false,
+                        not_callable: CalleeError::not_a_function(&self.name.to_string()),
+                    },
+                    IrNode::Local(stored),
+                ])
+            }
+            PrivateKind::Accessor { set: None, .. } => IrNode::Seq(vec![
+                self.check(obj, Some(value), true),
+                self.throw(PrivateError::NoSetter),
+            ]),
+        }
+    }
+
+    /// `#x in obj`.
+    fn has(&self, obj: IrNode) -> IrNode {
+        IrNode::PrivateIn {
+            obj: Box::new(obj),
+            brand: Box::new(self.brand()),
+            name: self.name.clone(),
+        }
+    }
+}
+
 /// One link of a flattened optional chain (see [`LowerCtx::lower_opt_chain`]),
 /// borrowed from the swc AST. `optional` marks the `?.` links (the ones that
 /// short-circuit); a member link carries its property, a call link its argument
@@ -2625,7 +2876,6 @@ enum ChainLink<'a> {
     Member {
         prop: &'a MemberProp,
         optional: bool,
-        span: Span,
     },
     Call {
         args: &'a [ExprOrSpread],
@@ -2650,7 +2900,6 @@ fn collect_chain_links<'a>(chain: &'a OptChainExpr, links: &mut Vec<ChainLink<'a
             ChainLink::Member {
                 prop: &m.prop,
                 optional: chain.optional,
-                span: m.span,
             },
         ),
         OptChainBase::Call(c) => (
@@ -2809,7 +3058,8 @@ fn nullish_check(value: IrNode, key: &str) -> IrNode {
 }
 
 /// The statically-known method name of a member callee: `obj.m` and the
-/// string-literal computed form `obj["m"]` both name `m`; a dynamic computed key
+/// string-literal computed form `obj["m"]` both name `m`, `obj.#m` names `#m`;
+/// a dynamic computed key
 /// `obj[k]` is only known at runtime, so it has no static name (nor has a
 /// literal with a lone surrogate, which no Rust `String` spells).
 fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
@@ -2819,7 +3069,7 @@ fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
             Expr::Lit(Lit::Str(s)) => lit_str(s).to_rust_string(),
             _ => None,
         },
-        MemberProp::PrivateName(_) => None,
+        MemberProp::PrivateName(p) => Some(format!("#{}", p.name)),
     }
 }
 
