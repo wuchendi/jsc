@@ -342,6 +342,12 @@ pub(super) fn emit_node(
                 emit_node(node, function, scratch, strings, helpers);
             }
         }
+        // The statements are stack-neutral and no jump escapes them, so they
+        // run in place, under any operands already pushed.
+        IrNode::Block { stmts, value } => {
+            emit_stmts(stmts, function, scratch, strings, helpers, None, None);
+            emit_node(value, function, scratch, strings, helpers);
+        }
         IrNode::ArraySpread(parts) => {
             emit_array_spread(parts, function, scratch, strings, helpers);
         }

@@ -1440,8 +1440,10 @@ catch binding).
   provably intact (the dirty bits of §6.4); an `arguments` object is walked
   by index while its own `@@iterator` is still `%Array.prototype.values%`
   (and the Array Iterator bits are clean). The loop head declares its
-  binding with `const`/`let`/`var` (identifier or pattern) or assigns a
-  pattern (`for ([a] of xs)`).
+  binding with `const`/`let`/`var` (identifier or pattern) or assigns any
+  assignment target (`for (a of xs)`, `for (o.p of xs)`, `for ([a] of
+  xs)`, `for ({a} of xs)`) as the first body statement, so a throwing
+  assignment closes the iterator.
 - **`for await`** (in async functions, async generators and the top level of
   `main`) has `for-of`'s shape and head forms over an async record (§7.8):
   each step awaits `next()`, then checks the result is an object; an abrupt
@@ -1450,7 +1452,10 @@ catch binding).
   rejection; a throw from a step does not close. It has no fast path: every
   step is a microtask turn.
 - **`for-in`** iterates the key snapshot of §6.3; strings and arrays list their
-  index keys first.
+  index keys first, and any other primitive (`null` / `undefined` included)
+  lists none. Its head takes every `for-of` head form (`for (const [a, b]
+  in o)`, `for (var {x} in o)`, `for (k in o)`, `for (o.p in o)`); an
+  Annex B `var` initializer (`for (var k = 0 in o)`) is a spanned error.
 
 A `for` loop with a `let` head is scoped to the loop; `continue` still runs the
 update clause. Labels may only be applied to loops.
@@ -1552,9 +1557,15 @@ those of `switch` and loops are not tracked.
   dynamically; `delete` removes them.
 - **Destructuring.** Array patterns (holes, defaults, rest, nesting) and object
   patterns (identifier and string keys, rename, defaults, nesting, rest) in
-  declarations, parameters, and `for-of` heads; destructuring assignment as
-  an expression statement, with member targets (`[o.x] = xs`, `({...o.r} =
-  src)`). An object rest is a fresh ordinary object filled by
+  declarations, parameters, and `for-of` / `for-in` heads; destructuring
+  assignment in any expression position (`x = [a, b] = c`, `f(({a} = o))`,
+  a `?:` arm, a `for` update, an arrow body), with member targets (`[o.x] =
+  xs`, `({...o.r} = src)`); its value is the RHS. It desugars to statements
+  (the RHS into a temp, then each target in order) wrapped in an IR
+  `Block { stmts, value }` node whose value is that temp: the emitter runs
+  the stack-neutral statements in place, under any operands already pushed,
+  and a generator body linearizes a block holding a suspend into its CFG
+  (§7.8) after spilling the earlier operands. An object rest is a fresh ordinary object filled by
   `CopyDataProperties` minus the destructured keys. An object pattern checks
   `RequireObjectCoercible` before its first target reference, rest, or read,
   so a nullish source throws a `TypeError` before anything else runs.
@@ -1740,7 +1751,8 @@ point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
 `break`/`continue`/`return` — becomes block jumps dispatched by a
 `loop { br_table(state) }`, while regions without a suspend keep ordinary wasm
 control flow. A `yield` may appear inside a larger expression
-(`1 + (yield 2)`, a loop condition); the expression is linearized around it.
+(`1 + (yield 2)`, a loop condition, a destructuring assignment's RHS or
+default); the expression is linearized around it.
 
 - Each generator function owns a `prototype` (writable, non-enumerable,
   non-configurable): a fresh object inheriting `%GeneratorPrototype%`
@@ -1909,8 +1921,7 @@ Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
 supported`, `with statements are not supported`, `private class fields are not
 supported`, `class static blocks are not supported`,
-`async generator functions are unsupported`, `a label may only be applied to a loop`,
-`destructuring assignment is only supported as an expression statement`.
+`async generator functions are unsupported`, `a label may only be applied to a loop`.
 
 **Run-time errors** carry no source span:
 
@@ -2190,7 +2201,7 @@ Each item below is current behaviour of this tree.
   | `void` (59; the cause is removed — §7.2, recount pending) | language | | | | | | |
   | thenables are not assimilated (`Array.fromAsync`, below) | async | 14 | | | | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
-  | tagged templates, `for-in` heads | language | 2 | 4 | | | | |
+  | tagged templates (`for-in` heads removed — §7.3, recount pending) | language | 2 | 4 | | | | |
   | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
   | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
   | CR line terminators hide the frontmatter `includes` (`nativeFunctionMatcher.js`) | runner | | | 1 | | | |
@@ -2206,9 +2217,6 @@ Each item below is current behaviour of this tree.
 
 **Functions & classes**
 
-- Destructuring assignment works only as an expression statement; it is
-  rejected in expression position (`x = [a] = b`), and a `for-of` head must
-  declare its binding or be a pattern (`for (a of xs)` is rejected).
 - Not supported: private `#` members, static blocks.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads

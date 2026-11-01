@@ -967,6 +967,12 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
                 collect_node(elem, strs);
             }
         }
+        IrNode::Block { stmts, value } => {
+            for stmt in stmts {
+                collect_stmt(stmt, strs);
+            }
+            collect_node(value, strs);
+        }
         IrNode::ArraySpread(parts) => {
             for part in parts {
                 collect_spread_elem(part, strs);

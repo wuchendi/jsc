@@ -28,14 +28,6 @@ impl LowerCtx<'_> {
         }
         match stmt {
             Stmt::Expr(expr_stmt) => {
-                // `[a, o.b] = rhs;` / `({k: o.p} = rhs);` desugars to a sequence of
-                // statements, so it is lowered here rather than as an expression.
-                if let Expr::Assign(assign) = strip_parens(&expr_stmt.expr)
-                    && assign.op == AssignOp::Assign
-                    && let AssignTarget::Pat(pat) = &assign.left
-                {
-                    return self.lower_destructuring_assign(pat, &assign.right, out);
-                }
                 let value = self.lower_expr(&expr_stmt.expr)?;
                 out.push(IrStmt::Expr(match self.completion_local() {
                     Some(local) => IrNode::Assign {
@@ -1041,20 +1033,20 @@ impl LowerCtx<'_> {
         rest
     }
 
-    /// Lower a destructuring ASSIGNMENT statement `pattern = rhs` (object or array
-    /// assignment pattern). The RHS is evaluated once into a hidden temp, each
-    /// target is assigned in source order, and the statement's value is the RHS.
-    fn lower_destructuring_assign(
+    /// Lower a destructuring assignment `pattern = rhs` (object or array
+    /// assignment pattern) into `out`: the RHS is evaluated once into a hidden
+    /// temp, returned as the expression's value, and each target is assigned
+    /// in source order.
+    pub(super) fn lower_destructuring_assign(
         &mut self,
         pat: &AssignTargetPat,
         rhs: &Expr,
         out: &mut Vec<IrStmt>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u32> {
         let init = self.lower_expr(rhs)?;
         let temp = self.fresh();
         out.push(IrStmt::Decl { local: temp, init });
         match pat {
-            // The statement's value stays the RHS itself.
             AssignTargetPat::Array(arr) => self.assign_array_pat(arr, IrNode::Local(temp), out)?,
             AssignTargetPat::Object(obj) => self.assign_object_pat(obj, temp, out)?,
             AssignTargetPat::Invalid(invalid) => {
@@ -1063,15 +1055,7 @@ impl LowerCtx<'_> {
                 );
             }
         }
-        // The statement's value is the RHS (stored into a tracked completion).
-        out.push(IrStmt::Expr(match self.completion_local() {
-            Some(local) => IrNode::Assign {
-                local,
-                value: Box::new(IrNode::Local(temp)),
-            },
-            None => IrNode::Local(temp),
-        }));
-        Ok(())
+        Ok(temp)
     }
 
     /// Assign `value` to a destructuring-assignment `target`: a nested pattern
@@ -1712,16 +1696,15 @@ impl LowerCtx<'_> {
     ///
     /// The head is a `const`/`let` identifier or destructuring binding (a
     /// duplicate name is a spanned error), a `var` head assigning its hoisted
-    /// binding(s), or a member / destructuring assignment target (`o.x`,
-    /// `[o.a, b]`) written each iteration; a bare identifier assignment head,
-    /// several declarators, or a `using` head is a spanned error.
+    /// binding(s), or an assignment target (`x`, `o.x`, `[o.a, b]`) written each
+    /// iteration; several declarators or a `using` head is a spanned error.
     fn lower_for_of(
         &mut self,
         for_of: &swc_ecma_ast::ForOfStmt,
         label: Option<u32>,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let head = for_of_head(&for_of.left)?;
+        let head = for_of_head(&for_of.left, "for-of")?;
 
         self.push_scope();
         let result = (|| {
@@ -1904,55 +1887,17 @@ impl LowerCtx<'_> {
     /// (mirroring [`Self::lower_for`]); the `for-in` head opens a lexical scope, so
     /// the binding is not visible after the loop.
     ///
-    /// Only a single `const`/`let`/`var` identifier head is supported; a
-    /// destructuring/assignment head is a spanned error. A statically-known
-    /// non-enumerable operand (a number/boolean/null literal) is rejected with a
-    /// span; objects, arrays, strings, and any dynamic value are allowed through.
+    /// The head is any `for-of` head ([`for_of_head`]): a declared binding or
+    /// pattern, a `var` head, or an assignment target. A primitive operand has no
+    /// enumerable keys but a string's indices (`null`/`undefined` iterate zero
+    /// times).
     fn lower_for_in(
         &mut self,
         for_in: &swc_ecma_ast::ForInStmt,
         label: Option<u32>,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        // The head must declare a single `const`/`let`/`var` identifier binding.
-        let (ident, pat, kind) = match &for_in.left {
-            ForHead::VarDecl(var_decl) => {
-                let [declarator] = var_decl.decls.as_slice() else {
-                    return Err(CompileError::spanned(
-                        var_decl.span(),
-                        "for-in requires a single loop variable",
-                    )
-                    .into());
-                };
-                let Pat::Ident(ident) = &declarator.name else {
-                    return Err(CompileError::spanned(
-                        declarator.name.span(),
-                        "unsupported for-in binding pattern",
-                    )
-                    .into());
-                };
-                (ident, &declarator.name, var_decl.kind)
-            }
-            other => {
-                return Err(CompileError::spanned(
-                    other.span(),
-                    "for-in requires a `const`/`let`/`var` loop variable",
-                )
-                .into());
-            }
-        };
-
-        // Reject a statically-known non-enumerable head (`for (const k in 5)`):
-        // only objects, arrays, and strings enumerate keys. Dynamic values carry no
-        // static type in the numeric IR, so a non-enumerable reaching the loop at
-        // runtime is undefined behavior, like an out-of-bounds index elsewhere.
-        if non_enumerable_literal(&for_in.right) {
-            return Err(CompileError::spanned(
-                for_in.right.span(),
-                "for-in operand must be an object, array, or string",
-            )
-            .into());
-        }
+        let head = for_of_head(&for_in.left, "for-in")?;
 
         self.push_scope();
         let result = (|| {
@@ -1983,18 +1928,10 @@ impl LowerCtx<'_> {
                 rhs: Box::new(IrNode::Local(len_local)),
             };
 
-            // The loop binding: a fresh block-scoped local, rebound each iteration
-            // to the key at index `i` as the first statement of the body; a
-            // `var` head assigns the hoisted binding instead.
-            let target = if kind == VarDeclKind::Var {
-                ForOfTarget::Var(pat)
-            } else {
-                ForOfTarget::Local(self.declare(
-                    ident.id.sym.as_ref(),
-                    kind != VarDeclKind::Const,
-                    binding_id(ident),
-                ))
-            };
+            // The loop binding: a fresh block-scoped local (or pattern), rebound
+            // each iteration to the key at index `i` as the first statement of
+            // the body; a `var` head or an assignment target is assigned instead.
+            let target = self.declare_for_of_head(head);
             self.breakable_inc();
             self.loopable_inc();
             let mut body = Vec::new();
@@ -2036,21 +1973,6 @@ impl LowerCtx<'_> {
         let mut body = Vec::new();
         self.lower_stmt(stmt, &mut body)?;
         Ok(body)
-    }
-}
-
-/// Whether `expr` is a compile-time literal that is definitely NOT enumerable by
-/// `for-in` — a number/boolean/null/bigint/regex literal. An object enumerates its
-/// keys, an array/string its index keys, and anything dynamic (an identifier, a
-/// call, an object/array literal) is allowed through; only a primitive-scalar
-/// literal is a statically-detectable non-enumerable operand. Used to reject an
-/// obviously wrong `for-in` head (`for (const k in 5)`) with a spanned error.
-fn non_enumerable_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(paren) => non_enumerable_literal(&paren.expr),
-        // A string literal enumerates its index keys ("0", "1", ..), like an array.
-        Expr::Lit(lit) => !matches!(lit, Lit::Str(_)),
-        _ => false,
     }
 }
 
@@ -2103,19 +2025,27 @@ enum ForOfTarget<'a> {
     Assign(&'a Pat),
 }
 
-/// Classify a `for-of` head: a single `const`/`let` identifier binding, a
-/// declared destructuring pattern, a `var` head, or a member / destructuring
-/// assignment target (`o.x`, `[o.a, o.b]`).
-fn for_of_head(left: &ForHead) -> anyhow::Result<ForOfHead<'_>> {
+/// Classify a `for-of` / `for-in` (`loop_kind`) head: a single `const`/`let`
+/// identifier binding, a declared destructuring pattern, a `var` head, or an
+/// assignment target (`x`, `o.x`, `[o.a, b]`, `{a}`).
+fn for_of_head<'a>(left: &'a ForHead, loop_kind: &str) -> anyhow::Result<ForOfHead<'a>> {
     Ok(match left {
         ForHead::VarDecl(var_decl) => {
             let [declarator] = var_decl.decls.as_slice() else {
                 return Err(CompileError::spanned(
                     var_decl.span(),
-                    "for-of requires a single loop variable",
+                    format!("{loop_kind} requires a single loop variable"),
                 )
                 .into());
             };
+            // `for (var x = init in o)` (Annex B) is not supported.
+            if let Some(init) = &declarator.init {
+                return Err(CompileError::spanned(
+                    init.span(),
+                    format!("unsupported {loop_kind} head initializer"),
+                )
+                .into());
+            }
             let mutable = var_decl.kind != VarDeclKind::Const;
             match &declarator.name {
                 // A `var` head assigns the hoisted binding(s).
@@ -2128,7 +2058,7 @@ fn for_of_head(left: &ForHead) -> anyhow::Result<ForOfHead<'_>> {
                     if let Some(dup) = names.iter().find(|name| !seen.insert(name.as_str())) {
                         return Err(CompileError::spanned(
                             pat.span(),
-                            format!("duplicate binding in for-of head: {dup}"),
+                            format!("duplicate binding in {loop_kind} head: {dup}"),
                         )
                         .into());
                     }
@@ -2137,31 +2067,21 @@ fn for_of_head(left: &ForHead) -> anyhow::Result<ForOfHead<'_>> {
                 other => {
                     return Err(CompileError::spanned(
                         other.span(),
-                        "unsupported for-of binding pattern",
+                        format!("unsupported {loop_kind} binding pattern"),
                     )
                     .into());
                 }
             }
         }
-        // A bare identifier head (`for (x of ..)`) stays rejected.
-        ForHead::Pat(pat) if !is_ident_target(pat) => ForOfHead::Assign(pat),
-        other => {
+        ForHead::Pat(pat) => ForOfHead::Assign(pat),
+        ForHead::UsingDecl(using) => {
             return Err(CompileError::spanned(
-                other.span(),
-                "for-of requires a `const`/`let` loop variable",
+                using.span(),
+                format!("unsupported `using` {loop_kind} head"),
             )
             .into());
         }
     })
-}
-
-/// Whether an assignment-target pattern is a bare identifier (`x` / `(x)`).
-fn is_ident_target(pat: &Pat) -> bool {
-    match pat {
-        Pat::Ident(_) => true,
-        Pat::Expr(expr) => matches!(strip_parens(expr), Expr::Ident(_)),
-        _ => false,
-    }
 }
 
 /// The class-member name early errors (`SyntaxError`s) of a literal key: a
