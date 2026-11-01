@@ -1403,6 +1403,16 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   identity.
 - **Logical** `!`, `&&`, `||`, `??` (each yields an operand value, not a coerced
   boolean) and `&&=`, `||=`, `??=` (short circuit).
+- **Assignment targets** are an identifier, a member `o.k` / `o[k]` (either
+  one parenthesized any number of times: `(a) = 1`, `((o.x)) += 1`, `++(a)`)
+  or a destructuring pattern (§7.3). A compound, `**=` or logical assignment
+  to a member evaluates the base and the key once (a `**=` / logical one
+  converts the key once with `ToPropertyKey`); a short-circuited `&&=` /
+  `||=` / `??=` skips both the right-hand side and the store, so no setter
+  runs. An anonymous function assigned by `=` or a logical assignment to an
+  unparenthesized identifier is named after it. An invalid target (`f() = 1`,
+  `1 = 2`, `a + b = c`, `(a, b) = c`, `a?.b = 1`) is an early `SyntaxError`
+  (`Invalid left-hand side in assignment`).
 - **Conditional** `c ? a : b`, optional chaining `a?.b`, `a?.[k]`, `a?.()`,
   `a?.m()` (a nullish base short-circuits the rest of the chain to
   `undefined`).
@@ -1411,7 +1421,10 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   alone keep the reference: `(o.m)()` calls with `this = o`); `yield`/`await`
   operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
-  (`__delete`).
+  (`__delete`; parentheses around the member are transparent). `delete x` of
+  an identifier is an early `SyntaxError` (strict code); `delete` of any other
+  non-reference (`delete 1`, `delete f()`) evaluates its operand and yields
+  `true`.
 - **`void`** evaluates its operand for its effects (calls, assignments,
   throws, `yield` / `await`) and yields `undefined`; a literal operand folds
   to `undefined`.
@@ -1424,9 +1437,19 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 ### 7.3 Control flow
 
 `if`/`else`, `while`, `do … while`, C-style `for`, `for-of`, `for-in`, `switch`
-(strict `===` matching, fall-through, `default`), `break` / `continue` (with
-labels on loops), `return`, `throw`, `try`/`catch`/`finally` (with or without a
+(strict `===` matching, fall-through, `default`), `break` / `continue`,
+labelled statements, `return`, `throw`, `try`/`catch`/`finally` (with or without a
 catch binding).
+
+- **Labels** apply to any statement (`a: { … }`, `a: if (…) …`, `a: try …`,
+  `a: switch …`, nested `a: b: while (…)`); a run of nested labels names one
+  statement. `break a` exits the labelled statement from anywhere inside it,
+  running every intervening `finally`; a labelled non-loop statement is an
+  `IrStmt::Labeled` (a wasm `block`, or an exit block in the generator CFG)
+  that an unlabeled `break` / `continue` passes through. `continue a` where
+  `a` does not label an iteration statement, an undefined label, a duplicate
+  nested label (`a: a: ;`, swc) and a labelled function declaration (strict
+  code) are early `SyntaxError`s.
 
 - **`catch` parameters** are an identifier or a binding pattern
   (`catch ({message})`, `catch ([a, b = 2, ...r])`), bound like a `let` in a
@@ -1947,7 +1970,8 @@ Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
 supported`, `with statements are not supported`, `private class fields are not
 supported`, `class static blocks are not supported`,
-`async generator functions are unsupported`, `a label may only be applied to a loop`.
+`async generator functions are unsupported`, `Invalid left-hand side in
+assignment`.
 
 **Run-time errors** carry no source span:
 
@@ -2170,6 +2194,12 @@ Each item below is current behaviour of this tree.
   (§6.4).
 - An assignment to an unresolvable name evaluates its right-hand side before
   the `HasProperty` check throws the `ReferenceError`.
+- Assigning to, incrementing or deleting a `super` property (`super.x = v`,
+  `super[k]++`, `delete super.x`) and `delete` of an optional chain
+  (`delete o?.x`) are compile errors.
+- A `**=` or logical assignment to a computed member on a `null` /
+  `undefined` base converts the key (`ToPropertyKey`, which may run a user
+  `toString`) before the `TypeError`.
 - `-p` completion values come from expression statements and `try`
   statements; `switch` and loops contribute none.
 
@@ -2355,7 +2385,7 @@ Still open from the phase-3 scope: `Date` string parsing and local time
 ### Phase 5 — Language completeness
 
 - Private fields and methods, static blocks, object spread.
-- Labeled statements, all remaining early errors.
+- All remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
 - `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,

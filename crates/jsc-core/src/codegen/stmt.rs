@@ -1560,33 +1560,50 @@ impl LowerCtx<'_> {
         Ok(())
     }
 
-    /// Lower a labeled statement `name: loop`. A label names its immediately
-    /// nested loop, and `break name`/`continue name` inside that loop (or a loop
-    /// nested within it) target THIS loop. The label is in scope only while its
-    /// loop body is lowered. A label on any non-loop statement is a spanned error.
+    /// Lower a labeled statement `a: b: stmt`. A run of nested labels names one
+    /// statement and shares one label id. On a loop the id is the loop's
+    /// [`IrStmt::While::label`], so `break a`/`continue a` inside it (or a loop
+    /// nested within it) target THIS loop; on any other statement it wraps the
+    /// lowered statement in an [`IrStmt::Labeled`] that only `break a` exits (a
+    /// `continue a` is an early error). The labels are in scope only while the
+    /// statement is lowered.
     fn lower_labeled(
         &mut self,
         labeled: &swc_ecma_ast::LabeledStmt,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let name = labeled.label.sym.as_ref();
+        let mut names = vec![labeled.label.sym.as_ref()];
+        let mut body = labeled.body.as_ref();
+        while let Stmt::Labeled(inner) = body {
+            names.push(inner.label.sym.as_ref());
+            body = inner.body.as_ref();
+        }
         let id = self.fresh_label();
-        self.with_label(name, id, |ctx| match labeled.body.as_ref() {
+        let is_loop = matches!(
+            body,
+            Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForOf(_) | Stmt::ForIn(_)
+        );
+        self.with_labels(&names, id, is_loop, |ctx| match body {
             Stmt::While(while_stmt) => ctx.lower_while(while_stmt, Some(id), out),
             Stmt::DoWhile(do_stmt) => ctx.lower_do_while(do_stmt, Some(id), out),
             Stmt::For(for_stmt) => ctx.lower_for(for_stmt, Some(id), out),
             Stmt::ForOf(for_of) => ctx.lower_for_of(for_of, Some(id), out),
             Stmt::ForIn(for_in) => ctx.lower_for_in(for_in, Some(id), out),
-            other => Err(CompileError::spanned(
-                other.span(),
-                "a label may only be applied to a loop",
-            )
-            .into()),
+            other => {
+                let mut inner = Vec::new();
+                ctx.lower_stmt(other, &mut inner)?;
+                out.push(IrStmt::Labeled {
+                    label: id,
+                    body: inner,
+                });
+                Ok(())
+            }
         })
     }
 
     /// Resolve the target of a `break`/`continue`. A `Some(label)` resolves to its
-    /// loop id via [`Self::label_id`] (an unknown label is a spanned error); an
+    /// label id via [`Self::label_id`] (an unknown label, or a `continue` to a
+    /// label that does not name an iteration statement, is a spanned error); an
     /// unlabeled `break`/`continue` yields `None` after checking it is inside a
     /// valid enclosing context (`is_continue` selects the loop-only `continue`
     /// check and its message, `span` locates the diagnostic).
@@ -1597,10 +1614,16 @@ impl LowerCtx<'_> {
         is_continue: bool,
     ) -> anyhow::Result<Option<u32>> {
         if let Some(label) = label {
-            return self
-                .label_id(label.sym.as_ref())
-                .map(Some)
-                .ok_or_else(|| CompileError::spanned(label.span, "undefined label").into());
+            let name = label.sym.as_ref();
+            return match self.label_id(name) {
+                None => Err(CompileError::spanned(label.span, "undefined label").into()),
+                Some((_, false)) if is_continue => Err(CompileError::spanned(
+                    span,
+                    format!("Illegal continue statement: '{name}' does not denote an iteration statement"),
+                )
+                .into()),
+                Some((id, _)) => Ok(Some(id)),
+            };
         }
         let (in_context, msg) = if is_continue {
             (self.loopable() > 0, "illegal continue statement")

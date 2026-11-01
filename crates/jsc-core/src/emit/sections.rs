@@ -835,6 +835,11 @@ pub(super) fn collect_stmt<'a>(stmt: &'a IrStmt, strs: &mut Strs<'a>) {
                 }
             }
         }
+        IrStmt::Labeled { body, .. } => {
+            for stmt in body {
+                collect_stmt(stmt, strs);
+            }
+        }
         IrStmt::Break(_) | IrStmt::Continue(_) => {}
         IrStmt::Try {
             body,

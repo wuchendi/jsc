@@ -488,12 +488,13 @@ struct Frame {
     /// Captured binding id → env slot (the inverse of `env`).
     env_index: HashMap<u32, u32>,
     /// Active statement labels enclosing the point being lowered, innermost last:
-    /// each is a `(label name, loop id)` pair, where the loop id is the
-    /// [`IrStmt::While::label`] of the labeled loop. A labeled `break`/`continue`
-    /// resolves its target name to a loop id here. Labels do not cross a function
-    /// boundary, so this is per-frame.
-    labels: Vec<(String, u32)>,
-    /// The next loop-id to hand out for a labeled loop in this frame.
+    /// each is a `(label name, label id, is_loop)` triple, where the label id is
+    /// the [`IrStmt::While::label`] of a labeled loop (`is_loop`) or the
+    /// [`IrStmt::Labeled::label`] of any other labeled statement. A labeled
+    /// `break`/`continue` resolves its target name to a label id here. Labels do
+    /// not cross a function boundary, so this is per-frame.
+    labels: Vec<(String, u32, bool)>,
+    /// The next label id to hand out for a labeled statement in this frame.
     next_label: u32,
     /// Whether this frame is a function scope that binds `this`. `true` for
     /// every lowered function/arrow/method body, `false` for the top-level `main`

@@ -223,9 +223,25 @@ impl LowerCtx<'_> {
                 // `!operand` is logical NOT: boolean inverse of truthiness.
                 UnaryOp::Bang => Ok(IrNode::Not(Box::new(self.lower_expr(&u.arg)?))),
                 // `delete obj.k` / `delete obj[k]` removes an own property and
-                // yields `true`. Only a member reference is supported; a
-                // bare `delete x` (a no-op in non-strict JS) is rejected.
-                UnaryOp::Delete => match &*u.arg {
+                // yields `true` (parentheses are transparent). `delete x` of an
+                // identifier is an early SyntaxError in strict code; any other
+                // non-reference operand is evaluated and yields `true`.
+                UnaryOp::Delete => match strip_parens(&u.arg) {
+                    Expr::Ident(ident) => Err(CompileError::spanned(
+                        ident.span,
+                        "Delete of an unqualified identifier in strict mode.",
+                    )
+                    .into()),
+                    Expr::SuperProp(super_prop) => Err(CompileError::spanned(
+                        super_prop.span,
+                        "`delete` of a `super` property is not supported",
+                    )
+                    .into()),
+                    Expr::OptChain(chain) => Err(CompileError::spanned(
+                        chain.span,
+                        "`delete` of an optional chain is not supported",
+                    )
+                    .into()),
                     Expr::Member(member) => {
                         let obj = self.lower_expr(&member.obj)?;
                         let key = match &member.prop {
@@ -244,11 +260,10 @@ impl LowerCtx<'_> {
                             key: Box::new(key),
                         })
                     }
-                    other => Err(CompileError::spanned(
-                        other.span(),
-                        "`delete` requires a property reference",
-                    )
-                    .into()),
+                    other => Ok(IrNode::Seq(vec![
+                        self.lower_expr(other)?,
+                        IrNode::Bool(true),
+                    ])),
                 },
                 // `void operand` evaluates the operand for its effects and
                 // yields `undefined`; a literal operand folds away.
@@ -1462,165 +1477,199 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower an assignment `target = value`. An identifier target is a local
-    /// assign; a computed-member target `obj[i] = v` is an in-place array element
-    /// store. A static-member target `obj.a = v` is object territory,
-    /// still unsupported here.
-    #[allow(clippy::too_many_lines)]
+    /// Lower an assignment `target op= value`. Parentheses around a simple
+    /// target are transparent (`(a) = 1`, `((o.x)) += 1`); an identifier target
+    /// is a binding write, a member target `obj[k]` / `obj.k` a property store,
+    /// and a destructuring pattern a statement block (DESIGN.md §7.3).
     fn lower_assign(&mut self, assign: &AssignExpr) -> anyhow::Result<IrNode> {
-        // `x **= e` desugars to `x = x ** e` — a `MathOp::Pow` (not a `BinOp`), so
-        // it is handled ahead of the `BinOp`-based compound path below. Only an
-        // identifier target is supported.
-        if matches!(assign.op, AssignOp::ExpAssign) {
-            let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &assign.left else {
-                return Err(CompileError::spanned(
-                    assign.left.span(),
-                    "unsupported `**=` assignment target",
-                )
-                .into());
-            };
-            let name = ident.id.sym.as_ref();
-            let resolved = self.resolve_target(name, ident.span())?;
-            if !resolved.mutable {
-                return Err(CompileError::spanned(
-                    ident.span(),
-                    format!("cannot assign to constant binding: {name}"),
-                )
-                .into());
-            }
-            let rhs = self.lower_expr(&assign.right)?;
-            let value = IrNode::MathCall {
-                op: MathOp::Pow,
-                args: vec![Self::read_of(resolved.kind.clone()), rhs],
-            };
-            return Ok(Self::write_of(resolved.kind, value));
-        }
-        // `x ??= e` / `x ||= e` / `x &&= e` desugar to a conditional assign that
-        // reuses the short-circuit `LogicalOp`: `x = x ?? e` / `x || e` / `x && e`.
-        // The logical op evaluates `x` once and only evaluates `e` on the
-        // non-short-circuit path, so the RHS is skipped exactly when the assign is
-        // (P0.4). Only an identifier target is supported.
-        if let Some(logical_op) = map_logical_assign_op(assign.op) {
-            let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &assign.left else {
-                return Err(CompileError::spanned(
-                    assign.left.span(),
-                    "unsupported logical-assignment target",
-                )
-                .into());
-            };
-            let name = ident.id.sym.as_ref();
-            let resolved = self.resolve_target(name, ident.span())?;
-            if !resolved.mutable {
-                return Err(CompileError::spanned(
-                    ident.span(),
-                    format!("cannot assign to constant binding: {name}"),
-                )
-                .into());
-            }
-            let rhs = self.lower_expr(&assign.right)?;
-            let value = IrNode::Logical {
-                op: logical_op,
-                lhs: Box::new(Self::read_of(resolved.kind.clone())),
-                rhs: Box::new(rhs),
-            };
-            return Ok(Self::write_of(resolved.kind, value));
-        }
-        // A compound operator (`+=`/`-=`/`*=`/`/=`/`%=` and the bitwise/shift
-        // compounds) maps to the `BinOp` it applies; plain `=` maps to `None`.
-        let compound_op = map_assign_op(assign.op, assign.span())?;
-        match &assign.left {
-            AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
-                let name = ident.id.sym.as_ref();
-                let resolved = self.resolve_target(name, ident.span())?;
-                // Reassigning a `const` binding (plain or compound) is rejected.
-                // Attach the target identifier's span so the diagnostic renderer
-                // can point a caret at the offending name.
-                if !resolved.mutable {
-                    return Err(CompileError::spanned(
-                        ident.span(),
-                        format!("cannot assign to constant binding: {name}"),
-                    )
-                    .into());
-                }
-                let rhs = if compound_op.is_none() {
-                    self.lower_named_expr(&assign.right, &JsStr::from(name))?
-                } else {
-                    self.lower_expr(&assign.right)?
-                };
-                // `x op= e` desugars to `x = x op e`. The target is read once, as
-                // a side-effect-free local/cell read, and reuses the binary op — so
-                // `+=` shares the `+` string/number overload (string concat when
-                // the lhs is a string). A captured target reads/writes its cell.
-                let value = match compound_op {
-                    Some(op) => IrNode::Binary {
-                        op,
-                        lhs: Box::new(Self::read_of(resolved.kind.clone())),
-                        rhs: Box::new(rhs),
-                    },
-                    None => rhs,
-                };
-                Ok(Self::write_of(resolved.kind, value))
-            }
-            // A member target `obj[i] = v` / `obj.k = v` (plain or compound). The
-            // base is evaluated before the key; `obj.k` ≡ `obj["k"]` (a heap-string
-            // key; `.length` on an array is the runtime's `length` write).
-            AssignTarget::Simple(SimpleAssignTarget::Member(m)) => {
-                let obj = self.lower_expr(&m.obj)?;
-                let index = match &m.prop {
-                    MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-                    MemberProp::PrivateName(_) => {
-                        return Err(CompileError::spanned(
-                            m.span(),
-                            "unsupported assignment target",
-                        )
-                        .into());
-                    }
-                };
-                let rhs = self.lower_expr(&assign.right)?;
-                match compound_op {
-                    // `obj[i] op= e`: read the current member once, apply
-                    // `op`, store back. Base and key are stashed in fresh temps so
-                    // each side effect runs exactly once.
-                    Some(op) => {
-                        let obj_local = self.fresh();
-                        let idx_local = self.fresh();
-                        let new_local = self.fresh();
-                        Ok(IrNode::IndexOpSet {
-                            obj: Box::new(obj),
-                            index: Box::new(index),
-                            op,
-                            rhs: Box::new(rhs),
-                            obj_local,
-                            idx_local,
-                            new_local,
-                            kind: OpSetKind::Compound,
-                        })
-                    }
-                    // `obj[i] = v` reuses the runtime `IndexSet` type-byte dispatch.
-                    None => Ok(IrNode::IndexSet {
-                        obj: Box::new(obj),
-                        index: Box::new(index),
-                        value: Box::new(rhs),
-                    }),
-                }
-            }
+        let simple = match &assign.left {
             // A destructuring assignment desugars to statements run in place by
             // an [`IrNode::Block`] whose value is the RHS.
             AssignTarget::Pat(pat) => {
                 let mut stmts = Vec::new();
                 let temp = self.lower_destructuring_assign(pat, &assign.right, &mut stmts)?;
-                Ok(IrNode::Block {
+                return Ok(IrNode::Block {
                     stmts,
                     value: Box::new(IrNode::Local(temp)),
-                })
+                });
             }
-            AssignTarget::Simple(_) => Err(CompileError::spanned(
-                assign.left.span(),
-                "unsupported assignment target",
+            AssignTarget::Simple(simple) => simple,
+        };
+        let op = if matches!(assign.op, AssignOp::ExpAssign) {
+            AssignKind::Pow
+        } else if let Some(logical) = map_logical_assign_op(assign.op) {
+            AssignKind::Logical(logical)
+        } else {
+            match map_assign_op(assign.op, assign.span())? {
+                Some(bin) => AssignKind::Binary(bin),
+                None => AssignKind::Plain,
+            }
+        };
+        match simple_target(simple, assign.left.span())? {
+            // Only an unparenthesized identifier names an anonymous function
+            // assigned by `=` or a logical assignment (IsIdentifierRef).
+            Target::Ident(ident) => {
+                let named = matches!(simple, SimpleAssignTarget::Ident(_))
+                    && matches!(op, AssignKind::Plain | AssignKind::Logical(_));
+                self.lower_ident_assign(ident, op, &assign.right, named)
+            }
+            Target::Member(member) => self.lower_member_assign(member, op, &assign.right),
+            Target::SuperProp(super_prop) => Err(CompileError::spanned(
+                super_prop.span,
+                "assignment to a `super` property is not supported",
             )
             .into()),
         }
+    }
+
+    /// Lower `x op= rhs` on the binding `ident`. `x op= e` reads the target once
+    /// (a side-effect-free local/cell/global read) and combines it with `e`, so
+    /// `+=` shares the `+` string/number overload; `x ??= e` / `x ||= e` /
+    /// `x &&= e` reuse the short-circuit [`LogicalOp`] around the write
+    /// (`x ?? (x = e)`), so neither `e` nor the write runs when it short-circuits.
+    /// `named` names an anonymous function `rhs` after the binding.
+    fn lower_ident_assign(
+        &mut self,
+        ident: &Ident,
+        op: AssignKind,
+        right: &Expr,
+        named: bool,
+    ) -> anyhow::Result<IrNode> {
+        let name = ident.sym.as_ref();
+        let resolved = self.resolve_target(name, ident.span())?;
+        // Reassigning a `const` binding is rejected. Attach the target
+        // identifier's span so the diagnostic renderer can point at it.
+        if !resolved.mutable {
+            return Err(CompileError::spanned(
+                ident.span(),
+                format!("cannot assign to constant binding: {name}"),
+            )
+            .into());
+        }
+        let rhs = if named {
+            self.lower_named_expr(right, &JsStr::from(name))?
+        } else {
+            self.lower_expr(right)?
+        };
+        let read = Self::read_of(resolved.kind.clone());
+        Ok(match op {
+            AssignKind::Plain => Self::write_of(resolved.kind, rhs),
+            AssignKind::Binary(op) => Self::write_of(
+                resolved.kind,
+                IrNode::Binary {
+                    op,
+                    lhs: Box::new(read),
+                    rhs: Box::new(rhs),
+                },
+            ),
+            AssignKind::Pow => Self::write_of(
+                resolved.kind,
+                IrNode::MathCall {
+                    op: MathOp::Pow,
+                    args: vec![read, rhs],
+                },
+            ),
+            AssignKind::Logical(op) => IrNode::Logical {
+                op,
+                lhs: Box::new(read),
+                rhs: Box::new(Self::write_of(resolved.kind, rhs)),
+            },
+        })
+    }
+
+    /// Lower `obj[k] op= rhs` / `obj.k op= rhs`. The base is evaluated before
+    /// the key; `obj.k` ≡ `obj["k"]` (a heap-string key; `.length` on an array
+    /// is the runtime's `length` write). A `**=` or logical assignment stashes
+    /// the base and the key (converted once by `ToPropertyKey`) in temps, reads
+    /// the member through them (throwing the read `TypeError` on a nullish base
+    /// before `rhs` runs) and stores through them, so each side effect runs
+    /// once; a short-circuited logical assignment skips both `rhs` and the store
+    /// (no setter call).
+    fn lower_member_assign(
+        &mut self,
+        member: &swc_ecma_ast::MemberExpr,
+        op: AssignKind,
+        right: &Expr,
+    ) -> anyhow::Result<IrNode> {
+        let obj = self.lower_expr(&member.obj)?;
+        let (index, computed) = match &member.prop {
+            MemberProp::Computed(c) => (self.lower_expr(&c.expr)?, true),
+            MemberProp::Ident(id) => (IrNode::Str(id.sym.as_ref().into()), false),
+            MemberProp::PrivateName(_) => {
+                return Err(
+                    CompileError::spanned(member.span(), "unsupported assignment target").into(),
+                );
+            }
+        };
+        let rhs = self.lower_expr(right)?;
+        let op = match op {
+            // `obj[i] = v` reuses the runtime `IndexSet` type-byte dispatch.
+            AssignKind::Plain => {
+                return Ok(IrNode::IndexSet {
+                    obj: Box::new(obj),
+                    index: Box::new(index),
+                    value: Box::new(rhs),
+                });
+            }
+            // `obj[i] op= e`: read the current member once, apply `op`, store
+            // back. Base and key are stashed in fresh temps so each side effect
+            // runs exactly once.
+            AssignKind::Binary(op) => {
+                let obj_local = self.fresh();
+                let idx_local = self.fresh();
+                let new_local = self.fresh();
+                return Ok(IrNode::IndexOpSet {
+                    obj: Box::new(obj),
+                    index: Box::new(index),
+                    op,
+                    rhs: Box::new(rhs),
+                    obj_local,
+                    idx_local,
+                    new_local,
+                    kind: OpSetKind::Compound,
+                });
+            }
+            op => op,
+        };
+        let obj_local = self.fresh();
+        let mut stmts = vec![IrStmt::Decl {
+            local: obj_local,
+            init: obj,
+        }];
+        let index = if computed {
+            let idx_local = self.fresh();
+            stmts.push(IrStmt::Decl {
+                local: idx_local,
+                init: IrNode::ToPropertyKey(Box::new(index)),
+            });
+            IrNode::Local(idx_local)
+        } else {
+            index
+        };
+        let read = IrNode::Index {
+            obj: Box::new(IrNode::Local(obj_local)),
+            index: Box::new(index.clone()),
+        };
+        let store = |value: IrNode| IrNode::IndexSet {
+            obj: Box::new(IrNode::Local(obj_local)),
+            index: Box::new(index.clone()),
+            value: Box::new(value),
+        };
+        let value = match op {
+            AssignKind::Logical(op) => IrNode::Logical {
+                op,
+                lhs: Box::new(read),
+                rhs: Box::new(store(rhs)),
+            },
+            _ => store(IrNode::MathCall {
+                op: MathOp::Pow,
+                args: vec![read, rhs],
+            }),
+        };
+        Ok(IrNode::Block {
+            stmts,
+            value: Box::new(value),
+        })
     }
 
     /// Lower an increment/decrement `++x`/`x++`/`--x`/`x--`. The target is an
@@ -1630,19 +1679,24 @@ impl LowerCtx<'_> {
     /// read-modify-write through its cell; a member target is an
     /// [`IrNode::IndexOpSet`] (see [`Self::lower_member_update`]).
     fn lower_update(&mut self, update: &UpdateExpr) -> anyhow::Result<IrNode> {
-        let target = match update.arg.as_ref() {
-            Expr::Paren(p) => p.expr.as_ref(),
-            other => other,
-        };
-        if let Expr::Member(member) = target {
-            return self.lower_member_update(update, member);
-        }
-        let Expr::Ident(ident) = target else {
-            return Err(CompileError::spanned(
-                update.arg.span(),
-                "increment/decrement target must be an identifier or member",
-            )
-            .into());
+        let ident = match expr_target(&update.arg) {
+            Some(Target::Ident(ident)) => ident,
+            Some(Target::Member(member)) => return self.lower_member_update(update, member),
+            Some(Target::SuperProp(super_prop)) => {
+                return Err(CompileError::spanned(
+                    super_prop.span,
+                    "increment/decrement of a `super` property is not supported",
+                )
+                .into());
+            }
+            None => {
+                let msg = if update.prefix {
+                    "Invalid left-hand side expression in prefix operation"
+                } else {
+                    "Invalid left-hand side expression in postfix operation"
+                };
+                return Err(CompileError::spanned(update.arg.span(), msg).into());
+            }
         };
         let name = ident.sym.as_ref();
         let resolved = self.resolve_target(name, ident.span())?;
@@ -2584,6 +2638,51 @@ fn method_not_a_function(obj: &Expr, method: &str) -> CalleeError {
             .map(|obj| format!("{obj}.{method}"))
             .as_deref(),
     )
+}
+
+/// The operator class of an assignment expression.
+#[derive(Clone, Copy)]
+enum AssignKind {
+    /// `=`.
+    Plain,
+    /// An arithmetic, bitwise or shift compound (`+=`, `<<=`, ...).
+    Binary(BinOp),
+    /// `**=`.
+    Pow,
+    /// `&&=`, `||=`, `??=`.
+    Logical(LogicalOp),
+}
+
+/// A simple assignment / update target with its parentheses stripped.
+enum Target<'a> {
+    Ident(&'a Ident),
+    Member(&'a swc_ecma_ast::MemberExpr),
+    SuperProp(&'a SuperPropExpr),
+}
+
+/// The target `expr` denotes once parentheses are stripped, or `None` when it
+/// is not a valid simple assignment target (`f()`, `1`, `a + b`, `(a, b)`,
+/// `a?.b`, ...).
+fn expr_target(expr: &Expr) -> Option<Target<'_>> {
+    match strip_parens(expr) {
+        Expr::Ident(ident) => Some(Target::Ident(ident)),
+        Expr::Member(member) => Some(Target::Member(member)),
+        Expr::SuperProp(super_prop) => Some(Target::SuperProp(super_prop)),
+        _ => None,
+    }
+}
+
+/// The target of a simple assignment, or the early `SyntaxError` for an
+/// invalid one (spanned at `span`, the whole left-hand side).
+fn simple_target(target: &SimpleAssignTarget, span: Span) -> anyhow::Result<Target<'_>> {
+    let target = match target {
+        SimpleAssignTarget::Ident(ident) => Some(Target::Ident(&ident.id)),
+        SimpleAssignTarget::Member(member) => Some(Target::Member(member)),
+        SimpleAssignTarget::SuperProp(super_prop) => Some(Target::SuperProp(super_prop)),
+        SimpleAssignTarget::Paren(p) => expr_target(&p.expr),
+        _ => None,
+    };
+    target.ok_or_else(|| CompileError::spanned(span, "Invalid left-hand side in assignment").into())
 }
 
 /// A plain-English description of an unsupported expression, used for the
