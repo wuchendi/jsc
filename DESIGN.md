@@ -1631,8 +1631,9 @@ those of `switch` and loops are not tracked.
 **Private names** (phase 5a; stages P2–P5 implement this text verbatim.
 Built (P2): private instance and static **fields** — names, `%penv`,
 resolution, storage, the four helpers, instance and static initialization,
-the field operations and invisibility. Until P3–P5 land, private methods and
-accessors, static blocks and `#x in o` stay spanned rejections, §8, §13.)
+the field operations and invisibility. Built (P4): static blocks. Until P3
+and P5 land, private methods and accessors and `#x in o` stay spanned
+rejections, §8, §13.)
 
 - **Names.** A private name is a `TYPE_SYMBOL` block with header flag `8`
   `SYMBOL_FLAG_PRIVATE` (bits `1`/`2` stay clear, `4` is `REGISTERED`;
@@ -1759,14 +1760,17 @@ accessors, static blocks and `#x in o` stay spanned rejections, §8, §13.)
   sets its dirty bit. There is no `Proxy`; when it lands, private operations
   act on the proxy's own table and never trap.
 
-**Static blocks** (phase 5a). `static { .. }` lowers to a lifted
+**Static blocks** (phase 5a, built in P4). `static { .. }` lowers to a lifted
 zero-parameter method function (`lower_lifted_function`, method kind, not
 a constructor, `name` `""`, the static `super` scope so `super.x` reads
 the parent constructor) created and called immediately with `this` = the
 class at its source position in the static-element pass; the call gives it
 its own `var` scope, `new.target` `undefined`, the class-scope captures
 (inner name, `%penv`) and exception propagation for free. One closure is
-allocated per block per class evaluation.
+allocated per block per class evaluation. The call is an `IrNode::ThisCall`
+on the class local, so the lifted body's own `this` is the class (an arrow
+inside reads it lexically) and the construct marker is absent; the capture
+and arity pre-passes visit the block as a zero-parameter function.
 
 **Early errors** (P5, `codegen/early.rs`; test262 marks them all `phase:
 parse`, so which swc already reports is not determinable without running —
@@ -1779,12 +1783,14 @@ non-arrow function (computed keys of a nested class included), `await` as
 a binding or reference outside nested functions and arrows, `await` /
 `yield` expressions, `return`, `super(..)`, `break` / `continue` / labels
 crossing the block, and lexical redeclarations (the block is a
-function-like scope). `super.#x` and private names in object literals are
+function-like scope: its top-level function declarations are var-scoped).
+The static-block checks landed with P4 (swc reports several of them first,
+with its own messages). `super.#x` and private names in object literals are
 parse errors. P2 deleted the diagnostics `private class fields are not
 supported` and `private fields are not supported` (until P5, `delete o.#x`
-is the spanned `private fields cannot be deleted`); P3–P4 delete `private
-class methods are not supported` and `class static blocks are not
-supported` (and their §8, §13 mentions) as their forms land.
+is the spanned `private fields cannot be deleted`); P4 deleted `class static
+blocks are not supported`; P3 deletes `private class methods are not
+supported` (and its §8, §13 mentions) as its forms land.
 
 ### 7.7 Errors
 
@@ -2055,8 +2061,7 @@ is recovered with `downcast_ref`.
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
 supported`, `with statements are not supported`, `private class methods are not
-supported`, `class static blocks are not supported`,
-`async generator functions are unsupported`, `a label may only be applied to a loop`,
+supported`, `async generator functions are unsupported`, `a label may only be applied to a loop`,
 `destructuring assignment is only supported as an expression statement`.
 
 **Run-time errors** carry no source span:
@@ -2357,7 +2362,7 @@ Each item below is current behaviour of this tree.
 - Destructuring assignment works only as an expression statement; it is
   rejected in expression position (`x = [a] = b`), and a `for-of` head must
   declare its binding or be a pattern (`for (a of xs)` is rejected).
-- Not supported: private methods and accessors, `#x in o`, static blocks.
+- Not supported: private methods and accessors, `#x in o`.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
   `undefined`.

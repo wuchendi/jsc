@@ -12,15 +12,21 @@
 //!   function f(){}`);
 //! - `await` (escaped or not) as an identifier inside an async body;
 //! - two `__proto__: v` entries in one object literal (a destructuring
-//!   assignment pattern is an `ObjectPat`, not visited here).
+//!   assignment pattern is an `ObjectPat`, not visited here);
+//! - in a class static block (a function-like scope for the lexical checks):
+//!   `arguments` outside a nested non-arrow function, `super(..)` likewise;
+//!   `await` as an identifier, `await` / `yield` expressions, `for await`,
+//!   `return`, and `break` / `continue` / labels crossing the block, outside
+//!   nested functions and arrows.
 
 use std::collections::HashMap;
 
 use swc_common::{Span, Spanned};
 use swc_ecma_ast::{
-    ArrowExpr, ArrowFunctionBody, BlockStmt, CatchClause, Constructor, Decl, FnExpr, ForHead,
-    Function, FunctionBody, Ident, ObjectLit, ObjectPatProp, ParamOrTsParamProp, Pat, Program,
-    Prop, PropOrSpread, Stmt, SwitchStmt, VarDeclKind, VarDeclOrExpr,
+    ArrowExpr, ArrowFunctionBody, AwaitExpr, BlockStmt, BreakStmt, CallExpr, Callee, CatchClause,
+    Constructor, ContinueStmt, Decl, FnExpr, ForHead, Function, FunctionBody, Ident, ObjectLit,
+    ObjectPatProp, ParamOrTsParamProp, Pat, Program, Prop, PropOrSpread, ReturnStmt, StaticBlock,
+    Stmt, SwitchStmt, VarDeclKind, VarDeclOrExpr, YieldExpr,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -44,6 +50,24 @@ struct Checker {
     error: Option<CompileError>,
     /// Whether the code being visited is an async function body.
     in_async: bool,
+    /// Inside a class static block and not inside a nested non-arrow
+    /// function: `arguments` and `super(..)` are errors.
+    static_fn: bool,
+    /// Inside a class static block and not inside a nested function or arrow:
+    /// the block body's labels and statement nesting.
+    static_body: Option<StaticBody>,
+}
+
+/// The jump targets visible in a class static block's own body (none from
+/// outside it).
+#[derive(Default)]
+struct StaticBody {
+    /// The enclosing labels.
+    labels: Vec<String>,
+    /// The enclosing loops.
+    loops: u32,
+    /// The enclosing `switch` statements.
+    switches: u32,
 }
 
 impl Checker {
@@ -120,6 +144,29 @@ impl Checker {
         self.in_async = outer_async;
     }
 
+    /// Visit a nested function (`arrow` unset) or arrow with `visit`, outside
+    /// the enclosing static block's restrictions it crosses.
+    fn nested(&mut self, arrow: bool, visit: impl FnOnce(&mut Self)) {
+        let outer_body = self.static_body.take();
+        let outer_fn = self.static_fn;
+        if !arrow {
+            self.static_fn = false;
+        }
+        visit(self);
+        self.static_body = outer_body;
+        self.static_fn = outer_fn;
+    }
+
+    /// Reject `what` when inside a static block's own body.
+    fn static_body_only(&mut self, span: Span, what: &str) {
+        if self.static_body.is_some() {
+            self.fail(
+                span,
+                format!("{what} is not allowed in a class static block"),
+            );
+        }
+    }
+
     /// Reject an `async function` declaration as the body of a statement.
     fn statement_position(&mut self, stmt: &Stmt) {
         if let Stmt::Decl(Decl::Fn(f)) = stmt
@@ -135,7 +182,74 @@ impl Checker {
 
 impl Visit for Checker {
     fn visit_function(&mut self, f: &Function) {
-        self.function(f.params.iter().map(|p| &p.pat), f.body.as_ref(), f.is_async);
+        self.nested(false, |this| {
+            this.function(f.params.iter().map(|p| &p.pat), f.body.as_ref(), f.is_async);
+        });
+    }
+
+    fn visit_static_block(&mut self, b: &StaticBlock) {
+        let outer_async = std::mem::replace(&mut self.in_async, false);
+        let outer_body = self.static_body.replace(StaticBody::default());
+        let outer_fn = std::mem::replace(&mut self.static_fn, true);
+        self.body(&[], b.body.stmts.iter());
+        self.in_async = outer_async;
+        self.static_body = outer_body;
+        self.static_fn = outer_fn;
+    }
+
+    fn visit_call_expr(&mut self, c: &CallExpr) {
+        if self.static_fn && matches!(c.callee, Callee::Super(_)) {
+            self.fail(
+                c.span,
+                "`super()` is not allowed in a class static block".to_owned(),
+            );
+        }
+        c.visit_children_with(self);
+    }
+
+    fn visit_await_expr(&mut self, a: &AwaitExpr) {
+        self.static_body_only(a.span, "`await`");
+        a.visit_children_with(self);
+    }
+
+    fn visit_yield_expr(&mut self, y: &YieldExpr) {
+        self.static_body_only(y.span, "`yield`");
+        y.visit_children_with(self);
+    }
+
+    fn visit_return_stmt(&mut self, r: &ReturnStmt) {
+        self.static_body_only(r.span, "`return`");
+        r.visit_children_with(self);
+    }
+
+    fn visit_break_stmt(&mut self, b: &BreakStmt) {
+        if let Some(body) = &self.static_body {
+            let found = match &b.label {
+                Some(label) => body.labels.iter().any(|l| *l == *label.sym),
+                None => body.loops + body.switches > 0,
+            };
+            if !found {
+                self.fail(
+                    b.span,
+                    "`break` must target a statement inside the class static block".to_owned(),
+                );
+            }
+        }
+    }
+
+    fn visit_continue_stmt(&mut self, c: &ContinueStmt) {
+        if let Some(body) = &self.static_body {
+            let found = match &c.label {
+                Some(label) => body.labels.iter().any(|l| *l == *label.sym),
+                None => body.loops > 0,
+            };
+            if !found {
+                self.fail(
+                    c.span,
+                    "`continue` must target a loop inside the class static block".to_owned(),
+                );
+            }
+        }
     }
 
     fn visit_fn_expr(&mut self, f: &FnExpr) {
@@ -150,15 +264,15 @@ impl Visit for Checker {
 
     fn visit_arrow_expr(&mut self, a: &ArrowExpr) {
         match a.body.as_ref() {
-            ArrowFunctionBody::FunctionBody(block) => {
-                self.function(a.params.iter(), Some(block), a.is_async);
-            }
-            ArrowFunctionBody::Expr(expr) => {
-                self.function(a.params.iter(), None, a.is_async);
-                let outer_async = std::mem::replace(&mut self.in_async, a.is_async);
-                expr.visit_with(self);
-                self.in_async = outer_async;
-            }
+            ArrowFunctionBody::FunctionBody(block) => self.nested(true, |this| {
+                this.function(a.params.iter(), Some(block), a.is_async);
+            }),
+            ArrowFunctionBody::Expr(expr) => self.nested(true, |this| {
+                this.function(a.params.iter(), None, a.is_async);
+                let outer_async = std::mem::replace(&mut this.in_async, a.is_async);
+                expr.visit_with(this);
+                this.in_async = outer_async;
+            }),
         }
     }
 
@@ -167,7 +281,7 @@ impl Visit for Checker {
             ParamOrTsParamProp::Param(p) => Some(&p.pat),
             ParamOrTsParamProp::TsParamProp(_) => None,
         });
-        self.function(params, c.body.as_ref(), false);
+        self.nested(false, |this| this.function(params, c.body.as_ref(), false));
     }
 
     fn visit_block_stmt(&mut self, b: &BlockStmt) {
@@ -205,7 +319,51 @@ impl Visit for Checker {
             Stmt::Labeled(l) => self.statement_position(&l.body),
             _ => {}
         }
+        if self.static_body.is_none() {
+            stmt.visit_children_with(self);
+            return;
+        }
+        // Inside a static block's own body: track the jump targets.
+        let label = match stmt {
+            Stmt::Labeled(l) => Some(&l.label),
+            _ => None,
+        };
+        if let Some(label) = label
+            && self
+                .static_body
+                .as_ref()
+                .is_some_and(|body| body.labels.iter().any(|l| *l == *label.sym))
+        {
+            self.fail(
+                label.span,
+                format!("label `{}` has already been declared", label.sym),
+            );
+        }
+        if let Stmt::ForOf(f) = stmt
+            && f.is_await
+        {
+            self.static_body_only(f.span, "`for await`");
+        }
+        let (loops, switches) = match stmt {
+            Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForIn(_) | Stmt::ForOf(_) => {
+                (1, 0)
+            }
+            Stmt::Switch(_) => (0, 1),
+            _ => (0, 0),
+        };
+        if let Some(body) = &mut self.static_body {
+            body.loops += loops;
+            body.switches += switches;
+            body.labels.extend(label.map(|l| l.sym.to_string()));
+        }
         stmt.visit_children_with(self);
+        if let Some(body) = &mut self.static_body {
+            body.loops -= loops;
+            body.switches -= switches;
+            if label.is_some() {
+                body.labels.pop();
+            }
+        }
     }
 
     fn visit_object_lit(&mut self, o: &ObjectLit) {
@@ -232,6 +390,18 @@ impl Visit for Checker {
             self.fail(
                 ident.span,
                 "`await` cannot be used as an identifier in an async context".to_owned(),
+            );
+        }
+        if self.static_body.is_some() && ident.sym.as_ref() == "await" {
+            self.fail(
+                ident.span,
+                "`await` cannot be used as an identifier in a class static block".to_owned(),
+            );
+        }
+        if self.static_fn && ident.sym.as_ref() == "arguments" {
+            self.fail(
+                ident.span,
+                "`arguments` is not allowed in a class static block".to_owned(),
             );
         }
     }
