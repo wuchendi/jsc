@@ -24,6 +24,7 @@ mod array;
 mod async_iter;
 mod ctor;
 mod date;
+mod date_parse;
 mod error;
 mod function;
 mod generator;
@@ -433,6 +434,10 @@ fn emit_object_family(
             date::emit_set(op, f, frame, strings, helpers);
         }
         Builtin::DateBody(DateBodyOp::Utc) => date::emit_utc(f, frame, strings, helpers),
+        Builtin::DateBody(DateBodyOp::Parse) => date_parse::emit_parse(f, frame, helpers),
+        Builtin::DateBody(DateBodyOp::ParseString) => {
+            date_parse::emit_parse_string(f, frame, strings, helpers);
+        }
         Builtin::DateBody(DateBodyOp::ToJson) => {
             date::emit_to_json(f, frame, strings, helpers);
         }

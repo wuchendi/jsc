@@ -921,7 +921,8 @@ pub(super) fn date_ms_slot() -> MemArg {
 /// Emit `new Date()` / `new Date(value)`, leaving the fresh `TYPE_DATE`
 /// handle jsval on the stack. The time value is computed first — `value`'s
 /// own time value when it is a Date (`thisTimeValue`, not `ToPrimitive`),
-/// else `ToNumber(value)`; when `arg` is `None`, the host wall clock (`__now`,
+/// else `ToPrimitive(value)` parsed by [`emit_date_parse_call`] when a
+/// string and `ToNumber` of it otherwise; when `arg` is `None`, the host wall clock (`__now`,
 /// already an f64) — and passed through [`emit_time_clip`], the single point
 /// every stored Date time value goes through. Only then is a
 /// [`DATE_BLOCK_SIZE`] block bump-allocated, its object-family prefix
@@ -955,6 +956,26 @@ pub(super) fn emit_date_new_node(
             function.instruction(&Instruction::I32WrapI64);
             function.instruction(&Instruction::I64Load(date_ms_slot()));
             function.instruction(&Instruction::LocalSet(v));
+            function.instruction(&Instruction::Else);
+            // Else `ToPrimitive(value)`: a string is parsed, anything else
+            // goes through `ToNumber`.
+            enter_frame(helpers);
+            emit_is_object(function, v);
+            function.instruction(&Instruction::If(BlockType::Empty));
+            enter_frame(helpers);
+            function.instruction(&Instruction::LocalGet(v));
+            function.instruction(&Instruction::I32Const(HINT_DEFAULT));
+            function.instruction(&Instruction::Call(helpers.to_primitive()));
+            function.instruction(&Instruction::LocalSet(v));
+            emit_propagate_if_pending(function, helpers);
+            leave_frame(helpers);
+            function.instruction(&Instruction::End);
+            emit_is_string(function, v);
+            function.instruction(&Instruction::If(BlockType::Empty));
+            emit_date_parse_call(function, v, helpers);
+            function.instruction(&Instruction::LocalSet(v));
+            function.instruction(&Instruction::End);
+            leave_frame(helpers);
             function.instruction(&Instruction::End);
             // A number (a Date's time value included) passes through.
             emit_coerce_number(function, v, helpers);
@@ -989,6 +1010,23 @@ pub(super) fn emit_date_new_node(
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
+}
+
+/// Call the internal `Date` string parser ([`DateBodyOp::ParseString`]) on
+/// the string jsval in i64 `string` (as `this`, no arguments), leaving the
+/// time value it denotes (a number jsval, `NaN` when the format is not
+/// accepted) on the stack. The parser runs no user code and never throws.
+pub(super) fn emit_date_parse_call(function: &mut Function, string: u32, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::LocalGet(string));
+    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
+    for _ in 0..helpers.max_args {
+        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    }
+    function.instruction(&Instruction::I64Const(0));
+    emit_argc(0, function);
+    function.instruction(&Instruction::Call(
+        helpers.builtin(Builtin::DateBody(realm::DateBodyOp::ParseString)),
+    ));
 }
 
 /// The largest magnitude of a valid Date time value (ES2024 §21.4.1.1).
