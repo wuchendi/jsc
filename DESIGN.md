@@ -1428,6 +1428,15 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 labels on loops), `return`, `throw`, `try`/`catch`/`finally` (with or without a
 catch binding).
 
+- **`catch` parameters** are an identifier or a binding pattern
+  (`catch ({message})`, `catch ([a, b = 2, ...r])`), bound like a `let` in a
+  fresh scope around the handler from the thrown value. A throw while
+  destructuring (`null` into `{a}`, a non-iterable into `[a]`) escapes the
+  catch clause as the new exception, still running `finally`; an array
+  pattern closes its iterator like any other. A duplicate bound name, or a
+  bound name redeclared by a `let`/`const`/`class`/function of the block (or,
+  for a pattern, by a `var` of the block), is an early `SyntaxError`.
+
 - **`for-of`** runs the iteration protocol (§7.8): `GetIterator` (`@@iterator`, called once; `next` read once;
   `TypeError: x is not iterable` without a callable `@@iterator`, an async
   generator included), `IteratorStep` / `IteratorValue` per iteration (a
@@ -2183,8 +2192,7 @@ Each item below is current behaviour of this tree.
 **Object model**
 
 - Property tables are linear-scanned; there are no inline caches.
-- Object patterns accept only identifier and string keys; `catch` parameters
-  must be identifiers.
+- Object patterns accept only identifier and string keys.
 - Array-like lengths are clamped to `2^32 - 1` by the generic loops of `map`,
   `filter`, `forEach`, `reduce`, `join`, `concat` and `flat` (`map` sizes its
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the

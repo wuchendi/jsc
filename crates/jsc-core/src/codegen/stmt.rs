@@ -1355,7 +1355,9 @@ impl LowerCtx<'_> {
     /// initialized from the in-flight exception value: its binding is emitted as
     /// the FIRST statement of the catch body — a `Decl` whose initializer reads
     /// [`IrNode::ExcValue`] (boxed into a cell when the binding is captured by a
-    /// nested closure, exactly like a `let`).
+    /// nested closure, exactly like a `let`). A destructuring parameter first
+    /// snapshots [`IrNode::ExcValue`] into a temp, then binds the pattern from it
+    /// through [`Self::lower_binding_pattern`].
     ///
     /// All four legal shapes lower here: `try`/`catch`, `try`/`finally`,
     /// `try`/`catch`/`finally`. The absent clause becomes `None` on
@@ -1415,18 +1417,39 @@ impl LowerCtx<'_> {
                 self.push_scope();
                 let mut catch_body = Vec::new();
                 let catch_result = (|| -> anyhow::Result<()> {
-                    if let Some(param) = &handler.param {
-                        let Pat::Ident(ident) = param else {
-                            return Err(CompileError::spanned(
-                                param.span(),
-                                "unsupported catch parameter pattern",
-                            )
-                            .into());
-                        };
-                        let local = self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
-                        // The binding value is the in-flight exception; box it when
-                        // the parameter is captured (mirrors a captured `let`).
-                        self.push_binding(local, IrNode::ExcValue, &mut catch_body);
+                    match &handler.param {
+                        Some(Pat::Ident(ident)) => {
+                            let local =
+                                self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
+                            // The binding value is the in-flight exception; box it
+                            // when the parameter is captured (mirrors a captured
+                            // `let`).
+                            self.push_binding(local, IrNode::ExcValue, &mut catch_body);
+                        }
+                        // A destructuring parameter (`catch ({message})`): snapshot
+                        // the exception into a temp first, then bind the pattern
+                        // like a `let`. A throw while destructuring (`null` thrown
+                        // into `{a}`) escapes the catch clause to the outer handler,
+                        // still running this `try`'s `finally`.
+                        Some(pat) => {
+                            let exc = self.fresh();
+                            catch_body.push(IrStmt::Decl {
+                                local: exc,
+                                init: IrNode::ExcValue,
+                            });
+                            // Lexical bindings even inside a `var` declarator's
+                            // default (`var [x = () => { try {} catch ({a}) {} }]`).
+                            let binding_var = std::mem::take(&mut self.binding_var);
+                            let result = self.lower_binding_pattern(
+                                pat,
+                                IrNode::Local(exc),
+                                true,
+                                &mut catch_body,
+                            );
+                            self.binding_var = binding_var;
+                            result?;
+                        }
+                        None => {}
                     }
                     // The catch clause's value replaces the guarded block's.
                     self.reset_completion(&mut catch_body);
