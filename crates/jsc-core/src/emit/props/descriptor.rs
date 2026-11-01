@@ -807,9 +807,11 @@ pub(in crate::emit) fn emit_test_integrity() -> Function {
         If(BlockType::Empty),
     );
     emit_live_entries(&mut f, p, e, end, |f| {
-        // A private entry is ignored (§7.6).
+        // A private entry is ignored (§7.6). Every operand of the final
+        // `I32And` is a 0/1 boolean, so the `C` bit is normalized first.
         wasm!(f;
             LocalGet(e), I32Load(m32(E_ATTRS)), LocalTee(a), I32Const(ATTR_CONFIGURABLE), I32And,
+            I32Const(0), I32Ne,
             LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq,
             LocalGet(a), I32Const(ATTR_ACCESSOR | ATTR_WRITABLE), I32And, I32Const(ATTR_WRITABLE), I32Eq,
             I32And, I32Or,
