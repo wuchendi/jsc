@@ -587,18 +587,25 @@ impl Frame {
 }
 
 /// What `super` resolves to inside a class body (DESIGN.md §7.6): the class
-/// frame's hidden by-value bindings of the parent constructor and of its
-/// `prototype` (the home object's prototype for instance members).
+/// frame's hidden bindings of two cells holding the home objects — the class
+/// (static members; also the derived constructor's active function, whose
+/// prototype `super(..)` constructs) and its `prototype` (instance members).
+/// Each `super` reference reads the home object's prototype at that moment.
 #[derive(Clone, Copy)]
 struct SuperScope {
     /// The frame depth holding the hidden bindings.
     frame: usize,
-    /// Hidden id of the parent constructor (`None`: a base class).
-    parent: Option<u32>,
-    /// Hidden id of `parent.prototype`.
-    proto_parent: Option<u32>,
+    /// Hidden id of the cell holding the class.
+    class_cell: u32,
+    /// Hidden id of the cell holding the class's `prototype`.
+    proto_cell: u32,
+    /// Whether the class has an `extends` clause (`super(..)` is valid).
+    derived: bool,
+    /// Whether a member read a home cell (the class then creates and fills
+    /// them).
+    used: bool,
     /// Whether the member being lowered is static (its home object is the
-    /// class, so `super.x` reads the parent constructor).
+    /// class).
     is_static: bool,
     /// Property-table capacity `super(..)` pre-reserves on `this`.
     reserve: u32,

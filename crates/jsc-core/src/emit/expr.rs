@@ -329,6 +329,15 @@ pub(super) fn emit_node(
             }));
             emit_node(obj, function, scratch, strings, helpers);
         }
+        IrNode::SuperBase(home) => {
+            emit_node(home, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32WrapI64);
+            function.instruction(&Instruction::I64Load(MemArg {
+                offset: u64::from(abi::OBJ_PROTO_OFFSET),
+                align: 3,
+                memory_index: 0,
+            }));
+        }
         // The value passed to `.next(v)` is the state machine's first wasm
         // parameter (local 0, `sent`).
         IrNode::SentValue => {

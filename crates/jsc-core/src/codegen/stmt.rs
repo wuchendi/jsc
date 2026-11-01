@@ -441,14 +441,13 @@ impl LowerCtx<'_> {
             None => None,
             Some(super_expr) => {
                 let value = self.lower_expr(super_expr)?;
-                let (parent, parent_id) = self.hidden_local();
-                let (proto, proto_id) = self.hidden_local();
+                let (parent, proto) = (self.fresh(), self.fresh());
                 seq.push(IrNode::ClassHeritage {
                     value: Box::new(value),
                     parent,
                     proto,
                 });
-                Some((parent, parent_id, proto, proto_id))
+                Some((parent, proto))
             }
         };
 
@@ -571,10 +570,16 @@ impl LowerCtx<'_> {
                 .insert(name, ClassInfo { fields });
         }
 
+        // The home objects' cells (created and filled only when a member
+        // references `super`).
+        let (class_cell, class_cell_id) = self.hidden_local();
+        let (proto_cell, proto_cell_id) = self.hidden_local();
         let prev_super = self.current_super.replace(SuperScope {
             frame: self.top(),
-            parent: heritage.map(|h| h.1),
-            proto_parent: heritage.map(|h| h.3),
+            class_cell: class_cell_id,
+            proto_cell: proto_cell_id,
+            derived: heritage.is_some(),
+            used: false,
             is_static: false,
             reserve,
         });
@@ -650,13 +655,17 @@ impl LowerCtx<'_> {
         for &(i, m) in private_methods.iter().filter(|(_, m)| !m.is_static) {
             private_stores.push((i, self.lower_private_method(m, penv_local)?));
         }
+        let proto_local = self.fresh();
         let mut class_entries = vec![(
             PropKey::Fixed("prototype".into()),
-            IrNode::Object {
-                entries: proto_entries,
-                proto: heritage.map(|h| Box::new(IrNode::Local(h.2))),
-                class: crate::abi::CLASS_ORDINARY,
-                reserve: 0,
+            IrNode::Assign {
+                local: proto_local,
+                value: Box::new(IrNode::Object {
+                    entries: proto_entries,
+                    proto: heritage.map(|h| Box::new(IrNode::Local(h.1))),
+                    class: crate::abi::CLASS_ORDINARY,
+                    reserve: 0,
+                }),
             },
         )];
         // Static methods and accessors: own non-enumerable properties of the
@@ -680,12 +689,13 @@ impl LowerCtx<'_> {
             },
             None => ctor_value,
         };
+        let define_at = seq.len();
         seq.push(IrNode::DefineProps {
             obj: Box::new(ctor_value),
             local: class_local,
             entries: class_entries,
         });
-        if let Some((parent, ..)) = heritage {
+        if let Some((parent, _)) = heritage {
             seq.push(IrNode::SetProto {
                 obj: Box::new(IrNode::Local(class_local)),
                 proto: Box::new(IrNode::Local(parent)),
@@ -769,6 +779,23 @@ impl LowerCtx<'_> {
             });
         }
         self.static_init = prev_static;
+        // A member referencing `super` captured the home cells: create them
+        // right before the class value (and its closures) and fill them
+        // right after, before any member can run.
+        if self.current_super.is_some_and(|scope| scope.used) {
+            let homes = [(class_cell, class_local), (proto_cell, proto_local)];
+            let fill = homes.map(|(cell, home)| IrNode::CellSet {
+                cell: Box::new(IrNode::Local(cell)),
+                value: Box::new(IrNode::Local(home)),
+            });
+            let after = define_at + 1;
+            seq.splice(after..after, fill);
+            let create = homes.map(|(cell, _)| IrNode::Assign {
+                local: cell,
+                value: Box::new(IrNode::CellNew(Box::new(IrNode::Undefined))),
+            });
+            seq.splice(define_at..define_at, create);
+        }
         self.current_super = prev_super;
         if penv.is_some() {
             self.private_scopes.pop();
