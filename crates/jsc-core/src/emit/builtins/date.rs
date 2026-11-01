@@ -153,7 +153,7 @@ fn make_full_year(year: u32) -> IrNode {
 /// `MakeTime(h, min, s, ms)` of the number locals: `((h * msPerHour + min *
 /// msPerMinute) + s * msPerSecond) + ms` over their integer parts. A
 /// non-finite field makes it non-finite, which `TimeClip` turns into `NaN`.
-fn make_time([h, min, s, ms]: [u32; 4]) -> IrNode {
+pub(super) fn make_time([h, min, s, ms]: [u32; 4]) -> IrNode {
     sum([
         bin(BinOp::Mul, trunc(h), num(3_600_000.0)),
         bin(BinOp::Mul, trunc(min), num(60_000.0)),
@@ -163,7 +163,7 @@ fn make_time([h, min, s, ms]: [u32; 4]) -> IrNode {
 }
 
 /// `MakeDate(day, time)`: `day * msPerDay + time`.
-fn make_date(day: IrNode, time: IrNode) -> IrNode {
+pub(super) fn make_date(day: IrNode, time: IrNode) -> IrNode {
     bin(BinOp::Add, bin(BinOp::Mul, day, num(MS_PER_DAY)), time)
 }
 
@@ -172,7 +172,7 @@ fn make_date(day: IrNode, time: IrNode) -> IrNode {
 /// then `days_from_civil` of the month's first day over a March-based year
 /// (`year` becomes the year of era, `month` the March-based month, `t` the
 /// era), plus `date - 1`. NaN and infinities propagate.
-fn make_day(year: u32, month: u32, date: u32, t: u32) -> [IrNode; 7] {
+pub(super) fn make_day(year: u32, month: u32, date: u32, t: u32) -> [IrNode; 7] {
     let local = IrNode::Local;
     let before_march = || bin(BinOp::Lt, local(month), num(2.0));
     let carry = bin(BinOp::Mul, num(12.0), floor_div(trunc(month), 12.0));
@@ -279,7 +279,7 @@ fn utc_time(frame: Frame) -> IrNode {
 
 /// `TimeClip` of the number jsval on the stack into i64 `out`, then that
 /// clipped number boxed on the stack, after `store` (emitted between).
-fn emit_clipped(
+pub(super) fn emit_clipped(
     function: &mut Function,
     out: u32,
     helpers: Helpers<'_>,

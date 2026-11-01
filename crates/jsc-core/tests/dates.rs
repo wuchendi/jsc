@@ -1,5 +1,5 @@
 //! Integration tests: the `%Date.prototype%` getters, setters and string
-//! forms and `Date.UTC` (DESIGN.md §6.4). The local time zone is UTC (`LocalTZA = 0`):
+//! forms, `Date.UTC`, `Date.parse` and `new Date(string)` (DESIGN.md §6.4). The local time zone is UTC (`LocalTZA = 0`):
 //! every local getter/setter equals its `UTC` twin.
 
 mod common;
@@ -585,6 +585,265 @@ fn date_called_as_a_function_returns_a_string() {
     both_string("typeof Date(0, 1, 2)", "string");
     both_bool(
         "Date(0).endsWith(' GMT+0000 (Coordinated Universal Time)')",
+        true,
+    );
+}
+
+// --- Date.parse ----------------------------------------------------------------
+
+#[test]
+fn date_parse_is_a_static() {
+    both_string("typeof Date.parse", "function");
+    both_string("Date.parse.name", "parse");
+    both_number("Date.parse.length", 1.0);
+    both_bool("Object.keys(Date).includes('parse')", false);
+}
+
+#[test]
+fn date_parse_reads_every_iso_form() {
+    for (text, expected) in [
+        ("2020", 1_577_836_800_000.0),
+        ("2020-02", 1_580_515_200_000.0),
+        ("2020-02-29", 1_582_934_400_000.0),
+        ("2020T10:20", 1_577_874_000_000.0),
+        ("2020-01-15T10:20", 1_579_083_600_000.0),
+        ("2020-01-15T10:20:30", 1_579_083_630_000.0),
+        ("2020-01-15T10:20:30.400", 1_579_083_630_400.0),
+        ("2020-01-15T10:20:30.400Z", 1_579_083_630_400.0),
+        ("+002020-01-15T10:20:30.400Z", 1_579_083_630_400.0),
+        ("0000", -62_167_219_200_000.0),
+        ("+000000-01-01T00:00:00Z", -62_167_219_200_000.0),
+        ("-000001-01-01T00:00:00Z", -62_198_755_200_000.0),
+        ("1970-01-01", 0.0),
+        ("1970-01-01T00:00:00", 0.0),
+    ] {
+        both_number(&format!("Date.parse('{text}')"), expected);
+    }
+}
+
+#[test]
+fn date_parse_applies_the_utc_offset() {
+    both_number(
+        "Date.parse('2020-01-15T10:20:30.400+01:00')",
+        1_579_080_030_400.0,
+    );
+    both_number(
+        "Date.parse('2020-01-15T10:20:30.400-05:30')",
+        1_579_103_430_400.0,
+    );
+    both_number("Date.parse('2020-01-15T10:20+00:00')", 1_579_083_600_000.0);
+    both_number("Date.parse('2020-01-15T10:20-00:00')", 1_579_083_600_000.0);
+    // A date-time without an offset is local time, which is UTC.
+    both_number(
+        "Date.parse('1970-01-01T00:00:00') - new Date(0).getTimezoneOffset() * 60000",
+        0.0,
+    );
+}
+
+#[test]
+fn date_parse_accepts_24_00_only_as_midnight() {
+    both_number("Date.parse('2020-01-15T24:00')", 1_579_132_800_000.0);
+    both_number(
+        "Date.parse('2020-01-15T24:00:00.000Z')",
+        1_579_132_800_000.0,
+    );
+    for text in [
+        "2020-01-15T24:01",
+        "2020-01-15T24:00:01",
+        "2020-01-15T24:00:00.001",
+    ] {
+        both_nan(&format!("Date.parse('{text}')"));
+    }
+}
+
+#[test]
+fn date_parse_rejects_out_of_range_fields() {
+    for text in [
+        "2020-00",
+        "2020-13",
+        "2020-01-00",
+        "2020-01-32",
+        "2020-04-31",
+        "2020-02-30",
+        "2019-02-29",
+        "2100-02-29",
+        "2020-01-15T25:00",
+        "2020-01-15T10:60",
+        "2020-01-15T10:20:60",
+        "2020-01-15T10:20+24:00",
+        "2020-01-15T10:20+01:60",
+    ] {
+        both_nan(&format!("Date.parse('{text}')"));
+    }
+    // 2000 is a leap year.
+    both_number("Date.parse('2000-02-29')", 951_782_400_000.0);
+}
+
+#[test]
+fn date_parse_rejects_minus_zero_as_an_expanded_year() {
+    for text in [
+        "-000000",
+        "-000000-03-31T00:45Z",
+        "-000000-03-31T01:45",
+        "-000000-03-31T01:45:00+01:00",
+    ] {
+        both_nan(&format!("Date.parse('{text}')"));
+    }
+}
+
+#[test]
+fn date_parse_time_clips_the_result() {
+    both_number("Date.parse('+275760-09-13T00:00:00.000Z')", 8.64e15);
+    both_number("Date.parse('-271821-04-20T00:00:00.000Z')", -8.64e15);
+    both_nan("Date.parse('+275760-09-13T00:00:00.001Z')");
+    both_nan("Date.parse('-271821-04-19T23:59:59.999Z')");
+}
+
+#[test]
+fn date_parse_reads_the_to_string_and_to_utc_string_forms() {
+    for (text, expected) in [
+        (
+            "Wed Jan 15 2020 10:20:30 GMT+0000 (Coordinated Universal Time)",
+            1_579_083_630_000.0,
+        ),
+        ("Wed Jan 15 2020 10:20:30 GMT+0000", 1_579_083_630_000.0),
+        ("Wed Jan 15 2020 10:20:30 GMT+0100", 1_579_080_030_000.0),
+        (
+            "Wed Jan 15 2020 10:20:30 GMT-0500 (Eastern Standard Time)",
+            1_579_101_630_000.0,
+        ),
+        ("Wed, 15 Jan 2020 10:20:30 GMT", 1_579_083_630_000.0),
+        ("Fri, 01 Jan -0001 00:00:00 GMT", -62_198_755_200_000.0),
+        (
+            "Fri Jan 01 -0001 00:00:00 GMT+0000 (Coordinated Universal Time)",
+            -62_198_755_200_000.0,
+        ),
+    ] {
+        both_number(&format!("Date.parse('{text}')"), expected);
+    }
+}
+
+#[test]
+fn date_parse_round_trips_the_string_forms() {
+    // `toString` / `toUTCString` drop the milliseconds; `toISOString` keeps them.
+    both_bool(
+        "const ts = [0, 1579083630400, -1, -62198755200000, -62167219200000, \
+         253402300800000, 8.64e15, -8.64e15]; \
+         ts.every(t => { \
+           const d = new Date(t), s = Math.floor(t / 1000) * 1000; \
+           return Date.parse(d.toString()) === s && Date.parse(d.toUTCString()) === s \
+             && Date.parse(d.toISOString()) === t; \
+         })",
+        true,
+    );
+}
+
+#[test]
+fn date_parse_of_anything_else_is_nan() {
+    for text in [
+        "",
+        "garbage",
+        " 2020",
+        "2020 ",
+        "20200",
+        "2020-1-15",
+        "2020-01-15T",
+        "2020-01-15T10",
+        "2020-01-15Z",
+        "2020-01-15T10:20:30.4",
+        "2020-01-15T10:20:30.400z",
+        "+2020-01-15",
+        "Wed Jan 15 2020",
+        "Wed Jan 15 2020 10:20:30",
+        "Wed Jan 15 2020 10:20:30 GMT",
+        "Wed Jan 15 2020 10:20:30 GMT+0160",
+        "Wed Jan 15 2020 10:20:30 GMT+2400",
+        "Wed Jan 15 2020 10:20:30 GMT+0000x",
+        "Wed Jan 15 2020 10:20:30 GMT+0000 (UTC",
+        "Wed Foo 15 2020 10:20:30 GMT+0000",
+        "Foo Jan 15 2020 10:20:30 GMT+0000",
+        "Wed Feb 30 2020 00:00:00 GMT+0000",
+        "Fri Jan 01 -0000 00:00:00 GMT+0000",
+        "Wed, 15 Jan 20 10:20:30 GMT",
+        "Wed, 15 Jan 2020 10:20:30 GMT+0000",
+        "2020-01-15T10:20:30Z\\u0100",
+    ] {
+        both_nan(&format!("Date.parse('{text}')"));
+    }
+}
+
+#[test]
+fn date_parse_converts_its_argument_with_to_string() {
+    both_number(
+        "Date.parse({ toString() { return '2020' } })",
+        1_577_836_800_000.0,
+    );
+    both_number("Date.parse(2020)", 1_577_836_800_000.0);
+    both_nan("Date.parse()");
+    both_nan("Date.parse(null)");
+    both_bool(
+        "try { Date.parse(Symbol()); false } catch (e) { e instanceof TypeError }",
+        true,
+    );
+}
+
+// --- new Date(value) -----------------------------------------------------------
+
+#[test]
+fn new_date_parses_a_string() {
+    both_number(
+        "new Date('2020-01-15T10:20:30.400Z').getTime()",
+        1_579_083_630_400.0,
+    );
+    both_number(
+        "new Date('Wed, 15 Jan 2020 10:20:30 GMT').getTime()",
+        1_579_083_630_000.0,
+    );
+    both_nan("new Date('nope').getTime()");
+    both_string("String(new Date('2020-13'))", "Invalid Date");
+    both_nan("new Date('+275760-09-13T00:00:00.001Z').getTime()");
+    // Through the constructor function value too (the builtin body).
+    both_number(
+        "const D = Date; new D('2020').getTime()",
+        1_577_836_800_000.0,
+    );
+}
+
+#[test]
+fn new_date_converts_its_argument_with_to_primitive() {
+    both_string(
+        "let hint; new Date({ [Symbol.toPrimitive](h) { hint = h; return 1 } }); hint",
+        "default",
+    );
+    both_number(
+        "new Date({ [Symbol.toPrimitive]() { return '2016-06-05T18:40:00.000Z' } }).getTime()",
+        1_465_152_000_000.0,
+    );
+    // Hint default tries `valueOf` first; a string result is parsed.
+    both_number(
+        "new Date({ valueOf() { return 5 }, toString() { return '2020' } }).getTime()",
+        5.0,
+    );
+    both_number(
+        "new Date({ valueOf() { return {} }, toString() { return '2020' } }).getTime()",
+        1_577_836_800_000.0,
+    );
+    both_number(
+        "new Date(new String('2020')).getTime()",
+        1_577_836_800_000.0,
+    );
+    // A Date argument contributes its time value without `ToPrimitive`.
+    both_number(
+        "const d = new Date(5); d[Symbol.toPrimitive] = () => 7; new Date(d).getTime()",
+        5.0,
+    );
+    both_bool(
+        "try { new Date({ valueOf() { throw new RangeError('x') } }); false } \
+         catch (e) { e instanceof RangeError }",
+        true,
+    );
+    both_bool(
+        "try { new Date(Symbol()); false } catch (e) { e instanceof TypeError }",
         true,
     );
 }

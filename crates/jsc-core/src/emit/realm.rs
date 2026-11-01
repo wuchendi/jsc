@@ -1180,6 +1180,13 @@ pub(super) enum DateBodyOp {
     ToPrimitive,
     /// The `Date.UTC` static.
     Utc,
+    /// The `Date.parse` static: `ToString` of its argument, then
+    /// [`Self::ParseString`].
+    Parse,
+    /// The internal string parser (not installed) behind `Date.parse` and
+    /// `new Date(string)`: `this` is a string; returns its `TimeClip`ped time
+    /// value, `NaN` for a format it does not accept.
+    ParseString,
     /// A `Date.prototype` setter; `utc` for its `setUTC*` twin (the same
     /// body: the local time zone is UTC).
     Set {
@@ -1197,6 +1204,8 @@ impl DateBodyOp {
             Self::ToJson => "toJSON",
             Self::ToPrimitive => "[Symbol.toPrimitive]",
             Self::Utc => "UTC",
+            Self::Parse => "parse",
+            Self::ParseString => "",
             Self::Set { op, utc } => op.name(utc),
         }
     }
@@ -1657,7 +1666,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 350] = [
+    pub(super) const ALL: [Builtin; 352] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1765,6 +1774,8 @@ impl Builtin {
         Self::PromiseStatic(PromiseStaticOp::Reject),
         Self::DateNow,
         Self::DateBody(DateBodyOp::Utc),
+        Self::DateBody(DateBodyOp::Parse),
+        Self::DateBody(DateBodyOp::ParseString),
         Self::ArrayPush,
         Self::ArrayPop,
         Self::ArrayHof(ArrayHofOp::Map),
@@ -2728,7 +2739,11 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
                 Builtin::StringRaw,
             ],
             BuiltinCtor::Promise => &PROMISE_STATICS,
-            BuiltinCtor::Date => &[Builtin::DateNow, Builtin::DateBody(DateBodyOp::Utc)],
+            BuiltinCtor::Date => &[
+                Builtin::DateNow,
+                Builtin::DateBody(DateBodyOp::Utc),
+                Builtin::DateBody(DateBodyOp::Parse),
+            ],
             BuiltinCtor::Iterator => &[Builtin::Iterator(IteratorOp::From)],
             BuiltinCtor::Symbol => &[
                 Builtin::Symbol(SymbolOp::For),

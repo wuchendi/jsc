@@ -1998,8 +1998,9 @@ pub enum IrNode {
     /// since the Unix epoch, and yields the handle heap jsval. `arg` is `None`
     /// for the no-argument form (the host clock, the `__now` import); otherwise
     /// it is the single constructor argument: a Date's time value is taken
-    /// directly, anything else goes through `ToNumber` (`new Date("2020")` is
-    /// `NaN`, like `Number`).
+    /// directly, anything else goes through `ToPrimitive`, then a string is
+    /// parsed as by `Date.parse` and any other primitive goes through
+    /// `ToNumber`.
     DateNew {
         /// The constructor argument, or `None` for the host clock.
         arg: Option<Box<IrNode>>,
