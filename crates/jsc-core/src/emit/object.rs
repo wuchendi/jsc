@@ -1055,7 +1055,7 @@ fn invalid_time_value() -> IrNode {
 /// ([`IrNode::DateField`]), leaving the field's jsval on the stack. `valueOf()` returns the raw stored ms (a `NaN`
 /// timestamp passes straight through); every other field first gates on a FINITE
 /// timestamp — an invalid (`NaN`) date yields `NaN` (numeric fields), the
-/// `"Invalid Date"` string (`toString`) or throws [`invalid_time_value`]
+/// `"Invalid Date"` string (the string forms) or throws [`invalid_time_value`]
 /// (`toISOString`). The finite path derives the field from the f64 payload via
 /// [`emit_date_int_field`] / [`emit_date_iso`] / [`emit_date_string`].
 pub(super) fn emit_date_field(
@@ -1089,8 +1089,8 @@ pub(super) fn emit_date_field(
     enter_frame(helpers);
     if matches!(op, DateOp::ToIsoString) {
         emit_date_iso(bits, function, scratch, helpers);
-    } else if matches!(op, DateOp::ToString) {
-        emit_date_string(bits, function, scratch, strings, helpers);
+    } else if let Some(text) = DateText::of(op) {
+        emit_date_string(text, bits, function, scratch, strings, helpers);
     } else if matches!(op, DateOp::GetTimezoneOffset) {
         // `LocalTZA = 0`: a valid date's offset is `+0`.
         function.instruction(&Instruction::I64Const(0));
@@ -1105,7 +1105,7 @@ pub(super) fn emit_date_field(
         DateOp::ToIsoString => {
             emit_throw_error(&invalid_time_value(), function, scratch, strings, helpers);
         }
-        DateOp::ToString => {
+        op if op.is_date_text() => {
             let offset = strings.get(INVALID_DATE).copied().unwrap_or(HEAP_BASE);
             function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(offset)));
         }
@@ -1383,12 +1383,8 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
                 }
             }
         }
-        DateOp::GetTime
-        | DateOp::ValueOf
-        | DateOp::ToIsoString
-        | DateOp::ToString
-        | DateOp::GetTimezoneOffset => {
-            unreachable!("valueOf / toISOString / getTimezoneOffset are handled above")
+        _ => {
+            unreachable!("valueOf / the string forms / getTimezoneOffset are handled above")
         }
     }
 }
@@ -1537,16 +1533,75 @@ pub(super) const DATE_WEEKDAYS: &str = "SunMonTueWedThuFriSat";
 pub(super) const DATE_MONTHS: &str = "JanFebMarAprMayJunJulAugSepOctNovDec";
 
 /// The `Date.prototype.toString` text after the year, its time digits
-/// overwritten per date (jsc dates are UTC).
+/// overwritten per date (jsc dates are UTC). `toTimeString` copies it without
+/// the leading space, `toUTCString` only its ` HH:MM:SS GMT` head.
 pub(super) const DATE_TAIL: &str = " 00:00:00 GMT+0000 (Coordinated Universal Time)";
 
-/// Emit the `Date.prototype.toString` text of the finite timestamp BITS in
-/// `bits` (`Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated Universal Time)`,
-/// the year zero-padded to four digits and signed when negative) as a fresh
-/// heap string, leaving its jsval on the stack. Uses the `Date` scratch
-/// slots of [`emit_date_iso`] plus `+0` and the i32 slots `+8..+12`.
+/// The layout of a `Date.prototype` string form ([`emit_date_string`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateText {
+    /// `toString` / `toLocaleString`: `Www Mmm DD YYYY HH:MM:SS GMT+0000
+    /// (Coordinated Universal Time)`.
+    Full,
+    /// `toDateString` / `toLocaleDateString`: `Www Mmm DD YYYY`.
+    Date,
+    /// `toTimeString` / `toLocaleTimeString`: `HH:MM:SS GMT+0000
+    /// (Coordinated Universal Time)`.
+    Time,
+    /// `toUTCString`: `Www, DD Mmm YYYY HH:MM:SS GMT`.
+    Utc,
+}
+
+/// The date half of a [`DateText`] before the year: its fixed byte count,
+/// the payload offsets of the weekday name, the month name and the two-digit
+/// day, and the separator bytes.
+type DateHalf = (i32, [u64; 3], &'static [(u64, u8)]);
+
+impl DateText {
+    /// The layout of the string form `op`, if it is one.
+    fn of(op: DateOp) -> Option<Self> {
+        match op {
+            DateOp::ToString | DateOp::ToLocaleString => Some(Self::Full),
+            DateOp::ToDateString | DateOp::ToLocaleDateString => Some(Self::Date),
+            DateOp::ToTimeString | DateOp::ToLocaleTimeString => Some(Self::Time),
+            DateOp::ToUtcString => Some(Self::Utc),
+            _ => None,
+        }
+    }
+
+    /// The date half before the year; `None` for the time-only form.
+    fn date_half(self) -> Option<DateHalf> {
+        match self {
+            Self::Full | Self::Date => Some((11, [0, 4, 8], &[(3, b' '), (7, b' '), (10, b' ')])),
+            Self::Utc => Some((
+                12,
+                [0, 8, 5],
+                &[(3, b','), (4, b' '), (7, b' '), (11, b' ')],
+            )),
+            Self::Time => None,
+        }
+    }
+
+    /// The `(start, len)` slice of [`DATE_TAIL`] that ends the text.
+    fn tail(self) -> (i32, i32) {
+        let len = i32::try_from(DATE_TAIL.len()).unwrap_or(0);
+        match self {
+            Self::Full => (0, len),
+            Self::Date => (0, 0),
+            Self::Time => (1, len - 1),
+            Self::Utc => (0, i32::try_from(" 00:00:00 GMT".len()).unwrap_or(0)),
+        }
+    }
+}
+
+/// Emit the `text` form of the finite timestamp BITS in `bits` as a fresh
+/// heap string, leaving its jsval on the stack. The year is zero-padded to
+/// four digits and signed when negative (`-0001`, spec `DateString`). Uses the
+/// `Date` scratch slots of [`emit_date_iso`] plus `+0` and the i32 slots
+/// `+8..+12`.
 #[allow(clippy::too_many_lines)]
 fn emit_date_string(
+    text: DateText,
     bits: u32,
     function: &mut Function,
     scratch: u32,
@@ -1564,78 +1619,87 @@ fn emit_date_string(
     let (weekday, abs_year, t) = (scratch + 24, scratch + 25, scratch);
     let (bptr, digits, sign, at) = (scratch + 3, scratch + 8, scratch + 9, scratch + 10);
     let payload = u64::from(abi::STR_DATA_OFFSET);
-    let tail = i32::try_from(DATE_TAIL.len()).unwrap_or(0);
+    let (tail_start, tail) = text.tail();
+    let half = text.date_half();
     let wasm = |function: &mut Function, ops: &[Instruction<'_>]| {
         for op in ops {
             function.instruction(op);
         }
     };
     emit_days_tod(function, bits, days, tod, scratch + 25, scratch + 28);
-    emit_date_civil(
-        function,
-        days,
-        year,
-        month,
-        day,
-        scratch + 24,
-        scratch + 25,
-        scratch,
-    );
-    // weekday = (days mod 7 + 11) mod 7 (day 0 was a Thursday); |year|, its
-    // sign and its digit count (at least four).
+    if half.is_some() {
+        emit_date_civil(
+            function,
+            days,
+            year,
+            month,
+            day,
+            scratch + 24,
+            scratch + 25,
+            scratch,
+        );
+        // weekday = (days mod 7 + 11) mod 7 (day 0 was a Thursday); |year|,
+        // its sign and its digit count (at least four).
+        wasm(
+            function,
+            &[
+                I::LocalGet(days),
+                I::I64Const(7),
+                I::I64RemS,
+                I::I64Const(11),
+                I::I64Add,
+                I::I64Const(7),
+                I::I64RemS,
+                I::LocalSet(weekday),
+                I::I64Const(0),
+                I::LocalGet(year),
+                I::I64Sub,
+                I::LocalGet(year),
+                I::LocalGet(year),
+                I::I64Const(0),
+                I::I64LtS,
+                I::LocalTee(sign),
+                I::Select,
+                I::LocalTee(abs_year),
+                I::I64Const(10_000),
+                I::I64DivU,
+                I::LocalSet(t),
+                I::I32Const(4),
+                I::LocalSet(digits),
+                I::Block(BlockType::Empty),
+                I::Loop(BlockType::Empty),
+                I::LocalGet(t),
+                I::I64Eqz,
+                I::BrIf(1),
+                I::LocalGet(digits),
+                I::I32Const(1),
+                I::I32Add,
+                I::LocalSet(digits),
+                I::LocalGet(t),
+                I::I64Const(10),
+                I::I64DivU,
+                I::LocalSet(t),
+                I::Br(0),
+                I::End,
+                I::End,
+            ],
+        );
+    }
+    // The text length: the fixed bytes (+ sign + year digits) -> `at`.
+    let fixed = half.map_or(0, |(prefix, ..)| prefix) + tail;
+    wasm(function, &[I::I32Const(fixed)]);
+    if half.is_some() {
+        wasm(
+            function,
+            &[I::LocalGet(sign), I::I32Add, I::LocalGet(digits), I::I32Add],
+        );
+    }
+    // The block: header + len + the text.
     wasm(
         function,
         &[
-            I::LocalGet(days),
-            I::I64Const(7),
-            I::I64RemS,
-            I::I64Const(11),
-            I::I64Add,
-            I::I64Const(7),
-            I::I64RemS,
-            I::LocalSet(weekday),
-            I::I64Const(0),
-            I::LocalGet(year),
-            I::I64Sub,
-            I::LocalGet(year),
-            I::LocalGet(year),
-            I::I64Const(0),
-            I::I64LtS,
-            I::LocalTee(sign),
-            I::Select,
-            I::LocalTee(abs_year),
-            I::I64Const(10_000),
-            I::I64DivU,
-            I::LocalSet(t),
-            I::I32Const(4),
-            I::LocalSet(digits),
-            I::Block(BlockType::Empty),
-            I::Loop(BlockType::Empty),
-            I::LocalGet(t),
-            I::I64Eqz,
-            I::BrIf(1),
-            I::LocalGet(digits),
-            I::I32Const(1),
-            I::I32Add,
-            I::LocalSet(digits),
-            I::LocalGet(t),
-            I::I64Const(10),
-            I::I64DivU,
-            I::LocalSet(t),
-            I::Br(0),
-            I::End,
-            I::End,
-        ],
-    );
-    // The block: header + len + 58 fixed bytes + sign + digits.
-    let fixed = 11 + tail;
-    wasm(
-        function,
-        &[
-            I::I32Const(STR_DATA_OFFSET + fixed),
-            I::LocalGet(sign),
-            I::I32Add,
-            I::LocalGet(digits),
+            I::LocalTee(at),
+            I::I32Const(STR_DATA_OFFSET),
             I::I32Add,
             I::Call(helpers.alloc),
             I::LocalTee(bptr),
@@ -1646,11 +1710,7 @@ fn emit_date_string(
                 memory_index: 0,
             }),
             I::LocalGet(bptr),
-            I::I32Const(fixed),
-            I::LocalGet(sign),
-            I::I32Add,
-            I::LocalGet(digits),
-            I::I32Add,
+            I::LocalGet(at),
             I::I32Store(MemArg {
                 offset: STR_LEN_OFFSET,
                 align: 2,
@@ -1658,125 +1718,135 @@ fn emit_date_string(
             }),
         ],
     );
-    // Weekday and month names, copied from their static tables.
     let table = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE) + STR_DATA_OFFSET;
-    for (pos, names, index) in [(0, DATE_WEEKDAYS, weekday), (4, DATE_MONTHS, month)] {
+    if let Some((prefix, [weekday_at, month_at, day_at], separators)) = half {
+        // Weekday and month names, copied from their static tables.
+        for (pos, names, index) in [
+            (weekday_at, DATE_WEEKDAYS, weekday),
+            (month_at, DATE_MONTHS, month),
+        ] {
+            wasm(
+                function,
+                &[
+                    I::LocalGet(bptr),
+                    I::I32Const(STR_DATA_OFFSET + i32::try_from(pos).unwrap_or(0)),
+                    I::I32Add,
+                    I::I32Const(table(names)),
+                    I::LocalGet(index),
+                ],
+            );
+            if index == month {
+                // `month` is 1-based.
+                wasm(function, &[I::I64Const(1), I::I64Sub]);
+            }
+            wasm(
+                function,
+                &[
+                    I::I32WrapI64,
+                    I::I32Const(3),
+                    I::I32Mul,
+                    I::I32Add,
+                    I::I32Const(3),
+                    I::MemoryCopy {
+                        src_mem: 0,
+                        dst_mem: 0,
+                    },
+                ],
+            );
+        }
+        for &(pos, ch) in separators {
+            emit_iso_byte(function, bptr, pos, ch);
+        }
+        emit_iso_digits(function, bptr, day_at, day, 2);
+        // The sign at `prefix`, then the year digits right to left from
+        // `at` (overwriting the sign of a non-negative year).
+        let prefix = u64::try_from(prefix).unwrap_or(0);
         wasm(
             function,
             &[
                 I::LocalGet(bptr),
-                I::I32Const(STR_DATA_OFFSET + pos),
+                I::I32Const(i32::from(b'-')),
+                I::I32Store8(MemArg {
+                    offset: payload + prefix,
+                    align: 0,
+                    memory_index: 0,
+                }),
+                I::LocalGet(bptr),
+                I::LocalGet(sign),
                 I::I32Add,
-                I::I32Const(table(names)),
-                I::LocalGet(index),
+                I::LocalGet(digits),
+                I::I32Add,
+                I::LocalSet(at),
+                I::Block(BlockType::Empty),
+                I::Loop(BlockType::Empty),
+                I::LocalGet(digits),
+                I::I32Eqz,
+                I::BrIf(1),
+                I::LocalGet(at),
+                I::LocalGet(abs_year),
+                I::I64Const(10),
+                I::I64RemU,
+                I::I64Const(i64::from(b'0')),
+                I::I64Add,
+                I::I32WrapI64,
+                I::I32Store8(MemArg {
+                    offset: payload + prefix - 1,
+                    align: 0,
+                    memory_index: 0,
+                }),
+                I::LocalGet(abs_year),
+                I::I64Const(10),
+                I::I64DivU,
+                I::LocalSet(abs_year),
+                I::LocalGet(at),
+                I::I32Const(1),
+                I::I32Sub,
+                I::LocalSet(at),
+                I::LocalGet(digits),
+                I::I32Const(1),
+                I::I32Sub,
+                I::LocalSet(digits),
+                I::Br(0),
+                I::End,
+                I::End,
             ],
         );
-        if pos == 4 {
-            // `month` is 1-based.
-            wasm(function, &[I::I64Const(1), I::I64Sub]);
-        }
+    }
+    if tail > 0 {
+        // The tail fills the last bytes; `at` = its offset from the payload.
         wasm(
             function,
             &[
-                I::I32WrapI64,
-                I::I32Const(3),
-                I::I32Mul,
+                I::LocalGet(bptr),
+                I::I32Load(MemArg {
+                    offset: STR_LEN_OFFSET,
+                    align: 2,
+                    memory_index: 0,
+                }),
+                I::I32Const(tail),
+                I::I32Sub,
+                I::LocalGet(bptr),
                 I::I32Add,
-                I::I32Const(3),
+                I::LocalTee(at),
+                I::I32Const(STR_DATA_OFFSET),
+                I::I32Add,
+                I::I32Const(table(DATE_TAIL) + tail_start),
+                I::I32Const(tail),
                 I::MemoryCopy {
                     src_mem: 0,
                     dst_mem: 0,
                 },
             ],
         );
-    }
-    for pos in [3, 7, 10] {
-        emit_iso_byte(function, bptr, pos, b' ');
-    }
-    emit_iso_digits(function, bptr, 8, day, 2);
-    // The sign, then the year digits right to left from `at`.
-    wasm(
-        function,
-        &[
-            I::LocalGet(bptr),
-            I::I32Const(i32::from(b'-')),
-            I::I32Store8(MemArg {
-                offset: payload + 11,
-                align: 0,
-                memory_index: 0,
-            }),
-            I::LocalGet(bptr),
-            I::LocalGet(sign),
-            I::I32Add,
-            I::LocalGet(digits),
-            I::I32Add,
-            I::LocalSet(at),
-            I::Block(BlockType::Empty),
-            I::Loop(BlockType::Empty),
-            I::LocalGet(digits),
-            I::I32Eqz,
-            I::BrIf(1),
-            I::LocalGet(at),
-            I::LocalGet(abs_year),
-            I::I64Const(10),
-            I::I64RemU,
-            I::I64Const(i64::from(b'0')),
-            I::I64Add,
-            I::I32WrapI64,
-            I::I32Store8(MemArg {
-                offset: payload + 10,
-                align: 0,
-                memory_index: 0,
-            }),
-            I::LocalGet(abs_year),
-            I::I64Const(10),
-            I::I64DivU,
-            I::LocalSet(abs_year),
-            I::LocalGet(at),
-            I::I32Const(1),
-            I::I32Sub,
-            I::LocalSet(at),
-            I::LocalGet(digits),
-            I::I32Const(1),
-            I::I32Sub,
-            I::LocalSet(digits),
-            I::Br(0),
-            I::End,
-            I::End,
-        ],
-    );
-    // The tail fills the last bytes; `at` = its offset from the payload.
-    wasm(
-        function,
-        &[
-            I::LocalGet(bptr),
-            I::I32Load(MemArg {
-                offset: STR_LEN_OFFSET,
-                align: 2,
-                memory_index: 0,
-            }),
-            I::I32Const(tail),
-            I::I32Sub,
-            I::LocalGet(bptr),
-            I::I32Add,
-            I::LocalTee(at),
-            I::I32Const(STR_DATA_OFFSET),
-            I::I32Add,
-            I::I32Const(table(DATE_TAIL)),
-            I::I32Const(tail),
-            I::MemoryCopy {
-                src_mem: 0,
-                dst_mem: 0,
-            },
-        ],
-    );
-    for (pos, div, rem) in [(1, 3_600_000_i64, 0_i64), (4, 60_000, 60), (7, 1000, 60)] {
-        wasm(function, &[I::LocalGet(tod), I::I64Const(div), I::I64DivS]);
-        if rem != 0 {
-            wasm(function, &[I::I64Const(rem), I::I64RemS]);
+        let shift = u64::try_from(tail_start).unwrap_or(0);
+        for (pos, div, rem) in [(1, 3_600_000_i64, 0_i64), (4, 60_000, 60), (7, 1000, 60)] {
+            wasm(function, &[I::LocalGet(tod), I::I64Const(div), I::I64DivS]);
+            if rem != 0 {
+                wasm(function, &[I::I64Const(rem), I::I64RemS]);
+            }
+            wasm(function, &[I::LocalSet(t)]);
+            emit_iso_digits(function, at, pos - shift, t, 2);
         }
-        wasm(function, &[I::LocalSet(t)]);
-        emit_iso_digits(function, at, pos, t, 2);
     }
     wasm(
         function,

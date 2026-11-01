@@ -743,12 +743,32 @@ pub enum DateOp {
     /// `d.toString()` — `Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated
     /// Universal Time)`, built GUEST-side as a fresh heap string.
     ToString,
+    /// `d.toDateString()` — the `Www Mmm DD YYYY` half of `toString()`.
+    ToDateString,
+    /// `d.toTimeString()` — the `HH:MM:SS GMT+0000 (Coordinated Universal
+    /// Time)` half of `toString()`.
+    ToTimeString,
+    /// `d.toUTCString()` (also Annex B `toGMTString`, the same function
+    /// object) — `Www, DD Mmm YYYY HH:MM:SS GMT`.
+    ToUtcString,
+    /// `d.toLocaleString()` — no `Intl`: the `toString()` text.
+    ToLocaleString,
+    /// `d.toLocaleDateString()` — no `Intl`: the `toDateString()` text.
+    ToLocaleDateString,
+    /// `d.toLocaleTimeString()` — no `Intl`: the `toTimeString()` text.
+    ToLocaleTimeString,
 }
 
 impl DateOp {
     /// Every field method, in `%Date.prototype%` order.
-    pub const ALL: [DateOp; 22] = [
+    pub const ALL: [DateOp; 28] = [
         Self::ToString,
+        Self::ToDateString,
+        Self::ToTimeString,
+        Self::ToUtcString,
+        Self::ToLocaleString,
+        Self::ToLocaleDateString,
+        Self::ToLocaleTimeString,
         Self::GetTime,
         Self::ValueOf,
         Self::GetFullYear,
@@ -798,7 +818,29 @@ impl DateOp {
             Self::GetYear => "getYear",
             Self::ToIsoString => "toISOString",
             Self::ToString => "toString",
+            Self::ToDateString => "toDateString",
+            Self::ToTimeString => "toTimeString",
+            Self::ToUtcString => "toUTCString",
+            Self::ToLocaleString => "toLocaleString",
+            Self::ToLocaleDateString => "toLocaleDateString",
+            Self::ToLocaleTimeString => "toLocaleTimeString",
         }
+    }
+
+    /// Whether the op renders a date string (an invalid date's is
+    /// `"Invalid Date"`); `toISOString` throws instead.
+    #[must_use]
+    pub fn is_date_text(self) -> bool {
+        matches!(
+            self,
+            Self::ToString
+                | Self::ToDateString
+                | Self::ToTimeString
+                | Self::ToUtcString
+                | Self::ToLocaleString
+                | Self::ToLocaleDateString
+                | Self::ToLocaleTimeString
+        )
     }
 
     /// The field method named `name`, if any.

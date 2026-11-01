@@ -1,5 +1,5 @@
-//! Integration tests: the `%Date.prototype%` getters and setters and
-//! `Date.UTC` (DESIGN.md §6.4). The local time zone is UTC (`LocalTZA = 0`):
+//! Integration tests: the `%Date.prototype%` getters, setters and string
+//! forms and `Date.UTC` (DESIGN.md §6.4). The local time zone is UTC (`LocalTZA = 0`):
 //! every local getter/setter equals its `UTC` twin.
 
 mod common;
@@ -448,5 +448,143 @@ fn date_utc_converts_every_argument_in_order() {
          const v = (n, r) => ({ valueOf() { log.push(n); return r } }); \
          const r = Date.UTC(v('y', NaN), v('m', 0)); log.join() + ':' + isNaN(r)",
         "y,m:true",
+    );
+}
+
+// --- string forms ----------------------------------------------------------------
+
+/// The string forms and their text for [`T`].
+const STRING_FORMS: [(&str, &str); 7] = [
+    (
+        "toString",
+        "Wed Jan 15 2020 10:20:30 GMT+0000 (Coordinated Universal Time)",
+    ),
+    ("toDateString", "Wed Jan 15 2020"),
+    (
+        "toTimeString",
+        "10:20:30 GMT+0000 (Coordinated Universal Time)",
+    ),
+    ("toUTCString", "Wed, 15 Jan 2020 10:20:30 GMT"),
+    (
+        "toLocaleString",
+        "Wed Jan 15 2020 10:20:30 GMT+0000 (Coordinated Universal Time)",
+    ),
+    ("toLocaleDateString", "Wed Jan 15 2020"),
+    (
+        "toLocaleTimeString",
+        "10:20:30 GMT+0000 (Coordinated Universal Time)",
+    ),
+];
+
+#[test]
+fn string_forms_render_the_utc_fields() {
+    for (method, expected) in STRING_FORMS {
+        both_string(&format!("new Date({T}).{method}()"), expected);
+        both_string(
+            &format!("Date.prototype.{method}.call(new Date({T}))"),
+            expected,
+        );
+    }
+    both_string(
+        "new Date(-1).toUTCString()",
+        "Wed, 31 Dec 1969 23:59:59 GMT",
+    );
+    both_string("new Date(-1).toDateString()", "Wed Dec 31 1969");
+}
+
+#[test]
+fn string_forms_of_an_invalid_date_are_invalid_date() {
+    for (method, _) in STRING_FORMS {
+        both_string(&format!("new Date(NaN).{method}()"), "Invalid Date");
+        both_string(&format!("new Date(8.64e15 + 1).{method}()"), "Invalid Date");
+    }
+    both_string("new Date(NaN).toGMTString()", "Invalid Date");
+}
+
+#[test]
+fn string_forms_pad_and_sign_the_year() {
+    // Year 0, year -1 (four digits after the sign), and the time value range ends.
+    both_string(
+        "new Date(-62167219200000).toDateString()",
+        "Sat Jan 01 0000",
+    );
+    both_string(
+        "new Date(-62198755200000).toUTCString()",
+        "Fri, 01 Jan -0001 00:00:00 GMT",
+    );
+    both_string(
+        "new Date(-62198755200000).toString()",
+        "Fri Jan 01 -0001 00:00:00 GMT+0000 (Coordinated Universal Time)",
+    );
+    both_string("new Date(8.64e15).toDateString()", "Sat Sep 13 275760");
+    both_string(
+        "new Date(-8.64e15).toUTCString()",
+        "Tue, 20 Apr -271821 00:00:00 GMT",
+    );
+    both_string(
+        "new Date(-8.64e15).toTimeString()",
+        "00:00:00 GMT+0000 (Coordinated Universal Time)",
+    );
+}
+
+#[test]
+fn to_iso_string_throws_on_an_invalid_date_and_expands_years() {
+    assert_uncaught(
+        "new Date(NaN).toISOString()",
+        "RangeError: Invalid time value",
+    );
+    both_string(
+        "new Date(-62198755200000).toISOString()",
+        "-000001-01-01T00:00:00.000Z",
+    );
+    both_string(
+        "new Date(8.64e15).toISOString()",
+        "+275760-09-13T00:00:00.000Z",
+    );
+}
+
+#[test]
+fn string_forms_are_methods_with_spec_shape() {
+    for (method, _) in STRING_FORMS {
+        both_string(&format!("Date.prototype.{method}.name"), method);
+        both_number(&format!("Date.prototype.{method}.length"), 0.0);
+        both_string(
+            &format!(
+                "(() => {{ const d = Object.getOwnPropertyDescriptor(Date.prototype, '{method}'); \
+                 return `${{d.writable}} ${{d.enumerable}} ${{d.configurable}}`; }})()"
+            ),
+            "true false true",
+        );
+        assert_uncaught(
+            &format!("Date.prototype.{method}.call({{}})"),
+            "TypeError: this is not a Date object.",
+        );
+    }
+}
+
+#[test]
+fn to_gmt_string_is_to_utc_string() {
+    both_bool(
+        "Date.prototype.toGMTString === Date.prototype.toUTCString",
+        true,
+    );
+    both_string("Date.prototype.toGMTString.name", "toUTCString");
+    both_string(
+        &format!("new Date({T}).toGMTString()"),
+        "Wed, 15 Jan 2020 10:20:30 GMT",
+    );
+    both_bool(
+        "Object.getOwnPropertyDescriptor(Date.prototype, 'toGMTString').enumerable",
+        false,
+    );
+}
+
+#[test]
+fn date_called_as_a_function_returns_a_string() {
+    both_string("typeof Date()", "string");
+    both_string("typeof Date(0, 1, 2)", "string");
+    both_bool(
+        "Date(0).endsWith(' GMT+0000 (Coordinated Universal Time)')",
+        true,
     );
 }

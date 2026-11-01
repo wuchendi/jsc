@@ -1657,7 +1657,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 344] = [
+    pub(super) const ALL: [Builtin; 350] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1871,6 +1871,12 @@ impl Builtin {
         Self::DateMethod(DateOp::GetUtcMilliseconds),
         Self::DateMethod(DateOp::GetYear),
         Self::DateMethod(DateOp::ToIsoString),
+        Self::DateMethod(DateOp::ToDateString),
+        Self::DateMethod(DateOp::ToTimeString),
+        Self::DateMethod(DateOp::ToUtcString),
+        Self::DateMethod(DateOp::ToLocaleString),
+        Self::DateMethod(DateOp::ToLocaleDateString),
+        Self::DateMethod(DateOp::ToLocaleTimeString),
         Self::DateBody(DateBodyOp::Set {
             op: DateSetOp::Milliseconds,
             utc: false,
@@ -2836,10 +2842,17 @@ fn species_entries(entries: &mut Vec<Entry>) {
     }));
 }
 
-/// `%Date.prototype%[@@toPrimitive]` and the builtin `[@@toStringTag]`s
-/// (configurable only) `Object.prototype.toString` reads; `%Symbol.prototype%`'s
-/// is in [`symbol_prototype_entries`].
+/// `%Date.prototype%[@@toPrimitive]`, Annex B `%Date.prototype%.toGMTString`
+/// (B.2.3.3: the `toUTCString` function object) and the builtin
+/// `[@@toStringTag]`s (configurable only) `Object.prototype.toString` reads;
+/// `%Symbol.prototype%`'s is in [`symbol_prototype_entries`].
 fn well_known_entries(entries: &mut Vec<Entry>) {
+    entries.push(Entry {
+        intrinsic: Intrinsic::Prototype(BuiltinCtor::Date),
+        key: Key::Str("toGMTString"),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(Builtin::DateMethod(DateOp::ToUtcString)),
+    });
     entries.push(Entry {
         intrinsic: Intrinsic::Prototype(BuiltinCtor::Date),
         key: Key::Symbol(WellKnown::ToPrimitive),
