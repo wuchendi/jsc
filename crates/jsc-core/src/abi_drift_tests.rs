@@ -477,6 +477,13 @@ fn symbol_layout_matches_design() {
         0
     );
     assert_eq!(SYMBOL_FLAG_REGISTERED, STR_FLAG_TWO_BYTE);
+    // Section 7.6: the private-name flag, clear of the string key bits.
+    assert_eq!(super::SYMBOL_FLAG_PRIVATE, 8);
+    assert_eq!(
+        super::SYMBOL_FLAG_PRIVATE
+            & (STR_FLAG_ARRAY_INDEX | STR_FLAG_INTERNED | SYMBOL_FLAG_REGISTERED),
+        0
+    );
     assert_ne!(TYPE_SYMBOL, TYPE_STRING);
     assert_eq!(CLASS_SYMBOL, CLASS_GLOBAL + 1);
     // Section 5.4: the iterator objects' class byte.

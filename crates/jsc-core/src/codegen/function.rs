@@ -163,7 +163,7 @@ impl LowerCtx<'_> {
         // 4.5: right after allocation, before the parameters are bound).
         if self.frame().ctor == FnKind::Class
             && let Some(this_local) = self.ensure_this_local()
-            && let Some(fields) = self.lower_field_inits(IrNode::Local(this_local))?
+            && let Some(fields) = self.lower_field_inits(&IrNode::Local(this_local))?
         {
             body.push(IrStmt::Expr(fields));
         }
@@ -1068,18 +1068,60 @@ impl LowerCtx<'_> {
     }
 
     /// Define the current class's instance fields ([`Self::class_fields`]) on
-    /// `this` in source order with `CreateDataProperty` semantics
-    /// (`__define`, so an inherited setter is not invoked); `None` when the
-    /// class declares no fields. An uninitialized `f;` defines `undefined`. A
-    /// computed field name reads its key, converted at class definition time.
-    pub(super) fn lower_field_inits(&mut self, this: IrNode) -> anyhow::Result<Option<IrNode>> {
+    /// `this` in source order: a public one with `CreateDataProperty`
+    /// semantics (`__define`, so an inherited setter is not invoked), a private
+    /// one with `PrivateFieldAdd` (DESIGN.md §7.6), all after the instance
+    /// brand when the class has instance private methods or accessors
+    /// (`PrivateMethodOrAccessorAdd`); `None` when the class declares no
+    /// fields and no brand. An uninitialized `f;` defines `undefined`. A
+    /// computed field name reads its key, converted at class definition time;
+    /// an anonymous function initializer of `#x` is named `"#x"`.
+    pub(super) fn lower_field_inits(&mut self, this: &IrNode) -> anyhow::Result<Option<IrNode>> {
         if self.class_fields.is_empty() {
             return Ok(None);
         }
         let fields = std::mem::take(&mut self.class_fields);
-        let mut entries = Vec::with_capacity(fields.len());
-        for (p, computed) in &fields {
-            let Some((frame, id)) = *computed else {
+        let mut seq = Vec::new();
+        let mut entries = Vec::new();
+        for field in &fields {
+            let (p, computed) = match field {
+                ClassField::Public(p, computed) => (p, *computed),
+                ClassField::Brand(frame, penv, name) => {
+                    let env = self.read_hidden(*frame, *penv);
+                    seq.push(IrNode::PrivateAdd {
+                        obj: Box::new(this.clone()),
+                        key: Box::new(IrNode::PrivEnvLoad {
+                            env: Box::new(env),
+                            slot: 1,
+                        }),
+                        value: Box::new(IrNode::Undefined),
+                        attrs: 0,
+                        name: name.clone(),
+                    });
+                    continue;
+                }
+                ClassField::Private(p, frame, penv, slot) => {
+                    self.flush_field_entries(this, &mut entries, &mut seq);
+                    let name = JsStr::from(format!("#{}", p.key.name));
+                    let value = match &p.value {
+                        Some(init) => self.lower_key_named_expr(init, &name)?,
+                        None => IrNode::Undefined,
+                    };
+                    let env = self.read_hidden(*frame, *penv);
+                    seq.push(IrNode::PrivateAdd {
+                        obj: Box::new(this.clone()),
+                        key: Box::new(IrNode::PrivEnvLoad {
+                            env: Box::new(env),
+                            slot: *slot,
+                        }),
+                        value: Box::new(value),
+                        attrs: crate::abi::ATTR_WRITABLE,
+                        name,
+                    });
+                    continue;
+                }
+            };
+            let Some((frame, id)) = computed else {
                 let key = super::stmt::prop_key_name(&p.key)?;
                 let value = match &p.value {
                     Some(init) => self.lower_key_named_expr(init, &key)?,
@@ -1103,12 +1145,27 @@ impl LowerCtx<'_> {
             entries.push((PropKey::Computed(key), value));
         }
         self.class_fields = fields;
+        self.flush_field_entries(this, &mut entries, &mut seq);
+        Ok(Some(IrNode::Seq(seq)))
+    }
+
+    /// Move the pending public field `entries` into one `DefineProps` on
+    /// `this` appended to `seq` (nothing when there are none).
+    fn flush_field_entries(
+        &mut self,
+        this: &IrNode,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        seq: &mut Vec<IrNode>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
         let local = self.fresh();
-        Ok(Some(IrNode::DefineProps {
-            obj: Box::new(this),
+        seq.push(IrNode::DefineProps {
+            obj: Box::new(this.clone()),
             local,
-            entries,
-        }))
+            entries: std::mem::take(entries),
+        });
     }
 }
 

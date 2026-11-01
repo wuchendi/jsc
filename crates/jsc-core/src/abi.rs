@@ -597,8 +597,9 @@ pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
 /// pointer, like an interned string's). `typeof` is `"symbol"`. Layout:
 /// `[type=14][gc][flags][class=0][reserved:u32 = 0][description:i64]`, the
 /// description (a string jsval or `undefined`) at
-/// [`SYMBOL_DESCRIPTION_OFFSET`], [`SYMBOL_BLOCK_SIZE`] bytes. The only flag
-/// is [`SYMBOL_FLAG_REGISTERED`]; bits `1` and `2` stay clear so a symbol key
+/// [`SYMBOL_DESCRIPTION_OFFSET`], [`SYMBOL_BLOCK_SIZE`] bytes. The flags are
+/// [`SYMBOL_FLAG_REGISTERED`] and [`SYMBOL_FLAG_PRIVATE`]; bits `1` and `2`
+/// stay clear so a symbol key
 /// never looks like an interned string ([`STR_FLAG_INTERNED`]) or an array
 /// index ([`STR_FLAG_ARRAY_INDEX`]), and the reserved word at offset 4 reads
 /// as "no own properties" if a symbol is mistaken for an object-family block.
@@ -620,6 +621,12 @@ pub(crate) const SYMBOL_BLOCK_SIZE: u32 = 16;
 /// key), so `Symbol.keyFor` returns the description.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SYMBOL_FLAG_REGISTERED: u8 = 4;
+
+/// [`TYPE_SYMBOL`] header `flags` bit: the symbol is a private name (`#x`,
+/// DESIGN.md §7.6), never registered and never yielded by an expression. A
+/// property keyed by one is invisible to every key walk, and `__define` adds
+/// it to a non-extensible object.
+pub(crate) const SYMBOL_FLAG_PRIVATE: u8 = 8;
 
 /// Property `attrs` bit: a data property's value may be reassigned (ignored
 /// for an accessor).
