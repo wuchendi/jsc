@@ -1031,6 +1031,9 @@ pub enum IrNode {
     /// `IsArray` of the value (`Array.isArray`), as a boolean jsval: whether it
     /// is an Array exotic object (a `TYPE_ARRAY` handle), whatever its `proto`.
     IsArray(Box<IrNode>),
+    /// `SetIntegrityLevel(o, frozen)` of the object the sub-expression yields
+    /// (a fresh tagged-template array, which cannot reject), yielding it.
+    Freeze(Box<IrNode>),
     /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
     /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
     ToObject(Box<IrNode>),
@@ -2371,6 +2374,7 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)
+            | IrNode::Freeze(inner)
             | IrNode::ToObject(inner)
             | IrNode::ToPropertyKey(inner)
             | IrNode::SetFunctionName { func: inner, .. }
@@ -2583,6 +2587,7 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)
+            | IrNode::Freeze(inner)
             | IrNode::ToObject(inner)
             | IrNode::ToPropertyKey(inner)
             | IrNode::SetFunctionName { func: inner, .. }
