@@ -92,12 +92,13 @@ fn super_in_static_field_and_static_block_reads_the_current_base() {
          class B extends A {
            static f = super.v;
            static { B.g = super.v; }
+           static h = () => super.v;
            static later() { return super.v }
          }
          console.log(B.f, B.g, B.later());
          Object.setPrototypeOf(B, { v: 'X' });
-         console.log(B.later());",
-        "A A A\nX\n",
+         console.log(B.later(), B.h());",
+        "A A A\nX X\n",
     );
 }
 

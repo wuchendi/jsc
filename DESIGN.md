@@ -1591,8 +1591,10 @@ those of `switch` and loops are not tracked.
   module bindings' cells) holding the hole until the site first runs, which
   builds the object into it; every later evaluation of that site, in a loop
   or another call, yields the same object, and two sites never share one.
-  A tagged template in an optional chain (`` a?.b`x` ``) is a `SyntaxError`
-  (swc).
+  A chain `` t`a``b` `` calls the first result with the second site's
+  object, and `` new t`x` `` is `` new (t`x`)() ``: the tag's result is the
+  constructor. A tagged template in an optional chain (`` a?.b`x` ``) is a
+  `SyntaxError` (swc).
 - **Call evaluation order.** A call evaluates its callee first — for a
   member callee the base, then the key, then the `[[Get]]` (a getter runs
   here) — then the arguments left to right, then `IsCallable` and the call;
@@ -1696,7 +1698,9 @@ those of `switch` and loops are not tracked.
 - **Fields.** Instance fields (`f = init`, or `f;` for `undefined`) are
   defined with `__define` in source order before the constructor body (for a
   derived class, right after `super(..)` returns). Static field initializers
-  run after the class binding exists, in source order, with `this` = the class.
+  run after the class binding exists, in source order, with `this` = the class
+  and the static `super` scope (`super.x` reads the class's current
+  prototype, as in a static method).
 - **Inheritance.** `class B extends E` evaluates `E` once at class definition
   (any expression; it must be a constructor or `null`), links
   `B.prototype.[[Prototype]]` to `E.prototype` and `B.[[Prototype]]` to `E`
@@ -1935,6 +1939,9 @@ lowering, so unreached code is checked too; spanned):
   `delete o?.a.#x`).
 - `unexpected private name #x`: a bare `#x` anywhere except as the left
   operand of `in` (`(#x) in o`, `#x + 1`).
+- `invalid private name #x`: a declared or referenced name whose first
+  character is not an IdentifierStart (`#\u200Dx`, `#\u200Cx`: swc checks a
+  leading `\u` escape only as an IdentifierPart).
 - In a static block: `arguments` anywhere outside a nested non-arrow
   function (computed keys of a nested class included), `await` as a binding
   or reference outside nested functions and arrows, `await` / `yield`
@@ -2049,7 +2056,9 @@ point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
 `loop { br_table(state) }`, while regions without a suspend keep ordinary wasm
 control flow. A `yield` may appear inside a larger expression
 (`1 + (yield 2)`, a loop condition, a destructuring assignment's RHS or
-default); the expression is linearized around it.
+default, a computed pattern key); the expression is linearized around it, and
+a compiler temporary that later statements read across the suspend (the
+source of `const { [yield k]: v } = o`) lives in a frame cell.
 
 - Each generator function owns a `prototype` (writable, non-enumerable,
   non-configurable): a fresh object inheriting `%GeneratorPrototype%`

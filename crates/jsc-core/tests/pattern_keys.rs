@@ -182,6 +182,30 @@ fn computed_key_with_yield_in_a_generator() {
          let it = g(); it.next(); it.next('y').value",
         4.0,
     );
+    // Nested patterns: the inner source survives the suspend too.
+    assert_number(
+        "function* g() { const { a: { [yield 'k']: v } } = { a: { x: 9 } }; return v } \
+         let it = g(); it.next(); it.next('x').value",
+        9.0,
+    );
+    assert_number(
+        "function* g() { let v; ({ a: { [yield 'k']: v } } = { a: { y: 4 } }); return v } \
+         let it = g(); it.next(); it.next('y').value",
+        4.0,
+    );
+    assert_number(
+        "function* g() { const [{ [yield 'k']: v }] = [{ x: 9 }]; return v } \
+         let it = g(); it.next(); it.next('x').value",
+        9.0,
+    );
+    // The key runs after the source; later keys read the same source.
+    assert_string(
+        "function* g() { let log = ''; \
+           const { [(log += 'k', yield 'k')]: a, b } = (log += 's', { x: 1, b: 2 }); \
+           return log + a + b } \
+         let it = g(); it.next(); it.next('x').value",
+        "sk12",
+    );
 }
 
 #[test]

@@ -24,7 +24,10 @@
 //!   sees only the enclosing classes' names), a private name declared twice in
 //!   one class body (except one getter plus one setter of the same
 //!   static-ness), `delete` of a private reference (parenthesised or the end
-//!   of an optional chain), and a bare `#x` anywhere but left of `in`.
+//!   of an optional chain), and a bare `#x` anywhere but left of `in`;
+//! - a private name whose first character is not an `IdentifierStart` (swc
+//!   checks a leading `\u` escape only as an `IdentifierPart`, so `#\u200Dx`
+//!   with a ZWJ / ZWNJ gets through).
 
 use std::collections::HashMap;
 
@@ -462,6 +465,9 @@ impl Visit for Checker {
 
     fn visit_private_name(&mut self, p: &PrivateName) {
         let name = format!("#{}", p.name);
+        if !p.name.chars().next().is_some_and(Ident::is_valid_start) {
+            self.fail(p.span, format!("invalid private name {name}"));
+        }
         if !self.private_names.iter().any(|names| names.contains(&name)) {
             self.fail(p.span, format!("private name {name} is not defined"));
         }
