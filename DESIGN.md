@@ -1935,6 +1935,9 @@ lowering, so unreached code is checked too; spanned):
   `delete o?.a.#x`).
 - `unexpected private name #x`: a bare `#x` anywhere except as the left
   operand of `in` (`(#x) in o`, `#x + 1`).
+- `invalid private name #x`: a declared or referenced name whose first
+  character is not an IdentifierStart (`#\u200Dx`, `#\u200Cx`: swc checks a
+  leading `\u` escape only as an IdentifierPart).
 - In a static block: `arguments` anywhere outside a nested non-arrow
   function (computed keys of a nested class included), `await` as a binding
   or reference outside nested functions and arrows, `await` / `yield`
