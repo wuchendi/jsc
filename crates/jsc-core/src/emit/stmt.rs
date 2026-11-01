@@ -97,6 +97,33 @@ pub(super) fn emit_stmt(
                 continue_label,
             );
         }
+        // `block B { body }`: a `break LABEL` anywhere inside reaches the end of
+        // `B` through the registered label entry. An unlabeled `break`/`continue`
+        // passes through to the enclosing loop/switch, one frame further out.
+        IrStmt::Labeled { label, body } => {
+            function.instruction(&Instruction::Block(BlockType::Empty));
+            enter_frame(helpers);
+            let entry = helpers.unwind.borrow().depth;
+            // No `continue` targets a labeled non-loop statement, so its continue
+            // entry only keeps the post-`finally` resume dispatch well-formed.
+            helpers.unwind.borrow_mut().labels.push(LabelTarget {
+                id: *label,
+                break_entry: entry,
+                continue_entry: entry,
+            });
+            emit_stmts(
+                body,
+                function,
+                scratch,
+                strings,
+                helpers,
+                break_label.map(|l| l + 1),
+                continue_label.map(|l| l + 1),
+            );
+            helpers.unwind.borrow_mut().labels.pop();
+            leave_frame(helpers);
+            function.instruction(&Instruction::End);
+        }
         IrStmt::Break(target) => {
             emit_abrupt_loop(function, helpers, CF_BREAK, *target, break_label, false);
         }

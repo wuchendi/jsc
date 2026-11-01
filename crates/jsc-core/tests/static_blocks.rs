@@ -155,6 +155,31 @@ fn once_per_class_evaluation() {
     );
 }
 
+/// A class with a static block defined inside a generator or async body,
+/// after a suspension, runs the block when the definition is reached.
+#[test]
+fn inside_generator_and_async_bodies() {
+    assert_output(
+        "function* g() { let seen = yield 1; class C { static { this.v = seen + '!' } } yield C.v } \
+         let it = g(); it.next(); console.log(it.next('x').value)",
+        "x!\n",
+    );
+    assert_output(
+        "async function f() { let v = await 'a'; class C { static { this.v = v + 'b' } } return C.v } \
+         f().then(v => console.log(v))",
+        "ab\n",
+    );
+}
+
+/// A block's captures of an enclosing binding see later reassignments.
+#[test]
+fn captures_see_reassignment() {
+    assert_output(
+        "let k = 1; let get; class C { static { get = () => k } } k = 2; console.log(get())",
+        "2\n",
+    );
+}
+
 /// An exception thrown in a block propagates out of the class definition;
 /// later static elements do not run.
 #[test]

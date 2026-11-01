@@ -1263,28 +1263,6 @@ fn lowers_for_in_to_counted_key_loop() {
 }
 
 #[test]
-fn rejects_for_in_over_non_enumerable() {
-    // A statically-known primitive-scalar operand cannot enumerate keys.
-    assert!(
-        lower_src("for (const k in 5) { }").is_err(),
-        "for-in over a number is rejected"
-    );
-    assert!(
-        lower_src("for (const k in true) { }").is_err(),
-        "for-in over a boolean is rejected"
-    );
-}
-
-#[test]
-fn rejects_for_in_destructuring_head() {
-    // Only a single identifier head is supported.
-    assert!(
-        lower_src("for (const [k] in {a:1}) { }").is_err(),
-        "for-in with a destructuring head is rejected"
-    );
-}
-
-#[test]
 fn rejects_break_outside_breakable() {
     assert!(
         lower_src("let x=1; break; x").is_err(),

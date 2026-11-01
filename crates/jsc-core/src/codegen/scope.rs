@@ -124,7 +124,7 @@ impl<'a> LowerCtx<'a> {
         frame.loopable = frame.loopable.saturating_sub(1);
     }
 
-    /// Allocate a fresh loop id for a labeled loop in the current frame.
+    /// Allocate a fresh label id for a labeled statement in the current frame.
     pub(super) fn fresh_label(&mut self) -> u32 {
         let frame = self.frame();
         let id = frame.next_label;
@@ -132,31 +132,36 @@ impl<'a> LowerCtx<'a> {
         id
     }
 
-    /// Register `name` as labeling the loop with `id` for the duration of that
-    /// loop's body, then run `f`, then remove the label. A labeled `break`/
-    /// `continue` lowered inside `f` resolves `name` to `id` via [`Self::label_id`].
-    pub(super) fn with_label<T>(
+    /// Register each of `names` as labeling the statement with `id` for the
+    /// duration of that statement, then run `f`, then remove the labels. `is_loop`
+    /// records whether the statement is an iteration statement (a `continue`
+    /// target). A labeled `break`/`continue` lowered inside `f` resolves its name
+    /// to `id` via [`Self::label_id`].
+    pub(super) fn with_labels<T>(
         &mut self,
-        name: &str,
+        names: &[&str],
         id: u32,
+        is_loop: bool,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        self.frame().labels.push((name.to_owned(), id));
+        let labels = &mut self.frame().labels;
+        labels.extend(names.iter().map(|&name| (name.to_owned(), id, is_loop)));
         let result = f(self);
-        self.frame().labels.pop();
+        let labels = &mut self.frame().labels;
+        labels.truncate(labels.len() - names.len());
         result
     }
 
-    /// The loop id a statement label resolves to in the current frame, or `None`
-    /// when no active label has that name.
-    pub(super) fn label_id(&self, name: &str) -> Option<u32> {
+    /// The `(label id, is_loop)` a statement label resolves to in the current
+    /// frame, or `None` when no active label has that name.
+    pub(super) fn label_id(&self, name: &str) -> Option<(u32, bool)> {
         self.frames
             .last()?
             .labels
             .iter()
             .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, id)| *id)
+            .find(|(n, _, _)| n == name)
+            .map(|&(_, id, is_loop)| (id, is_loop))
     }
 
     /// Allocate a fresh anonymous local in the current frame.

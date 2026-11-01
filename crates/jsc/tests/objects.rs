@@ -386,9 +386,9 @@ fn delete_removes_own_property() {
     assert_eq!(jsc(&["-p", "let o={a:1}; delete o.z; 'a' in o"]), "true");
 }
 
-/// `delete` requires a member reference; a bare `delete x` is rejected.
+/// `delete x` of an identifier is an early `SyntaxError` in strict code.
 #[test]
-fn delete_non_member_is_rejected() {
+fn delete_identifier_is_rejected() {
     use std::process::Command;
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
         .args(["-e", "let x=1; delete x"])
@@ -399,7 +399,8 @@ fn delete_non_member_is_rejected() {
         "expected `delete x` to fail"
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("`delete` requires a property reference")
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Delete of an unqualified identifier in strict mode.")
     );
 }
 
