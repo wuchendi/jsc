@@ -250,11 +250,16 @@ impl LowerCtx<'_> {
                     )
                     .into()),
                 },
-                UnaryOp::Void => Err(CompileError::spanned(
-                    u.span(),
-                    format!("unsupported unary operator `{}`", u.op.as_str()),
-                )
-                .into()),
+                // `void operand` evaluates the operand for its effects and
+                // yields `undefined`; a literal operand folds away.
+                UnaryOp::Void => Ok(match self.lower_expr(&u.arg)? {
+                    IrNode::Num(_)
+                    | IrNode::Str(_)
+                    | IrNode::Bool(_)
+                    | IrNode::Null
+                    | IrNode::Undefined => IrNode::Undefined,
+                    operand => IrNode::Seq(vec![operand, IrNode::Undefined]),
+                }),
             },
             // A template literal `` `a${x}b` `` folds into left-associated `+`
             // concatenations, reusing the string-coercion path. Tagged

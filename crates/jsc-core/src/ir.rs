@@ -1760,7 +1760,8 @@ pub enum IrNode {
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
     /// operands evaluated only for their side effects: surplus `Error(..)`
-    /// arguments, and the nullish-guarded receiver of a `push`/`pop`.
+    /// arguments, the nullish-guarded receiver of a `push`/`pop`, and the
+    /// operand of `void` (followed by `Undefined`).
     Seq(Vec<IrNode>),
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
