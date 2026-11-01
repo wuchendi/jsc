@@ -99,11 +99,21 @@ fn a_super_call_after_a_suspend_keeps_this() {
     );
 }
 
+/// `super.m(yield x)` reads the method before the argument suspends
+/// (ECMA-262 13.3.7.1): replacing `A.prototype.m` during the suspend does not
+/// change the call, and `this` survives the resume.
 #[test]
-fn a_super_call_with_a_suspending_argument_is_a_compile_error() {
-    assert_compile_error(
-        "class A { m(x){ return x; } } class B extends A { *g(){ return super.m(yield 1); } }",
-        "would lose a compiler temporary across the suspend",
+fn a_super_call_with_a_suspending_argument_reads_the_method_first() {
+    assert_output(
+        "class A { m(x){ return this.k + x; } }
+         class B extends A { *g(){ return super.m(yield 1); } }
+         const b = new B(); b.k = 'k';
+         const it = b.g();
+         console.log(it.next().value, it.next('!').value);
+         const it2 = b.g(); it2.next();
+         A.prototype.m = function(x){ return 'new' + x; };
+         console.log(it2.next('?').value);",
+        "1 k!\nk?\n",
     );
 }
 

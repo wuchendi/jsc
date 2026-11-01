@@ -124,27 +124,27 @@ fn unsupported_construct_renders_caret_diagnostic() {
     );
 }
 
-/// An unsupported `for-of` head (an assignment-target binding, not a
-/// `const`/`let` declaration) is rejected with a clean human message and a caret
-/// block — crucially, the diagnostic must NOT leak the raw swc AST debug form
-/// (`ForOfStmt { .. }`, `span:`, or braces from a `{:?}` dump). The body is
-/// written brace-free (`... ) x`) so the source-echo line cannot itself
-/// introduce a `{`/`}`, keeping the "no AST-debug braces" check meaningful.
+/// An unsupported `with` statement (sloppy-mode only, DESIGN.md §13) is
+/// rejected with a clean human message and a caret block — crucially, the
+/// diagnostic must NOT leak the raw swc AST debug form (`WithStmt { .. }`,
+/// `span:`, or braces from a `{:?}` dump). The body is written brace-free
+/// (`... ) x`) so the source-echo line cannot itself introduce a `{`/`}`,
+/// keeping the "no AST-debug braces" check meaningful.
 #[test]
-fn for_of_renders_clean_message_without_ast_debug() {
+fn with_statement_renders_clean_message_without_ast_debug() {
     let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", "for (x of [1,2]) x"])
+        .args(["-e", "with ([1,2]) x"])
         .output()
         .expect("failed to spawn jsc binary");
     assert!(output.status.code() == Some(2), "must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("for-of requires a `const`/`let` loop variable"),
+        stderr.contains("with statements are not supported"),
         "stderr should carry the clean message, got: {stderr}"
     );
     assert!(
         stderr.contains('^'),
-        "stderr should draw a caret under the loop, got: {stderr}"
+        "stderr should draw a caret under the statement, got: {stderr}"
     );
     for debris in ['{', '}'] {
         assert!(
@@ -153,7 +153,7 @@ fn for_of_renders_clean_message_without_ast_debug() {
         );
     }
     assert!(
-        !stderr.contains("ForOfStmt"),
+        !stderr.contains("WithStmt"),
         "stderr must not leak the AST node name, got: {stderr}"
     );
     assert!(
@@ -210,7 +210,7 @@ fn recoverable_parse_error_renders_caret_diagnostic() {
 }
 
 /// Consolidated diagnostics contract (§9): a table of distinct compile-error
-/// classes — a `const` reassignment, a `for-of` loop,
+/// classes — a `const` reassignment, a `with` statement,
 /// and an swc parse error — each renders the rustc/swc-style block, so every
 /// rendered stderr must carry BOTH a `:1:` line:col locator AND a `^` caret.
 /// This spans parse rejections and every codegen-rejection path in one place.
@@ -219,7 +219,7 @@ fn compile_errors_render_locator_and_caret() {
     // (source, a human label for the failure message)
     let cases = [
         ("const c = 1; c = 2", "const reassignment"),
-        ("for (x of [1,2]) x", "for-of loop"),
+        ("with ([1,2]) x", "with statement"),
         ("for (let i=0;i<3;i=i+1) break nope", "unknown break label"),
         ("foo: { break foo }", "label on non-loop"),
         ("let x = (", "parse error"),
