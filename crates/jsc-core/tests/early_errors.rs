@@ -347,9 +347,11 @@ fn private_names_must_start_with_an_identifier_start() {
     ] {
         assert_early_error(src, "");
     }
-    assert_early_error(r"class C { #‍_ZWJ; }", "invalid private name");
+    // swc rejects a raw ZWJ / ZWNJ itself; an escaped one reaches the early-error
+    // pass.
+    assert_early_error(r"class C { #\u200D_ZWJ; }", "invalid private name");
     assert_early_error(
-        r"class C { #‌x; m() { return this.#‌x; } }",
+        r"class C { #\u200Cx; m() { return this.#\u200Cx; } }",
         "invalid private name",
     );
     // A ZWJ / ZWNJ after the first character, `$`, `_`, an escaped

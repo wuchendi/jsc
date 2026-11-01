@@ -221,7 +221,7 @@ fn compile_errors_render_locator_and_caret() {
         ("const c = 1; c = 2", "const reassignment"),
         ("with ([1,2]) x", "with statement"),
         ("for (let i=0;i<3;i=i+1) break nope", "unknown break label"),
-        ("foo: { break foo }", "label on non-loop"),
+        ("({ m() { return super.x } })", "super outside a class"),
         ("let x = (", "parse error"),
     ];
     for (src, what) in cases {
