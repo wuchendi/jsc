@@ -373,33 +373,6 @@ fn property_write_error_unwinds_through_finally_and_calls() {
     );
 }
 
-/// Out-of-scope class forms are rejected at compile time with a
-/// non-zero exit and an explanatory, spanned message. Every other member form,
-/// computed names and private members included, is supported (see the classes
-/// suites); static blocks stay out of scope.
-#[test]
-fn unsupported_class_forms_error() {
-    let cases = [(
-        "class A{ static {} } 1",
-        "class static blocks are not supported",
-    )];
-    for (src, needle) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-            .args(["-e", src])
-            .output()
-            .expect("failed to spawn jsc binary");
-        assert!(
-            output.status.code() == Some(2),
-            "`{src}` must make jsc exit 2"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(needle),
-            "stderr for `{src}` should mention `{needle}`, got: {stderr}"
-        );
-    }
-}
-
 /// An unhandled promise rejection fails the process after the microtask queue
 /// drains: exit 1 with `Uncaught (in promise) <value>` on stderr.
 #[test]

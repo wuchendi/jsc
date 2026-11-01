@@ -704,3 +704,21 @@ fn captures_and_arity() {
         ),
     ]);
 }
+
+/// A static block sees the private methods and accessors (instance and
+/// static): their closures and the class slot exist before the static pass.
+#[test]
+fn static_blocks_use_private_methods() {
+    check(&[
+        (
+            "let r; class C { static #m() { return 'sm' } static get #g() { return this === C } \
+             #i() { return 'im' } static { r = [C.#m(), this.#g, new C().#i(), #i in new C(), #m in C].join() } } \
+             console.log(r)",
+            "sm,true,im,true,true\n",
+        ),
+        (
+            "let w; class C { static #v = 1; static set #x(v) { C.#v = v } static { this.#x = 5; w = C.#v } } console.log(w)",
+            "5\n",
+        ),
+    ]);
+}
