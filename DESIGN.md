@@ -1717,12 +1717,11 @@ those of `switch` and loops are not tracked.
 - **Bound functions** (§5.5) under `new` construct their target; a bound
   non-constructor is not a constructor (`TypeError: B is not a constructor`).
 
-**Private names** (phase 5a; stages P2–P5 implement this text verbatim.
-Built (P2–P4): private instance and static fields, methods and accessors
-(generator, async and async generator methods included) — names, `%penv`,
-resolution, storage, brands, the helpers, instance and static
-initialization, every operation, `#x in o` and invisibility — and static
-blocks. Until P5 lands, the early errors below are partial.)
+**Private names** (phase 5a, done): private instance and static fields,
+methods and accessors (generator, async and async generator methods
+included) — names, `%penv`, resolution, storage, brands, the helpers,
+instance and static initialization, every operation, `#x in o`,
+invisibility and the early errors — and static blocks.
 
 - **Names.** A private name is a `TYPE_SYMBOL` block with header flag `8`
   `SYMBOL_FLAG_PRIVATE` (bits `1`/`2` stay clear, `4` is `REGISTERED`;
@@ -1759,10 +1758,8 @@ blocks. Until P5 lands, the early errors below are partial.)
   the enclosing classes' names) and pops it with the class scope. `#x`
   resolves to the innermost class declaring it, so a nested class shadows
   an outer name and a nested class not declaring `#x` uses the outer one.
-  Until P5's early errors, an unresolved `#x` is the spanned compile error
-  `private name #x is not defined` and a repeated name (other than one
-  getter plus one setter of the same static-ness) `duplicate private name
-  #x`.
+  An unresolved or repeated name never reaches lowering: `early.rs` rejects
+  it first (below).
 - **Storage.** A private field is an own entry keyed by its symbol in the
   object's ordinary `TYPE_PROPS` table, attrs `WRITABLE` only; the instance
   brand is an entry keyed by the brand symbol, attrs `0`, value `undefined`.
@@ -1877,25 +1874,32 @@ on the class local, so the lifted body's own `this` is the class (an arrow
 inside reads it lexically) and the construct marker is absent; the capture
 and arity pre-passes visit the block as a zero-parameter function.
 
-**Early errors** (P5, `codegen/early.rs`; test262 marks them all `phase:
-parse`, so which swc already reports is not determinable without running —
-`early.rs` checks every one): a `#x` (also in `#x in o`) not declared by an
-enclosing class body; a duplicate private name, except exactly one getter
-plus one setter of the same static-ness; `#constructor`; `delete` of a
-private reference (`delete o.#x`, parenthesised, `delete o?.#x`, `delete
-o?.a.#x`); in a static block, `arguments` anywhere outside a nested
-non-arrow function (computed keys of a nested class included), `await` as
-a binding or reference outside nested functions and arrows, `await` /
-`yield` expressions, `return`, `super(..)`, `break` / `continue` / labels
-crossing the block, and lexical redeclarations (the block is a
-function-like scope: its top-level function declarations are var-scoped).
-The static-block checks landed with P4 (swc reports several of them first,
-with its own messages). `super.#x` and private names in object literals are
-parse errors. P2 deleted the diagnostics `private class fields are not
-supported` and `private fields are not supported` (until P5, `delete o.#x`
-is the spanned `private fields cannot be deleted`); P3 deleted `private
-class methods are not supported` and P4 `class static blocks are not
-supported`.
+**Early errors** (`codegen/early.rs`, run over the whole program before
+lowering, so unreached code is checked too; spanned):
+
+- `private name #x is not defined`: a `#x` (member access, optional chain,
+  `#x in o`, nested functions and classes included) that no enclosing class
+  body declares. A class heritage sees only the enclosing classes' names; its
+  computed keys, field initializers, methods and static blocks see its own.
+- `duplicate private name #x`: a name declared twice in one class body
+  (fields, methods, accessors and `accessor #x`, static or not), except
+  exactly one getter plus one setter of the same static-ness.
+- `private fields cannot be deleted`: `delete` of `o.#x`, parenthesised
+  (`delete (o.#x)`) or ending an optional chain (`delete o?.#x`,
+  `delete o?.a.#x`).
+- `unexpected private name #x`: a bare `#x` anywhere except as the left
+  operand of `in` (`(#x) in o`, `#x + 1`).
+- In a static block: `arguments` anywhere outside a nested non-arrow
+  function (computed keys of a nested class included), `await` as a binding
+  or reference outside nested functions and arrows, `await` / `yield`
+  expressions, `return`, `super(..)`, `break` / `continue` / labels crossing
+  the block, and lexical redeclarations (the block is a function-like scope:
+  its top-level function declarations are var-scoped). swc reports several of
+  these first, with its own messages.
+
+swc's parser itself rejects `#constructor` (`Classes can't have a private
+field named '#constructor'.`), `super.#x`, and a private name as an object
+literal or object pattern key.
 
 ### 7.7 Errors
 
@@ -2168,7 +2172,7 @@ Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
 supported`, `with statements are not supported`,
 `async generator functions are unsupported`, `Invalid left-hand side in
-assignment`.
+assignment`, `private name #x is not defined`.
 
 **Run-time errors** carry no source span:
 
@@ -2579,8 +2583,7 @@ Still open from the phase-3 scope: `Date` string parsing and local time
 
 ### Phase 5 — Language completeness
 
-- Private fields and methods, static blocks (phase 5a, in progress), object
-  spread.
+- Private fields and methods, static blocks, object spread (phase 5a, done).
 - All remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.

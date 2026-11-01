@@ -670,6 +670,10 @@ fn duplicate_private_names() {
         "class C { get #a() {} get #a() {} }",
         "class C { get #a() {} static set #a(v) {} }",
         "class C { #a() {} set #a(v) {} }",
+        "class C { #a; static #a; }",
+        "class C { static get #a() {} static get #a() {} }",
+        "class C { get #a() {} set #a(v) {} set #a(v) {} }",
+        "class C { m() { return 1 } #a; static m() {} #a() {} }",
     ] {
         let err = jsc_core::run::compile_and_run(src).expect_err("duplicate names are rejected");
         assert!(
@@ -701,6 +705,24 @@ fn captures_and_arity() {
         (
             "class C { #m(a, b, c, d, e, f, g) { return [a, g].join() } run() { return this.#m(1) } } console.log(new C().run())",
             "1,\n",
+        ),
+        // A captured outer `let` reassigned after the class is defined is
+        // read through its cell (fields, methods, accessors, static or not).
+        (
+            "let k = 1; class C { #f = () => k; static #s = () => k; #m() { return k } static #sm() { return k } \
+             get #g() { return k } static get #sg() { return k } \
+             run() { return [this.#f(), C.#s(), this.#m(), C.#sm(), this.#g, C.#sg].join() } } \
+             k = 2; console.log(new C().run())",
+            "2,2,2,2,2,2\n",
+        ),
+        // Calls with more arguments than any public function passes, from a
+        // private field initializer, method, accessor and static method.
+        (
+            "function f4(a, b, c, d, e) { return a + b + c + d + e } \
+             class C { #v = f4(1, 2, 3, 4, 5); static #s = f4(5, 5, 5, 5, 5); #m() { return f4(1, 1, 1, 1, 1) } \
+             get #g() { return f4(2, 2, 2, 2, 2) } static #sm() { return f4(3, 3, 3, 3, 3) } \
+             run() { return [this.#v, C.#s, this.#m(), this.#g, C.#sm()].join() } } console.log(new C().run())",
+            "15,25,5,10,15\n",
         ),
     ]);
 }

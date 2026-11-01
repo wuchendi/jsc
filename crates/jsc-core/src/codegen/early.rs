@@ -19,16 +19,22 @@
 //!   `arguments` outside a nested non-arrow function, `super(..)` likewise;
 //!   `await` as an identifier, `await` / `yield` expressions, `for await`,
 //!   `return`, and `break` / `continue` / labels crossing the block, outside
-//!   nested functions and arrows.
+//!   nested functions and arrows;
+//! - a private name `#x` no enclosing class body declares (a class heritage
+//!   sees only the enclosing classes' names), a private name declared twice in
+//!   one class body (except one getter plus one setter of the same
+//!   static-ness), `delete` of a private reference (parenthesised or the end
+//!   of an optional chain), and a bare `#x` anywhere but left of `in`.
 
 use std::collections::HashMap;
 
 use swc_common::{Span, Spanned};
 use swc_ecma_ast::{
-    ArrowExpr, ArrowFunctionBody, AwaitExpr, BlockStmt, BreakStmt, CallExpr, Callee, CatchClause,
-    Constructor, ContinueStmt, Decl, FnExpr, ForHead, Function, FunctionBody, Ident, ObjectLit,
-    ObjectPatProp, ParamOrTsParamProp, Pat, Program, Prop, PropOrSpread, ReturnStmt, StaticBlock,
-    Stmt, SwitchStmt, VarDeclKind, VarDeclOrExpr, YieldExpr,
+    ArrowExpr, ArrowFunctionBody, AwaitExpr, BinExpr, BinaryOp, BlockStmt, BreakStmt, CallExpr,
+    Callee, CatchClause, Class, ClassMember, Constructor, ContinueStmt, Decl, Expr, FnExpr,
+    ForHead, Function, FunctionBody, Ident, Key, MemberProp, MethodKind, ObjectLit, ObjectPatProp,
+    OptChainBase, ParamOrTsParamProp, Pat, PrivateName, Program, Prop, PropOrSpread, ReturnStmt,
+    StaticBlock, Stmt, SwitchStmt, UnaryExpr, UnaryOp, VarDeclKind, VarDeclOrExpr, YieldExpr,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -58,6 +64,20 @@ struct Checker {
     /// Inside a class static block and not inside a nested function or arrow:
     /// the block body's labels and statement nesting.
     static_body: Option<StaticBody>,
+    /// The private names (`"#x"`) declared by each enclosing class body,
+    /// innermost last.
+    private_names: Vec<Vec<String>>,
+}
+
+/// What a class body has declared so far under one private name.
+#[derive(Clone, Copy)]
+enum PrivateDeclared {
+    /// A lone getter (`true` when static), which one setter may complete.
+    Getter(bool),
+    /// A lone setter (`true` when static), which one getter may complete.
+    Setter(bool),
+    /// A field, method, auto-accessor or complete getter/setter pair.
+    Complete,
 }
 
 /// The jump targets visible in a class static block's own body (none from
@@ -397,6 +417,83 @@ impl Visit for Checker {
         }
     }
 
+    fn visit_class(&mut self, c: &Class) {
+        // The heritage is evaluated in the enclosing private environment.
+        c.decorators.visit_with(self);
+        c.super_class.visit_with(self);
+        let mut names = Vec::new();
+        let mut declared: HashMap<String, PrivateDeclared> = HashMap::new();
+        for member in &c.body {
+            let (key, kind, is_static) = match member {
+                ClassMember::PrivateProp(p) => (&p.key, None, p.is_static),
+                ClassMember::PrivateMethod(m) => (&m.key, Some(m.kind), m.is_static),
+                ClassMember::AutoAccessor(a) => match &a.key {
+                    Key::Private(key) => (key, None, a.is_static),
+                    Key::Public(_) => continue,
+                },
+                _ => continue,
+            };
+            let name = format!("#{}", key.name);
+            let prev = declared.get(&name).copied();
+            let next = match (kind, prev) {
+                (Some(MethodKind::Getter), None) => PrivateDeclared::Getter(is_static),
+                (Some(MethodKind::Setter), None) => PrivateDeclared::Setter(is_static),
+                (_, None) => PrivateDeclared::Complete,
+                (Some(MethodKind::Getter), Some(PrivateDeclared::Setter(s)))
+                | (Some(MethodKind::Setter), Some(PrivateDeclared::Getter(s)))
+                    if s == is_static =>
+                {
+                    PrivateDeclared::Complete
+                }
+                _ => {
+                    self.fail(key.span, format!("duplicate private name {name}"));
+                    PrivateDeclared::Complete
+                }
+            };
+            if prev.is_none() {
+                names.push(name.clone());
+            }
+            declared.insert(name, next);
+        }
+        self.private_names.push(names);
+        c.body.visit_with(self);
+        self.private_names.pop();
+    }
+
+    fn visit_private_name(&mut self, p: &PrivateName) {
+        let name = format!("#{}", p.name);
+        if !self.private_names.iter().any(|names| names.contains(&name)) {
+            self.fail(p.span, format!("private name {name} is not defined"));
+        }
+    }
+
+    fn visit_expr(&mut self, e: &Expr) {
+        // `#x` is an expression only as the left operand of `in`
+        // (`visit_bin_expr`).
+        if let Expr::PrivateName(p) = e {
+            self.fail(p.span, format!("unexpected private name #{}", p.name));
+        }
+        e.visit_children_with(self);
+    }
+
+    fn visit_bin_expr(&mut self, b: &BinExpr) {
+        if b.op == BinaryOp::In
+            && let Expr::PrivateName(p) = b.left.as_ref()
+        {
+            self.visit_private_name(p);
+            b.right.visit_with(self);
+            return;
+        }
+        b.visit_children_with(self);
+    }
+
+    fn visit_unary_expr(&mut self, u: &UnaryExpr) {
+        if u.op == UnaryOp::Delete && is_private_reference(&u.arg) {
+            self.fail(u.arg.span(), "private fields cannot be deleted".to_owned());
+        }
+        u.visit_children_with(self);
+    }
+
     fn visit_object_lit(&mut self, o: &ObjectLit) {
         let mut seen = false;
         for prop in &o.props {
@@ -436,6 +533,23 @@ impl Visit for Checker {
             );
         }
     }
+}
+
+/// Whether `expr`, parentheses stripped, is a private member reference
+/// `o.#x` or an optional chain ending in one (`o?.#x`, `o?.a.#x`).
+fn is_private_reference(mut expr: &Expr) -> bool {
+    while let Expr::Paren(p) = expr {
+        expr = &p.expr;
+    }
+    let member = match expr {
+        Expr::Member(m) => m,
+        Expr::OptChain(chain) => match chain.base.as_ref() {
+            OptChainBase::Member(m) => m,
+            OptChainBase::Call(_) => return false,
+        },
+        _ => return false,
+    };
+    matches!(member.prop, MemberProp::PrivateName(_))
 }
 
 fn already_declared(name: &str) -> String {

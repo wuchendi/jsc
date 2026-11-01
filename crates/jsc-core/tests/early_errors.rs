@@ -1,7 +1,8 @@
 //! Early (compile-time) errors of the static semantics: lexical
 //! redeclarations, declarations in statement position, `await` as an
-//! identifier in an async body, duplicate parameter / body names, and the
-//! class static block restrictions.
+//! identifier in an async body, duplicate parameter / body names, the class
+//! static block restrictions, and the private-name rules (undeclared and
+//! duplicate names, `delete` of a private reference, a bare `#x`).
 
 #![allow(clippy::expect_used)]
 
@@ -246,4 +247,86 @@ fn class_static_block_early_errors() {
     assert_runs("class C { static { (() => { return 1; })(); } }");
     assert_runs("class C { static { var f; function f() {} } }");
     assert_runs("class C { static { x: while (false) { break x; } } }");
+}
+
+#[test]
+fn private_name_early_errors() {
+    // A `#x` no enclosing class body declares, in any position and even in
+    // code that never runs.
+    for src in [
+        "this.#x;",
+        "function f(o) { return o.#x; }",
+        "function f(o) { return #x in o; }",
+        "function f(o) { return o?.#x; }",
+        "function f(o) { return o?.a.#x; }",
+        "function f(o) { o.#x = 1; }",
+        "function f(o) { o.#x(); }",
+        "class C { #y; m(o) { return o.#x; } }",
+        "class C { m() { class D { #x; } return this.#x; } }",
+        "class C { #y = () => this.#x; }",
+        "class C { static { this.#x; } }",
+        "class C { [this.#x] = 1; }",
+        "function f() { if (false) { class C { m(o) { o.#x; } } } }",
+        // The heritage sees only the enclosing classes' names.
+        "class C extends (o => o.#x) { #x; }",
+        "class C extends class { y = this.#x; } { #x; }",
+    ] {
+        assert_early_error(src, "private name #x is not defined");
+    }
+    // Duplicates in one class body, except one getter plus one setter of the
+    // same static-ness.
+    for src in [
+        "class C { #x; #x; }",
+        "class C { #x; static #x; }",
+        "class C { #x; #x() {} }",
+        "class C { #x() {} static #x() {} }",
+        "class C { get #x() {} get #x() {} }",
+        "class C { set #x(v) {} set #x(v) {} }",
+        "class C { get #x() {} set #x(v) {} get #x() {} }",
+        "class C { get #x() {} set #x(v) {} #x; }",
+        "class C { static get #x() {} set #x(v) {} }",
+        "class C { *#x() {} async #x() {} }",
+    ] {
+        assert_early_error(src, "duplicate private name #x");
+    }
+    // `delete` of a private reference, plain, parenthesised or ending an
+    // optional chain.
+    for src in [
+        "class C { #x; m() { delete this.#x; } }",
+        "class C { #x; m() { delete (this.#x); } }",
+        "class C { #x; m() { delete ((this.#x)); } }",
+        "class C { #x() {} m() { delete this.#x; } }",
+        "class C { #x; m() { delete this?.#x; } }",
+        "class C { #x; m(o) { delete o?.a.#x; } }",
+        "class C { #x; m(g) { delete g().#x; } }",
+        "class C { #x; f = () => delete this.#x; }",
+    ] {
+        assert_early_error(src, "private fields cannot be deleted");
+    }
+    // A bare `#x` is an expression only on the left of `in`.
+    for src in [
+        "class C { #x; m() { #x; } }",
+        "class C { #x; m(o) { return (#x) in o; } }",
+        "class C { #x; m() { return #x + 1; } }",
+    ] {
+        assert_early_error(src, "unexpected private name #x");
+    }
+    // swc rejects these at parse time with its own messages.
+    for src in [
+        "class C { #constructor; }",
+        "class C { #constructor() {} }",
+        "class C { static #constructor() {} }",
+        "class C extends Object { #x; m() { return super.#x; } }",
+        "class C { #x; m() { return { #x: 1 }; } }",
+        "class C { #x; m() { const { #x: x } = this; } }",
+    ] {
+        assert_early_error(src, "");
+    }
+    // Valid forms: an outer class's names inside a nested class, a getter /
+    // setter pair, and a `delete` of a member of a private field.
+    assert_runs("class C { #x = 1; m() { return class { f(o) { return o.#x; } }; } }");
+    assert_runs("class C { get #x() { return 1; } set #x(v) {} }");
+    assert_runs("class C { static set #x(v) {} static get #x() { return 1; } }");
+    assert_runs("class C { #x = {}; m() { return delete this.#x.y; } } new C().m();");
+    assert_runs("class C { #x; static has(o) { return #x in o; } } C.has({});");
 }
