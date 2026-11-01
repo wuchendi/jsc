@@ -1148,10 +1148,10 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
             seed_nullish_strs(strs);
             collect_node(obj, strs);
         }
-        // An invalid date's `toString()` is the interned `"Invalid Date"`
+        // An invalid date's string forms are the interned `"Invalid Date"`
         // literal; its `toISOString()` throws a `RangeError`.
         IrNode::DateField { op, .. } => match op {
-            DateOp::ToString => {
+            op if op.is_date_text() => {
                 strs.add(INVALID_DATE);
             }
             DateOp::ToIsoString => seed_strs(&INVALID_TIME_VALUE, strs),

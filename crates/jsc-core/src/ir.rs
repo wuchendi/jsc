@@ -704,7 +704,8 @@ impl MapOp {
 /// A `%Date.prototype%` field method ([`IrNode::DateField`]), run by its
 /// builtin and by a guarded call-site fast path on a `TYPE_DATE` block. All
 /// calendar/time fields are **UTC**, derived from the stored milliseconds with
-/// the standard civil-from-days algorithm.
+/// the standard civil-from-days algorithm: the local time zone is UTC
+/// (`LocalTZA = 0`), so each local getter equals its `getUTC*` twin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateOp {
     /// `d.getTime()` — the stored millisecond timestamp, as a number.
@@ -726,6 +727,28 @@ pub enum DateOp {
     GetMinutes,
     /// `d.getSeconds()` — the UTC second of the minute (`0`..`59`).
     GetSeconds,
+    /// `d.getMilliseconds()` — the millisecond of the second (`0`..`999`).
+    GetMilliseconds,
+    /// `d.getTimezoneOffset()` — always `0` (`LocalTZA = 0`).
+    GetTimezoneOffset,
+    /// `d.getUTCFullYear()`.
+    GetUtcFullYear,
+    /// `d.getUTCMonth()`.
+    GetUtcMonth,
+    /// `d.getUTCDate()`.
+    GetUtcDate,
+    /// `d.getUTCDay()`.
+    GetUtcDay,
+    /// `d.getUTCHours()`.
+    GetUtcHours,
+    /// `d.getUTCMinutes()`.
+    GetUtcMinutes,
+    /// `d.getUTCSeconds()`.
+    GetUtcSeconds,
+    /// `d.getUTCMilliseconds()`.
+    GetUtcMilliseconds,
+    /// Annex B `d.getYear()` — the full year minus `1900`.
+    GetYear,
     /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`
     /// (an expanded `±YYYYYY` year outside `0..=9999`), built GUEST-side as a
     /// fresh heap string.
@@ -733,12 +756,32 @@ pub enum DateOp {
     /// `d.toString()` — `Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated
     /// Universal Time)`, built GUEST-side as a fresh heap string.
     ToString,
+    /// `d.toDateString()` — the `Www Mmm DD YYYY` half of `toString()`.
+    ToDateString,
+    /// `d.toTimeString()` — the `HH:MM:SS GMT+0000 (Coordinated Universal
+    /// Time)` half of `toString()`.
+    ToTimeString,
+    /// `d.toUTCString()` (also Annex B `toGMTString`, the same function
+    /// object) — `Www, DD Mmm YYYY HH:MM:SS GMT`.
+    ToUtcString,
+    /// `d.toLocaleString()` — no `Intl`: the `toString()` text.
+    ToLocaleString,
+    /// `d.toLocaleDateString()` — no `Intl`: the `toDateString()` text.
+    ToLocaleDateString,
+    /// `d.toLocaleTimeString()` — no `Intl`: the `toTimeString()` text.
+    ToLocaleTimeString,
 }
 
 impl DateOp {
     /// Every field method, in `%Date.prototype%` order.
-    pub const ALL: [DateOp; 11] = [
+    pub const ALL: [DateOp; 28] = [
         Self::ToString,
+        Self::ToDateString,
+        Self::ToTimeString,
+        Self::ToUtcString,
+        Self::ToLocaleString,
+        Self::ToLocaleDateString,
+        Self::ToLocaleTimeString,
         Self::GetTime,
         Self::ValueOf,
         Self::GetFullYear,
@@ -748,6 +791,17 @@ impl DateOp {
         Self::GetHours,
         Self::GetMinutes,
         Self::GetSeconds,
+        Self::GetMilliseconds,
+        Self::GetTimezoneOffset,
+        Self::GetUtcFullYear,
+        Self::GetUtcMonth,
+        Self::GetUtcDate,
+        Self::GetUtcDay,
+        Self::GetUtcHours,
+        Self::GetUtcMinutes,
+        Self::GetUtcSeconds,
+        Self::GetUtcMilliseconds,
+        Self::GetYear,
         Self::ToIsoString,
     ];
 
@@ -764,9 +818,42 @@ impl DateOp {
             Self::GetHours => "getHours",
             Self::GetMinutes => "getMinutes",
             Self::GetSeconds => "getSeconds",
+            Self::GetMilliseconds => "getMilliseconds",
+            Self::GetTimezoneOffset => "getTimezoneOffset",
+            Self::GetUtcFullYear => "getUTCFullYear",
+            Self::GetUtcMonth => "getUTCMonth",
+            Self::GetUtcDate => "getUTCDate",
+            Self::GetUtcDay => "getUTCDay",
+            Self::GetUtcHours => "getUTCHours",
+            Self::GetUtcMinutes => "getUTCMinutes",
+            Self::GetUtcSeconds => "getUTCSeconds",
+            Self::GetUtcMilliseconds => "getUTCMilliseconds",
+            Self::GetYear => "getYear",
             Self::ToIsoString => "toISOString",
             Self::ToString => "toString",
+            Self::ToDateString => "toDateString",
+            Self::ToTimeString => "toTimeString",
+            Self::ToUtcString => "toUTCString",
+            Self::ToLocaleString => "toLocaleString",
+            Self::ToLocaleDateString => "toLocaleDateString",
+            Self::ToLocaleTimeString => "toLocaleTimeString",
         }
+    }
+
+    /// Whether the op renders a date string (an invalid date's is
+    /// `"Invalid Date"`); `toISOString` throws instead.
+    #[must_use]
+    pub fn is_date_text(self) -> bool {
+        matches!(
+            self,
+            Self::ToString
+                | Self::ToDateString
+                | Self::ToTimeString
+                | Self::ToUtcString
+                | Self::ToLocaleString
+                | Self::ToLocaleDateString
+                | Self::ToLocaleTimeString
+        )
     }
 
     /// The field method named `name`, if any.
@@ -2051,8 +2138,9 @@ pub enum IrNode {
     /// since the Unix epoch, and yields the handle heap jsval. `arg` is `None`
     /// for the no-argument form (the host clock, the `__now` import); otherwise
     /// it is the single constructor argument: a Date's time value is taken
-    /// directly, anything else goes through `ToNumber` (`new Date("2020")` is
-    /// `NaN`, like `Number`).
+    /// directly, anything else goes through `ToPrimitive`, then a string is
+    /// parsed as by `Date.parse` and any other primitive goes through
+    /// `ToNumber`.
     DateNew {
         /// The constructor argument, or `None` for the host clock.
         arg: Option<Box<IrNode>>,
