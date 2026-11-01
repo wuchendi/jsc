@@ -2317,8 +2317,8 @@ Errors are printed to stderr.
   | `968dd97` | 19243 | 30014 | 47665 |
   | `eee36ef` | 19378 | 30014 | 47665 |
 
-  The current metric is its last row: **23688 / 32889 eligible tests pass
-  (≈ 72.0 %)**; `baseline.txt` holds the same 23688 paths. The drop in
+  The current metric is its last row: **28037 / 32889 eligible tests pass
+  (≈ 85.2 %)**; `baseline.txt` holds the same 28037 paths. The drop in
   rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
   `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
   (1413 pass).
@@ -2492,20 +2492,20 @@ Each item below is current behaviour of this tree.
   `String` / `Number` exotic object: `String.prototype.valueOf()` throws
   `TypeError`, and `Object.prototype.toString.call(Number.prototype)` is
   `"[object Object]"`.
-- The remaining test262 failures of the phase-3 built-in families (413 of
-  built-ins/{Array 78, String 194, Function 134, Math 1, Number 5,
-  AggregateError 1}; NativeErrors has none; counted at `74daeeb` from the CI
-  per-test results), by cause and owner:
+- The remaining test262 failures of the phase-3 built-in families (361 of
+  built-ins/{Array 64, String 158, Function 133, Math 1, Number 4,
+  AggregateError 1}; NativeErrors has none; counted at `61f46be` from the CI
+  per-test results, after phase 5a removed the `void`, tagged-template and
+  `for-in` head causes; a few tests those causes hid now stop at `RegExp` or
+  the `Function` constructor), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number | AggregateError |
   |---|---|---|---|---|---|---|---|
-  | `RegExp` | never in phase 3 | 28 | 128 | 3 | | | |
-  | `Function` constructor | never in phase 3 | | 4 | 115 | | | 1 |
-  | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 21 | 18 | 4 | 1 | | |
-  | `void` (59; the cause is removed — §7.2, recount pending) | language | | | | | | |
+  | `RegExp` | phase 5b | 28 | 131 | 3 | | | |
+  | `Function` constructor | unsupported (§14 open decisions) | | 4 | 124 | | | 1 |
+  | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | `eval` unsupported; the rest phase 5b | 21 | 19 | 4 | 1 | | |
   | thenables are not assimilated (`Array.fromAsync`, below) | async | 14 | | | | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
-  | tagged templates, `for-in` heads (both removed — §7.3, §7.4, recount pending) | language | 2 | 4 | | | | |
   | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
   | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
   | CR line terminators hide the frontmatter `includes` (`nativeFunctionMatcher.js`) | runner | | | 1 | | | |
