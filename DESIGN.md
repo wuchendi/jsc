@@ -1628,8 +1628,11 @@ those of `switch` and loops are not tracked.
 - **Bound functions** (§5.5) under `new` construct their target; a bound
   non-constructor is not a constructor (`TypeError: B is not a constructor`).
 
-**Private names** (phase 5a; stages P2–P5 implement this text verbatim,
-until then every form below is a spanned rejection, §8, §13).
+**Private names** (phase 5a; stages P2–P5 implement this text verbatim.
+Built (P2): private instance and static **fields** — names, `%penv`,
+resolution, storage, the four helpers, instance and static initialization,
+the field operations and invisibility. Until P3–P5 land, private methods and
+accessors, static blocks and `#x in o` stay spanned rejections, §8, §13.)
 
 - **Names.** A private name is a `TYPE_SYMBOL` block with header flag `8`
   `SYMBOL_FLAG_PRIVATE` (bits `1`/`2` stay clear, `4` is `REGISTERED`;
@@ -1637,9 +1640,11 @@ until then every form below is a spanned rejection, §8, §13).
   the new `IrNode::PrivateName(desc)` (the `new_symbol` sequence of
   `emit/builtins/symbol.rs`). Only **fields** (instance and static) get one
   per name; methods and accessors are not keyed per name (brands, below).
-- **Private environment.** Each evaluation of a class body allocates
-  `%penv`, an internal dense array held in one `hidden_local` of the class
-  scope (captured by value, like the heritage locals; never a user value).
+- **Private environment.** Each evaluation of a class body declaring a
+  private name allocates `%penv` (an `IrNode::Array` literal), an internal
+  dense array held in one `hidden_local` of the class scope (captured by
+  value, like the heritage locals; never a user value); a class declaring
+  none allocates nothing.
   Slot `0` is the class value (stored once it exists, before any static
   element runs; `undefined` until then), slot `1` the instance brand (a
   private symbol, description = the first instance private method or
@@ -1658,11 +1663,15 @@ until then every form below is a spanned rejection, §8, §13).
   closures per evaluation.
 - **Resolution** is lexical at compile time: `LowerCtx::private_scopes`
   (new) is a stack of `{ frame, penv_id, names }`, each name
-  `{ "#x", kind: Field(slot) | Method(slot) | Accessor(get, set), static }`.
+  `{ "#x", kind: Field(slot) | Method(slot) | Accessor(get, set), static }`
+  (P2 builds `Field(slot)`; the other kinds and `static` land with P3).
   `lower_class` pushes the scope after lowering the heritage (which sees only
   the enclosing classes' names) and pops it with the class scope. `#x`
   resolves to the innermost class declaring it, so a nested class shadows
   an outer name and a nested class not declaring `#x` uses the outer one.
+  Until P5's early errors, an unresolved `#x` is the spanned compile error
+  `private name #x is not defined` and a repeated field name `duplicate
+  private name #x`.
 - **Storage.** A private field is an own entry keyed by its symbol in the
   object's ordinary `TYPE_PROPS` table, attrs `WRITABLE` only; the instance
   brand is an entry keyed by the brand symbol, attrs `0`, value `undefined`.
@@ -1680,11 +1689,15 @@ until then every form below is a spanned rejection, §8, §13).
   twice on the same object`, else `__define`, which skips its
   not-extensible check for a `SYMBOL_FLAG_PRIVATE` key, so adds work on
   non-extensible, sealed and frozen objects;
-  `__private_get(o, key, name)` / `__private_set(o, key, v, name)` on a field:
-  absent (a primitive included, no `ToObject`) → `TypeError: Cannot read
-  private member #x from an object whose class did not declare it` /
-  `Cannot write private member #x to an object whose class did not declare
-  it`; a set ignores attrs. The messages are new `__prop_throw` modes.
+  `__private_get(o, key, name)` / `__private_set(o, key, v, name)` (which
+  returns `v`) on a field: absent (a primitive included, no `ToObject`) →
+  `TypeError: Cannot read private member #x from an object whose class did
+  not declare it` / `Cannot write private member #x to an object whose class
+  did not declare it`; a set ignores attrs. The messages are new
+  `__prop_throw` modes (`21`–`23`, the `"#x"` string as the key). The IR
+  nodes are `PrivateAdd { obj, key, value, attrs, name }`, `PrivateGet {
+  obj, key, name }` and `PrivateSet { obj, key, value, name }` (`key` a
+  `PrivEnvLoad`).
 - **Methods and accessors.** `o.#m` brand-checks (`__private_find(o,
   brand)`, or the slot-`0` identity when static), throwing the read / write
   message above naming `#m`, then: a method reads its closure (one per
@@ -1717,7 +1730,10 @@ until then every form below is a spanned rejection, §8, §13).
   (throwing when absent), compute, set; destructuring targets (`[this.#x] =
   xs`, `({a: this.#x} = o)`) are member targets ending in a private set;
   `o?.#x`, `o?.a.#x`, `o?.#m()` short-circuit as usual; `o.#m(args)` reads
-  (brand check before the arguments) and calls with `this = o`. There is no
+  (brand check before the arguments) and calls with `this = o` (an
+  `IrNode::ThisCall` on the receiver temp; with a suspend in an argument,
+  generator linearization spills the callee and the receiver and rebinds
+  it, like a user method call). There is no
   `super.#x` (a parse error). `#x in o`: `o` not an object → `TypeError:
   Cannot use 'in' operator to search for '#x' in <o>` (new `__prop_throw`
   mode rendering `o` as `PROP_THROW_IN` does); else `__private_find` of the
@@ -1764,10 +1780,11 @@ a binding or reference outside nested functions and arrows, `await` /
 `yield` expressions, `return`, `super(..)`, `break` / `continue` / labels
 crossing the block, and lexical redeclarations (the block is a
 function-like scope). `super.#x` and private names in object literals are
-parse errors. P2–P5 delete the diagnostics `private class fields are not
-supported`, `private class methods are not supported`, `private fields are
-not supported` and `class static blocks are not supported` (and their §8,
-§13 mentions) as their forms land.
+parse errors. P2 deleted the diagnostics `private class fields are not
+supported` and `private fields are not supported` (until P5, `delete o.#x`
+is the spanned `private fields cannot be deleted`); P3–P4 delete `private
+class methods are not supported` and `class static blocks are not
+supported` (and their §8, §13 mentions) as their forms land.
 
 ### 7.7 Errors
 
@@ -2037,7 +2054,7 @@ is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`, `private class fields are not
+supported`, `with statements are not supported`, `private class methods are not
 supported`, `class static blocks are not supported`,
 `async generator functions are unsupported`, `a label may only be applied to a loop`,
 `destructuring assignment is only supported as an expression statement`.
@@ -2340,7 +2357,7 @@ Each item below is current behaviour of this tree.
 - Destructuring assignment works only as an expression statement; it is
   rejected in expression position (`x = [a] = b`), and a `for-of` head must
   declare its binding or be a pattern (`for (a of xs)` is rejected).
-- Not supported: private `#` members, static blocks.
+- Not supported: private methods and accessors, `#x in o`, static blocks.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
   `undefined`.

@@ -375,11 +375,14 @@ fn property_write_error_unwinds_through_finally_and_calls() {
 
 /// Out-of-scope class forms are rejected at compile time with a
 /// non-zero exit and an explanatory, spanned message. Every other member form,
-/// computed names included, is supported (see the classes suites); private
-/// members stay out of scope.
+/// computed names and private fields included, is supported (see the classes
+/// suites); private methods and accessors and static blocks stay out of scope.
 #[test]
 fn unsupported_class_forms_error() {
-    let cases = [("class A{ #p = 1 } 1", "private")];
+    let cases = [(
+        "class A{ #m() {} } 1",
+        "private class methods are not supported",
+    )];
     for (src, needle) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
             .args(["-e", src])

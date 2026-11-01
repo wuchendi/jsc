@@ -1369,11 +1369,7 @@ impl CfgBuilder {
             return Ok(node);
         }
         match node {
-            IrNode::Yield(value) => {
-                let value = self.linearize(*value)?;
-                self.suspend(value)?;
-                Ok(IrNode::SentValue)
-            }
+            IrNode::Yield(value) => self.linearize_yield(*value),
             node @ IrNode::YieldDelegate { .. } => self.linearize_delegate(node),
             IrNode::Ternary {
                 cond,
@@ -1436,6 +1432,10 @@ impl CfgBuilder {
                 })?;
                 self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
             }
+            // `o.#m(..)` with a suspend (DESIGN.md §7.6).
+            node @ IrNode::ThisCall {
+                construct: false, ..
+            } => self.linearize_this_call(node),
             IrNode::NamespaceGuard {
                 obj,
                 key,
@@ -1469,6 +1469,35 @@ impl CfgBuilder {
                 Ok(node)
             }
         }
+    }
+
+    /// Linearize `yield value`: suspend with the linearized value; the
+    /// expression is the sent value.
+    fn linearize_yield(&mut self, value: IrNode) -> anyhow::Result<IrNode> {
+        let value = self.linearize(value)?;
+        self.suspend(value)?;
+        Ok(IrNode::SentValue)
+    }
+
+    /// Linearize a (non-construct) [`IrNode::ThisCall`] binding the raw
+    /// `this_local` (a private method call) that contains a suspend: the
+    /// callee and the receiver are spilled before the arguments run and the
+    /// receiver is rebound after their suspends.
+    fn linearize_this_call(&mut self, node: IrNode) -> anyhow::Result<IrNode> {
+        let IrNode::ThisCall {
+            callee,
+            args,
+            this_local,
+            not_callable,
+            ..
+        } = node
+        else {
+            return Err(self.unsupported("unexpected call shape"));
+        };
+        let callee = self.linearize(*callee)?;
+        let callee = self.spill(callee)?;
+        let obj = self.spill(IrNode::Local(this_local))?;
+        self.linearize_bound_call(obj, callee, args, this_local, not_callable)
     }
 
     /// Linearize the arguments of a call of the already spilled `callee` with

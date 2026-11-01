@@ -43,6 +43,7 @@ impl<'a> LowerCtx<'a> {
             async_body: false,
             current_super: None,
             class_fields: Vec::new(),
+            private_scopes: Vec::new(),
             static_init: None,
             binding_var: false,
         }
@@ -289,6 +290,45 @@ impl<'a> LowerCtx<'a> {
                 .map_or(IrNode::Undefined, |&local| IrNode::Local(local));
         }
         IrNode::EnvLoad(self.route_env(frame, id))
+    }
+
+    /// Resolve the private name `#x` lexically (DESIGN.md §7.6) to the read
+    /// of its private symbol and its `"#x"` source text.
+    pub(super) fn private_field(&mut self, name: &PrivateName) -> anyhow::Result<(IrNode, JsStr)> {
+        let (frame, penv, slot, text) = self.private_slot(name)?;
+        let env = self.read_hidden(frame, penv);
+        Ok((
+            IrNode::PrivEnvLoad {
+                env: Box::new(env),
+                slot,
+            },
+            text,
+        ))
+    }
+
+    /// The innermost class body declaring `#x`: its frame, the hidden id of
+    /// its `%penv`, the name's slot and its `"#x"` text. A name no enclosing
+    /// class body declares is a spanned error.
+    pub(super) fn private_slot(
+        &self,
+        name: &PrivateName,
+    ) -> anyhow::Result<(usize, u32, u32, JsStr)> {
+        let text = JsStr::from(format!("#{}", name.name));
+        let found = self.private_scopes.iter().rev().find_map(|scope| {
+            scope
+                .names
+                .iter()
+                .find(|(declared, _)| *declared == text)
+                .map(|&(_, kind)| (scope.frame, scope.penv, kind))
+        });
+        let Some((frame, penv, PrivateKind::Field(slot))) = found else {
+            return Err(CompileError::spanned(
+                name.span,
+                format!("private name {text} is not defined"),
+            )
+            .into());
+        };
+        Ok((frame, penv, slot, text))
     }
 
     /// Whether every frame above `frame` is an arrow (so `this` there is the
