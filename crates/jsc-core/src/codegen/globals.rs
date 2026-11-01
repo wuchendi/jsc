@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use swc_ecma_ast::{
     AssignExpr, AssignTarget, BinExpr, BinaryOp, CallExpr, Callee, Class, Constructor, Expr,
     ForHead, Function, GetterProp, Ident, IdentName, MemberExpr, MemberProp, NewExpr, Program,
-    SetterProp, SimpleAssignTarget, Str, UnaryExpr, UnaryOp, UpdateExpr,
+    SetterProp, SimpleAssignTarget, Str, TaggedTpl, UnaryExpr, UnaryOp, UpdateExpr,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -259,6 +259,12 @@ impl Visit for Scan {
         } else {
             call.visit_children_with(self);
         }
+    }
+
+    fn visit_tagged_tpl(&mut self, tagged: &TaggedTpl) {
+        // The template object plus one argument per substitution.
+        self.facts.max_call_args = self.facts.max_call_args.max(tagged.tpl.exprs.len() + 1);
+        tagged.visit_children_with(self);
     }
 
     fn visit_new_expr(&mut self, new: &NewExpr) {

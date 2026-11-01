@@ -313,6 +313,11 @@ fn scan_expr_arity(expr: &Expr) -> usize {
             .map(|e| scan_expr_arity(e))
             .max()
             .unwrap_or(0),
+        // The template object plus one argument per substitution.
+        Expr::TaggedTpl(t) => t.tpl.exprs.iter().map(|e| scan_expr_arity(e)).fold(
+            scan_expr_arity(&t.tag).max(t.tpl.exprs.len() + 1),
+            usize::max,
+        ),
         Expr::Array(a) => a
             .elems
             .iter()

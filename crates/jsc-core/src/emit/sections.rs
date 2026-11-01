@@ -915,6 +915,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
         | IrNode::IsArray(operand)
+        | IrNode::Freeze(operand)
         | IrNode::ToObject(operand)
         | IrNode::ToPropertyKey(operand)
         | IrNode::CellNew(operand)

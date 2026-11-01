@@ -410,6 +410,13 @@ pub(super) fn emit_node(
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.to_object()));
         }
+        IrNode::Freeze(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalTee(scratch + 22));
+            function.instruction(&Instruction::I32Const(INTEGRITY_FROZEN));
+            function.instruction(&Instruction::Call(helpers.set_integrity()));
+            function.instruction(&Instruction::LocalGet(scratch + 22));
+        }
         IrNode::ToPropertyKey(operand) => {
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(1));

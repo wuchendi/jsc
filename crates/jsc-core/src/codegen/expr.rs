@@ -262,9 +262,9 @@ impl LowerCtx<'_> {
                 }),
             },
             // A template literal `` `a${x}b` `` folds into left-associated `+`
-            // concatenations, reusing the string-coercion path. Tagged
-            // templates stay unsupported (handled by the fallback below).
+            // concatenations, reusing the string-coercion path.
             Expr::Tpl(tpl) => self.lower_tpl(tpl),
+            Expr::TaggedTpl(tagged) => self.lower_tagged_tpl(tagged),
             // `this` reads the current function's snapshotted `this` slot,
             // allocated on first use; outside any function (the top-level `main`
             // frame) there is no `this` binding, so it stays unsupported. Inside a
@@ -751,8 +751,8 @@ impl LowerCtx<'_> {
     /// [`IrNode::ThisCall`]).
     fn lower_super_method_call(
         &mut self,
-        call: &swc_ecma_ast::CallExpr,
         super_prop: &SuperPropExpr,
+        args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
         let home = self.super_home(super_prop.span)?;
         let key = self.lower_super_key(super_prop)?;
@@ -764,15 +764,6 @@ impl LowerCtx<'_> {
             None => IrNode::Seq(vec![key, IrNode::Undefined]),
         };
         let (callee, this_local) = self.super_this(method, super_prop.span)?;
-        let mut args = Vec::with_capacity(call.args.len());
-        for arg in &call.args {
-            if arg.spread.is_some() {
-                return Err(
-                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
-                );
-            }
-            args.push(self.lower_expr(&arg.expr)?);
-        }
         // The method is read before the arguments run (ECMA-262 13.3.7.1).
         let (seq, callee) = self.callee_first(callee, &args);
         Ok(seq_then(
@@ -793,7 +784,6 @@ impl LowerCtx<'_> {
     /// computed callee, is an indirect call (`IrNode::CallIndirect`) whose arity
     /// is not checked (the uniform ABI pads/ignores). Spread arguments are out of
     /// scope.
-    #[allow(clippy::too_many_lines)]
     fn lower_call(&mut self, call: &swc_ecma_ast::CallExpr) -> anyhow::Result<IrNode> {
         // `super(..)` — the parent constructor call inside a derived class (E-series).
         if let Callee::Super(sup) = &call.callee {
@@ -810,7 +800,18 @@ impl LowerCtx<'_> {
         }
         // `super.m(..)` — a parent prototype method call inside a derived class.
         if let Expr::SuperProp(super_prop) = callee_expr.as_ref() {
-            return self.lower_super_method_call(call, super_prop);
+            let mut args = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                if arg.spread.is_some() {
+                    return Err(CompileError::spanned(
+                        arg.span(),
+                        "spread arguments are unsupported",
+                    )
+                    .into());
+                }
+                args.push(self.lower_expr(&arg.expr)?);
+            }
+            return self.lower_super_method_call(super_prop, args);
         }
         // A spread argument `f(...a)` makes the call's argument count only
         // known at runtime, so it takes a dedicated lowering path.
@@ -822,11 +823,88 @@ impl LowerCtx<'_> {
         for arg in &call.args {
             args.push(self.lower_expr(&arg.expr)?);
         }
+        self.lower_call_with(callee_expr, args)
+    }
+
+    /// Lower a tagged template `` tag`a${x}b` `` (ECMA-262 13.3.11): a call of
+    /// `tag` — with `this` bound for a member tag, as for `tag(..)` — passing
+    /// the site's template object and then the substitution values, evaluated
+    /// left to right after the tag.
+    fn lower_tagged_tpl(&mut self, tagged: &swc_ecma_ast::TaggedTpl) -> anyhow::Result<IrNode> {
+        // Parentheses keep the Reference: `(o.f)`x`` binds `this = o`.
+        let mut tag = tagged.tag.as_ref();
+        while let Expr::Paren(p) = tag {
+            tag = &p.expr;
+        }
+        let mut args = Vec::with_capacity(tagged.tpl.exprs.len() + 1);
+        args.push(self.template_object(&tagged.tpl));
+        for expr in &tagged.tpl.exprs {
+            args.push(self.lower_expr(expr)?);
+        }
+        if let Expr::SuperProp(super_prop) = tag {
+            return self.lower_super_method_call(super_prop, args);
+        }
+        self.lower_call_with(tag, args)
+    }
+
+    /// The template object of a tagged template site (`GetTemplateObject`):
+    /// a frozen array of the cooked strings (`undefined` for an invalid
+    /// escape) whose non-writable, non-enumerable, non-configurable `raw` is
+    /// the frozen array of the raw strings. It is built on the site's first
+    /// evaluation into the site's own module cell, which holds the TDZ hole
+    /// until then, so every later evaluation yields the same object.
+    fn template_object(&mut self, tpl: &swc_ecma_ast::Tpl) -> IrNode {
+        let site = self.shared.template_cells.get();
+        self.shared.template_cells.set(site + 1);
+        let slot = u32::try_from(self.shared.module_slots.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(site);
+        let cooked = tpl
+            .quasis
+            .iter()
+            .map(|q| {
+                q.cooked.as_ref().map_or(IrNode::Undefined, |c| {
+                    IrNode::Str(c.to_ill_formed_utf16().collect())
+                })
+            })
+            .collect();
+        // The TRV of a line terminator sequence normalizes CR and CRLF to LF.
+        let raw = tpl
+            .quasis
+            .iter()
+            .map(|q| {
+                let text = q.raw.as_ref().replace("\r\n", "\n").replace('\r', "\n");
+                IrNode::Str(JsStr::from(text.as_str()))
+            })
+            .collect();
+        let object = IrNode::Freeze(Box::new(IrNode::DefineProps {
+            obj: Box::new(IrNode::Array(cooked)),
+            local: self.fresh(),
+            entries: vec![(
+                PropKey::Fixed("raw".into()),
+                IrNode::Freeze(Box::new(IrNode::Array(raw))),
+            )],
+        }));
+        IrNode::Ternary {
+            cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
+                IrNode::ModuleCell(slot),
+            ))))),
+            then_branch: Box::new(IrNode::CellSet {
+                cell: Box::new(IrNode::ModuleCell(slot)),
+                value: Box::new(object),
+            }),
+            else_branch: Box::new(IrNode::CellGet(Box::new(IrNode::ModuleCell(slot)))),
+        }
+    }
+
+    /// Lower a call of `callee_expr` (parentheses stripped, not `super.m`)
+    /// with the already lowered, spread-free `args` (see [`Self::lower_call`]).
+    fn lower_call_with(&mut self, callee_expr: &Expr, args: Vec<IrNode>) -> anyhow::Result<IrNode> {
         // `N.m(..)` on an unshadowed builtin namespace (`Math`, `JSON`,
         // `console`, `Object`, `Promise`, `Date`): the inline code, guarded
         // unless `N` is inline (DESIGN.md §6.4); any other member is an
         // ordinary method call on the namespace object.
-        if let Expr::Member(member) = callee_expr.as_ref()
+        if let Expr::Member(member) = callee_expr
             && let Some((namespace, key)) = self.namespace_member(member)
         {
             return self.lower_namespace_call(namespace, key, member, args);
@@ -837,7 +915,7 @@ impl LowerCtx<'_> {
         // `%Promise.prototype%`, `%Date.prototype%` or `%GeneratorPrototype%`
         // builtin: a generic method call with guarded fast paths (DESIGN.md
         // §6.4).
-        if let Expr::Member(member) = callee_expr.as_ref()
+        if let Expr::Member(member) = callee_expr
             && let MemberProp::Ident(id) = &member.prop
             && (ARRAY_METHODS.contains(&id.sym.as_ref())
                 || STRING_METHODS.contains(&id.sym.as_ref())
@@ -850,10 +928,10 @@ impl LowerCtx<'_> {
         // `this = obj` for the call. This must come after the builtin-method
         // checks above (which return early for the recognized names) so only
         // genuine object methods reach here.
-        if let Expr::Member(member) = callee_expr.as_ref() {
+        if let Expr::Member(member) = callee_expr {
             return self.lower_method_call_user(member, args);
         }
-        let Expr::Ident(ident) = callee_expr.as_ref() else {
+        let Expr::Ident(ident) = callee_expr else {
             // A computed callee (e.g. a returned function value) is always an
             // indirect call through the funcref table.
             let callee = self.lower_expr(callee_expr)?;
@@ -2512,7 +2590,6 @@ fn method_not_a_function(obj: &Expr, method: &str) -> CalleeError {
 /// user-facing diagnostic message. Never renders the raw swc AST.
 fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
-        Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
