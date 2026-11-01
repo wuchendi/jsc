@@ -1407,6 +1407,32 @@ pub enum IrNode {
         /// The jsval stored into the slot; also the expression's result.
         value: Box<IrNode>,
     },
+    /// A `super[key]` read (DESIGN.md §7.6): `home.[[Get]](key, this)` — the
+    /// lookup starts at the home object's prototype `home`, and a getter
+    /// found there is called with `this`. Evaluates `this`, `key`, `home` in
+    /// that order, then converts the key (`ToPropertyKey`); codegen guards a
+    /// nullish `home` (an [`IrNode::NullishCheck`]).
+    SuperGet {
+        /// The `this` value (the receiver).
+        this: Box<IrNode>,
+        /// The property key operand.
+        key: Box<IrNode>,
+        /// The home object's prototype, where the lookup starts.
+        home: Box<IrNode>,
+    },
+    /// A `super[key] = value` store, yielding `value`: `home.[[Set]](key,
+    /// value, this)` (`__super_set`, DESIGN.md §6.3). Evaluates `this`, `key`,
+    /// `home`, `value` in that order, then converts the key.
+    SuperSet {
+        /// The `this` value (the receiver).
+        this: Box<IrNode>,
+        /// The property key operand.
+        key: Box<IrNode>,
+        /// The home object's prototype, where the lookup starts.
+        home: Box<IrNode>,
+        /// The stored jsval; also the expression's result.
+        value: Box<IrNode>,
+    },
     /// Compound element assignment `obj[index] op= rhs` (`+=`/`-=`/`*=`/`/=`/`%=`)
     /// on an array element or object member. `obj` and `index` are each
     /// evaluated EXACTLY ONCE into the fresh temp locals `obj_local`/`idx_local`,
@@ -2465,6 +2491,13 @@ impl IrNode {
                 obj, index, rhs, ..
             } => f(obj) || f(index) || f(rhs),
             IrNode::IndexSet { obj, index, value } => f(obj) || f(index) || f(value),
+            IrNode::SuperGet { this, key, home } => f(this) || f(key) || f(home),
+            IrNode::SuperSet {
+                this,
+                key,
+                home,
+                value,
+            } => f(this) || f(key) || f(home) || f(value),
             IrNode::CopyDataProperties {
                 target,
                 source,
@@ -2681,6 +2714,13 @@ impl IrNode {
                 obj, index, rhs, ..
             } => vec![&mut **obj, &mut **index, &mut **rhs],
             IrNode::IndexSet { obj, index, value } => vec![&mut **obj, &mut **index, &mut **value],
+            IrNode::SuperGet { this, key, home } => vec![&mut **this, &mut **key, &mut **home],
+            IrNode::SuperSet {
+                this,
+                key,
+                home,
+                value,
+            } => vec![&mut **this, &mut **key, &mut **home, &mut **value],
             IrNode::CopyDataProperties {
                 target,
                 source,
