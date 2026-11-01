@@ -14,7 +14,7 @@
 //!   function first) and `__define` (`CreateDataProperty` / accessor install,
 //!   growing the table), and `__fn_materialize`;
 //! - the algorithms `__get`, `__set`, `__has`, `__delete`, `__own_keys`,
-//!   `__for_in_keys`, and `__rest`.
+//!   `__for_in_keys`, and `__copy_data`.
 //!
 //! The compile-time half — the initial intern table holding every static
 //! string — is built by [`intern_table`] and laid into the data segment.
@@ -2575,26 +2575,21 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
     f
 }
 
-/// `__rest(src: i64, excl: i64) -> i64`: the object-rest copy
-/// (`CopyDataProperties`) — a fresh object defining each own enumerable
-/// property of `src` (string keys in own-key order, then symbol keys) whose
-/// key is not an element of the `excl` array of property keys. An object
-/// source re-checks each key as own and enumerable when visited (a getter may
-/// delete or hide a later key); a string's indices are always enumerable.
-pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
+/// `__copy_data(dst: i64, src: i64, excl: i64) -> i64`: `CopyDataProperties`
+/// (ECMA-262 7.3.25) — defines (`CreateDataProperty`) on the object `dst`
+/// each own enumerable property of `src` (string keys in own-key order, then
+/// symbol keys) whose key is not an element of the `excl` array of property
+/// keys, reading each value through `[[Get]]` (a getter runs), and returns
+/// `dst`. A primitive or nullish `src` has no own keys except a string's
+/// indices. An object source re-checks each key as own and enumerable when
+/// visited (a getter may delete or hide a later key); a string's indices are
+/// always enumerable.
+pub(super) fn emit_copy_data(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(8, ValType::I32), (1, ValType::I64)]);
-    let (src, excl) = (0, 1);
-    let (dst, ks, n, i, x, j, m, obj) = (2, 3, 4, 5, 6, 7, 8, 9);
-    let k = 10;
-    wasm!(f;
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(dst),
-    );
-    emit_object_prefix(
-        &mut f,
-        dst,
-        TYPE_OBJECT,
-        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
-    );
+    let (out, src, excl) = (0, 1, 2);
+    let (dst, ks, n, i, x, j, m, obj) = (3, 4, 5, 6, 7, 8, 9, 10);
+    let k = 11;
+    wasm!(f; LocalGet(out), I32WrapI64, LocalSet(dst));
     emit_is_object(&mut f, src);
     wasm!(f;
         LocalSet(obj),
@@ -2629,9 +2624,8 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
-        LocalGet(dst),
+        LocalGet(out),
+        End,
     );
-    emit_box_heap(&mut f);
-    wasm!(f; End);
     f
 }

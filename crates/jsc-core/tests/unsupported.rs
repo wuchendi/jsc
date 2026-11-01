@@ -9,13 +9,6 @@ use common::{assert_rejected, assert_uncaught};
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rejects_spread() {
-    // Call-argument and array-literal spread are supported; only
-    // object spread remains out of scope.
-    assert_rejected("let o = { a: 1 }; let p = { ...o }; p.a");
-}
-
-#[test]
 fn rejects_unsupported_for_of_and_for_in() {
     // A bare-identifier `for-of` head and a statically non-enumerable
     // `for-in` head still trap (a non-iterable `for-of` source is a run-time

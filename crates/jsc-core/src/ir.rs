@@ -1332,14 +1332,20 @@ pub enum IrNode {
         /// The entries, in definition order.
         entries: Vec<(PropKey, IrNode)>,
     },
-    /// An object rest binding `let {a, ...rest} = obj`. Builds a NEW heap
-    /// object holding every own key of `source` EXCEPT the statically-known
-    /// destructured keys in `exclude`. `source` is evaluated once (a hidden temp
-    /// read); `exclude` is an [`IrNode::Array`] of [`IrNode::Str`] key names. It
-    /// lowers to the `__rest` runtime helper, which defines every own enumerable
-    /// property of the source whose key is not excluded on a fresh object.
-    ObjectRest {
-        /// The source object being spread (a heap object jsval, evaluated once).
+    /// `CopyDataProperties(target, source, exclude)` (ECMA-262 7.3.25): an
+    /// object spread `{...source}` (into the literal under construction, an
+    /// empty `exclude`) or an object rest `let {a, ...rest} = obj` (into a
+    /// fresh ordinary object, `exclude` the statically-known destructured
+    /// keys). Evaluates `target`, `source`, then `exclude` (an
+    /// [`IrNode::Array`] of [`IrNode::Str`] key names), and lowers to the
+    /// `__copy_data` runtime helper, which defines on `target` every own
+    /// enumerable string then symbol property of `source` whose key is not
+    /// excluded (a getter runs; a nullish or primitive non-string source
+    /// copies nothing); yields `target`.
+    CopyDataProperties {
+        /// The object receiving the properties.
+        target: Box<IrNode>,
+        /// The source value being copied.
         source: Box<IrNode>,
         /// The excluded keys — an [`IrNode::Array`] of [`IrNode::Str`] names.
         exclude: Box<IrNode>,
@@ -2415,10 +2421,6 @@ impl IrNode {
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }
             | IrNode::GenResume { handle: a, sent: b }
-            | IrNode::ObjectRest {
-                source: a,
-                exclude: b,
-            }
             | IrNode::Index { obj: a, index: b }
             | IrNode::MakeAccessor {
                 getter: a,
@@ -2434,6 +2436,11 @@ impl IrNode {
                 obj, index, rhs, ..
             } => f(obj) || f(index) || f(rhs),
             IrNode::IndexSet { obj, index, value } => f(obj) || f(index) || f(value),
+            IrNode::CopyDataProperties {
+                target,
+                source,
+                exclude,
+            } => f(target) || f(source) || f(exclude),
             IrNode::Ternary {
                 cond,
                 then_branch,
@@ -2626,10 +2633,6 @@ impl IrNode {
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }
             | IrNode::GenResume { handle: a, sent: b }
-            | IrNode::ObjectRest {
-                source: a,
-                exclude: b,
-            }
             | IrNode::Index { obj: a, index: b }
             | IrNode::MakeAccessor {
                 getter: a,
@@ -2645,6 +2648,11 @@ impl IrNode {
                 obj, index, rhs, ..
             } => vec![&mut **obj, &mut **index, &mut **rhs],
             IrNode::IndexSet { obj, index, value } => vec![&mut **obj, &mut **index, &mut **value],
+            IrNode::CopyDataProperties {
+                target,
+                source,
+                exclude,
+            } => vec![&mut **target, &mut **source, &mut **exclude],
             IrNode::Ternary {
                 cond,
                 then_branch,

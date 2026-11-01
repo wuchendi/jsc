@@ -1701,8 +1701,10 @@ impl LowerCtx<'_> {
     /// string keys are static, computed and numeric keys are converted at run
     /// time. A getter/setter (`get x(){..}` / `set x(v){..}`) defines an
     /// accessor property; a getter and setter sharing a static key share one
-    /// accessor entry. Spread and async/generator methods are rejected with
-    /// spans.
+    /// accessor entry. A spread `{...o}` is `CopyDataProperties` from `o` in
+    /// source order: from the first spread on, the literal is built
+    /// incrementally on a temp (each later entry run, spread, and
+    /// `__proto__` entry applied in order).
     ///
     /// # Errors
     ///
@@ -1712,20 +1714,21 @@ impl LowerCtx<'_> {
         let mut entries = Vec::with_capacity(obj.props.len());
         // The `__proto__: v` entry: the entry count before it and `v`.
         let mut proto = None;
+        // From the first spread on: the object temp and the steps applied to it.
+        let mut built: Option<(u32, Vec<IrNode>)> = None;
         for prop in &obj.props {
             let prop = match prop {
                 PropOrSpread::Prop(prop) => prop,
-                PropOrSpread::Spread(_) => {
-                    return Err(CompileError::spanned(
-                        prop.span(),
-                        "spread object properties are unsupported",
-                    )
-                    .into());
+                PropOrSpread::Spread(spread) => {
+                    let source = self.lower_expr(&spread.expr)?;
+                    self.push_spread_entry(source, &mut built, &mut entries, &mut proto);
+                    continue;
                 }
             };
             match prop.as_ref() {
                 Prop::KeyValue(kv) if is_proto_key(&kv.key) => {
-                    proto = Some((entries.len(), self.lower_expr(&kv.value)?));
+                    let value = self.lower_expr(&kv.value)?;
+                    self.push_proto_entry(value, &mut built, &mut entries, &mut proto);
                 }
                 Prop::KeyValue(kv) => {
                     let key = self.lower_prop_key(&kv.key)?;
@@ -1808,10 +1811,113 @@ impl LowerCtx<'_> {
                 }
             }
         }
+        Ok(self.finish_object_literal(built, entries, proto))
+    }
+
+    /// The object literal from its collected parts: the incrementally built
+    /// object's steps (any pending `entries` flushed) yielding the object, else
+    /// the static literal with any pending `__proto__` entry.
+    fn finish_object_literal(
+        &mut self,
+        built: Option<(u32, Vec<IrNode>)>,
+        mut entries: Vec<(PropKey, IrNode)>,
+        proto: Option<(usize, IrNode)>,
+    ) -> IrNode {
+        if let Some((obj_local, mut steps)) = built {
+            self.flush_object_entries(obj_local, &mut entries, &mut steps);
+            steps.push(IrNode::Local(obj_local));
+            return IrNode::Seq(steps);
+        }
         let Some((at, value)) = proto else {
-            return Ok(literal_object(entries));
+            return literal_object(entries);
         };
-        Ok(self.with_proto_entry(entries, at, value))
+        self.with_proto_entry(entries, at, value)
+    }
+
+    /// Apply an object-literal spread `{...source}` (`CopyDataProperties`) in
+    /// order to the incrementally built object.
+    fn push_spread_entry(
+        &mut self,
+        source: IrNode,
+        built: &mut Option<(u32, Vec<IrNode>)>,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        proto: &mut Option<(usize, IrNode)>,
+    ) {
+        let (obj_local, steps) = self.incremental_object(built, entries, proto);
+        steps.push(IrNode::CopyDataProperties {
+            target: Box::new(IrNode::Local(obj_local)),
+            source: Box::new(source),
+            exclude: Box::new(IrNode::Array(Vec::new())),
+        });
+    }
+
+    /// Record an object-literal `__proto__: value` entry: pending (`proto`,
+    /// after the entries so far) while the literal is static, else a
+    /// prototype set applied in order to the incrementally built object.
+    fn push_proto_entry(
+        &mut self,
+        value: IrNode,
+        built: &mut Option<(u32, Vec<IrNode>)>,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        proto: &mut Option<(usize, IrNode)>,
+    ) {
+        if built.is_none() {
+            *proto = Some((entries.len(), value));
+            return;
+        }
+        let (obj_local, steps) = self.incremental_object(built, entries, proto);
+        let proto_local = self.fresh();
+        steps.push(IrNode::Assign {
+            local: proto_local,
+            value: Box::new(value),
+        });
+        steps.push(set_proto_if_valid(obj_local, proto_local));
+    }
+
+    /// The incrementally built object literal (see [`Self::lower_object`]):
+    /// its temp and steps, with the pending `entries` flushed onto it. On the
+    /// first call (`built` empty) the temp is assigned the literal so far —
+    /// the drained `entries` and any pending `__proto__` entry.
+    fn incremental_object<'b>(
+        &mut self,
+        built: &'b mut Option<(u32, Vec<IrNode>)>,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        proto: &mut Option<(usize, IrNode)>,
+    ) -> (u32, &'b mut Vec<IrNode>) {
+        if let Some((obj_local, steps)) = built {
+            self.flush_object_entries(*obj_local, entries, steps);
+            return (*obj_local, steps);
+        }
+        let obj_local = self.fresh();
+        let entries = std::mem::take(entries);
+        let init = match proto.take() {
+            Some((at, value)) => self.with_proto_entry(entries, at, value),
+            None => literal_object(entries),
+        };
+        let assign = IrNode::Assign {
+            local: obj_local,
+            value: Box::new(init),
+        };
+        let (obj_local, steps) = built.insert((obj_local, vec![assign]));
+        (*obj_local, steps)
+    }
+
+    /// Append to `steps` the definition of the pending object-literal
+    /// `entries` (drained) on the object in `obj_local`, if there are any.
+    fn flush_object_entries(
+        &mut self,
+        obj_local: u32,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        steps: &mut Vec<IrNode>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        steps.push(IrNode::DefineProps {
+            obj: Box::new(IrNode::Local(obj_local)),
+            local: self.fresh(),
+            entries: std::mem::take(entries),
+        });
     }
 
     /// A computed object-literal key whose entry is a function value named by
@@ -1886,22 +1992,7 @@ impl LowerCtx<'_> {
     ) -> IrNode {
         let after = entries.split_off(at);
         let (obj_local, proto_local) = (self.fresh(), self.fresh());
-        let set_proto = IrNode::Ternary {
-            cond: Box::new(IrNode::Logical {
-                op: LogicalOp::Or,
-                lhs: Box::new(IrNode::IsObject(Box::new(IrNode::Local(proto_local)))),
-                rhs: Box::new(IrNode::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(IrNode::Local(proto_local)),
-                    rhs: Box::new(IrNode::Null),
-                }),
-            }),
-            then_branch: Box::new(IrNode::SetProto {
-                obj: Box::new(IrNode::Local(obj_local)),
-                proto: Box::new(IrNode::Local(proto_local)),
-            }),
-            else_branch: Box::new(IrNode::Local(obj_local)),
-        };
+        let set_proto = set_proto_if_valid(obj_local, proto_local);
         let assign = |local, value| IrNode::Assign {
             local,
             value: Box::new(value),
@@ -2286,6 +2377,28 @@ fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
 }
 
 /// An ordinary object literal of `entries`.
+/// Set the [[Prototype]] of the object in `obj_local` to the `__proto__`
+/// entry value in `proto_local` when it is an object or `null` (ECMA-262
+/// B.3.1); yields the object either way.
+fn set_proto_if_valid(obj_local: u32, proto_local: u32) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(IrNode::Logical {
+            op: LogicalOp::Or,
+            lhs: Box::new(IrNode::IsObject(Box::new(IrNode::Local(proto_local)))),
+            rhs: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Local(proto_local)),
+                rhs: Box::new(IrNode::Null),
+            }),
+        }),
+        then_branch: Box::new(IrNode::SetProto {
+            obj: Box::new(IrNode::Local(obj_local)),
+            proto: Box::new(IrNode::Local(proto_local)),
+        }),
+        else_branch: Box::new(IrNode::Local(obj_local)),
+    }
+}
+
 fn literal_object(entries: Vec<(PropKey, IrNode)>) -> IrNode {
     IrNode::Object {
         entries,
