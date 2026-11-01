@@ -596,7 +596,10 @@ fn emit_fn_data(
     let anonymous = offsets.get("").copied().unwrap_or(HEAP_BASE);
     let function_proto = realm::intrinsic_addr_bits(layout.realm, Intrinsic::FunctionPrototype);
     for (index, func) in (0u32..).zip(functions) {
-        let name = offsets.get(&func.info.name).copied().unwrap_or(HEAP_BASE);
+        let name = offsets
+            .get_str(&func.info.name)
+            .copied()
+            .unwrap_or(HEAP_BASE);
         info.extend_from_slice(&name.to_le_bytes());
         info.extend_from_slice(&func.info.length.to_le_bytes());
         blocks.extend_from_slice(&[abi::TYPE_FUNCTION, 0, fn_flags(func.info.kind), 0]);
@@ -664,9 +667,11 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
         .chain(convert::strings())
         .chain([STACK_KEY])
         .chain(FN_KEYS);
-    let names = program.functions.iter().map(|f| f.info.name.as_str());
-    for text in realm_strs.map(|s| -> &str { s }).chain(names) {
+    for text in realm_strs {
         strs.add(text);
+    }
+    for func in &program.functions {
+        strs.add_units(&func.info.name);
     }
     // The namespace builtins' IR bodies.
     for fragment in &fragments {

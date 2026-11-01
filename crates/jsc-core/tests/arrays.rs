@@ -259,3 +259,29 @@ fn array_slice() {
     assert_number("[1,2,3,4].slice(1).length", 3.0);
     assert_number("[1,2,3].slice(0,0).length", 0.0);
 }
+
+/// `%Array.prototype%` is an Array exotic object: `IsArray` is true, its own
+/// `length` is 0 and tracks element writes, and an element written to it is
+/// seen through the holes of every array, inline fast paths included.
+#[test]
+fn array_prototype_is_an_array() {
+    assert_bool("Array.isArray(Array.prototype)", true);
+    assert_number("Array.prototype.length", 0.0);
+    assert_string(
+        "Object.prototype.toString.call(Array.prototype)",
+        "[object Array]",
+    );
+    assert_string(
+        "JSON.stringify(Object.getOwnPropertyDescriptor(Array.prototype, 'length'))",
+        "{\"value\":0,\"writable\":true,\"enumerable\":false,\"configurable\":false}",
+    );
+    assert_string(
+        "Array.prototype.push(5); Array.prototype.length + ',' + Array.prototype[0]",
+        "1,5",
+    );
+    assert_string("Array.prototype[1] = 'x'; [0, , 2][1]", "x");
+    assert_string(
+        "Array.prototype[1] = 'x'; [0, , 2].map(v => v).join()",
+        "0,x,2",
+    );
+}

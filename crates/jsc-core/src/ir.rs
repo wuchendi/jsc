@@ -2094,7 +2094,7 @@ pub struct IrFunction {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FnInfo {
     /// The `name` property (`""` for an anonymous function).
-    pub name: String,
+    pub name: JsStr,
     /// The `length` property: the parameters before the first default or rest.
     pub length: u32,
     /// What the function constructs.

@@ -47,10 +47,10 @@ impl LowerCtx<'_> {
                     .collect::<anyhow::Result<_>>()?,
             )),
             // An arrow function lifts to a top-level function value.
-            Expr::Arrow(arrow) => self.lower_arrow(arrow, ""),
+            Expr::Arrow(arrow) => self.lower_arrow(arrow, &JsStr::default()),
             // A function expression `function (..) { .. }` lifts the same way as
             // an arrow, e.g. a closure factory's `return function(){ .. }`.
-            Expr::Fn(fn_expr) => self.lower_fn_expr(fn_expr, ""),
+            Expr::Fn(fn_expr) => self.lower_fn_expr(fn_expr, &JsStr::default()),
             Expr::Assign(assign) => self.lower_assign(assign),
             Expr::Update(update) => self.lower_update(update),
             Expr::Call(call) => self.lower_call(call),
@@ -294,8 +294,10 @@ impl LowerCtx<'_> {
             // A class expression; an anonymous one has the empty name here
             // (`lower_named_expr` names it after its binding).
             Expr::Class(class_expr) => match &class_expr.ident {
-                Some(id) => self.lower_class(&class_expr.class, id.sym.as_ref(), true, None),
-                None => self.lower_class(&class_expr.class, "", false, None),
+                Some(id) => {
+                    self.lower_class(&class_expr.class, &JsStr::from(id.sym.as_ref()), true, None)
+                }
+                None => self.lower_class(&class_expr.class, &JsStr::default(), false, None),
             },
             // `new.target`: the enclosing non-arrow function's snapshot; outside
             // any function it is a SyntaxError.
@@ -545,16 +547,14 @@ impl LowerCtx<'_> {
         &mut self,
         expr: &Expr,
         key: &JsStr,
-        span: Span,
     ) -> anyhow::Result<IrNode> {
         if !is_anonymous_definition(expr) {
             return self.lower_expr(expr);
         }
-        let name = key_fn_name(key, span)?;
-        self.lower_named_expr(expr, &name)
+        self.lower_named_expr(expr, key)
     }
 
-    pub(super) fn lower_named_expr(&mut self, expr: &Expr, name: &str) -> anyhow::Result<IrNode> {
+    pub(super) fn lower_named_expr(&mut self, expr: &Expr, name: &JsStr) -> anyhow::Result<IrNode> {
         match expr {
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
             Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
@@ -573,7 +573,7 @@ impl LowerCtx<'_> {
     fn lower_fn_expr(
         &mut self,
         fn_expr: &swc_ecma_ast::FnExpr,
-        name: &str,
+        name: &JsStr,
     ) -> anyhow::Result<IrNode> {
         let function = &fn_expr.function;
         let Some(ident) = &fn_expr.ident else {
@@ -582,12 +582,12 @@ impl LowerCtx<'_> {
         let name = ident.sym.as_ref();
         let id = ident.span.lo.0;
         if !(function.is_generator || function.is_async) || !self.shared.captured.contains(&id) {
-            return self.lower_function_value(function, name);
+            return self.lower_function_value(function, &JsStr::from(name));
         }
         self.push_scope();
         let local = self.declare(name, false, id);
         let env_slot = self.env_slot_for_local(local);
-        let value = self.lower_function_value(function, name);
+        let value = self.lower_function_value(function, &JsStr::from(name));
         self.pop_scope();
         let value = value?;
         // In a generator frame the cell is a pre-created frame cell.
@@ -1460,7 +1460,7 @@ impl LowerCtx<'_> {
                     .into());
                 }
                 let rhs = if compound_op.is_none() {
-                    self.lower_named_expr(&assign.right, name)?
+                    self.lower_named_expr(&assign.right, &JsStr::from(name))?
                 } else {
                     self.lower_expr(&assign.right)?
                 };
@@ -1726,8 +1726,7 @@ impl LowerCtx<'_> {
                     let key = self.lower_prop_key(&kv.key)?;
                     let entry = match key {
                         PropKey::Static(name) => {
-                            let value =
-                                self.lower_key_named_expr(&kv.value, &name, kv.key.span())?;
+                            let value = self.lower_key_named_expr(&kv.value, &name)?;
                             (PropKey::Static(name), value)
                         }
                         key if is_anonymous_definition(&kv.value) => {
@@ -1753,7 +1752,7 @@ impl LowerCtx<'_> {
                 Prop::Method(method) => {
                     let key = self.lower_prop_key(&method.key)?;
                     let (key, named) = self.computed_name_key(key);
-                    let name = static_key_name(&key, method.key.span())?;
+                    let name = static_key_name(&key);
                     let value = self.lower_method(&method.function, &name)?;
                     entries.push((key, self.set_computed_name(value, named, "")));
                 }
@@ -1767,7 +1766,7 @@ impl LowerCtx<'_> {
                         .ok_or_else(|| anyhow!("getter requires a body"))?;
                     let param_pats: Vec<&Pat> =
                         getter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = format!("get {}", static_key_name(&key, getter.key.span())?);
+                    let name = prefixed_name("get ", &static_key_name(&key));
                     let value = self.lower_lifted_function(
                         &param_pats,
                         BodyKind::Block(&block.stmts),
@@ -1787,7 +1786,7 @@ impl LowerCtx<'_> {
                         .ok_or_else(|| anyhow!("setter requires a body"))?;
                     let param_pats: Vec<&Pat> =
                         setter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = format!("set {}", static_key_name(&key, setter.key.span())?);
+                    let name = prefixed_name("set ", &static_key_name(&key));
                     let value = self.lower_lifted_function(
                         &param_pats,
                         BodyKind::Block(&block.stmts),
@@ -1860,7 +1859,7 @@ impl LowerCtx<'_> {
     ) -> anyhow::Result<IrNode> {
         match expr {
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
-                self.lower_class(&class_expr.class, "", false, Some(key))
+                self.lower_class(&class_expr.class, &JsStr::default(), false, Some(key))
             }
             _ if is_anonymous_function(expr) => {
                 let value = self.lower_expr(expr)?;
@@ -2439,12 +2438,10 @@ pub(super) fn is_anonymous_definition(expr: &Expr) -> bool {
 /// The compile-time name of a static property key (`""` for a computed key,
 /// whose name is set at run time instead, [`IrNode::SetFunctionName`]): the
 /// `name` given to a method or accessor defined under it.
-fn static_key_name(key: &PropKey, span: Span) -> anyhow::Result<String> {
+fn static_key_name(key: &PropKey) -> JsStr {
     match key {
-        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => {
-            key_fn_name(name, span)
-        }
-        PropKey::Computed(_) | PropKey::HiddenComputed(_) => Ok(String::new()),
+        PropKey::Static(name) | PropKey::Hidden(name) | PropKey::Fixed(name) => name.clone(),
+        PropKey::Computed(_) | PropKey::HiddenComputed(_) => JsStr::default(),
     }
 }
 

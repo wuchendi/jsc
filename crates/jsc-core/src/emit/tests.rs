@@ -914,7 +914,7 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
     let arr = usize::try_from(arr).expect("base");
     assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
     assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
-    // `proto` = `%Array.prototype%`, an ordinary object.
+    // `proto` = `%Array.prototype%`.
     assert_eq!(
         mem[arr + 14..arr + 16],
         [0xFD, 0x7F],
@@ -1001,10 +1001,16 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
             function_proto(&memory, proto);
         } else {
             // Arrays, Map/Set, promises and dates inherit from their realm
-            // prototype, generators from %Object.prototype%: an ordinary object.
+            // prototype, generators from %Object.prototype%: an ordinary
+            // object, except %Array.prototype%, itself an array.
             assert_eq!((proto >> 48) & 0b111, 0b101, "{src}: proto is a heap block");
             let at = usize::try_from(proto & 0xFFFF_FFFF).expect("base");
-            assert_eq!(memory[at], TYPE_OBJECT, "{src}: proto");
+            let proto_kind = if kind == TYPE_ARRAY {
+                TYPE_ARRAY
+            } else {
+                TYPE_OBJECT
+            };
+            assert_eq!(memory[at], proto_kind, "{src}: proto");
         }
         (base, memory)
     };

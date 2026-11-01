@@ -168,7 +168,7 @@ jsc/
 `default-features = false` leaves frontend + codegen + emit only. Dependencies:
 `swc_ecma_parser 46`, `swc_ecma_ast 29`, `swc_ecma_visit 29`, `swc_common 26`,
 `swc_ecma_transforms_base 50`, `swc_ecma_transforms_typescript 56`,
-`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 49`; `wasmparser 0.262` is
+`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 50`; `wasmparser 0.262` is
 a dev-dependency.
 
 **`jsc`.** A thin `clap` shell (§9). `#![forbid(unsafe_code)]`.
@@ -992,8 +992,10 @@ out by `emit/realm.rs` from one registry of `(intrinsic, key, attrs, value)`
 entries (`key` is an interned string or a well-known symbol; `value` is a
 builtin method, a string, a number, `undefined`, another intrinsic, a
 well-known symbol, or an accessor pair). Each intrinsic is an object-family
-block (a `TYPE_FUNCTION` block when callable) followed by a full `TYPE_PROPS`
-table (flagged `PROPS_HAS_SYMBOL_KEYS` when it holds a symbol key); then one
+block (a `TYPE_FUNCTION` block when callable; `%Array.prototype%` is a
+`TYPE_ARRAY` handle in dictionary mode, `length` 0 and no store, so it is an
+Array exotic object whose element writes land in its watched table) followed
+by a full `TYPE_PROPS` table (flagged `PROPS_HAS_SYMBOL_KEYS` when it holds a symbol key); then one
 static `LAZY` `TYPE_FUNCTION` block per builtin method (`env = undefined`,
 `func_idx` = its builtin table slot); then one static `TYPE_ACCESSOR` block
 per accessor entry; then the 13 well-known symbols as static `TYPE_SYMBOL`
@@ -1982,8 +1984,8 @@ Errors are printed to stderr.
   | `968dd97` | 19243 | 30014 | 47665 |
   | `eee36ef` | 19378 | 30014 | 47665 |
 
-  The current metric is its last row: **23684 / 32889 eligible tests pass
-  (≈ 72.0 %)**; `baseline.txt` holds the same 23684 paths. The drop in
+  The current metric is its last row: **23688 / 32889 eligible tests pass
+  (≈ 72.0 %)**; `baseline.txt` holds the same 23688 paths. The drop in
   rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
   `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
   (1413 pass).
@@ -2123,10 +2125,8 @@ Each item below is current behaviour of this tree.
 - Strings are Latin-1 / UTF-16 code units (§5.2): `.length`, indexing,
   comparison and every guest `String.prototype` method are exact for any
   text, lone surrogates included. `localeCompare` is code-unit order, not
-  locale collation, and the `toLocale*Case` methods use no locale data; a
-  key with a lone surrogate cannot name a function (a method, accessor or
-  anonymous function under it is a compile error: function names are host
-  text); there are no ropes, so `s = s + x` in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
+  locale collation, and the `toLocale*Case` methods use no locale data;
+  there are no ropes, so `s = s + x` in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
   pattern as RegExp source: a pattern with RegExp syntax throws a
   `TypeError`, and `matchAll` (a RegExp string iterator) always throws one.
 - No `void`.
@@ -2158,30 +2158,28 @@ Each item below is current behaviour of this tree.
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the
   `RangeError` first); every other `Array.prototype` method uses the full
   `ToLength` range.
-- `Array.prototype`, `String.prototype` and `Number.prototype` are ordinary
-  objects, not an array / `String` / `Number` exotic object:
-  `Array.isArray(Array.prototype)` is `false`, `Array.prototype.length` is
-  `undefined`, `String.prototype.valueOf()` throws `TypeError`, and
-  `Object.prototype.toString.call(Number.prototype)` is `"[object Object]"`.
-- The remaining test262 failures of the phase-3 built-in families (after
-  element reads through the prototype chain, L2-V T3, and `var` hoisting /
-  global declarations, L2-V T1: 514 of built-ins/{Array 174, String 191,
-  Function 135, Math 9, Number 5}; NativeErrors and AggregateError have
-  none; counted at `eee36ef`, before `Symbol`, the iteration protocol and
-  UTF-16 strings, which fixed the 88 failures those causes accounted for),
-  by cause and owner:
+- `String.prototype` and `Number.prototype` are ordinary objects, not a
+  `String` / `Number` exotic object: `String.prototype.valueOf()` throws
+  `TypeError`, and `Object.prototype.toString.call(Number.prototype)` is
+  `"[object Object]"`.
+- The remaining test262 failures of the phase-3 built-in families (413 of
+  built-ins/{Array 78, String 194, Function 134, Math 1, Number 5,
+  AggregateError 1}; NativeErrors has none; counted at `74daeeb` from the CI
+  per-test results), by cause and owner:
 
-  | cause | owner | Array | String | Function | Math | Number |
-  |---|---|---|---|---|---|---|
-  | `RegExp` | never in phase 3 | 26 | 95 | 3 | | |
-  | `Function` constructor | never in phase 3 | | 3 | 117 | | |
-  | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 16 | 12 | 3 | 1 | |
-  | builtin prototypes are not exotic (above) | object model | 4 | 3 | | | 4 |
-  | `asyncTest` used by a test without the `async` flag | L2-R (runner) | 67 | | | | |
-  | `nativeFunctionMatcher.js` harness | L2-R (runner) | | | 1 | | |
-  | `void` | L2-L | 5 | 36 | 7 | | 1 |
-  | tagged templates, `for-in` heads (and `yield*` in async generators, since fixed) | L2-L | 4 | 4 | | | |
-  | strict `caller` access (`15.3.5.4_2-11gs`, `caller/prop-desc`) | — | | | 2 | | |
+  | cause | owner | Array | String | Function | Math | Number | AggregateError |
+  |---|---|---|---|---|---|---|---|
+  | `RegExp` | never in phase 3 | 28 | 128 | 3 | | | |
+  | `Function` constructor | never in phase 3 | | 4 | 115 | | | 1 |
+  | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 21 | 18 | 4 | 1 | | |
+  | `void` | language | 12 | 36 | 10 | | 1 | |
+  | thenables are not assimilated (`Array.fromAsync`, below) | async | 14 | | | | | |
+  | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
+  | tagged templates, `for-in` heads | language | 2 | 4 | | | | |
+  | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
+  | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
+  | CR line terminators hide the frontmatter `includes` (`nativeFunctionMatcher.js`) | runner | | | 1 | | | |
+  | `localeCompare` canonical equivalence (code-unit order, above) | — | | 1 | | | | |
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
   property table, so element access on a large frozen or attributed array is
   `O(n)`; the renderers print an accessor element as `undefined` and omit a

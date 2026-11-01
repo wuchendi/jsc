@@ -203,3 +203,37 @@ fn string_wrapper_index_is_read_only() {
     assert_bool("Object.isFrozen(Object.freeze(new String(\"ab\")))", true);
     assert_bool("Object.isSealed(Object.seal(new String(\"ab\")))", true);
 }
+
+/// A key with a lone surrogate names the method, accessor, class or anonymous
+/// function defined under it, code unit for code unit.
+#[test]
+fn lone_surrogate_keys_name_functions() {
+    assert_bool(
+        r#"var o = {"\ud800"(){}}; o["\ud800"].name === "\ud800""#,
+        true,
+    );
+    assert_bool(
+        r#"var o = {get "\udc00x"(){ return 1 }}; Object.getOwnPropertyDescriptor(o, "\udc00x").get.name === "get \udc00x""#,
+        true,
+    );
+    assert_bool(
+        r#"var o = {"\ud800": () => 1}; o["\ud800"].name === "\ud800""#,
+        true,
+    );
+    assert_bool(
+        r#"var o = {"\ud800": class {}}; o["\ud800"].name === "\ud800""#,
+        true,
+    );
+    assert_bool(
+        r#"class A { static "\udc00"(){} }; A["\udc00"].name === "\udc00""#,
+        true,
+    );
+    assert_number(
+        r#"class B { "\ud83d"(){} }; B.prototype["\ud83d"].name.charCodeAt(0)"#,
+        55357.0,
+    );
+    assert_bool(
+        r#"var o = {"\ud800": class {}}; try { o["\ud800"]() } catch (e) { e.message === "Class constructor \ud800 cannot be invoked without 'new'" }"#,
+        true,
+    );
+}

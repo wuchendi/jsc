@@ -45,17 +45,13 @@ pub(super) fn lit_str(s: &swc_ecma_ast::Str) -> JsStr {
     s.value.to_ill_formed_utf16().collect()
 }
 
-/// The function `name` a static property key gives the method or anonymous
-/// definition under it. Function names are Rust strings, so a key with a lone
-/// surrogate is a spanned compile error (correct-or-throw).
-pub(super) fn key_fn_name(key: &JsStr, span: swc_common::Span) -> anyhow::Result<String> {
-    key.to_rust_string().ok_or_else(|| {
-        CompileError::spanned(
-            span,
-            "unsupported function name: a key with a lone surrogate cannot name a function",
-        )
-        .into()
-    })
+/// `prefix` followed by `name` (the `name` of an accessor half, `"get "` /
+/// `"set "` + its key), code unit for code unit.
+pub(super) fn prefixed_name(prefix: &str, name: &JsStr) -> JsStr {
+    prefix
+        .encode_utf16()
+        .chain(name.as_units().iter().copied())
+        .collect()
 }
 
 /// Lower a parsed [`Program`] into an [`IrProgram`].
