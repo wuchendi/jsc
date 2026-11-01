@@ -329,8 +329,12 @@ impl LowerCtx<'_> {
     /// evaluation into `%penv` (DESIGN.md §7.6): instance ones are added with
     /// the public fields, in source order, static ones with the static fields.
     ///
+    /// A static block (`static { .. }`) is a lifted zero-parameter method
+    /// called with `this` = the class at its source position among the static
+    /// fields (DESIGN.md §7.6).
+    ///
     /// Out-of-scope forms are rejected WITH SPANS: decorators, private
-    /// methods and accessors, static blocks.
+    /// methods and accessors.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_class(
         &mut self,
@@ -346,8 +350,9 @@ impl LowerCtx<'_> {
         }
 
         // Collect the (at most one) constructor, the methods and accessors
-        // (instance or static), and the fields (public or private, held as
-        // their `ClassMember`); every other member is out of scope. Each
+        // (instance or static), the fields (public or private, held as their
+        // `ClassMember`) and the static blocks (with the static fields, in
+        // source order); every other member is out of scope. Each
         // member is held with its index in the body, which keys its computed
         // name (`keys`, below). A private field's slot in `%penv` follows the
         // class value and brand slots, in declaration order.
@@ -402,6 +407,7 @@ impl LowerCtx<'_> {
                         field_props.push((i, member));
                     }
                 }
+                ClassMember::StaticBlock(_) => static_fields.push((i, member)),
                 // A stray `;` in the class body binds nothing — harmless.
                 ClassMember::Empty(_) => {}
                 other => return Err(reject_class_member(other)),
@@ -660,7 +666,10 @@ impl LowerCtx<'_> {
 
         // Static fields, in source order, defined (CreateDataProperty, or
         // PrivateFieldAdd for a private one) once the class value and its inner
-        // binding exist; `this` is the class.
+        // binding exist; `this` is the class. A static block runs at its
+        // position: its lifted method (its own `var` scope, `new.target`
+        // `undefined`, the static `super` scope) is called with `this` = the
+        // class.
         let prev_static = self.static_init.replace((self.top(), class_id));
         for (i, member) in static_fields {
             let p = match member {
@@ -678,6 +687,22 @@ impl LowerCtx<'_> {
                         value: Box::new(value),
                         attrs: crate::abi::ATTR_WRITABLE,
                         name,
+                    });
+                    continue;
+                }
+                ClassMember::StaticBlock(block) => {
+                    let func = self.lower_lifted_function(
+                        &[],
+                        BodyKind::Block(&block.body.stmts),
+                        &JsStr::default(),
+                        FnKind::Plain,
+                    )?;
+                    seq.push(IrNode::ThisCall {
+                        callee: Box::new(func),
+                        args: Vec::new(),
+                        this_local: class_local,
+                        construct: false,
+                        not_callable: CalleeError::not_a_function(CalleeError::EXPRESSION),
                     });
                     continue;
                 }
@@ -2286,14 +2311,13 @@ fn check_member_name(key: &PropName, is_static: bool, field: bool) -> anyhow::Re
     Err(CompileError::spanned(key.span(), msg).into())
 }
 
-/// Build the spanned rejection for a non-method, non-constructor, non-field class
-/// member. Private methods / accessors and static blocks are out of scope.
+/// Build the spanned rejection for a non-method, non-constructor, non-field,
+/// non-static-block class member. Private methods / accessors are out of scope.
 /// Each carries the member's span. (Methods and fields are handled in
 /// [`LowerCtx::lower_class_decl`] directly — supported or rejected there.)
 fn reject_class_member(member: &ClassMember) -> anyhow::Error {
     let (span, msg) = match member {
         ClassMember::PrivateMethod(m) => (m.span(), "private class methods are not supported"),
-        ClassMember::StaticBlock(b) => (b.span(), "class static blocks are not supported"),
         other => (other.span(), "unsupported class member"),
     };
     CompileError::spanned(span, msg).into()

@@ -1,6 +1,7 @@
 //! Early (compile-time) errors of the static semantics: lexical
 //! redeclarations, declarations in statement position, `await` as an
-//! identifier in an async body, and duplicate parameter / body names.
+//! identifier in an async body, duplicate parameter / body names, and the
+//! class static block restrictions.
 
 #![allow(clippy::expect_used)]
 
@@ -175,4 +176,53 @@ fn a_duplicate_proto_entry_in_an_object_literal_is_an_early_error() {
     assert_runs("var o = {__proto__: null, __proto__() {}}");
     // A destructuring assignment pattern may repeat it.
     assert_runs("var a, b; ({__proto__: a, __proto__: b} = {})");
+}
+
+#[test]
+fn class_static_block_early_errors() {
+    // swc reports some of these itself, with its own messages, so only the
+    // rejection is asserted where `early.rs` is not the sole checker.
+    // `arguments`, outside a nested non-arrow function (computed keys of a
+    // nested class and nested arrows included).
+    for src in [
+        "class C { static { arguments; } }",
+        "class C { static { (class { [argument\\u0073]() {} }); } }",
+        "class C { static { () => arguments; } }",
+    ] {
+        assert_early_error(src, "");
+    }
+    // `await` as a binding or reference, outside nested functions and arrows.
+    for src in [
+        "class C { static { class await {} } }",
+        "class C { static { (class await {}); } }",
+        "function f() { var x; class C { static { x = await; } } }",
+    ] {
+        assert_early_error(src, "");
+    }
+    assert_early_error("async function f() { class C { static { await 0; } } }", "");
+    assert_early_error("function* g() { class C { static { yield; } } }", "");
+    assert_early_error("class C { static { return; } }", "");
+    assert_early_error("class C extends Object { static { super(); } }", "");
+    // Jumps and labels do not cross the block.
+    assert_early_error("x: while (false) { class C { static { break x; } } }", "");
+    assert_early_error("while (false) { class C { static { continue; } } }", "");
+    assert_early_error("class C { static { x: x: 0; } }", "");
+    assert_early_error("class C { static { x: while (false) { break y; } } }", "");
+    // The block is a function-like lexical scope.
+    assert_early_error(
+        "class C { static { let x; let x; } }",
+        "`x` has already been declared",
+    );
+    assert_early_error(
+        "class C { static { let x; var x; } }",
+        "`x` has already been declared",
+    );
+    // Valid forms: nested functions, arrows and methods lift the restrictions
+    // they cross; `var` and function declarations share the block's scope.
+    assert_runs("class C { static { (function () { return arguments; })(); } }");
+    assert_runs("class C { static { ({ m() { return arguments; } }).m(); } }");
+    assert_runs("class C { static { (() => { class await {} }); } }");
+    assert_runs("class C { static { (() => { return 1; })(); } }");
+    assert_runs("class C { static { var f; function f() {} } }");
+    assert_runs("class C { static { x: while (false) { break x; } } }");
 }

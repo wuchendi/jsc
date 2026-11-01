@@ -485,9 +485,9 @@ impl CaptureResolver {
 
     /// Analyze a class, mirroring [`LowerCtx::lower_class`]: a class scope
     /// binding the inner `name` (if any), the `extends` expression, then each
-    /// constructor, method, and field initializer as a fresh function frame, so
-    /// a binding referenced there from an enclosing scope (including the inner
-    /// name) is captured.
+    /// constructor, method, field initializer and static block as a fresh
+    /// function frame, so a binding referenced there from an enclosing scope
+    /// (including the inner name) is captured.
     fn class(&mut self, class: &swc_ecma_ast::Class, name: Option<&str>) {
         self.push_scope();
         if let Some(name) = name {
@@ -525,6 +525,8 @@ impl CaptureResolver {
                         self.exit_function();
                     }
                 }
+                // A static block is a lifted zero-parameter method.
+                ClassMember::StaticBlock(b) => self.function(&[], Some(&b.body.stmts)),
                 _ => {}
             }
         }
