@@ -4,7 +4,6 @@ use super::*;
 use swc_common::{Span, Spanned};
 
 use crate::error::CompileError;
-use crate::ir::BuiltinCtor;
 
 impl LowerCtx<'_> {
     /// The `await` of the already lowered `arg` in the current body (see
@@ -675,7 +674,9 @@ impl LowerCtx<'_> {
     }
 
     /// Lower `super(args)` inside a derived class constructor (DESIGN.md §7.6):
-    /// `__construct_with(parent, args, new.target)` — the parent allocates
+    /// `__construct_with(parent, args, new.target)` where `parent` is the
+    /// class's CURRENT prototype (`GetSuperConstructor`, read before the
+    /// arguments; a non-constructor throws after them) — the parent allocates
     /// `this` with `proto = new.target.prototype` (or returns its own object) —
     /// then bind the result as `this` (a `ReferenceError` when already bound)
     /// and run the class's instance fields on it. Yields `this`.
@@ -687,9 +688,8 @@ impl LowerCtx<'_> {
         let fi = self.derived_frame();
         let scope = self
             .current_super
-            .filter(|_| fi.is_some())
-            .and_then(|scope| scope.parent.map(|parent| (scope, parent)));
-        let (Some(fi), Some((scope, parent))) = (fi, scope) else {
+            .filter(|scope| fi.is_some() && scope.derived);
+        let (Some(fi), Some(scope)) = (fi, scope) else {
             return Err(CompileError::spanned(
                 span,
                 "`super(..)` is only valid inside a derived class constructor",
@@ -697,7 +697,8 @@ impl LowerCtx<'_> {
             .into());
         };
         let new_target = self.resolve_new_target().unwrap_or(IrNode::Undefined);
-        let callee = self.read_hidden(scope.frame, parent);
+        let callee = self.home_object(scope, scope.class_cell);
+        let callee = IrNode::SuperBase(Box::new(callee));
         let (args, spread) = self.lower_construct_args(&call.args)?;
         let result = self.fresh();
         let construct = IrNode::Construct {
@@ -738,25 +739,66 @@ impl LowerCtx<'_> {
         Ok(IrNode::Seq(seq))
     }
 
-    /// The object `super.x` looks `x` up on: the home object's prototype — the
-    /// parent's `prototype` for instance members, the parent itself for static
-    /// ones; in a base class `%Object.prototype%` / `%Function.prototype%`.
+    /// The object `super.x` looks `x` up on (`GetSuperBase`): the home
+    /// object's prototype, read at each reference — the home object is the
+    /// class's `prototype` for instance members (constructor and instance
+    /// field initializers included), the class itself for static ones.
     fn super_home(&mut self, span: Span) -> anyhow::Result<IrNode> {
         let Some(scope) = self.current_super else {
             return Err(CompileError::spanned(span, "`super` is only valid inside a class").into());
         };
-        let (id, base) = if scope.is_static {
-            (scope.parent, BuiltinCtor::Function)
+        let cell = if scope.is_static {
+            scope.class_cell
         } else {
-            (scope.proto_parent, BuiltinCtor::Object)
+            scope.proto_cell
         };
-        Ok(match id {
-            Some(id) => self.read_hidden(scope.frame, id),
-            None => IrNode::Index {
-                obj: Box::new(IrNode::Intrinsic(GlobalIntrinsic::Ctor(base))),
-                index: Box::new(IrNode::Str("prototype".into())),
-            },
-        })
+        Ok(IrNode::SuperBase(Box::new(self.home_object(scope, cell))))
+    }
+
+    /// Lower an object-literal accessor half (`prefix` `"get "` / `"set "`)
+    /// to its key and its function value named `prefix` + key.
+    fn lower_literal_accessor(
+        &mut self,
+        key: &PropName,
+        function: &swc_ecma_ast::Function,
+        prefix: &'static str,
+    ) -> anyhow::Result<(PropKey, IrNode)> {
+        let key = self.lower_prop_key(key)?;
+        let (key, named) = self.computed_name_key(key);
+        let block = function
+            .body
+            .as_ref()
+            .ok_or_else(|| anyhow!("{}ter requires a body", prefix.trim_end()))?;
+        let param_pats: Vec<&Pat> = function.params.iter().map(|p| &p.pat).collect();
+        let name = prefixed_name(prefix, &static_key_name(&key));
+        let value = self.without_super(|this| {
+            this.lower_lifted_function(
+                &param_pats,
+                BodyKind::Block(&block.stmts),
+                &name,
+                FnKind::Plain,
+            )
+        })?;
+        Ok((key, self.set_computed_name(value, named, prefix)))
+    }
+
+    /// Run `lower` outside any class `super` scope: an object-literal
+    /// method's `super` (unsupported) must not resolve to an enclosing
+    /// class's home object.
+    fn without_super<T>(&mut self, lower: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = self.current_super.take();
+        let result = lower(self);
+        self.current_super = prev;
+        result
+    }
+
+    /// Read the home object held by the class's hidden cell `cell`, marking
+    /// the class as needing its home cells.
+    fn home_object(&mut self, scope: SuperScope, cell: u32) -> IrNode {
+        if let Some(current) = self.current_super.as_mut() {
+            current.used = true;
+        }
+        IrNode::CellGet(Box::new(self.read_hidden(scope.frame, cell)))
     }
 
     /// Lower the key of `super.x` / `super[k]`.
@@ -921,10 +963,11 @@ impl LowerCtx<'_> {
     }
 
     /// The `super` reference of a read-modify-write (compound, logical or
-    /// update): `this` and a computed key evaluated once into temps, a
-    /// `null` home's `TypeError` (thrown through the read), then the key
-    /// converted once (`ToPropertyKey`) — the statements, and the
-    /// side-effect-free `(this, key, home)` reading them.
+    /// update): `this`, a computed key and the super base evaluated once
+    /// into temps (the store uses the base the read did), a `null` base's
+    /// `TypeError` (thrown through the read), then the key converted once
+    /// (`ToPropertyKey`) — the statements, and the side-effect-free
+    /// `(this, key, home)` reading them.
     fn super_rmw_ref(
         &mut self,
         super_prop: &SuperPropExpr,
@@ -936,16 +979,23 @@ impl LowerCtx<'_> {
             init: this,
         }];
         let this = IrNode::Local(this_local);
-        if !matches!(super_prop.prop, SuperProp::Computed(_)) {
-            return Ok((stmts, (this, key, home)));
-        }
-        let key_local = self.fresh();
-        let key_read = IrNode::Local(key_local);
+        let (key, key_local) = if matches!(super_prop.prop, SuperProp::Computed(_)) {
+            let local = self.fresh();
+            stmts.push(IrStmt::Decl { local, init: key });
+            (IrNode::Local(local), Some(local))
+        } else {
+            (key, None)
+        };
+        let home_local = self.fresh();
         stmts.push(IrStmt::Decl {
-            local: key_local,
-            init: key,
+            local: home_local,
+            init: home,
         });
-        let target = (this, key_read, home);
+        let home = IrNode::Local(home_local);
+        let Some(key_local) = key_local else {
+            return Ok((stmts, (this, key, home)));
+        };
+        let target = (this, key, home);
         stmts.push(IrStmt::Expr(nullish_base_guard(
             &target.2,
             super_get(&target),
@@ -2193,47 +2243,18 @@ impl LowerCtx<'_> {
                     let key = self.lower_prop_key(&method.key)?;
                     let (key, named) = self.computed_name_key(key);
                     let name = static_key_name(&key);
-                    let value = self.lower_method(&method.function, &name)?;
+                    let value =
+                        self.without_super(|this| this.lower_method(&method.function, &name))?;
                     entries.push((key, self.set_computed_name(value, named, "")));
                 }
                 Prop::Getter(getter) => {
-                    let key = self.lower_prop_key(&getter.key)?;
-                    let (key, named) = self.computed_name_key(key);
-                    let block = getter
-                        .function
-                        .body
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("getter requires a body"))?;
-                    let param_pats: Vec<&Pat> =
-                        getter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = prefixed_name("get ", &static_key_name(&key));
-                    let value = self.lower_lifted_function(
-                        &param_pats,
-                        BodyKind::Block(&block.stmts),
-                        &name,
-                        FnKind::Plain,
-                    )?;
-                    let value = self.set_computed_name(value, named, "get ");
+                    let (key, value) =
+                        self.lower_literal_accessor(&getter.key, &getter.function, "get ")?;
                     push_accessor_half(&mut entries, key, value, true);
                 }
                 Prop::Setter(setter) => {
-                    let key = self.lower_prop_key(&setter.key)?;
-                    let (key, named) = self.computed_name_key(key);
-                    let block = setter
-                        .function
-                        .body
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("setter requires a body"))?;
-                    let param_pats: Vec<&Pat> =
-                        setter.function.params.iter().map(|p| &p.pat).collect();
-                    let name = prefixed_name("set ", &static_key_name(&key));
-                    let value = self.lower_lifted_function(
-                        &param_pats,
-                        BodyKind::Block(&block.stmts),
-                        &name,
-                        FnKind::Plain,
-                    )?;
-                    let value = self.set_computed_name(value, named, "set ");
+                    let (key, value) =
+                        self.lower_literal_accessor(&setter.key, &setter.function, "set ")?;
                     push_accessor_half(&mut entries, key, value, false);
                 }
                 Prop::Assign(_) => {

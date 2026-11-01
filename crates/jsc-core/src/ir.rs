@@ -1524,17 +1524,23 @@ pub enum IrNode {
         /// The jsval stored into the slot; also the expression's result.
         value: Box<IrNode>,
     },
+    /// `GetSuperBase` (DESIGN.md §7.6): `home.[[GetPrototypeOf]]()` of a
+    /// method's home object `home` (a class or its `prototype`, always an
+    /// ordinary object) — its `proto` slot, an object or `null`, read at each
+    /// `super` reference.
+    SuperBase(Box<IrNode>),
     /// A `super[key]` read (DESIGN.md §7.6): `home.[[Get]](key, this)` — the
-    /// lookup starts at the home object's prototype `home`, and a getter
-    /// found there is called with `this`. Evaluates `this`, `key`, `home` in
-    /// that order, then converts the key (`ToPropertyKey`); codegen guards a
-    /// nullish `home` (an [`IrNode::NullishCheck`]).
+    /// lookup starts at the super base `home` (an [`IrNode::SuperBase`]), and
+    /// a getter found there is called with `this`. Evaluates `this`, `key`,
+    /// `home` in that order, then converts the key (`ToPropertyKey`); a
+    /// nullish `home` throws the read `TypeError` first.
     SuperGet {
         /// The `this` value (the receiver).
         this: Box<IrNode>,
         /// The property key operand.
         key: Box<IrNode>,
-        /// The home object's prototype, where the lookup starts.
+        /// The super base (the home object's prototype), where the lookup
+        /// starts.
         home: Box<IrNode>,
     },
     /// A `super[key] = value` store, yielding `value`: `home.[[Set]](key,
@@ -1545,7 +1551,8 @@ pub enum IrNode {
         this: Box<IrNode>,
         /// The property key operand.
         key: Box<IrNode>,
-        /// The home object's prototype, where the lookup starts.
+        /// The super base (the home object's prototype), where the lookup
+        /// starts.
         home: Box<IrNode>,
         /// The stored jsval; also the expression's result.
         value: Box<IrNode>,
@@ -2547,6 +2554,7 @@ impl IrNode {
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
+            | IrNode::SuperBase(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)
@@ -2786,6 +2794,7 @@ impl IrNode {
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
+            | IrNode::SuperBase(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)

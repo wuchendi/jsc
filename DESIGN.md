@@ -906,8 +906,8 @@ tables. Keys are interned `u32`s.
   undefined (setting 'k')`.
 - **`__super_get(home, key, recv)` / `__super_set(home, key, v, recv)`** —
   `home.[[Get]](key, recv)` / `home.[[Set]](key, v, recv)` for a `super`
-  reference (§7.6): the walk of `__get` / `__set` starts at the home object's
-  prototype `home`, and a getter or setter found on the way is called with
+  reference (§7.6): the walk of `__get` / `__set` starts at the super base
+  `home` (the home object's prototype, read at the reference), and a getter or setter found on the way is called with
   `this = recv`. A setter-less accessor or a non-writable data property on
   the chain throws; a writable data property or a miss writes the receiver
   (`OrdinarySetWithOwnDescriptor`): a primitive `recv` throws, an own
@@ -1701,7 +1701,10 @@ those of `switch` and loops are not tracked.
   (any expression; it must be a constructor or `null`), links
   `B.prototype.[[Prototype]]` to `E.prototype` and `B.[[Prototype]]` to `E`
   (statics are inherited). `B` is `SELF_ALLOC`: its `this` is in TDZ until
-  `super(args)` constructs it from `E` with `new.target`; touching `this` first
+  `super(args)` constructs it with `new.target` from `B`'s prototype at the
+  call (`GetSuperConstructor`: `E` unless `Object.setPrototypeOf(B, ..)`
+  moved it; read before the arguments, a non-constructor throws `TypeError:
+  Super constructor is not a constructor` after them); touching `this` first
   throws `ReferenceError: Must call super constructor in derived class before
   accessing 'this' …`. `super.m(args)` calls the parent prototype's method with
   the current `this`. A derived class without a constructor forwards its
@@ -1710,20 +1713,26 @@ those of `switch` and loops are not tracked.
   `new.target.prototype`.
 - **`super` properties.** In a class method, accessor or constructor (and
   an arrow inside one), `super.x` / `super[k]` is a
-  reference whose base is the home object's prototype — the parent's
-  `prototype` for an instance member, the parent constructor for a static
-  one, `%Object.prototype%` / `%Function.prototype%` in a base class — and
-  whose receiver is the current `this`, read first (TDZ-checked in a derived
+  reference whose base is the home object's `[[Prototype]]`, read at each
+  reference after `k` is evaluated and before it converts (`GetSuperBase`;
+  `IrNode::SuperBase`) — the home object is the class's `prototype` for an
+  instance member (constructor and instance field initializers included)
+  and the class itself for a static one (static field initializers and
+  static blocks included), so a later `Object.setPrototypeOf` of either is
+  observed. The class keeps both home objects in two hidden cells, created
+  and filled around its `DefineProps` only when a member references
+  `super` (the constructor closure exists before the class value). The
+  receiver is the current `this`, read first (TDZ-checked in a derived
   constructor), before `k` is evaluated. A read is `__super_get` (a getter
   runs with `this`); `super.x = v` is `__super_set` (§6.3: an inherited
   setter runs with `this`, otherwise `this` gets the own property, the
   prototype is unchanged, and a read-only, setter-less or non-extensible
   failure throws a `TypeError`), with `k` converted after `v` runs. Compound,
   `**=`, logical and `++` / `--` forms read through `__super_get` and store
-  through `__super_set`, converting `k` once before the right-hand side (a
-  short-circuited logical assignment skips the right-hand side and the
-  store); a `null` home (`class extends null`) throws a `TypeError` before
-  `k` converts. `delete super.x` throws a `ReferenceError` (§7.2). They work
+  through `__super_set` on the same base, converting `k` once before the
+  right-hand side (a short-circuited logical assignment skips the
+  right-hand side and the store); a `null` base (`class extends null`, or a
+  prototype set to `null`) throws a `TypeError` before `k` converts. `delete super.x` throws a `ReferenceError` (§7.2). They work
   in generator and async methods across suspensions.
 - **`new X(args)`.** `IsConstructor(X)` (a function with `CONSTRUCTOR`; else
   `TypeError: X is not a constructor`); unless `X` is `SELF_ALLOC`, `this` = a
@@ -1902,7 +1911,7 @@ invisibility and the early errors — and static blocks.
 **Static blocks** (phase 5a, built in P4). `static { .. }` lowers to a lifted
 zero-parameter method function (`lower_lifted_function`, method kind, not
 a constructor, `name` `""`, the static `super` scope so `super.x` reads
-the parent constructor) created and called immediately with `this` = the
+the class's current prototype) created and called immediately with `this` = the
 class at its source position in the static-element pass; the call gives it
 its own `var` scope, `new.target` `undefined`, the class-scope captures
 (inner name, `%penv`) and exception propagation for free. One closure is
@@ -2509,8 +2518,7 @@ Each item below is current behaviour of this tree.
 - A BigInt literal property key (`{1n: v}`, `class { 1n() {} }`, `{1n: a} =
   o`) is a compile error (`BigInt` is not available).
 - `super` outside a class body (an object-literal method) is a compile
-  error, and a class's `super` base is fixed at class definition: a later
-  `Object.setPrototypeOf` of the class or its `prototype` does not move it.
+  error.
 
 **Generators & async**
 

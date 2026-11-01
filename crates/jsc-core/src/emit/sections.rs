@@ -965,6 +965,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         | IrNode::ToPropertyKey(operand)
         | IrNode::CellNew(operand)
         | IrNode::CellGet(operand)
+        | IrNode::SuperBase(operand)
         | IrNode::Throw(operand)
         // A generator `yield e` carries only its operand.
         | IrNode::Yield(operand)
