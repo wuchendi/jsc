@@ -342,6 +342,12 @@ pub(super) fn emit_node(
                 emit_node(node, function, scratch, strings, helpers);
             }
         }
+        // The statements are stack-neutral and no jump escapes them, so they
+        // run in place, under any operands already pushed.
+        IrNode::Block { stmts, value } => {
+            emit_stmts(stmts, function, scratch, strings, helpers, None, None);
+            emit_node(value, function, scratch, strings, helpers);
+        }
         IrNode::ArraySpread(parts) => {
             emit_array_spread(parts, function, scratch, strings, helpers);
         }
@@ -403,6 +409,13 @@ pub(super) fn emit_node(
         IrNode::ToObject(operand) => {
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.to_object()));
+        }
+        IrNode::Freeze(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalTee(scratch + 22));
+            function.instruction(&Instruction::I32Const(INTEGRITY_FROZEN));
+            function.instruction(&Instruction::Call(helpers.set_integrity()));
+            function.instruction(&Instruction::LocalGet(scratch + 22));
         }
         IrNode::ToPropertyKey(operand) => {
             emit_node(operand, function, scratch, strings, helpers);
@@ -467,8 +480,12 @@ pub(super) fn emit_node(
                 helpers,
             );
         }
-        IrNode::ObjectRest { source, exclude } => {
-            emit_object_rest_node(source, exclude, function, scratch, strings, helpers);
+        IrNode::CopyDataProperties {
+            target,
+            source,
+            exclude,
+        } => {
+            emit_copy_data_node(target, source, exclude, function, scratch, strings, helpers);
         }
         IrNode::Index { obj, index } => {
             emit_index_node(obj, index, true, function, scratch, strings, helpers);

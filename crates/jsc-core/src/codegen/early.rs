@@ -6,10 +6,12 @@
 //!   in a block every function declaration is lexical, at a function's (or
 //!   the script's) top level it is var-scoped;
 //! - a parameter redeclared lexically in its function's body, a catch
-//!   parameter redeclared lexically in its block, and a duplicate parameter
-//!   name of any function (every function is strict);
+//!   parameter redeclared lexically in its block (or by `var` when it is a
+//!   destructuring pattern), a duplicate name in a catch parameter, and a
+//!   duplicate parameter name of any function (every function is strict);
 //! - an `async function` declaration in statement position (`if (x) async
-//!   function f(){}`);
+//!   function f(){}`), and a labelled function declaration (`l: function
+//!   f(){}`);
 //! - `await` (escaped or not) as an identifier inside an async body;
 //! - two `__proto__: v` entries in one object literal (a destructuring
 //!   assignment pattern is an `ObjectPat`, not visited here).
@@ -185,6 +187,25 @@ impl Visit for Checker {
         if let Some(param) = &c.param {
             pat_names(param, &mut names);
         }
+        let mut seen = std::collections::HashSet::new();
+        for (name, span) in &names {
+            if !seen.insert(name.as_str()) {
+                self.fail(*span, already_declared(name));
+            }
+        }
+        // A destructuring parameter also conflicts with a `var` of its block
+        // (B.3.4 relaxes this only for a plain identifier parameter).
+        if let Some(param) = &c.param
+            && !matches!(param, Pat::Ident(_))
+        {
+            let mut vars = Vec::new();
+            c.body.stmts.iter().for_each(|s| var_names(s, &mut vars));
+            for (name, span) in vars {
+                if seen.contains(name.as_str()) {
+                    self.fail(span, already_declared(&name));
+                }
+            }
+        }
         self.scope(c.body.stmts.iter(), true, &names);
         c.visit_children_with(self);
     }
@@ -202,7 +223,17 @@ impl Visit for Checker {
             Stmt::For(f) => self.statement_position(&f.body),
             Stmt::ForIn(f) => self.statement_position(&f.body),
             Stmt::ForOf(f) => self.statement_position(&f.body),
-            Stmt::Labeled(l) => self.statement_position(&l.body),
+            Stmt::Labeled(l) => {
+                // A labelled function declaration is sloppy-mode-only (B.3.1);
+                // every function here is strict.
+                if let Stmt::Decl(Decl::Fn(f)) = l.body.as_ref() {
+                    self.fail(
+                        f.function.span,
+                        "In strict mode code, functions can only be declared at top level or inside a block".to_owned(),
+                    );
+                }
+                self.statement_position(&l.body);
+            }
             _ => {}
         }
         stmt.visit_children_with(self);

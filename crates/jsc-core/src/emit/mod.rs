@@ -792,11 +792,12 @@ struct Unwind {
     labels: Vec<LabelTarget>,
 }
 
-/// A labeled loop's abrupt-exit landing blocks, keyed by the loop id an
-/// [`IrStmt::Break`]/[`IrStmt::Continue`] carries. Depths are absolute (see
+/// A labeled loop's (or labeled statement's) abrupt-exit landing blocks, keyed
+/// by the label id an [`IrStmt::Break`]/[`IrStmt::Continue`] carries. Depths are absolute (see
 /// [`Unwind::depth`]); the `br` immediate at a use site is `depth - entry`.
 struct LabelTarget {
-    /// The loop id matching [`crate::ir::IrStmt::While`]'s `label`.
+    /// The label id matching [`crate::ir::IrStmt::While`]'s (or
+    /// [`crate::ir::IrStmt::Labeled`]'s) `label`.
     id: u32,
     /// Depth just inside the loop's `break` block `B` (a `break LABEL` target).
     break_entry: u32,
@@ -940,8 +941,9 @@ struct Helpers<'a> {
     own_keys: u32,
     /// `__for_in_keys(obj) -> array`: the `for-in` key snapshot.
     for_in_keys: u32,
-    /// `__rest(src, excl) -> object`: the object-rest copy.
-    rest: u32,
+    /// `__copy_data(dst, src, excl) -> dst`: `CopyDataProperties` (object
+    /// spread and object rest).
+    copy_data: u32,
     /// `__array_push(base, value) -> base`: append `value` to the array handle
     /// in place (amortized growth through [`Self::array_reserve`]) and return
     /// the same handle base.
@@ -1561,7 +1563,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_delete(&offsets, helpers));
     code.function(&emit_own_keys(helpers));
     code.function(&emit_for_in_keys(helpers));
-    code.function(&emit_rest(helpers));
+    code.function(&emit_copy_data(helpers));
     code.function(&emit_array_reserve(helpers.alloc));
     code.function(&emit_array_push(
         helpers.array_reserve(),

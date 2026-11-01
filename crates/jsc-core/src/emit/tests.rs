@@ -1284,3 +1284,37 @@ fn builtin_bodies_validate() {
         Promise.any([Promise.reject(1)]).catch((e) => console.log(e.errors));",
     ));
 }
+
+#[test]
+fn computed_and_numeric_pattern_keys_validate() {
+    // Pattern keys converted into locals, in statement and expression
+    // position, a generator, a rest exclusion list, and numeric class keys.
+    validate(&compile(
+        "let s = Symbol(), k = 'a', v, r;
+        let { [k]: a = 1, 0x10: b, [s]: c, ...rest } = { a: 1 };
+        function f({ [k]: x, 1.5: y } = {}) { return x }
+        f(({ [k]: v, ...r } = { a: 2 }));
+        function* gen() { const { [yield 1]: z } = {}; ({ [yield 2]: v = yield 3 } = {}); return z }
+        for (const { [k]: w } of [{}]) {} try { throw {} } catch ({ [k]: e }) {}
+        class C { 1() {} static 2() {} get 3() { return 0 } set 3(x) {} 0x10 = 1; static 1e21 = 2 }
+        const o = { get a() { return 1 }, ...rest, set a(x) {}, 1.0: 2 };
+        console.log(a, b, c, rest, f({}), gen().next(), new C(), o)",
+    ));
+}
+
+#[test]
+fn expression_position_destructuring_validates() {
+    // A statement block in expression position runs under operands already
+    // pushed (a call argument, a `?:` arm, a `for` update, a generator).
+    validate(&compile(
+        "let a, b, o = {};
+        function f(x, y) { return y }
+        f(1, [a, [b = 2], ...o.r] = [1, [], 3]);
+        true ? ({ a, b: { c: b } = {} } = { a: 1 }) : 0;
+        for (let i = 0; i < 3; i++, [a, b] = [b, a]) {}
+        const g = (x) => [a] = x;
+        function* gen() { const r = [a = yield 1] = []; return f(yield 2, [b] = [r]) }
+        for (a of [1]) {} for ([a, b] in { ab: 1 }) {} for (const { length } in 'x') {}
+        console.log(g([1]), gen().next())",
+    ));
+}

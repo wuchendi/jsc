@@ -160,6 +160,27 @@ fn duplicate_parameters_and_body_names_are_rejected() {
 }
 
 #[test]
+fn a_catch_pattern_rejects_duplicate_and_redeclared_names() {
+    for src in [
+        "try {} catch ([x, x]) {}",
+        "try {} catch ({x, y: x}) {}",
+        "try {} catch ([x, {a: [x]}]) {}",
+        "try {} catch ({x, ...x}) {}",
+        "try {} catch ({x}) { let x; }",
+        "try {} catch ([x = 1]) { class x {} }",
+        "try {} catch ({x}) { function x() {} }",
+        // B.3.4 tolerates `var` only for an identifier parameter.
+        "try {} catch ({x}) { var x; }",
+        "try {} catch ([x]) { for (var x of []) {} }",
+        "try {} catch ([x]) { { var x = 1; } }",
+    ] {
+        assert_early_error(src, "`x` has already been declared");
+    }
+    assert_runs("try {} catch ({x}) { { let x; } }");
+    assert_runs("try {} catch ([x]) { function f() { var x; } }");
+}
+
+#[test]
 fn a_duplicate_proto_entry_in_an_object_literal_is_an_early_error() {
     assert_early_error(
         "var o = {__proto__: null, \"__proto__\": null}",
