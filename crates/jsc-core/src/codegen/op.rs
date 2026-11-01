@@ -177,10 +177,10 @@ pub(super) fn receiver_method(name: &str) -> bool {
     RECEIVER_METHODS.contains(&name) || date_fast_path(name).is_some()
 }
 
-/// The `Date` field method `name` with a call-site fast path (`toString` is
-/// called through its builtin only).
+/// The `Date` field method `name` with a call-site fast path (the string
+/// forms are called through their builtins only).
 fn date_fast_path(name: &str) -> Option<DateOp> {
-    DateOp::from_name(name).filter(|op| *op != DateOp::ToString)
+    DateOp::from_name(name).filter(|op| !op.is_date_text())
 }
 
 /// The inline fast paths of `recv.name(args)` on a `Map`/`Set`/`Promise`/
