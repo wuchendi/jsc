@@ -158,8 +158,8 @@ fn scan_prop_name_arity(key: &PropName) -> usize {
 /// one's own param count, parameter defaults, and body must widen `K` like any
 /// function/arrow (a setter matters especially — it is invoked with one
 /// argument by `obj.x = v`, an assignment no call-site arity scan covers); the
-/// `extends` expression and the (instance or static) field initializers are
-/// scanned too.
+/// `extends` expression, the (instance or static) field initializers and the
+/// static blocks are scanned too.
 fn scan_class_arity(class: &swc_ecma_ast::Class) -> usize {
     let heritage = class.super_class.as_deref().map_or(0, scan_expr_arity);
     class
@@ -181,7 +181,10 @@ fn scan_class_arity(class: &swc_ecma_ast::Class) -> usize {
                 own.max(params).max(body)
             }
             ClassMember::Method(m) => scan_function_arity(&m.function),
+            ClassMember::PrivateMethod(m) => scan_function_arity(&m.function),
             ClassMember::ClassProp(p) => p.value.as_deref().map_or(0, scan_expr_arity),
+            ClassMember::PrivateProp(p) => p.value.as_deref().map_or(0, scan_expr_arity),
+            ClassMember::StaticBlock(b) => scan_stmts_arity(&b.body.stmts),
             _ => 0,
         })
         .max()

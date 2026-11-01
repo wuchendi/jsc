@@ -43,6 +43,7 @@ impl<'a> LowerCtx<'a> {
             async_body: false,
             current_super: None,
             class_fields: Vec::new(),
+            private_scopes: Vec::new(),
             static_init: None,
             binding_var: false,
         }
@@ -294,6 +295,47 @@ impl<'a> LowerCtx<'a> {
                 .map_or(IrNode::Undefined, |&local| IrNode::Local(local));
         }
         IrNode::EnvLoad(self.route_env(frame, id))
+    }
+
+    /// Resolve the private name `#x` lexically (DESIGN.md §7.6) to a
+    /// [`PrivateRef`]: the `%penv` read, what the name denotes and its `"#x"`
+    /// text (an accessor also gets its receiver and value temps).
+    pub(super) fn private_ref(&mut self, name: &PrivateName) -> anyhow::Result<PrivateRef> {
+        let (frame, penv, kind, text) = self.private_slot(name)?;
+        let env = self.read_hidden(frame, penv);
+        let temps = matches!(kind, PrivateKind::Accessor { .. })
+            .then(|| [self.fresh(), self.fresh(), self.fresh()]);
+        Ok(PrivateRef {
+            env,
+            kind,
+            name: text,
+            temps,
+        })
+    }
+
+    /// The innermost class body declaring `#x`: its frame, the hidden id of
+    /// its `%penv`, what the name denotes and its `"#x"` text. A name no
+    /// enclosing class body declares is a spanned error.
+    pub(super) fn private_slot(
+        &self,
+        name: &PrivateName,
+    ) -> anyhow::Result<(usize, u32, PrivateKind, JsStr)> {
+        let text = JsStr::from(format!("#{}", name.name));
+        let found = self.private_scopes.iter().rev().find_map(|scope| {
+            scope
+                .names
+                .iter()
+                .find(|(declared, _)| *declared == text)
+                .map(|&(_, kind)| (scope.frame, scope.penv, kind))
+        });
+        let Some((frame, penv, kind)) = found else {
+            return Err(CompileError::spanned(
+                name.span,
+                format!("private name {text} is not defined"),
+            )
+            .into());
+        };
+        Ok((frame, penv, kind, text))
     }
 
     /// Whether every frame above `frame` is an arrow (so `this` there is the
