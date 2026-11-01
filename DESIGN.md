@@ -1591,8 +1591,10 @@ those of `switch` and loops are not tracked.
   module bindings' cells) holding the hole until the site first runs, which
   builds the object into it; every later evaluation of that site, in a loop
   or another call, yields the same object, and two sites never share one.
-  A tagged template in an optional chain (`` a?.b`x` ``) is a `SyntaxError`
-  (swc).
+  A chain `` t`a``b` `` calls the first result with the second site's
+  object, and `` new t`x` `` is `` new (t`x`)() ``: the tag's result is the
+  constructor. A tagged template in an optional chain (`` a?.b`x` ``) is a
+  `SyntaxError` (swc).
 - **Call evaluation order.** A call evaluates its callee first — for a
   member callee the base, then the key, then the `[[Get]]` (a getter runs
   here) — then the arguments left to right, then `IsCallable` and the call;
