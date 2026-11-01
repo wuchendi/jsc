@@ -2,7 +2,8 @@
 //! redeclarations, declarations in statement position, `await` as an
 //! identifier in an async body, duplicate parameter / body names, the class
 //! static block restrictions, and the private-name rules (undeclared and
-//! duplicate names, `delete` of a private reference, a bare `#x`).
+//! duplicate names, `delete` of a private reference, a bare `#x`, a name not
+//! starting with an `IdentifierStart`).
 
 #![allow(clippy::expect_used)]
 
@@ -329,4 +330,32 @@ fn private_name_early_errors() {
     assert_runs("class C { static set #x(v) {} static get #x() { return 1; } }");
     assert_runs("class C { #x = {}; m() { return delete this.#x.y; } } new C().m();");
     assert_runs("class C { #x; static has(o) { return #x in o; } } C.has({});");
+}
+
+#[test]
+fn private_names_must_start_with_an_identifier_start() {
+    // ZWJ / ZWNJ are IdentifierPart only, escaped or raw.
+    for src in [
+        r"class C { #‍_ZWJ; }",
+        r"class C { #‌_ZWNJ; }",
+        r"var C = class { #‍_ZWJ; };",
+        r"class C { #\u{200C}x() {} }",
+        "class C { #\u{200D}x; }",
+        r"class C { #x; m() { return this.#‍x; } }",
+        r"class C { #‍x; m() { return this.#‍x; } }",
+        r"class C { #‌x; static has(o) { return #‌x in o; } }",
+    ] {
+        assert_early_error(src, "");
+    }
+    assert_early_error(r"class C { #‍_ZWJ; }", "invalid private name");
+    assert_early_error(
+        r"class C { #‌x; m() { return this.#‌x; } }",
+        "invalid private name",
+    );
+    // A ZWJ / ZWNJ after the first character, `$`, `_`, an escaped
+    // IdentifierStart and an Other_ID_Start character are valid.
+    assert_runs(r"class C { #a‍‌b = 1; m() { return this.#a‍‌b; } } new C().m();");
+    assert_runs("class C { #$ = 1; #_ = 2; m() { return this.#$ + this.#_; } } new C().m();");
+    assert_runs(r"class C { #\u{6F} = 1; m() { return this.#o; } } new C().m();");
+    assert_runs("class C { #\u{2118} = 1; m() { return this.#\u{2118}; } } new C().m();");
 }
