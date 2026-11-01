@@ -434,7 +434,7 @@ the array bits is ever cleared (except `JOINING`).
 | `11` `TYPE_ACCESSOR` | accessor pair (internal) | header, pad, `getter: i64 @8`, `setter: i64 @16` | 24 | — |
 | `12` `TYPE_PROPS` | own-property table (internal) | §5.3 | `16 + 16·cap` | — |
 | `13` `TYPE_ELEMS` | array element store (internal) | header, `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
-| `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`; bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
+| `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 
 **`TYPE_OBJECT` classes** (header byte 3): `0` `CLASS_ORDINARY`, `1`
 `CLASS_ERROR` (an Error instance: its kind is its prototype, §7.7), `2`
@@ -945,6 +945,7 @@ tables. Keys are interned `u32`s.
   level reaches its elements; freezing also sets `LENGTH_READONLY`).
   `__test_integrity(obj, level)` is `IsExtensible` (level `0`) or
   `TestIntegrityLevel` (a frozen array also needs a read-only `length`).
+  Both ignore private-name entries (§7.6, phase 5a).
 - **Prototypes.** `__set_proto(o, proto)` is `OrdinarySetPrototypeOf`: the
   same `proto` succeeds; `%Object.prototype%` (an immutable prototype exotic
   object), a non-extensible object, and a `proto` whose chain reaches `o`
@@ -970,7 +971,8 @@ tables. Keys are interned `u32`s.
   `Object.assign`, `defineProperties` / `create`,
   `getOwnPropertyDescriptors`, which check enumerability per key); every
   string-key mode skips symbol keys, and the symbol walks are skipped when the
-  table lacks `HAS_SYMBOL_KEYS`. Values and entries follow EnumerableOwnProperties: the key list is
+  table lacks `HAS_SYMBOL_KEYS` (and, from phase 5a, skip private names,
+  §7.6). Values and entries follow EnumerableOwnProperties: the key list is
   taken once, then each key is re-checked as own and enumerable (`__own_enum`)
   when visited and skipped if a getter deleted it or made it non-enumerable;
   a key a getter adds is not visited. Only a getter can run between the
@@ -1330,6 +1332,9 @@ it):
   `NaN` time value);
 - cycles as `<ref *1> { self: [Circular *1] }`.
 
+Private-name entries (§7.6) are never enumerable, so neither renderer lists
+them.
+
 ---
 
 ## 7. Language surface
@@ -1622,6 +1627,147 @@ those of `switch` and loops are not tracked.
   `Object.create(Array.prototype) instanceof Array` is `true`).
 - **Bound functions** (§5.5) under `new` construct their target; a bound
   non-constructor is not a constructor (`TypeError: B is not a constructor`).
+
+**Private names** (phase 5a; stages P2–P5 implement this text verbatim,
+until then every form below is a spanned rejection, §8, §13).
+
+- **Names.** A private name is a `TYPE_SYMBOL` block with header flag `8`
+  `SYMBOL_FLAG_PRIVATE` (bits `1`/`2` stay clear, `4` is `REGISTERED`;
+  a private symbol is never registered) and description `"#x"`, minted by
+  the new `IrNode::PrivateName(desc)` (the `new_symbol` sequence of
+  `emit/builtins/symbol.rs`). Only **fields** (instance and static) get one
+  per name; methods and accessors are not keyed per name (brands, below).
+- **Private environment.** Each evaluation of a class body allocates
+  `%penv`, an internal dense array held in one `hidden_local` of the class
+  scope (captured by value, like the heritage locals; never a user value).
+  Slot `0` is the class value (stored once it exists, before any static
+  element runs; `undefined` until then), slot `1` the instance brand (a
+  private symbol, description = the first instance private method or
+  accessor's `"#m"`; `undefined` when the class has none), then one slot per
+  private field (its symbol), per method (its closure), and two per accessor
+  (getter, setter; `undefined` when absent), in declaration order. The array
+  and the brand / field symbols are created after the heritage and before
+  the computed keys, so every closure of the body (methods, accessors,
+  constructor, field initializers, static blocks, computed keys, nested
+  functions, arrows and classes) reads them through `read_hidden`; method
+  closures are stored into the array later (new IR
+  `PrivEnvLoad { env, slot }` / `PrivEnvStore { env, slot, value }`, a
+  direct access at `ELEMS_DATA_OFFSET + 8·slot`; the array never grows),
+  which is why they are not separate by-value locals. A class expression
+  in a loop or a factory therefore mints distinct names, brands and method
+  closures per evaluation.
+- **Resolution** is lexical at compile time: `LowerCtx::private_scopes`
+  (new) is a stack of `{ frame, penv_id, names }`, each name
+  `{ "#x", kind: Field(slot) | Method(slot) | Accessor(get, set), static }`.
+  `lower_class` pushes the scope after lowering the heritage (which sees only
+  the enclosing classes' names) and pops it with the class scope. `#x`
+  resolves to the innermost class declaring it, so a nested class shadows
+  an outer name and a nested class not declaring `#x` uses the outer one.
+- **Storage.** A private field is an own entry keyed by its symbol in the
+  object's ordinary `TYPE_PROPS` table, attrs `WRITABLE` only; the instance
+  brand is an entry keyed by the brand symbol, attrs `0`, value `undefined`.
+  Private entries are never `ENUMERABLE` (an invariant the renderers and
+  every enumerable-only walk rely on). Static private fields are entries of
+  the class. Static methods and accessors need no entry: the class is
+  their only possible holder, so their brand check is `o === %penv[0]`
+  (after an object test, so the `undefined` placeholder never matches).
+- **Helpers** (new, `emit/props.rs`; `name` is the static `"#x"` string):
+  `__private_find(o, key)` → i32 `1` iff `o` is an object-family block
+  whose own table holds `key` (no prototype walk, no `__fn_materialize`:
+  a `LAZY` function holds no private entry; a primitive is `0`);
+  `__private_add(o, key, v, attrs, name)` (PrivateFieldAdd /
+  PrivateMethodOrAccessorAdd): present → `TypeError: Cannot initialize #x
+  twice on the same object`, else `__define`, which skips its
+  not-extensible check for a `SYMBOL_FLAG_PRIVATE` key, so adds work on
+  non-extensible, sealed and frozen objects;
+  `__private_get(o, key, name)` / `__private_set(o, key, v, name)` on a field:
+  absent (a primitive included, no `ToObject`) → `TypeError: Cannot read
+  private member #x from an object whose class did not declare it` /
+  `Cannot write private member #x to an object whose class did not declare
+  it`; a set ignores attrs. The messages are new `__prop_throw` modes.
+- **Methods and accessors.** `o.#m` brand-checks (`__private_find(o,
+  brand)`, or the slot-`0` identity when static), throwing the read / write
+  message above naming `#m`, then: a method reads its closure (one per
+  class evaluation, so every instance sees the same function); a getter
+  is called with `this = o`; a missing getter throws `TypeError: '#x' was
+  defined without a getter`. A write after the brand check throws
+  `TypeError: Private method is not writable` for a method, calls the
+  setter, or throws `TypeError: '#x' was defined without a setter`. Closures
+  are lowered like `lower_class_method` with `name` `"#m"` / `"get #x"` /
+  `"set #x"` (generator, async and async generator methods included),
+  instance ones with the prototype `super` scope, static ones with
+  `is_static`, and stored in source order right after the class value's
+  `DefineProps`; then `%penv[0]` is set, then the inner name is bound.
+- **Instance initialization** (`lower_field_inits`, on constructor entry or
+  right after `super(..)` returns, on the `this` it returned): first
+  `__private_add(this, brand, undefined, 0, "#m")` when the class has
+  instance private methods or accessors, then every field — public
+  (`__define`) and private (`__private_add(.., WRITABLE, "#x")`) — in source
+  order; an anonymous function initializer is named `"#x"`. A base
+  constructor returning an existing object lets a derived class add to it
+  once; the second add throws.
+- **Static elements.** Static fields, static private fields and static
+  blocks run in one source-order pass after slot `0` and the inner name are
+  set, `this` = the class; a static private field is
+  `__private_add(C, key, v, WRITABLE, "#x")`. Statics are not inherited:
+  `Sub.#x` throws the read message (the lookup is own-only and the identity
+  check fails).
+- **Operations.** `o.#x = v` evaluates `o`, then `v`, then sets; compound
+  and logical assignment and `++`/`--` evaluate `o` once into a temp, get
+  (throwing when absent), compute, set; destructuring targets (`[this.#x] =
+  xs`, `({a: this.#x} = o)`) are member targets ending in a private set;
+  `o?.#x`, `o?.a.#x`, `o?.#m()` short-circuit as usual; `o.#m(args)` reads
+  (brand check before the arguments) and calls with `this = o`. There is no
+  `super.#x` (a parse error). `#x in o`: `o` not an object → `TypeError:
+  Cannot use 'in' operator to search for '#x' in <o>` (new `__prop_throw`
+  mode rendering `o` as `PROP_THROW_IN` does); else `__private_find` of the
+  field or brand symbol, or the slot-`0` identity; no prototype, getter or
+  proxy is consulted.
+- **Invisibility.** The private symbol is only ever passed as a key
+  argument of the helpers above: no expression yields it, so `typeof`,
+  `description`, `String(sym)`, `__get`, `__set`, `__has`, `__has_own`,
+  `__delete`, `__own_desc` (`getOwnPropertyDescriptor`), `__own_enum`,
+  `__define_own` (`defineProperty`) and `__to_key` can never receive it.
+  Walks that read raw table keys must skip it: `__own_keys`' symbol pass
+  (`OWN_SYMBOLS`: `getOwnPropertySymbols`; `OWN_ALL_KEYS`: object rest
+  `__rest`, `Object.assign`, `defineProperties` / `create`,
+  `getOwnPropertyDescriptors`, and `Reflect.ownKeys` / object spread once
+  they land) lists a symbol key only when it lacks `SYMBOL_FLAG_PRIVATE`; the
+  string modes (`Object.keys/values/entries`, `getOwnPropertyNames`,
+  `JSON.stringify`, `__for_in_keys`) already skip every symbol.
+  `__set_integrity` (`freeze` / `seal` / `preventExtensions`) leaves private
+  entries' attrs untouched and `__test_integrity` (`isFrozen` /
+  `isSealed`) ignores them. The renderers (`run/value.rs`, `value.ts`) list
+  only `ENUMERABLE` entries, so they never show one; `shim.ts` enumerates no
+  guest keys. A private key appended to a watched intrinsic's table only
+  sets its dirty bit. There is no `Proxy`; when it lands, private operations
+  act on the proxy's own table and never trap.
+
+**Static blocks** (phase 5a). `static { .. }` lowers to a lifted
+zero-parameter method function (`lower_lifted_function`, method kind, not
+a constructor, `name` `""`, the static `super` scope so `super.x` reads
+the parent constructor) created and called immediately with `this` = the
+class at its source position in the static-element pass; the call gives it
+its own `var` scope, `new.target` `undefined`, the class-scope captures
+(inner name, `%penv`) and exception propagation for free. One closure is
+allocated per block per class evaluation.
+
+**Early errors** (P5, `codegen/early.rs`; test262 marks them all `phase:
+parse`, so which swc already reports is not determinable without running —
+`early.rs` checks every one): a `#x` (also in `#x in o`) not declared by an
+enclosing class body; a duplicate private name, except exactly one getter
+plus one setter of the same static-ness; `#constructor`; `delete` of a
+private reference (`delete o.#x`, parenthesised, `delete o?.#x`, `delete
+o?.a.#x`); in a static block, `arguments` anywhere outside a nested
+non-arrow function (computed keys of a nested class included), `await` as
+a binding or reference outside nested functions and arrows, `await` /
+`yield` expressions, `return`, `super(..)`, `break` / `continue` / labels
+crossing the block, and lexical redeclarations (the block is a
+function-like scope). `super.#x` and private names in object literals are
+parse errors. P2–P5 delete the diagnostics `private class fields are not
+supported`, `private class methods are not supported`, `private fields are
+not supported` and `class static blocks are not supported` (and their §8,
+§13 mentions) as their forms land.
 
 ### 7.7 Errors
 
@@ -2306,7 +2452,8 @@ Still open from the phase-3 scope: `Date` string parsing and local time
 
 ### Phase 5 — Language completeness
 
-- Private fields and methods, static blocks, object spread.
+- Private fields and methods, static blocks (phase 5a, in progress), object
+  spread.
 - Labeled statements, all remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
