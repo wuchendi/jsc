@@ -1044,6 +1044,9 @@ pub enum IrNode {
     /// `IsArray` of the value (`Array.isArray`), as a boolean jsval: whether it
     /// is an Array exotic object (a `TYPE_ARRAY` handle), whatever its `proto`.
     IsArray(Box<IrNode>),
+    /// `SetIntegrityLevel(o, frozen)` of the object the sub-expression yields
+    /// (a fresh tagged-template array, which cannot reject), yielding it.
+    Freeze(Box<IrNode>),
     /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
     /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
     ToObject(Box<IrNode>),
@@ -1449,14 +1452,20 @@ pub enum IrNode {
         /// The entries, in definition order.
         entries: Vec<(PropKey, IrNode)>,
     },
-    /// An object rest binding `let {a, ...rest} = obj`. Builds a NEW heap
-    /// object holding every own key of `source` EXCEPT the statically-known
-    /// destructured keys in `exclude`. `source` is evaluated once (a hidden temp
-    /// read); `exclude` is an [`IrNode::Array`] of [`IrNode::Str`] key names. It
-    /// lowers to the `__rest` runtime helper, which defines every own enumerable
-    /// property of the source whose key is not excluded on a fresh object.
-    ObjectRest {
-        /// The source object being spread (a heap object jsval, evaluated once).
+    /// `CopyDataProperties(target, source, exclude)` (ECMA-262 7.3.25): an
+    /// object spread `{...source}` (into the literal under construction, an
+    /// empty `exclude`) or an object rest `let {a, ...rest} = obj` (into a
+    /// fresh ordinary object, `exclude` the statically-known destructured
+    /// keys). Evaluates `target`, `source`, then `exclude` (an
+    /// [`IrNode::Array`] of [`IrNode::Str`] key names), and lowers to the
+    /// `__copy_data` runtime helper, which defines on `target` every own
+    /// enumerable string then symbol property of `source` whose key is not
+    /// excluded (a getter runs; a nullish or primitive non-string source
+    /// copies nothing); yields `target`.
+    CopyDataProperties {
+        /// The object receiving the properties.
+        target: Box<IrNode>,
+        /// The source value being copied.
         source: Box<IrNode>,
         /// The excluded keys — an [`IrNode::Array`] of [`IrNode::Str`] names.
         exclude: Box<IrNode>,
@@ -1877,8 +1886,22 @@ pub enum IrNode {
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
     /// operands evaluated only for their side effects: surplus `Error(..)`
-    /// arguments, and the nullish-guarded receiver of a `push`/`pop`.
+    /// arguments, the nullish-guarded receiver of a `push`/`pop`, and the
+    /// operand of `void` (followed by `Undefined`).
     Seq(Vec<IrNode>),
+    /// Run `stmts` (stack-neutral statements with no `return`, `break` or
+    /// `continue` escaping them), then evaluate `value`, the node's value.
+    /// Built by codegen for a construct that desugars to statements in
+    /// expression position: a destructuring assignment (DESIGN.md §7.3), a
+    /// `**=` or logical assignment to a member (DESIGN.md §7.2).
+    /// [`Self::any_child`] / [`Self::children_mut`] see every expression of
+    /// the statements (recursively) and then `value`.
+    Block {
+        /// The statements run first.
+        stmts: Vec<IrStmt>,
+        /// The node's value, evaluated after `stmts`.
+        value: Box<IrNode>,
+    },
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
     /// `__own_keys` (`__for_in_keys`), which builds a fresh array in own-key
@@ -2124,10 +2147,22 @@ pub enum IrStmt {
         /// The clauses, in source order.
         cases: Vec<IrCase>,
     },
+    /// A labeled non-loop statement `LABEL: stmt` (a block, `if`, `try`,
+    /// `switch`, expression statement, ...): `body` runs once, and a
+    /// `break LABEL` ([`IrStmt::Break`] carrying `label`) anywhere inside it
+    /// exits to just after it, running any intervening `finally` clauses. An
+    /// unlabeled `break`/`continue` does not target it, and no `continue` may
+    /// (a `continue LABEL` to a non-loop label is rejected during lowering).
+    Labeled {
+        /// The label id a `break LABEL` targeting this statement carries.
+        label: u32,
+        /// The labeled statement, lowered.
+        body: Vec<IrStmt>,
+    },
     /// A `break` statement. `None` targets the nearest enclosing `switch` (or
     /// loop), exiting it; `Some(id)` is a labeled `break LABEL` targeting the
-    /// loop whose [`IrStmt::While::label`] equals `id`, even from inside a nested
-    /// loop.
+    /// loop whose [`IrStmt::While::label`] (or the [`IrStmt::Labeled`] statement
+    /// whose `label`) equals `id`, even from inside a nested loop.
     Break(Option<u32>),
     /// A `continue` statement: skip the rest of a loop body and jump to that
     /// loop's update/next-iteration point. `None` targets the nearest enclosing
@@ -2489,6 +2524,7 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)
+            | IrNode::Freeze(inner)
             | IrNode::ToObject(inner)
             | IrNode::ToPropertyKey(inner)
             | IrNode::SetFunctionName { func: inner, .. }
@@ -2534,10 +2570,6 @@ impl IrNode {
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }
             | IrNode::GenResume { handle: a, sent: b }
-            | IrNode::ObjectRest {
-                source: a,
-                exclude: b,
-            }
             | IrNode::Index { obj: a, index: b }
             | IrNode::MakeAccessor {
                 getter: a,
@@ -2553,6 +2585,11 @@ impl IrNode {
                 obj, index, rhs, ..
             } => f(obj) || f(index) || f(rhs),
             IrNode::IndexSet { obj, index, value } => f(obj) || f(index) || f(value),
+            IrNode::CopyDataProperties {
+                target,
+                source,
+                exclude,
+            } => f(target) || f(source) || f(exclude),
             IrNode::Ternary {
                 cond,
                 then_branch,
@@ -2587,6 +2624,9 @@ impl IrNode {
             | IrNode::ConsoleLog { args }
             | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter().any(f),
+            IrNode::Block { stmts, value } => {
+                stmts.iter().any(|stmt| stmt.any_node_deep(&mut f)) || f(value)
+            }
             IrNode::CallIndirect {
                 callee: recv, args, ..
             }
@@ -2716,6 +2756,7 @@ impl IrNode {
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)
+            | IrNode::Freeze(inner)
             | IrNode::ToObject(inner)
             | IrNode::ToPropertyKey(inner)
             | IrNode::SetFunctionName { func: inner, .. }
@@ -2760,10 +2801,6 @@ impl IrNode {
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }
             | IrNode::GenResume { handle: a, sent: b }
-            | IrNode::ObjectRest {
-                source: a,
-                exclude: b,
-            }
             | IrNode::Index { obj: a, index: b }
             | IrNode::MakeAccessor {
                 getter: a,
@@ -2779,6 +2816,11 @@ impl IrNode {
                 obj, index, rhs, ..
             } => vec![&mut **obj, &mut **index, &mut **rhs],
             IrNode::IndexSet { obj, index, value } => vec![&mut **obj, &mut **index, &mut **value],
+            IrNode::CopyDataProperties {
+                target,
+                source,
+                exclude,
+            } => vec![&mut **target, &mut **source, &mut **exclude],
             IrNode::Ternary {
                 cond,
                 then_branch,
@@ -2816,6 +2858,14 @@ impl IrNode {
             | IrNode::ConsoleLog { args }
             | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter_mut().collect(),
+            IrNode::Block { stmts, value } => {
+                let mut out = Vec::new();
+                for stmt in stmts {
+                    stmt.nodes_mut_deep(&mut out);
+                }
+                out.push(&mut **value);
+                out
+            }
             IrNode::CallIndirect {
                 callee: recv, args, ..
             }
@@ -2951,7 +3001,69 @@ impl IrStmt {
                         .iter()
                         .any(|case| case.test.as_ref().is_some_and(&mut f))
             }
-            IrStmt::Break(_) | IrStmt::Continue(_) | IrStmt::Try { .. } => false,
+            IrStmt::Break(_)
+            | IrStmt::Continue(_)
+            | IrStmt::Try { .. }
+            | IrStmt::Labeled { .. } => false,
+        }
+    }
+
+    /// Whether `f` holds for any expression of this statement or of a nested
+    /// statement, at any depth (an [`IrNode::Block`]'s children).
+    fn any_node_deep(&self, f: &mut dyn FnMut(&IrNode) -> bool) -> bool {
+        self.any_node(&mut *f) || self.any_stmt(|inner| inner.any_node_deep(&mut *f))
+    }
+
+    /// Mutable references to every expression of this statement and of its
+    /// nested statements, in [`Self::any_node_deep`] order.
+    fn nodes_mut_deep<'a>(&'a mut self, out: &mut Vec<&'a mut IrNode>) {
+        let nested: Vec<&'a mut Vec<IrStmt>> = match self {
+            IrStmt::Decl { init: node, .. } | IrStmt::Expr(node) => {
+                out.push(node);
+                Vec::new()
+            }
+            IrStmt::Return(value) => {
+                out.extend(value.as_mut());
+                Vec::new()
+            }
+            IrStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                out.push(cond);
+                vec![then_body, else_body]
+            }
+            IrStmt::While {
+                cond, body, update, ..
+            } => {
+                out.push(cond);
+                vec![body, update]
+            }
+            IrStmt::Switch { disc, cases, .. } => {
+                out.push(disc);
+                let mut bodies = Vec::new();
+                for case in cases {
+                    out.extend(case.test.as_mut());
+                    bodies.push(&mut case.body);
+                }
+                bodies
+            }
+            IrStmt::Break(_) | IrStmt::Continue(_) => Vec::new(),
+            IrStmt::Labeled { body, .. } => vec![body],
+            IrStmt::Try {
+                body,
+                catch_body,
+                finally_body,
+            } => std::iter::once(body)
+                .chain(catch_body.as_mut())
+                .chain(finally_body.as_mut())
+                .collect(),
+        };
+        for stmts in nested {
+            for stmt in stmts {
+                stmt.nodes_mut_deep(out);
+            }
         }
     }
 
@@ -2973,6 +3085,7 @@ impl IrStmt {
                 body: a, update: b, ..
             } => a.iter().chain(b).any(f),
             IrStmt::Switch { cases, .. } => cases.iter().flat_map(|case| &case.body).any(f),
+            IrStmt::Labeled { body, .. } => body.iter().any(f),
             IrStmt::Try {
                 body,
                 catch_body,

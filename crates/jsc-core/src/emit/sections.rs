@@ -97,7 +97,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         delete: index(),
         own_keys: index(),
         for_in_keys: index(),
-        rest: index(),
+        copy_data: index(),
         // `__array_reserve` takes the index right before `__array_push`.
         array_push: {
             index();
@@ -379,8 +379,8 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I64, I32], &[I64]),
         // `__for_in_keys(obj) -> array`.
         (&[I64], &[I64]),
-        // `__rest(src, excl) -> object`.
-        (&[I64, I64], &[I64]),
+        // `__copy_data(dst, src, excl) -> dst`.
+        (&[I64, I64, I64], &[I64]),
         // `__array_reserve(base, need)`.
         (&[I32, I32], &[]),
         // `__array_push(base, value) -> base`.
@@ -868,6 +868,11 @@ pub(super) fn collect_stmt<'a>(stmt: &'a IrStmt, strs: &mut Strs<'a>) {
                 }
             }
         }
+        IrStmt::Labeled { body, .. } => {
+            for stmt in body {
+                collect_stmt(stmt, strs);
+            }
+        }
         IrStmt::Break(_) | IrStmt::Continue(_) => {}
         IrStmt::Try {
             body,
@@ -948,6 +953,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
         | IrNode::IsArray(operand)
+        | IrNode::Freeze(operand)
         | IrNode::ToObject(operand)
         | IrNode::ToPropertyKey(operand)
         | IrNode::CellNew(operand)
@@ -999,6 +1005,12 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
             for elem in elems {
                 collect_node(elem, strs);
             }
+        }
+        IrNode::Block { stmts, value } => {
+            for stmt in stmts {
+                collect_stmt(stmt, strs);
+            }
+            collect_node(value, strs);
         }
         IrNode::ArraySpread(parts) => {
             for part in parts {
@@ -1165,7 +1177,12 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
                 collect_node(new_target, strs);
             }
         }
-        IrNode::ObjectRest { source, exclude } => {
+        IrNode::CopyDataProperties {
+            target,
+            source,
+            exclude,
+        } => {
+            collect_node(target, strs);
             collect_node(source, strs);
             collect_node(exclude, strs);
         }

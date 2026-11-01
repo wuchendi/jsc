@@ -457,11 +457,12 @@ impl CaptureResolver {
                 // The guarded block is its own scope.
                 self.analyze_scoped(&t.block.stmts);
                 if let Some(handler) = &t.handler {
-                    // The catch clause scope binds the (optional) parameter before
-                    // its body, so a nested closure referencing it marks it captured.
+                    // The catch clause scope binds the (optional) parameter — an
+                    // identifier or a destructuring pattern — before its body, so
+                    // a nested closure referencing it marks it captured.
                     self.push_scope();
-                    if let Some(Pat::Ident(ident)) = &handler.param {
-                        self.declare(ident.id.sym.as_ref(), binding_id(ident));
+                    if let Some(param) = &handler.param {
+                        self.declare_pat(param, false);
                     }
                     self.stmts(&handler.body.stmts);
                     self.pop_scope();
@@ -703,6 +704,12 @@ impl CaptureResolver {
             }
             Expr::Tpl(t) => {
                 for e in &t.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::TaggedTpl(t) => {
+                self.expr(&t.tag);
+                for e in &t.tpl.exprs {
                     self.expr(e);
                 }
             }

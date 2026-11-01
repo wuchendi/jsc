@@ -281,3 +281,89 @@ fn for_of_destructuring_head_rejects_duplicate_bindings() {
     assert_rejected("for (const [x, x] of []) {}");
     assert_rejected("for (let { a, b: [a] } of []) {}");
 }
+
+// --- assignment heads ----------------------------------------------------------
+
+#[test]
+fn for_of_assigns_identifier_member_and_pattern_heads() {
+    assert_string(
+        &collected("let a; for (a of [1, 2]) out.push(a); out.push(a)"),
+        "[1,2,2]",
+    );
+    assert_string(&collected("let a; for ((a) of [3]) out.push(a)"), "[3]");
+    assert_string(
+        &collected("const o = {}; for (o.p of [4, 5]) out.push(o.p)"),
+        "[4,5]",
+    );
+    assert_string(
+        &collected("let a, b; for ([a, b] of [[1, 2], [3, 4]]) out.push(a + b)"),
+        "[3,7]",
+    );
+    assert_string(
+        &collected("let a; for ({ a } of [{ a: 6 }]) out.push(a)"),
+        "[6]",
+    );
+    // A `const` target is rejected like any other assignment to it.
+    assert_rejected("const c = 0; for (c of [1]) {}");
+}
+
+#[test]
+fn a_throwing_for_of_assignment_head_closes_the_iterator() {
+    assert_string(
+        "const log = [];
+         const it = { [Symbol.iterator]() { return this },
+           next() { log.push('next'); return { value: 1, done: false } },
+           return() { log.push('return'); return {} } };
+         const o = { set p(v) { throw 'boom' } };
+         try { for (o.p of it) {} } catch (e) { log.push(e) }
+         log.join(',')",
+        "next,return,boom",
+    );
+}
+
+#[test]
+fn for_in_assigns_identifier_member_and_pattern_heads() {
+    assert_string(
+        &collected("let k; for (k in { a: 1, b: 2 }) out.push(k); out.push(k)"),
+        "[\"a\",\"b\",\"b\"]",
+    );
+    assert_string(
+        &collected("const o = {}; for (o.p in { x: 1 }) out.push(o.p)"),
+        "[\"x\"]",
+    );
+    assert_string(
+        &collected("let a, b; for ([a, b] in { ab: 1 }) out.push(a, b)"),
+        "[\"a\",\"b\"]",
+    );
+    assert_string(
+        &collected("let length; for ({ length } in { abc: 1 }) out.push(length)"),
+        "[3]",
+    );
+}
+
+#[test]
+fn for_in_binds_declared_patterns() {
+    assert_string(
+        &collected("for (const [a, b] in { xy: 1 }) out.push(b + a)"),
+        "[\"yx\"]",
+    );
+    assert_string(
+        &collected("for (var { length } in { abcd: 1 }) out.push(length)"),
+        "[4]",
+    );
+    assert_rejected("for (const [x, x] in {}) {}");
+}
+
+#[test]
+fn for_in_over_a_primitive_enumerates_only_string_indices() {
+    assert_string(&collected("for (const k in 5) out.push(k)"), "[]");
+    assert_string(&collected("for (const k in true) out.push(k)"), "[]");
+    assert_string(
+        &collected("for (const k in null) out.push(k); for (const k in undefined) out.push(k)"),
+        "[]",
+    );
+    assert_string(
+        &collected("for (const k in 'ab') out.push(k)"),
+        "[\"0\",\"1\"]",
+    );
+}

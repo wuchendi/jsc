@@ -1932,11 +1932,11 @@ fn emit_map_clear(handle: u32, function: &mut Function, scratch: u32) {
     function.instruction(&Instruction::End);
 }
 
-/// Emit an object-rest binding `{...rest} = source`, leaving the fresh
-/// object jsval on the stack: `source` (the hidden temp holding the
-/// initializer) and `exclude` (an [`IrNode::Array`] of the destructured key
-/// strings) are evaluated and handed to `__rest`.
-pub(super) fn emit_object_rest_node(
+/// Emit [`IrNode::CopyDataProperties`], leaving the `target` object jsval on
+/// the stack: `target`, `source`, and `exclude` (an [`IrNode::Array`] of
+/// excluded key strings) are evaluated in order and handed to `__copy_data`.
+pub(super) fn emit_copy_data_node(
+    target: &IrNode,
     source: &IrNode,
     exclude: &IrNode,
     function: &mut Function,
@@ -1944,9 +1944,10 @@ pub(super) fn emit_object_rest_node(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    emit_node(target, function, scratch, strings, helpers);
     emit_node(source, function, scratch, strings, helpers);
     emit_node(exclude, function, scratch, strings, helpers);
-    function.instruction(&Instruction::Call(helpers.rest));
+    function.instruction(&Instruction::Call(helpers.copy_data));
 }
 
 /// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for the

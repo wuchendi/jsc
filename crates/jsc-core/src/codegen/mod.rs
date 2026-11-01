@@ -202,6 +202,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             .map(|(name, slot)| (name.clone(), slot))
             .collect(),
         module_mutable: analysis.module_mutable,
+        template_cells: Cell::new(0),
         completion: Cell::new(None),
         globals,
         global_decls,
@@ -264,6 +265,11 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         functions.push(lower_function(fn_decl, &shared)?);
     }
 
+    // The tagged-template sites' cells follow the module bindings' cells.
+    let module_cells = u32::try_from(analysis.module_names.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(shared.template_cells.get());
+
     // Lifted arrow functions follow the declarations in the functions vector, so
     // their positions match the funcref table indices handed out at their use
     // sites.
@@ -273,7 +279,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         locals,
         stmts,
         functions,
-        module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
+        module_cells,
         arity: u32::try_from(max_arity).unwrap_or(u32::MAX),
     })
 }
@@ -316,6 +322,10 @@ struct Shared<'a> {
     module_slots: HashMap<String, u32>,
     /// Mutability of each module binding (see [`CaptureAnalysis::module_mutable`]).
     module_mutable: HashMap<String, bool>,
+    /// The number of tagged-template sites lowered so far: site `n` caches its
+    /// template object in module cell `module_slots.len() + n` (see
+    /// [`LowerCtx::template_object`]).
+    template_cells: Cell<u32>,
     /// The `main` local tracking the completion value (for `-p`) of the
     /// top-level `try` statement being lowered, or `None` outside one. While set,
     /// every expression statement in `main`'s own frame stores its value here
@@ -478,12 +488,13 @@ struct Frame {
     /// Captured binding id → env slot (the inverse of `env`).
     env_index: HashMap<u32, u32>,
     /// Active statement labels enclosing the point being lowered, innermost last:
-    /// each is a `(label name, loop id)` pair, where the loop id is the
-    /// [`IrStmt::While::label`] of the labeled loop. A labeled `break`/`continue`
-    /// resolves its target name to a loop id here. Labels do not cross a function
-    /// boundary, so this is per-frame.
-    labels: Vec<(String, u32)>,
-    /// The next loop-id to hand out for a labeled loop in this frame.
+    /// each is a `(label name, label id, is_loop)` triple, where the label id is
+    /// the [`IrStmt::While::label`] of a labeled loop (`is_loop`) or the
+    /// [`IrStmt::Labeled::label`] of any other labeled statement. A labeled
+    /// `break`/`continue` resolves its target name to a label id here. Labels do
+    /// not cross a function boundary, so this is per-frame.
+    labels: Vec<(String, u32, bool)>,
+    /// The next label id to hand out for a labeled statement in this frame.
     next_label: u32,
     /// Whether this frame is a function scope that binds `this`. `true` for
     /// every lowered function/arrow/method body, `false` for the top-level `main`
