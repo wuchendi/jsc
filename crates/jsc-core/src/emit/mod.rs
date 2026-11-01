@@ -1152,6 +1152,16 @@ impl Helpers<'_> {
         self.to_primitive() + 17
     }
 
+    /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).
+    fn super_get(self) -> u32 {
+        self.to_primitive() + 18
+    }
+
+    /// `__super_set(home, key, v, recv)` (see [`props::emit_super_set`]).
+    fn super_set(self) -> u32 {
+        self.to_primitive() + 19
+    }
+
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
@@ -1659,6 +1669,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_set_proto(helpers));
     code.function(&builtins::emit_promise_self_error(&offsets, helpers));
     code.function(&emit_symbol_get(helpers));
+    code.function(&emit_super_get(&offsets, helpers));
+    code.function(&emit_super_set(&offsets, helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

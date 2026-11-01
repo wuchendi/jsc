@@ -523,6 +523,23 @@ pub(super) fn emit_node(
         IrNode::IndexSet { obj, index, value } => {
             emit_index_set_node(obj, index, value, function, scratch, strings, helpers);
         }
+        IrNode::SuperGet { this, key, home } => {
+            emit_super_get_node(this, key, home, function, scratch, strings, helpers);
+        }
+        IrNode::SuperSet {
+            this,
+            key,
+            home,
+            value,
+        } => {
+            emit_super_set_node(
+                [this, key, home, value],
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
+        }
         node @ IrNode::IndexOpSet { .. } => {
             emit_index_op_set_node(node, function, scratch, strings, helpers);
         }

@@ -4,6 +4,7 @@ use super::*;
 use swc_common::{Span, Spanned};
 
 use crate::error::CompileError;
+use crate::ir::BuiltinCtor;
 
 impl LowerCtx<'_> {
     /// The `await` of the already lowered `arg` in the current body (see
@@ -87,7 +88,7 @@ impl LowerCtx<'_> {
             // Optional chaining `a?.b` / `a?.[i]` / `a?.()`: each `?.` link
             // short-circuits the whole chain to `undefined` when its base is
             // null/undefined (P0.4).
-            Expr::OptChain(chain) => self.lower_opt_chain(chain),
+            Expr::OptChain(chain) => self.lower_opt_chain(chain, false),
             // `<expr>.length` reads a string's/array's byte length; `<expr>.a`
             // (any other static property) is an object read, lowered to the same
             // `Index` node as `<expr>["a"]`; `<expr>[<idx>]` (computed access)
@@ -224,7 +225,10 @@ impl LowerCtx<'_> {
                 UnaryOp::Bang => Ok(IrNode::Not(Box::new(self.lower_expr(&u.arg)?))),
                 // `delete obj.k` / `delete obj[k]` removes an own property and
                 // yields `true` (parentheses are transparent). `delete x` of an
-                // identifier is an early SyntaxError in strict code; any other
+                // identifier is an early SyntaxError in strict code; `delete
+                // super.x` reads `this` and evaluates the key, then throws a
+                // `ReferenceError`; `delete o?.x` yields `true` without
+                // deleting when the chain short-circuits; any other
                 // non-reference operand is evaluated and yields `true`.
                 UnaryOp::Delete => match strip_parens(&u.arg) {
                     Expr::Ident(ident) => Err(CompileError::spanned(
@@ -232,16 +236,28 @@ impl LowerCtx<'_> {
                         "Delete of an unqualified identifier in strict mode.",
                     )
                     .into()),
-                    Expr::SuperProp(super_prop) => Err(CompileError::spanned(
-                        super_prop.span,
-                        "`delete` of a `super` property is not supported",
-                    )
-                    .into()),
-                    Expr::OptChain(chain) => Err(CompileError::spanned(
-                        chain.span,
-                        "`delete` of an optional chain is not supported",
-                    )
-                    .into()),
+                    Expr::SuperProp(super_prop) => {
+                        if self.current_super.is_none() {
+                            return Err(CompileError::spanned(
+                                super_prop.span,
+                                "`super` is only valid inside a class",
+                            )
+                            .into());
+                        }
+                        let this = self.super_this(super_prop.span)?;
+                        let key = self.lower_super_key(super_prop)?;
+                        Ok(IrNode::Seq(vec![
+                            this,
+                            key,
+                            IrNode::Throw(Box::new(reference_error(
+                                "Unsupported reference to 'super'",
+                            ))),
+                        ]))
+                    }
+                    Expr::OptChain(chain) if matches!(*chain.base, OptChainBase::Member(_)) => {
+                        let chain = self.lower_opt_chain(chain, true)?;
+                        Ok(IrNode::Seq(vec![chain, IrNode::Bool(true)]))
+                    }
                     Expr::Member(member) => {
                         let obj = self.lower_expr(&member.obj)?;
                         let key = match &member.prop {
@@ -388,9 +404,25 @@ impl LowerCtx<'_> {
     /// the tail (every following link) sits in the `else` arm of a [`IrNode::Ternary`]
     /// so it is skipped on the short-circuit path. A non-optional link is applied
     /// directly to the running value with no guard.
-    fn lower_opt_chain(&mut self, chain: &OptChainExpr) -> anyhow::Result<IrNode> {
+    ///
+    /// With `delete`, the last link (a member) deletes its property instead of
+    /// reading it (`delete o?.a.b`), so a short-circuit skips the deletion.
+    fn lower_opt_chain(&mut self, chain: &OptChainExpr, delete: bool) -> anyhow::Result<IrNode> {
         let mut links = Vec::new();
         let root = collect_chain_links(chain, &mut links);
+        if delete
+            && let Some(ChainLink::Member {
+                prop,
+                optional,
+                span,
+            }) = links.pop()
+        {
+            links.push(ChainLink::Delete {
+                prop,
+                optional,
+                span,
+            });
+        }
         // `o.m?.(..)`: the callee `o.m` is a plain member expression; split it
         // into its base and a member link so the call binds `this = o`.
         if let (Expr::Member(member), Some(ChainLink::Call { .. })) = (root, links.first()) {
@@ -417,7 +449,9 @@ impl LowerCtx<'_> {
             return Ok(value);
         };
         let optional = match link {
-            ChainLink::Member { optional, .. } | ChainLink::Call { optional, .. } => *optional,
+            ChainLink::Member { optional, .. }
+            | ChainLink::Call { optional, .. }
+            | ChainLink::Delete { optional, .. } => *optional,
         };
         if optional {
             // Evaluate the base once into `temp`, then continue the tail through a
@@ -528,6 +562,23 @@ impl LowerCtx<'_> {
             ChainLink::Call { args, .. } => {
                 let args = self.lower_chain_args(args)?;
                 Ok(self.call_indirect(obj, args, not_a_function(None)))
+            }
+            ChainLink::Delete { prop, span, .. } => {
+                let key = match prop {
+                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
+                    MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
+                    MemberProp::PrivateName(_) => {
+                        return Err(CompileError::spanned(
+                            *span,
+                            "private fields are not supported",
+                        )
+                        .into());
+                    }
+                };
+                Ok(IrNode::ObjectDelete {
+                    obj: Box::new(obj),
+                    key: Box::new(key),
+                })
             }
         }
     }
@@ -695,18 +746,23 @@ impl LowerCtx<'_> {
 
     /// The object `super.x` looks `x` up on: the home object's prototype — the
     /// parent's `prototype` for instance members, the parent itself for static
-    /// ones — or `None` in a base class (whose home prototype is the not yet
-    /// modelled `%Object.prototype%` / `%Function.prototype%`).
-    fn super_home(&mut self, span: Span) -> anyhow::Result<Option<IrNode>> {
+    /// ones; in a base class `%Object.prototype%` / `%Function.prototype%`.
+    fn super_home(&mut self, span: Span) -> anyhow::Result<IrNode> {
         let Some(scope) = self.current_super else {
             return Err(CompileError::spanned(span, "`super` is only valid inside a class").into());
         };
-        let id = if scope.is_static {
-            scope.parent
+        let (id, base) = if scope.is_static {
+            (scope.parent, BuiltinCtor::Function)
         } else {
-            scope.proto_parent
+            (scope.proto_parent, BuiltinCtor::Object)
         };
-        Ok(id.map(|id| self.read_hidden(scope.frame, id)))
+        Ok(match id {
+            Some(id) => self.read_hidden(scope.frame, id),
+            None => IrNode::Index {
+                obj: Box::new(IrNode::Intrinsic(GlobalIntrinsic::Ctor(base))),
+                index: Box::new(IrNode::Str("prototype".into())),
+            },
+        })
     }
 
     /// Lower the key of `super.x` / `super[k]`.
@@ -717,68 +773,72 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Prefix `node` with the read of `this` a `super.x` reference makes first
-    /// (TDZ-checked in a derived constructor); returns the local holding it.
-    fn super_this(&mut self, node: IrNode, span: Span) -> anyhow::Result<(IrNode, u32)> {
+    /// The `this` a `super.x` reference reads first (TDZ-checked in a derived
+    /// constructor; an arrow's is its enclosing function's, a generator/async
+    /// method's lives in its frame cell).
+    fn super_this(&mut self, span: Span) -> anyhow::Result<IrNode> {
         if let Some(fi) = self.derived_frame() {
-            let this = self.derived_this(fi);
-            let local = self.fresh();
-            let read = IrNode::Assign {
-                local,
-                value: Box::new(this),
-            };
-            return Ok((IrNode::Seq(vec![read, node]), local));
+            return Ok(self.derived_this(fi));
         }
-        // An arrow's `this` is its enclosing function's, and a generator/async
-        // method's lives in its frame cell: snapshot it into a local for the
-        // call.
         if let Some(this) = self.lexical_this().or_else(|| self.generator_this()) {
-            let local = self.fresh();
-            let read = IrNode::Assign {
-                local,
-                value: Box::new(this),
-            };
-            return Ok((IrNode::Seq(vec![read, node]), local));
+            return Ok(this);
         }
-        let Some(this_local) = self.ensure_this_local() else {
-            return Err(CompileError::spanned(span, "`super` is not available here").into());
-        };
-        Ok((node, this_local))
+        self.ensure_this_local()
+            .map(IrNode::Local)
+            .ok_or_else(|| CompileError::spanned(span, "`super` is not available here").into())
     }
 
-    /// Lower a `super.x` / `super[k]` read through the home object (see
-    /// [`Self::super_home`]).
-    fn lower_super_prop(&mut self, super_prop: &SuperPropExpr) -> anyhow::Result<IrNode> {
-        let home = self.super_home(super_prop.span)?;
+    /// The `this`, key and home object prototype of a `super.x` / `super[k]`
+    /// reference, lowered in evaluation order.
+    fn super_ref(
+        &mut self,
+        super_prop: &SuperPropExpr,
+    ) -> anyhow::Result<(IrNode, IrNode, IrNode)> {
+        let this = self.super_this(super_prop.span)?;
         let key = self.lower_super_key(super_prop)?;
-        let read = match home {
-            Some(home) => IrNode::Index {
-                obj: Box::new(home),
-                index: Box::new(key),
-            },
-            None => IrNode::Seq(vec![key, IrNode::Undefined]),
-        };
-        Ok(self.super_this(read, super_prop.span)?.0)
+        let home = self.super_home(super_prop.span)?;
+        Ok((this, key, home))
     }
 
-    /// Lower `super.m(args)`: the method found through the home object (see
-    /// [`Self::super_home`]), called with the CURRENT `this` (an
-    /// [`IrNode::ThisCall`]).
+    /// Lower a `super.x` / `super[k]` read: `[[Get]]` from the home object
+    /// prototype (see [`Self::super_home`]) with the current `this` as the
+    /// receiver (an [`IrNode::SuperGet`]).
+    fn lower_super_prop(&mut self, super_prop: &SuperPropExpr) -> anyhow::Result<IrNode> {
+        Ok(super_get(&self.super_ref(super_prop)?))
+    }
+
+    /// Lower `super.m(args)`: the method read like [`Self::lower_super_prop`],
+    /// called with the CURRENT `this` (an [`IrNode::ThisCall`]).
     fn lower_super_method_call(
         &mut self,
         super_prop: &SuperPropExpr,
         args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let home = self.super_home(super_prop.span)?;
-        let key = self.lower_super_key(super_prop)?;
-        let method = match home {
-            Some(home) => IrNode::Index {
-                obj: Box::new(home),
-                index: Box::new(key),
-            },
-            None => IrNode::Seq(vec![key, IrNode::Undefined]),
+        let derived = self.derived_frame().is_some();
+        let (this, key, home) = self.super_ref(super_prop)?;
+        // Snapshot `this` into a local the call binds (a plain method's own
+        // `this` local already is one; a derived constructor's changes at
+        // `super(..)`).
+        let (prefix, this_local) = match this {
+            IrNode::Local(local) if !derived => (None, local),
+            this => {
+                let local = self.fresh();
+                let read = IrNode::Assign {
+                    local,
+                    value: Box::new(this),
+                };
+                (Some(read), local)
+            }
         };
-        let (callee, this_local) = self.super_this(method, super_prop.span)?;
+        let method = IrNode::SuperGet {
+            this: Box::new(IrNode::Local(this_local)),
+            key: Box::new(key),
+            home: Box::new(home),
+        };
+        let callee = match prefix {
+            Some(read) => IrNode::Seq(vec![read, method]),
+            None => method,
+        };
         // The method is read before the arguments run (ECMA-262 13.3.7.1).
         let (seq, callee) = self.callee_first(callee, &args);
         Ok(seq_then(
@@ -791,6 +851,116 @@ impl LowerCtx<'_> {
                 not_callable: not_a_function(None),
             },
         ))
+    }
+
+    /// Lower an assignment or update of `super.x` / `super[k]`: `[[Set]]` from
+    /// the home object prototype with `this` as the receiver (an
+    /// [`IrNode::SuperSet`]). `this`, the key and the home are evaluated first,
+    /// in that order; a plain `=` converts the key after the right-hand side,
+    /// every other form reads the current value through [`IrNode::SuperGet`]
+    /// (see [`Self::super_rmw_ref`]) before the right-hand side runs. A
+    /// short-circuited logical assignment skips the right-hand side and the
+    /// store; a postfix update yields the old numeric value.
+    fn lower_super_assign(
+        &mut self,
+        super_prop: &SuperPropExpr,
+        write: SuperWrite<'_>,
+    ) -> anyhow::Result<IrNode> {
+        if let SuperWrite::Assign(AssignKind::Plain, right) = write {
+            let target = self.super_ref(super_prop)?;
+            let rhs = self.lower_expr(right)?;
+            return Ok(super_set(&target, rhs));
+        }
+        let (mut stmts, target) = self.super_rmw_ref(super_prop)?;
+        let read = super_get(&target);
+        let value = match write {
+            SuperWrite::Update { inc, prefix } => {
+                let old_local = self.fresh();
+                stmts.push(IrStmt::Decl {
+                    local: old_local,
+                    init: IrNode::ConvertCall {
+                        op: ConvertOp::ToNumber,
+                        arg: Box::new(read),
+                        radix: None,
+                    },
+                });
+                let store = super_set(
+                    &target,
+                    IrNode::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(IrNode::Local(old_local)),
+                        rhs: Box::new(IrNode::Num(if inc { 1.0 } else { -1.0 })),
+                    },
+                );
+                if prefix {
+                    store
+                } else {
+                    stmts.push(IrStmt::Expr(store));
+                    IrNode::Local(old_local)
+                }
+            }
+            SuperWrite::Assign(AssignKind::Logical(op), right) => IrNode::Logical {
+                op,
+                lhs: Box::new(read),
+                rhs: Box::new(super_set(&target, self.lower_expr(right)?)),
+            },
+            SuperWrite::Assign(AssignKind::Binary(op), right) => super_set(
+                &target,
+                IrNode::Binary {
+                    op,
+                    lhs: Box::new(read),
+                    rhs: Box::new(self.lower_expr(right)?),
+                },
+            ),
+            SuperWrite::Assign(AssignKind::Pow | AssignKind::Plain, right) => super_set(
+                &target,
+                IrNode::MathCall {
+                    op: MathOp::Pow,
+                    args: vec![read, self.lower_expr(right)?],
+                },
+            ),
+        };
+        Ok(IrNode::Block {
+            stmts,
+            value: Box::new(value),
+        })
+    }
+
+    /// The `super` reference of a read-modify-write (compound, logical or
+    /// update): `this` and a computed key evaluated once into temps, a
+    /// `null` home's `TypeError` (thrown through the read), then the key
+    /// converted once (`ToPropertyKey`) — the statements, and the
+    /// side-effect-free `(this, key, home)` reading them.
+    fn super_rmw_ref(
+        &mut self,
+        super_prop: &SuperPropExpr,
+    ) -> anyhow::Result<(Vec<IrStmt>, (IrNode, IrNode, IrNode))> {
+        let (this, key, home) = self.super_ref(super_prop)?;
+        let this_local = self.fresh();
+        let mut stmts = vec![IrStmt::Decl {
+            local: this_local,
+            init: this,
+        }];
+        let this = IrNode::Local(this_local);
+        if !matches!(super_prop.prop, SuperProp::Computed(_)) {
+            return Ok((stmts, (this, key, home)));
+        }
+        let key_local = self.fresh();
+        let key_read = IrNode::Local(key_local);
+        stmts.push(IrStmt::Decl {
+            local: key_local,
+            init: key,
+        });
+        let target = (this, key_read, home);
+        stmts.push(IrStmt::Expr(nullish_base_guard(
+            &target.2,
+            super_get(&target),
+        )));
+        stmts.push(IrStmt::Expr(IrNode::Assign {
+            local: key_local,
+            value: Box::new(IrNode::ToPropertyKey(Box::new(IrNode::Local(key_local)))),
+        }));
+        Ok((stmts, target))
     }
 
     /// Lower a call expression `callee(args)`. A call to a bare **function name**
@@ -1514,11 +1684,9 @@ impl LowerCtx<'_> {
                 self.lower_ident_assign(ident, op, &assign.right, named)
             }
             Target::Member(member) => self.lower_member_assign(member, op, &assign.right),
-            Target::SuperProp(super_prop) => Err(CompileError::spanned(
-                super_prop.span,
-                "assignment to a `super` property is not supported",
-            )
-            .into()),
+            Target::SuperProp(super_prop) => {
+                self.lower_super_assign(super_prop, SuperWrite::Assign(op, &assign.right))
+            }
         }
     }
 
@@ -1640,8 +1808,20 @@ impl LowerCtx<'_> {
             let idx_local = self.fresh();
             stmts.push(IrStmt::Decl {
                 local: idx_local,
-                init: IrNode::ToPropertyKey(Box::new(index)),
+                init: index,
             });
+            // A nullish base throws (through the read) before the key converts.
+            stmts.push(IrStmt::Expr(nullish_base_guard(
+                &IrNode::Local(obj_local),
+                IrNode::Index {
+                    obj: Box::new(IrNode::Local(obj_local)),
+                    index: Box::new(IrNode::Local(idx_local)),
+                },
+            )));
+            stmts.push(IrStmt::Expr(IrNode::Assign {
+                local: idx_local,
+                value: Box::new(IrNode::ToPropertyKey(Box::new(IrNode::Local(idx_local)))),
+            }));
             IrNode::Local(idx_local)
         } else {
             index
@@ -1683,11 +1863,11 @@ impl LowerCtx<'_> {
             Some(Target::Ident(ident)) => ident,
             Some(Target::Member(member)) => return self.lower_member_update(update, member),
             Some(Target::SuperProp(super_prop)) => {
-                return Err(CompileError::spanned(
-                    super_prop.span,
-                    "increment/decrement of a `super` property is not supported",
-                )
-                .into());
+                let write = SuperWrite::Update {
+                    inc: matches!(update.op, UpdateOp::PlusPlus),
+                    prefix: update.prefix,
+                };
+                return self.lower_super_assign(super_prop, write);
             }
             None => {
                 let msg = if update.prefix {
@@ -2451,6 +2631,12 @@ enum ChainLink<'a> {
         args: &'a [ExprOrSpread],
         optional: bool,
     },
+    /// The member link a `delete` of the chain removes.
+    Delete {
+        prop: &'a MemberProp,
+        optional: bool,
+        span: Span,
+    },
 }
 
 /// Flatten an [`OptChainExpr`] into its root base expression plus the ordered
@@ -2508,6 +2694,48 @@ fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
         cond: Box::new(is_nullish),
         then_branch: Box::new(IrNode::Undefined),
         else_branch: Box::new(tail),
+    }
+}
+
+/// The [`IrNode::SuperGet`] of the side-effect-free `super` reference
+/// `(this, key, home)`.
+fn super_get((this, key, home): &(IrNode, IrNode, IrNode)) -> IrNode {
+    IrNode::SuperGet {
+        this: Box::new(this.clone()),
+        key: Box::new(key.clone()),
+        home: Box::new(home.clone()),
+    }
+}
+
+/// The [`IrNode::SuperSet`] of `value` through the `super` reference
+/// `(this, key, home)` (see [`super_get`]).
+fn super_set((this, key, home): &(IrNode, IrNode, IrNode), value: IrNode) -> IrNode {
+    IrNode::SuperSet {
+        this: Box::new(this.clone()),
+        key: Box::new(key.clone()),
+        home: Box::new(home.clone()),
+        value: Box::new(value),
+    }
+}
+
+/// `read` (a member read of the side-effect-free `base`, which throws the
+/// nullish read `TypeError`) when `base` is `null` / `undefined`, else
+/// `undefined`: the guard a reference whose key converts once runs before
+/// that conversion (ECMA-262 `GetValue`: `ToObject` of the base first).
+fn nullish_base_guard(base: &IrNode, read: IrNode) -> IrNode {
+    let is = |value: IrNode| IrNode::Binary {
+        op: BinOp::Eq,
+        lhs: Box::new(base.clone()),
+        rhs: Box::new(value),
+    };
+    IrNode::Ternary {
+        cond: Box::new(IrNode::Logical {
+            op: LogicalOp::Or,
+            lhs: Box::new(is(IrNode::Null)),
+            rhs: Box::new(is(IrNode::Undefined)),
+        }),
+        then_branch: Box::new(read),
+        else_branch: Box::new(IrNode::Undefined),
     }
 }
 
@@ -2651,6 +2879,15 @@ enum AssignKind {
     Pow,
     /// `&&=`, `||=`, `??=`.
     Logical(LogicalOp),
+}
+
+/// The write a `super` property reference takes ([`LowerCtx::lower_super_assign`]).
+#[derive(Clone, Copy)]
+enum SuperWrite<'a> {
+    /// `super.x op= rhs`.
+    Assign(AssignKind, &'a Expr),
+    /// `++` / `--`, prefix or postfix.
+    Update { inc: bool, prefix: bool },
 }
 
 /// A simple assignment / update target with its parentheses stripped.

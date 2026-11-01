@@ -799,7 +799,9 @@ fn emit_bound_restart(function: &mut Function, f: u32) {
 }
 
 /// Emit a `delete obj[key]` property removal, leaving a `true` jsval on the
-/// stack. `obj` is evaluated, then the key is converted with `ToPropertyKey` (a
+/// stack. `obj` and the key are evaluated (stashed in the high scratch slots
+/// `+14` / `+15`); a `null` / `undefined` `obj` throws the nullish `TypeError`
+/// (`ToObject` of the base); then the key is converted with `ToPropertyKey` (a
 /// lookup: a never-interned key is absent) and `__delete` tombstones the own
 /// property; a non-configurable one throws.
 pub(super) fn emit_object_delete_node(
@@ -810,8 +812,17 @@ pub(super) fn emit_object_delete_node(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let (s_obj, s_key) = (scratch + 14, scratch + 15);
     emit_node(obj, function, scratch, strings, helpers);
-    emit_key_lookup(key, function, scratch, strings, helpers);
+    emit_node(key, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s_key));
+    function.instruction(&Instruction::LocalSet(s_obj));
+    if !never_nullish(obj) {
+        let key = IrNode::Local(s_key);
+        emit_nullish_guard(function, s_obj, &key, false, scratch, strings, helpers);
+    }
+    function.instruction(&Instruction::LocalGet(s_obj));
+    emit_prop_key(function, key, s_key, false, strings, helpers);
     function.instruction(&Instruction::Call(helpers.delete));
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64Const(TRUE_BITS));
@@ -2387,6 +2398,72 @@ pub(super) fn emit_index_set_node(
 
     // The assignment expression yields the stored value.
     function.instruction(&Instruction::LocalGet(sval));
+}
+
+/// Emit a [`IrNode::SuperGet`]: `this`, `key` and `home` are evaluated in
+/// that order (stashed in the high scratch slots `+14`..`+16`); a `null` home
+/// (`class extends null`) throws the read `TypeError` before the key is
+/// converted; then `__super_get(home, ToPropertyKey(key), this)` (a lookup)
+/// with the pending-exception check.
+pub(super) fn emit_super_get_node(
+    this: &IrNode,
+    key: &IrNode,
+    home: &IrNode,
+    function: &mut Function,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (s_this, s_key, s_home) = (scratch + 14, scratch + 15, scratch + 16);
+    emit_node(this, function, scratch, strings, helpers);
+    emit_node(key, function, scratch, strings, helpers);
+    emit_node(home, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s_home));
+    function.instruction(&Instruction::LocalSet(s_key));
+    function.instruction(&Instruction::LocalSet(s_this));
+    if !never_nullish(home) {
+        let key = IrNode::Local(s_key);
+        emit_nullish_guard(function, s_home, &key, false, scratch, strings, helpers);
+    }
+    function.instruction(&Instruction::LocalGet(s_home));
+    emit_prop_key(function, key, s_key, false, strings, helpers);
+    function.instruction(&Instruction::LocalGet(s_this));
+    function.instruction(&Instruction::Call(helpers.super_get()));
+    emit_propagate_if_pending(function, helpers);
+}
+
+/// Emit a [`IrNode::SuperSet`]: `this`, `key`, `home` and `value` are
+/// evaluated in that order (stashed in the high scratch slots `+14`..`+17`);
+/// a `null` home throws the store `TypeError` before the key is converted;
+/// then `__super_set(home, ToPropertyKey(key), value, this)` (the key
+/// interned) with the pending-exception check; yields `value`.
+pub(super) fn emit_super_set_node(
+    [this, key, home, value]: [&IrNode; 4],
+    function: &mut Function,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (s_this, s_key, s_home, s_val) = (scratch + 14, scratch + 15, scratch + 16, scratch + 17);
+    emit_node(this, function, scratch, strings, helpers);
+    emit_node(key, function, scratch, strings, helpers);
+    emit_node(home, function, scratch, strings, helpers);
+    emit_node(value, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s_val));
+    function.instruction(&Instruction::LocalSet(s_home));
+    function.instruction(&Instruction::LocalSet(s_key));
+    function.instruction(&Instruction::LocalSet(s_this));
+    if !never_nullish(home) {
+        let key = IrNode::Local(s_key);
+        emit_nullish_guard(function, s_home, &key, true, scratch, strings, helpers);
+    }
+    function.instruction(&Instruction::LocalGet(s_home));
+    emit_prop_key(function, key, s_key, true, strings, helpers);
+    function.instruction(&Instruction::LocalGet(s_val));
+    function.instruction(&Instruction::LocalGet(s_this));
+    function.instruction(&Instruction::Call(helpers.super_set()));
+    emit_propagate_if_pending(function, helpers);
+    function.instruction(&Instruction::LocalGet(s_val));
 }
 
 /// Emit `__set(s0, ToPropertyKey(index), sval)` (the key interned) followed
