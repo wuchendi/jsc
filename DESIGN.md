@@ -841,7 +841,7 @@ function-index order:
 |---|---|
 | allocation, strings | `__alloc`, `__concat`, `__str_eq`, `__str_cmp`, `__str_index` (all on code units, below) |
 | interning (§5.3) | `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`, `__index_value`, `__index_string`, `__str_exotic_index(o, key)`, `__to_key` |
-| property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__rest(src, excl)` |
+| property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__copy_data(dst, src, excl)` |
 | arrays (§5.4) | `__array_reserve(base, need)`, `__array_push(base, v)`, `__array_concat(dst, src)`, `__array_set(recv, key, v)`, `__array_set_length(arr, v)`, `__sparse_get(arr, i)`, `__sparse_set(arr, i, v)`, `__protos_indexless(o)`, `__proto_elem(o, i)`, `__proto_set(o, i, v)`, `__array_define(recv, key, v)`, `__sparse_define(arr, i, v)` |
 | JSON (stringify) | `__json_escape(str)`, `__json_str(v)` — the primitive serializer: finite numbers via `__convert` ToString, `NaN`/`±Infinity`/`undefined` as `null`, keywords, escaped strings, any heap kind `null` |
 | Map/Set, equality | `__same_value_zero`, `__map_find`, `__map_set`, `__map_get`, `__map_has`, `__map_delete`, `__loose_eq`, `__str_to_array` |
@@ -876,7 +876,7 @@ object unchanged.
 ### 6.3 Property algorithms
 
 `__get`, `__set`, `__has`, `__delete`, `__define`, `__own_keys`,
-`__for_in_keys`, `__rest`, and the descriptor helpers (`emit/props.rs`,
+`__for_in_keys`, `__copy_data`, and the descriptor helpers (`emit/props.rs`,
 `emit/props/descriptor.rs`) are the only code that reads or writes property
 tables. Keys are interned `u32`s.
 
@@ -980,10 +980,13 @@ tables. Keys are interned `u32`s.
 - **`for-in`** (`__for_in_keys`): a snapshot taken at loop entry — own
   enumerable string keys, then each prototype's enumerable keys not already
   seen (a key seen at a nearer level, enumerable or not, shadows it).
-- **Object rest** (`__rest`): a fresh object with every own enumerable property
-  of the source (string keys, then symbol keys; an object source re-checks
-  each key as own and enumerable when visited) whose key is not in the
-  exclusion list.
+- **`CopyDataProperties`** (`__copy_data`, object spread and object rest):
+  defines (`CreateDataProperty`, never a setter) on the target every own
+  enumerable property of the source (string keys in own-key order, then
+  symbol keys; an object source re-checks each key as own and enumerable
+  when visited) whose key is not in the exclusion list, the value read with
+  `[[Get]]` (a getter runs). A nullish or non-string primitive source copies
+  nothing; a string copies its indices.
 
 ### 6.4 Realm, global object, and fast paths
 
@@ -1465,7 +1468,8 @@ those of `switch` and loops are not tracked.
   object.
 - **Parameters.** Default values (evaluated per call in a prologue, may reference
   earlier parameters and captured bindings), trailing rest parameters
-  (collected from the positional slots and `$__spread_args`), and array/object
+  (collected from the positional slots and `$__spread_args`; the rest target
+  may itself be an array/object pattern, `f(...[a, b])`), and array/object
   destructuring patterns (composable with defaults). Every parameter name is
   declared up front and the parameters bind left to right. With parameter
   expressions (a default anywhere), a parameter is in its TDZ until it binds:
@@ -1534,14 +1538,23 @@ those of `switch` and loops are not tracked.
   accessor) defines no property: `v` is evaluated in source order and becomes
   the `[[Prototype]]` when it is an object or `null`, else it is ignored
   (ECMA-262 B.3.1). Two such entries in one literal are an early
-  `SyntaxError` (a destructuring assignment pattern may repeat it).
+  `SyntaxError` (a destructuring assignment pattern may repeat it). A spread
+  `...o` is `CopyDataProperties` (§6.3) in source order: from the first
+  spread on, the literal is built incrementally on a temp — the entries
+  before it, then each spread, run of later entries, and `__proto__` entry
+  in turn — so later properties overwrite spread keys and vice versa; a
+  `__proto__` key copied by a spread is an ordinary own property.
 - **Property access** `o.k`, `o["k"]`, `o[expr]` (§6.3): own keys, then the
   prototype chain; a missing key reads `undefined`. Writes add properties
   dynamically; `delete` removes them.
 - **Destructuring.** Array patterns (holes, defaults, rest, nesting) and object
-  patterns (identifier and string keys, rename, defaults, nesting, rest via
-  `__rest`) in declarations, parameters, and `for-of` heads; destructuring
-  assignment as an expression statement, with member targets (`[o.x] = xs`).
+  patterns (identifier and string keys, rename, defaults, nesting, rest) in
+  declarations, parameters, and `for-of` heads; destructuring assignment as
+  an expression statement, with member targets (`[o.x] = xs`, `({...o.r} =
+  src)`). An object rest is a fresh ordinary object filled by
+  `CopyDataProperties` minus the destructured keys. An object pattern checks
+  `RequireObjectCoercible` before its first target reference, rest, or read,
+  so a nullish source throws a `TypeError` before anything else runs.
   An array pattern runs the iteration protocol lazily
   (§7.8): `GetIterator`, one `IteratorStep` per
   hole or element (an element reads `undefined` once done; a hole reads no
@@ -2151,8 +2164,8 @@ Each item below is current behaviour of this tree.
 **Object model**
 
 - Property tables are linear-scanned; there are no inline caches.
-- No object spread (`{...o}`); object patterns accept only identifier and
-  string keys; `catch` parameters must be identifiers.
+- Object patterns accept only identifier and string keys; `catch` parameters
+  must be identifiers.
 - Array-like lengths are clamped to `2^32 - 1` by the generic loops of `map`,
   `filter`, `forEach`, `reduce`, `join`, `concat` and `flat` (`map` sizes its
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the

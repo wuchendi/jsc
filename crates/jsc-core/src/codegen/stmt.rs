@@ -777,9 +777,10 @@ impl LowerCtx<'_> {
                     local: temp,
                     init: source,
                 });
-                // An empty pattern reads nothing, but still requires an
-                // object-coercible source (`({}) = null` throws a TypeError).
-                if obj.props.is_empty() {
+                // A pattern that reads nothing before a leading rest (or nothing
+                // at all) still requires an object-coercible source first
+                // (`let {...r} = null` throws a TypeError).
+                if matches!(obj.props.first(), None | Some(ObjectPatProp::Rest(_))) {
                     out.push(IrStmt::Expr(IrNode::NullishCheck {
                         value: Box::new(IrNode::Local(temp)),
                         key: String::new(),
@@ -830,13 +831,7 @@ impl LowerCtx<'_> {
                         // `{...rest}`: a NEW object with every own key of `temp`
                         // except the destructured ones collected above.
                         ObjectPatProp::Rest(rest) => {
-                            let exclude = IrNode::Array(
-                                bound_keys.iter().cloned().map(IrNode::Str).collect(),
-                            );
-                            let value = IrNode::ObjectRest {
-                                source: Box::new(IrNode::Local(temp)),
-                                exclude: Box::new(exclude),
-                            };
+                            let value = object_rest(temp, &bound_keys);
                             self.lower_binding_pattern(&rest.arg, value, mutable, out)?;
                         }
                     }
@@ -1146,6 +1141,18 @@ impl LowerCtx<'_> {
             obj: Box::new(IrNode::Local(temp)),
             index: Box::new(IrNode::Str(key.clone())),
         };
+        // `RequireObjectCoercible` runs before any target reference: only a
+        // leading shorthand reads the source before a target can run code.
+        if !matches!(obj.props.first(), Some(ObjectPatProp::Assign(_))) {
+            let key = match obj.props.first() {
+                Some(ObjectPatProp::KeyValue(kv)) => prop_key_name(&kv.key)?.to_string(),
+                _ => String::new(),
+            };
+            out.push(IrStmt::Expr(IrNode::NullishCheck {
+                value: Box::new(IrNode::Local(temp)),
+                key,
+            }));
+        }
         let mut bound_keys: Vec<JsStr> = Vec::new();
         for prop in &obj.props {
             match prop {
@@ -1164,12 +1171,8 @@ impl LowerCtx<'_> {
                     out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
                 }
                 ObjectPatProp::Rest(rest) => {
-                    let exclude =
-                        IrNode::Array(bound_keys.iter().cloned().map(IrNode::Str).collect());
-                    self.assign_element(&rest.arg, out, |_, _| IrNode::ObjectRest {
-                        source: Box::new(IrNode::Local(temp)),
-                        exclude: Box::new(exclude),
-                    })?;
+                    let value = object_rest(temp, &bound_keys);
+                    self.assign_element(&rest.arg, out, |_, _| value)?;
                 }
             }
         }
@@ -2434,5 +2437,23 @@ fn unsupported_stmt_msg(stmt: &Stmt) -> &'static str {
         Stmt::With(_) => "with statements are not supported",
         Stmt::Debugger(_) => "debugger statements are not supported",
         _ => "this statement is not supported",
+    }
+}
+
+/// An object rest `{...rest}` over the source in `temp`: a fresh ordinary
+/// object holding every own enumerable property of the source except the
+/// destructured `bound_keys` (`CopyDataProperties`).
+fn object_rest(temp: u32, bound_keys: &[JsStr]) -> IrNode {
+    IrNode::CopyDataProperties {
+        target: Box::new(IrNode::Object {
+            entries: Vec::new(),
+            proto: None,
+            class: crate::abi::CLASS_ORDINARY,
+            reserve: 0,
+        }),
+        source: Box::new(IrNode::Local(temp)),
+        exclude: Box::new(IrNode::Array(
+            bound_keys.iter().cloned().map(IrNode::Str).collect(),
+        )),
     }
 }

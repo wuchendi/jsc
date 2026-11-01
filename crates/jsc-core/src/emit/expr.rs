@@ -467,8 +467,12 @@ pub(super) fn emit_node(
                 helpers,
             );
         }
-        IrNode::ObjectRest { source, exclude } => {
-            emit_object_rest_node(source, exclude, function, scratch, strings, helpers);
+        IrNode::CopyDataProperties {
+            target,
+            source,
+            exclude,
+        } => {
+            emit_copy_data_node(target, source, exclude, function, scratch, strings, helpers);
         }
         IrNode::Index { obj, index } => {
             emit_index_node(obj, index, true, function, scratch, strings, helpers);
