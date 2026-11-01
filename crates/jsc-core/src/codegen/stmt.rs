@@ -28,14 +28,6 @@ impl LowerCtx<'_> {
         }
         match stmt {
             Stmt::Expr(expr_stmt) => {
-                // `[a, o.b] = rhs;` / `({k: o.p} = rhs);` desugars to a sequence of
-                // statements, so it is lowered here rather than as an expression.
-                if let Expr::Assign(assign) = strip_parens(&expr_stmt.expr)
-                    && assign.op == AssignOp::Assign
-                    && let AssignTarget::Pat(pat) = &assign.left
-                {
-                    return self.lower_destructuring_assign(pat, &assign.right, out);
-                }
                 let value = self.lower_expr(&expr_stmt.expr)?;
                 out.push(IrStmt::Expr(match self.completion_local() {
                     Some(local) => IrNode::Assign {
@@ -325,8 +317,19 @@ impl LowerCtx<'_> {
     /// computed key an anonymous class is defined under (`{[k]: class {}}`):
     /// its `name` is set from it before the static members are defined.
     ///
-    /// Out-of-scope forms are rejected WITH SPANS: decorators, private
-    /// members, static blocks.
+    /// A private field (`#x`, `static #x`) is a private name minted per class
+    /// evaluation into `%penv` (DESIGN.md §7.6): instance ones are added with
+    /// the public fields, in source order, static ones with the static fields.
+    /// Private methods and accessors (instance or static, generator and async
+    /// included) are one closure each per class evaluation, stored into
+    /// `%penv` right after the class value is defined; instance ones are
+    /// guarded by the instance brand, added to `this` before every field.
+    ///
+    /// A static block (`static { .. }`) is a lifted zero-parameter method
+    /// called with `this` = the class at its source position among the static
+    /// fields (DESIGN.md §7.6).
+    ///
+    /// Out-of-scope forms are rejected WITH SPANS: decorators.
     #[allow(clippy::too_many_lines)]
     pub(super) fn lower_class(
         &mut self,
@@ -342,14 +345,23 @@ impl LowerCtx<'_> {
         }
 
         // Collect the (at most one) constructor, the methods and accessors
-        // (instance or static), and the fields; every other member is out of
-        // scope. Each member is held with its index in the body, which keys
-        // its computed name (`keys`, below).
+        // (instance or static), the fields (public or private, held as their
+        // `ClassMember`) and the static blocks (with the static fields, in
+        // source order); every other member is out of scope. Each
+        // member is held with its index in the body, which keys its computed
+        // name (`keys`, below). Private names take `%penv` slots after the
+        // class value and brand slots, in declaration order: one per field or
+        // method, two per accessor (getter, setter). The instance brand is
+        // named after the first instance private method or accessor.
         let mut ctor = None;
         let mut methods: Vec<(usize, &ClassMethod)> = Vec::new();
         let mut static_methods: Vec<(usize, &ClassMethod)> = Vec::new();
-        let mut field_props: Vec<(usize, &ClassProp)> = Vec::new();
-        let mut static_fields: Vec<(usize, &ClassProp)> = Vec::new();
+        let mut field_props: Vec<(usize, &ClassMember)> = Vec::new();
+        let mut static_fields: Vec<(usize, &ClassMember)> = Vec::new();
+        let mut private_names: Vec<(JsStr, PrivateKind)> = Vec::new();
+        let mut private_methods: Vec<(usize, &swc_ecma_ast::PrivateMethod)> = Vec::new();
+        let mut brand_name: Option<JsStr> = None;
+        let mut next_slot: u32 = 2;
         for (i, member) in class.body.iter().enumerate() {
             match member {
                 ClassMember::Constructor(c) => {
@@ -373,11 +385,36 @@ impl LowerCtx<'_> {
                 ClassMember::ClassProp(p) => {
                     check_member_name(&p.key, p.is_static, true)?;
                     if p.is_static {
-                        static_fields.push((i, p));
+                        static_fields.push((i, member));
                     } else {
-                        field_props.push((i, p));
+                        field_props.push((i, member));
                     }
                 }
+                ClassMember::PrivateProp(p) => {
+                    let name = JsStr::from(format!("#{}", p.key.name));
+                    if private_names.iter().any(|(declared, _)| *declared == name) {
+                        return Err(CompileError::spanned(
+                            p.key.span,
+                            format!("duplicate private name {name}"),
+                        )
+                        .into());
+                    }
+                    private_names.push((name, PrivateKind::Field(next_slot)));
+                    next_slot += 1;
+                    if p.is_static {
+                        static_fields.push((i, member));
+                    } else {
+                        field_props.push((i, member));
+                    }
+                }
+                ClassMember::PrivateMethod(m) => {
+                    let name = declare_private_method(&mut private_names, &mut next_slot, m)?;
+                    if !m.is_static && brand_name.is_none() {
+                        brand_name = Some(name);
+                    }
+                    private_methods.push((i, m));
+                }
+                ClassMember::StaticBlock(_) => static_fields.push((i, member)),
                 // A stray `;` in the class body binds nothing — harmless.
                 ClassMember::Empty(_) => {}
                 other => return Err(reject_class_member(other)),
@@ -415,9 +452,46 @@ impl LowerCtx<'_> {
             }
         };
 
+        // The private environment `%penv` (DESIGN.md §7.6), when the body
+        // declares a private name: `[class, brand, ..slots]`, minted after the
+        // heritage (which sees only the enclosing classes' names) and before
+        // the computed keys. A field's slot holds its private symbol; method
+        // and accessor slots stay `undefined` until their closures are stored.
+        let penv = if private_names.is_empty() {
+            None
+        } else {
+            let (local, id) = self.hidden_local();
+            let slots = (0..next_slot)
+                .map(|slot| {
+                    if slot == 1 {
+                        return brand_name
+                            .clone()
+                            .map_or(IrNode::Undefined, IrNode::PrivateName);
+                    }
+                    private_names
+                        .iter()
+                        .find(|(_, kind)| matches!(kind, PrivateKind::Field(s) if *s == slot))
+                        .map_or(IrNode::Undefined, |(name, _)| {
+                            IrNode::PrivateName(name.clone())
+                        })
+                })
+                .collect();
+            seq.push(IrNode::Assign {
+                local,
+                value: Box::new(IrNode::Array(slots)),
+            });
+            self.private_scopes.push(PrivateScope {
+                frame: self.top(),
+                penv: id,
+                names: private_names,
+            });
+            Some((local, id))
+        };
+
         // The computed member names, by member index: each evaluated once, in
         // source order, into a hidden local (read by the constructor's field
-        // initializers through its id).
+        // initializers through its id). A numeric key (`1() {}`, `0x10 = 1`)
+        // is converted the same way, to its canonical numeric string.
         let mut keys: Vec<Option<(u32, u32)>> = Vec::with_capacity(class.body.len());
         for member in &class.body {
             let (key, static_method) = match member {
@@ -428,11 +502,14 @@ impl LowerCtx<'_> {
                     continue;
                 }
             };
-            let PropName::Computed(computed) = key else {
-                keys.push(None);
-                continue;
+            let value = match key {
+                PropName::Computed(computed) => self.lower_expr(&computed.expr)?,
+                PropName::Num(n) => IrNode::Num(n.value),
+                _ => {
+                    keys.push(None);
+                    continue;
+                }
             };
-            let value = self.lower_expr(&computed.expr)?;
             let (local, id) = self.hidden_local();
             seq.push(IrNode::Assign {
                 local,
@@ -442,7 +519,7 @@ impl LowerCtx<'_> {
             // evaluation order, so one named `prototype` throws now. (A static
             // field named `prototype` throws when it is defined, from
             // `__define` of the non-configurable `prototype`.)
-            if static_method {
+            if static_method && matches!(key, PropName::Computed(_)) {
                 seq.push(IrNode::Ternary {
                     cond: Box::new(IrNode::Binary {
                         op: BinOp::Eq,
@@ -475,7 +552,10 @@ impl LowerCtx<'_> {
         };
         let own = field_props
             .iter()
-            .filter_map(|(_, p)| prop_key_name(&p.key).ok())
+            .filter_map(|(_, m)| match m {
+                ClassMember::ClassProp(p) => prop_key_name(&p.key).ok(),
+                _ => None,
+            })
             .chain(collect_instance_fields(ctor_stmts));
         for f in own {
             if !fields.contains(&f) {
@@ -502,13 +582,25 @@ impl LowerCtx<'_> {
         // The constructor function value — the class value itself. A derived
         // class without a constructor gets `constructor(...args) { super(...args) }`.
         let frame = self.top();
-        let prev_fields = std::mem::replace(
-            &mut self.class_fields,
-            field_props
-                .iter()
-                .map(|&(i, p)| (p.clone(), keys[i].map(|(_, id)| (frame, id))))
-                .collect(),
-        );
+        let mut class_fields = Vec::with_capacity(field_props.len() + 1);
+        if let (Some(name), Some((_, id))) = (&brand_name, penv) {
+            class_fields.push(ClassField::Brand(frame, id, name.clone()));
+        }
+        for &(i, member) in &field_props {
+            class_fields.push(match member {
+                ClassMember::PrivateProp(p) => {
+                    let (_, id, PrivateKind::Field(slot), _) = self.private_slot(&p.key)? else {
+                        return Err(reject_class_member(member));
+                    };
+                    ClassField::Private(p.clone(), frame, id, slot)
+                }
+                ClassMember::ClassProp(p) => {
+                    ClassField::Public(p.clone(), keys[i].map(|(_, id)| (frame, id)))
+                }
+                other => return Err(reject_class_member(other)),
+            });
+        }
+        let prev_fields = std::mem::replace(&mut self.class_fields, class_fields);
         let kind = if heritage.is_some() {
             FnKind::DerivedClass
         } else {
@@ -550,6 +642,14 @@ impl LowerCtx<'_> {
         for (i, m) in methods {
             self.lower_class_method(m, keys[i].map(|k| k.0), &mut proto_entries)?;
         }
+        // The private methods' and accessors' closures, stored into `%penv` in
+        // source order once the class value exists (a static one with the
+        // static `super` scope).
+        let penv_local = penv.map_or(0, |(local, _)| local);
+        let mut private_stores = Vec::with_capacity(private_methods.len());
+        for &(i, m) in private_methods.iter().filter(|(_, m)| !m.is_static) {
+            private_stores.push((i, self.lower_private_method(m, penv_local)?));
+        }
         let mut class_entries = vec![(
             PropKey::Fixed("prototype".into()),
             IrNode::Object {
@@ -567,6 +667,10 @@ impl LowerCtx<'_> {
         for (i, m) in static_methods {
             self.lower_class_method(m, keys[i].map(|k| k.0), &mut class_entries)?;
         }
+        for &(i, m) in private_methods.iter().filter(|(_, m)| m.is_static) {
+            private_stores.push((i, self.lower_private_method(m, penv_local)?));
+        }
+        private_stores.sort_by_key(|&(i, _)| i);
         let ctor_value = match name_key {
             Some(key) => IrNode::SetFunctionName {
                 func: Box::new(ctor_value),
@@ -587,14 +691,62 @@ impl LowerCtx<'_> {
                 proto: Box::new(IrNode::Local(parent)),
             });
         }
+        seq.extend(private_stores.into_iter().map(|(_, store)| store));
+        if let Some((local, _)) = penv {
+            seq.push(IrNode::PrivEnvStore {
+                env: Box::new(IrNode::Local(local)),
+                slot: 0,
+                value: Box::new(IrNode::Local(class_local)),
+            });
+        }
         if let Some(local) = inner {
             seq.push(self.init_binding(local, IrNode::Local(class_local)));
         }
 
-        // Static fields, in source order, defined (CreateDataProperty) once the
-        // class value and its inner binding exist; `this` is the class.
+        // Static fields, in source order, defined (CreateDataProperty, or
+        // PrivateFieldAdd for a private one) once the class value and its inner
+        // binding exist; `this` is the class. A static block runs at its
+        // position: its lifted method (its own `var` scope, `new.target`
+        // `undefined`, the static `super` scope) is called with `this` = the
+        // class.
         let prev_static = self.static_init.replace((self.top(), class_id));
-        for (i, p) in static_fields {
+        for (i, member) in static_fields {
+            let p = match member {
+                ClassMember::ClassProp(p) => p,
+                ClassMember::PrivateProp(p) => {
+                    let name = JsStr::from(format!("#{}", p.key.name));
+                    let value = match &p.value {
+                        Some(init) => self.lower_key_named_expr(init, &name)?,
+                        None => IrNode::Undefined,
+                    };
+                    let key = self.private_ref(&p.key)?.brand();
+                    seq.push(IrNode::PrivateAdd {
+                        obj: Box::new(IrNode::Local(class_local)),
+                        key: Box::new(key),
+                        value: Box::new(value),
+                        attrs: crate::abi::ATTR_WRITABLE,
+                        name,
+                    });
+                    continue;
+                }
+                ClassMember::StaticBlock(block) => {
+                    let func = self.lower_lifted_function(
+                        &[],
+                        BodyKind::Block(&block.body.stmts),
+                        &JsStr::default(),
+                        FnKind::Plain,
+                    )?;
+                    seq.push(IrNode::ThisCall {
+                        callee: Box::new(func),
+                        args: Vec::new(),
+                        this_local: class_local,
+                        construct: false,
+                        not_callable: CalleeError::not_a_function(CalleeError::EXPRESSION),
+                    });
+                    continue;
+                }
+                other => return Err(reject_class_member(other)),
+            };
             let entry = if let Some((key, _)) = keys[i] {
                 let value = match &p.value {
                     Some(init) => self.lower_computed_named_expr(init, key)?,
@@ -618,6 +770,9 @@ impl LowerCtx<'_> {
         }
         self.static_init = prev_static;
         self.current_super = prev_super;
+        if penv.is_some() {
+            self.private_scopes.pop();
+        }
         self.pop_scope();
         seq.push(IrNode::Local(class_local));
         Ok(IrNode::Seq(seq))
@@ -655,6 +810,39 @@ impl LowerCtx<'_> {
             None => entries.push((key, value)),
         }
         Ok(())
+    }
+
+    /// Lower the private method or accessor `m` of the class whose `%penv` is
+    /// in the local `penv` (DESIGN.md §7.6) to the store of its closure —
+    /// named `"#m"`, `"get #x"` or `"set #x"` — into its `%penv` slot.
+    fn lower_private_method(
+        &mut self,
+        m: &swc_ecma_ast::PrivateMethod,
+        penv: u32,
+    ) -> anyhow::Result<IrNode> {
+        let (_, _, kind, name) = self.private_slot(&m.key)?;
+        let (slot, prefix) = match (m.kind, kind) {
+            (MethodKind::Method, PrivateKind::Method { slot, .. }) => (slot, ""),
+            (
+                MethodKind::Getter,
+                PrivateKind::Accessor {
+                    get: Some(slot), ..
+                },
+            ) => (slot, "get "),
+            (
+                MethodKind::Setter,
+                PrivateKind::Accessor {
+                    set: Some(slot), ..
+                },
+            ) => (slot, "set "),
+            _ => return Err(CompileError::spanned(m.span(), "unsupported class member").into()),
+        };
+        let value = self.lower_method(&m.function, &prefixed_name(prefix, &name))?;
+        Ok(IrNode::PrivEnvStore {
+            env: Box::new(IrNode::Local(penv)),
+            slot,
+            value: Box::new(value),
+        })
     }
 
     /// Initialize the freshly declared binding `local` (not a module binding)
@@ -767,84 +955,97 @@ impl LowerCtx<'_> {
                     Ok(())
                 })
             }
-            // An object pattern (`let {x, y: b, z = 7, ...rest} = ..`) evaluates
-            // `source` ONCE into a hidden temp local, then binds each property from
-            // a keyed read (`temp.key`); a trailing rest collects every remaining
-            // own key into a new object.
-            Pat::Object(obj) => {
-                let temp = self.fresh();
-                out.push(IrStmt::Decl {
-                    local: temp,
-                    init: source,
-                });
-                // An empty pattern reads nothing, but still requires an
-                // object-coercible source (`({}) = null` throws a TypeError).
-                if obj.props.is_empty() {
-                    out.push(IrStmt::Expr(IrNode::NullishCheck {
-                        value: Box::new(IrNode::Local(temp)),
-                        key: String::new(),
-                    }));
-                }
-                // The statically-known destructured keys, excluded from a rest.
-                let mut bound_keys: Vec<JsStr> = Vec::new();
-                for prop in &obj.props {
-                    match prop {
-                        // `{key: pat}` (or renamed `{key: name}`): read `temp.key`
-                        // and bind the value pattern (which may be a nested pattern
-                        // or a `pat = default`).
-                        ObjectPatProp::KeyValue(kv) => {
-                            let key = prop_key_name(&kv.key)?;
-                            bound_keys.push(key.clone());
-                            let read = || IrNode::Index {
-                                obj: Box::new(IrNode::Local(temp)),
-                                index: Box::new(IrNode::Str(key.clone())),
-                            };
-                            self.bind_with_default(&kv.value, &read, mutable, out)?;
-                        }
-                        // Shorthand `{x}` or shorthand-with-default `{z = 7}`: the
-                        // key IS the bound name; a default fills an `undefined` read.
-                        ObjectPatProp::Assign(assign) => {
-                            let key = JsStr::from(assign.key.id.sym.as_ref());
-                            bound_keys.push(key.clone());
-                            let read = || IrNode::Index {
-                                obj: Box::new(IrNode::Local(temp)),
-                                index: Box::new(IrNode::Str(key.clone())),
-                            };
-                            let value = match &assign.value {
-                                Some(default) => {
-                                    let default = self.lower_expr(default)?;
-                                    IrNode::Ternary {
-                                        cond: Box::new(IrNode::Binary {
-                                            op: BinOp::Eq,
-                                            lhs: Box::new(read()),
-                                            rhs: Box::new(IrNode::Undefined),
-                                        }),
-                                        then_branch: Box::new(default),
-                                        else_branch: Box::new(read()),
-                                    }
-                                }
-                                None => read(),
-                            };
-                            self.bind_ident(&assign.key, value, mutable, out);
-                        }
-                        // `{...rest}`: a NEW object with every own key of `temp`
-                        // except the destructured ones collected above.
-                        ObjectPatProp::Rest(rest) => {
-                            let exclude = IrNode::Array(
-                                bound_keys.iter().cloned().map(IrNode::Str).collect(),
-                            );
-                            let value = IrNode::ObjectRest {
-                                source: Box::new(IrNode::Local(temp)),
-                                exclude: Box::new(exclude),
-                            };
-                            self.lower_binding_pattern(&rest.arg, value, mutable, out)?;
-                        }
-                    }
-                }
-                Ok(())
-            }
+            Pat::Object(obj) => self.bind_object_pattern(obj, source, mutable, out),
             other => Err(CompileError::spanned(other.span(), "unsupported binding pattern").into()),
         }
+    }
+
+    /// Bind an object pattern (`let {x, y: b, [k]: c, z = 7, ...rest} = ..`):
+    /// `source` is evaluated ONCE into a hidden temp local, then each property
+    /// is bound from a keyed read (`temp[key]`); a trailing rest collects every
+    /// remaining own key into a new object.
+    fn bind_object_pattern(
+        &mut self,
+        obj: &ObjectPat,
+        source: IrNode,
+        mutable: bool,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let temp = self.fresh();
+        out.push(IrStmt::Decl {
+            local: temp,
+            init: source,
+        });
+        // A pattern that reads nothing before a leading rest (or nothing
+        // at all), or whose first key is computed, still requires an
+        // object-coercible source first (`let {...r} = null` throws a
+        // TypeError before any key expression runs).
+        if leading_coercible_check(obj) {
+            out.push(IrStmt::Expr(IrNode::NullishCheck {
+                value: Box::new(IrNode::Local(temp)),
+                key: String::new(),
+            }));
+        }
+        // The destructured keys (converted property keys), excluded
+        // from a rest.
+        let mut bound_keys: Vec<IrNode> = Vec::new();
+        for prop in &obj.props {
+            match prop {
+                // `{key: pat}` (or renamed `{key: name}`): read `temp[key]`
+                // once and bind the value pattern (which may be a nested
+                // pattern or a `pat = default`).
+                ObjectPatProp::KeyValue(kv) => {
+                    let key = self.pattern_key(&kv.key, out)?;
+                    bound_keys.push(key.clone());
+                    let mut read = IrNode::Index {
+                        obj: Box::new(IrNode::Local(temp)),
+                        index: Box::new(key),
+                    };
+                    if matches!(kv.value.as_ref(), Pat::Assign(_)) {
+                        let local = self.fresh();
+                        out.push(IrStmt::Decl { local, init: read });
+                        read = IrNode::Local(local);
+                    }
+                    self.bind_with_default(&kv.value, &|| read.clone(), mutable, out)?;
+                }
+                // Shorthand `{x}` or shorthand-with-default `{z = 7}`: the
+                // key IS the bound name; a default fills an `undefined`
+                // read (stashed, so a getter runs once).
+                ObjectPatProp::Assign(assign) => {
+                    let key = JsStr::from(assign.key.id.sym.as_ref());
+                    let read = IrNode::Index {
+                        obj: Box::new(IrNode::Local(temp)),
+                        index: Box::new(IrNode::Str(key.clone())),
+                    };
+                    bound_keys.push(IrNode::Str(key));
+                    let value = match &assign.value {
+                        Some(default) => {
+                            let local = self.fresh();
+                            out.push(IrStmt::Decl { local, init: read });
+                            let default = self.lower_expr(default)?;
+                            IrNode::Ternary {
+                                cond: Box::new(IrNode::Binary {
+                                    op: BinOp::Eq,
+                                    lhs: Box::new(IrNode::Local(local)),
+                                    rhs: Box::new(IrNode::Undefined),
+                                }),
+                                then_branch: Box::new(default),
+                                else_branch: Box::new(IrNode::Local(local)),
+                            }
+                        }
+                        None => read,
+                    };
+                    self.bind_ident(&assign.key, value, mutable, out);
+                }
+                // `{...rest}`: a NEW object with every own key of `temp`
+                // except the destructured ones collected above.
+                ObjectPatProp::Rest(rest) => {
+                    let value = object_rest(temp, &bound_keys);
+                    self.lower_binding_pattern(&rest.arg, value, mutable, out)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Bind a single identifier `ident` to `value`, boxing a captured binding into
@@ -1046,20 +1247,20 @@ impl LowerCtx<'_> {
         rest
     }
 
-    /// Lower a destructuring ASSIGNMENT statement `pattern = rhs` (object or array
-    /// assignment pattern). The RHS is evaluated once into a hidden temp, each
-    /// target is assigned in source order, and the statement's value is the RHS.
-    fn lower_destructuring_assign(
+    /// Lower a destructuring assignment `pattern = rhs` (object or array
+    /// assignment pattern) into `out`: the RHS is evaluated once into a hidden
+    /// temp, returned as the expression's value, and each target is assigned
+    /// in source order.
+    pub(super) fn lower_destructuring_assign(
         &mut self,
         pat: &AssignTargetPat,
         rhs: &Expr,
         out: &mut Vec<IrStmt>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u32> {
         let init = self.lower_expr(rhs)?;
         let temp = self.fresh();
         out.push(IrStmt::Decl { local: temp, init });
         match pat {
-            // The statement's value stays the RHS itself.
             AssignTargetPat::Array(arr) => self.assign_array_pat(arr, IrNode::Local(temp), out)?,
             AssignTargetPat::Object(obj) => self.assign_object_pat(obj, temp, out)?,
             AssignTargetPat::Invalid(invalid) => {
@@ -1068,15 +1269,7 @@ impl LowerCtx<'_> {
                 );
             }
         }
-        // The statement's value is the RHS (stored into a tracked completion).
-        out.push(IrStmt::Expr(match self.completion_local() {
-            Some(local) => IrNode::Assign {
-                local,
-                value: Box::new(IrNode::Local(temp)),
-            },
-            None => IrNode::Local(temp),
-        }));
-        Ok(())
+        Ok(temp)
     }
 
     /// Assign `value` to a destructuring-assignment `target`: a nested pattern
@@ -1142,38 +1335,70 @@ impl LowerCtx<'_> {
         temp: u32,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let read = |key: &JsStr| IrNode::Index {
+        let read = |key: IrNode| IrNode::Index {
             obj: Box::new(IrNode::Local(temp)),
-            index: Box::new(IrNode::Str(key.clone())),
+            index: Box::new(key),
         };
-        let mut bound_keys: Vec<JsStr> = Vec::new();
+        // `RequireObjectCoercible` runs before any key expression or target
+        // reference: only a leading shorthand reads the source before either
+        // can run code.
+        if !matches!(obj.props.first(), Some(ObjectPatProp::Assign(_))) {
+            let key = match obj.props.first() {
+                Some(ObjectPatProp::KeyValue(kv)) => {
+                    prop_key_name(&kv.key).map_or_else(|_| String::new(), |k| k.to_string())
+                }
+                _ => String::new(),
+            };
+            out.push(IrStmt::Expr(IrNode::NullishCheck {
+                value: Box::new(IrNode::Local(temp)),
+                key,
+            }));
+        }
+        let mut bound_keys: Vec<IrNode> = Vec::new();
         for prop in &obj.props {
             match prop {
+                // The key is evaluated (and converted) first, then the target
+                // reference, then the read (`KeyedDestructuringAssignmentEvaluation`).
                 ObjectPatProp::KeyValue(kv) => {
-                    let key = prop_key_name(&kv.key)?;
-                    let value = read(&key);
+                    let key = self.pattern_key(&kv.key, out)?;
+                    let value = read(key.clone());
                     bound_keys.push(key);
                     self.assign_element(&kv.value, out, |_, _| value)?;
                 }
                 // Shorthand `{x}` / `{x = 7}` assigns the binding named by the key.
                 ObjectPatProp::Assign(assign) => {
-                    let key = JsStr::from(assign.key.id.sym.as_ref());
+                    let key = IrNode::Str(assign.key.id.sym.as_ref().into());
                     let target = self.assignable_binding(&assign.key.id)?;
-                    let value = self.apply_default(read(&key), assign.value.as_deref(), out)?;
+                    let value =
+                        self.apply_default(read(key.clone()), assign.value.as_deref(), out)?;
                     bound_keys.push(key);
                     out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
                 }
                 ObjectPatProp::Rest(rest) => {
-                    let exclude =
-                        IrNode::Array(bound_keys.iter().cloned().map(IrNode::Str).collect());
-                    self.assign_element(&rest.arg, out, |_, _| IrNode::ObjectRest {
-                        source: Box::new(IrNode::Local(temp)),
-                        exclude: Box::new(exclude),
-                    })?;
+                    let value = object_rest(temp, &bound_keys);
+                    self.assign_element(&rest.arg, out, |_, _| value)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// The key of an object-pattern property, in source order: an identifier or
+    /// string key is a static string; a numeric or computed key is evaluated and
+    /// converted (`ToPropertyKey`, exactly once: an object key's `toString`
+    /// runs once, a symbol stays a symbol) into a fresh local.
+    fn pattern_key(&mut self, key: &PropName, out: &mut Vec<IrStmt>) -> anyhow::Result<IrNode> {
+        let init = match key {
+            PropName::Num(n) => IrNode::Num(n.value),
+            PropName::Computed(c) => self.lower_expr(&c.expr)?,
+            _ => return Ok(IrNode::Str(prop_key_name(key)?)),
+        };
+        let local = self.fresh();
+        out.push(IrStmt::Decl {
+            local,
+            init: IrNode::ToPropertyKey(Box::new(init)),
+        });
+        Ok(IrNode::Local(local))
     }
 
     /// Assign one pattern element (optionally `target = default`) from the value
@@ -1269,12 +1494,9 @@ impl LowerCtx<'_> {
                         IrNode::Local(key)
                     }
                     MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-                    MemberProp::PrivateName(_) => {
-                        return Err(CompileError::spanned(
-                            m.span(),
-                            "unsupported assignment target",
-                        )
-                        .into());
+                    MemberProp::PrivateName(p) => {
+                        let target = self.private_ref(p)?;
+                        return Ok(AssignRef::Private { obj, target });
                     }
                 };
                 Ok(AssignRef::Member { obj, key })
@@ -1310,6 +1532,7 @@ impl LowerCtx<'_> {
                 index: Box::new(key),
                 value: Box::new(value),
             },
+            AssignRef::Private { obj, target } => target.write(IrNode::Local(obj), value),
         }
     }
 
@@ -1352,7 +1575,9 @@ impl LowerCtx<'_> {
     /// initialized from the in-flight exception value: its binding is emitted as
     /// the FIRST statement of the catch body — a `Decl` whose initializer reads
     /// [`IrNode::ExcValue`] (boxed into a cell when the binding is captured by a
-    /// nested closure, exactly like a `let`).
+    /// nested closure, exactly like a `let`). A destructuring parameter first
+    /// snapshots [`IrNode::ExcValue`] into a temp, then binds the pattern from it
+    /// through [`Self::lower_binding_pattern`].
     ///
     /// All four legal shapes lower here: `try`/`catch`, `try`/`finally`,
     /// `try`/`catch`/`finally`. The absent clause becomes `None` on
@@ -1412,18 +1637,39 @@ impl LowerCtx<'_> {
                 self.push_scope();
                 let mut catch_body = Vec::new();
                 let catch_result = (|| -> anyhow::Result<()> {
-                    if let Some(param) = &handler.param {
-                        let Pat::Ident(ident) = param else {
-                            return Err(CompileError::spanned(
-                                param.span(),
-                                "unsupported catch parameter pattern",
-                            )
-                            .into());
-                        };
-                        let local = self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
-                        // The binding value is the in-flight exception; box it when
-                        // the parameter is captured (mirrors a captured `let`).
-                        self.push_binding(local, IrNode::ExcValue, &mut catch_body);
+                    match &handler.param {
+                        Some(Pat::Ident(ident)) => {
+                            let local =
+                                self.declare(ident.id.sym.as_ref(), true, binding_id(ident));
+                            // The binding value is the in-flight exception; box it
+                            // when the parameter is captured (mirrors a captured
+                            // `let`).
+                            self.push_binding(local, IrNode::ExcValue, &mut catch_body);
+                        }
+                        // A destructuring parameter (`catch ({message})`): snapshot
+                        // the exception into a temp first, then bind the pattern
+                        // like a `let`. A throw while destructuring (`null` thrown
+                        // into `{a}`) escapes the catch clause to the outer handler,
+                        // still running this `try`'s `finally`.
+                        Some(pat) => {
+                            let exc = self.fresh();
+                            catch_body.push(IrStmt::Decl {
+                                local: exc,
+                                init: IrNode::ExcValue,
+                            });
+                            // Lexical bindings even inside a `var` declarator's
+                            // default (`var [x = () => { try {} catch ({a}) {} }]`).
+                            let binding_var = std::mem::take(&mut self.binding_var);
+                            let result = self.lower_binding_pattern(
+                                pat,
+                                IrNode::Local(exc),
+                                true,
+                                &mut catch_body,
+                            );
+                            self.binding_var = binding_var;
+                            result?;
+                        }
+                        None => {}
                     }
                     // The catch clause's value replaces the guarded block's.
                     self.reset_completion(&mut catch_body);
@@ -1550,33 +1796,50 @@ impl LowerCtx<'_> {
         Ok(())
     }
 
-    /// Lower a labeled statement `name: loop`. A label names its immediately
-    /// nested loop, and `break name`/`continue name` inside that loop (or a loop
-    /// nested within it) target THIS loop. The label is in scope only while its
-    /// loop body is lowered. A label on any non-loop statement is a spanned error.
+    /// Lower a labeled statement `a: b: stmt`. A run of nested labels names one
+    /// statement and shares one label id. On a loop the id is the loop's
+    /// [`IrStmt::While::label`], so `break a`/`continue a` inside it (or a loop
+    /// nested within it) target THIS loop; on any other statement it wraps the
+    /// lowered statement in an [`IrStmt::Labeled`] that only `break a` exits (a
+    /// `continue a` is an early error). The labels are in scope only while the
+    /// statement is lowered.
     fn lower_labeled(
         &mut self,
         labeled: &swc_ecma_ast::LabeledStmt,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let name = labeled.label.sym.as_ref();
+        let mut names = vec![labeled.label.sym.as_ref()];
+        let mut body = labeled.body.as_ref();
+        while let Stmt::Labeled(inner) = body {
+            names.push(inner.label.sym.as_ref());
+            body = inner.body.as_ref();
+        }
         let id = self.fresh_label();
-        self.with_label(name, id, |ctx| match labeled.body.as_ref() {
+        let is_loop = matches!(
+            body,
+            Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForOf(_) | Stmt::ForIn(_)
+        );
+        self.with_labels(&names, id, is_loop, |ctx| match body {
             Stmt::While(while_stmt) => ctx.lower_while(while_stmt, Some(id), out),
             Stmt::DoWhile(do_stmt) => ctx.lower_do_while(do_stmt, Some(id), out),
             Stmt::For(for_stmt) => ctx.lower_for(for_stmt, Some(id), out),
             Stmt::ForOf(for_of) => ctx.lower_for_of(for_of, Some(id), out),
             Stmt::ForIn(for_in) => ctx.lower_for_in(for_in, Some(id), out),
-            other => Err(CompileError::spanned(
-                other.span(),
-                "a label may only be applied to a loop",
-            )
-            .into()),
+            other => {
+                let mut inner = Vec::new();
+                ctx.lower_stmt(other, &mut inner)?;
+                out.push(IrStmt::Labeled {
+                    label: id,
+                    body: inner,
+                });
+                Ok(())
+            }
         })
     }
 
     /// Resolve the target of a `break`/`continue`. A `Some(label)` resolves to its
-    /// loop id via [`Self::label_id`] (an unknown label is a spanned error); an
+    /// label id via [`Self::label_id`] (an unknown label, or a `continue` to a
+    /// label that does not name an iteration statement, is a spanned error); an
     /// unlabeled `break`/`continue` yields `None` after checking it is inside a
     /// valid enclosing context (`is_continue` selects the loop-only `continue`
     /// check and its message, `span` locates the diagnostic).
@@ -1587,10 +1850,16 @@ impl LowerCtx<'_> {
         is_continue: bool,
     ) -> anyhow::Result<Option<u32>> {
         if let Some(label) = label {
-            return self
-                .label_id(label.sym.as_ref())
-                .map(Some)
-                .ok_or_else(|| CompileError::spanned(label.span, "undefined label").into());
+            let name = label.sym.as_ref();
+            return match self.label_id(name) {
+                None => Err(CompileError::spanned(label.span, "undefined label").into()),
+                Some((_, false)) if is_continue => Err(CompileError::spanned(
+                    span,
+                    format!("Illegal continue statement: '{name}' does not denote an iteration statement"),
+                )
+                .into()),
+                Some((id, _)) => Ok(Some(id)),
+            };
         }
         let (in_context, msg) = if is_continue {
             (self.loopable() > 0, "illegal continue statement")
@@ -1709,16 +1978,15 @@ impl LowerCtx<'_> {
     ///
     /// The head is a `const`/`let` identifier or destructuring binding (a
     /// duplicate name is a spanned error), a `var` head assigning its hoisted
-    /// binding(s), or a member / destructuring assignment target (`o.x`,
-    /// `[o.a, b]`) written each iteration; a bare identifier assignment head,
-    /// several declarators, or a `using` head is a spanned error.
+    /// binding(s), or an assignment target (`x`, `o.x`, `[o.a, b]`) written each
+    /// iteration; several declarators or a `using` head is a spanned error.
     fn lower_for_of(
         &mut self,
         for_of: &swc_ecma_ast::ForOfStmt,
         label: Option<u32>,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let head = for_of_head(&for_of.left)?;
+        let head = for_of_head(&for_of.left, "for-of")?;
 
         self.push_scope();
         let result = (|| {
@@ -1901,55 +2169,17 @@ impl LowerCtx<'_> {
     /// (mirroring [`Self::lower_for`]); the `for-in` head opens a lexical scope, so
     /// the binding is not visible after the loop.
     ///
-    /// Only a single `const`/`let`/`var` identifier head is supported; a
-    /// destructuring/assignment head is a spanned error. A statically-known
-    /// non-enumerable operand (a number/boolean/null literal) is rejected with a
-    /// span; objects, arrays, strings, and any dynamic value are allowed through.
+    /// The head is any `for-of` head ([`for_of_head`]): a declared binding or
+    /// pattern, a `var` head, or an assignment target. A primitive operand has no
+    /// enumerable keys but a string's indices (`null`/`undefined` iterate zero
+    /// times).
     fn lower_for_in(
         &mut self,
         for_in: &swc_ecma_ast::ForInStmt,
         label: Option<u32>,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        // The head must declare a single `const`/`let`/`var` identifier binding.
-        let (ident, pat, kind) = match &for_in.left {
-            ForHead::VarDecl(var_decl) => {
-                let [declarator] = var_decl.decls.as_slice() else {
-                    return Err(CompileError::spanned(
-                        var_decl.span(),
-                        "for-in requires a single loop variable",
-                    )
-                    .into());
-                };
-                let Pat::Ident(ident) = &declarator.name else {
-                    return Err(CompileError::spanned(
-                        declarator.name.span(),
-                        "unsupported for-in binding pattern",
-                    )
-                    .into());
-                };
-                (ident, &declarator.name, var_decl.kind)
-            }
-            other => {
-                return Err(CompileError::spanned(
-                    other.span(),
-                    "for-in requires a `const`/`let`/`var` loop variable",
-                )
-                .into());
-            }
-        };
-
-        // Reject a statically-known non-enumerable head (`for (const k in 5)`):
-        // only objects, arrays, and strings enumerate keys. Dynamic values carry no
-        // static type in the numeric IR, so a non-enumerable reaching the loop at
-        // runtime is undefined behavior, like an out-of-bounds index elsewhere.
-        if non_enumerable_literal(&for_in.right) {
-            return Err(CompileError::spanned(
-                for_in.right.span(),
-                "for-in operand must be an object, array, or string",
-            )
-            .into());
-        }
+        let head = for_of_head(&for_in.left, "for-in")?;
 
         self.push_scope();
         let result = (|| {
@@ -1980,18 +2210,10 @@ impl LowerCtx<'_> {
                 rhs: Box::new(IrNode::Local(len_local)),
             };
 
-            // The loop binding: a fresh block-scoped local, rebound each iteration
-            // to the key at index `i` as the first statement of the body; a
-            // `var` head assigns the hoisted binding instead.
-            let target = if kind == VarDeclKind::Var {
-                ForOfTarget::Var(pat)
-            } else {
-                ForOfTarget::Local(self.declare(
-                    ident.id.sym.as_ref(),
-                    kind != VarDeclKind::Const,
-                    binding_id(ident),
-                ))
-            };
+            // The loop binding: a fresh block-scoped local (or pattern), rebound
+            // each iteration to the key at index `i` as the first statement of
+            // the body; a `var` head or an assignment target is assigned instead.
+            let target = self.declare_for_of_head(head);
             self.breakable_inc();
             self.loopable_inc();
             let mut body = Vec::new();
@@ -2036,35 +2258,34 @@ impl LowerCtx<'_> {
     }
 }
 
-/// Whether `expr` is a compile-time literal that is definitely NOT enumerable by
-/// `for-in` — a number/boolean/null/bigint/regex literal. An object enumerates its
-/// keys, an array/string its index keys, and anything dynamic (an identifier, a
-/// call, an object/array literal) is allowed through; only a primitive-scalar
-/// literal is a statically-detectable non-enumerable operand. Used to reject an
-/// obviously wrong `for-in` head (`for (const k in 5)`) with a spanned error.
-fn non_enumerable_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(paren) => non_enumerable_literal(&paren.expr),
-        // A string literal enumerates its index keys ("0", "1", ..), like an array.
-        Expr::Lit(lit) => !matches!(lit, Lit::Str(_)),
-        _ => false,
-    }
-}
-
-/// Extract the static string name of an object-pattern property key. Only
-/// identifier and string-literal keys are supported (mirroring the object-literal
-/// keys in [`LowerCtx::lower_object`]); a computed or numeric key is a spanned
-/// error.
+/// Extract the static string name of an identifier or string-literal property
+/// key. Callers convert a numeric or computed key at run time instead; a `BigInt`
+/// key is a spanned error.
 pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<JsStr> {
     match key {
         PropName::Ident(id) => Ok(id.sym.as_ref().into()),
         PropName::Str(s) => Ok(lit_str(s)),
-        _ => Err(CompileError::spanned(
+        PropName::BigInt(_) => Err(CompileError::spanned(
             key.span(),
-            "unsupported object-pattern key: only identifier and string keys are supported \
-             (computed and numeric keys are not)",
+            "unsupported property key: BigInt keys are not supported",
         )
         .into()),
+        PropName::Num(_) | PropName::Computed(_) => Err(CompileError::spanned(
+            key.span(),
+            "a numeric or computed property key has no static name",
+        )
+        .into()),
+    }
+}
+
+/// Whether an object binding pattern checks `RequireObjectCoercible` up front:
+/// it is empty, starts with a rest, or starts with a computed key (which runs
+/// code before the first read).
+fn leading_coercible_check(obj: &ObjectPat) -> bool {
+    match obj.props.first() {
+        None | Some(ObjectPatProp::Rest(_)) => true,
+        Some(ObjectPatProp::KeyValue(kv)) => matches!(kv.key, PropName::Computed(_)),
+        Some(ObjectPatProp::Assign(_)) => false,
     }
 }
 
@@ -2077,6 +2298,9 @@ enum AssignRef {
     /// A member `obj[key]`: the object stashed in a local, the key either a
     /// static string or a stashed local.
     Member { obj: u32, key: IrNode },
+    /// A private member `obj.#x` (DESIGN.md §7.6): the stashed object and
+    /// the resolved name.
+    Private { obj: u32, target: PrivateRef },
 }
 
 /// The head of a `for-of` loop: a fresh `const`/`let` binding or
@@ -2100,19 +2324,27 @@ enum ForOfTarget<'a> {
     Assign(&'a Pat),
 }
 
-/// Classify a `for-of` head: a single `const`/`let` identifier binding, a
-/// declared destructuring pattern, a `var` head, or a member / destructuring
-/// assignment target (`o.x`, `[o.a, o.b]`).
-fn for_of_head(left: &ForHead) -> anyhow::Result<ForOfHead<'_>> {
+/// Classify a `for-of` / `for-in` (`loop_kind`) head: a single `const`/`let`
+/// identifier binding, a declared destructuring pattern, a `var` head, or an
+/// assignment target (`x`, `o.x`, `[o.a, b]`, `{a}`).
+fn for_of_head<'a>(left: &'a ForHead, loop_kind: &str) -> anyhow::Result<ForOfHead<'a>> {
     Ok(match left {
         ForHead::VarDecl(var_decl) => {
             let [declarator] = var_decl.decls.as_slice() else {
                 return Err(CompileError::spanned(
                     var_decl.span(),
-                    "for-of requires a single loop variable",
+                    format!("{loop_kind} requires a single loop variable"),
                 )
                 .into());
             };
+            // `for (var x = init in o)` (Annex B) is not supported.
+            if let Some(init) = &declarator.init {
+                return Err(CompileError::spanned(
+                    init.span(),
+                    format!("unsupported {loop_kind} head initializer"),
+                )
+                .into());
+            }
             let mutable = var_decl.kind != VarDeclKind::Const;
             match &declarator.name {
                 // A `var` head assigns the hoisted binding(s).
@@ -2125,7 +2357,7 @@ fn for_of_head(left: &ForHead) -> anyhow::Result<ForOfHead<'_>> {
                     if let Some(dup) = names.iter().find(|name| !seen.insert(name.as_str())) {
                         return Err(CompileError::spanned(
                             pat.span(),
-                            format!("duplicate binding in for-of head: {dup}"),
+                            format!("duplicate binding in {loop_kind} head: {dup}"),
                         )
                         .into());
                     }
@@ -2134,31 +2366,21 @@ fn for_of_head(left: &ForHead) -> anyhow::Result<ForOfHead<'_>> {
                 other => {
                     return Err(CompileError::spanned(
                         other.span(),
-                        "unsupported for-of binding pattern",
+                        format!("unsupported {loop_kind} binding pattern"),
                     )
                     .into());
                 }
             }
         }
-        // A bare identifier head (`for (x of ..)`) stays rejected.
-        ForHead::Pat(pat) if !is_ident_target(pat) => ForOfHead::Assign(pat),
-        other => {
+        ForHead::Pat(pat) => ForOfHead::Assign(pat),
+        ForHead::UsingDecl(using) => {
             return Err(CompileError::spanned(
-                other.span(),
-                "for-of requires a `const`/`let` loop variable",
+                using.span(),
+                format!("unsupported `using` {loop_kind} head"),
             )
             .into());
         }
     })
-}
-
-/// Whether an assignment-target pattern is a bare identifier (`x` / `(x)`).
-fn is_ident_target(pat: &Pat) -> bool {
-    match pat {
-        Pat::Ident(_) => true,
-        Pat::Expr(expr) => matches!(strip_parens(expr), Expr::Ident(_)),
-        _ => false,
-    }
 }
 
 /// The class-member name early errors (`SyntaxError`s) of a literal key: a
@@ -2189,18 +2411,82 @@ fn check_member_name(key: &PropName, is_static: bool, field: bool) -> anyhow::Re
     Err(CompileError::spanned(key.span(), msg).into())
 }
 
-/// Build the spanned rejection for a non-method, non-constructor, non-field class
-/// member. Private / static-block forms are out of scope entirely. Each carries
-/// the member's span. (Methods and plain instance fields are handled in
-/// [`LowerCtx::lower_class_decl`] directly — supported or rejected there.)
+/// Declare the private method or accessor `m` in `names` (DESIGN.md §7.6),
+/// taking its `%penv` slots from `next_slot` — one for a method, two for an
+/// accessor's first half (the second half of a getter / setter pair of the
+/// same static-ness fills the other); returns its `"#m"`. Any other repeat is
+/// the spanned `duplicate private name #m`.
+fn declare_private_method(
+    names: &mut Vec<(JsStr, PrivateKind)>,
+    next_slot: &mut u32,
+    m: &swc_ecma_ast::PrivateMethod,
+) -> anyhow::Result<JsStr> {
+    let name = JsStr::from(format!("#{}", m.key.name));
+    let is_static = m.is_static;
+    let existing = names.iter_mut().find(|(declared, _)| *declared == name);
+    match (m.kind, existing) {
+        (MethodKind::Method, None) => {
+            names.push((
+                name.clone(),
+                PrivateKind::Method {
+                    slot: *next_slot,
+                    is_static,
+                },
+            ));
+            *next_slot += 1;
+        }
+        (kind, None) => {
+            let base = *next_slot;
+            let getter = kind == MethodKind::Getter;
+            names.push((
+                name.clone(),
+                PrivateKind::Accessor {
+                    get: getter.then_some(base),
+                    set: (!getter).then_some(base + 1),
+                    is_static,
+                },
+            ));
+            *next_slot += 2;
+        }
+        (
+            MethodKind::Getter,
+            Some((
+                _,
+                PrivateKind::Accessor {
+                    get,
+                    set: Some(set),
+                    is_static: declared_static,
+                },
+            )),
+        ) if get.is_none() && *declared_static == is_static => *get = Some(*set - 1),
+        (
+            MethodKind::Setter,
+            Some((
+                _,
+                PrivateKind::Accessor {
+                    get: Some(get),
+                    set,
+                    is_static: declared_static,
+                },
+            )),
+        ) if set.is_none() && *declared_static == is_static => *set = Some(*get + 1),
+        _ => {
+            return Err(CompileError::spanned(
+                m.key.span,
+                format!("duplicate private name {name}"),
+            )
+            .into());
+        }
+    }
+    Ok(name)
+}
+
+/// Build the spanned rejection for a class member that is none of the
+/// supported forms. Each carries the member's span. (Methods, fields and
+/// static blocks are handled in [`LowerCtx::lower_class_decl`] directly —
+/// supported or rejected there.)
 fn reject_class_member(member: &ClassMember) -> anyhow::Error {
-    let (span, msg) = match member {
-        ClassMember::PrivateMethod(m) => (m.span(), "private class methods are not supported"),
-        ClassMember::PrivateProp(p) => (p.span(), "private class fields are not supported"),
-        ClassMember::StaticBlock(b) => (b.span(), "class static blocks are not supported"),
-        other => (other.span(), "unsupported class member"),
-    };
-    CompileError::spanned(span, msg).into()
+    CompileError::spanned(member.span(), "unsupported class member").into()
 }
 
 /// The name of a derived class's default-constructor rest binding (not
@@ -2434,5 +2720,22 @@ fn unsupported_stmt_msg(stmt: &Stmt) -> &'static str {
         Stmt::With(_) => "with statements are not supported",
         Stmt::Debugger(_) => "debugger statements are not supported",
         _ => "this statement is not supported",
+    }
+}
+
+/// An object rest `{...rest}` over the source in `temp`: a fresh ordinary
+/// object holding every own enumerable property of the source except the
+/// destructured `bound_keys` (static strings, or locals holding converted
+/// numeric/computed keys) (`CopyDataProperties`).
+fn object_rest(temp: u32, bound_keys: &[IrNode]) -> IrNode {
+    IrNode::CopyDataProperties {
+        target: Box::new(IrNode::Object {
+            entries: Vec::new(),
+            proto: None,
+            class: crate::abi::CLASS_ORDINARY,
+            reserve: 0,
+        }),
+        source: Box::new(IrNode::Local(temp)),
+        exclude: Box::new(IrNode::Array(bound_keys.to_vec())),
     }
 }

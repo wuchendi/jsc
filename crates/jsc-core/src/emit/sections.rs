@@ -97,7 +97,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         delete: index(),
         own_keys: index(),
         for_in_keys: index(),
-        rest: index(),
+        copy_data: index(),
         // `__array_reserve` takes the index right before `__array_push`.
         array_push: {
             index();
@@ -241,8 +241,14 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
     // i64) -> i32`; then the exported `__promise_self_error() -> i64`; then
-    // `__symbol_get(v: i64, sym: i32) -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 18] = [
+    // `__symbol_get(v: i64, sym: i32) -> i64`; then the private-name helpers
+    // `__private_find(o: i64, key: i32) -> i32`, `__private_add(o: i64, key:
+    // i32, v: i64, attrs: i32, name: i32)`, `__private_get(o: i64, key: i32,
+    // name: i32) -> i64`, `__private_set(o: i64, key: i32, v: i64, name:
+    // i32) -> i64`, `__private_brand(o: i64, v: i64, brand: i64, name: i32,
+    // mode: i32) -> i64` and `__private_in(o: i64, brand: i64, name: i32) ->
+    // i64`.
+    let conversions: [(&[ValType], &[ValType]); 24] = [
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
         (&[ValType::I64], &[ValType::I32]),
         (&[ValType::I64, ValType::I64], &[ValType::I64]),
@@ -281,6 +287,33 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[ValType::I32, ValType::I64], &[ValType::I32]),
         (&[], &[ValType::I64]),
         (&[ValType::I64, ValType::I32], &[ValType::I64]),
+        (&[ValType::I64, ValType::I32], &[ValType::I32]),
+        (
+            &[
+                ValType::I64,
+                ValType::I32,
+                ValType::I64,
+                ValType::I32,
+                ValType::I32,
+            ],
+            &[],
+        ),
+        (&[ValType::I64, ValType::I32, ValType::I32], &[ValType::I64]),
+        (
+            &[ValType::I64, ValType::I32, ValType::I64, ValType::I32],
+            &[ValType::I64],
+        ),
+        (
+            &[
+                ValType::I64,
+                ValType::I64,
+                ValType::I64,
+                ValType::I32,
+                ValType::I32,
+            ],
+            &[ValType::I64],
+        ),
+        (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I64]),
     ];
     for (ty, (params, results)) in (next_type + 11..).zip(conversions) {
         types
@@ -346,8 +379,8 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I64, I32], &[I64]),
         // `__for_in_keys(obj) -> array`.
         (&[I64], &[I64]),
-        // `__rest(src, excl) -> object`.
-        (&[I64, I64], &[I64]),
+        // `__copy_data(dst, src, excl) -> dst`.
+        (&[I64, I64, I64], &[I64]),
         // `__array_reserve(base, need)`.
         (&[I32, I32], &[]),
         // `__array_push(base, value) -> base`.
@@ -835,6 +868,11 @@ pub(super) fn collect_stmt<'a>(stmt: &'a IrStmt, strs: &mut Strs<'a>) {
                 }
             }
         }
+        IrStmt::Labeled { body, .. } => {
+            for stmt in body {
+                collect_stmt(stmt, strs);
+            }
+        }
         IrStmt::Break(_) | IrStmt::Continue(_) => {}
         IrStmt::Try {
             body,
@@ -915,6 +953,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
         | IrNode::IsArray(operand)
+        | IrNode::Freeze(operand)
         | IrNode::ToObject(operand)
         | IrNode::ToPropertyKey(operand)
         | IrNode::CellNew(operand)
@@ -966,6 +1005,12 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
             for elem in elems {
                 collect_node(elem, strs);
             }
+        }
+        IrNode::Block { stmts, value } => {
+            for stmt in stmts {
+                collect_stmt(stmt, strs);
+            }
+            collect_node(value, strs);
         }
         IrNode::ArraySpread(parts) => {
             for part in parts {
@@ -1132,9 +1177,70 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
                 collect_node(new_target, strs);
             }
         }
-        IrNode::ObjectRest { source, exclude } => {
+        IrNode::CopyDataProperties {
+            target,
+            source,
+            exclude,
+        } => {
+            collect_node(target, strs);
             collect_node(source, strs);
             collect_node(exclude, strs);
+        }
+        IrNode::PrivateName(name) => strs.add_units(name),
+        IrNode::PrivEnvLoad { env, .. } => collect_node(env, strs),
+        IrNode::PrivEnvStore { env, value, .. } => {
+            collect_node(env, strs);
+            collect_node(value, strs);
+        }
+        IrNode::PrivateGet { obj, key, name } => {
+            seed_prop_strs(strs);
+            strs.add_units(name);
+            collect_node(obj, strs);
+            collect_node(key, strs);
+        }
+        IrNode::PrivateBrand {
+            obj,
+            value,
+            brand,
+            name,
+            ..
+        } => {
+            seed_prop_strs(strs);
+            strs.add_units(name);
+            collect_node(obj, strs);
+            if let Some(value) = value {
+                collect_node(value, strs);
+            }
+            collect_node(brand, strs);
+        }
+        IrNode::PrivateThrow { name, .. } => {
+            seed_prop_strs(strs);
+            strs.add_units(name);
+        }
+        IrNode::PrivateIn { obj, brand, name } => {
+            seed_prop_strs(strs);
+            strs.add_units(name);
+            collect_node(obj, strs);
+            collect_node(brand, strs);
+        }
+        IrNode::PrivateAdd {
+            obj,
+            key,
+            value,
+            name,
+            ..
+        }
+        | IrNode::PrivateSet {
+            obj,
+            key,
+            value,
+            name,
+        } => {
+            seed_prop_strs(strs);
+            strs.add_units(name);
+            collect_node(obj, strs);
+            collect_node(key, strs);
+            collect_node(value, strs);
         }
         IrNode::Index { obj, index } => {
             seed_nullish_strs(strs);

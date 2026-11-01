@@ -1,28 +1,7 @@
 //! Integration tests: out-of-scope constructs that must fail with a clear error, not a wrong value.
 
 mod common;
-use common::{assert_rejected, assert_uncaught};
-
-// ---------------------------------------------------------------------------
-// Out-of-scope boundary: each of these must be REJECTED, never mis-evaluated.
-// (See DESIGN.md for the full catalogue + gaps.)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn rejects_spread() {
-    // Call-argument and array-literal spread are supported; only
-    // object spread remains out of scope.
-    assert_rejected("let o = { a: 1 }; let p = { ...o }; p.a");
-}
-
-#[test]
-fn rejects_unsupported_for_of_and_for_in() {
-    // A bare-identifier `for-of` head and a statically non-enumerable
-    // `for-in` head still trap (a non-iterable `for-of` source is a run-time
-    // `TypeError`, see the iteration suite).
-    assert_rejected("for (x of [1, 2, 3]) { x }");
-    assert_rejected("for (const k in 5) { k }");
-}
+use common::assert_uncaught;
 
 // ---------------------------------------------------------------------------
 // An unknown / not-yet-implemented method is a run-time `TypeError` from the

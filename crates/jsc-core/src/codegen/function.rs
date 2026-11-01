@@ -131,10 +131,11 @@ enum ParamBind<'p> {
         default: Option<&'p Expr>,
         arg: Option<u32>,
     },
-    /// A trailing rest parameter: its binding ident and its start position
-    /// `p` (the number of preceding positional parameters). It binds a
-    /// synthesized array rather than a single positional slot.
-    Rest(&'p swc_ecma_ast::BindingIdent, u32),
+    /// A trailing rest parameter: its binding target (an identifier, or an
+    /// array/object pattern destructuring the rest array) and its start
+    /// position `p` (the number of preceding positional parameters). It binds
+    /// a synthesized array rather than a single positional slot.
+    Rest(&'p Pat, u32),
     /// A destructuring parameter: the temp positional slot the incoming
     /// argument lands in, the pattern, and an optional parameter-level default
     /// (`f([a,b] = [1,2])`).
@@ -162,7 +163,7 @@ impl LowerCtx<'_> {
         // 4.5: right after allocation, before the parameters are bound).
         if self.frame().ctor == FnKind::Class
             && let Some(this_local) = self.ensure_this_local()
-            && let Some(fields) = self.lower_field_inits(IrNode::Local(this_local))?
+            && let Some(fields) = self.lower_field_inits(&IrNode::Local(this_local))?
         {
             body.push(IrStmt::Expr(fields));
         }
@@ -271,16 +272,17 @@ impl LowerCtx<'_> {
                         )
                         .into());
                     }
-                    let Pat::Ident(ident) = rest_pat.arg.as_ref() else {
+                    let arg = rest_pat.arg.as_ref();
+                    if !matches!(arg, Pat::Ident(_) | Pat::Array(_) | Pat::Object(_)) {
                         return Err(CompileError::spanned(
-                            rest_pat.arg.span(),
+                            arg.span(),
                             "unsupported rest parameter pattern",
                         )
                         .into());
-                    };
+                    }
                     params
                         .binds
-                        .push(ParamBind::Rest(ident, u32::try_from(i).unwrap_or(u32::MAX)));
+                        .push(ParamBind::Rest(arg, u32::try_from(i).unwrap_or(u32::MAX)));
                     continue;
                 }
                 _ => {
@@ -342,10 +344,9 @@ impl LowerCtx<'_> {
         for bind in &params.binds {
             match bind {
                 ParamBind::Ident { .. } => {}
-                ParamBind::Rest(ident, _) => {
-                    names.push((ident.id.sym.as_ref().to_owned(), binding_id(ident)));
+                ParamBind::Rest(pat, _) | ParamBind::Pattern { pat, .. } => {
+                    pat_bindings(pat, &mut names);
                 }
-                ParamBind::Pattern { pat, .. } => pat_bindings(pat, &mut names),
             }
         }
         for (name, id) in &names {
@@ -433,8 +434,9 @@ impl LowerCtx<'_> {
                     self.param_bound(id);
                 }
                 // Trailing rest parameter: gather the surplus arguments into a
-                // real array bound to the rest name.
-                ParamBind::Rest(rest_ident, p) => self.lower_rest_param(rest_ident, p, k, body),
+                // real array bound to the rest name (or destructured by its
+                // pattern).
+                ParamBind::Rest(rest_pat, p) => self.lower_rest_param(rest_pat, p, k, body)?,
                 // Destructuring parameters: each temp slot holds the incoming
                 // argument; apply an optional parameter-level default, then
                 // destructure it into the named locals by reusing the
@@ -640,14 +642,19 @@ impl LowerCtx<'_> {
     /// arguments `k..n` of a spread call are appended from the spread argument
     /// array ([`Self::overflow_loop`]). The array is built in a temp local
     /// ([`IrNode::ArrayPush`] appends to a handle held in a wasm local), then
-    /// bound to the rest name, boxed into a cell when the binding is captured.
+    /// bound to the rest name, boxed into a cell when the binding is captured
+    /// (or destructured by a rest pattern, `f(...[a, b])` / `f(...{length})`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rest pattern is outside the supported subset.
     fn lower_rest_param(
         &mut self,
-        rest_ident: &swc_ecma_ast::BindingIdent,
+        rest_pat: &Pat,
         p: u32,
         k: u32,
         body: &mut Vec<IrStmt>,
-    ) {
+    ) -> anyhow::Result<()> {
         let n = self.fresh();
         body.push(IrStmt::Decl {
             local: n,
@@ -680,7 +687,13 @@ impl LowerCtx<'_> {
             value: Box::new(value),
         });
         body.push(overflow);
-        self.bind_ident(rest_ident, IrNode::Local(tmp), true, body);
+        match rest_pat {
+            Pat::Ident(rest_ident) => {
+                self.bind_ident(rest_ident, IrNode::Local(tmp), true, body);
+                Ok(())
+            }
+            pat => self.lower_binding_pattern(pat, IrNode::Local(tmp), true, body),
+        }
     }
 
     /// The prologue building this function's `arguments` object into `local`:
@@ -1055,18 +1068,60 @@ impl LowerCtx<'_> {
     }
 
     /// Define the current class's instance fields ([`Self::class_fields`]) on
-    /// `this` in source order with `CreateDataProperty` semantics
-    /// (`__define`, so an inherited setter is not invoked); `None` when the
-    /// class declares no fields. An uninitialized `f;` defines `undefined`. A
-    /// computed field name reads its key, converted at class definition time.
-    pub(super) fn lower_field_inits(&mut self, this: IrNode) -> anyhow::Result<Option<IrNode>> {
+    /// `this` in source order: a public one with `CreateDataProperty`
+    /// semantics (`__define`, so an inherited setter is not invoked), a private
+    /// one with `PrivateFieldAdd` (DESIGN.md §7.6), all after the instance
+    /// brand when the class has instance private methods or accessors
+    /// (`PrivateMethodOrAccessorAdd`); `None` when the class declares no
+    /// fields and no brand. An uninitialized `f;` defines `undefined`. A
+    /// computed field name reads its key, converted at class definition time;
+    /// an anonymous function initializer of `#x` is named `"#x"`.
+    pub(super) fn lower_field_inits(&mut self, this: &IrNode) -> anyhow::Result<Option<IrNode>> {
         if self.class_fields.is_empty() {
             return Ok(None);
         }
         let fields = std::mem::take(&mut self.class_fields);
-        let mut entries = Vec::with_capacity(fields.len());
-        for (p, computed) in &fields {
-            let Some((frame, id)) = *computed else {
+        let mut seq = Vec::new();
+        let mut entries = Vec::new();
+        for field in &fields {
+            let (p, computed) = match field {
+                ClassField::Public(p, computed) => (p, *computed),
+                ClassField::Brand(frame, penv, name) => {
+                    let env = self.read_hidden(*frame, *penv);
+                    seq.push(IrNode::PrivateAdd {
+                        obj: Box::new(this.clone()),
+                        key: Box::new(IrNode::PrivEnvLoad {
+                            env: Box::new(env),
+                            slot: 1,
+                        }),
+                        value: Box::new(IrNode::Undefined),
+                        attrs: 0,
+                        name: name.clone(),
+                    });
+                    continue;
+                }
+                ClassField::Private(p, frame, penv, slot) => {
+                    self.flush_field_entries(this, &mut entries, &mut seq);
+                    let name = JsStr::from(format!("#{}", p.key.name));
+                    let value = match &p.value {
+                        Some(init) => self.lower_key_named_expr(init, &name)?,
+                        None => IrNode::Undefined,
+                    };
+                    let env = self.read_hidden(*frame, *penv);
+                    seq.push(IrNode::PrivateAdd {
+                        obj: Box::new(this.clone()),
+                        key: Box::new(IrNode::PrivEnvLoad {
+                            env: Box::new(env),
+                            slot: *slot,
+                        }),
+                        value: Box::new(value),
+                        attrs: crate::abi::ATTR_WRITABLE,
+                        name,
+                    });
+                    continue;
+                }
+            };
+            let Some((frame, id)) = computed else {
                 let key = super::stmt::prop_key_name(&p.key)?;
                 let value = match &p.value {
                     Some(init) => self.lower_key_named_expr(init, &key)?,
@@ -1090,12 +1145,27 @@ impl LowerCtx<'_> {
             entries.push((PropKey::Computed(key), value));
         }
         self.class_fields = fields;
+        self.flush_field_entries(this, &mut entries, &mut seq);
+        Ok(Some(IrNode::Seq(seq)))
+    }
+
+    /// Move the pending public field `entries` into one `DefineProps` on
+    /// `this` appended to `seq` (nothing when there are none).
+    fn flush_field_entries(
+        &mut self,
+        this: &IrNode,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        seq: &mut Vec<IrNode>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
         let local = self.fresh();
-        Ok(Some(IrNode::DefineProps {
-            obj: Box::new(this),
+        seq.push(IrNode::DefineProps {
+            obj: Box::new(this.clone()),
             local,
-            entries,
-        }))
+            entries: std::mem::take(entries),
+        });
     }
 }
 

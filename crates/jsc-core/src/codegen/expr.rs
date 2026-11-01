@@ -124,11 +124,10 @@ impl LowerCtx<'_> {
                     obj: Box::new(self.lower_expr(&member.obj)?),
                     index: Box::new(self.lower_expr(&c.expr)?),
                 }),
-                MemberProp::PrivateName(_) => Err(CompileError::spanned(
-                    member.span(),
-                    "private fields are not supported",
-                )
-                .into()),
+                MemberProp::PrivateName(p) => {
+                    let obj = self.lower_expr(&member.obj)?;
+                    self.lower_private_get(obj, p)
+                }
             },
             // An array literal `[e0, e1, ..]` lowers to a heap array.
             Expr::Array(arr) => self.lower_array(arr),
@@ -154,10 +153,17 @@ impl LowerCtx<'_> {
             }),
             // `key in obj`: an own-key membership test, lowered to a runtime
             // key-table scan. `left` is the property key, `right` the object.
-            Expr::Bin(b) if matches!(b.op, BinaryOp::In) => Ok(IrNode::ObjectHas {
-                key: Box::new(self.lower_expr(&b.left)?),
-                obj: Box::new(self.lower_expr(&b.right)?),
-            }),
+            // `#x in obj` tests the private name (DESIGN.md §7.6).
+            Expr::Bin(b) if matches!(b.op, BinaryOp::In) => match &*b.left {
+                Expr::PrivateName(p) => {
+                    let target = self.private_ref(p)?;
+                    Ok(target.has(self.lower_expr(&b.right)?))
+                }
+                left => Ok(IrNode::ObjectHas {
+                    key: Box::new(self.lower_expr(left)?),
+                    obj: Box::new(self.lower_expr(&b.right)?),
+                }),
+            },
             // `x instanceof RHS` (DESIGN.md §7.6): any right-hand side expression.
             Expr::Bin(b) if matches!(b.op, BinaryOp::InstanceOf) => {
                 self.lower_instanceof(&b.left, &b.right)
@@ -223,9 +229,25 @@ impl LowerCtx<'_> {
                 // `!operand` is logical NOT: boolean inverse of truthiness.
                 UnaryOp::Bang => Ok(IrNode::Not(Box::new(self.lower_expr(&u.arg)?))),
                 // `delete obj.k` / `delete obj[k]` removes an own property and
-                // yields `true`. Only a member reference is supported; a
-                // bare `delete x` (a no-op in non-strict JS) is rejected.
-                UnaryOp::Delete => match &*u.arg {
+                // yields `true` (parentheses are transparent). `delete x` of an
+                // identifier is an early SyntaxError in strict code; any other
+                // non-reference operand is evaluated and yields `true`.
+                UnaryOp::Delete => match strip_parens(&u.arg) {
+                    Expr::Ident(ident) => Err(CompileError::spanned(
+                        ident.span,
+                        "Delete of an unqualified identifier in strict mode.",
+                    )
+                    .into()),
+                    Expr::SuperProp(super_prop) => Err(CompileError::spanned(
+                        super_prop.span,
+                        "`delete` of a `super` property is not supported",
+                    )
+                    .into()),
+                    Expr::OptChain(chain) => Err(CompileError::spanned(
+                        chain.span,
+                        "`delete` of an optional chain is not supported",
+                    )
+                    .into()),
                     Expr::Member(member) => {
                         let obj = self.lower_expr(&member.obj)?;
                         let key = match &member.prop {
@@ -234,7 +256,7 @@ impl LowerCtx<'_> {
                             MemberProp::PrivateName(_) => {
                                 return Err(CompileError::spanned(
                                     member.span(),
-                                    "private fields are not supported",
+                                    "private fields cannot be deleted",
                                 )
                                 .into());
                             }
@@ -244,22 +266,26 @@ impl LowerCtx<'_> {
                             key: Box::new(key),
                         })
                     }
-                    other => Err(CompileError::spanned(
-                        other.span(),
-                        "`delete` requires a property reference",
-                    )
-                    .into()),
+                    other => Ok(IrNode::Seq(vec![
+                        self.lower_expr(other)?,
+                        IrNode::Bool(true),
+                    ])),
                 },
-                UnaryOp::Void => Err(CompileError::spanned(
-                    u.span(),
-                    format!("unsupported unary operator `{}`", u.op.as_str()),
-                )
-                .into()),
+                // `void operand` evaluates the operand for its effects and
+                // yields `undefined`; a literal operand folds away.
+                UnaryOp::Void => Ok(match self.lower_expr(&u.arg)? {
+                    IrNode::Num(_)
+                    | IrNode::Str(_)
+                    | IrNode::Bool(_)
+                    | IrNode::Null
+                    | IrNode::Undefined => IrNode::Undefined,
+                    operand => IrNode::Seq(vec![operand, IrNode::Undefined]),
+                }),
             },
             // A template literal `` `a${x}b` `` folds into left-associated `+`
-            // concatenations, reusing the string-coercion path. Tagged
-            // templates stay unsupported (handled by the fallback below).
+            // concatenations, reusing the string-coercion path.
             Expr::Tpl(tpl) => self.lower_tpl(tpl),
+            Expr::TaggedTpl(tagged) => self.lower_tagged_tpl(tagged),
             // `this` reads the current function's snapshotted `this` slot,
             // allocated on first use; outside any function (the top-level `main`
             // frame) there is no `this` binding, so it stays unsupported. Inside a
@@ -379,7 +405,6 @@ impl LowerCtx<'_> {
                 ChainLink::Member {
                     prop: &member.prop,
                     optional: false,
-                    span: member.span,
                 },
             );
             let base = self.lower_expr(&member.obj)?;
@@ -420,10 +445,8 @@ impl LowerCtx<'_> {
         link: &ChainLink<'_>,
         rest: &[ChainLink<'_>],
     ) -> anyhow::Result<IrNode> {
-        let (
-            ChainLink::Member { prop, span, .. },
-            Some((ChainLink::Call { args, optional }, after)),
-        ) = (link, rest.split_first())
+        let (ChainLink::Member { prop, .. }, Some((ChainLink::Call { args, optional }, after))) =
+            (link, rest.split_first())
         else {
             let applied = self.apply_link(obj, link)?;
             return self.build_chain(applied, rest);
@@ -452,10 +475,9 @@ impl LowerCtx<'_> {
         let key = match prop {
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::PrivateName(_) => {
-                return Err(
-                    CompileError::spanned(*span, "private fields are not supported").into(),
-                );
+            MemberProp::PrivateName(p) => {
+                let call = self.lower_private_call(obj, p, args, None)?;
+                return self.build_chain(call, after);
             }
         };
         let obj_local = self.fresh();
@@ -489,7 +511,7 @@ impl LowerCtx<'_> {
     /// `obj.length`; a call becomes an indirect call with `obj` as the callee.
     fn apply_link(&mut self, obj: IrNode, link: &ChainLink<'_>) -> anyhow::Result<IrNode> {
         match link {
-            ChainLink::Member { prop, span, .. } => match prop {
+            ChainLink::Member { prop, .. } => match prop {
                 MemberProp::Ident(id) if id.sym.as_ref() == "length" => {
                     Ok(IrNode::StrLen(Box::new(nullish_check(obj, "length"))))
                 }
@@ -501,9 +523,7 @@ impl LowerCtx<'_> {
                     obj: Box::new(obj),
                     index: Box::new(self.lower_expr(&c.expr)?),
                 }),
-                MemberProp::PrivateName(_) => {
-                    Err(CompileError::spanned(*span, "private fields are not supported").into())
-                }
+                MemberProp::PrivateName(p) => self.lower_private_get(obj, p),
             },
             ChainLink::Call { args, .. } => {
                 let args = self.lower_chain_args(args)?;
@@ -666,7 +686,7 @@ impl LowerCtx<'_> {
         }
         seq.push(self.derived_bind_this(fi, IrNode::Local(result)));
         self.frames[fi].supers.this_bound |= top_level;
-        if let Some(fields) = self.lower_field_inits(IrNode::Local(result))? {
+        if let Some(fields) = self.lower_field_inits(&IrNode::Local(result))? {
             seq.push(fields);
         }
         seq.push(IrNode::Local(result));
@@ -746,8 +766,8 @@ impl LowerCtx<'_> {
     /// [`IrNode::ThisCall`]).
     fn lower_super_method_call(
         &mut self,
-        call: &swc_ecma_ast::CallExpr,
         super_prop: &SuperPropExpr,
+        args: Vec<IrNode>,
     ) -> anyhow::Result<IrNode> {
         let home = self.super_home(super_prop.span)?;
         let key = self.lower_super_key(super_prop)?;
@@ -759,15 +779,6 @@ impl LowerCtx<'_> {
             None => IrNode::Seq(vec![key, IrNode::Undefined]),
         };
         let (callee, this_local) = self.super_this(method, super_prop.span)?;
-        let mut args = Vec::with_capacity(call.args.len());
-        for arg in &call.args {
-            if arg.spread.is_some() {
-                return Err(
-                    CompileError::spanned(arg.span(), "spread arguments are unsupported").into(),
-                );
-            }
-            args.push(self.lower_expr(&arg.expr)?);
-        }
         // The method is read before the arguments run (ECMA-262 13.3.7.1).
         let (seq, callee) = self.callee_first(callee, &args);
         Ok(seq_then(
@@ -788,7 +799,6 @@ impl LowerCtx<'_> {
     /// computed callee, is an indirect call (`IrNode::CallIndirect`) whose arity
     /// is not checked (the uniform ABI pads/ignores). Spread arguments are out of
     /// scope.
-    #[allow(clippy::too_many_lines)]
     fn lower_call(&mut self, call: &swc_ecma_ast::CallExpr) -> anyhow::Result<IrNode> {
         // `super(..)` — the parent constructor call inside a derived class (E-series).
         if let Callee::Super(sup) = &call.callee {
@@ -805,7 +815,18 @@ impl LowerCtx<'_> {
         }
         // `super.m(..)` — a parent prototype method call inside a derived class.
         if let Expr::SuperProp(super_prop) = callee_expr.as_ref() {
-            return self.lower_super_method_call(call, super_prop);
+            let mut args = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                if arg.spread.is_some() {
+                    return Err(CompileError::spanned(
+                        arg.span(),
+                        "spread arguments are unsupported",
+                    )
+                    .into());
+                }
+                args.push(self.lower_expr(&arg.expr)?);
+            }
+            return self.lower_super_method_call(super_prop, args);
         }
         // A spread argument `f(...a)` makes the call's argument count only
         // known at runtime, so it takes a dedicated lowering path.
@@ -817,11 +838,88 @@ impl LowerCtx<'_> {
         for arg in &call.args {
             args.push(self.lower_expr(&arg.expr)?);
         }
+        self.lower_call_with(callee_expr, args)
+    }
+
+    /// Lower a tagged template `` tag`a${x}b` `` (ECMA-262 13.3.11): a call of
+    /// `tag` — with `this` bound for a member tag, as for `tag(..)` — passing
+    /// the site's template object and then the substitution values, evaluated
+    /// left to right after the tag.
+    fn lower_tagged_tpl(&mut self, tagged: &swc_ecma_ast::TaggedTpl) -> anyhow::Result<IrNode> {
+        // Parentheses keep the Reference: `(o.f)`x`` binds `this = o`.
+        let mut tag = tagged.tag.as_ref();
+        while let Expr::Paren(p) = tag {
+            tag = &p.expr;
+        }
+        let mut args = Vec::with_capacity(tagged.tpl.exprs.len() + 1);
+        args.push(self.template_object(&tagged.tpl));
+        for expr in &tagged.tpl.exprs {
+            args.push(self.lower_expr(expr)?);
+        }
+        if let Expr::SuperProp(super_prop) = tag {
+            return self.lower_super_method_call(super_prop, args);
+        }
+        self.lower_call_with(tag, args)
+    }
+
+    /// The template object of a tagged template site (`GetTemplateObject`):
+    /// a frozen array of the cooked strings (`undefined` for an invalid
+    /// escape) whose non-writable, non-enumerable, non-configurable `raw` is
+    /// the frozen array of the raw strings. It is built on the site's first
+    /// evaluation into the site's own module cell, which holds the TDZ hole
+    /// until then, so every later evaluation yields the same object.
+    fn template_object(&mut self, tpl: &swc_ecma_ast::Tpl) -> IrNode {
+        let site = self.shared.template_cells.get();
+        self.shared.template_cells.set(site + 1);
+        let slot = u32::try_from(self.shared.module_slots.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(site);
+        let cooked = tpl
+            .quasis
+            .iter()
+            .map(|q| {
+                q.cooked.as_ref().map_or(IrNode::Undefined, |c| {
+                    IrNode::Str(c.to_ill_formed_utf16().collect())
+                })
+            })
+            .collect();
+        // The TRV of a line terminator sequence normalizes CR and CRLF to LF.
+        let raw = tpl
+            .quasis
+            .iter()
+            .map(|q| {
+                let text = q.raw.as_ref().replace("\r\n", "\n").replace('\r', "\n");
+                IrNode::Str(JsStr::from(text.as_str()))
+            })
+            .collect();
+        let object = IrNode::Freeze(Box::new(IrNode::DefineProps {
+            obj: Box::new(IrNode::Array(cooked)),
+            local: self.fresh(),
+            entries: vec![(
+                PropKey::Fixed("raw".into()),
+                IrNode::Freeze(Box::new(IrNode::Array(raw))),
+            )],
+        }));
+        IrNode::Ternary {
+            cond: Box::new(IrNode::IsHole(Box::new(IrNode::CellGet(Box::new(
+                IrNode::ModuleCell(slot),
+            ))))),
+            then_branch: Box::new(IrNode::CellSet {
+                cell: Box::new(IrNode::ModuleCell(slot)),
+                value: Box::new(object),
+            }),
+            else_branch: Box::new(IrNode::CellGet(Box::new(IrNode::ModuleCell(slot)))),
+        }
+    }
+
+    /// Lower a call of `callee_expr` (parentheses stripped, not `super.m`)
+    /// with the already lowered, spread-free `args` (see [`Self::lower_call`]).
+    fn lower_call_with(&mut self, callee_expr: &Expr, args: Vec<IrNode>) -> anyhow::Result<IrNode> {
         // `N.m(..)` on an unshadowed builtin namespace (`Math`, `JSON`,
         // `console`, `Object`, `Promise`, `Date`): the inline code, guarded
         // unless `N` is inline (DESIGN.md §6.4); any other member is an
         // ordinary method call on the namespace object.
-        if let Expr::Member(member) = callee_expr.as_ref()
+        if let Expr::Member(member) = callee_expr
             && let Some((namespace, key)) = self.namespace_member(member)
         {
             return self.lower_namespace_call(namespace, key, member, args);
@@ -832,7 +930,7 @@ impl LowerCtx<'_> {
         // `%Promise.prototype%`, `%Date.prototype%` or `%GeneratorPrototype%`
         // builtin: a generic method call with guarded fast paths (DESIGN.md
         // §6.4).
-        if let Expr::Member(member) = callee_expr.as_ref()
+        if let Expr::Member(member) = callee_expr
             && let MemberProp::Ident(id) = &member.prop
             && (ARRAY_METHODS.contains(&id.sym.as_ref())
                 || STRING_METHODS.contains(&id.sym.as_ref())
@@ -845,10 +943,10 @@ impl LowerCtx<'_> {
         // `this = obj` for the call. This must come after the builtin-method
         // checks above (which return early for the recognized names) so only
         // genuine object methods reach here.
-        if let Expr::Member(member) = callee_expr.as_ref() {
+        if let Expr::Member(member) = callee_expr {
             return self.lower_method_call_user(member, args);
         }
-        let Expr::Ident(ident) = callee_expr.as_ref() else {
+        let Expr::Ident(ident) = callee_expr else {
             // A computed callee (e.g. a returned function value) is always an
             // indirect call through the funcref table.
             let callee = self.lower_expr(callee_expr)?;
@@ -1195,28 +1293,25 @@ impl LowerCtx<'_> {
         member: &swc_ecma_ast::MemberExpr,
         args: Box<IrNode>,
     ) -> anyhow::Result<IrNode> {
-        let key = match &member.prop {
-            MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-            MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::PrivateName(_) => {
-                return Err(CompileError::spanned(
-                    member.span(),
-                    "private fields are not supported",
-                )
-                .into());
-            }
+        let this_local = self.fresh();
+        let read = match &member.prop {
+            MemberProp::Ident(id) => IrNode::Index {
+                obj: Box::new(IrNode::Local(this_local)),
+                index: Box::new(IrNode::Str(id.sym.as_ref().into())),
+            },
+            MemberProp::Computed(c) => IrNode::Index {
+                obj: Box::new(IrNode::Local(this_local)),
+                index: Box::new(self.lower_expr(&c.expr)?),
+            },
+            MemberProp::PrivateName(p) => self.lower_private_get(IrNode::Local(this_local), p)?,
         };
         let obj = self.lower_expr(&member.obj)?;
-        let this_local = self.fresh();
         let callee = IrNode::Seq(vec![
             IrNode::Assign {
                 local: this_local,
                 value: Box::new(obj),
             },
-            IrNode::Index {
-                obj: Box::new(IrNode::Local(this_local)),
-                index: Box::new(key),
-            },
+            read,
         ]);
         Ok(IrNode::CallSpread {
             target: SpreadCallee::Method {
@@ -1346,11 +1441,142 @@ impl LowerCtx<'_> {
         Ok(IrNode::Seq(seq))
     }
 
+    /// `obj.#x` on the already lowered receiver `obj` (DESIGN.md §7.6).
+    fn lower_private_get(&mut self, obj: IrNode, prop: &PrivateName) -> anyhow::Result<IrNode> {
+        Ok(self.private_ref(prop)?.read(obj))
+    }
+
+    /// `obj.#x(args)` on the already lowered receiver `obj`: the receiver,
+    /// then the private read (throwing before the arguments run), then the
+    /// arguments; the call binds `this = obj`. `source` names the callee in
+    /// the not-a-function `TypeError`.
+    fn lower_private_call(
+        &mut self,
+        obj: IrNode,
+        prop: &PrivateName,
+        args: Vec<IrNode>,
+        source: Option<&str>,
+    ) -> anyhow::Result<IrNode> {
+        let this_local = self.fresh();
+        let callee = self.fresh();
+        let read = self.lower_private_get(IrNode::Local(this_local), prop)?;
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: this_local,
+                value: Box::new(obj),
+            },
+            IrNode::Assign {
+                local: callee,
+                value: Box::new(read),
+            },
+            IrNode::ThisCall {
+                callee: Box::new(IrNode::Local(callee)),
+                args,
+                this_local,
+                construct: false,
+                not_callable: not_a_function(source),
+            },
+        ]))
+    }
+
+    /// `obj.#x = v`, `obj.#x op= v`, `obj.#x **= v` and the logical
+    /// `obj.#x ??= v` / `||=` / `&&=` (short-circuiting the store): `obj` is
+    /// evaluated once, then `v` (after the read, for every compound form).
+    fn lower_private_assign(
+        &mut self,
+        assign: &AssignExpr,
+        member: &swc_ecma_ast::MemberExpr,
+        prop: &PrivateName,
+    ) -> anyhow::Result<IrNode> {
+        let obj = self.lower_expr(&member.obj)?;
+        let target = self.private_ref(prop)?;
+        let rhs = self.lower_expr(&assign.right)?;
+        if assign.op == AssignOp::Assign {
+            return Ok(target.write(obj, rhs));
+        }
+        let tmp = self.fresh();
+        let get = target.read(IrNode::Local(tmp));
+        let set = |value: IrNode| target.write(IrNode::Local(tmp), value);
+        let result = if let Some(op) = map_logical_assign_op(assign.op) {
+            IrNode::Logical {
+                op,
+                lhs: Box::new(get),
+                rhs: Box::new(set(rhs)),
+            }
+        } else if assign.op == AssignOp::ExpAssign {
+            set(IrNode::MathCall {
+                op: MathOp::Pow,
+                args: vec![get, rhs],
+            })
+        } else {
+            let op = map_assign_op(assign.op, assign.span())?
+                .ok_or_else(|| CompileError::spanned(assign.span(), "unsupported assignment"))?;
+            set(IrNode::Binary {
+                op,
+                lhs: Box::new(get),
+                rhs: Box::new(rhs),
+            })
+        };
+        Ok(IrNode::Seq(vec![
+            IrNode::Assign {
+                local: tmp,
+                value: Box::new(obj),
+            },
+            result,
+        ]))
+    }
+
+    /// `obj.#x++` / `--obj.#x` on the already lowered receiver `obj`: read,
+    /// `ToNumber`, store the sum; a postfix update yields the old number.
+    fn lower_private_update(
+        &mut self,
+        update: &UpdateExpr,
+        obj: IrNode,
+        prop: &PrivateName,
+    ) -> anyhow::Result<IrNode> {
+        let target = self.private_ref(prop)?;
+        let (tmp, old) = (self.fresh(), self.fresh());
+        let delta = if matches!(update.op, UpdateOp::PlusPlus) {
+            1.0
+        } else {
+            -1.0
+        };
+        let read = IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            arg: Box::new(target.read(IrNode::Local(tmp))),
+            radix: None,
+        };
+        let store = target.write(
+            IrNode::Local(tmp),
+            IrNode::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(IrNode::Local(old)),
+                rhs: Box::new(IrNode::Num(delta)),
+            },
+        );
+        let mut seq = vec![
+            IrNode::Assign {
+                local: tmp,
+                value: Box::new(obj),
+            },
+            IrNode::Assign {
+                local: old,
+                value: Box::new(read),
+            },
+            store,
+        ];
+        if !update.prefix {
+            seq.push(IrNode::Local(old));
+        }
+        Ok(IrNode::Seq(seq))
+    }
+
     /// Lower a user method call `obj.m(args)` / `obj[k](args)` into an
     /// [`IrNode::MethodCallUser`] binding `this = obj`. The receiver is
     /// evaluated once into a fresh temp; the callee is the function value at the
     /// member `key`; the `__this` global is set to the receiver just before the
-    /// indirect call. A private-name member (`obj.#m`) is unsupported.
+    /// indirect call. A private-name member (`obj.#m`) is
+    /// [`Self::lower_private_call`].
     fn lower_method_call_user(
         &mut self,
         member: &swc_ecma_ast::MemberExpr,
@@ -1359,12 +1585,10 @@ impl LowerCtx<'_> {
         let key = match &member.prop {
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-            MemberProp::PrivateName(_) => {
-                return Err(CompileError::spanned(
-                    member.span(),
-                    "private fields are not supported",
-                )
-                .into());
+            MemberProp::PrivateName(p) => {
+                let obj = self.lower_expr(&member.obj)?;
+                let name = member_source_name(member);
+                return self.lower_private_call(obj, p, args, name.as_deref());
             }
         };
         let obj = self.lower_expr(&member.obj)?;
@@ -1379,162 +1603,202 @@ impl LowerCtx<'_> {
         })
     }
 
-    /// Lower an assignment `target = value`. An identifier target is a local
-    /// assign; a computed-member target `obj[i] = v` is an in-place array element
-    /// store. A static-member target `obj.a = v` is object territory,
-    /// still unsupported here.
-    #[allow(clippy::too_many_lines)]
+    /// Lower an assignment `target op= value`. Parentheses around a simple
+    /// target are transparent (`(a) = 1`, `((o.x)) += 1`); an identifier target
+    /// is a binding write, a member target `obj[k]` / `obj.k` a property store,
+    /// and a destructuring pattern a statement block (DESIGN.md §7.3).
     fn lower_assign(&mut self, assign: &AssignExpr) -> anyhow::Result<IrNode> {
-        // `x **= e` desugars to `x = x ** e` — a `MathOp::Pow` (not a `BinOp`), so
-        // it is handled ahead of the `BinOp`-based compound path below. Only an
-        // identifier target is supported.
-        if matches!(assign.op, AssignOp::ExpAssign) {
-            let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &assign.left else {
-                return Err(CompileError::spanned(
-                    assign.left.span(),
-                    "unsupported `**=` assignment target",
-                )
-                .into());
-            };
-            let name = ident.id.sym.as_ref();
-            let resolved = self.resolve_target(name, ident.span())?;
-            if !resolved.mutable {
-                return Err(CompileError::spanned(
-                    ident.span(),
-                    format!("cannot assign to constant binding: {name}"),
-                )
-                .into());
+        let simple = match &assign.left {
+            // A destructuring assignment desugars to statements run in place by
+            // an [`IrNode::Block`] whose value is the RHS.
+            AssignTarget::Pat(pat) => {
+                let mut stmts = Vec::new();
+                let temp = self.lower_destructuring_assign(pat, &assign.right, &mut stmts)?;
+                return Ok(IrNode::Block {
+                    stmts,
+                    value: Box::new(IrNode::Local(temp)),
+                });
             }
-            let rhs = self.lower_expr(&assign.right)?;
-            let value = IrNode::MathCall {
+            AssignTarget::Simple(simple) => simple,
+        };
+        let op = if matches!(assign.op, AssignOp::ExpAssign) {
+            AssignKind::Pow
+        } else if let Some(logical) = map_logical_assign_op(assign.op) {
+            AssignKind::Logical(logical)
+        } else {
+            match map_assign_op(assign.op, assign.span())? {
+                Some(bin) => AssignKind::Binary(bin),
+                None => AssignKind::Plain,
+            }
+        };
+        match simple_target(simple, assign.left.span())? {
+            // Only an unparenthesized identifier names an anonymous function
+            // assigned by `=` or a logical assignment (IsIdentifierRef).
+            Target::Ident(ident) => {
+                let named = matches!(simple, SimpleAssignTarget::Ident(_))
+                    && matches!(op, AssignKind::Plain | AssignKind::Logical(_));
+                self.lower_ident_assign(ident, op, &assign.right, named)
+            }
+            Target::Member(member) => match &member.prop {
+                MemberProp::PrivateName(p) => self.lower_private_assign(assign, member, p),
+                _ => self.lower_member_assign(member, op, &assign.right),
+            },
+            Target::SuperProp(super_prop) => Err(CompileError::spanned(
+                super_prop.span,
+                "assignment to a `super` property is not supported",
+            )
+            .into()),
+        }
+    }
+
+    /// Lower `x op= rhs` on the binding `ident`. `x op= e` reads the target once
+    /// (a side-effect-free local/cell/global read) and combines it with `e`, so
+    /// `+=` shares the `+` string/number overload; `x ??= e` / `x ||= e` /
+    /// `x &&= e` reuse the short-circuit [`LogicalOp`] around the write
+    /// (`x ?? (x = e)`), so neither `e` nor the write runs when it short-circuits.
+    /// `named` names an anonymous function `rhs` after the binding.
+    fn lower_ident_assign(
+        &mut self,
+        ident: &Ident,
+        op: AssignKind,
+        right: &Expr,
+        named: bool,
+    ) -> anyhow::Result<IrNode> {
+        let name = ident.sym.as_ref();
+        let resolved = self.resolve_target(name, ident.span())?;
+        // Reassigning a `const` binding is rejected. Attach the target
+        // identifier's span so the diagnostic renderer can point at it.
+        if !resolved.mutable {
+            return Err(CompileError::spanned(
+                ident.span(),
+                format!("cannot assign to constant binding: {name}"),
+            )
+            .into());
+        }
+        let rhs = if named {
+            self.lower_named_expr(right, &JsStr::from(name))?
+        } else {
+            self.lower_expr(right)?
+        };
+        let read = Self::read_of(resolved.kind.clone());
+        Ok(match op {
+            AssignKind::Plain => Self::write_of(resolved.kind, rhs),
+            AssignKind::Binary(op) => Self::write_of(
+                resolved.kind,
+                IrNode::Binary {
+                    op,
+                    lhs: Box::new(read),
+                    rhs: Box::new(rhs),
+                },
+            ),
+            AssignKind::Pow => Self::write_of(
+                resolved.kind,
+                IrNode::MathCall {
+                    op: MathOp::Pow,
+                    args: vec![read, rhs],
+                },
+            ),
+            AssignKind::Logical(op) => IrNode::Logical {
+                op,
+                lhs: Box::new(read),
+                rhs: Box::new(Self::write_of(resolved.kind, rhs)),
+            },
+        })
+    }
+
+    /// Lower `obj[k] op= rhs` / `obj.k op= rhs`. The base is evaluated before
+    /// the key; `obj.k` ≡ `obj["k"]` (a heap-string key; `.length` on an array
+    /// is the runtime's `length` write). A `**=` or logical assignment stashes
+    /// the base and the key (converted once by `ToPropertyKey`) in temps, reads
+    /// the member through them (throwing the read `TypeError` on a nullish base
+    /// before `rhs` runs) and stores through them, so each side effect runs
+    /// once; a short-circuited logical assignment skips both `rhs` and the store
+    /// (no setter call).
+    fn lower_member_assign(
+        &mut self,
+        member: &swc_ecma_ast::MemberExpr,
+        op: AssignKind,
+        right: &Expr,
+    ) -> anyhow::Result<IrNode> {
+        let obj = self.lower_expr(&member.obj)?;
+        let (index, computed) = match &member.prop {
+            MemberProp::Computed(c) => (self.lower_expr(&c.expr)?, true),
+            MemberProp::Ident(id) => (IrNode::Str(id.sym.as_ref().into()), false),
+            MemberProp::PrivateName(_) => {
+                return Err(
+                    CompileError::spanned(member.span(), "unsupported assignment target").into(),
+                );
+            }
+        };
+        let rhs = self.lower_expr(right)?;
+        let op = match op {
+            // `obj[i] = v` reuses the runtime `IndexSet` type-byte dispatch.
+            AssignKind::Plain => {
+                return Ok(IrNode::IndexSet {
+                    obj: Box::new(obj),
+                    index: Box::new(index),
+                    value: Box::new(rhs),
+                });
+            }
+            // `obj[i] op= e`: read the current member once, apply `op`, store
+            // back. Base and key are stashed in fresh temps so each side effect
+            // runs exactly once.
+            AssignKind::Binary(op) => {
+                let obj_local = self.fresh();
+                let idx_local = self.fresh();
+                let new_local = self.fresh();
+                return Ok(IrNode::IndexOpSet {
+                    obj: Box::new(obj),
+                    index: Box::new(index),
+                    op,
+                    rhs: Box::new(rhs),
+                    obj_local,
+                    idx_local,
+                    new_local,
+                    kind: OpSetKind::Compound,
+                });
+            }
+            op => op,
+        };
+        let obj_local = self.fresh();
+        let mut stmts = vec![IrStmt::Decl {
+            local: obj_local,
+            init: obj,
+        }];
+        let index = if computed {
+            let idx_local = self.fresh();
+            stmts.push(IrStmt::Decl {
+                local: idx_local,
+                init: IrNode::ToPropertyKey(Box::new(index)),
+            });
+            IrNode::Local(idx_local)
+        } else {
+            index
+        };
+        let read = IrNode::Index {
+            obj: Box::new(IrNode::Local(obj_local)),
+            index: Box::new(index.clone()),
+        };
+        let store = |value: IrNode| IrNode::IndexSet {
+            obj: Box::new(IrNode::Local(obj_local)),
+            index: Box::new(index.clone()),
+            value: Box::new(value),
+        };
+        let value = match op {
+            AssignKind::Logical(op) => IrNode::Logical {
+                op,
+                lhs: Box::new(read),
+                rhs: Box::new(store(rhs)),
+            },
+            _ => store(IrNode::MathCall {
                 op: MathOp::Pow,
-                args: vec![Self::read_of(resolved.kind.clone()), rhs],
-            };
-            return Ok(Self::write_of(resolved.kind, value));
-        }
-        // `x ??= e` / `x ||= e` / `x &&= e` desugar to a conditional assign that
-        // reuses the short-circuit `LogicalOp`: `x = x ?? e` / `x || e` / `x && e`.
-        // The logical op evaluates `x` once and only evaluates `e` on the
-        // non-short-circuit path, so the RHS is skipped exactly when the assign is
-        // (P0.4). Only an identifier target is supported.
-        if let Some(logical_op) = map_logical_assign_op(assign.op) {
-            let AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) = &assign.left else {
-                return Err(CompileError::spanned(
-                    assign.left.span(),
-                    "unsupported logical-assignment target",
-                )
-                .into());
-            };
-            let name = ident.id.sym.as_ref();
-            let resolved = self.resolve_target(name, ident.span())?;
-            if !resolved.mutable {
-                return Err(CompileError::spanned(
-                    ident.span(),
-                    format!("cannot assign to constant binding: {name}"),
-                )
-                .into());
-            }
-            let rhs = self.lower_expr(&assign.right)?;
-            let value = IrNode::Logical {
-                op: logical_op,
-                lhs: Box::new(Self::read_of(resolved.kind.clone())),
-                rhs: Box::new(rhs),
-            };
-            return Ok(Self::write_of(resolved.kind, value));
-        }
-        // A compound operator (`+=`/`-=`/`*=`/`/=`/`%=` and the bitwise/shift
-        // compounds) maps to the `BinOp` it applies; plain `=` maps to `None`.
-        let compound_op = map_assign_op(assign.op, assign.span())?;
-        match &assign.left {
-            AssignTarget::Simple(SimpleAssignTarget::Ident(ident)) => {
-                let name = ident.id.sym.as_ref();
-                let resolved = self.resolve_target(name, ident.span())?;
-                // Reassigning a `const` binding (plain or compound) is rejected.
-                // Attach the target identifier's span so the diagnostic renderer
-                // can point a caret at the offending name.
-                if !resolved.mutable {
-                    return Err(CompileError::spanned(
-                        ident.span(),
-                        format!("cannot assign to constant binding: {name}"),
-                    )
-                    .into());
-                }
-                let rhs = if compound_op.is_none() {
-                    self.lower_named_expr(&assign.right, &JsStr::from(name))?
-                } else {
-                    self.lower_expr(&assign.right)?
-                };
-                // `x op= e` desugars to `x = x op e`. The target is read once, as
-                // a side-effect-free local/cell read, and reuses the binary op — so
-                // `+=` shares the `+` string/number overload (string concat when
-                // the lhs is a string). A captured target reads/writes its cell.
-                let value = match compound_op {
-                    Some(op) => IrNode::Binary {
-                        op,
-                        lhs: Box::new(Self::read_of(resolved.kind.clone())),
-                        rhs: Box::new(rhs),
-                    },
-                    None => rhs,
-                };
-                Ok(Self::write_of(resolved.kind, value))
-            }
-            // A member target `obj[i] = v` / `obj.k = v` (plain or compound). The
-            // base is evaluated before the key; `obj.k` ≡ `obj["k"]` (a heap-string
-            // key; `.length` on an array is the runtime's `length` write).
-            AssignTarget::Simple(SimpleAssignTarget::Member(m)) => {
-                let obj = self.lower_expr(&m.obj)?;
-                let index = match &m.prop {
-                    MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
-                    MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-                    MemberProp::PrivateName(_) => {
-                        return Err(CompileError::spanned(
-                            m.span(),
-                            "unsupported assignment target",
-                        )
-                        .into());
-                    }
-                };
-                let rhs = self.lower_expr(&assign.right)?;
-                match compound_op {
-                    // `obj[i] op= e`: read the current member once, apply
-                    // `op`, store back. Base and key are stashed in fresh temps so
-                    // each side effect runs exactly once.
-                    Some(op) => {
-                        let obj_local = self.fresh();
-                        let idx_local = self.fresh();
-                        let new_local = self.fresh();
-                        Ok(IrNode::IndexOpSet {
-                            obj: Box::new(obj),
-                            index: Box::new(index),
-                            op,
-                            rhs: Box::new(rhs),
-                            obj_local,
-                            idx_local,
-                            new_local,
-                            kind: OpSetKind::Compound,
-                        })
-                    }
-                    // `obj[i] = v` reuses the runtime `IndexSet` type-byte dispatch.
-                    None => Ok(IrNode::IndexSet {
-                        obj: Box::new(obj),
-                        index: Box::new(index),
-                        value: Box::new(rhs),
-                    }),
-                }
-            }
-            // A destructuring assignment desugars to statements, so it is only
-            // lowered in statement position (see `lower_stmt`).
-            AssignTarget::Pat(_) => Err(CompileError::spanned(
-                assign.left.span(),
-                "destructuring assignment is only supported as an expression statement",
-            )
-            .into()),
-            AssignTarget::Simple(_) => Err(CompileError::spanned(
-                assign.left.span(),
-                "unsupported assignment target",
-            )
-            .into()),
-        }
+                args: vec![read, rhs],
+            }),
+        };
+        Ok(IrNode::Block {
+            stmts,
+            value: Box::new(value),
+        })
     }
 
     /// Lower an increment/decrement `++x`/`x++`/`--x`/`x--`. The target is an
@@ -1544,19 +1808,24 @@ impl LowerCtx<'_> {
     /// read-modify-write through its cell; a member target is an
     /// [`IrNode::IndexOpSet`] (see [`Self::lower_member_update`]).
     fn lower_update(&mut self, update: &UpdateExpr) -> anyhow::Result<IrNode> {
-        let target = match update.arg.as_ref() {
-            Expr::Paren(p) => p.expr.as_ref(),
-            other => other,
-        };
-        if let Expr::Member(member) = target {
-            return self.lower_member_update(update, member);
-        }
-        let Expr::Ident(ident) = target else {
-            return Err(CompileError::spanned(
-                update.arg.span(),
-                "increment/decrement target must be an identifier or member",
-            )
-            .into());
+        let ident = match expr_target(&update.arg) {
+            Some(Target::Ident(ident)) => ident,
+            Some(Target::Member(member)) => return self.lower_member_update(update, member),
+            Some(Target::SuperProp(super_prop)) => {
+                return Err(CompileError::spanned(
+                    super_prop.span,
+                    "increment/decrement of a `super` property is not supported",
+                )
+                .into());
+            }
+            None => {
+                let msg = if update.prefix {
+                    "Invalid left-hand side expression in prefix operation"
+                } else {
+                    "Invalid left-hand side expression in postfix operation"
+                };
+                return Err(CompileError::spanned(update.arg.span(), msg).into());
+            }
         };
         let name = ident.sym.as_ref();
         let resolved = self.resolve_target(name, ident.span())?;
@@ -1616,13 +1885,7 @@ impl LowerCtx<'_> {
         let index = match &member.prop {
             MemberProp::Computed(c) => self.lower_expr(&c.expr)?,
             MemberProp::Ident(id) => IrNode::Str(id.sym.as_ref().into()),
-            MemberProp::PrivateName(_) => {
-                return Err(CompileError::spanned(
-                    member.span(),
-                    "unsupported increment/decrement target",
-                )
-                .into());
-            }
+            MemberProp::PrivateName(p) => return self.lower_private_update(update, obj, p),
         };
         let delta = if matches!(update.op, UpdateOp::PlusPlus) {
             1.0
@@ -1696,8 +1959,10 @@ impl LowerCtx<'_> {
     /// string keys are static, computed and numeric keys are converted at run
     /// time. A getter/setter (`get x(){..}` / `set x(v){..}`) defines an
     /// accessor property; a getter and setter sharing a static key share one
-    /// accessor entry. Spread and async/generator methods are rejected with
-    /// spans.
+    /// accessor entry. A spread `{...o}` is `CopyDataProperties` from `o` in
+    /// source order: from the first spread on, the literal is built
+    /// incrementally on a temp (each later entry run, spread, and
+    /// `__proto__` entry applied in order).
     ///
     /// # Errors
     ///
@@ -1707,20 +1972,21 @@ impl LowerCtx<'_> {
         let mut entries = Vec::with_capacity(obj.props.len());
         // The `__proto__: v` entry: the entry count before it and `v`.
         let mut proto = None;
+        // From the first spread on: the object temp and the steps applied to it.
+        let mut built: Option<(u32, Vec<IrNode>)> = None;
         for prop in &obj.props {
             let prop = match prop {
                 PropOrSpread::Prop(prop) => prop,
-                PropOrSpread::Spread(_) => {
-                    return Err(CompileError::spanned(
-                        prop.span(),
-                        "spread object properties are unsupported",
-                    )
-                    .into());
+                PropOrSpread::Spread(spread) => {
+                    let source = self.lower_expr(&spread.expr)?;
+                    self.push_spread_entry(source, &mut built, &mut entries, &mut proto);
+                    continue;
                 }
             };
             match prop.as_ref() {
                 Prop::KeyValue(kv) if is_proto_key(&kv.key) => {
-                    proto = Some((entries.len(), self.lower_expr(&kv.value)?));
+                    let value = self.lower_expr(&kv.value)?;
+                    self.push_proto_entry(value, &mut built, &mut entries, &mut proto);
                 }
                 Prop::KeyValue(kv) => {
                     let key = self.lower_prop_key(&kv.key)?;
@@ -1803,10 +2069,113 @@ impl LowerCtx<'_> {
                 }
             }
         }
+        Ok(self.finish_object_literal(built, entries, proto))
+    }
+
+    /// The object literal from its collected parts: the incrementally built
+    /// object's steps (any pending `entries` flushed) yielding the object, else
+    /// the static literal with any pending `__proto__` entry.
+    fn finish_object_literal(
+        &mut self,
+        built: Option<(u32, Vec<IrNode>)>,
+        mut entries: Vec<(PropKey, IrNode)>,
+        proto: Option<(usize, IrNode)>,
+    ) -> IrNode {
+        if let Some((obj_local, mut steps)) = built {
+            self.flush_object_entries(obj_local, &mut entries, &mut steps);
+            steps.push(IrNode::Local(obj_local));
+            return IrNode::Seq(steps);
+        }
         let Some((at, value)) = proto else {
-            return Ok(literal_object(entries));
+            return literal_object(entries);
         };
-        Ok(self.with_proto_entry(entries, at, value))
+        self.with_proto_entry(entries, at, value)
+    }
+
+    /// Apply an object-literal spread `{...source}` (`CopyDataProperties`) in
+    /// order to the incrementally built object.
+    fn push_spread_entry(
+        &mut self,
+        source: IrNode,
+        built: &mut Option<(u32, Vec<IrNode>)>,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        proto: &mut Option<(usize, IrNode)>,
+    ) {
+        let (obj_local, steps) = self.incremental_object(built, entries, proto);
+        steps.push(IrNode::CopyDataProperties {
+            target: Box::new(IrNode::Local(obj_local)),
+            source: Box::new(source),
+            exclude: Box::new(IrNode::Array(Vec::new())),
+        });
+    }
+
+    /// Record an object-literal `__proto__: value` entry: pending (`proto`,
+    /// after the entries so far) while the literal is static, else a
+    /// prototype set applied in order to the incrementally built object.
+    fn push_proto_entry(
+        &mut self,
+        value: IrNode,
+        built: &mut Option<(u32, Vec<IrNode>)>,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        proto: &mut Option<(usize, IrNode)>,
+    ) {
+        if built.is_none() {
+            *proto = Some((entries.len(), value));
+            return;
+        }
+        let (obj_local, steps) = self.incremental_object(built, entries, proto);
+        let proto_local = self.fresh();
+        steps.push(IrNode::Assign {
+            local: proto_local,
+            value: Box::new(value),
+        });
+        steps.push(set_proto_if_valid(obj_local, proto_local));
+    }
+
+    /// The incrementally built object literal (see [`Self::lower_object`]):
+    /// its temp and steps, with the pending `entries` flushed onto it. On the
+    /// first call (`built` empty) the temp is assigned the literal so far —
+    /// the drained `entries` and any pending `__proto__` entry.
+    fn incremental_object<'b>(
+        &mut self,
+        built: &'b mut Option<(u32, Vec<IrNode>)>,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        proto: &mut Option<(usize, IrNode)>,
+    ) -> (u32, &'b mut Vec<IrNode>) {
+        if let Some((obj_local, steps)) = built {
+            self.flush_object_entries(*obj_local, entries, steps);
+            return (*obj_local, steps);
+        }
+        let obj_local = self.fresh();
+        let entries = std::mem::take(entries);
+        let init = match proto.take() {
+            Some((at, value)) => self.with_proto_entry(entries, at, value),
+            None => literal_object(entries),
+        };
+        let assign = IrNode::Assign {
+            local: obj_local,
+            value: Box::new(init),
+        };
+        let (obj_local, steps) = built.insert((obj_local, vec![assign]));
+        (*obj_local, steps)
+    }
+
+    /// Append to `steps` the definition of the pending object-literal
+    /// `entries` (drained) on the object in `obj_local`, if there are any.
+    fn flush_object_entries(
+        &mut self,
+        obj_local: u32,
+        entries: &mut Vec<(PropKey, IrNode)>,
+        steps: &mut Vec<IrNode>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        steps.push(IrNode::DefineProps {
+            obj: Box::new(IrNode::Local(obj_local)),
+            local: self.fresh(),
+            entries: std::mem::take(entries),
+        });
     }
 
     /// A computed object-literal key whose entry is a function value named by
@@ -1881,22 +2250,7 @@ impl LowerCtx<'_> {
     ) -> IrNode {
         let after = entries.split_off(at);
         let (obj_local, proto_local) = (self.fresh(), self.fresh());
-        let set_proto = IrNode::Ternary {
-            cond: Box::new(IrNode::Logical {
-                op: LogicalOp::Or,
-                lhs: Box::new(IrNode::IsObject(Box::new(IrNode::Local(proto_local)))),
-                rhs: Box::new(IrNode::Binary {
-                    op: BinOp::Eq,
-                    lhs: Box::new(IrNode::Local(proto_local)),
-                    rhs: Box::new(IrNode::Null),
-                }),
-            }),
-            then_branch: Box::new(IrNode::SetProto {
-                obj: Box::new(IrNode::Local(obj_local)),
-                proto: Box::new(IrNode::Local(proto_local)),
-            }),
-            else_branch: Box::new(IrNode::Local(obj_local)),
-        };
+        let set_proto = set_proto_if_valid(obj_local, proto_local);
         let assign = |local, value| IrNode::Assign {
             local,
             value: Box::new(value),
@@ -2206,6 +2560,140 @@ impl LowerCtx<'_> {
     }
 }
 
+impl PrivateRef {
+    /// `%penv[slot]`.
+    fn slot(&self, slot: u32) -> IrNode {
+        IrNode::PrivEnvLoad {
+            env: Box::new(self.env.clone()),
+            slot,
+        }
+    }
+
+    /// What a holder of the name carries (DESIGN.md §7.6): a field's private
+    /// symbol, the instance brand (slot `1`) or, for a static method or
+    /// accessor, the class value (slot `0`).
+    pub(super) fn brand(&self) -> IrNode {
+        self.slot(match self.kind {
+            PrivateKind::Field(slot) => slot,
+            PrivateKind::Method { is_static, .. } | PrivateKind::Accessor { is_static, .. } => {
+                u32::from(!is_static)
+            }
+        })
+    }
+
+    /// The brand check of `obj` (`value` is a write's right-hand side,
+    /// evaluated before it); yields `value`, else `obj`.
+    fn check(&self, obj: IrNode, value: Option<IrNode>, write: bool) -> IrNode {
+        IrNode::PrivateBrand {
+            obj: Box::new(obj),
+            value: value.map(Box::new),
+            brand: Box::new(self.brand()),
+            name: self.name.clone(),
+            write,
+        }
+    }
+
+    /// The `TypeError` `error` naming `#x`.
+    fn throw(&self, error: PrivateError) -> IrNode {
+        IrNode::PrivateThrow {
+            error,
+            name: self.name.clone(),
+        }
+    }
+
+    /// `obj.#x`: a field's value; after the brand check, a method's closure
+    /// (shared by every holder) or the getter called with `this = obj`.
+    fn read(&self, obj: IrNode) -> IrNode {
+        match self.kind {
+            PrivateKind::Field(slot) => IrNode::PrivateGet {
+                obj: Box::new(obj),
+                key: Box::new(self.slot(slot)),
+                name: self.name.clone(),
+            },
+            PrivateKind::Method { slot, .. } => {
+                IrNode::Seq(vec![self.check(obj, None, false), self.slot(slot)])
+            }
+            PrivateKind::Accessor { get: Some(get), .. } => {
+                let [this_local, ..] = self.temps.unwrap_or_default();
+                IrNode::ThisCall {
+                    callee: Box::new(IrNode::Seq(vec![
+                        IrNode::Assign {
+                            local: this_local,
+                            value: Box::new(self.check(obj, None, false)),
+                        },
+                        self.slot(get),
+                    ])),
+                    args: Vec::new(),
+                    this_local,
+                    construct: false,
+                    not_callable: CalleeError::not_a_function(&self.name.to_string()),
+                }
+            }
+            PrivateKind::Accessor { get: None, .. } => IrNode::Seq(vec![
+                self.check(obj, None, false),
+                self.throw(PrivateError::NoGetter),
+            ]),
+        }
+    }
+
+    /// `obj.#x = value` (`obj`, then `value`, then the check), yielding
+    /// `value`: a field's store, or the setter called with `this = obj`; a
+    /// method or a getter-only accessor throws after the brand check.
+    pub(super) fn write(&self, obj: IrNode, value: IrNode) -> IrNode {
+        match self.kind {
+            PrivateKind::Field(slot) => IrNode::PrivateSet {
+                obj: Box::new(obj),
+                key: Box::new(self.slot(slot)),
+                value: Box::new(value),
+                name: self.name.clone(),
+            },
+            PrivateKind::Method { .. } => IrNode::Seq(vec![
+                self.check(obj, Some(value), true),
+                self.throw(PrivateError::MethodNotWritable),
+            ]),
+            PrivateKind::Accessor { set: Some(set), .. } => {
+                // The receiver is snapshotted first; the call's argument is the
+                // value, brand-checked after it is evaluated.
+                let [_, this_local, stored] = self.temps.unwrap_or_default();
+                let checked = self.check(IrNode::Local(this_local), Some(value), true);
+                IrNode::Seq(vec![
+                    IrNode::Assign {
+                        local: this_local,
+                        value: Box::new(obj),
+                    },
+                    IrNode::ThisCall {
+                        callee: Box::new(self.slot(set)),
+                        args: vec![IrNode::Seq(vec![
+                            IrNode::Assign {
+                                local: stored,
+                                value: Box::new(checked),
+                            },
+                            IrNode::Local(stored),
+                        ])],
+                        this_local,
+                        construct: false,
+                        not_callable: CalleeError::not_a_function(&self.name.to_string()),
+                    },
+                    IrNode::Local(stored),
+                ])
+            }
+            PrivateKind::Accessor { set: None, .. } => IrNode::Seq(vec![
+                self.check(obj, Some(value), true),
+                self.throw(PrivateError::NoSetter),
+            ]),
+        }
+    }
+
+    /// `#x in obj`.
+    fn has(&self, obj: IrNode) -> IrNode {
+        IrNode::PrivateIn {
+            obj: Box::new(obj),
+            brand: Box::new(self.brand()),
+            name: self.name.clone(),
+        }
+    }
+}
+
 /// One link of a flattened optional chain (see [`LowerCtx::lower_opt_chain`]),
 /// borrowed from the swc AST. `optional` marks the `?.` links (the ones that
 /// short-circuit); a member link carries its property, a call link its argument
@@ -2214,7 +2702,6 @@ enum ChainLink<'a> {
     Member {
         prop: &'a MemberProp,
         optional: bool,
-        span: Span,
     },
     Call {
         args: &'a [ExprOrSpread],
@@ -2233,7 +2720,6 @@ fn collect_chain_links<'a>(chain: &'a OptChainExpr, links: &mut Vec<ChainLink<'a
             ChainLink::Member {
                 prop: &m.prop,
                 optional: chain.optional,
-                span: m.span,
             },
         ),
         OptChainBase::Call(c) => (
@@ -2281,6 +2767,28 @@ fn nullish_short_circuit(temp: u32, value: IrNode, tail: IrNode) -> IrNode {
 }
 
 /// An ordinary object literal of `entries`.
+/// Set the [[Prototype]] of the object in `obj_local` to the `__proto__`
+/// entry value in `proto_local` when it is an object or `null` (ECMA-262
+/// B.3.1); yields the object either way.
+fn set_proto_if_valid(obj_local: u32, proto_local: u32) -> IrNode {
+    IrNode::Ternary {
+        cond: Box::new(IrNode::Logical {
+            op: LogicalOp::Or,
+            lhs: Box::new(IrNode::IsObject(Box::new(IrNode::Local(proto_local)))),
+            rhs: Box::new(IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::Local(proto_local)),
+                rhs: Box::new(IrNode::Null),
+            }),
+        }),
+        then_branch: Box::new(IrNode::SetProto {
+            obj: Box::new(IrNode::Local(obj_local)),
+            proto: Box::new(IrNode::Local(proto_local)),
+        }),
+        else_branch: Box::new(IrNode::Local(obj_local)),
+    }
+}
+
 fn literal_object(entries: Vec<(PropKey, IrNode)>) -> IrNode {
     IrNode::Object {
         entries,
@@ -2328,7 +2836,8 @@ fn nullish_check(value: IrNode, key: &str) -> IrNode {
 }
 
 /// The statically-known method name of a member callee: `obj.m` and the
-/// string-literal computed form `obj["m"]` both name `m`; a dynamic computed key
+/// string-literal computed form `obj["m"]` both name `m`, `obj.#m` names `#m`;
+/// a dynamic computed key
 /// `obj[k]` is only known at runtime, so it has no static name (nor has a
 /// literal with a lone surrogate, which no Rust `String` spells).
 fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
@@ -2338,7 +2847,7 @@ fn member_method_name(member: &swc_ecma_ast::MemberExpr) -> Option<String> {
             Expr::Lit(Lit::Str(s)) => lit_str(s).to_rust_string(),
             _ => None,
         },
-        MemberProp::PrivateName(_) => None,
+        MemberProp::PrivateName(p) => Some(format!("#{}", p.name)),
     }
 }
 
@@ -2387,11 +2896,55 @@ fn method_not_a_function(obj: &Expr, method: &str) -> CalleeError {
     )
 }
 
+/// The operator class of an assignment expression.
+#[derive(Clone, Copy)]
+enum AssignKind {
+    /// `=`.
+    Plain,
+    /// An arithmetic, bitwise or shift compound (`+=`, `<<=`, ...).
+    Binary(BinOp),
+    /// `**=`.
+    Pow,
+    /// `&&=`, `||=`, `??=`.
+    Logical(LogicalOp),
+}
+
+/// A simple assignment / update target with its parentheses stripped.
+enum Target<'a> {
+    Ident(&'a Ident),
+    Member(&'a swc_ecma_ast::MemberExpr),
+    SuperProp(&'a SuperPropExpr),
+}
+
+/// The target `expr` denotes once parentheses are stripped, or `None` when it
+/// is not a valid simple assignment target (`f()`, `1`, `a + b`, `(a, b)`,
+/// `a?.b`, ...).
+fn expr_target(expr: &Expr) -> Option<Target<'_>> {
+    match strip_parens(expr) {
+        Expr::Ident(ident) => Some(Target::Ident(ident)),
+        Expr::Member(member) => Some(Target::Member(member)),
+        Expr::SuperProp(super_prop) => Some(Target::SuperProp(super_prop)),
+        _ => None,
+    }
+}
+
+/// The target of a simple assignment, or the early `SyntaxError` for an
+/// invalid one (spanned at `span`, the whole left-hand side).
+fn simple_target(target: &SimpleAssignTarget, span: Span) -> anyhow::Result<Target<'_>> {
+    let target = match target {
+        SimpleAssignTarget::Ident(ident) => Some(Target::Ident(&ident.id)),
+        SimpleAssignTarget::Member(member) => Some(Target::Member(member)),
+        SimpleAssignTarget::SuperProp(super_prop) => Some(Target::SuperProp(super_prop)),
+        SimpleAssignTarget::Paren(p) => expr_target(&p.expr),
+        _ => None,
+    };
+    target.ok_or_else(|| CompileError::spanned(span, "Invalid left-hand side in assignment").into())
+}
+
 /// A plain-English description of an unsupported expression, used for the
 /// user-facing diagnostic message. Never renders the raw swc AST.
 fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
-        Expr::TaggedTpl(_) => "tagged template literals are not supported",
         Expr::This(_) => "`this` is not supported",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
         Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",

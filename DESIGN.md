@@ -316,7 +316,7 @@ the table, including one without user functions.
 | 12 | `$__new_target` | `i64` | — | `new.target` carrier, initialized to `undefined` |
 | 13 | `$__spread_args` | `i64` | — | argument array of a spread call / construct, initialized to `undefined` |
 | 14 | `$__intrinsics_dirty` | `i32` | — | one dirty bit per watched intrinsic (§6.4) |
-| 15+ | module cells | `i64` | — | one cell pointer per module binding (`15 + slot`, §7.1) |
+| 15+ | module cells | `i64` | — | one cell pointer per module binding (`15 + slot`, §7.1), then one per tagged-template site (§7.4) |
 
 **Exports.** `main`, `memory`, `__heap_ptr`, `__exc_pending`, `__exc_value`,
 `__invoke1(fn: i64, arg: i64) -> i64`, `__async_step(gen: i64, sent: i64) -> i64`,
@@ -434,7 +434,7 @@ the array bits is ever cleared (except `JOINING`).
 | `11` `TYPE_ACCESSOR` | accessor pair (internal) | header, pad, `getter: i64 @8`, `setter: i64 @16` | 24 | — |
 | `12` `TYPE_PROPS` | own-property table (internal) | §5.3 | `16 + 16·cap` | — |
 | `13` `TYPE_ELEMS` | array element store (internal) | header, `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
-| `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`; bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
+| `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 
 **`TYPE_OBJECT` classes** (header byte 3): `0` `CLASS_ORDINARY`, `1`
 `CLASS_ERROR` (an Error instance: its kind is its prototype, §7.7), `2`
@@ -841,7 +841,7 @@ function-index order:
 |---|---|
 | allocation, strings | `__alloc`, `__concat`, `__str_eq`, `__str_cmp`, `__str_index` (all on code units, below) |
 | interning (§5.3) | `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`, `__index_value`, `__index_string`, `__str_exotic_index(o, key)`, `__to_key` |
-| property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__rest(src, excl)` |
+| property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__copy_data(dst, src, excl)` |
 | arrays (§5.4) | `__array_reserve(base, need)`, `__array_push(base, v)`, `__array_concat(dst, src)`, `__array_set(recv, key, v)`, `__array_set_length(arr, v)`, `__sparse_get(arr, i)`, `__sparse_set(arr, i, v)`, `__protos_indexless(o)`, `__proto_elem(o, i)`, `__proto_set(o, i, v)`, `__array_define(recv, key, v)`, `__sparse_define(arr, i, v)` |
 | JSON (stringify) | `__json_escape(str)`, `__json_str(v)` — the primitive serializer: finite numbers via `__convert` ToString, `NaN`/`±Infinity`/`undefined` as `null`, keywords, escaped strings, any heap kind `null` |
 | Map/Set, equality | `__same_value_zero`, `__map_find`, `__map_set`, `__map_get`, `__map_has`, `__map_delete`, `__loose_eq`, `__str_to_array` |
@@ -855,6 +855,7 @@ function-index order:
 | descriptors (§6.3) | `__define_own(o, key, desc, value, get, set)`, `__to_desc(attrs, list)`, `__own_desc(obj, key)`, `__set_integrity(obj, level)`, `__test_integrity(obj, level)` |
 | promises (§6.7) | `__promise_self_error()` — the self-resolution `TypeError`, exported for the hosts |
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
+| private names (§7.6) | `__private_find(o, key)`, `__private_add(o, key, v, attrs, name)`, `__private_get(o, key, name)`, `__private_set(o, key, v, name)`, `__private_brand(o, v, brand, name, mode)`, `__private_in(o, brand, name)` |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)
@@ -876,7 +877,7 @@ object unchanged.
 ### 6.3 Property algorithms
 
 `__get`, `__set`, `__has`, `__delete`, `__define`, `__own_keys`,
-`__for_in_keys`, `__rest`, and the descriptor helpers (`emit/props.rs`,
+`__for_in_keys`, `__copy_data`, and the descriptor helpers (`emit/props.rs`,
 `emit/props/descriptor.rs`) are the only code that reads or writes property
 tables. Keys are interned `u32`s.
 
@@ -945,6 +946,7 @@ tables. Keys are interned `u32`s.
   level reaches its elements; freezing also sets `LENGTH_READONLY`).
   `__test_integrity(obj, level)` is `IsExtensible` (level `0`) or
   `TestIntegrityLevel` (a frozen array also needs a read-only `length`).
+  Both ignore private-name entries (§7.6, phase 5a).
 - **Prototypes.** `__set_proto(o, proto)` is `OrdinarySetPrototypeOf`: the
   same `proto` succeeds; `%Object.prototype%` (an immutable prototype exotic
   object), a non-extensible object, and a `proto` whose chain reaches `o`
@@ -970,7 +972,8 @@ tables. Keys are interned `u32`s.
   `Object.assign`, `defineProperties` / `create`,
   `getOwnPropertyDescriptors`, which check enumerability per key); every
   string-key mode skips symbol keys, and the symbol walks are skipped when the
-  table lacks `HAS_SYMBOL_KEYS`. Values and entries follow EnumerableOwnProperties: the key list is
+  table lacks `HAS_SYMBOL_KEYS` (and, from phase 5a, skip private names,
+  §7.6). Values and entries follow EnumerableOwnProperties: the key list is
   taken once, then each key is re-checked as own and enumerable (`__own_enum`)
   when visited and skipped if a getter deleted it or made it non-enumerable;
   a key a getter adds is not visited. Only a getter can run between the
@@ -980,10 +983,13 @@ tables. Keys are interned `u32`s.
 - **`for-in`** (`__for_in_keys`): a snapshot taken at loop entry — own
   enumerable string keys, then each prototype's enumerable keys not already
   seen (a key seen at a nearer level, enumerable or not, shadows it).
-- **Object rest** (`__rest`): a fresh object with every own enumerable property
-  of the source (string keys, then symbol keys; an object source re-checks
-  each key as own and enumerable when visited) whose key is not in the
-  exclusion list.
+- **`CopyDataProperties`** (`__copy_data`, object spread and object rest):
+  defines (`CreateDataProperty`, never a setter) on the target every own
+  enumerable property of the source (string keys in own-key order, then
+  symbol keys; an object source re-checks each key as own and enumerable
+  when visited) whose key is not in the exclusion list, the value read with
+  `[[Get]]` (a getter runs). A nullish or non-string primitive source copies
+  nothing; a string copies its indices.
 
 ### 6.4 Realm, global object, and fast paths
 
@@ -1330,6 +1336,9 @@ it):
   `NaN` time value);
 - cycles as `<ref *1> { self: [Circular *1] }`.
 
+Private-name entries (§7.6) are never enumerable, so neither renderer lists
+them.
+
 ---
 
 ## 7. Language surface
@@ -1400,6 +1409,16 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   identity.
 - **Logical** `!`, `&&`, `||`, `??` (each yields an operand value, not a coerced
   boolean) and `&&=`, `||=`, `??=` (short circuit).
+- **Assignment targets** are an identifier, a member `o.k` / `o[k]` (either
+  one parenthesized any number of times: `(a) = 1`, `((o.x)) += 1`, `++(a)`)
+  or a destructuring pattern (§7.3). A compound, `**=` or logical assignment
+  to a member evaluates the base and the key once (a `**=` / logical one
+  converts the key once with `ToPropertyKey`); a short-circuited `&&=` /
+  `||=` / `??=` skips both the right-hand side and the store, so no setter
+  runs. An anonymous function assigned by `=` or a logical assignment to an
+  unparenthesized identifier is named after it. An invalid target (`f() = 1`,
+  `1 = 2`, `a + b = c`, `(a, b) = c`, `a?.b = 1`) is an early `SyntaxError`
+  (`Invalid left-hand side in assignment`).
 - **Conditional** `c ? a : b`, optional chaining `a?.b`, `a?.[k]`, `a?.()`,
   `a?.m()` (a nullish base short-circuits the rest of the chain to
   `undefined`).
@@ -1408,16 +1427,44 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   alone keep the reference: `(o.m)()` calls with `this = o`); `yield`/`await`
   operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
-  (`__delete`).
+  (`__delete`; parentheses around the member are transparent). `delete x` of
+  an identifier is an early `SyntaxError` (strict code); `delete` of any other
+  non-reference (`delete 1`, `delete f()`) evaluates its operand and yields
+  `true`.
+- **`void`** evaluates its operand for its effects (calls, assignments,
+  throws, `yield` / `await`) and yields `undefined`; a literal operand folds
+  to `undefined`.
+- **Template literals** `` `a${x}b` `` concatenate the cooked strings with
+  `ToString` of each substitution; an invalid escape is a `SyntaxError`
+  (swc). Tagged templates are calls (§7.4).
 - **Member access on `null`/`undefined`** throws a `TypeError`
   (`Cannot read properties of null (reading 'x')`), catchable like any throw.
 
 ### 7.3 Control flow
 
 `if`/`else`, `while`, `do … while`, C-style `for`, `for-of`, `for-in`, `switch`
-(strict `===` matching, fall-through, `default`), `break` / `continue` (with
-labels on loops), `return`, `throw`, `try`/`catch`/`finally` (with or without a
+(strict `===` matching, fall-through, `default`), `break` / `continue`,
+labelled statements, `return`, `throw`, `try`/`catch`/`finally` (with or without a
 catch binding).
+
+- **Labels** apply to any statement (`a: { … }`, `a: if (…) …`, `a: try …`,
+  `a: switch …`, nested `a: b: while (…)`); a run of nested labels names one
+  statement. `break a` exits the labelled statement from anywhere inside it,
+  running every intervening `finally`; a labelled non-loop statement is an
+  `IrStmt::Labeled` (a wasm `block`, or an exit block in the generator CFG)
+  that an unlabeled `break` / `continue` passes through. `continue a` where
+  `a` does not label an iteration statement, an undefined label, a duplicate
+  nested label (`a: a: ;`, swc) and a labelled function declaration (strict
+  code) are early `SyntaxError`s.
+
+- **`catch` parameters** are an identifier or a binding pattern
+  (`catch ({message})`, `catch ([a, b = 2, ...r])`), bound like a `let` in a
+  fresh scope around the handler from the thrown value. A throw while
+  destructuring (`null` into `{a}`, a non-iterable into `[a]`) escapes the
+  catch clause as the new exception, still running `finally`; an array
+  pattern closes its iterator like any other. A duplicate bound name, or a
+  bound name redeclared by a `let`/`const`/`class`/function of the block (or,
+  for a pattern, by a `var` of the block), is an early `SyntaxError`.
 
 - **`for-of`** runs the iteration protocol (§7.8): `GetIterator` (`@@iterator`, called once; `next` read once;
   `TypeError: x is not iterable` without a callable `@@iterator`, an async
@@ -1434,8 +1481,10 @@ catch binding).
   provably intact (the dirty bits of §6.4); an `arguments` object is walked
   by index while its own `@@iterator` is still `%Array.prototype.values%`
   (and the Array Iterator bits are clean). The loop head declares its
-  binding with `const`/`let`/`var` (identifier or pattern) or assigns a
-  pattern (`for ([a] of xs)`).
+  binding with `const`/`let`/`var` (identifier or pattern) or assigns any
+  assignment target (`for (a of xs)`, `for (o.p of xs)`, `for ([a] of
+  xs)`, `for ({a} of xs)`) as the first body statement, so a throwing
+  assignment closes the iterator.
 - **`for await`** (in async functions, async generators and the top level of
   `main`) has `for-of`'s shape and head forms over an async record (§7.8):
   each step awaits `next()`, then checks the result is an object; an abrupt
@@ -1444,7 +1493,10 @@ catch binding).
   rejection; a throw from a step does not close. It has no fast path: every
   step is a microtask turn.
 - **`for-in`** iterates the key snapshot of §6.3; strings and arrays list their
-  index keys first.
+  index keys first, and any other primitive (`null` / `undefined` included)
+  lists none. Its head takes every `for-of` head form (`for (const [a, b]
+  in o)`, `for (var {x} in o)`, `for (k in o)`, `for (o.p in o)`); an
+  Annex B `var` initializer (`for (var k = 0 in o)`) is a spanned error.
 
 A `for` loop with a `let` head is scoped to the loop; `continue` still runs the
 update clause. Labels may only be applied to loops.
@@ -1465,7 +1517,8 @@ those of `switch` and loops are not tracked.
   object.
 - **Parameters.** Default values (evaluated per call in a prologue, may reference
   earlier parameters and captured bindings), trailing rest parameters
-  (collected from the positional slots and `$__spread_args`), and array/object
+  (collected from the positional slots and `$__spread_args`; the rest target
+  may itself be an array/object pattern, `f(...[a, b])`), and array/object
   destructuring patterns (composable with defaults). Every parameter name is
   declared up front and the parameters bind left to right. With parameter
   expressions (a default anywhere), a parameter is in its TDZ until it binds:
@@ -1506,6 +1559,20 @@ those of `switch` and loops are not tracked.
   generator/async body's `this` cell by reference, so it survives suspension.
 - **Arity.** `length` is the count of parameters before the first default or
   rest; arity is never checked, at compile time or at run time.
+- **Tagged templates** `` tag`a${x}b` `` lower through the ordinary call
+  path: `this` is bound for a member tag (`` o.f`x` ``, `` o[k]`x` ``,
+  `` (o.f)`x` ``, `` super.m`x` ``), a non-callable tag is the same
+  `TypeError` as a call, and the substitutions run left to right after the
+  tag. The first argument is the site's template object
+  (`GetTemplateObject`): a frozen array of the cooked strings (`undefined`
+  for an invalid escape) with a non-writable, non-enumerable,
+  non-configurable `raw` holding the frozen array of the raw strings (CR and
+  CRLF normalized to LF). Each site owns a module cell (§4.2, after the
+  module bindings' cells) holding the hole until the site first runs, which
+  builds the object into it; every later evaluation of that site, in a loop
+  or another call, yields the same object, and two sites never share one.
+  A tagged template in an optional chain (`` a?.b`x` ``) is a `SyntaxError`
+  (swc).
 - **Call evaluation order.** A call evaluates its callee first — for a
   member callee the base, then the key, then the `[[Get]]` (a getter runs
   here) — then the arguments left to right, then `IsCallable` and the call;
@@ -1534,14 +1601,39 @@ those of `switch` and loops are not tracked.
   accessor) defines no property: `v` is evaluated in source order and becomes
   the `[[Prototype]]` when it is an object or `null`, else it is ignored
   (ECMA-262 B.3.1). Two such entries in one literal are an early
-  `SyntaxError` (a destructuring assignment pattern may repeat it).
+  `SyntaxError` (a destructuring assignment pattern may repeat it). A spread
+  `...o` is `CopyDataProperties` (§6.3) in source order: from the first
+  spread on, the literal is built incrementally on a temp — the entries
+  before it, then each spread, run of later entries, and `__proto__` entry
+  in turn — so later properties overwrite spread keys and vice versa; a
+  `__proto__` key copied by a spread is an ordinary own property. A getter
+  or setter defined after a spread or a computed entry is a partial
+  descriptor (`__define_own`): `{get a() {}, ...o, set a(v) {}}` keeps the
+  getter unless the spread turned `a` into a data property.
 - **Property access** `o.k`, `o["k"]`, `o[expr]` (§6.3): own keys, then the
   prototype chain; a missing key reads `undefined`. Writes add properties
   dynamically; `delete` removes them.
 - **Destructuring.** Array patterns (holes, defaults, rest, nesting) and object
-  patterns (identifier and string keys, rename, defaults, nesting, rest via
-  `__rest`) in declarations, parameters, and `for-of` heads; destructuring
-  assignment as an expression statement, with member targets (`[o.x] = xs`).
+  patterns (identifier, string, numeric, and computed keys, rename, defaults,
+  nesting, rest) in
+  declarations, parameters, and `for-of` / `for-in` heads; destructuring
+  assignment in any expression position (`x = [a, b] = c`, `f(({a} = o))`,
+  a `?:` arm, a `for` update, an arrow body), with member targets (`[o.x] =
+  xs`, `({...o.r} = src)`); its value is the RHS. It desugars to statements
+  (the RHS into a temp, then each target in order) wrapped in an IR
+  `Block { stmts, value }` node whose value is that temp: the emitter runs
+  the stack-neutral statements in place, under any operands already pushed,
+  and a generator body linearizes a block holding a suspend into its CFG
+  (§7.8) after spilling the earlier operands. A numeric or computed pattern
+  key is evaluated and converted (`ToPropertyKey`, once; a symbol stays a
+  symbol, `1.0` / `0x10` are `"1"` / `"16"`) in source order — before the
+  assignment target reference, which precedes the read and then the default.
+  Each property is read once (a default tests the stashed read). An object
+  rest is a fresh ordinary object filled by `CopyDataProperties` minus the
+  destructured keys, the converted computed keys (symbols included) among
+  them. An object pattern checks `RequireObjectCoercible` before its first
+  key expression, target reference, rest, or read, so a nullish source
+  throws a `TypeError` before anything else runs.
   An array pattern runs the iteration protocol lazily
   (§7.8): `GetIterator`, one `IteratorStep` per
   hole or element (an element reads `undefined` once done; a hole reads no
@@ -1576,7 +1668,9 @@ those of `switch` and loops are not tracked.
   descriptor (`__define_own`), so `get [k]()` / `set [k](v)` share one
   property. A computed `"constructor"` is an ordinary method; a computed
   static `"prototype"` throws a `TypeError` (the literal forms stay early
-  errors).
+  errors). A numeric literal member name (`1() {}`, `static 2() {}`,
+  `get 3() {}`, `0x10 = 1`) is converted the same way, to its canonical
+  numeric string.
   Calling `C` without `new` throws `TypeError: Class constructor C cannot be
   invoked without 'new'`.
 - **Fields.** Instance fields (`f = init`, or `f;` for `undefined`) are
@@ -1622,6 +1716,190 @@ those of `switch` and loops are not tracked.
   `Object.create(Array.prototype) instanceof Array` is `true`).
 - **Bound functions** (§5.5) under `new` construct their target; a bound
   non-constructor is not a constructor (`TypeError: B is not a constructor`).
+
+**Private names** (phase 5a, done): private instance and static fields,
+methods and accessors (generator, async and async generator methods
+included) — names, `%penv`, resolution, storage, brands, the helpers,
+instance and static initialization, every operation, `#x in o`,
+invisibility and the early errors — and static blocks.
+
+- **Names.** A private name is a `TYPE_SYMBOL` block with header flag `8`
+  `SYMBOL_FLAG_PRIVATE` (bits `1`/`2` stay clear, `4` is `REGISTERED`;
+  a private symbol is never registered) and description `"#x"`, minted by
+  the new `IrNode::PrivateName(desc)` (the `new_symbol` sequence of
+  `emit/builtins/symbol.rs`). Only **fields** (instance and static) get one
+  per name; methods and accessors are not keyed per name (brands, below).
+- **Private environment.** Each evaluation of a class body declaring a
+  private name allocates `%penv` (an `IrNode::Array` literal), an internal
+  dense array held in one `hidden_local` of the class scope (captured by
+  value, like the heritage locals; never a user value); a class declaring
+  none allocates nothing.
+  Slot `0` is the class value (stored once it exists, before any static
+  element runs; `undefined` until then), slot `1` the instance brand (a
+  private symbol, description = the first instance private method or
+  accessor's `"#m"`; `undefined` when the class has none), then one slot per
+  private field (its symbol), per method (its closure), and two per accessor
+  (getter, setter; `undefined` when absent), in declaration order. The array
+  and the brand / field symbols are created after the heritage and before
+  the computed keys, so every closure of the body (methods, accessors,
+  constructor, field initializers, static blocks, computed keys, nested
+  functions, arrows and classes) reads them through `read_hidden`; method
+  closures are stored into the array later (new IR
+  `PrivEnvLoad { env, slot }` / `PrivEnvStore { env, slot, value }`, a
+  direct access at `ELEMS_DATA_OFFSET + 8·slot`; the array never grows),
+  which is why they are not separate by-value locals. A class expression
+  in a loop or a factory therefore mints distinct names, brands and method
+  closures per evaluation.
+- **Resolution** is lexical at compile time: `LowerCtx::private_scopes`
+  (new) is a stack of `{ frame, penv_id, names }`, each name
+  `{ "#x", kind: Field(slot) | Method(slot) | Accessor(get, set), static }`
+  (`static` matters only for methods and accessors, whose brand it picks).
+  `lower_class` pushes the scope after lowering the heritage (which sees only
+  the enclosing classes' names) and pops it with the class scope. `#x`
+  resolves to the innermost class declaring it, so a nested class shadows
+  an outer name and a nested class not declaring `#x` uses the outer one.
+  An unresolved or repeated name never reaches lowering: `early.rs` rejects
+  it first (below).
+- **Storage.** A private field is an own entry keyed by its symbol in the
+  object's ordinary `TYPE_PROPS` table, attrs `WRITABLE` only; the instance
+  brand is an entry keyed by the brand symbol, attrs `0`, value `undefined`.
+  Private entries are never `ENUMERABLE` (an invariant the renderers and
+  every enumerable-only walk rely on). Static private fields are entries of
+  the class. Static methods and accessors need no entry: the class is
+  their only possible holder, so their brand check is `o === %penv[0]`
+  (after an object test, so the `undefined` placeholder never matches).
+- **Helpers** (new, `emit/props.rs`; `name` is the static `"#x"` string):
+  `__private_find(o, key)` → i32 `1` iff `o` is an object-family block
+  whose own table holds `key` (no prototype walk, no `__fn_materialize`:
+  a `LAZY` function holds no private entry; a primitive is `0`);
+  `__private_add(o, key, v, attrs, name)` (PrivateFieldAdd /
+  PrivateMethodOrAccessorAdd): present → `TypeError: Cannot initialize #x
+  twice on the same object`, else `__define`, which skips its
+  not-extensible check for a `SYMBOL_FLAG_PRIVATE` key, so adds work on
+  non-extensible, sealed and frozen objects;
+  `__private_get(o, key, name)` / `__private_set(o, key, v, name)` (which
+  returns `v`) on a field: absent (a primitive included, no `ToObject`) →
+  `TypeError: Cannot read private member #x from an object whose class did
+  not declare it` / `Cannot write private member #x to an object whose class
+  did not declare it`; a set ignores attrs.
+  `__private_brand(o, v, brand, name, mode)` (returns `v`): `o` must hold
+  `brand` — an own entry keyed by it when it is a private symbol (a field
+  or the instance brand), else be `brand` itself, an object (a static
+  member's class) — or the read / write message (`mode`) is thrown;
+  `__private_in(o, brand, name)` (a boolean): a non-object `o` throws the
+  `in` message, else the same test. The messages are new `__prop_throw`
+  modes `21`–`27` (the `"#x"` string as the key; `26`, `Private method is
+  not writable`, takes the empty string; `27`, the `in` message, the key
+  `"#x' in " + String(o)` that `__private_in` builds). The IR nodes are
+  `PrivateAdd { obj, key, value, attrs, name }`, `PrivateGet { obj, key,
+  name }` and `PrivateSet { obj, key, value, name }` (`key` a
+  `PrivEnvLoad`), `PrivateBrand { obj, value, brand, name, write }`
+  (evaluates `obj`, then a write's `value`, then checks; yields `value`,
+  else `obj`), `PrivateThrow { error, name }` and `PrivateIn { obj, brand,
+  name }`.
+- **Methods and accessors.** `o.#m` brand-checks (`__private_find(o,
+  brand)`, or the slot-`0` identity when static), throwing the read / write
+  message above naming `#m`, then: a method reads its closure (one per
+  class evaluation, so every instance sees the same function); a getter
+  is called with `this = o`; a missing getter throws `TypeError: '#x' was
+  defined without a getter`. A write after the brand check throws
+  `TypeError: Private method is not writable` for a method, calls the
+  setter, or throws `TypeError: '#x' was defined without a setter`. A getter
+  read is an `IrNode::ThisCall` whose callee snapshots the checked receiver
+  into its `this_local`; a setter write snapshots `o`, then calls the setter
+  with the brand-checked value (`o`, `v`, check, call; the expression yields
+  `v`). Closures
+  are lowered like `lower_class_method` with `name` `"#m"` / `"get #x"` /
+  `"set #x"` (generator, async and async generator methods included),
+  instance ones with the prototype `super` scope, static ones with
+  `is_static`, and stored in source order right after the class value's
+  `DefineProps`; then `%penv[0]` is set, then the inner name is bound.
+- **Instance initialization** (`lower_field_inits`, on constructor entry or
+  right after `super(..)` returns, on the `this` it returned): first
+  `__private_add(this, brand, undefined, 0, "#m")` when the class has
+  instance private methods or accessors, then every field — public
+  (`__define`) and private (`__private_add(.., WRITABLE, "#x")`) — in source
+  order; an anonymous function initializer is named `"#x"`. A base
+  constructor returning an existing object lets a derived class add to it
+  once; the second add throws.
+- **Static elements.** Static fields, static private fields and static
+  blocks run in one source-order pass after slot `0` and the inner name are
+  set, `this` = the class; a static private field is
+  `__private_add(C, key, v, WRITABLE, "#x")`. Statics are not inherited:
+  `Sub.#x` throws the read message (the lookup is own-only and the identity
+  check fails).
+- **Operations.** `o.#x = v` evaluates `o`, then `v`, then sets; compound
+  and logical assignment and `++`/`--` evaluate `o` once into a temp, get
+  (throwing when absent), compute, set; destructuring targets (`[this.#x] =
+  xs`, `({a: this.#x} = o)`) are member targets ending in a private set;
+  `o?.#x`, `o?.a.#x`, `o?.#m()` short-circuit as usual; `o.#m(args)` reads
+  (brand check before the arguments) and calls with `this = o` (an
+  `IrNode::ThisCall` on the receiver temp; with a suspend in an argument,
+  generator linearization spills the callee and the receiver and rebinds
+  it, like a user method call). There is no
+  `super.#x` (a parse error). `#x in o`: `o` not an object → `TypeError:
+  Cannot use 'in' operator to search for '#x' in <o>` (`__private_in`,
+  rendering `o` with `String` as `PROP_THROW_IN` does); else
+  `__private_find` of the field or brand symbol, or the slot-`0` identity;
+  no prototype, getter or proxy is consulted.
+- **Invisibility.** The private symbol is only ever passed as a key
+  argument of the helpers above: no expression yields it, so `typeof`,
+  `description`, `String(sym)`, `__get`, `__set`, `__has`, `__has_own`,
+  `__delete`, `__own_desc` (`getOwnPropertyDescriptor`), `__own_enum`,
+  `__define_own` (`defineProperty`) and `__to_key` can never receive it.
+  Walks that read raw table keys must skip it: `__own_keys`' symbol pass
+  (`OWN_SYMBOLS`: `getOwnPropertySymbols`; `OWN_ALL_KEYS`: object rest
+  `__rest`, `Object.assign`, `defineProperties` / `create`,
+  `getOwnPropertyDescriptors`, and `Reflect.ownKeys` / object spread once
+  they land) lists a symbol key only when it lacks `SYMBOL_FLAG_PRIVATE`; the
+  string modes (`Object.keys/values/entries`, `getOwnPropertyNames`,
+  `JSON.stringify`, `__for_in_keys`) already skip every symbol.
+  `__set_integrity` (`freeze` / `seal` / `preventExtensions`) leaves private
+  entries' attrs untouched and `__test_integrity` (`isFrozen` /
+  `isSealed`) ignores them. The renderers (`run/value.rs`, `value.ts`) list
+  only `ENUMERABLE` entries, so they never show one; `shim.ts` enumerates no
+  guest keys. A private key appended to a watched intrinsic's table only
+  sets its dirty bit. There is no `Proxy`; when it lands, private operations
+  act on the proxy's own table and never trap.
+
+**Static blocks** (phase 5a, built in P4). `static { .. }` lowers to a lifted
+zero-parameter method function (`lower_lifted_function`, method kind, not
+a constructor, `name` `""`, the static `super` scope so `super.x` reads
+the parent constructor) created and called immediately with `this` = the
+class at its source position in the static-element pass; the call gives it
+its own `var` scope, `new.target` `undefined`, the class-scope captures
+(inner name, `%penv`) and exception propagation for free. One closure is
+allocated per block per class evaluation. The call is an `IrNode::ThisCall`
+on the class local, so the lifted body's own `this` is the class (an arrow
+inside reads it lexically) and the construct marker is absent; the capture
+and arity pre-passes visit the block as a zero-parameter function.
+
+**Early errors** (`codegen/early.rs`, run over the whole program before
+lowering, so unreached code is checked too; spanned):
+
+- `private name #x is not defined`: a `#x` (member access, optional chain,
+  `#x in o`, nested functions and classes included) that no enclosing class
+  body declares. A class heritage sees only the enclosing classes' names; its
+  computed keys, field initializers, methods and static blocks see its own.
+- `duplicate private name #x`: a name declared twice in one class body
+  (fields, methods, accessors and `accessor #x`, static or not), except
+  exactly one getter plus one setter of the same static-ness.
+- `private fields cannot be deleted`: `delete` of `o.#x`, parenthesised
+  (`delete (o.#x)`) or ending an optional chain (`delete o?.#x`,
+  `delete o?.a.#x`).
+- `unexpected private name #x`: a bare `#x` anywhere except as the left
+  operand of `in` (`(#x) in o`, `#x + 1`).
+- In a static block: `arguments` anywhere outside a nested non-arrow
+  function (computed keys of a nested class included), `await` as a binding
+  or reference outside nested functions and arrows, `await` / `yield`
+  expressions, `return`, `super(..)`, `break` / `continue` / labels crossing
+  the block, and lexical redeclarations (the block is a function-like scope:
+  its top-level function declarations are var-scoped). swc reports several of
+  these first, with its own messages.
+
+swc's parser itself rejects `#constructor` (`Classes can't have a private
+field named '#constructor'.`), `super.#x`, and a private name as an object
+literal or object pattern key.
 
 ### 7.7 Errors
 
@@ -1724,7 +2002,8 @@ point — `if`, loops, `switch`, `for-of`/`for-in`, `try`/`catch`/`finally`,
 `break`/`continue`/`return` — becomes block jumps dispatched by a
 `loop { br_table(state) }`, while regions without a suspend keep ordinary wasm
 control flow. A `yield` may appear inside a larger expression
-(`1 + (yield 2)`, a loop condition); the expression is linearized around it.
+(`1 + (yield 2)`, a loop condition, a destructuring assignment's RHS or
+default); the expression is linearized around it.
 
 - Each generator function owns a `prototype` (writable, non-enumerable,
   non-configurable): a fresh object inheriting `%GeneratorPrototype%`
@@ -1891,10 +2170,9 @@ is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
 `regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`, `private class fields are not
-supported`, `class static blocks are not supported`,
-`async generator functions are unsupported`, `a label may only be applied to a loop`,
-`destructuring assignment is only supported as an expression statement`.
+supported`, `with statements are not supported`,
+`async generator functions are unsupported`, `Invalid left-hand side in
+assignment`, `private name #x is not defined`.
 
 **Run-time errors** carry no source span:
 
@@ -2117,6 +2395,12 @@ Each item below is current behaviour of this tree.
   (§6.4).
 - An assignment to an unresolvable name evaluates its right-hand side before
   the `HasProperty` check throws the `ReferenceError`.
+- Assigning to, incrementing or deleting a `super` property (`super.x = v`,
+  `super[k]++`, `delete super.x`) and `delete` of an optional chain
+  (`delete o?.x`) are compile errors.
+- A `**=` or logical assignment to a computed member on a `null` /
+  `undefined` base converts the key (`ToPropertyKey`, which may run a user
+  `toString`) before the `TypeError`.
 - `-p` completion values come from expression statements and `try`
   statements; `switch` and loops contribute none.
 
@@ -2129,7 +2413,6 @@ Each item below is current behaviour of this tree.
   there are no ropes, so `s = s + x` in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
   pattern as RegExp source: a pattern with RegExp syntax throws a
   `TypeError`, and `matchAll` (a RegExp string iterator) always throws one.
-- No `void`.
 - Symbol-keyed properties work on every object, and `@@iterator`,
   `@@toPrimitive`, `@@toStringTag`, `@@hasInstance`, `@@species`
   (`ArraySpeciesCreate`, and `SpeciesConstructor` in
@@ -2151,8 +2434,6 @@ Each item below is current behaviour of this tree.
 **Object model**
 
 - Property tables are linear-scanned; there are no inline caches.
-- No object spread (`{...o}`); object patterns accept only identifier and
-  string keys; `catch` parameters must be identifiers.
 - Array-like lengths are clamped to `2^32 - 1` by the generic loops of `map`,
   `filter`, `forEach`, `reduce`, `join`, `concat` and `flat` (`map` sizes its
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the
@@ -2172,10 +2453,10 @@ Each item below is current behaviour of this tree.
   | `RegExp` | never in phase 3 | 28 | 128 | 3 | | | |
   | `Function` constructor | never in phase 3 | | 4 | 115 | | | 1 |
   | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 21 | 18 | 4 | 1 | | |
-  | `void` | language | 12 | 36 | 10 | | 1 | |
+  | `void` (59; the cause is removed — §7.2, recount pending) | language | | | | | | |
   | thenables are not assimilated (`Array.fromAsync`, below) | async | 14 | | | | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
-  | tagged templates, `for-in` heads | language | 2 | 4 | | | | |
+  | tagged templates, `for-in` heads (both removed — §7.3, §7.4, recount pending) | language | 2 | 4 | | | | |
   | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
   | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
   | CR line terminators hide the frontmatter `includes` (`nativeFunctionMatcher.js`) | runner | | | 1 | | | |
@@ -2191,15 +2472,11 @@ Each item below is current behaviour of this tree.
 
 **Functions & classes**
 
-- Destructuring assignment works only as an expression statement; it is
-  rejected in expression position (`x = [a] = b`), and a `for-of` head must
-  declare its binding or be a pattern (`for (a of xs)` is rejected).
-- Not supported: private `#` members, static blocks.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
   `undefined`.
-- A numeric or BigInt literal class member key (`class { 1() {} }`) is a
-  compile error.
+- A BigInt literal property key (`{1n: v}`, `class { 1n() {} }`, `{1n: a} =
+  o`) is a compile error (`BigInt` is not available).
 
 **Generators & async**
 
@@ -2309,8 +2586,8 @@ code-point string iterator, full case mapping, `normalize`).
 
 ### Phase 5 — Language completeness
 
-- Private fields and methods, static blocks, object spread.
-- Labeled statements, all remaining early errors.
+- Private fields and methods, static blocks, object spread (phase 5a, done).
+- All remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
 - `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,

@@ -1,6 +1,8 @@
 //! Early (compile-time) errors of the static semantics: lexical
 //! redeclarations, declarations in statement position, `await` as an
-//! identifier in an async body, and duplicate parameter / body names.
+//! identifier in an async body, duplicate parameter / body names, the class
+//! static block restrictions, and the private-name rules (undeclared and
+//! duplicate names, `delete` of a private reference, a bare `#x`).
 
 #![allow(clippy::expect_used)]
 
@@ -160,6 +162,27 @@ fn duplicate_parameters_and_body_names_are_rejected() {
 }
 
 #[test]
+fn a_catch_pattern_rejects_duplicate_and_redeclared_names() {
+    for src in [
+        "try {} catch ([x, x]) {}",
+        "try {} catch ({x, y: x}) {}",
+        "try {} catch ([x, {a: [x]}]) {}",
+        "try {} catch ({x, ...x}) {}",
+        "try {} catch ({x}) { let x; }",
+        "try {} catch ([x = 1]) { class x {} }",
+        "try {} catch ({x}) { function x() {} }",
+        // B.3.4 tolerates `var` only for an identifier parameter.
+        "try {} catch ({x}) { var x; }",
+        "try {} catch ([x]) { for (var x of []) {} }",
+        "try {} catch ([x]) { { var x = 1; } }",
+    ] {
+        assert_early_error(src, "`x` has already been declared");
+    }
+    assert_runs("try {} catch ({x}) { { let x; } }");
+    assert_runs("try {} catch ([x]) { function f() { var x; } }");
+}
+
+#[test]
 fn a_duplicate_proto_entry_in_an_object_literal_is_an_early_error() {
     assert_early_error(
         "var o = {__proto__: null, \"__proto__\": null}",
@@ -175,4 +198,135 @@ fn a_duplicate_proto_entry_in_an_object_literal_is_an_early_error() {
     assert_runs("var o = {__proto__: null, __proto__() {}}");
     // A destructuring assignment pattern may repeat it.
     assert_runs("var a, b; ({__proto__: a, __proto__: b} = {})");
+}
+
+#[test]
+fn class_static_block_early_errors() {
+    // swc reports some of these itself, with its own messages, so only the
+    // rejection is asserted where `early.rs` is not the sole checker.
+    // `arguments`, outside a nested non-arrow function (computed keys of a
+    // nested class and nested arrows included).
+    for src in [
+        "class C { static { arguments; } }",
+        "class C { static { (class { [argument\\u0073]() {} }); } }",
+        "class C { static { () => arguments; } }",
+    ] {
+        assert_early_error(src, "");
+    }
+    // `await` as a binding or reference, outside nested functions and arrows.
+    for src in [
+        "class C { static { class await {} } }",
+        "class C { static { (class await {}); } }",
+        "function f() { var x; class C { static { x = await; } } }",
+    ] {
+        assert_early_error(src, "");
+    }
+    assert_early_error("async function f() { class C { static { await 0; } } }", "");
+    assert_early_error("function* g() { class C { static { yield; } } }", "");
+    assert_early_error("class C { static { return; } }", "");
+    assert_early_error("class C extends Object { static { super(); } }", "");
+    // Jumps and labels do not cross the block.
+    assert_early_error("x: while (false) { class C { static { break x; } } }", "");
+    assert_early_error("while (false) { class C { static { continue; } } }", "");
+    assert_early_error("class C { static { x: x: 0; } }", "");
+    assert_early_error("class C { static { x: while (false) { break y; } } }", "");
+    // The block is a function-like lexical scope.
+    assert_early_error(
+        "class C { static { let x; let x; } }",
+        "`x` has already been declared",
+    );
+    assert_early_error(
+        "class C { static { let x; var x; } }",
+        "`x` has already been declared",
+    );
+    // Valid forms: nested functions, arrows and methods lift the restrictions
+    // they cross; `var` and function declarations share the block's scope.
+    assert_runs("class C { static { (function () { return arguments; })(); } }");
+    assert_runs("class C { static { ({ m() { return arguments; } }).m(); } }");
+    assert_runs("class C { static { (() => { class await {} }); } }");
+    assert_runs("class C { static { (() => { return 1; })(); } }");
+    assert_runs("class C { static { var f; function f() {} } }");
+    assert_runs("class C { static { x: while (false) { break x; } } }");
+}
+
+#[test]
+fn private_name_early_errors() {
+    // A `#x` no enclosing class body declares, in any position and even in
+    // code that never runs.
+    for src in [
+        "this.#x;",
+        "function f(o) { return o.#x; }",
+        "function f(o) { return #x in o; }",
+        "function f(o) { return o?.#x; }",
+        "function f(o) { return o?.a.#x; }",
+        "function f(o) { o.#x = 1; }",
+        "function f(o) { o.#x(); }",
+        "class C { #y; m(o) { return o.#x; } }",
+        "class C { m() { class D { #x; } return this.#x; } }",
+        "class C { #y = () => this.#x; }",
+        "class C { static { this.#x; } }",
+        "class C { [this.#x] = 1; }",
+        "function f() { if (false) { class C { m(o) { o.#x; } } } }",
+        // The heritage sees only the enclosing classes' names.
+        "class C extends (o => o.#x) { #x; }",
+        "class C extends class { y = this.#x; } { #x; }",
+    ] {
+        assert_early_error(src, "private name #x is not defined");
+    }
+    // Duplicates in one class body, except one getter plus one setter of the
+    // same static-ness.
+    for src in [
+        "class C { #x; #x; }",
+        "class C { #x; static #x; }",
+        "class C { #x; #x() {} }",
+        "class C { #x() {} static #x() {} }",
+        "class C { get #x() {} get #x() {} }",
+        "class C { set #x(v) {} set #x(v) {} }",
+        "class C { get #x() {} set #x(v) {} get #x() {} }",
+        "class C { get #x() {} set #x(v) {} #x; }",
+        "class C { static get #x() {} set #x(v) {} }",
+        "class C { *#x() {} async #x() {} }",
+    ] {
+        assert_early_error(src, "duplicate private name #x");
+    }
+    // `delete` of a private reference, plain, parenthesised or ending an
+    // optional chain.
+    for src in [
+        "class C { #x; m() { delete this.#x; } }",
+        "class C { #x; m() { delete (this.#x); } }",
+        "class C { #x; m() { delete ((this.#x)); } }",
+        "class C { #x() {} m() { delete this.#x; } }",
+        "class C { #x; m() { delete this?.#x; } }",
+        "class C { #x; m(o) { delete o?.a.#x; } }",
+        "class C { #x; m(g) { delete g().#x; } }",
+        "class C { #x; f = () => delete this.#x; }",
+    ] {
+        assert_early_error(src, "private fields cannot be deleted");
+    }
+    // A bare `#x` is an expression only on the left of `in`.
+    for src in [
+        "class C { #x; m() { #x; } }",
+        "class C { #x; m(o) { return (#x) in o; } }",
+        "class C { #x; m() { return #x + 1; } }",
+    ] {
+        assert_early_error(src, "unexpected private name #x");
+    }
+    // swc rejects these at parse time with its own messages.
+    for src in [
+        "class C { #constructor; }",
+        "class C { #constructor() {} }",
+        "class C { static #constructor() {} }",
+        "class C extends Object { #x; m() { return super.#x; } }",
+        "class C { #x; m() { return { #x: 1 }; } }",
+        "class C { #x; m() { const { #x: x } = this; } }",
+    ] {
+        assert_early_error(src, "");
+    }
+    // Valid forms: an outer class's names inside a nested class, a getter /
+    // setter pair, and a `delete` of a member of a private field.
+    assert_runs("class C { #x = 1; m() { return class { f(o) { return o.#x; } }; } }");
+    assert_runs("class C { get #x() { return 1; } set #x(v) {} }");
+    assert_runs("class C { static set #x(v) {} static get #x() { return 1; } }");
+    assert_runs("class C { #x = {}; m() { return delete this.#x.y; } } new C().m();");
+    assert_runs("class C { #x; static has(o) { return #x in o; } } C.has({});");
 }

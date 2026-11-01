@@ -415,6 +415,9 @@ struct LoopCtx {
     break_block: u32,
     /// The loop's label id, for a labeled `break`/`continue`.
     label: Option<u32>,
+    /// Whether an unlabeled `break` targets it: `false` for a labeled non-loop
+    /// statement, which only a `break LABEL` exits.
+    unlabeled: bool,
     /// How many `finally` clauses enclosed the loop: a jump to its targets runs
     /// every `finally` opened inside it (those above this depth) first.
     finally_depth: usize,
@@ -679,6 +682,7 @@ impl CfgBuilder {
                     continue_block: Some(cont),
                     break_block: exit,
                     label: *label,
+                    unlabeled: true,
                     finally_depth: self.finallies.len(),
                 });
                 self.cur = body_b as usize;
@@ -689,6 +693,22 @@ impl CfgBuilder {
                     self.lower_stmts(update)?;
                     self.terminate(GenTerm::Jump(head));
                 }
+                self.loops.pop();
+                self.cur = exit as usize;
+            }
+            // `LABEL: stmt` crossing a suspend (or holding a jump): `stmt` runs
+            // in the current block, and a `break LABEL` inside jumps to the exit.
+            IrStmt::Labeled { label, body } => {
+                let exit = self.new_block();
+                self.loops.push(LoopCtx {
+                    continue_block: None,
+                    break_block: exit,
+                    label: Some(*label),
+                    unlabeled: false,
+                    finally_depth: self.finallies.len(),
+                });
+                self.lower_stmts(body)?;
+                self.terminate(GenTerm::Jump(exit));
                 self.loops.pop();
                 self.cur = exit as usize;
             }
@@ -752,6 +772,7 @@ impl CfgBuilder {
             continue_block: None,
             break_block: exit,
             label: None,
+            unlabeled: true,
             finally_depth: self.finallies.len(),
         });
         for (i, case) in cases.iter().enumerate() {
@@ -1369,12 +1390,9 @@ impl CfgBuilder {
             return Ok(node);
         }
         match node {
-            IrNode::Yield(value) => {
-                let value = self.linearize(*value)?;
-                self.suspend(value)?;
-                Ok(IrNode::SentValue)
-            }
+            IrNode::Yield(value) => self.linearize_yield(*value),
             node @ IrNode::YieldDelegate { .. } => self.linearize_delegate(node),
+            IrNode::Block { stmts, value } => self.linearize_block(&stmts, *value),
             IrNode::Ternary {
                 cond,
                 then_branch,
@@ -1436,6 +1454,10 @@ impl CfgBuilder {
                 })?;
                 self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
             }
+            // `o.#m(..)` with a suspend (DESIGN.md §7.6).
+            node @ IrNode::ThisCall {
+                construct: false, ..
+            } => self.linearize_this_call(node),
             IrNode::NamespaceGuard {
                 obj,
                 key,
@@ -1469,6 +1491,46 @@ impl CfgBuilder {
                 Ok(node)
             }
         }
+    }
+
+    /// Linearize `yield value`: suspend with the linearized value; the
+    /// expression is the sent value.
+    fn linearize_yield(&mut self, value: IrNode) -> anyhow::Result<IrNode> {
+        let value = self.linearize(value)?;
+        self.suspend(value)?;
+        Ok(IrNode::SentValue)
+    }
+
+    /// Linearize a (non-construct) [`IrNode::ThisCall`] binding the raw
+    /// `this_local` (a private method call) that contains a suspend: the
+    /// callee and the receiver are spilled before the arguments run and the
+    /// receiver is rebound after their suspends.
+    fn linearize_this_call(&mut self, node: IrNode) -> anyhow::Result<IrNode> {
+        let IrNode::ThisCall {
+            callee,
+            args,
+            this_local,
+            not_callable,
+            ..
+        } = node
+        else {
+            return Err(self.unsupported("unexpected call shape"));
+        };
+        let callee = self.linearize(*callee)?;
+        let callee = self.spill(callee)?;
+        let obj = self.spill(IrNode::Local(this_local))?;
+        self.linearize_bound_call(obj, callee, args, this_local, not_callable)
+    }
+
+    /// Linearize a statement block in expression position (a destructuring
+    /// assignment) with a suspend inside: its statements lower into the CFG in
+    /// place (every earlier operand is already spilled), then its value. A raw
+    /// local read after it must have been set since.
+    fn linearize_block(&mut self, stmts: &[IrStmt], value: IrNode) -> anyhow::Result<IrNode> {
+        self.lower_stmts(stmts)?;
+        self.suspended = true;
+        self.live.clear();
+        self.linearize(value)
     }
 
     /// Linearize the arguments of a call of the already spilled `callee` with
@@ -1583,7 +1645,12 @@ impl CfgBuilder {
     /// or the loop whose label matches — with that loop's `finally_depth`.
     fn loop_target(&self, label: Option<u32>, is_break: bool) -> anyhow::Result<(u32, usize)> {
         let target = match label {
-            None if is_break => self.loops.last().map(|l| (l.break_block, l.finally_depth)),
+            None if is_break => self
+                .loops
+                .iter()
+                .rev()
+                .find(|l| l.unlabeled)
+                .map(|l| (l.break_block, l.finally_depth)),
             None => self
                 .loops
                 .iter()
@@ -1696,6 +1763,14 @@ fn collect_node_locals(
     crossing: &mut HashSet<u32>,
     in_cfg: bool,
 ) {
+    // A statement block's declarations are temporaries like a statement's.
+    if let IrNode::Block { stmts, value } = node {
+        for stmt in stmts {
+            collect_locals(stmt, written, crossing, in_cfg);
+        }
+        collect_node_locals(value, written, crossing, in_cfg);
+        return;
+    }
     if let IrNode::Assign { local, .. } = node {
         written.insert(*local);
     }
@@ -1766,6 +1841,7 @@ fn remap_stmt(stmt: &mut IrStmt, map: &HashMap<u32, u32>) {
             remap_stmts(body, map);
             remap_stmts(update, map);
         }
+        IrStmt::Labeled { body, .. } => remap_stmts(body, map),
         IrStmt::Switch { disc, cases, .. } => {
             remap_node(disc, map);
             for case in cases {
@@ -1802,6 +1878,11 @@ fn remap_stmts(stmts: &mut [IrStmt], map: &HashMap<u32, u32>) {
 /// node reading its receiver from a raw local (an array push/pop, a Map/Set
 /// method, a Date field) first reloads that local from the cell.
 fn remap_node(node: &mut IrNode, map: &HashMap<u32, u32>) {
+    if let IrNode::Block { stmts, value } = node {
+        remap_stmts(stmts, map);
+        remap_node(value, map);
+        return;
+    }
     for child in node.children_mut() {
         remap_node(child, map);
     }
