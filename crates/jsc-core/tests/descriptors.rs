@@ -194,6 +194,10 @@ fn integrity_levels() {
             "true true\ntrue false\ntrue true\nfalse false\n",
         ),
         (
+            r"let d = {}; Object.defineProperty(d, 'x', {value: 1, configurable: true}); Object.preventExtensions(d); let g = {}; Object.defineProperty(g, 'x', {get: function () { return 1 }, set: function () {}, configurable: true}); Object.preventExtensions(g); let a = Object.preventExtensions([1]); console.log(Object.isFrozen(d), Object.isSealed(d), Object.isFrozen(g), Object.isSealed(g), Object.isFrozen(a), Object.isSealed(a))",
+            "false false false false false false\n",
+        ),
+        (
             r"console.log(Object.preventExtensions(1), Object.seal('s'), Object.freeze(true), Object.freeze(undefined), Object.seal(null)); console.log(Object.isExtensible(1), Object.isExtensible('s'), Object.isSealed(2), Object.isFrozen('x'), Object.isFrozen(undefined), Object.isSealed(null))",
             "1 s true undefined null\nfalse false true true true true\n",
         ),
