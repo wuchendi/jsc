@@ -792,11 +792,12 @@ struct Unwind {
     labels: Vec<LabelTarget>,
 }
 
-/// A labeled loop's abrupt-exit landing blocks, keyed by the loop id an
-/// [`IrStmt::Break`]/[`IrStmt::Continue`] carries. Depths are absolute (see
+/// A labeled loop's (or labeled statement's) abrupt-exit landing blocks, keyed
+/// by the label id an [`IrStmt::Break`]/[`IrStmt::Continue`] carries. Depths are absolute (see
 /// [`Unwind::depth`]); the `br` immediate at a use site is `depth - entry`.
 struct LabelTarget {
-    /// The loop id matching [`crate::ir::IrStmt::While`]'s `label`.
+    /// The label id matching [`crate::ir::IrStmt::While`]'s (or
+    /// [`crate::ir::IrStmt::Labeled`]'s) `label`.
     id: u32,
     /// Depth just inside the loop's `break` block `B` (a `break LABEL` target).
     break_entry: u32,

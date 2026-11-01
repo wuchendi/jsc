@@ -10,7 +10,8 @@
 //!   destructuring pattern), a duplicate name in a catch parameter, and a
 //!   duplicate parameter name of any function (every function is strict);
 //! - an `async function` declaration in statement position (`if (x) async
-//!   function f(){}`);
+//!   function f(){}`), and a labelled function declaration (`l: function
+//!   f(){}`);
 //! - `await` (escaped or not) as an identifier inside an async body;
 //! - two `__proto__: v` entries in one object literal (a destructuring
 //!   assignment pattern is an `ObjectPat`, not visited here).
@@ -222,7 +223,17 @@ impl Visit for Checker {
             Stmt::For(f) => self.statement_position(&f.body),
             Stmt::ForIn(f) => self.statement_position(&f.body),
             Stmt::ForOf(f) => self.statement_position(&f.body),
-            Stmt::Labeled(l) => self.statement_position(&l.body),
+            Stmt::Labeled(l) => {
+                // A labelled function declaration is sloppy-mode-only (B.3.1);
+                // every function here is strict.
+                if let Stmt::Decl(Decl::Fn(f)) = l.body.as_ref() {
+                    self.fail(
+                        f.function.span,
+                        "In strict mode code, functions can only be declared at top level or inside a block".to_owned(),
+                    );
+                }
+                self.statement_position(&l.body);
+            }
             _ => {}
         }
         stmt.visit_children_with(self);

@@ -1775,7 +1775,8 @@ pub enum IrNode {
     /// Run `stmts` (stack-neutral statements with no `return`, `break` or
     /// `continue` escaping them), then evaluate `value`, the node's value.
     /// Built by codegen for a construct that desugars to statements in
-    /// expression position: a destructuring assignment (DESIGN.md §7.3).
+    /// expression position: a destructuring assignment (DESIGN.md §7.3), a
+    /// `**=` or logical assignment to a member (DESIGN.md §7.2).
     /// [`Self::any_child`] / [`Self::children_mut`] see every expression of
     /// the statements (recursively) and then `value`.
     Block {
@@ -2029,10 +2030,22 @@ pub enum IrStmt {
         /// The clauses, in source order.
         cases: Vec<IrCase>,
     },
+    /// A labeled non-loop statement `LABEL: stmt` (a block, `if`, `try`,
+    /// `switch`, expression statement, ...): `body` runs once, and a
+    /// `break LABEL` ([`IrStmt::Break`] carrying `label`) anywhere inside it
+    /// exits to just after it, running any intervening `finally` clauses. An
+    /// unlabeled `break`/`continue` does not target it, and no `continue` may
+    /// (a `continue LABEL` to a non-loop label is rejected during lowering).
+    Labeled {
+        /// The label id a `break LABEL` targeting this statement carries.
+        label: u32,
+        /// The labeled statement, lowered.
+        body: Vec<IrStmt>,
+    },
     /// A `break` statement. `None` targets the nearest enclosing `switch` (or
     /// loop), exiting it; `Some(id)` is a labeled `break LABEL` targeting the
-    /// loop whose [`IrStmt::While::label`] equals `id`, even from inside a nested
-    /// loop.
+    /// loop whose [`IrStmt::While::label`] (or the [`IrStmt::Labeled`] statement
+    /// whose `label`) equals `id`, even from inside a nested loop.
     Break(Option<u32>),
     /// A `continue` statement: skip the rest of a loop body and jump to that
     /// loop's update/next-iteration point. `None` targets the nearest enclosing
@@ -2836,7 +2849,10 @@ impl IrStmt {
                         .iter()
                         .any(|case| case.test.as_ref().is_some_and(&mut f))
             }
-            IrStmt::Break(_) | IrStmt::Continue(_) | IrStmt::Try { .. } => false,
+            IrStmt::Break(_)
+            | IrStmt::Continue(_)
+            | IrStmt::Try { .. }
+            | IrStmt::Labeled { .. } => false,
         }
     }
 
@@ -2882,6 +2898,7 @@ impl IrStmt {
                 bodies
             }
             IrStmt::Break(_) | IrStmt::Continue(_) => Vec::new(),
+            IrStmt::Labeled { body, .. } => vec![body],
             IrStmt::Try {
                 body,
                 catch_body,
@@ -2916,6 +2933,7 @@ impl IrStmt {
                 body: a, update: b, ..
             } => a.iter().chain(b).any(f),
             IrStmt::Switch { cases, .. } => cases.iter().flat_map(|case| &case.body).any(f),
+            IrStmt::Labeled { body, .. } => body.iter().any(f),
             IrStmt::Try {
                 body,
                 catch_body,

@@ -415,6 +415,9 @@ struct LoopCtx {
     break_block: u32,
     /// The loop's label id, for a labeled `break`/`continue`.
     label: Option<u32>,
+    /// Whether an unlabeled `break` targets it: `false` for a labeled non-loop
+    /// statement, which only a `break LABEL` exits.
+    unlabeled: bool,
     /// How many `finally` clauses enclosed the loop: a jump to its targets runs
     /// every `finally` opened inside it (those above this depth) first.
     finally_depth: usize,
@@ -679,6 +682,7 @@ impl CfgBuilder {
                     continue_block: Some(cont),
                     break_block: exit,
                     label: *label,
+                    unlabeled: true,
                     finally_depth: self.finallies.len(),
                 });
                 self.cur = body_b as usize;
@@ -689,6 +693,22 @@ impl CfgBuilder {
                     self.lower_stmts(update)?;
                     self.terminate(GenTerm::Jump(head));
                 }
+                self.loops.pop();
+                self.cur = exit as usize;
+            }
+            // `LABEL: stmt` crossing a suspend (or holding a jump): `stmt` runs
+            // in the current block, and a `break LABEL` inside jumps to the exit.
+            IrStmt::Labeled { label, body } => {
+                let exit = self.new_block();
+                self.loops.push(LoopCtx {
+                    continue_block: None,
+                    break_block: exit,
+                    label: Some(*label),
+                    unlabeled: false,
+                    finally_depth: self.finallies.len(),
+                });
+                self.lower_stmts(body)?;
+                self.terminate(GenTerm::Jump(exit));
                 self.loops.pop();
                 self.cur = exit as usize;
             }
@@ -752,6 +772,7 @@ impl CfgBuilder {
             continue_block: None,
             break_block: exit,
             label: None,
+            unlabeled: true,
             finally_depth: self.finallies.len(),
         });
         for (i, case) in cases.iter().enumerate() {
@@ -1595,7 +1616,12 @@ impl CfgBuilder {
     /// or the loop whose label matches — with that loop's `finally_depth`.
     fn loop_target(&self, label: Option<u32>, is_break: bool) -> anyhow::Result<(u32, usize)> {
         let target = match label {
-            None if is_break => self.loops.last().map(|l| (l.break_block, l.finally_depth)),
+            None if is_break => self
+                .loops
+                .iter()
+                .rev()
+                .find(|l| l.unlabeled)
+                .map(|l| (l.break_block, l.finally_depth)),
             None => self
                 .loops
                 .iter()
@@ -1786,6 +1812,7 @@ fn remap_stmt(stmt: &mut IrStmt, map: &HashMap<u32, u32>) {
             remap_stmts(body, map);
             remap_stmts(update, map);
         }
+        IrStmt::Labeled { body, .. } => remap_stmts(body, map),
         IrStmt::Switch { disc, cases, .. } => {
             remap_node(disc, map);
             for case in cases {
