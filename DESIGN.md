@@ -1409,6 +1409,9 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   operands suspend in order.
 - **`typeof`**, **`instanceof`** (§7.6), **`in`** (`__has`), **`delete`**
   (`__delete`).
+- **`void`** evaluates its operand for its effects (calls, assignments,
+  throws, `yield` / `await`) and yields `undefined`; a literal operand folds
+  to `undefined`.
 - **Member access on `null`/`undefined`** throws a `TypeError`
   (`Cannot read properties of null (reading 'x')`), catchable like any throw.
 
@@ -2129,7 +2132,6 @@ Each item below is current behaviour of this tree.
   there are no ropes, so `s = s + x` in a loop is `O(n^2)`. `search` / `match` / `matchAll` interpret a string
   pattern as RegExp source: a pattern with RegExp syntax throws a
   `TypeError`, and `matchAll` (a RegExp string iterator) always throws one.
-- No `void`.
 - Symbol-keyed properties work on every object, and `@@iterator`,
   `@@toPrimitive`, `@@toStringTag`, `@@hasInstance`, `@@species`
   (`ArraySpeciesCreate`, and `SpeciesConstructor` in
@@ -2172,7 +2174,7 @@ Each item below is current behaviour of this tree.
   | `RegExp` | never in phase 3 | 28 | 128 | 3 | | | |
   | `Function` constructor | never in phase 3 | | 4 | 115 | | | 1 |
   | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | never in phase 3 | 21 | 18 | 4 | 1 | | |
-  | `void` | language | 12 | 36 | 10 | | 1 | |
+  | `void` (59; the cause is removed — §7.2, recount pending) | language | | | | | | |
   | thenables are not assimilated (`Array.fromAsync`, below) | async | 14 | | | | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
   | tagged templates, `for-in` heads | language | 2 | 4 | | | | |
