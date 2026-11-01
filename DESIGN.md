@@ -1577,12 +1577,16 @@ those of `switch` and loops are not tracked.
   spread on, the literal is built incrementally on a temp — the entries
   before it, then each spread, run of later entries, and `__proto__` entry
   in turn — so later properties overwrite spread keys and vice versa; a
-  `__proto__` key copied by a spread is an ordinary own property.
+  `__proto__` key copied by a spread is an ordinary own property. A getter
+  or setter defined after a spread or a computed entry is a partial
+  descriptor (`__define_own`): `{get a() {}, ...o, set a(v) {}}` keeps the
+  getter unless the spread turned `a` into a data property.
 - **Property access** `o.k`, `o["k"]`, `o[expr]` (§6.3): own keys, then the
   prototype chain; a missing key reads `undefined`. Writes add properties
   dynamically; `delete` removes them.
 - **Destructuring.** Array patterns (holes, defaults, rest, nesting) and object
-  patterns (identifier and string keys, rename, defaults, nesting, rest) in
+  patterns (identifier, string, numeric, and computed keys, rename, defaults,
+  nesting, rest) in
   declarations, parameters, and `for-of` / `for-in` heads; destructuring
   assignment in any expression position (`x = [a, b] = c`, `f(({a} = o))`,
   a `?:` arm, a `for` update, an arrow body), with member targets (`[o.x] =
@@ -1591,10 +1595,16 @@ those of `switch` and loops are not tracked.
   `Block { stmts, value }` node whose value is that temp: the emitter runs
   the stack-neutral statements in place, under any operands already pushed,
   and a generator body linearizes a block holding a suspend into its CFG
-  (§7.8) after spilling the earlier operands. An object rest is a fresh ordinary object filled by
-  `CopyDataProperties` minus the destructured keys. An object pattern checks
-  `RequireObjectCoercible` before its first target reference, rest, or read,
-  so a nullish source throws a `TypeError` before anything else runs.
+  (§7.8) after spilling the earlier operands. A numeric or computed pattern
+  key is evaluated and converted (`ToPropertyKey`, once; a symbol stays a
+  symbol, `1.0` / `0x10` are `"1"` / `"16"`) in source order — before the
+  assignment target reference, which precedes the read and then the default.
+  Each property is read once (a default tests the stashed read). An object
+  rest is a fresh ordinary object filled by `CopyDataProperties` minus the
+  destructured keys, the converted computed keys (symbols included) among
+  them. An object pattern checks `RequireObjectCoercible` before its first
+  key expression, target reference, rest, or read, so a nullish source
+  throws a `TypeError` before anything else runs.
   An array pattern runs the iteration protocol lazily
   (§7.8): `GetIterator`, one `IteratorStep` per
   hole or element (an element reads `undefined` once done; a hole reads no
@@ -1629,7 +1639,9 @@ those of `switch` and loops are not tracked.
   descriptor (`__define_own`), so `get [k]()` / `set [k](v)` share one
   property. A computed `"constructor"` is an ordinary method; a computed
   static `"prototype"` throws a `TypeError` (the literal forms stay early
-  errors).
+  errors). A numeric literal member name (`1() {}`, `static 2() {}`,
+  `get 3() {}`, `0x10 = 1`) is converted the same way, to its canonical
+  numeric string.
   Calling `C` without `new` throws `TypeError: Class constructor C cannot be
   invoked without 'new'`.
 - **Fields.** Instance fields (`f = init`, or `f;` for `undefined`) are
@@ -2203,7 +2215,6 @@ Each item below is current behaviour of this tree.
 **Object model**
 
 - Property tables are linear-scanned; there are no inline caches.
-- Object patterns accept only identifier and string keys.
 - Array-like lengths are clamped to `2^32 - 1` by the generic loops of `map`,
   `filter`, `forEach`, `reduce`, `join`, `concat` and `flat` (`map` sizes its
   `ArraySpeciesCreate` by the full length, so past `2^32 - 1` it throws the
@@ -2246,8 +2257,8 @@ Each item below is current behaviour of this tree.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
   `undefined`.
-- A numeric or BigInt literal class member key (`class { 1() {} }`) is a
-  compile error.
+- A BigInt literal property key (`{1n: v}`, `class { 1n() {} }`, `{1n: a} =
+  o`) is a compile error (`BigInt` is not available).
 
 **Generators & async**
 
