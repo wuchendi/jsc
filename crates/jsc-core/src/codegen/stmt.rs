@@ -409,7 +409,8 @@ impl LowerCtx<'_> {
 
         // The computed member names, by member index: each evaluated once, in
         // source order, into a hidden local (read by the constructor's field
-        // initializers through its id).
+        // initializers through its id). A numeric key (`1() {}`, `0x10 = 1`)
+        // is converted the same way, to its canonical numeric string.
         let mut keys: Vec<Option<(u32, u32)>> = Vec::with_capacity(class.body.len());
         for member in &class.body {
             let (key, static_method) = match member {
@@ -420,11 +421,14 @@ impl LowerCtx<'_> {
                     continue;
                 }
             };
-            let PropName::Computed(computed) = key else {
-                keys.push(None);
-                continue;
+            let value = match key {
+                PropName::Computed(computed) => self.lower_expr(&computed.expr)?,
+                PropName::Num(n) => IrNode::Num(n.value),
+                _ => {
+                    keys.push(None);
+                    continue;
+                }
             };
-            let value = self.lower_expr(&computed.expr)?;
             let (local, id) = self.hidden_local();
             seq.push(IrNode::Assign {
                 local,
@@ -434,7 +438,7 @@ impl LowerCtx<'_> {
             // evaluation order, so one named `prototype` throws now. (A static
             // field named `prototype` throws when it is defined, from
             // `__define` of the non-configurable `prototype`.)
-            if static_method {
+            if static_method && matches!(key, PropName::Computed(_)) {
                 seq.push(IrNode::Ternary {
                     cond: Box::new(IrNode::Binary {
                         op: BinOp::Eq,
@@ -759,79 +763,97 @@ impl LowerCtx<'_> {
                     Ok(())
                 })
             }
-            // An object pattern (`let {x, y: b, z = 7, ...rest} = ..`) evaluates
-            // `source` ONCE into a hidden temp local, then binds each property from
-            // a keyed read (`temp.key`); a trailing rest collects every remaining
-            // own key into a new object.
-            Pat::Object(obj) => {
-                let temp = self.fresh();
-                out.push(IrStmt::Decl {
-                    local: temp,
-                    init: source,
-                });
-                // A pattern that reads nothing before a leading rest (or nothing
-                // at all) still requires an object-coercible source first
-                // (`let {...r} = null` throws a TypeError).
-                if matches!(obj.props.first(), None | Some(ObjectPatProp::Rest(_))) {
-                    out.push(IrStmt::Expr(IrNode::NullishCheck {
-                        value: Box::new(IrNode::Local(temp)),
-                        key: String::new(),
-                    }));
-                }
-                // The statically-known destructured keys, excluded from a rest.
-                let mut bound_keys: Vec<JsStr> = Vec::new();
-                for prop in &obj.props {
-                    match prop {
-                        // `{key: pat}` (or renamed `{key: name}`): read `temp.key`
-                        // and bind the value pattern (which may be a nested pattern
-                        // or a `pat = default`).
-                        ObjectPatProp::KeyValue(kv) => {
-                            let key = prop_key_name(&kv.key)?;
-                            bound_keys.push(key.clone());
-                            let read = || IrNode::Index {
-                                obj: Box::new(IrNode::Local(temp)),
-                                index: Box::new(IrNode::Str(key.clone())),
-                            };
-                            self.bind_with_default(&kv.value, &read, mutable, out)?;
-                        }
-                        // Shorthand `{x}` or shorthand-with-default `{z = 7}`: the
-                        // key IS the bound name; a default fills an `undefined` read.
-                        ObjectPatProp::Assign(assign) => {
-                            let key = JsStr::from(assign.key.id.sym.as_ref());
-                            bound_keys.push(key.clone());
-                            let read = || IrNode::Index {
-                                obj: Box::new(IrNode::Local(temp)),
-                                index: Box::new(IrNode::Str(key.clone())),
-                            };
-                            let value = match &assign.value {
-                                Some(default) => {
-                                    let default = self.lower_expr(default)?;
-                                    IrNode::Ternary {
-                                        cond: Box::new(IrNode::Binary {
-                                            op: BinOp::Eq,
-                                            lhs: Box::new(read()),
-                                            rhs: Box::new(IrNode::Undefined),
-                                        }),
-                                        then_branch: Box::new(default),
-                                        else_branch: Box::new(read()),
-                                    }
-                                }
-                                None => read(),
-                            };
-                            self.bind_ident(&assign.key, value, mutable, out);
-                        }
-                        // `{...rest}`: a NEW object with every own key of `temp`
-                        // except the destructured ones collected above.
-                        ObjectPatProp::Rest(rest) => {
-                            let value = object_rest(temp, &bound_keys);
-                            self.lower_binding_pattern(&rest.arg, value, mutable, out)?;
-                        }
-                    }
-                }
-                Ok(())
-            }
+            Pat::Object(obj) => self.bind_object_pattern(obj, source, mutable, out),
             other => Err(CompileError::spanned(other.span(), "unsupported binding pattern").into()),
         }
+    }
+
+    /// Bind an object pattern (`let {x, y: b, [k]: c, z = 7, ...rest} = ..`):
+    /// `source` is evaluated ONCE into a hidden temp local, then each property
+    /// is bound from a keyed read (`temp[key]`); a trailing rest collects every
+    /// remaining own key into a new object.
+    fn bind_object_pattern(
+        &mut self,
+        obj: &ObjectPat,
+        source: IrNode,
+        mutable: bool,
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let temp = self.fresh();
+        out.push(IrStmt::Decl {
+            local: temp,
+            init: source,
+        });
+        // A pattern that reads nothing before a leading rest (or nothing
+        // at all), or whose first key is computed, still requires an
+        // object-coercible source first (`let {...r} = null` throws a
+        // TypeError before any key expression runs).
+        if leading_coercible_check(obj) {
+            out.push(IrStmt::Expr(IrNode::NullishCheck {
+                value: Box::new(IrNode::Local(temp)),
+                key: String::new(),
+            }));
+        }
+        // The destructured keys (converted property keys), excluded
+        // from a rest.
+        let mut bound_keys: Vec<IrNode> = Vec::new();
+        for prop in &obj.props {
+            match prop {
+                // `{key: pat}` (or renamed `{key: name}`): read `temp[key]`
+                // once and bind the value pattern (which may be a nested
+                // pattern or a `pat = default`).
+                ObjectPatProp::KeyValue(kv) => {
+                    let key = self.pattern_key(&kv.key, out)?;
+                    bound_keys.push(key.clone());
+                    let mut read = IrNode::Index {
+                        obj: Box::new(IrNode::Local(temp)),
+                        index: Box::new(key),
+                    };
+                    if matches!(kv.value.as_ref(), Pat::Assign(_)) {
+                        let local = self.fresh();
+                        out.push(IrStmt::Decl { local, init: read });
+                        read = IrNode::Local(local);
+                    }
+                    self.bind_with_default(&kv.value, &|| read.clone(), mutable, out)?;
+                }
+                // Shorthand `{x}` or shorthand-with-default `{z = 7}`: the
+                // key IS the bound name; a default fills an `undefined`
+                // read (stashed, so a getter runs once).
+                ObjectPatProp::Assign(assign) => {
+                    let key = JsStr::from(assign.key.id.sym.as_ref());
+                    let read = IrNode::Index {
+                        obj: Box::new(IrNode::Local(temp)),
+                        index: Box::new(IrNode::Str(key.clone())),
+                    };
+                    bound_keys.push(IrNode::Str(key));
+                    let value = match &assign.value {
+                        Some(default) => {
+                            let local = self.fresh();
+                            out.push(IrStmt::Decl { local, init: read });
+                            let default = self.lower_expr(default)?;
+                            IrNode::Ternary {
+                                cond: Box::new(IrNode::Binary {
+                                    op: BinOp::Eq,
+                                    lhs: Box::new(IrNode::Local(local)),
+                                    rhs: Box::new(IrNode::Undefined),
+                                }),
+                                then_branch: Box::new(default),
+                                else_branch: Box::new(IrNode::Local(local)),
+                            }
+                        }
+                        None => read,
+                    };
+                    self.bind_ident(&assign.key, value, mutable, out);
+                }
+                // `{...rest}`: a NEW object with every own key of `temp`
+                // except the destructured ones collected above.
+                ObjectPatProp::Rest(rest) => {
+                    let value = object_rest(temp, &bound_keys);
+                    self.lower_binding_pattern(&rest.arg, value, mutable, out)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Bind a single identifier `ident` to `value`, boxing a captured binding into
@@ -1121,15 +1143,18 @@ impl LowerCtx<'_> {
         temp: u32,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
-        let read = |key: &JsStr| IrNode::Index {
+        let read = |key: IrNode| IrNode::Index {
             obj: Box::new(IrNode::Local(temp)),
-            index: Box::new(IrNode::Str(key.clone())),
+            index: Box::new(key),
         };
-        // `RequireObjectCoercible` runs before any target reference: only a
-        // leading shorthand reads the source before a target can run code.
+        // `RequireObjectCoercible` runs before any key expression or target
+        // reference: only a leading shorthand reads the source before either
+        // can run code.
         if !matches!(obj.props.first(), Some(ObjectPatProp::Assign(_))) {
             let key = match obj.props.first() {
-                Some(ObjectPatProp::KeyValue(kv)) => prop_key_name(&kv.key)?.to_string(),
+                Some(ObjectPatProp::KeyValue(kv)) => {
+                    prop_key_name(&kv.key).map_or_else(|_| String::new(), |k| k.to_string())
+                }
                 _ => String::new(),
             };
             out.push(IrStmt::Expr(IrNode::NullishCheck {
@@ -1137,20 +1162,23 @@ impl LowerCtx<'_> {
                 key,
             }));
         }
-        let mut bound_keys: Vec<JsStr> = Vec::new();
+        let mut bound_keys: Vec<IrNode> = Vec::new();
         for prop in &obj.props {
             match prop {
+                // The key is evaluated (and converted) first, then the target
+                // reference, then the read (`KeyedDestructuringAssignmentEvaluation`).
                 ObjectPatProp::KeyValue(kv) => {
-                    let key = prop_key_name(&kv.key)?;
-                    let value = read(&key);
+                    let key = self.pattern_key(&kv.key, out)?;
+                    let value = read(key.clone());
                     bound_keys.push(key);
                     self.assign_element(&kv.value, out, |_, _| value)?;
                 }
                 // Shorthand `{x}` / `{x = 7}` assigns the binding named by the key.
                 ObjectPatProp::Assign(assign) => {
-                    let key = JsStr::from(assign.key.id.sym.as_ref());
+                    let key = IrNode::Str(assign.key.id.sym.as_ref().into());
                     let target = self.assignable_binding(&assign.key.id)?;
-                    let value = self.apply_default(read(&key), assign.value.as_deref(), out)?;
+                    let value =
+                        self.apply_default(read(key.clone()), assign.value.as_deref(), out)?;
                     bound_keys.push(key);
                     out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
                 }
@@ -1161,6 +1189,24 @@ impl LowerCtx<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The key of an object-pattern property, in source order: an identifier or
+    /// string key is a static string; a numeric or computed key is evaluated and
+    /// converted (`ToPropertyKey`, exactly once: an object key's `toString`
+    /// runs once, a symbol stays a symbol) into a fresh local.
+    fn pattern_key(&mut self, key: &PropName, out: &mut Vec<IrStmt>) -> anyhow::Result<IrNode> {
+        let init = match key {
+            PropName::Num(n) => IrNode::Num(n.value),
+            PropName::Computed(c) => self.lower_expr(&c.expr)?,
+            _ => return Ok(IrNode::Str(prop_key_name(key)?)),
+        };
+        let local = self.fresh();
+        out.push(IrStmt::Decl {
+            local,
+            init: IrNode::ToPropertyKey(Box::new(init)),
+        });
+        Ok(IrNode::Local(local))
     }
 
     /// Assign one pattern element (optionally `target = default`) from the value
@@ -2022,20 +2068,34 @@ impl LowerCtx<'_> {
     }
 }
 
-/// Extract the static string name of an object-pattern property key. Only
-/// identifier and string-literal keys are supported (mirroring the object-literal
-/// keys in [`LowerCtx::lower_object`]); a computed or numeric key is a spanned
-/// error.
+/// Extract the static string name of an identifier or string-literal property
+/// key. Callers convert a numeric or computed key at run time instead; a `BigInt`
+/// key is a spanned error.
 pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<JsStr> {
     match key {
         PropName::Ident(id) => Ok(id.sym.as_ref().into()),
         PropName::Str(s) => Ok(lit_str(s)),
-        _ => Err(CompileError::spanned(
+        PropName::BigInt(_) => Err(CompileError::spanned(
             key.span(),
-            "unsupported object-pattern key: only identifier and string keys are supported \
-             (computed and numeric keys are not)",
+            "unsupported property key: BigInt keys are not supported",
         )
         .into()),
+        PropName::Num(_) | PropName::Computed(_) => Err(CompileError::spanned(
+            key.span(),
+            "a numeric or computed property key has no static name",
+        )
+        .into()),
+    }
+}
+
+/// Whether an object binding pattern checks `RequireObjectCoercible` up front:
+/// it is empty, starts with a rest, or starts with a computed key (which runs
+/// code before the first read).
+fn leading_coercible_check(obj: &ObjectPat) -> bool {
+    match obj.props.first() {
+        None | Some(ObjectPatProp::Rest(_)) => true,
+        Some(ObjectPatProp::KeyValue(kv)) => matches!(kv.key, PropName::Computed(_)),
+        Some(ObjectPatProp::Assign(_)) => false,
     }
 }
 
@@ -2408,8 +2468,9 @@ fn unsupported_stmt_msg(stmt: &Stmt) -> &'static str {
 
 /// An object rest `{...rest}` over the source in `temp`: a fresh ordinary
 /// object holding every own enumerable property of the source except the
-/// destructured `bound_keys` (`CopyDataProperties`).
-fn object_rest(temp: u32, bound_keys: &[JsStr]) -> IrNode {
+/// destructured `bound_keys` (static strings, or locals holding converted
+/// numeric/computed keys) (`CopyDataProperties`).
+fn object_rest(temp: u32, bound_keys: &[IrNode]) -> IrNode {
     IrNode::CopyDataProperties {
         target: Box::new(IrNode::Object {
             entries: Vec::new(),
@@ -2418,8 +2479,6 @@ fn object_rest(temp: u32, bound_keys: &[JsStr]) -> IrNode {
             reserve: 0,
         }),
         source: Box::new(IrNode::Local(temp)),
-        exclude: Box::new(IrNode::Array(
-            bound_keys.iter().cloned().map(IrNode::Str).collect(),
-        )),
+        exclude: Box::new(IrNode::Array(bound_keys.to_vec())),
     }
 }
