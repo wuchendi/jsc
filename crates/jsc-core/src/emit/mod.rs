@@ -36,8 +36,8 @@ use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
-    IterRecord, JsStr, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey,
-    ProtoKind, SpreadCallee, SpreadElem,
+    IterRecord, JsStr, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind,
+    PrivateError, PropKey, ProtoKind, SpreadCallee, SpreadElem,
 };
 
 /// The name of the entry function exported from the emitted module.
@@ -517,7 +517,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 21] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 25] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -603,6 +603,26 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 21] = [
         "Cannot write private member ",
         " to an object whose class did not declare it",
     ),
+    (
+        PROP_THROW_PRIVATE_NO_GETTER,
+        "'",
+        "' was defined without a getter",
+    ),
+    (
+        PROP_THROW_PRIVATE_NO_SETTER,
+        "'",
+        "' was defined without a setter",
+    ),
+    (
+        PROP_THROW_PRIVATE_METHOD_WRITE,
+        "Private method is not writable",
+        "",
+    ),
+    (
+        PROP_THROW_PRIVATE_IN,
+        "Cannot use 'in' operator to search for '",
+        "",
+    ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
 /// for a `length` write whose value is not a valid array length.
@@ -684,12 +704,27 @@ const PROP_THROW_PRIVATE_READ: i32 = 22;
 /// `__prop_throw`'s `mode` argument: a private write to an object lacking the
 /// private name (the `key` is its `"#x"` source name).
 const PROP_THROW_PRIVATE_WRITE: i32 = 23;
+/// `__prop_throw`'s `mode` argument: a private read of an accessor without a
+/// getter (the `key` is its `"#x"` source name).
+const PROP_THROW_PRIVATE_NO_GETTER: i32 = 24;
+/// `__prop_throw`'s `mode` argument: a private write of an accessor without a
+/// setter (the `key` is its `"#x"` source name).
+const PROP_THROW_PRIVATE_NO_SETTER: i32 = 25;
+/// `__prop_throw`'s `mode` argument: a write of a private method (the `key`
+/// is the empty string).
+const PROP_THROW_PRIVATE_METHOD_WRITE: i32 = 26;
+/// `__prop_throw`'s `mode` argument: `#x in o` on a non-object `o` (the `key`
+/// is `"#x' in " + String(o)`, built by `__private_in`).
+const PROP_THROW_PRIVATE_IN: i32 = 27;
+/// The fragment `__private_in` splices between `#x` and `String(o)`.
+const PRIVATE_IN_MID: &str = "' in ";
 
 /// The static strings `__prop_throw` and `__array_set_length` need — the
 /// message fragments (plus every [`PROP_KEYED_MSGS`] fragment). Seeded by
 /// [`collect_node`] at every member store and `delete` site
 /// so their `[len][utf8]` blobs exist when they throw.
-const PROP_ERROR_STRS: [&str; 11] = [
+const PROP_ERROR_STRS: [&str; 12] = [
+    PRIVATE_IN_MID,
     ARRAY_LENGTH_MSG,
     ARRAY_LENGTH_STACK,
     TYPE_ERROR_STACK_PREFIX,
@@ -1194,6 +1229,17 @@ impl Helpers<'_> {
     /// [`props::emit_private_set`]).
     fn private_set(self) -> u32 {
         self.to_primitive() + 21
+    }
+
+    /// `__private_brand(o, v, brand, name, mode) -> i64` (see
+    /// [`props::emit_private_brand`]).
+    fn private_brand(self) -> u32 {
+        self.to_primitive() + 22
+    }
+
+    /// `__private_in(o, brand, name) -> i64` (see [`props::emit_private_in`]).
+    fn private_in(self) -> u32 {
+        self.to_primitive() + 23
     }
 
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
@@ -1707,6 +1753,8 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     code.function(&emit_private_add(helpers));
     code.function(&emit_private_get(helpers));
     code.function(&emit_private_set(helpers));
+    code.function(&emit_private_brand(helpers));
+    code.function(&emit_private_in(&offsets, helpers));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

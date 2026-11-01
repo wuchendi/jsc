@@ -153,10 +153,17 @@ impl LowerCtx<'_> {
             }),
             // `key in obj`: an own-key membership test, lowered to a runtime
             // key-table scan. `left` is the property key, `right` the object.
-            Expr::Bin(b) if matches!(b.op, BinaryOp::In) => Ok(IrNode::ObjectHas {
-                key: Box::new(self.lower_expr(&b.left)?),
-                obj: Box::new(self.lower_expr(&b.right)?),
-            }),
+            // `#x in obj` tests the private name (DESIGN.md §7.6).
+            Expr::Bin(b) if matches!(b.op, BinaryOp::In) => match &*b.left {
+                Expr::PrivateName(p) => {
+                    let target = self.private_ref(p)?;
+                    Ok(target.has(self.lower_expr(&b.right)?))
+                }
+                left => Ok(IrNode::ObjectHas {
+                    key: Box::new(self.lower_expr(left)?),
+                    obj: Box::new(self.lower_expr(&b.right)?),
+                }),
+            },
             // `x instanceof RHS` (DESIGN.md §7.6): any right-hand side expression.
             Expr::Bin(b) if matches!(b.op, BinaryOp::InstanceOf) => {
                 self.lower_instanceof(&b.left, &b.right)
@@ -1338,12 +1345,7 @@ impl LowerCtx<'_> {
 
     /// `obj.#x` on the already lowered receiver `obj` (DESIGN.md §7.6).
     fn lower_private_get(&mut self, obj: IrNode, prop: &PrivateName) -> anyhow::Result<IrNode> {
-        let (key, name) = self.private_field(prop)?;
-        Ok(IrNode::PrivateGet {
-            obj: Box::new(obj),
-            key: Box::new(key),
-            name,
-        })
+        Ok(self.private_ref(prop)?.read(obj))
     }
 
     /// `obj.#x(args)` on the already lowered receiver `obj`: the receiver,
@@ -1389,28 +1391,14 @@ impl LowerCtx<'_> {
         prop: &PrivateName,
     ) -> anyhow::Result<IrNode> {
         let obj = self.lower_expr(&member.obj)?;
-        let (key, name) = self.private_field(prop)?;
+        let target = self.private_ref(prop)?;
         let rhs = self.lower_expr(&assign.right)?;
         if assign.op == AssignOp::Assign {
-            return Ok(IrNode::PrivateSet {
-                obj: Box::new(obj),
-                key: Box::new(key),
-                value: Box::new(rhs),
-                name,
-            });
+            return Ok(target.write(obj, rhs));
         }
         let tmp = self.fresh();
-        let get = IrNode::PrivateGet {
-            obj: Box::new(IrNode::Local(tmp)),
-            key: Box::new(key.clone()),
-            name: name.clone(),
-        };
-        let set = |value: IrNode| IrNode::PrivateSet {
-            obj: Box::new(IrNode::Local(tmp)),
-            key: Box::new(key),
-            value: Box::new(value),
-            name,
-        };
+        let get = target.read(IrNode::Local(tmp));
+        let set = |value: IrNode| target.write(IrNode::Local(tmp), value);
         let result = if let Some(op) = map_logical_assign_op(assign.op) {
             IrNode::Logical {
                 op,
@@ -1448,7 +1436,7 @@ impl LowerCtx<'_> {
         obj: IrNode,
         prop: &PrivateName,
     ) -> anyhow::Result<IrNode> {
-        let (key, name) = self.private_field(prop)?;
+        let target = self.private_ref(prop)?;
         let (tmp, old) = (self.fresh(), self.fresh());
         let delta = if matches!(update.op, UpdateOp::PlusPlus) {
             1.0
@@ -1457,23 +1445,17 @@ impl LowerCtx<'_> {
         };
         let read = IrNode::ConvertCall {
             op: ConvertOp::ToNumber,
-            arg: Box::new(IrNode::PrivateGet {
-                obj: Box::new(IrNode::Local(tmp)),
-                key: Box::new(key.clone()),
-                name: name.clone(),
-            }),
+            arg: Box::new(target.read(IrNode::Local(tmp))),
             radix: None,
         };
-        let store = IrNode::PrivateSet {
-            obj: Box::new(IrNode::Local(tmp)),
-            key: Box::new(key),
-            value: Box::new(IrNode::Binary {
+        let store = target.write(
+            IrNode::Local(tmp),
+            IrNode::Binary {
                 op: BinOp::Add,
                 lhs: Box::new(IrNode::Local(old)),
                 rhs: Box::new(IrNode::Num(delta)),
-            }),
-            name,
-        };
+            },
+        );
         let mut seq = vec![
             IrNode::Assign {
                 local: tmp,
@@ -2342,6 +2324,140 @@ impl LowerCtx<'_> {
             None => None,
         };
         Ok(IrNode::DateNew { arg })
+    }
+}
+
+impl PrivateRef {
+    /// `%penv[slot]`.
+    fn slot(&self, slot: u32) -> IrNode {
+        IrNode::PrivEnvLoad {
+            env: Box::new(self.env.clone()),
+            slot,
+        }
+    }
+
+    /// What a holder of the name carries (DESIGN.md §7.6): a field's private
+    /// symbol, the instance brand (slot `1`) or, for a static method or
+    /// accessor, the class value (slot `0`).
+    pub(super) fn brand(&self) -> IrNode {
+        self.slot(match self.kind {
+            PrivateKind::Field(slot) => slot,
+            PrivateKind::Method { is_static, .. } | PrivateKind::Accessor { is_static, .. } => {
+                u32::from(!is_static)
+            }
+        })
+    }
+
+    /// The brand check of `obj` (`value` is a write's right-hand side,
+    /// evaluated before it); yields `value`, else `obj`.
+    fn check(&self, obj: IrNode, value: Option<IrNode>, write: bool) -> IrNode {
+        IrNode::PrivateBrand {
+            obj: Box::new(obj),
+            value: value.map(Box::new),
+            brand: Box::new(self.brand()),
+            name: self.name.clone(),
+            write,
+        }
+    }
+
+    /// The `TypeError` `error` naming `#x`.
+    fn throw(&self, error: PrivateError) -> IrNode {
+        IrNode::PrivateThrow {
+            error,
+            name: self.name.clone(),
+        }
+    }
+
+    /// `obj.#x`: a field's value; after the brand check, a method's closure
+    /// (shared by every holder) or the getter called with `this = obj`.
+    fn read(&self, obj: IrNode) -> IrNode {
+        match self.kind {
+            PrivateKind::Field(slot) => IrNode::PrivateGet {
+                obj: Box::new(obj),
+                key: Box::new(self.slot(slot)),
+                name: self.name.clone(),
+            },
+            PrivateKind::Method { slot, .. } => {
+                IrNode::Seq(vec![self.check(obj, None, false), self.slot(slot)])
+            }
+            PrivateKind::Accessor { get: Some(get), .. } => {
+                let [this_local, ..] = self.temps.unwrap_or_default();
+                IrNode::ThisCall {
+                    callee: Box::new(IrNode::Seq(vec![
+                        IrNode::Assign {
+                            local: this_local,
+                            value: Box::new(self.check(obj, None, false)),
+                        },
+                        self.slot(get),
+                    ])),
+                    args: Vec::new(),
+                    this_local,
+                    construct: false,
+                    not_callable: CalleeError::not_a_function(&self.name.to_string()),
+                }
+            }
+            PrivateKind::Accessor { get: None, .. } => IrNode::Seq(vec![
+                self.check(obj, None, false),
+                self.throw(PrivateError::NoGetter),
+            ]),
+        }
+    }
+
+    /// `obj.#x = value` (`obj`, then `value`, then the check), yielding
+    /// `value`: a field's store, or the setter called with `this = obj`; a
+    /// method or a getter-only accessor throws after the brand check.
+    pub(super) fn write(&self, obj: IrNode, value: IrNode) -> IrNode {
+        match self.kind {
+            PrivateKind::Field(slot) => IrNode::PrivateSet {
+                obj: Box::new(obj),
+                key: Box::new(self.slot(slot)),
+                value: Box::new(value),
+                name: self.name.clone(),
+            },
+            PrivateKind::Method { .. } => IrNode::Seq(vec![
+                self.check(obj, Some(value), true),
+                self.throw(PrivateError::MethodNotWritable),
+            ]),
+            PrivateKind::Accessor { set: Some(set), .. } => {
+                // The receiver is snapshotted first; the call's argument is the
+                // value, brand-checked after it is evaluated.
+                let [_, this_local, stored] = self.temps.unwrap_or_default();
+                let checked = self.check(IrNode::Local(this_local), Some(value), true);
+                IrNode::Seq(vec![
+                    IrNode::Assign {
+                        local: this_local,
+                        value: Box::new(obj),
+                    },
+                    IrNode::ThisCall {
+                        callee: Box::new(self.slot(set)),
+                        args: vec![IrNode::Seq(vec![
+                            IrNode::Assign {
+                                local: stored,
+                                value: Box::new(checked),
+                            },
+                            IrNode::Local(stored),
+                        ])],
+                        this_local,
+                        construct: false,
+                        not_callable: CalleeError::not_a_function(&self.name.to_string()),
+                    },
+                    IrNode::Local(stored),
+                ])
+            }
+            PrivateKind::Accessor { set: None, .. } => IrNode::Seq(vec![
+                self.check(obj, Some(value), true),
+                self.throw(PrivateError::NoSetter),
+            ]),
+        }
+    }
+
+    /// `#x in obj`.
+    fn has(&self, obj: IrNode) -> IrNode {
+        IrNode::PrivateIn {
+            obj: Box::new(obj),
+            brand: Box::new(self.brand()),
+            name: self.name.clone(),
+        }
     }
 }
 

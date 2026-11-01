@@ -375,6 +375,19 @@ pub enum PropKey {
     HiddenComputed(IrNode),
 }
 
+/// The `TypeError` of an [`IrNode::PrivateThrow`] (DESIGN.md §7.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateError {
+    /// A read of an accessor without a getter: `'#x' was defined without a
+    /// getter`.
+    NoGetter,
+    /// A write of an accessor without a setter: `'#x' was defined without a
+    /// setter`.
+    NoSetter,
+    /// A write of a private method: `Private method is not writable`.
+    MethodNotWritable,
+}
+
 /// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
 /// is accepted: the general case is [`InstanceOfKind::Ctor`]
 /// (`InstanceofOperator`). An unshadowed, sealed builtin constructor name is
@@ -1136,6 +1149,46 @@ pub enum IrNode {
         key: Box<IrNode>,
         /// The stored value.
         value: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+    },
+    /// The brand check of a private method or accessor access (DESIGN.md
+    /// §7.6, `__private_brand`): `obj`, then `value` (a write's right-hand
+    /// side), then `brand` are evaluated; `obj` must hold `brand` — an own
+    /// entry keyed by it when it is a private symbol (a field or the instance
+    /// brand), else be the object `brand` itself (a static member's class) —
+    /// or `TypeError: Cannot read private member #x from an object whose class
+    /// did not declare it` (`write`: `Cannot write private member #x to ..`).
+    /// Yields `value`, or `obj` when there is none.
+    PrivateBrand {
+        /// The receiver.
+        obj: Box<IrNode>,
+        /// A write's value, evaluated before the check.
+        value: Option<Box<IrNode>>,
+        /// The brand: a private symbol or the class value (`%penv` slot `0`).
+        brand: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+        /// Whether the access is a write (picks the message).
+        write: bool,
+    },
+    /// Throw the private-member `TypeError` `error` naming `name` (`"#x"`);
+    /// yields `undefined` (never reached).
+    PrivateThrow {
+        /// Which `TypeError`.
+        error: PrivateError,
+        /// The source name (`"#x"`).
+        name: JsStr,
+    },
+    /// `#x in obj` (DESIGN.md §7.6, `__private_in`): a non-object `obj` throws
+    /// `TypeError: Cannot use 'in' operator to search for '#x' in <obj>`; else
+    /// whether `obj` holds `brand` (as [`IrNode::PrivateBrand`] tests it), no
+    /// prototype walk. Yields a boolean.
+    PrivateIn {
+        /// The right-hand side.
+        obj: Box<IrNode>,
+        /// The field symbol, the instance brand or the class value.
+        brand: Box<IrNode>,
         /// The source name (`"#x"`) the `TypeError` names.
         name: JsStr,
     },
@@ -2427,7 +2480,8 @@ impl IrNode {
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
             | IrNode::DateField { .. }
-            | IrNode::PrivateName(_) => false,
+            | IrNode::PrivateName(_)
+            | IrNode::PrivateThrow { .. } => false,
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -2575,6 +2629,10 @@ impl IrNode {
             IrNode::SetProto { obj, proto } => f(obj) || f(proto),
             IrNode::PrivEnvStore { env, value, .. } => f(env) || f(value),
             IrNode::PrivateGet { obj, key, .. } => f(obj) || f(key),
+            IrNode::PrivateBrand {
+                obj, value, brand, ..
+            } => f(obj) || value.as_deref().is_some_and(&mut f) || f(brand),
+            IrNode::PrivateIn { obj, brand, .. } => f(obj) || f(brand),
             IrNode::PrivateAdd {
                 obj, key, value, ..
             }
@@ -2649,7 +2707,8 @@ impl IrNode {
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
             | IrNode::DateField { .. }
-            | IrNode::PrivateName(_) => Vec::new(),
+            | IrNode::PrivateName(_)
+            | IrNode::PrivateThrow { .. } => Vec::new(),
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
@@ -2805,6 +2864,13 @@ impl IrNode {
             IrNode::SetProto { obj, proto } => vec![&mut **obj, &mut **proto],
             IrNode::PrivEnvStore { env, value, .. } => vec![&mut **env, &mut **value],
             IrNode::PrivateGet { obj, key, .. } => vec![&mut **obj, &mut **key],
+            IrNode::PrivateBrand {
+                obj, value, brand, ..
+            } => std::iter::once(&mut **obj)
+                .chain(value.as_deref_mut())
+                .chain(std::iter::once(&mut **brand))
+                .collect(),
+            IrNode::PrivateIn { obj, brand, .. } => vec![&mut **obj, &mut **brand],
             IrNode::PrivateAdd {
                 obj, key, value, ..
             }

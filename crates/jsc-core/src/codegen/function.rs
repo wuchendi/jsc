@@ -1057,8 +1057,10 @@ impl LowerCtx<'_> {
     /// Define the current class's instance fields ([`Self::class_fields`]) on
     /// `this` in source order: a public one with `CreateDataProperty`
     /// semantics (`__define`, so an inherited setter is not invoked), a private
-    /// one with `PrivateFieldAdd` (DESIGN.md §7.6); `None` when the class
-    /// declares no fields. An uninitialized `f;` defines `undefined`. A
+    /// one with `PrivateFieldAdd` (DESIGN.md §7.6), all after the instance
+    /// brand when the class has instance private methods or accessors
+    /// (`PrivateMethodOrAccessorAdd`); `None` when the class declares no
+    /// fields and no brand. An uninitialized `f;` defines `undefined`. A
     /// computed field name reads its key, converted at class definition time;
     /// an anonymous function initializer of `#x` is named `"#x"`.
     pub(super) fn lower_field_inits(&mut self, this: &IrNode) -> anyhow::Result<Option<IrNode>> {
@@ -1071,6 +1073,20 @@ impl LowerCtx<'_> {
         for field in &fields {
             let (p, computed) = match field {
                 ClassField::Public(p, computed) => (p, *computed),
+                ClassField::Brand(frame, penv, name) => {
+                    let env = self.read_hidden(*frame, *penv);
+                    seq.push(IrNode::PrivateAdd {
+                        obj: Box::new(this.clone()),
+                        key: Box::new(IrNode::PrivEnvLoad {
+                            env: Box::new(env),
+                            slot: 1,
+                        }),
+                        value: Box::new(IrNode::Undefined),
+                        attrs: 0,
+                        name: name.clone(),
+                    });
+                    continue;
+                }
                 ClassField::Private(p, frame, penv, slot) => {
                     self.flush_field_entries(this, &mut entries, &mut seq);
                     let name = JsStr::from(format!("#{}", p.key.name));

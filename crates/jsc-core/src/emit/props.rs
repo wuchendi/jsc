@@ -2754,3 +2754,70 @@ pub(super) fn emit_private_set(helpers: Helpers<'_>) -> Function {
     );
     f
 }
+
+/// Push `1` when the jsval in i64 local `o` holds the private brand in i64
+/// local `brand` (DESIGN.md §7.6), else `0`: a private symbol (a field or the
+/// instance brand) is an own entry of `o`; any other brand (a static member's
+/// class, or `undefined` before the class value exists) must be `o` itself,
+/// an object.
+fn emit_private_has(function: &mut Function, o: u32, brand: u32, helpers: Helpers<'_>) {
+    emit_is_symbol(function, brand);
+    wasm!(function;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(o), LocalGet(brand), I32WrapI64, Call(helpers.private_find()),
+        Else,
+    );
+    emit_is_object(function, o);
+    wasm!(function;
+        LocalGet(o), LocalGet(brand), I64Eq, I32And,
+        End,
+    );
+}
+
+/// `__private_brand(o: i64, v: i64, brand: i64, name: i32, mode: i32) ->
+/// i64`: the brand check of a private method or accessor access — `o` lacking
+/// `brand` ([`emit_private_has`]) raises the `__prop_throw` `TypeError` of
+/// `mode` (the read or write message) naming the static `"#x"` in `name`.
+/// Returns `v`.
+pub(super) fn emit_private_brand(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
+    let (o, v, brand, name, mode) = (0, 1, 2, 3, 4);
+    emit_private_has(&mut f, o, brand, helpers);
+    wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(o), LocalGet(name));
+    emit_box_heap(&mut f);
+    wasm!(f;
+        LocalGet(mode), Call(helpers.prop_throw),
+        End,
+        LocalGet(v),
+        End,
+    );
+    f
+}
+
+/// `__private_in(o: i64, brand: i64, name: i32) -> i64`: `#x in o` — a
+/// non-object `o` throws `Cannot use 'in' operator to search for '#x' in
+/// <String(o)>` (the `key` built as `"#x' in " + String(o)`); else whether `o`
+/// holds `brand` ([`emit_private_has`]), as a boolean jsval.
+pub(super) fn emit_private_in(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
+    let (o, brand, name) = (0, 1, 2);
+    emit_is_object(&mut f, o);
+    wasm!(f;
+        I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(o),
+        LocalGet(name), I32Const(static_key(strings, PRIVATE_IN_MID)), Call(helpers.concat),
+        LocalGet(o), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        Call(helpers.concat),
+    );
+    emit_box_heap(&mut f);
+    wasm!(f;
+        I32Const(PROP_THROW_PRIVATE_IN), Call(helpers.prop_throw),
+        I64Const(FALSE_BITS), Return,
+        End,
+        I64Const(TRUE_BITS), I64Const(FALSE_BITS),
+    );
+    emit_private_has(&mut f, o, brand, helpers);
+    wasm!(f; Select, End);
+    f
+}

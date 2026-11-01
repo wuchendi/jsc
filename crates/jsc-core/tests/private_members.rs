@@ -1,7 +1,10 @@
-//! Integration tests: private class fields (DESIGN.md §7.6) — instance and
-//! static `#x` fields, their initialization order, every access form, the
-//! `TypeError`s, fresh names per class evaluation, and their invisibility to
-//! every key walk and renderer. Expected texts are Node's output.
+//! Integration tests: private class members (DESIGN.md §7.6) — instance and
+//! static `#x` fields, methods and accessors (generator and async ones
+//! included), their initialization order, every access form, brand checks,
+//! `#x in o`, the `TypeError`s, fresh names per class evaluation, and their
+//! invisibility to every key walk and renderer. Expected texts are Node's
+//! output, except the method and accessor messages, which follow DESIGN.md
+//! §7.6 (Node words the brand-check and not-writable errors differently).
 
 mod common;
 use common::{assert_output, assert_uncaught};
@@ -369,19 +372,335 @@ fn generator_methods() {
     ]);
 }
 
-/// Private methods and accessors stay a spanned compile error until they land.
+/// `#m() {}`: one closure per class evaluation, shared by every instance,
+/// named `"#m"`; `this` and `super.x` work in its body.
 #[test]
-fn private_methods_rejected() {
+fn instance_methods() {
+    check(&[
+        (
+            "class C { #x = 2; #m() { return this.#x * 10 } run() { return this.#m() } } \
+             console.log(new C().run())",
+            "20\n",
+        ),
+        (
+            "class C { #m() {} static f(o) { return o.#m } } let a = new C(), b = new C(); \
+             console.log(C.f(a) === C.f(b), typeof C.f(a), C.f(a).name)",
+            "true function #m\n",
+        ),
+        (
+            "function make() { return class { #m() {} static f(o) { return o.#m } } } \
+             let A = make(), B = make(); console.log(A.f(new A()) === B.f(new B()), t(() => A.f(new B())))",
+            "false TypeError: Cannot read private member #m from an object whose class did not declare it\n",
+        ),
+        (
+            "class A { hi() { return 'A' } } class B extends A { #m() { return super.hi() + 'B' } run() { return this.#m() } } \
+             console.log(new B().run())",
+            "AB\n",
+        ),
+        (
+            "class C { #m(a, b) { return [this instanceof C, a, b].join() } run() { let f = this.#m; return this.#m(1, 2) + '|' + f.call(this, 3) } } \
+             console.log(new C().run())",
+            "true,1,2|true,3,\n",
+        ),
+        (
+            "class C { #m() { return 1 } static f(o) { return o?.#m() } } console.log(C.f(new C()), C.f(null))",
+            "1 undefined\n",
+        ),
+    ]);
+}
+
+/// `static #m()`: the class is its only holder (`this` = the class in a
+/// static method); `super.x` reads the parent constructor; not inherited.
+#[test]
+fn static_methods() {
+    check(&[
+        (
+            "class C { static #m() { return this === C } static run() { return C.#m() } } console.log(C.run())",
+            "true\n",
+        ),
+        (
+            "class A { static hi() { return 'sA' } } class B extends A { static #m() { return super.hi() } static run() { return B.#m() } } \
+             console.log(B.run())",
+            "sA\n",
+        ),
+        (
+            "class C { static #m() { return 1 } static r(o) { return o.#m() } } class D extends C {} \
+             console.log(C.r(C), t(() => C.r(D)), t(() => C.r(new C())))",
+            "1 TypeError: Cannot read private member #m from an object whose class did not declare it \
+             TypeError: Cannot read private member #m from an object whose class did not declare it\n",
+        ),
+    ]);
+}
+
+/// `get #x` / `set #x`: called with `this` = the receiver; a write yields the
+/// assigned value; compound, logical and update forms call the getter then
+/// the setter; destructuring targets call the setter; static accessors.
+#[test]
+fn accessors() {
+    check(&[
+        (
+            "class C { #v = 1; get #x() { return this.#v } set #x(v) { this.#v = v * 2 } run() { this.#x = 5; return this.#x } } \
+             console.log(new C().run())",
+            "10\n",
+        ),
+        (
+            "class C { set #x(v) {} run() { return (this.#x = 7) } } console.log(new C().run())",
+            "7\n",
+        ),
+        (
+            "let c; class C { get #x() { return this === c } run() { return this.#x } } c = new C(); console.log(c.run())",
+            "true\n",
+        ),
+        (
+            "class C { #v = 1; log = []; get #x() { this.log.push('get'); return this.#v } \
+             set #x(v) { this.log.push('set ' + v); this.#v = v } \
+             run() { this.#x += 2; this.#x++; ++this.#x; this.#x ??= 9; return this.log.join() + '|' + this.#v } } \
+             console.log(new C().run())",
+            "get,set 3,get,set 4,get,set 5,get|5\n",
+        ),
+        (
+            "class C { #v = '4'; get #x() { return this.#v } set #x(v) { this.#v = v } \
+             run() { let a = this.#x++; return [a, typeof a, this.#v].join() } } console.log(new C().run())",
+            "4,number,5\n",
+        ),
+        (
+            "class C { #v = 0; set #x(v) { this.#v = v } get #x() { return this.#v } \
+             run() { [this.#x] = [3]; ({ a: this.#x } = { a: this.#x + 1 }); return this.#v } } console.log(new C().run())",
+            "4\n",
+        ),
+        (
+            "class C { static #v = 1; static get #x() { return C.#v } static set #x(v) { C.#v = v } \
+             static run() { C.#x = 3; return this.#x } } console.log(C.run())",
+            "3\n",
+        ),
+        (
+            "class C { get #x() { return 'g' } static f(o) { return o?.#x } } console.log(C.f(new C()), C.f(undefined))",
+            "g undefined\n",
+        ),
+    ]);
+}
+
+/// The instance brand is added before every field (on constructor entry, or
+/// after `super()` returns); static methods exist before static fields run.
+#[test]
+fn install_order() {
+    check(&[
+        (
+            "class C { #x = this.#m(); #m() { return 5 } get x() { return this.#x } } console.log(new C().x)",
+            "5\n",
+        ),
+        (
+            "class C { a = this.#g; get #g() { return 'g' } } console.log(new C().a)",
+            "g\n",
+        ),
+        (
+            "class A { constructor(f) { this.seen = f(this) } } \
+             class B extends A { #m() { return 1 } constructor() { super((o) => t(() => B.has(o))) } static has(o) { return o.#m() } } \
+             console.log(new B().seen, B.has(new B()))",
+            "TypeError: Cannot read private member #m from an object whose class did not declare it 1\n",
+        ),
+        (
+            "class C { static a = C.#m(); static #m() { return 'sm' } } console.log(C.a)",
+            "sm\n",
+        ),
+        (
+            "class C { static #m() { return this === C } static a = this.#m() } console.log(C.a)",
+            "true\n",
+        ),
+        (
+            "class C { #m() { return 1 } } console.log(Object.getOwnPropertyNames(new C()).length, \
+             Object.getOwnPropertySymbols(new C()).length, Object.getOwnPropertyNames(C.prototype).join())",
+            "0 0 constructor\n",
+        ),
+    ]);
+}
+
+/// The method and accessor `TypeError`s: writing a method, a getter-less
+/// read, a setter-less write (also compound), an absent brand (the value is
+/// evaluated first on a write), and a second brand add.
+#[test]
+fn method_type_errors() {
+    check(&[
+        (
+            "class C { #m() {} static w(o) { o.#m = 1 } } console.log(t(() => C.w(new C()))); console.log(t(() => C.w({})))",
+            "TypeError: Private method is not writable\n\
+             TypeError: Cannot write private member #m to an object whose class did not declare it\n",
+        ),
+        (
+            "class C { set #x(v) {} static r(o) { return o.#x } } console.log(t(() => C.r(new C())))",
+            "TypeError: '#x' was defined without a getter\n",
+        ),
+        (
+            "class C { get #x() { return 1 } static w(o) { o.#x = 1 } static c(o) { o.#x += 1 } } \
+             console.log(t(() => C.w(new C()))); console.log(t(() => C.c(new C())))",
+            "TypeError: '#x' was defined without a setter\nTypeError: '#x' was defined without a setter\n",
+        ),
+        (
+            "class C { #m() {} get #x() { return 1 } static r(o) { return o.#m } static g(o) { return o.#x } } \
+             console.log(t(() => C.r({}))); console.log(t(() => C.r(1))); console.log(t(() => C.g({})))",
+            "TypeError: Cannot read private member #m from an object whose class did not declare it\n\
+             TypeError: Cannot read private member #m from an object whose class did not declare it\n\
+             TypeError: Cannot read private member #x from an object whose class did not declare it\n",
+        ),
+        (
+            "class C { #m() {} set #x(v) {} static w(o) { let log = []; try { o.#m = log.push('m') } catch (e) { log.push(e.message) } \
+             try { o.#x = log.push('x') } catch (e) { log.push(e.message) } return log.join('|') } } console.log(C.w({}))",
+            "m|Cannot write private member #m to an object whose class did not declare it|\
+             x|Cannot write private member #x to an object whose class did not declare it\n",
+        ),
+        (
+            "class C { #m() {} static call(o) { let log = []; try { o.#m(log.push('arg')) } catch (e) { log.push(e.message) } return log.join('|') } } \
+             console.log(C.call({}))",
+            "Cannot read private member #m from an object whose class did not declare it\n",
+        ),
+        (
+            "class Base { constructor(o) { return o } } class Stamp extends Base { #m() { return 1 } static f(o) { return o.#m() } } \
+             let obj = {}; new Stamp(obj); console.log(Stamp.f(obj), t(() => new Stamp(obj)))",
+            "1 TypeError: Cannot initialize #m twice on the same object\n",
+        ),
+    ]);
+}
+
+/// An uncaught private-method `TypeError` renders like any other.
+#[test]
+fn uncaught_method_type_error() {
+    assert_uncaught(
+        "class C { #m() {} static w(o) { o.#m = 1 } } C.w(new C())",
+        "TypeError: Private method is not writable",
+    );
+}
+
+/// `#x in o`: fields, methods, accessors and statics; no prototype walk and
+/// no getter call; a non-object right-hand side throws.
+#[test]
+fn private_in() {
+    check(&[
+        (
+            "class C { #f = 1; #m() {} get #a() { return 1 } static #s = 1; static #sm() {} \
+             static test(o) { return [#f in o, #m in o, #a in o, #s in o, #sm in o].join() } } \
+             console.log(C.test(new C())); console.log(C.test(C)); console.log(C.test({}))",
+            "true,true,true,false,false\nfalse,false,false,true,true\nfalse,false,false,false,false\n",
+        ),
+        (
+            "class C { #x; static f(o) { return #x in o } } \
+             console.log(t(() => C.f(1))); console.log(t(() => C.f(undefined))); console.log(t(() => C.f('s')))",
+            "TypeError: Cannot use 'in' operator to search for '#x' in 1\n\
+             TypeError: Cannot use 'in' operator to search for '#x' in undefined\n\
+             TypeError: Cannot use 'in' operator to search for '#x' in s\n",
+        ),
+        (
+            "class C { #x; static f(o) { return #x in o } } console.log(C.f(Object.create(new C())), C.f(function () {}))",
+            "false false\n",
+        ),
+        (
+            "let n = 0; class C { get #g() { n++; return 1 } static f(o) { return #g in o } } console.log(C.f(new C()), n)",
+            "true 0\n",
+        ),
+        (
+            "class C { static #m() {} static f(o) { return #m in o } } class D extends C {} console.log(C.f(C), C.f(D))",
+            "true false\n",
+        ),
+        (
+            "class C { #x = 1; static f(o) { if (#x in o) return o.#x; return 'no' } } console.log(C.f(new C()), C.f({}))",
+            "1 no\n",
+        ),
+    ]);
+}
+
+/// Generator, async and async generator private methods (instance and
+/// static), and suspends inside private accessor and method accesses.
+#[test]
+fn generator_and_async_private_methods() {
+    check(&[
+        (
+            "class C { #v = 3; *#g() { yield this.#v; yield this.#v + 1 } run() { return [...this.#g()].join() } } \
+             console.log(new C().run())",
+            "3,4\n",
+        ),
+        (
+            "class C { static *#g() { yield 1; yield 2 } static run() { return [...C.#g()].join() } } console.log(C.run())",
+            "1,2\n",
+        ),
+        (
+            "class C { #m() {} *#g() {} async #a() {} async *#ag() {} \
+             static names(o) { return [o.#m.name, o.#g.name, o.#a.name, o.#ag.name].join() } } console.log(C.names(new C()))",
+            "#m,#g,#a,#ag\n",
+        ),
+        (
+            "class C { #v = 2; async #a() { await null; return this.#v * 5 } run() { return this.#a() } } \
+             new C().run().then((v) => console.log(v))",
+            "10\n",
+        ),
+        (
+            "class C { #k = 1; async *#ag() { yield this.#k; yield await 2 } \
+             async run() { let it = this.#ag(); let a = await it.next(); let b = await it.next(); return a.value + b.value } } \
+             new C().run().then((v) => console.log(v))",
+            "3\n",
+        ),
+        (
+            "class C { static async #a() { return 'sa' } static run() { return C.#a() } } C.run().then((v) => console.log(v))",
+            "sa\n",
+        ),
+        (
+            "class C { #v = 0; get #x() { return this.#v } set #x(v) { this.#v = v } \
+             *g() { this.#x = yield 'a'; this.#x += yield 'b'; return this.#x } } \
+             let it = new C().g(); console.log(it.next().value, it.next(2).value, it.next(5).value)",
+            "a b 7\n",
+        ),
+        (
+            "class C { #m(a) { return a + 1 } *g() { return this.#m(yield 0) } } let it = new C().g(); it.next(); \
+             console.log(it.next(41).value)",
+            "42\n",
+        ),
+        (
+            "class C { get #x() { return 'got' } *g() { return (yield 0).#x } } let c = new C(); let it = c.g(); it.next(); \
+             console.log(it.next(c).value)",
+            "got\n",
+        ),
+    ]);
+}
+
+/// A repeated private name is a spanned compile error, except one getter
+/// plus one setter of the same static-ness.
+#[test]
+fn duplicate_private_names() {
     for src in [
-        "class C { #m() {} }",
-        "class C { get #a() { return 1 } }",
-        "class C { static #m() {} }",
+        "class C { #a; #a() {} }",
+        "class C { #a() {} #a() {} }",
+        "class C { get #a() {} get #a() {} }",
+        "class C { get #a() {} static set #a(v) {} }",
+        "class C { #a() {} set #a(v) {} }",
     ] {
-        let err = jsc_core::run::compile_and_run(src).expect_err("private methods are rejected");
+        let err = jsc_core::run::compile_and_run(src).expect_err("duplicate names are rejected");
         assert!(
-            err.to_string()
-                .contains("private class methods are not supported"),
+            err.to_string().contains("duplicate private name #a"),
             "unexpected error for `{src}`: {err}"
         );
     }
+    check(&[(
+        "class C { static get #a() { return 1 } static set #a(v) {} static f() { return C.#a } } console.log(C.f())",
+        "1\n",
+    )]);
+}
+
+/// Private method bodies and private field initializers capture enclosing
+/// bindings, and their parameter counts widen the call arity.
+#[test]
+fn captures_and_arity() {
+    check(&[
+        (
+            "function f() { let k = 5; class C { #m() { return k } run() { return this.#m() } } return new C().run() } \
+             console.log(f())",
+            "5\n",
+        ),
+        (
+            "function g() { let z = 'z'; class C { #v = () => z; static #s = z + '!'; run() { return this.#v() + C.#s } } \
+             return new C().run() } console.log(g())",
+            "zz!\n",
+        ),
+        (
+            "class C { #m(a, b, c, d, e, f, g) { return [a, g].join() } run() { return this.#m(1) } } console.log(new C().run())",
+            "1,\n",
+        ),
+    ]);
 }
