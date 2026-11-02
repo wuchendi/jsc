@@ -375,6 +375,19 @@ pub enum PropKey {
     HiddenComputed(IrNode),
 }
 
+/// The `TypeError` of an [`IrNode::PrivateThrow`] (DESIGN.md §7.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateError {
+    /// A read of an accessor without a getter: `'#x' was defined without a
+    /// getter`.
+    NoGetter,
+    /// A write of an accessor without a setter: `'#x' was defined without a
+    /// setter`.
+    NoSetter,
+    /// A write of a private method: `Private method is not writable`.
+    MethodNotWritable,
+}
+
 /// What the right-hand side of an `instanceof` is (DESIGN.md §7.6). Any expression
 /// is accepted: the general case is [`InstanceOfKind::Ctor`]
 /// (`InstanceofOperator`). An unshadowed, sealed builtin constructor name is
@@ -691,7 +704,8 @@ impl MapOp {
 /// A `%Date.prototype%` field method ([`IrNode::DateField`]), run by its
 /// builtin and by a guarded call-site fast path on a `TYPE_DATE` block. All
 /// calendar/time fields are **UTC**, derived from the stored milliseconds with
-/// the standard civil-from-days algorithm.
+/// the standard civil-from-days algorithm: the local time zone is UTC
+/// (`LocalTZA = 0`), so each local getter equals its `getUTC*` twin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateOp {
     /// `d.getTime()` — the stored millisecond timestamp, as a number.
@@ -713,6 +727,28 @@ pub enum DateOp {
     GetMinutes,
     /// `d.getSeconds()` — the UTC second of the minute (`0`..`59`).
     GetSeconds,
+    /// `d.getMilliseconds()` — the millisecond of the second (`0`..`999`).
+    GetMilliseconds,
+    /// `d.getTimezoneOffset()` — always `0` (`LocalTZA = 0`).
+    GetTimezoneOffset,
+    /// `d.getUTCFullYear()`.
+    GetUtcFullYear,
+    /// `d.getUTCMonth()`.
+    GetUtcMonth,
+    /// `d.getUTCDate()`.
+    GetUtcDate,
+    /// `d.getUTCDay()`.
+    GetUtcDay,
+    /// `d.getUTCHours()`.
+    GetUtcHours,
+    /// `d.getUTCMinutes()`.
+    GetUtcMinutes,
+    /// `d.getUTCSeconds()`.
+    GetUtcSeconds,
+    /// `d.getUTCMilliseconds()`.
+    GetUtcMilliseconds,
+    /// Annex B `d.getYear()` — the full year minus `1900`.
+    GetYear,
     /// `d.toISOString()` — the ISO 8601 UTC string `YYYY-MM-DDTHH:MM:SS.mmmZ`
     /// (an expanded `±YYYYYY` year outside `0..=9999`), built GUEST-side as a
     /// fresh heap string.
@@ -720,12 +756,32 @@ pub enum DateOp {
     /// `d.toString()` — `Www Mmm DD YYYY HH:MM:SS GMT+0000 (Coordinated
     /// Universal Time)`, built GUEST-side as a fresh heap string.
     ToString,
+    /// `d.toDateString()` — the `Www Mmm DD YYYY` half of `toString()`.
+    ToDateString,
+    /// `d.toTimeString()` — the `HH:MM:SS GMT+0000 (Coordinated Universal
+    /// Time)` half of `toString()`.
+    ToTimeString,
+    /// `d.toUTCString()` (also Annex B `toGMTString`, the same function
+    /// object) — `Www, DD Mmm YYYY HH:MM:SS GMT`.
+    ToUtcString,
+    /// `d.toLocaleString()` — no `Intl`: the `toString()` text.
+    ToLocaleString,
+    /// `d.toLocaleDateString()` — no `Intl`: the `toDateString()` text.
+    ToLocaleDateString,
+    /// `d.toLocaleTimeString()` — no `Intl`: the `toTimeString()` text.
+    ToLocaleTimeString,
 }
 
 impl DateOp {
     /// Every field method, in `%Date.prototype%` order.
-    pub const ALL: [DateOp; 11] = [
+    pub const ALL: [DateOp; 28] = [
         Self::ToString,
+        Self::ToDateString,
+        Self::ToTimeString,
+        Self::ToUtcString,
+        Self::ToLocaleString,
+        Self::ToLocaleDateString,
+        Self::ToLocaleTimeString,
         Self::GetTime,
         Self::ValueOf,
         Self::GetFullYear,
@@ -735,6 +791,17 @@ impl DateOp {
         Self::GetHours,
         Self::GetMinutes,
         Self::GetSeconds,
+        Self::GetMilliseconds,
+        Self::GetTimezoneOffset,
+        Self::GetUtcFullYear,
+        Self::GetUtcMonth,
+        Self::GetUtcDate,
+        Self::GetUtcDay,
+        Self::GetUtcHours,
+        Self::GetUtcMinutes,
+        Self::GetUtcSeconds,
+        Self::GetUtcMilliseconds,
+        Self::GetYear,
         Self::ToIsoString,
     ];
 
@@ -751,9 +818,42 @@ impl DateOp {
             Self::GetHours => "getHours",
             Self::GetMinutes => "getMinutes",
             Self::GetSeconds => "getSeconds",
+            Self::GetMilliseconds => "getMilliseconds",
+            Self::GetTimezoneOffset => "getTimezoneOffset",
+            Self::GetUtcFullYear => "getUTCFullYear",
+            Self::GetUtcMonth => "getUTCMonth",
+            Self::GetUtcDate => "getUTCDate",
+            Self::GetUtcDay => "getUTCDay",
+            Self::GetUtcHours => "getUTCHours",
+            Self::GetUtcMinutes => "getUTCMinutes",
+            Self::GetUtcSeconds => "getUTCSeconds",
+            Self::GetUtcMilliseconds => "getUTCMilliseconds",
+            Self::GetYear => "getYear",
             Self::ToIsoString => "toISOString",
             Self::ToString => "toString",
+            Self::ToDateString => "toDateString",
+            Self::ToTimeString => "toTimeString",
+            Self::ToUtcString => "toUTCString",
+            Self::ToLocaleString => "toLocaleString",
+            Self::ToLocaleDateString => "toLocaleDateString",
+            Self::ToLocaleTimeString => "toLocaleTimeString",
         }
+    }
+
+    /// Whether the op renders a date string (an invalid date's is
+    /// `"Invalid Date"`); `toISOString` throws instead.
+    #[must_use]
+    pub fn is_date_text(self) -> bool {
+        matches!(
+            self,
+            Self::ToString
+                | Self::ToDateString
+                | Self::ToTimeString
+                | Self::ToUtcString
+                | Self::ToLocaleString
+                | Self::ToLocaleDateString
+                | Self::ToLocaleTimeString
+        )
     }
 
     /// The field method named `name`, if any.
@@ -1031,6 +1131,9 @@ pub enum IrNode {
     /// `IsArray` of the value (`Array.isArray`), as a boolean jsval: whether it
     /// is an Array exotic object (a `TYPE_ARRAY` handle), whatever its `proto`.
     IsArray(Box<IrNode>),
+    /// `SetIntegrityLevel(o, frozen)` of the object the sub-expression yields
+    /// (a fresh tagged-template array, which cannot reject), yielding it.
+    Freeze(Box<IrNode>),
     /// `ToObject` of a non-nullish value: a string, number or boolean becomes a
     /// fresh wrapper object (DESIGN.md §5.2); an object is itself.
     ToObject(Box<IrNode>),
@@ -1074,6 +1177,110 @@ pub enum IrNode {
         obj: Box<IrNode>,
         /// The new prototype (an object or `null`).
         proto: Box<IrNode>,
+    },
+    /// A fresh private name (DESIGN.md §7.6): a `TYPE_SYMBOL` block flagged
+    /// [`crate::abi::SYMBOL_FLAG_PRIVATE`] whose description is the static
+    /// string (`"#x"`). Minted once per class evaluation into `%penv`.
+    PrivateName(JsStr),
+    /// Read slot `slot` of a class body's private environment `env` (the
+    /// internal dense array `%penv`, which never grows).
+    PrivEnvLoad {
+        /// The `%penv` array.
+        env: Box<IrNode>,
+        /// The element index.
+        slot: u32,
+    },
+    /// Store `value` into slot `slot` of the private environment `env`;
+    /// yields `undefined`.
+    PrivEnvStore {
+        /// The `%penv` array.
+        env: Box<IrNode>,
+        /// The element index.
+        slot: u32,
+        /// The stored value.
+        value: Box<IrNode>,
+    },
+    /// `PrivateFieldAdd` (`__private_add`): `obj` (an object), then the private
+    /// name `key`, then `value` are evaluated; an own entry keyed `key` already
+    /// present throws `TypeError: Cannot initialize #x twice on the same
+    /// object`, else the entry is added with `attrs` (also to a
+    /// non-extensible object). Yields `undefined`.
+    PrivateAdd {
+        /// The object the entry is added to.
+        obj: Box<IrNode>,
+        /// The private name symbol.
+        key: Box<IrNode>,
+        /// The field value.
+        value: Box<IrNode>,
+        /// The entry's attributes.
+        attrs: u32,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+    },
+    /// `obj.#x` on a field (`__private_get`): the own entry keyed `key`
+    /// (no prototype walk), or `TypeError: Cannot read private member #x from
+    /// an object whose class did not declare it` (a primitive included).
+    PrivateGet {
+        /// The receiver.
+        obj: Box<IrNode>,
+        /// The private name symbol.
+        key: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+    },
+    /// `obj.#x = value` on a field (`__private_set`): `obj`, `key`, `value`
+    /// in order, then the own entry's value is replaced (its attrs ignored), or
+    /// `TypeError: Cannot write private member #x to an object whose class did
+    /// not declare it`. Yields `value`.
+    PrivateSet {
+        /// The receiver.
+        obj: Box<IrNode>,
+        /// The private name symbol.
+        key: Box<IrNode>,
+        /// The stored value.
+        value: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+    },
+    /// The brand check of a private method or accessor access (DESIGN.md
+    /// §7.6, `__private_brand`): `obj`, then `value` (a write's right-hand
+    /// side), then `brand` are evaluated; `obj` must hold `brand` — an own
+    /// entry keyed by it when it is a private symbol (a field or the instance
+    /// brand), else be the object `brand` itself (a static member's class) —
+    /// or `TypeError: Cannot read private member #x from an object whose class
+    /// did not declare it` (`write`: `Cannot write private member #x to ..`).
+    /// Yields `value`, or `obj` when there is none.
+    PrivateBrand {
+        /// The receiver.
+        obj: Box<IrNode>,
+        /// A write's value, evaluated before the check.
+        value: Option<Box<IrNode>>,
+        /// The brand: a private symbol or the class value (`%penv` slot `0`).
+        brand: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
+        /// Whether the access is a write (picks the message).
+        write: bool,
+    },
+    /// Throw the private-member `TypeError` `error` naming `name` (`"#x"`);
+    /// yields `undefined` (never reached).
+    PrivateThrow {
+        /// Which `TypeError`.
+        error: PrivateError,
+        /// The source name (`"#x"`).
+        name: JsStr,
+    },
+    /// `#x in obj` (DESIGN.md §7.6, `__private_in`): a non-object `obj` throws
+    /// `TypeError: Cannot use 'in' operator to search for '#x' in <obj>`; else
+    /// whether `obj` holds `brand` (as [`IrNode::PrivateBrand`] tests it), no
+    /// prototype walk. Yields a boolean.
+    PrivateIn {
+        /// The right-hand side.
+        obj: Box<IrNode>,
+        /// The field symbol, the instance brand or the class value.
+        brand: Box<IrNode>,
+        /// The source name (`"#x"`) the `TypeError` names.
+        name: JsStr,
     },
     /// A `yield expr` expression. Produced by lowering a generator
     /// body; the generator segmentation pass CONSUMES every `Yield`, turning it
@@ -1332,14 +1539,20 @@ pub enum IrNode {
         /// The entries, in definition order.
         entries: Vec<(PropKey, IrNode)>,
     },
-    /// An object rest binding `let {a, ...rest} = obj`. Builds a NEW heap
-    /// object holding every own key of `source` EXCEPT the statically-known
-    /// destructured keys in `exclude`. `source` is evaluated once (a hidden temp
-    /// read); `exclude` is an [`IrNode::Array`] of [`IrNode::Str`] key names. It
-    /// lowers to the `__rest` runtime helper, which defines every own enumerable
-    /// property of the source whose key is not excluded on a fresh object.
-    ObjectRest {
-        /// The source object being spread (a heap object jsval, evaluated once).
+    /// `CopyDataProperties(target, source, exclude)` (ECMA-262 7.3.25): an
+    /// object spread `{...source}` (into the literal under construction, an
+    /// empty `exclude`) or an object rest `let {a, ...rest} = obj` (into a
+    /// fresh ordinary object, `exclude` the statically-known destructured
+    /// keys). Evaluates `target`, `source`, then `exclude` (an
+    /// [`IrNode::Array`] of [`IrNode::Str`] key names), and lowers to the
+    /// `__copy_data` runtime helper, which defines on `target` every own
+    /// enumerable string then symbol property of `source` whose key is not
+    /// excluded (a getter runs; a nullish or primitive non-string source
+    /// copies nothing); yields `target`.
+    CopyDataProperties {
+        /// The object receiving the properties.
+        target: Box<IrNode>,
+        /// The source value being copied.
         source: Box<IrNode>,
         /// The excluded keys — an [`IrNode::Array`] of [`IrNode::Str`] names.
         exclude: Box<IrNode>,
@@ -1396,6 +1609,39 @@ pub enum IrNode {
         /// The property key.
         index: Box<IrNode>,
         /// The jsval stored into the slot; also the expression's result.
+        value: Box<IrNode>,
+    },
+    /// `GetSuperBase` (DESIGN.md §7.6): `home.[[GetPrototypeOf]]()` of a
+    /// method's home object `home` (a class or its `prototype`, always an
+    /// ordinary object) — its `proto` slot, an object or `null`, read at each
+    /// `super` reference.
+    SuperBase(Box<IrNode>),
+    /// A `super[key]` read (DESIGN.md §7.6): `home.[[Get]](key, this)` — the
+    /// lookup starts at the super base `home` (an [`IrNode::SuperBase`]), and
+    /// a getter found there is called with `this`. Evaluates `this`, `key`,
+    /// `home` in that order, then converts the key (`ToPropertyKey`); a
+    /// nullish `home` throws the read `TypeError` first.
+    SuperGet {
+        /// The `this` value (the receiver).
+        this: Box<IrNode>,
+        /// The property key operand.
+        key: Box<IrNode>,
+        /// The super base (the home object's prototype), where the lookup
+        /// starts.
+        home: Box<IrNode>,
+    },
+    /// A `super[key] = value` store, yielding `value`: `home.[[Set]](key,
+    /// value, this)` (`__super_set`, DESIGN.md §6.3). Evaluates `this`, `key`,
+    /// `home`, `value` in that order, then converts the key.
+    SuperSet {
+        /// The `this` value (the receiver).
+        this: Box<IrNode>,
+        /// The property key operand.
+        key: Box<IrNode>,
+        /// The super base (the home object's prototype), where the lookup
+        /// starts.
+        home: Box<IrNode>,
+        /// The stored jsval; also the expression's result.
         value: Box<IrNode>,
     },
     /// Compound element assignment `obj[index] op= rhs` (`+=`/`-=`/`*=`/`/=`/`%=`)
@@ -1760,8 +2006,22 @@ pub enum IrNode {
     /// Evaluate each expression left to right, discarding every value but the
     /// last, which is the node's value. Built by codegen (never empty) for
     /// operands evaluated only for their side effects: surplus `Error(..)`
-    /// arguments, and the nullish-guarded receiver of a `push`/`pop`.
+    /// arguments, the nullish-guarded receiver of a `push`/`pop`, and the
+    /// operand of `void` (followed by `Undefined`).
     Seq(Vec<IrNode>),
+    /// Run `stmts` (stack-neutral statements with no `return`, `break` or
+    /// `continue` escaping them), then evaluate `value`, the node's value.
+    /// Built by codegen for a construct that desugars to statements in
+    /// expression position: a destructuring assignment (DESIGN.md §7.3), a
+    /// `**=` or logical assignment to a member (DESIGN.md §7.2).
+    /// [`Self::any_child`] / [`Self::children_mut`] see every expression of
+    /// the statements (recursively) and then `value`.
+    Block {
+        /// The statements run first.
+        stmts: Vec<IrStmt>,
+        /// The node's value, evaluated after `stmts`.
+        value: Box<IrNode>,
+    },
     /// An `Object.keys/values/entries(arg)` collection built-in call (or the
     /// `for-in` key snapshot). The `arg` value is evaluated once and handed to
     /// `__own_keys` (`__for_in_keys`), which builds a fresh array in own-key
@@ -1911,8 +2171,9 @@ pub enum IrNode {
     /// since the Unix epoch, and yields the handle heap jsval. `arg` is `None`
     /// for the no-argument form (the host clock, the `__now` import); otherwise
     /// it is the single constructor argument: a Date's time value is taken
-    /// directly, anything else goes through `ToNumber` (`new Date("2020")` is
-    /// `NaN`, like `Number`).
+    /// directly, anything else goes through `ToPrimitive`, then a string is
+    /// parsed as by `Date.parse` and any other primitive goes through
+    /// `ToNumber`.
     DateNew {
         /// The constructor argument, or `None` for the host clock.
         arg: Option<Box<IrNode>>,
@@ -2007,10 +2268,22 @@ pub enum IrStmt {
         /// The clauses, in source order.
         cases: Vec<IrCase>,
     },
+    /// A labeled non-loop statement `LABEL: stmt` (a block, `if`, `try`,
+    /// `switch`, expression statement, ...): `body` runs once, and a
+    /// `break LABEL` ([`IrStmt::Break`] carrying `label`) anywhere inside it
+    /// exits to just after it, running any intervening `finally` clauses. An
+    /// unlabeled `break`/`continue` does not target it, and no `continue` may
+    /// (a `continue LABEL` to a non-loop label is rejected during lowering).
+    Labeled {
+        /// The label id a `break LABEL` targeting this statement carries.
+        label: u32,
+        /// The labeled statement, lowered.
+        body: Vec<IrStmt>,
+    },
     /// A `break` statement. `None` targets the nearest enclosing `switch` (or
     /// loop), exiting it; `Some(id)` is a labeled `break LABEL` targeting the
-    /// loop whose [`IrStmt::While::label`] equals `id`, even from inside a nested
-    /// loop.
+    /// loop whose [`IrStmt::While::label`] (or the [`IrStmt::Labeled`] statement
+    /// whose `label`) equals `id`, even from inside a nested loop.
     Break(Option<u32>),
     /// A `continue` statement: skip the rest of a loop body and jump to that
     /// loop's update/next-iteration point. `None` targets the nearest enclosing
@@ -2362,14 +2635,18 @@ impl IrNode {
             | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
-            | IrNode::DateField { .. } => false,
+            | IrNode::DateField { .. }
+            | IrNode::PrivateName(_)
+            | IrNode::PrivateThrow { .. } => false,
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
+            | IrNode::SuperBase(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)
+            | IrNode::Freeze(inner)
             | IrNode::ToObject(inner)
             | IrNode::ToPropertyKey(inner)
             | IrNode::SetFunctionName { func: inner, .. }
@@ -2399,7 +2676,8 @@ impl IrNode {
             | IrNode::SizeRead { obj: inner, .. }
             | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
-            | IrNode::MathSpread { args: inner, .. } => f(inner),
+            | IrNode::MathSpread { args: inner, .. }
+            | IrNode::PrivEnvLoad { env: inner, .. } => f(inner),
             IrNode::InstanceOf { value, kind } => {
                 f(value)
                     || match kind {
@@ -2414,10 +2692,6 @@ impl IrNode {
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }
             | IrNode::GenResume { handle: a, sent: b }
-            | IrNode::ObjectRest {
-                source: a,
-                exclude: b,
-            }
             | IrNode::Index { obj: a, index: b }
             | IrNode::MakeAccessor {
                 getter: a,
@@ -2433,6 +2707,18 @@ impl IrNode {
                 obj, index, rhs, ..
             } => f(obj) || f(index) || f(rhs),
             IrNode::IndexSet { obj, index, value } => f(obj) || f(index) || f(value),
+            IrNode::SuperGet { this, key, home } => f(this) || f(key) || f(home),
+            IrNode::SuperSet {
+                this,
+                key,
+                home,
+                value,
+            } => f(this) || f(key) || f(home) || f(value),
+            IrNode::CopyDataProperties {
+                target,
+                source,
+                exclude,
+            } => f(target) || f(source) || f(exclude),
             IrNode::Ternary {
                 cond,
                 then_branch,
@@ -2467,6 +2753,9 @@ impl IrNode {
             | IrNode::ConsoleLog { args }
             | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter().any(f),
+            IrNode::Block { stmts, value } => {
+                stmts.iter().any(|stmt| stmt.any_node_deep(&mut f)) || f(value)
+            }
             IrNode::CallIndirect {
                 callee: recv, args, ..
             }
@@ -2507,6 +2796,18 @@ impl IrNode {
                     || new_target.as_deref().is_some_and(f)
             }
             IrNode::SetProto { obj, proto } => f(obj) || f(proto),
+            IrNode::PrivEnvStore { env, value, .. } => f(env) || f(value),
+            IrNode::PrivateGet { obj, key, .. } => f(obj) || f(key),
+            IrNode::PrivateBrand {
+                obj, value, brand, ..
+            } => f(obj) || value.as_deref().is_some_and(&mut f) || f(brand),
+            IrNode::PrivateIn { obj, brand, .. } => f(obj) || f(brand),
+            IrNode::PrivateAdd {
+                obj, key, value, ..
+            }
+            | IrNode::PrivateSet {
+                obj, key, value, ..
+            } => f(obj) || f(key) || f(value),
             IrNode::Object { entries, proto, .. } => {
                 proto.as_deref().is_some_and(&mut f) || entries.iter().any(|(key, value)| {
                     matches!(key, PropKey::Computed(key) | PropKey::HiddenComputed(key) if f(key))
@@ -2574,14 +2875,18 @@ impl IrNode {
             | IrNode::ArrayValues
             | IrNode::GlobalGet { .. }
             | IrNode::DateNow
-            | IrNode::DateField { .. } => Vec::new(),
+            | IrNode::DateField { .. }
+            | IrNode::PrivateName(_)
+            | IrNode::PrivateThrow { .. } => Vec::new(),
             IrNode::Assign { value: inner, .. }
             | IrNode::GlobalSet { value: inner, .. }
             | IrNode::CellNew(inner)
             | IrNode::CellGet(inner)
+            | IrNode::SuperBase(inner)
             | IrNode::IsHole(inner)
             | IrNode::IsObject(inner)
             | IrNode::IsArray(inner)
+            | IrNode::Freeze(inner)
             | IrNode::ToObject(inner)
             | IrNode::ToPropertyKey(inner)
             | IrNode::SetFunctionName { func: inner, .. }
@@ -2611,7 +2916,8 @@ impl IrNode {
             | IrNode::SizeRead { obj: inner, .. }
             | IrNode::ProtoMethod { recv: inner, .. }
             | IrNode::ConsoleLogSpread { args: inner }
-            | IrNode::MathSpread { args: inner, .. } => vec![&mut **inner],
+            | IrNode::MathSpread { args: inner, .. }
+            | IrNode::PrivEnvLoad { env: inner, .. } => vec![&mut **inner],
             IrNode::InstanceOf { value, kind } => match kind {
                 InstanceOfKind::Proto(rhs) | InstanceOfKind::Ctor(rhs) => {
                     vec![&mut **value, &mut **rhs]
@@ -2625,10 +2931,6 @@ impl IrNode {
             | IrNode::Logical { lhs: a, rhs: b, .. }
             | IrNode::CellSet { cell: a, value: b }
             | IrNode::GenResume { handle: a, sent: b }
-            | IrNode::ObjectRest {
-                source: a,
-                exclude: b,
-            }
             | IrNode::Index { obj: a, index: b }
             | IrNode::MakeAccessor {
                 getter: a,
@@ -2644,6 +2946,18 @@ impl IrNode {
                 obj, index, rhs, ..
             } => vec![&mut **obj, &mut **index, &mut **rhs],
             IrNode::IndexSet { obj, index, value } => vec![&mut **obj, &mut **index, &mut **value],
+            IrNode::SuperGet { this, key, home } => vec![&mut **this, &mut **key, &mut **home],
+            IrNode::SuperSet {
+                this,
+                key,
+                home,
+                value,
+            } => vec![&mut **this, &mut **key, &mut **home, &mut **value],
+            IrNode::CopyDataProperties {
+                target,
+                source,
+                exclude,
+            } => vec![&mut **target, &mut **source, &mut **exclude],
             IrNode::Ternary {
                 cond,
                 then_branch,
@@ -2681,6 +2995,14 @@ impl IrNode {
             | IrNode::ConsoleLog { args }
             | IrNode::CollectionOp { args, .. }
             | IrNode::MathCall { args, .. } => args.iter_mut().collect(),
+            IrNode::Block { stmts, value } => {
+                let mut out = Vec::new();
+                for stmt in stmts {
+                    stmt.nodes_mut_deep(&mut out);
+                }
+                out.push(&mut **value);
+                out
+            }
             IrNode::CallIndirect {
                 callee: recv, args, ..
             }
@@ -2727,6 +3049,23 @@ impl IrNode {
                 .chain(new_target.as_deref_mut())
                 .collect(),
             IrNode::SetProto { obj, proto } => vec![&mut **obj, &mut **proto],
+            IrNode::PrivEnvStore { env, value, .. } => vec![&mut **env, &mut **value],
+            IrNode::PrivateGet { obj, key, .. } => vec![&mut **obj, &mut **key],
+            IrNode::PrivateBrand {
+                obj, value, brand, ..
+            } => std::iter::once(&mut **obj)
+                .chain(value.as_deref_mut())
+                .chain(std::iter::once(&mut **brand))
+                .collect(),
+            IrNode::PrivateIn { obj, brand, .. } => vec![&mut **obj, &mut **brand],
+            IrNode::PrivateAdd {
+                obj, key, value, ..
+            }
+            | IrNode::PrivateSet {
+                obj, key, value, ..
+            } => {
+                vec![&mut **obj, &mut **key, &mut **value]
+            }
             IrNode::Object { entries, proto, .. } => {
                 let mut out: Vec<&mut IrNode> = proto.as_deref_mut().into_iter().collect();
                 for (key, value) in entries {
@@ -2799,7 +3138,69 @@ impl IrStmt {
                         .iter()
                         .any(|case| case.test.as_ref().is_some_and(&mut f))
             }
-            IrStmt::Break(_) | IrStmt::Continue(_) | IrStmt::Try { .. } => false,
+            IrStmt::Break(_)
+            | IrStmt::Continue(_)
+            | IrStmt::Try { .. }
+            | IrStmt::Labeled { .. } => false,
+        }
+    }
+
+    /// Whether `f` holds for any expression of this statement or of a nested
+    /// statement, at any depth (an [`IrNode::Block`]'s children).
+    fn any_node_deep(&self, f: &mut dyn FnMut(&IrNode) -> bool) -> bool {
+        self.any_node(&mut *f) || self.any_stmt(|inner| inner.any_node_deep(&mut *f))
+    }
+
+    /// Mutable references to every expression of this statement and of its
+    /// nested statements, in [`Self::any_node_deep`] order.
+    fn nodes_mut_deep<'a>(&'a mut self, out: &mut Vec<&'a mut IrNode>) {
+        let nested: Vec<&'a mut Vec<IrStmt>> = match self {
+            IrStmt::Decl { init: node, .. } | IrStmt::Expr(node) => {
+                out.push(node);
+                Vec::new()
+            }
+            IrStmt::Return(value) => {
+                out.extend(value.as_mut());
+                Vec::new()
+            }
+            IrStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                out.push(cond);
+                vec![then_body, else_body]
+            }
+            IrStmt::While {
+                cond, body, update, ..
+            } => {
+                out.push(cond);
+                vec![body, update]
+            }
+            IrStmt::Switch { disc, cases, .. } => {
+                out.push(disc);
+                let mut bodies = Vec::new();
+                for case in cases {
+                    out.extend(case.test.as_mut());
+                    bodies.push(&mut case.body);
+                }
+                bodies
+            }
+            IrStmt::Break(_) | IrStmt::Continue(_) => Vec::new(),
+            IrStmt::Labeled { body, .. } => vec![body],
+            IrStmt::Try {
+                body,
+                catch_body,
+                finally_body,
+            } => std::iter::once(body)
+                .chain(catch_body.as_mut())
+                .chain(finally_body.as_mut())
+                .collect(),
+        };
+        for stmts in nested {
+            for stmt in stmts {
+                stmt.nodes_mut_deep(out);
+            }
         }
     }
 
@@ -2821,6 +3222,7 @@ impl IrStmt {
                 body: a, update: b, ..
             } => a.iter().chain(b).any(f),
             IrStmt::Switch { cases, .. } => cases.iter().flat_map(|case| &case.body).any(f),
+            IrStmt::Labeled { body, .. } => body.iter().any(f),
             IrStmt::Try {
                 body,
                 catch_body,

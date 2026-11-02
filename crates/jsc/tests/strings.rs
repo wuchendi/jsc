@@ -1,6 +1,5 @@
 //! Integration tests: string basics and truthiness via the CLI.
 
-use std::process::Command;
 mod common;
 use common::{jsc, jsc_raw_stdout};
 
@@ -76,22 +75,16 @@ fn string_methods_via_eval() {
     assert_eq!(jsc(&["-p", r#""  hi  ".trim().toUpperCase()"#]), "HI");
 }
 
-/// Tagged templates are unsupported: the CLI exits 2 and the
-/// diagnostic names them.
+/// A tagged template calls its tag with the template object (whose `raw`
+/// holds the literal segments) followed by the substitution values.
 #[test]
-fn tagged_template_is_rejected() {
-    let output = Command::new(env!("CARGO_BIN_EXE_jsc"))
-        .args(["-e", r"tag`hi ${1}`"])
-        .output()
-        .expect("failed to spawn jsc binary");
-    assert!(
-        output.status.code() == Some(2),
-        "a tagged template must make jsc exit 2"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("tagged template"),
-        "stderr should explain the tagged-template rejection, got: {stderr}"
+fn tagged_template_calls_its_tag() {
+    assert_eq!(
+        jsc(&[
+            "-e",
+            "const t = (s, ...v) => s.raw.join('|') + v.join(','); console.log(t`a${1}b${2}c`)",
+        ]),
+        "a|b|c1,2"
     );
 }
 

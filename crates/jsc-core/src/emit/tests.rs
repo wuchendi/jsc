@@ -1135,19 +1135,19 @@ fn compile(src: &str) -> Vec<u8> {
 #[test]
 fn dirty_bits_are_set_only_when_tested() {
     // Intrinsics-sealed with inline namespaces: no guard, so `__set`,
-    // `__define`, `__delete`, `__define_own`, `__set_integrity` and
-    // `__set_proto` never touch the bits.
+    // `__super_set`, `__define`, `__delete`, `__define_own`,
+    // `__set_integrity` and `__set_proto` never touch the bits.
     assert_eq!(
         dirty_bit_sets(&compile("let a = []; a.push(Math.max(1, 2))")),
         0
     );
     // A push guard (not intrinsics-sealed) or a watched-namespace guard (an
-    // escaping `Math`) makes the six helpers set the bits.
+    // escaping `Math`) makes the seven helpers set the bits.
     assert_eq!(
         dirty_bit_sets(&compile("Object.prototype.x = 1; let a = []; a.push(1)")),
-        6
+        7
     );
-    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 6);
+    assert_eq!(dirty_bit_sets(&compile("let m = Math; Math.max(1, 2)")), 7);
     // An unwatched namespace guard compares the member instead.
     assert_eq!(
         dirty_bit_sets(&compile("let o = Object; Object.keys({})")),
@@ -1282,5 +1282,60 @@ fn builtin_bodies_validate() {
         console.log(it.take(1).toArray(), Math.sumPrecise([0.1, 0.2]));
         Promise.all([Promise.resolve(1), 2]).then((v) => console.log(v));
         Promise.any([Promise.reject(1)]).catch((e) => console.log(e.errors));",
+    ));
+}
+
+#[test]
+fn computed_and_numeric_pattern_keys_validate() {
+    // Pattern keys converted into locals, in statement and expression
+    // position, a generator, a rest exclusion list, and numeric class keys.
+    validate(&compile(
+        "let s = Symbol(), k = 'a', v, r;
+        let { [k]: a = 1, 0x10: b, [s]: c, ...rest } = { a: 1 };
+        function f({ [k]: x, 1.5: y } = {}) { return x }
+        f(({ [k]: v, ...r } = { a: 2 }));
+        function* gen() { const { [yield 1]: z } = {}; ({ [yield 2]: v = yield 3 } = {}); return z }
+        for (const { [k]: w } of [{}]) {} try { throw {} } catch ({ [k]: e }) {}
+        class C { 1() {} static 2() {} get 3() { return 0 } set 3(x) {} 0x10 = 1; static 1e21 = 2 }
+        const o = { get a() { return 1 }, ...rest, set a(x) {}, 1.0: 2 };
+        console.log(a, b, c, rest, f({}), gen().next(), new C(), o)",
+    ));
+}
+
+#[test]
+fn expression_position_destructuring_validates() {
+    // A statement block in expression position runs under operands already
+    // pushed (a call argument, a `?:` arm, a `for` update, a generator).
+    validate(&compile(
+        "let a, b, o = {};
+        function f(x, y) { return y }
+        f(1, [a, [b = 2], ...o.r] = [1, [], 3]);
+        true ? ({ a, b: { c: b } = {} } = { a: 1 }) : 0;
+        for (let i = 0; i < 3; i++, [a, b] = [b, a]) {}
+        const g = (x) => [a] = x;
+        function* gen() { const r = [a = yield 1] = []; return f(yield 2, [b] = [r]) }
+        for (a of [1]) {} for ([a, b] in { ab: 1 }) {} for (const { length } in 'x') {}
+        console.log(g([1]), gen().next())",
+    ));
+}
+
+#[test]
+fn super_and_private_helpers_validate() {
+    // The `super` property helpers and the private-name helpers share the
+    // conversion-helper index range; using both checks their indices and
+    // signatures agree.
+    validate(&compile(
+        "class A { get x() { return 1 } set x(v) {} }
+        class B extends A {
+          #p = 1; #m() { return super.x } get #g() { return this.#p } static #s = 2;
+          run(o) {
+            super.x = 2; super.x += this.#p; super['x']++;
+            this.#p = super.x; this.#p ??= 3; this.#p++;
+            [this.#p] = [4];
+            return [this.#m(), this.#g, B.#s, #p in o].join();
+          }
+          static { super.y = B.#s; }
+        }
+        console.log(new B().run({}))",
     ));
 }

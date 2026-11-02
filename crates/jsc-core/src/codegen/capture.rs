@@ -457,11 +457,12 @@ impl CaptureResolver {
                 // The guarded block is its own scope.
                 self.analyze_scoped(&t.block.stmts);
                 if let Some(handler) = &t.handler {
-                    // The catch clause scope binds the (optional) parameter before
-                    // its body, so a nested closure referencing it marks it captured.
+                    // The catch clause scope binds the (optional) parameter — an
+                    // identifier or a destructuring pattern — before its body, so
+                    // a nested closure referencing it marks it captured.
                     self.push_scope();
-                    if let Some(Pat::Ident(ident)) = &handler.param {
-                        self.declare(ident.id.sym.as_ref(), binding_id(ident));
+                    if let Some(param) = &handler.param {
+                        self.declare_pat(param, false);
                     }
                     self.stmts(&handler.body.stmts);
                     self.pop_scope();
@@ -485,9 +486,9 @@ impl CaptureResolver {
 
     /// Analyze a class, mirroring [`LowerCtx::lower_class`]: a class scope
     /// binding the inner `name` (if any), the `extends` expression, then each
-    /// constructor, method, and field initializer as a fresh function frame, so
-    /// a binding referenced there from an enclosing scope (including the inner
-    /// name) is captured.
+    /// constructor, method, field initializer and static block as a fresh
+    /// function frame, so a binding referenced there from an enclosing scope
+    /// (including the inner name) is captured.
     fn class(&mut self, class: &swc_ecma_ast::Class, name: Option<&str>) {
         self.push_scope();
         if let Some(name) = name {
@@ -518,6 +519,12 @@ impl CaptureResolver {
                         m.function.body.as_ref().map(|b| &b.stmts),
                     );
                 }
+                ClassMember::PrivateMethod(m) => {
+                    self.function(
+                        &m.function.params,
+                        m.function.body.as_ref().map(|b| &b.stmts),
+                    );
+                }
                 ClassMember::ClassProp(p) => {
                     if let Some(value) = &p.value {
                         self.enter_function();
@@ -525,6 +532,15 @@ impl CaptureResolver {
                         self.exit_function();
                     }
                 }
+                ClassMember::PrivateProp(p) => {
+                    if let Some(value) = &p.value {
+                        self.enter_function();
+                        self.expr(value);
+                        self.exit_function();
+                    }
+                }
+                // A static block is a lifted zero-parameter method.
+                ClassMember::StaticBlock(b) => self.function(&[], Some(&b.body.stmts)),
                 _ => {}
             }
         }
@@ -634,6 +650,10 @@ impl CaptureResolver {
                     if let MemberProp::Computed(c) = &m.prop {
                         self.expr(&c.expr);
                     }
+                } else if let AssignTarget::Simple(SimpleAssignTarget::SuperProp(sp)) = &a.left
+                    && let swc_ecma_ast::SuperProp::Computed(c) = &sp.prop
+                {
+                    self.expr(&c.expr);
                 } else if let AssignTarget::Pat(pat) = &a.left {
                     // A destructuring assignment (`[o] = ..`, `({o} = ..)`) rebinds
                     // its targets — record every simple-ident target as referenced.
@@ -688,6 +708,12 @@ impl CaptureResolver {
             }
             Expr::Tpl(t) => {
                 for e in &t.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::TaggedTpl(t) => {
+                self.expr(&t.tag);
+                for e in &t.tpl.exprs {
                     self.expr(e);
                 }
             }

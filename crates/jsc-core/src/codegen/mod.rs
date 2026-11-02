@@ -24,9 +24,9 @@ use swc_ecma_ast::{
     ArrayLit, ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget,
     AssignTargetPat, BinaryOp, Callee, Class, ClassDecl, ClassMember, ClassMethod, ClassProp, Decl,
     Expr, ExprOrSpread, ExprStmt, FnDecl, ForHead, Ident, Lit, MemberProp, MethodKind, ObjectLit,
-    ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr, ParamOrTsParamProp, Pat, Program, Prop,
-    PropName, PropOrSpread, SimpleAssignTarget, Stmt, SuperProp, SuperPropExpr, SwitchStmt,
-    UnaryOp, UpdateExpr, UpdateOp, VarDeclKind, VarDeclOrExpr,
+    ObjectPat, ObjectPatProp, OptChainBase, OptChainExpr, ParamOrTsParamProp, Pat, PrivateName,
+    PrivateProp, Program, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, SuperProp,
+    SuperPropExpr, SwitchStmt, UnaryOp, UpdateExpr, UpdateOp, VarDeclKind, VarDeclOrExpr,
 };
 
 use globals::GlobalFacts;
@@ -34,8 +34,8 @@ use globals::GlobalFacts;
 use crate::ir::{
     ArrayHofOp, BinOp, CalleeError, ConvertOp, DateOp, ErrorKind, FnInfo, FnKind, GlobalIntrinsic,
     GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt, IterRecord, JsStr,
-    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PropKey, ProtoKind,
-    SpreadCallee, SpreadElem,
+    LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind, PrivateError, PropKey,
+    ProtoKind, SpreadCallee, SpreadElem,
 };
 
 /// A string literal's value as UTF-16 code units, losslessly: swc keeps a lone
@@ -202,6 +202,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
             .map(|(name, slot)| (name.clone(), slot))
             .collect(),
         module_mutable: analysis.module_mutable,
+        template_cells: Cell::new(0),
         completion: Cell::new(None),
         globals,
         global_decls,
@@ -264,6 +265,11 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         functions.push(lower_function(fn_decl, &shared)?);
     }
 
+    // The tagged-template sites' cells follow the module bindings' cells.
+    let module_cells = u32::try_from(analysis.module_names.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(shared.template_cells.get());
+
     // Lifted arrow functions follow the declarations in the functions vector, so
     // their positions match the funcref table indices handed out at their use
     // sites.
@@ -273,7 +279,7 @@ pub fn lower(program: &Program) -> anyhow::Result<IrProgram> {
         locals,
         stmts,
         functions,
-        module_cells: u32::try_from(analysis.module_names.len()).unwrap_or(u32::MAX),
+        module_cells,
         arity: u32::try_from(max_arity).unwrap_or(u32::MAX),
     })
 }
@@ -316,6 +322,10 @@ struct Shared<'a> {
     module_slots: HashMap<String, u32>,
     /// Mutability of each module binding (see [`CaptureAnalysis::module_mutable`]).
     module_mutable: HashMap<String, bool>,
+    /// The number of tagged-template sites lowered so far: site `n` caches its
+    /// template object in module cell `module_slots.len() + n` (see
+    /// [`LowerCtx::template_object`]).
+    template_cells: Cell<u32>,
     /// The `main` local tracking the completion value (for `-p`) of the
     /// top-level `try` statement being lowered, or `None` outside one. While set,
     /// every expression statement in `main`'s own frame stores its value here
@@ -478,12 +488,13 @@ struct Frame {
     /// Captured binding id → env slot (the inverse of `env`).
     env_index: HashMap<u32, u32>,
     /// Active statement labels enclosing the point being lowered, innermost last:
-    /// each is a `(label name, loop id)` pair, where the loop id is the
-    /// [`IrStmt::While::label`] of the labeled loop. A labeled `break`/`continue`
-    /// resolves its target name to a loop id here. Labels do not cross a function
-    /// boundary, so this is per-frame.
-    labels: Vec<(String, u32)>,
-    /// The next loop-id to hand out for a labeled loop in this frame.
+    /// each is a `(label name, label id, is_loop)` triple, where the label id is
+    /// the [`IrStmt::While::label`] of a labeled loop (`is_loop`) or the
+    /// [`IrStmt::Labeled::label`] of any other labeled statement. A labeled
+    /// `break`/`continue` resolves its target name to a label id here. Labels do
+    /// not cross a function boundary, so this is per-frame.
+    labels: Vec<(String, u32, bool)>,
+    /// The next label id to hand out for a labeled statement in this frame.
     next_label: u32,
     /// Whether this frame is a function scope that binds `this`. `true` for
     /// every lowered function/arrow/method body, `false` for the top-level `main`
@@ -576,21 +587,93 @@ impl Frame {
 }
 
 /// What `super` resolves to inside a class body (DESIGN.md §7.6): the class
-/// frame's hidden by-value bindings of the parent constructor and of its
-/// `prototype` (the home object's prototype for instance members).
+/// frame's hidden bindings of two cells holding the home objects — the class
+/// (static members; also the derived constructor's active function, whose
+/// prototype `super(..)` constructs) and its `prototype` (instance members).
+/// Each `super` reference reads the home object's prototype at that moment.
 #[derive(Clone, Copy)]
 struct SuperScope {
     /// The frame depth holding the hidden bindings.
     frame: usize,
-    /// Hidden id of the parent constructor (`None`: a base class).
-    parent: Option<u32>,
-    /// Hidden id of `parent.prototype`.
-    proto_parent: Option<u32>,
+    /// Hidden id of the cell holding the class.
+    class_cell: u32,
+    /// Hidden id of the cell holding the class's `prototype`.
+    proto_cell: u32,
+    /// Whether the class has an `extends` clause (`super(..)` is valid).
+    derived: bool,
+    /// Whether a member read a home cell (the class then creates and fills
+    /// them).
+    used: bool,
     /// Whether the member being lowered is static (its home object is the
-    /// class, so `super.x` reads the parent constructor).
+    /// class).
     is_static: bool,
     /// Property-table capacity `super(..)` pre-reserves on `this`.
     reserve: u32,
+}
+
+/// One class body's private names (DESIGN.md §7.6): the class frame, the
+/// hidden id of its `%penv` array, and each declared `"#x"` with its slot.
+struct PrivateScope {
+    /// The frame depth holding `%penv`.
+    frame: usize,
+    /// Hidden id of `%penv`.
+    penv: u32,
+    /// The declared names, in declaration order.
+    names: Vec<(JsStr, PrivateKind)>,
+}
+
+/// What a private name denotes.
+#[derive(Clone, Copy)]
+enum PrivateKind {
+    /// A field (instance or static): `%penv[slot]` holds its private symbol.
+    Field(u32),
+    /// A method: `%penv[slot]` holds its closure.
+    Method {
+        /// The closure's slot.
+        slot: u32,
+        /// A static method (brand-checked against the class, slot `0`).
+        is_static: bool,
+    },
+    /// An accessor: two consecutive slots, the getter's then the setter's;
+    /// each is `None` when that half is not declared.
+    Accessor {
+        /// The getter's slot.
+        get: Option<u32>,
+        /// The setter's slot.
+        set: Option<u32>,
+        /// A static accessor (brand-checked against the class, slot `0`).
+        is_static: bool,
+    },
+}
+
+/// A resolved private name reference `#x` (DESIGN.md §7.6), see
+/// [`LowerCtx::private_ref`].
+struct PrivateRef {
+    /// The read of the declaring class body's `%penv`.
+    env: IrNode,
+    /// What the name denotes.
+    kind: PrivateKind,
+    /// The `"#x"` source text.
+    name: JsStr,
+    /// An accessor's fresh temps: the getter call's receiver, the setter
+    /// call's receiver and the written value.
+    temps: Option<[u32; 3]>,
+}
+
+/// An instance field of the class whose constructor is being lowered (see
+/// [`LowerCtx::class_fields`]).
+#[derive(Clone)]
+enum ClassField {
+    /// A public field; a computed name carries the class frame and the hidden
+    /// id of its key, converted once at class definition time.
+    Public(ClassProp, Option<(usize, u32)>),
+    /// A private field: the class frame, the hidden id of `%penv` and the
+    /// slot of its private symbol.
+    Private(PrivateProp, usize, u32, u32),
+    /// The instance brand (DESIGN.md §7.6), added before every field: the
+    /// class frame, the hidden id of `%penv` and the `"#m"` the brand is
+    /// named after.
+    Brand(usize, u32, JsStr),
 }
 
 /// Lowering context: a stack of function frames. Each frame maps
@@ -624,10 +707,12 @@ struct LowerCtx<'a> {
     /// class does not leak its scope to an enclosing one.
     current_super: Option<SuperScope>,
     /// The instance field declarations of the class whose constructor is being
-    /// lowered: a base constructor defines them on entry, a derived one after
-    /// each `super(..)`. A computed field name carries the class frame and the
-    /// hidden id of its key, converted once at class definition time.
-    class_fields: Vec<(ClassProp, Option<(usize, u32)>)>,
+    /// lowered, public and private in source order: a base constructor
+    /// defines them on entry, a derived one after each `super(..)`.
+    class_fields: Vec<ClassField>,
+    /// The private names of the enclosing class bodies, innermost last
+    /// (DESIGN.md §7.6): `#x` resolves to the innermost one declaring it.
+    private_scopes: Vec<PrivateScope>,
     /// While lowering `static` field initializers: the class frame and the
     /// hidden id of the class value, which `this` resolves to there.
     static_init: Option<(usize, u32)>,

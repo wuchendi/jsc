@@ -78,7 +78,7 @@ test262 is the primary metric. `crates/jsc-test262` runs the official suite at a
 - `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module` or `noStrict` (and `raw` tests flagged `async`) are ineligible as well; other `async` tests run with the official `doneprintHandle.js` and pass on `Test262:AsyncTestComplete`.
 - `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records `pass` / `eligible` / `total` per commit from a full run (`--history`).
 
-Current result (last row of `tests/test262/history.tsv`): **23688 pass / 32889 eligible (72.0%)**.
+Current result (last row of `tests/test262/history.tsv`): **28037 pass / 32889 eligible (85.2%)**.
 
 ```bash
 bash scripts/test262-fetch.sh
@@ -129,14 +129,13 @@ Details are in [DESIGN.md](DESIGN.md).
 ## Current limitations
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
-- **Language gaps.** No object spread, private `#` members, or static blocks.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
 - **Not self-contained.** The module imports seven host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
 - **Missing built-ins.** No `RegExp` (regex literals are rejected), `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval` or the `Function` constructor; no ES modules.
 
 ## Roadmap
 
-The built-in library and UTF-16 strings, self-contained WASI modules with GC, the remaining language features (ES modules, `RegExp`, private members, …), performance work, and productization; see [DESIGN.md](DESIGN.md#14-roadmap).
+The built-in library and UTF-16 strings, self-contained WASI modules with GC, the remaining language features (ES modules, `RegExp`, …), performance work, and productization; see [DESIGN.md](DESIGN.md#14-roadmap).
 
 ## License
 

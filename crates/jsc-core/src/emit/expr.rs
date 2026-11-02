@@ -220,6 +220,104 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::End);
             emit_box_bool(function, scratch);
         }
+        IrNode::PrivateName(desc) => emit_private_name(desc, function, scratch, strings, helpers),
+        IrNode::PrivEnvLoad { env, slot } => {
+            emit_node(env, function, scratch, strings, helpers);
+            emit_penv_elems(function);
+            function.instruction(&Instruction::I64Load(penv_slot(*slot)));
+        }
+        IrNode::PrivEnvStore { env, slot, value } => {
+            emit_node(env, function, scratch, strings, helpers);
+            emit_penv_elems(function);
+            emit_node(value, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Store(penv_slot(*slot)));
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+        IrNode::PrivateAdd {
+            obj,
+            key,
+            value,
+            attrs,
+            name,
+        } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            emit_node(key, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32WrapI64);
+            emit_node(value, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(attrs.cast_signed()));
+            function.instruction(&Instruction::I32Const(static_str(strings, name)));
+            function.instruction(&Instruction::Call(helpers.private_add()));
+            emit_propagate_if_pending(function, helpers);
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+        IrNode::PrivateGet { obj, key, name } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            emit_node(key, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32WrapI64);
+            function.instruction(&Instruction::I32Const(static_str(strings, name)));
+            function.instruction(&Instruction::Call(helpers.private_get()));
+            emit_propagate_if_pending(function, helpers);
+        }
+        IrNode::PrivateSet {
+            obj,
+            key,
+            value,
+            name,
+        } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            emit_node(key, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32WrapI64);
+            emit_node(value, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(static_str(strings, name)));
+            function.instruction(&Instruction::Call(helpers.private_set()));
+            emit_propagate_if_pending(function, helpers);
+        }
+        IrNode::PrivateBrand {
+            obj,
+            value,
+            brand,
+            name,
+            write,
+        } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            if let Some(value) = value {
+                emit_node(value, function, scratch, strings, helpers);
+            } else {
+                function.instruction(&Instruction::LocalTee(scratch));
+                function.instruction(&Instruction::LocalGet(scratch));
+            }
+            emit_node(brand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(static_str(strings, name)));
+            function.instruction(&Instruction::I32Const(if *write {
+                PROP_THROW_PRIVATE_WRITE
+            } else {
+                PROP_THROW_PRIVATE_READ
+            }));
+            function.instruction(&Instruction::Call(helpers.private_brand()));
+            emit_propagate_if_pending(function, helpers);
+        }
+        IrNode::PrivateThrow { error, name } => {
+            let (key, mode) = match error {
+                PrivateError::NoGetter => (static_str(strings, name), PROP_THROW_PRIVATE_NO_GETTER),
+                PrivateError::NoSetter => (static_str(strings, name), PROP_THROW_PRIVATE_NO_SETTER),
+                PrivateError::MethodNotWritable => {
+                    (static_key(strings, ""), PROP_THROW_PRIVATE_METHOD_WRITE)
+                }
+            };
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+            function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(key)));
+            function.instruction(&Instruction::I32Const(mode));
+            function.instruction(&Instruction::Call(helpers.prop_throw));
+            emit_propagate_if_pending(function, helpers);
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+        }
+        IrNode::PrivateIn { obj, brand, name } => {
+            emit_node(obj, function, scratch, strings, helpers);
+            emit_node(brand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32Const(static_str(strings, name)));
+            function.instruction(&Instruction::Call(helpers.private_in()));
+            emit_propagate_if_pending(function, helpers);
+        }
         IrNode::SetProto { obj, proto } => {
             emit_node(obj, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32WrapI64);
@@ -230,6 +328,15 @@ pub(super) fn emit_node(
                 memory_index: 0,
             }));
             emit_node(obj, function, scratch, strings, helpers);
+        }
+        IrNode::SuperBase(home) => {
+            emit_node(home, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I32WrapI64);
+            function.instruction(&Instruction::I64Load(MemArg {
+                offset: u64::from(abi::OBJ_PROTO_OFFSET),
+                align: 3,
+                memory_index: 0,
+            }));
         }
         // The value passed to `.next(v)` is the state machine's first wasm
         // parameter (local 0, `sent`).
@@ -342,6 +449,12 @@ pub(super) fn emit_node(
                 emit_node(node, function, scratch, strings, helpers);
             }
         }
+        // The statements are stack-neutral and no jump escapes them, so they
+        // run in place, under any operands already pushed.
+        IrNode::Block { stmts, value } => {
+            emit_stmts(stmts, function, scratch, strings, helpers, None, None);
+            emit_node(value, function, scratch, strings, helpers);
+        }
         IrNode::ArraySpread(parts) => {
             emit_array_spread(parts, function, scratch, strings, helpers);
         }
@@ -403,6 +516,13 @@ pub(super) fn emit_node(
         IrNode::ToObject(operand) => {
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.to_object()));
+        }
+        IrNode::Freeze(operand) => {
+            emit_node(operand, function, scratch, strings, helpers);
+            function.instruction(&Instruction::LocalTee(scratch + 22));
+            function.instruction(&Instruction::I32Const(INTEGRITY_FROZEN));
+            function.instruction(&Instruction::Call(helpers.set_integrity()));
+            function.instruction(&Instruction::LocalGet(scratch + 22));
         }
         IrNode::ToPropertyKey(operand) => {
             emit_node(operand, function, scratch, strings, helpers);
@@ -467,8 +587,12 @@ pub(super) fn emit_node(
                 helpers,
             );
         }
-        IrNode::ObjectRest { source, exclude } => {
-            emit_object_rest_node(source, exclude, function, scratch, strings, helpers);
+        IrNode::CopyDataProperties {
+            target,
+            source,
+            exclude,
+        } => {
+            emit_copy_data_node(target, source, exclude, function, scratch, strings, helpers);
         }
         IrNode::Index { obj, index } => {
             emit_index_node(obj, index, true, function, scratch, strings, helpers);
@@ -505,6 +629,23 @@ pub(super) fn emit_node(
         }
         IrNode::IndexSet { obj, index, value } => {
             emit_index_set_node(obj, index, value, function, scratch, strings, helpers);
+        }
+        IrNode::SuperGet { this, key, home } => {
+            emit_super_get_node(this, key, home, function, scratch, strings, helpers);
+        }
+        IrNode::SuperSet {
+            this,
+            key,
+            home,
+            value,
+        } => {
+            emit_super_set_node(
+                [this, key, home, value],
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
         }
         node @ IrNode::IndexOpSet { .. } => {
             emit_index_op_set_node(node, function, scratch, strings, helpers);
@@ -1764,6 +1905,69 @@ pub(super) fn emit_is_object(function: &mut Function, local: u32) {
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
+}
+
+/// The static string offset of `text` (collected by [`collect_node`]).
+fn static_str(strings: &StrOffsets, text: &JsStr) -> i32 {
+    strings.get_str(text).copied().unwrap_or(HEAP_BASE)
+}
+
+/// Push a fresh private name (DESIGN.md §7.6): the `new_symbol` sequence of
+/// `emit/builtins/symbol.rs` with `SYMBOL_FLAG_PRIVATE` and the static
+/// description `desc` (the fresh block in the i32 scratch `+3`).
+fn emit_private_name(
+    desc: &JsStr,
+    function: &mut Function,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let block = scratch + 3;
+    let header = i32::from(abi::TYPE_SYMBOL) | (i32::from(abi::SYMBOL_FLAG_PRIVATE) << 16);
+    let mem = |offset: u32, align: u32| MemArg {
+        offset: u64::from(offset),
+        align,
+        memory_index: 0,
+    };
+    function.instruction(&Instruction::I32Const(abi::SYMBOL_BLOCK_SIZE.cast_signed()));
+    function.instruction(&Instruction::Call(helpers.alloc));
+    function.instruction(&Instruction::LocalTee(block));
+    function.instruction(&Instruction::I32Const(header));
+    function.instruction(&Instruction::I32Store(mem(0, 2)));
+    function.instruction(&Instruction::LocalGet(block));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Store(mem(4, 2)));
+    function.instruction(&Instruction::LocalGet(block));
+    function.instruction(&Instruction::I64Const(
+        HEAP_BITS | i64::from(static_str(strings, desc)),
+    ));
+    function.instruction(&Instruction::I64Store(mem(
+        abi::SYMBOL_DESCRIPTION_OFFSET,
+        3,
+    )));
+    function.instruction(&Instruction::LocalGet(block));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+}
+
+/// Replace the `%penv` array jsval on the stack with its element store base.
+fn emit_penv_elems(function: &mut Function) {
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(MemArg {
+        offset: u64::from(abi::ARRAY_ELEMS_OFFSET),
+        align: 2,
+        memory_index: 0,
+    }));
+}
+
+/// The `MemArg` of `%penv` element `slot`, from its element store base.
+fn penv_slot(slot: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(abi::ELEMS_DATA_OFFSET + 8 * slot),
+        align: 3,
+        memory_index: 0,
+    }
 }
 
 /// Push nonzero if the jsval in `local` is a constructor: a function value

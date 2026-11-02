@@ -43,6 +43,7 @@ impl<'a> LowerCtx<'a> {
             async_body: false,
             current_super: None,
             class_fields: Vec::new(),
+            private_scopes: Vec::new(),
             static_init: None,
             binding_var: false,
         }
@@ -123,7 +124,7 @@ impl<'a> LowerCtx<'a> {
         frame.loopable = frame.loopable.saturating_sub(1);
     }
 
-    /// Allocate a fresh loop id for a labeled loop in the current frame.
+    /// Allocate a fresh label id for a labeled statement in the current frame.
     pub(super) fn fresh_label(&mut self) -> u32 {
         let frame = self.frame();
         let id = frame.next_label;
@@ -131,31 +132,36 @@ impl<'a> LowerCtx<'a> {
         id
     }
 
-    /// Register `name` as labeling the loop with `id` for the duration of that
-    /// loop's body, then run `f`, then remove the label. A labeled `break`/
-    /// `continue` lowered inside `f` resolves `name` to `id` via [`Self::label_id`].
-    pub(super) fn with_label<T>(
+    /// Register each of `names` as labeling the statement with `id` for the
+    /// duration of that statement, then run `f`, then remove the labels. `is_loop`
+    /// records whether the statement is an iteration statement (a `continue`
+    /// target). A labeled `break`/`continue` lowered inside `f` resolves its name
+    /// to `id` via [`Self::label_id`].
+    pub(super) fn with_labels<T>(
         &mut self,
-        name: &str,
+        names: &[&str],
         id: u32,
+        is_loop: bool,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        self.frame().labels.push((name.to_owned(), id));
+        let labels = &mut self.frame().labels;
+        labels.extend(names.iter().map(|&name| (name.to_owned(), id, is_loop)));
         let result = f(self);
-        self.frame().labels.pop();
+        let labels = &mut self.frame().labels;
+        labels.truncate(labels.len() - names.len());
         result
     }
 
-    /// The loop id a statement label resolves to in the current frame, or `None`
-    /// when no active label has that name.
-    pub(super) fn label_id(&self, name: &str) -> Option<u32> {
+    /// The `(label id, is_loop)` a statement label resolves to in the current
+    /// frame, or `None` when no active label has that name.
+    pub(super) fn label_id(&self, name: &str) -> Option<(u32, bool)> {
         self.frames
             .last()?
             .labels
             .iter()
             .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, id)| *id)
+            .find(|(n, _, _)| n == name)
+            .map(|&(_, id, is_loop)| (id, is_loop))
     }
 
     /// Allocate a fresh anonymous local in the current frame.
@@ -289,6 +295,47 @@ impl<'a> LowerCtx<'a> {
                 .map_or(IrNode::Undefined, |&local| IrNode::Local(local));
         }
         IrNode::EnvLoad(self.route_env(frame, id))
+    }
+
+    /// Resolve the private name `#x` lexically (DESIGN.md §7.6) to a
+    /// [`PrivateRef`]: the `%penv` read, what the name denotes and its `"#x"`
+    /// text (an accessor also gets its receiver and value temps).
+    pub(super) fn private_ref(&mut self, name: &PrivateName) -> anyhow::Result<PrivateRef> {
+        let (frame, penv, kind, text) = self.private_slot(name)?;
+        let env = self.read_hidden(frame, penv);
+        let temps = matches!(kind, PrivateKind::Accessor { .. })
+            .then(|| [self.fresh(), self.fresh(), self.fresh()]);
+        Ok(PrivateRef {
+            env,
+            kind,
+            name: text,
+            temps,
+        })
+    }
+
+    /// The innermost class body declaring `#x`: its frame, the hidden id of
+    /// its `%penv`, what the name denotes and its `"#x"` text. A name no
+    /// enclosing class body declares is a spanned error.
+    pub(super) fn private_slot(
+        &self,
+        name: &PrivateName,
+    ) -> anyhow::Result<(usize, u32, PrivateKind, JsStr)> {
+        let text = JsStr::from(format!("#{}", name.name));
+        let found = self.private_scopes.iter().rev().find_map(|scope| {
+            scope
+                .names
+                .iter()
+                .find(|(declared, _)| *declared == text)
+                .map(|&(_, kind)| (scope.frame, scope.penv, kind))
+        });
+        let Some((frame, penv, kind)) = found else {
+            return Err(CompileError::spanned(
+                name.span,
+                format!("private name {text} is not defined"),
+            )
+            .into());
+        };
+        Ok((frame, penv, kind, text))
     }
 
     /// Whether every frame above `frame` is an arrow (so `this` there is the

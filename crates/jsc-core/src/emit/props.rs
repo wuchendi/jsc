@@ -14,7 +14,7 @@
 //!   function first) and `__define` (`CreateDataProperty` / accessor install,
 //!   growing the table), and `__fn_materialize`;
 //! - the algorithms `__get`, `__set`, `__has`, `__delete`, `__own_keys`,
-//!   `__for_in_keys`, and `__rest`.
+//!   `__for_in_keys`, and `__copy_data`.
 //!
 //! The compile-time half — the initial intern table holding every static
 //! string — is built by [`intern_table`] and laid into the data segment.
@@ -773,7 +773,8 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>) -> Function {
 /// install): overwrite in place when present, else append. Redefining a
 /// non-configurable property throws `Cannot redefine property: k`, and adding
 /// to a `NOT_EXTENSIBLE` object throws `Cannot define property k, object is
-/// not extensible` (both left pending, nothing changed). A missing table
+/// not extensible` (both left pending, nothing changed) unless `key` is a
+/// private name. A missing table
 /// starts at capacity 4; a full one is rebuilt with capacity `max(4, 2 *
 /// live)` (the same capacity when tombstones free half), keeping the live
 /// entries in order (and the table's watch flag and bit), and `o`'s `props`
@@ -794,7 +795,13 @@ pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
         If(BlockType::Empty),
+        // A private name is added to a non-extensible object too (§7.6).
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+        LocalGet(key),
+    );
+    emit_is_private_key(&mut f);
+    wasm!(f;
+        I32Eqz, I32And,
         If(BlockType::Empty),
     );
     throw(&mut f, PROP_THROW_DEFINE_NOT_EXTENSIBLE);
@@ -1042,8 +1049,24 @@ fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers
 /// wrapper;
 /// `null`/`undefined` and a key of `0` (never interned) read `undefined`.
 pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_get_from(strings, helpers, false)
+}
+
+/// `__super_get(home: i64, key: i32, recv: i64) -> i64`: `home.[[Get]](key,
+/// recv)` — [`emit_get`]'s lookup starting at `home` (a `super` reference's
+/// home object prototype), a getter called with `this = recv`.
+pub(super) fn emit_super_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_get_from(strings, helpers, true)
+}
+
+/// The body of [`emit_get`] (`receiver` = `false`: the lookup starts at the
+/// receiver) and [`emit_super_get`] (an extra receiver param).
+fn emit_get_from(strings: &StrOffsets, helpers: Helpers<'_>, receiver: bool) -> Function {
     let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
-    let (recv, key, o, e, t, i, p) = (0, 1, 2, 3, 4, 5, 6);
+    let shift = u32::from(receiver);
+    let (recv, key) = (0, 1);
+    let (o, e, t, i, p) = (2 + shift, 3 + shift, 4 + shift, 5 + shift, 6 + shift);
+    let this = if receiver { 2 } else { recv };
     let base = t;
     let proto_base = |ctor| {
         let bits = intrinsic_bits(realm::prototype_of(ctor), helpers);
@@ -1100,7 +1123,7 @@ pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         );
         emit_is_function(&mut f, p);
         wasm!(f; I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
-        emit_accessor_call(&mut f, p, recv, None, base, helpers);
+        emit_accessor_call(&mut f, p, this, None, base, helpers);
         wasm!(f; Return, End);
     }
     wasm!(f;
@@ -1207,17 +1230,48 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>) -> Function {
 /// dirty bit when the program tracks them (an add does so in `__define`). A
 /// throw leaves the exception pending.
 pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
+    emit_set_from(None, helpers)
+}
+
+/// `__super_set(home: i64, key: i32, v: i64, recv: i64)`: `home.[[Set]](key,
+/// v, recv)` (strict), the store of a `super` reference. The lookup of
+/// [`emit_set`] starts at `home` (the home object's prototype, an object): an
+/// accessor calls its setter with `this = recv` (a getter-only one throws), a
+/// non-writable data property throws. A writable data property or a miss
+/// writes `recv` instead (`OrdinarySetWithOwnDescriptor`): a primitive `recv`
+/// throws; an own table property of `recv` that is an accessor or read-only
+/// throws (as do a `String` wrapper's index and a read-only array `length`),
+/// a writable one takes the value in place; an exotic own key (an array
+/// element or `length`) is updated with `__define_own` of `{value}`, and a
+/// missing key is created with `CreateDataProperty` (a non-extensible `recv`
+/// throws). A throw leaves the exception pending.
+pub(super) fn emit_super_set(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_set_from(Some(strings), helpers)
+}
+
+/// The body of [`emit_set`] (`receiver` = `None`) and [`emit_super_set`]
+/// (an extra receiver param; `Some` carries the static key offsets).
+fn emit_set_from(receiver: Option<&StrOffsets>, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
+    let shift = u32::from(receiver.is_some());
     let (recv, key, v) = (0, 1, 2);
-    let (o, q, e, own, a, s) = (3, 4, 5, 6, 7, 8);
+    let (o, q, e, own, a, s) = (
+        3 + shift,
+        4 + shift,
+        5 + shift,
+        6 + shift,
+        7 + shift,
+        8 + shift,
+    );
+    let this = if receiver.is_some() { 3 } else { recv };
     wasm!(f;
         LocalGet(recv), I32WrapI64, LocalTee(o), LocalSet(q),
-        I32Const(1), LocalSet(own),
+        I32Const(i32::from(receiver.is_none())), LocalSet(own),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
     // A String wrapper's index is a read-only data property.
     emit_if_str_exotic(&mut f, q, key, a, helpers, |f| {
-        emit_prop_throw_return(f, recv, key, PROP_THROW_READ_ONLY, helpers);
+        emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
     });
     wasm!(f;
         LocalGet(q), LocalGet(key), Call(helpers.prop_find), LocalTee(e), BrIf(1),
@@ -1243,40 +1297,121 @@ pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
         );
         emit_is_function(&mut f, s);
         wasm!(f; If(BlockType::Empty));
-        emit_accessor_call(&mut f, s, recv, Some(v), q, helpers);
+        emit_accessor_call(&mut f, s, this, Some(v), q, helpers);
         wasm!(f; Drop, Return, End);
-        emit_prop_throw_return(&mut f, recv, key, PROP_THROW_GETTER_ONLY, helpers);
+        emit_prop_throw_return(&mut f, this, key, PROP_THROW_GETTER_ONLY, helpers);
         wasm!(f; End);
     }
     wasm!(f;
         LocalGet(a), I32Const(ATTR_WRITABLE), I32And, I32Eqz,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(&mut f, recv, key, PROP_THROW_READ_ONLY, helpers);
+    emit_prop_throw_return(&mut f, this, key, PROP_THROW_READ_ONLY, helpers);
+    wasm!(f; End);
+    let Some(strings) = receiver else {
+        wasm!(f;
+            LocalGet(own),
+            If(BlockType::Empty),
+            LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)),
+        );
+        emit_store_dirty(&mut f, o, a, helpers);
+        wasm!(f;
+            Return,
+            End,
+            End,
+            LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+            If(BlockType::Empty),
+        );
+        emit_prop_throw_return(&mut f, recv, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
+        wasm!(f;
+            End,
+            LocalGet(o), LocalGet(key), LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
+            End,
+        );
+        return f;
+    };
+    // A writable data property or a miss: the receiver takes the value.
+    wasm!(f; End);
+    emit_receiver_set(&mut f, [this, key, v], [o, e, a], strings, helpers);
+    wasm!(f; End);
+    f
+}
+
+/// The receiver half of [`emit_super_set`] (`OrdinarySetWithOwnDescriptor`
+/// steps 2.b-e): store the jsval `v` under the interned `key` on the jsval
+/// `this`, with the i32 scratch locals `o`, `e`, `a`.
+fn emit_receiver_set(
+    f: &mut Function,
+    [this, key, v]: [u32; 3],
+    [o, e, a]: [u32; 3],
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    emit_is_object(f, this);
+    wasm!(f; I32Eqz, If(BlockType::Empty));
+    emit_prop_throw_return(f, this, key, PROP_THROW_PRIMITIVE, helpers);
+    wasm!(f; End, LocalGet(this), I32WrapI64, LocalSet(o));
+    emit_if_str_exotic(f, o, key, a, helpers, |f| {
+        emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    });
+    wasm!(f;
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq, I32And,
+        If(BlockType::Empty),
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And,
+        If(BlockType::Empty),
+    );
+    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
     wasm!(f;
         End,
-        LocalGet(own),
+        End,
+        LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e),
         If(BlockType::Empty),
-        LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)),
+        LocalGet(e), I32Load(m32(E_ATTRS)), LocalSet(a),
     );
-    if helpers.dirty_tracking {
-        wasm!(f; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(a));
-        emit_mark_dirty(&mut f, a);
+    if helpers.has_accessors {
+        wasm!(f; LocalGet(a), I32Const(ATTR_ACCESSOR), I32And, If(BlockType::Empty));
+        emit_prop_throw_return(f, this, key, PROP_THROW_GETTER_ONLY, helpers);
+        wasm!(f; End);
     }
+    wasm!(f;
+        LocalGet(a), I32Const(ATTR_WRITABLE), I32And, I32Eqz,
+        If(BlockType::Empty),
+    );
+    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    wasm!(f; End, LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)));
+    emit_store_dirty(f, o, a, helpers);
+    // An exotic own key keeps its attributes; a missing one is created.
     wasm!(f;
         Return,
         End,
-        End,
-        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32And,
+        LocalGet(o), LocalGet(key),
+        I32Const(DESC_HAS_VALUE), I32Const(DESC_DATA_DEFAULT),
+        LocalGet(key), LocalGet(this), Call(helpers.has_own()), Select,
+        LocalGet(v), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
+        Call(helpers.define_own()), LocalSet(a),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
+        LocalGet(a), I32Const(DEFINE_NOT_EXTENSIBLE), I32Eq,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(&mut f, recv, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
+    emit_prop_throw_return(f, this, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
     wasm!(f;
         End,
-        LocalGet(o), LocalGet(key), LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
-        End,
+        LocalGet(a), I32Const(DEFINE_REJECT), I32Eq,
+        If(BlockType::Empty),
     );
-    f
+    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    wasm!(f; End);
+}
+
+/// Set the dirty bit of the own table of the object-family block `o` (i32
+/// local; `table` is an i32 scratch local) after an in-place store, when the
+/// program tracks dirty bits.
+fn emit_store_dirty(function: &mut Function, o: u32, table: u32, helpers: Helpers<'_>) {
+    if helpers.dirty_tracking {
+        wasm!(function; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(table));
+        emit_mark_dirty(function, table);
+    }
 }
 
 /// `__has(key: i32, obj: i64) -> i32`: `HasProperty` of the interned `key`
@@ -2085,7 +2220,7 @@ pub(super) fn emit_array_set_length(strings: &StrOffsets, helpers: Helpers<'_>) 
 /// ([`OWN_ENTRIES`]). Symbol keys are skipped, except that [`OWN_ALL_KEYS`]
 /// appends them after the string keys and [`OWN_SYMBOLS`] lists only them
 /// (both in slot order, the walk skipped when the table lacks
-/// `HAS_SYMBOL_KEYS`). A string lists its indices, a `String` wrapper its
+/// `HAS_SYMBOL_KEYS`; private names are never listed). A string lists its indices, a `String` wrapper its
 /// indices before its table keys; an array its present
 /// (non-hole) store indices, then its table keys (a `SPARSE` array's elements
 /// past the store sort first as integer keys); a primitive has no own keys.
@@ -2147,12 +2282,15 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
             End, End,
         );
     };
-    // Append each included symbol key of the table `p` (`end` set) to out[j..].
+    // Append each included symbol key of the table `p` (`end` set) to out[j..];
+    // a private name is never listed (§7.6).
     let symbol_pass = |f: &mut Function| {
         entry_loop_head(f);
         include(f);
         is_symbol(f);
-        wasm!(f; I32And, If(BlockType::Empty));
+        wasm!(f; LocalGet(k));
+        emit_is_private_key(f);
+        wasm!(f; I32Eqz, I32And, I32And, If(BlockType::Empty));
         emit_elem_addr(f, out, j);
         wasm!(f; LocalGet(k));
         emit_box_heap(f);
@@ -2575,26 +2713,21 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
     f
 }
 
-/// `__rest(src: i64, excl: i64) -> i64`: the object-rest copy
-/// (`CopyDataProperties`) — a fresh object defining each own enumerable
-/// property of `src` (string keys in own-key order, then symbol keys) whose
-/// key is not an element of the `excl` array of property keys. An object
-/// source re-checks each key as own and enumerable when visited (a getter may
-/// delete or hide a later key); a string's indices are always enumerable.
-pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
+/// `__copy_data(dst: i64, src: i64, excl: i64) -> i64`: `CopyDataProperties`
+/// (ECMA-262 7.3.25) — defines (`CreateDataProperty`) on the object `dst`
+/// each own enumerable property of `src` (string keys in own-key order, then
+/// symbol keys) whose key is not an element of the `excl` array of property
+/// keys, reading each value through `[[Get]]` (a getter runs), and returns
+/// `dst`. A primitive or nullish `src` has no own keys except a string's
+/// indices. An object source re-checks each key as own and enumerable when
+/// visited (a getter may delete or hide a later key); a string's indices are
+/// always enumerable.
+pub(super) fn emit_copy_data(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(8, ValType::I32), (1, ValType::I64)]);
-    let (src, excl) = (0, 1);
-    let (dst, ks, n, i, x, j, m, obj) = (2, 3, 4, 5, 6, 7, 8, 9);
-    let k = 10;
-    wasm!(f;
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(dst),
-    );
-    emit_object_prefix(
-        &mut f,
-        dst,
-        TYPE_OBJECT,
-        intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
-    );
+    let (out, src, excl) = (0, 1, 2);
+    let (dst, ks, n, i, x, j, m, obj) = (3, 4, 5, 6, 7, 8, 9, 10);
+    let k = 11;
+    wasm!(f; LocalGet(out), I32WrapI64, LocalSet(dst));
     emit_is_object(&mut f, src);
     wasm!(f;
         LocalSet(obj),
@@ -2629,9 +2762,184 @@ pub(super) fn emit_rest(helpers: Helpers<'_>) -> Function {
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
-        LocalGet(dst),
+        LocalGet(out),
+        End,
+    );
+    f
+}
+
+/// The header word mask and value of a private-name key block (DESIGN.md
+/// §7.6): kind byte `TYPE_SYMBOL` with `SYMBOL_FLAG_PRIVATE` set.
+const PRIVATE_KEY_MASK: i32 = 0xFF | (abi::SYMBOL_FLAG_PRIVATE as i32) << 16;
+/// See [`PRIVATE_KEY_MASK`].
+const PRIVATE_KEY_WORD: i32 = TYPE_SYMBOL | (abi::SYMBOL_FLAG_PRIVATE as i32) << 16;
+
+/// Replace the i32 key block address on the stack with `1` when it is a
+/// private name, else `0`.
+pub(super) fn emit_is_private_key(function: &mut Function) {
+    wasm!(function;
+        I32Load(m32(0)), I32Const(PRIVATE_KEY_MASK), I32And, I32Const(PRIVATE_KEY_WORD), I32Eq,
+    );
+}
+
+/// Set i32 local `e` to the own entry of the jsval in i64 local `o` keyed by
+/// the private name in i32 local `key`, or `0`: a primitive, or an object
+/// without a table (a `LAZY` function holds no private entry, so it is not
+/// materialized), has none.
+fn emit_private_entry(function: &mut Function, o: u32, key: u32, e: u32, helpers: Helpers<'_>) {
+    wasm!(function; I32Const(0), LocalSet(e));
+    emit_is_object(function, o);
+    wasm!(function;
+        If(BlockType::Empty),
+        LocalGet(o), I32WrapI64, I32Load(m32(OBJ_PROPS)),
+        If(BlockType::Empty),
+        LocalGet(o), I32WrapI64, LocalGet(key), Call(helpers.prop_find), LocalSet(e),
+        End,
+        End,
+    );
+}
+
+/// Raise the `__prop_throw` `TypeError` of `mode` naming the static `"#x"`
+/// string in i32 local `name` (the receiver jsval in i64 local `o`).
+fn emit_private_throw(function: &mut Function, o: u32, name: u32, mode: i32, helpers: Helpers<'_>) {
+    wasm!(function; LocalGet(o), LocalGet(name));
+    emit_box_heap(function);
+    wasm!(function; I32Const(mode), Call(helpers.prop_throw));
+}
+
+/// `__private_find(o: i64, key: i32) -> i32`: `1` iff `o` is an object whose
+/// own table holds the private name `key` (no prototype walk).
+pub(super) fn emit_private_find(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, key, e) = (0, 1, 2);
+    emit_private_entry(&mut f, o, key, e, helpers);
+    wasm!(f; LocalGet(e), I32Const(0), I32Ne, End);
+    f
+}
+
+/// `__private_add(o: i64, key: i32, v: i64, attrs: i32, name: i32)`:
+/// `PrivateFieldAdd` of the private name `key` to the object `o` — a present
+/// entry throws `Cannot initialize #x twice on the same object`, else
+/// `__define` appends it (skipping its not-extensible check for a private
+/// key).
+pub(super) fn emit_private_add(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
+    let (o, key, v, attrs, name) = (0, 1, 2, 3, 4);
+    wasm!(f;
+        LocalGet(o), LocalGet(key), Call(helpers.private_find()),
+        If(BlockType::Empty),
+    );
+    emit_private_throw(&mut f, o, name, PROP_THROW_PRIVATE_INIT, helpers);
+    wasm!(f;
+        Return,
+        End,
+        LocalGet(o), I32WrapI64, LocalGet(key), LocalGet(v), LocalGet(attrs), Call(helpers.define),
+        End,
+    );
+    f
+}
+
+/// `__private_get(o: i64, key: i32, name: i32) -> i64`: the value of the
+/// private field `key` of `o`; absent (a primitive included) throws `Cannot
+/// read private member #x from an object whose class did not declare it`.
+pub(super) fn emit_private_get(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, key, name, e) = (0, 1, 2, 3);
+    emit_private_entry(&mut f, o, key, e, helpers);
+    wasm!(f; LocalGet(e), I32Eqz, If(BlockType::Empty));
+    emit_private_throw(&mut f, o, name, PROP_THROW_PRIVATE_READ, helpers);
+    wasm!(f;
+        I64Const(UNDEFINED_BITS), Return,
+        End,
+        LocalGet(e), I64Load(m64(E_VALUE)),
+        End,
+    );
+    f
+}
+
+/// `__private_set(o: i64, key: i32, v: i64, name: i32) -> i64`: replace the
+/// value of the private field `key` of `o` (its attrs ignored) and return
+/// `v`; absent throws `Cannot write private member #x to an object whose
+/// class did not declare it`.
+pub(super) fn emit_private_set(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let (o, key, v, name, e) = (0, 1, 2, 3, 4);
+    emit_private_entry(&mut f, o, key, e, helpers);
+    wasm!(f; LocalGet(e), I32Eqz, If(BlockType::Empty));
+    emit_private_throw(&mut f, o, name, PROP_THROW_PRIVATE_WRITE, helpers);
+    wasm!(f;
+        LocalGet(v), Return,
+        End,
+        LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)),
+        LocalGet(v),
+        End,
+    );
+    f
+}
+
+/// Push `1` when the jsval in i64 local `o` holds the private brand in i64
+/// local `brand` (DESIGN.md §7.6), else `0`: a private symbol (a field or the
+/// instance brand) is an own entry of `o`; any other brand (a static member's
+/// class, or `undefined` before the class value exists) must be `o` itself,
+/// an object.
+fn emit_private_has(function: &mut Function, o: u32, brand: u32, helpers: Helpers<'_>) {
+    emit_is_symbol(function, brand);
+    wasm!(function;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(o), LocalGet(brand), I32WrapI64, Call(helpers.private_find()),
+        Else,
+    );
+    emit_is_object(function, o);
+    wasm!(function;
+        LocalGet(o), LocalGet(brand), I64Eq, I32And,
+        End,
+    );
+}
+
+/// `__private_brand(o: i64, v: i64, brand: i64, name: i32, mode: i32) ->
+/// i64`: the brand check of a private method or accessor access — `o` lacking
+/// `brand` ([`emit_private_has`]) raises the `__prop_throw` `TypeError` of
+/// `mode` (the read or write message) naming the static `"#x"` in `name`.
+/// Returns `v`.
+pub(super) fn emit_private_brand(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
+    let (o, v, brand, name, mode) = (0, 1, 2, 3, 4);
+    emit_private_has(&mut f, o, brand, helpers);
+    wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(o), LocalGet(name));
+    emit_box_heap(&mut f);
+    wasm!(f;
+        LocalGet(mode), Call(helpers.prop_throw),
+        End,
+        LocalGet(v),
+        End,
+    );
+    f
+}
+
+/// `__private_in(o: i64, brand: i64, name: i32) -> i64`: `#x in o` — a
+/// non-object `o` throws `Cannot use 'in' operator to search for '#x' in
+/// <String(o)>` (the `key` built as `"#x' in " + String(o)`); else whether `o`
+/// holds `brand` ([`emit_private_has`]), as a boolean jsval.
+pub(super) fn emit_private_in(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
+    let (o, brand, name) = (0, 1, 2);
+    emit_is_object(&mut f, o);
+    wasm!(f;
+        I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(o),
+        LocalGet(name), I32Const(static_key(strings, PRIVATE_IN_MID)), Call(helpers.concat),
+        LocalGet(o), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        Call(helpers.concat),
     );
     emit_box_heap(&mut f);
-    wasm!(f; End);
+    wasm!(f;
+        I32Const(PROP_THROW_PRIVATE_IN), Call(helpers.prop_throw),
+        I64Const(FALSE_BITS), Return,
+        End,
+        I64Const(TRUE_BITS), I64Const(FALSE_BITS),
+    );
+    emit_private_has(&mut f, o, brand, helpers);
+    wasm!(f; Select, End);
     f
 }

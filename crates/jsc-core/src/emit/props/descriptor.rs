@@ -730,7 +730,8 @@ fn emit_live_entries(
 /// ([`INTEGRITY_NON_EXTENSIBLE`] does only that). A `LAZY` function is
 /// materialized first; a watched table sets its dirty bit. An array is put in
 /// dictionary mode first, so its elements are table entries the level
-/// reaches, and a frozen array's `length` becomes read-only.
+/// reaches, and a frozen array's `length` becomes read-only. Private entries
+/// are left untouched.
 pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(6, ValType::I32)]);
     let (obj, level) = (0, 1);
@@ -749,8 +750,13 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>) -> Function {
         If(BlockType::Empty),
     );
     emit_live_entries(&mut f, p, e, end, |f| {
-        // attrs &= !C; a frozen data property also loses W.
+        // attrs &= !C; a frozen data property also loses W. A private entry
+        // is left untouched (§7.6).
+        wasm!(f; LocalGet(e), I32Load(m32(E_KEY)));
+        emit_is_private_key(f);
         wasm!(f;
+            I32Eqz,
+            If(BlockType::Empty),
             LocalGet(e),
             LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(!ATTR_CONFIGURABLE), I32And, LocalTee(a),
             I32Const(!ATTR_WRITABLE), I32And,
@@ -759,6 +765,7 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>) -> Function {
             LocalGet(a), I32Const(ATTR_ACCESSOR), I32And, I32Eqz, I32And,
             Select,
             I32Store(m32(E_ATTRS)),
+            End,
         );
     });
     wasm!(f; End);
@@ -782,7 +789,7 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>) -> Function {
 /// `TestIntegrityLevel` — the object is not extensible and every own property
 /// is non-configurable (and, [`INTEGRITY_FROZEN`], every own data property
 /// non-writable, an array's `length` included). A `String` wrapper's virtual
-/// indices are always frozen.
+/// indices are always frozen. Private entries are ignored.
 pub(in crate::emit) fn emit_test_integrity() -> Function {
     let mut f = Function::new(vec![(5, ValType::I32)]);
     let (obj, level) = (0, 1);
@@ -800,11 +807,19 @@ pub(in crate::emit) fn emit_test_integrity() -> Function {
         If(BlockType::Empty),
     );
     emit_live_entries(&mut f, p, e, end, |f| {
+        // A private entry is ignored (§7.6). Every operand of the final
+        // `I32And` is a 0/1 boolean, so the `C` bit is normalized first.
         wasm!(f;
             LocalGet(e), I32Load(m32(E_ATTRS)), LocalTee(a), I32Const(ATTR_CONFIGURABLE), I32And,
+            I32Const(0), I32Ne,
             LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq,
             LocalGet(a), I32Const(ATTR_ACCESSOR | ATTR_WRITABLE), I32And, I32Const(ATTR_WRITABLE), I32Eq,
             I32And, I32Or,
+            LocalGet(e), I32Load(m32(E_KEY)),
+        );
+        emit_is_private_key(f);
+        wasm!(f;
+            I32Eqz, I32And,
             If(BlockType::Empty), I32Const(0), Return, End,
         );
     });
