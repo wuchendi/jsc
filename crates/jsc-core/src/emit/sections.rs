@@ -56,13 +56,12 @@ pub(super) fn build_type_and_function_sections<'a>(
     let helpers = Helpers {
         unwind,
         // The `env` imports follow the four WASI imports (0..=3): `__convert`
-        // 4, `__method` 5, `__promise` 6, `__then` 7, `__now` 8, `__parse_int` 9.
+        // 4, `__method` 5, `__promise` 6, `__then` 7, `__now` 8; `__parse_int` is 9.
         convert: 4,
         method: 5,
         promise: 6,
         then: 7,
         now: 8,
-        parse_int: 9,
         alloc: index(),
         concat: index(),
         str_eq: index(),
@@ -131,6 +130,14 @@ pub(super) fn build_type_and_function_sections<'a>(
         prop_throw: index(),
         box_f64: index(),
         to_number: index(),
+        // The number parsers (`strtod`), in emission order.
+        strtod: {
+            let first = index();
+            for _ in 0..13 {
+                index();
+            }
+            first
+        },
         // The `__invoke1` callback trampoline is appended after every helper
         // above; the `__async_step` trampoline follows it, then the two
         // `new Promise` settler functions.
@@ -424,6 +431,21 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         // `__box_f64(x) -> i64` and `__to_number(v) -> i64`.
         (&[F64], &[I64]),
         (&[I64], &[I64]),
+        // The number parsers, in `strtod`'s emission order.
+        (&[I32, I32], &[I32]),           // __num_unit(data, i)
+        (&[I32], &[I32]),                // __str_ws(c)
+        (&[I32, I32, I32], &[F64]),      // __dec_parse(data, start, end)
+        (&[], &[I64]),                   // __dec_slow()
+        (&[], &[I64]),                   // __dec_round()
+        (&[I32], &[]),                   // __dec_left(shift)
+        (&[I32], &[]),                   // __dec_right(shift)
+        (&[I32, I32, I32, I32], &[I32]), // __digit_span(data, start, end, radix)
+        (&[I32, I32, I32, I32], &[F64]), // __radix_pow2(data, start, end, bits)
+        (&[I32, I32, I32, I32], &[F64]), // __radix_fold(data, start, end, radix)
+        (&[I32], &[F64]),                // __string_to_number(s)
+        (&[I64], &[I64]),                // __to_number_prim(v)
+        (&[I64], &[I64]),                // __parse_float(v)
+        (&[I64, I32], &[I64]),           // __parse_int(v, radix)
         // The `__invoke1(fn, arg)` and `__async_step(gen, sent)` trampolines.
         (&[I64, I64], &[I64]),
         (&[I64, I64], &[I64]),
@@ -563,6 +585,11 @@ pub(super) fn emit_data_section(
     oom.extend_from_slice(&u32::try_from(line.len()).unwrap_or(0).to_le_bytes());
     oom.extend_from_slice(line);
     data.active(0, &ConstExpr::i32_const(abi::OOM_IOVEC.cast_signed()), oom);
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::DEC_POW10.cast_signed()),
+        strtod::tables(),
+    );
     for (text, offset) in segments {
         data.active(0, &ConstExpr::i32_const(offset), str_block(text));
     }
