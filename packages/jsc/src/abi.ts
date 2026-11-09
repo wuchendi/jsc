@@ -159,7 +159,7 @@ export const FUNC_FLAG_SELF_ALLOC = 32
 /** {@link TYPE_FUNCTION} `flags` bit: a bound function (own `length`/`name`, `env` = `[target, boundThis, ...args]`). */
 export const FUNC_FLAG_BOUND = 64
 /** Address of the `u32` base of the `__fn_info` table (`[name key:u32][length:u32]` per function). */
-export const FN_INFO_ADDR = 4
+export const FN_INFO_ADDR = 1048580
 /** Byte size of one `__fn_info` entry. */
 export const FN_INFO_ENTRY_SIZE = 8
 /** Byte offset (within a `__fn_info` entry) of the interned `name` key (`u32`). */
@@ -191,13 +191,6 @@ export const INVOKE_EXPORT_NAME = '__invoke1'
 /** Export name of the `__async_step(gen, sent)` async-body step trampoline. */
 export const ASYNC_STEP_EXPORT_NAME = '__async_step'
 
-/** `__convert` op: stringify the argument (`String(x)`). */
-export const CONVERT_OP_TO_STRING = 0
-/** `__convert` op: coerce the argument to a number (`Number(x)`). */
-export const CONVERT_OP_TO_NUMBER = 1
-/** `__convert` op: parse a leading float (`parseFloat(x)`). */
-export const CONVERT_OP_PARSE_FLOAT = 3
-
 /** `__method` op: array `indexOf`. */
 export const METHOD_OP_INDEX_OF = 0
 /** `__method` op: array `includes`. */
@@ -206,20 +199,12 @@ export const METHOD_OP_INCLUDES = 1
 export const METHOD_OP_TO_UPPER = 4
 /** `__method` op: `toLowerCase`. */
 export const METHOD_OP_TO_LOWER = 5
-/** `__method` op: `Number.prototype.toString(radix)` (number receiver). */
-export const METHOD_OP_NUMBER_TO_STRING = 17
 /** `__method` op: `String.prototype.localeCompare` (string, code-unit order). */
 export const METHOD_OP_LOCALE_COMPARE = 22
 /** `__method` op: `String.prototype.normalize` (string). */
 export const METHOD_OP_NORMALIZE = 23
 /** `__method` result: an out-of-range argument (unknown `normalize` form). */
 export const METHOD_RANGE_ERROR = 0x7ffb_0000_0000_0002n
-/** `__method` op: `Number.prototype.toFixed(f)` (finite number receiver). */
-export const METHOD_OP_NUMBER_TO_FIXED = 40
-/** `__method` op: `Number.prototype.toExponential(f)` (finite number receiver). */
-export const METHOD_OP_NUMBER_TO_EXPONENTIAL = 41
-/** `__method` op: `Number.prototype.toPrecision(p)` (finite number receiver). */
-export const METHOD_OP_NUMBER_TO_PRECISION = 42
 /** `__method` op: a host `Math` function (`arg1` the raw `MATH_FN_*` code). */
 export const METHOD_OP_MATH = 43
 
@@ -263,8 +248,6 @@ export const MATH_FN_ASINH = 17
 export const MATH_FN_ACOSH = 18
 /** `METHOD_OP_MATH` function code: `Math.atanh`. */
 export const MATH_FN_ATANH = 19
-/** `METHOD_OP_MATH` function code: `Math.random`. */
-export const MATH_FN_RANDOM = 20
 
 /** `__promise` op: `Promise.resolve(a)`. */
 export const PROMISE_OP_RESOLVE = 0

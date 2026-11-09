@@ -7,7 +7,7 @@ use super::*;
 /// slot (at [`abi::OBJ_PROPS_OFFSET`], no own properties), then the `proto`
 /// slot (at [`OBJ_PROTO_OFFSET`]) gets the jsval `proto` (`null` or an
 /// intrinsic). Stack neutral.
-pub(super) fn emit_object_prefix(function: &mut Function, base: u32, type_byte: i32, proto: i64) {
+pub(super) fn emit_object_prefix(function: &mut impl Sink, base: u32, type_byte: i32, proto: i64) {
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64Const(i64::from(type_byte)));
     function.instruction(&Instruction::I64Store(MemArg {
@@ -32,14 +32,14 @@ pub(super) fn emit_object_prefix(function: &mut Function, base: u32, type_byte: 
 /// propagates its tag payload), and a raw reinterpret would leak those bits as a
 /// different value. Integer conversions (`f64.convert_i32_u`, ...) can never be
 /// NaN and reinterpret directly.
-pub(super) fn emit_box_f64(function: &mut Function, helpers: Helpers<'_>) {
+pub(super) fn emit_box_f64(function: &mut impl Sink, helpers: Helpers<'_>) {
     function.instruction(&Instruction::Call(helpers.box_f64));
 }
 
 /// Emit the `__box_f64(x: f64) -> i64` helper backing [`emit_box_f64`]:
 /// `x == x ? reinterpret(x) : QNAN`.
-pub(super) fn emit_box_f64_helper() -> Function {
-    let mut function = Function::new(vec![]);
+pub(super) fn emit_box_f64_helper(leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[RAW_F64], &[]);
     function.instruction(&Instruction::LocalGet(0));
     function.instruction(&Instruction::I64ReinterpretF64);
     function.instruction(&Instruction::I64Const(QNAN_BITS));
@@ -48,7 +48,7 @@ pub(super) fn emit_box_f64_helper() -> Function {
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Replace the jsval in `local` with its JS `ToNumber` (a number jsval). A number
@@ -56,7 +56,7 @@ pub(super) fn emit_box_f64_helper() -> Function {
 /// the shared `__to_number` helper, whose `valueOf`/`toString` call may throw
 /// (propagated here). Every numeric operator coerces its stashed operands with
 /// this before unboxing them.
-pub(super) fn emit_coerce_number(function: &mut Function, local: u32, helpers: Helpers<'_>) {
+pub(super) fn emit_coerce_number(function: &mut impl Sink, local: u32, helpers: Helpers<'_>) {
     emit_is_number(function, local);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
@@ -70,12 +70,17 @@ pub(super) fn emit_coerce_number(function: &mut Function, local: u32, helpers: H
 }
 
 /// Emit the `__to_number(v: i64) -> i64` helper backing [`emit_coerce_number`]
-/// and `Number(x)`: `ToPrimitive` (hint number, in the guest) then the host
-/// `__convert` to-number op on the primitive (`StringToNumber` rules); a
+/// and `Number(x)`: `ToPrimitive` (hint number, in the guest) then
+/// `__to_number_prim` on the primitive (`StringToNumber` rules); a
 /// symbol throws the `TypeError`. A throw from a user `valueOf`/`toString`
 /// stays pending and yields `NaN`.
-pub(super) fn emit_to_number_helper(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(type_error_helper_locals());
+pub(super) fn emit_to_number_helper(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_JS], &[]);
+    declare_error_scratch(&mut function);
     let (v, scratch) = (0, 1);
     helpers.unwind.borrow_mut().reset();
     emit_is_object(&mut function, v);
@@ -100,10 +105,9 @@ pub(super) fn emit_to_number_helper(strings: &StrOffsets, helpers: Helpers<'_>) 
         helpers,
     );
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Push `1` if the jsval in `local` is a number, else `0`. Every boxed
@@ -112,7 +116,7 @@ pub(super) fn emit_to_number_helper(strings: &StrOffsets, helpers: Helpers<'_>) 
 /// greater than `QNAN | 0x0000_FFFF_FFFF_FFFF`. A number is every value at or
 /// below that bound: ordinary `f64`s and the canonical NaN (the only NaN a
 /// number jsval can hold — see [`emit_box_f64`]).
-pub(super) fn emit_is_number(function: &mut Function, local: u32) {
+pub(super) fn emit_is_number(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I64Const(QNAN_BITS | 0x0000_FFFF_FFFF_FFFF));
     function.instruction(&Instruction::I64LeS);
@@ -123,7 +127,7 @@ pub(super) fn emit_is_number(function: &mut Function, local: u32) {
 /// is a pair of exact `i64` compares — no pointer/type-byte read. Used by loose
 /// equality (`==`), where `null` and `undefined` are mutually equal and unequal
 /// to everything else.
-pub(super) fn emit_is_nullish(function: &mut Function, local: u32) {
+pub(super) fn emit_is_nullish(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I64Const(NULL_BITS));
     function.instruction(&Instruction::I64Eq);
@@ -139,7 +143,7 @@ pub(super) fn emit_is_nullish(function: &mut Function, local: u32) {
 /// `0b101`, so a tag-only test would misread it as a pointer and read memory at a
 /// bogus offset. Callers rely on this to gate `__str_eq` / `__str_cmp` and the
 /// string-length load behind an `if`.
-pub(super) fn emit_is_pointer(function: &mut Function, local: u32) {
+pub(super) fn emit_is_pointer(function: &mut impl Sink, local: u32) {
     // is_boxed = (bits & QNAN) == QNAN
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I64Const(QNAN_BITS));
@@ -155,7 +159,7 @@ pub(super) fn emit_is_pointer(function: &mut Function, local: u32) {
 /// points at. The value MUST be a heap pointer — the caller is responsible
 /// for gating this behind an [`emit_is_pointer`] check (a non-pointer's low bits
 /// are not a valid heap offset). Leaves the type byte as an `i32` on the stack.
-pub(super) fn emit_load_type_byte(function: &mut Function, local: u32) {
+pub(super) fn emit_load_type_byte(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load8U(MemArg {
@@ -171,7 +175,7 @@ pub(super) fn emit_load_type_byte(function: &mut Function, local: u32) {
 /// gated behind an `if` on [`emit_is_pointer`] so it never runs for a non-pointer
 /// (whose wrapped low bits would be a bogus offset). Replaces the pre-refactor
 /// tag-only string test used by `+`, the relational operators, and `===`.
-pub(super) fn emit_is_string(function: &mut Function, local: u32) {
+pub(super) fn emit_is_string(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -184,7 +188,7 @@ pub(super) fn emit_is_string(function: &mut Function, local: u32) {
 
 /// Push `1` if the jsval in `local` is a symbol (a [`TYPE_SYMBOL`] heap
 /// block), else `0`. Same shape as [`emit_is_string`].
-pub(super) fn emit_is_symbol(function: &mut Function, local: u32) {
+pub(super) fn emit_is_symbol(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -201,7 +205,7 @@ pub(super) fn emit_is_symbol(function: &mut Function, local: u32) {
 /// [`emit_is_pointer`] so it never runs for a non-pointer. Used by `JSON.stringify`
 /// to omit function values (as object values) or render them as `null` (as array
 /// elements / at the top level).
-pub(super) fn emit_is_function(function: &mut Function, local: u32) {
+pub(super) fn emit_is_function(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -217,7 +221,7 @@ pub(super) fn emit_is_function(function: &mut Function, local: u32) {
 /// [`emit_is_function`], guarding the type-byte read behind
 /// [`emit_is_pointer`]. Used by `gen.next(v)` to reject a non-generator
 /// receiver with a `TypeError`, and by `for-of` / spread to step a generator.
-pub(super) fn emit_is_generator(function: &mut Function, local: u32) {
+pub(super) fn emit_is_generator(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -236,7 +240,7 @@ pub(super) fn emit_is_generator(function: &mut Function, local: u32) {
 
 /// Push the [`abi::GEN_ASYNC`] bit of the generator handle in `local`
 /// (nonzero for an async generator).
-pub(super) fn emit_generator_async_bit(function: &mut Function, local: u32) {
+pub(super) fn emit_generator_async_bit(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {

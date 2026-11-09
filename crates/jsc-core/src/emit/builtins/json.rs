@@ -70,13 +70,13 @@ const ARR_LEN: MemArg = MemArg {
 };
 
 /// Box the i32 heap base on the stack as a jsval.
-fn box_heap(function: &mut Function) {
+fn box_heap(function: &mut FnBuilder<'_>) {
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
 }
 
 /// Push `1` when the jsval in `local` is a wrapper object (`TYPE_OBJECT`
 /// class `BOOLEAN`, `NUMBER` or `STRING`).
-fn is_any_wrapper(function: &mut Function, local: u32) {
+fn is_any_wrapper(function: &mut FnBuilder<'_>, local: u32) {
     emit_is_pointer(function, local);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),
@@ -91,7 +91,7 @@ fn is_any_wrapper(function: &mut Function, local: u32) {
 }
 
 /// Replace a wrapper object in i64 `local` by its `[[PrimitiveValue]]`.
-fn unwrap_primitive(function: &mut Function, local: u32) {
+fn unwrap_primitive(function: &mut FnBuilder<'_>, local: u32) {
     is_any_wrapper(function, local);
     wasm!(function;
         If(BlockType::Empty),
@@ -106,7 +106,13 @@ fn unwrap_primitive(function: &mut Function, local: u32) {
 /// as `Get` reads it: an element at or past the current length or a hole
 /// reads through the prototype chain (`undefined` when absent; a throwing
 /// getter returns).
-fn elem_or_undefined(function: &mut Function, arr: u32, i: u32, out: u32, helpers: Helpers<'_>) {
+fn elem_or_undefined(
+    function: &mut FnBuilder<'_>,
+    arr: u32,
+    i: u32,
+    out: u32,
+    helpers: Helpers<'_>,
+) {
     wasm!(function;
         LocalGet(i), LocalGet(arr), I32Load(ARR_LEN), I32LtU,
         If(BlockType::Result(ValType::I64)),
@@ -124,7 +130,13 @@ fn elem_or_undefined(function: &mut Function, arr: u32, i: u32, out: u32, helper
 
 /// Call the function in i64 local `target` with `this` = i64 local `this`
 /// and the arguments `args` (i64 locals), leaving its result.
-fn call_with(function: &mut Function, target: u32, this: u32, args: &[u32], helpers: Helpers<'_>) {
+fn call_with(
+    function: &mut FnBuilder<'_>,
+    target: u32,
+    this: u32,
+    args: &[u32],
+    helpers: Helpers<'_>,
+) {
     for slot in 0..helpers.max_args as usize {
         if let Some(&arg) = args.get(slot) {
             wasm!(function; LocalGet(arg));
@@ -144,15 +156,15 @@ fn call_with(function: &mut Function, target: u32, this: u32, args: &[u32], help
 
 /// `JSON.stringify(value, replacer, space)`.
 pub(super) fn emit_stringify(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, rep, list, s) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (space, elem) = (frame.x64(0), frame.x64(1));
-    let (arr, n, i, gap) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let (j, m) = (frame.x32(0), frame.x32(1));
+    let (arr, gap, stack) = (frame.base(0), frame.base(3), frame.base(10));
+    let (n, i, j, m) = (frame.i32(1), frame.i32(2), frame.x32(0), frame.x32(1));
     for (slot, local) in (0..).zip([value, rep, space]) {
         frame.arg(function, slot);
         wasm!(function; LocalSet(local));
@@ -228,7 +240,11 @@ pub(super) fn emit_stringify(
         arg: Box::new(IrNode::Local(value)),
     };
     emit_node(&node, function, frame.scratch(), strings, helpers);
-    wasm!(function; LocalSet(s), Else);
+    wasm!(function;
+        LocalSet(s), Else,
+        // First: the operands pushed below are not read after this call.
+        I32Const(0), Call(helpers.new_array()), LocalSet(stack),
+    );
     emit_node(
         &root_holder(value),
         function,
@@ -239,7 +255,7 @@ pub(super) fn emit_stringify(
     push_str(function, strings, "");
     wasm!(function;
         LocalGet(value), LocalGet(rep), LocalGet(list),
-        I32Const(0), Call(helpers.new_array()), Call(helpers.json_rep()), LocalSet(s),
+        LocalGet(stack), Call(helpers.json_rep()), LocalSet(s),
     );
     return_if_pending(function);
     wasm!(function;
@@ -255,7 +271,13 @@ pub(super) fn emit_stringify(
 /// The gap of `space` (i64 local) into i32 local `gap` (`0` for none): a
 /// Number / String wrapper is converted first; a number is that many spaces
 /// (at most 10), a string its first 10 code units.
-fn emit_gap(function: &mut Function, frame: Frame, space: u32, gap: u32, helpers: Helpers<'_>) {
+fn emit_gap(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    space: u32,
+    gap: u32,
+    helpers: Helpers<'_>,
+) {
     let (len, i, count, w) = (frame.x32(0), frame.x32(1), frame.i32(0), frame.i32(1));
     let width = frame.f64(0);
     emit_is_wrapper(function, space, abi::CLASS_NUMBER);
@@ -313,7 +335,7 @@ fn emit_gap(function: &mut Function, frame: Frame, space: u32, gap: u32, helpers
 
 /// `JSON.parse(text, reviver)`.
 pub(super) fn emit_parse(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -357,20 +379,29 @@ pub(super) fn emit_parse(
 /// arrays and objects being serialized: meeting one again throws a
 /// `TypeError`. A throw returns with it pending.
 #[allow(clippy::too_many_lines)]
-pub(in crate::emit) fn emit_json_rep(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let (holder, key, value, rep, list, stack) = (0, 1, 2, 3, 4, 5);
-    let (ptr, n, i, first, acc, keys, j, m) = (6, 7, 8, 9, 10, 11, 12, 13);
-    let (elem, s, k, to_json) = (14, 15, 16, 17);
+pub(in crate::emit) fn emit_json_rep(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    use LocalClass::{Base, Jsval, Raw};
+    let int = Raw(ValType::I32);
+    let mut f = FnBuilder::new(leaves);
+    let [holder, key, value, rep, list] = [(); 5].map(|()| f.param(Jsval));
+    let stack = f.param(Base);
+    let ptr = f.local(Base);
+    let [n, i, first] = [(); 3].map(|()| f.local(int));
+    let [acc, keys] = [(); 2].map(|()| f.local(Base));
+    let [j, m] = [(); 2].map(|()| f.local(int));
+    let [elem, s, k, to_json] = [(); 4].map(|()| f.local(Jsval));
     let scratch = 18;
-    let mut locals = vec![(8, ValType::I32), (4, ValType::I64)];
-    locals.extend(type_error_helper_locals());
-    let mut f = Function::new(locals);
+    declare_error_scratch(&mut f);
     helpers.unwind.borrow_mut().reset();
     let tok = |text: &str| static_key(strings, text);
-    let concat = |f: &mut Function| wasm!(f; Call(helpers.concat), LocalSet(acc));
+    let concat = |f: &mut FnBuilder<'_>| wasm!(f; Call(helpers.concat), LocalSet(acc));
     // The recursive serialization of `elem` (property `k` of `value`) into
     // `s`, returning when it throws.
-    let recurse = |f: &mut Function| {
+    let recurse = |f: &mut FnBuilder<'_>| {
         wasm!(f;
             LocalGet(value), LocalGet(k), LocalGet(elem), LocalGet(rep), LocalGet(list),
             LocalGet(stack), Call(helpers.json_rep()), LocalSet(s),
@@ -378,7 +409,7 @@ pub(in crate::emit) fn emit_json_rep(strings: &StrOffsets, helpers: Helpers<'_>)
         return_if_pending(f);
     };
     // An array index key becomes its string.
-    let key_string = |f: &mut Function| {
+    let key_string = |f: &mut FnBuilder<'_>| {
         emit_is_number(f, key);
         wasm!(f;
             If(BlockType::Empty),
@@ -505,7 +536,33 @@ pub(in crate::emit) fn emit_json_rep(strings: &StrOffsets, helpers: Helpers<'_>)
     );
     box_heap(&mut f);
     wasm!(f; End);
+    finish_builder(f)
+}
+
+/// The locals of `__json_indent`: `s` and `gap` rooted, `dst` (local 9) a
+/// base, the rest integers.
+fn indent_builder(leaves: &LeafSet) -> FnBuilder<'_> {
+    use LocalClass::{Base, Raw};
+    let mut f = FnBuilder::new(leaves);
+    f.param(Base);
+    f.param(Base);
+    f.locals(7, Raw(ValType::I32));
+    f.locals(1, Base);
+    f.locals(5, Raw(ValType::I32));
     f
+}
+
+/// Read the lengths of `s` and `gap`, their widths, and whether either is
+/// two-byte into the locals named by `[s, gap, len, glen, ws, wg, w]`.
+fn indent_widths(f: &mut FnBuilder<'_>, [s, gap, len, glen, ws, wg, w]: [u32; 7]) {
+    wasm!(f;
+        LocalGet(s), I32Load(STR_LEN), LocalSet(len),
+        LocalGet(gap), I32Load(STR_LEN), LocalSet(glen),
+    );
+    emit_str_two_byte(f, s);
+    wasm!(f; LocalTee(ws));
+    emit_str_two_byte(f, gap);
+    wasm!(f; LocalTee(wg), I32Or, LocalSet(w));
 }
 
 /// `__json_indent(s: i32, gap: i32) -> i32`: the compact JSON text `s`
@@ -515,30 +572,24 @@ pub(in crate::emit) fn emit_json_rep(strings: &StrOffsets, helpers: Helpers<'_>)
 /// string contents are copied unchanged. Two passes: the length, then the
 /// code units. Each input is read at its width; the result is two-byte when
 /// either is, then narrowed when its units fit a byte.
-pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
+pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = indent_builder(leaves);
     let (s, gap) = (0, 1);
     let (len, glen, i, o, depth, b, quoted, dst, g) = (2, 3, 4, 5, 6, 7, 8, 9, 10);
     let (ws, wg, w, k) = (11, 12, 13, 14);
-    let mut f = Function::new(vec![(13, ValType::I32)]);
-    wasm!(f;
-        LocalGet(s), I32Load(STR_LEN), LocalSet(len),
-        LocalGet(gap), I32Load(STR_LEN), LocalSet(glen),
-    );
-    emit_str_two_byte(&mut f, s);
-    wasm!(f; LocalTee(ws));
-    emit_str_two_byte(&mut f, gap);
-    wasm!(f; LocalTee(wg), I32Or, LocalSet(w));
+    indent_widths(&mut f, [s, gap, len, glen, ws, wg, w]);
     for write in [false, true] {
-        let put = |f: &mut Function, unit: &dyn Fn(&mut Function)| {
+        let put = |f: &mut FnBuilder<'_>, unit: &dyn Fn(&mut FnBuilder<'_>)| {
             if write {
                 emit_store_unit(f, dst, o, w, unit);
             }
             wasm!(f; LocalGet(o), I32Const(1), I32Add, LocalSet(o));
         };
-        let put_const = |f: &mut Function, c: u8| put(f, &|f| wasm!(f; I32Const(i32::from(c))));
-        let put_b = |f: &mut Function| put(f, &|f| wasm!(f; LocalGet(b)));
+        let put_const =
+            |f: &mut FnBuilder<'_>, c: u8| put(f, &|f| wasm!(f; I32Const(i32::from(c))));
+        let put_b = |f: &mut FnBuilder<'_>| put(f, &|f| wasm!(f; LocalGet(b)));
         // A newline, then `depth` gaps.
-        let newline = |f: &mut Function| {
+        let newline = |f: &mut FnBuilder<'_>| {
             put_const(f, b'\n');
             wasm!(f;
                 LocalGet(depth), LocalSet(g),
@@ -559,11 +610,12 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
             );
         };
         // b = s[i]; i += 1.
-        let next = |f: &mut Function| {
+        let next = |f: &mut FnBuilder<'_>| {
             emit_str_unit(f, s, i, ws);
             wasm!(f; LocalSet(b), LocalGet(i), I32Const(1), I32Add, LocalSet(i));
         };
-        let is = |f: &mut Function, c: u8| wasm!(f; LocalGet(b), I32Const(i32::from(c)), I32Eq);
+        let is =
+            |f: &mut FnBuilder<'_>, c: u8| wasm!(f; LocalGet(b), I32Const(i32::from(c)), I32Eq);
         wasm!(f;
             I32Const(0), LocalSet(i), I32Const(0), LocalSet(o),
             I32Const(0), LocalSet(depth), I32Const(0), LocalSet(quoted),
@@ -618,7 +670,7 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
     }
     emit_str_canonical(&mut f, w, dst, i, g);
     wasm!(f; LocalGet(dst), End);
-    f
+    finish_builder(f)
 }
 
 /// `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`:
@@ -628,11 +680,18 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
 /// non-configurable property rejects both silently), then passed to the
 /// reviver as `(key, value)` with `this = holder`. A throw returns with it
 /// pending.
-pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>) -> Function {
-    let (holder, key, reviver) = (0, 1, 2);
-    let (val, result, name) = (3, 4, 5);
-    let (ptr, n, i, k, array, e) = (6, 7, 8, 9, 10, 11);
-    let mut f = Function::new(vec![(3, ValType::I64), (6, ValType::I32)]);
+pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    use LocalClass::{Base, Jsval, Raw};
+    let int = Raw(ValType::I32);
+    let mut f = FnBuilder::new(leaves);
+    let holder = f.param(Jsval);
+    let key = f.param(Base);
+    let reviver = f.param(Jsval);
+    let [val, result, name] = [(); 3].map(|()| f.local(Jsval));
+    let ptr = f.local(Base);
+    let [n, i] = [(); 2].map(|()| f.local(int));
+    let k = f.local(Base);
+    let [array, e] = [(); 2].map(|()| f.local(int));
     wasm!(f; LocalGet(holder), LocalGet(key), Call(helpers.get), LocalSet(val));
     return_if_pending(&mut f);
     emit_is_pointer(&mut f, val);
@@ -697,5 +756,5 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>) -> Function {
     wasm!(f; LocalSet(name));
     call_with(&mut f, reviver, holder, &[name, val], helpers);
     wasm!(f; End);
-    f
+    finish_builder(f)
 }

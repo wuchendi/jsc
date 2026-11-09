@@ -851,3 +851,23 @@ fn new_date_converts_its_argument_with_to_primitive() {
         true,
     );
 }
+
+/// `Date.now()` and `new Date()` read the WASI realtime clock: a whole number
+/// of milliseconds near the host's own clock. The window is wide so a loaded
+/// machine cannot fail it.
+#[test]
+fn date_now_from_wasi_clock() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let (lo, hi) = (now_ms - 60_000, now_ms + 600_000);
+    both_bool(
+        &format!("const t = Date.now(); t >= {lo} && t <= {hi} && t === Math.trunc(t)"),
+        true,
+    );
+    both_bool(
+        &format!("const t = new Date().getTime(); t >= {lo} && t <= {hi}"),
+        true,
+    );
+}
