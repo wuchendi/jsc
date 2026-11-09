@@ -11,8 +11,7 @@ use common::{assert_output, assert_uncaught};
 /// containing `message`.
 #[allow(clippy::expect_used)]
 fn assert_compile_error(src: &str, message: &str) {
-    let err = jsc_core::run::compile_and_run(src).expect_err("program should not compile");
-    let text = err.to_string();
+    let text = common::compile_error(src);
     assert!(
         text.contains(message),
         "expected a compile error containing `{message}` for `{src}`, got `{text}`"

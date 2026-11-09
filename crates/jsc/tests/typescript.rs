@@ -70,7 +70,9 @@ fn build_ts_file_emits_runnable_module() {
     );
     let bytes = std::fs::read(&out).expect("read module");
     assert!(bytes.starts_with(b"\0asm"), "output must be a wasm module");
-    jsc_core::run::run(&bytes).expect("built module must instantiate and run");
+    let outcome = jsc_core::run::run(&bytes, jsc_core::run::Sinks::Inherit, None)
+        .expect("built module must instantiate and run");
+    assert_eq!(outcome.code, 0);
 }
 
 #[test]

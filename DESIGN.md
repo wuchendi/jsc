@@ -3,7 +3,7 @@
 > An ahead-of-time **JavaScript → WebAssembly** compiler written in Rust, with
 > conformance tracked by test262. jsc parses source with swc, lowers it to an
 > in-house IR, emits a WebAssembly module with `wasm-encoder`, and runs that
-> module on wasmtime (natively) or in a JS shim (in the browser).
+> module on wasmtime (natively) or on a JS WASI polyfill and shim (in the browser).
 
 This is the authoritative technical spec. It describes the compiler as it is
 today: the pipeline, the value and memory model, the module ABI, the object
@@ -33,7 +33,7 @@ diagnostics, tooling, and the known limitations.
 
 jsc compiles a JavaScript program **ahead of time** into a WebAssembly module.
 There is no interpreter and no JIT: every program becomes a real, validatable
-wasm module whose exported `main` function runs the top-level code.
+wasm module whose exported `_start` function runs the top-level code.
 
 - **Output.** A wasm module (`jsc build FILE -o OUT.wasm`), or an immediate run of
   that module on an embedded wasmtime (`jsc FILE`, `jsc -e`, `jsc -p`).
@@ -95,12 +95,13 @@ JS source ──▶ swc AST ──▶ IR ──────────▶ wasm 
    memory, globals, exports, and the data segments holding the static region
    (interned strings, function data, the realm image, the intern table).
 4. **run** (`run/`, feature `native-run`) — instantiates the module on wasmtime
-   with a `Linker` that supplies the seven host imports (§6.1), calls `main`,
-   drains the microtask queue, checks for an uncaught exception or unhandled
-   rejection, and decodes the result jsval against a snapshot of linear memory.
+   with a `Linker` that supplies the WASI and `env` imports (§6.1), calls
+   `_start`, and maps `proc_exit` to an exit code. The module itself drains the
+   microtask queue, reports an uncaught exception or unhandled rejection, and
+   writes its output (§4.2, §6.9).
 
-`run::compile_and_run` and `run::compile_and_run_capturing` chain all four
-stages; the CLI and `jsc-wasm` call the stages individually.
+`run::run` takes finished module bytes; the CLI and `jsc-wasm` call the stages
+individually.
 
 ---
 
@@ -144,47 +145,55 @@ jsc/
 │   │   │   │   ├── value.rs           # jsval helpers (__box_f64, __to_number, type tests)
 │   │   │   │   ├── array.rs  object.rs function.rs generator.rs
 │   │   │   │   ├── json_parse.rs      # in-wasm JSON.parse
+│   │   │   │   ├── render.rs          # guest console renderer, output writer, _start helpers
 │   │   │   │   └── runtime.rs         # __alloc, strings, Map/Set, equality, trampolines
-│   │   │   └── run/               # wasmtime host
-│   │   │       ├── harness.rs         # Linker, host imports, main call, OOM + uncaught checks
+│   │   │   └── run/               # wasmtime WASI runner + the remaining env imports
+│   │   │       ├── harness.rs         # Linker (preview 1 + env), _start call, proc_exit -> exit code
 │   │   │       ├── host.rs            # __method dispatch, allocation through guest exports
 │   │   │       ├── promise.rs         # promise engine + microtask queue + async driver
-│   │   │       └── value.rs           # jsval decode + Node-style rendering
+│   │   │       └── value.rs           # jsval decode + ToString text for the env imports
 │   │   └── tests/             # integration tests by theme (arrays, properties, intrinsics,
 │   │                          #   intrinsic_guards, to_primitive, wrappers, ...) and the
 │   │                          #   opcount snapshot gate (opcount.rs + opcount/)
 │   ├── jsc/                   # binary: clap CLI (src/main.rs) + CLI integration tests
 │   ├── jsc-test262/           # test262 conformance runner (§10)
-│   └── jsc-wasm/              # wasm-bindgen boundary: `compile(src) -> Uint8Array`
-├── packages/jsc/              # @cdlab/jsc: compile() + run() in JS, host shim
-│   └── src/  index.ts  shim.ts  abi.ts  value.ts
+│   └── jsc-wasm/              # wasm-bindgen boundary: `compile(src, options?) -> Uint8Array`
+├── packages/jsc/              # @cdlab/jsc: compile() + run() in JS, WASI polyfill, env shim
+│   └── src/  index.ts  wasi.ts  shim.ts  abi.ts  value.ts
 ├── apps/jsc-web/              # browser playground (Vite + React + CodeMirror)
 ├── scripts/                   # build-wasm.sh, ensure-wasm.sh, test262-fetch.sh
 └── tests/test262/             # unsupported-features denylist, baseline, history
 ```
 
 **`jsc-core`.** The library. `#![forbid(unsafe_code)]`. The default feature
-`native-run` pulls in `wasmtime` (`cranelift`, `runtime`, `std`); building with
+`native-run` pulls in `wasmtime` (`cranelift`, `runtime`, `std`) and
+`wasmtime-wasi` (`p1`); building with
 `default-features = false` leaves frontend + codegen + emit only. Dependencies:
 `swc_ecma_parser 46`, `swc_ecma_ast 29`, `swc_ecma_visit 29`, `swc_common 26`,
 `swc_ecma_transforms_base 50`, `swc_ecma_transforms_typescript 56`,
-`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 50`; `wasmparser 0.262` is
+`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 50` and `wasmtime-wasi 50`;
+`wasmparser 0.262` is
 a dev-dependency.
 
 **`jsc`.** A thin `clap` shell (§9). `#![forbid(unsafe_code)]`.
 
 **`jsc-wasm`.** `crate-type = ["cdylib", "rlib"]`, depends on `jsc-core` with
 `default-features = false`. Exposes one `#[wasm_bindgen]` function,
-`compile(src) -> Result<Vec<u8>, JsError>`; a spanned error becomes the caret
-block labelled `<source>`. Its lint table mirrors the workspace's but relaxes
+`compile(src, options?) -> Result<Vec<u8>, JsError>` (`options.printCompletion`
+sets `print_completion`, §4.2); a spanned error becomes the caret block labelled
+`<source>`. Its lint table mirrors the workspace's but relaxes
 `unsafe_code` to `deny` because the `wasm-bindgen` glue expands to generated
 `unsafe` shims. `wasm-pack` builds it with `wasm-opt -Oz`.
 
 **`@cdlab/jsc`** (`packages/jsc`). `compile(src)` returns module bytes from the
-wasm-bindgen artifact; `run(src)` compiles, instantiates the module against a
-TypeScript host shim (`shim.ts`, which implements the same seven `env` imports and
-promise engine as `run/`), calls `main`, and returns `{ result, stdout }`.
-`abi.ts` and `value.ts` are ports of `abi.rs` and `run/value.rs`; a Rust test
+wasm-bindgen artifact; `run(src, options?)` compiles, instantiates the module
+against an in-memory `wasi_snapshot_preview1` polyfill (`wasi.ts`) and a
+TypeScript shim for the `env` imports (`shim.ts`, which implements the same six
+imports and promise engine as `run/`), calls `_start`, and returns
+`{ stdout, stderr, exitCode, completion? }`. An uncaught exception or unhandled
+rejection is the `Uncaught …` text on `stderr` with `exitCode` 1; `run` rejects
+on a compile error or a guest trap.
+`abi.ts` and `value.ts` are ports of `abi.rs` and the decoder of `run/value.rs`; a Rust test
 (`abi_drift_tests.rs`) parses `abi.ts` and fails when any of its constants
 differs from `abi.rs`. The wasm artifact is gitignored;
 `scripts/ensure-wasm.sh` rebuilds it (via `scripts/build-wasm.sh` →
@@ -262,7 +271,8 @@ every function — is truthy.
 
 ### 4.2 Module layout
 
-**Types.** `main` has type `() -> i64`. Every user function (declarations,
+**Types.** `_start` has type `() -> ()` and the internal `main` has type
+`() -> i64` (it returns the completion value). Every user function (declarations,
 expressions, arrows, methods, constructors, generator state machines), every
 builtin body, and the two `new Promise` settlers share **one** uniform type:
 
@@ -284,13 +294,15 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 
 | index | function |
 |---|---|
-| `0`–`6` | host imports `print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int` (§6.1) |
-| `7` | `main` (exported as `"main"`) |
-| `8 … 7+n` | the `n` user functions |
+| `0`–`3` | WASI imports `fd_write`, `clock_time_get`, `random_get`, `proc_exit` (§6.1) |
+| `4`–`9` | `env` imports `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int` (§6.1) |
+| `10` | `main` (not exported) |
+| `11 … 10+n` | the `n` user functions |
 | then | runtime helpers in a fixed order (§6.2): `__alloc` … `__to_number` |
 | then | `__invoke1`, `__async_step`, the two `new Promise` settlers, `__new_string`, `__new_array`, `__new_promise`, `__has_own` |
 | then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
-| last | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive` |
+| then | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive`, and the rest of §6.2 up to the private-name helpers |
+| last | the renderer helpers (§6.2), then `_start` |
 
 **Table.** A funcref table of exactly `n + 2 + 142` entries (min = max), filled
 by one active element segment: slots `0 … n-1` are the user functions, slots
@@ -305,7 +317,7 @@ the table, including one without user functions.
 
 | index | name | type | exported as | role |
 |---|---|---|---|---|
-| 0 | `$__heap_ptr` | `i32` | `__heap_ptr` | bump-allocator cursor (§5.6) |
+| 0 | `$__heap_ptr` | `i32` | — | bump-allocator cursor (§5.6) |
 | 1 | `$exc_pending` | `i32` | `__exc_pending` | `1` while an exception propagates |
 | 2 | `$exc_value` | `i64` | `__exc_value` | the in-flight thrown jsval |
 | 3 | `$cf_kind` | `i32` | — | pending `return`/`break`/`continue` routed through `finally` |
@@ -316,14 +328,26 @@ the table, including one without user functions.
 | 12 | `$__new_target` | `i64` | — | `new.target` carrier, initialized to `undefined` |
 | 13 | `$__spread_args` | `i64` | — | argument array of a spread call / construct, initialized to `undefined` |
 | 14 | `$__intrinsics_dirty` | `i32` | — | one dirty bit per watched intrinsic (§6.4) |
-| 15+ | module cells | `i64` | — | one cell pointer per module binding (`15 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| 15–17 | `$__out_buf`, `$__out_len`, `$__out_cap` | `i32` | — | output buffer: base, UTF-8 length, capacity (§6.9) |
+| 18–19 | `$__path_buf`, `$__path_cap` | `i32` | — | renderer recursion path |
+| 20–22 | `$__refs_buf`, `$__refs_cap`, `$__refs_len` | `i32` | — | renderer ref table |
+| 23+ | module cells | `i64` | — | one cell pointer per module binding (`23 + slot`, §7.1), then one per tagged-template site (§7.4) |
 
-**Exports.** `main`, `memory`, `__heap_ptr`, `__exc_pending`, `__exc_value`,
+**Exports.** `_start`, `memory`, `__exc_pending`, `__exc_value`,
 `__invoke1(fn: i64, arg: i64) -> i64`, `__async_step(gen: i64, sent: i64) -> i64`,
-and the allocator and guest constructors `__alloc(size: i32) -> i32`,
-`__new_string(len: i32, two_byte: i32) -> i32`, `__new_array(len: i32) -> i32`,
+the guest constructors `__new_string(len: i32, two_byte: i32) -> i32` and
 `__new_promise() -> i32` (§6.8), and `__promise_self_error() -> i64` (the
-self-resolution `TypeError`, §6.7; the last defined function).
+self-resolution `TypeError`, §6.7).
+
+**`_start`.** The command entry point calls `main` and keeps its result. Unless
+`main` left an exception pending, it drains the microtask queue (`__promise`
+op `8`, §6.1). A pending exception is then reported as one
+`Uncaught <value>` line on fd 2 and `proc_exit(1)`; otherwise the first
+unhandled rejection is reported as `Uncaught (in promise) <value>` the same
+way. On a clean finish, a module compiled with `CompileOptions::print_completion`
+renders the completion value as one line on fd 1 (`jsc -p`, §9); the default
+emit discards it. Finally `_start` flushes a line left unfinished on fd 1 by a
+throwing `console.log` argument, and returns (exit code `0`).
 
 **Static region (data segments).** Everything below the initial heap pointer is
 laid out by the compiler, in this order:
@@ -331,7 +355,9 @@ laid out by the compiler, in this order:
 | range | contents |
 |---|---|
 | `0 … 7` | null guard; the `u32` at `abi::FN_INFO_ADDR = 4` holds the base of the function info table |
-| from `HEAP_BASE = 8` | every distinct string literal and static key, one `TYPE_STRING` block each, 8-byte aligned, `flags = INTERNED` (plus `ARRAY_INDEX` for a canonical index spelling) |
+| `8 … 47` | WASI scratch area (`abi::WASI_SCRATCH`): one iovec, `nwritten`, the clock result and the random seed buffer |
+| `48 … 95` | the iovec (`abi::OOM_IOVEC`) and bytes of the static out-of-memory line (§5.6) |
+| from `HEAP_BASE = 96` | every distinct string literal and static key, one `TYPE_STRING` block each, 8-byte aligned, `flags = INTERNED` (plus `ARRAY_INDEX` for a canonical index spelling) |
 | next | the function info table: one 8-byte entry `[name: u32 interned key][length: u32]` per funcref slot (user functions, the two settlers, the builtins) |
 | next | one static 32-byte `TYPE_FUNCTION` block per user function (`LAZY`, no properties, `proto = %Function.prototype%`, `env = undefined`): the single function object of a top-level declaration |
 | next | the realm image (§6.4) |
@@ -478,7 +504,7 @@ Notes per kind:
   shrunk (it keeps its tombstones until a collector exists, §13). `size` is
   the live entry
   count. Lookup is a linear scan with `__same_value_zero` that skips
-  tombstones; the renderers skip them too.
+  tombstones; the renderer skips them too.
 - **Promise** blocks mirror settlement (`state` ∈ pending `0` / fulfilled `1` /
   rejected `2`, plus the settled `value`) so a memory snapshot can render them;
   reactions live in the host engine (§6.7).
@@ -494,8 +520,8 @@ Notes per kind:
   an async generator's request queue (§7.8): a linked list of internal
   `TYPE_ENV` records `[value, promise, kind, next]`.
 - **Accessor** blocks are the value of an `ACCESSOR` property-table entry; they
-  are consumed by `__get`/`__set` and never observed as values (the renderers
-  print `[Getter]`, `[Setter]`, `[Getter/Setter]`).
+  are consumed by `__get`/`__set` and never observed as values (the renderer
+  prints `[Getter]`, `[Setter]`, `[Getter/Setter]`).
 
 **Initial prototypes.** Ordinary objects are created with
 `%Object.prototype%`, functions with `%Function.prototype%`, arrays, Map, Set,
@@ -575,7 +601,7 @@ aliases, captured bindings, and member receivers all observe `push`.
 - **Holes.** A hole slot holds `HOLE`. Literal elisions, `delete a[i]`, gaps
   left by growth, and truncation produce holes. A hole is not an own
   property: `hasOwnProperty` and own-key enumeration skip it and the
-  renderers print `<N empty items>`, while `[[Get]]` and `HasProperty` (and
+  renderer prints `<N empty items>`, while `[[Get]]` and `HasProperty` (and
   so `in`, member reads, spread, destructuring, `for-of`, `JSON.stringify`,
   and every `Array.prototype` method) continue along the prototype chain
   exactly as for an index at or past `length`. Every element read that meets
@@ -709,21 +735,18 @@ declares enough initial pages to hold that region):
    4 header bytes, and return `old`.
 3. Otherwise grow: try `memory.grow(max(need, memory.size))` (at least doubling);
    if that fails, retry with exactly `need` pages.
-4. If both fail (the 8192-page / 512 MiB maximum is reached), store the sticky
-   sentinel `abi::HEAP_PTR_OOM` (`-1`, i.e. `0xFFFF_FFFF`) in `__heap_ptr` and
-   execute `unreachable`.
+4. If both fail (the 8192-page / 512 MiB maximum is reached), write the static
+   line `abi::OOM_LINE` to fd 2 through its static iovec and call `proc_exit(1)`.
 
-Host-built values (strings and arrays returned by `__convert` and `__method`,
-promises created by the promise engine) are allocated by calling the exported
-guest constructors (§6.8), never by bumping the pointer host-side. Every host
-import result goes through `oom_guard`, which turns a sentinel heap pointer
-into a trap.
+Host-built values (strings returned by `__convert` and `__method`, promises
+created by the promise engine) are allocated by calling the exported guest
+constructors (§6.8), never by bumping the pointer host-side, so they reach the
+same path; `proc_exit` from inside a host re-entry unwinds through the host
+import to the runner.
 
-**Out of memory.** After `main` (and after the post-`main` microtask drain) the
-harness checks the sentinel; if set, the run fails with
-`Uncaught RangeError: out of memory` — no wasm backtrace — regardless of the trap
-it caused. Because the sentinel makes every later allocation fail, an
-out-of-memory condition inside `try` is not catchable; the program terminates.
+**Out of memory.** The report is the fixed `Uncaught RangeError: out of memory`
+line; writing it allocates nothing. An out-of-memory condition inside `try` is
+not catchable; the program terminates with exit code `1`.
 
 **No free.** Nothing is ever freed. Store and table growth abandons the old
 block. Long-running allocation-heavy programs consume memory monotonically up
@@ -741,7 +764,7 @@ The layouts above are chosen so a collector can be added without relayout:
   2 KiB) in 64 KiB pages with a per-page class header, so no per-block size
   word; large objects in a list with a 16-byte pre-header. `__alloc` collects
   when the allocation budget since the last collection is spent, then grows
-  memory; the 512 MiB cap and the OOM sentinel stay.
+  memory; the 512 MiB cap stays.
 - **Roots.** A shadow stack in linear memory: each function reserves slots for
   jsvals live across a safepoint (any call that may allocate), clears them on
   entry, and pops them on every exit including the exception paths; raw `i32`
@@ -773,27 +796,34 @@ The layouts above are chosen so a collector can be added without relayout:
 
 ### 6.1 Host imports
 
-Every module imports exactly seven functions from the `"env"` namespace
-(`abi::IMPORT_MODULE`), declared in this order (function indices `0`–`6`):
+Every module imports ten functions, declared in this order. The first four
+come from `wasi_snapshot_preview1` (`abi::WASI_MODULE`):
 
 | # | import | signature | backs |
 |---|---|---|---|
-| 0 | `print` | `(bits: i64, flag: i32) -> ()` | `console.log` |
-| 1 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
-| 2 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, string case mapping / `localeCompare` / `normalize`, `Number.prototype` digit formatting, host `Math` functions |
-| 3 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn |
-| 4 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
-| 5 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
-| 6 | `__parse_int` | `(s: i64, radix: i64) -> i64` | `parseInt` |
+| 0 | `fd_write` | `(fd: i32, iovs: i32, iovs_len: i32, nwritten: i32) -> i32` | `console.log`, the `Uncaught …` reports, the completion line, the out-of-memory line |
+| 1 | `clock_time_get` | `(id: i32, precision: i64, time: i32) -> i32` | declared; no call site yet |
+| 2 | `random_get` | `(buf: i32, buf_len: i32) -> i32` | declared; no call site yet |
+| 3 | `proc_exit` | `(code: i32) -> ()` | exit code `1` after a report or a failed write |
 
-The native host is `run/harness.rs` (wasmtime `Linker::func_wrap`); the browser
-host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
-(`run/value.rs` / `value.ts`).
+The other six are interim imports from `"env"` (`abi::IMPORT_MODULE`), still
+backed by the hosts:
 
-- **`print` flags.** `0` = format the value and append a space (every argument
-  but the last), `1` = format and append a newline (the last argument),
-  `2` = newline only (zero-argument `console.log()`). Values render with the same
-  `format_value` used for the CLI's `-p` output (§6.9).
+| # | import | signature | backs |
+|---|---|---|---|
+| 4 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
+| 5 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, string case mapping / `localeCompare` / `normalize`, `Number.prototype` digit formatting, host `Math` functions |
+| 6 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn, the final drain |
+| 7 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
+| 8 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
+| 9 | `__parse_int` | `(s: i64, radix: i64) -> i64` | `parseInt` |
+
+Because of these six, a module does not run under a plain WASI host yet. The
+native host is `run/harness.rs` (`wasmtime_wasi::p1` plus `Linker::func_wrap`
+for `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
+`shim.ts`. Both decode jsvals with the same rules (`run/value.rs` /
+`value.ts`).
+
 - **`__convert` ops.** `0` ToString, `1` ToNumber (StringToNumber rules),
   `3` parseFloat. The guest runs `ToPrimitive` first (§6.5), so the host sees
   primitives, plus a `Date` (its `toString` text). A string argument to op `0` is returned unchanged; any
@@ -826,7 +856,8 @@ host is `packages/jsc/src/shim.ts`. Both decode jsvals with the same rules
   host only sees primitives.
 - **`__promise` ops.** `0` resolve, `1` reject, `2` await, `3` finally,
   `4` new pending promise, `5` settle-fulfill, `6` settle-reject,
-  `7` async spawn.
+  `7` async spawn, `8` drain the queue and return the first unhandled rejected
+  promise (`0` when there is none; `_start` only).
 - **`__now`.** `SystemTime::now()` since the Unix epoch in milliseconds (`0` if
   the clock is before the epoch). It is the only source of non-determinism.
 - **`__parse_int`.** Parses the formatted string form of `s` in radix
@@ -857,6 +888,9 @@ function-index order:
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
 | `super` references (§6.3) | `__super_get(home, key, recv)`, `__super_set(home, key, v, recv)` |
 | private names (§7.6) | `__private_find(o, key)`, `__private_add(o, key, v, attrs, name)`, `__private_get(o, key, name)`, `__private_set(o, key, v, name)`, `__private_brand(o, v, brand, name, mode)`, `__private_in(o, brand, name)` |
+| output (§6.9) | `__out_reserve(need)`, `__path_reserve(need)`, `__refs_reserve(need)`, `__out_byte(b)`, `__out_cp(cp)`, `__out_str(s)`, `__out_uint(n)`, `__out_flush(fd)`, `__report(fd, prefix, v)` |
+| renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
+| entry | `_start` (§4.2) |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)
@@ -975,7 +1009,7 @@ tables. Keys are interned `u32`s.
   throws on a rejection.
 - **Own-key order** (`__own_keys(obj, mode)`, behind `Object.keys/values/entries`,
   `JSON.stringify`, `for-in`, object rest, the `Object` statics, and the
-  renderers): integer keys ascending (array elements skipping holes, then
+  renderer): integer keys ascending (array elements skipping holes, then
   table keys flagged `ARRAY_INDEX` sorted numerically when the table has
   `HAS_INDEX_KEYS`), then the other string keys in insertion order, then — in
   `OWN_ALL_KEYS` only — the symbol keys in insertion order. `mode` selects
@@ -1218,8 +1252,8 @@ carry the in-flight exception: `$exc_pending` and `$exc_value`.
   it; a finalizer that itself completes abruptly overrides the pending action
   (`try { return 1 } finally { return 2 }` returns `2`). A pending exception is
   re-propagated after a normally completing `finally`.
-- At the boundary the harness reads `__exc_pending`; if set, it renders
-  `__exc_value` with `format_value` and fails with `Uncaught <value>`.
+- At the boundary `_start` reads `$exc_pending`; if set, it renders
+  `$exc_value` as `Uncaught <value>` on fd 2 and calls `proc_exit(1)` (§4.2).
 
 ### 6.7 Promises, microtasks, and the async driver
 
@@ -1274,7 +1308,7 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
 - **Draining.** There are no timers or I/O, so the microtask queue is the only
   asynchronous source. Top-level `await` drains the queue until its operand
   settles (a rejection surfaces as an uncaught throw). After `main` returns
-  normally the harness drains whatever remains, so unawaited `then` chains run.
+  normally `_start` drains whatever remains (op `8`), so unawaited `then` chains run.
   If `main` ends with a pending exception, the queue is not drained.
 - **`async` functions** (§7.8) are spawned with op `7`: the host allocates the
   result promise, drives the body's state machine one step at a time through the
@@ -1293,12 +1327,11 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
 ### 6.8 Host boundary
 
 The host reads layouts but never builds object-family blocks by hand: every
-string, array, and promise the Rust host or the shim creates is allocated by
+string and promise the Rust host or the shim creates is allocated by
 re-entering the exported `__new_string(len, two_byte)` (header, `TWO_BYTE`
 flag and length in code units written; the host fills `len` Latin-1 bytes or
 UTF-16LE units, choosing the width from the content so the block is
-canonical, §5.2), `__new_array(len)` (a handle with a `cap = len` store of
-`undefined`), or `__new_promise()` (pending, `%Promise.prototype%`). Layout
+canonical, §5.2) or `__new_promise()` (pending, `%Promise.prototype%`). Layout
 knowledge lives in the emitter plus read-only decoders.
 
 Host reads, all through `abi.rs` constants (and `abi.ts`, kept equal by the
@@ -1310,27 +1343,32 @@ tables, the function info table, and `class` bytes for rendering. The Rust
 decoder `string_units` is lossless (a Latin-1 byte is its own unit), and the
 string host ops (case mapping, `localeCompare`, `normalize`) read their
 operands through it; `normalize` uses `icu_normalizer` (an optional dependency
-enabled by the `native-run` feature). `decode_string` renders text for output
-and the number parsers (ToNumber, `parseInt`, `parseFloat`) as lossy text, a
+enabled by the `native-run` feature). `decode_string` renders text for the
+number parsers (ToNumber, `parseInt`, `parseFloat`) as lossy text, a
 lone surrogate becoming U+FFFD (safe for the number parsers: a lone surrogate
 is never whitespace or a digit). `alloc_units` allocates a result through
 `__new_string`, narrowing when every unit is `<= 0xFF`. The shim's
 `stringText` builds the JS string with `String.fromCharCode` over chunked
 `Uint8Array` / `Uint16Array` views (no `TextDecoder`: `latin1` would be
-windows-1252 and `utf-16le` would replace lone surrogates). Host-held
+windows-1252 and `utf-16le` would replace lone surrogates). Console output
+reads no layouts from the host side: the guest writes UTF-8 (§6.9). Host-held
 jsvals (reaction lists, the job queue) stay valid because no block moves.
 
 ### 6.9 Value rendering
 
-`run/value.rs` decodes a jsval against a memory snapshot into a `Value` and
-`format_value` renders it Node-console style (the shim's `value.ts` mirrors
-it):
+The guest renderer (`emit/render.rs`) appends the Node-console form of a value
+to the output buffer (`$__out_buf`) as UTF-8. It runs no user code and never
+throws. `console.log` joins its arguments with one space and ends the line with
+one `fd_write` to fd 1; `__report` writes one
+`prefix + value + "\n"` line to its fd (the `Uncaught …` reports and the `-p`
+completion, §4.2). A failed or stalled write ends the program with
+`proc_exit(1)`. The buffer, recursion path and ref table are headerless
+`__alloc` blocks. The rules:
 
-- numbers by the ECMAScript Number::toString rules (shortest round-trip digits,
-  exponential form at `>= 1e21` and `< 1e-6`, `-0` prints `0`); strings
-  unquoted, also inside containers, with a lone surrogate written as U+FFFD
-  on the native output (what Node writes; the shim hands the JS string
-  through); symbols `Symbol(a)` / `Symbol()`;
+- numbers by the ECMAScript Number::toString rules, through `__convert`
+  (shortest round-trip digits, exponential form at `>= 1e21` and `< 1e-6`,
+  `-0` prints `0`); strings unquoted, also inside containers, with a lone
+  surrogate written as U+FFFD (what Node writes); symbols `Symbol(a)` / `Symbol()`;
 - arrays `[ 1, <1 empty item>, 3, foo: 1 ]` (holes as runs, then own named
   properties); objects `{ a: 1, b: 2 }` from their own enumerable properties
   in own-key order (enumerable symbol keys last, as `[Symbol(a)]: 1`),
@@ -1349,7 +1387,7 @@ it):
   `NaN` time value);
 - cycles as `<ref *1> { self: [Circular *1] }`.
 
-Private-name entries (§7.6) are never enumerable, so neither renderer lists
+Private-name entries (§7.6) are never enumerable, so the renderer does not list
 them.
 
 ---
@@ -1390,7 +1428,7 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   iteration.
 - **Module cells.** A top-level binding that is referenced from inside a
   function is stored in a **module cell**: a cell whose pointer lives in a
-  dedicated `i64` global (index `15 + slot`), allocated in `main`'s prologue
+  dedicated `i64` global (index `23 + slot`), allocated in `main`'s prologue
   before any user code runs. Top-level functions reach it through the global, so
   they stay hoisted and directly callable from anywhere. The cell holds the TDZ
   `HOLE` until the declaration executes; reading or writing it earlier throws
@@ -1813,7 +1851,7 @@ invisibility and the early errors — and static blocks.
 - **Storage.** A private field is an own entry keyed by its symbol in the
   object's ordinary `TYPE_PROPS` table, attrs `WRITABLE` only; the instance
   brand is an entry keyed by the brand symbol, attrs `0`, value `undefined`.
-  Private entries are never `ENUMERABLE` (an invariant the renderers and
+  Private entries are never `ENUMERABLE` (an invariant the renderer and
   every enumerable-only walk rely on). Static private fields are entries of
   the class. Static methods and accessors need no entry: the class is
   their only possible holder, so their brand check is `o === %penv[0]`
@@ -1906,8 +1944,8 @@ invisibility and the early errors — and static blocks.
   `JSON.stringify`, `__for_in_keys`) already skip every symbol.
   `__set_integrity` (`freeze` / `seal` / `preventExtensions`) leaves private
   entries' attrs untouched and `__test_integrity` (`isFrozen` /
-  `isSealed`) ignores them. The renderers (`run/value.rs`, `value.ts`) list
-  only `ENUMERABLE` entries, so they never show one; `shim.ts` enumerates no
+  `isSealed`) ignores them. The renderer (`emit/render.rs`) lists
+  only `ENUMERABLE` entries, so it never shows one; `shim.ts` enumerates no
   guest keys. A private key appended to a watched intrinsic's table only
   sets its dirty bit. There is no `Proxy`; when it lands, private operations
   act on the proxy's own table and never trap.
@@ -2247,12 +2285,12 @@ assignment`, `private name #x is not defined`.
 |---|---|
 | `jsc FILE` | compile and run the file; only `console.log` output is printed |
 | `jsc -e SRC` / `--eval SRC` | compile and run inline source; only `console.log` output is printed |
-| `jsc -p SRC` / `--print SRC` | compile and run inline source, then print the completion value (last expression statement) |
-| `jsc build FILE -o OUT` | write the wasm module to `OUT`; `-o -` writes to stdout |
+| `jsc -p SRC` / `--print SRC` | compile inline source with `print_completion` and run it; the module prints the completion value (last expression statement) after the final drain |
+| `jsc build FILE -o OUT` | write the wasm command module to `OUT` (default options; it imports `env` as well as WASI, §6.1); `-o -` writes to stdout |
 
 Exactly one of `-e`, `-p`, or `FILE` is required (a clap argument group);
 `-e`/`-p`/`-o` accept values beginning with `-` (`jsc -p "-0"`). `console.log`
-streams to stdout while the module runs.
+writes each line to stdout with one `fd_write` while the module runs.
 
 **Exit codes.**
 
@@ -2358,8 +2396,8 @@ not run it.
 - `typos`
 - `cargo clippy --all-targets --workspace` (deny-warnings from the workspace lints)
 - `cargo test --doc --workspace`
-- `cargo shear`
-- `cargo deny check`
+- `cargo shear` (includes `wasmtime-wasi`)
+- `cargo deny check` (includes `wasmtime-wasi` and its dependency tree)
 
 **Job `test`** (matrix of 4): `cargo nextest run --workspace --no-fail-fast
 --partition count:N/4`, so the suite runs in four parallel quarters and every
@@ -2512,7 +2550,7 @@ Each item below is current behaviour of this tree.
   | `localeCompare` canonical equivalence (code-unit order, above) | — | | 1 | | | | |
 - An array in dictionary mode (§5.4) keeps every element in its linear-scan
   property table, so element access on a large frozen or attributed array is
-  `O(n)`; the renderers print an accessor element as `undefined` and omit a
+  `O(n)`; the renderer prints an accessor element as `undefined` and omit a
   non-enumerable one.
 - `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
   enumerable own keys of its `Properties` argument once, before reading any
@@ -2554,10 +2592,17 @@ Each item below is current behaviour of this tree.
 
 **Runtime**
 
-- The emitted module imports seven host functions from `env` (§6.1); it is not
-  self-contained and cannot run without jsc's wasmtime host or the
-  `@cdlab/jsc` shim. Runtime semantics are implemented three times (guest wasm,
-  the Rust host, the TypeScript shim).
+- The emitted module imports four WASI functions and six host functions from
+  `env` (§6.1); it is not self-contained and cannot run without jsc's wasmtime
+  host or the `@cdlab/jsc` polyfill and shim. The semantics behind the six
+  `env` imports are implemented three times (guest wasm, the Rust host, the
+  TypeScript shim).
+- The console renderer treats every non-ASCII code unit as alphanumeric when
+  deciding whether to quote a property key, until the Unicode tables land.
+- An `Error` whose `name` or `message` is a non-string object closing a cycle
+  gets no `<ref *N>` marker.
+- The renderer's `Error` `name` / `message` lookup materializes a lazy
+  function on the prototype chain.
 - No garbage collection (§5.7): memory only grows, up to 512 MiB, and
   exhaustion is not catchable. The intern table never shrinks.
 - Map / Set backing arrays never shrink: `delete` and `clear` leave

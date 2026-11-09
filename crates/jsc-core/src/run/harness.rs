@@ -1,408 +1,298 @@
-//! The execution harness: load an emitted module into `wasmtime`, wire up the
-//! host imports (`print`/`__convert`/`__method`), call `main`, and surface its
-//! result — plus the JS-source -> [`Value`] pipeline entry points.
-
-use std::io::Write;
+//! The WASI runner: load an emitted command module into `wasmtime`, link
+//! `wasi_snapshot_preview1` plus the `env` imports still backed by the host,
+//! call `_start`, and map `proc_exit` to an exit code.
 
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
+use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+use wasmtime_wasi::{I32Exit, WasiCtxBuilder};
 
-use super::host::{
-    alloc_string, heap_exhausted, method_dispatch, parse_float_str, parse_int_str, value_to_number,
-};
+use super::host::{alloc_string, method_dispatch, parse_float_str, parse_int_str, value_to_number};
 use super::promise::{self, Host};
+use super::value::{Value, decode, to_js_string};
 use crate::abi;
 
-use super::{HEAP, Value, decode, format_value, to_js_string};
+/// The WASI preview-1 context behind the `wasi_snapshot_preview1` imports.
+pub(super) type WasiCtx = wasmtime_wasi::p1::WasiP1Ctx;
 
-/// The `print` host-import flags (see [`abi`]): a value plus a trailing
-/// space, or a value plus a newline.
-const PRINT_FLAG_SEP: i32 = abi::PRINT_FLAG_SEP;
-const PRINT_FLAG_END: i32 = abi::PRINT_FLAG_END;
-
-/// The `__convert` host-import op flags (see [`abi`]): stringify the
-/// argument, coerce it to a number, or parse a leading float from its string
-/// form.
-const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
-const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
-const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
-
-/// Box a host-computed `f64` as a number jsval's raw bits, mapping every NaN to
-/// the canonical [`abi::QNAN`] (the guest-side twin of `emit::emit_box_f64`).
-fn number_bits(n: f64) -> i64 {
-    if n.is_nan() { abi::QNAN } else { n.to_bits() }.cast_signed()
-}
-
-/// The NaN-boxed `undefined` jsval bits (see [`abi::UNDEFINED`]), returned by the
-/// `__method` host import for a type-mismatched receiver or a failed allocation.
-const UNDEFINED_BITS: u64 = abi::UNDEFINED;
-
-/// The names under which `crate::emit` exports the exception-unwinding globals
-/// (see [`abi`]): the pending flag (`$exc_pending`, i32) and the in-flight
-/// value (`$exc_value`, i64). After `main` returns, a set flag means the program
-/// threw an exception that was never caught.
-const EXC_PENDING_EXPORT_NAME: &str = abi::EXC_PENDING_EXPORT_NAME;
-const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
-
-/// The rendered error for a program that exhausted the capped linear memory.
-const OUT_OF_MEMORY: &str = "Uncaught RangeError: out of memory";
-
-/// Pass a host import's result `bits` through, or trap the guest when the import
-/// (or an earlier allocation) left the out-of-memory sentinel in `__heap_ptr`;
-/// the run stage then reports [`OUT_OF_MEMORY`].
-fn oom_guard<W>(caller: &mut Caller<'_, W>, bits: i64) -> wasmtime::Result<i64> {
-    match caller
-        .get_export(abi::HEAP_PTR_EXPORT_NAME)
-        .and_then(wasmtime::Extern::into_global)
-    {
-        Some(global) if heap_exhausted(&mut *caller, global) => {
-            Err(wasmtime::Error::msg(OUT_OF_MEMORY))
-        }
-        _ => Ok(bits),
+/// Prepare the failure of a guest call made from inside a host import for
+/// propagation: a `proc_exit` passes through untouched, so the runner maps it
+/// to the exit code; a trap gets a note on where it happened.
+pub(super) fn reentry_error(err: wasmtime::Error) -> wasmtime::Error {
+    if err.downcast_ref::<I32Exit>().is_some() {
+        err
+    } else {
+        err.context("guest trap during a host re-entry")
     }
 }
 
-/// Load `wasm`, instantiate it, and call the exported `main` function.
+/// In-memory stdout and stderr of a run; clones share the same buffers.
+#[derive(Debug, Clone)]
+pub struct Capture {
+    stdout: MemoryOutputPipe,
+    stderr: MemoryOutputPipe,
+}
+
+impl Capture {
+    /// Fresh empty buffers.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stdout: MemoryOutputPipe::new(usize::MAX),
+            stderr: MemoryOutputPipe::new(usize::MAX),
+        }
+    }
+
+    /// Everything written to fd 1 so far.
+    #[must_use]
+    pub fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.stdout.contents()).into_owned()
+    }
+
+    /// Everything written to fd 2 so far.
+    #[must_use]
+    pub fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.contents()).into_owned()
+    }
+}
+
+impl Default for Capture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where a module's fd 1 and fd 2 go.
+#[derive(Debug)]
+pub enum Sinks {
+    /// The process's real stdout and stderr.
+    Inherit,
+    /// In-memory pipes read back through the [`Capture`].
+    Capture(Capture),
+}
+
+/// How a module run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOutcome {
+    /// The `proc_exit` code, or `0` when `_start` returned.
+    pub code: i32,
+    /// Fuel consumed; `0` on an unmetered run.
+    pub fuel: u64,
+}
+
+/// A finished store and instance, for reading results back.
+struct Finished {
+    outcome: RunOutcome,
+    #[cfg(test)]
+    store: Store<Host>,
+    #[cfg(test)]
+    instance: wasmtime::Instance,
+}
+
+/// Run the command module `wasm`.
 ///
-/// The module must export a function named `main` with signature `() -> i64`,
-/// as produced by [`crate::emit::emit`]. It returns the raw jsval bits together
-/// with a snapshot of the module's exported `"memory"` (needed to resolve
-/// pointer jsvals; empty if the module has no memory export). Decode the pair
-/// with [`decode`]. Any failure to compile, instantiate, resolve, or call the
-/// export is returned as an [`anyhow::Error`].
+/// With `fuel: Some(budget)` the engine meters fuel and
+/// [`RunOutcome::fuel`] reports the amount consumed.
 ///
 /// # Errors
 ///
-/// Returns an error if the bytes are not a valid module, if instantiation
-/// fails, if the `main` export is missing or has the wrong signature, or if the
-/// call traps.
-pub fn run(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>)> {
-    // Default sink: `console.log` output streams to the process's real stdout
-    // during execution.
-    let (bits, memory, _out, _fuel) = run_with_sink(wasm, std::io::stdout(), None)?;
-    Ok((bits, memory))
+/// Returns an error if the bytes are not a valid module, a required import or
+/// `_start` is missing, or the guest traps (including running out of fuel).
+pub fn run(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<RunOutcome> {
+    Ok(execute(wasm, sinks, fuel)?.outcome)
 }
 
-/// Like [`run`], but capture `console.log` output into a string instead of
-/// writing to stdout. Returns the raw `main` result bits, the linear
-/// memory snapshot, and everything `console.log` printed (in execution order).
-///
-/// Used by [`compile_and_run_capturing`] and the test suite to assert printed
-/// output without touching the process's real stdout.
-///
-/// # Errors
-///
-/// Returns an error under the same conditions as [`run`].
-pub fn run_capturing(wasm: &[u8]) -> anyhow::Result<(u64, Vec<u8>, String)> {
-    let (bits, memory, out, _fuel) = run_with_sink(wasm, Vec::<u8>::new(), None)?;
-    Ok((bits, memory, String::from_utf8_lossy(&out).into_owned()))
-}
-
-/// The fuel budget of [`run_metered`]: far above any measured program, so it
-/// never runs out in practice.
-const FUEL_BUDGET: u64 = 1 << 40;
-
-/// Like [`run_capturing`], but on an engine with wasmtime fuel metering on:
-/// returns the captured `console.log` output and the fuel consumed (executed
-/// wasm instructions, `main` plus the microtask drain).
-///
-/// For measurement only (the opcount snapshot gate in
-/// `crates/jsc-core/tests/opcount.rs`); the CLI and [`run`] keep the default
-/// unmetered engine.
-///
-/// # Errors
-///
-/// Returns an error under the same conditions as [`run`], or if the run
-/// exhausts the (very large) fuel budget.
-pub fn run_metered(wasm: &[u8]) -> anyhow::Result<(String, u64)> {
-    let (_bits, _memory, out, fuel) = run_with_sink(wasm, Vec::<u8>::new(), Some(FUEL_BUDGET))?;
-    Ok((String::from_utf8_lossy(&out).into_owned(), fuel))
-}
-
-/// Instantiate `wasm` with a `wasmtime::Linker` that supplies the host `print`
-/// import (backing `console.log`), call `main`, and return its result
-/// bits, a linear-memory snapshot, and the output sink `out`.
-///
-/// The `print` import reads the caller's linear memory via [`Caller`] and reuses
-/// [`decode`] + [`format_value`], so a printed jsval renders exactly like a final
-/// program value. `out` is any [`Write`] sink (real stdout, or an in-memory
-/// buffer for capture); it is threaded through the [`Store`] and handed back so
-/// captured output can be recovered.
-///
-/// With `fuel: Some(budget)` the engine meters fuel and the fourth result is the
-/// fuel consumed; with `None` it is the default unmetered engine and the fourth
-/// result is `0`.
-// One straight-line harness: engine setup, the seven host imports (print,
-// __convert, __method, __promise, __then, __now, __parse_int), the call, and the after-`main`
-// microtask drain — length reflects the import roster, not branching.
-#[allow(clippy::too_many_lines)]
-fn run_with_sink<W: Write + Send + 'static>(
-    wasm: &[u8],
-    out: W,
-    fuel: Option<u64>,
-) -> anyhow::Result<(u64, Vec<u8>, W, u64)> {
+fn execute(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<Finished> {
     let engine = match fuel {
         Some(_) => Engine::new(Config::new().consume_fuel(true))?,
         None => Engine::default(),
     };
     let module = Module::new(&engine, wasm)?;
-    let mut store = Store::new(&engine, Host::new(out));
+    let mut builder = WasiCtxBuilder::new();
+    match sinks {
+        Sinks::Inherit => builder.inherit_stdout().inherit_stderr(),
+        Sinks::Capture(capture) => builder.stdout(capture.stdout).stderr(capture.stderr),
+    };
+    let mut store = Store::new(&engine, Host::new(builder.build_p1()));
     if let Some(budget) = fuel {
         store.set_fuel(budget)?;
     }
     let mut linker = Linker::new(&engine);
-    linker.func_wrap(
-        "env",
-        "print",
-        |mut caller: Caller<'_, Host<W>>, bits: i64, flag: i32| {
-            // Format the jsval (unless the flag is newline-only), reading linear
-            // memory for pointer jsvals, then write the piece to the sink. The
-            // memory borrow ends before the mutable sink borrow begins.
-            let piece = if flag == PRINT_FLAG_SEP || flag == PRINT_FLAG_END {
-                let text = match caller
-                    .get_export("memory")
-                    .and_then(wasmtime::Extern::into_memory)
-                {
-                    Some(mem) => format_value(&decode(bits.cast_unsigned(), mem.data(&caller))),
-                    None => format_value(&decode(bits.cast_unsigned(), &[])),
-                };
-                match flag {
-                    PRINT_FLAG_SEP => format!("{text} "),
-                    _ => format!("{text}\n"),
-                }
-            } else {
-                // Newline-only (zero-argument `console.log()`).
-                "\n".to_owned()
-            };
-            // A write failure to the sink should not trap the guest; ignore it.
-            let _ = caller.data_mut().sink.write_all(piece.as_bytes());
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |host: &mut Host| &mut host.wasi)?;
+    link_conversions(&mut linker)?;
+    link_promises(&mut linker)?;
+    let instance = linker.instantiate(&mut store, &module)?;
+    let start = instance.get_typed_func::<(), ()>(&mut store, abi::START_EXPORT_NAME)?;
+    let code = match start.call(&mut store, ()) {
+        Ok(()) => 0,
+        Err(err) => match err.downcast_ref::<I32Exit>() {
+            Some(exit) => exit.0,
+            None => return Err(err.into()),
         },
-    )?;
-    // The `__convert` import backs `String`/`Number`/`parseFloat` on
-    // primitives: the guest runs `ToPrimitive` first, so the only objects it
-    // sees are a Date (`Date.prototype.toString`) and a function without a
-    // user `toString` (rendered until `Function.prototype.toString`, S5).
-    // It decodes the argument jsval (reading linear memory for heap-string
-    // operands), reuses `to_js_string`/`value_to_number` and the parse helpers, and
-    // returns the converted jsval. `String` allocates a fresh heap string in guest
-    // memory via the exported heap-pointer global; the rest return an immediate
-    // number jsval and never allocate.
+    };
+    let consumed = match fuel {
+        Some(budget) => budget.saturating_sub(store.get_fuel()?),
+        None => 0,
+    };
+    Ok(Finished {
+        outcome: RunOutcome {
+            code,
+            fuel: consumed,
+        },
+        #[cfg(test)]
+        store,
+        #[cfg(test)]
+        instance,
+    })
+}
+
+/// What a test reads back from a finished run.
+#[cfg(test)]
+pub(crate) struct Inspected {
+    pub(crate) code: i32,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    /// The final linear memory.
+    pub(crate) memory: Vec<u8>,
+    /// The `__exc_value` global: how layout tests reach a heap block, now that
+    /// `_start` returns nothing.
+    pub(crate) thrown: u64,
+}
+
+/// Test-only: run `wasm` capturing its output, then read its final state.
+#[cfg(test)]
+pub(crate) fn run_inspect(wasm: &[u8]) -> anyhow::Result<Inspected> {
+    let capture = Capture::new();
+    let Finished {
+        outcome,
+        mut store,
+        instance,
+    } = execute(wasm, Sinks::Capture(capture.clone()), None)?;
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .map_or_else(Vec::new, |mem| mem.data(&store).to_vec());
+    let thrown = instance
+        .get_global(&mut store, abi::EXC_VALUE_EXPORT_NAME)
+        .and_then(|global| global.get(&mut store).i64())
+        .unwrap_or(0)
+        .cast_unsigned();
+    Ok(Inspected {
+        code: outcome.code,
+        stdout: capture.stdout(),
+        stderr: capture.stderr(),
+        memory,
+        thrown,
+    })
+}
+
+/// Box a host-computed `f64` as a number jsval's raw bits, canonicalizing NaN.
+fn number_bits(n: f64) -> i64 {
+    if n.is_nan() { abi::QNAN } else { n.to_bits() }.cast_signed()
+}
+
+/// Decode a jsval, reading linear memory for heap operands.
+fn decode_arg(caller: &mut Caller<'_, Host>, bits: i64) -> Value {
+    let memory = caller
+        .get_export("memory")
+        .and_then(wasmtime::Extern::into_memory);
+    decode(
+        bits.cast_unsigned(),
+        memory.map_or(&[][..], |mem| mem.data(&*caller)),
+    )
+}
+
+/// The `__convert`/`__method`/`__now`/`__parse_int` imports.
+fn link_conversions(linker: &mut Linker<Host>) -> anyhow::Result<()> {
     linker.func_wrap(
-        "env",
-        "__convert",
-        |mut caller: Caller<'_, Host<W>>, bits: i64, op: i32| -> wasmtime::Result<i64> {
-            let ubits = bits.cast_unsigned();
-            // Decode the argument (heap-string operands need the memory snapshot).
-            let value = match caller
-                .get_export("memory")
-                .and_then(wasmtime::Extern::into_memory)
-            {
-                Some(mem) => decode(ubits, mem.data(&caller)),
-                None => decode(ubits, &[]),
-            };
-            let result = match op {
-                CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
-                // `parseFloat` operates on the argument's string form.
-                CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&to_js_string(&value))),
-                CONVERT_OP_TO_STRING => {
-                    // A string argument is returned unchanged (no allocation);
-                    // anything else takes its JS `ToString` text, allocated as
-                    // a heap string.
+        abi::IMPORT_MODULE,
+        abi::CONVERT_IMPORT_NAME,
+        |mut caller: Caller<'_, Host>, bits: i64, op: i32| -> wasmtime::Result<i64> {
+            let value = decode_arg(&mut caller, bits);
+            Ok(match op {
+                abi::CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
+                abi::CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&to_js_string(&value))),
+                abi::CONVERT_OP_TO_STRING => {
                     if matches!(value, Value::Str(_)) {
                         return Ok(bits);
                     }
-                    let text = to_js_string(&value);
-                    match alloc_string(&mut caller, &text) {
-                        Some(base) => (HEAP | base).cast_signed(),
-                        // Allocation failed: out of memory traps via
-                        // `oom_guard`; a missing export yields `undefined`.
-                        None => UNDEFINED_BITS.cast_signed(),
+                    let mut failed = None;
+                    let base = alloc_string(&mut caller, &mut failed, &to_js_string(&value));
+                    if let Some(err) = failed {
+                        return Err(err);
                     }
+                    base.map_or(abi::UNDEFINED, |base| abi::HEAP | base)
+                        .cast_signed()
                 }
-                // An unknown op flag never reaches here from `crate::emit`; yield
-                // `undefined` to keep the import total.
-                _ => UNDEFINED_BITS.cast_signed(),
-            };
-            oom_guard(&mut caller, result)
+                _ => abi::UNDEFINED.cast_signed(),
+            })
         },
     )?;
-    // The `__method` import backs the non-callback array/string methods:
-    // `indexOf`/`includes`/`slice` on arrays and
-    // `toUpperCase`/`toLowerCase`/`indexOf`/`slice`/`charAt` on strings. It
-    // snapshots linear memory to decode the receiver + arguments, branches on the
-    // receiver's TYPE BYTE for the overloaded `indexOf`/`slice`, and returns the
-    // result jsval — allocating a fresh heap string/array in guest memory (via the
-    // exported heap-pointer global) for the methods that build one.
     linker.func_wrap(
-        "env",
-        "__method",
-        |mut caller: Caller<'_, Host<W>>,
+        abi::IMPORT_MODULE,
+        abi::METHOD_IMPORT_NAME,
+        |mut caller: Caller<'_, Host>,
          recv: i64,
          op: i32,
          arg0: i64,
          arg1: i64|
          -> wasmtime::Result<i64> {
-            let result = method_dispatch(&mut caller, recv.cast_unsigned(), op, arg0, arg1)
-                .unwrap_or(UNDEFINED_BITS)
-                .cast_signed();
-            oom_guard(&mut caller, result)
-        },
-    )?;
-    // The host promise imports: `__promise` backs Promise.resolve/reject,
-    // top-level `await`, and `p.finally`; `__then` backs `p.then`/`p.catch`. Both
-    // drive the host promise engine (`super::promise`).
-    linker.func_wrap(
-        "env",
-        "__promise",
-        |mut caller: Caller<'_, Host<W>>, op: i32, a: i64, b: i64| -> wasmtime::Result<i64> {
-            let result = promise::dispatch(&mut caller, op, a.cast_unsigned(), b.cast_unsigned())
-                .cast_signed();
-            oom_guard(&mut caller, result)
+            let mut failed = None;
+            let result = method_dispatch(
+                &mut caller,
+                &mut failed,
+                recv.cast_unsigned(),
+                op,
+                arg0,
+                arg1,
+            );
+            if let Some(err) = failed {
+                return Err(err);
+            }
+            Ok(result.unwrap_or(abi::UNDEFINED).cast_signed())
         },
     )?;
     linker.func_wrap(
-        "env",
-        "__then",
-        |mut caller: Caller<'_, Host<W>>, p: i64, on_f: i64, on_r: i64| -> wasmtime::Result<i64> {
-            let result = promise::then(
+        abi::IMPORT_MODULE,
+        abi::NOW_IMPORT_NAME,
+        |_caller: Caller<'_, Host>| -> f64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+        },
+    )?;
+    linker.func_wrap(
+        abi::IMPORT_MODULE,
+        abi::PARSE_INT_IMPORT_NAME,
+        |mut caller: Caller<'_, Host>, bits: i64, radix: i64| -> i64 {
+            let text = to_js_string(&decode_arg(&mut caller, bits));
+            let radix = value_to_number(&decode_arg(&mut caller, radix));
+            number_bits(parse_int_str(&text, radix))
+        },
+    )?;
+    Ok(())
+}
+
+/// The `__promise`/`__then` imports driving the host promise engine.
+fn link_promises(linker: &mut Linker<Host>) -> anyhow::Result<()> {
+    linker.func_wrap(
+        abi::IMPORT_MODULE,
+        abi::PROMISE_IMPORT_NAME,
+        |mut caller: Caller<'_, Host>, op: i32, a: i64, b: i64| -> wasmtime::Result<i64> {
+            promise::dispatch(&mut caller, op, a.cast_unsigned(), b.cast_unsigned())
+                .map(u64::cast_signed)
+        },
+    )?;
+    linker.func_wrap(
+        abi::IMPORT_MODULE,
+        abi::THEN_IMPORT_NAME,
+        |mut caller: Caller<'_, Host>, p: i64, on_f: i64, on_r: i64| -> wasmtime::Result<i64> {
+            promise::then(
                 &mut caller,
                 p.cast_unsigned(),
                 on_f.cast_unsigned(),
                 on_r.cast_unsigned(),
             )
-            .cast_signed();
-            oom_guard(&mut caller, result)
+            .map(u64::cast_signed)
         },
     )?;
-    // The `__now` import (`Date`): the host wall clock backing
-    // `Date.now()` / `new Date()`, returning milliseconds since the Unix epoch as
-    // an f64. A clock stepped backwards before the epoch yields `0` rather than
-    // trapping.
-    linker.func_wrap("env", "__now", |_caller: Caller<'_, Host<W>>| -> f64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
-    })?;
-    // The `__parse_int` import (`parseInt(s, radix)`): parse the string form of
-    // `s` in the radix `ToNumber(radix)` (`undefined` for an omitted radix).
-    linker.func_wrap(
-        "env",
-        "__parse_int",
-        |mut caller: Caller<'_, Host<W>>, bits: i64, radix: i64| -> i64 {
-            let mem = caller
-                .get_export("memory")
-                .and_then(wasmtime::Extern::into_memory);
-            let data = mem.map_or(&[][..], |m| m.data(&caller));
-            let text = format_value(&decode(bits.cast_unsigned(), data));
-            let radix = value_to_number(&decode(radix.cast_unsigned(), data));
-            number_bits(parse_int_str(&text, radix))
-        },
-    )?;
-    let instance = linker.instantiate(&mut store, &module)?;
-    let main = instance.get_typed_func::<(), i64>(&mut store, "main")?;
-    // Out of memory (the sticky `__heap_ptr` sentinel, set by a failed guest or
-    // host grow) wins over the trap or result it caused: report it as an
-    // uncaught `RangeError` with no trap backtrace.
-    let exhausted = |store: &mut Store<Host<W>>| {
-        instance
-            .get_global(&mut *store, abi::HEAP_PTR_EXPORT_NAME)
-            .is_some_and(|g| heap_exhausted(&mut *store, g))
-    };
-    let called = main.call(&mut store, ());
-    if exhausted(&mut store) {
-        return Err(anyhow::anyhow!(OUT_OF_MEMORY));
-    }
-    let result = called?;
-    // Drain any microtasks scheduled by `.then`/`.catch`/`.finally` but never
-    // awaited, UNLESS `main` itself completed abruptly with a pending
-    // exception (an uncaught throw or a top-level `await` rejection) — in which
-    // case the program has already terminated and the queue must not run.
-    let main_pending = instance
-        .get_global(&mut store, EXC_PENDING_EXPORT_NAME)
-        .and_then(|g| g.get(&mut store).i32())
-        .unwrap_or(0);
-    let unhandled = if main_pending == 0 {
-        let unhandled = promise::drain_after_main(&mut store, &instance);
-        if exhausted(&mut store) {
-            return Err(anyhow::anyhow!(OUT_OF_MEMORY));
-        }
-        unhandled
-    } else {
-        None
-    };
-    // Snapshot linear memory AFTER the drain so any promise settled by a microtask
-    // renders its final state and pointer jsvals resolve against current memory.
-    let memory = match instance.get_memory(&mut store, "memory") {
-        Some(mem) => mem.data(&store).to_vec(),
-        None => Vec::new(),
-    };
-    // Uncaught-exception check: if `main` returned with `$exc_pending`
-    // set, the program threw an exception that propagated all the way out. Render
-    // the in-flight `$exc_value` (resolving heap pointers against the snapshot)
-    // and surface it as a distinct error instead of a normal result — never a
-    // panic. Modules always export these globals; a missing one reads as 0.
-    let pending = instance
-        .get_global(&mut store, EXC_PENDING_EXPORT_NAME)
-        .and_then(|g| g.get(&mut store).i32())
-        .unwrap_or(0);
-    if pending != 0 {
-        let value_bits = instance
-            .get_global(&mut store, EXC_VALUE_EXPORT_NAME)
-            .and_then(|g| g.get(&mut store).i64())
-            .unwrap_or(0)
-            .cast_unsigned();
-        let rendered = format_value(&decode(value_bits, &memory));
-        return Err(anyhow::anyhow!("Uncaught {rendered}"));
-    }
-    // Unhandled-rejection check: a rejected promise that never got a handler
-    // (reported after the queue drained, so a late `.catch` still counts).
-    if let Some(value_bits) = unhandled {
-        let rendered = format_value(&decode(value_bits, &memory));
-        return Err(anyhow::anyhow!("Uncaught (in promise) {rendered}"));
-    }
-    let consumed = match fuel {
-        Some(budget) => budget.saturating_sub(store.get_fuel()?),
-        None => 0,
-    };
-    Ok((
-        result.cast_unsigned(),
-        memory,
-        store.into_data().sink,
-        consumed,
-    ))
-}
-
-/// Compile JavaScript `src` all the way to a value: parse, lower, emit, run.
-///
-/// This is the full JS-source -> [`Value`] pipeline, chaining
-/// [`crate::frontend::parse`], [`crate::codegen::lower`], [`crate::emit::emit`],
-/// [`run`], and [`decode`].
-///
-/// # Errors
-///
-/// Returns an error if the source fails to parse, cannot be lowered to the
-/// supported IR, or if executing the emitted module fails.
-pub fn compile_and_run(src: &str) -> anyhow::Result<Value> {
-    let program = crate::frontend::parse(src, crate::frontend::Dialect::Js)?;
-    let ir = crate::codegen::lower(&program)?;
-    let wasm = crate::emit::emit(&ir);
-    let (bits, memory) = run(&wasm)?;
-    Ok(decode(bits, &memory))
-}
-
-/// Compile and run JavaScript `src`, capturing everything `console.log` prints
-/// instead of writing it to stdout.
-///
-/// Returns the program's final [`Value`] (the last expression statement's value)
-/// paired with the captured `console.log` output, in execution order. This is
-/// the same pipeline as [`compile_and_run`]; only the output sink differs.
-///
-/// # Errors
-///
-/// Returns an error under the same conditions as [`compile_and_run`].
-pub fn compile_and_run_capturing(src: &str) -> anyhow::Result<(Value, String)> {
-    let program = crate::frontend::parse(src, crate::frontend::Dialect::Js)?;
-    let ir = crate::codegen::lower(&program)?;
-    let wasm = crate::emit::emit(&ir);
-    let (bits, memory, output) = run_capturing(&wasm)?;
-    Ok((decode(bits, &memory), output))
+    Ok(())
 }

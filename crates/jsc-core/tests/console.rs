@@ -1,9 +1,8 @@
 //! Integration tests: `console.log` host-import output.
 #![allow(clippy::expect_used)]
 
-use jsc_core::run::{Value, compile_and_run, compile_and_run_capturing, format_value};
 mod common;
-use common::assert_output;
+use common::{assert_eval, assert_output, eval_text};
 
 // --- console.log ------------------------------------------------------------
 
@@ -78,22 +77,17 @@ fn console_log_mixed_arguments() {
 /// the program's completion value is independent of what was printed.
 #[test]
 fn console_log_prints_in_order_independent_of_final_value() {
-    let (value, output) = compile_and_run_capturing("console.log(1); console.log(2); 99")
-        .expect("pipeline should succeed");
-    assert_eq!(output, "1\n2\n");
+    assert_output("console.log(1); console.log(2); 99", "1\n2\n");
     // The final expression `99` is the completion value, unaffected by the prints.
-    assert_eq!(value, Value::Number(99.0));
-    assert_eq!(format_value(&value), "99");
+    assert_eval("console.log(1); console.log(2); 99", "99");
 }
 
 /// `console.log(..)` evaluates to `undefined` (its expression value), so it can
 /// appear as the final expression.
 #[test]
 fn console_log_expression_value_is_undefined() {
-    let (value, output) =
-        compile_and_run_capturing("console.log(7)").expect("pipeline should succeed");
-    assert_eq!(output, "7\n");
-    assert_eq!(value, Value::Undefined);
+    assert_output("console.log(7)", "7\n");
+    assert_eval("console.log(7)", "undefined");
 }
 
 /// `console.log` inside a loop prints once per iteration, computed values and
@@ -109,33 +103,26 @@ fn console_log_inside_loop() {
 // --- Regression: the import offset must not break existing programs -----------
 
 /// The host import shifts every defined-function index by one; recursion,
-/// closures, and indirect calls must still resolve. `compile_and_run` (no
-/// capture) drives the same pipeline the CLI uses.
+/// closures, and indirect calls must still resolve.
 #[test]
 fn import_offset_regression_spot_check() {
     // Direct arithmetic and a direct recursive call.
+    assert_eq!(eval_text("40 + 2"), "42");
     assert_eq!(
-        compile_and_run("40 + 2").expect("pipeline should succeed"),
-        Value::Number(42.0)
-    );
-    assert_eq!(
-        compile_and_run("function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)")
-            .expect("pipeline should succeed"),
-        Value::Number(55.0)
+        eval_text("function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } fib(10)"),
+        "55"
     );
     // Closures / indirect calls through the funcref table.
     assert_eq!(
-        compile_and_run(
+        eval_text(
             "function counter(){ let c=0; return function(){ c=c+1; return c } } \
              let n=counter(); n(); n(); n()"
-        )
-        .expect("pipeline should succeed"),
-        Value::Number(3.0)
+        ),
+        "3"
     );
     assert_eq!(
-        compile_and_run("function adder(x){ return y => x + y } let a5 = adder(5); a5(37)")
-            .expect("pipeline should succeed"),
-        Value::Number(42.0)
+        eval_text("function adder(x){ return y => x + y } let a5 = adder(5); a5(37)"),
+        "42"
     );
 }
 
@@ -143,11 +130,8 @@ fn import_offset_regression_spot_check() {
 /// prints stream first, then the computed completion value is returned.
 #[test]
 fn console_log_alongside_recursion() {
-    let (value, output) = compile_and_run_capturing(
-        "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } \
-         console.log(\"start\"); fib(10)",
-    )
-    .expect("pipeline should succeed");
-    assert_eq!(output, "start\n");
-    assert_eq!(value, Value::Number(55.0));
+    let src = "function fib(n){ if(n<2) return n; return fib(n-1)+fib(n-2) } \
+               console.log(\"start\"); fib(10)";
+    assert_output(src, "start\n");
+    assert_eval(src, "55");
 }

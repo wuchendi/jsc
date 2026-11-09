@@ -1,9 +1,8 @@
 //! Integration tests: array methods (push/pop, higher-order, indexOf/join/slice).
 #![allow(clippy::expect_used)]
 
-use jsc_core::run::{Value, compile_and_run, format_value};
 mod common;
-use common::{assert_bool, assert_number, assert_string};
+use common::{assert_bool, assert_number, assert_string, eval_text};
 
 // --- array growth: push / pop -------------------------------------------------
 
@@ -47,8 +46,8 @@ fn array_push_returns_new_length() {
 /// `pop` on an empty array yields `undefined`.
 #[test]
 fn array_pop_empty_is_undefined() {
-    let result = compile_and_run("let a=[]; a.pop()").expect("pipeline should succeed");
-    assert_eq!(result, Value::Undefined);
+    let result = eval_text("let a=[]; a.pop()");
+    assert_eq!(result, "undefined");
 }
 
 /// Existing elements survive a grow: all indices read back correctly after `push`.
@@ -59,36 +58,24 @@ fn array_push_preserves_existing_elements() {
     assert_number("let a=[1,2]; a.push(3); a.push(4); a[3]", 4.0);
 }
 
-/// A grown array decodes as a full [`Value::Array`] with the appended element.
+/// A grown array decodes as a full array with the appended element.
 #[test]
 fn array_push_decodes_grown_array() {
-    let result = compile_and_run("let a=[1,2]; a.push(3); a").expect("pipeline should succeed");
-    assert_eq!(
-        result,
-        Value::Array(
-            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0),],
-            Vec::new()
-        )
-    );
+    let result = eval_text("let a=[1,2]; a.push(3); a");
+    assert_eq!(result, "[ 1, 2, 3 ]");
 }
 
 /// `pop` mutates the block in place; the same binding decodes one element shorter.
 #[test]
 fn array_pop_decodes_shrunk_array() {
-    let result = compile_and_run("let a=[10,20,30]; a.pop(); a").expect("pipeline should succeed");
-    assert_eq!(
-        result,
-        Value::Array(vec![Value::Number(10.0), Value::Number(20.0)], Vec::new())
-    );
+    let result = eval_text("let a=[10,20,30]; a.pop(); a");
+    assert_eq!(result, "[ 10, 20 ]");
 }
 
 /// String elements round-trip through a grow (element bytes copied, not reparsed).
 #[test]
 fn array_push_preserves_string_elements() {
-    assert_eq!(
-        format_value(&compile_and_run("let a=[\"x\"]; a.push(\"y\"); a[1]").expect("runs")),
-        "y"
-    );
+    assert_eq!(eval_text("let a=[\"x\"]; a.push(\"y\"); a[1]"), "y");
 }
 
 /// `pop` then `push` on the same binding tracks the length through both edits.
@@ -155,10 +142,7 @@ fn array_foreach_closure_mutation() {
         30.0,
     );
     assert_number("let n=0; [1,2,3].forEach((x,i) => { n = n + i }); n", 3.0);
-    assert_eq!(
-        format_value(&compile_and_run("[1,2,3].forEach(x => x)").expect("runs")),
-        "undefined"
-    );
+    assert_eq!(eval_text("[1,2,3].forEach(x => x)"), "undefined");
 }
 
 /// The receiver may be a bound array variable (not only a literal); it is read,

@@ -3625,6 +3625,10 @@ mod tests {
             module_cells: 0,
             arity: 2,
         };
-        assert_eq!(super::super::emit(&program), super::super::emit(&program));
+        let options = super::super::CompileOptions::default();
+        assert_eq!(
+            super::super::emit(&program, options),
+            super::super::emit(&program, options)
+        );
     }
 }

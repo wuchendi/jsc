@@ -7,10 +7,9 @@
 //! 1. [`frontend`] — parse the source into an swc [`swc_ecma_ast::Program`].
 //! 2. [`codegen`] — lower that AST into the crate's own [`ir::IrProgram`].
 //! 3. [`emit`] — encode the IR into the bytes of a WebAssembly module.
-//! 4. [`run`] — instantiate the module with `wasmtime` and decode its result.
+//! 4. [`run`] — instantiate the module with `wasmtime` and run it.
 //!
-//! [`run::compile_and_run`] wires the stages together end to end. [`ir`] defines
-//! the intermediate representation shared by codegen and emit, and [`error`]
+//! [`ir`] defines the intermediate representation shared by codegen and emit, and [`error`]
 //! carries source-spanned compile diagnostics across the stages.
 
 mod abi;

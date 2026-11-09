@@ -13,14 +13,16 @@
 //! (types are stripped); `.tsx` is rejected; every other FILE and all `-e` /
 //! `-p` input is JavaScript.
 //!
-//! Exit codes: `0` success, `1` uncaught exception / runtime or I/O failure,
-//! `2` compile error.
+//! Exit codes: the module's exit code (`0` success, `1` uncaught exception), `1`
+//! on a trap or I/O failure, `2` compile error.
 
 use std::io::Write as _;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use jsc_core::emit::CompileOptions;
 use jsc_core::frontend::Dialect;
+use jsc_core::run::Sinks;
 
 /// Compile JavaScript/TypeScript to WebAssembly and run it, node-style.
 #[derive(Parser)]
@@ -71,11 +73,11 @@ enum Failure {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Some(Command::Build { file, output }) => build(&file, &output),
+        Some(Command::Build { file, output }) => build(&file, &output).map(|()| 0),
         None => run(cli.eval, cli.print, cli.file),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(Failure::Compile(err)) => {
             eprintln!("{err:#}");
             ExitCode::from(2)
@@ -87,12 +89,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the `-e` / `-p` / FILE form. The `source` `ArgGroup` guarantees exactly one
-/// source is present.
-fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Result<(), Failure> {
+/// Run the `-e` / `-p` / FILE form and return the process exit code. The
+/// `source` `ArgGroup` guarantees exactly one source is present.
+fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Result<u8, Failure> {
     // `label` names the source in diagnostics: `<eval>` for inline input, the
     // real path for a file.
-    let (src, label, dialect, print_value) = match (eval, print, file) {
+    let (src, label, dialect, print_completion) = match (eval, print, file) {
         (Some(src), None, None) => (src, "<eval>".to_owned(), Dialect::Js, false),
         (None, Some(src), None) => (src, "<eval>".to_owned(), Dialect::Js, true),
         (None, None, Some(path)) => {
@@ -105,21 +107,17 @@ fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Res
             )));
         }
     };
-    let wasm = compile(&src, dialect, &label)?;
-    // `console.log` streams to the real stdout while the module runs.
-    let (bits, memory) = jsc_core::run::run(&wasm).map_err(Failure::Runtime)?;
-    if print_value {
-        let value = jsc_core::run::decode(bits, &memory);
-        println!("{}", jsc_core::run::format_value(&value));
-    }
-    Ok(())
+    let options = CompileOptions { print_completion };
+    let wasm = compile(&src, dialect, &label, options)?;
+    let outcome = jsc_core::run::run(&wasm, Sinks::Inherit, None).map_err(Failure::Runtime)?;
+    Ok(u8::try_from(outcome.code).unwrap_or(1))
 }
 
 /// `jsc build FILE -o OUT`: write the module bytes to OUT (`-` = stdout).
 fn build(path: &str, output: &str) -> Result<(), Failure> {
     let dialect = file_dialect(path)?;
     let src = read_source(path)?;
-    let wasm = compile(&src, dialect, path)?;
+    let wasm = compile(&src, dialect, path, CompileOptions::default())?;
     let written = if output == "-" {
         let mut handle = std::io::stdout().lock();
         handle.write_all(&wasm).and_then(|()| handle.flush())
@@ -151,11 +149,16 @@ fn file_dialect(path: &str) -> Result<Dialect, Failure> {
 
 /// Parse `src` as `dialect`, lower, and emit it. A spanned `CompileError` is replaced by its
 /// rendered caret block (labelled `label`); a span-less one keeps its message.
-fn compile(src: &str, dialect: Dialect, label: &str) -> Result<Vec<u8>, Failure> {
+fn compile(
+    src: &str,
+    dialect: Dialect,
+    label: &str,
+    options: CompileOptions,
+) -> Result<Vec<u8>, Failure> {
     let lowered = jsc_core::frontend::parse(src, dialect)
         .and_then(|program| jsc_core::codegen::lower(&program));
     match lowered {
-        Ok(ir) => Ok(jsc_core::emit::emit(&ir)),
+        Ok(ir) => Ok(jsc_core::emit::emit(&ir, options)),
         Err(err) => {
             let rendered = err
                 .downcast_ref::<jsc_core::error::CompileError>()

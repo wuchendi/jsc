@@ -15,7 +15,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use jsc_core::run::{Capture, Sinks};
 use wasmparser::{Operator, Parser, Payload};
+
+/// Far above any measured program, so it never runs out in practice.
+const FUEL_BUDGET: u64 = 1 << 40;
 
 const HEADER: &str = "program\tuser_ops\tcall_indirect\tprop_calls\thost_calls\tfuel\treason";
 
@@ -62,7 +66,7 @@ fn measure(src: &str) -> Row {
     let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js).expect("parse");
     let ir = jsc_core::codegen::lower(&program).expect("lower");
     let user_bodies = ir.functions.len() + 1;
-    let wasm = jsc_core::emit::emit(&ir);
+    let wasm = jsc_core::emit::emit(&ir, jsc_core::emit::CompileOptions::default());
 
     let mut imports = 0u32;
     let mut row = Row {
@@ -108,9 +112,15 @@ fn measure(src: &str) -> Row {
         }
     }
 
-    let (out, fuel) = jsc_core::run::run_metered(&wasm).expect("program runs cleanly");
-    assert!(!out.is_empty(), "corpus program printed nothing");
-    row.fuel = fuel;
+    let capture = Capture::new();
+    let outcome = jsc_core::run::run(&wasm, Sinks::Capture(capture.clone()), Some(FUEL_BUDGET))
+        .expect("program runs cleanly");
+    assert_eq!(outcome.code, 0, "{}", capture.stderr());
+    assert!(
+        !capture.stdout().is_empty(),
+        "corpus program printed nothing"
+    );
+    row.fuel = outcome.fuel;
     row
 }
 

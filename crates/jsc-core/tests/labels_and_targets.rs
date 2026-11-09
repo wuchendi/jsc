@@ -13,8 +13,7 @@ use common::{assert_bool, assert_number, assert_output, assert_rejected, assert_
 
 /// Assert `src` fails to compile with a message containing `msg`.
 fn assert_compile_error(src: &str, msg: &str) {
-    let err = jsc_core::run::compile_and_run(src).expect_err("program should be rejected");
-    let text = err.to_string();
+    let text = common::compile_error(src);
     assert!(
         text.contains(msg),
         "expected `{msg}` for `{src}`, got `{text}`"

@@ -1,19 +1,27 @@
-//! Decode a raw jsval into a [`Value`] and render a [`Value`] as user-facing
-//! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
+//! Decode a raw jsval into a [`Value`] for the host imports not yet replaced by
+//! guest code, and their `ToString` text. Pure (no `wasmtime`).
 
-use super::{
-    ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
-    MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
-    PROMISE_VALUE_OFFSET, QNAN, STR_DATA_OFFSET, STR_LEN_OFFSET, TYPE_ARRAY, TYPE_DATE,
-    TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
+use crate::abi::{
+    self, CLASS_ERROR, QNAN, TYPE_ARRAY, TYPE_DATE, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP,
+    TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
+
+const STR_LEN_OFFSET: usize = abi::STR_LEN_OFFSET as usize;
+const STR_DATA_OFFSET: usize = abi::STR_DATA_OFFSET as usize;
+const DATE_MS_OFFSET: usize = abi::DATE_MS_OFFSET as usize;
+const MAP_SIZE_OFFSET: usize = abi::MAP_SIZE_OFFSET as usize;
+const PROMISE_STATE_OFFSET: usize = abi::PROMISE_STATE_OFFSET as usize;
+const PROMISE_VALUE_OFFSET: usize = abi::PROMISE_VALUE_OFFSET as usize;
+const ARRAY_LEN_OFFSET: usize = abi::ARRAY_LEN_OFFSET as usize;
+const ARRAY_ELEMS_OFFSET: usize = abi::ARRAY_ELEMS_OFFSET as usize;
+const ELEMS_DATA_OFFSET: usize = abi::ELEMS_DATA_OFFSET as usize;
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
 ///
 /// Not `Copy`: the `Str` variant owns a heap [`String`], so decoded values are
 /// cloned rather than copied.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Value {
+pub(super) enum Value {
     /// A JavaScript number (`f64`).
     Number(f64),
     /// A boolean (`true`/`false`).
@@ -154,12 +162,10 @@ impl Guard {
 
 /// Decode raw jsval `bits` into a [`Value`] per the NaN-box layout.
 ///
-/// `memory` is the linear-memory snapshot from [`run`]; it is consulted only for
-/// heap pointer jsvals (tag `0b101`). Pass `&[]` when decoding an immediate value.
-///
-/// [`run`]: super::run
+/// `memory` is the guest's linear memory; it is consulted only for heap pointer
+/// jsvals (tag `0b101`). Pass `&[]` when decoding an immediate value.
 #[must_use]
-pub fn decode(bits: u64, memory: &[u8]) -> Value {
+pub(super) fn decode(bits: u64, memory: &[u8]) -> Value {
     decode_in(
         bits,
         memory,
@@ -520,7 +526,7 @@ fn table_entries(ptr: usize, memory: &[u8]) -> Vec<TableEntry> {
             continue;
         }
         if memory.get(key as usize) == Some(&abi::TYPE_SYMBOL) {
-            let text = format!("[{}]", format_value(&decode_symbol(key as usize, memory)));
+            let text = format!("[{}]", to_js_string(&decode_symbol(key as usize, memory)));
             keyed.push(TableEntry {
                 index: None,
                 symbol: true,
@@ -711,7 +717,7 @@ fn function_name(bits: u64, memory: &[u8]) -> Option<String> {
 /// becomes `"42"`, matching JS and keeping `40 + 2` => `"42"`); every other
 /// value falls back to Rust's shortest round-tripping form (`42.5` => `"42.5"`).
 #[must_use]
-pub fn format_number(value: f64) -> String {
+pub(super) fn format_number(value: f64) -> String {
     if value.is_nan() {
         "NaN".to_owned()
     } else if value.is_infinite() {
@@ -784,149 +790,6 @@ fn format_finite_positive(value: f64) -> String {
     }
 }
 
-/// Render a decoded [`Value`] as user-facing text, the way JavaScript prints it.
-#[must_use]
-pub fn format_value(value: &Value) -> String {
-    match value {
-        Value::Number(n) => format_number(*n),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => "null".to_owned(),
-        // A hole outside an array (never produced) reads as `undefined`.
-        Value::Undefined | Value::Holes(_) => "undefined".to_owned(),
-        // A string renders as its raw text, with no surrounding quotes (a `typeof`
-        // result is an ordinary string, so `console.log(typeof x)` prints the word).
-        Value::Str(s) => s.clone(),
-        // A symbol renders Node-console style by its description.
-        Value::Symbol(description) => {
-            format!("Symbol({})", description.as_deref().unwrap_or_default())
-        }
-        // An array renders Node-console style: `[ 1, 2, 3 ]`, `[]` when empty,
-        // a run of holes as `<N empty items>`, named properties last.
-        Value::Array(elems, props) => {
-            let mut parts = Vec::new();
-            let mut holes = 0;
-            let flush = |parts: &mut Vec<String>, holes: &mut usize| {
-                if *holes > 0 {
-                    let s = if *holes == 1 { "" } else { "s" };
-                    parts.push(format!("<{holes} empty item{s}>"));
-                    *holes = 0;
-                }
-            };
-            for elem in elems {
-                if let Value::Holes(n) = elem {
-                    holes += n;
-                } else {
-                    flush(&mut parts, &mut holes);
-                    parts.push(format_value(elem));
-                }
-            }
-            flush(&mut parts, &mut holes);
-            parts.extend(
-                props
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {}", format_value(value))),
-            );
-            if parts.is_empty() {
-                "[]".to_owned()
-            } else {
-                format!("[ {} ]", parts.join(", "))
-            }
-        }
-        // An object renders Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
-        Value::Object(entries) => format_entries(entries),
-        // A class instance is prefixed with its constructor's name.
-        Value::Instance { class, entries } => format!("{class} {}", format_entries(entries)),
-        // A wrapper names its kind and quotes a wrapped string, as Node does.
-        Value::Wrapper { primitive, entries } => format_wrapper(primitive, entries),
-        // An `arguments` object quotes its (index) keys, as Node does.
-        Value::Arguments(entries) => {
-            let quoted: Vec<(String, Value)> = entries
-                .iter()
-                .map(|(key, value)| (quote_key(key), value.clone()))
-                .collect();
-            format!("[Arguments] {}", format_entries(&quoted))
-        }
-        // An Error instance renders as its single-line stack
-        // (`"<name>: <message>"`, or just the name without a message), the way
-        // a JS console prints an error's first line.
-        Value::Error { name, message } => {
-            if message.is_empty() {
-                name.clone()
-            } else {
-                format!("{name}: {message}")
-            }
-        }
-        Value::Accessor { getter, setter } => match (getter, setter) {
-            (true, true) => "[Getter/Setter]".to_owned(),
-            (false, true) => "[Setter]".to_owned(),
-            _ => "[Getter]".to_owned(),
-        },
-        // A function renders Node-console style by name and class-ness, then
-        // its enumerable properties.
-        Value::Function {
-            name,
-            class,
-            extends,
-            props,
-        } => {
-            let head = match (class, name.is_empty()) {
-                (true, _) => {
-                    let name = if name.is_empty() { "(anonymous)" } else { name };
-                    match extends {
-                        Some(parent) => format!("[class {name} extends {parent}]"),
-                        None => format!("[class {name}]"),
-                    }
-                }
-                (false, true) => "[Function (anonymous)]".to_owned(),
-                (false, false) => format!("[Function: {name}]"),
-            };
-            if props.is_empty() {
-                head
-            } else {
-                format!("{head} {}", format_entries(props))
-            }
-        }
-        // A Map/Set renders with its entry count (the backing entries are not
-        // decoded), e.g. `Map(2)` / `Set(0)`.
-        Value::Map(size) => format!("Map({size})"),
-        Value::Set(size) => format!("Set({size})"),
-        // A promise renders Node-console style by settlement.
-        Value::Promise { state, value } => {
-            if *state == PROMISE_FULFILLED {
-                format!("Promise {{ {} }}", format_value(value))
-            } else if *state == PROMISE_REJECTED {
-                format!("Promise {{ <rejected> {} }}", format_value(value))
-            } else {
-                "Promise { <pending> }".to_owned()
-            }
-        }
-        // A generator handle renders Node-console style.
-        Value::Generator => "Object [Generator]".to_owned(),
-        // A Date renders as its ISO 8601 UTC string.
-        Value::Date(ms) => format_date_iso(*ms),
-        // Cycle markers render Node-console style.
-        Value::Circular(id) => format!("[Circular *{id}]"),
-        Value::Ref(id, value) => format!("<ref *{id}> {}", format_value(value)),
-    }
-}
-
-/// Render a wrapper object Node-console style: `[String: 'abc']`,
-/// `[Number: -0]`, `[Boolean: true]`, `[Symbol: Symbol(a)]`, then its own properties when it has any.
-fn format_wrapper(primitive: &Value, entries: &[(String, Value)]) -> String {
-    let head = match primitive {
-        Value::Str(text) => format!("[String: '{text}']"),
-        Value::Number(n) if *n == 0.0 && n.is_sign_negative() => "[Number: -0]".to_owned(),
-        Value::Number(n) => format!("[Number: {}]", format_number(*n)),
-        Value::Symbol(_) => format!("[Symbol: {}]", format_value(primitive)),
-        other => format!("[Boolean: {}]", format_value(other)),
-    };
-    if entries.is_empty() {
-        head
-    } else {
-        format!("{head} {}", format_entries(entries))
-    }
-}
-
 /// `Array.prototype.join` over decoded array elements: each element's
 /// `ToString` (`null`/`undefined` elements, holes, and cycle back-references
 /// are empty) separated by `sep`; a run of `N` holes contributes `N` empty
@@ -956,15 +819,14 @@ fn join_elements(elems: &[Value], sep: &str) -> String {
 }
 
 /// The JS `ToString` text of a decoded [`Value`] (what `String(v)`, `'' + v`
-/// and `join` produce), as opposed to [`format_value`]'s console rendering:
-/// an array joins its elements' `ToString` with `,` (`null`/`undefined`
+/// and `join` produce): an array joins its elements' `ToString` with `,` (`null`/`undefined`
 /// elements, holes, and cycle back-references are empty, as in V8), a plain object or
 /// class instance is `[object Object]`, an error is `Error.prototype.toString`
 /// (`Name: message`, or whichever half is non-empty), and Map/Set/promise/
-/// generator use their `Object.prototype.toString` tags. Functions (no source
-/// text is kept) and Dates keep their console rendering.
+/// generator use their `Object.prototype.toString` tags. A function (no source
+/// text is kept) is its `[Function: f]` head and a Date its ISO form.
 #[must_use]
-pub fn to_js_string(value: &Value) -> String {
+pub(super) fn to_js_string(value: &Value) -> String {
     match value {
         Value::Array(elems, _) => join_elements(elems, ","),
         Value::Object(_) | Value::Instance { .. } => "[object Object]".to_owned(),
@@ -981,42 +843,37 @@ pub fn to_js_string(value: &Value) -> String {
         Value::Generator => "[object Generator]".to_owned(),
         Value::Accessor { .. } | Value::Circular(_) | Value::Holes(_) => String::new(),
         Value::Ref(_, inner) => to_js_string(inner),
-        Value::Number(_)
-        | Value::Bool(_)
-        | Value::Null
-        | Value::Undefined
-        | Value::Str(_)
-        | Value::Symbol(_)
-        | Value::Function { .. }
-        | Value::Date(_) => format_value(value),
+        Value::Number(n) => format_number(*n),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_owned(),
+        Value::Undefined => "undefined".to_owned(),
+        Value::Str(s) => s.clone(),
+        Value::Symbol(description) => {
+            format!("Symbol({})", description.as_deref().unwrap_or_default())
+        }
+        Value::Function {
+            name,
+            class,
+            extends,
+            ..
+        } => function_head(name, *class, extends.as_deref()),
+        Value::Date(ms) => format_date_iso(*ms),
     }
 }
 
-/// A property key as Node's console prints it: an identifier-like key bare,
-/// anything else (an index key) single-quoted.
-fn quote_key(key: &str) -> String {
-    let identifier = key.chars().next().is_some_and(|c| !c.is_ascii_digit())
-        && key
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
-    if identifier {
-        key.to_owned()
-    } else {
-        format!("'{key}'")
-    }
-}
-
-/// Render own properties Node-console style: `{ a: 1, b: 2 }`, `{}` when empty.
-fn format_entries(entries: &[(String, Value)]) -> String {
-    if entries.is_empty() {
-        "{}".to_owned()
-    } else {
-        let inner = entries
-            .iter()
-            .map(|(key, value)| format!("{key}: {}", format_value(value)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{{ {inner} }}")
+/// A function's text: `[Function: f]`, `[Function (anonymous)]`, `[class A]`
+/// or `[class B extends A]`.
+fn function_head(name: &str, class: bool, extends: Option<&str>) -> String {
+    match (class, name.is_empty()) {
+        (true, _) => {
+            let name = if name.is_empty() { "(anonymous)" } else { name };
+            match extends {
+                Some(parent) => format!("[class {name} extends {parent}]"),
+                None => format!("[class {name}]"),
+            }
+        }
+        (false, true) => "[Function (anonymous)]".to_owned(),
+        (false, false) => format!("[Function: {name}]"),
     }
 }
 

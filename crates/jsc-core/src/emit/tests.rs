@@ -3,9 +3,62 @@
 //! the bytes.
 #![cfg(feature = "native-run")]
 
-use super::{builtin_count, collect_strings, emit, intern_table, realm};
+use super::{CompileOptions, builtin_count, collect_strings, intern_table, realm};
 use crate::abi;
 use crate::ir::{BinOp, CalleeError, IrCase, IrFunction, IrNode, IrProgram, IrStmt, PropKey};
+
+/// Emit `program` with the completion value printed.
+fn emit(program: &IrProgram) -> Vec<u8> {
+    super::emit(
+        program,
+        CompileOptions {
+            print_completion: true,
+        },
+    )
+}
+
+/// Run `bytes` and return the rendered completion value.
+fn completion(bytes: &[u8]) -> String {
+    let done = crate::run::run_inspect(bytes).expect("module should run");
+    assert_eq!(done.code, 0, "{}", done.stderr);
+    done.stdout
+        .strip_suffix('\n')
+        .expect("completion line")
+        .to_owned()
+}
+
+/// Lower, emit and run JavaScript `src`, returning its rendered completion.
+fn run_js(src: &str) -> String {
+    completion(&emit_js(src))
+}
+
+/// Emit `program` with its final expression thrown instead of completed.
+fn emit_throwing(mut program: IrProgram) -> Vec<u8> {
+    let last = program.stmts.last_mut();
+    assert!(
+        matches!(last, Some(IrStmt::Expr(_))),
+        "program must end in an expression"
+    );
+    if let Some(IrStmt::Expr(node)) = last {
+        *node = IrNode::Throw(Box::new(std::mem::replace(node, IrNode::Num(0.0))));
+    }
+    emit(&program)
+}
+
+/// Lower `src`.
+fn lower_js(src: &str) -> IrProgram {
+    crate::codegen::lower(
+        &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
+    )
+    .expect("lower")
+}
+
+/// Run a module built by [`emit_throwing`]: the thrown jsval bits and memory.
+fn thrown(bytes: &[u8]) -> (u64, Vec<u8>) {
+    let done = crate::run::run_inspect(bytes).expect("module should run");
+    assert_eq!(done.code, 1, "the final expression throws");
+    (done.thrown, done.memory)
+}
 
 /// Wrap a single expression into a one-statement program.
 fn expr_program(node: IrNode) -> IrProgram {
@@ -72,37 +125,36 @@ fn emits_valid_module_for_non_numeric_literals() {
 #[test]
 fn compile_and_run_string_literal_end_to_end() {
     // Full JS-source pipeline: a string literal and `typeof` over one.
-    let value = crate::run::compile_and_run("\"foo\"").expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Str("foo".to_owned()));
-    assert_eq!(crate::run::format_value(&value), "foo");
+    let value = run_js("\"foo\"");
+    assert_eq!(value, "foo");
+    assert_eq!(value, "foo");
 
-    let ty = crate::run::compile_and_run("typeof \"hi\"").expect("pipeline should succeed");
-    assert_eq!(ty, crate::run::Value::Str("string".to_owned()));
-    assert_eq!(crate::run::format_value(&ty), "string");
+    let ty = run_js("typeof \"hi\"");
+    assert_eq!(ty, "string");
+    assert_eq!(ty, "string");
 }
 
 #[test]
 fn string_literal_round_trips_to_a_heap_string() {
     // A string literal lowers to a heap-pointer jsval backed by a data
     // segment; running the module and decoding against its memory yields the
-    // text (unquoted via `format_value`).
+    // text (unquoted by the guest renderer).
     let bytes = emit(&expr_program(IrNode::Str("foo".into())));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    let value = crate::run::decode(bits, &memory);
-    assert_eq!(value, crate::run::Value::Str("foo".to_owned()));
-    assert_eq!(crate::run::format_value(&value), "foo");
+    let value = completion(&bytes);
+    assert_eq!(value, "foo");
+    assert_eq!(value, "foo");
 }
 
 #[test]
 fn compile_and_run_string_length_end_to_end() {
     // Full JS-source pipeline: `.length` yields the byte count as a number.
-    let value = crate::run::compile_and_run("\"foo\".length").expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Number(3.0));
-    assert_eq!(crate::run::format_value(&value), "3");
+    let value = run_js("\"foo\".length");
+    assert_eq!(value, "3");
+    assert_eq!(value, "3");
 
-    let empty = crate::run::compile_and_run("\"\".length").expect("pipeline should succeed");
-    assert_eq!(empty, crate::run::Value::Number(0.0));
+    let empty = run_js("\"\".length");
+    assert_eq!(empty, "0");
 }
 
 #[test]
@@ -111,40 +163,35 @@ fn str_len_reads_byte_length_header() {
     let node = IrNode::StrLen(Box::new(IrNode::Str("foo".into())));
     let bytes = emit(&expr_program(node));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Number(3.0)
-    );
+    assert_eq!(completion(&bytes), "3");
 }
 
 #[test]
 fn compile_and_run_string_index_end_to_end() {
     // Full JS-source pipeline: `s[i]` yields a fresh one-char string.
-    let value = crate::run::compile_and_run("\"abc\"[1]").expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Str("b".to_owned()));
-    assert_eq!(crate::run::format_value(&value), "b");
+    let value = run_js("\"abc\"[1]");
+    assert_eq!(value, "b");
+    assert_eq!(value, "b");
 
-    let head = crate::run::compile_and_run("\"hello\"[0]").expect("pipeline should succeed");
-    assert_eq!(head, crate::run::Value::Str("h".to_owned()));
+    let head = run_js("\"hello\"[0]");
+    assert_eq!(head, "h");
 }
 
 #[test]
 fn string_index_result_is_a_real_string() {
     // The one-char result is itself a string: `typeof` and `.length` work.
-    let ty = crate::run::compile_and_run("typeof \"abc\"[1]").expect("pipeline should succeed");
-    assert_eq!(ty, crate::run::Value::Str("string".to_owned()));
+    let ty = run_js("typeof \"abc\"[1]");
+    assert_eq!(ty, "string");
 
-    let len = crate::run::compile_and_run("\"abc\"[1].length").expect("pipeline should succeed");
-    assert_eq!(len, crate::run::Value::Number(1.0));
+    let len = run_js("\"abc\"[1].length");
+    assert_eq!(len, "1");
 }
 
 #[test]
 fn string_index_via_variable() {
     // Indexing a string bound to a variable resolves through the local.
-    let value =
-        crate::run::compile_and_run("let s = \"xy\"; s[1]").expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Str("y".to_owned()));
+    let value = run_js("let s = \"xy\"; s[1]");
+    assert_eq!(value, "y");
 }
 
 #[test]
@@ -156,11 +203,7 @@ fn str_index_builds_fresh_one_char_string() {
     };
     let bytes = emit(&expr_program(node));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Str("c".to_owned())
-    );
+    assert_eq!(completion(&bytes), "c");
 }
 
 #[test]
@@ -170,18 +213,7 @@ fn array_literal_round_trips_to_a_heap_array() {
     let node = IrNode::Array(vec![IrNode::Num(1.0), IrNode::Num(2.0), IrNode::Num(3.0)]);
     let bytes = emit(&expr_program(node));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Array(
-            vec![
-                crate::run::Value::Number(1.0),
-                crate::run::Value::Number(2.0),
-                crate::run::Value::Number(3.0),
-            ],
-            Vec::new()
-        )
-    );
+    assert_eq!(completion(&bytes), "[ 1, 2, 3 ]");
 }
 
 #[test]
@@ -189,11 +221,7 @@ fn empty_array_literal_round_trips() {
     // `[]` (n = 0) allocates a 4-byte blob with a zero len header.
     let bytes = emit(&expr_program(IrNode::Array(Vec::new())));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Array(Vec::new(), Vec::new())
-    );
+    assert_eq!(completion(&bytes), "[]");
 }
 
 #[test]
@@ -230,11 +258,7 @@ fn array_element_assignment_writes_slot_and_yields_value() {
     };
     let bytes = emit(&program);
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Number(15.0)
-    );
+    assert_eq!(completion(&bytes), "15");
 }
 
 #[test]
@@ -247,49 +271,35 @@ fn array_element_assignment_expression_is_the_stored_value() {
     };
     let bytes = emit(&expr_program(node));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Number(7.0)
-    );
+    assert_eq!(completion(&bytes), "7");
 }
 
 #[test]
 fn object_property_assignment_static_member_updates_in_place() {
     // `o.x = 42` scans for key "x" and stores into its value slot.
-    let value = crate::run::compile_and_run("let o = {x: 10}; o.x = 42; o.x")
-        .expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Number(42.0));
+    let value = run_js("let o = {x: 10}; o.x = 42; o.x");
+    assert_eq!(value, "42");
 }
 
 #[test]
 fn object_property_assignment_computed_member_updates_in_place() {
     // `o["a"] = 7` is the computed form of the same key-scan store.
-    let value = crate::run::compile_and_run("let o = {a: 1}; o[\"a\"] = 7; o.a")
-        .expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Number(7.0));
+    let value = run_js("let o = {a: 1}; o[\"a\"] = 7; o.a");
+    assert_eq!(value, "7");
 }
 
 #[test]
 fn object_property_assignment_expression_is_the_stored_value() {
     // `o.a = v` evaluates to `v` (JS semantics), independent of the store.
-    let value = crate::run::compile_and_run("let o = {a: 0}; let x = (o.a = 9); x")
-        .expect("pipeline should succeed");
-    assert_eq!(value, crate::run::Value::Number(9.0));
+    let value = run_js("let o = {a: 0}; let x = (o.a = 9); x");
+    assert_eq!(value, "9");
 }
 
 #[test]
 fn object_property_assignment_missing_key_adds_property() {
     // `o.b = 5` on an object without `b` adds an own data property after `a`.
-    let value =
-        crate::run::compile_and_run("let o = {a: 1}; o.b = 5; o").expect("pipeline should succeed");
-    assert_eq!(
-        value,
-        crate::run::Value::Object(vec![
-            ("a".to_owned(), crate::run::Value::Number(1.0)),
-            ("b".to_owned(), crate::run::Value::Number(5.0)),
-        ])
-    );
+    let value = run_js("let o = {a: 1}; o.b = 5; o");
+    assert_eq!(value, "{ a: 1, b: 5 }");
 }
 
 #[test]
@@ -324,11 +334,7 @@ fn object_property_assignment_via_indexset_ir_updates_slot() {
     };
     let bytes = emit(&program);
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Number(42.0)
-    );
+    assert_eq!(completion(&bytes), "42");
 }
 
 #[test]
@@ -363,11 +369,7 @@ fn object_property_assignment_via_indexset_ir_missing_key_adds() {
     };
     let bytes = emit(&program);
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Number(42.0)
-    );
+    assert_eq!(completion(&bytes), "42");
 }
 
 #[test]
@@ -377,11 +379,7 @@ fn typeof_string_literal_reports_string() {
         "hi".into(),
     )))));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Str("string".to_owned())
-    );
+    assert_eq!(completion(&bytes), "string");
 }
 
 /// The data-segment count and the initial `__heap_ptr` of `bytes`.
@@ -627,11 +625,7 @@ fn emits_valid_module_with_string_concatenation() {
         rhs: Box::new(IrNode::Str("bar".into())),
     }));
     validate(&bytes);
-    let (bits, memory) = crate::run::run(&bytes).expect("module should run");
-    assert_eq!(
-        crate::run::decode(bits, &memory),
-        crate::run::Value::Str("foobar".to_owned())
-    );
+    assert_eq!(completion(&bytes), "foobar");
 }
 
 #[test]
@@ -646,13 +640,9 @@ fn heap_blocks_write_the_type_byte_header() {
         ("[7, 8]", 1u8, 0),
         ("let o = {a: 1}; o", 2u8, 0),
     ] {
-        let program = crate::codegen::lower(
-            &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
-        )
-        .expect("lower");
-        let bytes = emit(&program);
+        let bytes = emit_throwing(lower_js(src));
         validate(&bytes);
-        let (bits, memory) = crate::run::run(&bytes).expect("module should run");
+        let (bits, memory) = thrown(&bytes);
         // A heap jsval carries tag 0b101 and the block base in its low 32 bits.
         assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
         let base = (bits & 0xFFFF_FFFF) as usize;
@@ -759,11 +749,7 @@ fn emits_valid_closure_module_with_cells_and_env() {
     let bytes = emit(&program);
     validate(&bytes);
     // It computes the closure result end to end.
-    let (bits, _memory) = crate::run::run(&bytes).expect("module should run");
-    assert!(
-        (f64::from_bits(bits) - 42.0).abs() < 1e-9,
-        "closure result should be 42"
-    );
+    assert_eq!(completion(&bytes), "42", "closure result should be 42");
 }
 
 /// Lower and emit JavaScript `src`.
@@ -823,9 +809,9 @@ fn every_block_is_8_aligned_with_zero_header_bytes() {
     ] {
         // Allocate an odd-sized block first so an unrounded allocator would
         // misalign the block under test.
-        let bytes = emit_js(&format!("let pad = 'ab' + 'c'; {src}"));
+        let bytes = emit_throwing(lower_js(&format!("let pad = 'ab' + 'c'; {src}")));
         validate(&bytes);
-        let (bits, memory) = crate::run::run(&bytes).expect("module should run");
+        let (bits, memory) = thrown(&bytes);
         assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
         let base = (bits & 0xFFFF_FFFF) as usize;
         assert_eq!(base % 8, 0, "{src}: block base {base} is not 8-aligned");
@@ -852,6 +838,8 @@ fn every_block_is_8_aligned_with_zero_header_bytes() {
 fn exported_constructors_build_aligned_zeroed_blocks() {
     use wasmtime::{Engine, Linker, Module, Store};
     let bytes = emit_js("let s = 'odd'; s");
+    let start = usize::try_from(data_layout(&bytes).1.expect("heap start")).expect("start");
+    assert_eq!(start % 8, 0, "heap start is 8-aligned");
     let engine = Engine::default();
     let module = Module::new(&engine, &bytes).expect("compile");
     let mut linker = Linker::new(&engine);
@@ -863,21 +851,8 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
         .instantiate(&mut store, &module)
         .expect("instantiate");
     let memory = instance.get_memory(&mut store, "memory").expect("memory");
-    let heap_ptr = instance
-        .get_global(&mut store, crate::abi::HEAP_PTR_EXPORT_NAME)
-        .expect("heap ptr");
-    let ptr = |store: &mut Store<()>| heap_ptr.get(&mut *store).i32().expect("i32");
-    assert_eq!(ptr(&mut store) % 8, 0, "heap start is 8-aligned");
     // Dirty the free region so the constructors must WRITE the zero bytes.
-    let start = usize::try_from(ptr(&mut store)).expect("ptr");
     memory.data_mut(&mut store)[start..start + 256].fill(0xFF);
-
-    let alloc = instance
-        .get_typed_func::<i32, i32>(&mut store, crate::abi::ALLOC_EXPORT_NAME)
-        .expect("__alloc export");
-    let a = alloc.call(&mut store, 5).expect("alloc");
-    assert_eq!(a % 8, 0);
-    assert_eq!(ptr(&mut store) - a, 8, "__alloc(5) rounds up to 8");
 
     let new_string = instance
         .get_typed_func::<(i32, i32), i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
@@ -904,36 +879,6 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
         &[crate::abi::TYPE_STRING, 0, crate::abi::STR_FLAG_TWO_BYTE, 0]
     );
     assert_eq!(&mem[t + 4..t + 8], &3u32.to_le_bytes());
-
-    let new_array = instance
-        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_ARRAY_EXPORT_NAME)
-        .expect("__new_array export");
-    let arr = new_array.call(&mut store, 2).expect("new array");
-    assert_eq!(arr % 8, 0);
-    let mem = memory.data(&store);
-    let arr = usize::try_from(arr).expect("base");
-    assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
-    assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
-    // `proto` = `%Array.prototype%`.
-    assert_eq!(
-        mem[arr + 14..arr + 16],
-        [0xFD, 0x7F],
-        "proto is a heap pointer"
-    );
-    assert_eq!(&mem[arr + 16..arr + 20], &2u32.to_le_bytes(), "len");
-    let elems = u32::from_le_bytes(mem[arr + 20..arr + 24].try_into().expect("elems"));
-    let elems = usize::try_from(elems).expect("elems");
-    assert_eq!(elems % 8, 0);
-    assert_eq!(&mem[elems..elems + 4], &[crate::abi::TYPE_ELEMS, 0, 0, 0]);
-    assert_eq!(&mem[elems + 4..elems + 8], &2u32.to_le_bytes(), "cap");
-    for i in 0..2 {
-        let at = elems + 8 + 8 * i;
-        assert_eq!(&mem[at..at + 8], &crate::abi::UNDEFINED.to_le_bytes());
-    }
-    let empty = new_array.call(&mut store, 0).expect("empty array");
-    let mem = memory.data(&store);
-    let empty = usize::try_from(empty).expect("base");
-    assert_eq!(&mem[empty + 16..empty + 24], &[0; 8], "len 0, no store");
 
     let new_promise = instance
         .get_typed_func::<(), i32>(&mut store, crate::abi::NEW_PROMISE_EXPORT_NAME)
@@ -987,9 +932,9 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         );
     };
     let heap = |src: &str, kind: u8, flags: u8| {
-        let bytes = emit_js(src);
+        let bytes = emit_throwing(lower_js(src));
         validate(&bytes);
-        let (bits, memory) = crate::run::run(&bytes).expect("module should run");
+        let (bits, memory) = thrown(&bytes);
         assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
         let base = u32::try_from(bits & 0xFFFF_FFFF).expect("base");
         assert_eq!(base % 8, 0, "{src}: 8-aligned");
