@@ -12,7 +12,7 @@ use super::{
     CONVERT_OP_TO_STRING, FD_WRITE_IMPORT, HEAP_BITS, Helpers, INVALID_DATE, OUT_BUF_GLOBAL,
     OUT_CAP_GLOBAL, OUT_LEN_GLOBAL, OWN_KEYS, PATH_BUF_GLOBAL, PATH_CAP_GLOBAL, PROC_EXIT_IMPORT,
     QNAN_BITS, REFS_BUF_GLOBAL, REFS_CAP_GLOBAL, REFS_LEN_GLOBAL, StrOffsets, abi, emit_date_field,
-    emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at, static_key,
+    emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at, static_key, unicode,
 };
 use crate::ir::DateOp;
 
@@ -254,7 +254,7 @@ impl Helpers<'_> {
     fn date_text(self) -> u32 {
         self.render_base() + 22
     }
-    /// The exported `_start`, the last defined function.
+    /// The exported `_start`; the Unicode helpers follow it.
     pub(super) fn start(self) -> u32 {
         self.render_base() + 23
     }
@@ -1184,15 +1184,32 @@ fn emit_render_entry(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     f
 }
 
-/// Push `1` when the code unit in i32 local `u` may appear in a bare key.
-/// Non-ASCII units count as alphanumeric until the Unicode tables arrive.
-fn key_unit_ok(f: &mut Function, u: u32) {
+/// Push `1` when the character at unit `at` of the string `key`, whose first
+/// unit is in i32 local `u`, may appear in a bare key: an ASCII identifier
+/// unit, or a non-ASCII `Alphanumeric` code point (a lone surrogate is not).
+/// A surrogate pair advances `at` to its trail unit.
+fn key_unit_ok(
+    f: &mut Function,
+    helpers: Helpers<'_>,
+    key: u32,
+    count: u32,
+    wide: u32,
+    at: u32,
+    u: u32,
+) {
+    wasm!(f; LocalGet(u), I32Const(0x80), I32GeU, If(BlockType::Result(I32)), LocalGet(wide), If(BlockType::Result(I32)));
+    emit_surrogate_pair_at(f, key, at, count);
+    wasm!(f; Else, I32Const(0), End, If(BlockType::Empty));
+    unicode::push_pair_cp(f, key, at);
+    wasm!(f; LocalSet(u), LocalGet(at), I32Const(1), I32Add, LocalSet(at), End);
+    unicode::push_is_alphanumeric(f, helpers, u);
     wasm!(f;
+        Else,
         LocalGet(u), I32Const(0x20), I32Or, I32Const(0x61), I32Sub, I32Const(26), I32LtU,
         LocalGet(u), I32Const(0x30), I32Sub, I32Const(10), I32LtU, I32Or,
         LocalGet(u), I32Const(0x5F), I32Eq, I32Or,
         LocalGet(u), I32Const(0x24), I32Eq, I32Or,
-        LocalGet(u), I32Const(0x80), I32GeU, I32Or,
+        End,
     );
 }
 
@@ -1224,7 +1241,7 @@ fn emit_render_key(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     );
     emit_str_unit(&mut f, key, at, wide);
     wasm!(f; LocalSet(code));
-    key_unit_ok(&mut f, code);
+    key_unit_ok(&mut f, helpers, key, count, wide, at, code);
     wasm!(f; LocalSet(bare), LocalGet(at), I32Const(1), I32Add, LocalSet(at), Br(0), End, End);
     wasm!(f; LocalGet(bare), I32Eqz, LocalGet(quote), I32And, LocalSet(bare));
     quote_mark(&mut f, bare);

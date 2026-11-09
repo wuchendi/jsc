@@ -1556,9 +1556,9 @@ pub(super) enum AsyncGenReaction {
     ReturnRejected,
 }
 
-/// A generic `String.prototype` method: the case mappings, `localeCompare`
-/// and `normalize` are backed by a host `__method` op ([`StringOp::flag`]);
-/// the rest run in the guest on code units.
+/// A generic `String.prototype` method: `localeCompare` and `normalize` are
+/// backed by a host `__method` op ([`StringOp::flag`]); the rest run in the
+/// guest on code units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StringOp {
     IndexOf,
@@ -1655,8 +1655,6 @@ impl StringOp {
     /// The host `__method` op flag of a host-backed method.
     pub(super) fn flag(self) -> Option<i32> {
         Some(match self {
-            Self::ToUpperCase | Self::ToLocaleUpperCase => abi::METHOD_OP_TO_UPPER,
-            Self::ToLowerCase | Self::ToLocaleLowerCase => abi::METHOD_OP_TO_LOWER,
             Self::LocaleCompare => abi::METHOD_OP_LOCALE_COMPARE,
             Self::Normalize => abi::METHOD_OP_NORMALIZE,
             _ => return None,

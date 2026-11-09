@@ -147,6 +147,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
         has_accessors: program_has_accessors(program),
         dirty_tracking: program_tests_dirty_bits(program),
+        unicode: layout.unicode,
         fn_info: layout.info,
     };
     // Helper types follow the main (type 0) and uniform (type 1) types, one
@@ -310,8 +311,15 @@ pub(super) fn build_type_and_function_sections<'a>(
             .function(params.iter().copied(), results.iter().copied());
         functions.function(ty);
     }
-
     for (ty, (params, results)) in (render_type..).zip(render::TYPES) {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+        functions.function(ty);
+    }
+
+    let unicode_type = render_type + u32::try_from(render::TYPES.len()).unwrap_or(0);
+    for (ty, (params, results)) in (unicode_type..).zip(unicode::TYPES) {
         types
             .ty()
             .function(params.iter().copied(), results.iter().copied());
@@ -546,7 +554,7 @@ pub(super) fn build_globals(
 /// counts code units), its `flags` already `INTERNED`, plus `TWO_BYTE` for
 /// UTF-16 data and `ARRAY_INDEX` for a canonical index spelling, in ascending
 /// offset order for deterministic output, then the intern table's u32 slots,
-/// the function data, and the realm image.
+/// the function data, the realm image, and the Unicode tables.
 pub(super) fn emit_data_section(
     offsets: &StrOffsets,
     intern: &InternTable,
@@ -579,6 +587,7 @@ pub(super) fn emit_data_section(
         &ConstExpr::i32_const(layout.realm),
         realm::image(layout.realm, first_builtin_slot, offsets),
     );
+    data.active(0, &ConstExpr::i32_const(layout.unicode), unicode::data());
     data
 }
 

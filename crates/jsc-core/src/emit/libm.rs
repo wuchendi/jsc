@@ -19,7 +19,7 @@ use wasm_encoder::{
     TypeSection, ValType,
 };
 
-use super::{Helpers, MathOp};
+use super::{Helpers, MathOp, unicode};
 use crate::abi;
 
 type W = Instruction<'static>;
@@ -520,7 +520,7 @@ impl B {
     }
 }
 
-/// The helpers, in function-index order after `_start`.
+/// The helpers, in function-index order after the Unicode helpers.
 #[derive(Clone, Copy)]
 pub(super) enum H {
     Scalbn,
@@ -670,9 +670,10 @@ pub(super) fn register(types: &mut TypeSection, functions: &mut FunctionSection)
 }
 
 impl Helpers<'_> {
-    /// The wasm function index of libm helper `h`; the helpers follow `_start`.
+    /// The wasm function index of libm helper `h`; the helpers follow the
+    /// [`unicode`](super::unicode) helpers, which follow `_start`.
     pub(super) fn libm(self, h: H) -> u32 {
-        self.start() + 1 + h as u32
+        self.start() + 1 + u32::try_from(unicode::TYPES.len()).unwrap_or(0) + h as u32
     }
 }
 

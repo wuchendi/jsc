@@ -1079,6 +1079,8 @@ struct Helpers<'a> {
     /// Whether the program tests an intrinsics dirty bit (DESIGN.md §6.4). When
     /// `false`, `__set` / `__define` / `__delete` do not set the bits.
     dirty_tracking: bool,
+    /// Base address of the Unicode tables (see [`unicode`]).
+    unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
     /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
     /// is the helper right after `__define` (`define + 1`).
@@ -1364,6 +1366,8 @@ struct FnLayout {
     blocks: i32,
     /// Base address of the realm image.
     realm: i32,
+    /// Base address of the Unicode table segment ([`unicode::data`]).
+    unicode: i32,
 }
 
 mod array;
@@ -1384,6 +1388,8 @@ mod sections;
 mod stmt;
 #[cfg(test)]
 mod tests;
+mod unicode;
+mod unicode_data;
 mod value;
 
 #[allow(clippy::wildcard_imports)]
@@ -1442,14 +1448,17 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let info_count = fn_count + 2 + builtin_count();
     let blocks = strings_end + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_count;
     let realm = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
+    let intern_base = realm + realm::image_size();
+    let intern = intern_table(&offsets, intern_base);
+    // The raw Unicode tables end the static region; blocks stay 8-aligned.
+    let unicode_base = intern_base + 4 * intern.cap;
     let layout = FnLayout {
         info: strings_end,
         blocks,
         realm,
+        unicode: unicode_base,
     };
-    let intern_base = realm + realm::image_size();
-    let intern = intern_table(&offsets, intern_base);
-    let heap_ptr_init = intern_base + 4 * intern.cap;
+    let heap_ptr_init = (unicode_base + unicode::data_size() + BLOCK_ALIGN - 1) & -BLOCK_ALIGN;
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
@@ -1517,7 +1526,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // exception-unwinding globals (see [`build_globals`]).
     module.section(&build_globals(heap_ptr_init, &intern, program.module_cells));
 
-    // Export section: `_start` (the last defined function), memory index 0 as
+    // Export section: `_start`, memory index 0 as
     // "memory", and the helpers the host promise engine still needs.
     let mut exports = ExportSection::new();
     exports.export(abi::START_EXPORT_NAME, ExportKind::Func, helpers.start());
@@ -1718,6 +1727,10 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         code.function(&helper);
     }
     code.function(&emit_start(&offsets, helpers, options));
+    // The families after `_start`, in index order: Unicode, then libm.
+    for helper in unicode::emit_helpers(helpers) {
+        code.function(&helper);
+    }
     for helper in libm::emit_helpers(helpers) {
         code.function(&helper);
     }
