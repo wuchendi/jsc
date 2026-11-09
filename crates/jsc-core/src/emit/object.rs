@@ -2911,20 +2911,25 @@ pub(super) fn emit_nullish_guard(
 /// [`NULLISH_ERROR_STRS`] fragments plus `String(key)`:
 /// `Cannot read properties of null (reading 'x')`, with `.stack` prefixed
 /// `TypeError: `.
-pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_nullish_throw(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     // Params occupy locals 0..3; the shared `TypeError`-helper locals follow.
     let (recv, key, set) = (0, 1, 2);
     let scratch = 3;
     let msg = scratch + 24;
-    let mut function = Function::new(type_error_helper_locals());
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS, RAW_I32], &[]);
+    declare_error_scratch(&mut function);
     let at = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE);
-    let select = |function: &mut Function, if_set: &str, if_read: &str| {
+    let select = |function: &mut FnBuilder<'_>, if_set: &str, if_read: &str| {
         function.instruction(&Instruction::I32Const(at(if_set)));
         function.instruction(&Instruction::I32Const(at(if_read)));
         function.instruction(&Instruction::LocalGet(set));
         function.instruction(&Instruction::Select);
     };
-    let concat = |function: &mut Function| {
+    let concat = |function: &mut FnBuilder<'_>| {
         function.instruction(&Instruction::Call(helpers.concat));
     };
 
@@ -2939,11 +2944,15 @@ pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> 
     concat(&mut function);
     select(&mut function, NULLISH_SET_MID, NULLISH_READ_MID);
     concat(&mut function);
+    // The partial message sits under the conversion's safepoint.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Base);
     function.instruction(&Instruction::LocalGet(key));
     function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
     function.instruction(&Instruction::Call(helpers.convert));
     function.instruction(&Instruction::I32WrapI64);
     concat(&mut function);
+    function.release_temps(mark);
     function.instruction(&Instruction::I32Const(at(NULLISH_SUFFIX)));
     concat(&mut function);
     function.instruction(&Instruction::I64ExtendI32U);
@@ -2953,7 +2962,7 @@ pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> 
 
     emit_raise_type_error(&mut function, msg, scratch, strings, helpers);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// The locals of a `TypeError`-building helper after its params: the full
@@ -2973,6 +2982,14 @@ pub(super) fn type_error_helper_locals() -> Vec<(u32, ValType)> {
         (2, ValType::I64),
         (2, ValType::I64),
     ]
+}
+
+/// [`declare_scratch`] plus the message and stack string jsvals at
+/// `scratch + 24` and `scratch + 25` (the builder form of
+/// [`type_error_helper_locals`]).
+pub(super) fn declare_error_scratch(builder: &mut FnBuilder<'_>) {
+    declare_scratch(builder);
+    builder.locals(2, ROOT_JS);
 }
 
 /// Raise a `TypeError` whose message string jsval is in local `msg`:
@@ -3017,16 +3034,21 @@ fn emit_raise_type_error(
 /// a primitive `recv` — `Cannot create property '<String(key)>' on
 /// <number|string|boolean> '<String(recv)>'`; every other mode wraps
 /// `String(key)` in its [`PROP_KEYED_MSGS`] fragments.
-pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_prop_throw(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     let (recv, key, mode) = (0, 1, 2);
     let scratch = 3;
     let msg = scratch + 24;
-    let mut function = Function::new(type_error_helper_locals());
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS, RAW_I32], &[]);
+    declare_error_scratch(&mut function);
     let at = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE);
-    let concat = |function: &mut Function| {
+    let concat = |function: &mut FnBuilder<'_>| {
         function.instruction(&Instruction::Call(helpers.concat));
     };
-    let to_string = |function: &mut Function, local: u32| {
+    let to_string = |function: &mut FnBuilder<'_>, local: u32| {
         function.instruction(&Instruction::LocalGet(local));
         function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
         function.instruction(&Instruction::Call(helpers.convert));
@@ -3057,14 +3079,18 @@ pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_QUOTE)));
     concat(&mut function);
+    // The partial message sits under the conversion's safepoint.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Base);
     to_string(&mut function, recv);
     concat(&mut function);
+    function.release_temps(mark);
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_SUFFIX)));
     concat(&mut function);
     function.instruction(&Instruction::Else);
     // prefix(mode) + String(key) + suffix(mode), each fragment picked from
     // PROP_KEYED_MSGS by a `select` chain on `mode`.
-    let pick = |function: &mut Function,
+    let pick = |function: &mut FnBuilder<'_>,
                 part: fn(&(i32, &'static str, &'static str)) -> &'static str| {
         let [first, rest @ ..] = &PROP_KEYED_MSGS;
         function.instruction(&Instruction::I32Const(at(part(first))));
@@ -3089,5 +3115,5 @@ pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
 
     emit_raise_type_error(&mut function, msg, scratch, strings, helpers);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
