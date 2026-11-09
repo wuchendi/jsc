@@ -5,7 +5,7 @@ use wasm_encoder::{
 };
 
 use super::run_inspect;
-use super::value::{Value, decode, format_number, to_js_string};
+use super::value::{Value, decode, to_js_string};
 use crate::abi::{TYPE_ARRAY, TYPE_FUNCTION, TYPE_OBJECT, TYPE_STRING};
 use crate::emit::CompileOptions;
 
@@ -154,12 +154,6 @@ fn decode_reads_type_byte_to_pick_the_arm() {
     mem.extend_from_slice(&1u32.to_le_bytes());
     mem.push(b'x');
     assert_eq!(decode(bits, &mem), Value::Str("x".to_owned()));
-}
-
-#[test]
-fn format_number_still_renders_numbers() {
-    assert_eq!(format_number(42.0), "42");
-    assert_eq!(format_number(0.5), "0.5");
 }
 
 #[test]

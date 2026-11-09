@@ -624,7 +624,8 @@ rooted while the base is live. No write barriers.
 ```
 
 `SS_SIZE = 1 MiB` (16 pages, `abi::SHADOW_STACK_SIZE`); `HEAP_BASE =
-SS_SIZE + 96` (the WASI scratch and the OOM line of R1 sit below it); `FN_INFO_ADDR = SS_SIZE + 4` (today `abi.rs:310`, inside the
+abi::STATIC_AREA_END` (the WASI scratch, the OOM line of R1 and the R2 number
+scratch and tables sit below it); `FN_INFO_ADDR = SS_SIZE + 4` (today `abi.rs:310`, inside the
 `0..8` null guard). Initial memory pages grow by 16; maximum stays 8192.
 Addresses `0..8` stay zero (the frame pointer is biased, §5.3), so a raw ref
 of `0` reads zero however full the stack is.
@@ -738,7 +739,7 @@ on the slow path, e.g. `__array_push` growth); the builder enforces that a
 | intern table (`$__intern_base/_cap/_count`, `emit/props.rs:505-540`) | **weak** (§5.6); the table block itself marked via `$__intern_base - 8` |
 | static region | never swept; the compiler emits a **static root list** `[count: u32][addr: u32 × count]` of every static object-family block (realm intrinsics, static builtin-method and user top-level `TYPE_FUNCTION` blocks); each cycle traces their fields without marking them. Static strings / symbols / accessors are immutable and skipped. The `Symbol.for` registry (`emit/realm.rs:66-69`) is in the list (strong, per spec). |
 | promise engine (R4) | `$__job_head`, `$__job_tail`, `$__rejected_head` (raw refs) |
-| `$__out_buf` (R1) | raw ref |
+| `$__out_buf` (R1), `$__path_buf`, `$__refs_buf` | raw refs |
 | weak collections (M3) | `$__kept_objects` (strong array), `$__fin_jobs` (raw ref, traced as a registry list) |
 | host-held handles | **none after R4.** Today `PromiseEngine` (`run/promise.rs:36-98`) holds jsvals and bases (queue `callback`/`value`/`result`/`async_gen`, reactions, `rejected`, `handled`) and both hosts hold fresh `__new_string`/`__new_array` bases while filling them — invisible to a guest collector. **M2 must not land before R4.** |
 | `$__intrinsics_dirty`, `$exc_pending`, `$cf_kind`, `$__heap_ptr` | integers |

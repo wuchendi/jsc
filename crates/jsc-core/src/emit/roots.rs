@@ -71,6 +71,68 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.fn_name(), vec![helpers.heap_object()]),
         // Not a leaf: a lazy function's own properties materialize on lookup.
         (helpers.prop_find, vec![helpers.define + 1]),
+        // The number conversions: Ryu and the decimal parser only touch their
+        // static scratch.
+        (helpers.umul128(), vec![]),
+        (helpers.ryu_pow5(), vec![helpers.umul128()]),
+        (helpers.mul_shift(), vec![helpers.umul128()]),
+        (helpers.multiple_of_pow5(), vec![]),
+        (
+            helpers.ryu_d2d(),
+            vec![
+                helpers.ryu_pow5(),
+                helpers.mul_shift(),
+                helpers.multiple_of_pow5(),
+            ],
+        ),
+        (helpers.dec_expand(), vec![]),
+        (helpers.num_unit(), vec![]),
+        (helpers.str_ws(), vec![]),
+        (helpers.dec_left(), vec![]),
+        (helpers.dec_right(), vec![]),
+        (helpers.dec_round(), vec![]),
+        (
+            helpers.dec_slow(),
+            vec![helpers.dec_left(), helpers.dec_right(), helpers.dec_round()],
+        ),
+        (
+            helpers.dec_parse(),
+            vec![helpers.num_unit(), helpers.dec_slow()],
+        ),
+        (helpers.digit_span(), vec![helpers.num_unit()]),
+        (helpers.radix_pow2(), vec![helpers.num_unit()]),
+        (helpers.radix_fold(), vec![helpers.num_unit()]),
+        (
+            helpers.string_to_number(),
+            vec![
+                helpers.num_unit(),
+                helpers.str_ws(),
+                helpers.dec_parse(),
+                helpers.digit_span(),
+                helpers.radix_pow2(),
+            ],
+        ),
+        (helpers.to_number_prim(), vec![helpers.string_to_number()]),
+        (
+            helpers.parse_float(),
+            vec![helpers.num_unit(), helpers.str_ws(), helpers.dec_parse()],
+        ),
+        (
+            helpers.parse_int(),
+            vec![
+                helpers.num_unit(),
+                helpers.str_ws(),
+                helpers.digit_span(),
+                helpers.dec_parse(),
+                helpers.radix_pow2(),
+                helpers.radix_fold(),
+            ],
+        ),
+        (helpers.now, vec![CLOCK_TIME_GET_IMPORT]),
+        (
+            helpers.random(),
+            vec![CLOCK_TIME_GET_IMPORT, RANDOM_GET_IMPORT],
+        ),
     ]
 }
 

@@ -9,12 +9,11 @@
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use super::{
-    CONVERT_OP_TO_STRING, FD_WRITE_IMPORT, FnBuilder, HEAP_BITS, Helpers, INVALID_DATE, LeafSet,
-    OUT_BUF_GLOBAL, OUT_CAP_GLOBAL, OUT_LEN_GLOBAL, OWN_KEYS, PATH_BUF_GLOBAL, PATH_CAP_GLOBAL,
-    PROC_EXIT_IMPORT, QNAN_BITS, RAW_I32, RAW_I64, REFS_BUF_GLOBAL, REFS_CAP_GLOBAL,
-    REFS_LEN_GLOBAL, ROOT_BASE, ROOT_JS, Sink, StrOffsets, abi, declare_scratch, emit_date_field,
-    emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at, finish_builder, helper_builder,
-    static_key,
+    FD_WRITE_IMPORT, FnBuilder, HEAP_BITS, Helpers, INVALID_DATE, LeafSet, OUT_BUF_GLOBAL,
+    OUT_CAP_GLOBAL, OUT_LEN_GLOBAL, OWN_KEYS, PATH_BUF_GLOBAL, PATH_CAP_GLOBAL, PROC_EXIT_IMPORT,
+    QNAN_BITS, RAW_I32, RAW_I64, REFS_BUF_GLOBAL, REFS_CAP_GLOBAL, REFS_LEN_GLOBAL, ROOT_BASE,
+    ROOT_JS, Sink, StrOffsets, abi, declare_scratch, emit_date_field, emit_str_two_byte,
+    emit_str_unit, emit_surrogate_pair_at, finish_builder, helper_builder, static_key,
 };
 use crate::ir::DateOp;
 
@@ -491,7 +490,7 @@ fn tag_of(f: &mut impl Sink, v: u32) {
 
 /// `__render(v, depth_path)`: `depth_path` is the number of containers on the
 /// recursion path. A number, and a boxed value of an unused tag, renders
-/// through `__convert` (decode reads those as numbers).
+/// through the guest number formatter (decode reads those as numbers).
 fn emit_render(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS, RAW_I32], &[RAW_I32]);
     let (v, depth, tag) = (0, 1, 2);
@@ -512,7 +511,7 @@ fn emit_render(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> 
         LocalGet(v), I32WrapI64, LocalGet(depth), Call(helpers.render_heap()), Return,
         End,
         End,
-        LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        LocalGet(v), Call(helpers.num_to_str()),
         Call(helpers.out_str()),
         End,
     );

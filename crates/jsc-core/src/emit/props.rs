@@ -3098,7 +3098,7 @@ pub(super) fn emit_private_in(
     let mark = f.temp_mark();
     f.root_temp(TempClass::Base);
     wasm!(f;
-        LocalGet(o), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        LocalGet(o), Call(helpers.msg_str()),
         Call(helpers.concat),
     );
     f.release_temps(mark);

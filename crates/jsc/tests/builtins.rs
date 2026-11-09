@@ -52,7 +52,7 @@ fn math_methods_via_eval() {
 /// final value.
 #[test]
 fn conversions_via_eval() {
-    // String(x): number form matches `format_number`, and the result is a string.
+    // String(x): the canonical number form, and the result is a string.
     assert_eq!(jsc(&["-p", "String(42)"]), "42");
     assert_eq!(jsc(&["-p", "String(3.5)"]), "3.5");
     assert_eq!(jsc(&["-p", "typeof String(42)"]), "string");

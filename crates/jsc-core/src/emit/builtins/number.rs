@@ -34,8 +34,8 @@ const TRUE_TEXT: &str = "true";
 const FALSE_TEXT: &str = "false";
 
 /// A `Number.prototype` digit-formatting method: its name (for the
-/// receiver `TypeError`), host op and the `RangeError` text with the digit
-/// range it accepts.
+/// receiver `TypeError`) and the `RangeError` text with the digit range it
+/// accepts.
 #[derive(Clone, Copy)]
 pub(super) enum NumberFormat {
     Fixed,
@@ -89,12 +89,12 @@ impl NumberFormat {
         }
     }
 
-    /// The host `__method` op.
-    fn op(self) -> i32 {
+    /// The `__num_format` mode.
+    fn mode(self) -> i32 {
         match self {
-            Self::Fixed => abi::METHOD_OP_NUMBER_TO_FIXED,
-            Self::Exponential => abi::METHOD_OP_NUMBER_TO_EXPONENTIAL,
-            Self::Precision => abi::METHOD_OP_NUMBER_TO_PRECISION,
+            Self::Fixed => dtoa::MODE_FIXED,
+            Self::Exponential => dtoa::MODE_EXPONENTIAL,
+            Self::Precision => dtoa::MODE_PRECISION,
         }
     }
 
@@ -169,8 +169,7 @@ pub(super) fn emit_number_value_of(
 
 /// `Number.prototype.toString(radix)`: `thisNumberValue(this)`, then the
 /// radix (`10` when `undefined`, else `ToIntegerOrInfinity`, a `RangeError`
-/// outside `2..=36`); radix 10 is `ToString`, any other the host's radix
-/// rendering.
+/// outside `2..=36`); radix 10 is `ToString`, any other `__num_radix`.
 pub(super) fn emit_number_to_string(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -218,8 +217,8 @@ pub(super) fn emit_number_to_string(
         If(BlockType::Result(ValType::I64)),
         LocalGet(x), Call(helpers.to_str()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         Else,
-        LocalGet(x), I32Const(abi::METHOD_OP_NUMBER_TO_STRING),
-        LocalGet(radix), I64ReinterpretF64, I64Const(UNDEFINED_BITS), Call(helpers.method),
+        LocalGet(x), LocalGet(radix), I32TruncF64U, Call(helpers.num_radix()),
+        I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         End,
     );
 }
@@ -258,8 +257,8 @@ pub(super) fn emit_number_to_locale_string(
 /// `thisNumberValue(this)`, the digit count `ToIntegerOrInfinity(arg)` (a
 /// `toPrecision` with `undefined` is `ToString(x)`), then in spec order the
 /// non-finite receiver's `ToString` and the digit-range `RangeError`
-/// (`toFixed` checks the range first); the finite digits render on the host,
-/// which gets `undefined` for a `toExponential` without digits.
+/// (`toFixed` checks the range first); the finite digits render in
+/// `__num_format`, in the shortest mode for a `toExponential` without digits.
 pub(super) fn emit_number_format(
     format: NumberFormat,
     function: &mut FnBuilder<'_>,
@@ -324,16 +323,17 @@ pub(super) fn emit_number_format(
     if !matches!(format, NumberFormat::Fixed) {
         check_range(function);
     }
-    wasm!(function; LocalGet(x), I32Const(format.op()));
+    wasm!(function; LocalGet(x), I32Const(format.mode()));
     if matches!(format, NumberFormat::Exponential) {
         wasm!(function;
-            LocalGet(digits), I64ReinterpretF64, I64Const(UNDEFINED_BITS),
+            I32Const(dtoa::MODE_SHORTEST_EXPONENTIAL),
             LocalGet(arg), I64Const(UNDEFINED_BITS), I64Ne, Select,
         );
-    } else {
-        wasm!(function; LocalGet(digits), I64ReinterpretF64);
     }
-    wasm!(function; I64Const(UNDEFINED_BITS), Call(helpers.method));
+    wasm!(function;
+        LocalGet(digits), I32TruncF64U, Call(helpers.num_format()),
+        I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+    );
 }
 
 /// `Boolean.prototype.toString()` / `valueOf()`: `thisBooleanValue(this)`,

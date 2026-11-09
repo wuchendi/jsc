@@ -1400,3 +1400,44 @@ fn leaf_declarations_match_bodies() {
         assert_eq!(actual, declared, "declared callees of function {helper}");
     }
 }
+
+/// The R2 number conversions never allocate, except the ones that build the
+/// result string (design/runtime-memory.md §5.3).
+#[test]
+fn number_conversion_leaves() {
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let leaves = super::roots::leaf_set(helpers);
+    for helper in [
+        helpers.umul128(),
+        helpers.ryu_d2d(),
+        helpers.dec_expand(),
+        helpers.dec_parse(),
+        helpers.string_to_number(),
+        helpers.to_number_prim(),
+        helpers.parse_float(),
+        helpers.parse_int(),
+        helpers.now,
+        helpers.random(),
+    ] {
+        assert!(leaves.is_leaf(helper), "function {helper} is a leaf");
+    }
+    for helper in [
+        helpers.scratch_str(),
+        helpers.num_to_str(),
+        helpers.num_format(),
+        helpers.num_radix(),
+        helpers.prim_str(),
+        helpers.msg_str(),
+    ] {
+        assert!(!leaves.is_leaf(helper), "function {helper} allocates");
+    }
+}
