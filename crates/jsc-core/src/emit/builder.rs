@@ -500,6 +500,8 @@ impl Layout {
 
     /// `$old = $__sp; $fp = $__sp - 8N; $__sp = $fp`, clear the slots, then
     /// store the parameters that need a slot. Slot `k` is at `$fp + 8 + 8k`.
+    /// With `N <= 4` a slot a parameter store fills is not cleared first: no
+    /// safepoint lies between the two.
     ///
     /// The fill starts at `$fp` and covers the 8 free bytes below slot 0: the
     /// destination `$fp + 8` would wrap to `0` at `$fp = -8` and write the
@@ -513,7 +515,10 @@ impl Layout {
         out.instr(&Instruction::LocalTee(frame.fp));
         out.instr(&Instruction::GlobalSet(SP_GLOBAL));
         if n <= 4 {
-            for k in 0..n {
+            let filled: HashSet<u32> = (0..builder.params)
+                .filter_map(|param| self.local_slots.get(&param).copied())
+                .collect();
+            for k in (0..n).filter(|k| !filled.contains(k)) {
                 out.instr(&Instruction::LocalGet(frame.fp));
                 out.instr(&Instruction::I64Const(0));
                 out.instr(&Instruction::I64Store(slot_arg(k)));

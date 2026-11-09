@@ -384,7 +384,7 @@ fn call_args(
         }
     }
     if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 35;
+        let spread = frame.scratch() + 38;
         let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
         wasm!(function;
             I32Const(n), Call(helpers.new_array()),

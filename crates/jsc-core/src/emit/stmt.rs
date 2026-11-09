@@ -626,8 +626,9 @@ pub(super) fn emit_stmts(
 /// empty string; everything else is TRUTHY (a `typeof` result is a non-empty heap
 /// string, so it is truthy via the string path).
 ///
-/// The evaluated condition is stashed in the `scratch` local so its bits can be
-/// inspected twice: once as an `f64` (the number path) and once as a NaN-box tag
+/// The evaluated condition is stashed in a raw scratch local (read directly when
+/// it is already a local; no safepoint lies between the stash and its last read)
+/// so its bits can be inspected twice: once as an `f64` (the number path) and once as a NaN-box tag
 /// (the boxed path). The two candidate results are combined with `select` on
 /// whether the value is a number, avoiding any control flow.
 pub(super) fn emit_cond(
@@ -645,18 +646,23 @@ pub(super) fn emit_cond(
         builtins::emit_iterator_step(rec, function, scratch, strings, helpers);
         return;
     }
-    emit_node(cond, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(scratch));
+    let value = if let IrNode::Local(local) = cond {
+        *local
+    } else {
+        emit_node(cond, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(scratch + NUM_A));
+        scratch + NUM_A
+    };
 
     // number_truthy = (f != 0.0) & (f == f): nonzero and not NaN. `f != 0.0`
     // rejects 0/-0 but is `true` for NaN, so the `f == f` guard rejects NaN.
-    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Const(Ieee64::from(0.0)));
     function.instruction(&Instruction::F64Ne);
-    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::F64ReinterpretI64);
-    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::I32And);
@@ -674,22 +680,22 @@ pub(super) fn emit_cond(
     // result is now an ordinary non-empty heap string, so it is truthy via the HEAP
     // string path — no non-heap `typeof` case remains.
     //   is_heap = is_boxed(bits) & (tag == 0b101)
-    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::I64Const(QNAN_BITS));
     function.instruction(&Instruction::I64And);
     function.instruction(&Instruction::I64Const(QNAN_BITS));
     function.instruction(&Instruction::I64Eq);
-    emit_tag_eq(function, scratch, 0b101);
+    emit_tag_eq(function, value, 0b101);
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     // HEAP: dispatch on the type byte — STRING reads its length, everything else
     // (array/object/function) is unconditionally truthy.
-    emit_load_type_byte(function, scratch);
+    emit_load_type_byte(function, value);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     // STRING: load the u32 length at base + STR_LEN_OFFSET; truthy iff nonzero.
-    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::I32WrapI64);
     emit_load_str_len(function);
     function.instruction(&Instruction::I32Const(0));
@@ -700,18 +706,18 @@ pub(super) fn emit_cond(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     // NON-HEAP boxed: is_boolean ? (bits & 1) : 0.
-    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::I32Const(0));
-    emit_tag_eq(function, scratch, 0b001);
+    emit_tag_eq(function, value, 0b001);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::End);
 
     // Pick the number path when the value is a number (QNAN mask not fully set),
     // otherwise the boxed path.
-    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::I64Const(QNAN_BITS));
     function.instruction(&Instruction::I64And);
     function.instruction(&Instruction::I64Const(QNAN_BITS));

@@ -1469,7 +1469,7 @@ pub(super) fn emit_proto_guard<S: Sink>(
         // read decides; only a path reading own properties (an array's
         // elements, a promise's `constructor`) tests the receiver again.
         if callee.is_none() || props_sensitive(*kind) {
-            emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
+            emit_proto_kind_test(function, local, *kind, *sealed, scratch + KIND_TMP, helpers);
             if callee.is_some() {
                 found(function, slot);
                 function.instruction(&Instruction::I32And);
@@ -1485,7 +1485,7 @@ pub(super) fn emit_proto_guard<S: Sink>(
             function.instruction(&Instruction::I32And);
         }
         if matches!(path, IrNode::ArrayPush { .. }) {
-            emit_push_room_test(function, scratch + 3);
+            emit_push_room_test(function, scratch + KIND_TMP);
         }
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
@@ -1683,7 +1683,7 @@ pub(super) fn emit_proto_method<S: Sink>(
         open(function, STRING_SLOT);
     }
     for (slot, &kind) in kinds.iter().enumerate().take(STRING_SLOT) {
-        emit_proto_kind_test(function, local, kind, *sealed, scratch + 3, helpers);
+        emit_proto_kind_test(function, local, kind, *sealed, scratch + KIND_TMP, helpers);
         open(function, slot);
     }
     emit_index_node(

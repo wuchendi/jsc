@@ -1345,11 +1345,33 @@ fn array_push_frame_is_shrink_wrapped() {
             })
             .nth(wanted)
             .expect("__array_push body");
+        let ops: Vec<Operator<'_>> = body
+            .get_operators_reader()
+            .expect("operators")
+            .into_iter()
+            .map(|op| op.expect("operator"))
+            .collect();
+        // The test is `!sparse & (elems != 0)`: `elems` is 8-aligned, so
+        // AND-ing it directly with the boolean would always be 0.
+        let first_if = ops
+            .iter()
+            .position(|op| matches!(op, Operator::If { .. }))
+            .expect("the fast-path test");
+        assert!(matches!(
+            &ops[first_if - 5..first_if],
+            [
+                Operator::I32Eqz,
+                Operator::LocalGet { local_index: 3 },
+                Operator::I32Const { value: 0 },
+                Operator::I32Ne,
+                Operator::I32And,
+            ]
+        ));
         let (mut ifs, mut sp_writes, mut ifs_before_frame) = (0, 0, None);
-        for op in body.get_operators_reader().expect("operators") {
-            match op.expect("operator") {
+        for op in &ops {
+            match op {
                 Operator::If { .. } => ifs += 1,
-                Operator::GlobalSet { global_index } if global_index == super::SP_GLOBAL => {
+                Operator::GlobalSet { global_index } if *global_index == super::SP_GLOBAL => {
                     sp_writes += 1;
                     ifs_before_frame.get_or_insert(ifs);
                 }
