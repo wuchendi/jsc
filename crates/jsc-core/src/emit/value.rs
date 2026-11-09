@@ -38,8 +38,8 @@ pub(super) fn emit_box_f64(function: &mut impl Sink, helpers: Helpers<'_>) {
 
 /// Emit the `__box_f64(x: f64) -> i64` helper backing [`emit_box_f64`]:
 /// `x == x ? reinterpret(x) : QNAN`.
-pub(super) fn emit_box_f64_helper() -> Function {
-    let mut function = Function::new(vec![]);
+pub(super) fn emit_box_f64_helper(leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[RAW_F64], &[]);
     function.instruction(&Instruction::LocalGet(0));
     function.instruction(&Instruction::I64ReinterpretF64);
     function.instruction(&Instruction::I64Const(QNAN_BITS));
@@ -48,7 +48,7 @@ pub(super) fn emit_box_f64_helper() -> Function {
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Replace the jsval in `local` with its JS `ToNumber` (a number jsval). A number
@@ -74,8 +74,13 @@ pub(super) fn emit_coerce_number(function: &mut impl Sink, local: u32, helpers: 
 /// `__convert` to-number op on the primitive (`StringToNumber` rules); a
 /// symbol throws the `TypeError`. A throw from a user `valueOf`/`toString`
 /// stays pending and yields `NaN`.
-pub(super) fn emit_to_number_helper(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(type_error_helper_locals());
+pub(super) fn emit_to_number_helper(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_JS], &[]);
+    declare_error_scratch(&mut function);
     let (v, scratch) = (0, 1);
     helpers.unwind.borrow_mut().reset();
     emit_is_object(&mut function, v);
@@ -103,7 +108,7 @@ pub(super) fn emit_to_number_helper(strings: &StrOffsets, helpers: Helpers<'_>) 
     function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
     function.instruction(&Instruction::Call(helpers.convert));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Push `1` if the jsval in `local` is a number, else `0`. Every boxed

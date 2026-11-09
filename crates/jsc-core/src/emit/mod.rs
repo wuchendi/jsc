@@ -1597,133 +1597,144 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
             code.function(&emit_function(func, &offsets, helpers, &leaves));
         }
     }
-    code.function(&emit_alloc());
-    code.function(&emit_concat(helpers.alloc));
-    code.function(&emit_str_eq());
-    code.function(&emit_str_cmp());
-    code.function(&emit_str_index(helpers.alloc));
-    code.function(&emit_str_hash());
-    code.function(&emit_intern_slot(helpers));
-    code.function(&emit_intern_find(helpers));
-    code.function(&emit_intern(helpers));
-    code.function(&emit_index_value());
-    code.function(&emit_index_string(helpers));
-    code.function(&emit_str_exotic_index(helpers));
-    code.function(&emit_to_key(&offsets, helpers));
-    code.function(&emit_prop_find(helpers));
-    code.function(&emit_define(helpers));
-    code.function(&emit_fn_materialize(&offsets, helpers));
-    code.function(&emit_get(&offsets, helpers));
-    code.function(&emit_set(helpers));
-    code.function(&emit_has(&offsets, helpers));
-    code.function(&emit_delete(&offsets, helpers));
-    code.function(&emit_own_keys(helpers));
-    code.function(&emit_for_in_keys(helpers));
-    code.function(&emit_copy_data(helpers));
-    code.function(&emit_array_reserve(helpers.alloc));
+    code.function(&emit_alloc(&leaves));
+    code.function(&emit_concat(helpers.alloc, &leaves));
+    code.function(&emit_str_eq(&leaves));
+    code.function(&emit_str_cmp(&leaves));
+    code.function(&emit_str_index(helpers.alloc, &leaves));
+    code.function(&emit_str_hash(&leaves));
+    code.function(&emit_intern_slot(helpers, &leaves));
+    code.function(&emit_intern_find(helpers, &leaves));
+    code.function(&emit_intern(helpers, &leaves));
+    code.function(&emit_index_value(&leaves));
+    code.function(&emit_index_string(helpers, &leaves));
+    code.function(&emit_str_exotic_index(helpers, &leaves));
+    code.function(&emit_to_key(&offsets, helpers, &leaves));
+    code.function(&emit_prop_find(helpers, &leaves));
+    code.function(&emit_define(helpers, &leaves));
+    code.function(&emit_fn_materialize(&offsets, helpers, &leaves));
+    code.function(&emit_get(&offsets, helpers, &leaves));
+    code.function(&emit_set(helpers, &leaves));
+    code.function(&emit_has(&offsets, helpers, &leaves));
+    code.function(&emit_delete(&offsets, helpers, &leaves));
+    code.function(&emit_own_keys(helpers, &leaves));
+    code.function(&emit_for_in_keys(helpers, &leaves));
+    code.function(&emit_copy_data(helpers, &leaves));
+    code.function(&emit_array_reserve(helpers.alloc, &leaves));
     code.function(&emit_array_push(
         helpers.array_reserve(),
         helpers.sparse_define(),
+        &leaves,
     ));
     code.function(&emit_array_concat(
         helpers.array_reserve(),
         helpers.sparse_get(),
         helpers.proto_elem(),
+        &leaves,
     ));
-    code.function(&emit_array_set(&offsets, helpers, false));
-    code.function(&emit_array_set_length(&offsets, helpers));
-    code.function(&emit_sparse_get(helpers));
-    code.function(&emit_sparse_set(helpers, false));
-    code.function(&emit_protos_indexless());
-    code.function(&emit_proto_elem(helpers));
-    code.function(&emit_proto_set(helpers));
-    code.function(&emit_array_set(&offsets, helpers, true));
-    code.function(&emit_sparse_set(helpers, true));
-    code.function(&emit_json_escape(helpers.alloc));
+    code.function(&emit_array_set(&offsets, helpers, false, &leaves));
+    code.function(&emit_array_set_length(&offsets, helpers, &leaves));
+    code.function(&emit_sparse_get(helpers, &leaves));
+    code.function(&emit_sparse_set(helpers, false, &leaves));
+    code.function(&emit_protos_indexless(&leaves));
+    code.function(&emit_proto_elem(helpers, &leaves));
+    code.function(&emit_proto_set(helpers, &leaves));
+    code.function(&emit_array_set(&offsets, helpers, true, &leaves));
+    code.function(&emit_sparse_set(helpers, true, &leaves));
+    code.function(&emit_json_escape(helpers.alloc, &leaves));
     code.function(&emit_json_str(
         helpers.convert,
         helpers.json_escape,
         JsonTokens::resolve(&offsets),
+        &leaves,
     ));
-    code.function(&emit_same_value_zero(helpers.str_eq));
-    code.function(&emit_map_find(helpers.same_value_zero));
-    code.function(&emit_map_set(helpers.map_find, helpers.array_push));
-    code.function(&emit_map_get(helpers.map_find));
-    code.function(&emit_map_has(helpers.map_find));
-    code.function(&emit_map_delete(helpers.map_find));
+    code.function(&emit_same_value_zero(helpers.str_eq, &leaves));
+    code.function(&emit_map_find(helpers.same_value_zero, &leaves));
+    code.function(&emit_map_set(helpers.map_find, helpers.array_push, &leaves));
+    code.function(&emit_map_get(helpers.map_find, &leaves));
+    code.function(&emit_map_has(helpers.map_find, &leaves));
+    code.function(&emit_map_delete(helpers.map_find, &leaves));
     // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
     // Map/Set helpers.
-    code.function(&emit_loose_eq(helpers));
+    code.function(&emit_loose_eq(helpers, &leaves));
     code.function(&emit_str_to_array(
         helpers.new_array(),
         helpers.str_index,
         helpers.alloc,
+        &leaves,
     ));
     // The in-wasm `JSON.parse` family, in the order their indices were assigned.
-    code.function(&emit_json_ws());
-    code.function(&emit_json_throw(&offsets, helpers));
-    code.function(&emit_json_string(helpers.alloc, helpers));
-    code.function(&emit_json_number(helpers.alloc, helpers.convert, helpers));
-    code.function(&emit_json_value(helpers));
-    code.function(&emit_json_array(helpers));
-    code.function(&emit_json_object(helpers.alloc, helpers));
-    code.function(&emit_json_parse(helpers));
+    code.function(&emit_json_ws(&leaves));
+    code.function(&emit_json_throw(&offsets, helpers, &leaves));
+    code.function(&emit_json_string(helpers.alloc, helpers, &leaves));
+    code.function(&emit_json_number(
+        helpers.alloc,
+        helpers.convert,
+        helpers,
+        &leaves,
+    ));
+    code.function(&emit_json_value(helpers, &leaves));
+    code.function(&emit_json_array(helpers, &leaves));
+    code.function(&emit_json_object(helpers.alloc, helpers, &leaves));
+    code.function(&emit_json_parse(helpers, &leaves));
     // `__gen_to_array` — the generator-spread drain — precedes the
     // trampoline so every later index stays stable.
-    code.function(&generator::emit_gen_to_array(helpers));
-    code.function(&emit_nullish_throw(&offsets, helpers));
-    code.function(&emit_prop_throw(&offsets, helpers));
+    code.function(&generator::emit_gen_to_array(helpers, &leaves));
+    code.function(&emit_nullish_throw(&offsets, helpers, &leaves));
+    code.function(&emit_prop_throw(&offsets, helpers, &leaves));
     // The `__invoke1` callback trampoline is appended after every helper so
     // every helper index stays stable; the `__async_step` trampoline
     // follows it, then the two `new Promise` settler functions.
-    code.function(&emit_box_f64_helper());
-    code.function(&emit_to_number_helper(&offsets, helpers));
-    code.function(&emit_invoke1(helpers));
-    code.function(&generator::emit_async_step(helpers));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers));
-    code.function(&emit_new_string(helpers.alloc));
+    code.function(&emit_box_f64_helper(&leaves));
+    code.function(&emit_to_number_helper(&offsets, helpers, &leaves));
+    code.function(&emit_invoke1(helpers, &leaves));
+    code.function(&generator::emit_async_step(helpers, &leaves));
+    code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers, &leaves));
+    code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers, &leaves));
+    code.function(&emit_new_string(helpers.alloc, &leaves));
     code.function(&emit_new_array(
         helpers.alloc,
         intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Array), helpers),
+        &leaves,
     ));
     code.function(&emit_new_promise(
         helpers.alloc,
         intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers),
+        &leaves,
     ));
     // The realm: `__has_own`, then the builtin bodies.
-    code.function(&emit_has_own(&offsets, helpers));
+    code.function(&emit_has_own(&offsets, helpers, &leaves));
     for builtin in Builtin::ALL {
         code.function(&builtins::emit_builtin(builtin, &offsets, helpers));
     }
     // The conversion helpers follow the builtin bodies.
-    code.function(&emit_to_primitive(&offsets, helpers));
-    code.function(&convert::emit_to_string(&offsets, helpers));
-    code.function(&emit_add_helper(helpers));
-    code.function(&emit_compare(helpers));
-    code.function(&emit_array_join(&offsets, helpers));
+    code.function(&emit_to_primitive(&offsets, helpers, &leaves));
+    code.function(&convert::emit_to_string(&offsets, helpers, &leaves));
+    code.function(&emit_add_helper(helpers, &leaves));
+    code.function(&emit_compare(helpers, &leaves));
+    code.function(&emit_array_join(&offsets, helpers, &leaves));
     code.function(&builtins::emit_to_object(&offsets, helpers));
     code.function(&builtins::emit_json_rep(&offsets, helpers));
     code.function(&builtins::emit_json_indent(helpers));
     code.function(&builtins::emit_json_revive(helpers));
-    code.function(&emit_define_own(&offsets, helpers));
-    code.function(&emit_to_desc(&offsets, helpers));
-    code.function(&emit_own_desc(&offsets, helpers));
-    code.function(&emit_set_integrity(helpers));
-    code.function(&emit_test_integrity());
-    code.function(&emit_own_enum(&offsets, helpers));
-    code.function(&emit_set_proto(helpers));
+    code.function(&emit_define_own(&offsets, helpers, &leaves));
+    code.function(&emit_to_desc(&offsets, helpers, &leaves));
+    code.function(&emit_own_desc(&offsets, helpers, &leaves));
+    code.function(&emit_set_integrity(helpers, &leaves));
+    code.function(&emit_test_integrity(&leaves));
+    code.function(&emit_own_enum(&offsets, helpers, &leaves));
+    code.function(&emit_set_proto(helpers, &leaves));
     code.function(&builtins::emit_promise_self_error(&offsets, helpers));
-    code.function(&emit_symbol_get(helpers));
-    code.function(&emit_super_get(&offsets, helpers));
-    code.function(&emit_super_set(&offsets, helpers));
-    code.function(&emit_private_find(helpers));
-    code.function(&emit_private_add(helpers));
-    code.function(&emit_private_get(helpers));
-    code.function(&emit_private_set(helpers));
-    code.function(&emit_private_brand(helpers));
-    code.function(&emit_private_in(&offsets, helpers));
-    for helper in render::emit_helpers(&offsets, helpers) {
+    code.function(&emit_symbol_get(helpers, &leaves));
+    code.function(&emit_super_get(&offsets, helpers, &leaves));
+    code.function(&emit_super_set(&offsets, helpers, &leaves));
+    code.function(&emit_private_find(helpers, &leaves));
+    code.function(&emit_private_add(helpers, &leaves));
+    code.function(&emit_private_get(helpers, &leaves));
+    code.function(&emit_private_set(helpers, &leaves));
+    code.function(&emit_private_brand(helpers, &leaves));
+    code.function(&emit_private_in(&offsets, helpers, &leaves));
+    for helper in render::emit_helpers(&offsets, helpers, &leaves) {
         code.function(&helper);
     }
     code.function(&emit_start(&offsets, helpers, options, &leaves));

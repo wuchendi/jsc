@@ -775,7 +775,12 @@ The layouts above are chosen so a collector can be added without relayout:
   jsvals live across a safepoint (any call that may allocate), clears them on
   entry, and pops them on every exit including the exception paths; the
   collector does not move blocks, so a raw `i32` base is rooted as `HEAP |
-  base` and stays valid. Global roots are
+  base` and stays valid. Each helper declares every parameter and local as a
+  jsval, a base or key, or raw, and the builder rejects an undeclared one; a
+  raw local holds an integer, an interior address, or a base that another root
+  keeps reachable, and never shares a local with a rooted value. Helpers with a
+  cold allocating path (`__array_push`, `__array_reserve`, `__intern` growth,
+  `__prop_find` materialization) push the frame only on that path. Global roots are
   `$exc_value`, `$cf_value`, `$__this`, `$__new_target`, `$__spread_args`, and
   the module cells. The static region is a root region: static object-family
   blocks are traced, never swept. With the promise engine in the guest
@@ -910,6 +915,12 @@ width); `__str_index` is the fresh one-unit string at an index;
 `__json_escape` writes a lone surrogate as `\udxxx` (lowercase hex). Every
 helper that builds a string narrows a two-byte result whose units are all
 `<= 0xFF` (§5.2).
+
+A helper is a non-allocating leaf, and so not a safepoint for its callers,
+only when `emit/roots.rs::helper_graph` declares it and all its callees are
+leaves; a test checks each declaration against the emitted calls. `__prop_find`
+and `__private_find` are not leaves, because a `LAZY` function materializes on
+lookup (§5.5).
 
 `__to_number(v)` runs `ToPrimitive` (hint number) in the guest, then the host
 ToNumber on the primitive; numeric call sites skip it when the operand already

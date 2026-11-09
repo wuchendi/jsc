@@ -623,7 +623,7 @@ rooted while the base is live. No write barriers.
 ```
 
 `SS_SIZE = 1 MiB` (16 pages, `abi::SHADOW_STACK_SIZE`); `HEAP_BASE =
-SS_SIZE + 8`; `FN_INFO_ADDR = SS_SIZE + 4` (today `abi.rs:310`, inside the
+SS_SIZE + 96` (the WASI scratch and the OOM line of R1 sit below it); `FN_INFO_ADDR = SS_SIZE + 4` (today `abi.rs:310`, inside the
 `0..8` null guard). Initial memory pages grow by 16; maximum stays 8192.
 A stray read of address `0..8` now reads stack data instead of the zero
 guard; every raw ref is tested against `0` before use (M1 reviews the
@@ -678,12 +678,16 @@ audit mechanical. Exceptions unwind by `br` (SP unchanged) or by
 callee may reach `__alloc` — all user functions, builtins, `call_indirect`s,
 and helpers outside a **non-allocating leaf set** computed from a static
 helper call graph (each helper emitter declares its callees). Expected
-leaves: `__str_eq`, `__str_cmp`, `__str_hash`, `__intern_find`,
-`__index_value`, `__prop_find`, `__same_value_zero`, `__map_find`,
-`__box_f64`, `__protos_indexless`, `__private_find`, `__json_ws`,
-`__str_exotic_index`, plus the new `__ryu_d2d`, `__umul128`, libm helpers
+leaves: `__str_eq`, `__str_cmp`, `__str_hash`, `__intern_slot`,
+`__intern_find`, `__index_value`, `__same_value_zero`, `__map_find`,
+`__map_get`, `__map_has`, `__map_delete`, `__box_f64`,
+`__protos_indexless`, `__test_integrity`, `__json_ws`,
+`__str_exotic_index`, `__heap_object`, `__str_of`, `__fn_name`, plus the new `__ryu_d2d`, `__umul128`, libm helpers
 and Unicode lookups. WASI imports never call back, so they are not
-safepoints.
+safepoints. `__prop_find` is **not** a leaf (a `LAZY` function materializes
+on lookup through `__fn_materialize`, which allocates), and so neither is
+`__private_find`, which calls it; every property helper that loops over the
+`proto` chain therefore keeps its object and key rooted across the lookup.
 
 **Spill set** (all IR locals are `i64` jsvals, `emit/function.rs:45-56,128-139`):
 
@@ -693,7 +697,7 @@ safepoints.
 | parameters `a0..a_{K-1}`, `env` | locals `0..K+1` (DESIGN §4.2) | stored in the prologue iff read after a safepoint; `argc` never |
 | `this` snapshot | DESIGN §4.3 | write-through |
 | emitter `i64` scratch | `scratch+0..+2, +4..+6, +13..+20, +22, +23` (`emit/function.rs:15-44`) | write-through; **`Date` scratch `+24..+29` declared raw, never rooted** |
-| emitter `i32` bases / keys | `+3`, `+7`, `+8`, `+11`, `+12`, `+21` (`emit/object.rs:31`, `emit/generator.rs:43`) | write-through of `HEAP | base` (+6); `+9`, `+10` are integers |
+| emitter `i32` bases / keys | `+3`, `+7`, `+8`, `+11`, `+12`, `+21` (`emit/object.rs:31`, `emit/generator.rs:43`) | write-through of `HEAP | base` (+6); `+9`, `+10` are integers (`+9` also holds the array-pop `new_len`, moved off `+7`); the remaining integer uses of `+3`, `+8` and `+21` are to be re-audited before M2 enables collection |
 | builtin `Frame` locals | `emit/builtins/mod.rs:127-151` | `i64` write-through; `i32` only via `frame.base(k)`; `f64` never |
 | hand-written helper locals | each `Function::new` | declared jsval / base / raw; **no default** (Q11: the builder rejects an undeclared local) |
 | operand-stack temporaries | call args (`emit/expr.rs:808`), binary operands, `dst` under element expressions (`emit/array.rs:162-167`, `emit/object.rs:76-86`) | temp slot: `local.set $t; local.get $fp; local.get $t; i64.store off; local.get $t` (+4; +7 for `i32`) |
