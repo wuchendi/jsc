@@ -255,7 +255,7 @@ pub(super) fn emit_array_spread(
                 let value = scratch + 22;
                 emit_node(source, function, scratch, strings, helpers);
                 function.instruction(&Instruction::LocalSet(value));
-                builtins::emit_iter_classify(function, value, false, scratch + 3, helpers);
+                builtins::emit_iter_classify(function, value, false, scratch + KIND_TMP, helpers);
                 function.instruction(&Instruction::LocalSet(scratch + 26));
                 emit_spread_list(value, scratch + 26, function, helpers);
                 function.instruction(&Instruction::I32WrapI64);

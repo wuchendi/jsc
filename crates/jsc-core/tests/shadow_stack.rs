@@ -124,25 +124,59 @@ fn noroot_loop_counter_not_spilled() {
     assert_eq!(framed("g()"), framed("0") + 1);
 }
 
+/// A kind test's base is never rooted, even in a loop holding a safepoint: the
+/// tee is followed directly by the header load, with no write-through.
+#[test]
+fn proto_kind_test_tmp_is_raw() {
+    let bodies = bodies(
+        "function g() { return 0; }
+         function f(a) { for (var i = 0; i < 2; i = i + 1) { a.push(i); g(); } return a; }
+         f([])",
+    );
+    assert!(bodies[2].windows(3).any(|w| matches!(
+        w,
+        [
+            Operator::I32WrapI64,
+            Operator::LocalTee { .. },
+            Operator::I64Load { memarg },
+        ] if memarg.offset == 0
+    )));
+}
+
 #[test]
 fn frame_slots_cleared_on_entry() {
     // Few slots: one `i64.store` of zero per slot right after the prologue.
     let small = bodies(
         "function g(x) { return x; }
-         function f(a) { var y = g(a); g(y); return a; }
+         function f(a) { var y = g(a); g(y); return a + y; }
          f(1)",
     );
     let n = frame_slots(&small[2]).expect("framed") as usize;
     assert!(n <= 4, "expected a small frame, got {n}");
+    // Every slot is written once: cleared, or filled by its parameter's store.
+    let (mut offsets, mut cleared, mut filled) = (Vec::new(), 0, 0);
     for k in 0..n {
         let at = 6 + 3 * k;
         assert!(matches!(small[2][at], Operator::LocalGet { .. }));
-        assert!(matches!(small[2][at + 1], Operator::I64Const { value: 0 }));
-        assert!(matches!(
-            small[2][at + 2],
-            Operator::I64Store { memarg } if memarg.offset == 8 + 8 * k as u64
-        ));
+        match small[2][at + 1] {
+            Operator::I64Const { value: 0 } => cleared += 1,
+            Operator::LocalGet { .. } => filled += 1,
+            ref other => panic!("not a slot write: {other:?}"),
+        }
+        let Operator::I64Store { memarg } = small[2][at + 2] else {
+            panic!("not a slot store");
+        };
+        offsets.push(memarg.offset);
     }
+    offsets.sort_unstable();
+    assert_eq!(
+        offsets,
+        (0..n as u64).map(|k| 8 + 8 * k).collect::<Vec<_>>()
+    );
+    assert!(
+        cleared > 0 && filled > 0,
+        "{cleared} cleared, {filled} filled"
+    );
     // Many slots: a `memory.fill` instead.
     let big = bodies(
         "function g(x) { return x; }

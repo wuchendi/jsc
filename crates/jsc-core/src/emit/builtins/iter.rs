@@ -914,7 +914,7 @@ pub(in crate::emit) fn emit_get_iterator(
         strings,
         helpers,
     );
-    emit_iter_classify(function, v, sealed, scratch + 3, helpers);
+    emit_iter_classify(function, v, sealed, scratch + KIND_TMP, helpers);
     wasm!(function; LocalTee(kind), I64Const(st(ST_PROTOCOL)), I64Eq, If(BlockType::Empty));
     enter_frame(helpers);
     emit_iter_open(function, v, method, rec, scratch, strings, helpers);

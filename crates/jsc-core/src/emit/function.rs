@@ -3,7 +3,7 @@ use super::*;
 
 /// A builder with the user-function layout: `params` parameters (the `K`
 /// jsval arguments, `env`, and a raw `argc` when present), the IR locals up to
-/// `locals` as jsvals, then the 30 scratch locals of [`emit_main`].
+/// `locals` as jsvals, then the 31 scratch locals of [`emit_main`].
 pub(super) fn user_builder(params: u32, locals: u32, leaves: &LeafSet) -> FnBuilder<'_> {
     use LocalClass::{Base, Jsval, Raw};
     let mut b = FnBuilder::new(leaves);
@@ -26,8 +26,13 @@ pub(super) fn user_builder(params: u32, locals: u32, leaves: &LeafSet) -> FnBuil
     b.locals(1, Base); // +21
     b.locals(2, Jsval); // +22, +23
     b.locals(6, Raw(ValType::I64)); // +24..+29 (Date arithmetic)
+    b.locals(1, Raw(ValType::I32)); // +30 (KIND_TMP)
     b
 }
+
+/// The raw `i32` scratch local of a receiver kind test (`scratch + KIND_TMP`):
+/// a base read and dropped with no safepoint in between, so never rooted.
+pub(super) const KIND_TMP: u32 = 30;
 
 /// A jsval local or parameter, written through to its root slot when live.
 pub(super) const ROOT_JS: LocalClass = LocalClass::Jsval;
