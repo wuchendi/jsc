@@ -2965,28 +2965,9 @@ pub(super) fn emit_nullish_throw(
     finish_builder(function)
 }
 
-/// The locals of a `TypeError`-building helper after its params: the full
-/// `emit_main` scratch layout (so `emit_node` can build the error object as it
-/// would in `main`), then the message and stack string jsvals at `scratch + 24`
-/// and `scratch + 25`.
-pub(super) fn type_error_helper_locals() -> Vec<(u32, ValType)> {
-    vec![
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (5, ValType::I32),
-        (1, ValType::I64),
-        (7, ValType::I64),
-        (1, ValType::I32),
-        (2, ValType::I64),
-        (2, ValType::I64),
-    ]
-}
-
-/// [`declare_scratch`] plus the message and stack string jsvals at
-/// `scratch + 24` and `scratch + 25` (the builder form of
-/// [`type_error_helper_locals`]).
+/// [`declare_scratch`] (so `emit_node` can build the error object as it would
+/// in `main`) plus the message and stack string jsvals at `scratch + 24` and
+/// `scratch + 25`.
 pub(super) fn declare_error_scratch(builder: &mut FnBuilder<'_>) {
     declare_scratch(builder);
     builder.locals(2, ROOT_JS);

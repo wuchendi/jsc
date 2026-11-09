@@ -105,7 +105,7 @@ fn return_if_pending(function: &mut impl Sink, ret: &Instruction<'_>) {
 /// When the jsval in `v` is a symbol, leave the `TypeError` `text` pending and
 /// return the value `ret` pushes (a helper returning other than `i64` cannot
 /// unwind through [`emit_throw_error`]). The helper's locals must start with
-/// [`type_error_helper_locals`] at `scratch`.
+/// [`declare_error_scratch`] at `scratch`.
 pub(super) fn throw_if_symbol(
     f: &mut impl Sink,
     v: u32,
