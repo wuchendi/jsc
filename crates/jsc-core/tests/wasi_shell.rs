@@ -45,12 +45,9 @@ fn module_imports_only_wasi_and_env_remainder() {
         (preview1, "clock_time_get"),
         (preview1, "random_get"),
         (preview1, "proc_exit"),
-        ("env", "__convert"),
         ("env", "__method"),
         ("env", "__promise"),
         ("env", "__then"),
-        ("env", "__now"),
-        ("env", "__parse_int"),
     ]
     .iter()
     .map(|(module, name)| ((*module).to_owned(), (*name).to_owned()))

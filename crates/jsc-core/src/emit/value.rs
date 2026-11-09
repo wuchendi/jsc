@@ -70,8 +70,8 @@ pub(super) fn emit_coerce_number(function: &mut impl Sink, local: u32, helpers: 
 }
 
 /// Emit the `__to_number(v: i64) -> i64` helper backing [`emit_coerce_number`]
-/// and `Number(x)`: `ToPrimitive` (hint number, in the guest) then the host
-/// `__convert` to-number op on the primitive (`StringToNumber` rules); a
+/// and `Number(x)`: `ToPrimitive` (hint number, in the guest) then
+/// `__to_number_prim` on the primitive (`StringToNumber` rules); a
 /// symbol throws the `TypeError`. A throw from a user `valueOf`/`toString`
 /// stays pending and yields `NaN`.
 pub(super) fn emit_to_number_helper(
@@ -105,8 +105,7 @@ pub(super) fn emit_to_number_helper(
         helpers,
     );
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::End);
     finish_builder(function)
 }

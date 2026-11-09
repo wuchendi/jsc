@@ -35,14 +35,7 @@ it('links_wasi_polyfill', async () => {
       .filter((i) => i.module !== WASI)
       .map((i) => `${i.module}.${i.name}`)
       .sort(),
-  ).toEqual([
-    'env.__convert',
-    'env.__method',
-    'env.__now',
-    'env.__parse_int',
-    'env.__promise',
-    'env.__then',
-  ])
+  ).toEqual(['env.__method', 'env.__promise', 'env.__then'])
   const provided: WebAssembly.Imports = {
     ...createShim().imports,
     ...createWasi().imports,

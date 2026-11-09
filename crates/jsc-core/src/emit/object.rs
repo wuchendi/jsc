@@ -936,7 +936,7 @@ pub(super) fn date_ms_slot() -> MemArg {
 /// handle jsval on the stack. The time value is computed first — `value`'s
 /// own time value when it is a Date (`thisTimeValue`, not `ToPrimitive`),
 /// else `ToPrimitive(value)` parsed by [`emit_date_parse_call`] when a
-/// string and `ToNumber` of it otherwise; when `arg` is `None`, the host wall clock (`__now`,
+/// string and `ToNumber` of it otherwise; when `arg` is `None`, the WASI wall clock (guest `__now`,
 /// already an f64) — and passed through [`emit_time_clip`], the single point
 /// every stored Date time value goes through. Only then is a
 /// [`DATE_BLOCK_SIZE`] block bump-allocated, its object-family prefix
@@ -1070,7 +1070,7 @@ pub(super) fn emit_time_clip(function: &mut impl Sink, out: u32) {
     function.instruction(&Instruction::LocalSet(out));
 }
 
-/// Emit `Date.now()`: the host `__now` clock (an f64 ms count) through
+/// Emit `Date.now()`: the guest `__now` clock (an f64 ms count) through
 /// [`emit_time_clip`] (a time value is integral), boxed as a number jsval.
 pub(super) fn emit_date_now_node(function: &mut impl Sink, scratch: u32, helpers: Helpers<'_>) {
     let time = scratch + 24;
@@ -2185,12 +2185,9 @@ fn emit_index_string_key(
     function.instruction(&Instruction::Else);
     // tmp = ToNumber(key); if String(tmp) === key then key = tmp.
     function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::LocalTee(tmp));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.num_to_str()));
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(helpers.str_eq));
@@ -2948,9 +2945,7 @@ pub(super) fn emit_nullish_throw(
     let mark = function.temp_mark();
     function.root_temp(TempClass::Base);
     function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.msg_str()));
     concat(&mut function);
     function.release_temps(mark);
     function.instruction(&Instruction::I32Const(at(NULLISH_SUFFIX)));
@@ -3031,9 +3026,7 @@ pub(super) fn emit_prop_throw(
     };
     let to_string = |function: &mut FnBuilder<'_>, local: u32| {
         function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-        function.instruction(&Instruction::Call(helpers.convert));
-        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::Call(helpers.msg_str()));
     };
 
     function.instruction(&Instruction::LocalGet(mode));

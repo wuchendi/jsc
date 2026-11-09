@@ -1085,6 +1085,11 @@ fn emit_to_uint(function: &mut FnBuilder<'_>, v: u32, modulus: f64, x: u32) {
     );
 }
 
+/// Push `1` when the code unit in i32 local `c` is a `StrWhiteSpaceChar`.
+pub(in crate::emit) fn emit_is_whitespace(function: &mut FnBuilder<'_>, c: u32) {
+    emit_unit_in(function, c, WHITESPACE);
+}
+
 /// Push i32 `1` when the code unit in i32 local `c` is in `ranges`
 /// (inclusive).
 fn emit_unit_in(

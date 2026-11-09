@@ -428,17 +428,12 @@ fn emit_escape_byte(function: &mut impl Sink, e: u32, helpers: Helpers<'_>) {
     }
 }
 
-/// `__json_number() -> i64`: scan a JSON number token at the cursor into a
-/// substring, then coerce it via the `__convert` `ToNumber` import (at
-/// `convert_index`). A token with no number chars throws.
-pub(super) fn emit_json_number(
-    alloc_index: u32,
-    convert_index: u32,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut function = helper_builder(leaves, &[], &[RAW_I32, RAW_I32, ROOT_BASE, RAW_I32]);
-    let (start, len2, str_base, c) = (0, 1, 2, 3);
+/// `__json_number() -> i64`: scan a JSON number token at the cursor, then run
+/// the decimal parser over exactly its units; a token that is not wholly one
+/// decimal literal is NaN. A token with no number chars throws.
+pub(super) fn emit_json_number(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[], &[RAW_I32, RAW_I32]);
+    let (start, c) = (0, 1);
 
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     function.instruction(&Instruction::LocalSet(start));
@@ -478,56 +473,22 @@ pub(super) fn emit_json_number(
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
 
-    // len2 = pos - start; str_base = __alloc(STR_DATA_OFFSET+len2); copy the
-    // (ASCII) token units as bytes.
-    function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
+    // The decimal core on the token; anything left unconsumed is NaN.
+    function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
     function.instruction(&Instruction::LocalGet(start));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::LocalSet(len2));
-    function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
-    function.instruction(&Instruction::LocalGet(len2));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::Call(alloc_index));
-    function.instruction(&Instruction::LocalSet(str_base));
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::I32Const(TYPE_STRING));
-    function.instruction(&Instruction::I32Store8(byte_mem()));
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::LocalGet(len2));
-    function.instruction(&Instruction::I32Store(len_header()));
-    // for c in 0..len2: store8(str_base + STR_DATA_OFFSET + c, unit(start + c)).
+    function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
+    function.instruction(&Instruction::Call(helpers.dec_parse()));
+    function.instruction(&Instruction::I64ReinterpretF64);
+    function.instruction(&Instruction::I64Const(QNAN_BITS));
     function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::LocalSet(c));
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(c));
-    function.instruction(&Instruction::LocalGet(len2));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    function.instruction(&Instruction::LocalGet(str_base));
-    function.instruction(&Instruction::LocalGet(c));
-    function.instruction(&Instruction::I32Add);
-    unit_at(&mut function, |f| {
-        f.instruction(&Instruction::LocalGet(start));
-        f.instruction(&Instruction::LocalGet(c));
-        f.instruction(&Instruction::I32Add);
-    });
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: u64::from(abi::STR_DATA_OFFSET),
-        align: 0,
+    function.instruction(&Instruction::I32Load(MemArg {
+        offset: u64::from(abi::DEC_SCRATCH) + 12,
+        align: 2,
         memory_index: 0,
     }));
-    function.instruction(&Instruction::LocalGet(c));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(c));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-    // ToNumber(boxed str).
-    box_local(&mut function, str_base);
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(convert_index));
+    function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Select);
     function.instruction(&Instruction::End);
     finish_builder(function)
 }
