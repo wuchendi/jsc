@@ -257,10 +257,11 @@ const CF_BREAK: i32 = 2;
 const CF_CONTINUE: i32 = 3;
 
 /// The base heap offset: the first byte of static string-literal data, after
-/// the null guard, the function-table word and the fixed WASI area. Literal blobs are packed contiguously from here;
+/// the null guard, the function-table word, the fixed WASI area and the
+/// [`libm`] block. Literal blobs are packed contiguously from here;
 /// the bump allocator (`__alloc`) then starts at the first free offset *after*
 /// them (see [`emit`]).
-const HEAP_BASE: i32 = abi::STATIC_AREA_END.cast_signed();
+const HEAP_BASE: i32 = abi::STATIC_AREA_END.cast_signed() + libm::STATIC_SIZE;
 
 /// The alignment of every heap block base (see [`abi::BLOCK_ALIGN`]).
 const BLOCK_ALIGN: i32 = abi::BLOCK_ALIGN.cast_signed();
@@ -1372,6 +1373,7 @@ mod expr;
 mod function;
 mod generator;
 mod json_parse;
+mod libm;
 mod numeric;
 mod object;
 mod props;
@@ -1454,8 +1456,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
-    let (types, functions, helpers, import_types) =
+    let (mut types, mut functions, helpers, import_types) =
         build_type_and_function_sections(program, &unwind, layout);
+    libm::register(&mut types, &mut functions);
     module.section(&types);
 
     // Import section: the WASI functions (indices 0..=3), then the `env`
@@ -1715,15 +1718,15 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         code.function(&helper);
     }
     code.function(&emit_start(&offsets, helpers, options));
+    for helper in libm::emit_helpers(helpers) {
+        code.function(&helper);
+    }
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
-    module.section(&emit_data_section(
-        &offsets,
-        &intern,
-        &program.functions,
-        layout,
-    ));
+    let mut data = emit_data_section(&offsets, &intern, &program.functions, layout);
+    libm::emit_data(&mut data);
+    module.section(&data);
 
     module.finish()
 }
