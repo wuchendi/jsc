@@ -311,15 +311,15 @@ pub(super) fn build_type_and_function_sections<'a>(
             .function(params.iter().copied(), results.iter().copied());
         functions.function(ty);
     }
-    let unicode_type = render_type + u32::try_from(render::TYPES.len()).unwrap_or(0);
-    for (ty, (params, results)) in (unicode_type..).zip(unicode::TYPES) {
+    for (ty, (params, results)) in (render_type..).zip(render::TYPES) {
         types
             .ty()
             .function(params.iter().copied(), results.iter().copied());
         functions.function(ty);
     }
 
-    for (ty, (params, results)) in (render_type..).zip(render::TYPES) {
+    let unicode_type = render_type + u32::try_from(render::TYPES.len()).unwrap_or(0);
+    for (ty, (params, results)) in (unicode_type..).zip(unicode::TYPES) {
         types
             .ty()
             .function(params.iter().copied(), results.iter().copied());
