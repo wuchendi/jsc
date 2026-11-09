@@ -23,7 +23,7 @@ fn lower(c: char) -> Vec<char> {
 }
 
 /// Every Unicode scalar value.
-fn scalars() -> impl Iterator<Item = char> {
+pub(crate) fn scalars() -> impl Iterator<Item = char> {
     (0..=u32::from(char::MAX)).filter_map(char::from_u32)
 }
 
@@ -87,7 +87,7 @@ fn runs(map: Mapping) -> Vec<Run> {
 }
 
 /// The little-endian `u24` of `value`.
-fn u24(value: u32) -> [u8; 3] {
+pub(crate) fn u24(value: u32) -> [u8; 3] {
     let [a, b, c, _] = value.to_le_bytes();
     [a, b, c]
 }

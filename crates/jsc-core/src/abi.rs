@@ -863,9 +863,11 @@ pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
 
 /// `__method` op flag: `toUpperCase`.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
 
 /// `__method` op flag: `toLowerCase`.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
 
 /// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
@@ -878,10 +880,12 @@ pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
 
 /// `__method` op flag: `String.prototype.normalize` (string, a form string or
 /// `undefined`).
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
 
 /// `__method` result: the argument is out of range (an unknown `normalize`
 /// form); the calling builtin throws a `RangeError`.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
 
 /// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number

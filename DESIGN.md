@@ -816,7 +816,7 @@ backed by the hosts:
 | # | import | signature | backs |
 |---|---|---|---|
 | 4 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
-| 5 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, string case mapping / `localeCompare` / `normalize`, `Number.prototype` digit formatting, host `Math` functions |
+| 5 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, string case mapping / `localeCompare`, `Number.prototype` digit formatting, host `Math` functions |
 | 6 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn, the final drain |
 | 7 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
 | 8 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
@@ -836,7 +836,7 @@ and `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
   element search),
   `17` `Number.prototype.toString(radix)` (a number receiver and an integral
   radix in `2..=36`), `22` `localeCompare` (code-unit order, not locale
-  collation), `23` `normalize` (`NFC` / `NFD` / `NFKC` / `NFKD`), `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
+  collation), `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
   finite number receiver and an integral digit count already range-checked
   in the guest; `undefined` for a `toExponential` without digits; rendered
   from the exact decimal expansion, ties away from zero), `43` a `Math`
@@ -845,10 +845,8 @@ and `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
   `xorshift64*` generator, the JS shim `Math.random`). Every other `String.prototype` method and `String.fromCharCode` /
   `fromCodePoint` run in the guest on code units (§7.9). Both hosts read a
   string receiver losslessly (the native host through `string_units`, the
-  shim as JS strings): a lone surrogate passes through case mapping and
-  `normalize` unchanged. An unknown `normalize` form returns the refusal
-  sentinel `METHOD_RANGE_ERROR` (`undefined | 2`), which the calling builtin
-  throws as a `RangeError`. The
+  shim as JS strings): a lone surrogate passes through case mapping
+  unchanged. The
   calling string builtin coerces the receiver (`ToString`) and its arguments
   in the guest first, so user `toString`/`valueOf` run in the guest and the
   host only sees primitives.
@@ -1339,9 +1337,11 @@ drift test): string `len @4` (`STR_LEN_OFFSET`) / data `@8`
 `value @24`; generator `done @24`; Map/Set `size @16`; Date `ms @16`; property
 tables, the function info table, and `class` bytes for rendering. The Rust
 decoder `string_units` is lossless (a Latin-1 byte is its own unit), and the
-string host ops (`localeCompare`, `normalize`) read their
-operands through it; `normalize` uses `icu_normalizer` (an optional dependency
-enabled by the `native-run` feature). `decode_string` renders text for the
+string host op `localeCompare` reads its operands through it.
+`String.prototype.normalize` runs in the guest over the generated Unicode
+tables (`emit/unicode.rs`): full decomposition, canonical ordering, then
+canonical composition for NFC / NFKC, with lone surrogates passing through and
+an unknown form throwing `RangeError` directly. `decode_string` renders text for the
 number parsers (ToNumber, `parseInt`, `parseFloat`) as lossy text, a
 lone surrogate becoming U+FFFD (safe for the number parsers: a lone surrogate
 is never whitespace or a digit). `alloc_units` allocates a result through

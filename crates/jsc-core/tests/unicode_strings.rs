@@ -176,6 +176,72 @@ fn normalize_preserves_lone_surrogates() {
     );
 }
 
+/// A field of the conformance file (space-separated hex) as a JS literal.
+fn js_field(field: &str) -> String {
+    let escapes: Vec<String> = field
+        .split_whitespace()
+        .map(|cp| format!("\\u{{{cp}}}"))
+        .collect();
+    format!("\"{}\"", escapes.concat())
+}
+
+/// The UAX #15 invariants of `NormalizationTest.txt` over the fixture sample:
+/// each form, per column, maps to the expected column.
+#[test]
+fn normalize_all_forms_conformance_sample() {
+    let rows: Vec<String> = include_str!("normalization_sample.txt")
+        .lines()
+        .filter(|line| !line.starts_with(['#', '@']))
+        .map(|line| {
+            let fields: Vec<String> = line.split(';').map(js_field).collect();
+            format!("[{}]", fields.join(","))
+        })
+        .collect();
+    assert!(rows.len() > 500, "fixture has {} rows", rows.len());
+    let program = format!(
+        "const rows = [{}];
+         const forms = [
+           [\"NFC\", [1, 1, 1, 3, 3]],
+           [\"NFD\", [2, 2, 2, 4, 4]],
+           [\"NFKC\", [3, 3, 3, 3, 3]],
+           [\"NFKD\", [4, 4, 4, 4, 4]],
+         ];
+         let r = \"ok\";
+         for (let i = 0; i < rows.length; i++) {{
+           for (let f = 0; f < forms.length; f++) {{
+             for (let c = 0; c < 5; c++) {{
+               if (r === \"ok\" && rows[i][c].normalize(forms[f][0]) !== rows[i][forms[f][1][c]]) {{
+                 r = \"row \" + i + \" \" + forms[f][0] + \" column \" + c;
+               }}
+             }}
+           }}
+         }}
+         r",
+        rows.join(",")
+    );
+    assert_string(&program, "ok");
+}
+
+/// A form that is not exactly one of the four names throws, wherever it came
+/// from, and the form is coerced before it is checked.
+#[test]
+fn normalize_invalid_form_range_error() {
+    let text = "RangeError|The normalization form should be one of NFC, NFD, NFKC, NFKD.";
+    for form in [
+        "\"\"", "\"NF\"", "\"NFK\"", "\"NFCC\"", "\"NFKE\"", "\"nfd\"", "\"NFC \"", "null", "1",
+    ] {
+        assert_string(&caught(&format!("\"a\".normalize({form})")), text);
+        assert_string(
+            &caught(&format!("const f = {form}; \"\\u0100\".normalize(f)")),
+            text,
+        );
+    }
+    assert_string(
+        &caught("\"a\".normalize({ toString() { return \"NFKD\"; } })"),
+        "none",
+    );
+}
+
 #[test]
 fn locale_compare_code_unit_order() {
     assert_bool("\"a\".localeCompare(\"b\") < 0", true);
