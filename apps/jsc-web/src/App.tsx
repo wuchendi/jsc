@@ -33,12 +33,14 @@ export function App() {
     try {
       const src = sourceRef.current
       const c0 = performance.now()
-      const wasm = await compile(src)
+      const options = { printCompletion: true }
+      const wasm = await compile(src, options)
       const c1 = performance.now()
-      const out = await run(src)
+      const out = await run(src, options)
       const r1 = performance.now()
+      if (out.exitCode !== 0) throw new Error(out.stderr.trimEnd())
       setState({
-        result: out.result,
+        result: out.completion ?? '',
         stdout: out.stdout,
         wasm,
         compileMs: c1 - c0,

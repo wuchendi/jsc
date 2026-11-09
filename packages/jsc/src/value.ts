@@ -1,13 +1,10 @@
 /**
- * A TypeScript port of `crates/jsc-core/src/run/value.rs` (NaN-box decoder and
- * the Node-style value formatter) plus the numeric coercions from
- * `run/host.rs`. It duplicates Rust runtime semantics (see README, "Host
- * parity") so the browser shim can render emitted-module values.
+ * A TypeScript port of the parts of `crates/jsc-core/src/run/value.rs` (NaN-box
+ * decoder, `ToString` text) and `run/host.rs` (numeric coercions) the `env`
+ * shim still needs (see README, "Host parity").
  */
 
 import {
-  ACCESSOR_GET_OFFSET,
-  ACCESSOR_SET_OFFSET,
   ARRAY_ELEMS_OFFSET,
   ARRAY_FLAG_SPARSE,
   ARRAY_LEN_OFFSET,
@@ -32,13 +29,8 @@ import {
   HEADER_FLAGS_OFFSET,
   HEAP,
   HOLE,
-  MAP_SIZE_OFFSET,
   OBJ_PROPS_OFFSET,
   OBJ_PROTO_OFFSET,
-  PROMISE_FULFILLED,
-  PROMISE_REJECTED,
-  PROMISE_STATE_OFFSET,
-  PROMISE_VALUE_OFFSET,
   PROP_ATTRS_OFFSET,
   PROP_ENTRY_SIZE,
   PROP_KEY_OFFSET,
@@ -65,57 +57,37 @@ import {
   TYPE_SYMBOL,
   U32_MASK,
   U64_MASK,
-  UNDEFINED,
   WRAPPER_VALUE_OFFSET,
 } from './abi.js'
 
-/** A decoded jsval — the in-scope runtime value types (mirrors `value.rs::Value`). */
-export type Value =
+/** A decoded jsval, carrying what `ToString` and `ToNumber` read. */
+type Value =
   | { kind: 'number'; value: number }
   | { kind: 'bool'; value: boolean }
   | { kind: 'null' }
   | { kind: 'undefined' }
   | { kind: 'string'; value: string }
   | { kind: 'symbol'; description: string | undefined }
-  | { kind: 'array'; items: Value[]; props: [string, Value][] }
+  | { kind: 'array'; items: Value[] }
   | { kind: 'holes'; count: number }
-  | { kind: 'object'; entries: [string, Value][] }
-  | { kind: 'instance'; className: string; entries: [string, Value][] }
-  | { kind: 'arguments'; entries: [string, Value][] }
-  | { kind: 'wrapper'; primitive: Value; entries: [string, Value][] }
+  | { kind: 'circular' }
+  | { kind: 'object'; tag: string }
+  | { kind: 'wrapper'; primitive: Value }
   | { kind: 'error'; name: string; message: string }
-  | { kind: 'accessor'; getter: boolean; setter: boolean }
   | {
       kind: 'function'
       name: string
       isClass: boolean
       extends: string | undefined
-      props: [string, Value][]
     }
-  | { kind: 'map'; size: number }
-  | { kind: 'set'; size: number }
-  | { kind: 'promise'; state: number; value: Value }
-  | { kind: 'generator' }
   | { kind: 'date'; ms: number }
-  | { kind: 'circular'; id: number }
-  | { kind: 'ref'; id: number; value: Value }
-
-/**
- * Cycle-guard state for one {@link decode} call (mirrors `value.rs::Guard`):
- * the heap blocks on the current recursion path and the cycle targets numbered
- * so far, in discovery order (Node's `*1`, `*2`, ...).
- */
-interface Guard {
-  path: number[]
-  refs: number[]
-}
 
 // A single scratch buffer for f64 <-> u64 bit reinterpretation, reused so we do
 // not allocate a DataView per decode.
 const scratch = new DataView(new ArrayBuffer(8))
 
 /** Reinterpret raw `u64` bits as an IEEE-754 `f64` (mirrors `f64::from_bits`). */
-export function bitsToF64(bits: bigint): number {
+function bitsToF64(bits: bigint): number {
   scratch.setBigUint64(0, bits & U64_MASK, true)
   return scratch.getFloat64(0, true)
 }
@@ -159,11 +131,11 @@ function readU64(mem: Uint8Array, off: number): bigint | undefined {
  * Mirrors `value.rs::decode`.
  */
 export function decode(bits: bigint, mem: Uint8Array): Value {
-  return decodeIn(bits, mem, { path: [], refs: [] })
+  return decodeIn(bits, mem, [])
 }
 
-/** {@link decode} under the cycle guard `guard` (mirrors `value.rs::decode_in`). */
-function decodeIn(bits: bigint, mem: Uint8Array, guard: Guard): Value {
+/** {@link decode} with `path`, the arrays on the current recursion path. */
+function decodeIn(bits: bigint, mem: Uint8Array, path: number[]): Value {
   const u = asU64(bits)
   // Any value without the full QNAN mask set is an ordinary number (this also
   // covers infinities, whose exponent is all ones but quiet bit is clear).
@@ -177,57 +149,40 @@ function decodeIn(bits: bigint, mem: Uint8Array, guard: Guard): Value {
     case 0b011n:
       return { kind: 'undefined' }
     case 0b101n:
-      return decodeHeap(u, mem, guard)
+      return decodeHeap(u, mem, path)
     // Tags 0b100/0b110/0b111 are retired and 0b000 is the canonical number NaN.
     default:
       return { kind: 'number', value: bitsToF64(u) }
   }
 }
 
-/**
- * Resolve a heap pointer jsval by reading the block's TYPE BYTE. Containers
- * (array / object / promise) are cycle-guarded: a block already on the
- * recursion path decodes as `circular`, and the block it points back to is
- * wrapped in `ref` once decoded.
- */
-function decodeHeap(bits: bigint, mem: Uint8Array, guard: Guard): Value {
+/** Resolve a heap pointer jsval by reading the block's TYPE BYTE. */
+function decodeHeap(bits: bigint, mem: Uint8Array, path: number[]): Value {
   const ptr = Number(bits & U32_MASK)
-  const ty = mem[ptr]
-  if (
-    ty === TYPE_ARRAY ||
-    ty === TYPE_OBJECT ||
-    ty === TYPE_PROMISE ||
-    ty === TYPE_FUNCTION
-  ) {
-    if (guard.path.includes(ptr)) {
-      let id = guard.refs.indexOf(ptr) + 1
-      if (id === 0) id = guard.refs.push(ptr)
-      return { kind: 'circular', id }
+  switch (mem[ptr]) {
+    case TYPE_ARRAY: {
+      if (path.includes(ptr)) return { kind: 'circular' }
+      path.push(ptr)
+      const value = decodeArray(ptr, mem, path)
+      path.pop()
+      return value
     }
-    guard.path.push(ptr)
-    const value =
-      ty === TYPE_ARRAY
-        ? decodeArray(ptr, mem, guard)
-        : ty === TYPE_OBJECT
-          ? decodeObject(ptr, mem, guard)
-          : ty === TYPE_FUNCTION
-            ? decodeFunction(ptr, mem, guard)
-            : decodePromise(ptr, mem, guard)
-    guard.path.pop()
-    const id = guard.refs.indexOf(ptr) + 1
-    return id === 0 ? value : { kind: 'ref', id, value }
-  }
-  switch (ty) {
+    case TYPE_OBJECT:
+      return decodeObject(ptr, mem)
+    case TYPE_FUNCTION:
+      return decodeFunction(ptr, mem)
     case TYPE_STRING:
       return decodeString(ptr, mem)
     case TYPE_SYMBOL:
       return decodeSymbol(ptr, mem)
     case TYPE_MAP:
-      return { kind: 'map', size: decodeSize(ptr, mem) }
+      return { kind: 'object', tag: 'Map' }
     case TYPE_SET:
-      return { kind: 'set', size: decodeSize(ptr, mem) }
+      return { kind: 'object', tag: 'Set' }
+    case TYPE_PROMISE:
+      return { kind: 'object', tag: 'Promise' }
     case TYPE_GENERATOR:
-      return { kind: 'generator' }
+      return { kind: 'object', tag: 'Generator' }
     case TYPE_DATE:
       return decodeDate(ptr, mem)
     default:
@@ -247,31 +202,6 @@ function decodeSymbol(ptr: number, mem: Uint8Array): Value {
     kind: 'symbol',
     description: desc?.kind === 'string' ? desc.value : undefined,
   }
-}
-
-/**
- * Resolve a heap promise block at `ptr` (mirrors `value.rs::decode_promise`):
- * the `i32` state at `ptr + PROMISE_STATE_OFFSET` and the settled `i64` value at
- * `ptr + PROMISE_VALUE_OFFSET`. A truncated block reads as pending with an
- * `undefined` value.
- */
-function decodePromise(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  const state = readU32(mem, ptr + PROMISE_STATE_OFFSET)
-  const bits = readU64(mem, ptr + PROMISE_VALUE_OFFSET)
-  return {
-    kind: 'promise',
-    state: state === undefined ? 0 : state | 0,
-    value:
-      bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard),
-  }
-}
-
-/**
- * The `u32` logical entry count of a Map/Set handle block at `ptr` (mirrors
- * `value.rs::decode_size`); a truncated block reads as `0`.
- */
-function decodeSize(ptr: number, mem: Uint8Array): number {
-  return readU32(mem, ptr + MAP_SIZE_OFFSET) ?? 0
 }
 
 /**
@@ -324,21 +254,6 @@ export function stringText(mem: Uint8Array, ptr: number): string | null {
 }
 
 /**
- * The length of the array handle at `ptr` and the address of its element 0
- * (element `k` is at `data + 8 * k` of its element store), or `undefined`
- * when the handle is truncated (mirrors `value.rs::array_layout`).
- */
-export function arrayLayout(
-  mem: Uint8Array,
-  ptr: number,
-): [len: number, data: number] | undefined {
-  const len = readU32(mem, ptr + ARRAY_LEN_OFFSET)
-  const elems = readU32(mem, ptr + ARRAY_ELEMS_OFFSET)
-  if (len === undefined || elems === undefined) return undefined
-  return [len, elems + ELEMS_DATA_OFFSET]
-}
-
-/**
  * The `length` of the array handle at `ptr` and its present elements as
  * `[index, bits]` in ascending index order (holes are absent): the store
  * slots, then — for a `SPARSE` array, whose store holds only the elements
@@ -349,14 +264,14 @@ export function arrayElements(
   mem: Uint8Array,
   ptr: number,
 ): [len: number, present: [number, bigint][]] | undefined {
-  const layout = arrayLayout(mem, ptr)
-  if (layout === undefined) return undefined
-  const [len, data] = layout
+  const len = readU32(mem, ptr + ARRAY_LEN_OFFSET)
+  const store = readU32(mem, ptr + ARRAY_ELEMS_OFFSET)
+  if (len === undefined || store === undefined) return undefined
+  const data = store + ELEMS_DATA_OFFSET
   const sparse =
     ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & ARRAY_FLAG_SPARSE) !== 0
   let stored = len
   if (sparse) {
-    const store = readU32(mem, ptr + ARRAY_ELEMS_OFFSET) ?? 0
     const cap = store === 0 ? 0 : (readU32(mem, store + ELEMS_CAP_OFFSET) ?? 0)
     stored = Math.min(len, cap)
   }
@@ -367,10 +282,7 @@ export function arrayElements(
     if (bits !== HOLE) present.push([k, bits])
   }
   if (sparse) {
-    const keyed: [number, bigint][] = []
-    for (const { index, bits } of tableEntries(ptr, mem)) {
-      if (index !== undefined) keyed.push([index, bits])
-    }
+    const keyed = indexEntries(ptr, mem)
     keyed.sort((a, b) => a[0] - b[0])
     present.push(...keyed)
   }
@@ -379,99 +291,34 @@ export function arrayElements(
 
 /**
  * Resolve a heap array handle at `ptr`: its present elements (each decoded
- * recursively) with every run of holes up to `len` as one `holes`, then its
- * own named properties (mirrors `value.rs::decode_array`).
+ * recursively) with every run of holes up to `len` as one `holes`.
  */
-function decodeArray(ptr: number, mem: Uint8Array, guard: Guard): Value {
+function decodeArray(ptr: number, mem: Uint8Array, path: number[]): Value {
   const elements = arrayElements(mem, ptr)
-  if (elements === undefined) return { kind: 'array', items: [], props: [] }
+  if (elements === undefined) return { kind: 'array', items: [] }
   const [len, present] = elements
   const items: Value[] = []
   let next = 0
   for (const [index, bits] of present) {
     if (index > next) items.push({ kind: 'holes', count: index - next })
-    items.push(decodeIn(bits, mem, guard))
+    items.push(decodeIn(bits, mem, path))
     next = index + 1
   }
   if (len > next) items.push({ kind: 'holes', count: len - next })
-  return { kind: 'array', items, props: decodeProps(ptr, mem, guard) }
+  return { kind: 'array', items }
 }
 
 /**
- * Decode the own enumerable properties of the object-family block at `ptr` by
- * walking its property table (mirrors `value.rs::decode_props`): tombstones
- * and non-enumerable entries are skipped, integer keys come first in
- * ascending order when the table has `HAS_INDEX_KEYS`, then the other string
- * keys in slot order, then the symbol keys in slot order. An accessor
- * property decodes as `accessor`.
+ * The live enumerable integer-keyed entries of the property table of the
+ * array at `ptr`, in slot order, as `[index, bits]`.
  */
-function decodeProps(
-  ptr: number,
-  mem: Uint8Array,
-  guard: Guard,
-): [string, Value][] {
-  // An array's integer keys are its (sparse) elements, decoded by `decodeArray`.
-  const array = mem[ptr] === TYPE_ARRAY
-  const keyed = tableEntries(ptr, mem).filter(
-    ({ index }) => !(array && index !== undefined),
-  )
-  // A stable sort keeps the string keys in slot order after the indices, and
-  // the symbol keys in slot order after those.
-  const rank = (e: TableEntry) => (e.index !== undefined ? 0 : e.symbol ? 2 : 1)
-  keyed.sort((a, b) =>
-    rank(a) !== rank(b)
-      ? rank(a) - rank(b)
-      : a.index !== undefined && b.index !== undefined
-        ? a.index - b.index
-        : 0,
-  )
-  const entries: [string, Value][] = []
-  for (const { key, attrs, bits } of keyed) {
-    if ((attrs & ATTR_ACCESSOR) !== 0) {
-      const pair = Number(bits & U32_MASK)
-      const half = (offset: number) => {
-        const b = readU64(mem, pair + offset)
-        return b !== undefined && b !== UNDEFINED
-      }
-      entries.push([
-        key,
-        {
-          kind: 'accessor',
-          getter: half(ACCESSOR_GET_OFFSET),
-          setter: half(ACCESSOR_SET_OFFSET),
-        },
-      ])
-    } else {
-      entries.push([key, decodeIn(bits, mem, guard)])
-    }
-  }
-  return entries
-}
-
-/**
- * One live enumerable property table entry (mirrors `value.rs::TableEntry`):
- * `index` is the value of an integer key, `symbol` marks a symbol key, and
- * `key` is the rendered key (a symbol key as `[Symbol(desc)]`).
- */
-interface TableEntry {
-  index: number | undefined
-  symbol: boolean
-  key: string
-  attrs: number
-  bits: bigint
-}
-
-/**
- * The live enumerable entries of the property table of the object-family
- * block at `ptr`, in slot order; a key is a string or a symbol block, told
- * apart by its type byte (mirrors `value.rs::table_entries`).
- */
-function tableEntries(ptr: number, mem: Uint8Array): TableEntry[] {
+function indexEntries(ptr: number, mem: Uint8Array): [number, bigint][] {
   const props = readU32(mem, ptr + OBJ_PROPS_OFFSET) ?? 0
   if (props === 0) return []
+  if (((mem[props + PROPS_TFLAGS_OFFSET] ?? 0) & PROPS_HAS_INDEX_KEYS) === 0)
+    return []
   const count = readU32(mem, props + PROPS_COUNT_OFFSET) ?? 0
-  const tflags = mem[props + PROPS_TFLAGS_OFFSET] ?? 0
-  const keyed: TableEntry[] = []
+  const keyed: [number, bigint][] = []
   for (let k = 0; k < count; k++) {
     const entry = props + PROPS_HEADER_SIZE + PROP_ENTRY_SIZE * k
     const key = readU32(mem, entry + PROP_KEY_OFFSET)
@@ -479,36 +326,25 @@ function tableEntries(ptr: number, mem: Uint8Array): TableEntry[] {
     const bits = readU64(mem, entry + PROP_VALUE_OFFSET)
     if (key === undefined || attrs === undefined || bits === undefined) break
     if (key === 0 || (attrs & ATTR_ENUMERABLE) === 0) continue
-    if (mem[key] === TYPE_SYMBOL) {
-      const text = `[${formatValue(decodeSymbol(key, mem))}]`
-      keyed.push({ index: undefined, symbol: true, key: text, attrs, bits })
+    if (mem[key] === TYPE_SYMBOL) continue
+    if (((mem[key + HEADER_FLAGS_OFFSET] ?? 0) & STR_FLAG_ARRAY_INDEX) === 0)
       continue
-    }
-    const text = stringAt(key, mem)
-    const flags = mem[key + HEADER_FLAGS_OFFSET] ?? 0
-    const index =
-      (tflags & PROPS_HAS_INDEX_KEYS) !== 0 &&
-      (flags & STR_FLAG_ARRAY_INDEX) !== 0
-        ? Number(text)
-        : undefined
-    keyed.push({ index, symbol: false, key: text, attrs, bits })
+    keyed.push([Number(stringAt(key, mem)), bits])
   }
   return keyed
 }
 
 /**
- * Resolve a heap object block at `ptr` from its own enumerable properties
- * (mirrors `value.rs::decode_object`): an object of class `ERROR` decodes as
- * `error` with its (possibly inherited) `name` and `message`; an object whose
- * prototype chain (from its prototype, so a prototype object's own
- * `constructor` back-link does not name it) holds a `constructor` naming a
- * function other than `Object` decodes as `instance`.
+ * Resolve a heap object block at `ptr` by its `class` byte: an Error with its
+ * (possibly inherited) `name` and `message`, a wrapper with its primitive, or
+ * an `[object Tag]` object.
  */
-function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
-  if (mem[ptr + HEADER_CLASS_OFFSET] === CLASS_ERROR) {
+function decodeObject(ptr: number, mem: Uint8Array): Value {
+  const classByte = mem[ptr + HEADER_CLASS_OFFSET] ?? 0
+  if (classByte === CLASS_ERROR) {
     const field = (name: string) => {
       const bits = lookupData(ptr, name, mem)
-      const value = bits === undefined ? undefined : decodeIn(bits, mem, guard)
+      const value = bits === undefined ? undefined : decode(bits, mem)
       return value?.kind === 'string' ? value.value : undefined
     }
     return {
@@ -517,31 +353,21 @@ function decodeObject(ptr: number, mem: Uint8Array, guard: Guard): Value {
       message: field('message') ?? '',
     }
   }
-  const entries = decodeProps(ptr, mem, guard)
-  const classByte = mem[ptr + HEADER_CLASS_OFFSET] ?? 0
-  if (classByte === CLASS_ARGUMENTS) return { kind: 'arguments', entries }
+  if (classByte === CLASS_ARGUMENTS) return { kind: 'object', tag: 'Arguments' }
   if (
     (classByte >= CLASS_BOOLEAN && classByte <= CLASS_STRING) ||
     classByte === CLASS_SYMBOL
   ) {
     const bits = readU64(mem, ptr + WRAPPER_VALUE_OFFSET)
     const primitive: Value =
-      bits === undefined ? { kind: 'undefined' } : decodeIn(bits, mem, guard)
-    return { kind: 'wrapper', primitive, entries }
+      bits === undefined ? { kind: 'undefined' } : decode(bits, mem)
+    return { kind: 'wrapper', primitive }
   }
-  const proto = readU64(mem, ptr + OBJ_PROTO_OFFSET)
-  const protoPtr = proto === undefined ? undefined : heapObject(proto, mem)
-  if (protoPtr !== undefined) {
-    const ctor = lookupData(protoPtr, 'constructor', mem)
-    const className = ctor === undefined ? undefined : functionName(ctor, mem)
-    if (className !== undefined && className !== '' && className !== 'Object')
-      return { kind: 'instance', className, entries }
-  }
-  return { kind: 'object', entries }
+  return { kind: 'object', tag: 'Object' }
 }
 
 /** Resolve a function block at `ptr` (mirrors `value.rs::decode_function`). */
-function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
+function decodeFunction(ptr: number, mem: Uint8Array): Value {
   const isClass =
     ((mem[ptr + HEADER_FLAGS_OFFSET] ?? 0) & FUNC_FLAG_CLASS_CTOR) !== 0
   let parent: string | undefined
@@ -566,13 +392,7 @@ function decodeFunction(ptr: number, mem: Uint8Array, guard: Guard): Value {
     const own = bits === undefined ? undefined : decode(bits, mem)
     name = own?.kind === 'string' ? own.value : undefined
   }
-  return {
-    kind: 'function',
-    name: name ?? '',
-    isClass,
-    extends: parent,
-    props: decodeProps(ptr, mem, guard),
-  }
+  return { kind: 'function', name: name ?? '', isClass, extends: parent }
 }
 
 /** The text of the string block at `ptr`. */
@@ -658,143 +478,46 @@ function functionName(bits: bigint, mem: Uint8Array): string | undefined {
 }
 
 /**
- * Render an `f64` the way JavaScript prints a number. `value.rs::format_number`
- * reimplements ECMAScript `Number::toString` by hand; JS `String(n)` already IS
- * that algorithm (NaN/Infinity/-0/shortest-round-trip/exponential thresholds all
- * match), so this delegates to it.
+ * The JS `ToString` text of a decoded {@link Value} (mirrors
+ * `value.rs::to_js_string`): arrays join their elements with `,` (nullish
+ * elements and cycle back-references are empty), objects are `[object Tag]`,
+ * errors use `Error.prototype.toString`.
  */
-export function formatNumber(value: number): string {
-  return String(value)
-}
-
-/** Render a decoded {@link Value} as user-facing text (mirrors `value.rs::format_value`). */
-export function formatValue(value: Value): string {
+export function toJsString(value: Value): string {
   switch (value.kind) {
     case 'number':
-      return formatNumber(value.value)
+      return String(value.value)
     case 'bool':
       return value.value ? 'true' : 'false'
     case 'null':
       return 'null'
     case 'undefined':
       return 'undefined'
-    // A string renders as its raw text, with no surrounding quotes.
     case 'string':
       return value.value
-    // A symbol renders Node-console style by its description.
     case 'symbol':
       return `Symbol(${value.description ?? ''})`
     case 'array':
-      return formatArray(value.items, value.props)
-    // A hole outside an array (never produced) reads as `undefined`.
-    case 'holes':
-      return 'undefined'
-    case 'object':
-      return formatEntries(value.entries)
-    // A class instance is prefixed with its constructor's name.
-    case 'instance':
-      return `${value.className} ${formatEntries(value.entries)}`
-    // A wrapper names its kind and quotes a wrapped string, as Node does.
-    case 'wrapper': {
-      const p = value.primitive
-      const head =
-        p.kind === 'string'
-          ? `[String: '${p.value}']`
-          : p.kind === 'number'
-            ? `[Number: ${Object.is(p.value, -0) ? '-0' : formatNumber(p.value)}]`
-            : p.kind === 'symbol'
-              ? `[Symbol: ${formatValue(p)}]`
-              : `[Boolean: ${formatValue(p)}]`
-      return value.entries.length === 0
-        ? head
-        : `${head} ${formatEntries(value.entries)}`
-    }
-    // An `arguments` object quotes its (index) keys, as Node does.
-    case 'arguments':
-      return `[Arguments] ${formatEntries(
-        value.entries.map(([k, v]): [string, Value] => [quoteKey(k), v]),
-      )}`
-    // A branded Error renders as its single-line stack.
-    case 'error':
-      return value.message === ''
-        ? value.name
-        : `${value.name}: ${value.message}`
-    case 'accessor':
-      return value.getter && value.setter
-        ? '[Getter/Setter]'
-        : value.setter
-          ? '[Setter]'
-          : '[Getter]'
-    case 'function': {
-      const head = value.isClass
-        ? `[class ${value.name === '' ? '(anonymous)' : value.name}${value.extends === undefined ? '' : ` extends ${value.extends}`}]`
-        : value.name === ''
-          ? '[Function (anonymous)]'
-          : `[Function: ${value.name}]`
-      return value.props.length === 0
-        ? head
-        : `${head} ${formatEntries(value.props)}`
-    }
-    case 'map':
-      return `Map(${value.size})`
-    case 'set':
-      return `Set(${value.size})`
-    case 'generator':
-      return 'Object [Generator]'
-    case 'promise':
-      if (value.state === PROMISE_FULFILLED)
-        return `Promise { ${formatValue(value.value)} }`
-      if (value.state === PROMISE_REJECTED)
-        return `Promise { <rejected> ${formatValue(value.value)} }`
-      return 'Promise { <pending> }'
-    case 'date':
-      return formatDateIso(value.ms)
-    // Cycle markers render Node-console style.
-    case 'circular':
-      return `[Circular *${value.id}]`
-    case 'ref':
-      return `<ref *${value.id}> ${formatValue(value.value)}`
-  }
-}
-
-/**
- * The JS `ToString` text of a decoded {@link Value} (mirrors
- * `value.rs::to_js_string`): arrays join their elements with `,` (nullish
- * elements and cycle back-references are empty), plain objects and instances
- * are `[object Object]`, errors use `Error.prototype.toString`, Map/Set/
- * promise/generator their tags; functions and Dates keep the console text.
- */
-export function toJsString(value: Value): string {
-  switch (value.kind) {
-    case 'array':
       return joinElements(value.items, ',')
     case 'object':
-    case 'instance':
-      return '[object Object]'
-    case 'arguments':
-      return '[object Arguments]'
+      return `[object ${value.tag}]`
     case 'wrapper':
       return toJsString(value.primitive)
     case 'error':
       if (value.message === '') return value.name
       if (value.name === '') return value.message
       return `${value.name}: ${value.message}`
-    case 'map':
-      return '[object Map]'
-    case 'set':
-      return '[object Set]'
-    case 'promise':
-      return '[object Promise]'
-    case 'generator':
-      return '[object Generator]'
-    case 'accessor':
+    case 'function':
+      if (value.isClass)
+        return `[class ${value.name === '' ? '(anonymous)' : value.name}${value.extends === undefined ? '' : ` extends ${value.extends}`}]`
+      return value.name === ''
+        ? '[Function (anonymous)]'
+        : `[Function: ${value.name}]`
+    case 'date':
+      return formatDateIso(value.ms)
     case 'circular':
     case 'holes':
       return ''
-    case 'ref':
-      return toJsString(value.value)
-    default:
-      return formatValue(value)
   }
 }
 
@@ -816,45 +539,6 @@ function joinElements(items: Value[], sep: string): string {
     }
   }
   return pieces.join(sep)
-}
-
-/**
- * Render an array Node-console style: `[ 1, 2 ]`, `[]` when empty, a run of
- * holes as `<N empty items>`, named properties last (mirrors the
- * `value.rs::format_value` array arm).
- */
-function formatArray(items: Value[], props: [string, Value][]): string {
-  const parts: string[] = []
-  let holes = 0
-  const flush = () => {
-    if (holes > 0) parts.push(`<${holes} empty item${holes === 1 ? '' : 's'}>`)
-    holes = 0
-  }
-  for (const item of items) {
-    if (item.kind === 'holes') {
-      holes += item.count
-    } else {
-      flush()
-      parts.push(formatValue(item))
-    }
-  }
-  flush()
-  for (const [k, v] of props) parts.push(`${k}: ${formatValue(v)}`)
-  return parts.length === 0 ? '[]' : `[ ${parts.join(', ')} ]`
-}
-
-/** A property key as Node's console prints it: identifier-like bare, else single-quoted. */
-function quoteKey(key: string): string {
-  return /^[\p{L}\p{N}_$]+$/u.test(key) && !/^[0-9]/.test(key)
-    ? key
-    : `'${key}'`
-}
-
-/** Render own properties Node-console style: `{ a: 1 }`, `{}` when empty. */
-function formatEntries(entries: [string, Value][]): string {
-  return entries.length === 0
-    ? '{}'
-    : `{ ${entries.map(([k, v]) => `${k}: ${formatValue(v)}`).join(', ')} }`
 }
 
 /**

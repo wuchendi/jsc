@@ -1,11 +1,10 @@
 /**
- * The JS runtime shim: the `importObject` that backs the emitted module's host
- * env imports (`print` / `__convert` / `__method` / `__promise` / `__then` /
+ * The JS runtime shim: the `importObject` that backs the emitted module's
+ * remaining `env` imports (`__convert` / `__method` / `__promise` / `__then` /
  * `__now` / `__parse_int`). A port of `crates/jsc-core/src/run/harness.rs`
- * (import wiring + out-of-memory guard), `run/host.rs` (handlers), and
- * `run/promise.rs` (the promise engine + microtask queue). Every heap block is
- * allocated through the guest's exported constructors (`__new_string` /
- * `__new_array` / `__new_promise`), never by hand. It
+ * (import wiring), `run/host.rs` (handlers), and `run/promise.rs` (the promise
+ * engine + microtask queue). Every heap block is allocated through the guest's
+ * exported constructors (`__new_string` / `__new_promise`), never by hand. It
  * duplicates Rust host semantics against the emitted module's memory (see
  * README, "Host parity").
  */
@@ -20,8 +19,6 @@ import {
   FALSE,
   GEN_DONE_OFFSET,
   HEAP,
-  HEAP_PTR_EXPORT_NAME,
-  HEAP_PTR_OOM,
   INVOKE_EXPORT_NAME,
   MATH_FN_ACOS,
   MATH_FN_ACOSH,
@@ -60,8 +57,6 @@ import {
   METHOD_RANGE_ERROR,
   NEW_PROMISE_EXPORT_NAME,
   NEW_STRING_EXPORT_NAME,
-  PRINT_FLAG_END,
-  PRINT_FLAG_SEP,
   PROMISE_BLOCK_SIZE,
   PROMISE_FULFILLED,
   PROMISE_OP_ASYNC_SPAWN,
@@ -92,7 +87,6 @@ import {
   asU64,
   decode,
   f64ToBits,
-  formatValue,
   parseFloatStr,
   parseIntStr,
   stringText,
@@ -100,23 +94,15 @@ import {
   valueToNumber,
 } from './value.js'
 
-/** The wired shim: the `importObject`, the accumulated stdout, and instance binding. */
+/** `__promise` op: drain the queue, then return the first unhandled promise or `0`. */
+const PROMISE_OP_DRAIN = 8
+
+/** The wired shim: the `env` imports and instance binding. */
 export interface Shim {
-  /** Passed as the import object to `WebAssembly.instantiate`. */
+  /** The `env` part of the import object. */
   imports: WebAssembly.Imports
-  /** Everything `console.log` printed, in execution order (mirrors `run_capturing`). */
-  stdout: () => string
   /** Bind the instantiated module so the imports can read its memory and call its constructors. */
   bindInstance: (instance: WebAssembly.Instance) => void
-  /**
-   * Drain the microtask queue to empty, then throw
-   * `Error("Uncaught RangeError: out of memory")` if the heap is exhausted, or
-   * `Error("Uncaught (in promise) <value>")` for the first rejected promise that
-   * never got a handler (mirrors `harness.rs` / `promise.rs::drain_after_main`).
-   */
-  drainAfterMain: () => void
-  /** Whether `__heap_ptr` holds the out-of-memory sentinel (mirrors `host.rs::heap_exhausted`). */
-  heapExhausted: () => boolean
 }
 
 /**
@@ -149,13 +135,9 @@ interface Job {
 /** The linear-memory cap in bytes; constructor lengths are clamped to it (mirrors `host.rs`). */
 const MEMORY_MAX_BYTES = MEMORY_MAX_PAGES * 0x1_0000
 
-/** The rendered error for an exhausted heap (mirrors `harness.rs::OUT_OF_MEMORY`). */
-export const OUT_OF_MEMORY = 'Uncaught RangeError: out of memory'
-
-/** Build a fresh shim. One per `run()` call so stdout does not bleed across runs. */
+/** Build a fresh shim. One per `run()` call so promise state does not bleed across runs. */
 export function createShim(): Shim {
   let instance: WebAssembly.Instance | null = null
-  let out = ''
 
   /** The module's linear memory, or `undefined` before binding / when absent. */
   function memory(): WebAssembly.Memory | undefined {
@@ -175,38 +157,16 @@ export function createShim(): Shim {
     return instance?.exports[name] as WebAssembly.Global | undefined
   }
 
-  /** Whether `__heap_ptr` holds the out-of-memory sentinel (mirrors `host.rs::heap_exhausted`). */
-  function heapExhausted(): boolean {
-    const global = exportGlobal(HEAP_PTR_EXPORT_NAME)
-    return global !== undefined && global.value === HEAP_PTR_OOM
-  }
-
   /**
-   * Pass a host import's result through, or throw the out-of-memory error when
-   * the import (or an earlier allocation) left the sentinel in `__heap_ptr`
-   * (mirrors `harness.rs::oom_guard`).
-   */
-  function oomGuard(bits: bigint): bigint {
-    if (heapExhausted()) throw new Error(OUT_OF_MEMORY)
-    return bits
-  }
-
-  /**
-   * Call the guest constructor export `name(...args) -> base` and return the new
-   * block's base offset, or `null` when the export is missing or the call traps
-   * — an out-of-memory trap leaves the sentinel for {@link oomGuard} (mirrors
-   * `host.rs::guest_new`).
+   * Call the guest constructor export `name(...args) -> base` and return the
+   * new block's base offset, or `null` when the export is missing. The guest's
+   * out-of-memory `proc_exit` and any trap propagate to `run()`.
    */
   function guestNew(name: string, ...args: number[]): number | null {
     const ctor = instance?.exports[name] as
       | ((...a: number[]) => number)
       | undefined
-    if (!ctor) return null
-    try {
-      return ctor(...args) >>> 0
-    } catch {
-      return null
-    }
+    return ctor ? ctor(...args) >>> 0 : null
   }
 
   /**
@@ -429,19 +389,15 @@ export function createShim(): Shim {
    * `promise.rs::invoke1` / `async_step`): returns its result bits and whether
    * it threw — detected by `__exc_pending`, which (with `__exc_value`) is
    * cleared so a surfaced exception does not leak into the next microtask. A
-   * missing export or a trap yields `[undefined, false]`.
+   * missing export yields `[undefined, false]`; `proc_exit` and traps propagate
+   * to `run()`.
    */
   function callGuest(name: string, a: bigint, b: bigint): [bigint, boolean] {
     const func = exportTrampoline(name)
     const pending = exportGlobal(EXC_PENDING_EXPORT_NAME)
     const excValue = exportGlobal(EXC_VALUE_EXPORT_NAME)
     if (!func || !pending || !excValue) return [UNDEFINED, false]
-    let result: bigint
-    try {
-      result = asU64(func(a, b))
-    } catch {
-      return [UNDEFINED, false]
-    }
+    const result = asU64(func(a, b))
     if (Number(pending.value) !== 0) {
       const value = asU64(excValue.value as bigint)
       pending.value = 0
@@ -466,11 +422,7 @@ export function createShim(): Shim {
           | (() => bigint)
           | undefined
         if (!selfError) return
-        try {
-          value = asU64(selfError())
-        } catch {
-          return // an out-of-memory trap: the run stage reports it.
-        }
+        value = asU64(selfError())
         state = PROMISE_REJECTED
       } else if (inner !== null) {
         registerSource(value, UNDEFINED, UNDEFINED, base, false, null)
@@ -658,6 +610,13 @@ export function createShim(): Shim {
         driveAsync(a, baseOf(result), UNDEFINED)
         return result
       }
+      case PROMISE_OP_DRAIN: {
+        drain()
+        const unhandled = [...rejected]
+          .filter((base) => !handled.has(base))
+          .sort((x, y) => x - y)[0]
+        return unhandled === undefined ? 0n : HEAP | BigInt(unhandled)
+      }
       default:
         return UNDEFINED
     }
@@ -669,18 +628,6 @@ export function createShim(): Shim {
     if (result === null) return UNDEFINED
     registerSource(p, onF, onR, baseOf(result), false, null)
     return result
-  }
-
-  const print = (bits: bigint, flag: number): void => {
-    let piece: string
-    if (flag === PRINT_FLAG_SEP || flag === PRINT_FLAG_END) {
-      const text = formatValue(decode(asU64(bits), memView()))
-      piece = flag === PRINT_FLAG_SEP ? `${text} ` : `${text}\n`
-    } else {
-      // Newline-only (zero-argument `console.log()`).
-      piece = '\n'
-    }
-    out += piece
   }
 
   /**
@@ -707,33 +654,27 @@ export function createShim(): Shim {
     }
   }
 
-  const method = (
-    recv: bigint,
-    op: number,
-    arg0: bigint,
-    arg1: bigint,
-  ): bigint =>
-    oomGuard(
-      methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED,
-    )
-
   const imports: WebAssembly.Imports = {
     env: {
-      print,
-      __convert: (bits: bigint, op: number): bigint =>
-        oomGuard(convert(bits, op)),
-      __method: method,
+      __convert: convert,
+      __method: (
+        recv: bigint,
+        op: number,
+        arg0: bigint,
+        arg1: bigint,
+      ): bigint =>
+        methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED,
       __promise: (op: number, a: bigint, b: bigint): bigint =>
-        oomGuard(promiseDispatch(op, asU64(a), asU64(b))),
+        promiseDispatch(op, asU64(a), asU64(b)),
       __then: (p: bigint, onF: bigint, onR: bigint): bigint =>
-        oomGuard(promiseThen(asU64(p), asU64(onF), asU64(onR))),
+        promiseThen(asU64(p), asU64(onF), asU64(onR)),
       // The host wall clock backing `Date.now()` / `new Date()` (ms since epoch).
       __now: (): number => Date.now(),
-      // `parseInt(s, radix)` (an omitted radix arrives as `undefined`).
+      // `parseInt(s, radix)` (`s` is a string; an omitted radix arrives as `undefined`).
       __parse_int: (s: bigint, radix: bigint): bigint =>
         f64ToBits(
           parseIntStr(
-            formatValue(decode(asU64(s), memView())),
+            toJsString(decode(asU64(s), memView())),
             valueToNumber(decode(asU64(radix), memView())),
           ),
         ),
@@ -742,23 +683,9 @@ export function createShim(): Shim {
 
   return {
     imports,
-    stdout: () => out,
     bindInstance: (bound) => {
       instance = bound
     },
-    drainAfterMain: () => {
-      drain()
-      if (heapExhausted()) throw new Error(OUT_OF_MEMORY)
-      const unhandled = [...rejected]
-        .filter((base) => !handled.has(base))
-        .sort((a, b) => a - b)[0]
-      if (unhandled === undefined) return
-      const mem = memView()
-      throw new Error(
-        `Uncaught (in promise) ${formatValue(decode(readValue(mem, unhandled), mem))}`,
-      )
-    },
-    heapExhausted,
   }
 }
 
