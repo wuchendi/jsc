@@ -28,6 +28,7 @@ wasm-encoder                   = "0.262.0"
 wasmtime                       = { version = "50.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
 
 [dev-dependencies]
+libm = "0.2.16"
 wasmparser = "0.262.0"
 
 [lints]
