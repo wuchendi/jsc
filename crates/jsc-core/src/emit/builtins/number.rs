@@ -327,7 +327,7 @@ pub(super) fn emit_number_format(
     if matches!(format, NumberFormat::Exponential) {
         wasm!(function;
             I32Const(dtoa::MODE_SHORTEST_EXPONENTIAL),
-            LocalGet(arg), I64Const(UNDEFINED_BITS), I64Eq, Select,
+            LocalGet(arg), I64Const(UNDEFINED_BITS), I64Ne, Select,
         );
     }
     wasm!(function;
