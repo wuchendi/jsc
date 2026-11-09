@@ -1,12 +1,10 @@
 //! Run: execute an emitted WebAssembly command module with `wasmtime`.
 //!
-//! [`harness`] is the WASI runner; [`host`] and [`promise`] back the `env`
-//! imports not yet replaced by guest code, and [`value`] decodes jsvals for them.
+//! [`harness`] is the WASI runner; [`promise`] backs the `env` imports not yet
+//! replaced by guest code.
 
 mod harness;
-mod host;
 mod promise;
-mod value;
 
 #[cfg(test)]
 mod tests;

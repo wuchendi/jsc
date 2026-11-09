@@ -47,15 +47,6 @@ use crate::ir::{
 /// pointers.
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
-/// The module and field name of the host `__method` import backing the
-/// non-callback array/string methods. It receives the receiver jsval, a
-/// `METHOD_OP_*` flag, and two argument jsval slots (padded with `undefined` when
-/// the method takes fewer), branches on the receiver's runtime TYPE BYTE for the
-/// overloaded `indexOf`/`slice`, and returns the result jsval (allocating a heap
-/// string/array in guest memory when it builds one).
-const METHOD_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const METHOD_IMPORT_NAME: &str = abi::METHOD_IMPORT_NAME;
-
 /// The module and field names of the host promise imports: `__promise`
 /// backs the single-value primitives (`Promise.resolve`/`reject`, top-level
 /// `await`, `p.finally`) and `__then` backs `p.then`/`p.catch`. [`crate::run`]
@@ -90,10 +81,6 @@ const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
 const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
 const PROMISE_SELF_ERROR_EXPORT_NAME: &str = abi::PROMISE_SELF_ERROR_EXPORT_NAME;
 
-/// `__method` op flags; see [`abi`].
-const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
-const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-
 /// The name under which the pending-exception flag global (`$exc_pending`, i32) is
 /// exported so the run stage can detect an uncaught exception after `main` returns.
 /// `0` = no exception in flight, `1` = an exception is propagating.
@@ -106,9 +93,9 @@ const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
 
 /// The number of imported functions: the four WASI imports (`fd_write`,
 /// `clock_time_get`, `random_get`, `proc_exit`) at indices `0..=3`, then the
-/// three `env` imports (`__method`, `__promise`, `__then`). Every defined function, funcref-table element and
+/// two `env` imports (`__promise`, `__then`). Every defined function, funcref-table element and
 /// function export index is shifted up by this count.
-const IMPORT_FUNC_COUNT: u32 = 7;
+const IMPORT_FUNC_COUNT: u32 = 6;
 
 /// The function index of the WASI `fd_write` import.
 const FD_WRITE_IMPORT: u32 = 0;
@@ -887,12 +874,10 @@ struct Helpers<'a> {
     /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
     /// helpers (see [`dtoa::emit_helpers`]).
     dtoa: u32,
-    /// The host `__method` import's function index. Always `4`; the non-callback array/string methods lower to `call`s of it.
-    method: u32,
-    /// The host `__promise` import's function index. Always `5`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
+    /// The host `__promise` import's function index. Always `4`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
     /// `call`s of it.
     promise: u32,
-    /// The host `__then` import's function index. Always `6`; `p.then`/`p.catch` lower to `call`s of it.
+    /// The host `__then` import's function index. Always `5`; `p.then`/`p.catch` lower to `call`s of it.
     then: u32,
     /// `__now() -> f64`, the WASI clock in ms since the Unix epoch (backing
     /// `Date`); `__random` follows it (see [`Self::random`]).
@@ -1021,6 +1006,9 @@ struct Helpers<'a> {
     /// identical bits — so `NaN` matches `NaN` and `+0` matches `-0` — everything
     /// else by identity bits). The key equality of the `__map_*` linear scans.
     same_value_zero: u32,
+    /// `__array_search(recv: i64, needle: i64, includes: i32) -> i64` (see
+    /// [`builtins::emit_array_search`]): the `indexOf`/`includes` fast path.
+    array_search: u32,
     /// `__map_find(handle: i32, key: i64) -> i32`: the byte address of the
     /// matching key slot in a Map/Set's backing array (a `__same_value_zero` linear scan over
     /// the even element slots, skipping `HOLE` tombstones), or `-1` on a miss. Shared by get/has/set/delete.
@@ -1613,7 +1601,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     module.section(&types);
 
     // Import section: the WASI functions (indices 0..=3), then the `env`
-    // functions (indices 4..=9). Imports occupy the lowest function indices,
+    // functions (indices 4..=5). Imports occupy the lowest function indices,
     // so every defined function/element/export index is shifted by
     // IMPORT_FUNC_COUNT. The order must match `Helpers`.
     let mut imports = ImportSection::new();
@@ -1622,7 +1610,6 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         (abi::WASI_MODULE, abi::WASI_CLOCK_TIME_GET_NAME),
         (abi::WASI_MODULE, abi::WASI_RANDOM_GET_NAME),
         (abi::WASI_MODULE, abi::WASI_PROC_EXIT_NAME),
-        (METHOD_IMPORT_MODULE, METHOD_IMPORT_NAME),
         (PROMISE_IMPORT_MODULE, PROMISE_IMPORT_NAME),
         (THEN_IMPORT_MODULE, THEN_IMPORT_NAME),
     ];
@@ -1791,6 +1778,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         &leaves,
     ));
     code.function(&emit_same_value_zero(helpers.str_eq, &leaves));
+    code.function(&builtins::emit_array_search(helpers, &leaves));
     code.function(&emit_map_find(helpers.same_value_zero, &leaves));
     code.function(&emit_map_set(helpers.map_find, helpers.array_push, &leaves));
     code.function(&emit_map_get(helpers.map_find, &leaves));

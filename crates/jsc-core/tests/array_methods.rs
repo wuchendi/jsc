@@ -50,6 +50,47 @@ const SUB: &str = "class A extends Array {}; ";
 
 // --- function values ---------------------------------------------------------
 
+/// The `indexOf`/`includes` fast path scans the store in the guest: `===` and
+/// `SameValueZero`, holes, content-compared strings, sparse index keys (a huge
+/// `length` costs only the present elements), and dictionary-mode arrays
+/// through the generic path.
+#[test]
+fn index_of_fast_path_guest_scan() {
+    both_number("[1, 2, 3, 2].indexOf(2)", 1.0);
+    both_number("[1, 2].indexOf(9)", -1.0);
+    both_number("[].indexOf(undefined)", -1.0);
+    both_number("[NaN].indexOf(NaN)", -1.0);
+    both_number("[-0].indexOf(0)", 0.0);
+    both_number("['a' + 'b'].indexOf('ab')", 0.0);
+    both_number("const o = {}; [{}, o].indexOf(o)", 1.0);
+    both_number("[, undefined].indexOf(undefined)", 1.0);
+    both_number("[1, , 3].indexOf(undefined)", -1.0);
+    both_bool("[NaN].includes(NaN)", true);
+    both_bool("[-0].includes(0)", true);
+    both_bool("[1, , 3].includes(undefined)", true);
+    both_bool("[1, 3].includes(undefined)", false);
+    both_bool("['x'].includes('y')", false);
+    both_number(
+        "const a = []; a[4294967294] = 'z'; a.indexOf('z')",
+        4_294_967_294.0,
+    );
+    both_bool("const a = []; a[4294967294] = 'z'; a.includes('z')", true);
+    both_bool(
+        "const a = []; a[4294967294] = 'z'; a.includes(undefined)",
+        true,
+    );
+    both_number(
+        "const a = [1]; a[5000] = 2; a[3000] = 2; a.indexOf(2)",
+        3000.0,
+    );
+    both_number("const a = Object.freeze([4, 5]); a.indexOf(5)", 1.0);
+    both_bool("const a = Object.freeze([4]); a.includes(4)", true);
+    both_number(
+        "const a = [1]; Object.defineProperty(a, 0, { get() { return 8 } }); a.indexOf(8)",
+        0.0,
+    );
+}
+
 #[test]
 fn new_methods_have_name_and_length() {
     for (name, length) in [

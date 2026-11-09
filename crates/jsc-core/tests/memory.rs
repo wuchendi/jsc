@@ -73,7 +73,7 @@ fn pushed_objects_read_back() {
     );
 }
 
-/// Host-allocated strings and arrays (`String(n)`, `__method` ops) still work
+/// Guest-allocated strings and arrays (`String(n)`, array searches) still work
 /// after the guest heap has grown past the initial page.
 #[test]
 fn host_allocations_after_growth() {

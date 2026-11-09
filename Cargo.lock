@@ -841,7 +841,6 @@ name = "jsc-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "icu_normalizer",
  "libm",
  "swc_common",
  "swc_ecma_ast",

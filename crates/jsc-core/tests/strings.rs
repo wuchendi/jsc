@@ -5,6 +5,21 @@ use common::{assert_bool, assert_eval, assert_nan, assert_number, assert_output,
 
 /// String `toUpperCase`/`toLowerCase` map one-byte receivers to NEW strings
 /// (the guest Latin-1 path).
+/// `localeCompare` is code-unit order (`__str_cmp`), not locale collation,
+/// inline on a literal argument and through the builtin otherwise.
+#[test]
+fn locale_compare_code_unit_order() {
+    assert_number("\"a\".localeCompare(\"b\")", -1.0);
+    assert_number("\"Z\".localeCompare(\"a\")", -1.0);
+    assert_number("\"ab\".localeCompare(\"a\")", 1.0);
+    assert_number("\"a\".localeCompare(\"a\")", 0.0);
+    assert_number("const s = \"é\"; s.localeCompare(\"z\")", 1.0);
+    assert_number("const t = \"b\"; \"a\".localeCompare(t)", -1.0);
+    assert_number("let n = 0; \"a\".localeCompare(\"b\", n = 7); n", 7.0);
+    assert_number("\"\\uD83D\".localeCompare(\"\\uFFFF\")", -1.0);
+    assert_number("String.prototype.localeCompare.call(1, \"2\")", -1.0);
+}
+
 #[test]
 fn string_case_fold() {
     assert_string("\"abc\".toUpperCase()", "ABC");

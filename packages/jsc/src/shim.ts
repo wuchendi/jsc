@@ -1,9 +1,8 @@
 /**
  * The JS runtime shim: the `importObject` that backs the emitted module's
- * remaining `env` imports (`__method` / `__promise` / `__then`). A port of `crates/jsc-core/src/run/harness.rs`
- * (import wiring), `run/host.rs` (handlers), and `run/promise.rs` (the promise
- * engine + microtask queue). Every heap block is allocated through the guest's
- * exported constructors (`__new_string` / `__new_promise`), never by hand. It
+ * remaining `env` imports (`__promise` / `__then`). A port of `crates/jsc-core/src/run/harness.rs`
+ * (import wiring) and `run/promise.rs` (the promise engine + microtask queue). Every heap block is allocated through the guest's
+ * exported constructor `__new_promise`, never by hand. It
  * duplicates Rust host semantics against the emitted module's memory (see
  * README, "Host parity").
  */
@@ -12,42 +11,11 @@ import {
   ASYNC_STEP_EXPORT_NAME,
   EXC_PENDING_EXPORT_NAME,
   EXC_VALUE_EXPORT_NAME,
-  FALSE,
   GEN_DONE_OFFSET,
   HEAP,
   INVOKE_EXPORT_NAME,
-  MATH_FN_ACOS,
-  MATH_FN_ACOSH,
-  MATH_FN_ASIN,
-  MATH_FN_ASINH,
-  MATH_FN_ATAN,
-  MATH_FN_ATAN2,
-  MATH_FN_ATANH,
-  MATH_FN_CBRT,
-  MATH_FN_COS,
-  MATH_FN_COSH,
-  MATH_FN_EXP,
-  MATH_FN_EXPM1,
-  MATH_FN_LOG,
-  MATH_FN_LOG1P,
-  MATH_FN_LOG2,
-  MATH_FN_LOG10,
-  MATH_FN_SIN,
-  MATH_FN_SINH,
-  MATH_FN_TAN,
-  MATH_FN_TANH,
   MEMORY_EXPORT_NAME,
-  MEMORY_MAX_PAGES,
-  METHOD_OP_INCLUDES,
-  METHOD_OP_INDEX_OF,
-  METHOD_OP_LOCALE_COMPARE,
-  METHOD_OP_MATH,
-  METHOD_OP_NORMALIZE,
-  METHOD_OP_TO_LOWER,
-  METHOD_OP_TO_UPPER,
-  METHOD_RANGE_ERROR,
   NEW_PROMISE_EXPORT_NAME,
-  NEW_STRING_EXPORT_NAME,
   PROMISE_BLOCK_SIZE,
   PROMISE_FULFILLED,
   PROMISE_OP_ASYNC_SPAWN,
@@ -64,23 +32,17 @@ import {
   PROMISE_STATE_OFFSET,
   PROMISE_VALUE_OFFSET,
   QNAN,
-  STR_DATA_OFFSET,
-  TRUE,
-  TYPE_ARRAY,
   TYPE_FUNCTION,
   TYPE_PROMISE,
-  TYPE_STRING,
   U32_MASK,
+  U64_MASK,
   UNDEFINED,
 } from './abi.js'
-import {
-  arrayElements,
-  asU64,
-  decode,
-  f64ToBits,
-  stringText,
-  toJsString,
-} from './value.js'
+
+/** The low 64 bits of `bits`: a wasm `i64` crosses the boundary as a signed BigInt. */
+function asU64(bits: bigint): bigint {
+  return bits & U64_MASK
+}
 
 /** `__promise` op: drain the queue, then return the first unhandled promise or `0`. */
 const PROMISE_OP_DRAIN = 8
@@ -120,9 +82,6 @@ interface Job {
   asyncGen: bigint | null
 }
 
-/** The linear-memory cap in bytes; constructor lengths are clamped to it (mirrors `host.rs`). */
-const MEMORY_MAX_BYTES = MEMORY_MAX_PAGES * 0x1_0000
-
 /** Build a fresh shim. One per `run()` call so promise state does not bleed across runs. */
 export function createShim(): Shim {
   let instance: WebAssembly.Instance | null = null
@@ -155,151 +114,6 @@ export function createShim(): Shim {
       | ((...a: number[]) => number)
       | undefined
     return ctor ? ctor(...args) >>> 0 : null
-  }
-
-  /**
-   * Allocate a heap STRING block holding the code units of `text` in canonical
-   * form (one-byte Latin-1 when every unit is `<= 0xFF`, else UTF-16LE)
-   * through `__new_string(len, twoByte)`, filling only the payload (mirrors
-   * `host.rs::alloc_units`).
-   */
-  function allocString(text: string): bigint | null {
-    const len = Math.min(text.length, MEMORY_MAX_BYTES)
-    let twoByte = false
-    for (let i = 0; i < len && !twoByte; i++)
-      twoByte = text.charCodeAt(i) > 0xff
-    const base = guestNew(NEW_STRING_EXPORT_NAME, len, twoByte ? 1 : 0)
-    if (base === null) return null
-    const view = memView()
-    const at = base + STR_DATA_OFFSET
-    if (at + (twoByte ? len * 2 : len) > view.length) return null
-    // `at` is 8-aligned, so a `Uint16Array` (little-endian, like wasm) fits.
-    const units = twoByte
-      ? new Uint16Array(view.buffer, view.byteOffset + at, len)
-      : view.subarray(at, at + len)
-    for (let i = 0; i < len; i++) units[i] = text.charCodeAt(i)
-    return BigInt(base)
-  }
-
-  /**
-   * Dispatch a `__method` call (mirrors `host.rs::method_dispatch`): snapshot
-   * memory, read the receiver's TYPE BYTE, and perform the array/string method,
-   * returning the result jsval bits (or `null` to yield `undefined`).
-   */
-  /** The host `Math` function `code` (a `MATH_FN_*`) of `x` (and `y` for `atan2`). */
-  function mathFn(code: number, x: number, y: number): number {
-    switch (code) {
-      case MATH_FN_CBRT:
-        return Math.cbrt(x)
-      case MATH_FN_LOG:
-        return Math.log(x)
-      case MATH_FN_LOG2:
-        return Math.log2(x)
-      case MATH_FN_LOG10:
-        return Math.log10(x)
-      case MATH_FN_LOG1P:
-        return Math.log1p(x)
-      case MATH_FN_EXP:
-        return Math.exp(x)
-      case MATH_FN_EXPM1:
-        return Math.expm1(x)
-      case MATH_FN_SIN:
-        return Math.sin(x)
-      case MATH_FN_COS:
-        return Math.cos(x)
-      case MATH_FN_TAN:
-        return Math.tan(x)
-      case MATH_FN_ASIN:
-        return Math.asin(x)
-      case MATH_FN_ACOS:
-        return Math.acos(x)
-      case MATH_FN_ATAN:
-        return Math.atan(x)
-      case MATH_FN_ATAN2:
-        return Math.atan2(x, y)
-      case MATH_FN_SINH:
-        return Math.sinh(x)
-      case MATH_FN_COSH:
-        return Math.cosh(x)
-      case MATH_FN_TANH:
-        return Math.tanh(x)
-      case MATH_FN_ASINH:
-        return Math.asinh(x)
-      case MATH_FN_ACOSH:
-        return Math.acosh(x)
-      case MATH_FN_ATANH:
-        return Math.atanh(x)
-      default:
-        return Number.NaN
-    }
-  }
-
-  function methodDispatch(
-    recv: bigint,
-    op: number,
-    arg0: bigint,
-    arg1: bigint,
-  ): bigint | null {
-    // Snapshot memory (a copy) so reads below are stable across a later
-    // guest allocation that may grow/detach the buffer — mirrors the Rust snapshot.
-    const mem = memView().slice()
-    const ptr = heapPtr(recv)
-    const typeByte = ptr === null ? undefined : mem[ptr]
-    switch (op) {
-      case METHOD_OP_INDEX_OF:
-        if (ptr !== null && typeByte === TYPE_ARRAY)
-          return arrayIndexOf(mem, ptr, arg0)
-        return null
-      case METHOD_OP_INCLUDES:
-        if (ptr !== null && typeByte === TYPE_ARRAY)
-          return arrayIncludes(mem, ptr, arg0) ? TRUE : FALSE
-        return null
-      case METHOD_OP_TO_UPPER:
-      case METHOD_OP_TO_LOWER: {
-        if (ptr === null || typeByte !== TYPE_STRING) return null
-        const text = stringText(mem, ptr)
-        if (text === null) return null
-        // The full Unicode default case mappings (`ß` -> `SS`, final sigma);
-        // lone surrogates pass through unchanged.
-        const base = allocString(
-          op === METHOD_OP_TO_UPPER ? text.toUpperCase() : text.toLowerCase(),
-        )
-        return base === null ? null : HEAP | base
-      }
-      case METHOD_OP_LOCALE_COMPARE: {
-        if (ptr === null || typeByte !== TYPE_STRING) return null
-        const self = stringText(mem, ptr)
-        const thatPtr = heapPtr(arg0)
-        const that = thatPtr === null ? null : stringText(mem, thatPtr)
-        if (self === null || that === null) return null
-        // Code-unit order over the lossless text; the guest coerced the
-        // argument to a string.
-        return f64ToBits(self < that ? -1 : self > that ? 1 : 0)
-      }
-      case METHOD_OP_NORMALIZE: {
-        if (ptr === null || typeByte !== TYPE_STRING) return null
-        const text = stringText(mem, ptr)
-        if (text === null) return null
-        const formValue = decode(arg0, mem)
-        const form =
-          formValue.kind === 'undefined' ? 'NFC' : toJsString(formValue)
-        if (!['NFC', 'NFD', 'NFKC', 'NFKD'].includes(form))
-          return METHOD_RANGE_ERROR
-        // A lone surrogate passes through `normalize` unchanged.
-        const base = allocString(text.normalize(form))
-        return base === null ? null : HEAP | base
-      }
-      case METHOD_OP_MATH: {
-        const number = (bits: bigint): number => {
-          const value = decode(bits, mem)
-          return value.kind === 'number' ? value.value : Number.NaN
-        }
-        const n = mathFn(Number(arg1), number(recv), number(arg0))
-        return Number.isNaN(n) ? QNAN : f64ToBits(n)
-      }
-      default:
-        return null
-    }
   }
 
   // ---- promise engine (ported from promise.rs) ----------------------------
@@ -592,13 +406,6 @@ export function createShim(): Shim {
 
   const imports: WebAssembly.Imports = {
     env: {
-      __method: (
-        recv: bigint,
-        op: number,
-        arg0: bigint,
-        arg1: bigint,
-      ): bigint =>
-        methodDispatch(asU64(recv), op, asU64(arg0), asU64(arg1)) ?? UNDEFINED,
       __promise: (op: number, a: bigint, b: bigint): bigint =>
         promiseDispatch(op, asU64(a), asU64(b)),
       __then: (p: bigint, onF: bigint, onR: bigint): bigint =>
@@ -662,54 +469,4 @@ function readGenDone(mem: Uint8Array, gen: bigint): boolean {
   const at = base + GEN_DONE_OFFSET
   if (at + 4 > mem.length) return false
   return new DataView(mem.buffer, mem.byteOffset).getInt32(at, true) !== 0
-}
-
-/** Number jsval bits for a non-negative sequence index (lossless `u32 -> f64`). */
-function indexBits(i: number): bigint {
-  return f64ToBits(i >>> 0)
-}
-
-/**
- * JS strict equality (`===`) between two raw jsval bits (mirrors
- * `host.rs::strict_eq_bits`): numbers by `f64` value, strings by content, and
- * everything else by identical raw bits.
- */
-function strictEqBits(a: bigint, b: bigint, mem: Uint8Array): boolean {
-  const va = decode(a, mem)
-  const vb = decode(b, mem)
-  if (va.kind === 'number' && vb.kind === 'number') return va.value === vb.value
-  if (va.kind === 'string' && vb.kind === 'string') return va.value === vb.value
-  return a === b
-}
-
-/**
- * `array.includes(x)` (mirrors `host.rs::array_includes`): some element is
- * `SameValueZero` to `x` — `===`, except that `NaN` matches `NaN`; a hole
- * reads as `undefined`.
- */
-function arrayIncludes(mem: Uint8Array, ptr: number, needle: bigint): boolean {
-  const [len, present] = arrayElements(mem, ptr) ?? [0, []]
-  if (needle === UNDEFINED && present.length < len) return true
-  const n = decode(needle, mem)
-  for (const [, elem] of present) {
-    if (strictEqBits(elem, needle, mem)) return true
-    const e = decode(elem, mem)
-    if (
-      e.kind === 'number' &&
-      n.kind === 'number' &&
-      Number.isNaN(e.value) &&
-      Number.isNaN(n.value)
-    )
-      return true
-  }
-  return false
-}
-
-/** `array.indexOf(x)`: first index whose element `=== x`, or `-1` (a hole never matches). */
-function arrayIndexOf(mem: Uint8Array, ptr: number, needle: bigint): bigint {
-  const [, present] = arrayElements(mem, ptr) ?? [0, []]
-  for (const [i, elem] of present) {
-    if (strictEqBits(elem, needle, mem)) return indexBits(i)
-  }
-  return f64ToBits(-1)
 }

@@ -191,64 +191,6 @@ export const INVOKE_EXPORT_NAME = '__invoke1'
 /** Export name of the `__async_step(gen, sent)` async-body step trampoline. */
 export const ASYNC_STEP_EXPORT_NAME = '__async_step'
 
-/** `__method` op: array `indexOf`. */
-export const METHOD_OP_INDEX_OF = 0
-/** `__method` op: array `includes`. */
-export const METHOD_OP_INCLUDES = 1
-/** `__method` op: `toUpperCase`. */
-export const METHOD_OP_TO_UPPER = 4
-/** `__method` op: `toLowerCase`. */
-export const METHOD_OP_TO_LOWER = 5
-/** `__method` op: `String.prototype.localeCompare` (string, code-unit order). */
-export const METHOD_OP_LOCALE_COMPARE = 22
-/** `__method` op: `String.prototype.normalize` (string). */
-export const METHOD_OP_NORMALIZE = 23
-/** `__method` result: an out-of-range argument (unknown `normalize` form). */
-export const METHOD_RANGE_ERROR = 0x7ffb_0000_0000_0002n
-/** `__method` op: a host `Math` function (`arg1` the raw `MATH_FN_*` code). */
-export const METHOD_OP_MATH = 43
-
-/** `METHOD_OP_MATH` function code: `Math.cbrt`. */
-export const MATH_FN_CBRT = 0
-/** `METHOD_OP_MATH` function code: `Math.log`. */
-export const MATH_FN_LOG = 1
-/** `METHOD_OP_MATH` function code: `Math.log2`. */
-export const MATH_FN_LOG2 = 2
-/** `METHOD_OP_MATH` function code: `Math.log10`. */
-export const MATH_FN_LOG10 = 3
-/** `METHOD_OP_MATH` function code: `Math.log1p`. */
-export const MATH_FN_LOG1P = 4
-/** `METHOD_OP_MATH` function code: `Math.exp`. */
-export const MATH_FN_EXP = 5
-/** `METHOD_OP_MATH` function code: `Math.expm1`. */
-export const MATH_FN_EXPM1 = 6
-/** `METHOD_OP_MATH` function code: `Math.sin`. */
-export const MATH_FN_SIN = 7
-/** `METHOD_OP_MATH` function code: `Math.cos`. */
-export const MATH_FN_COS = 8
-/** `METHOD_OP_MATH` function code: `Math.tan`. */
-export const MATH_FN_TAN = 9
-/** `METHOD_OP_MATH` function code: `Math.asin`. */
-export const MATH_FN_ASIN = 10
-/** `METHOD_OP_MATH` function code: `Math.acos`. */
-export const MATH_FN_ACOS = 11
-/** `METHOD_OP_MATH` function code: `Math.atan`. */
-export const MATH_FN_ATAN = 12
-/** `METHOD_OP_MATH` function code: `Math.atan2`. */
-export const MATH_FN_ATAN2 = 13
-/** `METHOD_OP_MATH` function code: `Math.sinh`. */
-export const MATH_FN_SINH = 14
-/** `METHOD_OP_MATH` function code: `Math.cosh`. */
-export const MATH_FN_COSH = 15
-/** `METHOD_OP_MATH` function code: `Math.tanh`. */
-export const MATH_FN_TANH = 16
-/** `METHOD_OP_MATH` function code: `Math.asinh`. */
-export const MATH_FN_ASINH = 17
-/** `METHOD_OP_MATH` function code: `Math.acosh`. */
-export const MATH_FN_ACOSH = 18
-/** `METHOD_OP_MATH` function code: `Math.atanh`. */
-export const MATH_FN_ATANH = 19
-
 /** `__promise` op: `Promise.resolve(a)`. */
 export const PROMISE_OP_RESOLVE = 0
 /** `__promise` op: `Promise.reject(a)`. */

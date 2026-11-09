@@ -3,8 +3,7 @@
 //! `Promise.reject` / `p.then` / `p.catch` / `p.finally` and top-level `await`.
 //!
 //! A promise's *settlement* (state + value) lives in guest linear memory as a
-//! [`abi::TYPE_PROMISE`] block, so a bare memory snapshot still renders it (see
-//! [`super::value`]); the *scheduling* state — which reactions are registered on
+//! [`abi::TYPE_PROMISE`] block; the *scheduling* state — which reactions are registered on
 //! a still-pending promise, and which reactions are queued to run — lives here,
 //! host-side, keyed by the promise block's base offset.
 //!

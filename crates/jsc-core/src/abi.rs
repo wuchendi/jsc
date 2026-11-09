@@ -775,10 +775,6 @@ pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
 /// aligned.
 pub(crate) const RYU_TABLES_SIZE: u32 = 832;
 
-/// The field name of the host `__method` import backing the non-callback
-/// array/string methods.
-pub(crate) const METHOD_IMPORT_NAME: &str = "__method";
-
 /// The field name of the host `__promise` import backing the promise
 /// primitives that take at most a single value operand: `Promise.resolve(v)`,
 /// `Promise.reject(v)`, top-level `await p`, and `p.finally(fn)`. It receives a
@@ -888,80 +884,6 @@ pub(crate) const EXC_PENDING_EXPORT_NAME: &str = "__exc_pending";
 /// is exported so the run stage can render an uncaught exception.
 pub(crate) const EXC_VALUE_EXPORT_NAME: &str = "__exc_value";
 
-/// `__method` op flag: array `indexOf`.
-pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
-
-/// `__method` op flag: array `includes`.
-pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `toUpperCase`.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
-
-/// `__method` op flag: `toLowerCase`.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
-
-/// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
-/// order).
-pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
-
-/// `__method` op flag: `String.prototype.normalize` (string, a form string or
-/// `undefined`).
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
-
-/// `__method` result: the argument is out of range (an unknown `normalize`
-/// form); the calling builtin throws a `RangeError`.
-#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
-pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
-
-/// `__method` op flag: a host `Math` function. The receiver is the first
-/// number operand, `arg0` the second (`Math.atan2`'s `x`; `undefined` for
-/// the unary functions) and `arg1` the raw `MATH_FN_*` code; the result is a
-/// number jsval.
-pub(crate) const METHOD_OP_MATH: i32 = 43;
-
-/// `METHOD_OP_MATH` function code: `Math.cbrt`.
-pub(crate) const MATH_FN_CBRT: i64 = 0;
-/// `METHOD_OP_MATH` function code: `Math.log`.
-pub(crate) const MATH_FN_LOG: i64 = 1;
-/// `METHOD_OP_MATH` function code: `Math.log2`.
-pub(crate) const MATH_FN_LOG2: i64 = 2;
-/// `METHOD_OP_MATH` function code: `Math.log10`.
-pub(crate) const MATH_FN_LOG10: i64 = 3;
-/// `METHOD_OP_MATH` function code: `Math.log1p`.
-pub(crate) const MATH_FN_LOG1P: i64 = 4;
-/// `METHOD_OP_MATH` function code: `Math.exp`.
-pub(crate) const MATH_FN_EXP: i64 = 5;
-/// `METHOD_OP_MATH` function code: `Math.expm1`.
-pub(crate) const MATH_FN_EXPM1: i64 = 6;
-/// `METHOD_OP_MATH` function code: `Math.sin`.
-pub(crate) const MATH_FN_SIN: i64 = 7;
-/// `METHOD_OP_MATH` function code: `Math.cos`.
-pub(crate) const MATH_FN_COS: i64 = 8;
-/// `METHOD_OP_MATH` function code: `Math.tan`.
-pub(crate) const MATH_FN_TAN: i64 = 9;
-/// `METHOD_OP_MATH` function code: `Math.asin`.
-pub(crate) const MATH_FN_ASIN: i64 = 10;
-/// `METHOD_OP_MATH` function code: `Math.acos`.
-pub(crate) const MATH_FN_ACOS: i64 = 11;
-/// `METHOD_OP_MATH` function code: `Math.atan`.
-pub(crate) const MATH_FN_ATAN: i64 = 12;
-/// `METHOD_OP_MATH` function code: `Math.atan2` (`y` the receiver, `x` in `arg0`).
-pub(crate) const MATH_FN_ATAN2: i64 = 13;
-/// `METHOD_OP_MATH` function code: `Math.sinh`.
-pub(crate) const MATH_FN_SINH: i64 = 14;
-/// `METHOD_OP_MATH` function code: `Math.cosh`.
-pub(crate) const MATH_FN_COSH: i64 = 15;
-/// `METHOD_OP_MATH` function code: `Math.tanh`.
-pub(crate) const MATH_FN_TANH: i64 = 16;
-/// `METHOD_OP_MATH` function code: `Math.asinh`.
-pub(crate) const MATH_FN_ASINH: i64 = 17;
-/// `METHOD_OP_MATH` function code: `Math.acosh`.
-pub(crate) const MATH_FN_ACOSH: i64 = 18;
-/// `METHOD_OP_MATH` function code: `Math.atanh`.
-pub(crate) const MATH_FN_ATANH: i64 = 19;
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]
 mod drift_tests;

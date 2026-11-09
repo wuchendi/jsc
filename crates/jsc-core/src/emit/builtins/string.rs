@@ -3,7 +3,7 @@
 //! the guest (a user `toString` / `valueOf` may run, and throw), then works on
 //! the code units at each string's width (one-byte Latin-1 or two-byte
 //! UTF-16, DESIGN.md §5.2), producing canonical strings; only
-//! `localeCompare` runs a host `__method` op.
+//! `localeCompare` is `__str_cmp`, code-unit order.
 //! `toString` / `valueOf` are `thisStringValue`.
 
 #[allow(clippy::wildcard_imports)]
@@ -76,21 +76,8 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
 /// of the types its coercions produce (string / number literals; a missing
 /// argument is `undefined`), so that on a string receiver the builtin is
 /// exactly its host op, inline.
-pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<i32> {
-    let ready = |coerce: Coerce, arg: Option<&IrNode>| {
-        matches!(
-            (coerce, arg),
-            (Coerce::None, _)
-                | (Coerce::OptString | Coerce::Number, None)
-                | (Coerce::String | Coerce::OptString, Some(IrNode::Str(_)))
-                | (Coerce::Number, Some(IrNode::Num(_)))
-        )
-    };
-    let [first, second] = coercions(op);
-    if !(ready(first, args.first()) && ready(second, args.get(1))) {
-        return None;
-    }
-    op.flag()
+pub(in crate::emit) fn inline_str_cmp(op: StringOp, args: &[IrNode]) -> bool {
+    op == StringOp::LocaleCompare && matches!(args, [IrNode::Str(_)])
 }
 
 /// The `TypeError` text of `String.prototype.<name>` on a `null`/`undefined`
@@ -470,15 +457,18 @@ pub(super) fn emit_method(
         emit_normalize(function, frame, strings, helpers);
         return;
     }
-    let Some(flag) = op.flag() else {
-        emit_units(op, function, frame, strings, helpers);
-        if op == StringOp::Match {
-            wasm!(function; LocalSet(r));
-            emit_match_result(function, frame, s, a0, r, strings, helpers);
-        }
+    if op == StringOp::LocaleCompare {
+        wasm!(function;
+            LocalGet(s), I32WrapI64, LocalGet(a0), I32WrapI64, Call(helpers.str_cmp),
+            F64ConvertI32S, I64ReinterpretF64,
+        );
         return;
-    };
-    emit_host_op(flag, function, frame, helpers);
+    }
+    emit_units(op, function, frame, strings, helpers);
+    if op == StringOp::Match {
+        wasm!(function; LocalSet(r));
+        emit_match_result(function, frame, s, a0, r, strings, helpers);
+    }
 }
 
 /// The receiver of [`emit_method`] into i64 temp 0: `this`, a
@@ -630,15 +620,6 @@ fn emit_normalize(
     throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
     wasm!(function; End, LocalGet(dst));
     box_heap(function);
-}
-
-/// The host op `flag` over the receiver string in i64 temp 0 and the coerced
-/// arguments in i64 temps 1 and 2.
-fn emit_host_op(flag: i32, function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
-    let (s, a0, a1) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    wasm!(function;
-        LocalGet(s), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method),
-    );
 }
 
 /// The well-known symbol `op` dispatches to on an object first argument.
