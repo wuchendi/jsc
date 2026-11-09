@@ -1140,15 +1140,18 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
 /// `JSON.stringify` (`__json_rep` serializes arrays and objects). Returns the
 /// base offset of a heap string holding `v`'s JSON form:
 ///
-/// - number: `__convert(v, TO_STRING)` when finite (reusing the EXISTING host
-///   import — no new import), else the token `"null"` (JSON renders NaN/Infinity
-///   as null);
+/// - number: `__num_to_str(v)` when finite (`num_to_str_index`), else the token
+///   `"null"` (JSON renders NaN/Infinity as null);
 /// - `true`/`false`/`null`: the matching keyword token; `undefined`: `"null"`;
 /// - string: `__json_escape` (`escape_index`);
 /// - any other heap kind: `"null"`.
 ///
 /// Param `v` occupies local 0; one `i32` local holds the string accumulator.
-pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonTokens) -> Function {
+pub(super) fn emit_json_str(
+    num_to_str_index: u32,
+    escape_index: u32,
+    tokens: JsonTokens,
+) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let v = 0;
     let acc = 1;
@@ -1197,7 +1200,7 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
     function.instruction(&Instruction::I32Const(tokens.null));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::Else);
-    // number: finite (x - x == 0) ? __convert(v, TO_STRING) : "null".
+    // number: finite (x - x == 0) ? __num_to_str(v) : "null".
     function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(v));
@@ -1207,9 +1210,7 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(convert_index));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(num_to_str_index));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(tokens.null));
@@ -1273,7 +1274,7 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// `false`→`0`). Then: if either operand is `null`/`undefined`, the result is
 /// `1` iff BOTH are (nullish values equal each other and nothing else); two
 /// numbers compare as `f64`; two strings by byte content (via `__str_eq`); a
-/// number and a string coerce the string via the `__convert` `ToNumber` import
+/// number and a string coerce the string with `__to_number_prim`
 /// and compare as `f64`; an object against a (non-nullish) primitive is
 /// replaced by its `ToPrimitive` (hint default, `__to_primitive`) and compared
 /// again (a user `valueOf`/`toString` throw leaves it pending and yields `0`;
@@ -1283,7 +1284,7 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// string, without coercion). The two `i64` params occupy locals 0/1; they are
 /// mutated in place, so no extra locals are needed.
 pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
-    let (str_eq_index, convert_index) = (helpers.str_eq, helpers.convert);
+    let str_eq_index = helpers.str_eq;
     let mut function = Function::new(vec![]);
     let (a, b) = (0, 1);
     let one_bits = 1.0f64.to_bits().cast_signed();
@@ -1351,8 +1352,7 @@ pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(convert_index));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::Else);
@@ -1363,8 +1363,7 @@ pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(convert_index));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::F64ReinterpretI64);

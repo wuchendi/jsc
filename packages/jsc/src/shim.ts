@@ -1,7 +1,6 @@
 /**
  * The JS runtime shim: the `importObject` that backs the emitted module's
- * remaining `env` imports (`__convert` / `__method` / `__promise` / `__then` /
- * `__now` / `__parse_int`). A port of `crates/jsc-core/src/run/harness.rs`
+ * remaining `env` imports (`__method` / `__promise` / `__then`). A port of `crates/jsc-core/src/run/harness.rs`
  * (import wiring), `run/host.rs` (handlers), and `run/promise.rs` (the promise
  * engine + microtask queue). Every heap block is allocated through the guest's
  * exported constructors (`__new_string` / `__new_promise`), never by hand. It
@@ -11,9 +10,6 @@
 
 import {
   ASYNC_STEP_EXPORT_NAME,
-  CONVERT_OP_PARSE_FLOAT,
-  CONVERT_OP_TO_NUMBER,
-  CONVERT_OP_TO_STRING,
   EXC_PENDING_EXPORT_NAME,
   EXC_VALUE_EXPORT_NAME,
   FALSE,
@@ -36,7 +32,6 @@ import {
   MATH_FN_LOG1P,
   MATH_FN_LOG2,
   MATH_FN_LOG10,
-  MATH_FN_RANDOM,
   MATH_FN_SIN,
   MATH_FN_SINH,
   MATH_FN_TAN,
@@ -48,10 +43,6 @@ import {
   METHOD_OP_LOCALE_COMPARE,
   METHOD_OP_MATH,
   METHOD_OP_NORMALIZE,
-  METHOD_OP_NUMBER_TO_EXPONENTIAL,
-  METHOD_OP_NUMBER_TO_FIXED,
-  METHOD_OP_NUMBER_TO_PRECISION,
-  METHOD_OP_NUMBER_TO_STRING,
   METHOD_OP_TO_LOWER,
   METHOD_OP_TO_UPPER,
   METHOD_RANGE_ERROR,
@@ -87,11 +78,8 @@ import {
   asU64,
   decode,
   f64ToBits,
-  parseFloatStr,
-  parseIntStr,
   stringText,
   toJsString,
-  valueToNumber,
 } from './value.js'
 
 /** `__promise` op: drain the queue, then return the first unhandled promise or `0`. */
@@ -241,8 +229,6 @@ export function createShim(): Shim {
         return Math.acosh(x)
       case MATH_FN_ATANH:
         return Math.atanh(x)
-      case MATH_FN_RANDOM:
-        return Math.random()
       default:
         return Number.NaN
     }
@@ -301,32 +287,6 @@ export function createShim(): Shim {
           return METHOD_RANGE_ERROR
         // A lone surrogate passes through `normalize` unchanged.
         const base = allocString(text.normalize(form))
-        return base === null ? null : HEAP | base
-      }
-      case METHOD_OP_NUMBER_TO_STRING: {
-        const value = decode(recv, mem)
-        if (value.kind !== 'number') return null
-        const radix = Math.trunc(valueToNumber(decode(arg0, mem)))
-        const base = allocString(value.value.toString(radix))
-        return base === null ? null : HEAP | base
-      }
-      case METHOD_OP_NUMBER_TO_FIXED:
-      case METHOD_OP_NUMBER_TO_EXPONENTIAL:
-      case METHOD_OP_NUMBER_TO_PRECISION: {
-        const value = decode(recv, mem)
-        if (value.kind !== 'number') return null
-        const digits = decode(arg0, mem)
-        const d =
-          digits.kind === 'number' ? Math.trunc(digits.value) : undefined
-        if (d === undefined && op !== METHOD_OP_NUMBER_TO_EXPONENTIAL)
-          return null
-        const text =
-          op === METHOD_OP_NUMBER_TO_FIXED
-            ? value.value.toFixed(d)
-            : op === METHOD_OP_NUMBER_TO_PRECISION
-              ? value.value.toPrecision(d)
-              : value.value.toExponential(d)
-        const base = allocString(text)
         return base === null ? null : HEAP | base
       }
       case METHOD_OP_MATH: {
@@ -630,33 +590,8 @@ export function createShim(): Shim {
     return result
   }
 
-  /**
-   * `__convert` on primitives: the guest runs `ToPrimitive` first, so the
-   * only objects it sees are a Date (`Date.prototype.toString`) and a
-   * function without a user `toString` (mirrors `harness.rs`).
-   */
-  const convert = (bits: bigint, op: number): bigint => {
-    const u = asU64(bits)
-    const value = decode(u, memView())
-    switch (op) {
-      case CONVERT_OP_TO_NUMBER:
-        return f64ToBits(valueToNumber(value))
-      case CONVERT_OP_PARSE_FLOAT:
-        return f64ToBits(parseFloatStr(toJsString(value)))
-      case CONVERT_OP_TO_STRING: {
-        // A string argument is returned unchanged (no allocation).
-        if (value.kind === 'string') return u
-        const base = allocString(toJsString(value))
-        return base === null ? UNDEFINED : HEAP | base
-      }
-      default:
-        return UNDEFINED
-    }
-  }
-
   const imports: WebAssembly.Imports = {
     env: {
-      __convert: convert,
       __method: (
         recv: bigint,
         op: number,
@@ -668,16 +603,6 @@ export function createShim(): Shim {
         promiseDispatch(op, asU64(a), asU64(b)),
       __then: (p: bigint, onF: bigint, onR: bigint): bigint =>
         promiseThen(asU64(p), asU64(onF), asU64(onR)),
-      // The host wall clock backing `Date.now()` / `new Date()` (ms since epoch).
-      __now: (): number => Date.now(),
-      // `parseInt(s, radix)` (`s` is a string; an omitted radix arrives as `undefined`).
-      __parse_int: (s: bigint, radix: bigint): bigint =>
-        f64ToBits(
-          parseIntStr(
-            toJsString(decode(asU64(s), memView())),
-            valueToNumber(decode(asU64(radix), memView())),
-          ),
-        ),
     },
   }
 

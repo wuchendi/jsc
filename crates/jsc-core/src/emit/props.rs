@@ -2929,7 +2929,7 @@ pub(super) fn emit_private_in(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
         If(BlockType::Empty),
         LocalGet(o),
         LocalGet(name), I32Const(static_key(strings, PRIVATE_IN_MID)), Call(helpers.concat),
-        LocalGet(o), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        LocalGet(o), Call(helpers.msg_str()),
         Call(helpers.concat),
     );
     emit_box_heap(&mut f);

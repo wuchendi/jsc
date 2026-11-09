@@ -711,85 +711,6 @@ fn function_name(bits: u64, memory: &[u8]) -> Option<String> {
     }
 }
 
-/// Render an `f64` the way JavaScript prints a number.
-///
-/// Integer-valued finite numbers are printed without a fractional part (`42.0`
-/// becomes `"42"`, matching JS and keeping `40 + 2` => `"42"`); every other
-/// value falls back to Rust's shortest round-tripping form (`42.5` => `"42.5"`).
-#[must_use]
-pub(super) fn format_number(value: f64) -> String {
-    if value.is_nan() {
-        "NaN".to_owned()
-    } else if value.is_infinite() {
-        if value > 0.0 {
-            "Infinity".to_owned()
-        } else {
-            "-Infinity".to_owned()
-        }
-    } else if value == 0.0 {
-        // Both +0 and -0 render as "0" (JS `String(-0)` is "0"); the stored
-        // f64 sign is untouched so arithmetic still sees -0 (e.g. 1/-0 => -Infinity).
-        "0".to_owned()
-    } else {
-        let neg = value < 0.0;
-        let body = format_finite_positive(value.abs());
-        if neg { format!("-{body}") } else { body }
-    }
-}
-
-/// Render a finite, strictly positive `f64` per the ECMAScript `Number::toString`
-/// digit rules (ECMA-262, `Number::toString`).
-///
-/// The spec picks integers `n`, `k`, `s` with `k >= 1`, `10^(k-1) <= s < 10^k`,
-/// and `s * 10^(n-k) == x`, where `k` is minimal — i.e. `s` is the shortest
-/// decimal digit string that round-trips. Rust's `{:e}` already emits that
-/// shortest mantissa in scientific form (`d.ddd * 10^exp`), so we recover the
-/// digit string and derive `n = exp + 1`, then apply the spec's fixed vs.
-/// exponential threshold: fixed form for `-6 < n <= 21`, exponential otherwise
-/// (i.e. values `>= 1e21` or `0 < x < 1e-6`).
-fn format_finite_positive(value: f64) -> String {
-    let sci = format!("{value:e}");
-    // `{:e}` is always `<mantissa>e<exp>`; the `else` arms are unreachable but
-    // keep the function panic-free (Lock 6) by falling back to the raw form.
-    let Some((mantissa, exp)) = sci.split_once('e') else {
-        return sci;
-    };
-    let Ok(exp) = exp.parse::<i32>() else {
-        return sci;
-    };
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let k = digits.len();
-    // `n` is the position of the decimal point relative to the first digit.
-    let n = exp + 1;
-
-    if (1..=21).contains(&n) {
-        // `n >= 1` here, so the conversion never loses the value.
-        let n = usize::try_from(n).unwrap_or(0);
-        if n >= k {
-            // Integer: all `k` digits, then `n - k` trailing zeros.
-            let zeros = "0".repeat(n - k);
-            format!("{digits}{zeros}")
-        } else {
-            // `0 < n < k`: decimal point after the first `n` digits.
-            format!("{}.{}", &digits[..n], &digits[n..])
-        }
-    } else if (-5..=0).contains(&n) {
-        // `-6 < n <= 0`: "0.", then `-n` leading zeros, then the digits.
-        let zeros = "0".repeat(usize::try_from(-n).unwrap_or(0));
-        format!("0.{zeros}{digits}")
-    } else {
-        // Exponential: `n > 21` or `n <= -6`.
-        let e = n - 1;
-        let sign = if e >= 0 { "+" } else { "-" };
-        let mantissa = if k == 1 {
-            digits
-        } else {
-            format!("{}.{}", &digits[..1], &digits[1..])
-        };
-        format!("{mantissa}e{sign}{}", e.abs())
-    }
-}
-
 /// `Array.prototype.join` over decoded array elements: each element's
 /// `ToString` (`null`/`undefined` elements, holes, and cycle back-references
 /// are empty) separated by `sep`; a run of `N` holes contributes `N` empty
@@ -843,7 +764,9 @@ pub(super) fn to_js_string(value: &Value) -> String {
         Value::Generator => "[object Generator]".to_owned(),
         Value::Accessor { .. } | Value::Circular(_) | Value::Holes(_) => String::new(),
         Value::Ref(_, inner) => to_js_string(inner),
-        Value::Number(n) => format_number(*n),
+        // Only symbol descriptions and normalization forms reach this host
+        // path now; numbers are formatted in the guest.
+        Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_owned(),
         Value::Undefined => "undefined".to_owned(),
@@ -920,30 +843,4 @@ fn format_date_iso(ms: f64) -> String {
         format!("{sign}{:06}", year.abs())
     };
     format!("{year}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::format_number;
-
-    /// `format_number` follows the ECMAScript `Number::toString` fixed vs.
-    /// exponential thresholds: exponential for magnitudes `>= 1e21` or
-    /// `0 < |x| < 1e-6`, fixed form (shortest round-tripping digits) otherwise.
-    #[test]
-    fn exponential_thresholds() {
-        // Exponential form with lowercase `e`, explicit sign, no leading zeros.
-        assert_eq!(format_number(1e21), "1e+21");
-        assert_eq!(format_number(1e-7), "1e-7");
-        assert_eq!(format_number(1.5e22), "1.5e+22");
-        assert_eq!(format_number(-1e21), "-1e+21");
-        assert_eq!(format_number(5e-7), "5e-7");
-        // Fixed form on either side of the boundary and across the range.
-        assert_eq!(format_number(1e-6), "0.000001");
-        assert_eq!(format_number(123.0), "123");
-        assert_eq!(format_number(100_000.0), "100000");
-        assert_eq!(format_number(0.5), "0.5");
-        assert_eq!(format_number(4.5), "4.5");
-        assert_eq!(format_number(42.0), "42");
-        assert_eq!(format_number(-5.0), "-5");
-    }
 }

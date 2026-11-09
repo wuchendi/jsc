@@ -250,7 +250,7 @@ moves are bit-preserving. Numeric operations reinterpret operands to `f64`
 
 **NaN canonicalization.** The number NaN is *always* exactly `QNAN`. Every site
 that turns an `f64` back into a jsval — arithmetic, `Math.*`, a `Date` payload,
-the host clock — calls the `__box_f64(x: f64) -> i64` helper
+the WASI clock — calls the `__box_f64(x: f64) -> i64` helper
 (`x == x ? reinterpret(x) : QNAN`), because wasm may produce a sign-bit or
 payload-carrying NaN (`0/0` on x86, or a NaN operand such as `undefined`
 propagating its tag bits). Integer-to-float conversions cannot produce NaN and
@@ -295,9 +295,9 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | index | function |
 |---|---|
 | `0`–`3` | WASI imports `fd_write`, `clock_time_get`, `random_get`, `proc_exit` (§6.1) |
-| `4`–`9` | `env` imports `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int` (§6.1) |
-| `10` | `main` (not exported) |
-| `11 … 10+n` | the `n` user functions |
+| `4`–`6` | `env` imports `__method`, `__promise`, `__then` (§6.1) |
+| `7` | `main` (not exported) |
+| `8 … 7+n` | the `n` user functions |
 | then | runtime helpers in a fixed order (§6.2): `__alloc` … `__to_number` |
 | then | `__invoke1`, `__async_step`, the two `new Promise` settlers, `__new_string`, `__new_array`, `__new_promise`, `__has_own` |
 | then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
@@ -738,7 +738,7 @@ declares enough initial pages to hold that region):
 4. If both fail (the 8192-page / 512 MiB maximum is reached), write the static
    line `abi::OOM_LINE` to fd 2 through its static iovec and call `proc_exit(1)`.
 
-Host-built values (strings returned by `__convert` and `__method`, promises
+Host-built values (strings returned by `__method`, promises
 created by the promise engine) are allocated by calling the exported guest
 constructors (§6.8), never by bumping the pointer host-side, so they reach the
 same path; `proc_exit` from inside a host re-entry unwinds through the host
@@ -802,49 +802,37 @@ come from `wasi_snapshot_preview1` (`abi::WASI_MODULE`):
 | # | import | signature | backs |
 |---|---|---|---|
 | 0 | `fd_write` | `(fd: i32, iovs: i32, iovs_len: i32, nwritten: i32) -> i32` | `console.log`, the `Uncaught …` reports, the completion line, the out-of-memory line |
-| 1 | `clock_time_get` | `(id: i32, precision: i64, time: i32) -> i32` | declared; no call site yet |
-| 2 | `random_get` | `(buf: i32, buf_len: i32) -> i32` | declared; no call site yet |
+| 1 | `clock_time_get` | `(id: i32, precision: i64, time: i32) -> i32` | `Date.now()`, `new Date()`, `Date()` (the guest `__now`), and the `Math.random` seed when `random_get` fails |
+| 2 | `random_get` | `(buf: i32, buf_len: i32) -> i32` | the `Math.random` seed |
 | 3 | `proc_exit` | `(code: i32) -> ()` | exit code `1` after a report or a failed write |
 
-The other six are interim imports from `"env"` (`abi::IMPORT_MODULE`), still
+The other three are interim imports from `"env"` (`abi::IMPORT_MODULE`), still
 backed by the hosts:
 
 | # | import | signature | backs |
 |---|---|---|---|
-| 4 | `__convert` | `(bits: i64, op: i32) -> i64` | primitive ToString / ToNumber, `parseFloat` |
-| 5 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, string case mapping / `localeCompare` / `normalize`, `Number.prototype` digit formatting, host `Math` functions |
-| 6 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn, the final drain |
-| 7 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
-| 8 | `__now` | `() -> f64` | `Date.now()`, `new Date()`, `Date()` |
-| 9 | `__parse_int` | `(s: i64, radix: i64) -> i64` | `parseInt` |
+| 4 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, string case mapping / `localeCompare` / `normalize`, host `Math` functions |
+| 5 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn, the final drain |
+| 6 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
 
-Because of these six, a module does not run under a plain WASI host yet. The
+Because of these three, a module does not run under a plain WASI host yet. The
 native host is `run/harness.rs` (`Linker::func_wrap` for the four WASI imports
 and `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
 `shim.ts`. Both decode jsvals with the same rules (`run/value.rs` /
 `value.ts`).
 
-- **`__convert` ops.** `0` ToString, `1` ToNumber (StringToNumber rules),
-  `3` parseFloat. The guest runs `ToPrimitive` first (§6.5), so the host sees
-  primitives, plus a `Date` (its `toString` text). A string argument to op `0` is returned unchanged; any
-  other result string is allocated through `__new_string`.
 - **`__method` ops.** `0` `indexOf` / `1` `includes` (an array receiver:
   element search), `4` `toUpperCase`, `5` `toLowerCase` (full Unicode
   default case mapping — `SpecialCasing`, `Final_Sigma` — over each run of
   well-formed text; the guest maps one-byte receivers itself and calls these
   only for two-byte receivers and the one-byte `µ` / `ß` / `ÿ` uppercase
   cases),
-  `17` `Number.prototype.toString(radix)` (a number receiver and an integral
-  radix in `2..=36`), `22` `localeCompare` (code-unit order, not locale
-  collation), `23` `normalize` (`NFC` / `NFD` / `NFKC` / `NFKD`), `40` `toFixed`, `41` `toExponential`, `42` `toPrecision` (a
-  finite number receiver and an integral digit count already range-checked
-  in the guest; `undefined` for a `toExponential` without digits; rendered
-  from the exact decimal expansion, ties away from zero), `43` a `Math`
+  `22` `localeCompare` (code-unit order, not locale
+  collation), `23` `normalize` (`NFC` / `NFD` / `NFKC` / `NFKD`), `43` a `Math`
   function (`arg1` the `MATH_FN_*` code: `cbrt`, `log`, `log2`, `log10`,
   `log1p`, `exp`, `expm1`, the trigonometric and hyperbolic functions and
-  their inverses, `atan2` with `x` in `arg0`, and `random`; the Rust host
-  uses the platform libm and a `xorshift64*` generator, the JS shim its own
-  `Math`). Every other `String.prototype` method and `String.fromCharCode` /
+  their inverses, and `atan2` with `x` in `arg0`; the Rust host uses the
+  platform libm, the JS shim its own `Math`). Every other `String.prototype` method and `String.fromCharCode` /
   `fromCodePoint` run in the guest on code units (§7.9). Both hosts read a
   string receiver losslessly (the native host through `string_units`, the
   shim as JS strings): a lone surrogate passes through case mapping and
@@ -858,10 +846,6 @@ and `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
   `4` new pending promise, `5` settle-fulfill, `6` settle-reject,
   `7` async spawn, `8` drain the queue and return the first unhandled rejected
   promise (`0` when there is none; `_start` only).
-- **`__now`.** `SystemTime::now()` since the Unix epoch in milliseconds (`0` if
-  the clock is before the epoch). It is the only source of non-determinism.
-- **`__parse_int`.** Parses the formatted string form of `s` in radix
-  `ToNumber(radix)` (`undefined` for an omitted radix).
 
 ### 6.2 Guest runtime helpers
 
@@ -874,9 +858,12 @@ function-index order:
 | interning (§5.3) | `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`, `__index_value`, `__index_string`, `__str_exotic_index(o, key)`, `__to_key` |
 | property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__copy_data(dst, src, excl)` |
 | arrays (§5.4) | `__array_reserve(base, need)`, `__array_push(base, v)`, `__array_concat(dst, src)`, `__array_set(recv, key, v)`, `__array_set_length(arr, v)`, `__sparse_get(arr, i)`, `__sparse_set(arr, i, v)`, `__protos_indexless(o)`, `__proto_elem(o, i)`, `__proto_set(o, i, v)`, `__array_define(recv, key, v)`, `__sparse_define(arr, i, v)` |
-| JSON (stringify) | `__json_escape(str)`, `__json_str(v)` — the primitive serializer: finite numbers via `__convert` ToString, `NaN`/`±Infinity`/`undefined` as `null`, keywords, escaped strings, any heap kind `null` |
+| JSON (stringify) | `__json_escape(str)`, `__json_str(v)` — the primitive serializer: finite numbers via `__prim_str`, `NaN`/`±Infinity`/`undefined` as `null`, keywords, escaped strings, any heap kind `null` |
 | Map/Set, equality | `__same_value_zero`, `__map_find`, `__map_set`, `__map_get`, `__map_has`, `__map_delete`, `__loose_eq`, `__str_to_array` |
 | JSON (parse) | `__json_ws`, `__json_throw`, `__json_string`, `__json_number`, `__json_value`, `__json_array`, `__json_object`, `__json_parse` |
+| number to string (§6.5) | `__umul128`, `__ryu_pow5`, `__ryu_mul_shift`, `__ryu_mp5`, `__ryu_d2d(bits)` (Ryu shortest digits), `__scratch_str(ptr, len)`, `__num_to_str(bits)` (`Number::toString`), `__prim_str(v)` (`ToString` of a primitive), `__msg_str(v)` (the text of any value in an error message), `__dec_expand(bits)` (the exact decimal expansion), `__num_format(bits, mode, f)` (`toFixed` / `toExponential` / `toPrecision`), `__num_radix(bits, radix)` |
+| string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
+| clock, random | `__now()`, `__random()` (§6.5) |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
 | re-entry | `__invoke1(fn, arg)`, `__async_step(gen, sent)`, the two `new Promise` settlers |
 | constructors | `__new_string(len, two_byte)`, `__new_array(len)`, `__new_promise()` |
@@ -1217,8 +1204,27 @@ cell, which records why a change was accepted.
 - **`ToString`** (`__to_string`): a string is itself; an object is converted
   with hint string first; a symbol throws `TypeError` (only a called
   `String(sym)` yields `"Symbol(desc)"`); the remaining primitives are
-  formatted by the host (`__convert` op `0`, ECMAScript `Number::toString`
-  digits).
+  formatted in the guest (`__prim_str`; numbers by `__num_to_str`, ECMAScript
+  `Number::toString` digits from Ryu's shortest round-trip mantissa over its
+  size-optimized tables). `Number.prototype.toFixed` / `toExponential` /
+  `toPrecision` round the exact decimal expansion (`__dec_expand`, ties away
+  from zero) and `toString(radix)` uses V8's `DoubleToRadixCString` digits;
+  every formatter composes in the static `NUM_SCRATCH` buffer and copies into
+  one Latin-1 `__new_string`.
+- **StringToNumber, `parseFloat`, `parseInt`** (`__string_to_number`,
+  `__parse_float`, `__parse_int`): guest parsers over code units. A decimal
+  takes Clinger's exact fast path when it can, otherwise Simple Decimal
+  Conversion over the static 768-digit `DEC_SCRATCH` buffer (a port of
+  `dec2flt`'s `parse_long_mantissa`), so results are correctly rounded;
+  radix input folds digit by digit.
+- **Clock and random** (`__now`, `__random`): `__now()` calls
+  `clock_time_get(0, 1_000_000, WASI_CLOCK)` and returns `f64(ns) / 1e6`, or
+  `0` on errno; its callers apply TimeClip. `__random()` is `xorshift128+`
+  over the i64 globals `$__rng0/$__rng1`, seeded on the first call from
+  `random_get(WASI_SEED, 16)`, or from the clock nanoseconds through
+  `splitmix64` when that fails; an all-zero seed is replaced by a fixed
+  non-zero constant. The result is `f64::from_bits((state0 >> 12) | 0x3FF0…) - 1.0`,
+  uniform in `[0, 1)`. Neither allocates: both use the static WASI scratch area.
 - **`ToNumber`** (`__to_number`): §6.2.
 - **`+`** (`__add`): once an operand is a heap value, both operands go through
   `ToPrimitive` (hint default), then concatenation if either is a string,
@@ -1343,10 +1349,7 @@ tables, the function info table, and `class` bytes for rendering. The Rust
 decoder `string_units` is lossless (a Latin-1 byte is its own unit), and the
 string host ops (case mapping, `localeCompare`, `normalize`) read their
 operands through it; `normalize` uses `icu_normalizer` (an optional dependency
-enabled by the `native-run` feature). `decode_string` renders text for the
-number parsers (ToNumber, `parseInt`, `parseFloat`) as lossy text, a
-lone surrogate becoming U+FFFD (safe for the number parsers: a lone surrogate
-is never whitespace or a digit). `alloc_units` allocates a result through
+enabled by the `native-run` feature). `alloc_units` allocates a result through
 `__new_string`, narrowing when every unit is `<= 0xFF`. The shim's
 `stringText` builds the JS string with `String.fromCharCode` over chunked
 `Uint8Array` / `Uint16Array` views (no `TextDecoder`: `latin1` would be
@@ -1365,7 +1368,7 @@ completion, §4.2). A failed or stalled write ends the program with
 `proc_exit(1)`. The buffer, recursion path and ref table are headerless
 `__alloc` blocks. The rules:
 
-- numbers by the ECMAScript Number::toString rules, through `__convert`
+- numbers by the ECMAScript Number::toString rules, through `__num_to_str`
   (shortest round-trip digits, exponential form at `>= 1e21` and `< 1e-6`,
   `-0` prints `0`); strings unquoted, also inside containers, with a lone
   surrogate written as U+FFFD (what Node writes); symbols `Symbol(a)` / `Symbol()`;
