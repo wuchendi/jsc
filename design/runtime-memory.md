@@ -1,5 +1,8 @@
 # Phase 4 design: runtime independence (WASI) and memory management
 
+**Status: approved 2026-11-09** (Q1-Q24 at their recommended defaults; thenable
+assimilation added to R4; two PRs: R1-R4, then M1-M3).
+
 Design for DESIGN §14 phase 4. Every claim about current behaviour cites the
 tree at `c34cd36` (`origin/main`, PR #7); paths are repository-relative,
 `emit/` = `crates/jsc-core/src/emit/`, `run/` = `crates/jsc-core/src/run/`,
@@ -40,7 +43,7 @@ user approves this document and answers (or accepts the defaults of) §8.
 **Non-goals:** WASI preview 2 / component output (DESIGN §14 phase 7);
 `process.argv` / `process.env` / file or network I/O / timers; `$262` and
 `host-gc-required`; moving, generational or incremental collection; lazy
-sweep; Map/Set backing compaction; thenable assimilation (DESIGN §13 stays);
+sweep; Map/Set backing compaction;
 `console.error` / `console.warn` (only `console.log` exists today, §1.3 A);
 `Intl`.
 
@@ -354,8 +357,15 @@ other output changes.
 Replaces `run/promise.rs` (784 LOC), `shim.ts:397-672`, the `__promise` /
 `__then` imports, and every host → guest re-entry (`__invoke1`,
 `__async_step`, `__new_promise`, `__promise_self_error`). Semantics are
-ported 1:1 from the host engine (same job order, same settle-once, same
-self-resolution `TypeError`, same non-assimilation of thenables, DESIGN §13).
+ported from the host engine (same settle-once, same self-resolution
+`TypeError`), with one approved change: **thenables are assimilated per the
+spec**. The resolve function does `Get(resolution, "then")` (an abrupt
+completion rejects), and a callable `then` enqueues a
+`PromiseResolveThenableJob` with fresh once-only resolving functions, for
+native promises too; `await` and `Promise.resolve` use `PromiseResolve` (a
+promise of the same constructor is returned as is). Where the old host's
+adoption shortcut and the spec order jobs differently, the spec wins and
+the DESIGN §13 thenable limitation is deleted.
 
 **`TYPE_PROMISE` layout (40 bytes, was 32 — `PROMISE_BLOCK_SIZE`):**
 
@@ -1030,7 +1040,7 @@ L3.
 | **R1** WASI shell + guest output | `_start` command shape; imports `fd_write`, `proc_exit` (+ `clock_time_get`, `random_get` declared now so the import section changes once); guest renderer (§3.1), output buffer + UTF-8 writer, `__report`, `_start` epilogue (§2.4); OOM static line + `proc_exit` (§2.3); `print_completion` option; WASI runner, CLI, test helpers, opcount, `wasi.ts` + `index.ts`; `jsc-wasm` `compile(src, opts)`. Delete `print`, `main` export, `__heap_ptr`, `HEAP_PTR_OOM`, `oom_guard`, `__alloc`/`__new_array` exports, `format_value`/`value.ts` formatting | `emit/sections.rs`, `emit/mod.rs`, `emit/function.rs`, `emit/expr.rs` (console), new `emit/render.rs`, `emit/runtime.rs` (`__alloc` OOM), `abi.rs`, `run/harness.rs`, `run/value.rs`, `crates/jsc/src/main.rs`, `tests/common/mod.rs`, `tests/opcount.rs`, `packages/jsc/src/{index,wasi,shim,value}.ts`, `crates/jsc-wasm/src/lib.rs`, `deny.toml` | `module_imports_only_wasi_and_env_remainder`, `start_is_only_entry_export`, `render_parity_every_kind` (table §3.1, one assertion per row), `render_cycles_ref_numbering`, `render_lone_surrogate_as_fffd`, `uncaught_goes_to_fd2_exit1`, `unhandled_rejection_after_drain_exit1`, `oom_static_line_exit1`, `print_completion_matches_cli_p`, `every_compiled_module_validates`, vitest `links_wasi_polyfill` | modules import 4 WASI + 6 `env` (`__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`) until R2; exports `_start`, `memory` + the host-needed `__new_string`, `__new_promise`, `__promise_self_error`, `__invoke1`, `__async_step`, `__exc_*`; temporary `__promise` op `8` DRAIN returns the first unhandled promise (or `0`) so the guest epilogue renders it — deleted in R4 | +2,600-3,300 / −1,600 | 0 | renderer parity across ≈ 3,570 assertions; helper rewrite touches every suite; `wasmtime-wasi` deny/shear (Q8) |
 | **R2** numbers, clock, random | §3.2, §3.3, §3.5, §3.6; delete `__convert`, `__parse_int`, `__now`, `__method` 17/40/41/42, `MATH_FN_RANDOM`, the matching `host.rs` / `value.rs::format_number` / shim code | new `emit/dtoa.rs`, `emit/strtod.rs`, `emit/convert.rs`, `emit/numeric.rs`, `emit/builtins/number.rs`, `emit/object.rs` (clock), `emit/json_parse.rs`, `emit/runtime.rs` (`emit_json_str`, `emit_loose_eq`), `abi.rs`, `run/host.rs`, `shim.ts` | `number_to_string_shortest_roundtrip` (sample incl. `5e-324`, `1.7976931348623157e308`, `0.1+0.2`, `1e21`, `1e-7`, `123e-20`), `exponential_thresholds_output`, `to_fixed_exact_ties`, `to_precision_and_exponential_exact`, `radix_to_string_matches_v8`, `string_to_number_slow_path` (≥ 20 digits, `2.2250738585072011e-308`), `parse_int_power_of_two_radix_exact`, `parse_float_prefix`, `date_now_from_wasi_clock`, `math_random_in_unit_interval` | `env` = `__method` (0,1,4,5,22,23,43), `__promise`, `__then` | +1,700-2,400 / −700 | 0 … +5 | dtoa/strtod bugs are silent wrong digits → large differential sample vs Rust in tests |
 | **R3** Unicode, libm, search | §3.7, §3.8, §3.9; `tools/unicode-tables` + generated `emit/unicode_data.rs`; delete `__method` entirely, `host.rs`, `value.rs` (last users), `icu_normalizer` from `jsc-core` | new `emit/libm.rs`, `emit/unicode.rs`, `emit/unicode_data.rs`, `tools/unicode-tables/**`, `emit/builtins/string.rs`, `emit/numeric.rs`, `emit/builtins/array.rs`, `emit/expr.rs` (`emit_proto_guard`), `Cargo.toml`s, `ci.yml` (`--check` step), `shim.ts`, `value.ts` | `case_map_special_casing_and_final_sigma`, `case_map_lone_surrogate_passthrough`, `normalize_all_forms_conformance_sample` (lines from `NormalizationTest.txt` embedded as a fixture), `normalize_invalid_form_range_error`, `libm_matches_std_sample` (≥ 1,000 inputs per function, ≤ 1 ulp, exact on special values), `unicode_tables_within_budget` (data ≤ 96 KiB), `index_of_fast_path_guest_scan`, `locale_compare_code_unit_order` | `env` = `__promise`, `__then` only | +4,000-5,400 / −1,900 (+ ≈ 74 KiB tables) | 0 (± libm last-ulp) | module size; Unicode version skew std vs icu; libm port volume |
-| **R4** guest promises + final deletion | §3.4; delete `__promise`, `__then`, the `env` module, `run/promise.rs`, `shim.ts`, `abi.ts`, `value.ts`, remaining exports; final runners; `web.yml` `node:wasi` smoke step | new `emit/promise_engine.rs`, `emit/expr.rs`, `emit/runtime.rs` (settlers, `__invoke1`, `__async_step`), `emit/builtins/{promise,generator,async_iter,array}.rs`, `abi.rs` (`TYPE_PROMISE` 40 B, flags), `run/**`, `packages/jsc/**`, `abi_drift_tests.rs`, `.github/workflows/web.yml` | `module_imports_exactly_four_wasi`, `exports_exactly_start_and_memory`, `microtask_order_matches_spec` (then/await interleavings), `unhandled_rejection_creation_order`, `late_catch_counts_as_handled`, `promise_self_resolution_type_error`, `top_level_await_drains`, `async_generator_queue_order`, `long_then_chain_no_stack_growth` (1e5 links), `runs_under_node_wasi` (CI smoke) | final module shape | +1,100-1,400 / −2,900 | 0 | job ordering regressions (test262 async suite is the net) |
+| **R4** guest promises + final deletion | §3.4; delete `__promise`, `__then`, the `env` module, `run/promise.rs`, `shim.ts`, `abi.ts`, `value.ts`, remaining exports; final runners; `web.yml` `node:wasi` smoke step | new `emit/promise_engine.rs`, `emit/expr.rs`, `emit/runtime.rs` (settlers, `__invoke1`, `__async_step`), `emit/builtins/{promise,generator,async_iter,array}.rs`, `abi.rs` (`TYPE_PROMISE` 40 B, flags), `run/**`, `packages/jsc/**`, `abi_drift_tests.rs`, `.github/workflows/web.yml` | `module_imports_exactly_four_wasi`, `exports_exactly_start_and_memory`, `microtask_order_matches_spec` (then/await interleavings), `thenable_assimilated_per_spec` (`await` / `Promise.resolve` / `resolve(t)`, throwing `then` getter, once-only resolvers), `unhandled_rejection_creation_order`, `late_catch_counts_as_handled`, `promise_self_resolution_type_error`, `top_level_await_drains`, `async_generator_queue_order`, `long_then_chain_no_stack_growth` (1e5 links), `runs_under_node_wasi` (CI smoke) | final module shape | +1,100-1,400 / −2,900 | 0 | job ordering regressions (test262 async suite is the net) |
 | **M1** shadow stack (inert) | §5.1-§5.3, F1/F2 (§5.5), `TYPE_RAW`, function builder, NoRoot analysis, root declarations everywhere | `emit/mod.rs`, new `emit/builder.rs`, new `emit/roots.rs`, `emit/function.rs`, `emit/expr.rs`, `emit/object.rs`, `emit/array.rs`, `emit/generator.rs`, `emit/stmt.rs`, `emit/builtins/*.rs`, `emit/runtime.rs`, `emit/props.rs`, `emit/props/descriptor.rs`, `emit/json_parse.rs`, `emit/convert.rs`, `emit/numeric.rs`, `emit/sections.rs`, `abi.rs` | `shadow_sp_restored_after_return`, `shadow_sp_restored_after_uncaught_throw`, `shadow_sp_restored_after_caught_throw`, `leaf_function_has_no_frame`, `noroot_loop_counter_not_spilled`, `frame_slots_cleared_on_entry`, `async_gen_request_next_is_heap_jsval` (F2), `intern_growth_block_is_type_raw` (F1), `builder_rejects_undeclared_local`, `deep_recursion_traps` | always on, no collector: semantics unchanged | 1,500-2,200 | 0 | a missed root is silent until M2 (mitigated by `gc_stress` in M2 and the no-default declaration rule) |
 | **M2** collector | §5.4, §5.6-§5.8: `__alloc` rewrite, pages, classes, free lists, mark/trace/sweep in `emit/gc.rs`, intern tombstones, static root list, `%OutOfMemoryError%`, reserve, OOM propagation, `HOLE` on pop/shift, `gc_stress` | `emit/runtime.rs`, new `emit/gc.rs`, `emit/props.rs`, `emit/realm.rs`, `emit/sections.rs`, `emit/array.rs`, `abi.rs`, allocator call sites | `gc_stress_run_suite` (every run test under `gc_stress`, same output), `gc_reclaims_churn` (≈ 2 GiB allocated, small live set), `gc_oom_is_catchable_range_error`, `gc_keeps_operand_stack_temps`, `gc_keeps_partially_built_literals`, `gc_generator_frame_survives`, `gc_async_gen_queue_survives`, `gc_promise_reactions_survive`, `gc_static_proto_heap_props_survive`, `gc_intern_tombstones_probe`, `gc_map_iterator_survives`, `gc_free_list_reuse_zeroes`; `push_fuel_is_linear` holds | collection enabled; any test262 change is a root bug | 1,800-2,600 | 0 | missed roots in helpers (CI shards test262 under `gc_stress` once); OOM-propagation audit; pauses on large heaps |
 | **M3** weak collections | §6; renderer forms; drop five feature flags | new `emit/builtins/weak.rs`, `emit/realm.rs`, `emit/gc.rs`, `emit/promise_engine.rs` (checkpoint hooks), `emit/render.rs`, `abi.rs`, `tests/test262/unsupported-features.txt` | `weakmap_basic_api`, `weakmap_symbol_keys`, `weakmap_entry_dropped_after_key_unreachable` (`gc_stress`), `ephemeron_chain_fixpoint`, `weakref_cleared_after_checkpoint`, `weakref_kept_during_job`, `finreg_cleanup_runs_after_drain`, `finreg_unregister_token`, `finreg_target_equals_held_throws` | one merge; before it the four globals stay absent (runtime `ReferenceError`, as today) | 1,300-1,800 | up to +310 | cleanup-job ordering vs microtasks; collection inside `register` |
@@ -1087,7 +1097,7 @@ engine's per-job cost (≈ 60-120 per job). Each R stage re-baselines once.
 | R1 | 0 | stdout/stderr text and exit codes unchanged (§2.3) |
 | R2 | 0 … +5 | same correctly rounded algorithms; power-of-two `parseInt` becomes exact |
 | R3 | 0 | same Unicode data; libm last-ulp changes only affect tests that check exact transcendental bits (test262 checks special values) |
-| R4 | 0 | 1:1 port of the job order |
+| R4 | > 0 | thenable assimilation (the 14 `Array.fromAsync` failures of DESIGN §13 and the `Promise` / `await` thenable tests); any other change is a job-order bug |
 | M1 / M2 | 0 | no semantic change; any change is a bug |
 | M3 | ≤ +310 | §6.5 |
 
@@ -1125,8 +1135,7 @@ user approves without answering).
 | Q23 | **Decision needed.** Mark representation | (a) epoch byte (§5.2); (b) bit + clearing pass | (a) |
 | Q24 | **Decision needed.** Sweep | (a) eager in phase 4; (b) lazy now | (a); lazy is phase-6 work |
 
-Decided without a question (recorded for review): thenables stay
-unassimilated (DESIGN §13); `$262` stays absent; `__alloc` / `__new_array`
+Decided without a question (recorded for review): `$262` stays absent; `__alloc` / `__new_array`
 dead exports deleted in R1; shim-vs-native divergences (case mapping,
 `toString(radix)`, `Math.*`, `Math.random`, lone surrogates in output)
 disappear with one guest implementation, so no parity tests are kept; only
