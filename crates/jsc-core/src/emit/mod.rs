@@ -31,6 +31,9 @@ use wasm_encoder::{
     TableType, TypeSection, ValType,
 };
 
+use builder::{FnBuilder, LocalClass, Sink, TempClass};
+use roots::LeafSet;
+
 use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
@@ -233,10 +236,14 @@ const REFS_CAP_GLOBAL: u32 = 21;
 /// See [`REFS_BUF_GLOBAL`].
 const REFS_LEN_GLOBAL: u32 = 22;
 
+/// The wasm global index of the shadow-stack pointer (`$__sp`, i32, init
+/// [`abi::SHADOW_STACK_SIZE`]); see [`builder`].
+const SP_GLOBAL: u32 = 23;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
 /// the renderer globals and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 23;
+const MODULE_CELL_GLOBAL_BASE: u32 = 24;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -1366,6 +1373,7 @@ struct FnLayout {
 }
 
 mod array;
+mod builder;
 mod builtins;
 mod convert;
 mod expr;
@@ -1377,6 +1385,7 @@ mod object;
 mod props;
 mod realm;
 mod render;
+mod roots;
 mod runtime;
 mod sections;
 mod stmt;
@@ -1575,14 +1584,17 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // Code section: `main` first, then each user function's body, then the
     // helpers last (mirroring the function-index order above).
     let mut code = CodeSection::new();
-    code.function(&emit_main(program, &offsets, helpers));
+    let leaves = roots::leaf_set(helpers);
+    code.function(&emit_main(program, &offsets, helpers, &leaves));
     for func in &program.functions {
         // A generator state machine emits a `switch (gen.state)` dispatch
         // over its segments rather than a straight-line body.
         if func.machine.is_some() {
-            code.function(&generator::emit_generator_sm(func, &offsets, helpers));
+            code.function(&generator::emit_generator_sm(
+                func, &offsets, helpers, &leaves,
+            ));
         } else {
-            code.function(&emit_function(func, &offsets, helpers));
+            code.function(&emit_function(func, &offsets, helpers, &leaves));
         }
     }
     code.function(&emit_alloc());
@@ -1714,7 +1726,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     for helper in render::emit_helpers(&offsets, helpers) {
         code.function(&helper);
     }
-    code.function(&emit_start(&offsets, helpers, options));
+    code.function(&emit_start(&offsets, helpers, options, &leaves));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

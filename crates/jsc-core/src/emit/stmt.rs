@@ -9,7 +9,7 @@ use super::*;
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_stmt(
     stmt: &IrStmt,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -19,6 +19,7 @@ pub(super) fn emit_stmt(
     match stmt {
         IrStmt::Decl { local, init } => {
             emit_node(init, function, scratch, strings, helpers);
+            function.note_def(*local, init);
             function.instruction(&Instruction::LocalSet(*local));
         }
         IrStmt::Expr(node) => {
@@ -166,7 +167,7 @@ pub(super) fn emit_stmt(
 /// `want_continue` selects the labeled loop's continue vs break landing block. An
 /// out-of-context unlabeled `break`/`continue` is rejected during lowering.
 fn emit_abrupt_loop(
-    function: &mut Function,
+    function: &mut impl Sink,
     helpers: Helpers<'_>,
     kind: i32,
     target: Option<u32>,
@@ -205,7 +206,7 @@ fn emit_while(
     body: &[IrStmt],
     update: &[IrStmt],
     label: Option<u32>,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -330,7 +331,7 @@ pub(super) fn emit_try(
     body: &[IrStmt],
     catch_body: Option<&[IrStmt]>,
     finally_body: Option<&[IrStmt]>,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -456,7 +457,7 @@ pub(super) fn emit_try(
 pub(super) fn emit_catch_unit(
     body: &[IrStmt],
     catch_body: &[IrStmt],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -537,7 +538,7 @@ pub(super) fn emit_switch(
     disc_local: u32,
     disc: &IrNode,
     cases: &[IrCase],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -599,7 +600,7 @@ pub(super) fn emit_switch(
 /// Emit a sequence of statements for their side effects (nested body context).
 pub(super) fn emit_stmts(
     stmts: &[IrStmt],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -631,7 +632,7 @@ pub(super) fn emit_stmts(
 /// whether the value is a number, avoiding any control flow.
 pub(super) fn emit_cond(
     cond: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -734,7 +735,7 @@ pub(super) fn emit_logical(
     op: LogicalOp,
     lhs: &IrNode,
     rhs: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -783,7 +784,7 @@ pub(super) fn emit_logical(
 
 /// Push `1` if the jsval in `scratch` has NaN-box tag `tag` (its payload bits
 /// `[50:48]`), else `0`. Used by [`emit_cond`] to discriminate boxed types.
-pub(super) fn emit_tag_eq(function: &mut Function, scratch: u32, tag: i64) {
+pub(super) fn emit_tag_eq(function: &mut impl Sink, scratch: u32, tag: i64) {
     function.instruction(&Instruction::LocalGet(scratch));
     function.instruction(&Instruction::I64Const(48));
     function.instruction(&Instruction::I64ShrU);

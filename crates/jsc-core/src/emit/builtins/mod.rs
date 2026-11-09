@@ -597,7 +597,7 @@ fn throw_type_error(
 
 /// Push `1` when the jsval in `local` is a wrapper object of `class`
 /// (DESIGN.md §5.2).
-pub(super) fn emit_is_wrapper(function: &mut Function, local: u32, class: u8) {
+pub(super) fn emit_is_wrapper(function: &mut impl Sink, local: u32, class: u8) {
     emit_is_pointer(function, local);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),

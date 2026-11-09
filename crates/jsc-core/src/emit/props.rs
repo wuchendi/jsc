@@ -218,7 +218,7 @@ pub(super) fn static_str_key(strings: &StrOffsets, key: &JsStr) -> i32 {
 /// stashed in `local`: a static string key is a constant; any other key is
 /// converted by `__to_key` (`insert` = intern on a miss, else `0`).
 pub(super) fn emit_prop_key(
-    function: &mut Function,
+    function: &mut impl Sink,
     index: &IrNode,
     local: u32,
     insert: bool,
@@ -237,7 +237,7 @@ pub(super) fn emit_prop_key(
 /// without inserting (`0` when never interned, i.e. absent everywhere).
 pub(super) fn emit_key_lookup(
     key: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -368,7 +368,7 @@ fn emit_exotic_len(function: &mut Function, o: u32) {
 /// argument goes in a fresh one-element spread argument array, as for any
 /// call passing more than `K` arguments.
 pub(super) fn emit_accessor_call(
-    function: &mut Function,
+    function: &mut impl Sink,
     callee: u32,
     this: u32,
     arg: Option<u32>,
@@ -522,9 +522,14 @@ pub(super) fn emit_intern(helpers: Helpers<'_>) -> Function {
         If(BlockType::Empty),
         GlobalGet(INTERN_BASE_GLOBAL), LocalSet(old),
         GlobalGet(INTERN_CAP_GLOBAL), LocalSet(cap),
-        LocalGet(cap), I32Const(3), I32Shl, Call(helpers.alloc), LocalTee(a),
-        I32Const(0), LocalGet(cap), I32Const(3), I32Shl, MemoryFill(0),
-        LocalGet(a), GlobalSet(INTERN_BASE_GLOBAL),
+        // The new table is a `TYPE_RAW` block; `$__intern_base` is its data.
+        LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
+        Call(helpers.alloc), LocalTee(a),
+        I32Const(0), LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
+        MemoryFill(0),
+        LocalGet(a), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(m8(0)),
+        LocalGet(a), LocalGet(cap), I32Const(3), I32Shl, I32Store(m32(u64::from(HEADER_SIZE.cast_unsigned()))),
+        LocalGet(a), I32Const(HEADER_SIZE + 4), I32Add, GlobalSet(INTERN_BASE_GLOBAL),
         LocalGet(cap), I32Const(1), I32Shl, GlobalSet(INTERN_CAP_GLOBAL),
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),

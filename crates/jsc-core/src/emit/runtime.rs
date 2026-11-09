@@ -162,11 +162,11 @@ const DATA: u64 = abi::STR_DATA_OFFSET as u64;
 /// `s = __alloc(STR_DATA_OFFSET + (len << w))` as a [`TYPE_STRING`] block of
 /// `len` code units (pushed by `len`), `TWO_BYTE` when `w` (pushes `0`/`1`),
 /// leaving the base in i32 local `s`.
-pub(super) fn emit_alloc_str(
-    function: &mut Function,
+pub(super) fn emit_alloc_str<S: Sink>(
+    function: &mut S,
     alloc: u32,
-    len: impl Fn(&mut Function),
-    w: impl Fn(&mut Function),
+    len: impl Fn(&mut S),
+    w: impl Fn(&mut S),
     s: u32,
 ) {
     len(function);
@@ -180,7 +180,7 @@ pub(super) fn emit_alloc_str(
 }
 
 /// Push `1` when the string block in i32 local `s` is `TWO_BYTE`, else `0`.
-pub(super) fn emit_str_two_byte(function: &mut Function, s: u32) {
+pub(super) fn emit_str_two_byte(function: &mut impl Sink, s: u32) {
     wasm!(function;
         LocalGet(s), I32Load8U(mem8(u64::from(abi::HEADER_FLAGS_OFFSET))),
         I32Const(TWO_BYTE), I32And, I32Const(0), I32Ne,
@@ -204,7 +204,7 @@ pub(super) fn emit_str_unit(function: &mut Function, s: u32, i: u32, w: u32) {
 /// against the length in i32 local `len`) of the two-byte string block in
 /// i32 local `s` are a lead (`D800–DBFF`) and a trail (`DC00–DFFF`)
 /// surrogate, else `0`.
-pub(super) fn emit_surrogate_pair_at(function: &mut Function, s: u32, i: u32, len: u32) {
+pub(super) fn emit_surrogate_pair_at(function: &mut impl Sink, s: u32, i: u32, len: u32) {
     wasm!(function;
         LocalGet(i), I32Const(1), I32Add, LocalGet(len), I32LtU,
         If(BlockType::Result(ValType::I32)),
@@ -218,7 +218,7 @@ pub(super) fn emit_surrogate_pair_at(function: &mut Function, s: u32, i: u32, le
 
 /// `dst` = a fresh two-unit, two-byte string of units `i` and `i + 1` (i32
 /// local `i`) of the two-byte string block in i32 local `s`.
-pub(super) fn emit_str_pair(function: &mut Function, alloc: u32, s: u32, i: u32, dst: u32) {
+pub(super) fn emit_str_pair(function: &mut impl Sink, alloc: u32, s: u32, i: u32, dst: u32) {
     emit_alloc_str(
         function,
         alloc,
@@ -304,7 +304,7 @@ fn mem32(offset: u64) -> MemArg {
 }
 
 /// Replace the string block base on the stack with its u32 `len`.
-pub(super) fn emit_load_str_len(function: &mut Function) {
+pub(super) fn emit_load_str_len(function: &mut impl Sink) {
     function.instruction(&Instruction::I32Load(mem32(STR_LEN_OFFSET)));
 }
 
@@ -1024,11 +1024,11 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
     let mut function = Function::new(vec![(7, ValType::I32)]);
     let (str_ptr, len, dst, i, o, b, esc, w) = (0, 1, 2, 3, 4, 5, 6, 7);
     // Append the unit pushed by `unit` at `o`; o += 1.
-    let put = |f: &mut Function, unit: &dyn Fn(&mut Function)| {
+    let put = |f: &mut _, unit: &dyn Fn(&mut Function)| {
         emit_store_unit(f, dst, o, w, unit);
         wasm!(f; LocalGet(o), I32Const(1), I32Add, LocalSet(o));
     };
-    let put_const = |f: &mut Function, c: u8| put(f, &|f| wasm!(f; I32Const(i32::from(c))));
+    let put_const = |f: &mut _, c: u8| put(f, &|f| wasm!(f; I32Const(i32::from(c))));
 
     wasm!(function; LocalGet(str_ptr));
     emit_load_str_len(&mut function);

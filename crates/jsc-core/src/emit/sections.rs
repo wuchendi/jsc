@@ -527,10 +527,13 @@ pub(super) fn build_globals(
     let (dirty_ty, dirty_init) = mut_i32(0);
     globals.global(dirty_ty, &dirty_init);
     // The renderer's output buffer, recursion path and ref table (all i32, 0).
-    for _ in OUT_BUF_GLOBAL..MODULE_CELL_GLOBAL_BASE {
+    for _ in OUT_BUF_GLOBAL..SP_GLOBAL {
         let (ty, init) = mut_i32(0);
         globals.global(ty, &init);
     }
+    // The shadow-stack pointer ($__sp, i32, index SP_GLOBAL), empty at startup.
+    let (sp_ty, sp_init) = mut_i32(abi::SHADOW_STACK_SIZE.cast_signed());
+    globals.global(sp_ty, &sp_init);
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..module_cells {

@@ -35,7 +35,7 @@ pub(super) fn emit_make_generator(
     slots: &[IrNode],
     total: u32,
     limits: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -70,7 +70,9 @@ pub(super) fn emit_make_generator(
     // trailing body locals). `emit_cell_new` uses the `+3` dst scratch, disjoint
     // from `env_base` (`+21`).
     for i in 0..total {
+        let mark = function.temp_mark();
         function.instruction(&Instruction::LocalGet(env_base));
+        function.root_temp(TempClass::Base);
         match slots.get(i as usize) {
             Some(cell) => emit_node(cell, function, scratch, strings, helpers),
             None => emit_cell_new(&IrNode::Undefined, function, scratch, strings, helpers),
@@ -80,6 +82,7 @@ pub(super) fn emit_make_generator(
             align: 3,
             memory_index: 0,
         }));
+        function.release_temps(mark);
     }
 
     // 3. Allocate the generator handle and fill its fields (keeping its base on
@@ -171,7 +174,7 @@ pub(super) fn emit_make_generator(
 pub(super) fn emit_gen_resume(
     handle: &IrNode,
     sent: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -245,11 +248,11 @@ pub(super) fn emit_gen_resume(
 /// state machine runs with the running bit set, its returned value lands in
 /// i64 `sm_result` (the handle's `done` flag tells a yield from the return),
 /// and a throw it left pending unwinds.
-pub(super) fn emit_gen_drive(
+pub(super) fn emit_gen_drive<S: Sink>(
     handle_slot: u32,
     sent: &IrNode,
     sm_result: u32,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -272,7 +275,7 @@ pub(super) fn emit_gen_drive(
     emit_throw_not_a_function(function, GENERATOR_RUNNING, scratch, strings, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::End);
-    let set_running = |function: &mut Function, on: bool| {
+    let set_running = |function: &mut S, on: bool| {
         function.instruction(&Instruction::LocalGet(handle_slot));
         function.instruction(&Instruction::I32WrapI64);
         function.instruction(&Instruction::LocalGet(handle_slot));
@@ -337,7 +340,7 @@ fn emit_result_object(
     sm_result: u32,
     handle_slot: u32,
     scratch: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
@@ -382,25 +385,14 @@ pub(super) fn emit_generator_sm(
     func: &IrFunction,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> Function {
     let Some(segments) = func.machine.as_ref() else {
         unreachable!("emit_generator_sm is only called for a function with a machine")
     };
-    let declared = func.locals - func.params;
     // Same scratch layout as `emit_function` (see its comment): the state machine
     // reuses `emit_node`/`emit_stmts`, so it needs the full scratch block.
-    let mut function = Function::new(vec![
-        (declared + 3, ValType::I64),
-        (1, ValType::I32),
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (5, ValType::I32),
-        (1, ValType::I64),
-        (7, ValType::I64),
-        (1, ValType::I32),
-        (2, ValType::I64),
-        (6, ValType::I64),
-    ]);
+    let mut function = user_builder(func.params, func.locals, leaves);
     let scratch = func.locals;
     helpers.unwind.borrow_mut().reset();
 
@@ -509,7 +501,7 @@ pub(super) fn emit_generator_sm(
     store_gen_i32(&mut function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// The blocks a suspend resumes into, with the suspend's `on_return` /
@@ -538,8 +530,8 @@ fn resume_routes(segments: &[GenSegment]) -> HashMap<u32, (Option<u32>, Option<u
 /// `on_throw` the same way (a `yield*` forwarding it), or throws at the
 /// suspend point into the block's active handler. `loop_depth` is the
 /// dispatch loop's unwind depth.
-fn emit_resume_route(
-    function: &mut Function,
+fn emit_resume_route<S: Sink>(
+    function: &mut S,
     gen_local: u32,
     (on_return, on_throw): (Option<u32>, Option<u32>),
     loop_depth: u32,
@@ -555,7 +547,7 @@ fn emit_resume_route(
         memory_index: 0,
     };
     // Clear the pending exception and the mode, then `state = target`; `br`.
-    let enter = |function: &mut Function, target: u32| {
+    let enter = |function: &mut S, target: u32| {
         function.instruction(&Instruction::I32Const(0));
         function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
         function.instruction(&Instruction::LocalGet(gen_local));
@@ -610,7 +602,7 @@ fn emit_segment_term(
     gen_local: u32,
     n: u32,
     loop_rel: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -816,7 +808,7 @@ pub(super) fn emit_async_step(helpers: Helpers<'_>) -> Function {
 
 /// Open a `block` and register it as the innermost exception handler: a throw
 /// inside `br`s to just past its `End` (the landing code).
-fn open_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
+fn open_landing_pad(function: &mut impl Sink, helpers: Helpers<'_>) {
     function.instruction(&Instruction::Block(BlockType::Empty));
     let mut unwind = helpers.unwind.borrow_mut();
     unwind.depth += 1;
@@ -825,7 +817,7 @@ fn open_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Close a block opened with [`open_landing_pad`], unregistering its handler.
-fn close_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
+fn close_landing_pad(function: &mut impl Sink, helpers: Helpers<'_>) {
     let mut unwind = helpers.unwind.borrow_mut();
     unwind.handlers.pop();
     unwind.depth -= 1;
@@ -834,7 +826,7 @@ fn close_landing_pad(function: &mut Function, helpers: Helpers<'_>) {
 
 /// Store the i32 constant `value` into the generator handle field at `offset`
 /// (base = the handle jsval in `gen_local`).
-fn store_gen_i32(function: &mut Function, gen_local: u32, offset: u64, value: i32) {
+fn store_gen_i32(function: &mut impl Sink, gen_local: u32, offset: u64, value: i32) {
     function.instruction(&Instruction::LocalGet(gen_local));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Const(value));
@@ -848,7 +840,7 @@ fn store_gen_i32(function: &mut Function, gen_local: u32, offset: u64, value: i3
 /// Emit the flag store of [`IrNode::AwaitMark`] (its operand already on the
 /// stack, left there): set [`abi::GEN_AWAIT`] on the running state machine's
 /// generator (local 1).
-pub(super) fn emit_await_mark(function: &mut Function) {
+pub(super) fn emit_await_mark(function: &mut impl Sink) {
     let limits = MemArg {
         offset: u64::from(abi::GEN_LIMITS_OFFSET),
         align: 2,

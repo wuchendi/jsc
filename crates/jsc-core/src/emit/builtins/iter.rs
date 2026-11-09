@@ -559,7 +559,7 @@ fn step_collection(
 /// included) a one-unit string; a one-byte string has no surrogates. `t` is
 /// an i32 temp.
 fn emit_str_iter_next(
-    function: &mut Function,
+    function: &mut impl Sink,
     s: u32,
     i: u32,
     len: u32,
@@ -648,7 +648,7 @@ fn place_set(place: &IrNode, value: IrNode) -> IrNode {
 
 /// Emit `place = value`, discarding the value.
 pub(super) fn store(
-    function: &mut Function,
+    function: &mut impl Sink,
     place: &IrNode,
     value: IrNode,
     scratch: u32,
@@ -667,7 +667,7 @@ pub(super) fn store(
 
 /// Push the record place `place`.
 pub(super) fn load(
-    function: &mut Function,
+    function: &mut impl Sink,
     place: &IrNode,
     scratch: u32,
     strings: &StrOffsets,
@@ -678,7 +678,7 @@ pub(super) fn load(
 
 /// Push i32 `1` when the record's state is `state`.
 pub(super) fn state_is(
-    function: &mut Function,
+    function: &mut impl Sink,
     rec: &IterRecord,
     state: f64,
     scratch: u32,
@@ -691,7 +691,7 @@ pub(super) fn state_is(
 
 /// Push i32 `1` when none of `intrinsics` has its dirty bit set (always,
 /// when `sealed`).
-fn bits_clear(function: &mut Function, intrinsics: &[Intrinsic], sealed: bool) {
+fn bits_clear(function: &mut impl Sink, intrinsics: &[Intrinsic], sealed: bool) {
     let mask = intrinsics
         .iter()
         .filter_map(|intrinsic| intrinsic.watch_bit())
@@ -707,7 +707,7 @@ fn bits_clear(function: &mut Function, intrinsics: &[Intrinsic], sealed: bool) {
 /// and `env` = i64 `env` (`0` when `None`), no arguments, leaving its
 /// result (a throw left pending).
 pub(super) fn call_internal(
-    function: &mut Function,
+    function: &mut impl Sink,
     builtin: Builtin,
     this: u32,
     env: Option<u32>,
@@ -737,7 +737,7 @@ pub(super) fn call_internal(
 /// whose body has a `yield*` ([`abi::GEN_DELEGATES`]) takes the protocol.
 /// `tmp` is a free i32 local.
 pub(in crate::emit) fn emit_iter_classify(
-    function: &mut Function,
+    function: &mut impl Sink,
     v: u32,
     sealed: bool,
     tmp: u32,
@@ -808,7 +808,7 @@ pub(in crate::emit) fn emit_iter_classify(
 /// call (`not iterable`, the call, the object check) and `next` read once.
 /// A throw propagates, leaving the record done. `method` is a free i64 local.
 pub(in crate::emit) fn emit_iter_open(
-    function: &mut Function,
+    function: &mut impl Sink,
     v: u32,
     method: u32,
     rec: &IterRecord,
@@ -827,7 +827,7 @@ pub(in crate::emit) fn emit_iter_open(
 /// [`emit_iter_open`] with the `@@iterator` method already in i64 `method`
 /// (clobbered).
 pub(in crate::emit) fn emit_iter_open_with(
-    function: &mut Function,
+    function: &mut impl Sink,
     v: u32,
     method: u32,
     rec: &IterRecord,
@@ -851,7 +851,7 @@ pub(in crate::emit) fn emit_iter_open_with(
 /// `method` (clobbered): `rec.iter`, then `rec.next = Get(iterator,
 /// "next")` read once (a throw propagates, leaving the record done).
 pub(super) fn emit_record_fill(
-    function: &mut Function,
+    function: &mut impl Sink,
     method: u32,
     rec: &IterRecord,
     scratch: u32,
@@ -892,7 +892,7 @@ pub(in crate::emit) fn emit_get_iterator(
     value: &IrNode,
     rec: &IterRecord,
     sealed: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -946,7 +946,7 @@ pub(in crate::emit) fn emit_get_iterator(
 pub(in crate::emit) fn emit_open_iterator(
     value: &IrNode,
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -970,7 +970,7 @@ pub(in crate::emit) fn emit_open_iterator(
 /// order array, string, Map, Set, generator, `arguments`.
 pub(in crate::emit) fn emit_iterator_step(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1010,7 +1010,7 @@ pub(in crate::emit) fn emit_iterator_step(
 /// The record is done: `state = done`, push i32 `0`.
 fn step_done(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1030,7 +1030,7 @@ fn step_done(
 /// `iter[next]` (a hole through the prototype chain) and advances.
 fn step_indexed(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1071,7 +1071,7 @@ fn step_indexed(
 /// A string step: the next code point's string (`__str_iter_next`).
 fn step_code_point(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1121,7 +1121,7 @@ fn step_code_point(
 fn step_entry(
     rec: &IterRecord,
     set: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1175,7 +1175,7 @@ fn step_entry(
 /// object); its `done` flag ends the walk without the return value.
 fn step_generator(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1216,7 +1216,7 @@ fn step_generator(
 /// still closes it.
 fn step_protocol(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1271,7 +1271,7 @@ fn step_protocol(
 /// the record unclosed). Read once per successful step.
 pub(in crate::emit) fn emit_iterator_value(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1307,7 +1307,7 @@ pub(in crate::emit) fn emit_iterator_value(
 pub(in crate::emit) fn emit_iterator_close(
     rec: &IterRecord,
     mode: CloseMode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

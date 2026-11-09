@@ -190,7 +190,7 @@ pub(super) fn emit(
 pub(in crate::emit) fn emit_open_async_iterator(
     value: &IrNode,
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -223,7 +223,7 @@ pub(in crate::emit) fn emit_open_async_iterator(
 /// stepping.
 pub(in crate::emit) fn emit_async_iterator_next(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -257,7 +257,7 @@ pub(in crate::emit) fn emit_async_iterator_next(
 pub(in crate::emit) fn emit_async_iterator_complete(
     rec: &IterRecord,
     result: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -310,7 +310,7 @@ pub(in crate::emit) fn emit_async_iterator_complete(
 pub(in crate::emit) fn emit_async_iterator_return(
     rec: &IterRecord,
     throwing: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -357,7 +357,7 @@ pub(in crate::emit) fn emit_async_iterator_return(
 /// is an object; pushes `undefined`.
 pub(in crate::emit) fn emit_iterator_result_check(
     operand: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

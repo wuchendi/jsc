@@ -109,7 +109,7 @@ pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(
 
 /// Push i32 `1` when the `__method` result on the stack is the refusal
 /// sentinel `METHOD_RANGE_ERROR`.
-pub(in crate::emit) fn emit_is_method_refusal(function: &mut Function) {
+pub(in crate::emit) fn emit_is_method_refusal(function: &mut impl Sink) {
     wasm!(function; I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq);
 }
 
