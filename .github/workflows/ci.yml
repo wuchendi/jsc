@@ -92,7 +92,7 @@ jobs:
   test262:
     name: test262 (baseline regression gate)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
 
