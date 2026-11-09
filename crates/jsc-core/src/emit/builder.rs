@@ -18,8 +18,9 @@
 //!    holds no safepoint costs nothing.
 //! 4. Slow-path helpers shrink-wrap with [`FnBuilder::frame_begin`] /
 //!    [`FnBuilder::frame_end`]: a `Return` inside the region restores SP, one
-//!    outside does not; a safepoint outside the region or a branch out of it
-//!    is an error. Without a region the frame covers the whole body.
+//!    outside does not; a safepoint outside the region, a branch out of it, a
+//!    rooted local written before it and a kept temp rooted before it are
+//!    errors. Without a region the frame covers the whole body.
 //! 5. [`FnBuilder::finish`] solves slots and emits the frame; a function with
 //!    no root live across a safepoint gets none.
 //!
@@ -108,10 +109,12 @@ pub(super) enum BuilderError {
     BranchOutOfFrame,
     /// A `frame_begin` / `frame_end` pair is unmatched or repeated.
     BadFrameRegion,
-    /// Rooted non-parameter local `0` is written before the frame exists, so
-    /// its write-through would store through `$fp = 0` and the prologue would
-    /// not repopulate its slot.
+    /// Rooted local `0` (a parameter too) is written before the frame exists,
+    /// so its write-through would store through `$fp = 0`.
     WriteBeforeFrame(u32),
+    /// A kept temp is rooted before the frame exists, so its slot store would
+    /// go through `$fp = 0` and the slot would then be cleared by the prologue.
+    TempBeforeFrame,
 }
 
 impl fmt::Display for BuilderError {
@@ -126,6 +129,7 @@ impl fmt::Display for BuilderError {
             Self::WriteBeforeFrame(local) => {
                 write!(f, "rooted local {local} is written before the frame region")
             }
+            Self::TempBeforeFrame => write!(f, "kept temp rooted before the frame region"),
         }
     }
 }
@@ -388,11 +392,14 @@ impl Layout {
                 Op::Instr {
                     kind: Kind::Set(l) | Kind::Tee(l),
                     ..
-                } if *l >= builder.params && local_slots.contains_key(l) => Some(*l),
+                } if local_slots.contains_key(l) => Some(*l),
                 _ => None,
             });
             if let Some(local) = written_early {
                 return Err(BuilderError::WriteBeforeFrame(local));
+            }
+            if temp_slots.keys().any(|root| *root < begin) {
+                return Err(BuilderError::TempBeforeFrame);
             }
         }
         Ok(Self {
@@ -876,6 +883,68 @@ mod tests {
         b.instruction(&Instruction::LocalSet(local));
         b.instruction(&Instruction::Call(99));
         b.instruction(&Instruction::LocalGet(local));
+        b.instruction(&Instruction::Drop);
+        b.frame_end();
+        b.instruction(&Instruction::End);
+        assert!(b.finish().is_ok());
+    }
+
+    #[test]
+    fn rooted_param_reassigned_before_region_is_rejected() {
+        let leaves = LeafSet::empty();
+        let mut b = builder(&leaves);
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::LocalSet(0));
+        b.frame_begin();
+        b.instruction(&Instruction::Call(99));
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::Drop);
+        b.frame_end();
+        b.instruction(&Instruction::End);
+        assert_eq!(b.finish().err(), Some(BuilderError::WriteBeforeFrame(0)));
+    }
+
+    #[test]
+    fn rooted_param_reassigned_inside_region_is_accepted() {
+        let leaves = LeafSet::empty();
+        let mut b = builder(&leaves);
+        b.frame_begin();
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::LocalSet(0));
+        b.instruction(&Instruction::Call(99));
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::Drop);
+        b.frame_end();
+        b.instruction(&Instruction::End);
+        assert!(b.finish().is_ok());
+    }
+
+    #[test]
+    fn kept_temp_rooted_before_region_is_rejected() {
+        let leaves = LeafSet::empty();
+        let mut b = builder(&leaves);
+        let mark = b.temp_mark();
+        b.instruction(&Instruction::LocalGet(0));
+        b.root_temp(TempClass::Jsval);
+        b.frame_begin();
+        b.instruction(&Instruction::Call(99));
+        b.release_temps(mark);
+        b.instruction(&Instruction::Drop);
+        b.frame_end();
+        b.instruction(&Instruction::End);
+        assert_eq!(b.finish().err(), Some(BuilderError::TempBeforeFrame));
+    }
+
+    #[test]
+    fn kept_temp_rooted_inside_region_is_accepted() {
+        let leaves = LeafSet::empty();
+        let mut b = builder(&leaves);
+        let mark = b.temp_mark();
+        b.frame_begin();
+        b.instruction(&Instruction::LocalGet(0));
+        b.root_temp(TempClass::Jsval);
+        b.instruction(&Instruction::Call(99));
+        b.release_temps(mark);
         b.instruction(&Instruction::Drop);
         b.frame_end();
         b.instruction(&Instruction::End);
