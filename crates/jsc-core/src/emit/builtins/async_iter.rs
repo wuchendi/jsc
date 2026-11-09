@@ -146,7 +146,7 @@ fn m64(offset: u32) -> MemArg {
 /// Emit the body of the async iteration builtin `op`.
 pub(super) fn emit(
     op: AsyncIterOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -389,7 +389,7 @@ pub(in crate::emit) fn emit_iterator_result_check(
 /// `CreateAsyncFromSyncIterator`; neither callable throws `<x> is not async
 /// iterable`.
 fn emit_open_body(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -399,17 +399,17 @@ fn emit_open_body(
         frame.i64(1),
         frame.i64(2),
         frame.i64(3),
-        frame.i32(0),
+        frame.base(0),
     );
     let tmp = frame.x64(0);
-    let get_method = |function: &mut Function, symbol| {
+    let get_method = |function: &mut FnBuilder<'_>, symbol| {
         wasm!(function;
             LocalGet(v), I32Const(realm::symbol_addr(symbol, helpers)),
             Call(helpers.symbol_get()), LocalSet(method),
         );
         return_if_pending(function);
     };
-    let require_callable = |function: &mut Function| {
+    let require_callable = |function: &mut FnBuilder<'_>| {
         emit_is_function(function, method);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         throw_and_return(
@@ -450,7 +450,13 @@ fn emit_open_body(
 /// kind [`KIND_ASYNC_FROM_SYNC`] over `%AsyncFromSyncIteratorPrototype%`
 /// holding the sync iterator in i64 `it` and its `next` in i64 `next`
 /// (`obj` an i32 temp).
-pub(super) fn create(function: &mut Function, it: u32, next: u32, obj: u32, helpers: Helpers<'_>) {
+pub(super) fn create(
+    function: &mut FnBuilder<'_>,
+    it: u32,
+    next: u32,
+    obj: u32,
+    helpers: Helpers<'_>,
+) {
     let header = TYPE_OBJECT | (i32::from(abi::CLASS_ITERATOR) << 24);
     let proto = intrinsic_bits(Intrinsic::AsyncFromSyncIteratorPrototype, helpers);
     wasm!(function;
@@ -470,7 +476,7 @@ pub(super) fn create(function: &mut Function, it: u32, next: u32, obj: u32, help
 /// The [`AsyncIterOp::Step`] body: `this` is the iterator, `env` its cached
 /// `next` (a `TypeError` unless callable); the result of `next()`.
 fn emit_step_body(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -495,7 +501,7 @@ fn emit_step_body(
 /// `GetMethod(this, "return")` (the hole when nullish, a `TypeError` unless
 /// callable) and the result of its call.
 fn emit_return_body(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -525,7 +531,7 @@ fn emit_return_body(
 /// The [`AsyncIterOp::CloseRejected`] body: `IteratorClose` of the sync
 /// iterator in `env` with a throw completion (any throw of the close is
 /// discarded), then throw argument 0 (rejecting the derived promise).
-fn emit_close_rejected(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_close_rejected(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let (reason, it) = (frame.i64(0), frame.k);
     frame.arg(function, 0);
     wasm!(function; LocalSet(reason));
@@ -586,7 +592,7 @@ impl Wrap {
     /// Emit `node` in the body's scratch layout.
     fn emit(
         self,
-        function: &mut Function,
+        function: &mut FnBuilder<'_>,
         node: &IrNode,
         strings: &StrOffsets,
         helpers: Helpers<'_>,
@@ -597,7 +603,7 @@ impl Wrap {
     /// Throw `node` (an IR throw) to the body's handler.
     fn throw(
         self,
-        function: &mut Function,
+        function: &mut FnBuilder<'_>,
         node: &IrNode,
         strings: &StrOffsets,
         helpers: Helpers<'_>,
@@ -609,7 +615,7 @@ impl Wrap {
     /// Throw `node` (an IR throw) when the i32 on the stack is zero.
     fn throw_unless(
         self,
-        function: &mut Function,
+        function: &mut FnBuilder<'_>,
         node: &IrNode,
         strings: &StrOffsets,
         helpers: Helpers<'_>,
@@ -624,7 +630,7 @@ impl Wrap {
     /// `method = Get(sync, key)` (a throw propagates to the handler).
     fn get_method(
         self,
-        function: &mut Function,
+        function: &mut FnBuilder<'_>,
         key: &str,
         strings: &StrOffsets,
         helpers: Helpers<'_>,
@@ -638,7 +644,7 @@ impl Wrap {
 
     /// `result = Call(method, sync, « value »)` (no argument when the
     /// method itself got none): a `TypeError` unless `method` is callable.
-    fn call(self, function: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>) {
+    fn call(self, function: &mut FnBuilder<'_>, strings: &StrOffsets, helpers: Helpers<'_>) {
         emit_is_function(function, self.method);
         self.throw_unless(
             function,
@@ -677,7 +683,7 @@ impl Wrap {
     fn continuation(
         self,
         close_on_rejection: bool,
-        function: &mut Function,
+        function: &mut FnBuilder<'_>,
         strings: &StrOffsets,
         helpers: Helpers<'_>,
     ) {
@@ -708,6 +714,8 @@ impl Wrap {
         let scratch = self.frame.scratch();
         let slot = |op| helpers.builtin_slot(Builtin::Iter(IterOp::Async(op)));
         wasm!(function; LocalGet(self.method));
+        let mark = function.temp_mark();
+        function.root_temp(TempClass::Jsval);
         emit_settler_value(
             slot(AsyncIterOp::Unwrap),
             self.done,
@@ -715,6 +723,7 @@ impl Wrap {
             scratch,
             helpers,
         );
+        function.root_temp(TempClass::Jsval);
         if close_on_rejection {
             wasm!(function;
                 LocalGet(self.done), I64Const(TRUE_BITS), I64Eq,
@@ -731,6 +740,7 @@ impl Wrap {
         } else {
             wasm!(function; I64Const(UNDEFINED_BITS));
         }
+        function.release_temps(mark);
         wasm!(function; Call(helpers.then), LocalSet(self.out));
     }
 }
@@ -744,7 +754,7 @@ impl Wrap {
 /// (a non-throw completion), then rejects with a `TypeError`.
 fn emit_from_sync(
     request: AsyncGenRequest,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

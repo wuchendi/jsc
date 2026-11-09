@@ -176,7 +176,7 @@ fn strict_eq(a: u32, b: u32) -> IrNode {
 /// `ToObject(this)` into i64 `o`: `undefined`/`null` throws `nullish`, a
 /// primitive becomes its wrapper object.
 fn this_object(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     o: u32,
     nullish: CalleeErrorText<'static>,
@@ -193,7 +193,7 @@ fn this_object(
 /// Push i32 `1` when the jsval in `o` is an array handle that is not in
 /// dictionary mode (whose elements may carry any attributes, so it takes the
 /// generic per-index path).
-fn is_array(function: &mut Function, o: u32) {
+fn is_array(function: &mut FnBuilder<'_>, o: u32) {
     emit_is_pointer(function, o);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, o);
@@ -209,7 +209,7 @@ fn is_array(function: &mut Function, o: u32) {
 /// prototype of it can hold an integer index (`__protos_indexless`), so a
 /// host fast path that treats a hole as absent reads what `HasProperty` /
 /// `Get` would.
-fn indexless_array(function: &mut Function, o: u32, helpers: Helpers<'_>) {
+fn indexless_array(function: &mut FnBuilder<'_>, o: u32, helpers: Helpers<'_>) {
     is_array(function, o);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),
@@ -221,7 +221,7 @@ fn indexless_array(function: &mut Function, o: u32, helpers: Helpers<'_>) {
 /// `LengthOfArrayLike(o)` into i32 `len`: `ToLength(Get(o, "length"))` (NaN
 /// and negatives are 0; the u32 range bounds the rest).
 fn length_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     o: u32,
     len: u32,
     strings: &StrOffsets,
@@ -235,13 +235,13 @@ fn length_of(
 }
 
 /// Push the i32 index in local `i` as a number jsval.
-fn index_value(function: &mut Function, i: u32) {
+fn index_value(function: &mut FnBuilder<'_>, i: u32) {
     wasm!(function; LocalGet(i), F64ConvertI32U, I64ReinterpretF64);
 }
 
 /// Push `HasProperty(o, i)` (i32) for the i32 index in local `i`, leaving
 /// its interned key in i32 `key`.
-fn has_index(function: &mut Function, o: u32, i: u32, key: u32, helpers: Helpers<'_>) {
+fn has_index(function: &mut FnBuilder<'_>, o: u32, i: u32, key: u32, helpers: Helpers<'_>) {
     index_value(function, i);
     wasm!(function;
         I32Const(1), Call(helpers.to_key), LocalTee(key),
@@ -251,7 +251,7 @@ fn has_index(function: &mut Function, o: u32, i: u32, key: u32, helpers: Helpers
 
 /// `Get(o, i)` into i64 `v` for the i32 index in local `i` (`key` an i32
 /// temp); a throwing getter returns.
-fn get_index(function: &mut Function, o: u32, i: u32, key: u32, v: u32, helpers: Helpers<'_>) {
+fn get_index(function: &mut FnBuilder<'_>, o: u32, i: u32, key: u32, v: u32, helpers: Helpers<'_>) {
     index_value(function, i);
     wasm!(function;
         I32Const(1), Call(helpers.to_key), LocalSet(key),
@@ -262,7 +262,7 @@ fn get_index(function: &mut Function, o: u32, i: u32, key: u32, v: u32, helpers:
 
 /// `ToIntegerOrInfinity` of the jsval on the stack into f64 `r` (NaN is 0; a
 /// throwing `valueOf` returns).
-fn to_integer(function: &mut Function, r: u32, helpers: Helpers<'_>) {
+fn to_integer(function: &mut FnBuilder<'_>, r: u32, helpers: Helpers<'_>) {
     wasm!(function; Call(helpers.to_number));
     return_if_pending(function);
     wasm!(function;
@@ -275,7 +275,7 @@ fn to_integer(function: &mut Function, r: u32, helpers: Helpers<'_>) {
 /// (`__array_push`); any other object gets `Set(O, len + i, item)` per item
 /// and then `Set(O, "length", len + n)`. Returns the new length.
 pub(super) fn emit_push(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -348,7 +348,7 @@ pub(super) fn emit_push(
 /// reads `O[len - 1]`, deletes it and sets `length` (`0` for an empty one,
 /// which pops `undefined`).
 pub(super) fn emit_pop(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -402,7 +402,7 @@ pub(super) fn emit_pop(
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_hof(
     op: ArrayHofOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -412,19 +412,19 @@ pub(super) fn emit_hof(
     let (acc, result) = (frame.x64(0), frame.x64(1));
     let (c, kv, target) = (frame.y64(0), frame.y64(1), frame.y64(4));
     let (len, k, to, seeded) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let key = frame.x32(0);
+    let key = frame.base(4);
     let flen = frame.yf64(0);
     let reduce = op == ArrayHofOp::Reduce;
     let species = matches!(op, ArrayHofOp::Map | ArrayHofOp::Filter);
     this_object(function, frame, o, texts.nullish, strings, helpers);
     // `reduce` has an initial value when called with two arguments or more.
-    let has_init = |function: &mut Function| {
+    let has_init = |function: &mut FnBuilder<'_>| {
         wasm!(function;
             LocalGet(frame.argc()), F64ReinterpretI64, F64Const(Ieee64::from(2.0)), F64Ge,
         );
     };
     let extra = || Some(Box::new(arg(frame.k, 1)));
-    let fast = |function: &mut Function| {
+    let fast = |function: &mut FnBuilder<'_>| {
         if reduce {
             has_init(function);
             wasm!(function; If(BlockType::Result(ValType::I64)));
@@ -487,7 +487,7 @@ pub(super) fn emit_hof(
     }
     // The callback over `(acc,) value, k, O` with `this = thisArg`, its
     // result in `result`.
-    let call = |function: &mut Function| {
+    let call = |function: &mut FnBuilder<'_>| {
         let args: &[CallArg] = if reduce {
             &[
                 CallArg::Val(acc),
@@ -561,14 +561,14 @@ pub(super) fn emit_hof(
 /// `SameValueZero` (an absent index reads `undefined`).
 pub(super) fn emit_search(
     includes: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let texts = if includes { &INCLUDES } else { &INDEX_OF };
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let key = frame.i32(2);
+    let key = frame.base(2);
     let r = frame.f64(0);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     let (op, not_found) = if includes {
@@ -640,14 +640,14 @@ pub(super) fn emit_search(
 /// (`undefined`/`null` and absent indices are empty) with `ToString(separator)`
 /// (`","` when `undefined`).
 pub(super) fn emit_join(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, sep_v, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (len, k, acc, sep) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let key = frame.x32(0);
+    let (len, k, acc, sep) = (frame.i32(0), frame.i32(1), frame.base(2), frame.base(3));
+    let key = frame.base(4);
     this_object(function, frame, o, JOIN_TEXTS.nullish, strings, helpers);
     is_array(function, o);
     wasm!(function; If(BlockType::Empty), LocalGet(o));
@@ -691,14 +691,14 @@ pub(super) fn emit_join(
 /// (`undefined`/`null` and absent indices are empty); a non-callable
 /// `toLocaleString` throws.
 pub(super) fn emit_to_locale_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, f) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (len, k, acc, base) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let key = frame.x32(0);
+    let (len, k, acc, base) = (frame.i32(0), frame.i32(1), frame.base(2), frame.base(3));
+    let key = frame.base(4);
     this_object(
         function,
         frame,
@@ -753,14 +753,14 @@ pub(super) fn emit_to_locale_string(
 /// is copied into `A` by `CreateDataPropertyOrThrow` (an absent one stays a
 /// hole) and `A.length` is set.
 pub(super) fn emit_slice(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, end_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (c, count, target) = (frame.y64(0), frame.y64(1), frame.y64(4));
-    let key = frame.x32(1);
+    let key = frame.base(5);
     let rel = frame.f64(0);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     let (fin, to) = (frame.zf64(0), frame.zf64(1));
@@ -774,8 +774,8 @@ pub(super) fn emit_slice(
     relative_arg(function, end_v, true, rel, len, fin, helpers);
     species_ctor(function, frame, o, c, strings, helpers);
     indexless_array(function, o, helpers);
-    let (n, dst) = (frame.i32(0), frame.i32(1));
-    let data = |function: &mut Function| {
+    let (n, dst) = (frame.i32(0), frame.base(1));
+    let data = |function: &mut FnBuilder<'_>| {
         emit_array_elems(function);
         wasm!(function; I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()), I32Add);
     };
@@ -830,12 +830,12 @@ pub(super) fn emit_slice(
 /// receiver calls its own `join` when callable, else
 /// `%Object.prototype.toString%`.
 pub(super) fn emit_to_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (this, join, base) = (frame.i64(0), frame.i64(1), frame.i32(0));
+    let (this, join, base) = (frame.i64(0), frame.i64(1), frame.base(0));
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     is_array(function, this);
     wasm!(function;
@@ -986,14 +986,14 @@ pub(super) enum CallArg {
 /// slots and, when there are more, all of them in a fresh spread argument
 /// array published for the callee (built in the [`Frame::arg`] temp).
 pub(super) fn push_call(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     callee: u32,
     this: u32,
     args: &[CallArg],
     helpers: Helpers<'_>,
 ) {
-    let push = |function: &mut Function, arg: Option<&CallArg>| match arg {
+    let push = |function: &mut FnBuilder<'_>, arg: Option<&CallArg>| match arg {
         Some(CallArg::Val(local)) => wasm!(function; LocalGet(*local)),
         Some(CallArg::Index(local)) => index_value(function, *local),
         None => wasm!(function; I64Const(UNDEFINED_BITS)),
@@ -1025,7 +1025,7 @@ pub(super) fn push_call(
 
 /// [`push_call`] with the result into i64 `result`; a throw returns.
 fn call_fn(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     callee: u32,
     this: u32,
@@ -1040,7 +1040,7 @@ fn call_fn(
 
 /// Throw `text` unless the jsval in `local` is callable.
 fn require_callable(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     local: u32,
     text: CalleeErrorText<'static>,
@@ -1056,7 +1056,7 @@ fn require_callable(
 /// `ArrayCreate(len)` into i64 `out` for the number jsval in i64 `len`: a
 /// fresh array whose `length` write leaves `len` holes.
 fn array_create(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     len: u32,
     out: u32,
@@ -1075,7 +1075,7 @@ fn array_create(
 /// `out` (`args` = `[len]` for `Some(len)`, else none and `len` 0), the shared
 /// step of `Array.of` / `Array.from`; `%Array%` itself is `ArrayCreate`.
 fn construct_or_create(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     c: u32,
     len: Option<u32>,
@@ -1111,7 +1111,7 @@ fn construct_or_create(
 /// with `%Array%`'s dirty bit clear (its builtin `get [@@species]`
 /// returning `this`) skips the `@@species` read.
 fn species_ctor(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     o: u32,
     c: u32,
@@ -1164,7 +1164,7 @@ fn species_ctor(
 /// The array of `ArraySpeciesCreate` from the [`species_ctor`] in i64 `c`
 /// and the number jsval in i64 `len`, into i64 `out`.
 fn species_from(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     c: u32,
     len: u32,
@@ -1183,7 +1183,7 @@ fn species_from(
 /// `ArraySpeciesCreate(o, len)` into i64 `out` (`len` a number jsval in an
 /// i64 local).
 fn species_create(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     o: u32,
     len: u32,
@@ -1201,7 +1201,7 @@ fn species_create(
 /// enumerable, writable, configurable data property, throwing over a
 /// non-configurable own property or (absent) a non-extensible object.
 fn create_data_property(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     a: u32,
     key: u32,
@@ -1209,7 +1209,7 @@ fn create_data_property(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (k, entry) = (frame.y32(2), frame.y32(3));
+    let (k, entry) = (frame.base(8), frame.y32(3));
     is_array(function, a);
     wasm!(function;
         If(BlockType::Empty),
@@ -1249,7 +1249,7 @@ fn create_data_property(
 
 /// `Set(a, "length", len, true)` over i64 locals.
 fn set_length(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     a: u32,
     len: u32,
@@ -1261,7 +1261,7 @@ fn set_length(
 }
 
 /// `while k > 0 { k -= 1; body }` over the f64 local `k`.
-fn down_loop_f64(function: &mut Function, k: u32, body: impl FnOnce(&mut Function)) {
+fn down_loop_f64(function: &mut FnBuilder<'_>, k: u32, body: impl FnOnce(&mut FnBuilder<'_>)) {
     while_loop(
         function,
         |function| wasm!(function; LocalGet(k), F64Const(Ieee64::from(0.0)), F64Gt),
@@ -1278,7 +1278,7 @@ fn down_loop_f64(function: &mut Function, k: u32, body: impl FnOnce(&mut Functio
 /// ArrayCreate(n)`, then `CreateDataPropertyOrThrow(A, k, items[k])` and
 /// `Set(A, "length", n)`.
 pub(super) fn emit_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1313,14 +1313,14 @@ pub(super) fn emit_of(
 /// [len])`, `Get` per index). `A.length` is set last.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_from(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (c, items, map_fn, this_arg) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (a, v, kv, len_v) = (frame.x64(0), frame.x64(1), frame.y64(0), frame.y64(1));
-    let (k, len, mapping, key) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (k, len, mapping, key) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.base(3));
     let method = frame.y64(4);
     let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
     let scratch = frame.scratch();
@@ -1343,7 +1343,7 @@ pub(super) fn emit_from(
     wasm!(function; End);
     // `v = mapFn(v, k)` when mapping, then `A[k] = v`, `k += 1`; a throw
     // propagates (to the caller's handler, if any).
-    let store = |function: &mut Function| {
+    let store = |function: &mut FnBuilder<'_>| {
         wasm!(function; LocalGet(mapping), If(BlockType::Empty));
         enter_frame(helpers);
         push_call(
@@ -1498,12 +1498,12 @@ fn fa_flag(offset: u32) -> MemArg {
 /// result promise, after `AsyncIteratorClose` while the flag is set.
 pub(super) fn emit_from_async(
     op: FromAsyncOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (st, reason, st64) = (frame.i32(0), frame.x64(0), frame.y64(1));
+    let (st, reason, st64) = (frame.base(0), frame.x64(0), frame.y64(1));
     match op {
         FromAsyncOp::Entry => from_async_entry(function, frame, helpers),
         FromAsyncOp::Run => from_async_run(function, frame, strings, helpers),
@@ -1546,8 +1546,8 @@ pub(super) fn emit_from_async(
 /// `Array.fromAsync(items, mapFn, thisArg)`: a fresh state block and result
 /// promise, then the first [`FromAsyncOp::Run`] step; never a synchronous
 /// throw.
-fn from_async_entry(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
-    let (st, p, st64) = (frame.i32(0), frame.i64(0), frame.y64(1));
+fn from_async_entry(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
+    let (st, p, st64) = (frame.base(0), frame.i64(0), frame.y64(1));
     wasm!(function; I32Const(FA_SIZE), Call(helpers.alloc), LocalSet(st));
     for (i, offset) in (0..).zip([FA_SOURCE, FA_MAP, FA_THIS_ARG]) {
         wasm!(function; LocalGet(st));
@@ -1576,7 +1576,7 @@ fn from_async_entry(function: &mut Function, frame: Frame, helpers: Helpers<'_>)
 /// After a [`FromAsyncOp::Run`] step: a pending throw is taken and rejects
 /// the result promise ([`from_async_reject`]). Expects the state block in
 /// i32 `frame.i32(0)` and its jsval in `frame.y64(1)`.
-fn from_async_abrupt(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn from_async_abrupt(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     wasm!(function;
         GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
         GlobalGet(EXC_VALUE_GLOBAL), LocalSet(frame.x64(0)),
@@ -1591,15 +1591,15 @@ fn from_async_abrupt(function: &mut Function, frame: Frame, helpers: Helpers<'_>
 /// `return()` is called (a throw of `GetMethod` or the call is discarded)
 /// and its result awaited (either settlement rejecting with the reason, via
 /// [`FromAsyncOp::Rethrow`]).
-fn from_async_reject(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let (st, reason, it, r, st64) = (
-        frame.i32(0),
+        frame.base(0),
         frame.x64(0),
         frame.x64(1),
         frame.y64(0),
         frame.y64(1),
     );
-    let reject = |function: &mut Function| {
+    let reject = |function: &mut FnBuilder<'_>| {
         wasm!(function;
             I32Const(PROMISE_OP_SETTLE_REJECT),
             LocalGet(st), I64Load(fa_slot(FA_PROMISE)), LocalGet(reason),
@@ -1622,12 +1622,16 @@ fn from_async_reject(function: &mut Function, frame: Frame, helpers: Helpers<'_>
         End,
         LocalGet(r), I64Const(HOLE_BITS), I64Ne, If(BlockType::Empty),
         I32Const(PROMISE_OP_RESOLVE), LocalGet(r), I64Const(UNDEFINED_BITS), Call(helpers.promise),
-        LocalGet(st), I64ExtendI32U, LocalSet(st64),
     );
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
+    wasm!(function; LocalGet(st), I64ExtendI32U, LocalSet(st64));
     let rethrow = helpers.builtin_slot(from_async(FromAsyncOp::Rethrow));
     let scratch = frame.scratch();
     emit_settler_value(rethrow, st64, function, scratch, helpers);
+    function.root_temp(TempClass::Jsval);
     emit_settler_value(rethrow, st64, function, scratch, helpers);
+    function.release_temps(mark);
     wasm!(function; Call(helpers.then), Drop, Else);
     reject(function);
     wasm!(function; End, Else);
@@ -1638,7 +1642,7 @@ fn from_async_reject(function: &mut Function, frame: Frame, helpers: Helpers<'_>
 /// `Await(value)` of a [`FromAsyncOp::Run`] step, resuming at `phase`:
 /// `PromiseResolve(value).then(Resume, Reject)`, then return.
 fn from_async_await(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     st: u32,
     value: u32,
@@ -1651,6 +1655,8 @@ fn from_async_await(
         LocalGet(st), I32Const(phase), I32Store(fa_flag(FA_PHASE)),
         I32Const(PROMISE_OP_RESOLVE), LocalGet(value), I64Const(UNDEFINED_BITS), Call(helpers.promise),
     );
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
     emit_settler_value(
         slot(FromAsyncOp::Resume),
         frame.k,
@@ -1658,6 +1664,7 @@ fn from_async_await(
         scratch,
         helpers,
     );
+    function.root_temp(TempClass::Jsval);
     emit_settler_value(
         slot(FromAsyncOp::Reject),
         frame.k,
@@ -1665,6 +1672,7 @@ fn from_async_await(
         scratch,
         helpers,
     );
+    function.release_temps(mark);
     wasm!(function; Call(helpers.then), Drop, I64Const(UNDEFINED_BITS), Return);
 }
 
@@ -1716,10 +1724,10 @@ impl<'a> Run<'a> {
             frame,
             strings,
             helpers,
-            st: frame.i32(0),
+            st: frame.base(0),
             phase: frame.i32(1),
             index: frame.i32(2),
-            key: frame.i32(3),
+            key: frame.base(3),
             len: frame.x32(0),
             is_async: frame.y32(0),
             obj: frame.y32(1),
@@ -1736,26 +1744,26 @@ impl<'a> Run<'a> {
         }
     }
 
-    fn load(self, function: &mut Function, offset: u32, out: u32) {
+    fn load(self, function: &mut FnBuilder<'_>, offset: u32, out: u32) {
         wasm!(function; LocalGet(self.st), I64Load(fa_slot(offset)), LocalSet(out));
     }
 
-    fn store(self, function: &mut Function, offset: u32, from: u32) {
+    fn store(self, function: &mut FnBuilder<'_>, offset: u32, from: u32) {
         wasm!(function; LocalGet(self.st), LocalGet(from), I64Store(fa_slot(offset)));
     }
 
-    fn set_open(self, function: &mut Function, open: i32) {
+    fn set_open(self, function: &mut FnBuilder<'_>, open: i32) {
         wasm!(function; LocalGet(self.st), I32Const(open), I32Store(fa_flag(FA_OPEN)));
     }
 
     /// Push i32 `1` when there is a `mapFn`.
-    fn mapping(self, function: &mut Function) {
+    fn mapping(self, function: &mut FnBuilder<'_>) {
         wasm!(function; LocalGet(self.map_fn), I64Const(UNDEFINED_BITS), I64Ne);
     }
 
     /// `Set(A, "length", n)` for the number jsval in `n`, then fulfill the
     /// result promise with `A` and return.
-    fn finish(self, function: &mut Function, n: u32) {
+    fn finish(self, function: &mut FnBuilder<'_>, n: u32) {
         set_length(
             function,
             self.frame,
@@ -1773,7 +1781,7 @@ impl<'a> Run<'a> {
     }
 
     /// `Call(next, iterator)`, then await its result.
-    fn iter_next(self, function: &mut Function) {
+    fn iter_next(self, function: &mut FnBuilder<'_>) {
         self.set_open(function, 0);
         let step = Builtin::Iter(IterOp::Async(AsyncIterOp::Step));
         iter::call_internal(function, step, self.source, Some(self.next), self.helpers);
@@ -1790,7 +1798,7 @@ impl<'a> Run<'a> {
     }
 
     /// `k < len ? Await(Get(arrayLike, k)) : finish`.
-    fn like_next(self, function: &mut Function) {
+    fn like_next(self, function: &mut FnBuilder<'_>) {
         wasm!(function; LocalGet(self.index), LocalGet(self.len), I32GeU, If(BlockType::Empty));
         self.finish(function, self.next);
         wasm!(function; End);
@@ -1814,7 +1822,7 @@ impl<'a> Run<'a> {
 
     /// With a `mapFn`: `Await(Call(mapFn, thisArg, [v, k]))`, resuming at
     /// `phase`.
-    fn map_await(self, function: &mut Function, phase: i32) {
+    fn map_await(self, function: &mut FnBuilder<'_>, phase: i32) {
         self.mapping(function);
         wasm!(function; If(BlockType::Empty));
         let args = [CallArg::Val(self.value), CallArg::Index(self.index)];
@@ -1840,12 +1848,12 @@ impl<'a> Run<'a> {
     }
 
     /// Throw the `TypeError` `text` and return.
-    fn throw(self, function: &mut Function, text: CalleeErrorText<'static>) {
+    fn throw(self, function: &mut FnBuilder<'_>, text: CalleeErrorText<'static>) {
         throw_type_error(function, self.frame, text, self.strings, self.helpers);
     }
 
     /// `method = GetMethod(items, symbol)` (unchecked).
-    fn get_method(self, function: &mut Function, symbol: WellKnown) {
+    fn get_method(self, function: &mut FnBuilder<'_>, symbol: WellKnown) {
         wasm!(function;
             LocalGet(self.source), I32Const(realm::symbol_addr(symbol, self.helpers)),
             Call(self.helpers.symbol_get()), LocalSet(self.method),
@@ -1855,7 +1863,7 @@ impl<'a> Run<'a> {
 
     /// The start: the `mapFn` check, the iterator method, then the iterator
     /// path or the array-like path up to the first await.
-    fn start(self, function: &mut Function) {
+    fn start(self, function: &mut FnBuilder<'_>) {
         let (strings, helpers) = (self.strings, self.helpers);
         self.load(function, FA_CTOR, self.ctor);
         self.mapping(function);
@@ -1906,7 +1914,7 @@ impl<'a> Run<'a> {
 
     /// The iterator path of the start: `A`, then `GetIteratorFromMethod`
     /// (a sync iterator through `CreateAsyncFromSyncIterator`).
-    fn start_iterator(self, function: &mut Function) {
+    fn start_iterator(self, function: &mut FnBuilder<'_>) {
         let (frame, strings, helpers) = (self.frame, self.strings, self.helpers);
         let (method, result, next) = (self.method, self.result, self.next);
         emit_is_function(function, method);
@@ -1950,7 +1958,7 @@ impl<'a> Run<'a> {
     /// A resumed await: a `next()` result is checked (`done` finishes) and
     /// its value mapped; an array-like element is mapped; a mapped value (or
     /// an unmapped one) is defined, then the next step runs.
-    fn resume(self, function: &mut Function) {
+    fn resume(self, function: &mut FnBuilder<'_>) {
         let (strings, helpers) = (self.strings, self.helpers);
         let (value, result, index, key_value) =
             (self.value, self.result, self.index, self.key_value);
@@ -2008,7 +2016,7 @@ impl<'a> Run<'a> {
 /// fulfillment with `A`. The close flag covers the `mapFn` call, its await
 /// and the define of the iterator path.
 fn from_async_run(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2036,7 +2044,7 @@ fn from_async_run(
 
 /// `LengthOfArrayLike(o)` into f64 `len` over the full `ToLength` range.
 fn length_of_f64(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     o: u32,
     len: u32,
     strings: &StrOffsets,
@@ -2058,7 +2066,7 @@ fn length_of_f64(
 /// `Array.prototype.at(index)`: `k = ToIntegerOrInfinity(index)`, relative
 /// to `len` when negative; `Get(O, k)` when `0 <= k < len`, else `undefined`.
 pub(super) fn emit_at(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2077,9 +2085,14 @@ pub(super) fn emit_at(
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
         // `+ 0` turns `-0` into `+0`.
         LocalGet(o),
+    );
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
+    wasm!(function;
         LocalGet(r), F64Const(Ieee64::from(0.0)), F64Add, I64ReinterpretF64,
         I32Const(1), Call(helpers.to_key), Call(helpers.get),
     );
+    function.release_temps(mark);
 }
 
 /// `Array.prototype.find/findIndex/findLast/findLastIndex/some/every
@@ -2089,7 +2102,7 @@ pub(super) fn emit_at(
 /// reads `undefined`), `some` / `every` only the present ones.
 pub(super) fn emit_find(
     op: ArrayFindOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2097,7 +2110,7 @@ pub(super) fn emit_find(
     let texts = find_texts(op);
     let (o, pred, this_arg, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (r, kv) = (frame.x64(0), frame.x64(1));
-    let key = frame.i32(2);
+    let key = frame.base(2);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     let present_only = matches!(op, ArrayFindOp::Some | ArrayFindOp::Every);
     this_object(function, frame, o, texts.nullish, strings, helpers);
@@ -2107,7 +2120,7 @@ pub(super) fn emit_find(
     require_callable(function, frame, pred, texts.not_callable, strings, helpers);
     frame.arg(function, 1);
     wasm!(function; LocalSet(this_arg));
-    let body = |function: &mut Function| {
+    let body = |function: &mut FnBuilder<'_>| {
         if present_only {
             has_at(function, o, k, key, helpers);
             wasm!(function; If(BlockType::Empty));
@@ -2169,14 +2182,14 @@ pub(super) fn emit_find(
 /// index down, over the present indices; without an initial value the
 /// accumulator is seeded from the last present element (none throws).
 pub(super) fn emit_reduce_right(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, callback, this_arg, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (acc, kv) = (frame.x64(0), frame.x64(1));
-    let (key, seeded) = (frame.i32(2), frame.i32(3));
+    let (key, seeded) = (frame.base(2), frame.i32(3));
     let k = frame.yf64(1);
     this_object(function, frame, o, REDUCE_RIGHT.nullish, strings, helpers);
     length_of_f64(function, o, k, strings, helpers);
@@ -2228,13 +2241,13 @@ pub(super) fn emit_reduce_right(
 /// without the argument) down to 0 over the present indices, comparing with
 /// `===`.
 pub(super) fn emit_last_index_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let key = frame.i32(2);
+    let key = frame.base(2);
     let r = frame.f64(0);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     let not_found = (-1.0f64).to_bits().cast_signed();
@@ -2292,7 +2305,7 @@ pub(super) fn emit_last_index_of(
 /// `LengthOfArrayLike(item)` at `n + k` (`n` advancing over holes too), any
 /// other value is one element; then `Set(A, "length", n)`.
 pub(super) fn emit_concat(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2300,9 +2313,9 @@ pub(super) fn emit_concat(
     let (o, item, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (target, saved, zero) = (frame.x64(0), frame.x64(1), frame.y64(1));
     let (j, argn, len, k) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let key = frame.x32(0);
+    let key = frame.base(4);
     let count = frame.yf64(0);
-    let advance = |function: &mut Function| {
+    let advance = |function: &mut FnBuilder<'_>| {
         wasm!(function; LocalGet(count), F64Const(Ieee64::from(1.0)), F64Add, LocalSet(count));
     };
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
@@ -2378,7 +2391,7 @@ pub(super) fn emit_concat(
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_flat(
     map: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2386,7 +2399,7 @@ pub(super) fn emit_flat(
     let texts = if map { &FLAT_MAP } else { &FLAT };
     let (o, cur, el, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (a, mapper, zero, this_arg) = (frame.x64(0), frame.x64(1), frame.y64(1), frame.y64(4));
-    let (k, len, key, stack) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (k, len, key, stack) = (frame.i32(0), frame.i32(1), frame.base(2), frame.base(3));
     let top = frame.x32(0);
     let (depth, n) = (frame.f64(0), frame.yf64(0));
     this_object(function, frame, o, texts.nullish, strings, helpers);
@@ -2550,20 +2563,20 @@ fn mutating_strings() -> impl Iterator<Item = &'static str> {
 }
 
 /// Push the f64 index in local `f` as a number jsval.
-fn num(function: &mut Function, f: u32) {
+fn num(function: &mut FnBuilder<'_>, f: u32) {
     wasm!(function; LocalGet(f), I64ReinterpretF64);
 }
 
 /// `f += delta` over an f64 local.
-fn bump(function: &mut Function, f: u32, delta: f64) {
+fn bump(function: &mut FnBuilder<'_>, f: u32, delta: f64) {
     wasm!(function; LocalGet(f), F64Const(Ieee64::from(delta)), F64Add, LocalSet(f));
 }
 
 /// `while cond { body }`: `cond` pushes an i32, nonzero to run `body` again.
 fn while_loop(
-    function: &mut Function,
-    cond: impl FnOnce(&mut Function),
-    body: impl FnOnce(&mut Function),
+    function: &mut FnBuilder<'_>,
+    cond: impl FnOnce(&mut FnBuilder<'_>),
+    body: impl FnOnce(&mut FnBuilder<'_>),
 ) {
     wasm!(function; Block(BlockType::Empty), Loop(BlockType::Empty));
     cond(function);
@@ -2575,7 +2588,7 @@ fn while_loop(
 /// Push the index the relative position in f64 `r` designates in the f64
 /// length `len`: `max(len + r, 0)` when `r < 0`, else `min(r, len)` (`-0`
 /// is `+0`).
-fn relative_f64(function: &mut Function, r: u32, len: u32) {
+fn relative_f64(function: &mut FnBuilder<'_>, r: u32, len: u32) {
     wasm!(function;
         LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
         If(BlockType::Result(ValType::F64)),
@@ -2591,7 +2604,7 @@ fn relative_f64(function: &mut Function, r: u32, len: u32) {
 /// `len` (or `len` itself when `v` is `undefined` and `undefined_is_len`),
 /// into f64 `out` (`r` an f64 temp).
 fn relative_arg(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     v: u32,
     undefined_is_len: bool,
     r: u32,
@@ -2616,7 +2629,7 @@ fn relative_arg(
 
 /// Push `HasProperty(o, f)` (i32) for the f64 index in local `f`, leaving its
 /// interned key in i32 `key`.
-fn has_at(function: &mut Function, o: u32, f: u32, key: u32, helpers: Helpers<'_>) {
+fn has_at(function: &mut FnBuilder<'_>, o: u32, f: u32, key: u32, helpers: Helpers<'_>) {
     num(function, f);
     wasm!(function;
         I32Const(1), Call(helpers.to_key), LocalTee(key),
@@ -2626,14 +2639,14 @@ fn has_at(function: &mut Function, o: u32, f: u32, key: u32, helpers: Helpers<'_
 
 /// `Get(o, key)` into i64 `v` for the interned key in i32 `key`; a throwing
 /// getter returns.
-fn get_key(function: &mut Function, o: u32, key: u32, v: u32, helpers: Helpers<'_>) {
+fn get_key(function: &mut FnBuilder<'_>, o: u32, key: u32, v: u32, helpers: Helpers<'_>) {
     wasm!(function; LocalGet(o), LocalGet(key), Call(helpers.get), LocalSet(v));
     return_if_pending(function);
 }
 
 /// `Set(o, f, v, true)` for the f64 index in local `f` (`kv` an i64 temp).
 fn set_at(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     (o, f, v, kv): (u32, u32, u32, u32),
     strings: &StrOffsets,
@@ -2653,7 +2666,7 @@ fn set_at(
 /// `DeletePropertyOrThrow(o, f)` for the f64 index in local `f` (`kv` an i64
 /// temp).
 fn delete_at(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     (o, f, kv): (u32, u32, u32),
     strings: &StrOffsets,
@@ -2668,7 +2681,7 @@ fn delete_at(
 /// `HasProperty(o, from)`, `Set(o, to, Get(o, from), true)`, else
 /// `DeletePropertyOrThrow(o, to)` (f64 indices; `key`, `v`, `kv` temps).
 fn move_or_delete(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     (o, from, to): (u32, u32, u32),
     (key, v, kv): (u32, u32, u32),
@@ -2687,7 +2700,7 @@ fn move_or_delete(
 /// `Set(o, "length", f, true)` for the f64 length in local `f` (`kv` an i64
 /// temp).
 fn set_length_f64(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     (o, f, kv): (u32, u32, u32),
     strings: &StrOffsets,
@@ -2702,10 +2715,10 @@ fn set_length_f64(
 /// integer, so the sum rounds past [`MAX_SAFE_INTEGER`] only when it is past
 /// it) exceeds [`MAX_SAFE_INTEGER`].
 fn check_new_length(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     len: u32,
-    delta: impl FnOnce(&mut Function),
+    delta: impl FnOnce(&mut FnBuilder<'_>),
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
@@ -2729,7 +2742,7 @@ fn check_new_length(
 /// `Set(O, "length", len - actualDeleteCount + itemCount)`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_splice(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2737,7 +2750,7 @@ pub(super) fn emit_splice(
     let (o, v, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (dc_v, saved) = (frame.x64(0), frame.x64(1));
     let (count, target) = (frame.y64(1), frame.y64(4));
-    let (key, arg_i, argn) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (key, arg_i, argn) = (frame.base(0), frame.i32(1), frame.i32(2));
     let r = frame.f64(0);
     let (len, start) = (frame.yf64(0), frame.yf64(1));
     let (dc, items, k) = (frame.zf64(0), frame.zf64(1), frame.zf64(2));
@@ -2864,13 +2877,13 @@ pub(super) fn emit_splice(
 /// `lower < floor(len / 2)`, by `HasProperty` / `Get` of both, then `Set` of
 /// the present ones and `DeletePropertyOrThrow` of the absent ones.
 pub(super) fn emit_reverse(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, lv, uv, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (key, lower_present, upper_present) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (key, lower_present, upper_present) = (frame.base(0), frame.i32(1), frame.i32(2));
     let (len, lower) = (frame.yf64(0), frame.yf64(1));
     let (upper, middle) = (frame.zf64(0), frame.zf64(1));
     this_object(function, frame, o, REVERSE.nullish, strings, helpers);
@@ -2914,13 +2927,13 @@ pub(super) fn emit_reverse(
 /// `undefined`; else `first = Get(O, "0")`, each index `1..len` moves down
 /// one, the last index is deleted and `length` becomes `len - 1`.
 pub(super) fn emit_shift(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, first, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let key = frame.i32(0);
+    let key = frame.base(0);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     let to = frame.zf64(0);
     this_object(function, frame, o, SHIFT.nullish, strings, helpers);
@@ -2956,13 +2969,13 @@ pub(super) fn emit_shift(
 /// the items are `Set` from 0; `length` becomes (and the call returns)
 /// `len + argCount`.
 pub(super) fn emit_unshift(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, saved) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
-    let (key, arg_i, argn) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (key, arg_i, argn) = (frame.base(0), frame.i32(1), frame.i32(2));
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     let (from, to, items) = (frame.zf64(0), frame.zf64(1), frame.zf64(2));
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(saved));
@@ -3014,7 +3027,7 @@ pub(super) fn emit_unshift(
 /// each `k` in `[relative start, relative end)` (`end` is `len` when
 /// `undefined`).
 pub(super) fn emit_fill(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -3049,14 +3062,14 @@ pub(super) fn emit_fill(
 /// `count = min(final - from, len - to)`; the move runs downwards when the
 /// ranges overlap with `from < to`, and each step moves or deletes one index.
 pub(super) fn emit_copy_within(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, v, kv, target_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (start_v, end_v) = (frame.x64(0), frame.x64(1));
-    let key = frame.i32(0);
+    let key = frame.base(0);
     let r = frame.f64(0);
     let (len, to) = (frame.yf64(0), frame.yf64(1));
     let (from, fin, count, dir) = (frame.zf64(0), frame.zf64(1), frame.zf64(2), frame.zf64(3));
@@ -3108,7 +3121,7 @@ pub(super) fn emit_copy_within(
 /// Push the address of pair `p` (an i32 local) of the sort buffer whose array
 /// handle base is in i32 `buf`: its sort key at [`elem_slot`] 0, its value at
 /// slot 1.
-fn pair_at(function: &mut Function, buf: u32, p: u32) {
+fn pair_at(function: &mut FnBuilder<'_>, buf: u32, p: u32) {
     wasm!(function; LocalGet(buf));
     emit_array_elems(function);
     wasm!(function; LocalGet(p), I32Const(4), I32Shl, I32Add);
@@ -3132,14 +3145,14 @@ fn pair_at(function: &mut Function, buf: u32, p: u32) {
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_sort(
     copy: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, cmp, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (lhs, rhs, result, this_arg) = (frame.x64(0), frame.x64(1), frame.y64(1), frame.y64(4));
-    let (src, dst, pairs, width) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (src, dst, pairs, width) = (frame.base(0), frame.base(1), frame.i32(2), frame.i32(3));
     let (lo, mid) = (frame.x32(0), frame.x32(1));
     let (hi, left, right, out) = (frame.y32(0), frame.y32(1), frame.y32(2), frame.y32(3));
     // The key temp of the read and write-back loops (the merge is done or
@@ -3163,7 +3176,7 @@ pub(super) fn emit_sort(
     if copy {
         array_create_f64(function, frame, (len, kv, target), strings, helpers);
     }
-    let default_order = |function: &mut Function| {
+    let default_order = |function: &mut FnBuilder<'_>| {
         wasm!(function; LocalGet(cmp), I64Const(UNDEFINED_BITS), I64Eq);
     };
     // Collect.
@@ -3213,7 +3226,7 @@ pub(super) fn emit_sort(
         I64Const(UNDEFINED_BITS), LocalSet(this_arg),
     );
     // Push i32 `1` when pair `right` sorts strictly before pair `left`.
-    let less = |function: &mut Function| {
+    let less = |function: &mut FnBuilder<'_>| {
         pair_at(function, src, right);
         wasm!(function; I64Load(elem_slot(0)), LocalSet(lhs));
         pair_at(function, src, left);
@@ -3235,7 +3248,7 @@ pub(super) fn emit_sort(
         );
     };
     // dst[out] = src[pair], then pair += 1 and out += 1.
-    let take = |function: &mut Function, pair: u32| {
+    let take = |function: &mut FnBuilder<'_>, pair: u32| {
         for slot in 0..2 {
             pair_at(function, dst, out);
             pair_at(function, src, pair);
@@ -3299,7 +3312,7 @@ pub(super) fn emit_sort(
         },
     );
     // Write back the values, the `undefined`s, then delete up to `len`.
-    let put = |function: &mut Function| {
+    let put = |function: &mut FnBuilder<'_>| {
         if copy {
             put_at(function, frame, (target, k, v, kv), strings, helpers);
         } else {
@@ -3340,7 +3353,7 @@ pub(super) fn emit_sort(
 
 /// `Get(o, f)` into i64 `v` for the f64 index in local `f` (`key` an i32
 /// temp); a throwing getter returns.
-fn get_at(function: &mut Function, o: u32, f: u32, key: u32, v: u32, helpers: Helpers<'_>) {
+fn get_at(function: &mut FnBuilder<'_>, o: u32, f: u32, key: u32, v: u32, helpers: Helpers<'_>) {
     num(function, f);
     wasm!(function; I32Const(1), Call(helpers.to_key), LocalSet(key));
     get_key(function, o, key, v, helpers);
@@ -3349,7 +3362,7 @@ fn get_at(function: &mut Function, o: u32, f: u32, key: u32, v: u32, helpers: He
 /// `CreateDataPropertyOrThrow(a, f, v)` for the f64 index in local `f` (`kv`
 /// an i64 temp).
 fn put_at(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     (a, f, v, kv): (u32, u32, u32, u32),
     strings: &StrOffsets,
@@ -3363,7 +3376,7 @@ fn put_at(
 /// `ArrayCreate(len)` into i64 `out` for the f64 length in local `len` (`kv`
 /// an i64 temp): a length past `2^32 - 1` throws the `RangeError`.
 fn array_create_f64(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     (len, kv, out): (u32, u32, u32),
     strings: &StrOffsets,
@@ -3380,14 +3393,14 @@ fn array_create_f64(
 /// ArrayCreate(len)` gets `value` at `actualIndex` and `Get(O, k)` (holes
 /// read `undefined`) everywhere else.
 pub(super) fn emit_with(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, value, kv, index_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (copy, elem) = (frame.x64(0), frame.x64(1));
-    let key = frame.i32(0);
+    let key = frame.base(0);
     let r = frame.f64(0);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
     frame.arg(function, 0);
@@ -3434,13 +3447,13 @@ pub(super) fn emit_with(
 /// `Array.prototype.toReversed()`: `A = ArrayCreate(len)` gets `Get(O, len -
 /// 1 - k)` at each `k` (a hole reads through the prototype chain).
 pub(super) fn emit_to_reversed(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, a, v, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let key = frame.i32(0);
+    let key = frame.base(0);
     let (len, k, from) = (frame.yf64(0), frame.yf64(1), frame.zf64(0));
     this_object(function, frame, o, TO_REVERSED.nullish, strings, helpers);
     length_of_f64(function, o, len, strings, helpers);
@@ -3469,14 +3482,14 @@ pub(super) fn emit_to_reversed(
 /// `Get(O, i + actualSkipCount - itemCount)` up to `newLen` (holes read
 /// `undefined`).
 pub(super) fn emit_to_spliced(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, elem, kv, start_v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (sc_v, saved, copy) = (frame.x64(0), frame.x64(1), frame.y64(0));
-    let (key, arg_i, argn) = (frame.i32(0), frame.i32(1), frame.i32(2));
+    let (key, arg_i, argn) = (frame.base(0), frame.i32(1), frame.i32(2));
     let r = frame.f64(0);
     let (len, start) = (frame.yf64(0), frame.yf64(1));
     let (sc, items, i) = (frame.zf64(0), frame.zf64(1), frame.zf64(2));

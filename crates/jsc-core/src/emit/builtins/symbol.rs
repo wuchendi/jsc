@@ -62,7 +62,7 @@ pub(super) const STRINGS: [&str; 15] = [
 ];
 
 /// Push i32 `1` when the jsval in `local` is a symbol.
-fn is_symbol(function: &mut Function, local: u32) {
+fn is_symbol(function: &mut FnBuilder<'_>, local: u32) {
     emit_is_pointer(function, local);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -72,7 +72,7 @@ fn is_symbol(function: &mut Function, local: u32) {
 /// Push the jsval of a fresh symbol block with header `flags` and the
 /// description jsval in i64 `description` (i32 `block` is a temp).
 fn new_symbol(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     flags: u8,
     description: u32,
     block: u32,
@@ -90,7 +90,7 @@ fn new_symbol(
 }
 
 /// Push the description jsval of the symbol in i64 `symbol`.
-fn load_description(function: &mut Function, symbol: u32) {
+fn load_description(function: &mut FnBuilder<'_>, symbol: u32) {
     wasm!(function;
         LocalGet(symbol), I32WrapI64,
         I64Load(MemArg { offset: u64::from(abi::SYMBOL_DESCRIPTION_OFFSET), align: 3, memory_index: 0 }),
@@ -100,12 +100,12 @@ fn load_description(function: &mut Function, symbol: u32) {
 /// `Symbol(description)`: a fresh symbol whose description is `undefined`
 /// or `ToString(description)`; `new Symbol()` throws.
 pub(super) fn emit_ctor(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (description, block) = (frame.i64(0), frame.i32(0));
+    let (description, block) = (frame.i64(0), frame.base(0));
     emit_is_construct_call(function, frame.argc());
     wasm!(function; If(BlockType::Empty));
     throw_type_error(function, frame, NOT_A_CONSTRUCTOR, strings, helpers);
@@ -125,7 +125,7 @@ pub(super) fn emit_ctor(
 /// Emit the body of the `Symbol` static or `%Symbol.prototype%` builtin `op`.
 pub(super) fn emit(
     op: SymbolOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -139,8 +139,9 @@ pub(super) fn emit(
 
 /// `Symbol.for(key)`: the registered symbol of `ToString(key)` (interned),
 /// created with `REGISTERED` and that key as its description on a miss.
-fn emit_for(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
-    let (description, key, entry, block) = (frame.i64(0), frame.i32(0), frame.i32(1), frame.i32(2));
+fn emit_for(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
+    let (description, key, entry, block) =
+        (frame.i64(0), frame.base(0), frame.i32(1), frame.base(2));
     let registry = intrinsic_bits(realm::Intrinsic::SymbolRegistry, helpers);
     frame.arg(function, 0);
     wasm!(function; Call(helpers.to_str()), LocalSet(key));
@@ -172,7 +173,12 @@ fn emit_for(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
 
 /// `Symbol.keyFor(sym)`: the key of a registered symbol, `undefined` for any
 /// other symbol, a `TypeError` for a non-symbol.
-fn emit_key_for(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
+fn emit_key_for(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     let symbol = frame.i64(0);
     frame.arg(function, 0);
     wasm!(function; LocalSet(symbol));
@@ -195,7 +201,7 @@ fn emit_key_for(function: &mut Function, frame: Frame, strings: &StrOffsets, hel
 /// (the symbol) or the `description` getter.
 fn emit_method(
     op: SymbolOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
