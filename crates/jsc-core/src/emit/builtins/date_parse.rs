@@ -38,7 +38,7 @@ struct Cursor {
 
 impl Cursor {
     /// Push the code unit at the cursor, or `-1` at the end.
-    fn peek(self, function: &mut Function) {
+    fn peek(self, function: &mut FnBuilder<'_>) {
         wasm!(function;
             LocalGet(self.i), LocalGet(self.len), I32LtS,
             If(BlockType::Result(ValType::I32)),
@@ -48,18 +48,18 @@ impl Cursor {
     }
 
     /// Push whether the unit at the cursor is `unit`.
-    fn at(self, function: &mut Function, unit: u8) {
+    fn at(self, function: &mut FnBuilder<'_>, unit: u8) {
         self.peek(function);
         wasm!(function; I32Const(i32::from(unit)), I32Eq);
     }
 
     /// Advance the cursor by one unit.
-    fn bump(self, function: &mut Function) {
+    fn bump(self, function: &mut FnBuilder<'_>) {
         wasm!(function; LocalGet(self.i), I32Const(1), I32Add, LocalSet(self.i));
     }
 
     /// Consume the units of `text`, else `NaN`.
-    fn expect(self, function: &mut Function, text: &str) {
+    fn expect(self, function: &mut FnBuilder<'_>, text: &str) {
         for unit in text.bytes() {
             self.at(function, unit);
             wasm!(function; I32Eqz);
@@ -69,7 +69,7 @@ impl Cursor {
     }
 
     /// Consume exactly `count` decimal digits into `c`, else `NaN`.
-    fn digits(self, function: &mut Function, count: i32) {
+    fn digits(self, function: &mut FnBuilder<'_>, count: i32) {
         wasm!(function;
             I32Const(0), LocalSet(self.c), I32Const(count), LocalSet(self.n),
             Loop(BlockType::Empty),
@@ -88,7 +88,7 @@ impl Cursor {
     }
 
     /// Consume four to six decimal digits into `c`, else `NaN`.
-    fn year_digits(self, function: &mut Function) {
+    fn year_digits(self, function: &mut FnBuilder<'_>) {
         wasm!(function;
             I32Const(0), LocalSet(self.c), I32Const(0), LocalSet(self.n),
             Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -110,7 +110,7 @@ impl Cursor {
     }
 
     /// `NaN` unless `lo <= c <= hi`.
-    fn check(self, function: &mut Function, lo: i32, hi: i32) {
+    fn check(self, function: &mut FnBuilder<'_>, lo: i32, hi: i32) {
         wasm!(function;
             LocalGet(self.c), I32Const(lo), I32LtS,
             LocalGet(self.c), I32Const(hi), I32GtS, I32Or,
@@ -120,7 +120,7 @@ impl Cursor {
 
     /// Consume a three-letter name of `table` (three-byte entries) into `c`
     /// as its index, else `NaN`.
-    fn name(self, function: &mut Function, table: &str) {
+    fn name(self, function: &mut FnBuilder<'_>, table: &str) {
         wasm!(function; I32Const(0), LocalSet(self.n));
         for _ in 0..3 {
             self.peek(function);
@@ -144,7 +144,7 @@ impl Cursor {
     }
 
     /// Store `c` (plus `bias`) as a number jsval into i64 `field`.
-    fn store(self, function: &mut Function, field: u32, bias: i32) {
+    fn store(self, function: &mut FnBuilder<'_>, field: u32, bias: i32) {
         wasm!(function;
             LocalGet(self.c), I32Const(bias), I32Add,
             F64ConvertI32S, I64ReinterpretF64, LocalSet(field),
@@ -153,12 +153,12 @@ impl Cursor {
 }
 
 /// Return `NaN` when the i32 on the stack is nonzero.
-fn fail_if(function: &mut Function) {
+fn fail_if(function: &mut FnBuilder<'_>) {
     wasm!(function; If(BlockType::Empty), I64Const(QNAN_BITS), Return, End);
 }
 
 /// Push the small integral number jsval in i64 `field` as an i32.
-fn field_i32(function: &mut Function, field: u32) {
+fn field_i32(function: &mut FnBuilder<'_>, field: u32) {
     wasm!(function; LocalGet(field), F64ReinterpretI64, I32TruncSatF64S);
 }
 
@@ -174,7 +174,7 @@ struct Fields {
 }
 
 /// The `HH:mm:ss` of the text forms into the time fields.
-fn text_time(function: &mut Function, p: Cursor, f: Fields) {
+fn text_time(function: &mut FnBuilder<'_>, p: Cursor, f: Fields) {
     p.digits(function, 2);
     p.check(function, 0, 23);
     p.store(function, f.time[0], 0);
@@ -188,7 +188,7 @@ fn text_time(function: &mut Function, p: Cursor, f: Fields) {
 
 /// A signed year of the text forms (`-` then four to six digits; `-0000`
 /// rejected) into the year field.
-fn text_year(function: &mut Function, p: Cursor, f: Fields, sign: u32) {
+fn text_year(function: &mut FnBuilder<'_>, p: Cursor, f: Fields, sign: u32) {
     p.at(function, b'-');
     wasm!(function; LocalTee(sign));
     wasm!(function; If(BlockType::Empty));
@@ -202,14 +202,14 @@ fn text_year(function: &mut Function, p: Cursor, f: Fields, sign: u32) {
 }
 
 /// `c = sign ? -c : c`.
-fn negate_if(function: &mut Function, p: Cursor, sign: u32) {
+fn negate_if(function: &mut FnBuilder<'_>, p: Cursor, sign: u32) {
     wasm!(function;
         I32Const(0), LocalGet(p.c), I32Sub, LocalGet(p.c), LocalGet(sign), Select, LocalSet(p.c),
     );
 }
 
 /// The `toString` / `toUTCString` forms, after the weekday name.
-fn emit_text(function: &mut Function, p: Cursor, f: Fields, sign: u32) {
+fn emit_text(function: &mut FnBuilder<'_>, p: Cursor, f: Fields, sign: u32) {
     p.at(function, b',');
     wasm!(function; If(BlockType::Empty));
     // `toUTCString`: `, DD Mmm YYYY HH:mm:ss GMT`.
@@ -271,7 +271,7 @@ fn emit_text(function: &mut Function, p: Cursor, f: Fields, sign: u32) {
 }
 
 /// The Date Time String Format.
-fn emit_iso(function: &mut Function, p: Cursor, f: Fields, sign: u32) {
+fn emit_iso(function: &mut FnBuilder<'_>, p: Cursor, f: Fields, sign: u32) {
     // The year: `±YYYYYY` (not `-000000`) or `YYYY`.
     p.at(function, b'-');
     wasm!(function; LocalTee(sign));
@@ -352,7 +352,7 @@ fn emit_iso(function: &mut Function, p: Cursor, f: Fields, sign: u32) {
 }
 
 /// `NaN` unless the day field is within its month (leap years included).
-fn check_day(function: &mut Function, p: Cursor, f: Fields) {
+fn check_day(function: &mut FnBuilder<'_>, p: Cursor, f: Fields) {
     let (year, month) = (p.n, p.d);
     field_i32(function, f.year);
     wasm!(function; LocalSet(year));
@@ -382,7 +382,7 @@ fn check_day(function: &mut Function, p: Cursor, f: Fields) {
 /// The internal parser body: `this` is a string; returns the `TimeClip`ped
 /// time value it denotes, or `NaN`.
 pub(super) fn emit_parse_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -463,7 +463,7 @@ fn parse_time(frame: Frame, f: Fields, offset_ms: u32) -> IrNode {
 
 /// `Date.parse(string)`: `ToString(string)`, then the internal parser with
 /// it as `this`.
-pub(super) fn emit_parse(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+pub(super) fn emit_parse(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let string = frame.i64(0);
     frame.arg(function, 0);
     wasm!(function; Call(helpers.to_str()), LocalSet(frame.i32(0)));

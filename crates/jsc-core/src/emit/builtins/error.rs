@@ -19,7 +19,7 @@ pub(super) const STRINGS: [&str; 3] = [NOT_OBJECT[0], NOT_OBJECT[1], SEPARATOR];
 /// is `undefined`, else `ToString` of it.
 #[allow(clippy::too_many_arguments)]
 fn string_field(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     this: u32,
     value: u32,
     out: u32,
@@ -45,13 +45,13 @@ fn string_field(
 /// `Error.prototype.toString()`: `name` (default `"Error"`) and `message`
 /// (default `""`) joined by `": "`, either alone when the other is empty.
 pub(super) fn emit_to_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, value) = (frame.i64(0), frame.i64(1));
-    let (name, message) = (frame.i32(0), frame.i32(1));
+    let (name, message) = (frame.base(0), frame.base(1));
     let len = MemArg {
         offset: u64::from(abi::STR_LEN_OFFSET),
         align: 2,
