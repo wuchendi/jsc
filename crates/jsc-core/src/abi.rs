@@ -718,7 +718,21 @@ pub(crate) const OOM_LINE_ADDR: u32 = OOM_IOVEC + 8;
 pub(crate) const OOM_LINE: &str = "Uncaught RangeError: out of memory\n";
 
 /// The first address after the fixed static area, where the string blocks begin.
-pub(crate) const STATIC_AREA_END: u32 = OOM_LINE_ADDR + 40;
+pub(crate) const STATIC_AREA_END: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
+
+/// Address of the static `Number` formatting scratch, right after the
+/// [`OOM_LINE`] bytes.
+pub(crate) const NUM_SCRATCH_ADDR: u32 = OOM_LINE_ADDR + 40;
+
+/// Size of [`NUM_SCRATCH_ADDR`].
+pub(crate) const NUM_SCRATCH_SIZE: u32 = 2048;
+
+/// Address of the static Ryu power-of-5 tables, right after the scratch.
+pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
+
+/// Size of the Ryu tables (828 bytes), rounded up to keep the string blocks
+/// 8-aligned.
+pub(crate) const RYU_TABLES_SIZE: u32 = 832;
 
 /// The field name of the host `__convert` import backing the
 /// `String`/`Number`/`parseFloat` conversions.

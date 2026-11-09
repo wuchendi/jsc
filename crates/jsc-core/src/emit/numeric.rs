@@ -1036,7 +1036,7 @@ pub(super) fn emit_convert_call(
 /// Replace a symbol in i64 local `local` with its `SymbolDescriptiveString`:
 /// `"Symbol(" + description + ")"`, an `undefined` description as `""`. The
 /// i64 local `local + 1` is clobbered.
-fn emit_symbol_descriptive_string(
+pub(super) fn emit_symbol_descriptive_string(
     function: &mut Function,
     local: u32,
     strings: &StrOffsets,

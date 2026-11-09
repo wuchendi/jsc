@@ -2185,9 +2185,7 @@ fn emit_index_string_key(
     function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
     function.instruction(&Instruction::Call(helpers.convert));
     function.instruction(&Instruction::LocalTee(tmp));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.num_to_str()));
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(helpers.str_eq));
@@ -2929,9 +2927,7 @@ pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> 
     select(&mut function, NULLISH_SET_MID, NULLISH_READ_MID);
     concat(&mut function);
     function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.msg_str()));
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at(NULLISH_SUFFIX)));
     concat(&mut function);
@@ -3017,9 +3013,7 @@ pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
     };
     let to_string = |function: &mut Function, local: u32| {
         function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-        function.instruction(&Instruction::Call(helpers.convert));
-        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::Call(helpers.msg_str()));
     };
 
     function.instruction(&Instruction::LocalGet(mode));

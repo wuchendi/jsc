@@ -1140,15 +1140,18 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
 /// `JSON.stringify` (`__json_rep` serializes arrays and objects). Returns the
 /// base offset of a heap string holding `v`'s JSON form:
 ///
-/// - number: `__convert(v, TO_STRING)` when finite (reusing the EXISTING host
-///   import — no new import), else the token `"null"` (JSON renders NaN/Infinity
-///   as null);
+/// - number: `__num_to_str(v)` when finite (`num_to_str_index`), else the token
+///   `"null"` (JSON renders NaN/Infinity as null);
 /// - `true`/`false`/`null`: the matching keyword token; `undefined`: `"null"`;
 /// - string: `__json_escape` (`escape_index`);
 /// - any other heap kind: `"null"`.
 ///
 /// Param `v` occupies local 0; one `i32` local holds the string accumulator.
-pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonTokens) -> Function {
+pub(super) fn emit_json_str(
+    num_to_str_index: u32,
+    escape_index: u32,
+    tokens: JsonTokens,
+) -> Function {
     let mut function = Function::new(vec![(1, ValType::I32)]);
     let v = 0;
     let acc = 1;
@@ -1197,7 +1200,7 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
     function.instruction(&Instruction::I32Const(tokens.null));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::Else);
-    // number: finite (x - x == 0) ? __convert(v, TO_STRING) : "null".
+    // number: finite (x - x == 0) ? __num_to_str(v) : "null".
     function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(v));
@@ -1207,9 +1210,7 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(convert_index));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(num_to_str_index));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(tokens.null));

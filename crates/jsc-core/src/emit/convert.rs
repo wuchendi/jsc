@@ -220,8 +220,8 @@ pub(super) fn emit_to_primitive(strings: &StrOffsets, helpers: Helpers<'_>) -> F
 
 /// `__to_string(v: i64) -> i32`: `ToString(v)` as a heap-string base. A
 /// string is itself; an object is first converted with hint string; a symbol
-/// throws the `TypeError`; the remaining primitives are formatted by the
-/// host. A pending throw returns the empty string.
+/// throws the `TypeError`; the remaining primitives go through `__prim_str`.
+/// A pending throw returns the empty string.
 pub(super) fn emit_to_string(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (v, scratch) = (0, 1);
     let mut f = Function::new(type_error_helper_locals());
@@ -250,7 +250,7 @@ pub(super) fn emit_to_string(strings: &StrOffsets, helpers: Helpers<'_>) -> Func
         If(BlockType::Result(ValType::I32)),
         LocalGet(v), I32WrapI64,
         Else,
-        LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        LocalGet(v), Call(helpers.prim_str()),
         End,
         End,
         End,
@@ -289,8 +289,7 @@ pub(super) fn emit_add_helper(helpers: Helpers<'_>) -> Function {
         wasm!(f; End);
     }
     // Both operands are primitives now: a string is its own `ToString`, the
-    // rest go through `__to_string` (a symbol throws, the host formats the
-    // others).
+    // rest go through `__to_string` (a symbol throws).
     let primitive_to_string = |f: &mut Function, x: u32, kind: u32| {
         wasm!(f;
             LocalGet(kind), I32Eqz,

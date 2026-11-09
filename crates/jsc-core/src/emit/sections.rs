@@ -131,6 +131,13 @@ pub(super) fn build_type_and_function_sections<'a>(
         prop_throw: index(),
         box_f64: index(),
         to_number: index(),
+        dtoa: {
+            let first = index();
+            for _ in 1..dtoa::HELPER_COUNT {
+                index();
+            }
+            first
+        },
         // The `__invoke1` callback trampoline is appended after every helper
         // above; the `__async_step` trampoline follows it, then the two
         // `new Promise` settler functions.
@@ -424,6 +431,19 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         // `__box_f64(x) -> i64` and `__to_number(v) -> i64`.
         (&[F64], &[I64]),
         (&[I64], &[I64]),
+        // The `Number` to string helpers, in `dtoa::emit_helpers` order.
+        (&[I64, I64], &[I64, I64]),
+        (&[I32, I32], &[I64, I64]),
+        (&[I64, I64, I64, I32], &[I64]),
+        (&[I64, I32], &[I32]),
+        (&[I64], &[I64, I32]),
+        (&[I32, I32], &[I32]),
+        (&[I64], &[I32]),
+        (&[I64], &[I32, I32, I32]),
+        (&[I64, I32, I32], &[I32]),
+        (&[I64, I32], &[I32]),
+        (&[I64], &[I32]),
+        (&[I64], &[I32]),
         // The `__invoke1(fn, arg)` and `__async_step(gen, sent)` trampolines.
         (&[I64, I64], &[I64]),
         (&[I64, I64], &[I64]),
@@ -563,6 +583,11 @@ pub(super) fn emit_data_section(
     oom.extend_from_slice(&u32::try_from(line.len()).unwrap_or(0).to_le_bytes());
     oom.extend_from_slice(line);
     data.active(0, &ConstExpr::i32_const(abi::OOM_IOVEC.cast_signed()), oom);
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::RYU_TABLES_ADDR.cast_signed()),
+        dtoa::tables(),
+    );
     for (text, offset) in segments {
         data.active(0, &ConstExpr::i32_const(offset), str_block(text));
     }
@@ -695,6 +720,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     let realm_strs = realm::strings()
         .chain(builtins::strings())
         .chain(convert::strings())
+        .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY])
         .chain(FN_KEYS);
