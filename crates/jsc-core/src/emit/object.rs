@@ -2316,7 +2316,7 @@ pub(super) fn emit_size_read(
         recv,
         ProtoKind::Collection,
         sealed,
-        scratch + 3,
+        scratch + KIND_TMP,
         helpers,
     );
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));

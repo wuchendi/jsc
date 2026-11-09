@@ -3,7 +3,7 @@ use super::*;
 
 /// A builder with the user-function layout: `params` parameters (the `K`
 /// jsval arguments, `env`, and a raw `argc` when present), the IR locals up to
-/// `locals` as jsvals, then the 30 scratch locals of [`emit_main`].
+/// `locals` as jsvals, then the 33 scratch locals of [`emit_main`].
 pub(super) fn user_builder(params: u32, locals: u32, leaves: &LeafSet) -> FnBuilder<'_> {
     use LocalClass::{Base, Jsval, Raw};
     let mut b = FnBuilder::new(leaves);
@@ -26,8 +26,20 @@ pub(super) fn user_builder(params: u32, locals: u32, leaves: &LeafSet) -> FnBuil
     b.locals(1, Base); // +21
     b.locals(2, Jsval); // +22, +23
     b.locals(6, Raw(ValType::I64)); // +24..+29 (Date arithmetic)
+    b.locals(1, Raw(ValType::I32)); // +30 (KIND_TMP)
+    b.locals(2, Raw(ValType::I64)); // +31, +32 (NUM_A, NUM_B)
     b
 }
+
+/// The raw `i32` scratch local of a receiver kind test (`scratch + KIND_TMP`):
+/// a base read and dropped with no safepoint in between, so never rooted.
+pub(super) const KIND_TMP: u32 = 30;
+
+/// The raw `i64` scratch of the numeric operators (`scratch + NUM_A`, `NUM_B`):
+/// operands stashed for their `ToNumber` and tag tests. Never rooted: a heap
+/// value in one is only passed by value, or rooted by the cold coerce arm.
+pub(super) const NUM_A: u32 = 31;
+pub(super) const NUM_B: u32 = 32;
 
 /// A jsval local or parameter, written through to its root slot when live.
 pub(super) const ROOT_JS: LocalClass = LocalClass::Jsval;
@@ -121,6 +133,8 @@ pub(super) fn emit_main(
     // Six more i64 slots (`+24`..`+29`) are the `Date` field-method scratch: the
     // guest-side civil-from-days / time-of-day arithmetic runs entirely over these
     // (a `Date` method takes no arguments, so no child sub-expression is live).
+    // One raw i32 (`+30`, `KIND_TMP`) holds a receiver's kind for one test, and two
+    // raw i64 (`+31`/`+32`, `NUM_A`/`NUM_B`) stash the numeric operators' operands.
     let mut function = user_builder(0, program.locals, leaves);
     let scratch = program.locals;
     // Fresh unwinding state for this function body: no active `try`

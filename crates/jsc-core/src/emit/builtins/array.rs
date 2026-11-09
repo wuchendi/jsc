@@ -1121,7 +1121,7 @@ pub(super) fn push_call(
         push(function, args.get(slot as usize));
     }
     if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 35;
+        let spread = frame.scratch() + 38;
         let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
         wasm!(function; I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(spread));
         for (j, arg) in (0u64..).zip(args) {
