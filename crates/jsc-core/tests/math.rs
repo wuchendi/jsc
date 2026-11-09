@@ -355,7 +355,8 @@ fn ordinal(x: f64) -> i128 {
     i128::from(if bits < 0 { i64::MIN - bits } else { bits })
 }
 
-/// Run one guest expression per input and return its results, in order.
+/// Run one guest expression per input and return its results, in order
+/// (`-0` is printed with its sign so results round-trip bit-exactly).
 /// `call` renders the JS expression for input index expression `i`.
 fn guest_results(literals: &[Vec<f64>], call: &str) -> Vec<f64> {
     let decls: Vec<String> = ["xs", "ys"]
@@ -367,7 +368,7 @@ fn guest_results(literals: &[Vec<f64>], call: &str) -> Vec<f64> {
         })
         .collect();
     let src = format!(
-        "{}let out = \"\"; for (let i = 0; i < xs.length; i++) {{ out += {call} + \"\\n\"; }}\n\
+        "{}let out = \"\"; for (let i = 0; i < xs.length; i++) {{ const v = {call}; out += (Object.is(v, -0) ? \"-0\" : v) + \"\\n\"; }}\n\
          console.log(out);\n",
         decls.concat()
     );
@@ -380,26 +381,44 @@ fn guest_results(literals: &[Vec<f64>], call: &str) -> Vec<f64> {
         .collect()
 }
 
-/// Assert one guest result is within an ulp of the std result.
-fn assert_close(label: &str, input: (f64, f64), guest: f64, expected: f64) {
-    let close = if expected.is_nan() {
+/// Assert one guest result has the same bits as the `libm` crate's result
+/// (any two NaNs are equal).
+fn assert_bit_exact(label: &str, input: (f64, f64), guest: f64, reference: f64) {
+    let same = if reference.is_nan() {
         guest.is_nan()
     } else {
-        (ordinal(guest) - ordinal(expected)).abs() <= 1
+        guest.to_bits() == reference.to_bits()
     };
     assert!(
-        close,
-        "{label}{input:?}: guest {guest:e} ({:#018x}), std {expected:e} ({:#018x})",
+        same,
+        "{label}{input:?}: guest {guest:e} ({:#018x}), libm {reference:e} ({:#018x})",
         guest.to_bits(),
-        expected.to_bits()
+        reference.to_bits()
     );
 }
 
-/// One sampled function: its `Math` name, the std reference and its inputs.
-type Sampled<'a> = (&'a str, fn(f64) -> f64, &'a [Spread]);
+/// The Rust `std` sanity bound in ulps. `std` is the platform libm, so it may
+/// differ from msun by a few ulps; 4096 ulps (about 12 bits of the mantissa)
+/// cannot be reached by that difference and only catches gross errors.
+const STD_SANITY_ULPS: i128 = 4096;
 
-/// The guest libm agrees with Rust `std` within one ulp on a deterministic
-/// sample of every transcendental, and exactly on the special values.
+/// Assert one guest result is roughly the `std` result.
+fn assert_near_std(label: &str, input: (f64, f64), guest: f64, native: f64) {
+    let near = if native.is_nan() {
+        guest.is_nan()
+    } else {
+        (ordinal(guest) - ordinal(native)).abs() <= STD_SANITY_ULPS
+    };
+    assert!(near, "{label}{input:?}: guest {guest:e}, std {native:e}");
+}
+
+/// One sampled function: its `Math` name, the `libm` reference, the std
+/// sanity reference and its inputs.
+type Sampled<'a> = (&'a str, fn(f64) -> f64, fn(f64) -> f64, &'a [Spread]);
+
+/// The guest libm is bit-exact with the `libm` crate it was ported from on a
+/// deterministic sample of every transcendental, coarsely agrees with Rust
+/// `std`, and is exact on the special values.
 #[test]
 fn libm_matches_std_sample() {
     let trig: &[Spread] = &[
@@ -413,40 +432,48 @@ fn libm_matches_std_sample() {
     let exp: &[Spread] = &[Uniform(-700.0, 700.0), SignedLog(1e-300, 1.0)];
     let hyper: &[Spread] = &[Uniform(-30.0, 30.0), Uniform(-700.0, 700.0)];
     let functions: [Sampled<'_>; 19] = [
-        ("cbrt", f64::cbrt, wide),
-        ("log", f64::ln, log),
-        ("log2", f64::log2, log),
-        ("log10", f64::log10, log),
+        ("cbrt", libm::cbrt, f64::cbrt, wide),
+        ("log", libm::log, f64::ln, log),
+        ("log2", libm::log2, f64::log2, log),
+        ("log10", libm::log10, f64::log10, log),
         (
             "log1p",
+            libm::log1p,
             f64::ln_1p,
             &[Uniform(-0.99, 10.0), Log(1e-300, 1e300)],
         ),
-        ("exp", f64::exp, exp),
-        ("expm1", f64::exp_m1, exp),
-        ("sin", f64::sin, trig),
-        ("cos", f64::cos, trig),
-        ("tan", f64::tan, trig),
-        ("asin", f64::asin, unit),
-        ("acos", f64::acos, unit),
-        ("atan", f64::atan, wide),
-        ("sinh", f64::sinh, hyper),
-        ("cosh", f64::cosh, hyper),
+        ("exp", libm::exp, f64::exp, exp),
+        ("expm1", libm::expm1, f64::exp_m1, exp),
+        ("sin", libm::sin, f64::sin, trig),
+        ("cos", libm::cos, f64::cos, trig),
+        ("tan", libm::tan, f64::tan, trig),
+        ("asin", libm::asin, f64::asin, unit),
+        ("acos", libm::acos, f64::acos, unit),
+        ("atan", libm::atan, f64::atan, wide),
+        ("sinh", libm::sinh, f64::sinh, hyper),
+        ("cosh", libm::cosh, f64::cosh, hyper),
         (
             "tanh",
+            libm::tanh,
             f64::tanh,
             &[Uniform(-20.0, 20.0), SignedLog(1e-300, 1.0)],
         ),
-        ("asinh", f64::asinh, wide),
-        ("acosh", f64::acosh, &[Log(1.0, 1e300), Uniform(1.0, 10.0)]),
-        ("atanh", f64::atanh, unit),
+        ("asinh", libm::asinh, f64::asinh, wide),
+        (
+            "acosh",
+            libm::acosh,
+            f64::acosh,
+            &[Log(1.0, 1e300), Uniform(1.0, 10.0)],
+        ),
+        ("atanh", libm::atanh, f64::atanh, unit),
     ];
-    for (seed, (name, native, spreads)) in (1_u64..).zip(functions) {
+    for (seed, (name, reference, native, spreads)) in (1_u64..).zip(functions) {
         let xs = sample_inputs(seed * 0x9E37_79B9, spreads);
         let results = guest_results(std::slice::from_ref(&xs), &format!("Math.{name}(xs[i])"));
         assert_eq!(results.len(), xs.len(), "{name}: result count");
         for (&x, guest) in xs.iter().zip(results) {
-            assert_close(name, (x, f64::NAN), guest, native(x));
+            assert_bit_exact(name, (x, f64::NAN), guest, reference(x));
+            assert_near_std(name, (x, f64::NAN), guest, native(x));
         }
     }
     let ys = sample_inputs(0xA5A5_0001, wide);
@@ -454,7 +481,8 @@ fn libm_matches_std_sample() {
     let results = guest_results(&[xs.clone(), ys.clone()], "Math.atan2(ys[i], xs[i])");
     assert_eq!(results.len(), xs.len(), "atan2: result count");
     for ((&x, &y), guest) in xs.iter().zip(&ys).zip(results) {
-        assert_close("atan2", (y, x), guest, y.atan2(x));
+        assert_bit_exact("atan2", (y, x), guest, libm::atan2(y, x));
+        assert_near_std("atan2", (y, x), guest, y.atan2(x));
     }
     assert_libm_special_values();
 }
