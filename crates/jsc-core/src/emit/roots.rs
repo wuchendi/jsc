@@ -203,6 +203,12 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         | IrNode::IsObject(_)
         | IrNode::IsArray(_)
         | IrNode::IncDec { .. }
+        | IrNode::MathCall { .. }
+        | IrNode::MathSpread { .. }
+        | IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            ..
+        }
         | IrNode::Binary { .. }
             if !matches!(node, IrNode::Binary { op: BinOp::Add, .. }) =>
         {
@@ -304,6 +310,47 @@ fn retain_fixpoint(
         }
         if set.len() == before {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convert(op: ConvertOp) -> IrNode {
+        IrNode::ConvertCall {
+            op,
+            arg: Box::new(IrNode::Local(0)),
+            radix: None,
+        }
+    }
+
+    fn is_numeric(node: &IrNode) -> bool {
+        classify(node).numeric.is_some_and(|deps| deps.is_empty())
+    }
+
+    #[test]
+    fn number_producing_calls_are_numeric() {
+        assert!(is_numeric(&IrNode::MathCall {
+            op: MathOp::Floor,
+            args: vec![IrNode::Local(0)],
+        }));
+        assert!(is_numeric(&IrNode::MathSpread {
+            op: MathOp::Max,
+            args: Box::new(IrNode::ArraySpread(vec![])),
+        }));
+        assert!(is_numeric(&convert(ConvertOp::ToNumber)));
+    }
+
+    #[test]
+    fn other_conversions_may_hold_heap_values() {
+        for op in [
+            ConvertOp::ToString,
+            ConvertOp::String,
+            ConvertOp::ParseFloat,
+        ] {
+            assert!(classify(&convert(op)).noroot.is_none());
         }
     }
 }

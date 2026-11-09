@@ -232,6 +232,32 @@ fn opcount_snapshot() {
     );
 }
 
+/// The `__array_push` fast path stays frame-free. The marginal fuel of one
+/// `push_1e5` iteration is measured between 5e4 and 1e5 pushes, so startup and
+/// printing cancel and the single store doubling in that range is under 1
+/// fuel per push. Derivation of [`PUSH_FUEL_BOUND`]: the frame-free loop costs
+/// 207.5 fuel per iteration (`snapshot.tsv`, before the shadow stack, whose
+/// `__array_push` also ran 36 fuel: the fixed helper has the same 36), plus at
+/// most ~12 for scratch write-throughs in the loop, so 207..219. The slow path
+/// adds 38 (21 prologue with both parameter stores, 5 sparse test, 5 reserve
+/// call, 10 reserve body, 2 epilogue, less the fast-path tests it skips), so
+/// at least 245.
+const PUSH_FUEL_BOUND: u64 = 235;
+
+#[test]
+fn push_fast_path_fuel_is_bounded() {
+    let pushes = |n: u32| {
+        format!("const a = []; for (let i = 0; i < {n}; i++) a.push(i); console.log(a.length)")
+    };
+    let half = measure(&pushes(50_000)).fuel;
+    let full = measure(&pushes(100_000)).fuel;
+    let per_push = (full - half) / 50_000;
+    assert!(
+        per_push < PUSH_FUEL_BOUND,
+        "__array_push fast path looks dead: {per_push} fuel per push"
+    );
+}
+
 /// `n` pushes onto one array cost amortized O(1) each: the fuel of 1e5 pushes
 /// stays well under 2.5x the fuel of 5e4 (a per-push copy would be ~4x).
 #[test]

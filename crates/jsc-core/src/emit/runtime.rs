@@ -824,6 +824,8 @@ pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32, leaves: &Leaf
     emit_is_sparse(&mut function, base);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::LocalGet(elems));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(len));

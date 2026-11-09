@@ -139,10 +139,11 @@ impl Frame {
         b.locals(4, int); // i32(0..4)
         declare_error_scratch(&mut b);
         b.locals(4, Raw(ValType::I64)); // +26..+29 (Date arithmetic)
+        b.locals(1, int); // +30 (KIND_TMP)
         b.locals(2, Jsval); // x64(0..2)
         b.locals(2, int); // x32(0..2)
         b.locals(1, float); // f64(0)
-        b.locals(1, Jsval); // +35, the `arg` temp
+        b.locals(1, Jsval); // +36, the `arg` temp
         b.locals(6, Jsval); // y64(0..6)
         b.locals(4, int); // y32(0..4)
         b.locals(2, float); // yf64(0..2)
@@ -161,7 +162,7 @@ impl Frame {
             wasm!(function; LocalGet(i));
             return;
         }
-        let tmp = self.scratch() + 35;
+        let tmp = self.scratch() + 36;
         wasm!(function;
             LocalGet(self.argc()), F64ReinterpretI64, F64Const(Ieee64::from(f64::from(i))), F64Gt,
             If(BlockType::Result(ValType::I64)),
@@ -195,42 +196,42 @@ impl Frame {
 
     /// Extra i64 temp `n` (`0..2`), past the scratch layout.
     fn x64(self, n: u32) -> u32 {
-        self.scratch() + 30 + n
+        self.scratch() + 31 + n
     }
 
     /// Extra i32 temp `n` (`0..2`), past the scratch layout.
     fn x32(self, n: u32) -> u32 {
-        self.scratch() + 32 + n
+        self.scratch() + 33 + n
     }
 
     /// The f64 temp `n` (`0`), past the scratch layout.
     fn f64(self, n: u32) -> u32 {
-        self.scratch() + 34 + n
+        self.scratch() + 35 + n
     }
 
     /// Further i64 temp `n` (`0..6`), past the [`Self::arg`] temp.
     fn y64(self, n: u32) -> u32 {
-        self.scratch() + 36 + n
+        self.scratch() + 37 + n
     }
 
     /// Further i32 temp `n` (`0..4`).
     fn y32(self, n: u32) -> u32 {
-        self.scratch() + 42 + n
+        self.scratch() + 43 + n
     }
 
     /// Further f64 temp `n` (`0..2`).
     fn yf64(self, n: u32) -> u32 {
-        self.scratch() + 46 + n
+        self.scratch() + 47 + n
     }
 
     /// Further f64 temp `n` (`0..6`).
     fn zf64(self, n: u32) -> u32 {
-        self.scratch() + 48 + n
+        self.scratch() + 49 + n
     }
 
     /// Further i64 temp `n` (`0..4`): an iterator record's places.
     fn z64(self, n: u32) -> u32 {
-        self.scratch() + 54 + n
+        self.scratch() + 55 + n
     }
 
     /// The rooted `i32` locals: a block base or property key held across a
@@ -239,12 +240,12 @@ impl Frame {
 
     /// Rooted `i32` local `n` (`0..BASES`).
     fn base(self, n: u32) -> u32 {
-        self.scratch() + 58 + n
+        self.scratch() + 59 + n
     }
 
     /// Further raw `i32` temp `n` (`0..8`), past the rooted bases.
     fn w32(self, n: u32) -> u32 {
-        self.scratch() + 58 + Self::BASES + n
+        self.scratch() + 59 + Self::BASES + n
     }
 }
 
