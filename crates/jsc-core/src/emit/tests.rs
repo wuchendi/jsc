@@ -1284,3 +1284,160 @@ fn super_and_private_helpers_validate() {
         console.log(new B().run({}))",
     ));
 }
+
+/// The helpers of an empty program, for the static-graph tests below.
+fn empty_program_helpers<R>(check: impl FnOnce(super::Helpers<'_>, &[u8]) -> R) -> R {
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    check(helpers, &emit(&program))
+}
+
+/// `__prop_find` reaches `__fn_materialize`, so it and `__private_find` are
+/// safepoints; the Map probes and the renderer's pure lookups are not.
+#[test]
+fn leaf_set_matches_the_call_graph() {
+    empty_program_helpers(|helpers, _| {
+        let leaves = super::roots::leaf_set(helpers);
+        for helper in [helpers.prop_find, helpers.private_find(), helpers.alloc] {
+            assert!(
+                !leaves.is_leaf(helper),
+                "function {helper} must be a safepoint"
+            );
+        }
+        for helper in [
+            helpers.str_eq,
+            helpers.intern_find,
+            helpers.map_find,
+            helpers.map_get,
+            helpers.map_has,
+            helpers.map_delete,
+            helpers.test_integrity(),
+            helpers.heap_object(),
+            helpers.str_of(),
+            helpers.fn_name(),
+        ] {
+            assert!(leaves.is_leaf(helper), "function {helper} must be a leaf");
+        }
+    });
+}
+
+/// `__array_push` touches `$__sp` only on its sparse-or-growth path: the
+/// prologue, the sparse `return`, and the region end, all after the two
+/// fast-path tests.
+#[test]
+fn array_push_frame_is_shrink_wrapped() {
+    use wasmparser::{Operator, Parser, Payload};
+    empty_program_helpers(|helpers, bytes| {
+        let wanted = (helpers.array_push - super::IMPORT_FUNC_COUNT) as usize;
+        let body = Parser::new(0)
+            .parse_all(bytes)
+            .filter_map(|payload| match payload.expect("valid module") {
+                Payload::CodeSectionEntry(body) => Some(body),
+                _ => None,
+            })
+            .nth(wanted)
+            .expect("__array_push body");
+        let (mut ifs, mut sp_writes, mut ifs_before_frame) = (0, 0, None);
+        for op in body.get_operators_reader().expect("operators") {
+            match op.expect("operator") {
+                Operator::If { .. } => ifs += 1,
+                Operator::GlobalSet { global_index } if global_index == super::SP_GLOBAL => {
+                    sp_writes += 1;
+                    ifs_before_frame.get_or_insert(ifs);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(sp_writes, 3);
+        assert_eq!(ifs_before_frame, Some(2));
+    });
+}
+
+/// Every call a declared leaf-graph helper makes is declared
+/// ([`roots::helper_graph`]), so the leaf set cannot silently go stale.
+#[test]
+fn leaf_declarations_match_bodies() {
+    use wasmparser::{Operator, Parser, Payload};
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let bytes = emit(&program);
+    let mut calls: Vec<Vec<u32>> = Vec::new();
+    for payload in Parser::new(0).parse_all(&bytes) {
+        if let Payload::CodeSectionEntry(body) = payload.expect("valid module") {
+            let mut callees = Vec::new();
+            for op in body.get_operators_reader().expect("operators") {
+                if let Operator::Call { function_index } = op.expect("operator") {
+                    callees.push(function_index);
+                }
+            }
+            calls.push(callees);
+        }
+    }
+    for (helper, declared) in super::roots::helper_graph(helpers) {
+        let defined = (helper - super::IMPORT_FUNC_COUNT) as usize;
+        let mut actual = calls[defined].clone();
+        actual.sort_unstable();
+        actual.dedup();
+        let mut declared = declared;
+        declared.sort_unstable();
+        declared.dedup();
+        assert_eq!(actual, declared, "declared callees of function {helper}");
+    }
+}
+
+/// The R2 number conversions never allocate, except the ones that build the
+/// result string (design/runtime-memory.md §5.3).
+#[test]
+fn number_conversion_leaves() {
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let leaves = super::roots::leaf_set(helpers);
+    for helper in [
+        helpers.umul128(),
+        helpers.ryu_d2d(),
+        helpers.dec_expand(),
+        helpers.dec_parse(),
+        helpers.string_to_number(),
+        helpers.to_number_prim(),
+        helpers.parse_float(),
+        helpers.parse_int(),
+        helpers.now,
+        helpers.random(),
+    ] {
+        assert!(leaves.is_leaf(helper), "function {helper} is a leaf");
+    }
+    for helper in [
+        helpers.scratch_str(),
+        helpers.num_to_str(),
+        helpers.num_format(),
+        helpers.num_radix(),
+        helpers.prim_str(),
+        helpers.msg_str(),
+    ] {
+        assert!(!leaves.is_leaf(helper), "function {helper} allocates");
+    }
+}

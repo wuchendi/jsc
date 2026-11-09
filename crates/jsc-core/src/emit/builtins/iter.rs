@@ -167,7 +167,7 @@ pub(super) fn iter_result(value: IrNode, done: bool) -> IrNode {
 /// Emit the body of the iteration builtin `op`.
 pub(super) fn emit(
     op: IterOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -191,7 +191,7 @@ pub(super) fn emit(
 /// Push a fresh `CLASS_ITERATOR` object over the jsval in i64 `target`
 /// with `kind` and the `proto` of `family` (`obj` an i32 temp).
 fn create(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     target: u32,
     obj: u32,
     family: IterFamily,
@@ -236,12 +236,12 @@ fn create_text(family: IterFamily, kind: IterKind) -> CalleeErrorText<'static> {
 /// `ToObject(this)`.
 fn emit_array_iter(
     kind: IterKind,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (o, obj) = (frame.i64(0), frame.i32(0));
+    let (o, obj) = (frame.i64(0), frame.base(0));
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(o));
     emit_is_nullish(function, o);
     wasm!(function; If(BlockType::Empty));
@@ -256,12 +256,12 @@ fn emit_array_iter(
 fn emit_collection_iter(
     set: bool,
     kind: IterKind,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (this, obj) = (frame.i64(0), frame.i32(0));
+    let (this, obj) = (frame.i64(0), frame.base(0));
     let family = if set {
         IterFamily::Set
     } else {
@@ -284,12 +284,12 @@ fn emit_collection_iter(
 /// `String.prototype[@@iterator]`: a String Iterator over
 /// `ToString(RequireObjectCoercible(this))`.
 fn emit_string_iter(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (s, obj) = (frame.i64(0), frame.i32(0));
+    let (s, obj) = (frame.i64(0), frame.base(0));
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(s));
     emit_is_string(function, s);
     wasm!(function; I32Eqz, If(BlockType::Empty));
@@ -359,7 +359,7 @@ impl Step {
     /// Emit `node` in the body's scratch layout.
     fn emit(
         self,
-        function: &mut Function,
+        function: &mut FnBuilder<'_>,
         node: &IrNode,
         strings: &StrOffsets,
         helpers: Helpers<'_>,
@@ -368,7 +368,7 @@ impl Step {
     }
 
     /// Exhaust the iterator: `[[IteratedObject]] = undefined`.
-    fn exhaust(self, function: &mut Function) {
+    fn exhaust(self, function: &mut FnBuilder<'_>) {
         wasm!(function;
             LocalGet(self.this), I32WrapI64, I64Const(UNDEFINED_BITS),
             I64Store(MemArg { offset: u64::from(ITER_ITERATED_OFFSET), align: 3, memory_index: 0 }),
@@ -376,14 +376,14 @@ impl Step {
     }
 
     /// A pending throw exhausts the iterator and returns.
-    fn bail_if_pending(self, function: &mut Function) {
+    fn bail_if_pending(self, function: &mut FnBuilder<'_>) {
         wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
         self.exhaust(function);
         wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
     }
 
     /// Return the done result.
-    fn done(self, function: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>) {
+    fn done(self, function: &mut FnBuilder<'_>, strings: &StrOffsets, helpers: Helpers<'_>) {
         self.emit(
             function,
             &iter_result(IrNode::Undefined, true),
@@ -394,7 +394,7 @@ impl Step {
     }
 
     /// `i >= len`: exhaust and return the done result.
-    fn end_at_len(self, function: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>) {
+    fn end_at_len(self, function: &mut FnBuilder<'_>, strings: &StrOffsets, helpers: Helpers<'_>) {
         wasm!(function; LocalGet(self.i), LocalGet(self.len), I32GeU, If(BlockType::Empty));
         self.exhaust(function);
         self.done(function, strings, helpers);
@@ -402,7 +402,7 @@ impl Step {
     }
 
     /// Store `i` as the next index.
-    fn store_index(self, function: &mut Function) {
+    fn store_index(self, function: &mut FnBuilder<'_>) {
         wasm!(function;
             LocalGet(self.this), I32WrapI64, LocalGet(self.i),
             I32Store(MemArg { offset: u64::from(ITER_INDEX_OFFSET), align: 2, memory_index: 0 }),
@@ -424,7 +424,7 @@ impl Step {
 /// completes.
 fn emit_next(
     family: IterFamily,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -473,7 +473,7 @@ fn emit_next(
 
 /// An Array Iterator step into `value`: `LengthOfArrayLike` re-read per
 /// step, then the index (keys), `Get(target, index)` (values) or both.
-fn step_array(function: &mut Function, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
+fn step_array(function: &mut FnBuilder<'_>, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(st.target), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get),
     );
@@ -491,9 +491,15 @@ fn step_array(function: &mut Function, st: Step, strings: &StrOffsets, helpers: 
         LocalGet(st.kind), I32Eqz,
         If(BlockType::Empty), LocalGet(st.item), LocalSet(st.value),
         Else,
-        LocalGet(st.target), LocalGet(st.item), I32Const(1), Call(helpers.to_key),
+        LocalGet(st.target),
+    );
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
+    wasm!(function;
+        LocalGet(st.item), I32Const(1), Call(helpers.to_key),
         Call(helpers.get), LocalSet(st.value),
     );
+    function.release_temps(mark);
     st.bail_if_pending(function);
     wasm!(function; LocalGet(st.kind), I32Const(2), I32Eq, If(BlockType::Empty));
     st.emit(function, &Step::pair(st.item, st.value), strings, helpers);
@@ -501,7 +507,7 @@ fn step_array(function: &mut Function, st: Step, strings: &StrOffsets, helpers: 
 }
 
 /// A String Iterator step into `value`: the next code point's string.
-fn step_string(function: &mut Function, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
+fn step_string(function: &mut FnBuilder<'_>, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
     wasm!(function; LocalGet(st.target), I32WrapI64, LocalTee(st.at));
     emit_load_str_len(function);
     wasm!(function; LocalSet(st.len));
@@ -516,7 +522,7 @@ fn step_string(function: &mut Function, st: Step, strings: &StrOffsets, helpers:
 /// seen), as its key, value or `[key, value]` (a Set's value is its key).
 fn step_collection(
     set: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     st: Step,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -559,7 +565,7 @@ fn step_collection(
 /// included) a one-unit string; a one-byte string has no surrogates. `t` is
 /// an i32 temp.
 fn emit_str_iter_next(
-    function: &mut Function,
+    function: &mut impl Sink,
     s: u32,
     i: u32,
     len: u32,
@@ -648,7 +654,7 @@ fn place_set(place: &IrNode, value: IrNode) -> IrNode {
 
 /// Emit `place = value`, discarding the value.
 pub(super) fn store(
-    function: &mut Function,
+    function: &mut impl Sink,
     place: &IrNode,
     value: IrNode,
     scratch: u32,
@@ -667,7 +673,7 @@ pub(super) fn store(
 
 /// Push the record place `place`.
 pub(super) fn load(
-    function: &mut Function,
+    function: &mut impl Sink,
     place: &IrNode,
     scratch: u32,
     strings: &StrOffsets,
@@ -678,7 +684,7 @@ pub(super) fn load(
 
 /// Push i32 `1` when the record's state is `state`.
 pub(super) fn state_is(
-    function: &mut Function,
+    function: &mut impl Sink,
     rec: &IterRecord,
     state: f64,
     scratch: u32,
@@ -691,7 +697,7 @@ pub(super) fn state_is(
 
 /// Push i32 `1` when none of `intrinsics` has its dirty bit set (always,
 /// when `sealed`).
-fn bits_clear(function: &mut Function, intrinsics: &[Intrinsic], sealed: bool) {
+fn bits_clear(function: &mut impl Sink, intrinsics: &[Intrinsic], sealed: bool) {
     let mask = intrinsics
         .iter()
         .filter_map(|intrinsic| intrinsic.watch_bit())
@@ -707,7 +713,7 @@ fn bits_clear(function: &mut Function, intrinsics: &[Intrinsic], sealed: bool) {
 /// and `env` = i64 `env` (`0` when `None`), no arguments, leaving its
 /// result (a throw left pending).
 pub(super) fn call_internal(
-    function: &mut Function,
+    function: &mut impl Sink,
     builtin: Builtin,
     this: u32,
     env: Option<u32>,
@@ -737,7 +743,7 @@ pub(super) fn call_internal(
 /// whose body has a `yield*` ([`abi::GEN_DELEGATES`]) takes the protocol.
 /// `tmp` is a free i32 local.
 pub(in crate::emit) fn emit_iter_classify(
-    function: &mut Function,
+    function: &mut impl Sink,
     v: u32,
     sealed: bool,
     tmp: u32,
@@ -808,7 +814,7 @@ pub(in crate::emit) fn emit_iter_classify(
 /// call (`not iterable`, the call, the object check) and `next` read once.
 /// A throw propagates, leaving the record done. `method` is a free i64 local.
 pub(in crate::emit) fn emit_iter_open(
-    function: &mut Function,
+    function: &mut impl Sink,
     v: u32,
     method: u32,
     rec: &IterRecord,
@@ -827,7 +833,7 @@ pub(in crate::emit) fn emit_iter_open(
 /// [`emit_iter_open`] with the `@@iterator` method already in i64 `method`
 /// (clobbered).
 pub(in crate::emit) fn emit_iter_open_with(
-    function: &mut Function,
+    function: &mut impl Sink,
     v: u32,
     method: u32,
     rec: &IterRecord,
@@ -851,7 +857,7 @@ pub(in crate::emit) fn emit_iter_open_with(
 /// `method` (clobbered): `rec.iter`, then `rec.next = Get(iterator,
 /// "next")` read once (a throw propagates, leaving the record done).
 pub(super) fn emit_record_fill(
-    function: &mut Function,
+    function: &mut impl Sink,
     method: u32,
     rec: &IterRecord,
     scratch: u32,
@@ -892,7 +898,7 @@ pub(in crate::emit) fn emit_get_iterator(
     value: &IrNode,
     rec: &IterRecord,
     sealed: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -946,7 +952,7 @@ pub(in crate::emit) fn emit_get_iterator(
 pub(in crate::emit) fn emit_open_iterator(
     value: &IrNode,
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -970,7 +976,7 @@ pub(in crate::emit) fn emit_open_iterator(
 /// order array, string, Map, Set, generator, `arguments`.
 pub(in crate::emit) fn emit_iterator_step(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1010,7 +1016,7 @@ pub(in crate::emit) fn emit_iterator_step(
 /// The record is done: `state = done`, push i32 `0`.
 fn step_done(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1030,7 +1036,7 @@ fn step_done(
 /// `iter[next]` (a hole through the prototype chain) and advances.
 fn step_indexed(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1071,7 +1077,7 @@ fn step_indexed(
 /// A string step: the next code point's string (`__str_iter_next`).
 fn step_code_point(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1121,7 +1127,7 @@ fn step_code_point(
 fn step_entry(
     rec: &IterRecord,
     set: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1175,7 +1181,7 @@ fn step_entry(
 /// object); its `done` flag ends the walk without the return value.
 fn step_generator(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1216,7 +1222,7 @@ fn step_generator(
 /// still closes it.
 fn step_protocol(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1271,7 +1277,7 @@ fn step_protocol(
 /// the record unclosed). Read once per successful step.
 pub(in crate::emit) fn emit_iterator_value(
     rec: &IterRecord,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1307,12 +1313,12 @@ pub(in crate::emit) fn emit_iterator_value(
 pub(in crate::emit) fn emit_iterator_close(
     rec: &IterRecord,
     mode: CloseMode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (iter, saved) = (scratch + 22, scratch + 25);
+    let iter = scratch + 22;
     for (state, builtin) in [
         (ST_PROTOCOL, Builtin::Protocol(ProtocolOp::Close)),
         (ST_GEN, Builtin::GeneratorReturn),
@@ -1320,11 +1326,13 @@ pub(in crate::emit) fn emit_iterator_close(
         state_is(function, rec, state, scratch, strings, helpers);
         wasm!(function; If(BlockType::Empty));
         enter_frame(helpers);
+        // The in-flight exception waits on the stack, rooted: `return()` may
+        // throw over `$exc_value`.
+        let mark = function.temp_mark();
         if mode == CloseMode::Pending {
-            wasm!(function;
-                GlobalGet(EXC_VALUE_GLOBAL), LocalSet(saved),
-                I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
-            );
+            wasm!(function; GlobalGet(EXC_VALUE_GLOBAL));
+            function.root_temp(TempClass::Jsval);
+            wasm!(function; I32Const(0), GlobalSet(EXC_PENDING_GLOBAL));
         }
         store(
             function,
@@ -1342,10 +1350,11 @@ pub(in crate::emit) fn emit_iterator_close(
             CloseMode::Normal => emit_propagate_if_pending(function, helpers),
             CloseMode::Catch => wasm!(function; I32Const(0), GlobalSet(EXC_PENDING_GLOBAL)),
             CloseMode::Pending => wasm!(function;
-                LocalGet(saved), GlobalSet(EXC_VALUE_GLOBAL),
+                GlobalSet(EXC_VALUE_GLOBAL),
                 I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
             ),
         }
+        function.release_temps(mark);
         leave_frame(helpers);
         wasm!(function; End);
     }
@@ -1365,9 +1374,9 @@ pub(super) fn local_record(iter: u32, next: u32, state: u32, result: u32) -> Ite
 /// lands after it with the exception pending, so the caller can close an
 /// iterator before returning.
 pub(super) fn guarded(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     helpers: Helpers<'_>,
-    body: impl FnOnce(&mut Function),
+    body: impl FnOnce(&mut FnBuilder<'_>),
 ) {
     wasm!(function; Block(BlockType::Empty));
     {
@@ -1442,7 +1451,7 @@ pub(super) fn throw_type(message: IrNode, tmp: u32) -> IrNode {
 
 /// Throw `node` (an IR throw) from a builtin body and return.
 pub(super) fn throw_and_return(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     node: &IrNode,
     strings: &StrOffsets,
@@ -1455,7 +1464,7 @@ pub(super) fn throw_and_return(
 /// Call the function in i64 `callee` with `this` = i64 `this` and no
 /// arguments into i64 `out`, returning on a throw.
 pub(super) fn call_method(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     callee: u32,
     this: u32,
@@ -1474,7 +1483,7 @@ pub(super) fn call_method(
 /// Emit the body of the internal protocol builtin `op`.
 pub(super) fn emit_protocol(
     op: ProtocolOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1491,7 +1500,7 @@ pub(super) fn emit_protocol(
 /// `@@iterator` method; `<x> is not iterable` unless callable, else the
 /// iterator its call returns (a `TypeError` unless an object).
 fn emit_open_body(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1513,7 +1522,7 @@ fn emit_open_body(
 /// `next`; the result object of `next()` (a `TypeError` unless callable /
 /// unless the result is an object), or the hole when `ToBoolean(result.done)`.
 fn emit_step_body(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1544,7 +1553,7 @@ fn emit_step_body(
 /// unless an object, then push the hole when `ToBoolean(r.done)`, else `r`
 /// (`done` and `tmp` i64 temps).
 pub(super) fn emit_result_done(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     r: u32,
     done: u32,
@@ -1580,7 +1589,7 @@ pub(super) fn emit_result_done(
 /// `TypeError` unless callable), its call, and a `TypeError` unless the
 /// result is an object.
 fn emit_close_body(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1621,14 +1630,14 @@ fn emit_close_body(
 /// path, e.g. a clean `arguments` walked by index, or through the
 /// protocol; never closed: a throw marks it done).
 fn emit_to_list_body(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, value) = (frame.i64(0), frame.i64(2));
     let rec = local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
-    let (list, scratch) = (frame.i32(0), frame.scratch());
+    let (list, scratch) = (frame.base(0), frame.scratch());
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(v));
     emit_get_iterator(
         &IrNode::Local(v),

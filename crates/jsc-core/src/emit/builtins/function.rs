@@ -76,7 +76,7 @@ pub(super) const STRINGS: [&str; 22] = [
 /// `false` for a non-callable `this`, `InstanceofOperator(V, target)` for a
 /// bound one, else the `prototype` chain walk.
 pub(super) fn emit_has_instance(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -96,7 +96,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
 
 /// `%ThrowTypeError%`: throw the restricted-property `TypeError`.
 pub(super) fn emit_throw_type_error(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -107,7 +107,7 @@ pub(super) fn emit_throw_type_error(
 
 /// Read `this` into `target` and throw `text` unless it is callable.
 fn this_callable(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     target: u32,
     text: CalleeErrorText<'_>,
@@ -126,7 +126,7 @@ fn this_callable(
 /// `len`) as its arguments, exactly like a spread call: the first `K` fill the
 /// slots and the array is published for a callee gathering the rest.
 fn call_with_array(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     target: u32,
     this: u32,
     args: u32,
@@ -151,13 +151,13 @@ fn call_with_array(
 /// down one slot in place; more can only arrive through a spread call, whose
 /// published argument array is copied without its first element.
 pub(super) fn emit_call(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, this) = (frame.i64(0), frame.i64(1));
-    let (n, src, dst, i) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (n, src, dst, i) = (frame.i32(0), frame.base(1), frame.base(2), frame.i32(3));
     let k = frame.k;
     this_callable(function, frame, target, CALL_NOT_CALLABLE, strings, helpers);
     wasm!(function;
@@ -214,13 +214,13 @@ pub(super) fn emit_call(
 /// `null`): an array's elements (a hole read through the prototype chain), else
 /// `ToLength(argList.length)` indexed reads; a non-object throws.
 pub(super) fn emit_apply(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, this, list, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (n, src, dst, i) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (n, src, dst, i) = (frame.i32(0), frame.base(1), frame.base(2), frame.i32(3));
     this_callable(
         function,
         frame,
@@ -287,7 +287,7 @@ pub(super) fn emit_apply(
 /// the high half of `env`), then call it with the same argument slots and
 /// count and `this` = the receiver.
 pub(super) fn emit_method_call(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -339,7 +339,7 @@ pub(super) fn emit_method_call(
 /// `tmp`; `n` holds the decoded argument count.
 #[allow(clippy::too_many_arguments)]
 fn store_args(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     dst: u32,
     shift: u32,
@@ -400,13 +400,13 @@ fn store_args(
 /// `name` (`"bound " + target.name`, `""` for a non-string), both
 /// configurable only.
 pub(super) fn emit_bind(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, v, tmp) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (n, rec, i, f) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (n, rec, i, f) = (frame.i32(0), frame.base(1), frame.i32(2), frame.base(3));
     let (shift, nb) = (frame.x32(0), frame.x32(1));
     let len = frame.f64(0);
     this_callable(function, frame, target, BIND_NOT_CALLABLE, strings, helpers);
@@ -507,13 +507,13 @@ fn bound_construct(frame: Frame) -> IrNode {
 /// target when it was this bound function (recognised by its `env`), else
 /// the incoming `new.target`.
 pub(super) fn emit_bound_call(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (target, this, args, nt) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (n, rec, dst, i) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (n, rec, dst, i) = (frame.i32(0), frame.base(1), frame.base(2), frame.i32(3));
     let (nb, total) = (frame.x32(0), frame.x32(1));
     let (c, tmp) = (frame.f64(0), frame.x64(0));
     let env = frame.k;
@@ -582,7 +582,7 @@ pub(super) fn emit_bound_call(
 /// when that is an `IdentifierName`, optionally after `get ` / `set `, else
 /// empty (a bound function's info name is empty).
 pub(super) fn emit_to_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -590,7 +590,7 @@ pub(super) fn emit_to_string(
     let target = frame.i64(0);
     let (name, len, i, start) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
     let (c, w) = (frame.x32(0), frame.x32(1));
-    let at = |function: &mut Function| {
+    let at = |function: &mut FnBuilder<'_>| {
         emit_str_unit(function, name, i, w);
         wasm!(function; LocalTee(c));
     };

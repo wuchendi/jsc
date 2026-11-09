@@ -45,7 +45,7 @@ pub(super) const STRINGS: [&str; 15] = [
 
 /// Read `this` into `this` and throw unless it is a Date.
 fn this_date(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     this: u32,
     strings: &StrOffsets,
@@ -67,7 +67,7 @@ fn this_date(
 /// The Date method `op`: its field of the Date receiver.
 pub(super) fn emit_method(
     op: DateOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -280,10 +280,10 @@ fn utc_time(frame: Frame) -> IrNode {
 /// `TimeClip` of the number jsval on the stack into i64 `out`, then that
 /// clipped number boxed on the stack, after `store` (emitted between).
 pub(super) fn emit_clipped(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     out: u32,
     helpers: Helpers<'_>,
-    store: impl FnOnce(&mut Function),
+    store: impl FnOnce(&mut FnBuilder<'_>),
 ) {
     wasm!(function; F64ReinterpretI64);
     emit_time_clip(function, out);
@@ -295,7 +295,7 @@ pub(super) fn emit_clipped(
 /// `Date.UTC(year[, month[, date[, hours[, minutes[, seconds[, ms]]]]]])`:
 /// `TimeClip` of the [`utc_time`] — a number, nothing allocated.
 pub(super) fn emit_utc(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -395,7 +395,7 @@ fn set_time(op: DateSetOp, frame: Frame) -> IrNode {
 /// Date and returned.
 pub(super) fn emit_set(
     op: DateSetOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -450,7 +450,7 @@ fn to_iso_string_call(frame: Frame) -> IrNode {
 /// `ToPrimitive(O, number)` is a non-finite number, else
 /// `Invoke(O, "toISOString")`. Generic over any receiver.
 pub(super) fn emit_to_json(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -492,7 +492,7 @@ pub(super) fn emit_to_json(
 /// first (`OrdinaryToPrimitive`, `__to_primitive` with [`HINT_ORDINARY`]);
 /// any other hint throws the `TypeError`. Generic over any object receiver.
 pub(super) fn emit_to_primitive(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

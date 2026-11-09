@@ -57,7 +57,7 @@ fn len_header() -> MemArg {
 /// Push the input's code unit at the index `pos` pushes, read at the input's
 /// width (the low bit of `$__json_data`). The caller must have established
 /// the index is in range.
-fn unit_at(function: &mut Function, pos: impl Fn(&mut Function)) {
+fn unit_at<S: Sink>(function: &mut S, pos: impl Fn(&mut S)) {
     function.instruction(&Instruction::GlobalGet(JSON_DATA_GLOBAL));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32And);
@@ -84,21 +84,21 @@ fn unit_at(function: &mut Function, pos: impl Fn(&mut Function)) {
 
 /// Push the code unit at the cursor. The caller must have established the
 /// position is in range.
-fn cur_unit(function: &mut Function) {
+fn cur_unit(function: &mut impl Sink) {
     unit_at(function, |f| {
         f.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     });
 }
 
 /// Push `1` if the cursor is at/past the end (`$__json_pos >= $__json_len`).
-fn at_end(function: &mut Function) {
+fn at_end(function: &mut impl Sink) {
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     function.instruction(&Instruction::GlobalGet(JSON_LEN_GLOBAL));
     function.instruction(&Instruction::I32GeU);
 }
 
 /// Emit `$__json_pos += 1`.
-fn advance(function: &mut Function) {
+fn advance(function: &mut impl Sink) {
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
@@ -109,7 +109,7 @@ fn advance(function: &mut Function) {
 /// error in flight. `__json_throw` leaves an `i64` dummy on the stack that the
 /// `return` yields; the caller's `$exc_pending` check then propagates it. Valid
 /// only in helpers that return `i64`.
-fn throw_return(function: &mut Function, helpers: Helpers<'_>) {
+fn throw_return(function: &mut impl Sink, helpers: Helpers<'_>) {
     function.instruction(&Instruction::Call(helpers.json_throw));
     function.instruction(&Instruction::Return);
 }
@@ -117,7 +117,7 @@ fn throw_return(function: &mut Function, helpers: Helpers<'_>) {
 /// After a recursive `__json_*` call, propagate an in-flight exception by
 /// returning the pending `undefined` dummy (the caller re-checks and unwinds one
 /// frame further). Valid only in helpers that return `i64`.
-fn propagate_if_pending(function: &mut Function) {
+fn propagate_if_pending(function: &mut impl Sink) {
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -126,7 +126,7 @@ fn propagate_if_pending(function: &mut Function) {
 }
 
 /// Push the boxed heap jsval of the i32 block base in `local`.
-fn box_local(function: &mut Function, local: u32) {
+fn box_local(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
@@ -137,7 +137,7 @@ fn box_local(function: &mut Function, local: u32) {
 /// them, and push `result_bits`; throw + return on any mismatch or out-of-range.
 /// Used for the `true`/`false`/`null` literals. Leaves an `i64` (the literal's
 /// jsval).
-fn expect_word(function: &mut Function, word: &[u8], result_bits: i64, helpers: Helpers<'_>) {
+fn expect_word(function: &mut impl Sink, word: &[u8], result_bits: i64, helpers: Helpers<'_>) {
     let n = i32::try_from(word.len()).unwrap_or(i32::MAX);
     // if $__json_pos + n > $__json_len: throw.
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
@@ -170,8 +170,8 @@ fn expect_word(function: &mut Function, word: &[u8], result_bits: i64, helpers: 
 }
 
 /// `__json_ws()`: advance the cursor past JSON whitespace (space/tab/LF/CR).
-pub(super) fn emit_json_ws() -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
+pub(super) fn emit_json_ws(leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[], &[RAW_I32]);
     let c = 0;
     function.instruction(&Instruction::Block(BlockType::Empty));
     function.instruction(&Instruction::Loop(BlockType::Empty));
@@ -203,26 +203,21 @@ pub(super) fn emit_json_ws() -> Function {
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// `__json_throw() -> i64`: stash a `SyntaxError` in `$exc_value`, set the
 /// pending flag + clear any routed completion, and return a dummy `undefined`.
-pub(super) fn emit_json_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_json_throw(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     // The full `emit_main` scratch-local layout (starting at local 0, since this
     // helper has no params) so `emit_node` can build the error object exactly as
     // it would in `main`.
-    let mut function = Function::new(vec![
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (5, ValType::I32),
-        (1, ValType::I64),
-        (7, ValType::I64),
-        (1, ValType::I32),
-        (2, ValType::I64),
-    ]);
+    let mut function = helper_builder(leaves, &[], &[]);
+    declare_scratch(&mut function);
     let scratch = 0;
     emit_node(
         &json_syntax_error(),
@@ -238,7 +233,7 @@ pub(super) fn emit_json_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
     function.instruction(&Instruction::GlobalSet(CF_KIND_GLOBAL));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// `__json_string() -> i64`: parse a JSON string token (the cursor is at the
@@ -247,8 +242,18 @@ pub(super) fn emit_json_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
 /// surrogate included; a pair is two escapes). The units are decoded into a
 /// two-byte block, narrowed to one-byte when every unit is `<= 0xFF`. A
 /// malformed escape or an unterminated string throws.
-pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![(7, ValType::I32)]);
+pub(super) fn emit_json_string(
+    alloc_index: u32,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[],
+        &[
+            RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+        ],
+    );
     let (cap, str_base, wp, c, e, out, d) = (0, 1, 2, 3, 4, 5, 6);
 
     // Consume the opening quote.
@@ -339,13 +344,13 @@ pub(super) fn emit_json_string(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     // Box and return.
     box_local(&mut function, str_base);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Decode the four hex digits of a `\uXXXX` escape at the cursor (advancing
 /// past them), pushing the code unit; throw on a missing or non-hex digit.
 /// `out` and `d` are i32 scratch.
-fn emit_hex4(function: &mut Function, out: u32, d: u32, helpers: Helpers<'_>) {
+fn emit_hex4(function: &mut impl Sink, out: u32, d: u32, helpers: Helpers<'_>) {
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(out));
     for _ in 0..4 {
@@ -395,7 +400,7 @@ fn emit_hex4(function: &mut Function, out: u32, d: u32, helpers: Helpers<'_>) {
 
 /// Map a simple JSON escape char (in i32 local `e`) to its decoded unit, pushing
 /// it as an i32; throw on any other escape. Leaves one i32.
-fn emit_escape_byte(function: &mut Function, e: u32, helpers: Helpers<'_>) {
+fn emit_escape_byte(function: &mut impl Sink, e: u32, helpers: Helpers<'_>) {
     // A chain of `e == <escape> ? <byte> : …`, throwing in the final else.
     let cases: [(i32, i32); 8] = [
         (34, 34),  // \"  -> "
@@ -426,8 +431,8 @@ fn emit_escape_byte(function: &mut Function, e: u32, helpers: Helpers<'_>) {
 /// `__json_number() -> i64`: scan a JSON number token at the cursor, then run
 /// the decimal parser over exactly its units; a token that is not wholly one
 /// decimal literal is NaN. A token with no number chars throws.
-pub(super) fn emit_json_number(helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
+pub(super) fn emit_json_number(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[], &[RAW_I32, RAW_I32]);
     let (start, c) = (0, 1);
 
     function.instruction(&Instruction::GlobalGet(JSON_POS_GLOBAL));
@@ -485,13 +490,13 @@ pub(super) fn emit_json_number(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// `__json_value() -> i64`: skip whitespace, then dispatch on the current byte to
 /// the object / array / string / literal / number parser.
-pub(super) fn emit_json_value(helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
+pub(super) fn emit_json_value(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[], &[RAW_I32]);
     let c = 0;
     function.instruction(&Instruction::Call(helpers.json_ws));
     // if at_end: unexpected end of input -> throw.
@@ -553,17 +558,13 @@ pub(super) fn emit_json_value(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// `__json_array() -> i64`: parse a JSON array (cursor at `[`) into a fresh heap
 /// array, growing it element by element via `__array_push`.
-pub(super) fn emit_json_array(helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![
-        (1, ValType::I32),
-        (1, ValType::I64),
-        (1, ValType::I32),
-    ]);
+pub(super) fn emit_json_array(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[], &[ROOT_BASE, ROOT_JS, RAW_I32]);
     let (arr, elem, c) = (0, 1, 2);
 
     advance(&mut function); // consume '['
@@ -624,18 +625,18 @@ pub(super) fn emit_json_array(helpers: Helpers<'_>) -> Function {
 
     box_local(&mut function, arr);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// `__json_object() -> i64`: parse a JSON object (cursor at `{`) into a fresh
 /// `TYPE_OBJECT`, defining each member (key interned) through `__define` in
 /// source order — a duplicate key overwrites the earlier slot in place.
-pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![
-        (1, ValType::I32),
-        (2, ValType::I64),
-        (1, ValType::I32),
-    ]);
+pub(super) fn emit_json_object(
+    alloc_index: u32,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = helper_builder(leaves, &[], &[ROOT_BASE, ROOT_JS, ROOT_JS, RAW_I32]);
     let (obj, k, v, c) = (0, 1, 2, 3);
 
     advance(&mut function); // consume '{'
@@ -739,14 +740,14 @@ pub(super) fn emit_json_object(alloc_index: u32, helpers: Helpers<'_>) -> Functi
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// `__json_parse(s: i64) -> i64`: the parse entry. `s` is a heap string; set the
 /// cursor globals, parse one value, require no trailing content, and return the
 /// value (or leave a syntax error in flight).
-pub(super) fn emit_json_parse(helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32), (1, ValType::I64)]);
+pub(super) fn emit_json_parse(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_JS], &[ROOT_BASE, ROOT_JS]);
     let (s, base, result) = (0, 1, 2);
 
     // base = wrap(s); DATA = (base + STR_DATA_OFFSET) | two_byte;
@@ -778,9 +779,12 @@ pub(super) fn emit_json_parse(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::If(BlockType::Empty));
     throw_return(&mut function, helpers);
     function.instruction(&Instruction::End);
+    // `$__json_data` is an interior address of `s`: keep `s` rooted to here.
+    function.instruction(&Instruction::LocalGet(s));
+    function.instruction(&Instruction::Drop);
     function.instruction(&Instruction::LocalGet(result));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit a `JSON.parse(arg)` node (the emit-context dispatch): coerce `arg` with
@@ -790,7 +794,7 @@ pub(super) fn emit_json_parse(helpers: Helpers<'_>) -> Function {
 /// conversion or syntax error.
 pub(super) fn emit_json_parse_node(
     arg: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

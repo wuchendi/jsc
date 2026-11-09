@@ -138,7 +138,7 @@ pub(super) const STRINGS: [&str; 26] = [
 ];
 
 /// Push `1` when the jsval in `local` is a boolean.
-fn is_boolean(function: &mut Function, local: u32) {
+fn is_boolean(function: &mut FnBuilder<'_>, local: u32) {
     wasm!(function;
         LocalGet(local), I64Const(TRUE_BITS), I64Eq,
         LocalGet(local), I64Const(FALSE_BITS), I64Eq, I32Or,
@@ -147,7 +147,7 @@ fn is_boolean(function: &mut Function, local: u32) {
 
 /// `Number.prototype.valueOf()`: `thisNumberValue(this)`.
 pub(super) fn emit_number_value_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -159,7 +159,7 @@ pub(super) fn emit_number_value_of(
         frame,
         x,
         abi::CLASS_NUMBER,
-        emit_is_number,
+        |f, l| emit_is_number(f, l),
         text,
         strings,
         helpers,
@@ -171,7 +171,7 @@ pub(super) fn emit_number_value_of(
 /// radix (`10` when `undefined`, else `ToIntegerOrInfinity`, a `RangeError`
 /// outside `2..=36`); radix 10 is `ToString`, any other `__num_radix`.
 pub(super) fn emit_number_to_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -184,7 +184,7 @@ pub(super) fn emit_number_to_string(
         frame,
         x,
         abi::CLASS_NUMBER,
-        emit_is_number,
+        |f, l| emit_is_number(f, l),
         text,
         strings,
         helpers,
@@ -224,7 +224,7 @@ pub(super) fn emit_number_to_string(
 }
 
 /// Return `ToString` of the number jsval in `x`.
-fn return_to_string(function: &mut Function, x: u32, helpers: Helpers<'_>) {
+fn return_to_string(function: &mut FnBuilder<'_>, x: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(x), Call(helpers.to_str()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Return,
     );
@@ -233,7 +233,7 @@ fn return_to_string(function: &mut Function, x: u32, helpers: Helpers<'_>) {
 /// `Number.prototype.toLocaleString()`: `thisNumberValue(this)`, then
 /// `ToString` (no locale data: the `toString()` rendering).
 pub(super) fn emit_number_to_locale_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -245,7 +245,7 @@ pub(super) fn emit_number_to_locale_string(
         frame,
         x,
         abi::CLASS_NUMBER,
-        emit_is_number,
+        |f, l| emit_is_number(f, l),
         text,
         strings,
         helpers,
@@ -261,7 +261,7 @@ pub(super) fn emit_number_to_locale_string(
 /// `__num_format`, in the shortest mode for a `toExponential` without digits.
 pub(super) fn emit_number_format(
     format: NumberFormat,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -274,7 +274,7 @@ pub(super) fn emit_number_format(
         frame,
         x,
         abi::CLASS_NUMBER,
-        emit_is_number,
+        |f, l| emit_is_number(f, l),
         text,
         strings,
         helpers,
@@ -295,7 +295,7 @@ pub(super) fn emit_number_format(
         LocalGet(digits), LocalGet(digits), F64Eq,
         Select, LocalSet(digits),
     );
-    let check_range = |function: &mut Function| {
+    let check_range = |function: &mut FnBuilder<'_>| {
         wasm!(function;
             LocalGet(digits), F64Const(Ieee64::from(format.min())), F64Ge,
             LocalGet(digits), F64Const(Ieee64::from(100.0)), F64Le, I32And, I32Eqz,
@@ -340,7 +340,7 @@ pub(super) fn emit_number_format(
 /// as `"true"`/`"false"` for `toString`.
 pub(super) fn emit_boolean(
     value_of: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -420,13 +420,15 @@ fn slot(offset: u64) -> MemArg {
 /// ([`add_exact`]) and rounded once ([`round_exact`]). No value (or only
 /// `-0`) yields `-0`.
 pub(super) fn emit_sum_precise(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (items, v) = (frame.i64(0), frame.i64(1));
-    let (acc, state) = (frame.i32(0), frame.i32(1));
+    let (acc, state) = (frame.base(0), frame.i32(1));
+    // The accumulator's data (`acc`, the `TYPE_RAW` block base, plus 8).
+    let data = frame.x32(1);
     let temps = [frame.i64(2), frame.i64(3), frame.x64(0), frame.x64(1)];
     let (cursor, bound) = (frame.i32(2), frame.i32(3));
     let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
@@ -443,8 +445,12 @@ pub(super) fn emit_sum_precise(
         helpers,
     );
     wasm!(function;
-        I32Const(SUM_SLOTS * 8), Call(helpers.alloc), LocalTee(acc),
-        I32Const(0), I32Const(SUM_SLOTS * 8), MemoryFill(0),
+        // A `TYPE_RAW` block; `acc` stays the block base with data at `+8`.
+        I32Const(SUM_SLOTS * 8 + 8), Call(helpers.alloc), LocalTee(acc),
+        I32Const(0), I32Const(SUM_SLOTS * 8 + 8), MemoryFill(0),
+        LocalGet(acc), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
+        LocalGet(acc), I32Const(SUM_SLOTS * 8), I32Store(MemArg { offset: 4, align: 2, memory_index: 0 }),
+        LocalGet(acc), I32Const(8), I32Add, LocalSet(data),
         I32Const(SUM_MINUS_ZERO), LocalSet(state),
     );
     iter::guarded(function, helpers, |function| {
@@ -482,7 +488,7 @@ pub(super) fn emit_sum_precise(
             LocalGet(state), I32Const(SUM_PLUS_INF), I32LtU, I32And,
             If(BlockType::Empty), I32Const(SUM_FINITE), LocalSet(state),
         );
-        add_exact(function, acc, v, [cursor, bound], temps);
+        add_exact(function, data, v, [cursor, bound], temps);
         wasm!(function; End, End, End, End, End);
         leave_frame(helpers);
         leave_frame(helpers);
@@ -501,7 +507,7 @@ pub(super) fn emit_sum_precise(
         I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(state), I32Const(SUM_FINITE), I32Eq, If(BlockType::Result(ValType::F64)),
     );
-    round_exact(function, acc, [cursor, bound, frame.x32(0)], temps);
+    round_exact(function, data, [cursor, bound, frame.x32(0)], temps);
     wasm!(function;
         F64ReinterpretI64,
         Else,
@@ -522,7 +528,7 @@ pub(super) fn emit_sum_precise(
 /// digits (negated for a negative `x`) on the slots from `p / 32`, then the
 /// carries ripple up (to the sign slot at most).
 fn add_exact(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     acc: u32,
     bits: u32,
     [bit, at]: [u32; 2],
@@ -546,14 +552,14 @@ fn add_exact(
     );
     // The three digits: `lo` low half, `lo` high half + `hi` low half, `hi`
     // high half; each `(d ^ s) - s` (negated when `x < 0`).
-    let digits: [&dyn Fn(&mut Function); 3] = [
-        &|function: &mut Function| wasm!(function; LocalGet(lo), I64Const(LIMB_MASK), I64And),
-        &|function: &mut Function| {
+    let digits: [&dyn Fn(&mut FnBuilder<'_>); 3] = [
+        &|function: &mut FnBuilder<'_>| wasm!(function; LocalGet(lo), I64Const(LIMB_MASK), I64And),
+        &|function: &mut FnBuilder<'_>| {
             wasm!(function;
                 LocalGet(lo), I64Const(32), I64ShrU, LocalGet(hi), I64Const(LIMB_MASK), I64And, I64Add,
             );
         },
-        &|function: &mut Function| wasm!(function; LocalGet(hi), I64Const(32), I64ShrU),
+        &|function: &mut FnBuilder<'_>| wasm!(function; LocalGet(hi), I64Const(32), I64ShrU),
     ];
     for (k, digit) in (0u64..).zip(digits) {
         wasm!(function; LocalGet(at), LocalGet(at), I64Load(slot(8 * k)));
@@ -589,7 +595,7 @@ fn add_exact(
 /// (the rest: the slots below), and the result is `(L - 53) << 52 + M`
 /// (a carry out of `M` bumps the exponent; at the top, `+∞`).
 fn round_exact(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     acc: u32,
     [at, width, neg]: [u32; 3],
     [window, len, carry, sticky]: [u32; 4],

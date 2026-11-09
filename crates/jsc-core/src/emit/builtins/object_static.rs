@@ -49,7 +49,7 @@ fn m64(offset: u64) -> MemArg {
 /// Emit the body of the `Object` static `op`.
 pub(super) fn emit(
     op: ReflectOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -91,7 +91,7 @@ pub(super) fn emit(
 
 /// Throw `text` when the jsval in `local` is not an object.
 fn require_object(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     local: u32,
     text: CalleeErrorText<'static>,
@@ -106,7 +106,7 @@ fn require_object(
 
 /// `ToObject` of argument `i` into i64 `out` (`null` / `undefined` throw).
 fn arg_to_object(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     i: u32,
     out: u32,
@@ -120,7 +120,7 @@ fn arg_to_object(
 }
 
 /// Push element `i` (an i32 local) of the array whose i32 base is in `arr`.
-fn emit_element(function: &mut Function, arr: u32, i: u32, slot: u64) {
+fn emit_element(function: &mut FnBuilder<'_>, arr: u32, i: u32, slot: u64) {
     wasm!(function; LocalGet(arr));
     emit_array_elems(function);
     wasm!(function;
@@ -135,7 +135,7 @@ fn emit_element(function: &mut Function, arr: u32, i: u32, slot: u64) {
 /// with the `TypeError` pending when it is rejected, or with the exception an
 /// array `length` left pending (`r` is i32 scratch).
 fn emit_apply(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     o: u32,
     key: u32,
     list: u32,
@@ -165,11 +165,11 @@ fn emit_apply(
 /// rejection returns from the body with its `TypeError` pending, as does an
 /// exception an array `length` left pending (`r` is i32 scratch).
 pub(super) fn define_or_throw(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     o: u32,
     key: u32,
     r: u32,
-    record: impl FnOnce(&mut Function),
+    record: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(o), I32WrapI64, LocalGet(key));
@@ -195,13 +195,13 @@ pub(super) fn define_or_throw(
 /// `ToPropertyKey(P)`, `ToPropertyDescriptor(Attributes)`, and
 /// `DefinePropertyOrThrow`; returns `O`.
 fn emit_define_property(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let o = frame.i64(0);
-    let (key, list, j, r) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (key, list, j, r) = (frame.base(0), frame.base(1), frame.i32(2), frame.i32(3));
     frame.arg(function, 0);
     wasm!(function; LocalSet(o));
     require_object(
@@ -229,7 +229,7 @@ fn emit_define_property(
 /// (`Get` + `ToPropertyDescriptor`, in own-key order), then each is applied
 /// in order; returns `O`.
 fn emit_define_properties(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -257,15 +257,15 @@ fn emit_define_properties(
 /// the front of the key list), then each is applied in order; a throw returns
 /// from the body.
 fn object_define_properties(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     o: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (props, attrs) = (frame.i64(1), frame.i64(2));
-    let (ks, n, i, key) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let (list, result) = (frame.x32(0), frame.x32(1));
+    let (ks, n, i, key) = (frame.base(0), frame.i32(1), frame.i32(2), frame.base(3));
+    let (list, result) = (frame.base(4), frame.x32(1));
     arg_to_object(function, frame, 1, props, strings, helpers);
     wasm!(function;
         LocalGet(props), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
@@ -273,7 +273,7 @@ fn object_define_properties(
         I32Const(0), Call(helpers.new_array()), LocalSet(list),
     );
     // key = the interned key `ks[i]`.
-    let key_at = |function: &mut Function| {
+    let key_at = |function: &mut FnBuilder<'_>| {
         wasm!(function; LocalGet(ks));
         emit_array_elems(function);
         wasm!(function;
@@ -281,7 +281,7 @@ fn object_define_properties(
             I32Const(1), Call(helpers.to_key), LocalSet(key),
         );
     };
-    let each = |function: &mut Function, body: &dyn Fn(&mut Function)| {
+    let each = |function: &mut FnBuilder<'_>, body: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(function;
             I32Const(0), LocalSet(i),
             Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -325,12 +325,12 @@ fn object_define_properties(
 /// then `FromPropertyDescriptor` of the own property (`undefined` when
 /// absent).
 fn emit_get_own_property_descriptor(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (v, key) = (frame.i64(0), frame.i32(0));
+    let (v, key) = (frame.i64(0), frame.base(0));
     arg_to_object(function, frame, 0, v, strings, helpers);
     frame.arg(function, 1);
     wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
@@ -342,14 +342,14 @@ fn emit_get_own_property_descriptor(
 /// of `ToObject(O)` (own-key order: string keys, an array's `length` after
 /// its indices, then symbol keys) to its descriptor object.
 fn emit_get_own_property_descriptors(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, kv, d) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (res, ks, n, i) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let (key, length) = (frame.x32(0), frame.x32(1));
+    let (res, ks, n, i) = (frame.base(0), frame.base(1), frame.i32(2), frame.i32(3));
+    let (key, length) = (frame.base(4), frame.x32(1));
     arg_to_object(function, frame, 0, v, strings, helpers);
     wasm!(function; LocalGet(v), I32WrapI64, LocalSet(key));
     emit_materialize(function, key, helpers);
@@ -370,7 +370,7 @@ fn emit_get_own_property_descriptors(
         I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
     );
     // Define res[key] = the descriptor of the interned key pushed by `push`.
-    let add = |function: &mut Function, push: &dyn Fn(&mut Function)| {
+    let add = |function: &mut FnBuilder<'_>, push: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(function; LocalGet(v));
         push(function);
         wasm!(function;
@@ -421,7 +421,7 @@ fn emit_get_own_property_descriptors(
 
 /// `Object.preventExtensions` / `seal` / `freeze` (`level`): an object takes
 /// the integrity level (`__set_integrity`); any other value is returned as is.
-fn emit_set_level(level: i32, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_set_level(level: i32, function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let v = frame.i64(0);
     frame.arg(function, 0);
     wasm!(function; LocalSet(v));
@@ -437,7 +437,7 @@ fn emit_set_level(level: i32, function: &mut Function, frame: Frame, helpers: He
 /// `Object.isExtensible` / `isSealed` / `isFrozen` (`level`): an object is
 /// tested (`__test_integrity`); any other value is not extensible, so it is
 /// sealed and frozen.
-fn emit_test_level(level: i32, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_test_level(level: i32, function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let v = frame.i64(0);
     let primitive = if level == INTEGRITY_NON_EXTENSIBLE {
         FALSE_BITS
@@ -459,9 +459,9 @@ fn emit_test_level(level: i32, function: &mut Function, frame: Frame, helpers: H
 /// Raise the keyed `__prop_throw` `TypeError` of the mode pushed by `mode`
 /// over the key jsval pushed by `key`, and return from the body.
 pub(super) fn prop_throw(
-    function: &mut Function,
-    key: impl FnOnce(&mut Function),
-    mode: impl FnOnce(&mut Function),
+    function: &mut FnBuilder<'_>,
+    key: impl FnOnce(&mut FnBuilder<'_>),
+    mode: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
     wasm!(function; I64Const(UNDEFINED_BITS));
@@ -472,7 +472,7 @@ pub(super) fn prop_throw(
 
 /// Throw `Object prototype may only be an Object or null: <v>` unless the
 /// jsval in `proto` is an object or `null`.
-fn require_proto(function: &mut Function, proto: u32, helpers: Helpers<'_>) {
+fn require_proto(function: &mut FnBuilder<'_>, proto: u32, helpers: Helpers<'_>) {
     emit_is_object(function, proto);
     wasm!(function;
         LocalGet(proto), I64Const(NULL_BITS), I64Eq, I32Or, I32Eqz,
@@ -490,8 +490,13 @@ fn require_proto(function: &mut Function, proto: u32, helpers: Helpers<'_>) {
 /// `Object.create(O, Properties)`: `O` must be an object or `null`; a fresh
 /// ordinary object with `proto` `O`, then `ObjectDefineProperties` when
 /// `Properties` is not `undefined`.
-fn emit_create(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
-    let (proto, o, base) = (frame.i64(0), frame.i64(3), frame.i32(0));
+fn emit_create(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (proto, o, base) = (frame.i64(0), frame.i64(3), frame.base(0));
     frame.arg(function, 0);
     wasm!(function; LocalSet(proto));
     require_proto(function, proto, helpers);
@@ -510,7 +515,7 @@ fn emit_create(function: &mut Function, frame: Frame, strings: &StrOffsets, help
 /// `Object.getPrototypeOf(O)`: the `proto` of `ToObject(O)` (a primitive's
 /// realm prototype).
 fn emit_get_prototype_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -525,7 +530,7 @@ fn emit_get_prototype_of(
 /// takes `[[SetPrototypeOf]]` (`__set_proto`; a rejection throws); returns
 /// `O`.
 fn emit_set_prototype_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -556,14 +561,14 @@ fn emit_set_prototype_of(
 /// enumerable or not, in own-key order (a `LAZY` function is materialized
 /// first; an array's `length` follows its indices).
 fn emit_get_own_property_names(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (v, kv) = (frame.i64(0), frame.i64(1));
-    let (res, ks, n, i) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
-    let (key, length) = (frame.x32(0), frame.x32(1));
+    let (res, ks, n, i) = (frame.base(0), frame.base(1), frame.i32(2), frame.i32(3));
+    let (key, length) = (frame.base(4), frame.x32(1));
     arg_to_object(function, frame, 0, v, strings, helpers);
     wasm!(function; LocalGet(v), I32WrapI64, LocalSet(key));
     emit_materialize(function, key, helpers);
@@ -576,7 +581,7 @@ fn emit_get_own_property_names(
         I32Const(1), LocalSet(length),
     );
     // Push `length` (once) onto `res`.
-    let push_length = |function: &mut Function| {
+    let push_length = |function: &mut FnBuilder<'_>| {
         wasm!(function; LocalGet(res));
         push_str(function, strings, INDEX_LENGTH_KEY);
         wasm!(function; Call(helpers.array_push), Drop, I32Const(0), LocalSet(length));
@@ -614,12 +619,12 @@ fn emit_get_own_property_names(
 /// `Object.getOwnPropertySymbols(O)`: every own symbol key of `ToObject(O)`,
 /// enumerable or not, in creation order.
 fn emit_get_own_property_symbols(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (v, key) = (frame.i64(0), frame.i32(0));
+    let (v, key) = (frame.i64(0), frame.base(0));
     arg_to_object(function, frame, 0, v, strings, helpers);
     wasm!(function; LocalGet(v), I32WrapI64, LocalSet(key));
     emit_materialize(function, key, helpers);
@@ -632,9 +637,14 @@ fn emit_get_own_property_symbols(
 /// an own enumerable property when reached (`__own_enum`) is read with
 /// `[[Get]]` and written to the target with a strict `[[Set]]` (a throw
 /// returns); returns the target.
-fn emit_assign(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
+fn emit_assign(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     let (to, from, kv, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (n, i, ks, len) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (n, i, ks, len) = (frame.i32(0), frame.i32(1), frame.base(2), frame.i32(3));
     let (at, spread) = (frame.x32(0), frame.x64(0));
     // The spread argument array, before a getter's spread call republishes it.
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
@@ -689,8 +699,13 @@ fn emit_assign(function: &mut Function, frame: Frame, strings: &StrOffsets, help
 
 /// `Object.hasOwn(O, P)`: `ToObject(O)`, then `ToPropertyKey(P)`, then
 /// whether the own property exists (`__has_own`).
-fn emit_has_own(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
-    let (v, key) = (frame.i64(0), frame.i32(0));
+fn emit_has_own(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (v, key) = (frame.i64(0), frame.base(0));
     arg_to_object(function, frame, 0, v, strings, helpers);
     frame.arg(function, 1);
     wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
@@ -702,7 +717,7 @@ fn emit_has_own(function: &mut Function, frame: Frame, strings: &StrOffsets, hel
 }
 
 /// `Object.is(a, b)`: `SameValue` (`NaN` is `NaN`, `+0` is not `-0`).
-fn emit_is(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_is(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let (a, b) = (frame.i64(0), frame.i64(1));
     frame.arg(function, 0);
     wasm!(function; LocalSet(a));
@@ -719,13 +734,13 @@ fn emit_is(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
 /// fresh ordinary object. A non-object entry or a throwing entry read or key
 /// conversion closes the iterator.
 fn emit_from_entries(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (src, item, kv, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (res, key) = (frame.i32(0), frame.i32(3));
+    let (res, key) = (frame.base(0), frame.base(3));
     let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
     let scratch = frame.scratch();
     frame.arg(function, 0);

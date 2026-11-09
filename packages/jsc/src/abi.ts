@@ -159,7 +159,7 @@ export const FUNC_FLAG_SELF_ALLOC = 32
 /** {@link TYPE_FUNCTION} `flags` bit: a bound function (own `length`/`name`, `env` = `[target, boundThis, ...args]`). */
 export const FUNC_FLAG_BOUND = 64
 /** Address of the `u32` base of the `__fn_info` table (`[name key:u32][length:u32]` per function). */
-export const FN_INFO_ADDR = 4
+export const FN_INFO_ADDR = 1048580
 /** Byte size of one `__fn_info` entry. */
 export const FN_INFO_ENTRY_SIZE = 8
 /** Byte offset (within a `__fn_info` entry) of the interned `name` key (`u32`). */

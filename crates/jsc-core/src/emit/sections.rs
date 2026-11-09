@@ -572,10 +572,13 @@ pub(super) fn build_globals(
     let (dirty_ty, dirty_init) = mut_i32(0);
     globals.global(dirty_ty, &dirty_init);
     // The renderer's output buffer, recursion path and ref table (all i32, 0).
-    for _ in OUT_BUF_GLOBAL..RNG0_GLOBAL {
+    for _ in OUT_BUF_GLOBAL..SP_GLOBAL {
         let (ty, init) = mut_i32(0);
         globals.global(ty, &init);
     }
+    // The shadow-stack pointer ($__sp, i32, index SP_GLOBAL), empty at startup.
+    let (sp_ty, sp_init) = mut_i32((abi::SHADOW_STACK_SIZE - abi::SHADOW_FP_BIAS).cast_signed());
+    globals.global(sp_ty, &sp_init);
     // The `Math.random` state (i64, 0 = not seeded yet).
     for _ in RNG0_GLOBAL..MODULE_CELL_GLOBAL_BASE {
         let (ty, init) = mut_i64();

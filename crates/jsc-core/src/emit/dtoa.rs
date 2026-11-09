@@ -249,20 +249,21 @@ const COPY: Instruction<'static> = Instruction::MemoryCopy {
 pub(super) fn emit_helpers(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> [Function; HELPER_COUNT as usize] {
     [
-        emit_umul128(),
-        emit_pow5(helpers),
-        emit_mul_shift(helpers),
-        emit_multiple_of_pow5(),
-        emit_d2d(helpers),
-        emit_scratch_str(helpers),
-        emit_num_to_str(strings, helpers),
-        emit_dec_expand(),
-        emit_num_format(helpers),
-        emit_num_radix(helpers),
-        emit_prim_str(strings, helpers),
-        emit_msg_str(strings, helpers),
+        emit_umul128(leaves),
+        emit_pow5(helpers, leaves),
+        emit_mul_shift(helpers, leaves),
+        emit_multiple_of_pow5(leaves),
+        emit_d2d(helpers, leaves),
+        emit_scratch_str(helpers, leaves),
+        emit_num_to_str(strings, helpers, leaves),
+        emit_dec_expand(leaves),
+        emit_num_format(helpers, leaves),
+        emit_num_radix(helpers, leaves),
+        emit_prim_str(strings, helpers, leaves),
+        emit_msg_str(strings, helpers, leaves),
     ]
 }
 
@@ -270,12 +271,12 @@ pub(super) fn emit_helpers(
 
 /// `__umul128(a: i64, b: i64) -> (low: i64, high: i64)`: the full 128-bit
 /// product from four multiplies of the 32-bit halves.
-fn emit_umul128() -> Function {
+fn emit_umul128(leaves: &LeafSet) -> Function {
     let (lhs, rhs, low_low, low_high, high_low, high_high, mid_one, mid_two) =
         (0, 1, 2, 3, 4, 5, 6, 7);
-    let mut f = Function::new(vec![(6, ValType::I64)]);
-    let low = |f: &mut Function, x: u32| wasm!(f; LocalGet(x), I64Const(LOW_32), I64And);
-    let high = |f: &mut Function, x: u32| wasm!(f; LocalGet(x), I64Const(32), I64ShrU);
+    let mut f = helper_builder(leaves, &[RAW_I64, RAW_I64], &[RAW_I64; 6]);
+    let low = |f: &mut FnBuilder<'_>, x: u32| wasm!(f; LocalGet(x), I64Const(LOW_32), I64And);
+    let high = |f: &mut FnBuilder<'_>, x: u32| wasm!(f; LocalGet(x), I64Const(32), I64ShrU);
     low(&mut f, lhs);
     low(&mut f, rhs);
     wasm!(f; I64Mul, LocalSet(low_low));
@@ -298,11 +299,11 @@ fn emit_umul128() -> Function {
     wasm!(f; I64Add);
     high(&mut f, mid_two);
     wasm!(f; I64Add, End);
-    f
+    finish_builder(f)
 }
 
 /// Push `pow5bits(local)`: the bit length of `5^local`.
-fn pow5bits(f: &mut Function, local: u32) {
+fn pow5bits(f: &mut FnBuilder<'_>, local: u32) {
     wasm!(f;
         LocalGet(local), I32Const(1_217_359), I32Mul, I32Const(19), I32ShrU,
         I32Const(1), I32Add,
@@ -311,7 +312,7 @@ fn pow5bits(f: &mut Function, local: u32) {
 
 /// Push `(hi:lo) >> dist` truncated to 64 bits (`dist`, an i64 local, in
 /// `1..64`).
-fn shift_right_128(f: &mut Function, lo: u32, hi: u32, dist: u32) {
+fn shift_right_128(f: &mut FnBuilder<'_>, lo: u32, hi: u32, dist: u32) {
     wasm!(f;
         LocalGet(hi), I64Const(64), LocalGet(dist), I64Sub, I64Shl,
         LocalGet(lo), LocalGet(dist), I64ShrU, I64Or,
@@ -319,7 +320,7 @@ fn shift_right_128(f: &mut Function, lo: u32, hi: u32, dist: u32) {
 }
 
 /// Set `sum = carry_in + add` and bump `high` on the 64-bit overflow.
-fn add_with_carry(f: &mut Function, sum: u32, carry_in: u32, add: u32, high: u32) {
+fn add_with_carry(f: &mut FnBuilder<'_>, sum: u32, carry_in: u32, add: u32, high: u32) {
     wasm!(f;
         LocalGet(carry_in), LocalGet(add), I64Add, LocalTee(sum), LocalGet(carry_in), I64LtU,
         If(BlockType::Empty), LocalGet(high), I64Const(1), I64Add, LocalSet(high), End,
@@ -330,12 +331,13 @@ fn add_with_carry(f: &mut Function, sum: u32, carry_in: u32, add: u32, high: u32
 /// `5^i` (`double_computePow5`), or with `inv` the inverse
 /// `2^k / 5^i + 1` (`double_computeInvPow5`), from a table entry times
 /// `5^offset` and its 2-bit correction.
-fn emit_pow5(helpers: Helpers<'_>) -> Function {
+fn emit_pow5(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (i, inv) = (0, 1);
     let (base2, offset, bits_delta, addr) = (2, 3, 4, 5);
     let (mul_low, mul_high, factor, prod_low, carry_low, prod_high, carry_high, sum, delta) =
         (6, 7, 8, 9, 10, 11, 12, 13, 14);
-    let mut f = Function::new(vec![(4, ValType::I32), (9, ValType::I64)]);
+    let mut f = helper_builder(leaves, &[RAW_I32, RAW_I32], &[RAW_I32; 4]);
+    f.locals(9, RAW_I64);
     let umul = helpers.umul128();
     wasm!(f;
         // base = (i + (inv ? 25 : 0)) / 26; the table entry; |base * 26 - i|.
@@ -377,15 +379,15 @@ fn emit_pow5(helpers: Helpers<'_>) -> Function {
     );
     shift_right_128(&mut f, sum, prod_high, delta);
     wasm!(f; End);
-    f
+    finish_builder(f)
 }
 
 /// `__ryu_mul_shift(m: i64, low: i64, high: i64, j: i32) -> i64`: `mulShift64`,
 /// `(m * (high:low)) >> j` for `j` in `65..128`.
-fn emit_mul_shift(helpers: Helpers<'_>) -> Function {
+fn emit_mul_shift(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (factor, mul_low, mul_high, shift) = (0, 1, 2, 3);
     let (carry_high, prod_high, carry_low, sum, dist) = (4, 5, 6, 7, 8);
-    let mut f = Function::new(vec![(5, ValType::I64)]);
+    let mut f = helper_builder(leaves, &[RAW_I64, RAW_I64, RAW_I64, RAW_I32], &[RAW_I64; 5]);
     let umul = helpers.umul128();
     wasm!(f;
         LocalGet(factor), LocalGet(mul_high), Call(umul), LocalSet(prod_high), LocalSet(carry_high),
@@ -395,14 +397,14 @@ fn emit_mul_shift(helpers: Helpers<'_>) -> Function {
     wasm!(f; LocalGet(shift), I32Const(64), I32Sub, I64ExtendI32U, LocalSet(dist));
     shift_right_128(&mut f, sum, prod_high, dist);
     wasm!(f; End);
-    f
+    finish_builder(f)
 }
 
 /// `__ryu_mp5(value: i64, p: i32) -> i32`: whether the nonzero `value` is a
 /// multiple of `5^p`.
-fn emit_multiple_of_pow5() -> Function {
+fn emit_multiple_of_pow5(leaves: &LeafSet) -> Function {
     let (value, power, count) = (0, 1, 2);
-    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let mut f = helper_builder(leaves, &[RAW_I64, RAW_I32], &[RAW_I32]);
     wasm!(f;
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(value), I64Const(5), I64RemU, I64Const(0), I64Ne, BrIf(1),
@@ -413,7 +415,7 @@ fn emit_multiple_of_pow5() -> Function {
         LocalGet(count), LocalGet(power), I32GeU,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// The locals of [`emit_d2d`].
@@ -477,8 +479,9 @@ const D2D: D2d = D2d {
 /// round-tripping decimal `digits * 10^exp10` of the finite, positive, nonzero
 /// double `bits`, closest to the exact value and ties to even (Ryu's `d2d`
 /// general loop, which the upstream common-case path only speeds up).
-fn emit_d2d(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(11, ValType::I64), (13, ValType::I32)]);
+fn emit_d2d(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I64], &[RAW_I64; 11]);
+    f.locals(13, RAW_I32);
     d2d_decode(&mut f);
     wasm!(f; LocalGet(D2D.e2), I32Const(0), I32GeS, If(BlockType::Empty));
     d2d_positive_exponent(&mut f, helpers);
@@ -487,11 +490,11 @@ fn emit_d2d(helpers: Helpers<'_>) -> Function {
     wasm!(f; End);
     d2d_shorten(&mut f);
     d2d_output(&mut f);
-    f
+    finish_builder(f)
 }
 
 /// Step 1 and 2: decode `bits` and compute `mv` and `mm_shift`.
-fn d2d_decode(f: &mut Function) {
+fn d2d_decode(f: &mut FnBuilder<'_>) {
     let bits = 0;
     let D2d {
         mantissa,
@@ -520,7 +523,7 @@ fn d2d_decode(f: &mut Function) {
 }
 
 /// `vp`, `vm` and `vr`: `mulShiftAll64` by the power in `pow_low`/`pow_high`.
-fn d2d_mul_all(f: &mut Function, helpers: Helpers<'_>) {
+fn d2d_mul_all(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let D2d {
         mv,
         vr,
@@ -544,7 +547,7 @@ fn d2d_mul_all(f: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Step 3 for `e2 >= 0`.
-fn d2d_positive_exponent(f: &mut Function, helpers: Helpers<'_>) {
+fn d2d_positive_exponent(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let D2d {
         mv,
         vp,
@@ -589,7 +592,7 @@ fn d2d_positive_exponent(f: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Step 3 for `e2 < 0`.
-fn d2d_negative_exponent(f: &mut Function, helpers: Helpers<'_>) {
+fn d2d_negative_exponent(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let D2d {
         mv,
         vp,
@@ -637,7 +640,7 @@ fn d2d_negative_exponent(f: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Push `value - 10 * next` (the digit `value` loses) as i32.
-fn low_digit(f: &mut Function, value: u32, next: u32) {
+fn low_digit(f: &mut FnBuilder<'_>, value: u32, next: u32) {
     wasm!(f;
         LocalGet(value), LocalGet(next), I64Const(10), I64Mul, I64Sub, I32WrapI64,
     );
@@ -645,7 +648,7 @@ fn low_digit(f: &mut Function, value: u32, next: u32) {
 
 /// Commit one removed digit: update `vr_zeros` and `last` from `vr_digit` and
 /// move `vr`/`vp`/`vm` to their `*_next` values.
-fn d2d_commit(f: &mut Function) {
+fn d2d_commit(f: &mut FnBuilder<'_>) {
     let D2d {
         vr,
         vp,
@@ -670,7 +673,7 @@ fn d2d_commit(f: &mut Function) {
 }
 
 /// Step 4: remove digits while the interval still holds a shorter decimal.
-fn d2d_shorten(f: &mut Function) {
+fn d2d_shorten(f: &mut FnBuilder<'_>) {
     let D2d {
         vr,
         vp,
@@ -721,7 +724,7 @@ fn d2d_shorten(f: &mut Function) {
 }
 
 /// Push the results: `vr` rounded by the removed digits, and `e10 + removed`.
-fn d2d_output(f: &mut Function) {
+fn d2d_output(f: &mut FnBuilder<'_>) {
     let D2d {
         vr,
         vm,
@@ -751,7 +754,7 @@ fn d2d_output(f: &mut Function) {
 // --- Text building -----------------------------------------------------------
 
 /// Store `byte` at the cursor `p` and advance it.
-fn put(f: &mut Function, p: u32, byte: i32) {
+fn put(f: &mut FnBuilder<'_>, p: u32, byte: i32) {
     wasm!(f;
         LocalGet(p), I32Const(byte), I32Store8(mem(0)),
         LocalGet(p), I32Const(1), I32Add, LocalSet(p),
@@ -759,7 +762,12 @@ fn put(f: &mut Function, p: u32, byte: i32) {
 }
 
 /// Copy `len` bytes from `src` to the cursor `p` and advance it.
-fn put_copy(f: &mut Function, p: u32, src: impl Fn(&mut Function), len: impl Fn(&mut Function)) {
+fn put_copy(
+    f: &mut FnBuilder<'_>,
+    p: u32,
+    src: impl Fn(&mut FnBuilder<'_>),
+    len: impl Fn(&mut FnBuilder<'_>),
+) {
     wasm!(f; LocalGet(p));
     src(f);
     len(f);
@@ -770,7 +778,7 @@ fn put_copy(f: &mut Function, p: u32, src: impl Fn(&mut Function), len: impl Fn(
 }
 
 /// Write `len` `'0'` bytes at the cursor `p` and advance it.
-fn put_zeros(f: &mut Function, p: u32, len: impl Fn(&mut Function)) {
+fn put_zeros(f: &mut FnBuilder<'_>, p: u32, len: impl Fn(&mut FnBuilder<'_>)) {
     wasm!(f; LocalGet(p), I32Const(ZERO));
     len(f);
     wasm!(f; MemoryFill(0), LocalGet(p));
@@ -779,7 +787,7 @@ fn put_zeros(f: &mut Function, p: u32, len: impl Fn(&mut Function)) {
 }
 
 /// Store `'0' + digit` (pushed by `digit`) at the cursor `p` and advance it.
-fn put_digit(f: &mut Function, p: u32, digit: impl Fn(&mut Function)) {
+fn put_digit(f: &mut FnBuilder<'_>, p: u32, digit: impl Fn(&mut FnBuilder<'_>)) {
     wasm!(f; LocalGet(p));
     digit(f);
     wasm!(f;
@@ -789,7 +797,7 @@ fn put_digit(f: &mut Function, p: u32, digit: impl Fn(&mut Function)) {
 }
 
 /// Write `e±k` for the exponent in i32 local `exp` (clobbered).
-fn put_exponent(f: &mut Function, p: u32, exp: u32) {
+fn put_exponent(f: &mut FnBuilder<'_>, p: u32, exp: u32) {
     put(f, p, LOWER_E);
     wasm!(f; LocalGet(exp), I32Const(0), I32LtS, If(BlockType::Empty));
     put(f, p, MINUS);
@@ -809,7 +817,7 @@ fn put_exponent(f: &mut Function, p: u32, exp: u32) {
 
 /// Write the decimal digits of the i64 local `digits` (clobbered) backwards,
 /// ending at `end`: `ptr` is their start and `count` their number.
-fn write_digits(f: &mut Function, digits: u32, end: i32, ptr: u32, count: u32) {
+fn write_digits(f: &mut FnBuilder<'_>, digits: u32, end: i32, ptr: u32, count: u32) {
     wasm!(f;
         I32Const(end), LocalSet(ptr),
         Loop(BlockType::Empty),
@@ -824,27 +832,31 @@ fn write_digits(f: &mut Function, digits: u32, end: i32, ptr: u32, count: u32) {
 
 /// `__scratch_str(ptr: i32, len: i32) -> i32`: a fresh Latin-1 string of the
 /// `len` bytes at `ptr`.
-fn emit_scratch_str(helpers: Helpers<'_>) -> Function {
+fn emit_scratch_str(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (ptr, len, string) = (0, 1, 2);
-    let mut f = Function::new(vec![(1, ValType::I32)]);
+    let mut f = helper_builder(leaves, &[RAW_I32, RAW_I32], &[ROOT_BASE]);
     wasm!(f;
         LocalGet(len), I32Const(0), Call(helpers.new_string), LocalTee(string),
         I32Const(STR_DATA_OFFSET), I32Add, LocalGet(ptr), LocalGet(len),
     );
     f.instruction(&COPY);
     wasm!(f; LocalGet(string), End);
-    f
+    finish_builder(f)
 }
 
 // --- ToString ----------------------------------------------------------------
 
 /// `__num_to_str(bits: i64) -> i32`: `Number::toString(x, 10)` as a string
 /// base.
-fn emit_num_to_str(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+fn emit_num_to_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let bits = 0;
     let digits = 1;
     let (exp10, count, point, ptr, p) = (2, 3, 4, 5, 6);
-    let mut f = Function::new(vec![(1, ValType::I64), (5, ValType::I32)]);
+    let mut f = helper_builder(
+        leaves,
+        &[RAW_I64],
+        &[RAW_I64, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+    );
     let at = |text: &str| static_key(strings, text);
     wasm!(f;
         LocalGet(bits), I64Const(INFINITY_BITS), I64And, I64Const(INFINITY_BITS), I64Eq,
@@ -877,20 +889,20 @@ fn emit_num_to_str(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         I32Const(ROUNDED), LocalGet(p), I32Const(ROUNDED), I32Sub, Call(helpers.scratch_str()),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// The spec layout of `count` digits at `ptr` with the decimal point at
 /// `point` (clobbered): fixed for `-6 < point <= 21`, else exponential.
-fn shortest_layout(f: &mut Function, ptr: u32, count: u32, point: u32, p: u32) {
-    let digits = |f: &mut Function| wasm!(f; LocalGet(ptr));
-    let all = |f: &mut Function| wasm!(f; LocalGet(count));
-    let head = |f: &mut Function| wasm!(f; LocalGet(point));
-    let tail_src = |f: &mut Function| wasm!(f; LocalGet(ptr), LocalGet(point), I32Add);
-    let tail = |f: &mut Function| wasm!(f; LocalGet(count), LocalGet(point), I32Sub);
-    let one = |f: &mut Function| wasm!(f; I32Const(1));
-    let rest_src = |f: &mut Function| wasm!(f; LocalGet(ptr), I32Const(1), I32Add);
-    let rest = |f: &mut Function| wasm!(f; LocalGet(count), I32Const(1), I32Sub);
+fn shortest_layout(f: &mut FnBuilder<'_>, ptr: u32, count: u32, point: u32, p: u32) {
+    let digits = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(ptr));
+    let all = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(count));
+    let head = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(point));
+    let tail_src = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(ptr), LocalGet(point), I32Add);
+    let tail = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(count), LocalGet(point), I32Sub);
+    let one = |f: &mut FnBuilder<'_>| wasm!(f; I32Const(1));
+    let rest_src = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(ptr), I32Const(1), I32Add);
+    let rest = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(count), I32Const(1), I32Sub);
     wasm!(f;
         LocalGet(point), I32Const(1), I32Sub, I32Const(21), I32LtU, If(BlockType::Empty),
         LocalGet(point), LocalGet(count), I32GeS, If(BlockType::Empty),
@@ -922,9 +934,10 @@ fn shortest_layout(f: &mut Function, ptr: u32, count: u32, point: u32, p: u32) {
 
 /// `__prim_str(v: i64) -> i32`: `ToString` of a number, boolean, `null` or
 /// `undefined`.
-fn emit_prim_str(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+fn emit_prim_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let v = 0;
-    let mut f = Function::new(vec![]);
+    // `v` is never a heap reference here, so it needs no root.
+    let mut f = helper_builder(leaves, &[RAW_I64], &[]);
     let at = |text: &str| static_key(strings, text);
     emit_is_number(&mut f, v);
     wasm!(f;
@@ -941,15 +954,15 @@ fn emit_prim_str(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         wasm!(f; I32Const(at(text)), LocalGet(v), I64Const(bits), I64Ne, Select);
     }
     wasm!(f; End, End);
-    f
+    finish_builder(f)
 }
 
 /// `__msg_str(v: i64) -> i32`: the text of any value in an error message: like
 /// `ToString`, but a symbol is its `SymbolDescriptiveString` and an object
 /// stays unconverted (`[object Object]`), so it never throws or runs user code.
-fn emit_msg_str(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+fn emit_msg_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let v = 0;
-    let mut f = Function::new(vec![(1, ValType::I64)]);
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[ROOT_JS]);
     emit_symbol_descriptive_string(&mut f, v, strings, helpers);
     emit_is_string(&mut f, v);
     wasm!(f; If(BlockType::Result(ValType::I32)), LocalGet(v), I32WrapI64, Else);
@@ -963,19 +976,19 @@ fn emit_msg_str(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         End,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 // --- Exact decimal expansion -------------------------------------------------
 
 /// The address of limb `i` (an i32 local) is pushed; load or store at
 /// `mem(LIMBS)`.
-fn limb_offset(f: &mut Function, i: u32) {
+fn limb_offset(f: &mut FnBuilder<'_>, i: u32) {
     wasm!(f; LocalGet(i), I32Const(2), I32Shl);
 }
 
 /// Drop the zero limbs at the top of the `n` live limbs.
-fn trim_limbs(f: &mut Function, n: u32) {
+fn trim_limbs(f: &mut FnBuilder<'_>, n: u32) {
     wasm!(f;
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(n), I32Eqz, BrIf(1),
@@ -1019,16 +1032,17 @@ const EXPAND: Expand = Expand {
 /// (no leading or trailing zeros) with `x = 0.digits * 10^point`: `m << e` as
 /// a bignum, or `m * 5^-e` with the point `-e` digits from the right, printed
 /// by repeated division by `10^9`.
-fn emit_dec_expand() -> Function {
-    let mut f = Function::new(vec![(3, ValType::I64), (6, ValType::I32)]);
+fn emit_dec_expand(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I64], &[RAW_I64; 3]);
+    f.locals(6, RAW_I32);
     expand_load(&mut f);
     expand_digits(&mut f);
     expand_finish(&mut f);
-    f
+    finish_builder(f)
 }
 
 /// Decode `bits` into `significand * 2^exp2` and build the bignum in the limbs.
-fn expand_load(f: &mut Function) {
+fn expand_load(f: &mut FnBuilder<'_>) {
     let bits = 0;
     let Expand {
         significand,
@@ -1057,7 +1071,7 @@ fn expand_load(f: &mut Function) {
 }
 
 /// The bignum `significand << exp2` for `exp2 >= 0`.
-fn expand_shift(f: &mut Function) {
+fn expand_shift(f: &mut FnBuilder<'_>) {
     let Expand {
         significand,
         carry,
@@ -1090,7 +1104,7 @@ fn expand_shift(f: &mut Function) {
 
 /// The bignum `significand * 5^-exp2` for `exp2 < 0`, by steps of at most
 /// `5^13` (so a limb product plus carry fits 64 bits).
-fn expand_times_pow5(f: &mut Function) {
+fn expand_times_pow5(f: &mut FnBuilder<'_>) {
     let Expand {
         significand,
         carry,
@@ -1136,7 +1150,7 @@ fn expand_times_pow5(f: &mut Function) {
 }
 
 /// Print the limbs as nine-digit groups ending at the digit buffer's end.
-fn expand_digits(f: &mut Function) {
+fn expand_digits(f: &mut FnBuilder<'_>) {
     let Expand {
         carry,
         chunk,
@@ -1178,7 +1192,7 @@ fn expand_digits(f: &mut Function) {
 }
 
 /// Strip the zeros at both ends and push `(ptr, count, point)`.
-fn expand_finish(f: &mut Function) {
+fn expand_finish(f: &mut FnBuilder<'_>) {
     let Expand {
         exp2, ptr, count, ..
     } = EXPAND;
@@ -1251,7 +1265,7 @@ const FORMAT: Format = Format {
 /// `__num_format(bits: i64, mode: i32, f: i32) -> i32`: `toFixed(f)`,
 /// `toExponential(f)`, `toPrecision(f)` or `toExponential()` (the `MODE_*`) of
 /// the finite double `bits`, with `f` in the method's range.
-fn emit_num_format(helpers: Helpers<'_>) -> Function {
+fn emit_num_format(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (bits, mode) = (0, 1);
     let Format {
         magnitude,
@@ -1259,7 +1273,8 @@ fn emit_num_format(helpers: Helpers<'_>) -> Function {
         p,
         ..
     } = FORMAT;
-    let mut f = Function::new(vec![(2, ValType::I64), (13, ValType::I32)]);
+    let mut f = helper_builder(leaves, &[RAW_I64, RAW_I32, RAW_I32], &[RAW_I64; 2]);
+    f.locals(13, RAW_I32);
     wasm!(f;
         LocalGet(bits), I64Const(i64::MAX), I64And, LocalSet(magnitude),
         LocalGet(mode), I32Const(MODE_FIXED), I32Eq,
@@ -1288,12 +1303,12 @@ fn emit_num_format(helpers: Helpers<'_>) -> Function {
         I32Const(TEXT), LocalGet(p), I32Const(TEXT), I32Sub, Call(helpers.scratch_str()),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// Fill [`ROUNDED`] with the digits to print: sets `rounded` (their number)
 /// and `rounded_point` (`x = 0.digits * 10^rounded_point`).
-fn format_digits(f: &mut Function, helpers: Helpers<'_>) {
+fn format_digits(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let (mode, digits_arg) = (1, 2);
     let Format {
         magnitude,
@@ -1345,7 +1360,7 @@ fn format_digits(f: &mut Function, helpers: Helpers<'_>) {
 
 /// Round the `count` digits at `ptr` to `keep` significant digits, ties to the
 /// larger `n`, into [`ROUNDED`] (`keep < 0` rounds to no digits at all).
-fn round_digits(f: &mut Function) {
+fn round_digits(f: &mut FnBuilder<'_>) {
     let Format {
         ptr,
         count,
@@ -1379,7 +1394,7 @@ fn round_digits(f: &mut Function) {
 
 /// Add one unit in the last of the `keep` digits at [`ROUNDED`]; a carry out
 /// of all of them yields `1` followed by zeros and bumps the point.
-fn round_up(f: &mut Function) {
+fn round_up(f: &mut FnBuilder<'_>) {
     let Format {
         point,
         keep,
@@ -1412,7 +1427,7 @@ fn round_up(f: &mut Function) {
 }
 
 /// The `toFixed` text at the cursor from the rounded digits.
-fn format_fixed(f: &mut Function) {
+fn format_fixed(f: &mut FnBuilder<'_>) {
     let digits_arg = 2;
     let Format {
         magnitude,
@@ -1441,7 +1456,7 @@ fn format_fixed(f: &mut Function) {
         End,
         LocalGet(digits_arg), I32Eqz, If(BlockType::Empty),
     );
-    let text = |f: &mut Function| wasm!(f; I32Const(ROUNDED));
+    let text = |f: &mut FnBuilder<'_>| wasm!(f; I32Const(ROUNDED));
     put_copy(f, p, text, |f| wasm!(f; LocalGet(length)));
     wasm!(f;
         Else,
@@ -1468,7 +1483,7 @@ fn format_fixed(f: &mut Function) {
 }
 
 /// `d.ddd` + `e±k` at the cursor from the rounded digits and `exp`.
-fn format_exponential_text(f: &mut Function) {
+fn format_exponential_text(f: &mut FnBuilder<'_>) {
     let Format {
         rounded, p, exp, ..
     } = FORMAT;
@@ -1491,7 +1506,7 @@ fn format_exponential_text(f: &mut Function) {
 }
 
 /// The `toExponential` text.
-fn format_exponential(f: &mut Function) {
+fn format_exponential(f: &mut FnBuilder<'_>) {
     let Format {
         rounded_point, exp, ..
     } = FORMAT;
@@ -1500,7 +1515,7 @@ fn format_exponential(f: &mut Function) {
 }
 
 /// The `toPrecision` text: exponential for `e < -6 || e >= p`, else fixed.
-fn format_precision(f: &mut Function) {
+fn format_precision(f: &mut FnBuilder<'_>) {
     let precision = 2;
     let Format {
         rounded,
@@ -1509,8 +1524,8 @@ fn format_precision(f: &mut Function) {
         exp,
         ..
     } = FORMAT;
-    let text = |f: &mut Function| wasm!(f; I32Const(ROUNDED));
-    let all = |f: &mut Function| wasm!(f; LocalGet(rounded));
+    let text = |f: &mut FnBuilder<'_>| wasm!(f; I32Const(ROUNDED));
+    let all = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(rounded));
     wasm!(f;
         LocalGet(rounded_point), I32Const(1), I32Sub, LocalTee(exp), I32Const(-6), I32LtS,
         LocalGet(exp), LocalGet(precision), I32GeS, I32Or, If(BlockType::Empty),
@@ -1575,7 +1590,7 @@ const RADIX: Radix = Radix {
 /// for a radix other than 10 (V8's `DoubleToRadixCString`): the fraction digits
 /// grow from the scratch start, the integer digits down from its end. They
 /// cannot meet: a value with many integer digits has no fraction left.
-fn emit_num_radix(helpers: Helpers<'_>) -> Function {
+fn emit_num_radix(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (bits, radix) = (0, 1);
     let Radix {
         integer,
@@ -1584,7 +1599,10 @@ fn emit_num_radix(helpers: Helpers<'_>) -> Function {
         base,
         ..
     } = RADIX;
-    let mut f = Function::new(vec![(6, ValType::F64), (5, ValType::I32)]);
+    let mut f = helper_builder(leaves, &[RAW_I64, RAW_I32], &[RAW_F64; 6]);
+    f.locals(3, RAW_I32);
+    f.local(ROOT_BASE); // `string`
+    f.local(RAW_I32);
     wasm!(f;
         LocalGet(bits), I64Const(INFINITY_BITS), I64And, I64Const(INFINITY_BITS), I64Eq,
         LocalGet(bits), I64Const(1), I64Shl, I64Eqz, I32Or, If(BlockType::Empty),
@@ -1604,11 +1622,11 @@ fn emit_num_radix(helpers: Helpers<'_>) -> Function {
     wasm!(f; End);
     radix_integer(&mut f);
     radix_finish(&mut f, helpers);
-    f
+    finish_builder(f)
 }
 
 /// The fraction digits, as values, at the scratch start.
-fn radix_fraction(f: &mut Function) {
+fn radix_fraction(f: &mut FnBuilder<'_>) {
     let radix = 1;
     let Radix {
         integer,
@@ -1656,7 +1674,7 @@ fn radix_fraction(f: &mut Function) {
 }
 
 /// Push the ASCII radix digit of the i32 local `digit`.
-fn radix_char(f: &mut Function, digit: u32) {
+fn radix_char(f: &mut FnBuilder<'_>, digit: u32) {
     wasm!(f;
         LocalGet(digit), I32Const(ZERO), I32Add,
         LocalGet(digit), I32Const(87), I32Add,
@@ -1668,7 +1686,7 @@ fn radix_char(f: &mut Function, digit: u32) {
 /// unrepresented low digits are zeros. `integer` is below `2^59` at the
 /// modulo, so the exact remainder comes from its i64 value (plus the
 /// fractional part a division may have left).
-fn radix_integer(f: &mut Function) {
+fn radix_integer(f: &mut FnBuilder<'_>) {
     let radix = 1;
     let Radix {
         integer,
@@ -1706,7 +1724,7 @@ fn radix_integer(f: &mut Function) {
 }
 
 /// Map the fraction digits to ASCII and build the string.
-fn radix_finish(f: &mut Function, helpers: Helpers<'_>) {
+fn radix_finish(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let bits = 0;
     let Radix {
         frac_len,

@@ -70,7 +70,7 @@ pub(super) const STRINGS: [&str; 21] = [
 /// Throw the `ToObject` `TypeError` when the `this` value in `this` is
 /// `undefined` or `null`.
 pub(super) fn require_object_coercible(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     this: u32,
     strings: &StrOffsets,
@@ -86,12 +86,12 @@ pub(super) fn require_object_coercible(
 /// `ToObject(this)` (a primitive other than a string has no own properties),
 /// then whether the own property exists (`__has_own`).
 pub(super) fn emit_has_own_property(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (this, key) = (frame.i64(0), frame.i32(0));
+    let (this, key) = (frame.i64(0), frame.base(0));
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     frame.arg(function, 0);
     wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
@@ -108,13 +108,13 @@ pub(super) fn emit_has_own_property(
 /// builtin tag of `O` (Array, Function, Date, Error, Arguments, Boolean,
 /// Number, String, else Object).
 pub(super) fn emit_to_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (this, kind, tag) = (frame.i64(0), frame.i32(0), frame.i64(1));
-    let tag_if = |function: &mut Function, tag: &str| {
+    let tag_if = |function: &mut FnBuilder<'_>, tag: &str| {
         wasm!(function; If(BlockType::Empty));
         push_str(function, strings, tag);
         wasm!(function; Return, End);
@@ -176,7 +176,7 @@ pub(super) fn emit_to_string(
 
 /// `Object.prototype.valueOf()`: `ToObject(this)`.
 pub(super) fn emit_value_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -190,7 +190,7 @@ pub(super) fn emit_value_of(
 /// `Object.prototype.isPrototypeOf(V)`: `false` for a non-object `V`; else
 /// `ToObject(this)` and whether it is on `V`'s `proto` chain.
 pub(super) fn emit_is_prototype_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -225,12 +225,12 @@ pub(super) fn emit_is_prototype_of(
 /// `ToObject(this)`, then whether it has an own enumerable property `V`
 /// (`__own_enum`).
 pub(super) fn emit_property_is_enumerable(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (this, key) = (frame.i64(0), frame.i32(0));
+    let (this, key) = (frame.i64(0), frame.base(0));
     frame.arg(function, 0);
     wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
     return_if_pending(function);
@@ -246,7 +246,7 @@ pub(super) fn emit_property_is_enumerable(
 /// nullish `this` throws; a primitive's `toString` is looked up on its realm
 /// prototype and called with the primitive itself).
 pub(super) fn emit_to_locale_string(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -275,13 +275,13 @@ pub(super) fn emit_to_locale_string(
 /// [[Set]]: accessor, enumerable: true, configurable: true}`.
 pub(super) fn emit_define_accessor(
     set: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, accessor) = (frame.i64(0), frame.i64(1));
-    let (key, r) = (frame.i32(0), frame.i32(1));
+    let (key, r) = (frame.base(0), frame.i32(1));
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(o));
     require_object_coercible(function, frame, o, strings, helpers);
     wasm!(function; LocalGet(o), Call(helpers.to_object()), LocalSet(o));
@@ -331,13 +331,13 @@ pub(super) fn emit_define_accessor(
 /// else (a data property or none) `undefined`.
 pub(super) fn emit_lookup_accessor(
     set: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, desc) = (frame.i64(0), frame.i64(1));
-    let key = frame.i32(0);
+    let key = frame.base(0);
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(o));
     require_object_coercible(function, frame, o, strings, helpers);
     wasm!(function; LocalGet(o), Call(helpers.to_object()), LocalSet(o));
@@ -369,7 +369,7 @@ pub(super) fn emit_lookup_accessor(
 /// The getter of `Object.prototype.__proto__`: the `proto` of
 /// `ToObject(this)`.
 pub(super) fn emit_proto_get(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -388,7 +388,7 @@ pub(super) fn emit_proto_get(
 /// nothing; else `[[SetPrototypeOf]]` (`__set_proto`; a rejection throws).
 /// Returns `undefined`.
 pub(super) fn emit_proto_set(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
