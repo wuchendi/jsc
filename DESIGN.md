@@ -147,7 +147,7 @@ jsc/
 │   │   │   │   ├── json_parse.rs      # in-wasm JSON.parse
 │   │   │   │   ├── render.rs          # guest console renderer, output writer, _start helpers
 │   │   │   │   └── runtime.rs         # __alloc, strings, Map/Set, equality, trampolines
-│   │   │   └── run/               # wasmtime WASI runner + the remaining env imports
+│   │   │   └── run/               # wasmtime runner: four WASI imports + the remaining env
 │   │   │       ├── harness.rs         # Linker (preview 1 + env), _start call, proc_exit -> exit code
 │   │   │       ├── host.rs            # __method dispatch, allocation through guest exports
 │   │   │       ├── promise.rs         # promise engine + microtask queue + async driver
@@ -167,11 +167,11 @@ jsc/
 
 **`jsc-core`.** The library. `#![forbid(unsafe_code)]`. The default feature
 `native-run` pulls in `wasmtime` (`cranelift`, `runtime`, `std`) and
-`wasmtime-wasi` (`p1`); building with
+the runner hand-writes the four WASI imports; building with
 `default-features = false` leaves frontend + codegen + emit only. Dependencies:
 `swc_ecma_parser 46`, `swc_ecma_ast 29`, `swc_ecma_visit 29`, `swc_common 26`,
 `swc_ecma_transforms_base 50`, `swc_ecma_transforms_typescript 56`,
-`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 50` and `wasmtime-wasi 50`;
+`wasm-encoder 0.262`, `anyhow`, optional `wasmtime 50`;
 `wasmparser 0.262` is
 a dev-dependency.
 
@@ -819,8 +819,8 @@ backed by the hosts:
 | 9 | `__parse_int` | `(s: i64, radix: i64) -> i64` | `parseInt` |
 
 Because of these six, a module does not run under a plain WASI host yet. The
-native host is `run/harness.rs` (`wasmtime_wasi::p1` plus `Linker::func_wrap`
-for `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
+native host is `run/harness.rs` (`Linker::func_wrap` for the four WASI imports
+and `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
 `shim.ts`. Both decode jsvals with the same rules (`run/value.rs` /
 `value.ts`).
 
@@ -2396,8 +2396,8 @@ not run it.
 - `typos`
 - `cargo clippy --all-targets --workspace` (deny-warnings from the workspace lints)
 - `cargo test --doc --workspace`
-- `cargo shear` (includes `wasmtime-wasi`)
-- `cargo deny check` (includes `wasmtime-wasi` and its dependency tree)
+- `cargo shear`
+- `cargo deny check`
 
 **Job `test`** (matrix of 4): `cargo nextest run --workspace --no-fail-fast
 --partition count:N/4`, so the suite runs in four parallel quarters and every
