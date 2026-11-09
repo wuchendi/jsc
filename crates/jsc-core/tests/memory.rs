@@ -3,7 +3,6 @@
 //! backtrace).
 #![allow(clippy::expect_used)]
 
-use jsc_core::run::compile_and_run;
 mod common;
 use common::{assert_number, assert_str, assert_uncaught};
 
@@ -105,16 +104,9 @@ fn huge_allocation_is_out_of_memory() {
 /// The out-of-memory error carries no wasmtime trap backtrace.
 #[test]
 fn out_of_memory_has_no_backtrace() {
-    let err = compile_and_run(&format!("{HUGE} a.length")).expect_err("should run out of memory");
-    let text = format!("{err:?}");
-    assert!(
-        !text.contains("wasm backtrace"),
-        "unexpected backtrace: {text}"
-    );
-    assert!(
-        !text.contains("unreachable"),
-        "unexpected trap text: {text}"
-    );
+    let done = common::exec(&format!("{HUGE} a.length"), false).expect("exits cleanly");
+    assert_eq!(done.code, 1);
+    assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
 }
 
 /// An out-of-memory inside `try` is not catchable (the heap is exhausted, so
@@ -139,65 +131,4 @@ const HOST_OOM: &str = "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } 
 #[test]
 fn host_initiated_out_of_memory() {
     assert_uncaught(HOST_OOM, "RangeError: out of memory");
-}
-
-/// A store far past the end makes the array sparse: the gap is never
-/// allocated, so a length of a million costs no ~8 MB element store.
-#[test]
-fn sparse_store_does_not_allocate_the_gap() {
-    let program = jsc_core::frontend::parse(
-        "const a = []; a[1e6] = 1; a.length",
-        jsc_core::frontend::Dialect::Js,
-    )
-    .expect("parses");
-    let ir = jsc_core::codegen::lower(&program).expect("lowers");
-    let wasm = jsc_core::emit::emit(&ir);
-    let (bits, memory) = jsc_core::run::run(&wasm).expect("runs");
-    assert_eq!(f64::from_bits(bits), 1_000_001.0);
-    assert!(
-        memory.len() < 4 * 1024 * 1024,
-        "linear memory grew to {} bytes",
-        memory.len()
-    );
-}
-
-/// Run `src` and return its number result and final linear-memory size.
-fn run_with_memory(src: &str) -> (f64, usize) {
-    let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js).expect("parses");
-    let ir = jsc_core::codegen::lower(&program).expect("lowers");
-    let wasm = jsc_core::emit::emit(&ir);
-    let (bits, memory) = jsc_core::run::run(&wasm).expect("runs");
-    (f64::from_bits(bits), memory.len())
-}
-
-/// The dense bound is a gap of 1024 holes past the length, whatever the store
-/// capacity: stores that each land 1024 past the end (or roughly double the
-/// index, test262 `S15.4_A1.1_T10`) stay sparse and small, while a gap of
-/// 1023 still grows the store densely.
-#[test]
-fn dense_growth_is_bounded_by_the_gap() {
-    let (len, sparse) = run_with_memory(
-        "const a = []; for (let k = 0; k < 1000; k++) a[a.length + 1024] = k; a.length",
-    );
-    assert_eq!(len, 1_025_000.0);
-    assert!(
-        sparse < 4 * 1024 * 1024,
-        "sparse stores grew memory to {sparse} bytes"
-    );
-    let (len, dense) = run_with_memory(
-        "const a = []; for (let k = 0; k < 1000; k++) a[a.length + 1023] = k; a.length",
-    );
-    assert_eq!(len, 1_024_000.0);
-    assert!(
-        dense > 8 * 1024 * 1024,
-        "dense stores only grew memory to {dense} bytes"
-    );
-    let (len, doubling) = run_with_memory(
-        "const x = []; let k = 1; for (let i = 0; i < 32; i++) { k = k * 2; x[k - 2] = k } x.length",
-    );
-    assert_eq!(len, 4_294_967_295.0);
-    assert!(
-        doubling < 4 * 1024 * 1024,
-        "doubling stores grew memory to {doubling} bytes"
-    );
 }

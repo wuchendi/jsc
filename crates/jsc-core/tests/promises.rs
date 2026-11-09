@@ -8,8 +8,10 @@
 #![allow(clippy::expect_used)]
 
 mod common;
-use common::{assert_eval, assert_output, assert_rejected, assert_uncaught};
-use jsc_core::run::compile_and_run;
+use common::{
+    assert_eval, assert_output, assert_rejected, assert_uncaught,
+    assert_unhandled_rejection as assert_unhandled,
+};
 
 // --- Microtask ordering -------------------------------------------------------
 
@@ -519,16 +521,6 @@ fn then_on_a_primitive_throws_a_type_error() {
 }
 
 // --- Unhandled rejections -----------------------------------------------------
-
-/// Run `src` and assert it fails with `Uncaught (in promise) <expected>`.
-fn assert_unhandled(src: &str, expected: &str) {
-    let err = compile_and_run(src).expect_err("program should report an unhandled rejection");
-    assert_eq!(
-        err.to_string(),
-        format!("Uncaught (in promise) {expected}"),
-        "unhandled-rejection message for source `{src}`"
-    );
-}
 
 /// A rejection that never gets a handler fails the run, rendered like an
 /// uncaught exception (Error objects as `Name: message`, primitives as-is).

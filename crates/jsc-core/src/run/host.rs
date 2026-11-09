@@ -8,8 +8,11 @@ use wasmtime::{AsContextMut, Caller, Global};
 
 use crate::abi;
 
-use super::value::{array_elements, string_units};
-use super::{HEAP, QNAN, STR_DATA_OFFSET, TYPE_ARRAY, TYPE_STRING, Value, decode, to_js_string};
+use abi::{HEAP, QNAN, TYPE_ARRAY, TYPE_STRING};
+
+use super::value::{Value, array_elements, decode, string_units, to_js_string};
+
+const STR_DATA_OFFSET: usize = abi::STR_DATA_OFFSET as usize;
 
 /// The `__method` op flags (see [`abi`]): the array element searches, the
 /// number formatting and `Math` ops, and the string case mappings,

@@ -3,9 +3,8 @@
 //! overflowing the native stack. Expected texts are Node's `console.log` output.
 #![allow(clippy::expect_used)]
 
-use jsc_core::run::{compile_and_run, format_value};
 mod common;
-use common::assert_output;
+use common::{assert_output, eval_text};
 
 /// An array that contains itself, built by in-bounds index writes or by
 /// `push` (the handle never moves, so the pushed value is the array itself).
@@ -81,6 +80,6 @@ fn shared_reference_is_not_circular() {
 /// The completion value (`jsc -p`) goes through the same guard.
 #[test]
 fn completion_value() {
-    let value = compile_and_run("let a = [1, 0]; a[1] = a; a").expect("runs");
-    assert_eq!(format_value(&value), "<ref *1> [ 1, [Circular *1] ]");
+    let value = eval_text("let a = [1, 0]; a[1] = a; a");
+    assert_eq!(value, "<ref *1> [ 1, [Circular *1] ]");
 }

@@ -33,7 +33,10 @@ pub fn compile(src: &str) -> Result<Vec<u8>, JsError> {
 fn compile_inner(src: &str) -> anyhow::Result<Vec<u8>> {
     let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js)?;
     let ir = jsc_core::codegen::lower(&program)?;
-    Ok(jsc_core::emit::emit(&ir))
+    Ok(jsc_core::emit::emit(
+        &ir,
+        jsc_core::emit::CompileOptions::default(),
+    ))
 }
 
 /// Render a pipeline error into a diagnostic string. A spanned [`CompileError`]

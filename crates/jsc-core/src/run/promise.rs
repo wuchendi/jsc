@@ -16,35 +16,37 @@
 //! them by RE-ENTERING the guest through the exported `__invoke1` trampoline.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Write;
 
-use wasmtime::{AsContextMut, Caller, Func, Global, Instance, Memory, Store, StoreContextMut, Val};
+use wasmtime::{AsContextMut, Caller, Func, Global, Memory, StoreContextMut, Val};
+use wasmtime_wasi::p1::WasiP1Ctx;
 
 use crate::abi;
 
-use super::{
-    GEN_DONE_OFFSET, HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED,
-    PROMISE_STATE_OFFSET, PROMISE_VALUE_OFFSET, TYPE_FUNCTION, TYPE_PROMISE,
+use abi::{
+    HEAP, PROMISE_FULFILLED, PROMISE_PENDING, PROMISE_REJECTED, TYPE_FUNCTION, TYPE_PROMISE,
 };
+
+const GEN_DONE_OFFSET: usize = abi::GEN_DONE_OFFSET as usize;
+const PROMISE_STATE_OFFSET: usize = abi::PROMISE_STATE_OFFSET as usize;
+const PROMISE_VALUE_OFFSET: usize = abi::PROMISE_VALUE_OFFSET as usize;
 
 /// The NaN-boxed `undefined` jsval bits.
 const UNDEFINED: u64 = abi::UNDEFINED;
 
-/// The store data threaded through `wasmtime`: the `console.log` output sink plus
-/// the promise engine. Split so the `print` import writes to `sink` while the
-/// promise imports drive `engine`.
-pub(super) struct Host<W> {
-    /// The `console.log` output sink (real stdout, or an in-memory capture buffer).
-    pub(super) sink: W,
+/// The store data threaded through `wasmtime`: the WASI context plus the
+/// promise engine.
+pub(super) struct Host {
+    /// The preview-1 context behind the `wasi_snapshot_preview1` imports.
+    pub(super) wasi: WasiP1Ctx,
     /// The promise engine's microtask queue and reaction lists.
     pub(super) engine: PromiseEngine,
 }
 
-impl<W> Host<W> {
-    /// Wrap an output sink with a fresh, empty promise engine.
-    pub(super) fn new(sink: W) -> Self {
+impl Host {
+    /// Wrap a WASI context with a fresh, empty promise engine.
+    pub(super) fn new(wasi: WasiP1Ctx) -> Self {
         Self {
-            sink,
+            wasi,
             engine: PromiseEngine::default(),
         }
     }
@@ -132,8 +134,8 @@ struct Handles {
 }
 
 impl Handles {
-    /// Resolve the handles from a host-import [`Caller`] (mid-run).
-    fn from_caller<W: 'static>(caller: &mut Caller<'_, Host<W>>) -> Option<Self> {
+    /// Resolve the handles from a host-import [`Caller`].
+    fn from_caller(caller: &mut Caller<'_, Host>) -> Option<Self> {
         Some(Self {
             memory: caller.get_export("memory")?.into_memory()?,
             new_promise: caller
@@ -156,32 +158,13 @@ impl Handles {
                 .and_then(wasmtime::Extern::into_func),
         })
     }
-
-    /// Resolve the handles from an [`Instance`] + [`Store`] (the after-`main`
-    /// drain).
-    fn from_instance<W: 'static>(store: &mut Store<Host<W>>, instance: &Instance) -> Option<Self> {
-        Some(Self {
-            memory: instance.get_memory(&mut *store, "memory")?,
-            new_promise: instance.get_func(&mut *store, abi::NEW_PROMISE_EXPORT_NAME)?,
-            self_error: instance.get_func(&mut *store, abi::PROMISE_SELF_ERROR_EXPORT_NAME)?,
-            exc_pending: instance.get_global(&mut *store, abi::EXC_PENDING_EXPORT_NAME)?,
-            exc_value: instance.get_global(&mut *store, abi::EXC_VALUE_EXPORT_NAME)?,
-            invoke1: instance.get_func(&mut *store, abi::INVOKE_EXPORT_NAME),
-            async_step: instance.get_func(&mut *store, abi::ASYNC_STEP_EXPORT_NAME),
-        })
-    }
 }
 
 /// Handle a `__promise(op, a, b)` host-import call: `Promise.resolve`/`reject`,
 /// top-level `await`, or `p.finally`. Returns the result jsval bits (a promise,
 /// or the awaited value). A missing export set makes it a no-op returning
 /// `undefined` rather than trapping the guest.
-pub(super) fn dispatch<W: Write + Send + 'static>(
-    caller: &mut Caller<'_, Host<W>>,
-    op: i32,
-    a: u64,
-    b: u64,
-) -> u64 {
+pub(super) fn dispatch(caller: &mut Caller<'_, Host>, op: i32, a: u64, b: u64) -> u64 {
     let Some(handles) = Handles::from_caller(caller) else {
         return UNDEFINED;
     };
@@ -212,6 +195,16 @@ pub(super) fn dispatch<W: Write + Send + 'static>(
         }
         // Spawn an `async function` body: `a` is the generator handle.
         x if x == abi::PROMISE_OP_ASYNC_SPAWN => spawn_async(ctx, &handles, a),
+        // Deleted in R4 with the host promise engine.
+        x if x == abi::PROMISE_OP_DRAIN => {
+            drain(ctx.as_context_mut(), &handles);
+            let engine = &ctx.data().engine;
+            engine
+                .rejected
+                .iter()
+                .find(|base| !engine.handled.contains(base))
+                .map_or(0, |base| HEAP | u64::from(*base))
+        }
         _ => UNDEFINED,
     }
 }
@@ -219,8 +212,8 @@ pub(super) fn dispatch<W: Write + Send + 'static>(
 /// Handle a `__then(p, on_f, on_r)` host-import call: allocate the chained result
 /// promise, register the reactions on `p` (or, if `p` is already settled / not a
 /// promise, queue the appropriate microtask), and return the result promise.
-pub(super) fn then<W: Write + Send + 'static>(
-    caller: &mut Caller<'_, Host<W>>,
+pub(super) fn then(
+    caller: &mut Caller<'_, Host>,
     p: u64,
     on_fulfilled: u64,
     on_rejected: u64,
@@ -247,35 +240,9 @@ pub(super) fn then<W: Write + Send + 'static>(
     result
 }
 
-/// Drain any microtasks still queued after `main` returns: the reactions
-/// scheduled by `.then`/`.catch`/`.finally` that were never awaited. Runs until
-/// the queue is empty so a program that only chains (no top-level `await`) still
-/// observes its callbacks.
-///
-/// Returns the reason of the first (in creation order) rejected promise that
-/// never had a handler attached, or `None` when every rejection was handled.
-pub(super) fn drain_after_main<W: Write + Send + 'static>(
-    store: &mut Store<Host<W>>,
-    instance: &Instance,
-) -> Option<u64> {
-    let handles = Handles::from_instance(store, instance)?;
-    drain(store.as_context_mut(), &handles);
-    let engine = &store.data().engine;
-    let base = engine
-        .rejected
-        .iter()
-        .copied()
-        .find(|base| !engine.handled.contains(base))?;
-    Some(read_value(handles.memory.data(&*store), base))
-}
-
 /// `Promise.resolve(a)`: `a` itself when it is already a promise, else a fresh
 /// promise fulfilled with `a`.
-fn resolve<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
-    handles: &Handles,
-    a: u64,
-) -> u64 {
+fn resolve(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, a: u64) -> u64 {
     let is_promise = as_promise(handles.memory.data(&ctx), a).is_some();
     if is_promise {
         a
@@ -286,12 +253,7 @@ fn resolve<W: Write + Send + 'static>(
 
 /// `p.finally(fn)`: a chained promise that runs `fn` on settlement (both paths)
 /// and passes `p`'s original settlement through.
-fn finally<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
-    handles: &Handles,
-    p: u64,
-    on_finally: u64,
-) -> u64 {
+fn finally(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64, on_finally: u64) -> u64 {
     let Some(result) = alloc_promise(ctx.as_context_mut(), handles, PROMISE_PENDING, UNDEFINED)
     else {
         return UNDEFINED;
@@ -320,11 +282,7 @@ fn finally<W: Write + Send + 'static>(
 /// always drains `p` to a settlement. A rejection is surfaced through the
 /// exception globals (`__exc_pending`/`__exc_value`) so the emitted propagation
 /// unwinds it as an uncaught error; awaiting a non-promise yields it unchanged.
-fn await_promise<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
-    handles: &Handles,
-    p: u64,
-) -> u64 {
+fn await_promise(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64) -> u64 {
     let Some(base) = as_promise(handles.memory.data(&ctx), p) else {
         return p;
     };
@@ -357,11 +315,7 @@ fn await_promise<W: Write + Send + 'static>(
 /// `__async_step` — the same re-entrant pattern the reaction engine uses for
 /// `__invoke1`, so a nested `await`/`.then` chain is driven to completion by the
 /// enclosing top-level `await` or the after-`main` drain.
-fn spawn_async<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
-    handles: &Handles,
-    gen_handle: u64,
-) -> u64 {
+fn spawn_async(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, gen_handle: u64) -> u64 {
     let Some(result) = alloc_promise(ctx.as_context_mut(), handles, PROMISE_PENDING, UNDEFINED)
     else {
         return UNDEFINED;
@@ -378,8 +332,8 @@ fn spawn_async<W: Write + Send + 'static>(
 /// fulfill it with the returned value; otherwise the yielded value is the awaited
 /// operand — register a continuation that resumes the body when the operand
 /// settles.
-fn drive_async<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
+fn drive_async(
+    mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     gen_handle: u64,
     result_base: u32,
@@ -414,8 +368,8 @@ fn drive_async<W: Write + Send + 'static>(
 /// machine's value bits and whether it threw — detected by `__exc_pending`, which
 /// (with `__exc_value`) is cleared here so a surfaced rejection does not leak into
 /// the next step. Mirrors [`invoke1`].
-fn async_step<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
+fn async_step(
+    mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     gen_handle: u64,
     sent: u64,
@@ -470,7 +424,7 @@ fn read_gen_done(mem: &[u8], gen_handle: u64) -> bool {
 /// Drive the microtask queue to empty, running each job FIFO. Shared by top-level
 /// `await` (turning the event loop) and the after-`main` drain. A job may enqueue
 /// more jobs (a reaction that chains); they are appended and run in turn.
-fn drain<W: Write + Send + 'static>(mut ctx: StoreContextMut<'_, Host<W>>, handles: &Handles) {
+fn drain(mut ctx: StoreContextMut<'_, Host>, handles: &Handles) {
     while let Some(job) = ctx.data_mut().engine.queue.pop_front() {
         run_job(ctx.as_context_mut(), handles, job);
     }
@@ -481,11 +435,7 @@ fn drain<W: Write + Send + 'static>(mut ctx: StoreContextMut<'_, Host<W>>, handl
 /// forwards the source settlement; a `finally` job runs the callback for effect
 /// and forwards the original settlement (unless the callback throws, which
 /// rejects the result).
-fn run_job<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
-    handles: &Handles,
-    job: Job,
-) {
+fn run_job(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, job: Job) {
     // An `async function` continuation: the awaited value has settled.
     // On fulfillment, resume the body's generator with the settled value (which
     // may suspend again on the next `await` or complete and settle the result);
@@ -527,8 +477,8 @@ fn run_job<W: Write + Send + 'static>(
 /// when the inner one does); fulfilling a promise with ITSELF rejects it with a
 /// fresh `TypeError` instead (Promise Resolve Functions step 7). On a real
 /// settlement, its registered reactions are moved into the microtask queue.
-fn settle<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
+fn settle(
+    mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     base: u32,
     mut state: i32,
@@ -595,8 +545,8 @@ fn settle<W: Write + Send + 'static>(
 /// matching microtask now; on a non-promise value, queue a fulfilled microtask
 /// (so `.then` on a non-promise behaves like `Promise.resolve(value).then`).
 #[allow(clippy::too_many_arguments)]
-fn register_source<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
+fn register_source(
+    mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     source: u64,
     on_fulfilled: u64,
@@ -655,8 +605,8 @@ fn register_source<W: Write + Send + 'static>(
 /// `__invoke1` trampoline (re-entering the guest). Returns the callback's result
 /// bits and whether it threw — detected by the `__exc_pending` global, which is
 /// cleared here so a caught rejection does not leak into the next microtask.
-fn invoke1<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
+fn invoke1(
+    mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     callback: u64,
     arg: u64,
@@ -700,8 +650,8 @@ fn invoke1<W: Write + Send + 'static>(
 /// settle it to `state`/`value` unless pending, and return its heap jsval, or
 /// `None` on a failed allocation (an out-of-memory trap leaves the sentinel for
 /// the run stage to report).
-fn alloc_promise<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
+fn alloc_promise(
+    mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     state: i32,
     value: u64,
@@ -718,8 +668,8 @@ fn alloc_promise<W: Write + Send + 'static>(
 }
 
 /// Write a promise block's settlement (`state` + `value`) into guest memory.
-fn write_settlement<W: Write + Send + 'static>(
-    mut ctx: StoreContextMut<'_, Host<W>>,
+fn write_settlement(
+    mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     base: u32,
     state: i32,

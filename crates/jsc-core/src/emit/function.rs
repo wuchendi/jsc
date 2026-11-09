@@ -11,7 +11,12 @@ pub(super) fn emit_main(
     program: &IrProgram,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    options: CompileOptions,
 ) -> Function {
+    // The epilogue that renders the completion value is emitted with `_start`.
+    let CompileOptions {
+        print_completion: _,
+    } = options;
     // One i64 local per top-level variable, plus three trailing i64 scratch
     // locals (indices `program.locals`/`+1`/`+2`) used to inspect operand bits:
     // `typeof` and truthiness use the first, strict `===`/`!==` uses both, and

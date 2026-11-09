@@ -2,36 +2,35 @@
 //! (index `>= length` or negative), while in-range reads are unchanged.
 #![allow(clippy::expect_used)]
 
-use jsc_core::run::{Value, compile_and_run};
 mod common;
-use common::{assert_number, assert_string, assert_type_str};
+use common::{assert_number, assert_string, assert_type_str, eval_text};
 
 /// An array index past the last element reads `undefined`.
 #[test]
 fn array_index_past_end_is_undefined() {
-    let result = compile_and_run("let a=[1]; a[9]").expect("pipeline should succeed");
-    assert_eq!(result, Value::Undefined);
+    let result = eval_text("let a=[1]; a[9]");
+    assert_eq!(result, "undefined");
 }
 
 /// An array index exactly at `length` (one past the last valid index) is `undefined`.
 #[test]
 fn array_index_at_length_is_undefined() {
-    let result = compile_and_run("let a=[1,2,3]; a[3]").expect("pipeline should succeed");
-    assert_eq!(result, Value::Undefined);
+    let result = eval_text("let a=[1,2,3]; a[3]");
+    assert_eq!(result, "undefined");
 }
 
 /// A string index past the last character reads `undefined`.
 #[test]
 fn string_index_past_end_is_undefined() {
-    let result = compile_and_run("\"ab\"[9]").expect("pipeline should succeed");
-    assert_eq!(result, Value::Undefined);
+    let result = eval_text("\"ab\"[9]");
+    assert_eq!(result, "undefined");
 }
 
 /// A negative array index reads `undefined` (not the clamped element 0).
 #[test]
 fn array_negative_index_is_undefined() {
-    let result = compile_and_run("let a=[1]; a[-1]").expect("pipeline should succeed");
-    assert_eq!(result, Value::Undefined);
+    let result = eval_text("let a=[1]; a[-1]");
+    assert_eq!(result, "undefined");
 }
 
 /// In-range array access is unchanged.
@@ -58,21 +57,15 @@ fn typeof_oob_read_is_undefined() {
 fn array_store_past_end_grows() {
     assert_number("let a=[1]; a[3]=4; a[3]", 4.0);
     assert_number("let a=[1]; a[3]=4; a.length", 4.0);
-    let gap = compile_and_run("let a=[1]; a[3]=4; a[2]").expect("pipeline should succeed");
-    assert_eq!(gap, Value::Undefined);
+    let gap = eval_text("let a=[1]; a[3]=4; a[2]");
+    assert_eq!(gap, "undefined");
 }
 
-/// A hole decodes as a [`Value::Holes`] run inside the array and reads `undefined`.
+/// A hole renders as an empty-item run inside the array and reads `undefined`.
 #[test]
 fn array_hole_decodes_and_reads_undefined() {
-    let arr = compile_and_run("[1,,3]").expect("pipeline should succeed");
-    assert_eq!(
-        arr,
-        Value::Array(
-            vec![Value::Number(1.0), Value::Holes(1), Value::Number(3.0)],
-            Vec::new()
-        )
-    );
-    let read = compile_and_run("[1,,3][1]").expect("pipeline should succeed");
-    assert_eq!(read, Value::Undefined);
+    let arr = eval_text("[1,,3]");
+    assert_eq!(arr, "[ 1, <1 empty item>, 3 ]");
+    let read = eval_text("[1,,3][1]");
+    assert_eq!(read, "undefined");
 }
