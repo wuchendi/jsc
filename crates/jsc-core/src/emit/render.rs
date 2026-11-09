@@ -3,8 +3,8 @@
 //! a value to `$__out_buf` as UTF-8 and issues one `fd_write` per line.
 //!
 //! Rendering runs no user code and never throws. The output buffer, the
-//! recursion path and the ref table are headerless `__alloc` blocks, the raw
-//! form `__intern` growth uses until `TYPE_RAW` arrives.
+//! recursion path and the ref table are `TYPE_RAW` blocks: each buffer global
+//! holds the block base (a raw ref), with the data at [`DATA`].
 
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
@@ -82,6 +82,9 @@ const TYPE_SET: i32 = abi::TYPE_SET as i32;
 const TYPE_GENERATOR: i32 = abi::TYPE_GENERATOR as i32;
 const TYPE_DATE: i32 = abi::TYPE_DATE as i32;
 const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+const TYPE_RAW: i32 = abi::TYPE_RAW as i32;
+/// The data offset of a `TYPE_RAW` block.
+const DATA: u32 = abi::HEADER_SIZE + 4;
 
 const OPEN_ARRAY: &str = "[ ";
 const OPEN_OBJECT: &str = "{ ";
@@ -301,19 +304,24 @@ fn lit(f: &mut impl Sink, strings: &StrOffsets, helpers: Helpers<'_>, text: &str
     wasm!(f; I32Const(static_key(strings, text)), Call(helpers.out_str()));
 }
 
-/// `reserve(need: i32)`: grow the raw block in `base`/`cap` to at least `need`
-/// bytes, keeping its contents. `max(need, 2 * cap, 64)` bytes when it grows.
+/// `reserve(need: i32)`: grow the `TYPE_RAW` block in `base`/`cap` to at least
+/// `need` data bytes, keeping its contents. `max(need, 2 * cap, 64)` bytes when
+/// it grows. The old block stays rooted through its global across the alloc.
 fn emit_reserve(base: u32, cap: u32, alloc: u32, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32]);
+    let mut f = helper_builder(leaves, &[RAW_I32], &[ROOT_BASE, RAW_I32]);
     let (need, block, size) = (0, 1, 2);
+    let data = DATA.cast_signed();
     wasm!(f;
         LocalGet(need), GlobalGet(cap), I32LeU, If(BlockType::Empty), Return, End,
         GlobalGet(cap), I32Const(1), I32Shl, LocalTee(size),
         I32Const(64), LocalGet(size), I32Const(64), I32GtU, Select, LocalTee(size),
         LocalGet(need), LocalGet(size), LocalGet(need), I32GtU, Select, LocalTee(size),
-        Call(alloc), LocalSet(block),
+        I32Const(data), I32Add, Call(alloc), LocalTee(block),
+        I32Const(TYPE_RAW), I32Store8(m8(0)),
+        LocalGet(block), LocalGet(size), I32Store(m32(abi::HEADER_SIZE)),
         GlobalGet(cap), If(BlockType::Empty),
-        LocalGet(block), GlobalGet(base), GlobalGet(cap), COPY,
+        LocalGet(block), I32Const(data), I32Add,
+        GlobalGet(base), I32Const(data), I32Add, GlobalGet(cap), COPY,
         End,
         LocalGet(block), GlobalSet(base),
         LocalGet(size), GlobalSet(cap),
@@ -327,7 +335,7 @@ fn emit_out_byte(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[RAW_I32], &[]);
     wasm!(f;
         GlobalGet(OUT_LEN_GLOBAL), I32Const(1), I32Add, Call(helpers.out_reserve()),
-        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(0), I32Store8(m8(0)),
+        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(0), I32Store8(m8(DATA)),
         GlobalGet(OUT_LEN_GLOBAL), I32Const(1), I32Add, GlobalSet(OUT_LEN_GLOBAL),
         End,
     );
@@ -338,11 +346,12 @@ fn emit_out_byte(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 fn emit_out_cp(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32]);
     let (cp, p, n) = (0, 1, 2);
-    // Store `lead | (cp >> shift & mask)` at byte `at` of the sequence.
+    // Store `lead | (cp >> shift & mask)` at byte `at` of the sequence; `p` is
+    // `base + len`, the data offset is in the store.
     let unit = |f: &mut FnBuilder<'_>, at: u32, lead: i32, shift: i32, mask: i32| {
         wasm!(f;
             LocalGet(p), LocalGet(cp), I32Const(shift), I32ShrU, I32Const(mask), I32And,
-            I32Const(lead), I32Or, I32Store8(m8(at)),
+            I32Const(lead), I32Or, I32Store8(m8(DATA + at)),
         );
     };
     wasm!(f;
@@ -430,7 +439,7 @@ fn emit_out_flush(leaves: &LeafSet) -> Function {
     let iov = abi::WASI_SCRATCH.cast_signed();
     let nwritten = abi::WASI_NWRITTEN.cast_signed();
     wasm!(f;
-        GlobalGet(OUT_BUF_GLOBAL), LocalSet(p),
+        GlobalGet(OUT_BUF_GLOBAL), I32Const(DATA.cast_signed()), I32Add, LocalSet(p),
         GlobalGet(OUT_LEN_GLOBAL), LocalSet(left),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(left), I32Eqz, BrIf(1),
@@ -566,17 +575,17 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
         leaves,
         &[ROOT_BASE, RAW_I32],
         &[
-            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
         ],
     );
-    let (p, depth, ty, i, id, mark, end, size, cond) = (0, 1, 2, 3, 4, 5, 6, 7, 8);
+    let (p, depth, ty, i, id, mark, end, size, cond, data) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
     // id = the 1-based ref number of `p`, or 0.
     let ref_of = |f: &mut FnBuilder<'_>| {
         wasm!(f;
             I32Const(0), LocalSet(id), I32Const(0), LocalSet(i),
             Block(BlockType::Empty), Loop(BlockType::Empty),
             LocalGet(i), GlobalGet(REFS_LEN_GLOBAL), I32GeU, BrIf(1),
-            GlobalGet(REFS_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(0)),
+            GlobalGet(REFS_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(DATA)),
             LocalGet(p), I32Eq, If(BlockType::Empty),
             LocalGet(i), I32Const(1), I32Add, LocalSet(id), Br(2),
             End,
@@ -594,7 +603,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(depth), I32GeU, BrIf(1),
-        GlobalGet(PATH_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(0)),
+        GlobalGet(PATH_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(DATA)),
         LocalGet(p), I32Eq, If(BlockType::Empty),
     );
     ref_of(&mut f);
@@ -602,7 +611,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
         LocalGet(id), I32Eqz, If(BlockType::Empty),
         GlobalGet(REFS_LEN_GLOBAL), I32Const(1), I32Add, I32Const(2), I32Shl, Call(helpers.refs_reserve()),
         GlobalGet(REFS_BUF_GLOBAL), GlobalGet(REFS_LEN_GLOBAL), I32Const(2), I32Shl, I32Add,
-        LocalGet(p), I32Store(m32(0)),
+        LocalGet(p), I32Store(m32(DATA)),
         GlobalGet(REFS_LEN_GLOBAL), I32Const(1), I32Add, GlobalSet(REFS_LEN_GLOBAL),
         GlobalGet(REFS_LEN_GLOBAL), LocalSet(id),
         End,
@@ -617,7 +626,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
         Br(0), End, End,
         LocalGet(depth), I32Const(1), I32Add, I32Const(2), I32Shl, Call(helpers.path_reserve()),
         GlobalGet(PATH_BUF_GLOBAL), LocalGet(depth), I32Const(2), I32Shl, I32Add,
-        LocalGet(p), I32Store(m32(0)),
+        LocalGet(p), I32Store(m32(DATA)),
         GlobalGet(OUT_LEN_GLOBAL), LocalSet(mark),
     );
     render_container(&mut f, helpers, p, ty, depth);
@@ -632,13 +641,14 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
     wasm!(f;
         GlobalGet(OUT_LEN_GLOBAL), LocalGet(end), I32Sub, LocalSet(size),
         GlobalGet(OUT_LEN_GLOBAL), LocalGet(size), I32Add, Call(helpers.out_reserve()),
-        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(end), I32Add, LocalGet(size), COPY,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(mark), I32Add, LocalGet(size), I32Add,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(mark), I32Add,
+        GlobalGet(OUT_BUF_GLOBAL), I32Const(DATA.cast_signed()), I32Add, LocalSet(data),
+        LocalGet(data), GlobalGet(OUT_LEN_GLOBAL), I32Add,
+        LocalGet(data), LocalGet(end), I32Add, LocalGet(size), COPY,
+        LocalGet(data), LocalGet(mark), I32Add, LocalGet(size), I32Add,
+        LocalGet(data), LocalGet(mark), I32Add,
         LocalGet(end), LocalGet(mark), I32Sub, COPY,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(mark), I32Add,
-        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(size), COPY,
+        LocalGet(data), LocalGet(mark), I32Add,
+        LocalGet(data), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(size), COPY,
         End,
         Return,
         End,

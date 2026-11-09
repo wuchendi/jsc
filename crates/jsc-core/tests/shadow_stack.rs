@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 mod common;
-use common::{assert_number, assert_uncaught, compile, fails};
+use common::{assert_number, assert_output, assert_uncaught, compile, fails};
 use wasmparser::{Operator, Parser, Payload};
 use wasmtime::{Config, Engine, Linker, Module, Store, Trap};
 
@@ -203,6 +203,56 @@ fn intern_growth_block_is_type_raw() {
          for (var i = 0; i < 5000; i = i + 1) { o['k' + i] = i; }
          o['k4999'] + o['k0']",
         4999.0,
+    );
+}
+
+/// The three render reserves (output, recursion path, ref table) each build a
+/// `TYPE_RAW` block, and rendering is unchanged once all three have grown.
+#[test]
+fn render_buffers_are_type_raw() {
+    let reserves = bodies("1")
+        .iter()
+        .filter(|ops| {
+            let typed = ops.windows(2).any(|w| {
+                matches!(w[0], Operator::I32Const { value } if value == TYPE_RAW)
+                    && matches!(w[1], Operator::I32Store8 { memarg } if memarg.offset == 0)
+            });
+            let copies = ops
+                .iter()
+                .any(|op| matches!(op, Operator::MemoryCopy { .. }));
+            let calls = ops
+                .iter()
+                .filter(|op| matches!(op, Operator::Call { .. }))
+                .count();
+            typed && copies && calls == 1
+        })
+        .count();
+    assert_eq!(reserves, 3, "out, path and refs reserves");
+
+    // Output past the first 64-byte block.
+    let long = "x".repeat(200);
+    assert_output(&format!("console.log('{long}')"), &format!("{long}\n"));
+    // Recursion path past 16 entries.
+    let depth = 20;
+    assert_output(
+        &format!(
+            "var a = []; for (var i = 0; i < {depth}; i = i + 1) {{ a = [a]; }} console.log(a)"
+        ),
+        &format!("{}[]{}\n", "[ ".repeat(depth), " ]".repeat(depth)),
+    );
+    // Ref table past 16 entries, with each `<ref *N>` rotated into place.
+    let refs = 20;
+    let items = (1..=refs)
+        .map(|n| format!("<ref *{n}> {{ s: [Circular *{n}] }}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_output(
+        &format!(
+            "var a = [];
+             for (var i = 0; i < {refs}; i = i + 1) {{ var o = {{}}; o.s = o; a.push(o); }}
+             console.log(a)"
+        ),
+        &format!("[ {items} ]\n"),
     );
 }
 
