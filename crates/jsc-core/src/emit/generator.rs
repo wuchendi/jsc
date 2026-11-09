@@ -679,9 +679,9 @@ fn emit_segment_term(
 /// to exhaustion via `call_indirect`, collecting each yielded value into a fresh
 /// array (the generator's `return` value is NOT included, matching the
 /// iterator protocol). Backs `[...gen]` / `f(...gen)` spread.
-pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_gen_to_array(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     // Param: gen (local 0). Locals: val (i64, local 1), arr base (i32, local 2).
-    let mut function = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
+    let mut function = helper_builder(leaves, &[ROOT_JS], &[ROOT_JS, ROOT_BASE]);
     let gen_p = 0;
     let val = 1;
     let arr = 2;
@@ -748,7 +748,7 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__async_step(gen, sent) -> value` trampoline: advance an
@@ -759,9 +759,9 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>) -> Function {
 /// deliberately does NOT build a `{ value, done }` object or propagate a pending
 /// exception: the host async engine reads the handle's `done` flag and the
 /// `__exc_pending`/`__exc_value` globals directly after the call.
-pub(super) fn emit_async_step(helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_async_step(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     // Params: gen (local 0, i64), sent (local 1, i64) -> i64. No extra locals.
-    let mut function = Function::new(vec![]);
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS], &[]);
     let gen_p = 0;
     let sent_p = 1;
 
@@ -803,7 +803,7 @@ pub(super) fn emit_async_step(helpers: Helpers<'_>) -> Function {
     });
     // The SM's value is on the stack; the host reads `done`/`__exc_pending`.
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Open a `block` and register it as the innermost exception handler: a throw
