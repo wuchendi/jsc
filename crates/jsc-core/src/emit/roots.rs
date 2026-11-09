@@ -46,7 +46,7 @@ const WASI_IMPORT_COUNT: u32 = 4;
 
 /// Each candidate leaf helper and its declared callees.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
-    vec![
+    let mut graph = vec![
         (helpers.str_eq, vec![]),
         (helpers.str_cmp, vec![]),
         (helpers.str_hash, vec![]),
@@ -55,6 +55,10 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.index_value, vec![]),
         (helpers.str_exotic_index(), vec![helpers.index_value]),
         (helpers.same_value_zero, vec![helpers.str_eq]),
+        (
+            helpers.array_search,
+            vec![helpers.same_value_zero, helpers.index_value],
+        ),
         (helpers.map_find, vec![helpers.same_value_zero]),
         (helpers.map_get, vec![helpers.map_find]),
         (helpers.map_has, vec![helpers.map_find]),
@@ -133,7 +137,10 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
             helpers.random(),
             vec![CLOCK_TIME_GET_IMPORT, RANDOM_GET_IMPORT],
         ),
-    ]
+    ];
+    graph.extend(unicode::helper_graph(helpers));
+    graph.extend(libm::helper_graph(helpers));
+    graph
 }
 
 /// Solve [`helper_graph`]: a declared helper is a leaf iff every callee is.

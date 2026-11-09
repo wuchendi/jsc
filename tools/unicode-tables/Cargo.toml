@@ -1,0 +1,15 @@
+[package]
+name         = "unicode-tables"
+description  = "Generates the Unicode data tables embedded in every jsc module"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Exact: the generated header records this version (src/norm.rs).
+icu_normalizer = "=2.4.0"

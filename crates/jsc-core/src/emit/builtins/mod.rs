@@ -42,6 +42,7 @@ mod string;
 mod symbol;
 
 use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
+pub(super) use array::emit_array_search;
 pub(super) use async_iter::{
     emit_async_iterator_complete, emit_async_iterator_next, emit_async_iterator_return,
     emit_iterator_result_check, emit_open_async_iterator,
@@ -54,7 +55,7 @@ pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 use number::NumberFormat;
 pub(super) use promise::emit_promise_self_error;
-pub(super) use string::{emit_is_method_refusal, emit_is_whitespace, inline_host_op};
+pub(super) use string::{MAX_STRING_LENGTH, emit_is_whitespace, inline_str_cmp};
 
 /// Argument `i` (an i32 local) into i64 `out`: element `i` of the spread
 /// argument array captured (as the `__spread_args` jsval) in i64 `spread`

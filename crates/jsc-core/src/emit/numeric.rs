@@ -220,9 +220,8 @@ fn emit_to_int32(function: &mut impl Sink, local: u32) {
 /// Every argument is converted with `ToNumber` (a user `valueOf`/`toString`
 /// runs, and may throw); the conversion is emitted behind one `is_number` test
 /// and skipped for an argument that always yields a number. The unary ops then
-/// unbox their single argument to `f64`, apply a native wasm op (or the host
-/// `__method` [`abi::METHOD_OP_MATH`] function for the transcendentals), and
-/// rebox. `Min`/`Max` fold the native `f64.min`/`f64.max` (which propagate NaN
+/// unbox their single argument to `f64`, apply a native wasm op (or the guest
+/// [`libm`] helper for the transcendentals), and rebox. `Min`/`Max` fold the native `f64.min`/`f64.max` (which propagate NaN
 /// and order `-0`/`+0` like JS) over the arguments starting from the identity
 /// (`+Infinity` for min, `-Infinity` for max), so the empty-args case yields
 /// the correct infinity; `Hypot` folds its scaled sum of squares the same way
@@ -265,7 +264,11 @@ pub(super) fn emit_math_call<S: Sink>(
             emit_coerce_operands(function, s0, s1, &args[1], helpers);
             if op == MathOp::Atan2 {
                 function.instruction(&Instruction::LocalGet(s0));
-                emit_host_math(abi::MATH_FN_ATAN2, Some(s1), function, helpers);
+                function.instruction(&Instruction::F64ReinterpretI64);
+                function.instruction(&Instruction::LocalGet(s1));
+                function.instruction(&Instruction::F64ReinterpretI64);
+                function.instruction(&Instruction::Call(helpers.libm(libm::H::Atan2)));
+                emit_box_f64(function, helpers);
             } else {
                 emit_to_int32(function, s0);
                 emit_to_int32(function, s1);
@@ -295,9 +298,11 @@ pub(super) fn emit_math_call<S: Sink>(
                     emit_coerce_number(function, s0, helpers);
                 }
             }
-            if let Some(code) = host_math_code(op) {
+            if let Some(helper) = libm::unary_helper(op) {
                 function.instruction(&Instruction::LocalGet(s0));
-                emit_host_math(code, None, function, helpers);
+                function.instruction(&Instruction::F64ReinterpretI64);
+                function.instruction(&Instruction::Call(helpers.libm(helper)));
+                emit_box_f64(function, helpers);
                 return;
             }
             if op == MathOp::Clz32 {
@@ -354,45 +359,6 @@ pub(super) fn emit_math_call<S: Sink>(
             emit_box_f64(function, helpers);
         }
     }
-}
-
-/// The host [`abi::METHOD_OP_MATH`] function code of a unary `Math` method
-/// without an exact wasm instruction, or `None`.
-fn host_math_code(op: MathOp) -> Option<i64> {
-    Some(match op {
-        MathOp::Cbrt => abi::MATH_FN_CBRT,
-        MathOp::Log => abi::MATH_FN_LOG,
-        MathOp::Log2 => abi::MATH_FN_LOG2,
-        MathOp::Log10 => abi::MATH_FN_LOG10,
-        MathOp::Log1p => abi::MATH_FN_LOG1P,
-        MathOp::Exp => abi::MATH_FN_EXP,
-        MathOp::Expm1 => abi::MATH_FN_EXPM1,
-        MathOp::Sin => abi::MATH_FN_SIN,
-        MathOp::Cos => abi::MATH_FN_COS,
-        MathOp::Tan => abi::MATH_FN_TAN,
-        MathOp::Asin => abi::MATH_FN_ASIN,
-        MathOp::Acos => abi::MATH_FN_ACOS,
-        MathOp::Atan => abi::MATH_FN_ATAN,
-        MathOp::Sinh => abi::MATH_FN_SINH,
-        MathOp::Cosh => abi::MATH_FN_COSH,
-        MathOp::Tanh => abi::MATH_FN_TANH,
-        MathOp::Asinh => abi::MATH_FN_ASINH,
-        MathOp::Acosh => abi::MATH_FN_ACOSH,
-        MathOp::Atanh => abi::MATH_FN_ATANH,
-        _ => return None,
-    })
-}
-
-/// Call the host `Math` function `code` on the number jsval on the stack
-/// (and the one in i64 local `second`), leaving its number jsval.
-fn emit_host_math(code: i64, second: Option<u32>, function: &mut impl Sink, helpers: Helpers<'_>) {
-    function.instruction(&Instruction::I32Const(abi::METHOD_OP_MATH));
-    match second {
-        Some(local) => function.instruction(&Instruction::LocalGet(local)),
-        None => function.instruction(&Instruction::I64Const(UNDEFINED_BITS)),
-    };
-    function.instruction(&Instruction::I64Const(code));
-    function.instruction(&Instruction::Call(helpers.method));
 }
 
 /// The first of the i64 slots variadic `Math.min`/`Math.max` stash evaluated
@@ -1128,11 +1094,9 @@ fn emit_to_string_jsval(function: &mut impl Sink, local: u32, helpers: Helpers<'
 }
 
 /// Emit the array fast path `IrNode::MethodCall`, leaving its result jsval
-/// on the stack: the receiver, then (`indexOf`/`includes`) the `METHOD_OP_*`
-/// flag, the argument (`undefined` when missing) and an unused `undefined`
-/// slot, then a `call` of the host `__method` import. `join` runs in the guest
-/// (`__array_join`) so an element's `ToString` can call a user `toString`
-/// (which may throw).
+/// on the stack: the receiver and the argument (`undefined` when missing),
+/// then `__array_search` (`indexOf`/`includes`) or `__array_join` (`join`,
+/// which may run a throwing user `toString`).
 pub(super) fn emit_method_call(
     op: MethodOp,
     recv: &IrNode,
@@ -1143,26 +1107,18 @@ pub(super) fn emit_method_call(
     helpers: Helpers<'_>,
 ) {
     emit_operand(recv, function, scratch, strings, helpers);
-    let flag = match op {
-        MethodOp::Join => None,
-        MethodOp::IndexOf => Some(METHOD_OP_INDEX_OF),
-        MethodOp::Includes => Some(METHOD_OP_INCLUDES),
-    };
-    if let Some(flag) = flag {
-        function.instruction(&Instruction::I32Const(flag));
-    }
     match args.first() {
         Some(arg) => emit_node(arg, function, scratch, strings, helpers),
         None => {
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
     }
-    if flag.is_some() {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::Call(helpers.method));
-    } else {
+    if op == MethodOp::Join {
         function.instruction(&Instruction::Call(helpers.array_join()));
         emit_propagate_if_pending(function, helpers);
+    } else {
+        function.instruction(&Instruction::I32Const(i32::from(op == MethodOp::Includes)));
+        function.instruction(&Instruction::Call(helpers.array_search));
     }
 }
 

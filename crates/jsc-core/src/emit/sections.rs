@@ -55,11 +55,10 @@ pub(super) fn build_type_and_function_sections<'a>(
     };
     let helpers = Helpers {
         unwind,
-        // The `env` imports follow the four WASI imports (0..=3): `__method`
-        // 4, `__promise` 5, `__then` 6.
-        method: 4,
-        promise: 5,
-        then: 6,
+        // The `env` imports follow the four WASI imports (0..=3): `__promise`
+        // 4, `__then` 5.
+        promise: 4,
+        then: 5,
         alloc: index(),
         concat: index(),
         str_eq: index(),
@@ -108,6 +107,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         json_escape: index(),
         json_str: index(),
         same_value_zero: index(),
+        array_search: index(),
         map_find: index(),
         map_set: index(),
         map_get: index(),
@@ -165,6 +165,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
         has_accessors: program_has_accessors(program),
         dirty_tracking: program_tests_dirty_bits(program),
+        unicode: layout.unicode,
         fn_info: layout.info,
     };
     // Helper types follow the main (type 0) and uniform (type 1) types, one
@@ -190,7 +191,6 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[I32, I64, I32], &[I32]),      // clock_time_get(id, precision, time)
         (&[I32, I32], &[I32]),           // random_get(buf, buf_len)
         (&[I32], &[]),                   // proc_exit(rval)
-        (&[I64, I32, I64, I64], &[I64]), // __method(recv, op, arg0, arg1)
         (&[I32, I64, I64], &[I64]),      // __promise(op, a, b)
         (&[I64, I64, I64], &[I64]),      // __then(p, on_f, on_r)
     ];
@@ -325,8 +325,15 @@ pub(super) fn build_type_and_function_sections<'a>(
             .function(params.iter().copied(), results.iter().copied());
         functions.function(ty);
     }
-
     for (ty, (params, results)) in (render_type..).zip(render::TYPES) {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+        functions.function(ty);
+    }
+
+    let unicode_type = render_type + u32::try_from(render::TYPES.len()).unwrap_or(0);
+    for (ty, (params, results)) in (unicode_type..).zip(unicode::TYPES) {
         types
             .ty()
             .function(params.iter().copied(), results.iter().copied());
@@ -408,10 +415,12 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32], &[I32]),
         (&[I64], &[I32]),
         // The Map/Set helpers: `__same_value_zero(a, b) -> i32`,
+        // `__array_search(recv, needle, includes) -> i64`,
         // `__map_find(handle, key) -> i32`, `__map_set(handle, key, val)`,
         // `__map_get(handle, key) -> i64`, `__map_has(handle, key) -> i32`,
         // `__map_delete(handle, key) -> i32`.
         (&[I64, I64], &[I32]),
+        (&[I64, I64, I32], &[I64]),
         (&[I32, I64], &[I32]),
         (&[I32, I64, I64], &[]),
         (&[I32, I64], &[I64]),
@@ -599,7 +608,7 @@ pub(super) fn build_globals(
 /// counts code units), its `flags` already `INTERNED`, plus `TWO_BYTE` for
 /// UTF-16 data and `ARRAY_INDEX` for a canonical index spelling, in ascending
 /// offset order for deterministic output, then the intern table's u32 slots,
-/// the function data, and the realm image.
+/// the function data, the realm image, and the Unicode tables.
 pub(super) fn emit_data_section(
     offsets: &StrOffsets,
     intern: &InternTable,
@@ -642,6 +651,7 @@ pub(super) fn emit_data_section(
         &ConstExpr::i32_const(layout.realm),
         realm::image(layout.realm, first_builtin_slot, offsets),
     );
+    data.active(0, &ConstExpr::i32_const(layout.unicode), unicode::data());
     data
 }
 

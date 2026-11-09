@@ -47,15 +47,6 @@ use crate::ir::{
 /// pointers.
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
-/// The module and field name of the host `__method` import backing the
-/// non-callback array/string methods. It receives the receiver jsval, a
-/// `METHOD_OP_*` flag, and two argument jsval slots (padded with `undefined` when
-/// the method takes fewer), branches on the receiver's runtime TYPE BYTE for the
-/// overloaded `indexOf`/`slice`, and returns the result jsval (allocating a heap
-/// string/array in guest memory when it builds one).
-const METHOD_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const METHOD_IMPORT_NAME: &str = abi::METHOD_IMPORT_NAME;
-
 /// The module and field names of the host promise imports: `__promise`
 /// backs the single-value primitives (`Promise.resolve`/`reject`, top-level
 /// `await`, `p.finally`) and `__then` backs `p.then`/`p.catch`. [`crate::run`]
@@ -90,10 +81,6 @@ const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
 const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
 const PROMISE_SELF_ERROR_EXPORT_NAME: &str = abi::PROMISE_SELF_ERROR_EXPORT_NAME;
 
-/// `__method` op flags; see [`abi`].
-const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
-const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-
 /// The name under which the pending-exception flag global (`$exc_pending`, i32) is
 /// exported so the run stage can detect an uncaught exception after `main` returns.
 /// `0` = no exception in flight, `1` = an exception is propagating.
@@ -106,9 +93,9 @@ const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
 
 /// The number of imported functions: the four WASI imports (`fd_write`,
 /// `clock_time_get`, `random_get`, `proc_exit`) at indices `0..=3`, then the
-/// three `env` imports (`__method`, `__promise`, `__then`). Every defined function, funcref-table element and
+/// two `env` imports (`__promise`, `__then`). Every defined function, funcref-table element and
 /// function export index is shifted up by this count.
-const IMPORT_FUNC_COUNT: u32 = 7;
+const IMPORT_FUNC_COUNT: u32 = 6;
 
 /// The function index of the WASI `fd_write` import.
 const FD_WRITE_IMPORT: u32 = 0;
@@ -259,10 +246,11 @@ const CF_BREAK: i32 = 2;
 const CF_CONTINUE: i32 = 3;
 
 /// The base heap offset: the first byte of static string-literal data, after
-/// the null guard, the function-table word and the fixed WASI area. Literal blobs are packed contiguously from here;
+/// the null guard, the function-table word, the fixed WASI area and the
+/// [`libm`] block. Literal blobs are packed contiguously from here;
 /// the bump allocator (`__alloc`) then starts at the first free offset *after*
 /// them (see [`emit`]).
-const HEAP_BASE: i32 = abi::STATIC_AREA_END.cast_signed();
+const HEAP_BASE: i32 = abi::STATIC_AREA_END.cast_signed() + libm::STATIC_SIZE;
 
 /// The alignment of every heap block base (see [`abi::BLOCK_ALIGN`]).
 const BLOCK_ALIGN: i32 = abi::BLOCK_ALIGN.cast_signed();
@@ -886,12 +874,10 @@ struct Helpers<'a> {
     /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
     /// helpers (see [`dtoa::emit_helpers`]).
     dtoa: u32,
-    /// The host `__method` import's function index. Always `4`; the non-callback array/string methods lower to `call`s of it.
-    method: u32,
-    /// The host `__promise` import's function index. Always `5`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
+    /// The host `__promise` import's function index. Always `4`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
     /// `call`s of it.
     promise: u32,
-    /// The host `__then` import's function index. Always `6`; `p.then`/`p.catch` lower to `call`s of it.
+    /// The host `__then` import's function index. Always `5`; `p.then`/`p.catch` lower to `call`s of it.
     then: u32,
     /// `__now() -> f64`, the WASI clock in ms since the Unix epoch (backing
     /// `Date`); `__random` follows it (see [`Self::random`]).
@@ -1020,6 +1006,9 @@ struct Helpers<'a> {
     /// identical bits — so `NaN` matches `NaN` and `+0` matches `-0` — everything
     /// else by identity bits). The key equality of the `__map_*` linear scans.
     same_value_zero: u32,
+    /// `__array_search(recv: i64, needle: i64, includes: i32) -> i64` (see
+    /// [`builtins::emit_array_search`]): the `indexOf`/`includes` fast path.
+    array_search: u32,
     /// `__map_find(handle: i32, key: i64) -> i32`: the byte address of the
     /// matching key slot in a Map/Set's backing array (a `__same_value_zero` linear scan over
     /// the even element slots, skipping `HOLE` tombstones), or `-1` on a miss. Shared by get/has/set/delete.
@@ -1081,6 +1070,8 @@ struct Helpers<'a> {
     /// Whether the program tests an intrinsics dirty bit (DESIGN.md §6.4). When
     /// `false`, `__set` / `__define` / `__delete` do not set the bits.
     dirty_tracking: bool,
+    /// Base address of the Unicode tables (see [`unicode`]).
+    unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
     /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
     /// is the helper right after `__define` (`define + 1`).
@@ -1501,6 +1492,8 @@ struct FnLayout {
     blocks: i32,
     /// Base address of the realm image.
     realm: i32,
+    /// Base address of the Unicode table segment ([`unicode::data`]).
+    unicode: i32,
 }
 
 mod array;
@@ -1512,6 +1505,7 @@ mod expr;
 mod function;
 mod generator;
 mod json_parse;
+mod libm;
 mod numeric;
 mod object;
 mod props;
@@ -1524,6 +1518,8 @@ mod stmt;
 mod strtod;
 #[cfg(test)]
 mod tests;
+mod unicode;
+mod unicode_data;
 mod value;
 
 #[allow(clippy::wildcard_imports)]
@@ -1582,26 +1578,30 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let info_count = fn_count + 2 + builtin_count();
     let blocks = strings_end + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_count;
     let realm = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
+    let intern_base = realm + realm::image_size();
+    let intern = intern_table(&offsets, intern_base);
+    // The raw Unicode tables end the static region; blocks stay 8-aligned.
+    let unicode_base = intern_base + 4 * intern.cap;
     let layout = FnLayout {
         info: strings_end,
         blocks,
         realm,
+        unicode: unicode_base,
     };
-    let intern_base = realm + realm::image_size();
-    let intern = intern_table(&offsets, intern_base);
-    let heap_ptr_init = intern_base + 4 * intern.cap;
+    let heap_ptr_init = (unicode_base + unicode::data_size() + BLOCK_ALIGN - 1) & -BLOCK_ALIGN;
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
-    let (types, functions, helpers, import_types) =
+    let (mut types, mut functions, helpers, import_types) =
         build_type_and_function_sections(program, &unwind, layout);
+    libm::register(&mut types, &mut functions);
     module.section(&types);
 
     // Import section: the WASI functions (indices 0..=3), then the `env`
-    // functions (indices 4..=9). Imports occupy the lowest function indices,
+    // functions (indices 4..=5). Imports occupy the lowest function indices,
     // so every defined function/element/export index is shifted by
     // IMPORT_FUNC_COUNT. The order must match `Helpers`.
     let mut imports = ImportSection::new();
@@ -1610,7 +1610,6 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         (abi::WASI_MODULE, abi::WASI_CLOCK_TIME_GET_NAME),
         (abi::WASI_MODULE, abi::WASI_RANDOM_GET_NAME),
         (abi::WASI_MODULE, abi::WASI_PROC_EXIT_NAME),
-        (METHOD_IMPORT_MODULE, METHOD_IMPORT_NAME),
         (PROMISE_IMPORT_MODULE, PROMISE_IMPORT_NAME),
         (THEN_IMPORT_MODULE, THEN_IMPORT_NAME),
     ];
@@ -1653,7 +1652,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // exception-unwinding globals (see [`build_globals`]).
     module.section(&build_globals(heap_ptr_init, &intern, program.module_cells));
 
-    // Export section: `_start` (the last defined function), memory index 0 as
+    // Export section: `_start`, memory index 0 as
     // "memory", and the helpers the host promise engine still needs.
     let mut exports = ExportSection::new();
     exports.export(abi::START_EXPORT_NAME, ExportKind::Func, helpers.start());
@@ -1779,6 +1778,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         &leaves,
     ));
     code.function(&emit_same_value_zero(helpers.str_eq, &leaves));
+    code.function(&builtins::emit_array_search(helpers, &leaves));
     code.function(&emit_map_find(helpers.same_value_zero, &leaves));
     code.function(&emit_map_set(helpers.map_find, helpers.array_push, &leaves));
     code.function(&emit_map_get(helpers.map_find, &leaves));
@@ -1884,15 +1884,19 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         code.function(&helper);
     }
     code.function(&emit_start(&offsets, helpers, options, &leaves));
+    // The families after `_start`, in index order: Unicode, then libm.
+    for helper in unicode::emit_helpers(helpers, &leaves) {
+        code.function(&helper);
+    }
+    for helper in libm::emit_helpers(helpers, &leaves) {
+        code.function(&helper);
+    }
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
-    module.section(&emit_data_section(
-        &offsets,
-        &intern,
-        &program.functions,
-        layout,
-    ));
+    let mut data = emit_data_section(&offsets, &intern, &program.functions, layout);
+    libm::emit_data(&mut data);
+    module.section(&data);
 
     module.finish()
 }

@@ -2,8 +2,8 @@
 //! takes `ToString(RequireObjectCoercible(this))` and coerces its arguments in
 //! the guest (a user `toString` / `valueOf` may run, and throw), then works on
 //! the code units at each string's width (one-byte Latin-1 or two-byte
-//! UTF-16, DESIGN.md §5.2), producing canonical strings; only the
-//! case mappings, `localeCompare` and `normalize` run a host `__method` op.
+//! UTF-16, DESIGN.md §5.2), producing canonical strings; only
+//! `localeCompare` is `__str_cmp`, code-unit order.
 //! `toString` / `valueOf` are `thisStringValue`.
 
 #[allow(clippy::wildcard_imports)]
@@ -75,42 +75,9 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
 /// The host op flag of `op` when the call-site arguments `args` are already
 /// of the types its coercions produce (string / number literals; a missing
 /// argument is `undefined`), so that on a string receiver the builtin is
-/// exactly its host op, inline; with whether that op may refuse its input
-/// (`normalize`; then the call site falls back to the builtin, which throws).
-pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(i32, bool)> {
-    let ready = |coerce: Coerce, arg: Option<&IrNode>| {
-        matches!(
-            (coerce, arg),
-            (Coerce::None, _)
-                | (Coerce::OptString | Coerce::Number, None)
-                | (Coerce::String | Coerce::OptString, Some(IrNode::Str(_)))
-                | (Coerce::Number, Some(IrNode::Num(_)))
-        )
-    };
-    // Case mapping takes its Latin-1 fast path in the builtin.
-    if case_upper(op).is_some() {
-        return None;
-    }
-    let [first, second] = coercions(op);
-    if !(ready(first, args.first()) && ready(second, args.get(1))) {
-        return None;
-    }
-    // Only `normalize` with a form that is not a literal valid one may refuse.
-    let may_fail = op == StringOp::Normalize
-        && match args.first() {
-            None => false,
-            Some(IrNode::Str(form)) => !["NFC", "NFD", "NFKC", "NFKD"]
-                .iter()
-                .any(|valid| form == valid),
-            Some(_) => true,
-        };
-    op.flag().map(|flag| (flag, may_fail))
-}
-
-/// Push i32 `1` when the `__method` result on the stack is the refusal
-/// sentinel `METHOD_RANGE_ERROR`.
-pub(in crate::emit) fn emit_is_method_refusal(function: &mut impl Sink) {
-    wasm!(function; I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq);
+/// exactly its host op, inline.
+pub(in crate::emit) fn inline_str_cmp(op: StringOp, args: &[IrNode]) -> bool {
+    op == StringOp::LocaleCompare && matches!(args, [IrNode::Str(_)])
 }
 
 /// The `TypeError` text of `String.prototype.<name>` on a `null`/`undefined`
@@ -305,12 +272,12 @@ const NULLISH_TO_OBJECT: CalleeErrorText<'static> = [
 const REPEAT_COUNT: [&str; 2] = ["Invalid count value: ", "RangeError: Invalid count value: "];
 
 /// The `RangeError` of a `repeat` / `padStart` / `padEnd` result past
-/// [`MAX_STRING_LENGTH`].
+/// [`MAX_STRING_LENGTH`], or of a case mapping that grows past it.
 const STRING_LENGTH: [&str; 2] = ["Invalid string length", "RangeError: Invalid string length"];
 
 /// The longest string a `repeat` / `padStart` / `padEnd` builds, in code
 /// units (`2^29 - 24`, as V8).
-const MAX_STRING_LENGTH: f64 = 536_870_888.0;
+pub(in crate::emit) const MAX_STRING_LENGTH: f64 = 536_870_888.0;
 
 /// The own keys of a `match` result besides its element.
 const MATCH_KEYS: [&str; 3] = ["index", "input", "groups"];
@@ -482,19 +449,26 @@ pub(super) fn emit_method(
         push_str(function, strings, "");
         wasm!(function; LocalSet(a0), End);
     }
-    let Some(flag) = op.flag() else {
-        emit_units(op, function, frame, strings, helpers);
-        if op == StringOp::Match {
-            wasm!(function; LocalSet(r));
-            emit_match_result(function, frame, s, a0, r, strings, helpers);
-        }
-        return;
-    };
     if let Some(upper) = case_upper(op) {
-        emit_case_map(upper, op, flag, function, frame, strings, helpers);
+        emit_case_map(upper, function, frame, strings, helpers);
         return;
     }
-    emit_host_op(op, flag, function, frame, strings, helpers);
+    if op == StringOp::Normalize {
+        emit_normalize(function, frame, strings, helpers);
+        return;
+    }
+    if op == StringOp::LocaleCompare {
+        wasm!(function;
+            LocalGet(s), I32WrapI64, LocalGet(a0), I32WrapI64, Call(helpers.str_cmp),
+            F64ConvertI32S, I64ReinterpretF64,
+        );
+        return;
+    }
+    emit_units(op, function, frame, strings, helpers);
+    if op == StringOp::Match {
+        wasm!(function; LocalSet(r));
+        emit_match_result(function, frame, s, a0, r, strings, helpers);
+    }
 }
 
 /// The receiver of [`emit_method`] into i64 temp 0: `this`, a
@@ -538,11 +512,10 @@ fn case_upper(op: StringOp) -> Option<bool> {
 /// `toUpperCase` / `toLowerCase` (and the `toLocale*` twins) over the string
 /// in i64 temp 0: a one-byte receiver whose mapping stays one-byte at the
 /// same length (lowercasing always; uppercasing unless it holds `µ`, `ß` or
-/// `ÿ`) maps per unit in the guest, anything else runs the host op `flag`.
+/// `ÿ`) maps per unit, anything else runs the table-driven `__case_map`,
+/// which refuses a result past [`MAX_STRING_LENGTH`].
 fn emit_case_map(
     upper: bool,
-    op: StringOp,
-    flag: i32,
     function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
@@ -605,35 +578,48 @@ fn emit_case_map(
     });
     wasm!(function; LocalGet(dst));
     box_heap(function);
-    wasm!(function; Else);
-    emit_host_op(op, flag, function, frame, strings, helpers);
+    wasm!(function;
+        Else,
+        LocalGet(s.p), I32Const(i32::from(upper)), Call(helpers.case_map()), LocalTee(dst), I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
+    wasm!(function; End, LocalGet(dst));
+    box_heap(function);
     wasm!(function; End);
 }
 
-/// The host op `flag` of `op` over the receiver string in i64 temp 0 and the
-/// coerced arguments in i64 temps 1 and 2; `normalize`'s refusal sentinel
-/// throws.
-fn emit_host_op(
-    op: StringOp,
-    flag: i32,
+/// `normalize` over the string in i64 temp 0 with the form (a string or
+/// `undefined`) in i64 temp 1: an unknown form throws, as does a result past
+/// [`MAX_STRING_LENGTH`].
+fn emit_normalize(
     function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (s, a0) = (frame.i64(0), frame.i64(1));
+    let locals = i32_locals(frame);
+    let [form, dst] = [locals[0], locals[1]];
     wasm!(function;
-        LocalGet(s), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method), LocalSet(r),
+        LocalGet(a0), I64Const(UNDEFINED_BITS), I64Eq,
+        If(BlockType::Result(ValType::I32)),
+        I32Const(crate::emit::unicode::FORM_COMPOSE),
+        Else,
+        LocalGet(a0), I32WrapI64, Call(helpers.normalize_form()),
+        End,
+        LocalTee(form), I32Const(0), I32LtS,
+        If(BlockType::Empty),
     );
-    if op == StringOp::Normalize {
-        wasm!(function;
-            LocalGet(r), I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq,
-            If(BlockType::Empty),
-        );
-        throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
-        wasm!(function; End);
-    }
-    wasm!(function; LocalGet(r));
+    throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
+    wasm!(function;
+        End,
+        LocalGet(s), I32WrapI64, LocalGet(form), Call(helpers.normalize()), LocalTee(dst), I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
+    wasm!(function; End, LocalGet(dst));
+    box_heap(function);
 }
 
 /// The well-known symbol `op` dispatches to on an object first argument.

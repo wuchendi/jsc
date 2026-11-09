@@ -299,6 +299,303 @@ fn math_round_edges() {
     assert_eval("Math.round(Infinity)", "Infinity");
 }
 
+/// A sample range: uniform, log-uniform positive, or log-uniform of either sign.
+#[derive(Clone, Copy)]
+enum Spread {
+    Uniform(f64, f64),
+    Log(f64, f64),
+    SignedLog(f64, f64),
+}
+use Spread::{Log, SignedLog, Uniform};
+
+/// A deterministic `xorshift64*` over `[0, 1)`.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> f64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        let mantissa = self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 12;
+        f64::from_bits((0x3ff_u64 << 52) | mantissa) - 1.0
+    }
+
+    fn sample(&mut self, spread: Spread) -> f64 {
+        match spread {
+            Uniform(lo, hi) => lo + (hi - lo) * self.next(),
+            Log(lo, hi) => lo * (hi / lo).powf(self.next()),
+            SignedLog(lo, hi) => {
+                let magnitude = self.sample(Log(lo, hi));
+                if self.next() < 0.5 {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            }
+        }
+    }
+}
+
+/// At least 1,000 inputs drawn across `spreads`, plus the domain edges.
+fn sample_inputs(seed: u64, spreads: &[Spread]) -> Vec<f64> {
+    const PER_FUNCTION: usize = 1_200;
+    let mut rng = Rng(seed);
+    let mut inputs: Vec<f64> = (0..PER_FUNCTION)
+        .map(|i| rng.sample(spreads[i % spreads.len()]))
+        .collect();
+    let edges = [5e-324, f64::MIN_POSITIVE, 1e-300, 0.5, 1.0, 2.0, 709.5];
+    inputs.extend(edges);
+    inputs.extend(edges.map(|x| -x));
+    inputs
+}
+
+/// `x` on a line where adjacent doubles differ by one (`-0` and `+0` coincide).
+fn ordinal(x: f64) -> i128 {
+    let bits = x.to_bits().cast_signed();
+    i128::from(if bits < 0 { i64::MIN - bits } else { bits })
+}
+
+/// Run one guest expression per input and return its results, in order
+/// (`-0` is printed with its sign so results round-trip bit-exactly).
+/// `call` renders the JS expression for input index expression `i`.
+fn guest_results(literals: &[Vec<f64>], call: &str) -> Vec<f64> {
+    let decls: Vec<String> = ["xs", "ys"]
+        .iter()
+        .zip(literals)
+        .map(|(name, values)| {
+            let list: Vec<String> = values.iter().map(|x| format!("{x:e}")).collect();
+            format!("const {name} = [{}];\n", list.join(","))
+        })
+        .collect();
+    let src = format!(
+        "{}let out = \"\"; for (let i = 0; i < xs.length; i++) {{ const v = {call}; out += (Object.is(v, -0) ? \"-0\" : v) + \"\\n\"; }}\n\
+         console.log(out);\n",
+        decls.concat()
+    );
+    let done = common::exec(&src, false).expect("sample program runs");
+    assert_eq!(done.code, 0, "{call}: {}", done.stderr);
+    done.stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.parse().expect("numeric output line"))
+        .collect()
+}
+
+/// Assert one guest result has the same bits as the `libm` crate's result
+/// (any two NaNs are equal).
+fn assert_bit_exact(label: &str, input: (f64, f64), guest: f64, reference: f64) {
+    let same = if reference.is_nan() {
+        guest.is_nan()
+    } else {
+        guest.to_bits() == reference.to_bits()
+    };
+    assert!(
+        same,
+        "{label}{input:?}: guest {guest:e} ({:#018x}), libm {reference:e} ({:#018x})",
+        guest.to_bits(),
+        reference.to_bits()
+    );
+}
+
+/// The Rust `std` sanity bound in ulps. `std` is the platform libm, so it may
+/// differ from msun by a few ulps; 4096 ulps (about 12 bits of the mantissa)
+/// cannot be reached by that difference and only catches gross errors.
+const STD_SANITY_ULPS: i128 = 4096;
+
+/// Assert one guest result is roughly the `std` result.
+fn assert_near_std(label: &str, input: (f64, f64), guest: f64, native: f64) {
+    let near = if native.is_nan() {
+        guest.is_nan()
+    } else {
+        (ordinal(guest) - ordinal(native)).abs() <= STD_SANITY_ULPS
+    };
+    assert!(near, "{label}{input:?}: guest {guest:e}, std {native:e}");
+}
+
+/// One sampled function: its `Math` name, the `libm` reference, the std
+/// sanity reference and its inputs.
+type Sampled<'a> = (&'a str, fn(f64) -> f64, fn(f64) -> f64, &'a [Spread]);
+
+/// The guest libm is bit-exact with the `libm` crate it was ported from on a
+/// deterministic sample of every transcendental, coarsely agrees with Rust
+/// `std`, and is exact on the special values.
+#[test]
+fn libm_matches_std_sample() {
+    let trig: &[Spread] = &[
+        Uniform(-7.0, 7.0),
+        SignedLog(1e-12, 1e6),
+        SignedLog(1e7, 1e300),
+    ];
+    let log: &[Spread] = &[Log(1e-300, 1e300), Uniform(0.5, 2.0)];
+    let wide: &[Spread] = &[SignedLog(1e-300, 1e300), Uniform(-30.0, 30.0)];
+    let unit: &[Spread] = &[Uniform(-1.0, 1.0), SignedLog(1e-300, 1.0)];
+    let exp: &[Spread] = &[Uniform(-700.0, 700.0), SignedLog(1e-300, 1.0)];
+    let hyper: &[Spread] = &[Uniform(-30.0, 30.0), Uniform(-700.0, 700.0)];
+    let functions: [Sampled<'_>; 19] = [
+        ("cbrt", libm::cbrt, f64::cbrt, wide),
+        ("log", libm::log, f64::ln, log),
+        ("log2", libm::log2, f64::log2, log),
+        ("log10", libm::log10, f64::log10, log),
+        (
+            "log1p",
+            libm::log1p,
+            f64::ln_1p,
+            &[Uniform(-0.99, 10.0), Log(1e-300, 1e300)],
+        ),
+        ("exp", libm::exp, f64::exp, exp),
+        ("expm1", libm::expm1, f64::exp_m1, exp),
+        ("sin", libm::sin, f64::sin, trig),
+        ("cos", libm::cos, f64::cos, trig),
+        ("tan", libm::tan, f64::tan, trig),
+        ("asin", libm::asin, f64::asin, unit),
+        ("acos", libm::acos, f64::acos, unit),
+        ("atan", libm::atan, f64::atan, wide),
+        ("sinh", libm::sinh, f64::sinh, hyper),
+        ("cosh", libm::cosh, f64::cosh, hyper),
+        (
+            "tanh",
+            libm::tanh,
+            f64::tanh,
+            &[Uniform(-20.0, 20.0), SignedLog(1e-300, 1.0)],
+        ),
+        ("asinh", libm::asinh, f64::asinh, wide),
+        (
+            "acosh",
+            libm::acosh,
+            f64::acosh,
+            &[Log(1.0, 1e300), Uniform(1.0, 10.0)],
+        ),
+        ("atanh", libm::atanh, f64::atanh, unit),
+    ];
+    for (seed, (name, reference, native, spreads)) in (1_u64..).zip(functions) {
+        let xs = sample_inputs(seed * 0x9E37_79B9, spreads);
+        let results = guest_results(std::slice::from_ref(&xs), &format!("Math.{name}(xs[i])"));
+        assert_eq!(results.len(), xs.len(), "{name}: result count");
+        for (&x, guest) in xs.iter().zip(results) {
+            assert_bit_exact(name, (x, f64::NAN), guest, reference(x));
+            assert_near_std(name, (x, f64::NAN), guest, native(x));
+        }
+    }
+    let ys = sample_inputs(0xA5A5_0001, wide);
+    let xs = sample_inputs(0xA5A5_0002, wide);
+    let results = guest_results(&[xs.clone(), ys.clone()], "Math.atan2(ys[i], xs[i])");
+    assert_eq!(results.len(), xs.len(), "atan2: result count");
+    for ((&x, &y), guest) in xs.iter().zip(&ys).zip(results) {
+        assert_bit_exact("atan2", (y, x), guest, libm::atan2(y, x));
+        assert_near_std("atan2", (y, x), guest, y.atan2(x));
+    }
+    assert_libm_special_values();
+}
+
+/// The `Math.*` calls with an exact expected result: NaN, signed zeros,
+/// infinities and domain edges.
+const LIBM_SPECIAL_CASES: &[(&str, &str)] = &[
+    ("cbrt(-0)", "-0"),
+    ("cbrt(Infinity)", "Infinity"),
+    ("cbrt(-Infinity)", "-Infinity"),
+    ("cbrt(27)", "3"),
+    ("cbrt(-8)", "-2"),
+    ("cbrt(NaN)", "NaN"),
+    ("log(1)", "0"),
+    ("log(0)", "-Infinity"),
+    ("log(-0)", "-Infinity"),
+    ("log(-1)", "NaN"),
+    ("log(Infinity)", "Infinity"),
+    ("log(-Infinity)", "NaN"),
+    ("log(NaN)", "NaN"),
+    ("log2(1)", "0"),
+    ("log2(8)", "3"),
+    ("log2(0)", "-Infinity"),
+    ("log2(-1)", "NaN"),
+    ("log10(1)", "0"),
+    ("log10(0)", "-Infinity"),
+    ("log10(-1)", "NaN"),
+    ("log1p(-0)", "-0"),
+    ("log1p(0)", "0"),
+    ("log1p(-1)", "-Infinity"),
+    ("log1p(-2)", "NaN"),
+    ("log1p(Infinity)", "Infinity"),
+    ("exp(0)", "1"),
+    ("exp(-0)", "1"),
+    ("exp(-Infinity)", "0"),
+    ("exp(Infinity)", "Infinity"),
+    ("exp(710)", "Infinity"),
+    ("exp(-746)", "0"),
+    ("exp(NaN)", "NaN"),
+    ("expm1(-0)", "-0"),
+    ("expm1(0)", "0"),
+    ("expm1(-Infinity)", "-1"),
+    ("expm1(Infinity)", "Infinity"),
+    ("sin(-0)", "-0"),
+    ("sin(Infinity)", "NaN"),
+    ("sin(-Infinity)", "NaN"),
+    ("sin(NaN)", "NaN"),
+    ("cos(-0)", "1"),
+    ("cos(Infinity)", "NaN"),
+    ("tan(-0)", "-0"),
+    ("tan(Infinity)", "NaN"),
+    ("asin(-0)", "-0"),
+    ("asin(1)", "Math.PI / 2"),
+    ("asin(-1)", "-Math.PI / 2"),
+    ("asin(2)", "NaN"),
+    ("acos(1)", "0"),
+    ("acos(-1)", "Math.PI"),
+    ("acos(-2)", "NaN"),
+    ("atan(-0)", "-0"),
+    ("atan(Infinity)", "Math.PI / 2"),
+    ("atan(-Infinity)", "-Math.PI / 2"),
+    ("atan2(0, 0)", "0"),
+    ("atan2(-0, 0)", "-0"),
+    ("atan2(0, -0)", "Math.PI"),
+    ("atan2(-0, -0)", "-Math.PI"),
+    ("atan2(1, 0)", "Math.PI / 2"),
+    ("atan2(-1, 0)", "-Math.PI / 2"),
+    ("atan2(Infinity, Infinity)", "Math.PI / 4"),
+    ("atan2(Infinity, -Infinity)", "3 * Math.PI / 4"),
+    ("atan2(-Infinity, Infinity)", "-Math.PI / 4"),
+    ("atan2(1, Infinity)", "0"),
+    ("atan2(-1, Infinity)", "-0"),
+    ("atan2(1, -Infinity)", "Math.PI"),
+    ("atan2(NaN, 1)", "NaN"),
+    ("sinh(-0)", "-0"),
+    ("sinh(Infinity)", "Infinity"),
+    ("sinh(-Infinity)", "-Infinity"),
+    ("cosh(-0)", "1"),
+    ("cosh(-Infinity)", "Infinity"),
+    ("tanh(-0)", "-0"),
+    ("tanh(Infinity)", "1"),
+    ("tanh(-Infinity)", "-1"),
+    ("tanh(NaN)", "NaN"),
+    ("asinh(-0)", "-0"),
+    ("asinh(-Infinity)", "-Infinity"),
+    ("acosh(1)", "0"),
+    ("acosh(0.5)", "NaN"),
+    ("acosh(Infinity)", "Infinity"),
+    ("acosh(-Infinity)", "NaN"),
+    ("atanh(-0)", "-0"),
+    ("atanh(1)", "Infinity"),
+    ("atanh(-1)", "-Infinity"),
+    ("atanh(2)", "NaN"),
+];
+
+/// Exact results at NaN, signed zeros, infinities and domain edges.
+fn assert_libm_special_values() {
+    let cases: Vec<(String, &str)> = LIBM_SPECIAL_CASES
+        .iter()
+        .map(|(call, want)| (format!("Math.{call}"), *want))
+        .collect();
+    let checks: Vec<String> = cases
+        .iter()
+        .map(|(call, want)| format!("Object.is({call}, {want})"))
+        .collect();
+    let output = eval_text(&format!("[{}].join()", checks.join(",")));
+    let verdicts: Vec<&str> = output.split(',').collect();
+    assert_eq!(verdicts.len(), cases.len(), "special-value result count");
+    for ((call, want), verdict) in cases.iter().zip(verdicts) {
+        assert_eq!(verdict, "true", "{call} should be exactly {want}");
+    }
+}
+
 /// `Math.random()` stays in `[0, 1)` and varies between draws (two 52-bit
 /// draws collide with probability `2^-52`).
 #[test]

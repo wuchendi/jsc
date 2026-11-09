@@ -554,9 +554,9 @@ pub(super) fn emit_hof(
 }
 
 /// `Array.prototype.indexOf(search, fromIndex)` (`includes`: `includes`).
-/// An array without a `fromIndex` (and no prototype holding an index) runs
-/// the call sites' host search. Any
-/// other receiver scans `k` from `fromIndex` (relative to `len`): `indexOf`
+/// An array in non-dictionary mode without a `fromIndex` (and no prototype
+/// holding an index) runs `__array_search`, as its call sites do. Any other
+/// receiver scans `k` from `fromIndex` (relative to `len`): `indexOf`
 /// over the present indices with `===`, `includes` over every index with
 /// `SameValueZero` (an absent index reads `undefined`).
 pub(super) fn emit_search(
@@ -571,24 +571,24 @@ pub(super) fn emit_search(
     let key = frame.base(2);
     let r = frame.f64(0);
     let (len, k) = (frame.yf64(0), frame.yf64(1));
-    let (op, not_found) = if includes {
-        (abi::METHOD_OP_INCLUDES, FALSE_BITS)
-    } else {
-        (abi::METHOD_OP_INDEX_OF, (-1.0f64).to_bits().cast_signed())
-    };
+    let not_found = if includes { FALSE_BITS } else { NOT_FOUND_BITS };
     this_object(function, frame, o, texts.nullish, strings, helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(search));
     indexless_array(function, o, helpers);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
+    wasm!(function;
+        LocalGet(o), I32WrapI64, I32Load8U(m8(abi::HEADER_FLAGS_OFFSET)),
+        I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
+        If(BlockType::Result(ValType::I32)),
+    );
     wasm!(function; LocalGet(frame.argc()), F64ReinterpretI64, F64Const(Ieee64::from(2.0)), F64Lt);
     frame.arg(function, 1);
     wasm!(function;
         I64Const(UNDEFINED_BITS), I64Eq, I32Or,
         Else, I32Const(0), End,
         If(BlockType::Empty),
-        LocalGet(o), I32Const(op), LocalGet(search), I64Const(UNDEFINED_BITS),
-        Call(helpers.method), Return,
+        LocalGet(o), LocalGet(search), I32Const(i32::from(includes)),
+        Call(helpers.array_search), Return,
         End,
     );
     length_of_f64(function, o, len, strings, helpers);
@@ -633,6 +633,125 @@ pub(super) fn emit_search(
         },
     );
     wasm!(function; I64Const(not_found));
+}
+
+/// A byte [`MemArg`] at `offset`.
+fn m8(offset: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(offset),
+        align: 0,
+        memory_index: 0,
+    }
+}
+
+/// A `u32` [`MemArg`] at `offset`.
+fn m32(offset: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(offset),
+        align: 2,
+        memory_index: 0,
+    }
+}
+
+/// An `i64` [`MemArg`] at `offset`.
+fn m64(offset: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(offset),
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+/// The number jsval `-1`, what `indexOf` returns on a miss.
+const NOT_FOUND_BITS: i64 = (-1.0f64).to_bits().cast_signed();
+
+/// `__array_search(recv: i64, needle: i64, includes: i32) -> i64`: the guest
+/// element scan behind `indexOf` (`includes = 0`, the first index whose
+/// element is `=== needle`, else `-1`) and `includes` (`SameValueZero`, a
+/// boolean, a hole reading as `undefined`) on an array whose elements are all
+/// plain data (not in dictionary mode) and whose prototypes hold no index.
+/// Walks the store, then a `SPARSE` array's index keys, so a huge `length`
+/// costs only its present elements. Allocates nothing: strings compare by
+/// content, everything else as `__same_value_zero` does.
+pub(in crate::emit) fn emit_array_search(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_JS, ROOT_JS, RAW_I32],
+        &[
+            ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+            RAW_I64,
+        ],
+    );
+    let (recv, needle, includes) = (0, 1, 2);
+    let (o, len, store, k, count, entry, end, key, best, v) = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    let stored = end;
+    let svz = helpers.same_value_zero;
+    wasm!(f;
+        LocalGet(includes), I32Eqz, LocalGet(needle), I64Const(QNAN_BITS), I64Eq, I32And,
+        If(BlockType::Empty), I64Const(NOT_FOUND_BITS), Return, End,
+        LocalGet(recv), I32WrapI64, LocalTee(o), I32Load(m32(abi::ARRAY_LEN_OFFSET)), LocalSet(len),
+        LocalGet(o), I32Load(m32(abi::ARRAY_ELEMS_OFFSET)), LocalTee(store),
+        If(BlockType::Empty),
+        LocalGet(store), I32Load(m32(abi::ELEMS_CAP_OFFSET)), LocalTee(stored),
+        LocalGet(len), I32GtU,
+        If(BlockType::Empty), LocalGet(len), LocalSet(stored), End,
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(k), LocalGet(stored), I32GeU, BrIf(1),
+        LocalGet(store), LocalGet(k), I32Const(8), I32Mul, I32Add,
+        I64Load(m64(abi::ELEMS_DATA_OFFSET)), LocalTee(v), I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(count), I32Const(1), I32Add, LocalSet(count),
+        LocalGet(v), LocalGet(needle), Call(svz),
+        If(BlockType::Empty),
+        I64Const(TRUE_BITS),
+        LocalGet(k), F64ConvertI32U, I64ReinterpretF64,
+        LocalGet(includes), Select, Return,
+        End,
+        End,
+        LocalGet(k), I32Const(1), I32Add, LocalSet(k),
+        Br(0),
+        End, End,
+        End,
+        I32Const(-1), LocalSet(best),
+        LocalGet(o), I32Load8U(m8(abi::HEADER_FLAGS_OFFSET)), I32Const(ARRAY_SPARSE), I32And,
+        If(BlockType::Empty),
+        LocalGet(o), I32Load(m32(abi::OBJ_PROPS_OFFSET)), LocalTee(entry),
+        If(BlockType::Empty),
+        LocalGet(entry), I32Load(m32(abi::PROPS_COUNT_OFFSET)),
+        I32Const(abi::PROP_ENTRY_SIZE.cast_signed()), I32Mul, LocalGet(entry), I32Add,
+        I32Const(abi::PROPS_HEADER_SIZE.cast_signed()), I32Add, LocalSet(end),
+        LocalGet(entry), I32Const(abi::PROPS_HEADER_SIZE.cast_signed()), I32Add, LocalSet(entry),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(entry), LocalGet(end), I32GeU, BrIf(1),
+        LocalGet(entry), I32Load(m32(abi::PROP_KEY_OFFSET)), LocalTee(key),
+        If(BlockType::Empty),
+        LocalGet(key), I32Load8U(m8(abi::HEADER_FLAGS_OFFSET)),
+        I32Const(i32::from(abi::STR_FLAG_ARRAY_INDEX)), I32And,
+        If(BlockType::Empty),
+        LocalGet(count), I32Const(1), I32Add, LocalSet(count),
+        LocalGet(entry), I64Load(m64(abi::PROP_VALUE_OFFSET)), LocalGet(needle), Call(svz),
+        If(BlockType::Empty),
+        LocalGet(includes),
+        If(BlockType::Empty), I64Const(TRUE_BITS), Return, End,
+        LocalGet(key), Call(helpers.index_value), LocalTee(k), LocalGet(best), I32LtU,
+        If(BlockType::Empty), LocalGet(k), LocalSet(best), End,
+        End,
+        End,
+        End,
+        LocalGet(entry), I32Const(abi::PROP_ENTRY_SIZE.cast_signed()), I32Add, LocalSet(entry),
+        Br(0),
+        End, End,
+        End,
+        End,
+        LocalGet(best), I32Const(-1), I32Ne,
+        If(BlockType::Empty), LocalGet(best), F64ConvertI32U, I64ReinterpretF64, Return, End,
+        LocalGet(includes), LocalGet(needle), I64Const(UNDEFINED_BITS), I64Eq, I32And,
+        LocalGet(count), LocalGet(len), I32LtU, I32And,
+        If(BlockType::Empty), I64Const(TRUE_BITS), Return, End,
+        I64Const(FALSE_BITS), I64Const(NOT_FOUND_BITS), LocalGet(includes), Select,
+        End,
+    );
+    finish_builder(f)
 }
 
 /// `Array.prototype.join(separator)`: an array runs `__array_join` (as its

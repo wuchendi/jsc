@@ -437,7 +437,11 @@ fn no_literals_starts_heap_after_the_intern_table() {
     let info = abi::FN_INFO_ENTRY_SIZE.cast_signed() * (2 + builtin_count());
     let intern_base = strings_end + info + realm::image_size();
     let cap = intern_table(&offsets, intern_base).cap;
-    assert_eq!(data_layout(&bytes).1, Some(intern_base + 4 * cap));
+    let end = intern_base + 4 * cap + crate::emit::unicode::data_size();
+    assert_eq!(
+        data_layout(&bytes).1,
+        Some((end + crate::emit::BLOCK_ALIGN - 1) & -crate::emit::BLOCK_ALIGN)
+    );
 }
 
 #[test]
@@ -1293,6 +1297,7 @@ fn empty_program_helpers<R>(check: impl FnOnce(super::Helpers<'_>, &[u8]) -> R) 
         info: strings_end,
         blocks: strings_end,
         realm: strings_end,
+        unicode: strings_end,
     };
     let unwind = std::cell::RefCell::new(super::Unwind::default());
     let (.., helpers, _) =
@@ -1394,6 +1399,7 @@ fn leaf_declarations_match_bodies() {
         info: strings_end,
         blocks: strings_end,
         realm: strings_end,
+        unicode: strings_end,
     };
     let unwind = std::cell::RefCell::new(super::Unwind::default());
     let (.., helpers, _) =
@@ -1423,6 +1429,33 @@ fn leaf_declarations_match_bodies() {
     }
 }
 
+/// Every Unicode lookup and libm helper is a leaf; the two Unicode helpers
+/// that build a result string are safepoints (design/runtime-memory.md §5.3).
+#[test]
+fn unicode_and_libm_leaves() {
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+        unicode: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let leaves = super::roots::leaf_set(helpers);
+    let lookups = super::unicode::helper_graph(helpers);
+    let math = super::libm::helper_graph(helpers);
+    assert_eq!(math.len(), super::libm::H::Atanh as usize + 1);
+    for (helper, _) in lookups.into_iter().chain(math) {
+        assert!(leaves.is_leaf(helper), "function {helper} is a leaf");
+    }
+    for helper in [helpers.case_map(), helpers.normalize()] {
+        assert!(!leaves.is_leaf(helper), "function {helper} allocates");
+    }
+}
+
 /// The R2 number conversions never allocate, except the ones that build the
 /// result string (design/runtime-memory.md §5.3).
 #[test]
@@ -1433,6 +1466,7 @@ fn number_conversion_leaves() {
         info: strings_end,
         blocks: strings_end,
         realm: strings_end,
+        unicode: strings_end,
     };
     let unwind = std::cell::RefCell::new(super::Unwind::default());
     let (.., helpers, _) =

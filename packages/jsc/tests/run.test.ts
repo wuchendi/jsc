@@ -35,7 +35,7 @@ it('links_wasi_polyfill', async () => {
       .filter((i) => i.module !== WASI)
       .map((i) => `${i.module}.${i.name}`)
       .sort(),
-  ).toEqual(['env.__method', 'env.__promise', 'env.__then'])
+  ).toEqual(['env.__promise', 'env.__then'])
   const provided: WebAssembly.Imports = {
     ...createShim().imports,
     ...createWasi().imports,
@@ -158,7 +158,12 @@ it('keeps Math.random in range', async () => {
   ).toBe('true')
 })
 
-it('backs the remaining env imports', async () => {
+it('renders a function with its own properties in the guest', async () => {
+  const { stdout } = await run('function f() {} f.a = 1; console.log(f)')
+  expect(stdout).toBe('[Function: f] { a: 1 }\n')
+})
+
+it('runs what the env imports used to back in the guest', async () => {
   expect(await evalText("parseInt('ff', 16) + Number('2')")).toBe('257')
   expect(await evalText("'straße'.toUpperCase()")).toBe('STRASSE')
   expect(await evalText("String(1.5) + ',' + [1,,NaN].indexOf(NaN)")).toBe(
