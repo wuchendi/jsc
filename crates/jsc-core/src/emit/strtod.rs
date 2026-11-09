@@ -1232,7 +1232,7 @@ fn parse_int_value(f: &mut Function, h: Helpers<'_>, [radix, data, pos, span]: [
 /// The static tables at [`abi::DEC_POW10`]: the 23 exact powers of ten, the
 /// 65-entry left-shift table, the packed digits of `5^s`, and the step table.
 pub(super) fn tables() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity((abi::STATIC_AREA_END - abi::DEC_POW10) as usize);
+    let mut bytes = Vec::with_capacity((abi::NUM_SCRATCH_ADDR - abi::DEC_POW10) as usize);
     let mut power = 1.0_f64;
     for _ in 0..23 {
         bytes.extend_from_slice(&power.to_le_bytes());

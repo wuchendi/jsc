@@ -52,9 +52,6 @@ const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 const CONVERT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const CONVERT_IMPORT_NAME: &str = abi::CONVERT_IMPORT_NAME;
 
-/// `__convert` op flags; see [`abi`].
-const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
-
 /// The module and field name of the host `__method` import backing the
 /// non-callback array/string methods. It receives the receiver jsval, a
 /// `METHOD_OP_*` flag, and two argument jsval slots (padded with `undefined` when
@@ -879,8 +876,9 @@ struct Helpers<'a> {
     /// place (push/pop a handler, bump/restore the depth) without re-plumbing a
     /// `&mut` through every helper.
     unwind: &'a RefCell<Unwind>,
-    /// The host `__convert` import's function index. Always `4`; `String`/`Number`/`parseFloat` lower to `call`s of it.
-    convert: u32,
+    /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
+    /// helpers (see [`dtoa::emit_helpers`]).
+    dtoa: u32,
     /// The host `__method` import's function index. Always `5`; the non-callback array/string methods lower to `call`s of it.
     method: u32,
     /// The host `__promise` import's function index. Always `6`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
@@ -1171,6 +1169,66 @@ impl Helpers<'_> {
         self.new_string + 4 + builtin.index()
     }
 
+    /// `__umul128(a, b) -> (low, high)`.
+    fn umul128(self) -> u32 {
+        self.dtoa
+    }
+
+    /// `__ryu_pow5(i, inv) -> (low, high)`.
+    fn ryu_pow5(self) -> u32 {
+        self.dtoa + 1
+    }
+
+    /// `__ryu_mul_shift(m, low, high, j) -> i64`.
+    fn mul_shift(self) -> u32 {
+        self.dtoa + 2
+    }
+
+    /// `__ryu_mp5(value, p) -> i32`.
+    fn multiple_of_pow5(self) -> u32 {
+        self.dtoa + 3
+    }
+
+    /// `__ryu_d2d(bits) -> (digits, exp10)`.
+    fn ryu_d2d(self) -> u32 {
+        self.dtoa + 4
+    }
+
+    /// `__scratch_str(ptr, len) -> i32`.
+    fn scratch_str(self) -> u32 {
+        self.dtoa + 5
+    }
+
+    /// `__num_to_str(bits) -> i32`.
+    fn num_to_str(self) -> u32 {
+        self.dtoa + 6
+    }
+
+    /// `__dec_expand(bits) -> (ptr, count, point)`.
+    fn dec_expand(self) -> u32 {
+        self.dtoa + 7
+    }
+
+    /// `__num_format(bits, mode, f) -> i32`.
+    fn num_format(self) -> u32 {
+        self.dtoa + 8
+    }
+
+    /// `__num_radix(bits, radix) -> i32`.
+    fn num_radix(self) -> u32 {
+        self.dtoa + 9
+    }
+
+    /// `__prim_str(v) -> i32`.
+    fn prim_str(self) -> u32 {
+        self.dtoa + 10
+    }
+
+    /// `__msg_str(v) -> i32`.
+    fn msg_str(self) -> u32 {
+        self.dtoa + 11
+    }
+
     /// `__to_primitive(v, hint) -> i64` (see [`convert::emit_to_primitive`]):
     /// the first of the conversion helpers, which follow the builtin bodies.
     fn to_primitive(self) -> u32 {
@@ -1436,6 +1494,7 @@ struct FnLayout {
 mod array;
 mod builtins;
 mod convert;
+mod dtoa;
 mod expr;
 mod function;
 mod generator;
@@ -1698,7 +1757,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&emit_sparse_set(helpers, true));
     code.function(&emit_json_escape(helpers.alloc));
     code.function(&emit_json_str(
-        helpers.convert,
+        helpers.num_to_str(),
         helpers.json_escape,
         JsonTokens::resolve(&offsets),
     ));
@@ -1735,6 +1794,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // follows it, then the two `new Promise` settler functions.
     code.function(&emit_box_f64_helper());
     code.function(&emit_to_number_helper(&offsets, helpers));
+    for helper in dtoa::emit_helpers(&offsets, helpers) {
+        code.function(&helper);
+    }
     code.function(&strtod::emit_num_unit());
     code.function(&strtod::emit_str_ws());
     code.function(&strtod::emit_dec_parse(helpers));

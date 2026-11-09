@@ -57,7 +57,6 @@ pub(super) fn build_type_and_function_sections<'a>(
         unwind,
         // The `env` imports follow the four WASI imports (0..=3): `__convert`
         // 4, `__method` 5, `__promise` 6, `__then` 7, `__now` 8; `__parse_int` is 9.
-        convert: 4,
         method: 5,
         promise: 6,
         then: 7,
@@ -130,6 +129,13 @@ pub(super) fn build_type_and_function_sections<'a>(
         prop_throw: index(),
         box_f64: index(),
         to_number: index(),
+        dtoa: {
+            let first = index();
+            for _ in 1..dtoa::HELPER_COUNT {
+                index();
+            }
+            first
+        },
         // The number parsers (`strtod`), in emission order.
         strtod: {
             let first = index();
@@ -431,6 +437,19 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         // `__box_f64(x) -> i64` and `__to_number(v) -> i64`.
         (&[F64], &[I64]),
         (&[I64], &[I64]),
+        // The `Number` to string helpers, in `dtoa::emit_helpers` order.
+        (&[I64, I64], &[I64, I64]),
+        (&[I32, I32], &[I64, I64]),
+        (&[I64, I64, I64, I32], &[I64]),
+        (&[I64, I32], &[I32]),
+        (&[I64], &[I64, I32]),
+        (&[I32, I32], &[I32]),
+        (&[I64], &[I32]),
+        (&[I64], &[I32, I32, I32]),
+        (&[I64, I32, I32], &[I32]),
+        (&[I64, I32], &[I32]),
+        (&[I64], &[I32]),
+        (&[I64], &[I32]),
         // The number parsers, in `strtod`'s emission order.
         (&[I32, I32], &[I32]),           // __num_unit(data, i)
         (&[I32], &[I32]),                // __str_ws(c)
@@ -587,6 +606,11 @@ pub(super) fn emit_data_section(
     data.active(0, &ConstExpr::i32_const(abi::OOM_IOVEC.cast_signed()), oom);
     data.active(
         0,
+        &ConstExpr::i32_const(abi::RYU_TABLES_ADDR.cast_signed()),
+        dtoa::tables(),
+    );
+    data.active(
+        0,
         &ConstExpr::i32_const(abi::DEC_POW10.cast_signed()),
         strtod::tables(),
     );
@@ -722,6 +746,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     let realm_strs = realm::strings()
         .chain(builtins::strings())
         .chain(convert::strings())
+        .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY])
         .chain(FN_KEYS);

@@ -738,7 +738,21 @@ pub(crate) const DEC_POW5_LEN: u32 = 1440;
 pub(crate) const DEC_POWERS: u32 = DEC_POW5 + DEC_POW5_LEN;
 
 /// The first address after the fixed static area, where the string blocks begin.
-pub(crate) const STATIC_AREA_END: u32 = (DEC_POWERS + 19 + 15) & !15;
+pub(crate) const STATIC_AREA_END: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
+
+/// Address of the static `Number` formatting scratch, right after the
+/// decimal-conversion tables, 16-aligned.
+pub(crate) const NUM_SCRATCH_ADDR: u32 = (DEC_POWERS + 19 + 15) & !15;
+
+/// Size of [`NUM_SCRATCH_ADDR`].
+pub(crate) const NUM_SCRATCH_SIZE: u32 = 2048;
+
+/// Address of the static Ryu power-of-5 tables, right after the scratch.
+pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
+
+/// Size of the Ryu tables (828 bytes), rounded up to keep the string blocks
+/// aligned.
+pub(crate) const RYU_TABLES_SIZE: u32 = 832;
 
 /// The field name of the host `__convert` import backing the
 /// `String`/`Number`/`parseFloat` conversions.
