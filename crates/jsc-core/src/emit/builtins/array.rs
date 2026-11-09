@@ -1440,26 +1440,29 @@ const FROM_ASYNC_NOT_CALLABLE: CalleeErrorText<'static> = [
 ];
 
 /// The byte offsets of an `Array.fromAsync` state block (the `env` of its
-/// internal builtins): i64 jsvals, then the i32 phase and the i32 flag set
-/// while an abrupt completion must close the iterator.
-const FA_PROMISE: u32 = 0;
+/// internal builtins, as a heap jsval): a `TYPE_ENV` block whose slots are
+/// the i64 jsvals, then one slot sharing the i32 phase and the i32 flag set
+/// while an abrupt completion must close the iterator (small integers, so
+/// the slot reads as a denormal number).
+const FA_PROMISE: u32 = 8;
 /// `A`.
-const FA_TARGET: u32 = 8;
+const FA_TARGET: u32 = 16;
 /// The `this` of the call (`C`).
-const FA_CTOR: u32 = 16;
+const FA_CTOR: u32 = 24;
 /// `items`, then the iterator or the array-like.
-const FA_SOURCE: u32 = 24;
+const FA_SOURCE: u32 = 32;
 /// The iterator's `next`, or the array-like's length.
-const FA_NEXT: u32 = 32;
-const FA_MAP: u32 = 40;
-const FA_THIS_ARG: u32 = 48;
+const FA_NEXT: u32 = 40;
+const FA_MAP: u32 = 48;
+const FA_THIS_ARG: u32 = 56;
 /// `k`, a number jsval.
-const FA_K: u32 = 56;
+const FA_K: u32 = 64;
 /// The value an await resumed with, or the reason a close rethrows.
-const FA_VALUE: u32 = 64;
-const FA_PHASE: u32 = 72;
-const FA_OPEN: u32 = 76;
-const FA_SIZE: i32 = 80;
+const FA_VALUE: u32 = 72;
+const FA_PHASE: u32 = 80;
+const FA_OPEN: u32 = 84;
+const FA_SLOTS: i32 = 10;
+const FA_SIZE: i32 = HEADER_SIZE + 4 + 8 * FA_SLOTS;
 
 /// The phases of the state machine: the start, then what the pending await
 /// resumes with (a `next()` result, a mapped value, an array-like element).
@@ -1548,7 +1551,11 @@ pub(super) fn emit_from_async(
 /// throw.
 fn from_async_entry(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let (st, p, st64) = (frame.base(0), frame.i64(0), frame.y64(1));
-    wasm!(function; I32Const(FA_SIZE), Call(helpers.alloc), LocalSet(st));
+    wasm!(function;
+        I32Const(FA_SIZE), Call(helpers.alloc), LocalTee(st),
+        I32Const(TYPE_ENV), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
+        LocalGet(st), I32Const(FA_SLOTS), I32Store(fa_flag(HEADER_SIZE.cast_unsigned())),
+    );
     for (i, offset) in (0..).zip([FA_SOURCE, FA_MAP, FA_THIS_ARG]) {
         wasm!(function; LocalGet(st));
         frame.arg(function, i);
@@ -1564,7 +1571,7 @@ fn from_async_entry(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers
         I32Const(PROMISE_OP_NEW), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
         Call(helpers.promise), LocalSet(p),
         LocalGet(st), LocalGet(p), I64Store(fa_slot(FA_PROMISE)),
-        LocalGet(st), I64ExtendI32U, LocalSet(st64),
+        LocalGet(st), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(st64),
     );
     let run = from_async(FromAsyncOp::Run);
     iter::call_internal(function, run, st64, Some(st64), helpers);
@@ -1625,7 +1632,7 @@ fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helper
     );
     let mark = function.temp_mark();
     function.root_temp(TempClass::Jsval);
-    wasm!(function; LocalGet(st), I64ExtendI32U, LocalSet(st64));
+    wasm!(function; LocalGet(st), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(st64));
     let rethrow = helpers.builtin_slot(from_async(FromAsyncOp::Rethrow));
     let scratch = frame.scratch();
     emit_settler_value(rethrow, st64, function, scratch, helpers);

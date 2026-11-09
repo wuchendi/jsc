@@ -1705,7 +1705,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // The realm: `__has_own`, then the builtin bodies.
     code.function(&emit_has_own(&offsets, helpers, &leaves));
     for builtin in Builtin::ALL {
-        code.function(&builtins::emit_builtin(builtin, &offsets, helpers));
+        code.function(&builtins::emit_builtin(builtin, &offsets, helpers, &leaves));
     }
     // The conversion helpers follow the builtin bodies.
     code.function(&emit_to_primitive(&offsets, helpers, &leaves));
@@ -1713,10 +1713,10 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&emit_add_helper(helpers, &leaves));
     code.function(&emit_compare(helpers, &leaves));
     code.function(&emit_array_join(&offsets, helpers, &leaves));
-    code.function(&builtins::emit_to_object(&offsets, helpers));
-    code.function(&builtins::emit_json_rep(&offsets, helpers));
-    code.function(&builtins::emit_json_indent(helpers));
-    code.function(&builtins::emit_json_revive(helpers));
+    code.function(&builtins::emit_to_object(&offsets, helpers, &leaves));
+    code.function(&builtins::emit_json_rep(&offsets, helpers, &leaves));
+    code.function(&builtins::emit_json_indent(helpers, &leaves));
+    code.function(&builtins::emit_json_revive(helpers, &leaves));
     code.function(&emit_define_own(&offsets, helpers, &leaves));
     code.function(&emit_to_desc(&offsets, helpers, &leaves));
     code.function(&emit_own_desc(&offsets, helpers, &leaves));
@@ -1724,7 +1724,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&emit_test_integrity(&leaves));
     code.function(&emit_own_enum(&offsets, helpers, &leaves));
     code.function(&emit_set_proto(helpers, &leaves));
-    code.function(&builtins::emit_promise_self_error(&offsets, helpers));
+    code.function(&builtins::emit_promise_self_error(
+        &offsets, helpers, &leaves,
+    ));
     code.function(&emit_symbol_get(helpers, &leaves));
     code.function(&emit_super_get(&offsets, helpers, &leaves));
     code.function(&emit_super_set(&offsets, helpers, &leaves));

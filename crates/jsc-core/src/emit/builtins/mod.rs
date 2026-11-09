@@ -22,7 +22,6 @@ macro_rules! wasm {
 
 mod array;
 mod async_iter;
-mod bridge;
 mod ctor;
 mod date;
 mod date_parse;
@@ -46,10 +45,6 @@ use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
 pub(super) use async_iter::{
     emit_async_iterator_complete, emit_async_iterator_next, emit_async_iterator_return,
     emit_iterator_result_check, emit_open_async_iterator,
-};
-use bridge::{
-    emit_array_contains, emit_materialize, emit_same_value, emit_store_unit, emit_str_canonical,
-    emit_str_narrow, emit_str_unit,
 };
 pub(super) use iter::{
     CloseMode, ST_ARRAY, ST_GEN, ST_STRING, emit_get_iterator, emit_iter_classify,
@@ -300,9 +295,9 @@ pub(super) fn emit_builtin(
     builtin: Builtin,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> Function {
-    let leaves = roots::leaf_set(helpers);
-    let (mut f, frame) = Frame::begin(helpers, &leaves);
+    let (mut f, frame) = Frame::begin(helpers, leaves);
     emit_builtin_body(builtin, &mut f, frame, strings, helpers);
     wasm!(f; End);
     finish_builder(f)
@@ -706,9 +701,12 @@ fn this_primitive(
 /// which callers reject first) is returned as is. A String wrapper's
 /// `length` is defined as its own read-only, non-configurable property; its
 /// indices are virtual (`__str_exotic_index`).
-pub(super) fn emit_to_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let leaves = roots::leaf_set(helpers);
-    let mut f = FnBuilder::new(&leaves);
+pub(super) fn emit_to_object(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut f = FnBuilder::new(leaves);
     let v = f.param(LocalClass::Jsval);
     let obj = f.local(LocalClass::Base);
     let class = f.local(LocalClass::Raw(ValType::I32));

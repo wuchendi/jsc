@@ -696,7 +696,7 @@ on lookup through `__fn_materialize`, which allocates), and so neither is
 | IR locals (`let`/`const`/`var`, temps, `%penv`, iterator records) | `ir.rs:2347-2365,2470-2478` | write-through on every `local.set`/`tee` (+3 ops) |
 | parameters `a0..a_{K-1}`, `env` | locals `0..K+1` (DESIGN §4.2) | stored in the prologue iff read after a safepoint; `argc` never |
 | `this` snapshot | DESIGN §4.3 | write-through |
-| emitter `i64` scratch | `scratch+0..+2, +4..+6, +13..+20, +22, +23` (`emit/function.rs:15-44`) | write-through; **`Date` scratch `+24..+29` declared raw, never rooted** |
+| emitter `i64` scratch | `scratch+0..+2, +4..+6, +13..+20, +22, +23` (`emit/function.rs:15-44`) | write-through; **`Date` scratch `+24..+29` declared raw, never rooted**; `emit/builtins/iter.rs` and `async_iter.rs` also hold jsvals in `+24..+26`, raw for the same reason: no safepoint between def and last use, except the Map `step_entry` key/value across the one entry-array allocation, which stay reachable from the Map backing |
 | emitter `i32` bases / keys | `+3`, `+7`, `+8`, `+11`, `+12`, `+21` (`emit/object.rs:31`, `emit/generator.rs:43`) | write-through of `HEAP | base` (+6); `+9`, `+10` are integers (`+9` also holds the array-pop `new_len`, moved off `+7`); the remaining integer uses of `+3`, `+8` and `+21` are to be re-audited before M2 enables collection |
 | builtin `Frame` locals | `emit/builtins/mod.rs:127-151` | `i64` write-through; `i32` only via `frame.base(k)`; `f64` never |
 | hand-written helper locals | each `Function::new` | declared jsval / base / raw; **no default** (Q11: the builder rejects an undeclared local) |
@@ -789,7 +789,8 @@ a **raw ref** is a `u32` base, `0` = none.
 | # | blocker | fix |
 |---|---|---|
 | F1 | headerless `__alloc` blocks: the intern growth copy (`emit/props.rs:525-526`, `cap·8` bytes, slot 0 overlapping the header) and the `Math.sumPrecise` accumulator (`emit/builtins/number.rs:446-447`, 576 bytes, held in an `i32` across user-code iterator steps) | both become `TYPE_RAW` blocks (data at `+8`); `$__intern_base` points at `block + 8`; the accumulator base is a rooted base local |
-| F2 | async-generator request record `next` stored as a zero-extended raw `u32` in a `TYPE_ENV` slot (`emit/builtins/generator.rs:505-519`, `I64ExtendI32U` at `:517`), invisible to env tracing | store `HEAP | record` (`I64Or` `HEAP_BITS`); readers already `I32WrapI64` (`:395`); the only raw-`u32`-into-`i64` store in `emit/` |
+| F2 | async-generator request record `next` stored as a zero-extended raw `u32` in a `TYPE_ENV` slot (`emit/builtins/generator.rs:505-519`, `I64ExtendI32U` at `:517`), invisible to env tracing | store `HEAP | record` (`I64Or` `HEAP_BITS`); readers already `I32WrapI64` (`:395`) |
+| F3 | `Array.fromAsync` state block (`emit/builtins/array.rs`, `from_async_entry`): headerless `__alloc` block with a jsval at `+0`, passed as the settler `env` zero-extended, so neither the block nor its jsvals were traceable | a `TYPE_ENV` block of 10 slots at `+8` (the last slot packs the i32 phase and close flag, reading as a denormal number); the `env` is `HEAP | st`, readers `I32WrapI64` |
 
 ### 5.6 Allocator and collection policy
 
