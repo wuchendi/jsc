@@ -138,7 +138,7 @@ fn compile_and_run_string_literal_end_to_end() {
 fn string_literal_round_trips_to_a_heap_string() {
     // A string literal lowers to a heap-pointer jsval backed by a data
     // segment; running the module and decoding against its memory yields the
-    // text (unquoted via `format_value`).
+    // text (unquoted by the guest renderer).
     let bytes = emit(&expr_program(IrNode::Str("foo".into())));
     validate(&bytes);
     let value = completion(&bytes);
@@ -838,6 +838,8 @@ fn every_block_is_8_aligned_with_zero_header_bytes() {
 fn exported_constructors_build_aligned_zeroed_blocks() {
     use wasmtime::{Engine, Linker, Module, Store};
     let bytes = emit_js("let s = 'odd'; s");
+    let start = usize::try_from(data_layout(&bytes).1.expect("heap start")).expect("start");
+    assert_eq!(start % 8, 0, "heap start is 8-aligned");
     let engine = Engine::default();
     let module = Module::new(&engine, &bytes).expect("compile");
     let mut linker = Linker::new(&engine);
@@ -849,21 +851,8 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
         .instantiate(&mut store, &module)
         .expect("instantiate");
     let memory = instance.get_memory(&mut store, "memory").expect("memory");
-    let heap_ptr = instance
-        .get_global(&mut store, crate::abi::HEAP_PTR_EXPORT_NAME)
-        .expect("heap ptr");
-    let ptr = |store: &mut Store<()>| heap_ptr.get(&mut *store).i32().expect("i32");
-    assert_eq!(ptr(&mut store) % 8, 0, "heap start is 8-aligned");
     // Dirty the free region so the constructors must WRITE the zero bytes.
-    let start = usize::try_from(ptr(&mut store)).expect("ptr");
     memory.data_mut(&mut store)[start..start + 256].fill(0xFF);
-
-    let alloc = instance
-        .get_typed_func::<i32, i32>(&mut store, crate::abi::ALLOC_EXPORT_NAME)
-        .expect("__alloc export");
-    let a = alloc.call(&mut store, 5).expect("alloc");
-    assert_eq!(a % 8, 0);
-    assert_eq!(ptr(&mut store) - a, 8, "__alloc(5) rounds up to 8");
 
     let new_string = instance
         .get_typed_func::<(i32, i32), i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
@@ -890,36 +879,6 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
         &[crate::abi::TYPE_STRING, 0, crate::abi::STR_FLAG_TWO_BYTE, 0]
     );
     assert_eq!(&mem[t + 4..t + 8], &3u32.to_le_bytes());
-
-    let new_array = instance
-        .get_typed_func::<i32, i32>(&mut store, crate::abi::NEW_ARRAY_EXPORT_NAME)
-        .expect("__new_array export");
-    let arr = new_array.call(&mut store, 2).expect("new array");
-    assert_eq!(arr % 8, 0);
-    let mem = memory.data(&store);
-    let arr = usize::try_from(arr).expect("base");
-    assert_eq!(&mem[arr..arr + 4], &[crate::abi::TYPE_ARRAY, 0, 0, 0]);
-    assert_eq!(&mem[arr + 4..arr + 8], &0u32.to_le_bytes(), "props");
-    // `proto` = `%Array.prototype%`.
-    assert_eq!(
-        mem[arr + 14..arr + 16],
-        [0xFD, 0x7F],
-        "proto is a heap pointer"
-    );
-    assert_eq!(&mem[arr + 16..arr + 20], &2u32.to_le_bytes(), "len");
-    let elems = u32::from_le_bytes(mem[arr + 20..arr + 24].try_into().expect("elems"));
-    let elems = usize::try_from(elems).expect("elems");
-    assert_eq!(elems % 8, 0);
-    assert_eq!(&mem[elems..elems + 4], &[crate::abi::TYPE_ELEMS, 0, 0, 0]);
-    assert_eq!(&mem[elems + 4..elems + 8], &2u32.to_le_bytes(), "cap");
-    for i in 0..2 {
-        let at = elems + 8 + 8 * i;
-        assert_eq!(&mem[at..at + 8], &crate::abi::UNDEFINED.to_le_bytes());
-    }
-    let empty = new_array.call(&mut store, 0).expect("empty array");
-    let mem = memory.data(&store);
-    let empty = usize::try_from(empty).expect("base");
-    assert_eq!(&mem[empty + 16..empty + 24], &[0; 8], "len 0, no store");
 
     let new_promise = instance
         .get_typed_func::<(), i32>(&mut store, crate::abi::NEW_PROMISE_EXPORT_NAME)

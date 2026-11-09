@@ -4,12 +4,13 @@
 //! block through the guest's exported constructors.
 
 use icu_normalizer::{ComposingNormalizerBorrowed, DecomposingNormalizerBorrowed};
-use wasmtime::{AsContextMut, Caller, Global};
+use wasmtime::Caller;
 
 use crate::abi;
 
 use abi::{HEAP, QNAN, TYPE_ARRAY, TYPE_STRING};
 
+use super::harness::reentry_error;
 use super::value::{Value, array_elements, decode, string_units, to_js_string};
 
 const STR_DATA_OFFSET: usize = abi::STR_DATA_OFFSET as usize;
@@ -37,9 +38,6 @@ const RANGE_ERROR: u64 = abi::METHOD_RANGE_ERROR;
 const TRUE_BITS: u64 = abi::TRUE;
 const FALSE_BITS: u64 = abi::FALSE;
 
-/// The out-of-memory heap-pointer sentinel; see [`abi::HEAP_PTR_OOM`].
-const HEAP_PTR_OOM: i32 = abi::HEAP_PTR_OOM;
-
 /// The linear-memory cap in bytes. A constructor request at or past it can
 /// only run out of memory, so lengths are clamped to it before the call (which
 /// keeps the guest's `i32` size arithmetic from wrapping).
@@ -51,17 +49,24 @@ const MEMORY_MAX_BYTES: usize = abi::MEMORY_MAX_PAGES as usize * 0x1_0000;
 /// [`alloc_units`]) and return its base offset.
 pub(super) fn alloc_string<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
+    failed: &mut Option<wasmtime::Error>,
     text: &str,
 ) -> Option<u64> {
-    alloc_units(caller, &text.encode_utf16().collect::<Vec<u16>>())
+    alloc_units(caller, failed, &text.encode_utf16().collect::<Vec<u16>>())
 }
 
 /// Allocate a heap STRING block holding the code units `units` in canonical
 /// form (one-byte Latin-1 when every unit is `<= 0xFF`, else UTF-16LE) through
 /// the guest `__new_string(len, two_byte)` export and return its base offset,
 /// or `None` if the export is missing or the allocation/write fails. The guest
-/// writes the header and the width flag; the host only fills the payload.
-fn alloc_units<W: Send + 'static>(caller: &mut Caller<'_, W>, units: &[u16]) -> Option<u64> {
+/// writes the header and the width flag; the host only fills the payload. A
+/// failed guest call (a `proc_exit` from the out-of-memory path, or a trap) is
+/// left in `failed` for the import to return.
+fn alloc_units<W: Send + 'static>(
+    caller: &mut Caller<'_, W>,
+    failed: &mut Option<wasmtime::Error>,
+    units: &[u16],
+) -> Option<u64> {
     let units = &units[..units.len().min(MEMORY_MAX_BYTES)];
     let two_byte = units.iter().any(|&unit| unit > 0xFF);
     let ctor = caller
@@ -70,7 +75,13 @@ fn alloc_units<W: Send + 'static>(caller: &mut Caller<'_, W>, units: &[u16]) -> 
         .typed::<(i32, i32), i32>(&*caller)
         .ok()?;
     let len = i32::try_from(units.len()).ok()?;
-    let base = ctor.call(&mut *caller, (len, i32::from(two_byte))).ok()?;
+    let base = match ctor.call(&mut *caller, (len, i32::from(two_byte))) {
+        Ok(base) => base,
+        Err(err) => {
+            *failed = Some(reentry_error(err));
+            return None;
+        }
+    };
     let base = usize::try_from(base).ok()?;
     let data: Vec<u8> = if two_byte {
         units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
@@ -85,12 +96,6 @@ fn alloc_units<W: Send + 'static>(caller: &mut Caller<'_, W>, units: &[u16]) -> 
     Some(base as u64)
 }
 
-/// Whether the heap-pointer global holds the out-of-memory sentinel: some guest
-/// or host allocation could not grow linear memory.
-pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bool {
-    global.get(&mut store).i32() == Some(HEAP_PTR_OOM)
-}
-
 /// Dispatch a `__method` host-import call: snapshot linear memory, read
 /// the receiver's raw jsval bits, and perform the requested method, returning
 /// the result jsval bits (or `None` to yield `undefined` — a type-mismatched
@@ -103,6 +108,7 @@ pub(super) fn heap_exhausted(mut store: impl AsContextMut, global: Global) -> bo
 #[allow(clippy::too_many_lines)] // one flat dispatch over the op flags
 pub(super) fn method_dispatch<W: Send + 'static>(
     caller: &mut Caller<'_, W>,
+    failed: &mut Option<wasmtime::Error>,
     recv: u64,
     op: i32,
     arg0: i64,
@@ -135,7 +141,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             };
             let radix = value_to_number(&decode(arg0.cast_unsigned(), &mem));
             let text = number_to_radix_string(x, radix_digits(radix));
-            alloc_string(caller, &text).map(|base| HEAP | base)
+            alloc_string(caller, failed, &text).map(|base| HEAP | base)
         }
         METHOD_OP_NUMBER_TO_FIXED
         | METHOD_OP_NUMBER_TO_EXPONENTIAL
@@ -153,7 +159,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                 (METHOD_OP_NUMBER_TO_EXPONENTIAL, f) => number_to_exponential(x, f),
                 _ => return None,
             };
-            alloc_string(caller, &text).map(|base| HEAP | base)
+            alloc_string(caller, failed, &text).map(|base| HEAP | base)
         }
         METHOD_OP_MATH => {
             let number = |bits: u64| match decode(bits, &mem) {
@@ -167,7 +173,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
             Some(TYPE_STRING) => {
                 let units = string_units(&mem, ptr?)?;
                 let mapped = map_case(&units, op == METHOD_OP_TO_UPPER);
-                alloc_units(caller, &mapped).map(|base| HEAP | base)
+                alloc_units(caller, failed, &mapped).map(|base| HEAP | base)
             }
             _ => None,
         },
@@ -191,7 +197,7 @@ pub(super) fn method_dispatch<W: Send + 'static>(
                     return Some(RANGE_ERROR);
                 }
                 let units = normalize_units(&string_units(&mem, ptr?)?, &form);
-                alloc_units(caller, &units).map(|base| HEAP | base)
+                alloc_units(caller, failed, &units).map(|base| HEAP | base)
             }
             _ => None,
         },

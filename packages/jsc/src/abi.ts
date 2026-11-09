@@ -167,20 +167,14 @@ export const FN_INFO_NAME_OFFSET = 0
 
 /** Export name of the module's linear memory. */
 export const MEMORY_EXPORT_NAME = 'memory'
-/** Export name of the bump-allocator heap-pointer global (read for the OOM sentinel). */
-export const HEAP_PTR_EXPORT_NAME = '__heap_ptr'
 /** The linear-memory cap in 64 KiB wasm pages (512 MiB). */
 export const MEMORY_MAX_PAGES = 8192
-/** The sticky out-of-memory sentinel the guest stores in `__heap_ptr` (`i32`). */
-export const HEAP_PTR_OOM = -1
 /**
  * Export name of the `__new_string(len, twoByte) -> base` guest string constructor:
  * `len` code units, Latin-1 (`twoByte` 0) or UTF-16LE (`twoByte` 1, sets
  * `STR_FLAG_TWO_BYTE`); the caller fills the data at `base + STR_DATA_OFFSET`.
  */
 export const NEW_STRING_EXPORT_NAME = '__new_string'
-/** Export name of the `__new_array(len) -> base` guest array constructor. */
-export const NEW_ARRAY_EXPORT_NAME = '__new_array'
 /** Export name of the `__new_promise() -> base` guest pending-promise constructor. */
 export const NEW_PROMISE_EXPORT_NAME = '__new_promise'
 /**
@@ -196,13 +190,6 @@ export const EXC_VALUE_EXPORT_NAME = '__exc_value'
 export const INVOKE_EXPORT_NAME = '__invoke1'
 /** Export name of the `__async_step(gen, sent)` async-body step trampoline. */
 export const ASYNC_STEP_EXPORT_NAME = '__async_step'
-
-/** `print` flag: format the jsval and follow it with a single space. */
-export const PRINT_FLAG_SEP = 0
-/** `print` flag: format the jsval and follow it with a newline. */
-export const PRINT_FLAG_END = 1
-/** `print` flag: emit only a newline (zero-argument `console.log()`). */
-export const PRINT_FLAG_NEWLINE = 2
 
 /** `__convert` op: stringify the argument (`String(x)`). */
 export const CONVERT_OP_TO_STRING = 0
